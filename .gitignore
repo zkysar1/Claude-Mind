@@ -1,0 +1,33 @@
+
+# Environment / secrets
+.env.local
+.env
+*.env
+
+# Temporary / scratch files
+tmp_*
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.stackdump
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+
+# User-specific settings (framework settings live in .claude/settings.json)
+.claude/settings.local.json
