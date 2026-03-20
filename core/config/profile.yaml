@@ -5,7 +5,7 @@
 # --- FRAMEWORK ---
 
 system:
-  name: "Continual Learning Base Agent"
+  name: "Self"
   version: "0.1.0"
   purpose: "Domain-agnostic continual learning agent that explores, builds knowledge, forms hypotheses, tracks outcomes, and self-evolves its capabilities over time"
 
