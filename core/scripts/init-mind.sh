@@ -2,7 +2,7 @@
 # init-mind.sh — Deterministic mind/ directory initialization
 #
 # Creates the agent's mind from core/config/ initial_state: sections.
-# Idempotent: exits early if mind/ already exists.
+# Idempotent: exits early if mind/.initialized marker exists.
 # Called by /boot Phase -2 instead of LLM-driven file creation.
 #
 # Usage:
@@ -18,8 +18,10 @@ MIND="$REPO_ROOT/mind"
 CONFIG="$CONFIG_DIR"
 
 # --- Idempotent gate ---
-if [ -d "$MIND" ]; then
-    echo "mind/ already exists — skipping initialization"
+# Check for .initialized marker, NOT just the directory. On Windows, rm -rf mind/
+# can partially fail (file locks), leaving an empty husk that blocks re-init.
+if [ -f "$MIND/.initialized" ]; then
+    echo "mind/ already initialized — skipping"
     exit 0
 fi
 
@@ -324,6 +326,7 @@ echo "  Created L1 tree stub files"
 
 FILE_COUNT=$(find "$MIND" -type f | wc -l)
 DIR_COUNT=$(find "$MIND" -type d | wc -l)
+touch "$MIND/.initialized"
 echo ""
 echo "Mind initialization complete — $FILE_COUNT files created, $DIR_COUNT directories"
 echo "First boot detected — agent is a blank slate"

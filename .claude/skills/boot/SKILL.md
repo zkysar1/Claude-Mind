@@ -62,7 +62,8 @@ WHITELISTED = [
   "working-memory.yaml", "handoff.yaml",
   "pending-questions.yaml", "overflow-queue.yaml",
   "last-report-timestamp",
-  "compact-checkpoint.yaml"
+  "compact-checkpoint.yaml",
+  "pending-agents.yaml"
 ]
 
 For each file in mind/session/:

@@ -113,6 +113,13 @@ def main():
                     lines.append(f"    ACTIVE: {item.get('id', '?')} ({item.get('type', '?')})")
         lines.append("")
 
+    # Pending background agents warning
+    pending_count = checkpoint.get("pending_agents_count", 0)
+    if pending_count:
+        lines.append(f"PENDING AGENTS: {pending_count} background agent(s) were running before compaction.")
+        lines.append("  Their completion notifications will re-engage you. Collect results in Phase -0.5a.")
+        lines.append("")
+
     lines.append("ACTION: The stop hook will fire next. Re-enter /aspirations loop.")
     lines.append("Phase -0.5c will detect compact-checkpoint.yaml and process encoding queue")
     lines.append("in this fresh context before resuming goal execution.")

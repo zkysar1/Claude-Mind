@@ -342,6 +342,9 @@ def cmd_add(args):
         print(f"Invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # New aspirations are never archived — default it so callers don't need to include it
+    asp.setdefault("archived", False)
+
     try:
         validate_aspiration(asp)
     except ValueError as e:

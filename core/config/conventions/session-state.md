@@ -115,3 +115,34 @@ Skills use `load-conventions.sh` in Step 0 to batch-check which conventions need
 Partial reads (offset/limit) bypass tracking.
 
 **Scripts**: `core/scripts/context-reads.py`, `core/scripts/load-conventions.sh`.
+
+---
+
+# Pending Background Agents
+
+Tracks dispatched background agents (`Agent(run_in_background=true)`) so the stop hook
+and aspirations loop can handle the idle-while-agents-work scenario correctly.
+
+- **File**: `mind/session/pending-agents.yaml`
+- **Written by**: aspirations-execute Phase 4 (before Agent dispatch)
+- **Read by**: stop-hook.sh Gate 2.5, aspirations Phase -0.5a
+- **Cleaned by**: aspirations post-Phase 9.7 (team shutdown), `pending-agents.sh prune-stale`
+
+**Scripts**: `core/scripts/pending-agents.sh` (thin wrapper), `core/scripts/pending-agents.py`
+
+| Subcommand | Purpose |
+|-----------|---------|
+| `register --id <id> --team <team> --goal <goal> --purpose <desc> [--timeout <min>]` | Register agent before dispatch |
+| `deregister --id <id>` | Remove completed agent |
+| `deregister-team --team <name>` | Remove all agents from a team |
+| `list [--json]` | Show all registered agents |
+| `has-pending` | Exit 0 if non-stale agents exist, exit 1 if not (runs prune-stale internally) |
+| `prune-stale` | Remove agents past their timeout_minutes |
+| `clear` | Delete file entirely |
+
+**Stop hook Gate 2.5**: calls `has-pending`. If pending agents exist, stop is allowed
+(exit 0) and the counter is cleared. Background agent completion notifications re-engage
+the parent agent, which collects results in Phase -0.5a.
+
+**Staleness guard**: agents past their `timeout_minutes` (default 30) are auto-pruned by
+`has-pending`, preventing orphaned registrations from permanently disabling the stop hook.

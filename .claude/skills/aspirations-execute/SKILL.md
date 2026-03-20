@@ -198,7 +198,7 @@ ELSE:
 
 # ── End Intelligent Retrieval ───────────────────────────────────────
 
-# [EXPERIMENTAL] Team-Based Research Delegation
+# Team-Based Research Delegation
 #
 # The host MAY dispatch team agents to gather information via TeamCreate.
 # Never use bare sub-agents (Agent tool without team_name) — they start
@@ -221,6 +221,8 @@ IF prefetch_goals:
     TeamCreate(team_name="research-{session}", description="Pre-fetch research for goals")
     FOR pg in prefetch_goals:
         research_task = extract_research_question(pg)  # What info does this goal need?
+        # Register agent BEFORE dispatch (crash-safe: staleness timeout cleans up if dispatch fails)
+        Bash: `pending-agents.sh register --id "researcher-{pg.goal_id}" --team "research-{session}" --goal "{pg.goal_id}" --purpose "{research_task[:100]}" --timeout 30`
         Agent(team_name="research-{session}", name="researcher-{pg.goal_id}",
               prompt="First, invoke /prime. Then do READ-ONLY research:
                       {research_task}. Do NOT write files or invoke skills.

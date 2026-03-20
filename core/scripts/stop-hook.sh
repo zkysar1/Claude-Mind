@@ -3,16 +3,18 @@
 #
 # Global hook registered in .claude/settings.json. Fires on every stop attempt.
 #
-# Gate 0: Non-runner sessions pass through immediately (session identity check)
-# Gate 1: Not RUNNING → allow stop
-# Gate 2: stop-loop signal → allow stop
+# Gate 0:   Non-runner sessions pass through immediately (session identity check)
+# Gate 1:   Not RUNNING → allow stop
+# Gate 2:   stop-loop signal → allow stop
+# Gate 2.5: Pending background agents → allow stop (agent completions re-engage parent)
 # Tier 1-3: Block stop, tell Claude to re-enter the aspirations loop
 # Tier 4:   Block stop, tell Claude to invoke /recover skill
 # Tier 5+:  Safety valve — allow stop unconditionally
 #
 # Counter lifecycle:
 #   Incremented: each stop attempt while RUNNING (before tier decision)
-#   Reset by: /boot (stale cleanup), aspirations loop entry (Phase -0.5), safety valve (block 5+)
+#   Reset by: /boot (stale cleanup), aspirations loop entry (Phase -0.5),
+#             Gate 2.5 (pending agents), safety valve (block 5+)
 #   Lives at: mind/session/stop-block-count
 
 set -euo pipefail
@@ -41,6 +43,17 @@ fi
 if bash "$CORE_ROOT/scripts/session-signal-exists.sh" stop-loop 2>/dev/null; then
     bash "$CORE_ROOT/scripts/session-signal-clear.sh" stop-loop
     bash "$CORE_ROOT/scripts/session-counter-clear.sh"
+    exit 0
+fi
+
+# --- Gate 2.5: Pending background agents → allow stop ---
+# Parent agent is idle-waiting for background agents to complete.
+# Allow stop — agent completion notifications will re-engage the parent.
+# has-pending prunes stale agents (>timeout_minutes), so orphaned entries self-heal.
+if bash "$CORE_ROOT/scripts/pending-agents.sh" has-pending 2>/dev/null; then
+    # Counter clear is critical: without it, each idle-wait increments the counter
+    # and after 5 episodes the safety valve would permanently stop the loop.
+    bash "$CORE_ROOT/scripts/session-counter-clear.sh" 2>/dev/null
     exit 0
 fi
 

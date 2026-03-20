@@ -236,6 +236,7 @@ Signal files (all in `mind/session/`):
 | `persona-active` | "true" or "false" | /escapePersona, /enterPersona, /boot |
 | `stop-loop` | Allow exit | /stop, /recover |
 | `handoff.yaml` | Cross-session state | aspirations consolidation |
+| `pending-agents.yaml` | Background agent tracking (stop hook Gate 2.5) | aspirations-execute Phase 4 |
 
 Other session signals (`loop-active`, `stop-block-count`, `compact-checkpoint.yaml`, `context-reads.txt`, `pending-questions.yaml`, `aspirations-compact.json`): see `core/config/conventions/session-state.md`.
 

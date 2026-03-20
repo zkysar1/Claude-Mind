@@ -136,6 +136,27 @@ evolutions_this_session = 0       # counter for Phase 9 evolution cap
 goals_since_last_alignment_check = 0  # counter for Phase 2 Self-alignment check
 aspirations_touched_this_session = set()  # track which aspirations had goals executed (for sessions_active)
 
+# Phase -0.5a: Background Agent Result Collection
+# If background agents were dispatched in a previous turn, their completion
+# notifications may have re-engaged us. Collect results and deregister.
+IF mind/session/pending-agents.yaml EXISTS:
+    Bash: `pending-agents.sh list --json`
+    pending = parse JSON output
+    IF pending.agents is non-empty:
+        FOR EACH agent in pending.agents:
+            # Check if this agent's results are available in context
+            # (Claude Code injects completion notifications into the turn)
+            IF completion results available for agent.agent_id:
+                Store results as prefetch research for agent.goal_id
+                Bash: `pending-agents.sh deregister --id {agent.agent_id}`
+                Log: "AGENT RESULT COLLECTED: {agent.agent_id} for {agent.goal_id}"
+            ELSE:
+                # Agent still running or no results yet — prune-stale handles timeout
+                Log: "AGENT PENDING: {agent.agent_id} dispatched at {agent.dispatched_at}"
+        # If all agents collected or pruned, clean up
+        Bash: `pending-agents.sh has-pending` → check exit code
+        IF exit 1 (no pending): Bash: `pending-agents.sh clear`
+
 # Phase -0.5c: Compact Checkpoint Processing
 # After autocompact, PreCompact hook saves encoding state to compact-checkpoint.yaml.
 # Process the encoding queue NOW while context is freshest (just after compaction).
@@ -528,7 +549,7 @@ FOREVER:
                 Set effort_level = skip
                 # Re-evaluate: remove this goal, try next-highest scoring
 
-    # Phase 2.6: Pre-Fetch Context for Upcoming Goals [EXPERIMENTAL]
+    # Phase 2.6: Pre-Fetch Context for Upcoming Goals
     #
     # The host MAY dispatch team agents to gather information for upcoming goals.
     # This parallelizes the SLOW part (research, reading, analysis) while the host
@@ -1148,7 +1169,7 @@ FOREVER:
             IF real_signals < 2 AND conclusion.blocks_goals is non-empty AND conclusion.outcome is null:
                 Log: "WEAK CONCLUSION: '{conclusion.conclusion}' has {real_signals} signal(s) but blocks {N} goals"
 
-    # [EXPERIMENTAL] Apply Pre-Fetched Research to Upcoming Goals
+    # Apply Pre-Fetched Research to Upcoming Goals
     # Team agents have gathered information for upcoming goals.
     # The host now executes each goal with enriched context.
     # The research is INPUT to the goal, not the goal's OUTPUT.
@@ -1160,6 +1181,8 @@ FOREVER:
             Run Phase 4.1 through Phase 9 for this goal (full cycle)
             # Each goal completes ALL phases before the next starts
         Shutdown team (SendMessage shutdown_request to all workers)
+        # Deregister all agents from this team's tracking
+        Bash: `pending-agents.sh deregister-team --team "research-{session}"`
 
     # Phase 10: Check stop conditions
     # 10a: Agent state check (authoritative)

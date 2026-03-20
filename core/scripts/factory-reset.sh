@@ -67,6 +67,11 @@ echo -e "${YELLOW}Removing mind/ directory...${NC}"
 
 if [ -d "$REPO_ROOT/mind" ]; then
     rm -rf "$REPO_ROOT/mind"
+    if [ -d "$REPO_ROOT/mind" ]; then
+        echo "  WARNING: mind/ not fully removed (files may be locked)"
+        echo "  Close other programs accessing mind/ and retry."
+        exit 1
+    fi
     echo "  deleted: mind/"
 else
     echo "  (mind/ directory not found — already clean)"

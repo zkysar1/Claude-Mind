@@ -61,6 +61,16 @@ def main():
     active_ctx = slots.get("active_context") or {}
     retrieval_manifest = active_ctx.get("retrieval_manifest")
 
+    # Pending background agents (informational — actual data in pending-agents.yaml)
+    pending_agents_file = MIND_DIR / "session" / "pending-agents.yaml"
+    pending_agents_count = 0
+    if pending_agents_file.exists():
+        try:
+            pa_data = yaml.safe_load(pending_agents_file.read_text(encoding="utf-8")) or {}
+            pending_agents_count = len(pa_data.get("agents", []))
+        except Exception:
+            pass
+
     checkpoint = {
         "created_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "compact_count": compact_count,
@@ -77,6 +87,8 @@ def main():
         "known_blockers": slots.get("known_blockers", []),
         # Retrieval manifest — survives compaction for Phase 4.26 utilization feedback
         "retrieval_manifest": retrieval_manifest,
+        # Pending background agents — count only (file persists on disk)
+        "pending_agents_count": pending_agents_count,
     }
 
     # Atomic write (tmp + rename)
@@ -96,7 +108,8 @@ def main():
         checkpoint["known_blockers"],
         checkpoint["retrieval_manifest"],
     ] if v)
-    log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {slot_count} slots, {prior_count} prior")
+    pa_msg = f", {pending_agents_count} agents" if pending_agents_count else ""
+    log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {slot_count} slots, {prior_count} prior{pa_msg}")
 
     # Clear context reads tracker — post-compaction context may not retain file contents
     context_reads_path = MIND_DIR / "session" / "context-reads.txt"

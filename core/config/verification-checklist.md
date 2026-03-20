@@ -859,10 +859,10 @@ _(Domain-specific items live in `mind/verification-checklist.md`, seeded from `c
 
 ---
 
-## AH. Team-Based Research Delegation [EXPERIMENTAL]
+## AH. Team-Based Research Delegation
 
 ### AH1. Framework Config
-1. `core/config/aspirations.yaml` has `max_concurrent_goals: 3` in framework section with `[EXPERIMENTAL]` tag
+1. `core/config/aspirations.yaml` has `max_concurrent_goals: 3` in framework section
 2. `core/config/aspirations.yaml` `modifiable:` section has `max_concurrent_goals: {min: 1, max: 3, default: 3}`
 3. Config comment says "Max concurrent goals per iteration (primary + parallel)" — NOT "dispatched to sub-agents"
 
@@ -871,7 +871,7 @@ _(Domain-specific items live in `mind/verification-checklist.md`, seeded from `c
 5. Phase 2.6 says "team agents are research assistants, not executors"
 6. Phase 2.6 limits prefetch goals to `max_concurrent_goals - 1`
 7. Phase 2.6 checks "g has a research/analysis phase that can run independently"
-8. `aspirations-execute/SKILL.md` Phase 4 has `[EXPERIMENTAL] Team-Based Research Delegation` section
+8. `aspirations-execute/SKILL.md` Phase 4 has `Team-Based Research Delegation` section
 9. Phase 4 says "Never use bare sub-agents (Agent tool without team_name)"
 10. Phase 4 dispatch uses `TeamCreate` + `Agent(team_name=...)` — NOT bare `Agent(...)`
 11. Worker prompt says "First, invoke /prime" — NOT `/enterPersona`
@@ -896,7 +896,7 @@ _(Domain-specific items live in `mind/verification-checklist.md`, seeded from `c
 
 ### AH5. Consistency
 26. `grep -c "sub-agent" .claude/skills/aspirations-execute/SKILL.md` returns exactly 1 match (the "Never use bare sub-agents" warning — this is correct)
-27. No bare `Agent(...)` calls (without `team_name`) appear in the experimental delegation sections
+27. No bare `Agent(...)` calls (without `team_name`) appear in the delegation sections
 28. Delegation is opt-in: Phase 2.6 says "IF host chooses to pre-fetch" — not mandatory
 
 ---
@@ -1400,6 +1400,55 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 29. **Runtime**: After multiple compactions in one session, `compact_count` increments and `prior_encoding_items` accumulates
 30. **Runtime**: g-002-09 (regular encoding flush) and Phase -0.5c (post-compaction encoding) complement each other without conflict
 31. **Runtime**: After autocompact, terminal shows `[precompact]` and `[postcompact]` stderr lines (user-visible hook feedback)
+
+---
+
+## ARa. Pending Background Agent Tracking (Stop Hook Gate 2.5)
+
+Verifies that background agents dispatched via `Agent(run_in_background=true)` are tracked
+persistently and the stop hook allows graceful idle-waiting instead of forced loop re-entry.
+
+### ARa1. Script Infrastructure
+1. `core/scripts/pending-agents.py` exists — manages `mind/session/pending-agents.yaml`
+2. `core/scripts/pending-agents.sh` exists — thin bash wrapper, delegates to .py
+3. `pending-agents.py` supports subcommands: register, deregister, deregister-team, list, has-pending, prune-stale, clear
+4. `pending-agents.py` `has-pending` runs `prune_stale` internally before checking — stale entries self-heal
+5. `pending-agents.py` uses `os.replace()` for atomic write (Windows-safe)
+6. `pending-agents.py` `deregister` and `deregister-team` delete file when list becomes empty (no orphaned empty files)
+7. `pending-agents.py` has `sys.stderr.reconfigure(encoding="utf-8")` boilerplate (Windows cp1252 safety)
+
+### ARa2. Stop Hook Integration
+8. `stop-hook.sh` header comment lists Gate 2.5 in gate summary
+9. `stop-hook.sh` header comment lists Gate 2.5 in counter lifecycle reset sources
+10. `stop-hook.sh` Gate 2.5 is between Gate 2 (stop-loop) and counter increment — never reached if earlier gates pass
+11. `stop-hook.sh` Gate 2.5 calls `has-pending` with `2>/dev/null` — script failure falls through (fail-open)
+12. `stop-hook.sh` Gate 2.5 clears counter before exit 0 — prevents idle-wait episodes from accumulating toward safety valve
+13. `stop-hook.sh` Gate 2.5 counter clear has a comment explaining why it must not be removed
+
+### ARa3. Aspirations Loop Integration
+14. `aspirations/SKILL.md` has Phase -0.5a between Phase -0.5 and Phase -0.5c
+15. Phase -0.5a checks for `mind/session/pending-agents.yaml` existence
+16. Phase -0.5a calls `pending-agents.sh list --json` to enumerate pending agents
+17. Phase -0.5a deregisters agents whose results are available in context
+18. Phase -0.5a calls `has-pending` at end to prune stale and clean up
+19. `aspirations/SKILL.md` post-Phase 9.7 calls `pending-agents.sh deregister-team` after team shutdown
+20. `aspirations-execute/SKILL.md` calls `pending-agents.sh register` BEFORE each `Agent()` dispatch (crash-safe ordering)
+
+### ARa4. Supporting Integration
+21. `boot/SKILL.md` Phase -1.5 whitelist includes `pending-agents.yaml`
+22. `precompact-checkpoint.py` saves `pending_agents_count` to checkpoint (informational — file persists on disk)
+23. `precompact-checkpoint.py` log summary includes agent count when > 0
+24. `postcompact-restore.py` prints PENDING AGENTS warning when `pending_agents_count > 0`
+25. `CLAUDE.md` signal files table includes `pending-agents.yaml` row
+26. `core/config/conventions/session-state.md` has "Pending Background Agents" section
+
+### ARa5. Runtime
+27. **Runtime**: `pending-agents.sh register --id X --team Y --goal Z` creates `mind/session/pending-agents.yaml`
+28. **Runtime**: `pending-agents.sh has-pending` returns exit 0 when non-stale agents exist, exit 1 when empty/all-stale
+29. **Runtime**: `pending-agents.sh deregister --id X` removes entry and deletes file when list empty
+30. **Runtime**: `pending-agents.sh deregister-team --team Y` removes all team entries
+31. **Runtime**: After staleness timeout, `has-pending` prunes expired agents and returns exit 1 if none remain
+32. **Runtime**: Stop hook allows stop (exit 0) when `pending-agents.yaml` has non-stale entries
 
 ---
 
