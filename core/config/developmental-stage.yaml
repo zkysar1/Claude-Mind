@@ -1,0 +1,111 @@
+# Developmental Stage Model — Framework Definition
+# Competence-based progression replacing fixed hypothesis count gates.
+# Inspired by Piaget's cognitive development + autotelic agent research.
+# Immutable definitions. Agent state lives in mind/developmental-stage.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+# Stage labels derived from average domain competence.
+# These are descriptive labels, not gates — competence drives behavior.
+stages:
+  exploring:
+    description: "Learning through direct interaction — forming hypotheses to see what happens"
+    criteria:
+      average_competence_min: 0.00
+      average_competence_max: 0.30
+    behaviors:
+      hypothesis_types: ["calibration", "exploration"]
+      max_commitment: "SMALL"
+      system_2_mandatory: true
+    reflection_weights:
+      episode: 0.6
+      pattern: 0.3
+      strategic: 0.1
+
+  developing:
+    description: "Building patterns and categories — can classify and reason about domains"
+    criteria:
+      average_competence_min: 0.30
+      average_competence_max: 0.55
+    behaviors:
+      hypothesis_types: ["calibration", "exploration", "high-conviction"]
+      max_commitment: "MEDIUM"
+      system_2_mandatory: true
+    reflection_weights:
+      episode: 0.4
+      pattern: 0.4
+      strategic: 0.2
+
+  applying:
+    description: "Applying knowledge systematically — tracks patterns, classifies categories"
+    criteria:
+      average_competence_min: 0.55
+      average_competence_max: 0.80
+    behaviors:
+      hypothesis_types: ["calibration", "exploration", "high-conviction", "contrarian"]
+      max_commitment: "LARGE"
+      system_2_mandatory: false
+    reflection_weights:
+      episode: 0.2
+      pattern: 0.4
+      strategic: 0.4
+
+  mastering:
+    description: "Abstract thinking — hypothesis testing, meta-cognition, strategy transfer"
+    criteria:
+      average_competence_min: 0.80
+    behaviors:
+      hypothesis_types: ["all"]
+      max_commitment: "LARGE"
+      system_2_mandatory: false
+      meta_cognition_active: true
+      strategy_transfer_active: true
+    reflection_weights:
+      episode: 0.1
+      pattern: 0.3
+      strategic: 0.6
+
+# Exploration budget computed dynamically from average domain competence.
+# No fixed per-stage budgets — continuous adjustment.
+exploration_budget:
+  formula: "max(0.15, min(0.85, 1.0 - average_domain_competence))"
+  competence_mapping:
+    EXPLORE: 0.15
+    CALIBRATE: 0.45
+    EXPLOIT: 0.70
+    MASTER: 0.90
+  description: >
+    Average competence is computed from L2 capability_levels using competence_mapping.
+    Each L2 node's capability_level maps to a numeric value.
+    exploration_budget = max(0.15, min(0.85, 1.0 - average)).
+    Higher competence → less exploration, more exploitation.
+
+exploration:
+  epsilon_schedule: "competence_decay"
+  minimum_epsilon: 0.10
+  noise_scale: 3.0  # Multiplier for exploration noise in goal scoring
+
+modifiable:
+  noise_scale: {min: 1.0, max: 6.0, default: 3.0}
+  minimum_epsilon: {min: 0.05, max: 0.30, default: 0.10}
+
+# --- INITIAL STATE ---
+
+initial_state:
+  last_updated: null
+  overall_stage: "exploring"
+  current_assessment:
+    stage: "exploring"
+    resolved_hypotheses: 0
+    average_competence: 0.0
+    highest_capability: "EXPLORE"
+    lowest_capability: "EXPLORE"
+    exploration_budget: 0.85
+    evidence: "Fresh start — no domain competence established yet"
+  schema_operations:
+    equilibration_state: "balanced"
+    log: []
+  exploration:
+    epsilon: 0.85
+    category_allocation: {}

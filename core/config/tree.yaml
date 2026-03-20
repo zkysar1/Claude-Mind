@@ -1,0 +1,210 @@
+# Memory Tree Configuration — Framework Definition
+# Based on Random Tree Model (Zhong et al., PRL 2025)
+# Immutable tree rules. Agent state lives in mind/knowledge/tree/_tree.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+config:
+  K_max: 4
+  D_max: 6
+  D_retrieval: 4
+  split_threshold: 3
+  merge_threshold: 1
+  min_articles_per_child: 2
+  decompose_threshold: 80               # line count triggering DECOMPOSE of monolith files
+  max_decompose_per_invocation: 7      # max DECOMPOSE ops per /tree maintain run
+  max_redistribute_per_invocation: 5   # max REDISTRIBUTE ops per /tree maintain run
+  compression_ratio_formula: "10 * 1.5^(depth - 2)"  # target compression at each depth
+  growth_approval:
+    L1_new_domain: auto
+    L2_and_deeper: auto
+
+pruning:
+  distill_utility_threshold: 0.3          # utility_ratio below this triggers DISTILL
+  distill_min_retrievals: 5               # minimum retrievals before DISTILL eligible
+  distill_line_threshold: 50              # line count threshold for large-but-mediocre nodes
+  distill_line_utility_threshold: 0.5     # utility threshold for line-count-based DISTILL
+  max_distill_per_invocation: 5           # max DISTILL ops per /tree maintain run
+  retire_sessions_unused: 5              # sessions with 0 retrievals before RETIRE eligible
+  retire_noise_threshold: 0.1            # utility below this with 10+ retrievals = actively harmful
+  retire_noise_min_retrievals: 10
+
+domain_health:
+  weights:
+    capability: 0.50
+    coverage: 0.25
+    confidence: 0.25
+  min_data_threshold: 2    # minimum leaves with data to compute health
+  # Must match capability_level values used in tree nodes (from developmental-stage.yaml)
+  competence_mapping:
+    EXPLORE: 0.25
+    CALIBRATE: 0.50
+    EXPLOIT: 0.75
+    MASTER: 1.00
+
+# Bounds for self-tuning. Each 'default' MUST match the actual config value above.
+modifiable:
+  K_max: {min: 3, max: 6, default: 4}
+  D_max: {min: 4, max: 8, default: 6}
+  D_retrieval: {min: 3, max: 6, default: 4}
+  split_threshold: {min: 3, max: 10, default: 3}
+  merge_threshold: {min: 1, max: 3, default: 1}
+  min_articles_per_child: {min: 1, max: 4, default: 2}
+  decompose_threshold: {min: 50, max: 300, default: 80}
+  max_decompose_per_invocation: {min: 1, max: 15, default: 7}
+  max_redistribute_per_invocation: {min: 1, max: 10, default: 5}
+  max_entities: {min: 50, max: 500, default: 200}
+  domain_health_capability_weight: {min: 0.20, max: 0.80, default: 0.50}
+  domain_health_coverage_weight: {min: 0.10, max: 0.50, default: 0.25}
+  domain_health_confidence_weight: {min: 0.10, max: 0.50, default: 0.25}
+  domain_health_min_data_threshold: {min: 1, max: 5, default: 2}
+  distill_utility_threshold: {min: 0.1, max: 0.5, default: 0.3}
+  distill_min_retrievals: {min: 3, max: 10, default: 5}
+  max_distill_per_invocation: {min: 1, max: 10, default: 5}
+  retire_sessions_unused: {min: 3, max: 10, default: 5}
+
+# Entity cross-link index configuration (HindSight-inspired)
+entity_index:
+  max_entities: 200
+  extract_during:
+    - research-topic   # Step 3: extract from tree node findings
+    - reflect          # Step 7.5b: extract from ABC chains
+  entity_types: [person, organization, concept, metric, event]
+
+# L1 domains — the four fundamental branches every agent starts with
+l1_domains:
+  - key: execution
+    file: mind/knowledge/tree/execution.md
+    summary: "What to DO — strategies and methods for taking action"
+  - key: intelligence
+    file: mind/knowledge/tree/intelligence.md
+    summary: "What we KNOW — domain knowledge and understanding"
+  - key: performance
+    file: mind/knowledge/tree/performance.md
+    summary: "How we're DOING — outcome tracking and accuracy analysis"
+  - key: system
+    file: mind/knowledge/tree/system.md
+    summary: "HOW we work — meta-knowledge about the agent's own operation"
+
+# --- NODE TEMPLATES ---
+# Reference templates for tree node creation. Used by /tree, /research-topic,
+# and session-end consolidation when creating new nodes or node files.
+# These are patterns — adapt fields to the actual domain and content.
+
+node_templates:
+  # Generic entry in _tree.yaml — works at any depth L2-L6
+  _tree_entry_node:
+    key: "{node-slug}"                     # kebab-case, matches filename
+    file: "mind/knowledge/tree/{path}/{node-slug}.md"  # path built from ancestry
+    depth: "{depth}"                       # integer 2-6
+    parent: "{parent-slug}"               # parent node key
+    children: []
+    child_count: 0
+    capability_level: "EXPLORE"            # EXPLORE (<0.30), CALIBRATE, EXPLOIT, MASTER
+    confidence: null                       # set after first article
+    summary: "One-line description of what this node covers"
+    article_count: 0
+    growth_state: stable                   # stable, growing, ready_to_split, ready_to_decompose, distilled
+    retrieval_count: 0                     # incremented by retrieve.py on every retrieval
+    last_retrieved: null                   # date of last retrieval
+    times_helpful: 0                       # Phase 4.26 feedback: node content informed execution
+    times_noise: 0                         # Phase 4.26 feedback: node content was irrelevant/misleading
+    utility_ratio: 0.0                     # computed: times_helpful / max(retrieval_count, 1)
+
+
+  # Generic YAML front matter for node .md files at any depth L2-L6
+  # Minimal schema: content-provenance fields only. All scoring/structural
+  # metadata (confidence, capability_level, depth, parent, node_type, etc.)
+  # lives exclusively in _tree.yaml — never duplicated in .md front matter.
+  node_file_front_matter:
+    topic: "Node display name"
+    entities: []
+    temporal_validity:
+      first_observed: null
+      last_confirmed: null
+      observation_count: 0
+    sources: []
+    last_update_trigger:
+      type: null
+      source: null
+      session: null
+
+  # YAML front matter for L1 domain .md files (mind/knowledge/tree/{domain}.md)
+  # Minimal schema: content-provenance only. domain_confidence, capability_level,
+  # children, depth all live in _tree.yaml exclusively.
+  l1_file_front_matter:
+    domain: "{domain}"                     # L1 legacy display name
+    level: L1                              # L1 marker
+    topics: []                             # L1 legacy — convenience listing
+    last_update_trigger:
+      type: null
+      source: null
+      session: null
+
+  # Markdown sections for L1 domain files
+  # ## Key Insights
+  # ## Capability Map
+  #   | Topic | Confidence | Level | Articles |
+  # ## Cross-Domain Links
+
+
+# --- INITIAL STATE ---
+
+initial_state:
+  last_updated: null
+  tree_growth_log: []
+  unmapped_categories: []
+  cross_references: []
+  entity_index: {}
+  total_entities: 0
+  nodes:
+    root:
+      file: null
+      depth: 0
+      parent: null
+      children: [execution, intelligence, performance, system]
+      child_count: 4
+      article_count: 0
+      growth_state: stable
+      summary: "Top-level routing index. Four L1 domains: execution (strategies), intelligence (knowledge), performance (tracking), system (meta). Empty — agent has not learned anything yet."
+    execution:
+      file: mind/knowledge/tree/execution.md
+      depth: 1
+      parent: root
+      children: []
+      child_count: 0
+      domain_confidence: null
+      article_count: 0
+      growth_state: stable
+      summary: "What to DO — strategies and methods for taking action. Empty — will grow as the agent learns a domain."
+    intelligence:
+      file: mind/knowledge/tree/intelligence.md
+      depth: 1
+      parent: root
+      children: []
+      child_count: 0
+      domain_confidence: null
+      article_count: 0
+      growth_state: stable
+      summary: "What we KNOW — domain knowledge and understanding. Empty — will grow as the agent learns."
+    performance:
+      file: mind/knowledge/tree/performance.md
+      depth: 1
+      parent: root
+      children: []
+      child_count: 0
+      domain_confidence: null
+      article_count: 0
+      growth_state: stable
+      summary: "How we're DOING — outcome tracking and accuracy analysis. Empty — will grow as the agent tests hypotheses."
+    system:
+      file: mind/knowledge/tree/system.md
+      depth: 1
+      parent: root
+      children: []
+      child_count: 0
+      domain_confidence: null
+      article_count: 0
+      growth_state: stable
+      summary: "HOW we work — meta-knowledge about the agent's own operation. Empty — will grow as the agent gains self-knowledge."

@@ -1,0 +1,228 @@
+# Skill Tree Index
+# Registers all skills with parent/children relationships
+# Mirrors memory tree K=4 branching constraint
+# Updated: 2026-03-16
+
+config:
+  K: 4                          # max sub-skills per parent
+  max_skills: 15                # ceiling to prevent sprawl
+  developmental_gate: EXPLOIT   # minimum capability level before forging allowed
+  control_skills: [start, stop, reset, escapePersona, enterPersona, verify-learning]
+  # Forged skills tracked in mind/forged-skills.yaml (not here).
+  # This file is STATIC framework — never modified during RUNNING state.
+
+# --- Control Skills (USER-ONLY — Claude must NEVER invoke these) ---
+
+start:
+  file: .claude/skills/start/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+stop:
+  file: .claude/skills/stop/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+reset:
+  file: .claude/skills/reset/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+escapePersona:
+  file: .claude/skills/escapePersona/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+enterPersona:
+  file: .claude/skills/enterPersona/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+# --- Orchestrator (root) ---
+
+aspirations:
+  file: .claude/skills/aspirations/SKILL.md
+  parent: null
+  children:
+    - review-hypotheses
+    - reflect
+    - research-topic
+    - boot
+    - decompose
+    - forge-skill
+    - recover
+    - create-aspiration
+    # Forged skills register as children in mind/forged-skills.yaml, not here.
+  type: orchestrator
+  user_invocable: false
+  status: active
+
+# --- Review ---
+
+review-hypotheses:
+  file: .claude/skills/review-hypotheses/SKILL.md
+  parent: aspirations
+  children: []
+  type: review
+  user_invocable: false
+  status: active
+
+# --- Learning ---
+
+reflect:
+  file: .claude/skills/reflect/SKILL.md
+  parent: aspirations
+  children:
+    - replay
+  type: learning
+  user_invocable: false
+  status: active
+
+replay:
+  file: .claude/skills/replay/SKILL.md
+  parent: reflect
+  children: []
+  type: learning
+  user_invocable: false
+  status: active
+
+# --- Research ---
+
+research-topic:
+  file: .claude/skills/research-topic/SKILL.md
+  parent: aspirations
+  children: []
+  type: research
+  user_invocable: false
+  status: active
+
+# --- Reporting ---
+
+boot:
+  file: .claude/skills/boot/SKILL.md
+  parent: aspirations
+  children: []
+  type: reporting
+  user_invocable: false
+  status: active
+
+# --- Planning ---
+
+decompose:
+  file: .claude/skills/decompose/SKILL.md
+  parent: aspirations
+  children: []
+  type: planning
+  user_invocable: false
+  status: active
+
+# --- System (tree maintenance) ---
+
+tree:
+  file: .claude/skills/tree/SKILL.md
+  parent: null
+  children: []
+  type: system
+  user_invocable: false
+  status: active
+
+# --- Context Priming (dual-use: user + agent) ---
+
+prime:
+  file: .claude/skills/prime/SKILL.md
+  parent: null
+  children: []
+  type: system
+  user_invocable: false
+  status: active
+
+# --- Meta ---
+
+forge-skill:
+  file: .claude/skills/forge-skill/SKILL.md
+  parent: aspirations
+  children: []
+  type: meta
+  user_invocable: false
+  status: active
+
+# --- Recovery ---
+
+recover:
+  file: .claude/skills/recover/SKILL.md
+  parent: aspirations
+  children: []
+  type: recovery
+  user_invocable: false
+  status: active
+
+# --- Planning (aspiration creation) ---
+
+create-aspiration:
+  file: .claude/skills/create-aspiration/SKILL.md
+  parent: aspirations
+  children: []
+  type: planning
+  user_invocable: false
+  status: active
+
+# --- Respond ---
+
+respond:
+  file: .claude/skills/respond/SKILL.md
+  parent: null
+  children: []
+  type: routing
+  user_invocable: false
+  status: active
+
+# --- Verification (USER-ONLY) ---
+
+verify-learning:
+  file: .claude/skills/verify-learning/SKILL.md
+  parent: null
+  children: []
+  type: control
+  user_invocable: true
+  model_invocable: false
+  status: active
+
+# --- Reporting (hybrid — user-invocable AND agent-callable) ---
+
+completion-report:
+  file: .claude/skills/completion-report/SKILL.md
+  parent: null
+  children: []
+  type: reporting
+  user_invocable: true
+  model_invocable: true
+  status: active
+
+backlog-report:
+  file: .claude/skills/backlog-report/SKILL.md
+  parent: null
+  children: []
+  type: reporting
+  user_invocable: true
+  model_invocable: true
+  status: active

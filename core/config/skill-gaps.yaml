@@ -1,0 +1,30 @@
+# Skill Gap Registry — Framework Definition
+# Immutable forge configuration. Agent state lives in mind/skill-gaps.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+config:
+  forge_threshold: 2
+  max_gaps: 20
+  encounter_log_limit: 5
+
+gap_types:
+  utility:
+    description: "Well-defined procedures (API calls, data formatting, retrieval workflows)"
+    forge_gate: CALIBRATE  # 0.30+ confidence required
+  analytical:
+    description: "Skills requiring domain understanding (pattern recognition, evaluation)"
+    forge_gate: EXPLOIT    # 0.60+ confidence required (default)
+
+modifiable:
+  forge_threshold: {min: 1, max: 5, default: 2}
+  max_gaps: {min: 10, max: 40, default: 20}
+  encounter_log_limit: {min: 3, max: 10, default: 5}
+  max_skills: {min: 10, max: 25, default: 15}
+
+# --- INITIAL STATE ---
+
+initial_state:
+  last_updated: null
+  gaps: []

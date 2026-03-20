@@ -1,0 +1,277 @@
+# Aspiration Engine — Framework Definition
+# Immutable configuration. Agent state lives in mind/aspirations.jsonl
+# init-mind.sh copies core/config/aspirations-initial.jsonl to mind/ on first run.
+
+# --- FRAMEWORK ---
+
+max_active: 20
+
+# [EXPERIMENTAL] Team-based goal delegation
+max_concurrent_goals: 3   # Max concurrent goals per iteration (primary + parallel)
+
+# --- GOAL TEMPLATES ---
+# Reference templates for goal creation. Match the goal's purpose to a template.
+# When creating a goal, start from _common_fields, then layer on the style-specific fields.
+# These are patterns, not live data — adapt IDs, titles, and details to the situation.
+
+goal_templates:
+  # Fields required on EVERY goal regardless of style
+  _common_fields:
+    id: "g-{asp}-{seq}"             # aspiration number + sequence (e.g., g-003-02)
+    title: "Short descriptive title"
+    description: "What this goal does, why it matters, and key context"
+    status: pending
+    participants: [agent]            # [agent], [user], or [agent, user]
+    blocked_by: []                   # IDs of prerequisite goals
+    verification:                    # unified field (replaces desiredEndState + completion_check)
+      outcomes: ["Measurable outcome that agent can verify"]  # human-readable
+      checks: []                     # machine-verifiable conditions
+      preconditions: []              # what must be true before execution
+    achievedCount: 0
+    priority: MEDIUM                 # HIGH, MEDIUM, LOW
+    category: null                    # Tree category for retrieval — set via category-suggest.sh
+    deferred_until: null              # ISO 8601 timestamp — goal skipped in COLLECT until this time
+    defer_reason: null                # Why deferred (context for follow-up)
+
+  # Build knowledge — deep-dives, audits, topic exploration
+  research:
+    skill: /research-topic
+    verification:
+      outcomes: ["Knowledge node registered for {topic} with research findings"]
+      checks:
+        - type: file_check
+          target: "mind/knowledge/tree/_tree.yaml"
+          condition: "Node registered for {topic} with research findings"
+
+  # Code changes — bug fixes, features, refactoring, security hardening
+  development:
+    skill: null                      # agent uses tools directly (Read, Edit, Bash)
+    verification:
+      outcomes: ["Specific code artifact changed or created"]
+      checks: []                     # agent verifies inline during Phase 5
+      verification_hint: "Consider: file_check on changed file, command_check on build/test"
+
+  # Testable predictions — created by sq-009 spark or /decompose companion
+  hypothesis:
+    skill: "/review-hypotheses --hypothesis {hypothesis_id}"
+    hypothesis_id: "{YYYY-MM-DD}_{slug}"  # links to pipeline backing file
+    horizon: short                   # session | short | long (micro stays in working memory)
+    resolves_no_earlier_than: null    # session: null, short: +12h, long: +24h
+    resolves_by: null                # session: session_end, short: +7d, long: +90d
+    # Pipeline record must exist in mind/pipeline.jsonl (accessed via pipeline-read.sh)
+    # Phase 5 handles CONFIRMED/CORRECTED/PENDING/EXPIRED — not completion_check
+
+  # Batch hypothesis operations — resolve outcomes, learn from results
+  review:
+    skill: "/review-hypotheses --resolve"  # or --learn, --full-cycle, --accuracy-report
+    verification:
+      outcomes: ["Pipeline records processed and accuracy updated"]
+      checks: []
+      verification_hint: "Consider: command_check on pipeline-read.sh to verify records moved"
+
+  # Recurring housekeeping — goals that re-fire on a schedule.
+  # NOTE: Any goal template can be combined with these recurring fields.
+  # Add recurring: true + interval_hours to any goal to make it repeat.
+  # The monitoring template is an example of a naturally recurring pattern.
+  recurring:
+    recurring: true
+    interval_hours: 24
+    lastAchievedAt: null
+    achievedCount: 0
+    currentStreak: 0
+    longestStreak: 0
+    verification:
+      outcomes: ["Task completed successfully"]
+      checks: []
+      preconditions: []
+      verification_hint: "Consider: command_check or file_check appropriate to the recurring task"
+
+  # Requires user decision or infrastructure access the agent lacks
+  user_action:
+    participants: [user]
+    skill: null
+    # Agent skips in COLLECT (scores +0 in agent_executable)
+    # Agent logs reminder and continues autonomously
+
+  # --- Verification & Testing ---
+
+  test_automated:
+    skill: null
+    verification:
+      outcomes: ["Test suite passes with N assertions covering {scope}"]
+      checks:
+        - type: command_check
+          command: "{test_command}"
+          condition: "exit code 0"
+
+  test_manual:
+    skill: null
+    verification:
+      outcomes: ["Observed behavior matches expected: {description}"]
+      checks: []
+      verification_hint: "Consider: can this be converted to a command_check or automated test?"
+
+  test_regression:
+    skill: null
+    verification:
+      outcomes: ["Regression test added covering {bug/change}"]
+      checks:
+        - type: file_check
+          target: "{test_file_path}"
+          condition: "exists and contains assertion for {scenario}"
+
+  test_integration:
+    skill: null
+    verification:
+      outcomes:
+        - "Integration path traced: {trigger} -> {handler} -> {side_effect}"
+        - "Silent behavioral gaps identified or confirmed absent"
+      checks: []
+      verification_hint: "STRONGLY consider: command_check on integration test, file_check on trace output"
+      preconditions:
+        - "Target module or integration path identified"
+
+  # --- Analysis & Knowledge ---
+
+  analysis:
+    skill: null
+    verification:
+      outcomes: ["Analysis complete with findings documented in {location}"]
+      checks: []
+      verification_hint: "Consider: file_check on output document or knowledge node"
+
+  audit:
+    skill: null
+    verification:
+      outcomes: ["Audit complete: {N} items reviewed, {M} issues found"]
+      checks: []
+      verification_hint: "Consider: file_check on audit report, command_check verifying item count"
+
+  documentation:
+    skill: null
+    verification:
+      outcomes: ["{document} created/updated at {path}"]
+      checks:
+        - type: file_check
+          target: "{path}"
+          condition: "exists"
+
+  knowledge_encoding:
+    skill: null
+    verification:
+      outcomes: ["Knowledge node {key} updated with {topic} findings"]
+      checks:
+        - type: file_check
+          target: "mind/knowledge/tree/_tree.yaml"
+          condition: "Node {key} exists with updated content"
+
+  infrastructure:
+    skill: null
+    verification:
+      outcomes: ["{system} deployed/configured and operational"]
+      checks: []
+      verification_hint: "Consider: command_check on health endpoint or infra-health.sh check"
+
+  # --- Pain / Reactive ---
+
+  diagnosis:
+    skill: null
+    # Deliverable is understanding, not code. Use when something is broken
+    # and the root cause is unknown. Distinct from development (which fixes).
+    verification:
+      outcomes: ["Root cause of {problem} identified and documented"]
+      checks: []
+      verification_hint: "Consider: file_check on knowledge node documenting root cause"
+
+  blocker_resolution:
+    skill: null
+    # Actively clear a blocker instead of waiting for expiry or user.
+    # Links to working memory known_blockers entries.
+    verification:
+      outcomes: ["{blocker} resolved — {skill/resource} now accessible"]
+      checks: []
+      verification_hint: "Consider: command_check verifying the previously-blocked action succeeds"
+
+  cleanup:
+    skill: null
+    # Remove stale data, orphaned references, dead code, contradicted knowledge.
+    # Distinct from audit (which finds issues) — cleanup fixes them.
+    verification:
+      outcomes: ["{target} cleaned — {N} items removed/updated, no orphaned references"]
+      checks: []
+      verification_hint: "Consider: command_check counting remaining orphaned items (should be 0)"
+
+  # --- Recurring / Trigger-Aware ---
+
+  monitoring:
+    skill: null
+    # Naturally recurring observation. Combine with recurring fields.
+    # Use for health checks, log watching, metric tracking.
+    recurring: true
+    interval_hours: 4
+    lastAchievedAt: null
+    achievedCount: 0
+    currentStreak: 0
+    longestStreak: 0
+    verification:
+      outcomes: ["Health check passed for {system}, anomalies documented if found"]
+      checks: []
+      verification_hint: "Consider: command_check on health endpoint, file_check on anomaly log"
+
+  # --- Learning Through Building ---
+
+  spike:
+    skill: null
+    # Build throwaway prototype to learn. Artifacts are disposable —
+    # the LEARNING (encoded in knowledge tree) is the deliverable.
+    # Do not commit spike code to production repos.
+    verification:
+      outcomes: ["Spike findings documented — {question} answered via {approach}"]
+      checks:
+        - type: file_check
+          target: "mind/knowledge/tree/_tree.yaml"
+          condition: "Node updated with spike findings"
+
+planning:
+  check_interval_goals: 3       # run alignment check every N completed goals
+  novelty_drought_hours: 48     # hours since last first-time goal completion
+  maintenance_threshold: 0.70   # fraction of recurring goals that suggests planning
+
+# --- ASPIRATION SCOPES ---
+# Aspirations are classified by scope to control research depth, goal count,
+# and archival maturity. Default is "project" — multi-session arcs with research.
+# Scope cascades into: research requirements, goal count ranges, archival gates.
+# Cognitive primitives (Unblock/Investigate/Idea goals) are scope-exempt.
+
+aspiration_scopes:
+  sprint:
+    description: "Tactical — single fix, cleanup, reactive response (1-2 sessions)"
+    goal_range: [2, 5]
+    research_required: false
+    archival_min_sessions: 1
+    goal_addition_research: false
+  project:
+    description: "Multi-session arc — research + build + test lifecycle (3-10 sessions)"
+    goal_range: [5, 15]
+    research_required: true
+    archival_min_sessions: 2
+    goal_addition_research: true
+  initiative:
+    description: "Strategic arc — phased work, many sessions (10+)"
+    goal_range: [10, 30]
+    research_required: true
+    archival_min_sessions: 4
+    goal_addition_research: true
+    phased_generation: true    # Generate Phase 1 goals now; later phases in description
+
+default_scope: project
+
+modifiable:
+  max_active: {min: 3, max: 25, default: 20}
+  # [EXPERIMENTAL] Agent delegation
+  max_concurrent_goals: {min: 1, max: 3, default: 3}
+  # Planning thresholds (guidelines for LLM, not hard gates)
+  check_interval_goals: {min: 1, max: 10, default: 3}
+  novelty_drought_hours: {min: 12, max: 168, default: 48}
+  maintenance_threshold: {min: 0.50, max: 0.95, default: 0.70}
+  default_scope: {values: [sprint, project, initiative], default: project}

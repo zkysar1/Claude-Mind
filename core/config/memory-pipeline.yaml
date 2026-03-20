@@ -1,0 +1,270 @@
+# Memory Pipeline Configuration — Framework Definition
+# Hippocampal encoding: sensory buffer -> working memory -> consolidation -> long-term
+# Immutable pipeline config. Agent state for category_overrides/weight_log in mind/memory-pipeline.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+sensory_buffer:
+  max_items: 20
+  encoding_filters:
+    novelty_threshold: 0.4
+    outcome_significance: 0.7
+    goal_relevance: true
+    surprise_threshold: 5
+    repetition_boost: 0.1
+
+working_memory:
+  max_slots: 16
+  chunking_enabled: true
+  slot_types:
+    - active_constraints
+    - active_context
+    - active_hypothesis
+    - active_strategy
+    - archived_context
+    - cross_domain_transfer
+    - domain_data
+    - ephemeral_observation
+    - knowledge_debt
+    - known_blockers
+    - micro_hypotheses
+    - pending_resolutions
+    - recent_violations
+    - sensory_buffer
+    - session_goal
+    - conclusions
+
+encoding_gate:
+  score_formula: >
+    (novelty * 0.30) + (outcome_impact * 0.25) + (surprise * 0.20) +
+    (goal_relevance * 0.15) + (repetition_strength * 0.10)
+  encode_threshold: 0.40
+  skip_threshold: 0.15
+  review_range: [0.15, 0.40]
+
+consolidation:
+  replay_trigger: "session_end"
+  replay_priority_order:
+    - violations
+    - high_surprise
+    - high_outcome_impact
+    - goal_completions
+    - routine_observations
+  max_replay_items: 10
+  compression_ratio: 5
+
+consolidation_budget:
+  formula: "min(15, max(5, base + violations*violation_weight + new_domains*domain_weight + surprise_gt7_count))"
+  base: 10
+  violation_weight: 2
+  domain_weight: 3
+  min: 5
+  max: 15
+  ranking_mode: top_k
+
+long_term:
+  tree_structure: "K=4, D=4"
+  levels:
+    L0: "mind/knowledge/tree/_tree.yaml root node"
+    L1: "mind/knowledge/tree/{domain}.md"
+    L2: "mind/knowledge/tree/{domain}/{topic}.md"
+    L3: "mind/knowledge/{category}/*.md"
+    L4: "mind/pipeline.jsonl, mind/journal/, config/"
+
+forgetting:
+  active_pruning_enabled: true
+  prune_trigger: "evolution_check"
+  staleness_thresholds:
+    fresh: 7
+    aging: 30
+    stale: 90
+    deprecated: 180
+  retrieval_strengthening: true
+  interference_detection: true
+  decay_model:
+    formula: "retention = e^(-days / (lambda * importance * type_decay))"
+    lambda: 30
+    type_decay_factors:
+      validated_strategy: 3.0
+      strategy: 2.0
+      pattern: 1.5
+      violation: 1.0
+      analysis: 0.7
+      refuted: 0.3
+  reconsolidation:
+    enabled: true
+    window: "1 session"
+    description: >
+      When an article is retrieved for use in a hypothesis, it enters a
+      reconsolidation window. During that session, new evidence can UPDATE
+      the article (not just append) — beliefs become temporarily labile.
+      After session end (consolidation pass): reset reconsolidation_window: false.
+
+working_memory_pruning:
+  stale_threshold_minutes: 30       # Flag for refresh in Phase 11
+  evict_threshold_minutes: 120      # Auto-null untouched scalar slots after 2 hours
+  array_limits:
+    encoding_queue: 20              # Matches sensory_buffer max_items
+    sensory_buffer: 20
+    micro_hypotheses: 30
+    knowledge_debt: 15
+    known_blockers: 10
+    recent_violations: 5
+  item_stale_minutes:               # Item-level age thresholds
+    micro_hypotheses: 180           # 3 hours — unresolved micros
+    sensory_buffer: 60              # 1 hour
+    ephemeral_observation: 60       # 1 hour
+  protected_slots:                  # Only pruned by specific rules (resolution, etc.)
+    - known_blockers
+    - knowledge_debt
+
+micro_hypothesis_consolidation:
+  description: >
+    At session-end, sweep working memory micro_hypotheses array.
+    Compute batch stats, promote surprises to encoding gate.
+  surprise_promotion_threshold: 7
+  batch_stats_fields: [total, confirmed, corrected, accuracy_pct, categories_touched]
+  promotion_rules:
+    - condition: "surprise >= 7"
+      action: "promote to encoding gate as high_surprise observation"
+    - condition: "confidence >= 0.90 AND outcome == corrected"
+      action: "promote to encoding gate as violation observation"
+    - condition: "confidence <= 0.30 AND outcome == confirmed"
+      action: "promote to encoding gate as underconfidence observation"
+  count_toward_resolved: true
+  journal_format: >
+    Batch summary only: "Micro-hypotheses: {confirmed}/{total} ({accuracy}%)
+    Promoted to encoding: {promoted_count} (surprises/violations)"
+
+# --- TEMPLATES ---
+# Reference templates for structures the agent creates during memory pipeline operation.
+# Used by /aspirations (working memory init, consolidation), /reflect (encoding observations).
+
+pipeline_templates:
+  # Working memory slot contents (mind/session/working-memory.yaml)
+  # Not all slots need content every session — null slots are fine.
+  working_memory_slots:
+    active_context:
+      description: "Current goal and aspiration being worked on"
+      goal_id: "g-NNN-NN"
+      aspiration_id: "asp-NNN"
+      skill: "/skill-name"
+      experience_refs: []
+    active_hypothesis:
+      description: "Hypothesis currently being evaluated or formed"
+      id: "{YYYY-MM-DD}_{slug}"
+      claim: "What we predict will happen"
+      confidence: 0.0
+      experience_refs: []
+    recent_violations:
+      description: "Last 3 expectation violations for pattern awareness"
+      items:
+        - hypothesis_id: "{id}"
+          violation_type: "high-confidence miss"
+          surprise: 8
+    domain_data:
+      description: "Domain-specific data loaded for current goal"
+      category: "{category}"
+      key_facts: []
+    pending_resolutions:
+      description: "Hypotheses approaching resolution deadline"
+      items:
+        - id: "{id}"
+          resolves_by: "YYYY-MM-DD"
+    active_strategy:
+      description: "Current reasoning strategy for this session"
+      strategy: "Description of approach"
+      source: "Where this strategy came from"
+    session_goal:
+      description: "High-level session objective"
+      focus: "What this session aims to accomplish"
+    cross_domain_transfer:
+      description: "Patterns from strong domains to test in weak domains"
+      source_domain: "{strong-domain}"
+      target_domain: "{weak-domain}"
+      pattern: "Abstracted pattern to test"
+    ephemeral_observation:
+      description: "Temporary noteworthy observation, may or may not encode"
+      observation: "What was noticed"
+      encoding_score: 0.0
+    micro_hypotheses:
+      description: "Inline predictions resolved within the same session"
+      items:
+        - claim: "Short natural-language prediction"
+          confidence: 0.0
+          formed: "HH:MM:SS"
+          outcome: null                    # confirmed | corrected | null
+          surprise: 0                      # computed after resolution
+          category: "{category-slug}"
+    knowledge_debt:
+      description: "Tree nodes that may need updating due to actions taken this session"
+      items: []
+      # Each item: {node_key, reason, source_goal, priority, created}
+      # Swept during session-end consolidation (aspirations Step 2.25)
+      # Debts older than 2 sessions promoted to HIGH
+    archived_context:
+      description: "Pointer-only slot for prior session context — full details in experience archive"
+      summary: "Prior session context summary"
+      experience_refs: []
+      # Each ref: experience JSONL record ID (e.g., "exp-g002-03-database")
+
+  # Observation format for encoding gate evaluation
+  # Created during goal execution, scored for encoding worthiness
+  encoding_observation:
+    source_goal: "g-NNN-NN"
+    observation: "What was observed or learned"
+    encoding_score: 0.0                    # computed from score_formula
+    scores:
+      novelty: 0.0                         # 0-1, how new is this?
+      outcome_impact: 0.0                  # 0-1, how much did it affect results?
+      surprise: 0.0                        # 0-1, how unexpected?
+      goal_relevance: 0.0                  # 0-1, how related to active goals?
+      repetition_strength: 0.0             # 0-1, how often has this been seen?
+    target_article: "mind/knowledge/tree/{path}.md"
+    replay_priority: routine_observations  # violations, high_surprise, high_outcome_impact, goal_completions, routine_observations
+
+modifiable:
+  sensory_buffer_max_items: {min: 10, max: 40, default: 20}
+  working_memory_max_slots: {min: 5, max: 20, default: 15}
+  encode_threshold: {min: 0.20, max: 0.60, default: 0.40}
+  skip_threshold: {min: 0.05, max: 0.25, default: 0.15}
+  max_replay_items: {min: 5, max: 25, default: 10}
+  compression_ratio: {min: 3, max: 10, default: 5}
+  consolidation_budget_base: {min: 5, max: 20, default: 10}
+  consolidation_budget_min: {min: 3, max: 10, default: 5}
+  consolidation_budget_max: {min: 10, max: 30, default: 15}
+  forgetting_lambda: {min: 15, max: 60, default: 30}
+  wm_stale_threshold_minutes: {min: 10, max: 120, default: 30}
+  wm_evict_threshold_minutes: {min: 30, max: 360, default: 120}
+
+experience_staleness:
+  archive_unused_after_days: 30
+  archive_low_utility_after_days: 90
+  protect_threshold:
+    min_retrieval_count: 5
+    min_utility_ratio: 0.5
+
+encoding_weight_adaptation:
+  enabled: true
+  adjustment_per_session: 0.05
+  min_weights:
+    novelty: 0.10
+    outcome_impact: 0.10
+    surprise: 0.10
+    goal_relevance: 0.05
+    repetition_strength: 0.05
+  max_weights:
+    novelty: 0.50
+    outcome_impact: 0.40
+    surprise: 0.35
+    goal_relevance: 0.30
+    repetition_strength: 0.20
+
+# --- INITIAL STATE ---
+
+initial_state:
+  last_updated: null
+  category_overrides: {}
+  weight_performance_log:
+    entries: []

@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+"""Goal scoring and selection with exploration noise.
+
+Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorithm.
+The LLM no longer computes scores — this script handles the arithmetic.
+The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
+
+Scoring criteria (11 deterministic + 1 stochastic weighted factors):
+  priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
+  + variety_bonus × 0.7 + streak_momentum × 0.5 + novelty_bonus × 0.6
+  + recurring_urgency × 0.8 + reward_history × 0.5 + evidence_backing × 0.7
+  + deferred_readiness × 0.6 + context_coherence × 1.0
+  + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
+
+  context_coherence: +2.0 if same category as last goal (fresh/normal zone),
+    +1.0 if same category (tight zone), 0 otherwise.
+    Reads context budget from mind/session/context-budget.json (written by status line).
+
+  recurring_urgency: 2.0 base when due + overdue_ratio, capped at 5.0
+  deferred_readiness: +1.5 when a deferred goal's time has arrived
+  exploration_noise: random(0,1) scaled by developmental epsilon.
+    At exploring stage (~0.85 epsilon): noise can reorder rankings.
+    At mastering stage (~0.19 epsilon): noise mostly breaks ties.
+"""
+
+import argparse
+import json
+import random
+import subprocess
+import sys
+from datetime import date, datetime
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+import yaml  # Required — tree.py already depends on PyYAML
+
+from _paths import MIND_DIR, CONFIG_DIR, CORE_ROOT
+from wm import read_wm, WM_PATH as WORKING_MEMORY_PATH  # noqa: E402
+
+ASP_PATH = MIND_DIR / "aspirations.jsonl"
+PIPELINE_PATH = MIND_DIR / "pipeline.jsonl"
+PIPELINE_ARCHIVE_PATH = MIND_DIR / "pipeline-archive.jsonl"
+DEV_STAGE_PATH = MIND_DIR / "developmental-stage.yaml"
+DEV_STAGE_CONFIG_PATH = CONFIG_DIR / "developmental-stage.yaml"
+BUDGET_PATH = MIND_DIR / "session" / "context-budget.json"
+
+# Static scoring weights — MUST match aspirations/SKILL.md Goal Selection Algorithm.
+# If you change a weight here, update the SKILL.md documentation to match.
+# NOTE: exploration_noise is NOT here — its weight is dynamic (epsilon × noise_scale),
+# computed at runtime in score_goal(). Do not add it to this dict.
+WEIGHTS = {
+    "priority": 1.0,
+    "deadline_urgency": 1.0,
+    "agent_executable": 0.8,
+    "variety_bonus": 0.7,
+    "streak_momentum": 0.5,
+    "novelty_bonus": 0.6,
+    "recurring_urgency": 0.8,
+    "reward_history": 0.5,
+    "evidence_backing": 0.7,
+    "deferred_readiness": 0.6,
+    "context_coherence": 1.0,
+}
+
+PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+def read_jsonl(path):
+    """Read a JSONL file and return a list of dicts."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    items = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                items.append(json.loads(s))
+    return items
+
+
+def read_yaml_file(path):
+    """Read a YAML file via PyYAML."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+# ---------------------------------------------------------------------------
+# Exploration params
+# ---------------------------------------------------------------------------
+
+def load_exploration_params():
+    """Load epsilon and noise_scale from developmental stage + config.
+
+    Returns (epsilon, noise_scale) tuple.
+    Epsilon from mind/developmental-stage.yaml -> exploration.epsilon
+    noise_scale from core/config/developmental-stage.yaml -> exploration.noise_scale
+    """
+    # Read epsilon from mutable state
+    dev_state = read_yaml_file(DEV_STAGE_PATH)
+    epsilon = 0.85  # default for uninitialized (exploring stage)
+    exploration = dev_state.get("exploration", {})
+    if isinstance(exploration, dict):
+        epsilon = exploration.get("epsilon", 0.85)
+
+    # Read noise_scale from framework config
+    dev_config = read_yaml_file(DEV_STAGE_CONFIG_PATH)
+    noise_scale = 3.0  # default
+    config_exploration = dev_config.get("exploration", {})
+    if isinstance(config_exploration, dict):
+        noise_scale = config_exploration.get("noise_scale", 3.0)
+
+    return (float(epsilon), float(noise_scale))
+
+
+def read_context_budget():
+    """Read context budget from status line output file.
+
+    Returns dict with zone and used_pct. Defaults to normal if unavailable.
+    The budget file is written by scripts/context-budget-status.py (status line).
+    """
+    if not BUDGET_PATH.exists():
+        return {"zone": "normal", "used_pct": 50}
+    try:
+        data = json.loads(BUDGET_PATH.read_text(encoding="utf-8"))
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"zone": "normal", "used_pct": 50}
+
+
+# ---------------------------------------------------------------------------
+# Date helpers
+# ---------------------------------------------------------------------------
+
+def days_until(date_str):
+    """Days until a future date. Negative if past."""
+    if not date_str:
+        return None
+    try:
+        return (date.fromisoformat(str(date_str)) - date.today()).days
+    except (ValueError, TypeError):
+        return None
+
+
+def days_since(date_str):
+    """Days since a past date. Negative if future."""
+    if not date_str:
+        return None
+    try:
+        return (date.today() - date.fromisoformat(str(date_str))).days
+    except (ValueError, TypeError):
+        return None
+
+
+def hours_since(timestamp_str):
+    """Hours since a past timestamp. Handles both YYYY-MM-DD and YYYY-MM-DDTHH:MM:SS.
+
+    For date-only strings (legacy), assumes start of day (00:00:00).
+    Returns float hours, or None if unparseable/corrupt.
+    Timestamps must be local system time — see core/config/conventions/goal-schemas.md.
+    """
+    if not timestamp_str:
+        return None
+    s = str(timestamp_str)
+    try:
+        if "T" in s:
+            past = datetime.fromisoformat(s)
+        else:
+            past = datetime.combine(date.fromisoformat(s), datetime.min.time())
+        delta = datetime.now() - past
+        hours = delta.total_seconds() / 3600.0
+        # Negative = corrupt timestamp. Return None so callers treat goal as due (fail open).
+        if hours < 0:
+            return None
+        return hours
+    except (ValueError, TypeError):
+        return None
+
+
+def get_interval_hours(goal):
+    """Get the recurring interval in hours for a goal.
+
+    Reads interval_hours first, falls back to remind_days * 24, defaults to 24.
+    """
+    if "interval_hours" in goal:
+        return goal["interval_hours"]
+    if "remind_days" in goal:
+        return goal["remind_days"] * 24
+    return 24
+
+
+# ---------------------------------------------------------------------------
+# FILTER + COLLECT
+# ---------------------------------------------------------------------------
+
+def collect_candidates(aspirations, known_blockers=None):
+    """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT)."""
+    today = date.today()
+    results = []
+
+    # Build set of skills blocked by infrastructure blockers
+    blocked_skills = set()
+    if known_blockers:
+        for b in known_blockers:
+            if b.get("resolution") is None:
+                for skill in b.get("affected_skills", []):
+                    blocked_skills.add(skill)
+
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+
+        # Cooldown check
+        cooldown = asp.get("cooldown_days", 0)
+        if cooldown > 0:
+            lw = days_since(asp.get("last_worked"))
+            if lw is not None and lw < cooldown:
+                continue
+
+        # Build set of completed/decomposed goal IDs for blocking check
+        done_ids = {g["id"] for g in asp.get("goals", [])
+                    if g.get("status") in ("completed", "decomposed")}
+
+        # Note: verification.preconditions are natural-language conditions
+        # evaluated by the LLM in Phase 2 of SKILL.md, not here.
+        for goal in asp.get("goals", []):
+            if goal.get("status") != "pending":
+                continue
+
+            # blocked_by check
+            if any(b not in done_ids for b in goal.get("blocked_by", [])):
+                continue
+
+            # Infrastructure blocker check
+            goal_skill = goal.get("skill", "")
+            if goal_skill and blocked_skills and goal_skill in blocked_skills:
+                continue
+
+            # Recurring time gate (hour-level precision)
+            if goal.get("recurring"):
+                interval = get_interval_hours(goal)
+                la = hours_since(goal.get("lastAchievedAt"))
+                if la is not None and la < interval:
+                    continue
+
+            # Hypothesis time gate
+            rne = goal.get("resolves_no_earlier_than")
+            if rne:
+                try:
+                    if today < date.fromisoformat(str(rne)):
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # Deferred time gate
+            deferred = goal.get("deferred_until")
+            if deferred:
+                try:
+                    dt = datetime.fromisoformat(str(deferred))
+                    if datetime.now() < dt:
+                        continue  # Not yet time
+                except (ValueError, TypeError):
+                    pass  # Corrupt value — fail open
+
+            # User-only skip
+            if goal.get("participants") == ["user"]:
+                continue
+
+            results.append({"goal": goal, "aspiration": asp})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED GOAL DIAGNOSTICS
+# ---------------------------------------------------------------------------
+
+def collect_blocked(aspirations, known_blockers=None):
+    """Return blocked goals with reasons (inverse of collect_candidates).
+
+    Checks blocking conditions in priority order (first match = primary reason):
+      explicit_status  — goal.status == "blocked"
+      infrastructure   — goal.skill in known_blockers affected_skills
+      dependency       — blocked_by contains unmet prerequisite IDs
+      deferred         — deferred_until is in the future
+      hypothesis_gate  — resolves_no_earlier_than is in the future
+
+    Excludes: recurring cooldown (not a real block), user-only goals,
+    completed/skipped/expired/decomposed/in-progress goals.
+    """
+    today = date.today()
+    blocked = []
+
+    # Map skill -> blocker info for infrastructure blocks
+    blocker_by_skill = {}
+    if known_blockers:
+        for b in known_blockers:
+            if b.get("resolution") is None:
+                for skill in b.get("affected_skills", []):
+                    blocker_by_skill[skill] = b
+
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+
+        asp_id = asp.get("id", "")
+        done_ids = {g["id"] for g in asp.get("goals", [])
+                    if g.get("status") in ("completed", "decomposed")}
+
+        for goal in asp.get("goals", []):
+            status = goal.get("status", "")
+            goal_id = goal.get("id", "")
+
+            # Skip terminal and in-progress statuses
+            if status in ("completed", "skipped", "expired", "decomposed", "in-progress"):
+                continue
+
+            # Skip user-only goals (shown in Phase 3 of open-questions)
+            if goal.get("participants") == ["user"]:
+                continue
+
+            entry = {
+                "goal_id": goal_id,
+                "aspiration_id": asp_id,
+                "title": goal.get("title", ""),
+                "skill": goal.get("skill"),
+                "priority": goal.get("priority", asp.get("priority", "MEDIUM")),
+                "chain_position": None,
+            }
+
+            # Checks 1-5: first match wins. Order matters — higher-level blocks
+            # (infrastructure) must precede lower-level (dependency) so chain
+            # compression classifies downstream goals correctly.
+            # 1. Explicit "blocked" status
+            if status == "blocked":
+                entry["block_reason"] = "explicit_status"
+                entry["block_detail"] = goal.get("block_reason", "No reason given")
+                blocked.append(entry)
+                continue
+
+            # Only pending goals from here
+            if status != "pending":
+                continue
+
+            # 2. Infrastructure blocker
+            goal_skill = goal.get("skill", "")
+            if goal_skill and goal_skill in blocker_by_skill:
+                b = blocker_by_skill[goal_skill]
+                entry["block_reason"] = "infrastructure"
+                entry["block_detail"] = "{skill} blocked: {reason}".format(
+                    skill=goal_skill, reason=b.get("reason", "unknown"))
+                entry["blocker_id"] = b.get("blocker_id", "")
+                blocked.append(entry)
+                continue
+
+            # 3. Dependency (blocked_by with unmet prerequisites)
+            unmet = [bid for bid in goal.get("blocked_by", []) if bid not in done_ids]
+            if unmet:
+                entry["block_reason"] = "dependency"
+                entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
+                entry["unmet_deps"] = unmet
+                blocked.append(entry)
+                continue
+
+            # 4. Deferred time gate
+            deferred = goal.get("deferred_until")
+            if deferred:
+                try:
+                    dt = datetime.fromisoformat(str(deferred))
+                    if datetime.now() < dt:
+                        entry["block_reason"] = "deferred"
+                        entry["block_detail"] = "Deferred until {until}: {reason}".format(
+                            until=deferred,
+                            reason=goal.get("defer_reason", ""))
+                        entry["deferred_until"] = str(deferred)
+                        blocked.append(entry)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # 5. Hypothesis time gate
+            rne = goal.get("resolves_no_earlier_than")
+            if rne:
+                try:
+                    if today < date.fromisoformat(str(rne)):
+                        entry["block_reason"] = "hypothesis_gate"
+                        entry["block_detail"] = "Not before {date}".format(date=rne)
+                        blocked.append(entry)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+            # Recurring cooldown is NOT a block — goal is just "not yet due"
+
+    # Dependency chain compression: mark head vs downstream
+    dep_blocked_ids = {e["goal_id"] for e in blocked if e["block_reason"] == "dependency"}
+    for entry in blocked:
+        if entry["block_reason"] == "dependency":
+            # Head = none of its unmet deps are themselves dependency-blocked
+            unmet = entry.get("unmet_deps", [])
+            if any(u in dep_blocked_ids for u in unmet):
+                entry["chain_position"] = "downstream"
+            else:
+                entry["chain_position"] = "head"
+
+    return blocked
+
+
+def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited=None):
+    """Walk dependency chains to find the ultimate root blocker.
+
+    Returns (root_goal_id, cause_label) tuple.
+    Follows blocked_by references recursively until hitting a terminal condition.
+    """
+    if visited is None:
+        visited = set()
+    if goal_id in visited:
+        return (goal_id, "CYCLE")
+    visited.add(goal_id)
+
+    goal = goal_map.get(goal_id)
+    if not goal:
+        return (goal_id, "UNKNOWN (missing goal)")
+
+    status = goal.get("status", "")
+
+    # Terminal statuses
+    if status == "in-progress":
+        return (goal_id, "IN PROGRESS")
+    if status == "blocked":
+        return (goal_id, "BLOCKED (status)")
+    if status in ("skipped", "expired"):
+        return (goal_id, "DEAD END: prereq {id} {status}".format(id=goal_id, status=status))
+
+    # For pending goals: check unsatisfied deps
+    if status == "pending":
+        unsatisfied = [b for b in goal.get("blocked_by", []) if b not in done_ids]
+        if unsatisfied:
+            # Follow first dep only — preserves 1:1 goal→bottleneck invariant
+            return trace_root_bottleneck(unsatisfied[0], goal_map, done_ids,
+                                         blocker_by_skill, visited)
+
+        # No unsatisfied deps — this IS the root. Classify it.
+        deferred = goal.get("deferred_until")
+        if deferred:
+            try:
+                dt = datetime.fromisoformat(str(deferred))
+                if datetime.now() < dt:
+                    return (goal_id, "DEFERRED until {t}".format(t=deferred))
+            except (ValueError, TypeError):
+                pass
+
+        goal_skill = goal.get("skill", "")
+        if goal_skill and goal_skill in blocker_by_skill:
+            reason = blocker_by_skill[goal_skill].get("reason", "unknown")
+            return (goal_id, "INFRA: {r}".format(r=reason))
+
+        if goal.get("participants") == ["user"]:
+            return (goal_id, "NEEDS USER")
+
+        return (goal_id, "READY")
+
+    # Completed/decomposed shouldn't reach here (in done_ids), but handle gracefully
+    return (goal_id, "READY")
+
+
+# ---------------------------------------------------------------------------
+# Evidence backing
+# ---------------------------------------------------------------------------
+
+def evidence_score(asp, resolved):
+    """Compute evidence_backing for an aspiration from resolved hypotheses.
+
+    For each resolved hypothesis relevant to this goal's aspiration:
+      earned_confirmed: +2.0, unlucky_corrected: +1.0
+      lucky_confirmed: +0.5, deserved_corrected: -1.0
+    Normalize by count. 0 if no relevant hypotheses.
+    """
+    tags = set(asp.get("tags", []))
+    hyp_ids = {g.get("hypothesis_id") for g in asp.get("goals", [])
+               if g.get("hypothesis_id")}
+
+    relevant = [h for h in resolved
+                if h.get("category") in tags or h.get("id") in hyp_ids]
+    if not relevant:
+        return 0.0
+
+    dual_scores = {
+        "earned_confirmed": 2.0, "unlucky_corrected": 1.0,
+        "lucky_confirmed": 0.5, "deserved_corrected": -1.0,
+    }
+    total = 0.0
+    for h in relevant:
+        ps = h.get("process_score") or {}
+        dc = ps.get("dual_classification") if isinstance(ps, dict) else None
+        if dc and dc in dual_scores:
+            total += dual_scores[dc]
+        else:
+            # Fallback: use outcome directly
+            outcome = h.get("outcome")
+            total += 1.0 if outcome == "CONFIRMED" else (-0.5 if outcome == "CORRECTED" else 0)
+
+    return total / len(relevant)
+
+
+# ---------------------------------------------------------------------------
+# Category resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_category(goal, asp):
+    """Resolve goal category: direct field > suggest from text > aspiration tag.
+
+    Falls back through three strategies:
+    1. goal.category if set and not "uncategorized"
+    2. category-suggest.py on title+description
+    3. First aspiration tag, then "uncategorized"
+    """
+    cat = goal.get("category")
+    if cat and cat != "uncategorized":
+        return cat
+
+    # Derive from title+description via category-suggest
+    text = "{title}. {desc}".format(
+        title=goal.get("title", ""),
+        desc=goal.get("description", ""),
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CORE_ROOT / "scripts" / "category-suggest.py"),
+             "--text", text, "--top", "1"],
+            capture_output=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode == 0:
+            matches = json.loads(result.stdout)
+            if matches and matches[0].get("score", 0) > 0:
+                return matches[0]["key"]
+    except Exception:
+        pass
+
+    tags = asp.get("tags", [])
+    return tags[0] if tags else "uncategorized"
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scale=3.0,
+               budget=None):
+    """Score a single goal using the multi-criteria weighted formula."""
+    goal, asp = cand["goal"], cand["aspiration"]
+    raw = {}
+
+    # 1. priority (HIGH=3, MEDIUM=2, LOW=1)
+    raw["priority"] = PRIORITY_MAP.get(
+        goal.get("priority", asp.get("priority", "MEDIUM")), 2)
+
+    # 2. deadline_urgency (+3 ≤1d, +2 ≤3d, +1 ≤7d)
+    deadline = goal.get("resolves_by") or goal.get("deadline")
+    remaining = days_until(deadline)
+    raw["deadline_urgency"] = (
+        3 if remaining is not None and remaining <= 1 else
+        2 if remaining is not None and remaining <= 3 else
+        1 if remaining is not None and remaining <= 7 else 0)
+
+    # 3. agent_executable (+2 if agent in participants)
+    raw["agent_executable"] = 2 if "agent" in goal.get("participants", ["agent"]) else 0
+
+    # 4. variety_bonus (+1.5 if different aspiration than last touched)
+    touched = wm.get("aspiration_touched_last", "")
+    raw["variety_bonus"] = 1.5 if asp.get("id") != touched else 0
+
+    # 5. streak_momentum (+0.5 if same aspiration had a goal completed this session)
+    asp_id = asp.get("id", "")
+    raw["streak_momentum"] = (
+        0.5 if any(s.get("aspiration_id") == asp_id for s in session_completions) else 0)
+
+    # 6. novelty_bonus (+1.0 if never done before)
+    raw["novelty_bonus"] = 1.0 if goal.get("achievedCount", 0) == 0 else 0
+
+    # 7. recurring_urgency (2.0 base when due + overdue ratio, capped at 5.0)
+    rec = 0
+    if goal.get("recurring"):
+        interval = get_interval_hours(goal)
+        la = hours_since(goal.get("lastAchievedAt"))
+        if la is None or (la >= interval and interval > 0):
+            # 2.0 base = "this goal is due now" signal
+            # + linear overdue growth
+            # Cap at 5.0 prevents indefinite starvation of domain work
+            overdue_ratio = 0.0
+            if la is not None and interval > 0:
+                overdue_ratio = (la - interval) / interval
+            rec = min(2.0 + overdue_ratio, 5.0)
+    raw["recurring_urgency"] = rec
+
+    # 8. reward_history (+1.0 if previous goals in this aspiration had high success)
+    completed = sum(1 for g in asp.get("goals", []) if g.get("status") == "completed")
+    raw["reward_history"] = 1.0 if completed > 0 else 0
+
+    # 9. evidence_backing (resolved hypothesis support score)
+    raw["evidence_backing"] = evidence_score(asp, resolved)
+
+    # 10. deferred_readiness (+1.5 when a deferred goal becomes due)
+    dr = 0
+    deferred = goal.get("deferred_until")
+    if deferred:
+        try:
+            dt = datetime.fromisoformat(str(deferred))
+            if datetime.now() >= dt:
+                dr = 1.5
+        except (ValueError, TypeError):
+            pass
+    raw["deferred_readiness"] = dr
+
+    # 11. context_coherence (same-category bonus modulated by context budget zone)
+    budget = budget or {}
+    last_cat = wm.get("last_goal_category", "")
+    category = _resolve_category(goal, asp)
+    if category and last_cat and category == last_cat:
+        raw["context_coherence"] = 2.0 if budget.get("zone") != "tight" else 1.0
+    else:
+        raw["context_coherence"] = 0
+
+    # 12. exploration_noise (random value scaled by developmental epsilon)
+    raw["exploration_noise"] = random.random()
+
+    # Weighted total — static criteria + dynamic exploration noise
+    total = sum(raw[k] * WEIGHTS[k] for k in WEIGHTS)
+    noise_weight = epsilon * noise_scale
+    total += raw["exploration_noise"] * noise_weight
+
+    return {
+        "goal_id": goal.get("id"),
+        "aspiration_id": asp_id,
+        "title": goal.get("title", ""),
+        "skill": goal.get("skill"),
+        "category": category,
+        "recurring": bool(goal.get("recurring")),
+        "score": round(total, 2),
+        "breakdown": {
+            **{k: round(raw[k] * WEIGHTS[k], 2) for k in WEIGHTS},
+            "exploration_noise": round(raw["exploration_noise"] * noise_weight, 2),
+        },
+        "raw": {k: round(v, 2) if isinstance(v, float) else v for k, v in raw.items()},
+        "exploration_params": {
+            "epsilon": epsilon,
+            "noise_scale": noise_scale,
+            "noise_weight": round(noise_weight, 2),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_select(args):
+    """Score and rank all unblocked goals. Output: JSON array sorted by score desc."""
+    aspirations = read_jsonl(ASP_PATH)
+    if not aspirations:
+        print("[]")
+        return
+
+    # Load resolved hypotheses for evidence_backing
+    pipeline = read_jsonl(PIPELINE_PATH)
+    archive = read_jsonl(PIPELINE_ARCHIVE_PATH)
+    resolved = [r for r in pipeline + archive
+                if r.get("outcome") in ("CONFIRMED", "CORRECTED")]
+
+    # Load working memory for variety/streak context
+    wm = read_wm()
+    sc = wm.get("goals_completed_this_session", [])
+    if not isinstance(sc, list):
+        sc = []
+
+    known_blockers = wm.get("slots", {}).get("known_blockers", [])
+    if not isinstance(known_blockers, list):
+        known_blockers = []
+    candidates = collect_candidates(aspirations, known_blockers=known_blockers)
+    if not candidates:
+        print("[]")
+        return
+
+    epsilon, noise_scale = load_exploration_params()
+    budget = read_context_budget()
+    scored = [score_goal(c, wm, resolved, sc, epsilon=epsilon, noise_scale=noise_scale,
+                         budget=budget)
+              for c in candidates]
+    # Sort: highest score first, then lower aspiration number, then lower goal number
+    scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))
+
+    print(json.dumps(scored, indent=2, ensure_ascii=False))
+
+
+def cmd_blocked(args):
+    """List all blocked goals with reasons. Output: JSON with blocked_goals and by_reason."""
+    empty_reasons = {r: {"count": 0, "goal_ids": []} for r in
+                      ["infrastructure", "dependency", "deferred", "hypothesis_gate", "explicit_status"]}
+    empty_reasons["dependency"]["head_count"] = 0
+    empty_reasons["dependency"]["downstream_count"] = 0
+
+    aspirations = read_jsonl(ASP_PATH)
+    if not aspirations:
+        print(json.dumps({"blocked_goals": [], "by_reason": empty_reasons,
+            "bottlenecks": [], "summary": {
+            "total_blocked": 0, "total_active_goals": 0,
+            "bottleneck_count": 0}}, indent=2))
+        return
+
+    wm = read_wm()
+    known_blockers = wm.get("slots", {}).get("known_blockers", [])
+    if not isinstance(known_blockers, list):
+        known_blockers = []
+
+    blocked = collect_blocked(aspirations, known_blockers=known_blockers)
+
+    # Count total non-terminal goals across active aspirations
+    total_active = 0
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []):
+            if g.get("status") not in ("completed", "skipped", "expired", "decomposed"):
+                total_active += 1
+
+    # Group by reason
+    reasons = ["infrastructure", "dependency", "deferred", "hypothesis_gate", "explicit_status"]
+    by_reason = {}
+    for reason in reasons:
+        matches = [e for e in blocked if e["block_reason"] == reason]
+        entry = {"count": len(matches), "goal_ids": [e["goal_id"] for e in matches]}
+        if reason == "dependency":
+            entry["head_count"] = sum(1 for e in matches if e.get("chain_position") == "head")
+            entry["downstream_count"] = sum(1 for e in matches if e.get("chain_position") == "downstream")
+        by_reason[reason] = entry
+
+    # --- Root bottleneck tracing ---
+    # Global goal map + done_ids (NOT per-aspiration) — chains cross aspirations
+    goal_map = {}
+    all_done_ids = set()
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []):
+            gid = g.get("id", "")
+            goal_map[gid] = {
+                "status": g.get("status", ""),
+                "blocked_by": g.get("blocked_by", []),
+                "skill": g.get("skill"),
+                "deferred_until": g.get("deferred_until"),
+                "participants": g.get("participants"),
+                "title": g.get("title", ""),
+                "aspiration_id": asp.get("id", ""),
+            }
+            if g.get("status") in ("completed", "decomposed"):
+                all_done_ids.add(gid)
+
+    # Build blocker_by_skill for INFRA classification
+    blocker_by_skill = {}
+    if known_blockers:
+        for b in known_blockers:
+            if b.get("resolution") is None:
+                for skill in b.get("affected_skills", []):
+                    blocker_by_skill[skill] = b
+
+    # Trace root bottleneck for each blocked goal
+    for entry in blocked:
+        gid = entry["goal_id"]
+        if entry["block_reason"] == "dependency":
+            # Follow the chain to its root
+            root_id, cause = trace_root_bottleneck(
+                gid, goal_map, all_done_ids, blocker_by_skill)
+            entry["root_bottleneck"] = {"goal_id": root_id, "cause": cause}
+        else:
+            # Non-dependency blocks: root is self, cause from block_detail
+            cause_map = {
+                "infrastructure": entry.get("block_detail", "INFRA"),
+                "deferred": "DEFERRED until {t}".format(
+                    t=entry.get("deferred_until", "?")),
+                "hypothesis_gate": entry.get("block_detail", "hypothesis gate"),
+                "explicit_status": entry.get("block_detail", "explicit block"),
+            }
+            entry["root_bottleneck"] = {
+                "goal_id": gid,
+                "cause": cause_map.get(entry["block_reason"], entry["block_reason"]),
+            }
+
+    # Group by root bottleneck → build bottlenecks array
+    root_groups = {}
+    for entry in blocked:
+        root_id = entry["root_bottleneck"]["goal_id"]
+        if root_id not in root_groups:
+            root_info = goal_map.get(root_id, {})
+            root_groups[root_id] = {
+                "goal_id": root_id,
+                "title": root_info.get("title", entry.get("title", "")),
+                "aspiration_id": root_info.get("aspiration_id",
+                                               entry.get("aspiration_id", "")),
+                "cause": entry["root_bottleneck"]["cause"],
+                "downstream_ids": [],
+                "affected_aspirations": set(),
+            }
+        group = root_groups[root_id]
+        if entry["goal_id"] != root_id:
+            group["downstream_ids"].append(entry["goal_id"])
+        group["affected_aspirations"].add(entry["aspiration_id"])
+
+    bottlenecks = []
+    for root_id, group in root_groups.items():
+        bottlenecks.append({
+            "goal_id": group["goal_id"],
+            "title": group["title"],
+            "aspiration_id": group["aspiration_id"],
+            "cause": group["cause"],
+            "downstream_count": len(group["downstream_ids"]),
+            "downstream_ids": group["downstream_ids"],
+            "affected_aspirations": sorted(group["affected_aspirations"]),
+        })
+    bottlenecks.sort(key=lambda b: -b["downstream_count"])
+
+    result = {
+        "blocked_goals": blocked,
+        "by_reason": by_reason,
+        "bottlenecks": bottlenecks,
+        "summary": {
+            "total_blocked": len(blocked),
+            "total_active_goals": total_active,
+            "bottleneck_count": len(bottlenecks),
+        },
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Goal scoring with exploration noise")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("select", help="Score and rank all unblocked goals")
+    sub.add_parser("blocked", help="List all blocked goals with reasons")
+    args = parser.parse_args()
+    {"select": cmd_select, "blocked": cmd_blocked}[args.command](args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,224 @@
+# Adaptive Spark Questions — Framework Definition
+# Seed questions and evolution rules are immutable framework.
+# Agent state (times_asked, yield, status) lives in mind/spark-questions.jsonl (script-accessed)
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+seed_questions:
+  - id: sq-001
+    text: "Did this goal reveal a NEW information source we haven't used before?"
+    category: discovery
+
+  - id: sq-002
+    text: "Did this goal expose a BLIND SPOT in our current knowledge?"
+    category: gap_detection
+
+  - id: sq-003
+    text: "Could the approach used here transfer to a DIFFERENT category?"
+    category: transfer
+
+  - id: sq-004
+    text: "Did the outcome SURPRISE us? What does the surprise reveal?"
+    category: surprise
+
+  - id: sq-005
+    text: "Is there a RECURRING pattern we should formalize as a new pattern signature?"
+    category: pattern_extraction
+
+  - id: sq-006
+    text: "Did this goal reveal a GAP between our expectation and the actual outcome?"
+    category: calibration
+
+  - id: sq-007
+    text: "Is there a new ASPIRATION suggested by this outcome?"
+    category: aspiration_generation
+
+  - id: sq-008
+    text: "Did this goal involve a REPETITIVE procedure (API calls, data fetching, multi-step workflow) that should be formalized into a reusable skill?"
+    category: skill_gap_detection
+
+  - id: sq-009
+    text: "Could we form a TESTABLE PREDICTION from this goal's findings? What would we expect to see, and when could we check?"
+    category: hypothesis_generation
+
+  - id: sq-010
+    text: "How well do I actually understand this domain? Does my self-assessment match my computed capability level?"
+    category: metacognitive_calibration
+
+  - id: sq-011
+    text: "Based on what we learned, what would BREAK or CHANGE if the user modifies this area next? What consequence can we predict NOW and verify LATER?"
+    category: forward_prediction
+
+  - id: sq-012
+    text: "Does this outcome change how I think about my core purpose? Should my Self evolve — is there a refinement, expansion, or course correction to what I'm fundamentally here to do?"
+    category: self_evolution
+
+  - id: sq-013
+    text: "Did executing this goal reveal actionable work — a requirement, dependency, follow-up, fix, capability gap, or opportunity — that isn't already tracked?"
+    category: work_discovery
+
+seed_candidates:
+  - id: sq-c01
+    text: "Did this goal reveal a timing pattern (time-of-day, day-of-week, seasonal)?"
+    category: temporal_pattern
+
+  - id: sq-c02
+    text: "Was there a data source that CONTRADICTED our primary source?"
+    category: contradiction
+
+  - id: sq-c03
+    text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
+    proposed_session: 0
+    category: memory_curation
+
+  - id: sq-c04
+    text: "Is there knowledge in our memory tree that CONTRADICTS what we just learned, or that we now know is STALE?"
+    proposed_session: 0
+    category: memory_curation
+
+  - id: sq-c05
+    text: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
+    proposed_session: 0
+    category: data_acquisition
+
+evolution_rules:
+  retire_threshold: 0.03
+  min_asks_before_retire: 20
+  review_interval_sessions: 5
+  max_active_questions: 15
+  promotion_rule: "Highest-category-need candidate replaces lowest-yield retired question"
+
+# --- INITIAL STATE ---
+
+initial_state:
+  questions:
+    - id: sq-001
+      text: "Did this goal reveal a NEW information source we haven't used before?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: discovery
+
+    - id: sq-002
+      text: "Did this goal expose a BLIND SPOT in our current knowledge?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: gap_detection
+
+    - id: sq-003
+      text: "Could the approach used here transfer to a DIFFERENT category?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: transfer
+
+    - id: sq-004
+      text: "Did the outcome SURPRISE us? What does the surprise reveal?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: surprise
+
+    - id: sq-005
+      text: "Is there a RECURRING pattern we should formalize as a new pattern signature?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: pattern_extraction
+
+    - id: sq-006
+      text: "Did this goal reveal a GAP between our expectation and the actual outcome?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: calibration
+
+    - id: sq-007
+      text: "Is there a new ASPIRATION suggested by this outcome?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: aspiration_generation
+
+    - id: sq-008
+      text: "Did this goal involve a REPETITIVE procedure (API calls, data fetching, multi-step workflow) that should be formalized into a reusable skill?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: skill_gap_detection
+
+    - id: sq-009
+      text: "Could we form a TESTABLE PREDICTION from this goal's findings? What would we expect to see, and when could we check?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: hypothesis_generation
+
+    - id: sq-010
+      text: "How well do I actually understand this domain? Does my self-assessment match my computed capability level?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: metacognitive_calibration
+
+    - id: sq-011
+      text: "Based on what we learned, what would BREAK or CHANGE if the user modifies this area next? What consequence can we predict NOW and verify LATER?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: forward_prediction
+
+    - id: sq-012
+      text: "Does this outcome change how I think about my core purpose? Should my Self evolve — is there a refinement, expansion, or course correction to what I'm fundamentally here to do?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: self_evolution
+
+    - id: sq-013
+      text: "Did executing this goal reveal actionable work — a requirement, dependency, follow-up, fix, capability gap, or opportunity — that isn't already tracked?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: work_discovery
+
+  candidates:
+    - id: sq-c01
+      text: "Did this goal reveal a timing pattern (time-of-day, day-of-week, seasonal)?"
+      proposed_session: 0
+      category: temporal_pattern
+
+    - id: sq-c02
+      text: "Was there a data source that CONTRADICTED our primary source?"
+      proposed_session: 0
+      category: contradiction
+
+    - id: sq-c03
+      text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
+      proposed_session: 0
+      category: memory_curation
+
+    - id: sq-c04
+      text: "Is there knowledge in our memory tree that CONTRADICTS what we just learned, or that we now know is STALE?"
+      proposed_session: 0
+      category: memory_curation
+
+    - id: sq-c05
+      text: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
+      proposed_session: 0
+      category: data_acquisition

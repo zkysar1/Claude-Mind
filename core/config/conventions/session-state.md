@@ -1,0 +1,117 @@
+# Agent State Machine
+
+- State file: `mind/session/agent-state` (plain text, no YAML)
+- Valid values: `RUNNING`, `IDLE`. Absence = UNINITIALIZED.
+- ONLY `/start` and `/stop` may write to this file (via `session-state-set.sh`)
+- Claude MUST NOT modify agent-state under any circumstances
+- Boot and aspirations check agent-state before executing (defense in depth)
+- All reads via `session-state-get.sh`, all writes via `session-state-set.sh`
+
+---
+
+# Session State Script Access
+
+Session control files in `mind/session/` are accessed exclusively via scripts.
+The LLM MUST NOT read or write `agent-state`, `persona-active`, signal files,
+or `stop-block-count` directly. All access goes through scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `session-state-get.sh` | Returns: RUNNING, IDLE, or UNINITIALIZED |
+| `session-state-set.sh <value>` | Validates and writes (RUNNING or IDLE only) |
+| `session-persona-get.sh` | Returns: true, false, or unset |
+| `session-persona-set.sh <value>` | Validates and writes (true or false only) |
+| `session-signal-set.sh <name>` | Creates marker file (loop-active or stop-loop only) |
+| `session-signal-clear.sh <name>` | Removes marker file |
+| `session-signal-exists.sh <name>` | Exit 0 if exists, exit 1 if not |
+| `session-counter-get.sh` | Returns stop-block-count integer (0 if missing) |
+| `session-counter-increment.sh` | Atomic increment, returns new value |
+| `session-counter-clear.sh` | Removes counter file |
+
+All backed by `core/scripts/session.py` (Python 3, stdlib only).
+
+---
+
+# Generic YAML Store (mind/ files)
+
+YAML state files in `mind/` are accessed via generic scripts.
+File paths are relative to `mind/`. Path traversal outside `mind/` is rejected.
+
+| Script | Purpose |
+|--------|---------|
+| `mind-read.sh <file> [--field <path>] [--json]` | Read file or specific field |
+| `mind-set.sh <file> <path> <value> [--string]` | Set a scalar field (auto-detects type) |
+| `mind-increment.sh <file> <path>` | Increment numeric field, prints new value |
+| `mind-append.sh <file> <path>` | Append JSON from stdin to array field |
+| `mind-write.sh <file>` | Full file replacement from stdin (JSON or YAML) |
+
+Dot-notation for nested access: `current_assessment.resolved_hypotheses`.
+Numeric segments index into arrays: `gaps.0.status`.
+All backed by `core/scripts/mind-yaml.py` (Python 3, PyYAML).
+
+---
+
+# Working Memory Scripts
+
+Working memory (`mind/session/working-memory.yaml`) has its own dedicated script family.
+The LLM MUST NOT read or write `working-memory.yaml` directly — all access via `wm-*.sh`.
+Full schema and pruning rules: `core/config/conventions/working-memory.md`.
+
+| Script | Purpose |
+|--------|---------|
+| `wm-read.sh [slot] [--json]` | Read slot or full WM (updates accessed_at) |
+| `echo '<json>' \| wm-set.sh <slot>` | Set slot value (updates updated_at) |
+| `echo '<json>' \| wm-append.sh <slot>` | Append to array slot (auto-adds _item_ts) |
+| `wm-clear.sh <slot>` | Null scalars, empty arrays |
+| `wm-ages.sh [--json]` | Report all slot ages |
+| `wm-prune.sh [--dry-run]` | Mid-session pruning per config thresholds |
+| `wm-init.sh` | Initialize from template (Phase -1) |
+| `wm-reset.sh` | Reset to template (consolidation Step 5) |
+
+All backed by `core/scripts/wm.py` (Python 3, PyYAML).
+
+---
+
+# Compact Checkpoint (PreCompact / SessionStart Hooks)
+
+When autocompact fires, `PreCompact` hook saves encoding state before context compression:
+
+- **File**: `mind/session/compact-checkpoint.yaml`
+- **Written by**: `core/scripts/precompact-checkpoint.sh` (PreCompact hook, matcher: auto)
+- **Injected by**: `core/scripts/postcompact-restore.sh` (SessionStart hook, matcher: compact — stdout injected into context)
+- **Consumed by**: aspirations loop Phase -0.5c (processes encoding queue in fresh context, then deletes checkpoint)
+
+The checkpoint accumulates across multiple compactions (`compact_count` field). If precompact fires
+again before the loop re-enters, prior encoding items are preserved in `prior_encoding_items`.
+
+Phase -0.5c processes a budget of `min(5, queue_length)` encoding items — a lightweight mid-session
+encoding pass, not full consolidation. Remaining items stay in the encoding queue for session-end.
+
+Hooks configured in `.claude/settings.json` (project-level, not skill-scoped).
+
+---
+
+# Report Timestamp
+
+`mind/session/last-report-timestamp` — plain text file containing an ISO timestamp.
+Written by `/completion-report` Phase 4 after generating a report. Read by Phase 1
+to determine the report window. If missing, report falls back to `handoff.yaml`
+session start time or shows lifetime totals.
+
+---
+
+# Context Read Deduplication
+
+Hooks prevent redundant file reads between compaction cycles:
+
+- `PreToolUse[Read]` gates re-reads of tracked files (exit 2 = block)
+- `PostToolUse[Read]` auto-records reads
+- `PostToolUse[Write,Edit]` invalidates modified tree nodes
+- PreCompact clears the tracker
+
+Skills use `load-conventions.sh` in Step 0 to batch-check which conventions need loading.
+
+**Scope**: `core/config/**`, `.claude/skills/**/SKILL.md`, `mind/knowledge/tree/**`, `mind/conventions/**`.
+Partial reads (offset/limit) bypass tracking.
+
+**Scripts**: `core/scripts/context-reads.py`, `core/scripts/load-conventions.sh`.

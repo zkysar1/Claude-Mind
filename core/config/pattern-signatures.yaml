@@ -1,0 +1,69 @@
+# Pattern Signatures Configuration — Framework Definition
+# Dentate Gyrus (separation) + CA3 (completion)
+# Immutable config. Agent state lives in mind/pattern-signatures.jsonl (script-accessed)
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+config:
+  max_signatures: 50
+  validation_states: [unvalidated, calibrating, validated]
+  min_triggers_for_calibrating: 3
+  min_triggers_for_validated: 10
+
+calibration_protocol:
+  description: "Track each signature's hit rate vs false positive rate over time"
+  review_interval: 10
+
+# --- SIGNATURE TEMPLATES ---
+# Reference template for creating pattern signatures. Used by /reflect when
+# extracting new patterns from hypothesis outcomes. Adapt fields to actual patterns.
+
+signature_templates:
+  # Complete pattern signature structure
+  pattern_signature:
+    id: "sig-NNN"                          # zero-padded 3-digit
+    name: "Human-readable pattern name"
+    category: "{domain-slug}"              # which knowledge domain this applies to
+    status: active                         # active | retired | contradicted
+    validation_status: unvalidated         # unvalidated → calibrating → validated
+
+    # Dentate Gyrus: pattern separation
+    # "This looks like X but is actually Y because of Z"
+    separation:
+      looks_like: "Surface-level pattern that triggers false recognition"
+      actually_is: "Correct classification after deeper analysis"
+      distinguishing_features:
+        - "Key feature that differentiates the two"
+        - "Second distinguishing feature"
+      confused_with: []                    # sig-IDs of patterns this gets confused with
+
+    # CA3: pattern completion
+    # "Given these partial cues, retrieve this full strategy context"
+    completion:
+      partial_cues:
+        - "Observable signal or indicator 1"
+        - "Observable signal or indicator 2"
+      full_context: "Complete strategy or understanding to retrieve when cues match"
+      confidence_boost: 0.0                # how much to adjust confidence when pattern matches
+
+    # Tracking fields — updated by /reflect and /replay
+    times_triggered: 0
+    true_positives: 0
+    false_positives: 0
+    hit_rate: 0.0                          # true_positives / times_triggered
+    false_positive_rate: 0.0               # false_positives / times_triggered
+    created_session: null
+    last_triggered: null
+
+    # Utility tracking — updated by retrieve.sh (increments counters on each retrieval)
+    utility_stats:
+      times_retrieved: 0
+      times_useful: 0
+      times_noise: 0
+      utility_ratio: 0.0                   # times_useful / max(times_retrieved, 1)
+
+# --- INITIAL STATE ---
+
+initial_state:
+  signatures: []

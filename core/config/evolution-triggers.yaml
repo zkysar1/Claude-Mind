@@ -1,0 +1,92 @@
+# Evolution Triggers — Framework Definition
+# Immutable trigger definitions. Agent state lives in mind/evolution-triggers.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+triggers:
+  accuracy_drop:
+    description: "Rolling accuracy drops significantly in recent window"
+    threshold: -10
+    window_size: 10
+    per_category: true
+    cooldown_sessions: 3
+
+  consecutive_losses:
+    description: "Multiple consecutive corrected predictions in any category"
+    threshold: 3
+    per_category: true
+    cooldown_sessions: 2
+
+  pattern_divergence:
+    description: "Pattern signature hit rate diverges from claimed accuracy"
+    threshold: 0.15
+    min_sample: 5
+    cooldown_sessions: 5
+
+  capability_unlock:
+    description: "Any category reaches a new capability level"
+    trigger: "any category reaches new capability level"
+    cooldown_sessions: 0
+
+  stale_strategy:
+    description: "Category touched 3+ sessions without accuracy improvement"
+    sessions_without_improvement: 3
+    per_category: true
+    cooldown_sessions: 5
+
+  context_retrieval_ineffectiveness:
+    description: "Context retrieval consistently fails to help — same gaps recur or loaded context is unhelpful"
+    min_sample: 10
+    gap_frequency_threshold: 0.40
+    usefulness_rate_threshold: 0.50
+    cooldown_sessions: 5
+    per_category: false
+
+  evolution_cadence:
+    description: "Evolution has not run in N sessions — periodic strategic review"
+    sessions_without_evolution: 7
+    per_category: false
+    cooldown_sessions: 5
+
+global:
+  max_evolutions_per_session: 2
+  evolution_log_path: "mind/evolution-log.jsonl"
+
+modifiable:
+  accuracy_drop_threshold: {min: -20, max: -5, default: -10}
+  accuracy_drop_window: {min: 5, max: 20, default: 10}
+  consecutive_losses_threshold: {min: 2, max: 5, default: 3}
+  pattern_divergence_threshold: {min: 0.05, max: 0.30, default: 0.15}
+  stale_strategy_sessions: {min: 2, max: 7, default: 3}
+  context_retrieval_min_sample: {min: 5, max: 20, default: 10}
+  context_retrieval_gap_threshold: {min: 0.20, max: 0.60, default: 0.40}
+  context_retrieval_usefulness_threshold: {min: 0.30, max: 0.70, default: 0.50}
+  max_evolutions_per_session: {min: 1, max: 5, default: 2}
+  evolution_cadence_sessions: {min: 3, max: 15, default: 7}
+
+# --- INITIAL STATE ---
+
+initial_state:
+  triggers:
+    accuracy_drop:
+      last_fired: null
+      times_fired: 0
+    consecutive_losses:
+      last_fired: null
+      times_fired: 0
+    pattern_divergence:
+      last_fired: null
+      times_fired: 0
+    capability_unlock:
+      last_fired: null
+      times_fired: 0
+    stale_strategy:
+      last_fired: null
+      times_fired: 0
+    context_retrieval_ineffectiveness:
+      last_fired: null
+      times_fired: 0
+    evolution_cadence:
+      last_fired: null
+      times_fired: 0

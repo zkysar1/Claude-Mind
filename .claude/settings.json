@@ -1,0 +1,207 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(git commit*)",
+      "Bash(git push*)",
+      "Bash(git pull*)",
+      "Bash(git checkout*)",
+      "Bash(git merge*)",
+      "Bash(git rebase*)",
+      "Bash(git reset*)",
+      "Bash(git branch*)",
+      "Bash(git stash*)",
+      "Bash(git tag*)",
+      "Bash(git clone*)",
+      "Bash(git init*)",
+      "Bash(git remote*)",
+      "Bash(git cherry-pick*)",
+      "Bash(git revert*)",
+      "Bash(git add*)",
+
+      "Edit(*/.claude/settings*)",
+      "Write(*/.claude/settings*)",
+
+      "AskUserQuestion(*)",
+
+      "Read(*/.env.local)",
+
+      "Edit(*/.claude/skills/aspirations/*)",
+      "Write(*/.claude/skills/aspirations/*)",
+      "Edit(*/.claude/skills/aspirations-consolidate/*)",
+      "Write(*/.claude/skills/aspirations-consolidate/*)",
+      "Edit(*/.claude/skills/aspirations-evolve/*)",
+      "Write(*/.claude/skills/aspirations-evolve/*)",
+      "Edit(*/.claude/skills/aspirations-execute/*)",
+      "Write(*/.claude/skills/aspirations-execute/*)",
+      "Edit(*/.claude/skills/aspirations-spark/*)",
+      "Write(*/.claude/skills/aspirations-spark/*)",
+      "Edit(*/.claude/skills/aspirations-state-update/*)",
+      "Write(*/.claude/skills/aspirations-state-update/*)",
+      "Edit(*/.claude/skills/backlog-report/*)",
+      "Write(*/.claude/skills/backlog-report/*)",
+      "Edit(*/.claude/skills/boot/*)",
+      "Write(*/.claude/skills/boot/*)",
+      "Edit(*/.claude/skills/completion-report/*)",
+      "Write(*/.claude/skills/completion-report/*)",
+      "Edit(*/.claude/skills/create-aspiration/*)",
+      "Write(*/.claude/skills/create-aspiration/*)",
+      "Edit(*/.claude/skills/decompose/*)",
+      "Write(*/.claude/skills/decompose/*)",
+      "Edit(*/.claude/skills/enterPersona/*)",
+      "Write(*/.claude/skills/enterPersona/*)",
+      "Edit(*/.claude/skills/escapePersona/*)",
+      "Write(*/.claude/skills/escapePersona/*)",
+      "Edit(*/.claude/skills/forge-skill/*)",
+      "Write(*/.claude/skills/forge-skill/*)",
+      "Edit(*/.claude/skills/open-questions/*)",
+      "Write(*/.claude/skills/open-questions/*)",
+      "Edit(*/.claude/skills/prime/*)",
+      "Write(*/.claude/skills/prime/*)",
+      "Edit(*/.claude/skills/recover/*)",
+      "Write(*/.claude/skills/recover/*)",
+      "Edit(*/.claude/skills/reflect/*)",
+      "Write(*/.claude/skills/reflect/*)",
+      "Edit(*/.claude/skills/reflect-batch-micro/*)",
+      "Write(*/.claude/skills/reflect-batch-micro/*)",
+      "Edit(*/.claude/skills/reflect-calibration/*)",
+      "Write(*/.claude/skills/reflect-calibration/*)",
+      "Edit(*/.claude/skills/reflect-curate-aspirations/*)",
+      "Write(*/.claude/skills/reflect-curate-aspirations/*)",
+      "Edit(*/.claude/skills/reflect-curate-memory/*)",
+      "Write(*/.claude/skills/reflect-curate-memory/*)",
+      "Edit(*/.claude/skills/reflect-execution/*)",
+      "Write(*/.claude/skills/reflect-execution/*)",
+      "Edit(*/.claude/skills/reflect-extract-patterns/*)",
+      "Write(*/.claude/skills/reflect-extract-patterns/*)",
+      "Edit(*/.claude/skills/reflect-hypothesis/*)",
+      "Write(*/.claude/skills/reflect-hypothesis/*)",
+      "Edit(*/.claude/skills/reflect-tree-update/*)",
+      "Write(*/.claude/skills/reflect-tree-update/*)",
+      "Edit(*/.claude/skills/replay/*)",
+      "Write(*/.claude/skills/replay/*)",
+      "Edit(*/.claude/skills/research-topic/*)",
+      "Write(*/.claude/skills/research-topic/*)",
+      "Edit(*/.claude/skills/reset/*)",
+      "Write(*/.claude/skills/reset/*)",
+      "Edit(*/.claude/skills/respond/*)",
+      "Write(*/.claude/skills/respond/*)",
+      "Edit(*/.claude/skills/review-hypotheses/*)",
+      "Write(*/.claude/skills/review-hypotheses/*)",
+      "Edit(*/.claude/skills/start/*)",
+      "Write(*/.claude/skills/start/*)",
+      "Edit(*/.claude/skills/stop/*)",
+      "Write(*/.claude/skills/stop/*)",
+      "Edit(*/.claude/skills/tree/*)",
+      "Write(*/.claude/skills/tree/*)",
+      "Edit(*/.claude/skills/verify-learning/*)",
+      "Write(*/.claude/skills/verify-learning/*)",
+      "Edit(*/.claude/skills/_tree.yaml)",
+      "Write(*/.claude/skills/_tree.yaml)",
+      "Edit(*/.claude/skills/_triggers.yaml)",
+      "Write(*/.claude/skills/_triggers.yaml)",
+      "Edit(*/.claude/rules/*)",
+      "Write(*/.claude/rules/*)",
+      "Edit(*/core/config/*)",
+      "Write(*/core/config/*)",
+      "Edit(*/core/scripts/*)",
+      "Write(*/core/scripts/*)",
+      "Edit(*/CLAUDE.md)",
+      "Write(*/CLAUDE.md)",
+
+      "Edit(*/mind/knowledge/tree/_tree.yaml)",
+      "Write(*/mind/knowledge/tree/_tree.yaml)",
+      "Edit(*/mind/*.jsonl)",
+      "Write(*/mind/*.jsonl)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/context-reads-gate.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/context-reads-record.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/precompact-checkpoint.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/session-save-id.sh",
+            "timeout": 3
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/postcompact-restore.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/stop-hook.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

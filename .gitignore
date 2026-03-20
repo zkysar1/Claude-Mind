@@ -28,6 +28,18 @@ __pycache__/
 .venv/
 venv/
 
+# Node artifacts
+node_modules/
+
+# Agent mind (generated — recreated by /boot from core/config/ initial_state: sections)
+mind/
+
+# Forged skills (domain-specific, registered in mind/forged-skills.yaml, destroyed on /reset)
+# Base skills are committed; forged skills are agent-created and domain-specific.
+# Add your forged skill directories here per deployment, e.g.:
+# .claude/skills/my-forged-skill/
 
 # User-specific settings (framework settings live in .claude/settings.json)
 .claude/settings.local.json
+
+.claude/worktrees

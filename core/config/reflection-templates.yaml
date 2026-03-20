@@ -1,0 +1,26 @@
+# Domain-Specialized Reflection Templates — Framework Definition
+# Default template is immutable. Domain-specific templates are agent state.
+# Agent state lives in mind/reflection-templates.yaml
+# Boot reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+default_template:
+  questions:
+    - "What was the primary information edge (or lack thereof)?"
+    - "Was confidence calibrated correctly vs the outcome?"
+    - "What context was missing that would have changed the hypothesis?"
+    - "Were there biases that should have been accounted for?"
+  focus: "General calibration and edge assessment"
+
+# --- INITIAL STATE ---
+
+initial_state:
+  templates:
+    default:
+      questions:
+        - "What was the primary information edge (or lack thereof)?"
+        - "Was confidence calibrated correctly vs the outcome?"
+        - "What context was missing that would have changed the hypothesis?"
+        - "Were there biases that should have been accounted for?"
+      focus: "General calibration and edge assessment"
