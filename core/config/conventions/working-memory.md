@@ -1,6 +1,6 @@
 # Working Memory Convention
 
-Working memory (`mind/session/working-memory.yaml`) is the agent's session-scoped RAM.
+Working memory (`<agent>/session/working-memory.yaml`) is the agent's session-scoped RAM.
 All access goes through dedicated `wm-*.sh` scripts. The LLM MUST NOT read or write
 the file directly — all access via scripts.
 
@@ -50,7 +50,7 @@ slot_meta:
 
 ## Script API
 
-All scripts in `core/scripts/`. File path is hardcoded to `mind/session/working-memory.yaml`.
+All scripts in `core/scripts/`. File path is hardcoded to `<agent>/session/working-memory.yaml`.
 
 | Script | Purpose | Side Effects |
 |--------|---------|-------------|
@@ -184,7 +184,7 @@ See `core/config/conventions/handoff-working-memory.md` for full schema.
   observation: "What was learned"
   encoding_score: 0.0-1.0
   scores: {novelty, outcome_impact, surprise, goal_relevance, repetition_strength}
-  target_article: "mind/knowledge/tree/{path}.md"
+  target_article: "world/knowledge/tree/{path}.md"
   replay_priority: "violations | high_surprise | routine_observations"
   _item_ts: "YYYY-MM-DDTHH:MM:SS"
 ```

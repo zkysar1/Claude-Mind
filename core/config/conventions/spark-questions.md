@@ -3,7 +3,7 @@
 Spark questions use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `mind/spark-questions.jsonl` — Live spark questions and candidates
+- `meta/spark-questions.jsonl` — Live spark questions and candidates
 
 ## Record Schema (Questions)
 Required: `id`, `text`, `category`, `type`
@@ -21,7 +21,7 @@ Two record types coexist in one file:
 Valid statuses: `active`, `retired`, `candidate`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `mind/spark-questions.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `meta/spark-questions.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|

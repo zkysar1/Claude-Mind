@@ -12,7 +12,17 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     REPO_ROOT="$(cygpath -m "$REPO_ROOT")"
     PROJECT_ROOT="$(cygpath -m "$PROJECT_ROOT")"
     CORE_ROOT="$(cygpath -m "$CORE_ROOT")"
-    MIND_DIR="$(cygpath -m "$MIND_DIR")"
     CONFIG_DIR="$(cygpath -m "$CONFIG_DIR")"
+    # AGENT_DIR may be empty (no agent bound); META_DIR and WORLD_DIR are always set
+    if [ -n "$META_DIR" ]; then
+        META_DIR="$(cygpath -m "$META_DIR")"
+    fi
+    if [ -n "$WORLD_DIR" ]; then
+        WORLD_DIR="$(cygpath -m "$WORLD_DIR")"
+    fi
+    if [ -n "$AGENT_DIR" ]; then
+        AGENT_DIR="$(cygpath -m "$AGENT_DIR")"
+        MIND_DIR="$AGENT_DIR"
+    fi
     export MSYS_NO_PATHCONV=1
 fi

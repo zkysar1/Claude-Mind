@@ -4,6 +4,7 @@ description: "Self-driven aspiration creation — from user input, autonomous ge
 user-invocable: false
 triggers: []
 conventions: [aspirations, goal-schemas, tree-retrieval]
+minimum_mode: assistant
 ---
 
 # /create-aspiration — Self-Driven Aspiration Creation
@@ -41,8 +42,8 @@ Creates aspirations aligned with the agent's Self (core purpose). Two modes:
 ## Step 1: Read Self
 
 ```
-Read mind/self.md → extract Self (body content after front matter)
-IF mind/self.md is empty or missing:
+Read <agent>/self.md → extract Self (body content after front matter)
+IF <agent>/self.md is empty or missing:
     ABORT: "Cannot create aspirations — Self is not defined. Run /start to set up."
 ```
 
@@ -52,7 +53,7 @@ IF mind/self.md is empty or missing:
 Bash: load-aspirations-compact.sh          → IF path returned: Read it (compact aspirations data — IDs, titles, statuses, priorities, categories, skills, recurring, participants, blocked_by, deferred, args, parent_goal, discovered_by, started — no descriptions/verification)
 Bash: aspirations-read.sh --summary       → all including archived (for dedup)
 Bash: tree-read.sh --stats                → knowledge coverage
-Read mind/developmental-stage.yaml        → maturity level
+Read <agent>/developmental-stage.yaml        → maturity level
 Read core/config/aspirations.yaml              → max_active cap, aspiration_scopes, default_scope
 ```
 
@@ -81,6 +82,14 @@ Phase A — Purpose scan:
       - What would a person with this purpose naturally prioritize?
     Generate aspirations that advance Self's mission.
 
+    # Meta-strategy aspiration heuristics
+    Read meta/aspiration-generation-strategy.yaml
+    # Apply agent-learned generation preferences:
+    # - preferred_scope_ratio: learned balance of sprint/project/initiative
+    # - category_saturation: categories already well-covered
+    # - generation_heuristics: learned rules for aspiration generation
+    # These are advisory — the agent uses judgment on whether to follow.
+
     # Constraint awareness
     Bash: wm-read.sh active_constraints --json && Bash: wm-read.sh known_blockers --json
     If active constraints or unresolved blockers exist:
@@ -89,7 +98,7 @@ Phase A — Purpose scan:
       - If constraint_context was passed from evolve: strictly exclude avoid_skills
 
 Phase B — Data acquisition scan:
-    Read mind/knowledge/tree/_tree.yaml → node summaries + entity_index
+    Read world/knowledge/tree/_tree.yaml → node summaries + entity_index
     For each node: does it reference data sources, systems, APIs,
     environments, or files that the agent hasn't directly accessed?
     "What data do I KNOW ABOUT in my knowledge tree that would be
@@ -108,7 +117,7 @@ Phase D — Pain scan:
     "What is broken, blocked, or degraded right now?"
     Bash: wm-read.sh known_blockers --json
     Bash: journal-read.sh --recent 3        → recent failures, skipped goals
-    Read mind/experiential-index.yaml       → categories with declining accuracy
+    Read <agent>/experiential-index.yaml       → categories with declining accuracy
 
     For each pain signal found:
     - Unresolved blockers → blocker_resolution goals
@@ -173,8 +182,8 @@ Self drives the research — ask Self what it WANTS to know.
 IF scope == "sprint":
     SKIP this step — sprint aspirations don't need external research.
 
-Read mind/self.md → what are Self's priorities, curiosities, blind spots?
-Read mind/knowledge/tree/_tree.yaml → where are the knowledge gaps?
+Read <agent>/self.md → what are Self's priorities, curiosities, blind spots?
+Read world/knowledge/tree/_tree.yaml → where are the knowledge gaps?
 
 IF scope == "project" or scope == "initiative":
     # DEEP RESEARCH MODE — genuine understanding of the problem space.
@@ -206,7 +215,7 @@ IF scope == "project" or scope == "initiative":
 Self is the judge — re-read Self and evaluate candidates against it.
 
 ```
-Read mind/self.md (explicit re-read — Self anchors the deliberation)
+Read <agent>/self.md (explicit re-read — Self anchors the deliberation)
 
 # The LLM now has: introspective candidates (Phases A-D) + web findings
 # Self decides what matters. The LLM should:
@@ -229,8 +238,8 @@ Journal the planning cycle for future reflection:
 Quick orientation before generating goals:
 
 ```
-Read mind/self.md → what domain is this agent for?
-Read mind/knowledge/tree/_tree.yaml → what does the agent already know?
+Read <agent>/self.md → what domain is this agent for?
+Read world/knowledge/tree/_tree.yaml → what does the agent already know?
 IF Self references an external codebase:
     Scan that project's CLAUDE.md for test frameworks (pytest, jest, gradle test, etc.)
 ```
@@ -471,5 +480,5 @@ For each created aspiration:
 
 - **Called by**: `/start`, `/aspirations evolve` (`--plan` for gap analysis), `/aspirations loop` (Phase 0.5/2/7 with `--plan`, no-goals with `--plan`), `/aspirations-spark` (sq-007, sq-c05, sq-013 with context), `/aspirations-consolidate` (with `batch_context`), `/reflect-hypothesis` (with `forge_context`), `/respond`
 - **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5)
-- **Reads**: `mind/self.md`, `aspirations-read.sh`, `tree-read.sh`, `mind/developmental-stage.yaml`, `core/config/aspirations.yaml`
+- **Reads**: `<agent>/self.md`, `aspirations-read.sh`, `tree-read.sh`, `<agent>/developmental-stage.yaml`, `core/config/aspirations.yaml`
 - **Web research** (`--plan` only): WebSearch for Self-grounded queries (Step 2.5)

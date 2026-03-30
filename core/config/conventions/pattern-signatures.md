@@ -3,7 +3,7 @@
 Pattern signatures use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `mind/pattern-signatures.jsonl` — Live pattern signature entries
+- `world/pattern-signatures.jsonl` — Live pattern signature entries
 
 ## Record Schema
 Required: `id`, `name`, `description`, `conditions`, `expected_outcome`, `created`
@@ -14,7 +14,7 @@ ID format: `sig-NNN` (zero-padded 3-digit, regex: `^sig-\d{3}$`)
 Valid statuses: `active`, `retired`, `contradicted`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `mind/pattern-signatures.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `world/pattern-signatures.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|

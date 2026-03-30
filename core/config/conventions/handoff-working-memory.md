@@ -1,13 +1,13 @@
 # Handoff Schema (Enhanced)
 
-The continuation handoff (`mind/session/handoff.yaml`) includes structured fields for
+The continuation handoff (`<agent>/session/handoff.yaml`) includes structured fields for
 fast cross-session resume:
 
 ```yaml
 # Core fields (existing)
 session_number: 14
 timestamp: "2026-03-09T15:30:00"
-last_goal_completed: "g-002-03"
+last_goal_completed: "g-001-03"
 goals_in_progress: ["g-001-05"]
 hypotheses_pending: 3
 next_focus: "Continue API caching research"

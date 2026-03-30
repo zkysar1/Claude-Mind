@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 # Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
 if hasattr(sys.stdout, "reconfigure"):
@@ -25,10 +26,10 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, MIND_DIR, CONFIG_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, CONFIG_DIR
 
 REPO_ROOT = str(PROJECT_ROOT)
-TREE_PATH = str(MIND_DIR / "knowledge" / "tree" / "_tree.yaml")
+TREE_PATH = str(WORLD_DIR / "knowledge" / "tree" / "_tree.yaml")
 
 
 # ---------------------------------------------------------------------------
@@ -49,15 +50,27 @@ def read_tree():
 
 
 def write_tree(data):
-    """Atomic write with sort_keys=False to preserve key order."""
+    """Atomic write with locking, history, and sort_keys=False to preserve key order."""
+    from _fileops import acquire_lock, release_lock, save_history, append_changelog, resolve_base_dir, _agent_name
     data["last_updated"] = date.today().isoformat()
-    parent_dir = os.path.dirname(TREE_PATH)
-    os.makedirs(parent_dir, exist_ok=True)
-    tmp = TREE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=None, sort_keys=False,
-                  allow_unicode=True, width=200)
-    os.replace(tmp, TREE_PATH)
+    path = Path(TREE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = resolve_base_dir(path)
+    lock_path = path.with_suffix(".lock")
+    acquire_lock(lock_path)
+    try:
+        agent = _agent_name()
+        if base_dir:
+            save_history(path, base_dir, agent)
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=None, sort_keys=False,
+                      allow_unicode=True, width=200)
+        os.replace(tmp, TREE_PATH)
+        if base_dir:
+            append_changelog(base_dir, agent, path, "edit")
+    finally:
+        release_lock(lock_path)
 
 
 # ---------------------------------------------------------------------------

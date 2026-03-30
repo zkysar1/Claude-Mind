@@ -1,5 +1,5 @@
 # Skill Gap Registry — Framework Definition
-# Immutable forge configuration. Agent state lives in mind/skill-gaps.yaml
+# Immutable forge configuration. Agent state lives in meta/skill-gaps.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -16,6 +16,17 @@ gap_types:
   analytical:
     description: "Skills requiring domain understanding (pattern recognition, evaluation)"
     forge_gate: EXPLOIT    # 0.60+ confidence required (default)
+
+experience_mining:
+  min_cluster_size: 3           # Min similar executions to register a gap
+  scan_window_days: 30          # Only scan recent experiences
+  max_gaps_per_scan: 3          # Prevent gap explosion from single mining pass
+
+quality_thresholds:
+  retirement_floor: 0.30        # Overall skill quality below → retirement candidate
+  review_floor: 0.50            # Overall skill quality below → review needed
+  dimension_floor: 0.20         # Any single dimension below → alert
+  min_evaluations: 5            # Min evaluations before quality-based actions
 
 modifiable:
   forge_threshold: {min: 1, max: 5, default: 2}

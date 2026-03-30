@@ -15,9 +15,9 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 
-CHECKPOINT_PATH = MIND_DIR / "session" / "compact-checkpoint.yaml"
+CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
 
 
 def log(msg):
@@ -120,6 +120,8 @@ def main():
         lines.append("  Their completion notifications will re-engage you. Collect results in Phase -0.5a.")
         lines.append("")
 
+    lines.append("IDENTITY: Phase -0.5d will re-read self.md and program.md — identity context lost during compaction.")
+    lines.append("")
     lines.append("ACTION: The stop hook will fire next. Re-enter /aspirations loop.")
     lines.append("Phase -0.5c will detect compact-checkpoint.yaml and process encoding queue")
     lines.append("in this fresh context before resuming goal execution.")

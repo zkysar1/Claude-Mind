@@ -5,7 +5,8 @@ user-invocable: false
 parent-skill: aspirations
 triggers:
   - "Phase 4"
-conventions: [aspirations, pipeline, experience, tree-retrieval, goal-schemas, infrastructure, reasoning-guardrails]
+conventions: [aspirations, pipeline, experience, tree-retrieval, retrieval-escalation, goal-schemas, infrastructure, reasoning-guardrails, agent-spawning]
+minimum_mode: autonomous
 ---
 
 # Phase 4: Goal Execution
@@ -28,7 +29,7 @@ When a goal requires a judgment call (e.g., "push now vs. modify CI first",
 "use approach A vs. B"), the agent:
 1. Makes the call — pick the safer/simpler option when unsure
 2. Logs the decision:
-   - Write to `mind/session/pending-questions.yaml`:
+   - Write to `<agent>/session/pending-questions.yaml`:
      ```yaml
      - id: pq-NNN
        date: "{today}"
@@ -104,6 +105,27 @@ Before expensive data retrieval (SSH, large files, APIs), check local/cheap
 preconditions first: timestamps, git log, file existence, metadata.
 See: guard-009
 
+## Phase 3.9: Pre-Execution Domain Steps
+
+```
+# Load domain convention into context if not yet loaded (dedup).
+Bash: paths=$(bash core/scripts/load-conventions.sh pre-execution 2>/dev/null)
+IF paths is non-empty:
+    Read the file at the returned path
+
+# Follow domain pre-execution steps if convention exists.
+# CRITICAL: Gate on file existence, NOT on load status. The convention is procedural —
+# it must run every goal, not just the first time it's loaded into context.
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/pre-execution.md" && echo "exists"
+IF exists:
+    Follow each Step in the convention, evaluating conditions against current goal context
+    IF any pre-execution step returns SKIP:
+        Skip this goal (mark as skipped with reason from pre-execution check)
+        GOTO Phase 7 (next iteration)
+ELSE:
+    # No domain pre-execution convention exists. Nothing to do.
+```
+
 ## Phase 4: Execute (with intelligent retrieval)
 
 ```
@@ -163,13 +185,30 @@ FOR EACH item in reasoning_bank + guardrails + pattern_signatures:
     Assess relevance to current goal context
     Note: ACTIVE (will inform execution) or SKIPPED (loaded but not applicable)
 
-# Step 5: Evaluate sufficiency
+# Step 5: Evaluate sufficiency (with escalation per retrieval-escalation convention)
 # Review what was loaded. For secondary_nodes identified in Step 2:
 IF context feels insufficient for the goal's complexity:
     Read additional secondary_nodes .md files
     Bash: tree-update.sh --increment {node_key} retrieval_count
     Output: "▸ Follow-up: loaded {N} additional nodes for context"
 # Follow entity cross-references spotted in .md front matter if needed.
+
+# Step 5a.1: Codebase escalation (Tier 2 — per retrieval-escalation convention)
+# After tree retrieval, if context still feels insufficient AND goal relates to
+# codebase work (implementation details, code structure, configuration, debugging):
+IF context still insufficient AND goal involves codebase knowledge:
+    # Read workspace path from <agent>/self.md if not already known
+    # Use targeted Grep/Glob/Read on the primary workspace (2-3 specific queries)
+    # Look for: function implementations, config values, error patterns, file structure
+    Output: "▸ Tier 2 codebase exploration: {summary of what was searched and found}"
+
+# Step 5a.2: Web search escalation (Tier 3 — per retrieval-escalation convention)
+# If context still insufficient AND topic involves external knowledge (APIs, services,
+# technologies not in tree/codebase):
+IF context still insufficient AND topic involves external knowledge:
+    # WebSearch: targeted query for the specific gap
+    # WebFetch: authoritative sources if identified
+    Output: "▸ Tier 3 web search: {summary of what was found}"
 
 # Step 5b: Write retrieval manifest (MANDATORY — survives autocompact via hooks)
 # The manifest makes Memory Deliberation results durable. Phase 4.26 reads it
@@ -184,6 +223,9 @@ echo '<retrieval_manifest_json>' | Bash: wm-set.sh active_context.retrieval_mani
 #   deliberation:
 #       active_items: [{id, type} for each item marked ACTIVE]
 #       skipped_items: [{id, type} for each item marked SKIPPED]
+#   tiers_used: [1] or [1, 2] or [1, 2, 3]  # escalation tracking
+#   escalation_reasons: [{tier: 2, reason: "..."}, ...]  # why each tier was needed
+#   sufficient: true/false  # was combined result sufficient?
 #   utilization_pending: true  # Phase 4.26 has not yet fired
 Output: "▸ Retrieval manifest: {N} nodes, {A} active, {S} skipped items written"
 
@@ -202,13 +244,14 @@ ELSE:
 #
 # The host MAY dispatch team agents to gather information via TeamCreate.
 # Never use bare sub-agents (Agent tool without team_name) — they start
-# with zero context. Team agents call /prime as their first action,
-# which primes them with the full knowledge tree, guardrails, reasoning
-# bank, and domain context.
+# with zero context. Use build-agent-context.sh to inject primed context
+# directly into the agent prompt. The host builds context BEFORE spawning;
+# the sub-agent receives it as data, not as an instruction to execute.
+# See core/config/conventions/agent-spawning.md for the full protocol.
 #
 # CRITICAL: Team agents do READ-ONLY research. They MUST NOT:
 #   - Invoke skills (skills write to shared state)
-#   - Write or edit ANY files (mind/, external repos, anything)
+#   - Write or edit ANY files (world/, agent dirs, external repos, anything)
 #   - Call state-mutating scripts (pipeline-move.sh, experience-add.sh, etc.)
 #   - Make git commits or pushes
 #
@@ -217,17 +260,41 @@ ELSE:
 #
 # This is a tool, not a rule. The host is free to skip delegation entirely.
 
+# Curriculum gate: check if parallel execution is permitted before dispatching
+Bash: `curriculum-contract-check.sh --action allow_multi_goal_parallelism`
+IF exit code 1:
+    Log: "Parallel dispatch blocked by curriculum (stage: {stage_name from JSON})"
+    SKIP team delegation — execute research synchronously instead
+
 IF prefetch_goals:
     TeamCreate(team_name="research-{session}", description="Pre-fetch research for goals")
     FOR pg in prefetch_goals:
         research_task = extract_research_question(pg)  # What info does this goal need?
+        # Build primed context for spawned agent (read-only, category-targeted)
+        Bash: agent_context=$(build-agent-context.sh --category "{pg.category}" --role researcher)
         # Register agent BEFORE dispatch (crash-safe: staleness timeout cleans up if dispatch fails)
-        Bash: `pending-agents.sh register --id "researcher-{pg.goal_id}" --team "research-{session}" --goal "{pg.goal_id}" --purpose "{research_task[:100]}" --timeout 30`
+        Bash: `pending-agents.sh register --id "researcher-{pg.goal_id}" --team "research-{session}" --goal "{pg.goal_id}" --purpose "{research_task[:100]}" --timeout 10`
         Agent(team_name="research-{session}", name="researcher-{pg.goal_id}",
-              prompt="First, invoke /prime. Then do READ-ONLY research:
-                      {research_task}. Do NOT write files or invoke skills.
-                      Report your findings as a structured summary.",
+              prompt="{agent_context}
+
+                      YOUR TASK (READ-ONLY research):
+                      {research_task}
+
+                      TIME LIMIT: You have a maximum of 10 minutes. Wrap up and
+                      report your findings before then — do not start new work
+                      after 8 minutes of elapsed time.
+
+                      CONSTRAINTS:
+                      - Do NOT write or edit ANY files
+                      - Do NOT invoke skills or call state-mutating scripts
+                      - Report your findings as a structured summary",
               run_in_background=true)
+
+# Misroute guard: catch skill-creation goals that arrived with skill: null
+IF goal.skill is null AND goal.title matches pattern (forge|create.*skill|make.*skill|skill.*creation):
+    Log: "MISROUTE GUARD: {goal.id} '{goal.title}' describes skill creation but has skill: null — re-routing to /forge-skill list"
+    goal.skill = "/forge-skill"
+    goal.args = "list"
 
 # Execute primary goal inline (host does ALL writing)
 result = invoke goal.skill with goal.args
@@ -257,6 +324,110 @@ IF goal.recurring AND goal_succeeded (no errors, no timeouts):
 # SAFETY: If uncertain, remain "productive"
 ```
 
+## Phase 4-chain: Episode Chain Protocol (MR-Search)
+
+After Phase 4-post outcome classification, before proceeding to Phase 4.0/4.1,
+check if this goal should be retried with accumulated reflection context.
+Inspired by MR-Search (arXiv 2603.11327): chaining N attempts with structured
+self-reflection between each episode enables the agent to learn *through*
+failure within the same problem context.
+
+```
+# Read episode chaining config
+Read core/config/aspirations.yaml → episode_chaining section
+
+# Determine if chaining should activate
+# GUARD: Never chain infrastructure failures — Phase 4.0 owns the blocker protocol.
+chain_trigger = false
+IF result is INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
+    chain_trigger = false  # Let Phase 4.0 handle infrastructure failures
+ELIF outcome_class == "productive" AND NOT goal_succeeded:
+    IF "failed" in episode_chaining.chain_on_outcomes:
+        chain_trigger = true
+
+IF chain_trigger:
+    # Check context budget zone for max episodes
+    Read <agent>/session/working-memory.yaml → context_zone (fresh|normal|tight)
+    max_episodes = episode_chaining.context_zone_override[context_zone]
+        # Default: episode_chaining.max_episodes_per_goal
+
+    # Check current episode count
+    Bash: wm-read.sh episode_chain --json
+    IF episode_chain exists AND episode_chain.goal_id == goal.id:
+        current_episode = episode_chain.current_episode
+    ELSE:
+        current_episode = 0
+
+    IF current_episode < max_episodes:
+        # ── Archive this attempt as an episode ────────────────────────
+        episode_entry = {
+            episode: current_episode + 1,
+            approach: "1-2 sentence summary of approach taken",
+            outcome: result.outcome_summary or "failed",
+            key_observations: [
+                "Key observation 1 from execution",
+                "Key observation 2 (what was unexpected)"
+            ],
+            reflection: null,   # Populated below
+            timestamp: "$(date +%Y-%m-%dT%H:%M:%S)"
+        }
+
+        # ── Structured mini-reflection between episodes ───────────────
+        # MR-Search's core insight: explicit reflection between attempts
+        # enables cross-episode exploration improvement.
+        # The agent asks itself four questions:
+        #   1. What went wrong or was unexpected?
+        #   2. What assumptions were violated?
+        #   3. What should I try differently next time?
+        #   4. For violated assumptions: are there deeper inherited assumptions in
+        #      my framing of this goal? Strip to ground truth and rebuild approach.
+        episode_entry.reflection = generate_mini_reflection(
+            goal, result, episode_entry.key_observations
+        )
+
+        # ── Update episode chain in working memory ────────────────────
+        IF episode_chain exists:
+            Append episode_entry to episode_chain.episodes
+            episode_chain.current_episode = current_episode + 1
+        ELSE:
+            episode_chain = {
+                goal_id: goal.id,
+                max_episodes: max_episodes,
+                current_episode: 1,
+                episodes: [episode_entry]
+            }
+        echo '<episode_chain_json>' | Bash: wm-set.sh episode_chain
+
+        # ── Update goal with episode history ──────────────────────────
+        Bash: aspirations-update-goal.sh <goal-id> episode_history '<episodes_array_json>'
+
+        # ── Re-execute with accumulated context ───────────────────────
+        # The execution preamble for the next attempt includes ALL prior
+        # episodes + reflections. This is MR-Search's context accumulation:
+        #   goal → episode₀ → reflection₀ → episode₁ → reflection₁ → ...
+        Output: "▸ EPISODE CHAIN: Attempt {current_episode + 1}/{max_episodes} — retrying with reflection context"
+        Log: "Episode {current_episode + 1}: Reflection: {episode_entry.reflection}"
+
+        # Reset goal status for re-execution
+        Bash: aspirations-update-goal.sh <goal-id> status in-progress
+
+        # Re-invoke Phase 4 execution with episode chain as context preamble
+        → re-execute goal.skill with episode_chain.episodes as execution context
+        → return to Phase 4-post with new result (episode chain protocol re-evaluates)
+
+    ELSE:
+        # Max episodes reached — proceed normally with the final outcome
+        Output: "▸ EPISODE CHAIN: Max attempts ({max_episodes}) reached — accepting final outcome"
+        # Clear episode chain from working memory
+        echo 'null' | Bash: wm-set.sh episode_chain
+
+ELSE:
+    # No chaining needed — clear any stale episode chain
+    Bash: wm-read.sh episode_chain --json
+    IF episode_chain exists AND episode_chain.goal_id == goal.id:
+        echo 'null' | Bash: wm-set.sh episode_chain
+```
+
 ## Phase 4.0: Structured SKIP Fast-Path (with Recovery Attempt)
 
 Skills that SKIP at preflight return INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED.
@@ -267,7 +438,7 @@ for registered components). Only block if recovery fails.
 IF result is INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
     # RECOVERY ATTEMPT — runs once. Do not remove this guard.
     IF NOT retry_attempted:
-        component = map goal.skill to infra component via mind/infra-health.yaml skill_mapping
+        component = map goal.skill to infra component via <agent>/infra-health.yaml skill_mapping
         IF component:
             Bash: probe=$(bash core/scripts/infra-health.sh check {component} 2>/dev/null)
             Parse probe JSON → status
@@ -376,19 +547,19 @@ CREATE_BLOCKER(failure_skill, failure_reason, goal, aspiration_id, diagnostic_co
 After goal execution, consult learned guardrails and reasoning bank for
 checks relevant to this goal's outcome. This is how the agent applies
 lessons from experience — the specific checks are learned behaviors stored
-in mind/, not hardcoded here.
+in world/ (guardrails, reasoning bank), not hardcoded here.
 
 For infrastructure goals, this enables learned behaviors to fire even when
 the goal appeared to succeed. A "successful" goal can mask real infrastructure
 errors that only guardrails know to check for.
 
 Phase 4.1 does NOT fire guardrail checks on local/tooling errors: script
-validation rejections, file not found in mind/, build/compile errors during
+validation rejections, file not found in world/ or agent dir, build/compile errors during
 code editing, or git failures.
 
 ```
 goal_succeeded = (result achieved verification.outcomes AND no errors/timeouts)
-involved_infrastructure = (goal.skill (without leading /) in mind/infra-health.yaml skill_mapping OR goal.category in mind/infra-health.yaml category_mapping)
+involved_infrastructure = (goal.skill (without leading /) in <agent>/infra-health.yaml skill_mapping OR goal.category in <agent>/infra-health.yaml category_mapping)
 
 # Step 4.1-pre: Guardrail consultation (ALL infrastructure goals)
 # After ANY infrastructure interaction, run guardrail-check.sh to get a
@@ -548,7 +719,7 @@ IF paths is non-empty:
 # Follow domain post-execution steps if convention exists.
 # CRITICAL: Gate on file existence, NOT on load status. The convention is procedural —
 # it must run every goal, not just the first time it's loaded into context.
-Bash: test -f mind/conventions/post-execution.md && echo "exists"
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/post-execution.md" && echo "exists"
 IF exists:
     Follow each Step in the convention, evaluating conditions against current goal context
     Collect results (external_changes, behavioral_observations)
@@ -569,7 +740,7 @@ SKIP: outcome_class == "routine" — nothing meaningful to archive.
 ```
 IF outcome_class == "productive":
     experience_id = "exp-{goal.id}-{goal.skill_name_slug}"
-    Write mind/experience/{experience_id}.md with:
+    Write <agent>/experience/{experience_id}.md with:
         - Full reasoning trace from goal execution
         - Tool outputs and decisions made
         - Outcome and verification results
@@ -597,7 +768,10 @@ IF outcome_class == "productive":
             # with exact numbers, configuration values, equations/formulas/algorithms,
             # file paths + line numbers + commit hashes, latencies/sizes/counts/percentages,
             # exact API responses/status codes. Store the raw value, not a summary.
-        content_path: "mind/experience/{experience_id}.md"
+        content_path: "<agent>/experience/{experience_id}.md"
+        # MR-Search temporal credit fields (Priority 4)
+        enabled_by: []             # Populated below by causal enabler scan
+        temporal_credit: 0.0       # Accumulated by Step 8.9 from downstream successes
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 
@@ -621,6 +795,12 @@ IF outcome_class == "productive" AND retrieval_manifest exists AND retrieval_man
            OR (item.type == "guardrail" AND item.id in matched_guardrails from Phase 4.1)
            OR item.id explicitly referenced in execution commands, decisions, or output:
             Bash: {reasoning-bank|guardrails}-increment.sh {item.id} utilization.times_helpful
+            # MR-Search reflection quality tracking (Priority 2):
+            # If item has source_reflection_id, record positive downstream signal.
+            IF item has source_reflection_id field (non-null):
+                Read meta/reflection-strategy.yaml → reflection_quality_log
+                Append {"reflection_id": "{item.source_reflection_id}", "downstream_goal": "{goal.id}", "helpful": true}
+                Bash: meta-set.sh reflection-strategy.yaml reflection_quality_log '<updated_array_json>'
         ELSE:
             Bash: {reasoning-bank|guardrails}-increment.sh {item.id} utilization.times_noise
     FOR EACH item in retrieval_manifest.deliberation.skipped_items:
@@ -647,6 +827,49 @@ ELIF outcome_class == "productive":
 # Phase 4.26 correctly skips feedback but must still clear the flag.
 IF retrieval_manifest exists AND retrieval_manifest.goal_id == current goal.id:
     echo 'false' | Bash: wm-set.sh active_context.retrieval_manifest.utilization_pending
+```
+
+## Phase 4.27: Causal Enabler Scan (MR-Search Temporal Credit)
+
+Runs after Phase 4.26 so helpfulness data is available.
+When execution succeeds and retrieved items were structurally helpful,
+identify prior experiences that causally enabled this success.
+
+```
+IF outcome_class == "productive" AND goal_succeeded:
+    # Apply the same structural helpfulness criteria used by Phase 4.26
+    FOR EACH item in retrieval_manifest.deliberation.active_items:
+        IF item met structural helpfulness criteria (same test as Phase 4.26: referenced in influence text, matched guardrails, or cited in execution):
+            # Find the experience that originally produced this item
+            item_source_goal = item.source_goal or item.source  # field name varies by store
+            IF item_source_goal:
+                goals_between = count goals completed between item_source_goal and current goal
+                enabler = {
+                    experience_id: "exp-{item_source_goal}",
+                    relationship: "provided_foundation",
+                    temporal_distance: goals_between
+                }
+                Bash: experience-update-field.sh {experience_id} enabled_by '<append enabler>'
+    IF any enablers recorded:
+        Output: "▸ Causal enablers: {N} prior experiences credited"
+```
+
+## Phase 4.28: Skill Co-Invocation Logging
+
+Log which skills were invoked together during this goal execution.
+Feeds the skill relation graph discovery pipeline (used by consolidation Step 8).
+
+```
+IF goal.skill is set:
+    # Collect all skills involved in this execution
+    # Primary skill + any skills invoked during execution (decompose, tree, reflect, etc.)
+    invoked_skills = [goal.skill stripped of "/" and params]
+    IF decompose was invoked: append "decompose" to invoked_skills
+    IF tree operations were used: append "tree" to invoked_skills
+    IF research-topic was invoked: append "research-topic" to invoked_skills
+    # Only log if 2+ skills were involved (single skill = no co-invocation)
+    IF len(invoked_skills) >= 2:
+        Bash: skill-relations.sh co-invoke --goal {goal.id} --skills {comma_separated_skills}
 ```
 
 ## Phase 4.5: Knowledge Reconciliation Check
@@ -679,6 +902,18 @@ ELIF goal resolved a hypothesis with outcome CORRECTED:
         IF outcome contradicts node content → reconcile immediately or log HIGH debt
         IF outcome refines understanding → update confidence, add compressed insight
 ```
+
+### Phase 4.6: Post Findings to Board
+
+After goal execution and knowledge reconciliation, post notable findings:
+
+```
+IF goal produced actionable findings OR hypothesis was resolved:
+    summary = one-line summary of what was learned or accomplished
+    echo "${summary}" | Bash: board-post.sh --channel findings --tags <goal.category>
+```
+
+Skip for routine/maintenance goals that produce no new knowledge.
 
 ## Batched Execution
 

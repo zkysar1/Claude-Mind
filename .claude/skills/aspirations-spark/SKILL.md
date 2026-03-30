@@ -7,6 +7,7 @@ triggers:
   - "run_spark_check()"
   - "run_aspiration_spark()"
 conventions: [aspirations, spark-questions, reasoning-guardrails, experience]
+minimum_mode: autonomous
 ---
 
 # Spark Check (Micro-Evolution) and Immediate Learning
@@ -48,6 +49,7 @@ SKIP: goal outcome was routine/expected with no new insight.
           content: the insight — what to do and why
           when_to_use: when this insight applies
           source_goal: goal.id
+          source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
         Log in journal: "Immediate learning: created {rb-id} from {goal.id}"
 
     IF goal outcome revealed a safety hazard, a mistake to avoid, or a
@@ -69,26 +71,27 @@ SKIP: goal outcome was routine/expected with no new insight.
           category: goal's category
           trigger_condition: when this guardrail applies
           source: goal.id
+          source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
         Log in journal: "Immediate guardrail: created {guard-id} from {goal.id}"
 
     # Forge awareness: detect recurring manual procedures that should be skills
     IF goal execution required a manual multi-step procedure that was repeated
        across goals, OR that would clearly benefit FUTURE goals as a discoverable
        skill (entry point) rather than inline code:
-        Read mind/skill-gaps.yaml
+        Read meta/skill-gaps.yaml
         IF gap already exists for this procedure:
             Increment times_encountered, append to encounter_log
         ELSE:
             Register new gap: id: gap-{next}, status: registered,
               times_encountered: 1, procedure_name, estimated_value
-        Write updated mind/skill-gaps.yaml
+        Write updated meta/skill-gaps.yaml
 
         # Check forge criteria immediately
         # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
         IF gap.status == "forged": skip forge criteria check
 
         Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-        Read mind/developmental-stage.yaml → current stage
+        Read <agent>/developmental-stage.yaml → current stage
         IF gap.times_encountered >= forge_threshold
            AND gap.estimated_value >= "medium"
            AND developmental stage >= EXPLOIT (developing+):
@@ -149,6 +152,28 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
    ```
    Check retrieved active/discovered hypotheses for semantic overlap with the proposed prediction.
    IF a hypothesis already covers this prediction → SKIP creation, log: "sq-009: Duplicate of {existing_id}, skipped"
+0.5. Calibration gate (BEFORE assigning confidence):
+     a. Read recent accuracy: `Bash: pipeline-read.sh --stage resolved`
+        - Count CONFIRMED vs CORRECTED in this category (or overall if <3 in category)
+        - If total == 0: SKIP gate (no track record yet), proceed to Step 0.7
+        - Compute recent_accuracy = confirmed / total
+     b. Apply confidence ceiling:
+        - If recent_accuracy < 0.40: cap at 0.55
+        - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
+        - If recent_accuracy >= 0.60 and < 0.80: cap at 0.80
+        - If recent_accuracy >= 0.80: no cap
+        - Log: "Calibration gate: {N} resolved, {accuracy}% accurate → cap {cap}"
+     c. The agent MAY assign confidence below the cap freely.
+        The cap only prevents overconfidence, not underconfidence.
+0.7. Adversarial pre-mortem (required when proposed confidence > 0.65):
+     Before finalizing confidence, articulate:
+     a. "The strongest reason this prediction could be WRONG is: ___"
+     b. "The code/system might actually handle this because: ___"
+     c. If (b) identifies a plausible mechanism the code already handles it,
+        reduce confidence by 0.15 (the "well-engineered codebase" prior).
+     d. Record the pre-mortem in the experience archive (Step 2.5 content).
+     SKIP this step only if the prediction is about external systems
+     (AWS behavior, third-party APIs) rather than AyoAI code quality.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
 2. Add goal to aspiration: read current aspiration via `aspirations-read.sh --id <asp-id>`,
    add new goal with hypothesis fields, then pipe updated aspiration JSON to
@@ -177,7 +202,7 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
 
 2.5. Archive hypothesis formation context:
         experience_id = "exp-{hypothesis_id}"
-        Write mind/experience/{experience_id}.md with:
+        Write <agent>/experience/{experience_id}.md with:
             - Full context manifest content (what was actually read, not just paths)
             - Evidence consulted and reasoning chain
             - Why this confidence level was chosen
@@ -192,7 +217,7 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
             hypothesis_id: "{hypothesis_id}"
             tree_nodes_related: [nodes from context manifest]
             verbatim_anchors: [key evidence excerpts that informed the prediction]
-            content_path: "mind/experience/{experience_id}.md"
+            content_path: "<agent>/experience/{experience_id}.md"
         Set experience_ref on pipeline record:
             bash core/scripts/pipeline-update-field.sh {hypothesis_id} experience_ref "{experience_id}"
 3. Move pipeline file from `discovered/` to `active/` (it's immediately actionable)
@@ -203,14 +228,19 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
 **sq-012**: "Does this outcome change how I think about my core purpose? Should my Self evolve?"
 
 When sq-012 fires after goal completion:
-1. Read `mind/self.md` — current Self content
+1. Read `<agent>/self.md` — current Self content
 2. Assess: does the goal outcome suggest a refinement, expansion, or course correction?
+2.5. CONTRACT CHECK (before acting on Self):
+   Bash: `curriculum-contract-check.sh --action allow_self_edits`
+   IF exit code 1 (not permitted):
+       Log: "sq-012: Self edit blocked by curriculum stage {stage_name from JSON output}"
+       Skip to step 4 — increment sparks_generated but DO NOT edit Self or write pending question
 3. IF YES — choose ONE path (never both):
    a. IF highly confident AND the change is a minor refinement (not a rewrite):
-      Edit `mind/self.md` — update body, set last_update_trigger: self_evolution
+      Edit `<agent>/self.md` — update body, set last_update_trigger: self_evolution
       Log: "SELF EVOLUTION: {summary of change}"
    b. ELSE (uncertain or significant change):
-      Write proposed update to `mind/session/pending-questions.yaml`:
+      Write proposed update to `<agent>/session/pending-questions.yaml`:
         question: "Based on [outcome], I think my Self should evolve from [current summary] to [proposed]. Should I update?"
         default_action: "Keep current Self unchanged"
         status: pending
@@ -221,7 +251,7 @@ When sq-012 fires after goal completion:
 **sq-c05**: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
 
 When sq-c05 fires after goal completion:
-1. Read `mind/knowledge/tree/_tree.yaml` — scan node summaries for data source references
+1. Read `world/knowledge/tree/_tree.yaml` — scan node summaries for data source references
 2. Read entity_index — look for external system references (SSH endpoints, file paths, APIs, databases)
 3. Identify accessible but unaccessed data sources
 4. IF found:
@@ -332,6 +362,25 @@ When sq-007 fires after goal completion:
 3. Log spark event: `echo '{"event":"spark","details":"sq-007: Goal <completed-id> suggested new aspiration direction: <brief description>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
 4. Increment `sparks_generated` on the spark question
 
+#### sq-c06: Meta-Improvement Spark
+
+**Handler for sq-c06** — "Did this outcome suggest a better improvement PROCEDURE?"
+
+When sq-c06 fires after goal completion:
+1. Read meta/improvement-instructions.md
+2. Compare: did the approach used in this goal deviate from the documented procedure?
+   - Deviated AND succeeded: procedure may be outdated → note for evolve phase
+   - Deviated AND failed: procedure may be correct → reinforcing signal
+   - Followed AND succeeded: procedure validated → reinforcing signal
+   - Followed AND failed: procedure may need revision → note for evolve phase
+3. IF meta-insight found:
+   - Append to meta/meta-log.jsonl via meta-log-append.sh:
+     {"date":"<today>","event":"meta_spark","goal_id":"<goal.id>",
+      "insight":"<what the meta-insight is>","procedure_match":"<deviated|followed>",
+      "outcome":"<succeeded|failed>"}
+   - Log: "META SPARK: {insight} from {goal.id}"
+4. Bash: spark-questions-increment.sh sq-c06 sparks_generated
+
 ### Aspiration-Level Spark (when entire aspiration completes)
 ```
 Ask these 3 questions:
@@ -340,7 +389,12 @@ Ask these 3 questions:
 2. Does this completion unlock a new strategic direction?
    → YES: Create new aspiration via gap analysis
 3. Should the system's self-model update?
-   → YES: Update mind/knowledge/meta/_index.yaml
+   → YES: Update meta/meta-knowledge/_index.yaml
+4. Did completing this aspiration teach us something about HOW we generate aspirations?
+   → IF yes:
+       Bash: curriculum-contract-check.sh --action allow_meta_edits
+       IF permitted: Read and update meta/aspiration-generation-strategy.yaml with learned heuristic.
+     Append to meta/meta-log.jsonl: {"date":"<today>","event":"aspiration_meta_learning","aspiration":"<asp-id>","insight":"<insight>"}
 
 Replacement aspiration generation is handled by Phase 7 archival in aspirations/SKILL.md
 (with --plan for full planning treatment). Do NOT duplicate generation here.

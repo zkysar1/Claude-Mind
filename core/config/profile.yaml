@@ -1,5 +1,5 @@
 # System Identity & Configuration — Framework Definition
-# Immutable identity and methodology. Agent state for strategy/evaluation in mind/profile.yaml
+# Immutable identity and methodology. Agent state for strategy/evaluation in <agent>/profile.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -31,7 +31,7 @@ tool_access:
   available_tools:
     - Bash           # Shell commands, script execution
     - Read           # Read any file on the system
-    - Write          # Create files within mind/ and .claude/skills/ only
+    - Write          # Create files within world/, <agent>/, meta/, and .claude/skills/ only
     - Edit           # Modify any file
     - Glob           # File pattern matching
     - Grep           # Content search

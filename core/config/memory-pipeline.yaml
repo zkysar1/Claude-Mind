@@ -1,6 +1,6 @@
 # Memory Pipeline Configuration — Framework Definition
 # Hippocampal encoding: sensory buffer -> working memory -> consolidation -> long-term
-# Immutable pipeline config. Agent state for category_overrides/weight_log in mind/memory-pipeline.yaml
+# Immutable pipeline config. Agent state for category_overrides/weight_log in world/memory-pipeline.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -26,6 +26,7 @@ working_memory:
     - cross_domain_transfer
     - domain_data
     - ephemeral_observation
+    - episode_chain          # MR-Search: accumulated episodes + reflections for retry chaining
     - knowledge_debt
     - known_blockers
     - micro_hypotheses
@@ -66,11 +67,11 @@ consolidation_budget:
 long_term:
   tree_structure: "K=4, D=4"
   levels:
-    L0: "mind/knowledge/tree/_tree.yaml root node"
-    L1: "mind/knowledge/tree/{domain}.md"
-    L2: "mind/knowledge/tree/{domain}/{topic}.md"
-    L3: "mind/knowledge/{category}/*.md"
-    L4: "mind/pipeline.jsonl, mind/journal/, config/"
+    L0: "world/knowledge/tree/_tree.yaml root node"
+    L1: "world/knowledge/tree/{domain}.md"
+    L2: "world/knowledge/tree/{domain}/{topic}.md"
+    L3: "world/knowledge/{category}/*.md"
+    L4: "world/pipeline.jsonl, <agent>/journal/, config/"
 
 forgetting:
   active_pruning_enabled: true
@@ -142,7 +143,7 @@ micro_hypothesis_consolidation:
 # Used by /aspirations (working memory init, consolidation), /reflect (encoding observations).
 
 pipeline_templates:
-  # Working memory slot contents (mind/session/working-memory.yaml)
+  # Working memory slot contents (<agent>/session/working-memory.yaml)
   # Not all slots need content every session — null slots are fine.
   working_memory_slots:
     active_context:
@@ -184,6 +185,18 @@ pipeline_templates:
       source_domain: "{strong-domain}"
       target_domain: "{weak-domain}"
       pattern: "Abstracted pattern to test"
+    episode_chain:
+      description: "MR-Search episode chaining — accumulated attempts + reflections for goal retry"
+      goal_id: "g-NNN-NN"
+      max_episodes: 3
+      current_episode: 1
+      episodes:
+        - episode: 1
+          approach: "Description of approach taken"
+          outcome: "failed|blocked|surprise"
+          key_observations: ["What was learned"]
+          reflection: "What went wrong? What should change?"
+          timestamp: "YYYY-MM-DDTHH:MM:SS"
     ephemeral_observation:
       description: "Temporary noteworthy observation, may or may not encode"
       observation: "What was noticed"
@@ -221,7 +234,7 @@ pipeline_templates:
       surprise: 0.0                        # 0-1, how unexpected?
       goal_relevance: 0.0                  # 0-1, how related to active goals?
       repetition_strength: 0.0             # 0-1, how often has this been seen?
-    target_article: "mind/knowledge/tree/{path}.md"
+    target_article: "world/knowledge/tree/{path}.md"
     replay_priority: routine_observations  # violations, high_surprise, high_outcome_impact, goal_completions, routine_observations
 
 modifiable:
@@ -237,6 +250,11 @@ modifiable:
   forgetting_lambda: {min: 15, max: 60, default: 30}
   wm_stale_threshold_minutes: {min: 10, max: 120, default: 30}
   wm_evict_threshold_minutes: {min: 30, max: 360, default: 120}
+  # Curator gate bounds (AutoContext-inspired)
+  curator_gate_pass_threshold: {min: 0.25, max: 0.70, default: 0.45}
+  curator_gate_coverage_weight: {min: 0.20, max: 0.60, default: 0.40}
+  curator_gate_specificity_weight: {min: 0.15, max: 0.50, default: 0.35}
+  curator_gate_actionability_weight: {min: 0.10, max: 0.40, default: 0.25}
 
 experience_staleness:
   archive_unused_after_days: 30
@@ -244,6 +262,19 @@ experience_staleness:
   protect_threshold:
     min_retrieval_count: 5
     min_utility_ratio: 0.5
+
+# Curator quality gate — evaluates QUALITY of knowledge encoding (AutoContext-inspired).
+# Runs between encoding decision and tree write. Complements encoding_gate which decides
+# IF to encode; this decides if the content is GOOD ENOUGH to encode.
+curator_gate:
+  enabled: true
+  score_formula: "(coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)"
+  pass_threshold: 0.45
+  dimensions:
+    coverage: "Does this add information the target node doesn't already contain?"
+    specificity: "Is this concrete enough to reproduce/verify? (exact values, steps, conditions)"
+    actionability: "Can future goals use this to make better decisions?"
+  on_fail: "demote_to_overflow"    # don't encode now; consolidation gets second chance
 
 encoding_weight_adaptation:
   enabled: true

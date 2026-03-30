@@ -19,14 +19,17 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import PROJECT_ROOT, MIND_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR
 
-LIVE_PATH = MIND_DIR / "experience.jsonl"
-ARCHIVE_PATH = MIND_DIR / "experience-archive.jsonl"
-META_PATH = MIND_DIR / "experience-meta.json"
-PIPELINE_LIVE_PATH = MIND_DIR / "pipeline.jsonl"
-PIPELINE_ARCHIVE_PATH = MIND_DIR / "pipeline-archive.jsonl"
-INDEX_PATH = MIND_DIR / "experiential-index.yaml"
+# Per-agent experience stores (agent directory)
+LIVE_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
+ARCHIVE_PATH = AGENT_DIR / "experience-archive.jsonl" if AGENT_DIR else None
+META_PATH = AGENT_DIR / "experience-meta.json" if AGENT_DIR else None
+INDEX_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
+
+# Collective domain stores (world/) — used by recompute-index
+PIPELINE_LIVE_PATH = WORLD_DIR / "pipeline.jsonl"
+PIPELINE_ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
 
 VALID_TYPES = {"goal_execution", "hypothesis_formation", "research", "reflection", "user_correction", "user_interaction", "execution_reflection"}
 ID_RE = re.compile(r"^exp-[a-z0-9._-]+$")
@@ -494,7 +497,7 @@ def cmd_archive_sweep(args):
 
 def cmd_validate(args):
     """Check for orphaned JSONL records and .md files."""
-    experience_dir = MIND_DIR / "experience"
+    experience_dir = AGENT_DIR / "experience" if AGENT_DIR else None
     items = read_jsonl(LIVE_PATH) + read_jsonl(ARCHIVE_PATH)
 
     # Collect all content_paths from JSONL

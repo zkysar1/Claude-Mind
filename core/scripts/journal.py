@@ -4,7 +4,7 @@
 All shell scripts are thin wrappers around this. Subcommands managed via argparse.
 Follows the same patterns as experience.py and pipeline.py.
 
-Manages mind/journal.jsonl (session index only — .md content files stay as-is).
+Manages <agent>/journal.jsonl (session index only — .md content files stay as-is).
 """
 
 import argparse
@@ -21,11 +21,13 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 
-LIVE_PATH = MIND_DIR / "journal.jsonl"
+LIVE_PATH = AGENT_DIR / "journal.jsonl"
 
-JOURNAL_FILE_RE = re.compile(r"^mind/journal/\d{4}/\d{2}/\d{4}-\d{2}-\d{2}\.md$")
+JOURNAL_FILE_RE = re.compile(
+    rf"^{re.escape(AGENT_DIR.name)}/journal/\d{{4}}/\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}\.md$"
+)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 REQUIRED_FIELDS = {"session", "date", "journal_file"}
@@ -131,7 +133,7 @@ def validate_record(rec):
     if not JOURNAL_FILE_RE.match(rec["journal_file"]):
         raise ValueError(
             f"Invalid journal_file: {rec['journal_file']} "
-            f"(expected mind/journal/YYYY/MM/YYYY-MM-DD.md)"
+            f"(expected {AGENT_DIR.name}/journal/YYYY/MM/YYYY-MM-DD.md)"
         )
 
     if not isinstance(rec.get("goals_completed", []), list):

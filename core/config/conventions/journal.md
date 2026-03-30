@@ -1,12 +1,12 @@
 # Journal Index JSONL Format
 
 The journal session index uses JSONL (one JSON object per line) with script-based access.
-Journal content `.md` files remain in `mind/journal/{year}/{month}/{YYYY-MM-DD}.md` as before.
+Journal content `.md` files remain in `<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` as before.
 The JSONL index tracks which sessions wrote to which journal files.
 
 ## File Layout
-- `mind/journal.jsonl` — Session index (one record per session)
-- `mind/journal/{year}/{month}/{YYYY-MM-DD}.md` — Content files (unchanged)
+- `<agent>/journal.jsonl` — Session index (one record per session)
+- `<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` — Content files (unchanged)
 
 ## Record Schema
 Required: `session`, `date`, `journal_file`
@@ -14,7 +14,7 @@ Defaults: `goals_completed` (0), `goals_attempted` (0)
 Optional: `key_events`, `hypotheses_resolved`, `aspirations_created`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `mind/journal.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `<agent>/journal.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|

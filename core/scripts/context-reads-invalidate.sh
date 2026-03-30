@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PostToolUse[Write,Edit] hook — invalidate modified files from context-reads tracker.
 # Reads JSON from stdin (tool_input.file_path), removes from tracker if present.
-# Only invalidates mutable tracked paths (mind/knowledge/tree/**).
+# Only invalidates mutable tracked paths (world/knowledge/tree/**).
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 

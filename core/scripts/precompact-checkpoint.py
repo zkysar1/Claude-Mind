@@ -18,10 +18,10 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 from wm import read_wm, WM_PATH  # noqa: E402
 
-CHECKPOINT_PATH = MIND_DIR / "session" / "compact-checkpoint.yaml"
+CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
 
 
 def log(msg):
@@ -62,7 +62,7 @@ def main():
     retrieval_manifest = active_ctx.get("retrieval_manifest")
 
     # Pending background agents (informational — actual data in pending-agents.yaml)
-    pending_agents_file = MIND_DIR / "session" / "pending-agents.yaml"
+    pending_agents_file = AGENT_DIR / "session" / "pending-agents.yaml"
     pending_agents_count = 0
     if pending_agents_file.exists():
         try:
@@ -112,7 +112,7 @@ def main():
     log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {slot_count} slots, {prior_count} prior{pa_msg}")
 
     # Clear context reads tracker — post-compaction context may not retain file contents
-    context_reads_path = MIND_DIR / "session" / "context-reads.txt"
+    context_reads_path = AGENT_DIR / "session" / "context-reads.txt"
     if context_reads_path.exists():
         context_reads_path.unlink()
         log("cleared context-reads tracker")

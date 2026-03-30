@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Session state engine for mind/session/ control files.
+"""Session state engine for <agent>/session/ control files.
 
 All shell scripts are thin wrappers around this. Subcommands managed via argparse.
 
 Manages:
   agent-state      — plain text: RUNNING or IDLE (absence = UNINITIALIZED)
+  agent-mode       — plain text: reader, assistant, or autonomous (absence = reader)
   persona-active   — plain text: true or false (absence = unset, defaults to true)
   loop-active      — empty marker file (presence = true)
   stop-loop        — empty marker file (presence = true)
@@ -21,17 +22,29 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 
-SESSION_DIR = MIND_DIR / "session"
+# AGENT_DIR is None when AYOAI_AGENT is not set (no-agent mode).
+# Session scripts return "NO_AGENT" instead of crashing.
+SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
 
 VALID_STATES = {"RUNNING", "IDLE"}
 VALID_PERSONA = {"true", "false"}
 VALID_SIGNALS = {"loop-active", "stop-loop"}
+VALID_MODES = {"reader", "assistant", "autonomous"}
+DEFAULT_MODE = "reader"
+
+
+def require_agent():
+    """Exit with clear error if no agent is bound to this session."""
+    if SESSION_DIR is None:
+        print("Error: no agent active (AYOAI_AGENT not set). Use /start <name> first.", file=sys.stderr)
+        sys.exit(1)
 
 
 def ensure_session_dir():
-    """Create mind/session/ if it doesn't exist."""
+    """Create <agent>/session/ if it doesn't exist."""
+    require_agent()
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -58,7 +71,10 @@ def write_file(path, value):
 # ---------------------------------------------------------------------------
 
 def cmd_state_get(args):
-    """Read agent-state: prints RUNNING, IDLE, or UNINITIALIZED."""
+    """Read agent-state: prints RUNNING, IDLE, UNINITIALIZED, or NO_AGENT."""
+    if SESSION_DIR is None:
+        print("NO_AGENT")
+        return
     val = read_file(SESSION_DIR / "agent-state")
     if val is None:
         print("UNINITIALIZED")
@@ -68,6 +84,7 @@ def cmd_state_get(args):
 
 def cmd_state_set(args):
     """Write agent-state after validation."""
+    require_agent()
     value = args.value
     if value not in VALID_STATES:
         print(f"ERROR: Invalid state '{value}'. Must be one of: {', '.join(sorted(VALID_STATES))}", file=sys.stderr)
@@ -80,7 +97,10 @@ def cmd_state_set(args):
 # ---------------------------------------------------------------------------
 
 def cmd_persona_get(args):
-    """Read persona-active: prints true, false, or unset."""
+    """Read persona-active: prints true, false, unset, or no_agent."""
+    if SESSION_DIR is None:
+        print("no_agent")
+        return
     val = read_file(SESSION_DIR / "persona-active")
     if val is None:
         print("unset")
@@ -90,6 +110,7 @@ def cmd_persona_get(args):
 
 def cmd_persona_set(args):
     """Write persona-active after validation."""
+    require_agent()
     value = args.value
     if value not in VALID_PERSONA:
         print(f"ERROR: Invalid persona value '{value}'. Must be one of: {', '.join(sorted(VALID_PERSONA))}", file=sys.stderr)
@@ -98,11 +119,38 @@ def cmd_persona_set(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: mode
+# ---------------------------------------------------------------------------
+
+def cmd_mode_get(args):
+    """Read agent-mode: prints reader, assistant, autonomous, or reader (default)."""
+    if SESSION_DIR is None:
+        print("NO_AGENT")
+        return
+    val = read_file(SESSION_DIR / "agent-mode")
+    if val is None:
+        print(DEFAULT_MODE)
+    else:
+        print(val)
+
+
+def cmd_mode_set(args):
+    """Write agent-mode after validation."""
+    require_agent()
+    value = args.value
+    if value not in VALID_MODES:
+        print(f"ERROR: Invalid mode '{value}'. Must be one of: {', '.join(sorted(VALID_MODES))}", file=sys.stderr)
+        sys.exit(1)
+    write_file(SESSION_DIR / "agent-mode", value)
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: signal
 # ---------------------------------------------------------------------------
 
 def cmd_signal_set(args):
     """Create an empty marker file."""
+    require_agent()
     name = args.name
     if name not in VALID_SIGNALS:
         print(f"ERROR: Invalid signal name '{name}'. Must be one of: {', '.join(sorted(VALID_SIGNALS))}", file=sys.stderr)
@@ -128,6 +176,7 @@ def cmd_signal_set(args):
 
 def cmd_signal_clear(args):
     """Remove a marker file if it exists."""
+    require_agent()
     name = args.name
     if name not in VALID_SIGNALS:
         print(f"ERROR: Invalid signal name '{name}'. Must be one of: {', '.join(sorted(VALID_SIGNALS))}", file=sys.stderr)
@@ -137,6 +186,7 @@ def cmd_signal_clear(args):
 
 def cmd_signal_exists(args):
     """Check if a signal marker exists. Exit 0 if yes, exit 1 if no."""
+    require_agent()
     name = args.name
     if name not in VALID_SIGNALS:
         print(f"ERROR: Invalid signal name '{name}'. Must be one of: {', '.join(sorted(VALID_SIGNALS))}", file=sys.stderr)
@@ -156,6 +206,7 @@ COUNTER_FILE = "stop-block-count"
 
 def cmd_counter_get(args):
     """Read stop-block-count: prints integer (0 if missing)."""
+    require_agent()
     val = read_file(SESSION_DIR / COUNTER_FILE)
     if val is None:
         print("0")
@@ -167,6 +218,7 @@ def cmd_counter_get(args):
 
 def cmd_counter_increment(args):
     """Atomic read + increment + write. Prints new value."""
+    require_agent()
     val = read_file(SESSION_DIR / COUNTER_FILE)
     current = 0 if val is None else int(val)
     new_val = current + 1
@@ -176,6 +228,7 @@ def cmd_counter_increment(args):
 
 def cmd_counter_clear(args):
     """Delete the stop-block-count file."""
+    require_agent()
     (SESSION_DIR / COUNTER_FILE).unlink(missing_ok=True)
 
 
@@ -202,6 +255,14 @@ def build_parser():
     persona_sub.add_parser("get", help="Read persona state")
     persona_set = persona_sub.add_parser("set", help="Set persona state")
     persona_set.add_argument("value", help="true or false")
+
+    # --- mode ---
+    mode_parser = sub.add_parser("mode", help="Agent mode management")
+    mode_sub = mode_parser.add_subparsers(dest="action", required=True)
+
+    mode_sub.add_parser("get", help="Read agent mode")
+    mode_set = mode_sub.add_parser("set", help="Set agent mode")
+    mode_set.add_argument("value", help="reader, assistant, or autonomous")
 
     # --- signal ---
     signal_parser = sub.add_parser("signal", help="Signal file management")
@@ -232,6 +293,8 @@ DISPATCH = {
     ("state", "set"): cmd_state_set,
     ("persona", "get"): cmd_persona_get,
     ("persona", "set"): cmd_persona_set,
+    ("mode", "get"): cmd_mode_get,
+    ("mode", "set"): cmd_mode_set,
     ("signal", "set"): cmd_signal_set,
     ("signal", "clear"): cmd_signal_clear,
     ("signal", "exists"): cmd_signal_exists,

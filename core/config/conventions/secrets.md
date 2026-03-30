@@ -18,9 +18,9 @@ All backed by `core/scripts/env.py` (Python 3, stdlib only).
 
 ## Security Rules
 - Credential values MUST NEVER appear in journal, knowledge tree, working memory,
-  handoff, or any file in `mind/`
+  handoff, or any file in `world/`, `<agent>/`, or `meta/`
 - When using `value`, consume in the same Bash invocation (shell variable, not disk)
-- If an API response echoes the credential, redact before writing to `mind/`
+- If an API response echoes the credential, redact before writing to `world/`, `<agent>/`, or `meta/`
 
 ## Missing Credential Flow
 1. Skill calls `env-read.sh has KEY` → missing

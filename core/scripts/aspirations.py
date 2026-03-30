@@ -19,12 +19,18 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import MIND_DIR, CORE_ROOT
+from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT
 
-LIVE_PATH = MIND_DIR / "aspirations.jsonl"
-ARCHIVE_PATH = MIND_DIR / "aspirations-archive.jsonl"
-META_PATH = MIND_DIR / "aspirations-meta.json"
-EVOLUTION_PATH = MIND_DIR / "evolution-log.jsonl"
+# Default paths point to world/ (collective task queue).
+# Overridden to agent/ at runtime when --source agent is passed.
+LIVE_PATH = WORLD_DIR / "aspirations.jsonl"
+ARCHIVE_PATH = WORLD_DIR / "aspirations-archive.jsonl"
+META_PATH = WORLD_DIR / "aspirations-meta.json"
+EVOLUTION_PATH = META_DIR / "evolution-log.jsonl"
+
+# World-only subcommands — reject --source agent.
+# complete-by is NOT here: agents need it for their own recurring goals.
+WORLD_ONLY_COMMANDS = {"claim", "release"}
 
 VALID_ASP_STATUSES = {"active", "paused", "completed", "retired"}
 VALID_GOAL_STATUSES = {"pending", "in-progress", "completed", "blocked", "skipped", "expired", "decomposed"}
@@ -54,24 +60,15 @@ def read_jsonl(path):
 
 
 def write_jsonl(path, items):
-    """Atomically write a list of dicts as JSONL (one JSON object per line)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        for item in items:
-            # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-            f.write(json.dumps(item, ensure_ascii=True) + "\n")
-    os.replace(str(tmp), str(p))
+    """Atomically write a list of dicts as JSONL with locking and history."""
+    from _fileops import locked_write_jsonl
+    locked_write_jsonl(path, items)
 
 
 def append_jsonl(path, item):
-    """Append one JSON line to a JSONL file, creating it if needed."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        f.write(json.dumps(item, ensure_ascii=True) + "\n")
+    """Append one JSON line to a JSONL file with locking and history."""
+    from _fileops import locked_append_jsonl
+    locked_append_jsonl(path, item)
 
 
 def read_json(path):
@@ -81,15 +78,9 @@ def read_json(path):
 
 
 def write_json(path, data):
-    """Atomically write a dict as pretty-printed JSON."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        json.dump(data, f, indent=2, ensure_ascii=True)
-        f.write("\n")
-    os.replace(str(tmp), str(p))
+    """Atomically write a dict as pretty-printed JSON with locking and history."""
+    from _fileops import locked_write_json
+    locked_write_json(path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +418,8 @@ def _clear_stale_blockers(items, archived_goal_ids):
     for asp in items:
         for goal in asp.get("goals", []):
             bb = goal.get("blocked_by", [])
+            if isinstance(bb, str):
+                bb = [bb]
             if bb:
                 cleaned = [b for b in bb if b not in archived_goal_ids]
                 if len(cleaned) != len(bb):
@@ -621,6 +614,93 @@ def cmd_add_goal(args):
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 
 
+def cmd_claim(args):
+    """Atomically claim a world goal for this agent."""
+    goal_id = args.goal_id
+    agent_name = args.agent_name
+
+    items = read_jsonl(LIVE_PATH)
+    result = find_goal_in_aspirations(items, goal_id)
+    if result is None:
+        print(f"Goal {goal_id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    asp_idx, goal_idx, asp = result
+    goal = asp["goals"][goal_idx]
+
+    # Check not already claimed by someone else
+    existing = goal.get("claimed_by")
+    if existing and existing != agent_name:
+        print(f"Goal {goal_id} already claimed by {existing}", file=sys.stderr)
+        sys.exit(1)
+
+    goal["claimed_by"] = agent_name
+    goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    items[asp_idx] = asp
+    write_jsonl(LIVE_PATH, items)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
+
+
+def cmd_release(args):
+    """Release a claimed goal (clear claimed_by and claimed_at)."""
+    goal_id = args.goal_id
+
+    items = read_jsonl(LIVE_PATH)
+    result = find_goal_in_aspirations(items, goal_id)
+    if result is None:
+        print(f"Goal {goal_id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    asp_idx, goal_idx, asp = result
+    goal = asp["goals"][goal_idx]
+    goal.pop("claimed_by", None)
+    goal.pop("claimed_at", None)
+    items[asp_idx] = asp
+    write_jsonl(LIVE_PATH, items)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
+
+
+def cmd_complete_by(args):
+    """Mark a goal as completed and record which agent completed it.
+
+    Recurring goals stay 'pending' with updated lastAchievedAt/achievedCount —
+    they must NOT be permanently marked 'completed'.
+    """
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    goal_id = args.goal_id
+    agent_name = args.agent_name
+
+    items = read_jsonl(LIVE_PATH)
+    result = find_goal_in_aspirations(items, goal_id)
+    if result is None:
+        print(f"Goal {goal_id} not found", file=sys.stderr)
+        sys.exit(1)
+
+    asp_idx, goal_idx, asp = result
+    goal = asp["goals"][goal_idx]
+    goal["completed_by"] = agent_name
+
+    if goal.get("recurring"):
+        # Recurring: cycle back to pending, update tracking fields.
+        # Clear claim so the goal returns to the pool for any agent's next cycle.
+        goal.pop("claimed_by", None)
+        goal.pop("claimed_at", None)
+        goal["lastAchievedAt"] = now
+        goal["achievedCount"] = goal.get("achievedCount", 0) + 1
+        goal["currentStreak"] = goal.get("currentStreak", 0) + 1
+        goal["longestStreak"] = max(
+            goal.get("longestStreak", 0), goal.get("currentStreak", 0))
+        # Status stays 'pending' — the interval gate in goal-selector handles timing
+    else:
+        goal["status"] = "completed"
+        goal["completed_date"] = now
+
+    recompute_progress(asp)
+    items[asp_idx] = asp
+    write_jsonl(LIVE_PATH, items)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
+
+
 def cmd_evolution_append(args):
     if sys.stdin.isatty():
         print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
@@ -651,6 +731,8 @@ def cmd_evolution_append(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Aspiration lifecycle engine")
+    parser.add_argument("--source", choices=["world", "agent"], default="world",
+                        help="Which aspiration queue to operate on (default: world)")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # read
@@ -704,7 +786,34 @@ def main():
     # evolution-append
     subparsers.add_parser("evolution-append", help="Append evolution event from stdin JSON")
 
+    # claim — atomically claim a world goal for an agent
+    p_claim = subparsers.add_parser("claim", help="Claim a world goal for an agent")
+    p_claim.add_argument("goal_id", type=str, help="Goal ID to claim")
+    p_claim.add_argument("agent_name", type=str, help="Agent name claiming the goal")
+
+    # release — release a claimed goal
+    p_release = subparsers.add_parser("release", help="Release a claimed goal")
+    p_release.add_argument("goal_id", type=str, help="Goal ID to release")
+
+    # complete-by — mark goal completed with agent attribution
+    p_cb = subparsers.add_parser("complete-by", help="Complete a goal with agent attribution")
+    p_cb.add_argument("goal_id", type=str, help="Goal ID to complete")
+    p_cb.add_argument("agent_name", type=str, help="Agent that completed it")
+
     args = parser.parse_args()
+
+    # Override paths for agent source
+    global LIVE_PATH, ARCHIVE_PATH, META_PATH
+    if args.source == "agent":
+        if not AGENT_DIR:
+            print("Error: AYOAI_AGENT not set — cannot use --source agent", file=sys.stderr)
+            sys.exit(1)
+        if args.command in WORLD_ONLY_COMMANDS:
+            print(f"Error: '{args.command}' is a world-only operation", file=sys.stderr)
+            sys.exit(1)
+        LIVE_PATH = AGENT_DIR / "aspirations.jsonl"
+        ARCHIVE_PATH = AGENT_DIR / "aspirations-archive.jsonl"
+        META_PATH = AGENT_DIR / "aspirations-meta.json"
 
     dispatch = {
         "read": cmd_read,
@@ -718,6 +827,9 @@ def main():
         "meta-update": cmd_meta_update,
         "recompute-all-progress": cmd_recompute_all_progress,
         "evolution-append": cmd_evolution_append,
+        "claim": cmd_claim,
+        "release": cmd_release,
+        "complete-by": cmd_complete_by,
     }
 
     try:

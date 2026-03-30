@@ -18,11 +18,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import MIND_DIR
+from _paths import WORLD_DIR
 
-LIVE_PATH = MIND_DIR / "pipeline.jsonl"
-ARCHIVE_PATH = MIND_DIR / "pipeline-archive.jsonl"
-META_PATH = MIND_DIR / "pipeline-meta.json"
+LIVE_PATH = WORLD_DIR / "pipeline.jsonl"
+ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
+META_PATH = WORLD_DIR / "pipeline-meta.json"
 
 VALID_STAGES = {"discovered", "evaluating", "active", "resolved", "archived"}
 VALID_HORIZONS = {"micro", "session", "short", "long"}
@@ -77,24 +77,15 @@ def read_jsonl(path):
 
 
 def write_jsonl(path, items):
-    """Atomically write a list of dicts as JSONL (one JSON object per line)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        for item in items:
-            # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-            f.write(json.dumps(item, ensure_ascii=True) + "\n")
-    os.replace(str(tmp), str(p))
+    """Atomically write a list of dicts as JSONL with locking and history."""
+    from _fileops import locked_write_jsonl
+    locked_write_jsonl(path, items)
 
 
 def append_jsonl(path, item):
-    """Append one JSON line to a JSONL file, creating it if needed."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        f.write(json.dumps(item, ensure_ascii=True) + "\n")
+    """Append one JSON line to a JSONL file with locking and history."""
+    from _fileops import locked_append_jsonl
+    locked_append_jsonl(path, item)
 
 
 def read_json(path):
@@ -104,15 +95,9 @@ def read_json(path):
 
 
 def write_json(path, data):
-    """Atomically write a dict as pretty-printed JSON."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        json.dump(data, f, indent=2, ensure_ascii=True)
-        f.write("\n")
-    os.replace(str(tmp), str(p))
+    """Atomically write a dict as pretty-printed JSON with locking and history."""
+    from _fileops import locked_write_json
+    locked_write_json(path, data)
 
 
 def parse_value(value_str):

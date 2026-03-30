@@ -12,6 +12,14 @@ Conventions: aspirations, pipeline, experience, tree-retrieval, goal-schemas, in
 
 Check local/cheap preconditions (timestamps, git log, file existence) BEFORE expensive retrieval. (guard-009)
 
+## Phase 3.9: Pre-Execution Domain Steps
+
+```
+Bash: load-conventions.sh pre-execution → Read if returned
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/pre-execution.md" && echo "exists"
+IF exists: follow pre-execution steps. IF any returns SKIP → skip goal, goto Phase 7.
+```
+
 ## Intelligent Retrieval Protocol (Steps 1-5c)
 
 ```
@@ -107,7 +115,7 @@ IF guardrail_found_issues: outcome_class = "productive"  # override routine
 
 ```
 Bash: load-conventions.sh post-execution → Read if returned
-Bash: test -f mind/conventions/post-execution.md && echo "exists"
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/post-execution.md" && echo "exists"
 IF exists: follow steps, collect external_changes + behavioral_observations
 ```
 
@@ -116,7 +124,7 @@ IF exists: follow steps, collect external_changes + behavioral_observations
 ```
 IF productive:
     experience_id = "exp-{goal.id}-{skill_slug}"
-    Write mind/experience/{experience_id}.md (full trace)
+    Write <agent>/experience/{experience_id}.md (full trace)
     echo '<experience-json>' | bash core/scripts/experience-add.sh
     # Include: retrieval_audit, verbatim_anchors, content_path
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs

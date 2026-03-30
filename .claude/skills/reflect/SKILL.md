@@ -18,6 +18,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, reasoning-guardrails, pattern-signatures, handoff-working-memory]
+minimum_mode: assistant
 ---
 
 # /reflect — Reflexion-Based Self-Learning Engine
@@ -72,6 +73,50 @@ Use retrieved context to:
 - Identify if a pattern signature matched (or should have matched)
 
 Step 0 runs ONCE per /reflect invocation. Context is available to the invoked sub-skill. For --full-cycle mode with multiple hypotheses, cache context per category — don't re-retrieve for same category.
+
+## Step 0.3: Load Meta-Reflection Strategy
+
+```
+# Step 0.3: Load Meta-Reflection Strategy
+Read meta/reflection-strategy.yaml
+# The agent's learned reflection preferences:
+# - depth_allocation: episode/pattern/strategic weight distribution
+#   (overrides developmental stage defaults when non-default)
+# - trigger_overrides: conditions that modify reflection behavior
+# - skip_conditions: conditions where reflection can be safely skipped
+# - category_depth_overrides: per-category depth preferences
+# - reflection_effectiveness_by_type: MR-Search quality tracking (Priority 2)
+# - adaptive_depth: MR-Search adaptive reflection scaling (Priority 6)
+# These are advisory — structural rules (horizon gating) still apply.
+
+# MR-Search reflection quality-driven depth allocation (Priority 2):
+# Use reflection_effectiveness_by_type to allocate more depth to reflection
+# types that historically produce downstream improvement.
+IF reflection_effectiveness_by_type exists AND has data:
+    # Only adjust depth for types with sufficient data (total >= 3).
+    # total == 0 means "no data" not "ineffective" — use default allocation.
+    # Currently only spark reflections are tracked (Phase 6.5 tags artifacts).
+    # Hypothesis and execution types will show total=0 until those sub-skills
+    # also tag their artifacts with source_reflection_id.
+    types_with_data = {type: data for type, data in reflection_effectiveness_by_type if data.total >= 3}
+    IF types_with_data is non-empty:
+        Apply effectiveness rates as advisory weight on depth_allocation for those types only
+        # Types without sufficient data: keep default depth_allocation unchanged
+
+# MR-Search adaptive reflection depth (Priority 6):
+# Scale reflection effort dynamically based on task properties.
+# Only applies when goal context is available (--on-execution, --on-hypothesis from Phase 8.75).
+# Skipped in --full-cycle mode where reflect iterates over hypotheses without goal context.
+IF adaptive_depth exists AND goal context is available:
+    depth_multiplier = 1.0
+    IF adaptive_depth.scale_on_surprise AND surprise_level > 7:
+        depth_multiplier = min(depth_multiplier * 1.5, adaptive_depth.max_depth_multiplier)
+    IF adaptive_depth.scale_on_chain_length AND goal has episode_history with length > 1:
+        depth_multiplier = min(depth_multiplier * 1.25, adaptive_depth.max_depth_multiplier)
+    IF adaptive_depth.scale_on_importance AND goal.priority == "HIGH":
+        depth_multiplier = min(depth_multiplier * 1.25, adaptive_depth.max_depth_multiplier)
+    # Apply multiplier as advisory guidance to sub-skill invocations
+```
 
 ## Mode Routing
 
@@ -160,6 +205,116 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 4. invoke /reflect-extract-patterns
 5. invoke /reflect-calibration
 5.5. invoke /reflect-curate-memory (light sweep scoped to categories touched this session)
+5.55. **Weakness Analysis (AutoContext-inspired)**:
+     # Aggregates signals from pattern signatures, guardrails, experience archive,
+     # and backpressure rollbacks into a coherent weakness report. HIGH-severity
+     # weaknesses auto-create investigation goals.
+     # Only runs during --full-cycle.
+
+     Read <agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: []} if missing)
+
+     # Gather signals from multiple sources
+     signals = []
+
+     # 1. Pattern signatures with high false positive rate
+     Bash: pattern-signatures-read.sh --active
+     FOR EACH sig WHERE sig.false_positive_rate > 0.3 AND sig.times_triggered >= 3:
+         signals.append({source: "pattern_signature", id: sig.id, detail: sig})
+
+     # 2. Guardrails that fired frequently
+     Bash: guardrails-read.sh --active
+     FOR EACH guard WHERE guard.times_triggered >= 3:
+         signals.append({source: "guardrail", id: guard.id, detail: guard})
+
+     # 3. Experience records with negative relative_advantage clustered by approach
+     Bash: experience-read.sh --recent 20
+     negative_experiences = filter WHERE relative_advantage < -0.1
+     IF len(negative_experiences) >= 3:
+         # Cluster by category
+         clusters = group_by(negative_experiences, "category")
+         FOR EACH cluster WHERE len(cluster.items) >= 2:
+             signals.append({source: "experience_cluster", category: cluster.key, count: len(cluster.items)})
+
+     # 4. Backpressure rollback patterns
+     Bash: meta-backpressure.sh status
+     FOR EACH rollback in result.rollback_history:
+         signals.append({source: "backpressure_rollback", id: rollback.meta_change_id, detail: rollback})
+
+     # Synthesize weaknesses from signals
+     IF len(signals) >= 2:
+         # Detect weakness types
+         # regression: declining performance in a category over time
+         # stagnation: category with many goals but no capability improvement
+         # dead_end: same approach keeps failing (feeds into dead end registry)
+         # systematic_bias: agent consistently over/under-estimates
+
+         FOR EACH detected weakness:
+             existing = find in weakness_report.weaknesses WHERE description matches
+             IF existing:
+                 existing.last_confirmed = now
+                 existing.times_confirmed += 1
+             ELSE:
+                 new_weakness = {
+                     id: "wk-{next_num}",
+                     type: detected_type,
+                     description: synthesized_description,
+                     evidence: {
+                         pattern_signatures: [relevant sig IDs],
+                         guardrail_triggers: [relevant guard IDs],
+                         experience_ids: [relevant exp IDs],
+                         meta_log_entries: count_of_relevant
+                     },
+                     severity: HIGH if regression/dead_end else MEDIUM,
+                     first_detected: now,
+                     last_confirmed: now,
+                     times_confirmed: 1,
+                     status: "active",
+                     remediation: {proposed: null, applied: null, goal_id: null}
+                 }
+                 weakness_report.weaknesses.append(new_weakness)
+
+         # Create investigation goals for HIGH-severity active weaknesses
+         FOR EACH weakness WHERE severity == "HIGH" AND status == "active" AND remediation.goal_id is null:
+             # Check dedup against existing goals
+             Bash: load-aspirations-compact.sh → IF path returned: Read it
+             IF no existing "Investigate: {weakness.description}" goal:
+                 goal_json = {
+                     title: "Investigate: {weakness.description (60 chars)}",
+                     status: "pending", priority: "MEDIUM",
+                     skill: null, participants: ["agent"],
+                     description: "Weakness detected by aggregated failure analysis.\nType: {weakness.type}\nEvidence: {weakness.evidence}\nDiscovered by: Step 5.55 Weakness Analysis"
+                 }
+                 # Route to most relevant aspiration
+                 target_asp = aspiration matching weakness category, or most recent active
+                 echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh {target_asp}
+                 weakness.remediation.goal_id = created_goal_id
+                 Output: "▸ WEAKNESS ANALYSIS: Created investigation goal for {weakness.description}"
+
+     weakness_report.last_analyzed = now
+     weakness_report.analysis_count += 1
+     Edit <agent>/weakness-report.yaml with updated content
+
+     Output: "▸ Weakness analysis: {len(signals)} signals, {new_weakness_count} new weakness(es), {goal_count} investigation goal(s)"
+5.7. **Meta-Reflection ROI Tracking**:
+     For each reflection mode invoked in this cycle, track:
+     - Did it produce a reasoning bank entry, guardrail, or pattern signature?
+     - Did it add an encoding queue item?
+     - Did it change a belief or knowledge node?
+     Compute: reflection_roi = artifacts_produced / modes_invoked
+     Append to meta/reflection-strategy.yaml roi_history:
+       {date: today, modes_invoked: N, artifacts_produced: N, roi: N, session: N}
+
+5.8. **Reflection Quality Consolidation (MR-Search Priority 2)**:
+     Update reflection_effectiveness_by_type from reflection_quality_log:
+     For each entry in reflection_quality_log:
+       Derive type from reflection_id prefix (ref-{goal_id} → look up goal's spark/execution context)
+       Count by type: entries where helpful == true are "effective"
+     For each reflection type (execution, hypothesis, spark):
+       total = count entries of this type
+       effective = count entries of this type where helpful == true
+       rate = effective / total (or 0.0 if total == 0)
+     Bash: meta-set.sh reflection-strategy.yaml reflection_effectiveness_by_type '<updated_json>'
+     This closes the meta-learning loop: reflection quality → depth allocation → better reflections
 6. invoke /replay --sharp-wave --selective (if violations detected)
 
 ---
@@ -178,8 +333,8 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 - **Updates evaluation calibration**: Adjusts evaluation weights based on calibration data
 - **Updates pattern signatures** (via `pattern-signatures-add.sh`, `pattern-signatures-record-outcome.sh`): New signatures, accuracy updates, separation markers
 - **Updates working memory** (via `wm-append.sh`): Encoding queue items from Step 2.5
-- **Updates `mind/developmental-stage.yaml`**: Schema operations (assimilation/accommodation)
-- **Updates `mind/skill-gaps.yaml`**: Capability gap detection (Spark Q6) and skill underperformance (Spark Q7)
+- **Updates `<agent>/developmental-stage.yaml`**: Schema operations (assimilation/accommodation)
+- **Updates `meta/skill-gaps.yaml`**: Capability gap detection (Spark Q6) and skill underperformance (Spark Q7)
 
 ---
 

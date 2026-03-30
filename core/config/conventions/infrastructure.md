@@ -18,7 +18,7 @@ iterations via pre-selection guardrail sweep. Local/tooling errors (script valid
 ## Guardrail-Driven Enforcement
 
 The specific checks (what to run, when, how) are learned behaviors stored
-in `mind/guardrails.jsonl`. The core skill (Phase 4.1) consults guardrails
+in `world/guardrails.jsonl`. The core skill (Phase 4.1) consults guardrails
 after every infrastructure goal — it does not hardcode which checks to run.
 The guardrails tell it.
 
@@ -66,6 +66,13 @@ broke during startup. The agent sees symptom #3 and must look for causes #1 and
     When the goal completes, Phase 0.5b clears the blocker.
 11. **Ideas and investigations are encouraged** — create investigation/idea goals
     anytime. These are separate from unblocking goals. A single event can spawn all three.
+12. **Framework bugs go to the Framework Improvements aspiration** — when encountering
+    bugs in read-only framework files (`core/`, `.claude/`), add a goal with
+    `participants: ["user"]` to the "Framework Improvements" world aspiration (asp-093)
+    via `aspirations-add-goal.sh`. Include: file path, line numbers, observed behavior,
+    expected behavior, and any workaround in use. Also create a reasoning bank entry
+    for the workaround (existing practice). Do NOT silently work around framework bugs
+    without logging them.
 
 ## Protocol Steps
 
@@ -73,7 +80,7 @@ broke during startup. The agent sees symptom #3 and must look for causes #1 and
 invoke CREATE_BLOCKER directly (no email check, no inline fix — problem is at preflight).
 
 **Phase 4.1 (full diagnosis)**: Goal ran and failed or guardrail found issues →
-1. **SEEK ERROR ALERTS** — via `error_check` config in `mind/infra-health.yaml`
+1. **SEEK ERROR ALERTS** — via `error_check` config in `<agent>/infra-health.yaml`
 2. **CASCADE DETECTION** — sort alerts by timestamp ascending, earliest = root cause
 3. **DETERMINE SEVERITY** — confirmed_infrastructure, explicit_failure, or soft_failure
 4. **TRY FIX INLINE** — search knowledge tree, reasoning bank, experience for solutions. One attempt.
@@ -87,13 +94,13 @@ Dedup existing blocker → create unblocking goal (HIGH) → create blocker entr
 ## Reference
 Full protocol: Phase 4.0 + Phase 4.1 + CREATE_BLOCKER in `.claude/skills/aspirations-execute/SKILL.md`
 Broad sweep: Phase 0.5a + blocker resolution: Phase 0.5b in `.claude/skills/aspirations/SKILL.md`
-Script: error check script configured in `mind/infra-health.yaml` `error_check` section
+Script: error check script configured in `<agent>/infra-health.yaml` `error_check` section
 
 ---
 
 # Error Alerts Configuration
 
-Error alert checking is configured in `mind/infra-health.yaml` under `error_check`:
+Error alert checking is configured in `<agent>/infra-health.yaml` under `error_check`:
 ```yaml
 error_check:
   script: <path to error check script>
@@ -102,23 +109,23 @@ error_check:
 ```
 
 Fresh agents start with `error_check: null` (no alert checking configured).
-Domain-specific scripts (e.g., email-based, webhook-based) are placed in `mind/scripts/`.
+Domain-specific scripts (e.g., email-based, webhook-based) are placed in `<agent>/scripts/`.
 
 ---
 
 # Infrastructure Health Tracking
 
-Infrastructure health state is tracked in `mind/infra-health.yaml`.
+Infrastructure health state is tracked in `<agent>/infra-health.yaml`.
 Updated automatically by `core/scripts/infra-health.sh` on every probe.
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `infra-health.sh check <component>` | Probe component health (auto-records result) | — |
 | `infra-health.sh check-all` | Probe all components | — |
-| `infra-health.sh status` | Current state from mind/infra-health.yaml | — |
+| `infra-health.sh status` | Current state from <agent>/infra-health.yaml | — |
 | `infra-health.sh stale [--hours N]` | Components not checked within N hours (default: 2) | — |
 
-Components are domain-specific — defined in `mind/infra-health.yaml` under `components:`.
+Components are domain-specific — defined in `<agent>/infra-health.yaml` under `components:`.
 
 Schema per component:
 ```yaml
@@ -129,10 +136,10 @@ consecutive_failures: 0
 session_last_checked: 40              # or null
 ```
 
-Side effects: `check` and `check-all` automatically update `mind/infra-health.yaml`
+Side effects: `check` and `check-all` automatically update `<agent>/infra-health.yaml`
 with success/failure timestamps. No separate record call needed from the agent.
 
-Skill-to-component mapping lives in `mind/infra-health.yaml` (`skill_mapping` + `category_mapping`).
+Skill-to-component mapping lives in `<agent>/infra-health.yaml` (`skill_mapping` + `category_mapping`).
 Used by Phase 0.5b/2.5b blocker gates and Phase 4.2 domain post-execution steps.
 
 All backed by `core/scripts/infra-health.py` (Python 3, PyYAML).
@@ -146,7 +153,7 @@ All backed by `core/scripts/infra-health.py` (Python 3, PyYAML).
 1. **Probe before concluding** — Before saying "X is down/unreachable/unavailable",
    run `infra-health.sh check <component>`. SSH timeout, curl failure,
    connection refused — these are evidence. Assumptions are not.
-2. **Check recency** — Read `mind/infra-health.yaml` for last successful contact.
+2. **Check recency** — Read `<agent>/infra-health.yaml` for last successful contact.
    If a component succeeded recently (current session or last 2 hours), it
    likely still works. Probe anyway if about to skip a goal over it.
 3. **Stale host keys are not outages** — SSH "REMOTE HOST IDENTIFICATION HAS
@@ -160,7 +167,7 @@ When this applies:
 - Any moment the agent considers deferring a goal due to infrastructure
 - Any moment the agent is about to declare infrastructure unavailable
 
-Reference: `core/scripts/infra-health.sh`, `mind/infra-health.yaml`
+Reference: `core/scripts/infra-health.sh`, `<agent>/infra-health.yaml`
 
 ---
 
@@ -171,7 +178,7 @@ Reference: `core/scripts/infra-health.sh`, `mind/infra-health.yaml`
 After ANY of these events, ask: "Which knowledge nodes informed this action, and
 do they need updating?"
 
-1. **External code change** — editing files outside mind/ (bug fix, feature, refactor)
+1. **External code change** — editing files outside world/<agent>/meta/ (bug fix, feature, refactor)
 2. **Hypothesis resolution** — an outcome contradicts or refines what a node says
 3. **User correction** — the user provides information that supersedes stored knowledge
 4. **Research discovery** — new research reveals a node's content is outdated or wrong
@@ -196,7 +203,7 @@ The `last_update_trigger` front matter field tracks WHY a node was last updated:
 | `user-correction` | User provided authoritative correction |
 | `post-reflection-reconciliation` | Reflection lesson updated the node |
 | `capability_change` | Accuracy/capability level changed |
-| `self_evolution` | Self/Program evolved via sq-012 spark |
+| `self_evolution` | Self evolved via sq-012 spark |
 | `initial_creation` | First-time creation during /start |
 
 ## Knowledge Debt

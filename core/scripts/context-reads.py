@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Context read deduplication engine for mind/session/context-reads.txt.
+"""Context read deduplication engine for <agent>/session/context-reads.txt.
 
 Tracks which files have been loaded into the LLM's context window since the
 last autocompact. Prevents redundant Read tool calls from re-loading identical
@@ -24,17 +24,26 @@ Session scoping:
 import argparse
 import os
 import sys
+import threading
 from pathlib import Path
+
+# Self-destruct after 10s — prevents zombie processes when the parent hook wrapper
+# is killed by timeout but Python child survives (Windows doesn't propagate SIGTERM
+# from bash to Python subprocesses).
+# MUST be daemon=True so normal exit isn't blocked waiting for the timer.
+_timer = threading.Timer(10, lambda: os._exit(0))
+_timer.daemon = True
+_timer.start()
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import PROJECT_ROOT, MIND_DIR, CONFIG_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR
 
-SESSION_DIR = MIND_DIR / "session"
-TRACKER_PATH = SESSION_DIR / "context-reads.txt"
+SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
+TRACKER_PATH = SESSION_DIR / "context-reads.txt" if SESSION_DIR else None
 CONVENTIONS_DIR = CONFIG_DIR / "conventions"
 
 SESSION_HEADER_PREFIX = "#session:"
@@ -43,14 +52,14 @@ SESSION_HEADER_PREFIX = "#session:"
 TRACKED_PREFIXES = [
     str(CONFIG_DIR),
     str(PROJECT_ROOT / ".claude" / "skills"),
-    str(MIND_DIR / "knowledge" / "tree"),
-    str(MIND_DIR / "conventions"),
+    str(WORLD_DIR / "knowledge" / "tree"),
+    str(WORLD_DIR / "conventions"),
 ]
 
 # Individual files tracked outside any tracked prefix
 TRACKED_FILES = [
-    str(MIND_DIR / "session" / "aspirations-compact.json"),
-]
+    str(AGENT_DIR / "session" / "aspirations-compact.json")
+] if AGENT_DIR else []
 
 
 def normalize_path(file_path):
@@ -74,7 +83,7 @@ def is_in_scope(normalized):
 
 def _read_raw_lines():
     """Read tracker file, return (session_id_or_None, [path_lines])."""
-    if not TRACKER_PATH.exists():
+    if TRACKER_PATH is None or not TRACKER_PATH.exists():
         return None, []
     lines = TRACKER_PATH.read_text(encoding="utf-8").strip().splitlines()
     if not lines:
@@ -106,7 +115,8 @@ def read_tracker(session_id=None):
 
 def append_tracker(normalized, session_id=None):
     """Append a single path to the tracker file."""
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    if SESSION_DIR is None or not SESSION_DIR.is_dir():
+        return  # No agent bound, or dir gone after factory reset
 
     if not TRACKER_PATH.exists() or TRACKER_PATH.stat().st_size == 0:
         # New tracker — write session header + first path
@@ -119,7 +129,7 @@ def append_tracker(normalized, session_id=None):
 
 def remove_from_tracker(normalized):
     """Remove a path from the tracker file if present."""
-    if not TRACKER_PATH.exists():
+    if TRACKER_PATH is None or not TRACKER_PATH.exists():
         return
     lines = TRACKER_PATH.read_text(encoding="utf-8").strip().splitlines()
     # Preserve session header, filter path lines
@@ -194,8 +204,8 @@ def cmd_invalidate(args):
             return
 
     # Only invalidate tree nodes — they change during goal execution.
-    # mind/conventions/** are tracked but procedurally stable (no mid-session edits).
-    tree_prefix = str(MIND_DIR / "knowledge" / "tree").replace("\\", "/")
+    # world/conventions/** are tracked but procedurally stable (no mid-session edits).
+    tree_prefix = str(WORLD_DIR / "knowledge" / "tree").replace("\\", "/")
     if not normalized.startswith(tree_prefix):
         return
 
@@ -217,8 +227,8 @@ def cmd_check(args):
         if conv_path not in tracked and os.path.exists(str(CONVENTIONS_DIR / f"{name}.md")):
             print(conv_path)
             continue
-        # Fallback: domain conventions in mind/conventions/ (only if no framework match)
-        domain_dir = MIND_DIR / "conventions"
+        # Fallback: domain conventions in world/conventions/ (only if no framework match)
+        domain_dir = WORLD_DIR / "conventions"
         domain_path = normalize_path(domain_dir / f"{name}.md")
         if domain_path not in tracked and os.path.exists(str(domain_dir / f"{name}.md")):
             print(domain_path)

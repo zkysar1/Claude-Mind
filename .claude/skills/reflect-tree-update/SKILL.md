@@ -6,6 +6,7 @@ parent-skill: reflect
 triggers:
   - "/reflect-tree-update"
 conventions: [tree-retrieval]
+minimum_mode: assistant
 ---
 
 # /reflect-tree-update — Tree Update Protocol
@@ -46,7 +47,7 @@ Behavior depends on whether the target node is a leaf or interior node:
 2. EXTRACT PRECISION: Scan insight for exact values (numbers, thresholds, code refs,
    formulas, error codes, config values). Build precision items:
      {type, label, value (VERBATIM), unit, context}
-   See mind/conventions/precision-encoding.md for schema and extraction heuristics.
+   See core/config/conventions/precision-encoding.md for schema and extraction heuristics.
 3. IF precision items found:
      Append to "## Verified Values" section (create if missing):
        For each item: - **{label}**: `{value}` {unit} — {context}

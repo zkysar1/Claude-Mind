@@ -1,6 +1,6 @@
 # Adaptive Spark Questions — Framework Definition
 # Seed questions and evolution rules are immutable framework.
-# Agent state (times_asked, yield, status) lives in mind/spark-questions.jsonl (script-accessed)
+# Agent state (times_asked, yield, status) lives in meta/spark-questions.jsonl (script-accessed)
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -81,6 +81,16 @@ seed_candidates:
     text: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
     proposed_session: 0
     category: data_acquisition
+
+  - id: sq-c06
+    text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
+    proposed_session: 0
+    category: meta_improvement
+
+  - id: sq-c07
+    text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
+    proposed_session: 0
+    category: first_principles
 
 evolution_rules:
   retire_threshold: 0.03
@@ -222,3 +232,13 @@ initial_state:
       text: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
       proposed_session: 0
       category: data_acquisition
+
+    - id: sq-c06
+      text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
+      proposed_session: 0
+      category: meta_improvement
+
+    - id: sq-c07
+      text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
+      proposed_session: 0
+      category: first_principles

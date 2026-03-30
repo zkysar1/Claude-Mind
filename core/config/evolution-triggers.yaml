@@ -1,5 +1,5 @@
 # Evolution Triggers — Framework Definition
-# Immutable trigger definitions. Agent state lives in mind/evolution-triggers.yaml
+# Immutable trigger definitions. Agent state lives in world/evolution-triggers.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -49,9 +49,15 @@ triggers:
     per_category: false
     cooldown_sessions: 5
 
+  evolution_goal_cadence:
+    description: "Evolution has not run in N productive goals — mid-session strategic review"
+    goals_without_evolution: 15
+    per_category: false
+    cooldown_sessions: 0
+
 global:
   max_evolutions_per_session: 2
-  evolution_log_path: "mind/evolution-log.jsonl"
+  evolution_log_path: "meta/evolution-log.jsonl"
 
 modifiable:
   accuracy_drop_threshold: {min: -20, max: -5, default: -10}
@@ -64,6 +70,7 @@ modifiable:
   context_retrieval_usefulness_threshold: {min: 0.30, max: 0.70, default: 0.50}
   max_evolutions_per_session: {min: 1, max: 5, default: 2}
   evolution_cadence_sessions: {min: 3, max: 15, default: 7}
+  evolution_goal_cadence_goals: {min: 8, max: 30, default: 15}
 
 # --- INITIAL STATE ---
 
@@ -88,5 +95,8 @@ initial_state:
       last_fired: null
       times_fired: 0
     evolution_cadence:
+      last_fired: null
+      times_fired: 0
+    evolution_goal_cadence:
       last_fired: null
       times_fired: 0

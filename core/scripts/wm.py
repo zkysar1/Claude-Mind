@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Working memory script — dedicated access layer for mind/session/working-memory.yaml.
+"""Working memory script — dedicated access layer for <agent>/session/working-memory.yaml.
 
 All shell scripts (wm-*.sh) are thin wrappers around this. Subcommands managed via argparse.
 
@@ -30,9 +30,9 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import MIND_DIR, CONFIG_DIR
+from _paths import AGENT_DIR, CONFIG_DIR
 
-WM_PATH = MIND_DIR / "session" / "working-memory.yaml"
+WM_PATH = AGENT_DIR / "session" / "working-memory.yaml"
 CONFIG_PATH = CONFIG_DIR / "memory-pipeline.yaml"
 
 # Top-level keys (not inside slots:)

@@ -3,35 +3,82 @@
 Aspirations use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `mind/aspirations.jsonl` — Live active/pending aspirations
-- `mind/aspirations-archive.jsonl` — Completed/retired (append-only)
-- `mind/aspirations-meta.json` — Metadata (session_count, readiness_gates, last_updated, last_evolution)
-- `mind/evolution-log.jsonl` — Evolution events (append-only, was evolution_log in aspirations.yaml)
-- `core/config/aspirations-initial.jsonl` — Bootstrap aspiration template (copied by init-mind.sh)
+
+### World Queue (collective task list — `world/`)
+- `world/aspirations.jsonl` — Live active/pending world aspirations
+- `world/aspirations-archive.jsonl` — Completed/retired (append-only)
+- `world/aspirations-meta.json` — Metadata (session_count, readiness_gates)
+
+### Agent Queue (per-agent local tasks — `<agent>/`)
+- `<agent>/aspirations.jsonl` — Agent's local work queue (maintenance, decomposed sub-goals)
+- `<agent>/aspirations-archive.jsonl` — Agent's completed local tasks
+- `<agent>/aspirations-meta.json` — Agent aspiration metadata
+
+### Shared
+- `meta/evolution-log.jsonl` — Evolution events (append-only)
+- `core/config/world-aspirations-initial.jsonl` — World bootstrap aspirations (copied by init-world.sh)
+- `core/config/agent-aspirations-initial.jsonl` — Agent maintenance goals (copied by init-agent.sh)
+- `core/config/agent-aspirations-onboard.jsonl` — Onboarding aspiration for subsequent agents
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits aspiration JSONL files directly. All operations go through scripts:
+
+The LLM NEVER reads or edits aspiration JSONL files directly. All operations go through scripts.
+Two script families — world (default) and agent — operate on separate queues via the same Python engine.
+
+### World Queue Scripts (default — operate on `world/aspirations.jsonl`)
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `load-aspirations-compact.sh` | Cached compact active aspirations (dedup-aware) | — |
-| `aspirations-read.sh --active` | Return active aspirations as full JSON | — |
+| `aspirations-read.sh --active` | Return active world aspirations as full JSON | — |
 | `aspirations-read.sh --active-compact` | Compact active aspirations (no descriptions/verification) | — |
-| `aspirations-read.sh --id <id>` | Return one aspiration by ID | — |
-| `aspirations-read.sh --summary` | Compact one-liner per aspiration | — |
-| `aspirations-read.sh --archive` | Return archived aspirations | — |
-| `aspirations-read.sh --meta` | Return metadata | — |
-| `aspirations-add.sh` | Validate + append new aspiration | JSON |
-| `aspirations-update.sh <asp-id>` | Validate + replace aspiration | JSON |
-| `aspirations-update-goal.sh <goal-id> <field> <value>` | Update single goal field | — |
-| `aspirations-add-goal.sh <asp-id>` | Validate + append goal to aspiration (auto-assigns ID) | JSON |
-| `aspirations-complete.sh <asp-id>` | Mark completed + move to archive | — |
-| `aspirations-retire.sh <asp-id>` | Mark retired (never-started) + move to archive | — |
-| `aspirations-archive.sh` | Sweep completed/retired to archive | — |
-| `aspirations-meta-update.sh <field> <value>` | Update metadata field | — |
+| `aspirations-read.sh --id <id>` | Return one world aspiration by ID | — |
+| `aspirations-read.sh --summary` | Compact one-liner per world aspiration | — |
+| `aspirations-read.sh --archive` | Return archived world aspirations | — |
+| `aspirations-read.sh --meta` | Return world aspirations metadata | — |
+| `aspirations-add.sh` | Validate + append new world aspiration | JSON |
+| `aspirations-update.sh <asp-id>` | Validate + replace world aspiration | JSON |
+| `aspirations-update-goal.sh <goal-id> <field> <value>` | Update single goal field in world queue | — |
+| `aspirations-add-goal.sh <asp-id>` | Validate + append goal to world aspiration (auto-assigns ID) | JSON |
+| `aspirations-complete.sh <asp-id>` | Mark world aspiration completed + archive | — |
+| `aspirations-retire.sh <asp-id>` | Mark world aspiration retired + archive | — |
+| `aspirations-archive.sh` | Sweep completed/retired world aspirations to archive | — |
+| `aspirations-meta-update.sh <field> <value>` | Update world aspirations metadata | — |
 | `evolution-log-append.sh` | Append evolution event | JSON |
 
+### World-Only Operations (no agent equivalent)
+
+| Script | Purpose |
+|--------|---------|
+| `aspirations.py claim <goal-id> <agent-name>` | Atomically claim a world goal for an agent |
+| `aspirations.py release <goal-id>` | Release a claimed world goal |
+| `aspirations.py complete-by <goal-id> <agent-name>` | Mark world goal completed with agent attribution |
+
+### Agent Queue Scripts (operate on `<agent>/aspirations.jsonl`)
+
+| Script | Purpose | Stdin |
+|--------|---------|-------|
+| `agent-aspirations-read.sh --active` | Return active agent aspirations | — |
+| `agent-aspirations-read.sh --active-compact` | Compact active agent aspirations (no descriptions/verification) | — |
+| `agent-aspirations-read.sh --id <id>` | Return one agent aspiration by ID | — |
+| `agent-aspirations-read.sh --summary` | Compact one-liner per agent aspiration | — |
+| `agent-aspirations-read.sh --archive` | Return archived agent aspirations | — |
+| `agent-aspirations-read.sh --meta` | Return agent aspirations metadata | — |
+| `agent-aspirations-add.sh` | Validate + append new agent aspiration | JSON |
+| `agent-aspirations-update.sh <asp-id>` | Validate + replace agent aspiration | JSON |
+| `agent-aspirations-update-goal.sh <goal-id> <field> <value>` | Update single goal field in agent queue | — |
+| `agent-aspirations-add-goal.sh <asp-id>` | Validate + append goal to agent aspiration | JSON |
+| `agent-aspirations-complete.sh <asp-id>` | Mark agent aspiration completed + archive | — |
+| `agent-aspirations-retire.sh <asp-id>` | Mark agent aspiration retired + archive | — |
+| `agent-aspirations-archive.sh` | Sweep completed/retired agent aspirations to archive | — |
+
 Scripts validate JSON schema before writing. On validation failure: exit non-zero with error.
+
+### Under the Hood
+
+Both script families delegate to `aspirations.py` with a `--source {world|agent}` flag.
+Agent wrappers pass `--source agent`; world wrappers use the default (`world`).
+Goal-selector reads from BOTH queues and tags candidates with `source: "world"` or `source: "agent"`.
 
 ## Archival Rules
 - Completed/retired aspirations move from live → archive via `aspirations-complete.sh`, `aspirations-retire.sh`, or `aspirations-archive.sh`

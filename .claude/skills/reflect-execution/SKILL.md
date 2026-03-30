@@ -7,6 +7,7 @@ triggers:
   - "/reflect-execution"
   - "/reflect --on-execution"
 conventions: [reasoning-guardrails, pattern-signatures, tree-retrieval, experience, aspirations]
+minimum_mode: autonomous
 ---
 
 # /reflect-execution — Execution Outcome Reflection
@@ -145,7 +146,7 @@ IF "surprise" in signals OR "mistake" in signals:
 
             # Log transition if fundamental (not minor refinement)
             IF contradiction is fundamental:
-                Read mind/knowledge/transitions.yaml
+                Read world/knowledge/transitions.yaml
                 Append transition entry:
                     entity: node.key
                     from: "old insight summary"
@@ -156,7 +157,7 @@ IF "surprise" in signals OR "mistake" in signals:
 
         ELIF execution outcome REFINES understanding (not contradiction):
             # Extract precision from refinement before compressing
-            # See mind/conventions/precision-encoding.md for extraction heuristics
+            # See core/config/conventions/precision-encoding.md for extraction heuristics
             IF refinement contains exact values (numbers, thresholds, code refs, formulas):
                 Append to node "## Verified Values" section (create if missing):
                   - **{label}**: `{value}` {unit} — {context}
@@ -267,7 +268,7 @@ If any learning occurred in Steps 1-3, archive as an experience record.
 ```
 IF matched OR new signature created OR contradiction handled OR goals_created_count > 0:
     experience_id = "exp-exec-{goal.id}"
-    Write mind/experience/{experience_id}.md with:
+    Write <agent>/experience/{experience_id}.md with:
         ---
         type: execution_reflection
         goal_id: {goal.id}
@@ -299,7 +300,7 @@ IF matched OR new signature created OR contradiction handled OR goals_created_co
     #   summary: "Exec reflection on {goal.title}: {signals} → {outcomes}",
     #   goal_id: goal.id,
     #   tree_nodes_related: [node.key if any],
-    #   content_path: "mind/experience/{experience_id}.md"
+    #   content_path: "<agent>/experience/{experience_id}.md"
     # }
 ```
 
@@ -308,7 +309,7 @@ IF matched OR new signature created OR contradiction handled OR goals_created_co
 Append execution reflection summary to the session journal.
 
 ```
-Append to mind/journal/YYYY/MM/YYYY-MM-DD.md:
+Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
 
     ## {timestamp} — Execution Reflection: {goal.title}
     Signals: {signals joined by ", "}
@@ -336,5 +337,5 @@ Update journal index via scripts (same pattern as state-update Step 7):
 | Calls | `aspirations-read.sh` | Dedup check before goal creation |
 | Calls | `experience-add.sh` | Archive execution reflection |
 | Updates | Tree node `.md` files | Inline contradiction fixes and refinements |
-| Updates | `mind/knowledge/transitions.yaml` | Fundamental contradictions |
-| Updates | `mind/journal/` | Execution reflection entries |
+| Updates | `world/knowledge/transitions.yaml` | Fundamental contradictions |
+| Updates | `<agent>/journal/` | Execution reflection entries |

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Infrastructure health check and tracking.
 
-Probes infrastructure components and records results in mind/infra-health.yaml.
+Probes infrastructure components and records results in world/infra-health.yaml.
 All shell scripts are thin wrappers around this.
 
-Components are defined dynamically in mind/infra-health.yaml. Domain-specific
-probe scripts live in mind/scripts/probe-{component}.sh and are discovered
+Components are defined dynamically in world/infra-health.yaml. Domain-specific
+probe scripts live in world/scripts/probe-{component}.sh and are discovered
 automatically when a check is requested.
 """
 
@@ -29,8 +29,8 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, MIND_DIR
-HEALTH_FILE = MIND_DIR / "infra-health.yaml"
+from _paths import PROJECT_ROOT, WORLD_DIR
+HEALTH_FILE = WORLD_DIR / "infra-health.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ HEALTH_FILE = MIND_DIR / "infra-health.yaml"
 # ---------------------------------------------------------------------------
 
 def load_health():
-    """Load mind/infra-health.yaml. Returns dict or empty structure."""
+    """Load world/infra-health.yaml. Returns dict or empty structure."""
     if not HEALTH_FILE.exists():
         return {"components": {}}
     with open(HEALTH_FILE, "r", encoding="utf-8") as f:
@@ -47,7 +47,7 @@ def load_health():
 
 
 def save_health(data):
-    """Write mind/infra-health.yaml atomically."""
+    """Write world/infra-health.yaml atomically."""
     HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = HEALTH_FILE.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -118,8 +118,8 @@ def get_credential(key):
 # ---------------------------------------------------------------------------
 
 def _find_probe_script(component):
-    """Check if mind/scripts/probe-{component}.sh exists. Returns Path or None."""
-    script = MIND_DIR / "scripts" / f"probe-{component}.sh"
+    """Check if world/scripts/probe-{component}.sh exists. Returns Path or None."""
+    script = WORLD_DIR / "scripts" / f"probe-{component}.sh"
     if script.exists():
         return script
     return None
@@ -170,7 +170,7 @@ def probe_component(component):
 
     return {
         "status": "no_probe",
-        "error": "No probe defined for component. Add probe via mind/scripts/ or domain conventions.",
+        "error": "No probe defined for component. Add probe via world/scripts/ or domain conventions.",
     }
 
 
@@ -200,7 +200,7 @@ def record_result(data, component, result):
 
 def _get_session_number():
     """Read session number from aspirations-meta.json."""
-    meta_file = MIND_DIR / "aspirations-meta.json"
+    meta_file = WORLD_DIR / "aspirations-meta.json"
     if meta_file.exists():
         try:
             with open(meta_file, "r", encoding="utf-8") as f:
@@ -216,7 +216,7 @@ def _get_session_number():
 # ---------------------------------------------------------------------------
 
 def _get_known_components():
-    """Get the list of known components from mind/infra-health.yaml.
+    """Get the list of known components from world/infra-health.yaml.
 
     Returns the keys under 'components:' in the health file. If the file
     doesn't exist or has no components, returns an empty list.
@@ -297,14 +297,14 @@ def cmd_stale(args):
 
 
 def cmd_list(args):
-    """List all known components from mind/infra-health.yaml."""
+    """List all known components from world/infra-health.yaml."""
     components = _get_known_components()
     for c in components:
         script = _find_probe_script(c)
         probe_status = "probe: " + str(script) if script else "no probe"
         print(f"  {c} ({probe_status})")
     if not components:
-        print("  (no components defined in mind/infra-health.yaml)")
+        print("  (no components defined in world/infra-health.yaml)")
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +316,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_check = sub.add_parser("check", help="Probe a single component")
-    p_check.add_argument("component", help="Component to probe (from mind/infra-health.yaml or any name)")
+    p_check.add_argument("component", help="Component to probe (from world/infra-health.yaml or any name)")
 
     sub.add_parser("check-all", help="Probe all known components")
 

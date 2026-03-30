@@ -14,6 +14,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [tree-retrieval, reasoning-guardrails, pattern-signatures]
+minimum_mode: internal
 ---
 
 # /prime — Context Priming Engine
@@ -21,7 +22,7 @@ conventions: [tree-retrieval, reasoning-guardrails, pattern-signatures]
 Loads the agent's accumulated knowledge into active context so that conversations
 and goal execution start with domain awareness rather than amnesia.
 
-**Internal skill**: called by boot (RUNNING state) and `/enterPersona` (any state).
+**Internal skill**: called by boot (RUNNING state) and session start protocol (any mode).
 Not user-invocable — users enter persona to prime automatically.
 
 **Key design**: Boot loads the MAP (indexes, summaries). Prime loads the TERRITORY
@@ -39,6 +40,27 @@ give the agent full domain awareness.
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
+## Phase 0.5: Agent Mode Detection
+
+```
+Bash: session-state-get.sh
+IF output is "NO_AGENT":
+  → World-only priming mode. Skip all agent-specific steps.
+  → Read world/program.md (The Program — shared purpose)
+  → Read world/knowledge/tree/_tree.yaml (collective knowledge overview)
+  → Bash: guardrails-read.sh --active (shared safety rules)
+  → Bash: reasoning-bank-read.sh --active (shared lessons)
+  → Display:
+    ═══ WORLD PRIME (no agent) ═══
+    PROGRAM: [contents of world/program.md]
+    KNOWLEDGE: [tree summary]
+    GUARDRAILS: [count] active
+    REASONING: [count] active
+    ════════════════════════════════
+  → Output: "Primed in world-only mode. No agent identity active."
+  → DONE (skip all remaining phases)
+```
+
 ## Phase 1: Detect Context & Build Category List
 
 ```
@@ -50,10 +72,10 @@ give the agent full domain awareness.
      Set categories = [{name: <cat>, depth: "deep"}]
      SKIP to Phase 2
 
-3. Read mind/self.md → extract domain identity (for display in Phase 4)
+3. Read <agent>/self.md → extract domain identity (for display in Phase 4)
    IF missing: self_summary = "Not configured"
 
-4. Read mind/profile.yaml → check focus field
+4. Read <agent>/profile.yaml → check focus field
    IF focus is set and non-null: add focus domain as Tier 1 category
 
 5. Determine categories from aspirations and pipeline:
@@ -79,19 +101,34 @@ give the agent full domain awareness.
 These are small, always relevant, and not category-specific. Load unconditionally.
 
 ```
-1. Read mind/self.md → full content
+1. Read <agent>/self.md → full content
    Display:
    ═══ SELF ══════════════════════════════════════
-   {mind/self.md body content after YAML front matter}
+   {<agent>/self.md body content after YAML front matter}
 
-2. Bash: guardrails-read.sh --active → ALL active guardrails
+2. Read world/program.md → full content (if non-empty)
+   IF non-empty:
+     Display:
+     ═══ THE PROGRAM ════════════════════════════════
+     {world/program.md content}
+   IF empty or missing: skip silently
+
+3. Bash: guardrails-read.sh --active → ALL active guardrails
    IF count > 30: note overflow but still load all (guardrails are safety-critical)
 
-3. Bash: reasoning-bank-read.sh --active → ALL active reasoning bank entries
+4. Bash: reasoning-bank-read.sh --active → ALL active reasoning bank entries
    IF count > 30: note overflow but still load all
 
-4. Read mind/knowledge/beliefs.yaml → filter status in (active, weakened)
+5. Read world/knowledge/beliefs.yaml → filter status in (active, weakened)
    IF file missing: beliefs = [] (skip silently)
+
+6. Bash: board-read.sh --channel coordination --since 2h
+   → Recent coordination messages from other agents (what they're working on)
+   IF no messages or board not initialized: skip silently
+
+7. Bash: board-read.sh --channel general --since 24h --tag forge
+   → Recent skill forge announcements from other agents
+   IF no messages or board not initialized: skip silently
 ```
 
 ## Phase 3: Load Category-Specific Knowledge
@@ -99,14 +136,14 @@ These are small, always relevant, and not category-specific. Load unconditionall
 For each category from Phase 1 (in tier order, respecting budget):
 
 ```
-1. Bash: retrieve.sh --category {cat} --depth {tier_depth}
+1. Bash: session-mode-get.sh → if "reader", add --read-only flag below
+   Bash: retrieve.sh --category {cat} --depth {tier_depth} [--read-only]
    → Returns JSON with: tree_nodes, reasoning_bank, guardrails,
      pattern_signatures, experiences, beliefs, experiential_index
 
-   NOTE: retrieve.sh increments retrieval counters. This is intentional.
-   Primed knowledge IS retrieved knowledge — the spaced repetition
-   signal is accurate. Knowledge that gets primed is knowledge the
-   agent needs.
+   In reader mode: --read-only suppresses counter writes (side-effect-free).
+   In assistant/autonomous: counters increment normally — primed knowledge
+   IS retrieved knowledge, the spaced repetition signal is accurate.
 
 2. From the result, extract and display:
    - Tree nodes loaded (count + capability levels)
@@ -122,8 +159,9 @@ For each category from Phase 1 (in tier order, respecting budget):
 
 ```
 ═══ PRIMED ════════════════════════════════════
-Self: {one-line Self summary from mind/self.md}
-Focus: {focus directive from mind/profile.yaml, or "none set"}
+Self: {one-line Self summary from <agent>/self.md}
+Program: {one-line summary from world/program.md, or "not set"}
+Focus: {focus directive from <agent>/profile.yaml, or "none set"}
 State: {IDLE | RUNNING}
 Domains loaded:
   - {category}: {N} nodes at {depth}, capability: {level}
@@ -140,7 +178,7 @@ IF IDLE state:
 IF RUNNING state:
   (no additional output — boot continues to next step)
 
-IF no mind/ data exists (fresh install, no aspirations):
+IF no world/ data exists (fresh install, no aspirations):
   "Primed with empty state. Run /start to begin building knowledge."
 ```
 
@@ -149,12 +187,11 @@ IF no mind/ data exists (fresh install, no aspirations):
 - Does NOT require a session snapshot — reads data stores directly via scripts
 - Does NOT modify agent-state, working-memory, handoff, or any state files
 - When called from boot: runs after Step 2.5 (snapshot exists for navigation)
-- When called from enterPersona: runs without snapshot (direct reads only)
 - For auto-continuation, boot passes `--category {goal_category}`
 
 ## Chaining
 
-- **Called by**: `/boot` (Step 2.7 full, Step 8.5 continuation), `/enterPersona` (after enabling persona)
+- **Called by**: `/boot` (Step 2.7 full, Step 8.5 continuation), session start protocol (reader/assistant modes)
 - **Calls**: `retrieve.sh`, `guardrails-read.sh`, `reasoning-bank-read.sh`, `aspirations-read.sh` (read-only), `pipeline-read.sh` (read-only)
 - **Does NOT call**: `/boot`, `/aspirations`, `/respond`, or any other skill
 - **Does NOT modify**: agent-state, working-memory, handoff, or any state files

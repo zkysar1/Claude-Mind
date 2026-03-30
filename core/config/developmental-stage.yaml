@@ -1,7 +1,7 @@
 # Developmental Stage Model — Framework Definition
 # Competence-based progression replacing fixed hypothesis count gates.
 # Inspired by Piaget's cognitive development + autotelic agent research.
-# Immutable definitions. Agent state lives in mind/developmental-stage.yaml
+# Immutable definitions. Agent state lives in <agent>/developmental-stage.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---

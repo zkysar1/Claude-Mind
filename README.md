@@ -1,222 +1,106 @@
 # Claude-Mind
 
-**A Claude "skill-system" that aspires to grow knowledge and judgement in any domain.**
+Give Claude Code a persistent mind. It sets its own goals, researches topics, forms predictions, learns from outcomes, and grows smarter across sessions. You tell it what domain to explore — it runs itself from there.
 
-Give Claude Code a persistent mind — goals it sets for itself, knowledge it accumulates across sessions, hypotheses it forms and tests, and skills it builds when it finds gaps. Clone the repo, type `/start`, tell it what domain to explore, and it runs itself from there.
-
-No code to write. Everything is YAML, JSONL, and Markdown files that Claude reads and updates autonomously.
-
-> **Status: Alpha** — Actively developed. The core loop works and has been tested across multi-week autonomous sessions, but APIs and file formats may change.
+> **Status: Alpha** — The core loop works across multi-week autonomous sessions. APIs and file formats may change.
 
 ## Prerequisites
 
-- **Python 3 + PyYAML** — `pip install pyyaml` (all other dependencies are stdlib)
-- **Claude Code CLI** — the agent runs as a Claude Code session
-- **Optional: `.env.local`** — credentials for external integrations (API keys, SSH, email). Copy `.env.example` to `.env.local` and fill in values. This file is gitignored and survives factory reset.
+- **Python 3 + PyYAML** — `pip install pyyaml`
+- **Claude Code** — CLI, desktop app, or IDE extension
 
-## Getting Started
+## Quick Start
 
 ```bash
 git clone <this-repo>
 cd <this-repo>
-# launch Claude Code, then:
-/start
 ```
 
-1. The agent asks you to define its **Self** — what is this agent for? What domain should it explore?
-2. The agent asks for your **initial aspirations** — or generates them from your Self description
-3. `init-mind.sh` creates the `mind/` directory and seeds it from framework definitions
-4. The autonomous learning loop begins — researching, hypothesizing, reflecting, evolving
-
-That's it. The agent runs itself from here. It continues across sessions automatically.
-
-## What Makes This Different
-
-Most agent frameworks run once and forget. This one compounds.
-
-- **Persistent across sessions** — The agent resumes where it left off with full memory of what it learned, what it tried, and what failed. Session 50 builds on everything from sessions 1-49.
-- **Prediction-driven, not just accumulation** — It doesn't just collect facts. It forms hypotheses with confidence levels, tracks outcomes, and calibrates from being wrong. The hypothesis pipeline is the core learning mechanism.
-- **Self-evolving** — When the agent detects a recurring capability gap, it forges a new skill to fill it. The agent you have after months of running is structurally different from the one you started with — it has skills that didn't exist in the original repo.
-- **Pure data, no code** — The entire agent is configuration and state files. Claude reads and writes them autonomously. You never touch code — just define what domain to explore and watch.
-- **Clean separation of learned vs framework** — Everything the agent learns lives in `mind/`. The framework that defines *how* it learns lives in `core/` and `.claude/`. `rm -rf mind/` is a full factory reset — the framework stays, the learned state goes. Fork the framework for a new domain without carrying over old knowledge.
-
-## How It Works
+Then in Claude Code:
 
 ```
-  /start
-    │
-    ▼
-┌─────────────────────────────────────────────┐
-│  Define Self  →  "What am I for?"           │
-│  Seed Aspirations  →  initial goals         │
-└──────────────────┬──────────────────────────┘
-                   │
-    ┌──────────────▼──────────────┐
-    │     Aspirations Loop        │◄──────────────────────┐
-    │  (the perpetual heartbeat)  │                       │
-    └──────────────┬──────────────┘                       │
-                   │                                      │
-    ┌──────────────▼──────────────┐                       │
-    │  Select Goal (scored +      │                       │
-    │  exploration noise)         │                       │
-    └──────────────┬──────────────┘                       │
-                   │                                      │
-    ┌──────────────▼──────────────┐                       │
-    │  Execute  →  research,      │                       │
-    │  test, build, investigate   │                       │
-    └──────────────┬──────────────┘                       │
-                   │                                      │
-    ┌──────────────▼──────────────┐                       │
-    │  Reflect  →  hypotheses,    │                       │
-    │  patterns, calibration      │                       │
-    └──────────────┬──────────────┘                       │
-                   │                                      │
-    ┌──────────────▼──────────────┐                       │
-    │  Encode  →  knowledge tree, │                       │
-    │  reasoning bank, guardrails │                       │
-    └──────────────┬──────────────┘                       │
-                   │                                      │
-    ┌──────────────▼──────────────┐                       │
-    │  Spark  →  new questions,   │                       │
-    │  new goals, evolution check │──────────────────────►┘
-    └─────────────────────────────┘
+/start alpha
 ```
 
-1. **Bootstrap** — Define the agent's Self and seed initial aspirations
-2. **Research** — Build foundational knowledge in the memory tree via web research
-3. **Hypothesize** — Form testable predictions with confidence levels
-4. **Track** — Monitor outcomes, resolve hypotheses as confirmed or disconfirmed
-5. **Learn** — Reflect on outcomes, extract patterns, update reasoning and guardrails
-6. **Evolve** — Spark checks generate new goals. Decompose complex goals. Forge new skills. Adjust strategy.
-7. **Repeat** — The loop never stops. Completion of one thing seeds the next.
+The agent will walk you through setup:
 
-## What It Looks Like
+1. **Where to store shared data** — Point it to a folder for collective knowledge (can be a shared drive, NAS, OneDrive, or a local directory). Then another folder for improvement strategies.
+2. **What is this program about?** — The domain or purpose (e.g., "master competitive Pokemon strategy", "learn quantum computing", "analyze our codebase architecture")
+3. **What should this agent focus on?** — The agent's role and specialization
+4. **What should it work on first?** — Its initial aspiration and curriculum
 
-After a few sessions, the agent's `mind/` directory contains real, accumulated state:
+That's it. The agent runs itself from here. It continues across sessions automatically — just reopen Claude Code and it picks up where it left off.
 
-```
-mind/
-  self.md                    # "I exist to master competitive Pokémon strategy"
-  aspirations.jsonl          # 4 active aspirations, 12 goals across them
-  pipeline.jsonl             # 8 hypotheses: 3 active, 2 resolved, 3 discovered
-  knowledge/tree/            # 23 nodes across 4 domains
-  reasoning-bank.jsonl       # 11 learned reasoning entries
-  guardrails.jsonl           # 6 safety rules discovered from mistakes
-  journal/                   # 9 daily entries documenting what happened
-  developmental-stage.yaml   # Stage: "developing" (was "exploring" on day 1)
-```
+> **Just want knowledge access?** Use `/start alpha --mode reader` for read-only access, or `--mode assistant` to learn only when you teach it.
 
-Here's what a hypothesis lifecycle looks like in `pipeline.jsonl`:
+## What to Expect
 
-```
-Session 3:  hypothesis formed — "Weather teams are more effective in doubles
-            than singles because both slots benefit from weather"
-            confidence: 0.70, horizon: short, stage: discovered
+The agent works in a continuous loop: pick a goal, execute it, reflect on what happened, encode what it learned, then pick the next goal. It never stops unless you tell it to.
 
-Session 5:  moved to active — designed test criteria, began tracking matches
+**In the first session**, it researches your domain, builds initial knowledge, and starts forming hypotheses — predictions it can test later.
 
-Session 8:  resolved CONFIRMED — 68% win rate in doubles vs 41% in singles
-            surprise: 2 (low — matched expectation)
-            → encoded findings to knowledge tree node "weather-strategy"
-            → reflected: extracted reasoning entry rb-014
-            → updated developmental stage for "team-building" category
-```
+**Over multiple sessions**, it accumulates real state: a knowledge tree that grows and restructures itself, a bank of learned reasoning patterns, safety guardrails it discovered from mistakes, and hypotheses that get confirmed or corrected. Session 50 builds on everything from sessions 1-49.
 
-The knowledge tree, reasoning bank, guardrails, and forged skills all grow the same way — incrementally, from real outcomes, across sessions.
+**Over weeks**, it starts evolving structurally. It detects capability gaps and creates new skills to fill them. It tunes its own goal-selection weights and reflection strategies. The agent you have after a month is fundamentally different from the one you started with.
 
-## Core Systems
+You don't need to do anything while it runs. But you can chat with it anytime — ask it what it's learned, point it toward new topics, or give it corrections. It incorporates your feedback immediately.
 
-| System | What it does |
-|--------|-------------|
-| **Goal engine** | Perpetual loop that generates, decomposes, executes, and evolves goals. Completion of one goal seeds the next. |
-| **Knowledge tree** | Dynamic tree that grows as the agent learns. Nodes split when too large, sprout children for subtopics, merge when redundant, prune when stale. |
-| **Hypothesis pipeline** | Forms testable predictions, assigns confidence, tracks outcomes, learns from surprises. `discovered → evaluating → active → resolved → archived` |
-| **Memory pipeline** | Observations flow through staged encoding: sensory buffer → working memory → encoding gate → consolidation → long-term tree. Filtered by novelty, surprise, goal relevance. |
-| **Reflection engine** | After outcomes resolve, reflects on expected vs. actual, extracts patterns and strategies, replays past outcomes to strengthen or revise knowledge. |
-| **Pattern signatures** | Distinguishes situations that look similar but require different responses. Completes partial cues from past experience. |
-| **Skill forging** | Detects recurring capability gaps and creates new skill definitions to fill them. Forged skills persist across sessions. |
-| **Developmental stages** | Competence-based maturity model (exploring → developing → applying → mastering) that adjusts exploration vs. exploitation. |
-
-## Controlling the Agent
+## Commands
 
 | Command | What it does |
 |---------|-------------|
-| `/start` | Initialize or resume the autonomous loop |
-| `/stop` | Stop the loop — chat normally with full knowledge access |
-| `/reset` | Factory reset — wipe all learned state and forged skills |
-| `/escapePersona` | Disable agent persona, act as standard Claude assistant |
-| `/enterPersona` | Re-enable agent persona and knowledge tree |
-| `/verify-learning` | Post-test verification — check agent state against checklist |
-| `/completion-report` | Show what changed since last status report |
-| `/backlog-report` | Sprint planning backlog as markdown |
+| `/start <name>` | Create a new agent or resume in autonomous mode (full perpetual loop). |
+| `/start <name> --mode reader` | Read-only mode — access all accumulated knowledge without writing anything. Safe default. |
+| `/start <name> --mode assistant` | Assistant mode — learns when you teach it, writes when you ask, but doesn't self-direct. |
+| `/stop` | Drop to reader mode. Consolidates session state and returns to safe baseline. |
+| `/start` | Resume in current mode after stopping. |
+| `/start --mode <mode>` | Switch mode and resume. |
+| `/agent-completion-report` | See what the agent accomplished recently. |
+| `/backlog-report` | See the agent's current task queue and priorities. |
+| `/open-questions` | See decisions the agent logged for your review. |
+| `/verify-learning` | Run a diagnostic check on the agent's state. |
 
-When stopped, you can chat normally — ask the agent to review its knowledge, explain what it's learned, restructure strategy, or do regular coding tasks. Run `/start` to resume the loop.
+### Three Modes
 
-## Architecture
+- **Reader** (baseline) — Read-only access to everything the agent has learned. Ask questions, search the knowledge tree, view dashboards. No writes. This is what you get after `/stop`.
+- **Assistant** — Everything reader can do, plus the agent learns when you teach it. Say "remember this", "learn about X", or "research Y" and it writes to its knowledge base. It never self-initiates work.
+- **Autonomous** — Full perpetual learner. The agent sets its own goals, executes them, reflects, and evolves. This is the original mode.
 
-```
-core/                 # Shareable cognitive framework (the "skill-system")
-  config/             # Framework definitions (18 files — immutable)
-    conventions/      # On-demand reference docs (17 files)
-  scripts/            # Utility scripts (100 shell + 25 Python)
+When stopped, you're in reader mode — chat normally, ask about knowledge, or do regular coding tasks. Run `/start` or `/start --mode assistant` to upgrade.
 
-.claude/
-  skills/             # 35 base skill definitions (+ forged skills created by agent)
-  rules/              # Behavioral rules
+## Multiple Agents
 
-mind/                 # All mutable agent state (rm -rf to reset)
-  self.md             # Agent's core purpose
-  aspirations.jsonl   # Goals and aspirations
-  pipeline.jsonl      # Hypothesis lifecycle
-  knowledge/tree/     # Dynamic knowledge tree
-  session/            # Ephemeral session state
-  ...                 # + reasoning bank, guardrails, journal, experiences, etc.
-```
+Run `/start <name>` in separate Claude Code sessions to have multiple agents working on the same domain simultaneously. Each agent has its own identity, experience, and task queue, but they share collective knowledge — what one agent learns, the others can use.
 
-### Framework vs State
+Use `/start <other-name> --mode <mode>` to switch which agent a session controls.
 
-- **`core/`** — The cognitive framework. Defines *how* the agent learns. Immutable during operation. Copy `core/` + `.claude/` + `CLAUDE.md` into any project to bootstrap a new agent.
-- **`mind/`** — Everything the agent learns, discovers, and tracks. Mutable. Domain-specific. `rm -rf mind/` is a full factory reset.
+## Shared Workspace
 
-### Key Design Principles
+The agent stores shared data (knowledge, hypotheses, message board) at a location you choose during setup. This can be:
+- A folder on a shared drive or NAS
+- A OneDrive or SharePoint folder
+- A local directory (for single-machine use)
 
-- **No terminal state** — Completion of one thing seeds the next. The loop runs until you say `/stop`.
-- **Manager, not intern** — The agent makes decisions and continues. It logs significant calls for your review but never blocks waiting for permission.
-- **Autocompact-resilient** — Long sessions survive context compression. Hooks checkpoint state before compaction and restore it after.
-- **Script-mediated data** — All JSONL stores are accessed through scripts, never directly by the LLM. This keeps data consistent and validated.
+Multiple machines can point to the same shared folder. Agents communicate via a message board and all file changes are automatically versioned — browse `world/.history/` to see previous versions of any file, or check `world/changelog.jsonl` for an audit trail of everything that changed.
 
-## Credentials
+## Removing Data
 
-The agent can use external services (APIs, SSH, email) via a simple secrets system:
+Each agent is a self-contained directory. To remove data, delete the relevant directory:
 
-1. Copy `.env.example` to `.env.local`
-2. Fill in the values you need
-3. Scripts access credentials via `core/scripts/env-read.sh`
+| What to remove | What to delete |
+|----------------|---------------|
+| One agent | Delete `<agent>/` (e.g., `rm -rf alpha/`) |
+| Shared knowledge | Delete the world directory at its external path |
+| Improvement strategies | Delete the meta directory at its external path |
+| All local agents | Delete all agent directories from the project root |
 
-`.env.local` is gitignored and survives factory reset. If a skill needs a credential that's missing, it creates a user-action goal and falls back gracefully.
+If an agent created forged skills (check `<agent>/forged-skills.yaml`), those live in `.claude/skills/` and should be manually removed.
 
-## Factory Reset
+## Going Deeper
 
-Run `/reset` in Claude Code, or manually:
-
-```bash
-bash core/scripts/factory-reset.sh
-```
-
-This wipes `mind/` (all learned state) and removes forged skill directories. Framework files (`.claude/`, `core/`) are unchanged.
-
-## Forking for a New Domain
-
-The framework is domain-agnostic. To adapt it:
-
-1. **Clone or fork** this repo
-2. **Optionally customize** entry points:
-   - `core/config/aspirations-initial.jsonl` — bootstrap aspirations (what the agent starts working on)
-   - `core/config/profile.yaml` — system identity and strategy parameters
-   - `core/config/spark-questions.yaml` — seed questions that drive curiosity
-3. **Run `/start`** — the agent asks for its Self and begins learning
-
-No code changes required. The agent builds everything else — knowledge tree, hypotheses, patterns, reasoning entries, guardrails, and forged skills — through its own learning loop.
+- **`CLAUDE.md`** — Full architecture reference, file formats, conventions, and the complete skill catalog. This is the agent's own instruction manual.
+- **`core/config/conventions/`** — Detailed documentation for each subsystem (aspirations, pipeline, knowledge tree, etc.)
+- **`core/config/architecture-reference.md`** — Skill chaining map and self-evolution loop
 
 ## License
 

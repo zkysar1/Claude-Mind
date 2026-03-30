@@ -1,6 +1,7 @@
 # Aspiration Engine — Framework Definition
-# Immutable configuration. Agent state lives in mind/aspirations.jsonl
-# init-mind.sh copies core/config/aspirations-initial.jsonl to mind/ on first run.
+# Immutable configuration. Agent state lives in world/aspirations.jsonl
+# init-world.sh copies core/config/world-aspirations-initial.jsonl to world/ on first run.
+# init-agent.sh copies core/config/agent-aspirations-initial.jsonl to <agent>/ on first run.
 
 # --- FRAMEWORK ---
 
@@ -31,7 +32,7 @@ goal_templates:
     priority: MEDIUM                 # HIGH, MEDIUM, LOW
     category: null                    # Tree category for retrieval — set via category-suggest.sh
     deferred_until: null              # ISO 8601 timestamp — goal skipped in COLLECT until this time
-    defer_reason: null                # Why deferred (context for follow-up)
+    defer_reason: null                # Why deferred — non-null value filters goal from selection
 
   # Build knowledge — deep-dives, audits, topic exploration
   research:
@@ -40,7 +41,7 @@ goal_templates:
       outcomes: ["Knowledge node registered for {topic} with research findings"]
       checks:
         - type: file_check
-          target: "mind/knowledge/tree/_tree.yaml"
+          target: "world/knowledge/tree/_tree.yaml"
           condition: "Node registered for {topic} with research findings"
 
   # Code changes — bug fixes, features, refactoring, security hardening
@@ -58,7 +59,7 @@ goal_templates:
     horizon: short                   # session | short | long (micro stays in working memory)
     resolves_no_earlier_than: null    # session: null, short: +12h, long: +24h
     resolves_by: null                # session: session_end, short: +7d, long: +90d
-    # Pipeline record must exist in mind/pipeline.jsonl (accessed via pipeline-read.sh)
+    # Pipeline record must exist in world/pipeline.jsonl (accessed via pipeline-read.sh)
     # Phase 5 handles CONFIRMED/CORRECTED/PENDING/EXPIRED — not completion_check
 
   # Batch hypothesis operations — resolve outcomes, learn from results
@@ -162,7 +163,7 @@ goal_templates:
       outcomes: ["Knowledge node {key} updated with {topic} findings"]
       checks:
         - type: file_check
-          target: "mind/knowledge/tree/_tree.yaml"
+          target: "world/knowledge/tree/_tree.yaml"
           condition: "Node {key} exists with updated content"
 
   infrastructure:
@@ -229,7 +230,7 @@ goal_templates:
       outcomes: ["Spike findings documented — {question} answered via {approach}"]
       checks:
         - type: file_check
-          target: "mind/knowledge/tree/_tree.yaml"
+          target: "world/knowledge/tree/_tree.yaml"
           condition: "Node updated with spike findings"
 
 planning:
@@ -266,6 +267,67 @@ aspiration_scopes:
 
 default_scope: project
 
+# --- EPISODE CHAINING (MR-Search: Meta-RL with Self-Reflection) ---
+# When a goal fails or produces a surprising outcome, chain multiple attempts
+# with structured reflection between each. Context accumulates:
+#   goal → episode₀ → reflection₀ → episode₁ → reflection₁ → ...
+# Inspired by: MR-Search (arXiv 2603.11327) sequential episode chaining.
+# The agent learns through failure within the same problem context rather than
+# deferring retry to a future loop iteration with no structured memory.
+
+episode_chaining:
+  max_episodes_per_goal: 3           # Max retry attempts with reflection
+  reflection_budget_per_episode: "mini"  # mini | standard — controls reflection depth between episodes
+  chain_on_outcomes:                 # Which outcomes trigger chaining
+    - "failed"                       # Goal execution failed (NOT infrastructure — Phase 4.0 handles those)
+  carry_forward_context: true        # Include prior episode context in next attempt
+  context_zone_override:             # Limit chaining based on context budget
+    tight: 0                         # Disabled — no retries in tight context
+    normal: 1                        # One retry
+    fresh: 2                         # Two retries
+
+# --- EXPLORATION MODE (MR-Search: Exploration/Exploitation Masking) ---
+# Designates certain goal executions as "exploration" where failure does NOT
+# negatively impact accuracy stats, streaks, or evolution triggers.
+# Information gathered IS retained in experience archive and knowledge tree.
+# Inspired by: MR-Search exploration episode masking — zero reward during
+# backpropagation, but full context retention in forward pass.
+
+# --- PLATEAU DETECTION (AVO-inspired: arXiv 2603.24517) ---
+# Detects when aspirations keep completing goals but learning yield is stagnating.
+# Inspired by NVIDIA AVO's self-supervision mechanism that detects exhausted
+# exploration directions and unproductive cycles, then redirects strategically.
+
+plateau_detection:
+  velocity_window: 5              # Number of recent completed goals to analyze
+  plateau_threshold: 0.2          # Learning velocity below this = plateau
+  diminishing_returns_window: 5   # Goals over which to check monotonic decline
+  # Learning is measured by aspiration-trajectory.py as: reasoning bank entries,
+  # guardrails, pattern signatures, and tree node updates attributed to each goal.
+
+# --- CYCLE DETECTION (AVO-inspired: arXiv 2603.24517) ---
+# Detects when the agent cycles through similar failing approaches across
+# different goals within the same aspiration without stepping back to
+# question root assumptions. Inspired by AVO's unproductive edit cycle detection.
+
+cycle_detection:
+  lookback_window: 3              # Number of recent goals to check for cycles
+  checks:                         # What the precheck skill looks for
+    - repeated_failure             # Almost all recent goals skipped/blocked
+    - zero_learning_velocity       # Same-category goals producing no learning artifacts
+
+exploration_mode:
+  auto_designate_below_capability: 0.30  # Categories below this capability_level
+  max_exploration_fraction: 0.25          # Max fraction of goals in exploration mode per session
+  shield_from:                            # What exploration goals are shielded from
+    - accuracy_stats                      # Don't count toward accuracy tracking
+    - streak_reset                        # Don't break streaks on failure
+    - evolution_triggers                  # Don't fire accuracy_drop or consecutive_losses
+  retain_in:                              # What exploration goals still contribute to
+    - experience_archive                  # Full-fidelity trace preserved
+    - tree_encoding                       # Knowledge encoded regardless of outcome
+    - pattern_signatures                  # Patterns still matched and recorded
+
 modifiable:
   max_active: {min: 3, max: 25, default: 20}
   # Agent delegation
@@ -275,3 +337,14 @@ modifiable:
   novelty_drought_hours: {min: 12, max: 168, default: 48}
   maintenance_threshold: {min: 0.50, max: 0.95, default: 0.70}
   default_scope: {values: [sprint, project, initiative], default: project}
+  # Episode chaining bounds
+  max_episodes_per_goal: {min: 1, max: 5, default: 3}
+  # Exploration mode bounds
+  auto_designate_below_capability: {min: 0.10, max: 0.50, default: 0.30}
+  max_exploration_fraction: {min: 0.10, max: 0.50, default: 0.25}
+  # Plateau detection bounds (AVO-inspired)
+  plateau_detection.velocity_window: {min: 3, max: 10, default: 5}
+  plateau_detection.plateau_threshold: {min: 0.05, max: 0.50, default: 0.2}
+  plateau_detection.diminishing_returns_window: {min: 3, max: 10, default: 5}
+  # Cycle detection bounds (AVO-inspired)
+  cycle_detection.lookback_window: {min: 2, max: 5, default: 3}

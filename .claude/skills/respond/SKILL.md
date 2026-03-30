@@ -3,14 +3,15 @@ name: respond
 description: "Handle user messages — persona, knowledge search, directive routing"
 user-invocable: false
 triggers: []
-conventions: [aspirations, tree-retrieval, session-state, experience, reasoning-guardrails, pipeline, journal]
+conventions: [aspirations, tree-retrieval, retrieval-escalation, session-state, experience, reasoning-guardrails, pipeline, journal]
+minimum_mode: reader
 ---
 
 # /respond — User Message Handler
 
-> **CRITICAL**: Step 4 (Knowledge Search) is NOT optional. You MUST execute tree retrieval
-> before answering ANY domain question. Never say "I don't have context" without first
-> reading `mind/knowledge/tree/_tree.yaml` and relevant node files.
+> **CRITICAL**: Step 4 (Knowledge Search) is NOT optional. You MUST attempt retrieval
+> before answering ANY domain question. Follow the 3-tier escalation (tree → codebase → web)
+> defined in Step 4. Never say "I don't have context" without attempting all eligible tiers.
 
 Handles all user messages across agent states. Loaded on-demand when a user message arrives (routed from `.claude/rules/user-interaction.md` stub).
 
@@ -35,44 +36,74 @@ Bash: `session-state-get.sh` → read output:
 ## Step 3a: RUNNING State Response
 
 1. Acknowledge user immediately — respond before any other work
-2. Read `mind/profile.yaml` → use persona settings (tone, verbosity)
+2. Read `<agent>/profile.yaml` → use persona settings (tone, verbosity)
 3. **MANDATORY**: Execute knowledge search (Step 4) — do NOT skip this step
 4. Surface 1-2 pending questions or user goals (Step 4b)
 5. Resume aspirations loop after responding
 
 ## Step 3b: IDLE State Response
 
-1. Read `mind/profile.yaml` → use persona settings (tone, verbosity)
+1. Read `<agent>/profile.yaml` → use persona settings (tone, verbosity)
 2. **MANDATORY**: Execute knowledge search (Step 4) — do NOT skip this step
 3. Surface pending questions and user goals (Step 4b)
 4. On first message only: mention `/start` is available to resume the autonomous loop (do not repeat)
 
 ## Step 3c: UNINITIALIZED State Response
 
-1. Warm welcome: "I'm a continual learning agent. To get started, you'll define my Program (core purpose) and initial aspirations. The Program tells me WHY I exist — it shapes every decision I make. Aspirations are the goals I'll work toward."
+1. Warm welcome: "I'm a continual learning agent. To get started, you'll define The Program (the world's shared purpose) and my Self (my identity as an agent), plus initial aspirations. The Program tells the world WHY it exists. My Self tells me WHO I am. Aspirations are the goals I'll work toward."
 2. Show commands:
-   - `/start` — Define my Program and aspirations, then begin the autonomous learning loop
-   - `/reset` — Wipe everything and start fresh
-3. Prompt: "Type `/start` to get going! I'll ask you for your Program and what you'd like me to aspire to."
-4. If user seems confused, suggest example Programs and aspirations or offer a guided walkthrough
+   - `/start` — Define The Program, my Self, and aspirations, then begin the autonomous learning loop
+3. Prompt: "Type `/start` to get going! I'll ask you for The Program, your agent's identity, and aspirations."
+4. If user seems confused, suggest example Programs, agent identities, and aspirations or offer a guided walkthrough
 5. Answer any questions about the system naturally
 
-## Step 4: Knowledge Search
+## Step 4: Knowledge Search (Escalated Retrieval)
 
-Applies in all states when persona is active. Uses `retrieve.sh` for unified context loading:
+Applies in all states when persona is active. Follows the retrieval escalation convention
+(`core/config/conventions/retrieval-escalation.md`). Stop at the first tier that provides
+sufficient knowledge. Context manifests and quality ratings are NOT needed for conversational responses.
 
-- Bash: `retrieve.sh --category {topic} --depth medium` (default depth)
+### Tier 1 — Knowledge Tree
+
+- Bash: `session-mode-get.sh` → if `reader`, add `--read-only` flag below
+- Bash: `retrieve.sh --category {topic} --depth medium [--read-only]` (default depth)
 - Escalate to `--depth deep` if user asks about a specific topic
 - retrieve.sh returns tree nodes, reasoning bank, guardrails, pattern signatures, experiences
-- Context manifests and quality ratings are NOT needed for conversational responses
-- If nothing relevant found: be transparent — "I don't have anything on that in my knowledge tree yet."
-  - If IDLE or UNINITIALIZED: suggest "Run `/start` and I can begin learning about this!"
+- **Sufficiency check**: Does this answer the user's question confidently?
+  - **YES** → use tree knowledge, proceed to Step 4b
+  - **PARTIAL or NO** → note what's missing, proceed to Tier 2
+
+### Tier 2 — Codebase Exploration
+
+- Read `<agent>/self.md` to identify the primary workspace path (if not already known)
+- If no workspace configured: skip Tier 2
+- Use targeted searches related to the user's question:
+  - **Grep**: search for function names, config values, error messages, patterns
+  - **Glob**: find relevant files by name pattern
+  - **Read**: examine key files identified by Grep/Glob
+- Keep searches targeted — 2-3 specific queries, not exhaustive
+- **Sufficiency check**: Does tree + codebase answer the question?
+  - **YES** → use combined knowledge, proceed to Step 4b
+  - **NO** → check mode for Tier 3 eligibility
+
+### Tier 3 — Web Search (assistant/autonomous only)
+
+- Bash: `session-mode-get.sh` → if `reader`, SKIP Tier 3 entirely
+- WebSearch: targeted query for the specific knowledge gap
+- Optional: WebFetch top result if it looks authoritative
+- Use combined knowledge from all tiers, proceed to Step 4b
+
+### If All Eligible Tiers Exhausted
+
+- Be transparent about what was tried: "I searched my knowledge tree, explored the codebase,
+  [and checked the web,] but don't have information on that yet."
+- If IDLE or UNINITIALIZED: suggest "Run `/start` and I can begin learning about this!"
 
 ## Step 4b: Surfacing
 
 ### Pending Questions
 
-- Read `mind/session/pending-questions.yaml`
+- Read `<agent>/session/pending-questions.yaml`
 - For `status: pending` items, weave 1-2 into conversation naturally
 - Or append: "By the way, I had a question: {question}"
 - When user answers, update status to `answered` and record the answer
@@ -85,22 +116,28 @@ Applies in all states when persona is active. Uses `retrieve.sh` for unified con
 - Mention relevant ones in context
 - Occasionally: "There are {N} items waiting for your input — ask me about them anytime."
 
+### Mode Gate (Steps 5-7.5)
+Bash: `session-mode-get.sh`
+- If mode is `reader`: SKIP Steps 5, 6, 7, 7.5 entirely (read-only mode, no directive processing or learning). RETURN after Step 4b.
+- If mode is `assistant` or `autonomous`: PROCEED with Steps 5-7.5.
+
 ## Step 5: Directive Detection & Routing
 
 Applies in ALL states, persona on or off. When a user message contains a directive (not just a question/comment), detect the type and act:
 
 | Directive Type | Example | Action |
 |---------------|---------|--------|
-| Self/Program update | "Change your purpose to..." / "You're actually a..." | Edit `mind/self.md`, update `last_update_trigger: user-correction`, confirm change |
+| Self update | "Change your purpose to..." / "You're actually a..." | Edit `<agent>/self.md`, update `last_update_trigger: user-correction`, confirm change |
 | New aspiration | "Learn about cooking" | Invoke `/create-aspiration from-user` with the user's description |
 | Remove/pause aspiration | "Stop learning about politics" | Mark aspiration as `paused` via `aspirations-update.sh`, mark its goals as `skipped` |
 | Reprioritize | "Focus more on X than Y" | Update aspiration priorities (HIGH/MEDIUM/LOW) via `aspirations-update.sh` |
-| Persona change | "Be more casual" | Update persona settings in `mind/profile.yaml` |
+| Persona change | "Be more casual" | Update persona settings in `<agent>/profile.yaml` |
 | Remember fact/preference | "Remember I prefer Python" | Write to knowledge tree (via `/tree add`) or working memory if session-scoped (`echo '<json>' | wm-set.sh domain_data`). NEVER use platform auto-memory. |
 | Recurring task | "Check news every week" | Add as recurring goal to an appropriate aspiration |
+| Skill creation request | "Make a skill for X" / "Create a skill" / "Forge a skill for Y" | Route through forge pipeline. Read `meta/skill-gaps.yaml`. If a gap matches the user's description, create goal: title `"Forge skill: {gap.procedure_name}"`, `skill: "/forge-skill"`, `args: "skill {gap-id}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh`. If no matching gap exists, register a new gap in `meta/skill-gaps.yaml` (id: `gap-{next}`, status: `registered`, times_encountered: 1, procedure_name from user description, estimated_value: `medium`), then create the forge goal targeting it. If user was generic ("make a skill" with no specifics), create goal with `skill: "/forge-skill"`, `args: "list"`. Forge-skill gates (curriculum, threshold, stage) apply at execution time — do NOT pre-check here. Confirm: "I'll queue a skill forge for {description}." In UNINITIALIZED state, acknowledge verbally only. |
 | Idea/suggestion | "What if we...?" / "I had an idea..." | Create idea goal: title `"Idea: {user's suggestion}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh` |
-| Observation / problem report | "The processor is running on CPU" / "Logs show errors" / "This is really slow" / "X isn't working" | User observations are implicit investigation requests. Create goal: `"Investigate: {user's observation (50 chars)}"`, priority **HIGH**, in best-fit aspiration via `aspirations-add-goal.sh`. Dedup against existing goals first. Capture user's exact words in description. No confirmation needed — acknowledge and act. In UNINITIALIZED state (no mind/), acknowledge verbally only. |
-| Focus | "Focus on coding" / "explore more" / "save tokens" / "go back to normal" | Update `focus` in `mind/profile.yaml` (null clears focus) |
+| Observation / problem report | "The processor is running on CPU" / "Logs show errors" / "This is really slow" / "X isn't working" | User observations are implicit investigation requests. Create goal: `"Investigate: {user's observation (50 chars)}"`, priority **HIGH**, in best-fit aspiration via `aspirations-add-goal.sh`. Dedup against existing goals first. Capture user's exact words in description. No confirmation needed — acknowledge and act. In UNINITIALIZED state (no world/), acknowledge verbally only. |
+| Focus | "Focus on coding" / "explore more" / "save tokens" / "go back to normal" | Update `focus` in `<agent>/profile.yaml` (null clears focus) |
 
 ### Processing Rules
 
@@ -110,7 +147,7 @@ Applies in ALL states, persona on or off. When a user message contains a directi
 4. Confirm completion: "Done — added aspiration asp-003: Explore Cooking. I'll start working on this in my next loop cycle."
 5. In RUNNING state: directive takes effect on next aspirations loop iteration
 6. In IDLE state: state is updated, takes effect when user runs `/start`
-7. In UNINITIALIZED state: do NOT write files (mind/ doesn't exist yet). Acknowledge conversationally: "Got it — once you run `/start`, I'll set that up." Process the directive immediately after `/start` creates mind/.
+7. In UNINITIALIZED state: do NOT write files (world/ and agent dir don't exist yet). Acknowledge conversationally: "Got it — once you run `/start`, I'll set that up." Process the directive immediately after `/start` creates world/ and agent dir.
 
 ## Step 6: Knowledge Freshness Check
 
@@ -126,7 +163,7 @@ extends knowledge in my tree?
    e. Log: "KNOWLEDGE UPDATE (user correction): {node_key} — {summary}"
    f. Archive user correction as experience:
       experience_id = "exp-user-correction-{node_key}-{date}"
-      Write mind/experience/{experience_id}.md with:
+      Write <agent>/experience/{experience_id}.md with:
           - Exact user statement (verbatim)
           - What was corrected (prior belief/knowledge)
           - Which tree nodes were updated
@@ -144,7 +181,7 @@ extends knowledge in my tree?
                 content: "{exact user message}"
               - key: "prior-belief"
                 content: "{what the agent previously believed}"
-          content_path: "mind/experience/{experience_id}.md"
+          content_path: "<agent>/experience/{experience_id}.md"
 
 2. If the user provided new information that extends but doesn't contradict:
    a. Append insight to relevant node
@@ -219,7 +256,7 @@ The goal enters the aspirations queue and gets full treatment when executed.
 
 ## Step 7.5: Interaction Learning (All Initialized States)
 
-SKIP if: agent state is UNINITIALIZED (no mind/ directory).
+SKIP if: agent state is UNINITIALIZED (no world/ directory).
 SKIP if: persona is false (standard Claude assistant mode, no learning).
 
 After completing the response, directives, knowledge freshness, and discovery checks,
@@ -344,7 +381,7 @@ qualifies, but "I think we should do Z" is a directive (Step 5), not a hypothesi
 
 If any artifacts were **created** (not just strengthened) → archive the interaction:
 
-1. Write content to `mind/experience/exp-interaction-{date}-{slug}.md`:
+1. Write content to `<agent>/experience/exp-interaction-{date}-{slug}.md`:
    ```markdown
    ---
    type: user_interaction
@@ -371,7 +408,7 @@ If any artifacts were **created** (not just strengthened) → archive the intera
        "created": "{today}",
        "category": "{relevant category}",
        "summary": "Interaction learning: {what was learned}",
-       "content_path": "mind/experience/exp-interaction-{date}-{slug}.md",
+       "content_path": "<agent>/experience/exp-interaction-{date}-{slug}.md",
        "tree_nodes_related": ["{nodes consulted in Step 4}"],
        "verbatim_anchors": [{"key": "user-statement", "content": "{user's key statement}"}]
    }
@@ -403,7 +440,7 @@ Artifacts: {list of created/strengthened artifact IDs}
 ## Persona Configuration Reference
 
 - Persona framework defaults defined in `core/config/profile.yaml` under `persona:`
-- Live persona state in `mind/profile.yaml` under `persona:` (seeded from config by `/boot`)
+- Live persona state in `<agent>/profile.yaml` under `persona:` (seeded from config by `/boot`)
 - Tone options: `direct`, `friendly`, `formal`, `casual`
 - Verbosity options: `terse`, `concise`, `detailed`, `thorough`
 - `personality_notes`: free-form string for additional persona guidance (empty by default)
@@ -411,12 +448,12 @@ Artifacts: {list of created/strengthened artifact IDs}
 - `surface_pending_questions`: whether to weave pending questions into responses
 - `surface_user_goals`: whether to mention user-participant goals
 - Persona state: `session-persona-get.sh` returns `true`, `false`, or `unset` (default `true`)
-- Only `/escapePersona`, `/enterPersona`, and `/boot` may set persona via `session-persona-set.sh`
-- User directives like "be more casual" update `mind/profile.yaml` persona fields directly
+- Only `/start`, `/stop`, and `/boot` may set persona via `session-persona-set.sh`
+- User directives like "be more casual" update `<agent>/profile.yaml` persona fields directly
 
 ## Pending Questions Queue Format
 
-When the agent needs user input during autonomous operation, it writes to `mind/session/pending-questions.yaml` instead of blocking:
+When the agent needs user input during autonomous operation, it writes to `<agent>/session/pending-questions.yaml` instead of blocking:
 
 ```yaml
 questions:

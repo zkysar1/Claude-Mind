@@ -3,7 +3,7 @@
 Reasoning bank entries use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `mind/reasoning-bank.jsonl` — Live reasoning bank entries
+- `world/reasoning-bank.jsonl` — Live reasoning bank entries
 
 ## Record Schema
 Required: `id`, `title`, `type`, `category`, `content`, `created`
@@ -15,7 +15,7 @@ Valid types: `success`, `failure`, `user_provided`
 Valid statuses: `active`, `retired`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `mind/reasoning-bank.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `world/reasoning-bank.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
@@ -37,7 +37,7 @@ All backed by `core/scripts/reasoning-bank.py` (Python 3, stdlib only).
 Guardrails use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `mind/guardrails.jsonl` — Live guardrail entries
+- `world/guardrails.jsonl` — Live guardrail entries
 
 ## Record Schema
 Required: `id`, `rule`, `category`, `trigger_condition`, `source`, `created`
@@ -48,7 +48,7 @@ ID format: `guard-NNN` (zero-padded 3-digit, regex: `^guard-\d{3}$`)
 Valid statuses: `active`, `retired`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `mind/guardrails.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `world/guardrails.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|

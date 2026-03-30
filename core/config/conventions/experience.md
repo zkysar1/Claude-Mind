@@ -3,10 +3,10 @@
 Experience records store full-fidelity interaction traces in JSONL with script-based access.
 
 ## File Layout
-- `mind/experience.jsonl` — Live experience records
-- `mind/experience-archive.jsonl` — Archived experiences (append-only)
-- `mind/experience-meta.json` — Metadata (totals, by_type, by_category)
-- `mind/experience/{id}.md` — Full content files (one per experience)
+- `<agent>/experience.jsonl` — Live experience records
+- `<agent>/experience-archive.jsonl` — Archived experiences (append-only)
+- `<agent>/experience-meta.json` — Metadata (totals, by_type, by_category)
+- `<agent>/experience/{id}.md` — Full content files (one per experience)
 
 ## Record Schema
 Required: `id`, `type`, `created`, `category`, `summary`, `content_path`
@@ -37,3 +37,24 @@ The LLM NEVER reads or edits experience JSONL files directly. All operations go 
 
 Scripts validate JSON schema before writing. On validation failure: exit non-zero with error.
 All backed by `core/scripts/experience.py` (Python 3, stdlib only).
+
+## Temporal Credit Fields (MR-Search)
+
+Experience records support temporal credit propagation — when a later goal succeeds because of an earlier goal's research, the earlier experience gets credit. Inspired by MR-Search's discounted temporal credit: `A_{i,n} = Σ γ^(n'-n) × r̃_{i,n'}`.
+
+Optional fields on experience records:
+
+```yaml
+enabled_by:                          # Causal enablers from prior experiences
+  - experience_id: "exp-g-003-02-research"
+    relationship: "provided_foundation"  # provided_foundation | corrected_approach | revealed_constraint
+    temporal_distance: 3             # Number of goals between enabler and this success
+temporal_credit: 0.0                 # Accumulated backward credit from downstream successes
+```
+
+- `enabled_by`: Set by Phase 4.27 when execution succeeds and retrieved context from a prior experience was causally helpful.
+- `temporal_credit`: Accumulated by Step 8.9 of state update — `credit = downstream_learning_value × 0.9^temporal_distance`.
+
+**Note:** `source_reflection_id` is set on **reasoning bank and guardrail records** (not experience records) by Phase 6.5. Phase 4.26 reads it from those records to track which reflections produced helpful artifacts downstream.
+
+Temporal credit informs strategy extraction (`/reflect-extract-patterns` Step 3): experiences with high temporal_credit represent "enabling strategies" that set up later success.

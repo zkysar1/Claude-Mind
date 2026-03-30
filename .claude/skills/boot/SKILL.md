@@ -13,7 +13,8 @@ execution_history:
   last_invocation: null
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
-conventions: [aspirations, pipeline, session-state, handoff-working-memory, secrets, reasoning-guardrails, tree-retrieval, pattern-signatures, journal]
+conventions: [aspirations, pipeline, session-state, handoff-working-memory, secrets, reasoning-guardrails, tree-retrieval, pattern-signatures, journal, curriculum]
+minimum_mode: autonomous
 ---
 
 # /boot — Session Entry Point & Status Report
@@ -38,22 +39,22 @@ This gate means boot can ONLY run when /start has set agent-state to RUNNING.
 
 ## Phase -2: State Initialization (First Boot)
 
-Run the deterministic init script. It creates mind/ with all directories, extracts
-`initial_state:` sections from core/config/ files, and writes boilerplate indexes and L1 tree stubs.
-Idempotent — exits immediately if mind/ already exists.
+Run the deterministic init scripts. They create world/ (collective state), <agent>/ (per-agent state),
+and meta/ (meta-strategies) from core/config/ `initial_state:` sections.
+Idempotent — each exits immediately if its .initialized marker already exists.
 
 ```
-Run: bash core/scripts/init-mind.sh
+Run: bash core/scripts/init-mind.sh $AYOAI_AGENT
 IF exit code != 0: ABORT with error message
 IF output contains "First boot": log "First boot detected — agent is a blank slate"
 ```
 
-Note: init-mind.sh includes migration detection. If mind/aspirations.yaml exists
-without mind/aspirations.jsonl, it auto-runs aspirations-migrate.sh.
+Note: init-mind.sh includes migration detection. If world/aspirations.yaml exists
+without world/aspirations.jsonl, it auto-runs aspirations-migrate.sh.
 
 ## Phase -1.5: Session Temp Cleanup
 
-Remove non-framework files from `mind/session/` left by previous goal execution
+Remove non-framework files from `<agent>/session/` left by previous goal execution
 (domain data exports, analysis artifacts, ad-hoc scripts). Prevents unbounded growth.
 
 ```
@@ -66,7 +67,7 @@ WHITELISTED = [
   "pending-agents.yaml"
 ]
 
-For each file in mind/session/:
+For each file in <agent>/session/:
   IF filename NOT in WHITELISTED:
     Delete file
     Log: "CLEANUP: removed session temp file {filename}"
@@ -76,8 +77,8 @@ For each file in mind/session/:
 
 Ensure persona configuration exists in state files (handles upgrades from pre-persona installations):
 
-1. Read `mind/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
-2. Read `mind/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
+1. Read `<agent>/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
+2. Read `<agent>/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
 3. Bash: `session-persona-set.sh true` — starting the loop always means full agent mode
 
 ## Phase -0.5: Environment Check
@@ -148,12 +149,13 @@ Before generating the report:
 
 ## Step 0.5: Continuation Detection (Auto-Session)
 
-Check for `mind/session/handoff.yaml` to detect auto-continuation from a previous session:
+Check for `<agent>/session/handoff.yaml` to detect auto-continuation from a previous session:
 
 ```
-IF mind/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
+IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
     1. Read handoff.yaml for previous session state
-    1b. Read mind/self.md (Self must be in working context even during fast auto-resume)
+    1b. Read <agent>/self.md (Self must be in working context even during fast auto-resume)
+    1b2. Read world/program.md (The Program must be in working context even during fast auto-resume)
     1c. User Goals Resume:
         IF handoff.user_goals_pending exists and count > 0:
             Output: "USER GOALS: {count} items waiting for your input"
@@ -204,15 +206,18 @@ IF mind/session/handoff.yaml EXISTS (auto-continuation / inline restart from con
     5. Delete handoff.yaml (consumed)
     6. Bash: `session-signal-clear.sh loop-active` (cleanup from previous cycle)
     6b. Bash: `session-counter-clear.sh` (stale counter cleanup)
-    6c. Bash: `rm -f mind/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
+    6c. Bash: `rm -f <agent>/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
     6d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     7. Output abbreviated status:
        "## Auto-Continuation from Session {N}
        {hypotheses_pending} hypotheses pending.
        Previous: {session_summary.goals_completed} goals completed.
        Key outcomes: {session_summary.key_outcomes}.
+       Curriculum: {curriculum_stage_name} ({gates_passed}/{gates_total} gates).
        First action: {first_action.goal_id} ({first_action.reason}).
+       Meta: imp@k {last_session_imp_k} ({trend}) | {active_variant or 'baseline'} | {meta_changes} changes.
        Resuming aspirations loop."
+       (Curriculum line: read from Bash: curriculum-status.sh. If not configured, omit line.)
     8. Run Step 1.5 (resolve catch-up) — always check for new resolutions
     8.5. Context Priming (continuation):
         # Look up first_action.goal_id's category from aspirations data (read at sub-step 1)
@@ -221,10 +226,10 @@ IF mind/session/handoff.yaml EXISTS (auto-continuation / inline restart from con
     10. Jump directly to Step 10 → handoff to /aspirations loop
         Pass first_action and decisions_locked to the loop
 
-IF mind/session/handoff.yaml NOT EXISTS (user-initiated):
+IF <agent>/session/handoff.yaml NOT EXISTS (user-initiated):
     1. Bash: `session-signal-clear.sh loop-active` (cleanup from crashed session)
     1b. Bash: `session-counter-clear.sh` (stale counter cleanup)
-    1c. Bash: `rm -f mind/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
+    1c. Bash: `rm -f <agent>/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
     1d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     2. Proceed with full boot (Steps 1.5 through 12)
 ```
@@ -250,33 +255,44 @@ If no active hypotheses exist, this is a no-op.
 
 Read all state files (including freshly updated data from Step 1.5):
 ```
-mind/self.md                                 → agent Self (core purpose)
+<agent>/self.md                                 → agent Self (core purpose)
+world/program.md                                → The Program (world shared purpose)
 core/config/profile.yaml                          → system config, evaluation framework (framework)
-mind/profile.yaml                           → strategy parameters, evaluation state (mutable state)
+<agent>/profile.yaml                           → strategy parameters, evaluation state (mutable state)
 Bash: aspirations-read.sh --active           → aspirations and goals
 Bash: aspirations-read.sh --meta             → readiness gates, session_count, last_updated
-mind/prep-tasks.yaml                        → pending tasks
-mind/sources.yaml                           → information source tracking
+<agent>/prep-tasks.yaml                        → pending tasks
+world/sources.yaml                           → information source tracking
 Bash: pipeline-read.sh --counts              → pipeline stage counts
 Bash: pipeline-read.sh --accuracy            → accuracy stats
 Bash: pipeline-read.sh --meta                → pipeline metadata
 Bash: pipeline-read.sh --stage active        → active hypotheses
 Bash: pipeline-read.sh --stage discovered    → unscored hypotheses waiting
-mind/knowledge/meta/_index.yaml             → meta-memory (strengths, weaknesses)
-mind/knowledge/patterns/violations.md       → recent violations (if exists)
-mind/experiential-index.yaml               → experiential memory cross-references
+meta/meta-knowledge/_index.yaml             → meta-memory (strengths, weaknesses)
+world/knowledge/patterns/violations.md       → recent violations (if exists)
+<agent>/experiential-index.yaml               → experiential memory cross-references
 Bash: journal-read.sh --meta                → session-level totals for episodic retrieval
 Bash: journal-read.sh --latest              → context from last session
-mind/knowledge/tree/_tree.yaml              → identify all depth-1 nodes
+world/knowledge/tree/_tree.yaml              → identify all depth-1 nodes
 For each depth-1 node: read its .md file    → capability level summaries
+Bash: curriculum-status.sh                  → curriculum stage, unlocks, gates
+Read meta/meta.yaml                             → meta-strategy state (imp@k, evaluations)
+Read meta/improvement-velocity.yaml             → last 5 entries for trend
+Bash: meta-experiment.sh list --active          → active A/B experiments
 ```
 
-Display Self prominently in the dashboard:
+Display Self and The Program prominently in the dashboard:
 ```
 ═══ SELF ══════════════════════════════════════
-[contents of mind/self.md body — everything after the YAML front matter]
+[contents of <agent>/self.md body — everything after the YAML front matter]
 ```
-If mind/self.md is empty or missing, display: "SELF: Not configured — run /start to set up."
+If <agent>/self.md is empty or missing, display: "SELF: Not configured — run /start to set up."
+
+```
+═══ THE PROGRAM ════════════════════════════════
+[contents of world/program.md]
+```
+If world/program.md is empty or missing, display: "PROGRAM: Not set — define via /start."
 
 ## Step 2.7: Context Priming
 
@@ -369,6 +385,12 @@ Confidence calibration: {well-calibrated | overconfident | underconfident}
 |----------|----------|-------|----------|---------|
 | {category-a} | N | moderate | YYYY-MM-DD | YYYY-MM-DD |
 | {category-b} | N | shallow | YYYY-MM-DD | YYYY-MM-DD |
+
+### Meta-Strategy Status
+**Improvement Velocity**: {meta.yaml.last_session_imp_k} (trend: {improving|stable|declining based on delta})
+**Meta Evaluations**: {evaluation_count} total ({total_meta_changes} strategy changes)
+**Active Experiment**: {experiment id + description, or "none — baseline strategies active"}
+**Strategy Files**: {count of meta/ strategy files with non-default content}
 ```
 
 ## Step 5b: Context Health Check
@@ -378,11 +400,11 @@ Monitor knowledge freshness, contradiction, and declining reliability:
 ```
 ### Context Health
 
-Read mind/knowledge/patterns/_index.yaml, mind/knowledge/tree/_tree.yaml, mind/sources.yaml
+Read world/knowledge/patterns/_index.yaml, world/knowledge/tree/_tree.yaml, world/sources.yaml
 
 1. STALE KNOWLEDGE CHECK:
    For each node article at any depth with last_updated > 14 days:
-     If article was cited in a corrected hypothesis (check mind/experiential-index.yaml):
+     If article was cited in a corrected hypothesis (check <agent>/experiential-index.yaml):
        FLAG: "STALE + CORRECTED: {article} — last updated {date}, cited in {corrected_hypothesis}"
    For each pattern signature with outcome_stats:
      If confirmed_rate < 50% in last 10 uses:
@@ -400,11 +422,11 @@ Read mind/knowledge/patterns/_index.yaml, mind/knowledge/tree/_tree.yaml, mind/s
      FLAG: "CONTRADICTION: {article1} ↔ {article2} — requires resolution"
 
 3. SOURCE RELIABILITY CHECK:
-   For each source in mind/sources.yaml:
+   For each source in world/sources.yaml:
      If reliability < 50% AND times_used > 5:
        FLAG: "UNRELIABLE SOURCE: {source} — {reliability}% over {times_used} uses"
 
-4. CONTEXT GAP TRENDS (from mind/experiential-index.yaml):
+4. CONTEXT GAP TRENDS (from <agent>/experiential-index.yaml):
    Read by_context_quality section
    If context_gap_identified count > 0:
      Report: "{N} hypotheses had context gaps — common gaps: {list}"
@@ -421,7 +443,7 @@ Output format:
 If all clear: "Context health: ALL CLEAR — no staleness, contradictions, or reliability issues detected."
 
 ### Temporal Validity Alerts
-Read articles at all tree depths in `mind/knowledge/tree/`. For each article with `temporal_validity` front matter:
+Read articles at all tree depths in `world/knowledge/tree/`. For each article with `temporal_validity` front matter:
 1. Calculate days since `last_confirmed`: today - last_confirmed
 2. If days > `staleness_days`: flag as STALE
 3. Report stale articles in the status dashboard:
@@ -435,7 +457,7 @@ Bash: `journal-read.sh --recent 5` to get last 5 session entries. Look for:
 1. **Repeated topics**: Same category touched 3+ sessions without accuracy improvement → stale strategy alert
 2. **Repeated patterns**: Same pattern signature triggered 3+ sessions → well-exercised, check if `validation_status` should update
 3. **Coverage gaps**: Categories NOT touched in last 5 sessions → potential blind spot alert
-4. **Encoding overflow persistence**: Read `mind/session/overflow-queue.yaml`. Items with `deferred_count >= 3` → promote to consolidation priority or discard
+4. **Encoding overflow persistence**: Read `<agent>/session/overflow-queue.yaml`. Items with `deferred_count >= 3` → promote to consolidation priority or discard
 
 Report findings in the boot dashboard under "Cross-Session Insights" section.
 
@@ -472,19 +494,43 @@ Display the memory tree capability levels:
 
 | Domain | Topic | Level | Confidence | Trend |
 |--------|-------|-------|-----------|-------|
-| (populated from tree nodes in mind/knowledge/tree/) |
+| (populated from tree nodes in world/knowledge/tree/) |
 
-Read actual values from L1 domain files (mind/knowledge/tree/*.md) YAML front matter.
+Read actual values from L1 domain files (world/knowledge/tree/*.md) YAML front matter.
 On first boot with no nodes beyond L1: "No capability data yet — explore a domain first."
 
 Recent capability changes: {list any level transitions since last boot}
 Next capability unlock: {which topic is closest to next threshold}
 ```
 
-Read mind/developmental-stage.yaml for stage context:
-Read mind/profile.yaml for focus:
+Read <agent>/developmental-stage.yaml for stage context:
+Read <agent>/profile.yaml for focus:
 Report: "Stage: {current_stage} | Highest capability: {highest_capability} | Exploration budget: {epsilon}%"
 If focus is set: append "| Focus: \"{focus text}\""
+
+### Step 6b.5: Curriculum Stage
+
+Display the agent's current curriculum stage, unlocks, and gate progress.
+Data source: `curriculum-status.sh` output from Step 2.
+
+```
+IF curriculum-status.sh shows configured: true:
+    ### Curriculum Stage
+
+    Current: {stage_name} ({current_stage})
+    Unlocks: self_edits={yes/no} | forge={yes/no} | parallel={yes/no}
+    Gates: {gates_passed}/{gates_total} passed
+
+    | Gate | Status | Current | Required | Description |
+    |------|--------|---------|----------|-------------|
+    | {gate.id} | PASS/FAIL | {current_value} | {threshold} | {description} |
+
+    Next promotion: {next_stage name, or "Terminal stage — fully autonomous"}
+    Promotion requires: {plain-language description of remaining gates}
+
+IF curriculum-status.sh shows configured: false:
+    "Curriculum: Not configured — agent has no staged capability restrictions."
+```
 
 ### Step 6c: Domain Health Summary
 
@@ -566,7 +612,7 @@ If no L1 nodes have sufficient data, output: "Domain health: insufficient data a
 - Research queue items pending > 14 days: {list}
 - Accuracy dropping (last 5 below last 10): {flag}
 - Confidence calibration significantly off: {flag}
-- Status report: last generated {from mind/session/last-report-timestamp or "never"}
+- Status report: last generated {from <agent>/session/last-report-timestamp or "never"}
 
 ### Triggered Reviews
 {List any auto-review triggers from resolve_result.triggered_reviews (from Step 1.5)}
@@ -621,16 +667,17 @@ Readiness: {N}/6 gates ({stage})
 Focus: {today's recommended focus area}
 Alerts: {count} ({brief list})
 Stage: {developmental stage} (exploration budget {N}%)
+Curriculum: {stage_name} ({gates_passed}/{gates_total} gates)
 ```
 
-Note: /aspirations State Update Step 7 is the authoritative owner of mind/journal.jsonl.
+Note: /aspirations State Update Step 7 is the authoritative owner of <agent>/journal.jsonl.
 Boot creates the session's journal .md entry; the aspirations loop creates/updates the journal.jsonl session record on first goal completion via `journal-add.sh` and `journal-merge.sh`.
 
 ## Step 12: Evolution Check
 
 Check `core/config/evolution-triggers.yaml` performance-based triggers (accuracy drop, consecutive losses, pattern divergence, capability unlock, stale strategy).
 Read aspiration state: Bash: `aspirations-read.sh --active`
-Read evolution history: `mind/evolution-log.jsonl`
+Read evolution history: `meta/evolution-log.jsonl`
 1. Review accuracy trends
 2. Review meta-memory changes since last evolution
 3. Propose aspiration changes
@@ -644,4 +691,4 @@ Read evolution history: `mind/evolution-log.jsonl`
 - **Called by**: `/start` (user command), `/aspirations` session-end consolidation (inline restart)
 - **Calls**: `/prime` (context priming — Step 2.7 full, Step 8.5 continuation), `/review-hypotheses --resolve` (catch-up on resolutions, NO learning), `/aspirations` completion checks (Phase 0), `/aspirations loop` (handoff to perpetual heartbeat)
 - **Does NOT call**: `/reflect` (learning happens downstream via `/aspirations` goals calling `/review-hypotheses --learn`)
-- **Auto-session**: When `mind/session/handoff.yaml` exists, runs in continuation mode (abbreviated report, fast handoff). See `/aspirations` Auto-Session Continuation Protocol for details.
+- **Auto-session**: When `<agent>/session/handoff.yaml` exists, runs in continuation mode (abbreviated report, fast handoff). See `/aspirations` Auto-Session Continuation Protocol for details.

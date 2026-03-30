@@ -4,7 +4,7 @@ Reference documentation for memory tree structure, entity cross-links, reasoning
 
 ## Knowledge Articles (= Tree Nodes)
 
-Knowledge articles ARE tree node `.md` files — there is no separate article storage. All knowledge lives in the memory tree under `mind/knowledge/tree/`.
+Knowledge articles ARE tree node `.md` files — there is no separate article storage. All knowledge lives in the memory tree under `world/knowledge/tree/`.
 
 - YAML front matter minimal schema (all scoring/structural fields live in `_tree.yaml` only):
   - `topic` — display name of this node
@@ -20,23 +20,23 @@ Knowledge articles ARE tree node `.md` files — there is no separate article st
 
 The system's memory is organized as a **dynamic random tree** inspired by the *Random Tree Model of Meaningful Memory* (Zhong et al., PRL 2025). Each node compresses its descendants, producing sublinear memory growth. The tree grows organically via `/tree maintain` operations: DECOMPOSE, REDISTRIBUTE, SPLIT, SPROUT, MERGE, PRUNE.
 
-**Dynamic tree index**: `mind/knowledge/tree/_tree.yaml` — the living registry of all nodes. Skills read this to navigate; never hardcode category-to-path mappings. Framework config (K_max, D_max, thresholds): `core/config/tree.yaml`.
+**Dynamic tree index**: `world/knowledge/tree/_tree.yaml` — the living registry of all nodes. Skills read this to navigate; never hardcode category-to-path mappings. Framework config (K_max, D_max, thresholds): `core/config/tree.yaml`.
 
 ```
 L0: _tree.yaml root node (virtual root — summary field)
- ├── L1: mind/knowledge/tree/{domain}.md              (interior)
- │    ├── L2: mind/knowledge/tree/{domain}/{topic}.md  (leaf or interior)
+ ├── L1: world/knowledge/tree/{domain}.md              (interior)
+ │    ├── L2: world/knowledge/tree/{domain}/{topic}.md  (leaf or interior)
  │    │    ├── L3: .../{topic}/{subtopic}.md            (leaf or interior)
  │    │    │    ├── L4: .../{subtopic}/{detail}.md      (leaf or interior)
  │    │    │    │    ├── L5: .../{detail}/{sub-detail}.md
  │    │    │    │    └── L6: max structural depth
  │    │    │    └── L4: .../{subtopic}/{detail-2}.md
  │    │    └── L3: .../{topic}/{subtopic-2}.md
- │    └── L2: mind/knowledge/tree/{domain}/{topic-2}.md
- ├── L1: mind/knowledge/tree/execution.md              (what to DO)
- ├── L1: mind/knowledge/tree/intelligence.md           (what we KNOW)
- ├── L1: mind/knowledge/tree/performance.md            (how we're DOING)
- └── L1: mind/knowledge/tree/system.md                 (HOW we work)
+ │    └── L2: world/knowledge/tree/{domain}/{topic-2}.md
+ ├── L1: world/knowledge/tree/execution.md              (what to DO)
+ ├── L1: world/knowledge/tree/intelligence.md           (what we KNOW)
+ ├── L1: world/knowledge/tree/performance.md            (how we're DOING)
+ └── L1: world/knowledge/tree/system.md                 (HOW we work)
 
 Directory nesting: interior nodes at depth N have a same-named directory
 containing their children at depth N+1. Retrieval descends to D_retrieval=4.
@@ -73,7 +73,7 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 ## Dynamic Tree Conventions
 
 ### Node Registry
-- All memory tree nodes registered in `mind/knowledge/tree/_tree.yaml`
+- All memory tree nodes registered in `world/knowledge/tree/_tree.yaml`
 - Skills read `_tree.yaml` to navigate — never hardcode category→path mappings
 - `growth_state` values: `stable`, `growing`, `ready_to_split`, `ready_to_decompose`
 - K_max=4 is a soft limit at all levels (can exceed when justified, log reason to tree_growth_log)
@@ -85,7 +85,7 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 - MERGE: `article_count <= merge_threshold (1)`, no children → absorb into sibling
 - PRUNE: empty node, no sibling → archive
 - All levels auto-create; L1 new domains logged prominently in journal and tree_growth_log
-- Always log to `tree_growth_log` in `mind/knowledge/tree/_tree.yaml`
+- Always log to `tree_growth_log` in `world/knowledge/tree/_tree.yaml`
 
 ### Interior vs Leaf Invariant
 - **Interior nodes**: have children, contain summary/index only, `node_type: interior` in `_tree.yaml`
@@ -96,7 +96,7 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 - Every node is exactly one of interior or leaf — never both. The `node_type` field in `_tree.yaml` is the source of truth.
 
 ### Tree Node Files
-- Path construction at any depth: `mind/knowledge/tree/{L1}/{L2}/.../{node}.md`
+- Path construction at any depth: `world/knowledge/tree/{L1}/{L2}/.../{node}.md`
 - YAML front matter: minimal schema only — `topic`, `entities`, `temporal_validity`, `sources`, `last_update_trigger`
 - All structural/scoring metadata (`parent`, `depth`, `node_type`, `confidence`, `capability_level`, `article_count`) lives in `_tree.yaml` only
 - See `core/config/tree.yaml` `node_file_front_matter` template for the canonical minimal schema
@@ -115,7 +115,7 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 
 ## Entity Cross-Links
 
-- Entity index lives in `mind/knowledge/tree/_tree.yaml` under `entity_index`
+- Entity index lives in `world/knowledge/tree/_tree.yaml` under `entity_index`
 - Entity format: `{entity_name: {articles: [paths], tree_nodes: [node_ids], mention_count: N}}`
 - Entity types: `person`, `organization`, `concept`, `metric`, `event` (informational, not enforced)
 - Entities extracted during: `/research-topic` (Step 3), `/reflect` (Step 7.5b)
@@ -181,10 +181,10 @@ Experiences store complete interaction traces, tool outputs, and evidence indexe
 
 Experiences are **operational state** (lifecycle, retrieval stats, archival) not **reference knowledge**. A single experience may span multiple tree node topics. They live separately from the tree but cross-link to it.
 
-- Experience records: `mind/experience.jsonl` (JSONL, script-accessed only)
-- Full content files: `mind/experience/{id}.md` (markdown, read via Read tool)
-- Experience archive: `mind/experience-archive.jsonl` (append-only)
-- Experience metadata: `mind/experience-meta.json`
+- Experience records: `<agent>/experience.jsonl` (JSONL, script-accessed only)
+- Full content files: `<agent>/experience/{id}.md` (markdown, read via Read tool)
+- Experience archive: `<agent>/experience-archive.jsonl` (append-only)
+- Experience metadata: `<agent>/experience-meta.json`
 
 ### JSONL Record Schema
 
@@ -224,7 +224,7 @@ retrieval_stats:
 
 ### Content Files
 
-Full interaction trace stored at `content_path` (e.g., `mind/experience/exp-g001-05-research.md`). Created alongside the JSONL record. Contains complete reasoning traces, tool outputs, decisions, and outcomes. Read via standard `Read` tool when dereferencing.
+Full interaction trace stored at `content_path` (e.g., `<agent>/experience/exp-g001-05-research.md`). Created alongside the JSONL record. Contains complete reasoning traces, tool outputs, decisions, and outcomes. Read via standard `Read` tool when dereferencing.
 
 ### Cross-Linking to Tree Nodes
 
@@ -234,7 +234,7 @@ Full interaction trace stored at `content_path` (e.g., `mind/experience/exp-g001
 
 ### Staleness & Archival
 
-Experiences are records of what happened — the event doesn't become less true, but its relevance decays. Staleness triggers archival (move JSONL record to `experience-archive.jsonl`), not deletion. Content `.md` files stay in `mind/experience/` and remain dereferenceable.
+Experiences are records of what happened — the event doesn't become less true, but its relevance decays. Staleness triggers archival (move JSONL record to `experience-archive.jsonl`), not deletion. Content `.md` files stay in `<agent>/experience/` and remain dereferenceable.
 
 Archive triggers (via `experience-archive.sh`, called during session-end consolidation):
 - `created` > 30 days AND `retrieval_count == 0` → never used → archive

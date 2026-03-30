@@ -18,6 +18,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, experience, tree-retrieval, reasoning-guardrails, pattern-signatures, handoff-working-memory]
+minimum_mode: autonomous
 ---
 
 # /replay — Hippocampal Replay Engine
@@ -72,7 +73,7 @@ Apply spaced repetition filter:
 Select top N candidates (N = max_replay_items from config, default 10)
 
    # Add experience-backed candidates
-   IF mind/experience.jsonl exists:
+   IF <agent>/experience.jsonl exists:
        Bash: experience-read.sh --type goal_execution
        Bash: experience-read.sh --type hypothesis_formation
        Include experiences with high retrieval_count as additional replay candidates
@@ -213,7 +214,7 @@ Find patterns in the strongest domain that could bootstrap weaker domains.
 ```
 leaves_json=$(bash core/scripts/tree-read.sh --leaves)
 # Each entry has key, depth, capability_level — extract domain-level capability info
-Read mind/developmental-stage.yaml → exploration budget allocation
+Read <agent>/developmental-stage.yaml → exploration budget allocation
 
 strongest = leaf with highest capability_level (strong domain, EXPLOIT or MASTER level)
 weakest = leaf with lowest capability_level (weak domain, EXPLORE or CALIBRATE level)

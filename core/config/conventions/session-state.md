@@ -1,6 +1,6 @@
 # Agent State Machine
 
-- State file: `mind/session/agent-state` (plain text, no YAML)
+- State file: `<agent>/session/agent-state` (plain text, no YAML)
 - Valid values: `RUNNING`, `IDLE`. Absence = UNINITIALIZED.
 - ONLY `/start` and `/stop` may write to this file (via `session-state-set.sh`)
 - Claude MUST NOT modify agent-state under any circumstances
@@ -9,16 +9,36 @@
 
 ---
 
+# Agent Mode
+
+- Mode file: `<agent>/session/agent-mode` (plain text, no YAML)
+- Valid values: `reader`, `assistant`, `autonomous`. Absence = `reader` (safe default).
+- ONLY `/start` and `/stop` may write to this file (via `session-mode-set.sh`)
+- Claude MUST NOT modify agent-mode under any circumstances
+- Skills check mode at entry via `session-mode-get.sh` and refuse if insufficient
+- All reads via `session-mode-get.sh`, all writes via `session-mode-set.sh`
+
+Mode is the single user-facing control. State and persona are derived:
+- reader → IDLE, persona light (knowledge access, no agent character)
+- assistant → IDLE, persona full (agent identity, tone, personality)
+- autonomous → RUNNING, persona full + perpetual loop
+
+Mode-specific behavioral rules live in `core/config/modes/{mode}.md`.
+
+---
+
 # Session State Script Access
 
-Session control files in `mind/session/` are accessed exclusively via scripts.
-The LLM MUST NOT read or write `agent-state`, `persona-active`, signal files,
+Session control files in `<agent>/session/` are accessed exclusively via scripts.
+The LLM MUST NOT read or write `agent-state`, `agent-mode`, `persona-active`, signal files,
 or `stop-block-count` directly. All access goes through scripts:
 
 | Script | Purpose |
 |--------|---------|
 | `session-state-get.sh` | Returns: RUNNING, IDLE, or UNINITIALIZED |
 | `session-state-set.sh <value>` | Validates and writes (RUNNING or IDLE only) |
+| `session-mode-get.sh` | Returns: reader, assistant, autonomous (default: reader) |
+| `session-mode-set.sh <value>` | Validates and writes (reader, assistant, or autonomous only) |
 | `session-persona-get.sh` | Returns: true, false, or unset |
 | `session-persona-set.sh <value>` | Validates and writes (true or false only) |
 | `session-signal-set.sh <name>` | Creates marker file (loop-active or stop-loop only) |
@@ -32,10 +52,10 @@ All backed by `core/scripts/session.py` (Python 3, stdlib only).
 
 ---
 
-# Generic YAML Store (mind/ files)
+# Generic YAML Store (agent directory files)
 
-YAML state files in `mind/` are accessed via generic scripts.
-File paths are relative to `mind/`. Path traversal outside `mind/` is rejected.
+YAML state files in the agent directory are accessed via generic scripts.
+File paths are relative to the agent directory (`$AGENT_DIR`). Path traversal outside it is rejected.
 
 | Script | Purpose |
 |--------|---------|
@@ -53,7 +73,7 @@ All backed by `core/scripts/mind-yaml.py` (Python 3, PyYAML).
 
 # Working Memory Scripts
 
-Working memory (`mind/session/working-memory.yaml`) has its own dedicated script family.
+Working memory (`<agent>/session/working-memory.yaml`) has its own dedicated script family.
 The LLM MUST NOT read or write `working-memory.yaml` directly — all access via `wm-*.sh`.
 Full schema and pruning rules: `core/config/conventions/working-memory.md`.
 
@@ -76,7 +96,7 @@ All backed by `core/scripts/wm.py` (Python 3, PyYAML).
 
 When autocompact fires, `PreCompact` hook saves encoding state before context compression:
 
-- **File**: `mind/session/compact-checkpoint.yaml`
+- **File**: `<agent>/session/compact-checkpoint.yaml`
 - **Written by**: `core/scripts/precompact-checkpoint.sh` (PreCompact hook, matcher: auto)
 - **Injected by**: `core/scripts/postcompact-restore.sh` (SessionStart hook, matcher: compact — stdout injected into context)
 - **Consumed by**: aspirations loop Phase -0.5c (processes encoding queue in fresh context, then deletes checkpoint)
@@ -93,28 +113,39 @@ Hooks configured in `.claude/settings.json` (project-level, not skill-scoped).
 
 # Report Timestamp
 
-`mind/session/last-report-timestamp` — plain text file containing an ISO timestamp.
-Written by `/completion-report` Phase 4 after generating a report. Read by Phase 1
+`<agent>/session/last-report-timestamp` — plain text file containing an ISO timestamp.
+Written by `/agent-completion-report` Phase 5 after generating a report. Read by Phase 1
 to determine the report window. If missing, report falls back to `handoff.yaml`
 session start time or shows lifetime totals.
+
+Report files: `/agent-completion-report` Phase 4 writes the full report markdown to
+`<agent>/reports/completion-report-{timestamp}.md` (timestamped archive) and
+`<agent>/COMPLETION-REPORT.md` (latest, overwritten each run).
 
 ---
 
 # Context Read Deduplication
 
-Hooks prevent redundant file reads between compaction cycles:
+Hooks prevent redundant file reads AND skill invocations between compaction cycles:
 
 - `PreToolUse[Read]` gates re-reads of tracked files (exit 2 = block)
+- `PreToolUse[Skill]` gates duplicate skill invocations (exit 2 = block, combined gate+record)
 - `PostToolUse[Read]` auto-records reads
 - `PostToolUse[Write,Edit]` invalidates modified tree nodes
 - PreCompact clears the tracker
 
+**Note**: `PostToolUse` does not fire for the Skill tool (the Skill tool injects content
+into the conversation stream rather than returning a traditional tool result). The
+`PreToolUse[Skill]` hook therefore combines gating and recording in a single step: on
+first invocation it records the SKILL.md path and allows; on subsequent invocations it
+blocks with "Skill /name instructions already in context."
+
 Skills use `load-conventions.sh` in Step 0 to batch-check which conventions need loading.
 
-**Scope**: `core/config/**`, `.claude/skills/**/SKILL.md`, `mind/knowledge/tree/**`, `mind/conventions/**`.
+**Scope**: `core/config/**`, `.claude/skills/**/SKILL.md` (Read AND Skill tool), `world/knowledge/tree/**`, `world/conventions/**`.
 Partial reads (offset/limit) bypass tracking.
 
-**Scripts**: `core/scripts/context-reads.py`, `core/scripts/load-conventions.sh`.
+**Scripts**: `core/scripts/context-reads.py`, `core/scripts/context-reads-skill-gate.sh`, `core/scripts/load-conventions.sh`.
 
 ---
 
@@ -123,7 +154,7 @@ Partial reads (offset/limit) bypass tracking.
 Tracks dispatched background agents (`Agent(run_in_background=true)`) so the stop hook
 and aspirations loop can handle the idle-while-agents-work scenario correctly.
 
-- **File**: `mind/session/pending-agents.yaml`
+- **File**: `<agent>/session/pending-agents.yaml`
 - **Written by**: aspirations-execute Phase 4 (before Agent dispatch)
 - **Read by**: stop-hook.sh Gate 2.5, aspirations Phase -0.5a
 - **Cleaned by**: aspirations post-Phase 9.7 (team shutdown), `pending-agents.sh prune-stale`
@@ -144,5 +175,5 @@ and aspirations loop can handle the idle-while-agents-work scenario correctly.
 (exit 0) and the counter is cleared. Background agent completion notifications re-engage
 the parent agent, which collects results in Phase -0.5a.
 
-**Staleness guard**: agents past their `timeout_minutes` (default 30) are auto-pruned by
-`has-pending`, preventing orphaned registrations from permanently disabling the stop hook.
+**Staleness guard**: agents past their `timeout_minutes` (default 10) are auto-pruned by
+`has-pending` and `list`, preventing orphaned registrations from permanently disabling the stop hook.

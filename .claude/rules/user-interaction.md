@@ -2,10 +2,34 @@
 
 ## Immutable Constraints (all states)
 
-- Claude MUST NOT invoke /start, /stop, /reset, /escapePersona, /enterPersona, /open-questions
-- Claude MUST NOT modify `mind/session/agent-state` or `mind/session/persona-active` (all access via session-*.sh scripts)
-- `/escapePersona` and `/enterPersona` ALWAYS work — persona behavior never blocks the escape hatch
-- User directive processing ALWAYS works regardless of persona state
+- Claude MUST NOT invoke /start, /stop, /open-questions
+- Claude MUST NOT modify `<agent>/session/agent-state`, `<agent>/session/agent-mode`, or `<agent>/session/persona-active` — see Script-Level Restrictions below
+- User directive processing works in assistant and autonomous modes (not reader mode)
+
+## Script-Level Restrictions
+
+The following scripts perform user-only state changes. Claude MUST NOT call them
+directly via Bash — they may only be executed as part of user-invoked skills:
+
+- `session-state-set.sh` — only /start and /stop may change agent state
+- `session-mode-set.sh` — only /start and /stop may change agent mode
+- `init-mind.sh`, `init-world.sh`, `init-agent.sh`, `init-meta.sh` — only /start and /boot may initialize
+
+The following are restricted to specific callers:
+
+- `session-persona-set.sh false` — only /stop
+- `session-persona-set.sh true` — /start, /boot
+- `session-counter-increment.sh` — only the stop hook (not an LLM tool call)
+- `session-signal-set.sh stop-loop` — only /stop and /recover (existing rule, see stop-hook-compliance.md)
+
+The agent retains full access to all **read-only** session scripts:
+`session-state-get.sh`, `session-mode-get.sh`, `session-persona-get.sh`, `session-signal-exists.sh`, `session-counter-get.sh`
+
+And to these **write** scripts for legitimate loop operations:
+`session-signal-set.sh loop-active`, `session-signal-clear.sh *`, `session-counter-clear.sh`
+
+Claude MUST NOT write to session state files directly (via Write, Edit, echo, cat, python, etc.):
+`agent-state`, `agent-mode`, `persona-active`, `stop-loop`, `stop-block-count`, `.active-agent-*`
 
 ## Response Header (RUNNING state)
 
@@ -20,21 +44,19 @@ Respond to user FIRST, then resume autonomous work.
 
 ## State Reporting
 
-When asked about state: `State: {IDLE/RUNNING} | Persona: {ON/OFF} | Loop: {ACTIVE/INACTIVE}`
+When asked about state: `State: {IDLE/RUNNING} | Mode: {reader/assistant/autonomous} | Persona: {ON/OFF} | Loop: {ACTIVE/INACTIVE}`
 
-Bash: `session-state-get.sh`, `session-persona-get.sh`, and `session-signal-exists.sh loop-active`.
+Bash: `session-state-get.sh`, `session-mode-get.sh`, `session-persona-get.sh`, and `session-signal-exists.sh loop-active`.
 
-## Knowledge Tree Retrieval (MANDATORY)
+## Knowledge Retrieval (MANDATORY)
 
-When persona is active (`session-persona-get.sh` returns `true` or `unset`) and the user asks ANY question that could relate to learned knowledge:
+When persona is active (`session-persona-get.sh` returns `true` or `unset`) and the user asks ANY question that could relate to learned knowledge, follow the retrieval escalation convention (`core/config/conventions/retrieval-escalation.md`):
 
-1. Read `mind/knowledge/tree/_tree.yaml` — scan node summaries for relevance
-2. For each relevant node: read its `.md` file for content
-3. Use retrieved knowledge to inform your answer
-4. NEVER say "I don't have context" or "Could you clarify?" without FIRST checking the tree
-5. If the tree has nothing relevant: say so explicitly — "I checked my knowledge tree but don't have anything on that topic yet."
+1. **Tier 1**: Knowledge tree — `retrieve.sh` or read `_tree.yaml` + relevant node `.md` files
+2. **Tier 2**: Codebase exploration — Grep/Glob/Read on the primary workspace (all modes)
+3. **Tier 3**: Web search — WebSearch/WebFetch (assistant/autonomous only)
 
-This applies in ALL states (RUNNING, IDLE, UNINITIALIZED) as long as persona is active and `mind/knowledge/tree/_tree.yaml` exists. Full retrieval via `retrieve.sh --category {topic} --depth medium` runs in Step 4 of `/respond`, but the tree check above is the **minimum** — it must always happen.
+Stop at the first tier that provides sufficient knowledge. NEVER say "I don't have context" without attempting all eligible tiers. Full escalated retrieval runs in Step 4 of `/respond`.
 
 ## Routing
 

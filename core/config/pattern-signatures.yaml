@@ -1,6 +1,6 @@
 # Pattern Signatures Configuration — Framework Definition
 # Dentate Gyrus (separation) + CA3 (completion)
-# Immutable config. Agent state lives in mind/pattern-signatures.jsonl (script-accessed)
+# Immutable config. Agent state lives in world/pattern-signatures.jsonl (script-accessed)
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---

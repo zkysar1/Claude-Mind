@@ -84,10 +84,10 @@ TESTING_KEYWORDS = [
     "integration path", "event bus", "verification",
 ]
 
-# Extracts script commands from rule text (e.g., "mind/scripts/domain-check.sh check --since 30").
-# Captures: optional mind/scripts/ prefix + script name + optional subcommand + optional --flag value.
+# Extracts script commands from rule text (e.g., "world/scripts/domain-check.sh check --since 30").
+# Captures: optional world/scripts/ prefix + script name + optional subcommand + optional --flag value.
 ACTION_HINT_RE = re.compile(
-    r'((?:mind/scripts/)?(?:[\w-]+\.sh)'
+    r'((?:world/scripts/)?(?:[\w-]+\.sh)'
     r'(?:\s+(?:check|status|has|value|check-all|stale|read)'  # subcommand
     r'(?:\s+--\w+\s+\d+)?)?)',  # optional --flag value
     re.IGNORECASE,
@@ -170,7 +170,7 @@ def extract_action_hint(rule_text):
     """Extract recognizable script commands from rule text.
 
     Guardrail text should use full paths: 'scripts/infra-health.sh' for
-    framework scripts, 'mind/scripts/my-check.sh' for domain scripts.
+    framework scripts, 'world/scripts/my-check.sh' for domain scripts.
     No auto-prefix magic — the path in the text is the path that runs.
     """
     match = ACTION_HINT_RE.search(rule_text)

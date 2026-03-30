@@ -7,6 +7,7 @@ triggers:
   - "/reflect-batch-micro"
   - "/reflect --batch-micro"
 conventions: [pipeline, handoff-working-memory]
+minimum_mode: autonomous
 ---
 
 # /reflect-batch-micro — Batch Micro-Hypothesis Reflection
@@ -97,15 +98,15 @@ Update micro_hypothesis_stats:
 Bash: pipeline-meta-update.sh micro_hypothesis_stats '<JSON>'
 
 # Count toward developmental stage resolved_hypotheses total
-Read mind/developmental-stage.yaml
+Read <agent>/developmental-stage.yaml
 Update: resolved_hypotheses += (confirmed + corrected)  # only resolved micros count
-Write mind/developmental-stage.yaml
+Write <agent>/developmental-stage.yaml
 ```
 
 ## Step 5: Journal Entry
 
 ```
-Append to mind/journal/YYYY/MM/YYYY-MM-DD.md:
+Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
 
 ## Micro-Hypothesis Batch — Session {N}
 Total: {total} | Confirmed: {confirmed}/{confirmed+corrected} ({accuracy_pct}%)

@@ -34,7 +34,7 @@ execution. Quality over quantity.
 
 Good rules:
 - IF probing service health THEN use /health endpoint not /status — source: g-001-03
-- IF accessing remote data THEN use path from env config, not hardcoded paths — source: g-002-02
+- IF accessing remote data THEN use path from env config, not hardcoded paths — source: g-001-02
 - IF calling external API THEN use https:// with proper cert handling — source: g-003-01
 
 Bad rules (don't write these):

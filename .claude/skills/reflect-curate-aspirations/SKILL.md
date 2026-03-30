@@ -7,6 +7,7 @@ triggers:
   - "/reflect-curate-aspirations"
   - "/reflect --curate-aspirations"
 conventions: [aspirations, experience, goal-schemas]
+minimum_mode: autonomous
 ---
 
 # /reflect-curate-aspirations — Aspiration Grooming
@@ -61,7 +62,7 @@ For each aspiration:
 
     # 1e: Orphaned deferral — defer_reason references infrastructure but
     #     no matching decisions_locked entry exists (decision was invalidated/expired)
-    IF goal.defer_reason is set AND goal.deferred_until is set:
+    IF goal.defer_reason is set:
       IF defer_reason mentions blocked/unavailable/down/infrastructure:
         Check decisions_locked from current session context (passed from boot)
         IF no decisions_locked entry substantiates the defer_reason:

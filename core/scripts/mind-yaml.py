@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generic YAML store for mind/ state files.
+"""Generic YAML store for agent state files.
 
 All shell scripts are thin wrappers around this. Subcommands managed via argparse.
 
-Provides field-level read/write/increment/append for any YAML file in mind/.
-File paths are relative to mind/ and validated to prevent traversal.
+Provides field-level read/write/increment/append for any YAML file in the agent directory.
+File paths are relative to the agent directory and validated to prevent traversal.
 """
 
 import argparse
@@ -24,7 +24,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -32,10 +32,10 @@ from _paths import MIND_DIR
 # ---------------------------------------------------------------------------
 
 def resolve_path(rel_path):
-    """Resolve a path relative to mind/, rejecting traversal outside mind/."""
-    target = (MIND_DIR / rel_path).resolve()
-    if not target.is_relative_to(MIND_DIR.resolve()):
-        print(f"ERROR: Path '{rel_path}' resolves outside mind/", file=sys.stderr)
+    """Resolve a path relative to the agent directory, rejecting traversal outside it."""
+    target = (AGENT_DIR / rel_path).resolve()
+    if not target.is_relative_to(AGENT_DIR.resolve()):
+        print(f"ERROR: Path '{rel_path}' resolves outside {AGENT_DIR.name}/", file=sys.stderr)
         sys.exit(1)
     return target
 
@@ -206,35 +206,35 @@ def cmd_write(args):
 # ---------------------------------------------------------------------------
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Generic YAML store for mind/ files")
+    parser = argparse.ArgumentParser(description="Generic YAML store for agent state files")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # --- read ---
     p_read = sub.add_parser("read", help="Read file or field")
-    p_read.add_argument("file", help="File path relative to mind/")
+    p_read.add_argument("file", help="File path relative to agent directory")
     p_read.add_argument("--field", help="Dot-notation path to a specific field")
     p_read.add_argument("--json", action="store_true", help="Output as JSON instead of YAML")
 
     # --- set ---
     p_set = sub.add_parser("set", help="Set a scalar field")
-    p_set.add_argument("file", help="File path relative to mind/")
+    p_set.add_argument("file", help="File path relative to agent directory")
     p_set.add_argument("dotpath", help="Dot-notation path to field")
     p_set.add_argument("value", help="Value to set (auto-detects type)")
     p_set.add_argument("--string", action="store_true", help="Force value as string (no type detection)")
 
     # --- increment ---
     p_inc = sub.add_parser("increment", help="Increment a numeric field")
-    p_inc.add_argument("file", help="File path relative to mind/")
+    p_inc.add_argument("file", help="File path relative to agent directory")
     p_inc.add_argument("dotpath", help="Dot-notation path to numeric field")
 
     # --- append ---
     p_app = sub.add_parser("append", help="Append JSON from stdin to an array field")
-    p_app.add_argument("file", help="File path relative to mind/")
+    p_app.add_argument("file", help="File path relative to agent directory")
     p_app.add_argument("dotpath", help="Dot-notation path to array field")
 
     # --- write ---
     p_write = sub.add_parser("write", help="Full file replacement from stdin")
-    p_write.add_argument("file", help="File path relative to mind/")
+    p_write.add_argument("file", help="File path relative to agent directory")
 
     return parser
 

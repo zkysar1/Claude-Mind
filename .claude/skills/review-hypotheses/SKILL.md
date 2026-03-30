@@ -18,6 +18,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, aspirations, tree-retrieval, reasoning-guardrails, pattern-signatures]
+minimum_mode: assistant
 ---
 
 # /review-hypotheses — Hypothesis Review & Resolution Engine
@@ -514,7 +515,7 @@ learn_result:
 
 ```
 Bash: pipeline-read.sh --stage resolved  (all resolved records)
-Read mind/knowledge/meta/_index.yaml for existing meta-data
+Read meta/meta-knowledge/_index.yaml for existing meta-data
 
 # Include micro-hypothesis batch stats from pipeline metadata.
 # Micro stats are stored in pipeline-meta.json under micro_hypothesis_stats.
@@ -592,13 +593,13 @@ H5: "Shorter time horizons are more predictable (compare micro→session→short
 H6: "Micro-hypothesis accuracy correlates with self-model accuracy (are we good at predicting our own behavior?)"
 
 For each: compare groups, note significance, write to
-mind/knowledge/strategies/hypothesis-results.md
+world/knowledge/strategies/hypothesis-results.md
 ```
 
 ### Step 4: Update Meta-Memory
 
 ```
-Update mind/knowledge/meta/_index.yaml with all accuracy figures
+Update meta/meta-knowledge/_index.yaml with all accuracy figures
 Update aspirations meta via Bash: `aspirations-meta-update.sh <field> <value>`
 ```
 

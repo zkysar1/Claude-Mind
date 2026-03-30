@@ -12,10 +12,12 @@ a signal to stop.
 1. **Follow the hook instruction** — If the hook says "invoke /aspirations loop", do exactly that.
    Do not rationalize. Do not write a handoff. Do not consolidate. Just re-enter the loop.
 
-2. **Never manually set stop-loop** — Only `/stop` (user command, sets IDLE first) and
-   `/recover` (Tier 4, after 3 failed re-entries) may create the stop-loop signal.
-   The agent MUST NOT call `session-signal-set.sh stop-loop` directly.
-   The agent MUST NOT create `mind/session/stop-loop` by any means (touch, Write, echo, python).
+2. **Never manually change state** — The agent MUST NOT call any of these directly:
+   - `session-state-set.sh` — only /start and /stop may change agent state
+   - `session-signal-set.sh stop-loop` — only /stop and /recover may set stop-loop
+   - `session-counter-increment.sh` — only the stop hook may increment the counter
+   The agent MUST NOT create or modify `<agent>/session/stop-loop`, `<agent>/session/agent-state`,
+   or `<agent>/session/stop-block-count` by any means (touch, Write, echo, python).
 
 3. **Context compression is normal** — "The session has been running for a long time" is NOT
    a reason to stop. Autocompact compresses context to free space. The loop is designed to

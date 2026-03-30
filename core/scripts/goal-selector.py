@@ -5,16 +5,16 @@ Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorith
 The LLM no longer computes scores — this script handles the arithmetic.
 The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
 
-Scoring criteria (11 deterministic + 1 stochastic weighted factors):
+Scoring criteria (12 deterministic + 1 stochastic weighted factors):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
   + variety_bonus × 0.7 + streak_momentum × 0.5 + novelty_bonus × 0.6
   + recurring_urgency × 0.8 + reward_history × 0.5 + evidence_backing × 0.7
-  + deferred_readiness × 0.6 + context_coherence × 1.0
+  + deferred_readiness × 0.6 + context_coherence × 1.0 + skill_affinity × 0.4
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
   context_coherence: +2.0 if same category as last goal (fresh/normal zone),
     +1.0 if same category (tight zone), 0 otherwise.
-    Reads context budget from mind/session/context-budget.json (written by status line).
+    Reads context budget from <agent>/session/context-budget.json (written by status line).
 
   recurring_urgency: 2.0 base when due + overdue_ratio, capped at 5.0
   deferred_readiness: +1.5 when a deferred goal's time has arrived
@@ -38,35 +38,62 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml  # Required — tree.py already depends on PyYAML
 
-from _paths import MIND_DIR, CONFIG_DIR, CORE_ROOT
+from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT
 from wm import read_wm, WM_PATH as WORKING_MEMORY_PATH  # noqa: E402
 
-ASP_PATH = MIND_DIR / "aspirations.jsonl"
-PIPELINE_PATH = MIND_DIR / "pipeline.jsonl"
-PIPELINE_ARCHIVE_PATH = MIND_DIR / "pipeline-archive.jsonl"
-DEV_STAGE_PATH = MIND_DIR / "developmental-stage.yaml"
-DEV_STAGE_CONFIG_PATH = CONFIG_DIR / "developmental-stage.yaml"
-BUDGET_PATH = MIND_DIR / "session" / "context-budget.json"
+# Collective domain stores (world/)
+WORLD_ASP_PATH = WORLD_DIR / "aspirations.jsonl"
+PIPELINE_PATH = WORLD_DIR / "pipeline.jsonl"
+PIPELINE_ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
 
-# Static scoring weights — MUST match aspirations/SKILL.md Goal Selection Algorithm.
-# If you change a weight here, update the SKILL.md documentation to match.
+# Per-agent aspiration queue
+AGENT_ASP_PATH = AGENT_DIR / "aspirations.jsonl" if AGENT_DIR else None
+
+# Agent identity (for claim checking)
+AGENT_NAME = AGENT_DIR.name if AGENT_DIR else ""
+
+# Meta-strategies (meta/)
+SKILL_QUALITY_PATH = META_DIR / "skill-quality.yaml"
+
+# Per-agent state
+DEV_STAGE_PATH = AGENT_DIR / "developmental-stage.yaml" if AGENT_DIR else None
+DEV_STAGE_CONFIG_PATH = CONFIG_DIR / "developmental-stage.yaml"
+BUDGET_PATH = AGENT_DIR / "session" / "context-budget.json" if AGENT_DIR else None
+
+# Single source of truth for goal scoring weights: meta/goal-selection-strategy.yaml
+# Seeded by init-meta.sh, editable by the agent during evolution Step 0.7.
 # NOTE: exploration_noise is NOT here — its weight is dynamic (epsilon × noise_scale),
 # computed at runtime in score_goal(). Do not add it to this dict.
-WEIGHTS = {
-    "priority": 1.0,
-    "deadline_urgency": 1.0,
-    "agent_executable": 0.8,
-    "variety_bonus": 0.7,
-    "streak_momentum": 0.5,
-    "novelty_bonus": 0.6,
-    "recurring_urgency": 0.8,
-    "reward_history": 0.5,
-    "evidence_backing": 0.7,
-    "deferred_readiness": 0.6,
-    "context_coherence": 1.0,
-}
+META_GOAL_SELECTION = META_DIR / "goal-selection-strategy.yaml"
+
+
+def load_weights():
+    """Load goal selection weights from meta/goal-selection-strategy.yaml."""
+    with open(META_GOAL_SELECTION, encoding="utf-8") as f:
+        meta = yaml.safe_load(f)
+    raw = meta["weights"]
+    return {k: max(0.0, min(3.0, float(v))) for k, v in raw.items()}
+
+
+WEIGHTS = load_weights()
 
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+
+def _ensure_list(val, default=None):
+    """Normalize a JSONL field that should be a list. Strings become [string].
+
+    Use this for every list-typed JSONL field (blocked_by, participants, tags).
+    Raw .get() on these fields will silently iterate characters if the data is
+    a string, producing wrong results without any error.
+    """
+    if val is None:
+        return default if default is not None else []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        return [val]
+    return default if default is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +131,7 @@ def load_exploration_params():
     """Load epsilon and noise_scale from developmental stage + config.
 
     Returns (epsilon, noise_scale) tuple.
-    Epsilon from mind/developmental-stage.yaml -> exploration.epsilon
+    Epsilon from <agent>/developmental-stage.yaml -> exploration.epsilon
     noise_scale from core/config/developmental-stage.yaml -> exploration.noise_scale
     """
     # Read epsilon from mutable state
@@ -204,8 +231,14 @@ def get_interval_hours(goal):
 # FILTER + COLLECT
 # ---------------------------------------------------------------------------
 
-def collect_candidates(aspirations, known_blockers=None):
-    """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT)."""
+def collect_candidates(aspirations, known_blockers=None, source="world"):
+    """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT).
+
+    Args:
+        aspirations: list of aspiration dicts
+        known_blockers: list of blocker dicts from working memory
+        source: "world" or "agent" — tags each candidate with its origin queue
+    """
     today = date.today()
     results = []
 
@@ -238,8 +271,14 @@ def collect_candidates(aspirations, known_blockers=None):
             if goal.get("status") != "pending":
                 continue
 
+            # Claim check (world goals only): skip goals claimed by another agent
+            if source == "world":
+                claimed = goal.get("claimed_by")
+                if claimed and claimed != AGENT_NAME:
+                    continue  # Claimed by a different agent
+
             # blocked_by check
-            if any(b not in done_ids for b in goal.get("blocked_by", [])):
+            if any(b not in done_ids for b in _ensure_list(goal.get("blocked_by"))):
                 continue
 
             # Infrastructure blocker check
@@ -263,6 +302,10 @@ def collect_candidates(aspirations, known_blockers=None):
                 except (ValueError, TypeError):
                     pass
 
+            # Defer reason (no date needed — textual deferral is sufficient)
+            if goal.get("defer_reason"):
+                continue
+
             # Deferred time gate
             deferred = goal.get("deferred_until")
             if deferred:
@@ -274,10 +317,10 @@ def collect_candidates(aspirations, known_blockers=None):
                     pass  # Corrupt value — fail open
 
             # User-only skip
-            if goal.get("participants") == ["user"]:
+            if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
                 continue
 
-            results.append({"goal": goal, "aspiration": asp})
+            results.append({"goal": goal, "aspiration": asp, "source": source})
 
     return results
 
@@ -327,7 +370,7 @@ def collect_blocked(aspirations, known_blockers=None):
                 continue
 
             # Skip user-only goals (shown in Phase 3 of open-questions)
-            if goal.get("participants") == ["user"]:
+            if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
                 continue
 
             entry = {
@@ -365,7 +408,7 @@ def collect_blocked(aspirations, known_blockers=None):
                 continue
 
             # 3. Dependency (blocked_by with unmet prerequisites)
-            unmet = [bid for bid in goal.get("blocked_by", []) if bid not in done_ids]
+            unmet = [bid for bid in _ensure_list(goal.get("blocked_by")) if bid not in done_ids]
             if unmet:
                 entry["block_reason"] = "dependency"
                 entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
@@ -388,6 +431,14 @@ def collect_blocked(aspirations, known_blockers=None):
                         continue
                 except (ValueError, TypeError):
                     pass
+
+            # 4b. Defer reason (textual — blocks regardless of deferred_until state)
+            if goal.get("defer_reason"):
+                entry["block_reason"] = "deferred"
+                entry["block_detail"] = "Deferred: {reason}".format(
+                    reason=goal.get("defer_reason", ""))
+                blocked.append(entry)
+                continue
 
             # 5. Hypothesis time gate
             rne = goal.get("resolves_no_earlier_than")
@@ -445,7 +496,7 @@ def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited
 
     # For pending goals: check unsatisfied deps
     if status == "pending":
-        unsatisfied = [b for b in goal.get("blocked_by", []) if b not in done_ids]
+        unsatisfied = [b for b in _ensure_list(goal.get("blocked_by")) if b not in done_ids]
         if unsatisfied:
             # Follow first dep only — preserves 1:1 goal→bottleneck invariant
             return trace_root_bottleneck(unsatisfied[0], goal_map, done_ids,
@@ -466,7 +517,7 @@ def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited
             reason = blocker_by_skill[goal_skill].get("reason", "unknown")
             return (goal_id, "INFRA: {r}".format(r=reason))
 
-        if goal.get("participants") == ["user"]:
+        if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
             return (goal_id, "NEEDS USER")
 
         return (goal_id, "READY")
@@ -487,7 +538,7 @@ def evidence_score(asp, resolved):
       lucky_confirmed: +0.5, deserved_corrected: -1.0
     Normalize by count. 0 if no relevant hypotheses.
     """
-    tags = set(asp.get("tags", []))
+    tags = set(_ensure_list(asp.get("tags")))
     hyp_ids = {g.get("hypothesis_id") for g in asp.get("goals", [])
                if g.get("hypothesis_id")}
 
@@ -549,7 +600,7 @@ def _resolve_category(goal, asp):
     except Exception:
         pass
 
-    tags = asp.get("tags", [])
+    tags = _ensure_list(asp.get("tags"))
     return tags[0] if tags else "uncategorized"
 
 
@@ -560,7 +611,7 @@ def _resolve_category(goal, asp):
 def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scale=3.0,
                budget=None):
     """Score a single goal using the multi-criteria weighted formula."""
-    goal, asp = cand["goal"], cand["aspiration"]
+    goal, asp, source = cand["goal"], cand["aspiration"], cand.get("source", "world")
     raw = {}
 
     # 1. priority (HIGH=3, MEDIUM=2, LOW=1)
@@ -576,13 +627,14 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         1 if remaining is not None and remaining <= 7 else 0)
 
     # 3. agent_executable (+2 if agent in participants)
-    raw["agent_executable"] = 2 if "agent" in goal.get("participants", ["agent"]) else 0
+    raw["agent_executable"] = 2 if "agent" in _ensure_list(goal.get("participants"), ["agent"]) else 0
 
     # 4. variety_bonus (+1.5 if different aspiration than last touched)
     touched = wm.get("aspiration_touched_last", "")
     raw["variety_bonus"] = 1.5 if asp.get("id") != touched else 0
 
     # 5. streak_momentum (+0.5 if same aspiration had a goal completed this session)
+    # Each entry written by aspirations-state-update Step 3: {"goal_id", "aspiration_id", "_item_ts"}
     asp_id = asp.get("id", "")
     raw["streak_momentum"] = (
         0.5 if any(s.get("aspiration_id") == asp_id for s in session_completions) else 0)
@@ -633,7 +685,20 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     else:
         raw["context_coherence"] = 0
 
-    # 12. exploration_noise (random value scaled by developmental epsilon)
+    # 12. skill_affinity (quality-weighted skill preference)
+    # Reads meta/skill-quality.yaml for aggregate quality of the goal's linked skill.
+    # High-quality skills get a boost; low-quality skills get a penalty.
+    # Goals with no skill or unevaluated skills get neutral 0.
+    skill = goal.get("skill", "")
+    skill_name = skill.strip("/").split()[0] if skill else ""
+    skill_quality_data = read_yaml_file(SKILL_QUALITY_PATH)
+    sq_skills = skill_quality_data.get("skills", {})
+    sq_entry = sq_skills.get(skill_name, {})
+    sq_aggregate = sq_entry.get("aggregate", {})
+    sq_overall = sq_aggregate.get("overall", 0.5)  # default neutral
+    raw["skill_affinity"] = (sq_overall - 0.5) * 2  # maps [0,1] to [-1, +1]
+
+    # 13. exploration_noise (random value scaled by developmental epsilon)
     raw["exploration_noise"] = random.random()
 
     # Weighted total — static criteria + dynamic exploration noise
@@ -644,6 +709,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     return {
         "goal_id": goal.get("id"),
         "aspiration_id": asp_id,
+        "source": source,
         "title": goal.get("title", ""),
         "skill": goal.get("skill"),
         "category": category,
@@ -667,9 +733,15 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
 # ---------------------------------------------------------------------------
 
 def cmd_select(args):
-    """Score and rank all unblocked goals. Output: JSON array sorted by score desc."""
-    aspirations = read_jsonl(ASP_PATH)
-    if not aspirations:
+    """Score and rank all unblocked goals from both world and agent queues.
+
+    Output: JSON array sorted by score desc, each entry tagged with source.
+    """
+    # Read from both aspiration queues
+    world_aspirations = read_jsonl(WORLD_ASP_PATH)
+    agent_aspirations = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
+
+    if not world_aspirations and not agent_aspirations:
         print("[]")
         return
 
@@ -688,9 +760,33 @@ def cmd_select(args):
     known_blockers = wm.get("slots", {}).get("known_blockers", [])
     if not isinstance(known_blockers, list):
         known_blockers = []
-    candidates = collect_candidates(aspirations, known_blockers=known_blockers)
+
+    # Collect candidates from both queues
+    candidates = collect_candidates(world_aspirations, known_blockers=known_blockers, source="world")
+    candidates += collect_candidates(agent_aspirations, known_blockers=known_blockers, source="agent")
     if not candidates:
-        print("[]")
+        # Distinguish "no goals exist" from "goals exist but all blocked"
+        all_aspirations = world_aspirations + agent_aspirations
+        blocked = collect_blocked(all_aspirations, known_blockers=known_blockers)
+        if blocked:
+            summary = {}
+            for b in blocked:
+                reason = b["block_reason"]
+                summary[reason] = summary.get(reason, 0) + 1
+            print(json.dumps({
+                "candidates": [],
+                "all_blocked": True,
+                "blocked_count": len(blocked),
+                "by_reason": summary,
+                "blocked_goals": [
+                    {"goal_id": b["goal_id"], "title": b["title"],
+                     "reason": b["block_reason"],
+                     "detail": b.get("block_detail", "")}
+                    for b in blocked[:10]
+                ]
+            }, indent=2))
+        else:
+            print("[]")
         return
 
     epsilon, noise_scale = load_exploration_params()
@@ -711,7 +807,10 @@ def cmd_blocked(args):
     empty_reasons["dependency"]["head_count"] = 0
     empty_reasons["dependency"]["downstream_count"] = 0
 
-    aspirations = read_jsonl(ASP_PATH)
+    # Read from both aspiration queues
+    world_aspirations = read_jsonl(WORLD_ASP_PATH)
+    agent_aspirations = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
+    aspirations = world_aspirations + agent_aspirations
     if not aspirations:
         print(json.dumps({"blocked_goals": [], "by_reason": empty_reasons,
             "bottlenecks": [], "summary": {

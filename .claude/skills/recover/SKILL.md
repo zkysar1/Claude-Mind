@@ -5,21 +5,22 @@ user-invocable: false
 triggers:
   - "/recover"
 conventions: [session-state, handoff-working-memory]
+minimum_mode: autonomous
 ---
 
 # /recover — Last-Resort Recovery
 
 Invoked by the stop hook after 3 failed re-entry attempts. Reads agent state,
 outputs a friendly status to the user explaining what happened, and creates
-`mind/session/stop-loop` so the next stop attempt succeeds.
+`<agent>/session/stop-loop` so the next stop attempt succeeds.
 
 This skill does NOT resume the loop. It gives control back to the user.
 
 ## Constraints
 
-- MUST NOT modify `mind/session/agent-state` (only /start and /stop can)
+- MUST NOT modify `<agent>/session/agent-state` (only /start and /stop can)
 - MUST NOT invoke `/aspirations loop` (that already failed 3 times)
-- MUST create `mind/session/stop-loop` (enables clean exit)
+- MUST create `<agent>/session/stop-loop` (enables clean exit)
 
 ## Steps
 

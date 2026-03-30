@@ -1,0 +1,157 @@
+# Curriculum — Framework Definition
+# Staged developmental trajectory with graduation gates.
+# User defines stages at /start time. Framework defines structure.
+# Immutable definitions. Agent state lives in <agent>/curriculum.yaml
+# init-agent.sh reads initial_state to seed state file on first run.
+
+# --- FRAMEWORK ---
+
+# Schema for user-defined stages
+stage_schema:
+  required_fields:
+    - id            # cur-NN (e.g., cur-01, cur-02)
+    - name          # Human-readable stage name
+    - description   # What this stage represents
+  optional_fields:
+    - unlocks             # Map of capabilities enabled at this stage
+    - graduation_gates    # List of gate objects — ALL must pass to promote
+
+# Supported unlock capabilities.
+# Each is a boolean. false = not permitted, true = permitted.
+# Missing keys inherit the default value.
+unlock_capabilities:
+  allow_self_edits:
+    description: "Agent may edit <agent>/self.md via sq-012 spark"
+    default: false
+  allow_forge_skill:
+    description: "Agent may invoke /forge-skill to create new skills"
+    default: false
+  allow_multi_goal_parallelism:
+    description: "Agent may execute multiple goals concurrently via TeamCreate"
+    default: false
+  allow_meta_edits:
+    description: "Agent may edit meta/ strategy files to modify improvement procedures"
+    default: false
+
+# Gate types for graduation — deterministic checks only.
+# The curriculum.py evaluator resolves each gate by type.
+gate_types:
+  metric_threshold:
+    description: "A numeric metric at a YAML dotpath must meet a threshold"
+    fields: [metric, operator, threshold]
+    # metric: dotpath relative to <agent>/ — e.g., "developmental-stage.current_assessment.average_competence"
+    #   The evaluator reads <agent>/{first-segment}.yaml and navigates the remaining path.
+    # operator: ">=", "<=", "==", ">"
+    # threshold: number
+    example:
+      metric: "developmental-stage.current_assessment.average_competence"
+      operator: ">="
+      threshold: 0.30
+
+  count_check:
+    description: "Count JSONL entries matching a field/value filter"
+    fields: [file, field, value, operator, threshold]
+    # file: path relative to <agent>/ — e.g., "aspirations.jsonl"
+    # field: dotpath into each JSON line — e.g., "status" or "goals[*].status"
+    # value: expected value to match (or "*" for any)
+    # operator: ">=", "<=", "==", ">"
+    # threshold: required count
+    example:
+      file: "aspirations.jsonl"
+      field: "goals[*].status"
+      value: "completed"
+      operator: ">="
+      threshold: 10
+
+  log_scan:
+    description: "Count entries in a JSONL log matching field/value"
+    fields: [log_file, match_field, match_value, min_count]
+    # log_file: path relative to <agent>/ — e.g., "evolution-log.jsonl"
+    example:
+      log_file: "evolution-log.jsonl"
+      match_field: "event"
+      match_value: "aspiration_created"
+      min_count: 5
+
+  command_check:
+    description: "A shell command must exit 0"
+    fields: [command]
+    # command: must start with "bash core/scripts/" for safety
+    example:
+      command: "bash core/scripts/tree-read.sh --validate"
+
+# Default stages when user provides no curriculum.
+# Conservative: unlock nothing at stage 1, progressively unlock.
+# NOTE: count_check gates count goals in the live aspirations.jsonl file only.
+# Archived aspirations (moved by aspirations-archive.sh) are not counted.
+# This is intentionally conservative — promotion may be slightly delayed
+# but never premature. For early stages this rarely matters in practice.
+default_stages:
+  - id: cur-01
+    name: Foundation
+    description: "Learn the domain. Build knowledge. Form initial hypotheses."
+    unlocks:
+      allow_self_edits: false
+      allow_forge_skill: false
+      allow_multi_goal_parallelism: false
+    graduation_gates:
+      - type: count_check
+        id: gate_completed_goals
+        description: "Complete at least 10 goals"
+        file: "aspirations.jsonl"
+        field: "goals[*].status"
+        value: "completed"
+        operator: ">="
+        threshold: 10
+      - type: metric_threshold
+        id: gate_min_competence
+        description: "Reach minimum domain competence"
+        metric: "developmental-stage.current_assessment.average_competence"
+        operator: ">="
+        threshold: 0.25
+
+  - id: cur-02
+    name: Growth
+    description: "Apply knowledge. Refine Self. Create specialized tools."
+    unlocks:
+      allow_self_edits: true
+      allow_forge_skill: true
+      allow_multi_goal_parallelism: false
+      allow_meta_edits: true
+    graduation_gates:
+      - type: metric_threshold
+        id: gate_applied_competence
+        description: "Reach applied-level domain competence"
+        metric: "developmental-stage.current_assessment.average_competence"
+        operator: ">="
+        threshold: 0.55
+      - type: count_check
+        id: gate_deep_goals
+        description: "Complete at least 30 goals"
+        file: "aspirations.jsonl"
+        field: "goals[*].status"
+        value: "completed"
+        operator: ">="
+        threshold: 30
+
+  - id: cur-03
+    name: Autonomy
+    description: "Full capabilities unlocked. Parallel execution. Strategic evolution."
+    unlocks:
+      allow_self_edits: true
+      allow_forge_skill: true
+      allow_multi_goal_parallelism: true
+      allow_meta_edits: true
+    graduation_gates: []  # Terminal stage — no graduation needed
+
+modifiable:
+  max_stage_jumps: {min: 0, max: 3, default: 1}
+
+# --- INITIAL STATE ---
+# Seeded to <agent>/curriculum.yaml by init-agent.sh.
+# /start populates stages and current_stage from user input or defaults.
+
+initial_state:
+  current_stage: null
+  stage_history: []
+  stages: []

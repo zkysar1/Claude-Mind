@@ -1,6 +1,6 @@
 # Domain-Specialized Reflection Templates — Framework Definition
 # Default template is immutable. Domain-specific templates are agent state.
-# Agent state lives in mind/reflection-templates.yaml
+# Agent state lives in meta/reflection-templates.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---

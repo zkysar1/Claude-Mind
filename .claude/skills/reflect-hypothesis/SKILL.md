@@ -7,6 +7,7 @@ triggers:
   - "/reflect-hypothesis"
   - "/reflect --on-hypothesis"
 conventions: [pipeline, experience, tree-retrieval, reasoning-guardrails, pattern-signatures, spark-questions, aspirations]
+minimum_mode: autonomous
 ---
 
 # /reflect-hypothesis — Single Hypothesis Reflection
@@ -43,6 +44,14 @@ IF horizon == "session":
       - Skip Step 7.7 context gap analysis
       - Run spark check (Step 8) — normal (short hypotheses can still spark insights)
     RETURN after lightweight path — do not continue to full Step 1.
+
+    # Meta-strategy category depth override
+    Read meta/reflection-strategy.yaml
+    IF hypothesis.category in category_depth_overrides:
+        override = category_depth_overrides[hypothesis.category]
+        IF override == "full" AND horizon == "session":
+            Log: "META OVERRIDE: session horizon → full pipeline for category {hypothesis.category}"
+            CONTINUE to full reflection pipeline (skip lightweight return)
 
 IF horizon == "short" OR horizon == "long" OR horizon is missing:
     Continue to full reflection below.
@@ -206,7 +215,7 @@ If pair already extracted (check reasoning-bank-read.sh --active for existing co
 ```
 # Archive reflection insight as experience
 experience_id = "exp-reflect-{hypothesis_id}"
-Write mind/experience/{experience_id}.md with:
+Write <agent>/experience/{experience_id}.md with:
     - ABC chain analysis
     - Extracted strategy or guardrail
     - Contrastive analysis (if applicable)
@@ -221,7 +230,7 @@ Experience JSON:
     hypothesis_id: "{hypothesis_id}"
     tree_nodes_related: [nodes updated during reflection]
     verbatim_anchors: [key quotes from ABC chain, exact strategy text]
-    content_path: "mind/experience/{experience_id}.md"
+    content_path: "<agent>/experience/{experience_id}.md"
 ```
 
 ## Step 2.7: Memory Encoding Score (Hippocampal Gate)
@@ -249,7 +258,7 @@ If encoding_score >= 0.40 (encode_threshold):
     # Build precision_manifest from: data_signals, consequence actual_outcome,
     # experience verbatim_anchors if loaded. Include ALL numbers, code refs,
     # error codes, thresholds, formulas, config values, commit hashes, line numbers.
-    # See mind/conventions/precision-encoding.md for full extraction heuristics.
+    # See core/config/conventions/precision-encoding.md for full extraction heuristics.
     # Each item: {type, label, value (VERBATIM), unit, context}
     # Empty list [] only if genuinely no precise values in this hypothesis.
 
@@ -321,7 +330,7 @@ reflection:
 
 ## Step 4: Track Violation (if hypothesis was wrong)
 
-If the hypothesis was corrected, append to `mind/knowledge/patterns/violations.md`:
+If the hypothesis was corrected, append to `world/knowledge/patterns/violations.md`:
 
 ```markdown
 ### YYYY-MM-DD: record-slug
@@ -353,18 +362,18 @@ If the resolved hypothesis has `source_validation` in its record, use the struct
 **Legacy path** (no source_validation on record):
 ```
 For each information source used in the hypothesis:
-  Read mind/sources.yaml
+  Read world/sources.yaml
   Find or create source entry
   Increment total_signals
   If correct: increment correct_signals
   Recalculate reliability: correct_signals / total_signals
-  Write updated sources.yaml
+  Write updated world/sources.yaml
 ```
 
 **Source Agreement path** (source_validation exists — single source of truth, replaces legacy):
 ```
 For each source in source_validation.sources:
-  Find or create source entry in mind/sources.yaml
+  Find or create source entry in world/sources.yaml
   Increment total_signals
   Update last_seen to today
   If source.verdict matches actual outcome: increment correct_signals
@@ -378,7 +387,7 @@ For each source in source_validation.sources:
 
 ## Step 6: Append to Journal
 
-Write reflection to `mind/journal/YYYY/MM/YYYY-MM-DD.md`:
+Write reflection to `<agent>/journal/YYYY/MM/YYYY-MM-DD.md`:
 
 ```markdown
 ## Reflection: {record-slug}
@@ -421,6 +430,12 @@ Accuracy dimensions to assess:
      - Did the key_assumption fail? → Log as "assumption_failure"
      - Was the edge_basis invalid? → Log as "edge_basis_failure"
      - Was it random/unpredictable? → Log as "variance"
+   - If root cause is "model-error" or "overconfidence":
+     Apply first-principles analysis to the hypothesis category:
+     1. What assumptions did we inherit about this category?
+     2. Which are verifiable vs inherited?
+     3. Rebuild the category mental model from verified facts only
+     4. Log what changed — this becomes the guardrail/reasoning bank content
    - Track edge_basis success rates over time
    - This feeds directly into strategy evolution:
      - If an edge_basis has < 40% success rate → STOP relying on it
@@ -491,7 +506,7 @@ From the ABC chain (Step 2), extract named entities:
   - Key terms from behavior.reasoning
   - Normalize to lowercase-kebab-case (e.g., "Federal Reserve" → "federal-reserve")
 
-Read mind/knowledge/tree/_tree.yaml → entity_index (create section if missing)
+Read world/knowledge/tree/_tree.yaml → entity_index (create section if missing)
 
 For each extracted entity:
   If entity already in index:
@@ -511,7 +526,7 @@ Log: "ENTITY INDEX: updated {N} entities from {hypothesis-id}"
 
 ## Step 7.6: Belief Registry Update
 
-1. Read `mind/knowledge/beliefs.yaml`
+1. Read `world/knowledge/beliefs.yaml`
 2. Identify beliefs relevant to this hypothesis (match by category, entities)
 3. For each relevant belief, classify the outcome's impact:
    - `reinforce`: outcome confirms belief → increase confidence by 0.05-0.15
@@ -520,7 +535,7 @@ Log: "ENTITY INDEX: updated {N} entities from {hypothesis-id}"
    - `neutral`: no impact
 4. Add trajectory entry: { session, confidence (new), evidence (brief), classification }
 5. Update `last_updated` timestamp
-6. If status changes to "contradicted": log transition in `mind/knowledge/transitions.yaml`
+6. If status changes to "contradicted": log transition in `world/knowledge/transitions.yaml`
 
 ## Step 7.6b: Contradiction Detection
 
@@ -528,10 +543,10 @@ Log: "ENTITY INDEX: updated {N} entities from {hypothesis-id}"
 2. If interference detected:
    a. Read the interfering article
    b. Determine if this is a genuine contradiction or compatible knowledge
-   c. If contradiction: create entry in `mind/knowledge/transitions.yaml`
+   c. If contradiction: create entry in `world/knowledge/transitions.yaml`
       - entity, belief_id (if applicable), from, to, evidence, impact
    d. If compatible: update both articles to clarify relationship
-3. Cross-reference with `mind/knowledge/beliefs.yaml` -- if belief weakened below 0.20, mark as "contradicted"
+3. Cross-reference with `world/knowledge/beliefs.yaml` -- if belief weakened below 0.20, mark as "contradicted"
 
 ## Step 7.6c: Process-Outcome Dual Classification
 
@@ -563,7 +578,7 @@ Read hypothesis.context_consulted (if exists — older hypotheses may not have t
 # Were there relevant tree nodes, pattern signatures, or articles that EXISTED
 # at hypothesis time but were NOT consulted?
 
-Read mind/knowledge/tree/_tree.yaml → find all nodes matching this hypothesis's category
+Read world/knowledge/tree/_tree.yaml → find all nodes matching this hypothesis's category
 Compare tree_nodes_read against available nodes:
   If a relevant node existed but wasn't in tree_nodes_read:
     Append to context_consulted.context_gaps_identified:
@@ -631,7 +646,7 @@ When a strategy is loaded and marked ACTIVE in deliberation:
 
 ```
 Read hypothesis context_consulted.deliberation (if exists)
-For each strategy from mind/knowledge/strategies/extracted-strategies.md that was loaded:
+For each strategy from world/knowledge/strategies/extracted-strategies.md that was loaded:
   If deliberation marks this strategy as ACTIVE:
     Increment strategy's times_applied by 1
     Set strategy's last_applied to today's date
@@ -644,7 +659,7 @@ Runs after Step 7.7d so the context quality rating is always finalized before ag
 
 ```
 # Part 1: Experiential Index
-Read mind/experiential-index.yaml (if exists, else skip)
+Read <agent>/experiential-index.yaml (if exists, else skip)
 Update by_context_quality section:
   - Increment total for this category
   - Increment the usefulness bucket (helpful/neutral/misleading/irrelevant)
@@ -686,7 +701,7 @@ After every reflection, ask:
 1. Does this lesson change how we should discover opportunities? → Update discovery filters
 2. Does this challenge an existing knowledge article? → Flag for re-research
 3. Should we adjust category priorities? → Propose aspiration evolution
-4. Is there a new trap type to watch for? → Add to `mind/knowledge/patterns/traps.md`
+4. Is there a new trap type to watch for? → Add to `world/knowledge/patterns/traps.md`
 5. Should a new aspiration be created? → Propose via gap analysis
 6. Should confidence thresholds change for any category? → Propose calibration adjustment
 
@@ -701,17 +716,17 @@ Gap detection heuristics:
   - "Did I hit a tool failure and have to improvise?"
 
 If YES:
-  Read mind/skill-gaps.yaml
+  Read meta/skill-gaps.yaml
   If gap already exists → increment times_encountered, append to encounter_log
   If gap is new → create new entry with id: gap-{next}, status: registered
-  Write updated mind/skill-gaps.yaml
+  Write updated meta/skill-gaps.yaml
 
   # --- Forge criteria check: turn ready gaps into goals ---
   # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
   IF gap.status == "forged": skip forge criteria check
 
   Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-  Read mind/developmental-stage.yaml → current stage
+  Read <agent>/developmental-stage.yaml → current stage
   IF gap.times_encountered >= forge_threshold
      AND gap.estimated_value >= "medium"
      AND developmental stage >= EXPLOIT (developing+):
@@ -747,7 +762,7 @@ If YES:
 
 **Q7: Update Experiential Memory Index**:
 ```
-Read mind/experiential-index.yaml (if exists, else skip)
+Read <agent>/experiential-index.yaml (if exists, else skip)
 Update indexes with this hypothesis's data:
   - by_violation_cause: if corrected, add to relevant cause bucket
   - by_category: update accuracy, confirmed/corrected, update exemplar_confirmed/corrected if notable
@@ -775,7 +790,7 @@ invalidates existing knowledge beyond the hypothesis record itself.
 
 ```
 IF hypothesis was CORRECTED or had surprise >= 7:
-    Read mind/knowledge/tree/_tree.yaml
+    Read world/knowledge/tree/_tree.yaml
     For each node consulted during this hypothesis lifecycle (from context):
         Read node .md file
         Compare node content against lesson learned:
@@ -803,7 +818,7 @@ For each high-retrieval experience with tree_nodes_related:
 
 After pattern extraction, check if the tree needs to grow:
 ```
-Read mind/knowledge/tree/_tree.yaml
+Read world/knowledge/tree/_tree.yaml
 Read core/config/tree.yaml for decompose_threshold, split_threshold
 If new category detected without tree node:
   Add to _tree.yaml unmapped_categories

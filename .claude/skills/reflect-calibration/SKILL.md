@@ -7,6 +7,7 @@ triggers:
   - "/reflect-calibration"
   - "/reflect --calibration-check"
 conventions: [pipeline, pattern-signatures]
+minimum_mode: autonomous
 ---
 
 # /reflect-calibration — Calibration Check
@@ -52,4 +53,4 @@ For future hypotheses, recommend using self-consistency:
 
 Write calibration report to journal and update:
 - Aspirations meta confidence_calibration_bias via Bash: `aspirations-meta-update.sh confidence_calibration_bias <value>` (read via `aspirations-read.sh --meta`)
-- `mind/knowledge/meta/_index.yaml` category-level calibration data
+- `meta/meta-knowledge/_index.yaml` category-level calibration data

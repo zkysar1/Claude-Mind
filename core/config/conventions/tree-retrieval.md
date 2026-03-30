@@ -1,3 +1,7 @@
+> For the full retrieval escalation policy (tree → codebase → web search),
+> see `core/config/conventions/retrieval-escalation.md`. This file documents
+> the Tier 1 (knowledge tree) retrieval engine specifically.
+
 # Unified Retrieval Script Access
 
 Context retrieval is implemented by `core/scripts/retrieve.sh` — a single script call that
@@ -39,7 +43,7 @@ Side effect: increments retrieval_count on all returned items.
 
 # Memory Tree Script Access
 
-The memory tree (`mind/knowledge/tree/_tree.yaml`) is accessed via scripts for mechanical operations.
+The memory tree (`world/knowledge/tree/_tree.yaml`) is accessed via scripts for mechanical operations.
 Use scripts for node lookup, path computation, ancestor walking, and field updates.
 Direct `_tree.yaml` reads are still used for complex multi-node operations (SPLIT, DECOMPOSE)
 and for semantic matching (choosing which node fits a category).

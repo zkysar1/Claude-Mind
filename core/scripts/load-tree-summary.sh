@@ -5,8 +5,8 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 source "$CORE_ROOT/scripts/_platform.sh"
-TREE_YAML="$REPO_ROOT/mind/knowledge/tree/_tree.yaml"
-SUMMARY_JSON="$REPO_ROOT/mind/knowledge/tree/_summary.json"
+TREE_YAML="$WORLD_DIR/knowledge/tree/_tree.yaml"
+SUMMARY_JSON="$WORLD_DIR/knowledge/tree/_summary.json"
 TMP_SUMMARY="$SUMMARY_JSON.tmp"
 
 # Regenerate if stale (tree.yaml newer than cached summary)

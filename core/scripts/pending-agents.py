@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pending background agent tracker for mind/session/pending-agents.yaml.
+"""Pending background agent tracker for <agent>/session/pending-agents.yaml.
 
 Tracks dispatched background agents so the stop hook and aspirations loop
 can handle idle-while-agents-work scenarios. Agents are registered before
@@ -9,7 +9,7 @@ Subcommands:
   register       — Add an agent entry
   deregister     — Remove by agent_id (deletes file if list empty)
   deregister-team — Remove all agents with a given team_name
-  list           — Print all registered agents
+  list           — Print all registered agents (prunes stale first)
   has-pending    — Exit 0 if non-stale agents remain, exit 1 otherwise
   prune-stale    — Remove agents past their timeout_minutes
   clear          — Delete file entirely
@@ -29,11 +29,11 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import MIND_DIR
+from _paths import AGENT_DIR
 
-PENDING_PATH = MIND_DIR / "session" / "pending-agents.yaml"
+PENDING_PATH = AGENT_DIR / "session" / "pending-agents.yaml"
 
-DEFAULT_TIMEOUT_MINUTES = 30
+DEFAULT_TIMEOUT_MINUTES = 10
 
 
 def log(msg):
@@ -152,12 +152,29 @@ def cmd_deregister_team(args):
 
 
 def cmd_list(args):
-    """Print all registered agents."""
+    """Print all registered agents (prunes stale before returning)."""
     data = read_data()
+    agents = data.get("agents", [])
+
+    # Prune stale agents before returning — same as has-pending.
+    # Without this, Phase -0.5a could try to collect from agents that timed out.
+    if agents:
+        kept, pruned = prune_stale(agents)
+        if pruned > 0:
+            if kept:
+                data["agents"] = kept
+                write_data(data)
+            else:
+                delete_file()
+            log(f"list: pruned {pruned} stale agent(s), {len(kept)} remaining")
+            agents = kept
+
     if args.json:
+        # Required: when all agents were stale, delete_file() runs but data["agents"]
+        # still holds the original list. This line is the single source of truth for output.
+        data["agents"] = agents
         print(json.dumps(data, indent=2, default=str))
     else:
-        agents = data.get("agents", [])
         if not agents:
             print("No pending agents.")
             return
@@ -243,7 +260,7 @@ def build_parser():
     dereg_team.add_argument("--team", required=True, help="Team name")
 
     # list
-    lst = sub.add_parser("list", help="List all registered agents")
+    lst = sub.add_parser("list", help="List all registered agents (prunes stale first)")
     lst.add_argument("--json", action="store_true", help="Output as JSON")
 
     # has-pending

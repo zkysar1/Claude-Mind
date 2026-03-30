@@ -5,13 +5,13 @@ type: system
 user-invocable: false
 triggers: []
 reads:
-  - mind/knowledge/tree/_tree.yaml
+  - world/knowledge/tree/_tree.yaml
   - core/config/memory-pipeline.yaml
   - core/config/tree.yaml
 writes:
-  - mind/knowledge/tree/_tree.yaml
-  - mind/knowledge/tree/**/*.md
-  - mind/knowledge/archive/*.md
+  - world/knowledge/tree/_tree.yaml
+  - world/knowledge/tree/**/*.md
+  - world/knowledge/archive/*.md
 execution_history:
   total_invocations: 0
   outcome_tracking:
@@ -22,6 +22,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [tree-retrieval]
+minimum_mode: reader
 ---
 
 # /tree — Knowledge Tree Operations
@@ -31,6 +32,13 @@ discoverable sub-commands. Replaces the former `/tree-growth` skill and extends 
 with granular read/write operations that any skill can call.
 
 Supports recursive knowledge tree at arbitrary depth up to D_max=6.
+
+## Mode Gate for Write Operations
+For sub-commands: add, edit, set, decompose, distill, maintain
+Bash: `session-mode-get.sh`
+- If mode is `reader`: output "Tree write operations require assistant mode. Run `/start --mode assistant` to enable." STOP.
+- If mode is `assistant` or `autonomous`: PROCEED.
+Read-only sub-commands (read, find, stats, validate) work in all modes.
 
 ## Sub-Commands
 
@@ -52,17 +60,17 @@ Supports recursive knowledge tree at arbitrary depth up to D_max=6.
 Node files live at paths derived from their ancestry in `_tree.yaml`:
 
 ```
-L1: mind/knowledge/tree/{L1-domain}.md
-L2: mind/knowledge/tree/{L1}/{L2-topic}.md
-L3: mind/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}.md
-L4: mind/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}/{L4-detail}.md
-L5: mind/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5-detail}.md
-L6: mind/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5}/{L6-detail}.md
+L1: world/knowledge/tree/{L1-domain}.md
+L2: world/knowledge/tree/{L1}/{L2-topic}.md
+L3: world/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}.md
+L4: world/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}/{L4-detail}.md
+L5: world/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5-detail}.md
+L6: world/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5}/{L6-detail}.md
 ```
 
 Path construction rule: compute the child file path from the parent's `file` field
-in `_tree.yaml`. For a parent with `file: mind/knowledge/tree/a/b/c.md`, a new child
-`d` gets `file: mind/knowledge/tree/a/b/c/d.md` (strip `.md` from parent path, use
+in `_tree.yaml`. For a parent with `file: world/knowledge/tree/a/b/c.md`, a new child
+`d` gets `file: world/knowledge/tree/a/b/c/d.md` (strip `.md` from parent path, use
 as directory, append `{child-slug}.md`).
 
 ## Step 0: Load Conventions
@@ -201,8 +209,8 @@ node=$(bash core/scripts/tree-read.sh --node <key>)
 Read {node.file}
 
 # 2. Archive full original content
-mkdir -p mind/knowledge/archive
-Write mind/knowledge/archive/{key}-{date}.md:
+mkdir -p world/knowledge/archive
+Write world/knowledge/archive/{key}-{date}.md:
   ---
   distilled_from: <key>
   distilled_date: <date>
@@ -351,7 +359,7 @@ of utility tracking have accumulated signal.
 
 **Steps**:
 1. Find empty childless nodes (skip L1 domains, skip `growth_state: growing`)
-2. Archive topic file to `mind/knowledge/archive/`
+2. Archive topic file to `world/knowledge/archive/`
 3. Remove from `_tree.yaml`, log to tree_growth_log
 
 #### 5.5. RETIRE — Remove never-consulted dead nodes
@@ -365,7 +373,7 @@ of utility tracking have accumulated signal.
 **Steps**:
 1. Find candidates: leaf nodes with `retrieval_count == 0`, created before session N-5
    (check `tree_growth_log` for creation date, or node's `.md` front matter `last_update_trigger.session`)
-2. Archive `.md` content to `mind/knowledge/archive/{key}-retired-{date}.md`
+2. Archive `.md` content to `world/knowledge/archive/{key}-retired-{date}.md`
 3. Remove node: `bash core/scripts/tree-update.sh --remove-child <parent> <key>`
 4. Log to tree_growth_log: `{op: RETIRE, node, date, reason: "never retrieved in N sessions"}`
 
@@ -472,6 +480,6 @@ ELSE:
 ## Chaining
 
 - **Called by**: any skill that needs tree operations, `/reflect-tree-update` (via sub-commands), `/aspirations` consolidation (via `/tree maintain`)
-- **Reads**: `mind/knowledge/tree/_tree.yaml`, node `.md` files, `core/config/memory-pipeline.yaml`, `core/config/tree.yaml`
-- **Writes**: `mind/knowledge/tree/_tree.yaml`, node `.md` files, `mind/knowledge/archived/`
+- **Reads**: `world/knowledge/tree/_tree.yaml`, node `.md` files, `core/config/memory-pipeline.yaml`, `core/config/tree.yaml`
+- **Writes**: `world/knowledge/tree/_tree.yaml`, node `.md` files, `world/knowledge/archived/`
 - **Does NOT call**: any other skills (pure tree operations)

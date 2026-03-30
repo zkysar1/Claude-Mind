@@ -1,12 +1,12 @@
-# Self (The Program)
+# Self (Agent Identity)
 
-The agent's core purpose is defined in `mind/self.md`.
+The agent's core purpose is defined in `<agent>/self.md`.
 This is the fundamental drive that shapes all decisions.
 
 ## Directive
 
 Before generating aspirations, evaluating priorities, or making
-strategic decisions: read `mind/self.md` and ensure alignment.
+strategic decisions: read `<agent>/self.md` and ensure alignment.
 
 The Self answers: "Why do I exist? What am I for?"
 
@@ -26,7 +26,7 @@ they don't stop work to ask permission for every choice.
 - Make the best decision you can with available information. Act on it. Continue.
 - For significant decisions (architectural choices, deployment strategies, trade-off
   calls), log the decision for user review using ONE of these mechanisms:
-  1. **Pending question** (`mind/session/pending-questions.yaml`) with status `pending`,
+  1. **Pending question** (`<agent>/session/pending-questions.yaml`) with status `pending`,
      the decision already executed as `default_action`, and `question` framed as
      "I decided X because Y — override if you disagree."
   2. **User-participant goal** with `participants: [user]` — for decisions
@@ -42,8 +42,8 @@ Updates require user confirmation (via pending-questions queue).
 
 ## Maintenance
 - Written during first boot (/start UNINITIALIZED flow)
-- For existing agents: manually create mind/self.md during upgrade
+- For existing agents: manually create <agent>/self.md during upgrade
 - Evolved via sq-012 spark (with user confirmation)
 - Updated when user provides corrections (/respond directive)
-- Survives session boundaries (lives in mind/)
-- Wiped on /reset (factory reset = new Self)
+- Survives session boundaries (lives in <agent>/)
+- Wiped when agent directory is deleted

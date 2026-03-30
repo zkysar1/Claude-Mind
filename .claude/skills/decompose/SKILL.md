@@ -18,6 +18,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [aspirations, goal-schemas, tree-retrieval, pipeline]
+minimum_mode: assistant
 ---
 
 # /decompose — Hierarchical Task Network Goal Decomposition
@@ -85,12 +86,12 @@ Before decomposing, load the minimum context needed. Map goal keywords to files:
 
 | Keyword Pattern | Files to Read |
 |---|---|
-| discover, explore, find | `pipeline-read.sh --counts`, `mind/knowledge/tree/_tree.yaml` |
+| discover, explore, find | `pipeline-read.sh --counts`, `world/knowledge/tree/_tree.yaml` |
 | evaluate, score, predict | `core/config/profile.yaml` (evaluation framework), `pipeline-read.sh --stage discovered` |
-| research, learn, document | `mind/knowledge/tree/_tree.yaml` |
+| research, learn, document | `world/knowledge/tree/_tree.yaml` |
 | review, accuracy, resolve | `pipeline-read.sh --stage active`, `pipeline-read.sh --stage resolved` |
-| reflect, pattern, learn | `mind/knowledge/patterns/`, `mind/journal/` (most recent) |
-| evolve, strategy, adjust | `aspirations-read.sh --active`, `mind/knowledge/meta/_index.yaml` |
+| reflect, pattern, learn | `world/knowledge/patterns/`, `<agent>/journal/` (most recent) |
+| evolve, strategy, adjust | `aspirations-read.sh --active`, `meta/meta-knowledge/_index.yaml` |
 
 Only read what's needed — minimize context window usage.
 
@@ -165,6 +166,30 @@ function decompose(goal, depth=0):
 | Generate/produce/export a report | Direct goal with Write tool |
 | Analyze/process/transform data | Direct goal with Bash (scripts) |
 
+### Skill Inference Refinement (Relation Graph)
+
+After the static Skill Inference Table lookup, refine skill assignment using the
+skill relation graph (`core/config/skill-relations.yaml` + `<agent>/skill-relations.yaml`):
+
+```
+IF sg.skill is null OR confidence is low:
+    # Check compose_with chain from parent goal's skill
+    Bash: skill-relations.sh read --composable {parent_goal.skill}
+    composable_skills = parse JSON output
+    IF any composable skill's description matches sg's pattern:
+        sg.skill = matched_composable_skill
+
+IF sg.skill is set:
+    # Check for similar alternatives with better quality scores
+    Bash: skill-relations.sh read --similar {sg.skill}
+    IF similar skills found:
+        Bash: skill-evaluate.sh read --all --summary
+        FOR EACH similar_skill:
+            IF similar_skill.quality.overall > sg_skill.quality.overall + 0.15:
+                sg.skill = similar_skill
+                Log: "SKILL ROUTING: Substituted {similar_skill} for {original} (quality delta +{delta})"
+```
+
 ### Verification Inference
 
 For each sub-goal, infer the `verification` field using these patterns:
@@ -173,9 +198,9 @@ For each sub-goal, infer the `verification` field using these patterns:
 |---|---|---|
 | Knowledge article | "Article exists at {path} with {topic} content" | `{type: file_check, target: "{path}", condition: "exists"}` |
 | Pipeline records | "Pipeline has {N}+ records in {stage}" | `{type: pipeline_count, stage: "{stage}", min: N}` |
-| Journal entry | "Journal entry for {date} documents {topic}" | `{type: file_check, target: "mind/journal/{path}", condition: "exists"}` |
+| Journal entry | "Journal entry for {date} documents {topic}" | `{type: file_check, target: "<agent>/journal/{path}", condition: "exists"}` |
 | Config update | "Config field {field} set to {value}" | `{type: config_check, file: "{path}", field: "{field}", value: "{val}"}` |
-| Pattern identified | "Pattern documented in patterns article" | `{type: file_check, target: "mind/knowledge/patterns/...", condition: "updated"}` |
+| Pattern identified | "Pattern documented in patterns article" | `{type: file_check, target: "world/knowledge/patterns/...", condition: "updated"}` |
 | Script/code artifact | "File {path} exists and is functional" | `{type: file_check, target: "{path}", condition: "exists"}` |
 | Hypothesis resolved | "Hypothesis {id} has outcome" | `{type: pipeline_check, id: "{id}", field: "outcome", not_null: true}` |
 

@@ -57,7 +57,7 @@ Every hypothesis has a `horizon` field that controls its overhead level. Default
 | `long` | 7+ days | Standard pipeline record | Full verification suite | Full + pattern extraction |
 
 ### Micro-Hypothesis Format (working memory batch)
-Micro-hypotheses live in `mind/session/working-memory.yaml` under the `micro_hypotheses` slot — no pipeline records, no stage moves.
+Micro-hypotheses live in `<agent>/session/working-memory.yaml` under the `micro_hypotheses` slot — no pipeline records, no stage moves.
 ```yaml
 micro_hypotheses:
   - claim: "Short natural-language prediction"
@@ -160,3 +160,15 @@ experience_ref: "exp-2026-03-10_api-response-latency"  # optional, string
   - `lucky_confirmed`: low priority — don't reinforce reasoning that was flawed
   - `unlucky_corrected`: skip guardrail extraction — the process was sound
   - `deserved_corrected`: high priority — extract guardrail + investigate failure
+
+## Pre-Formation Calibration Gate
+
+Every hypothesis formed via sq-009 MUST pass the calibration gate defined in
+`aspirations-spark/SKILL.md` Step 0.5. The gate reads recent accuracy data and
+applies a confidence ceiling proportional to demonstrated calibration.
+
+This closes the feedback loop: resolved hypothesis outcomes accumulate →
+`aspirations-spark` reads accuracy at formation time → confidence is bounded by track record.
+
+The adversarial pre-mortem (Step 0.7) additionally requires articulating why
+the prediction might be wrong before assigning confidence > 0.65.

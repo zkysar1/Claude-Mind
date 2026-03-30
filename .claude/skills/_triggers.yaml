@@ -2,8 +2,8 @@
 # Maps when parent skills should invoke child skills
 # Updated: 2026-03-06
 
-# Control skills (start, stop, reset, escapePersona, enterPersona, open-questions) are user-only — never triggered by agent.
-# completion-report is user-invocable AND agent-callable (safe: read-only + timer reset).
+# Control skills (start, stop, open-questions) are user-only — never triggered by agent.
+# agent-completion-report is user-invocable AND agent-callable. Writes report files to <agent>/.
 # Internal skills are agent-only — invoked during RUNNING state.
 # State machine: agent-state file is the authoritative signal.
 
@@ -35,7 +35,7 @@ aspirations:
     - condition: "aspiration generation needed (no goals, aspiration complete, evolve, user request)"
       calls: create-aspiration
       priority: 2
-      notes: "Self-driven aspiration creation — reads mind/self.md for alignment"
+      notes: "Self-driven aspiration creation — reads <agent>/self.md for alignment"
 
 # --- Review triggers ---
 # /review-hypotheses may invoke sub-skills for result checking
@@ -65,21 +65,21 @@ reflect:
     - condition: "belief_update — update belief confidence after hypothesis resolution"
       calls: reflect
       priority: 1
-      writes: ["mind/knowledge/beliefs.yaml", "mind/knowledge/transitions.yaml"]
+      writes: ["world/knowledge/beliefs.yaml", "world/knowledge/transitions.yaml"]
       step: "Step 7.6"
       notes: "Update belief confidence after hypothesis resolution"
 
     - condition: "reasoning_extraction — extract reasoning strategies from resolved hypotheses"
       calls: reflect
       priority: 2
-      writes: ["mind/knowledge/reasoning-bank/"]
+      writes: ["world/reasoning-bank.jsonl"]
       step: "Step 2.5"
       notes: "Extract reasoning strategies from resolved hypotheses"
 
     - condition: "step_attribution — label evaluation steps after reflection"
       calls: reflect
       priority: 2
-      writes: ["mind/knowledge/meta/step-attribution.yaml"]
+      writes: ["meta/step-attribution.yaml"]
       step: "Step 7.6c"
       notes: "Label evaluation steps after reflection"
 
@@ -102,7 +102,7 @@ aspirations_evolution:
       calls: aspirations
       priority: 1
       reads: ["core/config/evolution-triggers.yaml"]
-      writes: ["mind/strategy-archive.yaml"]
+      writes: ["meta/strategy-archive.yaml"]
       step: "Phase 9"
       notes: "Check performance-based evolution triggers after each goal completion"
 
@@ -112,4 +112,4 @@ aspirations_evolution:
 routing_notes:
   - "Priority 1 = always invoke when condition met; Priority 2 = invoke if time/budget allows; Priority 3 = optional"
   - "Conditions are evaluated by the parent skill at runtime using pattern matching on context"
-  - "This file is STATIC framework — forged skill triggers tracked in mind/forged-skills.yaml"
+  - "This file is STATIC framework — forged skill triggers tracked in <agent>/forged-skills.yaml"

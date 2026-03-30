@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Work alignment check — provides Self-alignment metrics for LLM interpretation.
 
-Reads Self (mind/self.md), active aspirations, and goal history to compute
+Reads Self (<agent>/self.md), active aspirations, and goal history to compute
 raw metrics. Does NOT make decisions — outputs JSON for the LLM to interpret.
 
 Three core metrics:
@@ -28,11 +28,14 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import MIND_DIR, CONFIG_DIR
+from _paths import WORLD_DIR, AGENT_DIR, CONFIG_DIR
 
-SELF_PATH = MIND_DIR / "self.md"
-ASP_PATH = MIND_DIR / "aspirations.jsonl"
-ASP_ARCHIVE_PATH = MIND_DIR / "aspirations-archive.jsonl"
+# Per-agent identity
+SELF_PATH = AGENT_DIR / "self.md" if AGENT_DIR else None
+
+# Collective domain stores (world/)
+ASP_PATH = WORLD_DIR / "aspirations.jsonl"
+ASP_ARCHIVE_PATH = WORLD_DIR / "aspirations-archive.jsonl"
 CONFIG_PATH = CONFIG_DIR / "aspirations.yaml"
 
 
@@ -54,7 +57,7 @@ def read_jsonl(path):
 
 
 def read_self():
-    """Read mind/self.md and extract body content after YAML front matter."""
+    """Read <agent>/self.md and extract body content after YAML front matter."""
     if not SELF_PATH.exists():
         return ""
     text = SELF_PATH.read_text(encoding="utf-8")
@@ -183,7 +186,7 @@ def cmd_check(args):
     # Read Self
     self_text = read_self()
     if not self_text:
-        print(json.dumps({"error": "Self not found at mind/self.md"}, indent=2))
+        print(json.dumps({"error": "Self not found at <agent>/self.md"}, indent=2))
         sys.exit(1)
 
     # Extract priorities from Self

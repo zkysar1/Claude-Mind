@@ -1,0 +1,241 @@
+# Skill Relation Graph — Framework Definition
+# SkillNet-inspired four relation types between skills.
+# Read by: /decompose (Step 5 skill assignment), goal-selector.py (skill_affinity criterion),
+#          /forge-skill (dedup check), /aspirations-consolidate (skill health report).
+# Immutable framework — forged skill relations tracked in <agent>/skill-relations.yaml.
+
+# --- FRAMEWORK ---
+
+config:
+  relation_types:
+    similar_to:
+      description: "Functionally equivalent or overlapping — can be used interchangeably"
+      symmetric: true
+    compose_with:
+      description: "Output→input chaining — frequently co-invoked in sequence"
+      symmetric: false
+    belong_to:
+      description: "Sub-component of a larger workflow or parent skill"
+      symmetric: false
+    depend_on:
+      description: "Cannot execute without prerequisite skill having run first"
+      symmetric: false
+
+  max_relations_per_skill: 10
+  staleness_threshold_sessions: 20
+  co_invocation_log_cap: 200
+  discover_min_co_occurrences: 3
+
+# --- RELATIONS (base skills) ---
+# Each: {source, target, type, confidence, evidence}
+# confidence: [0.0, 1.0] — 1.0 for structurally guaranteed, lower for inferred
+
+relations:
+  # ═══ ORCHESTRATION CHAINS (compose_with) ═══
+  # Boot → Prime → Aspirations loop startup sequence
+  - source: boot
+    target: prime
+    type: compose_with
+    confidence: 1.0
+    evidence: "Boot always invokes prime for context loading"
+
+  - source: boot
+    target: aspirations
+    type: compose_with
+    confidence: 1.0
+    evidence: "Boot hands off to aspirations loop after priming"
+
+  - source: prime
+    target: aspirations
+    type: compose_with
+    confidence: 0.9
+    evidence: "Prime loads context that aspirations loop consumes"
+
+  # Aspirations loop internal phase chains
+  - source: aspirations-execute
+    target: aspirations-spark
+    type: compose_with
+    confidence: 1.0
+    evidence: "Phase 4 execution → Phase 6 spark check"
+
+  - source: aspirations-spark
+    target: aspirations-state-update
+    type: compose_with
+    confidence: 1.0
+    evidence: "Phase 6 spark → Phase 8 state update"
+
+  - source: aspirations-state-update
+    target: aspirations-evolve
+    type: compose_with
+    confidence: 0.8
+    evidence: "Phase 8 state update → Phase 9 evolution (when triggered)"
+
+  # Cross-cutting composition
+  - source: review-hypotheses
+    target: reflect
+    type: compose_with
+    confidence: 0.9
+    evidence: "--learn mode invokes reflect for each unlearned resolution"
+
+  - source: research-topic
+    target: tree
+    type: compose_with
+    confidence: 0.8
+    evidence: "Research findings encoded to knowledge tree"
+
+  - source: decompose
+    target: aspirations-execute
+    type: compose_with
+    confidence: 0.7
+    evidence: "Decomposed sub-goals feed into execution pipeline"
+
+  - source: create-aspiration
+    target: decompose
+    type: compose_with
+    confidence: 0.6
+    evidence: "New aspirations often need goal decomposition"
+
+  # ═══ SUB-SKILL HIERARCHY (belong_to) ═══
+  # Aspirations sub-skills
+  - source: aspirations-execute
+    target: aspirations
+    type: belong_to
+    confidence: 1.0
+    evidence: "Phase 4 sub-skill of aspirations loop"
+
+  - source: aspirations-spark
+    target: aspirations
+    type: belong_to
+    confidence: 1.0
+    evidence: "Phase 6 sub-skill of aspirations loop"
+
+  - source: aspirations-state-update
+    target: aspirations
+    type: belong_to
+    confidence: 1.0
+    evidence: "Phase 8 sub-skill of aspirations loop"
+
+  - source: aspirations-consolidate
+    target: aspirations
+    type: belong_to
+    confidence: 1.0
+    evidence: "Consolidation sub-skill of aspirations loop"
+
+  - source: aspirations-evolve
+    target: aspirations
+    type: belong_to
+    confidence: 1.0
+    evidence: "Phase 9 evolution sub-skill of aspirations loop"
+
+  # Reflect sub-skills
+  - source: reflect-hypothesis
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Single hypothesis reflection mode"
+
+  - source: reflect-execution
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Execution reflection mode"
+
+  - source: reflect-extract-patterns
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Pattern extraction mode"
+
+  - source: reflect-batch-micro
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Batch micro-hypothesis mode"
+
+  - source: reflect-calibration
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Confidence calibration mode"
+
+  - source: reflect-curate-memory
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Memory curation mode"
+
+  - source: reflect-curate-aspirations
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Aspiration grooming mode"
+
+  - source: reflect-tree-update
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Shared tree update protocol"
+
+  - source: replay
+    target: reflect
+    type: belong_to
+    confidence: 1.0
+    evidence: "Hippocampal replay child of reflect"
+
+  # ═══ DEPENDENCIES (depend_on) ═══
+  - source: research-topic
+    target: tree
+    type: depend_on
+    confidence: 0.8
+    evidence: "Research results require tree operations to encode"
+
+  - source: reflect
+    target: tree
+    type: depend_on
+    confidence: 0.7
+    evidence: "Reflection encodes findings to knowledge tree"
+
+  - source: aspirations
+    target: prime
+    type: depend_on
+    confidence: 0.6
+    evidence: "Loop needs primed context to function effectively"
+
+  - source: forge-skill
+    target: aspirations-spark
+    type: depend_on
+    confidence: 0.5
+    evidence: "Gap detection in Phase 6.5 feeds forge pipeline"
+
+  # ═══ SIMILARITY (similar_to) ═══
+  - source: research-topic
+    target: replay
+    type: similar_to
+    confidence: 0.5
+    evidence: "Both build knowledge — replay from memory, research from external"
+
+  - source: forge-skill
+    target: decompose
+    type: similar_to
+    confidence: 0.4
+    evidence: "Both analyze capability needs — forge creates skills, decompose breaks goals"
+
+  - source: agent-completion-report
+    target: backlog-report
+    type: similar_to
+    confidence: 0.7
+    evidence: "Both are user-facing reporting skills"
+
+  - source: create-aspiration
+    target: decompose
+    type: similar_to
+    confidence: 0.5
+    evidence: "Both are planning skills that structure work"
+
+# --- INITIAL STATE ---
+# Seeded to <agent>/skill-relations.yaml by init-agent.sh.
+
+initial_state:
+  last_updated: null
+  forged_relations: []
+  co_invocation_log: []

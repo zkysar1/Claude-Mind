@@ -1,0 +1,276 @@
+# Meta-Strategy — Framework Definition
+# Metacognitive self-modification layer inspired by HyperAgents (Zhang et al., 2026).
+# The agent reads meta/ files to guide its improvement procedures,
+# and writes to them during evolution (Step 0.7) and reflection (Step 5).
+# Immutable definitions. Agent state lives in meta/ directory.
+# init-meta.sh reads initial_state to seed files on first run.
+
+# --- FRAMEWORK ---
+
+# Strategy file schemas — define structure and bounds for each meta/ file.
+# The agent may modify values within these bounds. Bounds are enforced by meta-set.sh.
+strategy_schemas:
+  goal_selection:
+    file: "meta/goal-selection-strategy.yaml"
+    description: "Scoring weights and heuristics for goal prioritization"
+    weight_bounds: {min: 0.0, max: 3.0}
+    max_custom_criteria: 5
+    max_selection_heuristics: 10
+
+  reflection:
+    file: "meta/reflection-strategy.yaml"
+    description: "When and how deeply to reflect, trigger policies, ROI tracking"
+    max_trigger_overrides: 15
+    max_skip_conditions: 5
+    depth_allocation_constraint: "episode + pattern + strategic must sum to 1.0"
+
+  evolution:
+    file: "meta/evolution-strategy.yaml"
+    description: "How to evolve — meta-meta level, trigger sensitivity, evaluation frequency"
+    trigger_sensitivity_bounds: {min: 0.1, max: 5.0}
+
+  aspiration_generation:
+    file: "meta/aspiration-generation-strategy.yaml"
+    description: "Heuristics for generating new aspirations from Self"
+    max_generation_heuristics: 10
+
+  encoding:
+    file: "meta/encoding-strategy.yaml"
+    description: "Memory encoding priority rules and compression preferences"
+    max_priority_rules: 10
+
+  skill_quality:
+    file: "meta/skill-quality-strategy.yaml"
+    description: "Skill quality dimension weights and evaluation thresholds"
+    weight_bounds: {min: 0.0, max: 1.0}
+    weight_sum_constraint: "must sum to 1.0"
+
+  backpressure:
+    file: "meta/backpressure.yaml"
+    description: "Automated rollback gate for meta-strategy changes (AutoContext-inspired)"
+    regression_window: 5            # consecutive goals below baseline to trigger rollback
+    graduation_window: 15           # goals above baseline before graduating (stop monitoring)
+    baseline_tolerance: -0.10       # how far below baseline before counting as regression
+    max_active_monitors: 5          # don't monitor more than 5 changes simultaneously
+
+  improvement_instructions:
+    file: "meta/improvement-instructions.md"
+    description: "Agent's self-authored procedure document for how to improve"
+    format: markdown
+
+# Improvement velocity (imp@k) metric — measures rate of learning improvement.
+# imp@k = (metric_after_k_goals - metric_at_strategy_change) / k
+improvement_velocity:
+  window_sizes: [5, 10, 20]
+  tracked_metrics:
+    - pipeline_accuracy         # Hypothesis accuracy from pipeline-meta
+    - goal_completion_rate      # Goals completed / goals attempted
+    - encoding_efficiency       # Encoded items later retrieved
+    - reflection_yield          # Actionable findings per reflection
+  learning_value_weights:
+    tree_updated: 0.3
+    artifacts_created: 0.3
+    encoding_score: 0.2
+    findings_gated: 0.2
+
+# A/B experiment framework — test meta-strategy variants before adopting.
+experiments:
+  max_concurrent: 1
+  min_duration_goals: 10
+  max_duration_goals: 30
+  significance_threshold: 0.05
+  phase_rotation: "alternating"   # baseline → variant → baseline → variant
+
+# Transfer mechanism — export/import domain-agnostic meta-knowledge.
+transfer:
+  exportable_strategies:
+    - goal_selection.weights
+    - goal_selection.selection_heuristics
+    - reflection.depth_allocation
+    - reflection.trigger_overrides
+    - encoding.priority_rules
+    - skill_quality.dimension_weights
+    - skill_quality.learned_relations
+  format: yaml_bundle
+  includes_provenance: true
+
+modifiable:
+  imp_k_window: {min: 5, max: 30, default: 10}
+  variant_min_goals: {min: 5, max: 20, default: 10}
+  variant_max_goals: {min: 15, max: 50, default: 30}
+  variant_significance: {min: 0.02, max: 0.15, default: 0.05}
+  max_concurrent_experiments: {min: 1, max: 3, default: 1}
+  # Backpressure gate bounds (AutoContext-inspired)
+  backpressure_regression_window: {min: 3, max: 10, default: 5}
+  backpressure_graduation_window: {min: 10, max: 30, default: 15}
+  backpressure_baseline_tolerance: {min: -0.20, max: -0.02, default: -0.10}
+
+# --- INITIAL STATE ---
+# Seeded to individual meta/ files by init-meta.sh on first run.
+# Each top-level key maps to a file: goal_selection_strategy → meta/goal-selection-strategy.yaml
+# All values are REAL working defaults — no null fallbacks.
+
+initial_state:
+  goal_selection_strategy:
+    version: 1
+    last_updated: null
+    weights:
+      priority: 1.0
+      deadline_urgency: 1.0
+      agent_executable: 0.8
+      variety_bonus: 0.7
+      streak_momentum: 0.5
+      novelty_bonus: 0.6
+      recurring_urgency: 0.8
+      reward_history: 0.5
+      evidence_backing: 0.7
+      deferred_readiness: 0.6
+      context_coherence: 1.0
+      skill_affinity: 0.4
+    custom_criteria: []
+    selection_heuristics: []
+
+  reflection_strategy:
+    version: 1
+    last_updated: null
+    depth_allocation:
+      episode: 0.6
+      pattern: 0.3
+      strategic: 0.1
+    category_depth_overrides: {}
+    trigger_overrides: []
+    skip_conditions: []
+    mode_preferences:
+      full_cycle_cadence_goals: 15
+      batch_micro_threshold: 5
+    roi_history: []
+    # MR-Search: Reflection quality tracking (Priority 2)
+    # Measures which reflections actually improve downstream outcomes.
+    # Populated by Phase 4.26 when retrieved items with source_reflection_id are helpful.
+    reflection_quality_log: []
+    # Each entry: {reflection_id, downstream_goal, helpful} — written by Phase 4.26
+    reflection_effectiveness_by_type:
+      execution: {total: 0, effective: 0, rate: 0.0}
+      hypothesis: {total: 0, effective: 0, rate: 0.0}
+      spark: {total: 0, effective: 0, rate: 0.0}
+    # MR-Search: Adaptive reflection depth (Priority 6)
+    # Scales reflection effort dynamically based on task properties.
+    adaptive_depth:
+      scale_on_surprise: true        # surprise > 7 → deeper reflection
+      scale_on_chain_length: true    # multi-episode goals → deeper reflection
+      scale_on_importance: true      # HIGH priority completed → deeper reflection
+      max_depth_multiplier: 2.0      # never exceed 2x standard depth
+
+  evolution_strategy:
+    version: 1
+    last_updated: null
+    evaluation_frequency: "every_evolve"
+    trigger_sensitivity: {}
+    gap_analysis_heuristics: []
+    meta_change_patience: 10
+
+  aspiration_generation_strategy:
+    version: 1
+    last_updated: null
+    generation_heuristics: []
+    preferred_scope_ratio:
+      sprint: 0.4
+      project: 0.4
+      initiative: 0.2
+    category_saturation: {}
+
+  encoding_strategy:
+    version: 1
+    last_updated: null
+    precision_emphasis_categories: []
+    narrative_compression_level: "standard"
+    decision_rule_preference: "balanced"
+    priority_rules: []
+
+  skill_quality_strategy:
+    version: 1
+    last_updated: null
+    dimension_weights:
+      safety: 0.30
+      completeness: 0.25
+      executability: 0.20
+      maintainability: 0.15
+      cost_awareness: 0.10
+    review_threshold: 0.50
+    retirement_threshold: 0.30
+
+  improvement_instructions: |
+    # Improvement Instructions
+
+    *This file is authored and maintained by the agent itself.*
+    *It describes HOW the agent should improve, and evolves over time.*
+
+    ## Current Procedure
+    1. Execute goals with full retrieval and spark checks
+    2. Encode insights to knowledge tree with precision extraction
+    3. Reflect on outcomes using ABC chain analysis
+    4. Evolve strategies when performance triggers fire
+    5. Track improvement velocity to detect declining effectiveness
+
+    ## Effort Allocation
+    - Standard effort for familiar goal types
+    - Full effort for novel categories or high-priority goals
+    - Skip effort for routine recurring goals with established patterns
+
+    ## First-Principles Analysis (When Warranted)
+    When encountering a novel domain, a high-conviction hypothesis, or a failure
+    caused by assumption violation:
+    1. List every assumption embedded in the current framing
+    2. For each: can I verify this from data I have, or am I inheriting it?
+    3. Strip unverified assumptions and rebuild the approach from ground truth
+    4. Record the delta — what changed when inherited thinking was removed
+    This is expensive; skip for routine/familiar work. Apply when System 2 is active.
+
+    ## Learned Modifications
+    (None yet — this section grows as the agent learns better procedures)
+
+  meta_state:
+    overall_imp_k: 0.0
+    last_session_imp_k: 0.0
+    sessions_evaluated: 0
+    last_evaluation: null
+    evaluation_count: 0
+    total_meta_changes: 0
+
+  improvement_velocity:
+    entries: []
+    rolling_averages:
+      window_5: 0.0
+      window_10: 0.0
+      window_20: 0.0
+
+  active_experiments:
+    experiments: []
+
+  completed_experiments:
+    experiments: []
+
+  transfer_profile:
+    validated_strategies: []
+    last_export: null
+    total_goals_at_export: 0
+  # transfer/_index.yaml is created directly by init-meta.sh, not via initial_state
+
+  # AutoContext-inspired subsystems (backpressure, credit assignment, generations)
+  # dead-ends.jsonl is seeded as empty JSONL by init-meta.sh, not via initial_state
+
+  backpressure:
+    version: 1
+    active_monitors: []
+    rollback_history: []
+
+  credit_assignment:
+    version: 1
+    assignments: []
+
+  strategy_generations:
+    version: 1
+    current_generation: 0
+    generations: []
+    peak_generation: null
+    peak_score: 0.0

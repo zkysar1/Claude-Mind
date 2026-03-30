@@ -24,6 +24,7 @@ execution_history:
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [tree-retrieval, experience]
+minimum_mode: assistant
 ---
 
 # /research-topic — Web Research Engine
@@ -139,7 +140,7 @@ After writing content, check growth triggers:
 ```
 1. Register in _tree.yaml (sets parent, depth, capability_level, confidence):
    bash core/scripts/tree-update.sh --add-child <parent-key> < JSON
-   JSON: {"key": "<topic-slug>", "file": "mind/knowledge/tree/<parent>/<topic-slug>.md",
+   JSON: {"key": "<topic-slug>", "file": "world/knowledge/tree/<parent>/<topic-slug>.md",
           "depth": <parent_depth+1>, "summary": "<one-line summary>", "article_count": 1}
 2. Create directory if needed (mkdir -p)
 3. Write new .md file with front matter:
@@ -167,7 +168,7 @@ After writing content, check growth triggers:
 ### Archive Research Results as Experience
 ```
 experience_id = "exp-research-{topic-slug}-{date}"
-Write mind/experience/{experience_id}.md with:
+Write <agent>/experience/{experience_id}.md with:
     - Complete web fetch results and source evaluations
     - Key findings with full context (not just compressed insights)
     - Source URLs, reliability assessments, contradictions found
@@ -186,7 +187,7 @@ Experience JSON:
           content: "exact quote or data point from source"
         - key: "key-finding-2"
           content: "exact quote or data point from source"
-    content_path: "mind/experience/{experience_id}.md"
+    content_path: "<agent>/experience/{experience_id}.md"
 
 # Add experience_refs to tree node front matter
 Read target tree node .md file
@@ -198,7 +199,7 @@ Edit the tree node to include the updated front matter
 ```
 Extract named entities from findings (people, orgs, concepts, metrics, events)
 Normalize to lowercase-kebab-case
-Read mind/knowledge/tree/_tree.yaml → entity_index
+Read world/knowledge/tree/_tree.yaml → entity_index
   If entity exists: add this node's path, increment mention_count
   If entity is new AND total_entities < max_entities: create entry
   If entity is new AND over cap: skip

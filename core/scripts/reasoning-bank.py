@@ -2,8 +2,8 @@
 """Reasoning bank and guardrails engine for JSONL-based record management.
 
 Manages two stores:
-  - mind/reasoning-bank.jsonl  (reasoning bank entries, rb-NNN)
-  - mind/guardrails.jsonl      (guardrail rules, guard-NNN)
+  - world/reasoning-bank.jsonl  (reasoning bank entries, rb-NNN)
+  - world/guardrails.jsonl      (guardrail rules, guard-NNN)
 
 All shell scripts are thin wrappers around this. Top-level subcommands `rb` and
 `guard` select the store; nested subcommands manage records.
@@ -24,10 +24,10 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import MIND_DIR
+from _paths import WORLD_DIR
 
-RB_PATH = MIND_DIR / "reasoning-bank.jsonl"
-GUARD_PATH = MIND_DIR / "guardrails.jsonl"
+RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
+GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
 
 RB_ID_RE = re.compile(r"^rb-\d{3}$")
 GUARD_ID_RE = re.compile(r"^guard-\d{3}$")
@@ -96,24 +96,15 @@ def read_jsonl(path):
 
 
 def write_jsonl(path, items):
-    """Atomically write a list of dicts as JSONL (one JSON object per line)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        for item in items:
-            # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-            f.write(json.dumps(item, ensure_ascii=True) + "\n")
-    os.replace(str(tmp), str(p))
+    """Atomically write a list of dicts as JSONL with locking and history."""
+    from _fileops import locked_write_jsonl
+    locked_write_jsonl(path, items)
 
 
 def append_jsonl(path, item):
-    """Append one JSON line to a JSONL file, creating it if needed."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        f.write(json.dumps(item, ensure_ascii=True) + "\n")
+    """Append one JSON line to a JSONL file with locking and history."""
+    from _fileops import locked_append_jsonl
+    locked_append_jsonl(path, item)
 
 
 def parse_value(value_str):

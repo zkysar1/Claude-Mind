@@ -27,9 +27,9 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 suggest = _mod.suggest
 
-from _paths import MIND_DIR
+from _paths import WORLD_DIR
 
-ASP_PATH = MIND_DIR / "aspirations.jsonl"
+ASP_PATH = WORLD_DIR / "aspirations.jsonl"
 
 
 def read_jsonl(path):

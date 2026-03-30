@@ -5,11 +5,20 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 source "$CORE_ROOT/scripts/_platform.sh"
-ASP_JSONL="$REPO_ROOT/mind/aspirations.jsonl"
-COMPACT="$REPO_ROOT/mind/session/aspirations-compact.json"
+ASP_JSONL="$WORLD_DIR/aspirations.jsonl"
+
+# Cache lives in agent session dir (per-agent)
+if [ -z "$AGENT_DIR" ]; then
+    echo "[load-aspirations-compact] no agent bound, skipping" >&2
+    exit 0
+fi
+COMPACT="$AGENT_DIR/session/aspirations-compact.json"
 
 # Skip if aspirations.jsonl doesn't exist (fresh agent)
-[ -f "$ASP_JSONL" ] || exit 0
+if [ ! -f "$ASP_JSONL" ]; then
+    echo "[load-aspirations-compact] $ASP_JSONL not found, skipping" >&2
+    exit 0
+fi
 
 # Regenerate if stale (aspirations.jsonl newer than cached compact)
 if [ ! -f "$COMPACT" ] || [ "$ASP_JSONL" -nt "$COMPACT" ]; then

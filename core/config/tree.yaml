@@ -1,6 +1,6 @@
 # Memory Tree Configuration — Framework Definition
 # Based on Random Tree Model (Zhong et al., PRL 2025)
-# Immutable tree rules. Agent state lives in mind/knowledge/tree/_tree.yaml
+# Immutable tree rules. Agent state lives in world/knowledge/tree/_tree.yaml
 # Boot reads initial_state to seed state file on first run.
 
 # --- FRAMEWORK ---
@@ -75,16 +75,16 @@ entity_index:
 # L1 domains — the four fundamental branches every agent starts with
 l1_domains:
   - key: execution
-    file: mind/knowledge/tree/execution.md
+    file: world/knowledge/tree/execution.md
     summary: "What to DO — strategies and methods for taking action"
   - key: intelligence
-    file: mind/knowledge/tree/intelligence.md
+    file: world/knowledge/tree/intelligence.md
     summary: "What we KNOW — domain knowledge and understanding"
   - key: performance
-    file: mind/knowledge/tree/performance.md
+    file: world/knowledge/tree/performance.md
     summary: "How we're DOING — outcome tracking and accuracy analysis"
   - key: system
-    file: mind/knowledge/tree/system.md
+    file: world/knowledge/tree/system.md
     summary: "HOW we work — meta-knowledge about the agent's own operation"
 
 # --- NODE TEMPLATES ---
@@ -96,7 +96,7 @@ node_templates:
   # Generic entry in _tree.yaml — works at any depth L2-L6
   _tree_entry_node:
     key: "{node-slug}"                     # kebab-case, matches filename
-    file: "mind/knowledge/tree/{path}/{node-slug}.md"  # path built from ancestry
+    file: "world/knowledge/tree/{path}/{node-slug}.md"  # path built from ancestry
     depth: "{depth}"                       # integer 2-6
     parent: "{parent-slug}"               # parent node key
     children: []
@@ -130,7 +130,7 @@ node_templates:
       source: null
       session: null
 
-  # YAML front matter for L1 domain .md files (mind/knowledge/tree/{domain}.md)
+  # YAML front matter for L1 domain .md files (world/knowledge/tree/{domain}.md)
   # Minimal schema: content-provenance only. domain_confidence, capability_level,
   # children, depth all live in _tree.yaml exclusively.
   l1_file_front_matter:
@@ -169,7 +169,7 @@ initial_state:
       growth_state: stable
       summary: "Top-level routing index. Four L1 domains: execution (strategies), intelligence (knowledge), performance (tracking), system (meta). Empty — agent has not learned anything yet."
     execution:
-      file: mind/knowledge/tree/execution.md
+      file: world/knowledge/tree/execution.md
       depth: 1
       parent: root
       children: []
@@ -179,7 +179,7 @@ initial_state:
       growth_state: stable
       summary: "What to DO — strategies and methods for taking action. Empty — will grow as the agent learns a domain."
     intelligence:
-      file: mind/knowledge/tree/intelligence.md
+      file: world/knowledge/tree/intelligence.md
       depth: 1
       parent: root
       children: []
@@ -189,7 +189,7 @@ initial_state:
       growth_state: stable
       summary: "What we KNOW — domain knowledge and understanding. Empty — will grow as the agent learns."
     performance:
-      file: mind/knowledge/tree/performance.md
+      file: world/knowledge/tree/performance.md
       depth: 1
       parent: root
       children: []
@@ -199,7 +199,7 @@ initial_state:
       growth_state: stable
       summary: "How we're DOING — outcome tracking and accuracy analysis. Empty — will grow as the agent tests hypotheses."
     system:
-      file: mind/knowledge/tree/system.md
+      file: world/knowledge/tree/system.md
       depth: 1
       parent: root
       children: []

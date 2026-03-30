@@ -7,6 +7,7 @@ triggers:
   - "/reflect-curate-memory"
   - "/reflect --curate-memory"
 conventions: [aspirations, experience, tree-retrieval, reasoning-guardrails, pattern-signatures]
+minimum_mode: autonomous
 ---
 
 # /reflect-curate-memory — Memory Curation + Active Forgetting
@@ -25,7 +26,7 @@ Scope: If triggered by spark/stale_strategy, scope to that category only. If tri
 
 ### 1a: Stale Strategies
 ```
-Read mind/knowledge/strategies/extracted-strategies.md
+Read world/knowledge/strategies/extracted-strategies.md
 For each strategy with status: active:
   stale = (today - last_reinforced).days > 30 AND times_applied == 0
   If stale: add to candidates with reason "unused for 30+ days"
@@ -137,7 +138,7 @@ For each RETIRE decision:
 1. Set `status: retired`
 2. Set `retirement_date: {today}`
 3. Set `retirement_reason: "{brief explanation}"`
-4. If strategy: append summary to `mind/strategy-archive.yaml` retired section
+4. If strategy: append summary to `meta/strategy-archive.yaml` retired section
 5. Log retirement event via `evolution-log-append.sh`:
    ```json
    {"event": "memory_curation", "action": "retired", "artifact_type": "{type}", "artifact_id": "{id}", "reason": "{reason}", "date": "{today}"}
@@ -201,9 +202,9 @@ For each leaf node article:
   If retention 0.4-0.7 → AGING: flag for reinforcement or re-research
   If retention < 0.4:
     If article has validated evidence (statistical significance):
-      → ARCHIVE to mind/knowledge/archived/ (don't delete validated work)
+      → ARCHIVE to world/knowledge/archived/ (don't delete validated work)
     Else:
-      → DEPRECATE: move to mind/knowledge/deprecated/
+      → DEPRECATE: move to world/knowledge/deprecated/
       → bash core/scripts/tree-update.sh --remove-child <parent-key> <child-key>
       → Log: "ACTIVE FORGETTING: {article} pruned (retention {score})"
 ```
@@ -216,7 +217,7 @@ When new knowledge contradicts existing knowledge:
    interference_with: ["path/to/contradicting-article.md"]
 2. During next /replay session, prioritize resolving the interference
 3. Resolution: one article strengthened (evidence wins), other weakened or accommodation triggered
-4. Log schema operation to mind/developmental-stage.yaml:
+4. Log schema operation to <agent>/developmental-stage.yaml:
    type: "accommodation" if framework changes, "assimilation" if framework holds
 ```
 
@@ -231,4 +232,4 @@ When an article is retrieved for use in a hypothesis (during evaluation):
   This is how strategies get updated with new evidence rather than accumulating stale content
 ```
 
-Update `mind/knowledge/meta/_index.yaml` knowledge_articles_by_recency on every cycle.
+Update `meta/meta-knowledge/_index.yaml` knowledge_articles_by_recency on every cycle.

@@ -47,15 +47,18 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, MIND_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR
 
-TREE_PATH = MIND_DIR / "knowledge" / "tree" / "_tree.yaml"
-RB_PATH = MIND_DIR / "reasoning-bank.jsonl"
-GUARD_PATH = MIND_DIR / "guardrails.jsonl"
-SIGS_PATH = MIND_DIR / "pattern-signatures.jsonl"
-EXP_PATH = MIND_DIR / "experience.jsonl"
-BELIEFS_PATH = MIND_DIR / "knowledge" / "beliefs.yaml"
-EI_PATH = MIND_DIR / "experiential-index.yaml"
+# Collective domain stores (world/)
+TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
+RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
+GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
+SIGS_PATH = WORLD_DIR / "pattern-signatures.jsonl"
+BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml"
+
+# Per-agent stores (agent directory)
+EXP_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
+EI_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 
 # All depths return the same limits — retrieval intelligence is in the LLM, not here.
 # Do not re-differentiate these; the old 3/7/12 split was replaced by LLM-driven node selection.
@@ -132,12 +135,13 @@ def now_str():
 # Tree node loading (main entry point for tree retrieval)
 # ---------------------------------------------------------------------------
 
-def load_tree_nodes(categories, depth):
+def load_tree_nodes(categories, depth, read_only=False):
     """Load matching tree nodes for one or more categories.
 
     Args:
         categories: list of category strings (supports multi-category)
         depth: "shallow", "medium", or "deep"
+        read_only: if True, skip retrieval counter increments
 
     Returns list of node dicts with content and match metadata.
     """
@@ -218,11 +222,12 @@ def load_tree_nodes(categories, depth):
                 except Exception:
                     entry["content"] = None
 
-        # Increment retrieval_count on the tree node
-        rc = node.get("retrieval_count", 0)
-        node["retrieval_count"] = rc + 1
-        node["last_retrieved"] = today_str()
-        tree_modified = True
+        # Increment retrieval_count on the tree node (skip in read-only mode)
+        if not read_only:
+            rc = node.get("retrieval_count", 0)
+            node["retrieval_count"] = rc + 1
+            node["last_retrieved"] = today_str()
+            tree_modified = True
 
         retrieval_channels_used.add(channel)
         results.append(entry)
@@ -239,68 +244,73 @@ def load_tree_nodes(categories, depth):
 # Supporting data loaders (unchanged logic, load ALL active)
 # ---------------------------------------------------------------------------
 
-def load_reasoning_bank():
-    """Load ALL active reasoning bank entries. Increment retrieval counters."""
+def load_reasoning_bank(read_only=False):
+    """Load ALL active reasoning bank entries. Increment retrieval counters unless read_only."""
     records = read_jsonl(RB_PATH)
     active = [r for r in records if r.get("status") == "active"]
 
-    modified = False
-    for rec in records:
-        if rec.get("status") != "active":
-            continue
-        util = rec.setdefault("utilization", {})
-        util["retrieval_count"] = util.get("retrieval_count", 0) + 1
-        util["last_retrieved"] = today_str()
-        modified = True
+    if not read_only:
+        modified = False
+        for rec in records:
+            if rec.get("status") != "active":
+                continue
+            util = rec.setdefault("utilization", {})
+            util["retrieval_count"] = util.get("retrieval_count", 0) + 1
+            util["last_retrieved"] = today_str()
+            modified = True
 
-    if modified:
-        write_jsonl(RB_PATH, records)
+        if modified:
+            write_jsonl(RB_PATH, records)
 
     return active
 
 
-def load_guardrails():
-    """Load ALL active guardrails. Increment retrieval counters."""
+def load_guardrails(read_only=False):
+    """Load ALL active guardrails. Increment retrieval counters unless read_only."""
     records = read_jsonl(GUARD_PATH)
     active = [r for r in records if r.get("status") == "active"]
 
-    modified = False
-    for rec in records:
-        if rec.get("status") != "active":
-            continue
-        util = rec.setdefault("utilization", {})
-        util["retrieval_count"] = util.get("retrieval_count", 0) + 1
-        util["last_retrieved"] = today_str()
-        modified = True
+    if not read_only:
+        modified = False
+        for rec in records:
+            if rec.get("status") != "active":
+                continue
+            util = rec.setdefault("utilization", {})
+            util["retrieval_count"] = util.get("retrieval_count", 0) + 1
+            util["last_retrieved"] = today_str()
+            modified = True
 
-    if modified:
-        write_jsonl(GUARD_PATH, records)
+        if modified:
+            write_jsonl(GUARD_PATH, records)
 
     return active
 
 
-def load_pattern_signatures():
-    """Load ALL active pattern signatures. Increment retrieval counters."""
+def load_pattern_signatures(read_only=False):
+    """Load ALL active pattern signatures. Increment retrieval counters unless read_only."""
     records = read_jsonl(SIGS_PATH)
     active = [r for r in records if r.get("status") == "active"]
 
-    modified = False
-    for rec in records:
-        if rec.get("status") != "active":
-            continue
-        util = rec.setdefault("utilization", {})
-        util["retrieval_count"] = util.get("retrieval_count", 0) + 1
-        util["last_retrieved"] = today_str()
-        modified = True
+    if not read_only:
+        modified = False
+        for rec in records:
+            if rec.get("status") != "active":
+                continue
+            util = rec.setdefault("utilization", {})
+            util["retrieval_count"] = util.get("retrieval_count", 0) + 1
+            util["last_retrieved"] = today_str()
+            modified = True
 
-    if modified:
-        write_jsonl(SIGS_PATH, records)
+        if modified:
+            write_jsonl(SIGS_PATH, records)
 
     return active
 
 
-def load_experiences(categories, depth):
-    """Load top N experiences matching any category. Increment retrieval counters."""
+def load_experiences(categories, depth, read_only=False):
+    """Load top N experiences matching any category. Increment retrieval counters unless read_only."""
+    if not EXP_PATH:
+        return []
     records = read_jsonl(EXP_PATH)
     limit = EXP_LIMITS.get(depth, 5)
 
@@ -320,19 +330,19 @@ def load_experiences(categories, depth):
     )
 
     selected = matching[:limit]
-    selected_ids = {r["id"] for r in selected}
 
-    # Increment retrieval_count on selected records in the full list
-    modified = False
-    for rec in records:
-        if rec.get("id") in selected_ids:
-            stats = rec.setdefault("retrieval_stats", {})
-            stats["retrieval_count"] = stats.get("retrieval_count", 0) + 1
-            stats["last_retrieved"] = today_str()
-            modified = True
+    if not read_only:
+        selected_ids = {r["id"] for r in selected}
+        modified = False
+        for rec in records:
+            if rec.get("id") in selected_ids:
+                stats = rec.setdefault("retrieval_stats", {})
+                stats["retrieval_count"] = stats.get("retrieval_count", 0) + 1
+                stats["last_retrieved"] = today_str()
+                modified = True
 
-    if modified:
-        write_jsonl(EXP_PATH, records)
+        if modified:
+            write_jsonl(EXP_PATH, records)
 
     return selected
 
@@ -355,6 +365,8 @@ def load_beliefs(categories):
 
 def load_experiential_index(categories):
     """Load experiential index entries for categories."""
+    if not EI_PATH:
+        return {}
     ei = read_yaml(EI_PATH)
     if not ei:
         return {}
@@ -391,28 +403,34 @@ def main():
                         help="(Deprecated — all depths return full results)")
     parser.add_argument("--supplementary-only", action="store_true",
                         help="Skip tree node matching, only return supplementary stores")
+    parser.add_argument("--read-only", action="store_true",
+                        help="Skip retrieval counter increments (for reader mode)")
     args = parser.parse_args()
 
     # Support comma-separated multi-category
     categories = [c.strip() for c in args.category.split(",") if c.strip()]
     depth = args.depth
 
+    read_only = args.read_only
+
     # Load tree nodes unless --supplementary-only
     if args.supplementary_only:
         tree_nodes, retrieval_channels = [], set()
     else:
-        tree_nodes, retrieval_channels = load_tree_nodes(categories, depth)
+        tree_nodes, retrieval_channels = load_tree_nodes(categories, depth, read_only=read_only)
 
     # Load supplementary stores (always)
-    reasoning_bank = load_reasoning_bank()
-    guardrails = load_guardrails()
-    pattern_signatures = load_pattern_signatures()
-    experiences = load_experiences(categories, depth)
+    reasoning_bank = load_reasoning_bank(read_only=read_only)
+    guardrails = load_guardrails(read_only=read_only)
+    pattern_signatures = load_pattern_signatures(read_only=read_only)
+    experiences = load_experiences(categories, depth, read_only=read_only)
     beliefs = load_beliefs(categories)
     experiential_index = load_experiential_index(categories)
 
     # Stderr summary for visibility
     mode = "supplementary-only" if args.supplementary_only else depth
+    if read_only:
+        mode += " read-only"
     node_keys = ", ".join(n["key"] for n in tree_nodes[:3])
     if len(tree_nodes) > 3:
         node_keys += f" +{len(tree_nodes) - 3} more"
@@ -424,6 +442,7 @@ def main():
         "meta": {
             "category": args.category,
             "depth": depth,
+            "read_only": read_only,
             "timestamp": now_str(),
             "retrieval_channels": sorted(retrieval_channels),
             "items_returned": {

@@ -6,12 +6,13 @@ triggers:
   - "/backlog-report"
 tools_used: [Bash, Read, Write]
 conventions: [aspirations, goal-schemas, goal-selection, pipeline]
+minimum_mode: reader
 ---
 
 # /backlog-report — Sprint Planning Backlog
 
 Generates a complete, copy-pasteable markdown backlog of all aspirations, goals,
-scores, blockers, and user action items. Writes `mind/BACKLOG.md` and displays a compact terminal summary.
+scores, blockers, and user action items. Writes `<agent>/BACKLOG.md` and displays a compact terminal summary.
 
 **Hybrid skill**: user-invocable AND agent-callable. Valid from ANY state.
 Safe: read-only with respect to agent state (only writes the output file).
@@ -44,7 +45,7 @@ Run these in parallel where possible:
    → Parse JSON → store as blocked_data
 
 4. Pending questions (user review items)
-   Read: mind/session/pending-questions.yaml
+   Read: <agent>/session/pending-questions.yaml
    → Parse YAML → filter status == "pending" → store as pending_questions[]
    → IF file missing or empty: pending_questions = []
 
@@ -129,7 +130,7 @@ Top 10 goals from scored_goals[] (by score descending).
 
 | # | Goal | Aspiration | Title | Score | Priority | Category | Recurring |
 |---|------|------------|-------|-------|----------|----------|-----------|
-| 1 | g-002-01 | asp-002 | Reflect and journal | 8.7 | HIGH | maintenance | 4h |
+| 1 | g-001-01 | asp-001 | Reflect and journal | 8.7 | HIGH | maintenance | 4h |
 | 2 | g-001-03 | asp-001 | Research API response... | 7.9 | MEDIUM | intelligence | — |
 ```
 
@@ -145,8 +146,8 @@ Only show if any recurring goals exist.
 
 | Goal | Title | Interval | Last Done | Overdue By | Streak |
 |------|-------|----------|-----------|------------|--------|
-| g-002-06 | Check agent inbox | 0.25h | 14:30 today | 2.1h | 8 |
-| g-002-01 | Reflect and journal | 4h | 10:09 today | — | 15 |
+| g-001-04 | Check agent inbox | 0.25h | 14:30 today | 2.1h | 8 |
+| g-001-01 | Reflect and journal | 4h | 10:09 today | — | 15 |
 ```
 
 Overdue By: show hours if overdue, "—" if on time.
@@ -156,15 +157,15 @@ Sort by overdue_by descending (most overdue first), then on-time goals by next-d
 ### 3e: Aspirations (one section per active aspiration)
 
 ```markdown
-## asp-002: Maintain Agent Health [ACTIVE] (3/12 goals)
+## asp-001: Maintain Agent Health [ACTIVE] (3/12 goals)
 
 **Priority**: MEDIUM | **Motivation**: Keep the agent's knowledge fresh...
 
 | Goal | Title | Status | Pri | Score | Category | Skill | Recur | Who |
 |------|-------|--------|-----|-------|----------|-------|-------|-----|
-| g-002-01 | Reflect and journal | pending | HIGH | 8.7 | maintenance | /reflect | 4h | agent |
-| g-002-03 | Tree maintenance | pending | MED | 5.2 | maintenance | /tree maintain | 24h | agent |
-| g-002-07 | Run test circuits | blocked | HIGH | BLK | testing | /some-domain-skill | — | agent |
+| g-001-01 | Reflect and journal | pending | HIGH | 8.7 | maintenance | /reflect | 4h | agent |
+| g-001-03 | Tree maintenance | pending | MED | 5.2 | maintenance | /tree maintain | 24h | agent |
+| g-001-05 | Run test circuits | blocked | HIGH | BLK | testing | /some-domain-skill | — | agent |
 ```
 
 Rules:
@@ -202,7 +203,7 @@ Then list by reason group. Omit any group with count 0.
 - g-003-02: Deploy config — waiting on g-001-02
 
 ### Deferred ({count})
-- g-002-08: Check inbox — until 2026-03-17 (cooldown)
+- g-001-06: Check inbox — until 2026-03-17 (cooldown)
 
 ### Hypothesis Gate ({count})
 - g-001-06: Verify spatial memory — resolves_no_earlier_than 2026-03-20
@@ -237,9 +238,9 @@ Window: "{resolves_no_earlier_than} – {resolves_by}" formatted as short dates.
 ## Phase 4: Write File
 
 ```
-Write: mind/BACKLOG.md ← rendered markdown from Phase 3
+Write: <agent>/BACKLOG.md ← rendered markdown from Phase 3
 
-IF mind/BACKLOG.md already exists: overwrite (regenerated snapshot, not append-only)
+IF <agent>/BACKLOG.md already exists: overwrite (regenerated snapshot, not append-only)
 ```
 
 ## Phase 5: Terminal Summary
@@ -264,12 +265,12 @@ Top 5 Next Actions:
 Recurring: {N} overdue, {M} on-streak
 Aspirations:
   asp-001: {title} [ACTIVE] ({completed}/{total}) — {priority}
-  asp-002: {title} [ACTIVE] ({completed}/{total}) — {priority}
+  asp-001: {title} [ACTIVE] ({completed}/{total}) — {priority}
 
 Blocked: {N} goals, {B} bottlenecks
 Hypotheses: {H} ready to test
 
-Full report written to: {absolute_path_to_mind/BACKLOG.md}
+Full report written to: {absolute_path_to_<agent>/BACKLOG.md}
 ═══════════════════════════════════════════════
 ```
 
@@ -277,4 +278,4 @@ Full report written to: {absolute_path_to_mind/BACKLOG.md}
 
 - **Called by**: User directly (`/backlog-report`), OR by agent during RUNNING state
 - **Calls**: No other skills — only framework scripts (`aspirations-read.sh`, `goal-selector.sh`, `pipeline-read.sh`) and file reads
-- **Modifies**: Writes/overwrites `mind/BACKLOG.md`
+- **Modifies**: Writes/overwrites `<agent>/BACKLOG.md`

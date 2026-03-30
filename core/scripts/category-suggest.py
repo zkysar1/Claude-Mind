@@ -36,9 +36,9 @@ except ImportError:
 # Shared matching primitives — single source of truth for front matter
 # parsing and concept index building. See tree_match.py.
 from tree_match import build_concept_index  # noqa: E402
-from _paths import MIND_DIR
+from _paths import WORLD_DIR
 
-TREE_PATH = MIND_DIR / "knowledge" / "tree" / "_tree.yaml"
+TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
 
 # Structural nodes excluded from category suggestions (too broad)
 STRUCTURAL_DEPTHS = {0, 1}

@@ -7,8 +7,8 @@ config:
   K: 4                          # max sub-skills per parent
   max_skills: 15                # ceiling to prevent sprawl
   developmental_gate: EXPLOIT   # minimum capability level before forging allowed
-  control_skills: [start, stop, reset, escapePersona, enterPersona, verify-learning]
-  # Forged skills tracked in mind/forged-skills.yaml (not here).
+  control_skills: [start, stop, verify-learning]
+  # Forged skills tracked in <agent>/forged-skills.yaml (not here).
   # This file is STATIC framework — never modified during RUNNING state.
 
 # --- Control Skills (USER-ONLY — Claude must NEVER invoke these) ---
@@ -31,33 +31,6 @@ stop:
   model_invocable: false
   status: active
 
-reset:
-  file: .claude/skills/reset/SKILL.md
-  parent: null
-  children: []
-  type: control
-  user_invocable: true
-  model_invocable: false
-  status: active
-
-escapePersona:
-  file: .claude/skills/escapePersona/SKILL.md
-  parent: null
-  children: []
-  type: control
-  user_invocable: true
-  model_invocable: false
-  status: active
-
-enterPersona:
-  file: .claude/skills/enterPersona/SKILL.md
-  parent: null
-  children: []
-  type: control
-  user_invocable: true
-  model_invocable: false
-  status: active
-
 # --- Orchestrator (root) ---
 
 aspirations:
@@ -72,7 +45,7 @@ aspirations:
     - forge-skill
     - recover
     - create-aspiration
-    # Forged skills register as children in mind/forged-skills.yaml, not here.
+    # Forged skills register as children in <agent>/forged-skills.yaml, not here.
   type: orchestrator
   user_invocable: false
   status: active
@@ -209,8 +182,8 @@ verify-learning:
 
 # --- Reporting (hybrid — user-invocable AND agent-callable) ---
 
-completion-report:
-  file: .claude/skills/completion-report/SKILL.md
+agent-completion-report:
+  file: .claude/skills/agent-completion-report/SKILL.md
   parent: null
   children: []
   type: reporting

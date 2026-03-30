@@ -15,18 +15,19 @@
 #   Incremented: each stop attempt while RUNNING (before tier decision)
 #   Reset by: /boot (stale cleanup), aspirations loop entry (Phase -0.5),
 #             Gate 2.5 (pending agents), safety valve (block 5+)
-#   Lives at: mind/session/stop-block-count
+#   Lives at: <agent>/session/stop-block-count
 
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 cd "$PROJECT_ROOT"
 
 # --- Gate 0: Session identity — only block the runner session ---
-# The aspirations loop writes its session UUID to running-session-id on entry.
+# running-session-id is set by Phase -0.5 (loop entry) and kept in sync by
+# session-save-id.sh (on compact). Do not assume it is write-once.
 # Any other Claude Code session (different UUID) stops freely.
 HOOK_SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
-RUNNER_FILE="$REPO_ROOT/mind/session/running-session-id"
-if [ -f "$RUNNER_FILE" ] && [ -n "$HOOK_SID" ]; then
+RUNNER_FILE="${AGENT_DIR:+$AGENT_DIR/session/running-session-id}"
+if [ -n "$RUNNER_FILE" ] && [ -f "$RUNNER_FILE" ] && [ -n "$HOOK_SID" ]; then
     RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null || echo "")
     if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
         exit 0  # Different session — not the autonomous loop runner, allow stop
@@ -69,7 +70,7 @@ fi
 # --- Tier 1-3: Re-enter aspirations loop ---
 if [ "$COUNT" -le 3 ]; then
     CKPT_MSG=""
-    if [ -f "$REPO_ROOT/mind/session/compact-checkpoint.yaml" ]; then
+    if [ -n "$AGENT_DIR" ] && [ -f "$AGENT_DIR/session/compact-checkpoint.yaml" ]; then
         CKPT_MSG=" Encoding checkpoint saved -- Phase -0.5c will process it on re-entry."
     fi
     echo "{\"decision\":\"block\",\"reason\":\"[Recovery Tier ${COUNT}/3] Context compressed -- this is NORMAL. You MUST invoke /aspirations loop NOW. Do NOT set stop-loop. Do NOT write handoff. Do NOT consolidate. Re-enter the loop immediately.${CKPT_MSG}\"}"
