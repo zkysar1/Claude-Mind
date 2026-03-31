@@ -21,11 +21,21 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 cd "$PROJECT_ROOT"
 
+# --- Read stdin once — DO NOT read stdin again after this line ---
+# Hooks receive JSON on stdin. We save it so both capture-insights (background)
+# and the stop-hook logic can read it. Stdin is consumed here; echo redelivers.
+HOOK_INPUT=$(cat)
+
+# --- Fire-and-forget: capture Insight blocks from assistant output ---
+# Background (&) so it never delays the stop decision.
+# &>/dev/null prevents stdout contamination of the decision JSON below.
+echo "$HOOK_INPUT" | python3 core/scripts/capture-insights.py &>/dev/null &
+
 # --- Gate 0: Session identity — only block the runner session ---
 # running-session-id is set by Phase -0.5 (loop entry) and kept in sync by
 # session-save-id.sh (on compact). Do not assume it is write-once.
 # Any other Claude Code session (different UUID) stops freely.
-HOOK_SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
+HOOK_SID=$(echo "$HOOK_INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 RUNNER_FILE="${AGENT_DIR:+$AGENT_DIR/session/running-session-id}"
 if [ -n "$RUNNER_FILE" ] && [ -f "$RUNNER_FILE" ] && [ -n "$HOOK_SID" ]; then
     RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null || echo "")

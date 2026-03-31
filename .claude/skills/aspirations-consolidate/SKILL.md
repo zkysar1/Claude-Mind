@@ -217,6 +217,29 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                    bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
        Log summary: "Judgment quality: {total} conclusions ({negative} negative), {correct} correct, {wrong} wrong, {pending} pending. Avg signals: {avg_signals:.1f}"
 
+2.8. Insight Consolidation:
+   Bash: insights-read.sh --count
+   IF count > 0:
+     insights_json = Bash: insights-read.sh  # returns unprocessed as JSON array
+     encoded_count = 0
+     buffered_count = 0
+     FOR EACH insight in insights_json:
+       node = bash core/scripts/tree-find-node.sh --text "{insight.content}" --leaf-only --top 1
+       IF node found AND node.score > 0.3:
+         Read node file
+         Append compressed insight (1-2 sentences) to "Key Insights" section
+         bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
+         Log: "INSIGHT ENCODED: {insight.id} → {node.key}"
+         encoded_count += 1
+       ELSE:
+         echo '{"observation": "{insight.content}", "source": "insight-capture", "insight_id": "{insight.id}"}' | bash core/scripts/wm-append.sh sensory_buffer
+         Log: "INSIGHT BUFFERED: {insight.id} — no matching tree node"
+         buffered_count += 1
+     Bash: insights-read.sh --mark-processed
+     Output: "▸ CONSOLIDATION: {encoded_count} insights → tree, {buffered_count} buffered"
+   ELSE:
+     Log: "No unprocessed insights"
+
 3. **MANDATORY** — run even if all earlier steps had empty data:
    Bash: wm-read.sh sensory_buffer --json
    Log consolidation to journal (use this EXACT format, with zeros for empty fields):
@@ -437,6 +460,7 @@ CONSOLIDATION CHECKLIST:
   Step 2.6  Experience Archive:    {done}
   Step 2.6  Encoding Weights:      {done|skipped (insufficient data)|skipped (file missing)}
   Step 2.7  Conclusion Quality:    {done|empty}
+  Step 2.8  Insight Consolidation: {done|empty}
   Step 3  Journal (structured):    {done}    ← MANDATORY
   Step 4  WM Archive:              {done}    ← MANDATORY
   Step 5  WM Reset:                {done}

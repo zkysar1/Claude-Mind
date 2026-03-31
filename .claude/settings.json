@@ -233,11 +233,6 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/capture-insights.sh",
-            "timeout": 3
-          },
-          {
-            "type": "command",
             "command": "bash core/scripts/stop-hook.sh",
             "timeout": 5
           }

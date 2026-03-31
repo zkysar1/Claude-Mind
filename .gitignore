@@ -25,6 +25,8 @@ desktop.ini
 __pycache__/
 *.pyc
 *.pyo
+core/scripts/.python-shim/
+core/scripts/.capture-insights.log
 .venv/
 venv/
 
