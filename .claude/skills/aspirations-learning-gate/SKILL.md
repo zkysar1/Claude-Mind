@@ -25,11 +25,12 @@ and the agent drifts into "busy but not learning" mode.
 ## Inputs (from orchestrator)
 
 - `goal`: The executed goal
-- `outcome_class`: "routine" or "productive"
+- `outcome_class`: "routine", "standard", or "deep"
 - `goals_completed_this_session`: Running counter (all goals)
 - `productive_goals_this_session`: Running counter (productive outcomes only)
 - `batch_mode`: Boolean (was this a batched execution?)
 - `prefetch_goals`: Any pre-fetched research results
+- `goals_since_last_tree_update`: From session_signals — encoding drift counter
 
 ## Outputs (to orchestrator)
 
@@ -40,12 +41,47 @@ and the agent drifts into "busy but not learning" mode.
 
 **For routine outcomes**: Explicit bypass — no tree encoding needed.
 
-**For productive outcomes**: The loop MUST NOT continue without confirming learning occurred.
+**For standard/deep outcomes**: The loop MUST NOT continue without confirming learning occurred.
 
 ```
 IF outcome_class == "routine":
-    Log: "No tree encoding needed — routine outcome"
-ELSE:
+    Log: "▸ Learning gate: PASS — routine outcome, no encoding needed"
+
+ELIF outcome_class == "standard":
+    # Standard tier: tree write is DEFERRED. Verify encoding_queue was populated.
+    # Check 1: Was encoding_queue item added for this goal? (State Update Step 8 deferred path)
+    Bash: wm-read.sh encoding_queue --json
+    last_eq_item = encoding_queue[-1] if encoding_queue else null
+    IF last_eq_item AND last_eq_item.source_goal == goal.id:
+        Log: "▸ Learning gate: PASS — encoding queued for consolidation (standard tier)"
+    ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
+        Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
+    ELSE:
+        # ENCODING WAS MISSED — check sensory buffer before falling back
+        Bash: wm-read.sh sensory_buffer --json
+        related_items = [item for item in sensory_buffer
+                         if item.encoding_score >= 0.40
+                         AND (item.source_goal == goal.id OR item.category == goal.category)]
+        IF len(related_items) > 0:
+            Output: "▸ LEARNING GATE CATCH: found {len(related_items)} high-value buffer items — forcing inline encoding"
+            top = max(related_items, key=encoding_score)
+            node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or goal.category}" --leaf-only --top 1)
+            Read node.file → compress top.observation into "Key Insights" → Edit
+            Log: "▸ Learning gate: RECOVERED via buffer — inline encoding to {node.key}"
+        ELSE:
+            # Force inline recovery from execution context directly
+            Output: "▸ LEARNING GATE CATCH: encoding not queued for {goal.id} — forcing inline"
+            node=$(bash core/scripts/tree-find-node.sh --text "{goal.category}" --leaf-only --top 1)
+            # ... perform inline tree encoding as recovery ...
+            Log: "▸ Learning gate: RECOVERED — inline encoding completed for {goal.id}"
+
+    # Check 2: Was journal entry written? (State Update Step 7)
+    # Check 3: Was working memory updated with goal context?
+    Bash: wm-read.sh active_context --json
+    # Verify active_context reflects current goal execution.
+
+ELIF outcome_class == "deep":
+    # Deep tier: tree write should have happened inline. Verify it did.
     # Check 1: Was knowledge tree updated? (State Update Step 8)
     #   If no: complete it NOW — read _tree.yaml, find matching node,
     #   compress goal insight, edit node .md, propagate up chain.
@@ -54,8 +90,31 @@ ELSE:
 
     Bash: wm-read.sh active_context --json
     # Verify active_context reflects current goal execution.
-    # If goal produced no new insight (blocked, duplicate): note explicitly.
-    # "No tree encoding needed — {reason}."
+
+    # ── HARDENED ESCAPE HATCH ─────────────────────────────────────────
+    # "No tree encoding needed" requires STRUCTURAL justification, not self-assessment.
+    # Valid reasons: goal was blocked/skipped, goal produced <100 chars of output.
+    # Invalid: "findings already known", "nothing new" (for investigation goals).
+    IF tree_was_NOT_updated:
+        Bash: wm-read.sh sensory_buffer --json
+        related_items = [item for item in sensory_buffer
+                         if item.encoding_score >= 0.40
+                         AND (item.source_goal == goal.id OR item.category == goal.category)]
+        IF len(related_items) > 0:
+            Output: "▸ LEARNING GATE: rejected 'no insight' claim — {len(related_items)} high-value buffer items found for {goal.category}"
+            top = max(related_items, key=encoding_score)
+            node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or goal.category}" --leaf-only --top 1)
+            Read node.file
+            Compress top.observation into "Key Insights" section (1-3 sentences)
+            Edit node.file with updates
+            bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+            Output: "▸ LEARNING GATE: forced encoding to {node.key}"
+        ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
+            Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
+        ELSE:
+            Log: "▸ LEARNING GATE WARNING: no tree update despite substantive output — flagging as knowledge debt"
+            echo '{"node_key": "general", "reason": "deep_outcome_without_encoding", "source_goal": "'"${goal.id}"'", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
+    # ── End hardened escape hatch ─────────────────────────────────────
 ```
 
 ## Phase 9.5a: Meta-Learning Signal Capture
@@ -128,11 +187,34 @@ Time budget: 1-2 minutes, not a deep reflection.
 
 ```
 IF goals_completed_this_session % 5 == 0:
-    # 4-question inline pause:
+    # 5-question inline pause:
     1. What patterns have I seen across the last 5 goals?
     2. Any recurring surprises or corrections? → pipeline-add.sh
     3. Any knowledge nodes growing stale? → wm-append.sh knowledge_debt
     4. Conclusion audit: scan conclusions slot for stale/weak judgments
+    5. Encoding frequency check: how many goals since last tree update?
+
+    # Q5 Encoding Drift Detector:
+    # Uses the orchestrator's goals_since_last_tree_update counter (passed via inputs).
+    # Also checks encoding_queue and sensory_buffer for accumulated unencoded items.
+    IF goals_since_last_tree_update >= 3:
+        Output: "▸ ENCODING DRIFT DETECTED: {goals_since_last_tree_update} goals without tree update"
+        Bash: wm-read.sh sensory_buffer --json
+        Bash: wm-read.sh encoding_queue --json
+        high_value_items = [item for item in (sensory_buffer + encoding_queue)
+                            if item.encoding_score >= 0.40]
+        IF len(high_value_items) > 0:
+            top = max(high_value_items, key=encoding_score)
+            node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or top.category}" --leaf-only --top 1)
+            IF node found:
+                Read node.file
+                Compress top.observation into "Key Insights" section (1-3 sentences)
+                Edit node.file with updates
+                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                Output: "▸ ENCODING DRIFT RECOVERY: forced encoding to {node.key} (score {top.encoding_score:.2f})"
+        ELSE:
+            echo '{"node_key": "general", "reason": "encoding_drift_checkpoint", "source_goal": "periodic-5-goal", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
+            Output: "▸ ENCODING DRIFT WARNING: no encodable items found — logged HIGH-priority knowledge debt"
 
     # Q4 Conclusion Audit Detail:
     Bash: wm-read.sh conclusions --json

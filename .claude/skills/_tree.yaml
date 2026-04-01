@@ -199,3 +199,12 @@ backlog-report:
   user_invocable: true
   model_invocable: true
   status: active
+
+priority-review:
+  file: .claude/skills/priority-review/SKILL.md
+  parent: null
+  children: []
+  type: reporting
+  user_invocable: true
+  model_invocable: true
+  status: active

@@ -65,7 +65,7 @@ def main():
     }
 
     # Only write if <agent>/session/ already exists — do NOT mkdir here.
-    # The status line fires every prompt, even after factory reset.
+    # The status line fires every prompt, even when session dir doesn't exist.
     # Using mkdir would silently recreate the session dir when it shouldn't exist.
     if BUDGET_PATH and BUDGET_PATH.parent.is_dir():
         tmp = BUDGET_PATH.with_suffix(".tmp")

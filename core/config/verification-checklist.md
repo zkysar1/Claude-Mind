@@ -49,7 +49,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 17. `aspirations/SKILL.md` Phase 9 Part A.1 checks `goals_since_last_evolution >= evolution_goal_cadence.goals_without_evolution`
 18. `aspirations/SKILL.md` Phase -0.5 initializes `productive_goals_this_session`, `last_evolution_goal_count`, and `session_signals`
 19. `aspirations/SKILL.md` `productive_goals_this_session` increment is AFTER all reclassification (per-goal + global anti-drift)
-20. `aspirations/SKILL.md` global anti-drift fires at threshold 8 (higher than per-goal threshold 5)
+20. `aspirations/SKILL.md` global anti-drift fires at threshold 5 (higher than per-goal threshold 3)
 21. `aspirations-learning-gate/SKILL.md` Phase 9.8 reads threshold from `meta/reflection-strategy.yaml` → `mode_preferences.full_cycle_cadence_goals`
 22. `aspirations-learning-gate/SKILL.md` Phase 9.8 has team-aware deferral (checks coordination board for orchestrator)
 23. `meta/reflection-strategy.yaml` has `mode_preferences.full_cycle_cadence_goals: 15`
@@ -498,7 +498,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 6. `aspirations/SKILL.md` Phase 0 recurring check uses `interval_hours` with `remind_days * 24` fallback
 7. `aspirations/SKILL.md` Phase 5 writes full ISO timestamp (`YYYY-MM-DDTHH:MM:SS`) to `lastAchievedAt` on recurring goal completion
 8. `aspirations/SKILL.md` Phase 5 updates `currentStreak` and `longestStreak` on recurring completion — resets streak to 1 when overdue by > 2x interval
-9. `aspirations/SKILL.md` Phase 7 skips "aspiration fully complete" for aspirations where ALL goals are recurring
+9. `aspirations/SKILL.md` Phase 7 skips "aspiration fully complete" for aspirations where ANY goals are recurring (mixed or all-recurring)
 10. `aspirations/SKILL.md` `complete <goal-id>` documents `--permanent` flag (sets `recurring: false`)
 11. `aspirations/SKILL.md` Goal Selection Algorithm COLLECT references `interval_hours`
 12. `aspirations/SKILL.md` Goal Selection Algorithm SCORE `recurring_urgency` uses normalized overdue ratio (capped at 5.0)
@@ -525,10 +525,33 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 24. **Runtime**: After completing a recurring goal, `lastAchievedAt` contains a full timestamp (not just date)
 25. **Runtime**: `agent-aspirations-read.sh --active` shows asp-001 with recurring goals
 26. **Runtime**: Setting `recurring: false` via `aspirations-update-goal.sh` permanently stops the goal
-27. **Runtime**: Maintain aspiration never triggers "aspiration fully complete" in Phase 7
+27. **Runtime**: Aspirations with ANY recurring goals skip Phase 7 completion review (not just all-recurring)
 28. **Runtime**: After completing a recurring goal that was overdue by > 2x interval, `currentStreak` is 1 (not incremented)
 29. **Runtime**: `recurring_urgency` raw score never exceeds 5.0 in goal-selector.sh output
 30. **Runtime**: g-001-01 is skipped on first boot iteration when no non-recurring goals have been executed
+
+### R9. Recurring Goal Data-Layer Guards
+31. `aspirations.py` `cmd_update_goal()` blocks `status=completed` on goals with `recurring: true` (exit 1)
+32. `aspirations.py` `cmd_complete()` blocks archival of aspirations containing any `recurring: true` goals (exit 1, unless `--force`)
+33. `aspirations.py` `cmd_retire()` blocks retirement of aspirations containing any `recurring: true` goals (exit 1, unless `--force`)
+34. `aspirations.py` `cmd_archive_sweep()` auto-recovers aspirations with recurring goals: resets status to `active`, resets corrupted recurring goals to `pending`
+35. `aspirations.py` `recompute_progress()` excludes recurring goals from `completed_goals` and `total_goals` counts; tracks `recurring_goals` separately
+36. `aspirations.py` `--summary` output shows `+ N recurring` suffix for aspirations with recurring goals
+37. **Runtime**: `aspirations-update-goal.sh g-XXX status completed` on a recurring goal exits 1 with BLOCKED message
+38. **Runtime**: `aspirations-complete.sh asp-XXX` on aspiration with recurring goals exits 1 with BLOCKED message
+39. **Runtime**: `aspirations-complete.sh asp-XXX --force` succeeds (escape hatch works)
+40. **Runtime**: `aspirations-read.sh --summary` shows `(0/0 goals + N recurring)` for all-recurring aspirations
+
+### R10. Premature-Archival Guards
+41. `aspirations.py` `find_unfinished_goals()` returns non-recurring goals whose status is not in `{completed, skipped, expired, decomposed}`
+42. `aspirations.py` `cmd_complete()` blocks archival when `find_unfinished_goals()` returns non-empty (exit 1, unless `--force`)
+43. `aspirations.py` `cmd_retire()` emits RETIREMENT NOTE to stderr when unfinished goals exist (warning, does not block)
+44. `aspirations.py` `cmd_archive_sweep()` recovers completed aspirations with unfinished non-recurring goals: resets status to `active`, recomputes progress
+45. `aspirations.py` `cmd_archive_sweep()` does NOT recover retired aspirations with unfinished goals (retirement = intentional abandonment)
+46. **Runtime**: `aspirations-complete.sh asp-XXX` on aspiration with pending/in-progress/blocked goals exits 1 with BLOCKED message listing unfinished goals
+47. **Runtime**: `aspirations-complete.sh asp-XXX --force` succeeds despite unfinished goals (escape hatch works)
+48. **Runtime**: `aspirations-retire.sh asp-XXX` on aspiration with unfinished goals succeeds with RETIREMENT NOTE on stderr
+49. **Runtime**: `aspirations-complete.sh asp-XXX` succeeds when all non-recurring goals are completed/skipped/expired/decomposed
 
 ### R7. Deferred Goal Infrastructure
 31. `core/scripts/goal-selector.py` `collect_candidates()` filters goals where `now < deferred_until`
@@ -1179,7 +1202,7 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 ### AN3. Domain Decoupling
 
 11. `/agent-completion-report` contains NO domain-specific script calls, credential checks, or delivery references — pure framework scripts only
-12. Domain-specific delivery wrappers live in forged registry, deleted on factory reset
+12. Domain-specific delivery wrappers live in forged registry, deleted when agent directory is removed
 
 ### AN4. Blocked Goals Section
 
@@ -1490,35 +1513,36 @@ persistently and the stop hook allows graceful idle-waiting instead of forced lo
 
 ## AS. Routine Outcome Fast-Path (outcome_class)
 
-Recurring goals that find nothing to do (empty inbox, all healthy) skip expensive post-execution phases via `outcome_class`. Two values: `"productive"` (default, full pipeline) and `"routine"` (reduced pipeline). Only recurring goals on success can be routine.
+Recurring goals that find nothing to do (empty inbox, all healthy) skip expensive post-execution phases via `outcome_class`. Three tiers: `"deep"` (default — immediate tree encoding), `"standard"` (recurring with findings — deferred tree encoding), and `"routine"` (recurring, no findings — reduced pipeline). Only recurring goals on success can be demoted from deep.
 
 ### AS1. Classification (aspirations-execute/SKILL.md)
-1. Phase 4-post sets `outcome_class = "productive"` as default before any conditional
-2. Only `goal.recurring AND goal_succeeded` can produce `outcome_class = "routine"`
-3. Non-recurring goals ALWAYS remain `"productive"` (structural constraint)
-4. Failed goals ALWAYS remain `"productive"` (safety rule)
-5. If uncertain, remains `"productive"` (fail-open)
-6. After Phase 4.1 guardrail check: `IF guardrail_found_issues: outcome_class = "productive"` (guardrails override routine)
-7. `outcome_class` is listed in the Phase 4 return values comment
+1. Phase 4-post sets `outcome_class = "deep"` as default before any conditional
+2. Only `goal.recurring AND goal_succeeded` can produce `outcome_class = "routine"` or `"standard"`
+3. Recurring goals WITH findings → `"standard"` (deferred tree encoding, all other steps run)
+4. Non-recurring goals ALWAYS remain `"deep"` (structural constraint)
+5. Failed goals ALWAYS remain `"deep"` (safety rule)
+6. If uncertain, remains `"deep"` (fail-open — bias toward full treatment)
+7. After Phase 4.1 guardrail check: `IF guardrail_found_issues: outcome_class = "deep"` (guardrails override routine/standard)
+8. `outcome_class` is listed in the Phase 4 return values comment
 
 ### AS2. Pipeline Gating (aspirations-execute/SKILL.md)
-8. Phase 4.25 (experience archival) wrapped with `IF outcome_class == "productive":`
+8. Phase 4.25 (experience archival) wrapped with `IF outcome_class != "routine":`
 9. Phase 4.2 (domain steps) runs unconditionally (NOT gated by outcome_class)
-10. Phase 4.26 (context utilization) feedback loop gated by `outcome_class == "productive"`, but `utilization_pending: false` clearing runs unconditionally for ALL outcomes
+10. Phase 4.26 (context utilization) feedback loop gated by `outcome_class != "routine"`, but `utilization_pending: false` clearing runs unconditionally for ALL outcomes
 
 ### AS3. Pipeline Gating (aspirations/SKILL.md)
-11. Phase 6 (spark check) wrapped with `IF outcome_class == "productive":`
+11. Phase 6 (spark check) wrapped with `IF outcome_class in ("standard", "deep"):`
 12. Phase 7 (aspiration-level check) runs unconditionally (NOT gated)
-13. Phase 8 passes `outcome_class` to `/aspirations-state-update`
+13. Phase 8 passes `outcome_class` to `/aspirations-state-update` (3-tier: routine/standard/deep)
 14. Phase 9 Part A (cadence/lifecycle triggers: `evolution_cadence`, `capability_unlock`) runs unconditionally — NOT gated by `outcome_class`
-15. Phase 9 Part B (performance triggers: `accuracy_drop`, `consecutive_losses`, `pattern_divergence`, `stale_strategy`, `context_retrieval_ineffectiveness`) wrapped with `IF outcome_class == "productive":`
+15. Phase 9 Part B (performance triggers: `accuracy_drop`, `consecutive_losses`, `pattern_divergence`, `stale_strategy`, `context_retrieval_ineffectiveness`) wrapped with `IF outcome_class in ("standard", "deep"):`
 16. Phase 9 Part B resets `evolution_cadence.last_fired` when performance triggers fire evolution — prevents cadence from ignoring performance-triggered evolutions
 17. Phase 9.5 (learning gate) has explicit routine bypass: `IF outcome_class == "routine": # No tree encoding needed`
 18. Phase 9.7 (reflection counter) increments unconditionally — routine goals count toward 5-goal checkpoint
 
 ### AS4. State Update (aspirations-state-update/SKILL.md)
-19. Skill description mentions `outcome_class` parameter (default: `"productive"`)
-20. Body text describes productive (all 9 steps) vs routine (Steps 1-4 + abbreviated Step 7) paths
+19. Skill description mentions `outcome_class` parameter (default: `"deep"`)
+20. Body text describes 3-tier paths: deep (all steps, immediate tree encoding), standard (all steps, deferred tree encoding), routine (Steps 1-4 + abbreviated Step 7)
 21. Routine early-return block exists between Step 4 and Step 5 with `IF outcome_class == "routine":`
 22. Routine path writes abbreviated journal: `"## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}."`
 23. Routine path still updates journal index via `journal-merge.sh` or `journal-add.sh`
@@ -1526,9 +1550,45 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 
 ### AS5. Anti-Drift Safeguard (aspirations/SKILL.md)
 25. `routine_streaks[goal.id]` counter increments on each routine outcome
-26. After 5 consecutive routine outcomes: `outcome_class` overridden to `"productive"`, counter reset to 0
-27. Any productive outcome resets the counter for that goal to 0
+26. After 3 consecutive routine outcomes for same goal: `outcome_class` overridden to `"deep"`, counter reset to 0
+27. Any standard/deep outcome resets the per-goal counter to 0
 28. Counter is ephemeral (in-memory) — autocompact reset fails open (more processing, not less)
+28a. Global anti-drift fires after 5 consecutive routine outcomes across ALL goals (not per-goal)
+
+### AS5a. Encoding Drift Safeguard (aspirations/SKILL.md + aspirations-state-update/SKILL.md)
+28b. `session_signals.goals_since_last_tree_update` counter initialized to 0 at session start
+28c. Counter increments after every state update where `step_8_wrote_insight` is false (all outcome types, including routine)
+28d. Counter resets to 0 when `step_8_wrote_insight` is true OR when mid-session drain encodes an item
+28e. After 4 goals without tree update: orchestrator sets `force_tree_encoding = "true"` in WM and resets counter
+28f. `aspirations-state-update` Step 8 reads `force_tree_encoding` from WM BEFORE the "new insight" gate
+28g. When `force_tree_encoding` is true: `force_encoding = true`, flag cleared from WM, "new insight" gate bypassed
+28h. Curator quality gate still runs on forced encodings — garbage is rejected even when force is active
+
+### AS5b. Investigation Encoding Obligation (aspirations-state-update/SKILL.md)
+28i. `is_investigation_goal` detection: title starts with (Investigate, Research, Audit, Analyze, Diagnose, Trace, Review) OR category in (analysis, diagnosis, research)
+28j. Title matching uses word-start (no colon required) — matches both "Audit web app..." and "Investigate: why..."
+28k. Investigation goals with >500 chars output get `force_encoding = true` — bypasses "new insight" gate
+28l. Investigation-aware curator weights: coverage 0.50, specificity 0.30, actionability 0.20 (vs default 0.40/0.35/0.25)
+28m. Investigation-aware weights apply in BOTH deep and standard curator gate branches
+
+### AS5c. Hardened Learning Gate Escape Hatch (aspirations-learning-gate/SKILL.md)
+28n. Deep branch: "No tree encoding needed" requires structural justification (<100 chars output OR blocked/skipped status)
+28o. Deep branch: if tree was NOT updated, learning gate checks sensory buffer for items scored >= 0.40 related to goal
+28p. Deep branch: if high-value buffer items found, learning gate forces inline encoding (rejects "no insight" claim)
+28q. Deep branch: if no buffer items but substantive output, creates HIGH-priority knowledge debt
+28r. Standard branch: same buffer-check recovery before falling back to inline encoding from execution context
+
+### AS5d. Mid-Session Encoding Queue Drain (aspirations/SKILL.md Phase 11)
+28s. Phase 11 reads encoding_queue from WM after sensory buffer overflow handling
+28t. Drain fires only when `len(encoding_queue) >= 3` (below that, consolidation is sufficient)
+28u. Drains exactly 1 item per iteration (highest encoding_score) — bounded overhead
+28v. Resets `goals_since_last_tree_update = 0` after successful drain (tree WAS updated)
+
+### AS5e. Flag Consistency (aspirations-state-update/SKILL.md) — guard-046
+28w. Deep branch: `step_8_wrote_insight = true` AND `step_8_tree_encoded = true` set at branch level (NOT inside capability check)
+28x. Standard branch: `step_8_wrote_insight = true` (content computed) AND `step_8_tree_encoded = false` (tree write deferred)
+28y. Else branch (no insight): both flags set to false
+28z. Orchestrator drift tracking, Step 8.5, and Step 8.75 all gate on `step_8_wrote_insight` — never on `step_8_tree_encoded`
 
 ### AS6. Batched Execution (aspirations-execute/SKILL.md)
 29. Batched execution section mentions `outcome_class` classification per batched goal
@@ -1537,7 +1597,10 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 ### AS7. Runtime
 31. **Runtime**: After a recurring inbox check with no emails, journal shows `"Routine: Check inbox..."` (not full goal entry)
 32. **Runtime**: After a recurring inbox check that FINDS an email, full experience trace is archived
-33. **Runtime**: After 5 consecutive routine outcomes for a recurring goal, the 6th runs full pipeline (spark, tree, evolution)
+33. **Runtime**: After 3 consecutive routine outcomes for a recurring goal, the 4th runs full pipeline (spark, tree, evolution)
+33a. **Runtime**: After 4 consecutive goals without tree update, next state update reads `force_tree_encoding` from WM and bypasses "new insight" gate
+33b. **Runtime**: An "Audit..." goal with >500 chars output produces `is_investigation_goal = true` and forces encoding
+33c. **Runtime**: When encoding queue reaches 3 items, Phase 11 drains 1 item to tree and resets drift counter
 
 ---
 
@@ -1634,9 +1697,9 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 
 ### AF1. Gate Structure
 1. `aspirations-state-update/SKILL.md` Step 8.5 exists between Step 8 (tree encoding) and the closing block
-2. Step 8.5 only runs when `outcome_class == "productive"` (inside routine early-return block)
+2. Step 8.5 runs for both standard and deep outcomes (after routine early-return block)
 3. Step 8.5 has instant-skip when Step 8 did NOT write new insight (no `step_8_wrote_insight`)
-4. Investigation goals (`"Investigate:"` prefix) get mandatory binary fallback check even without keyword match
+4. Investigation goals (title starts with Investigate, Research, Audit, etc.) get mandatory binary fallback check even without keyword match
 
 ### AF2. Signal Detection
 5. Gate checks for 4 keyword patterns: `root_cause`, `bug_identified`, `proposed_fix`, `unimplemented_action`

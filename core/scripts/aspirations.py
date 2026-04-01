@@ -206,6 +206,18 @@ def find_goal_in_aspirations(items, goal_id):
     return None
 
 
+def find_recurring_goals(asp):
+    """Return list of goals with recurring: true in an aspiration."""
+    return [g for g in asp.get("goals", []) if g.get("recurring")]
+
+
+def find_unfinished_goals(asp):
+    """Return non-recurring goals not in a terminal status."""
+    terminal = {"completed", "skipped", "expired", "decomposed"}
+    return [g for g in asp.get("goals", [])
+            if not g.get("recurring") and g.get("status") not in terminal]
+
+
 def parse_value(value_str):
     """Parse a string value into the appropriate Python type."""
     if value_str == "true":
@@ -294,11 +306,42 @@ def cmd_read(args):
         for asp in items:
             completed = asp.get("progress", {}).get("completed_goals", 0)
             total = asp.get("progress", {}).get("total_goals", 0)
+            recurring = asp.get("progress", {}).get("recurring_goals", 0)
             status = asp.get("status", "unknown").upper()
-            print(f"{asp['id']}: {asp['title']} [{status}] ({completed}/{total} goals)")
+            rec_suffix = f" + {recurring} recurring" if recurring else ""
+            print(f"{asp['id']}: {asp['title']} [{status}] ({completed}/{total} goals{rec_suffix})")
     elif args.archive:
         items = read_jsonl(ARCHIVE_PATH)
         print(json.dumps(items, indent=2, ensure_ascii=False))
+    elif args.stepping_stones:
+        # OMNI-EPIC-inspired (arXiv 2405.15568): return K most recently completed
+        # aspirations as stepping-stone context for creative aspiration generation.
+        # Deliberately partial — showing the full archive constrains creativity.
+        archived = read_jsonl(ARCHIVE_PATH)
+        # Sort by recency. Retired aspirations have completed_at=None (key exists
+        # but value is None), so .get() won't use the default — use `or ""`.
+        archived.sort(key=lambda a: a.get("completed_at") or "", reverse=True)
+        limit = args.limit
+
+        stones = []
+        for asp in archived[:limit]:
+            stone = {
+                "id": asp["id"],
+                "title": asp["title"],
+                "motivation": asp.get("motivation", ""),
+                "scope": asp.get("scope", "unknown"),
+                "tags": asp.get("tags", []),
+                "goals_completed": len([g for g in asp.get("goals", [])
+                                        if g.get("status") == "completed"]),
+                "goals_total": len(asp.get("goals", [])),
+                "goal_summaries": [
+                    {"title": g["title"], "status": g.get("status", "unknown"),
+                     "category": g.get("category")}
+                    for g in asp.get("goals", [])
+                ],
+            }
+            stones.append(stone)
+        print(json.dumps(stones, indent=2, ensure_ascii=False))
     elif args.meta:
         if not META_PATH.exists():
             print("{}")
@@ -306,16 +349,23 @@ def cmd_read(args):
             data = read_json(META_PATH)
             print(json.dumps(data, indent=2, ensure_ascii=False))
     else:
-        print("Specify one of: --active, --id, --summary, --archive, --meta", file=sys.stderr)
+        print("Specify one of: --active, --id, --summary, --archive, --stepping-stones, --meta", file=sys.stderr)
         sys.exit(1)
 
 
 def recompute_progress(asp):
-    """Always derive progress from goals array — single source of truth."""
+    """Derive progress from goals — recurring goals excluded from completion counts.
+
+    Recurring goals run perpetually and never "complete", so they must not inflate
+    the total or be counted as completed. They are tracked separately.
+    """
     goals = asp.get("goals", [])
+    non_recurring = [g for g in goals if not g.get("recurring")]
+    recurring_count = sum(1 for g in goals if g.get("recurring"))
     asp["progress"] = {
-        "completed_goals": sum(1 for g in goals if g.get("status") == "completed"),
-        "total_goals": len(goals)
+        "completed_goals": sum(1 for g in non_recurring if g.get("status") == "completed"),
+        "total_goals": len(non_recurring),
+        "recurring_goals": recurring_count,
     }
 
 
@@ -400,7 +450,17 @@ def cmd_update_goal(args):
         sys.exit(1)
 
     asp_idx, goal_idx, asp = result
-    asp["goals"][goal_idx][field] = value
+    goal = asp["goals"][goal_idx]
+
+    # Guard: recurring goals must never reach status=completed (LLM drift protection)
+    if field == "status" and value == "completed" and goal.get("recurring"):
+        print(f"BLOCKED: Cannot set status=completed on recurring goal {goal_id}. "
+              f"Recurring goals stay 'pending'. Use complete-by for cycle tracking, "
+              f"or set recurring=false first to permanently stop it.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    goal[field] = value
 
     recompute_progress(asp)
 
@@ -434,6 +494,26 @@ def cmd_complete(args):
         sys.exit(1)
 
     idx, asp = result
+
+    # Guard: refuse to archive aspirations containing recurring goals (LLM drift protection)
+    recurring = find_recurring_goals(asp)
+    if recurring and not getattr(args, 'force', False):
+        rg_ids = ", ".join(g["id"] for g in recurring)
+        print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
+              f"Recurring goals run perpetually and must not be archived. "
+              f"Set recurring=false on goals to stop, or use --force.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Guard: refuse to archive if any non-recurring goals are unfinished (premature-archival protection)
+    unfinished = find_unfinished_goals(asp)
+    if unfinished and not getattr(args, 'force', False):
+        uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
+        print(f"BLOCKED: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
+              f"All non-recurring goals must be completed/skipped/expired/decomposed before archival. "
+              f"Use --force to override.",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Maturity warning: check if aspiration has been active long enough for its scope
     scope = asp.get("scope", "project")
@@ -469,6 +549,25 @@ def cmd_retire(args):
         sys.exit(1)
 
     idx, asp = result
+
+    # Guard: refuse to retire aspirations containing recurring goals (LLM drift protection)
+    recurring = find_recurring_goals(asp)
+    if recurring and not getattr(args, 'force', False):
+        rg_ids = ", ".join(g["id"] for g in recurring)
+        print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
+              f"Recurring goals run perpetually and must not be archived. "
+              f"Set recurring=false on goals to stop, or use --force.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Warning: retiring with unfinished goals is intentional but worth noting
+    unfinished = find_unfinished_goals(asp)
+    if unfinished:
+        uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
+        print(f"RETIREMENT NOTE: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
+              f"Proceeding with retirement (abandonment is intentional for retire).",
+              file=sys.stderr)
+
     asp["status"] = "retired"
     asp["completed_at"] = None  # Explicitly clear — retired means never completed
     asp["archived"] = True
@@ -485,10 +584,52 @@ def cmd_retire(args):
 
 def cmd_archive_sweep(args):
     items = read_jsonl(LIVE_PATH)
-    to_archive = [a for a in items if a.get("status") in ("completed", "retired")]
-    remaining = [a for a in items if a.get("status") not in ("completed", "retired")]
+    to_archive = []
+    remaining = []
+    recovered = 0
+
+    for a in items:
+        if a.get("status") in ("completed", "retired"):
+            recurring = find_recurring_goals(a)
+            if recurring:
+                # Safety net: aspirations with recurring goals should never be archived.
+                # Reset to active and warn — prevents LLM drift from killing recurring goals.
+                rg_ids = ", ".join(g["id"] for g in recurring)
+                print(f"WARNING: Recovering {a['id']} — has {len(recurring)} recurring goal(s): "
+                      f"{rg_ids}. Resetting to active.", file=sys.stderr)
+                a["status"] = "active"
+                a["archived"] = False
+                a.pop("completed_at", None)
+                # Also reset any recurring goals that were incorrectly set to completed
+                for g in recurring:
+                    if g.get("status") == "completed":
+                        g["status"] = "pending"
+                recompute_progress(a)
+                remaining.append(a)
+                recovered += 1
+            else:
+                # Safety net: aspirations marked completed but with unfinished goals
+                # should be recovered (same pattern as recurring-goal recovery above)
+                if a.get("status") == "completed":
+                    unfinished = find_unfinished_goals(a)
+                    if unfinished:
+                        uf_ids = ", ".join(g["id"] for g in unfinished)
+                        print(f"WARNING: Recovering {a['id']} — has {len(unfinished)} unfinished "
+                              f"goal(s): {uf_ids}. Resetting to active.", file=sys.stderr)
+                        a["status"] = "active"
+                        a["archived"] = False
+                        a.pop("completed_at", None)
+                        recompute_progress(a)
+                        remaining.append(a)
+                        recovered += 1
+                        continue
+                to_archive.append(a)
+        else:
+            remaining.append(a)
 
     if not to_archive:
+        if recovered:
+            write_jsonl(LIVE_PATH, remaining)  # persist recovered aspirations
         print("0")
         return
 
@@ -744,7 +885,11 @@ def main():
     read_group.add_argument("--id", type=str, help="Find aspiration by ID")
     read_group.add_argument("--summary", action="store_true", help="One-liner summary per active aspiration")
     read_group.add_argument("--archive", action="store_true", help="List archived aspirations")
+    read_group.add_argument("--stepping-stones", action="store_true", dest="stepping_stones",
+                            help="Return K most recent archived aspirations as stepping-stone context")
     read_group.add_argument("--meta", action="store_true", help="Show aspirations metadata")
+    p_read.add_argument("--limit", type=int, default=5,
+                        help="Limit results (used with --stepping-stones)")
 
     # add
     subparsers.add_parser("add", help="Add aspiration from stdin JSON")
@@ -762,10 +907,14 @@ def main():
     # complete
     p_complete = subparsers.add_parser("complete", help="Complete and archive an aspiration")
     p_complete.add_argument("asp_id", type=str, help="Aspiration ID to complete")
+    p_complete.add_argument("--force", action="store_true",
+                            help="Force archival even if aspiration has recurring goals")
 
     # retire
     p_retire = subparsers.add_parser("retire", help="Retire (never-started) and archive an aspiration")
     p_retire.add_argument("asp_id", type=str, help="Aspiration ID to retire")
+    p_retire.add_argument("--force", action="store_true",
+                          help="Force retirement even if aspiration has recurring goals")
 
     # archive-sweep
     subparsers.add_parser("archive-sweep", help="Move completed/retired aspirations to archive")

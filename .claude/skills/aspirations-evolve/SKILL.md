@@ -228,8 +228,12 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            # Decision: redirect, archive, or continue
            IF trajectory.goals_since_inflection >= velocity_window * 2:
                # Prolonged plateau — recommend archival and pivot
-               Log: "STRATEGIC REDIRECT: {asp.id} — prolonged plateau, recommending archival"
-               Bash: aspirations-complete.sh {asp.id}
+               # Guard: aspirations with recurring goals cannot be archived (data layer blocks it)
+               IF any(g.recurring for g in asp.goals):
+                   Log: "Cannot archive {asp.id} — contains recurring goals. Adding exploration goal instead."
+               ELSE:
+                   Log: "STRATEGIC REDIRECT: {asp.id} — prolonged plateau, recommending archival"
+                   Bash: aspirations-complete.sh {asp.id}
                invoke /create-aspiration from-self --plan with:
                    context: "Pivoting from '{asp.title}' after learning plateau. Prior trajectory: {trajectory.summary}. Explore directions NOT yet tried."
            ELSE:
@@ -299,10 +303,10 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    (title starts with "Idea:"). If 3+ idea goals cluster in one domain/category,
    this signals a potential new aspiration direction. Consider creating an aspiration
    to explore that cluster. Ideas are proto-aspirations.
-4. **Novelty filter** (stepping stones): Before creating new aspirations:
-   - Compare candidate against existing aspirations
-   - If too similar to an existing aspiration → reject (prevents sprawl)
-   - If sufficiently novel → accept (encourages exploration)
+4. **Interestingness filter** (OMNI-EPIC two-stage): All aspiration creation in evolve
+   routes through `/create-aspiration`, which runs the two-stage interestingness filter
+   (Stage 1: generation-time criteria, Stage 2: post-generation archive comparison).
+   See create-aspiration Step 5. No separate filtering needed here.
 5. **Aspiration cap enforcement**: If > `max_active` aspirations exist:
    - Use `aspirations-retire.sh <asp-id>` for never-started aspirations (no goals completed, last_worked is null)
    - Use `aspirations-complete.sh <asp-id>` for aspirations that had progress
@@ -312,6 +316,34 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    - `date`, `event`, `details`, `trigger_reason`
    - `aspirations_created`, `aspirations_completed`, `aspirations_archived`
    - Update last_evolution timestamp: `Bash: aspirations-meta-update.sh last_evolution "$(date +%Y-%m-%d)"`
+
+   **ANNECS metric update** (OMNI-EPIC-inspired open-ended progress tracking):
+   ```
+   # ANNECS = Accumulated Novel Aspirations Created and Solved
+   # "Novel" = passed interestingness filter during creation
+   # "Solved" = completed with at least 1 tree node updated (learning happened)
+   #
+   # Read current counters (meta-update is SET, not increment — read first):
+   Bash: aspirations-read.sh --meta → extract annecs_created, annecs_solved
+   current_created = annecs_created (default 0 if missing)
+   current_solved = annecs_solved (default 0 if missing)
+   #
+   # For each aspiration CREATED this evolution cycle that passed interestingness filter:
+   new_created = current_created + {count_created_this_cycle}
+   Bash: aspirations-meta-update.sh annecs_created {new_created}
+   #
+   # For each aspiration COMPLETED this cycle with learning artifacts:
+   #   (check: did completion produce tree node updates, pattern signatures, or reasoning bank entries?)
+   new_solved = current_solved + {count_solved_this_cycle}
+   Bash: aspirations-meta-update.sh annecs_solved {new_solved}
+   #
+   # Log ANNECS snapshot:
+   echo '{"date":"<today>","event":"annecs_update","details":"created={new_created} solved={new_solved} ratio={new_solved/new_created} trend={improving|stable|declining}","trigger_reason":"evolve-annecs"}' | bash core/scripts/evolution-log-append.sh
+   #
+   # If ratio is declining over last 3 evolution cycles:
+   #   Log: "ANNECS STAGNATION: novel aspiration solve rate declining"
+   #   This signals aspiration quality issues — interestingness filter may need tuning
+   ```
 7. Update `<agent>/profile.yaml` if strategy parameters change
 8. Update `meta/meta-knowledge/_index.yaml` with any new self-model insights
 9. **Forge check**: Audit registries, then create goals for forge-ready gaps:

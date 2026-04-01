@@ -129,6 +129,9 @@ Every `evolution_rules.review_interval_sessions` sessions:
 
 ```
 Bash: spark-questions-read.sh --active
+# ALL active spark questions evaluated for both standard and deep outcomes.
+# No question count gating — full treatment regardless of outcome tier.
+Log: "▸ Spark: evaluating ALL {len(result)} questions (outcome: {outcome_class})"
 For each question in result:
     Ask the question about the just-completed goal
     Bash: spark-questions-increment.sh <question.id> times_asked
@@ -380,6 +383,44 @@ When sq-c06 fires after goal completion:
       "outcome":"<succeeded|failed>"}
    - Log: "META SPARK: {insight} from {goal.id}"
 4. Bash: spark-questions-increment.sh sq-c06 sparks_generated
+
+#### Failure Stepping-Stone Spark Handler (OMNI-EPIC-inspired)
+
+**sq-c08** (candidate): "Did this goal fail in a way that suggests an easier stepping-stone variant?"
+
+Inspired by OMNI-EPIC's failure-informed difficulty adjustment (arXiv 2405.15568):
+when a task fails, generate an easier variant rather than retrying or abandoning.
+This creates natural curriculum progression without explicit difficulty parameters.
+
+When sq-c08 fires after a FAILED goal:
+1. Analyze the failure mode:
+   - Was it too ambitious? (scope exceeded current capability level)
+   - Was it missing prerequisites? (knowledge gap, infrastructure dependency)
+   - Was it unclear? (poorly specified, ambiguous verification criteria)
+   - Was it blocked by external factors? (user action needed, service unavailable)
+
+2. If the failure suggests a simpler version would succeed:
+   Generate a stepping-stone goal that:
+   - Addresses the SAME domain/category as the failed goal
+   - Has reduced scope (narrower question, smaller artifact, fewer components)
+   - Includes the prerequisite the original was missing
+   - Explicitly references the failed goal in description:
+     "Stepping stone for {failed.title} — {what makes this version simpler}"
+
+3. Add via aspirations-add-goal.sh to the same aspiration:
+   ```
+   echo '{"title":"Stepping stone: {simpler variant title}","description":"Easier variant of {failed.id}: {failed.title}. {what makes this simpler}. Original failure mode: {failure_analysis}.","priority":"{same as failed}","category":"{failed.category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh {asp.id}
+   ```
+
+4. Log: `echo '{"date":"<today>","event":"stepping_stone_created","details":"Easier variant of {failed.id} → {new.title}","trigger_reason":"sq-c08 failure stepping-stone"}' | bash core/scripts/evolution-log-append.sh`
+
+5. Bash: spark-questions-increment.sh sq-c08 sparks_generated
+
+**When NOT to create a stepping stone:**
+- Failure was due to infrastructure issues (transient — retry is appropriate)
+- Failure was due to blocked_by dependency (wait, don't simplify)
+- The goal is already a stepping stone (avoid infinite regression)
+- The failed goal's title starts with "Stepping stone:" → SKIP
 
 ### Aspiration-Level Spark (when entire aspiration completes)
 ```

@@ -55,6 +55,11 @@ triggers:
     per_category: false
     cooldown_sessions: 0
 
+  idle_blocked:
+    description: "All goals blocked — evolution triggered by idle state to find new directions"
+    per_category: false
+    cooldown_sessions: 0
+
 global:
   max_evolutions_per_session: 2
   evolution_log_path: "meta/evolution-log.jsonl"
@@ -98,5 +103,8 @@ initial_state:
       last_fired: null
       times_fired: 0
     evolution_goal_cadence:
+      last_fired: null
+      times_fired: 0
+    idle_blocked:
       last_fired: null
       times_fired: 0

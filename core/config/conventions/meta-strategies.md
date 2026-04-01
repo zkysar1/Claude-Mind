@@ -214,7 +214,7 @@ Maps parameter configurations to performance. Each "generation" = a frozen set o
 
 Aggregated failure pattern detection from multiple signal sources.
 
-**State**: `<agent>/weakness-report.yaml` (domain-specific, wiped on reset).
+**State**: `<agent>/weakness-report.yaml` (domain-specific, wiped when agent is removed).
 
 **Schema per weakness**:
 - `id`: wk-NNN

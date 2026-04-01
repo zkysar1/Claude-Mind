@@ -59,6 +59,8 @@
       "Write(*/.claude/skills/open-questions/*)",
       "Edit(*/.claude/skills/prime/*)",
       "Write(*/.claude/skills/prime/*)",
+      "Edit(*/.claude/skills/priority-review/*)",
+      "Write(*/.claude/skills/priority-review/*)",
       "Edit(*/.claude/skills/recover/*)",
       "Write(*/.claude/skills/recover/*)",
       "Edit(*/.claude/skills/reflect/*)",
@@ -231,6 +233,11 @@
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/capture-insights.sh",
+            "timeout": 3
+          },
           {
             "type": "command",
             "command": "bash core/scripts/stop-hook.sh",

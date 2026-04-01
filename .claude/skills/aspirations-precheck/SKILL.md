@@ -80,6 +80,37 @@ if active_count < 2:
     log "Aspiration health: below minimum, created new aspirations"
 ```
 
+## Phase 0.5.1: Pipeline Depth Check
+
+Proactive starvation prevention — create work BEFORE the pipeline empties.
+Uses compact data already loaded in Phase 0.5 (no extra I/O).
+
+```
+Read core/config/aspirations.yaml → pipeline_low_water_mark (default 3)
+
+# Count executable goals from compact data
+executable_count = 0
+completed_ids = set()
+
+# First pass: collect all completed goal IDs (for blocked_by resolution)
+FOR EACH active aspiration in compact data:
+    FOR EACH goal:
+        IF status == "completed": completed_ids.add(goal.id)
+
+# Second pass: count executable goals
+FOR EACH active aspiration in compact data:
+    FOR EACH goal:
+        IF status == "pending"
+           AND (deferred_until is null OR deferred_until <= now)
+           AND (blocked_by is empty OR all blocked_by IDs are in completed_ids):
+            executable_count += 1
+
+IF executable_count < pipeline_low_water_mark:
+    Output: "▸ Pipeline thin: {executable_count} executable goals (threshold: {pipeline_low_water_mark})"
+    invoke /create-aspiration from-self
+    log "Pipeline depth: below low-water-mark ({executable_count} < {pipeline_low_water_mark}), created new work"
+```
+
 ## Phase 0.5a: Pre-Selection Guardrail Check
 
 ```
@@ -159,5 +190,5 @@ check_recurring_goals()
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (every iteration, first phase)
-- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection), `/create-aspiration` (health), CREATE_BLOCKER protocol
-- **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection)
+- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection), `/create-aspiration` (health + pipeline depth), CREATE_BLOCKER protocol
+- **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection), `core/config/aspirations.yaml` (pipeline_low_water_mark)

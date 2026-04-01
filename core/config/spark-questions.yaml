@@ -92,6 +92,11 @@ seed_candidates:
     proposed_session: 0
     category: first_principles
 
+  - id: sq-c08
+    text: "Did this goal fail in a way that suggests an easier stepping-stone variant? What simpler version of this goal would succeed and build toward the original?"
+    proposed_session: 0
+    category: failure_stepping_stone
+
 evolution_rules:
   retire_threshold: 0.03
   min_asks_before_retire: 20
@@ -242,3 +247,8 @@ initial_state:
       text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
       proposed_session: 0
       category: first_principles
+
+    - id: sq-c08
+      text: "Did this goal fail in a way that suggests an easier stepping-stone variant? What simpler version of this goal would succeed and build toward the original?"
+      proposed_session: 0
+      category: failure_stepping_stone

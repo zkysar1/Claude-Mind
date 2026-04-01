@@ -64,6 +64,18 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `core/scripts/_paths.py` `_resolve_agent_name` uses `"AYOAI_AGENT" in os.environ` (not `os.environ.get`)
    Check: `core/scripts/_paths.sh` uses `${AYOAI_AGENT+x}` for agent name resolution (not `:-` or `-n`)
 
+   # 3-tier agent resolution chain (Section 4T continued)
+   # Both _paths.sh and _paths.py MUST implement identical 3-tier fallback:
+   #   Tier 1: AYOAI_AGENT env var (set-vs-unset, even if empty)
+   #   Tier 2: .active-agent-$AYOAI_SESSION_ID (session-keyed file)
+   #   Tier 3: .active-agent (global last-resort fallback)
+   # Prevents cross-agent state contamination when multiple agents run concurrently.
+   Check: `_paths.sh` has 3-tier chain: `${AYOAI_AGENT+x}` THEN `.active-agent-$AYOAI_SESSION_ID` THEN `.active-agent` (in that order)
+   Check: `_paths.py` `_resolve_agent_name` has 3-tier chain: `"AYOAI_AGENT" in os.environ` THEN `.active-agent-{sid}` THEN `.active-agent` (in that order)
+   Check: `_paths.sh` Tier 2 guards on BOTH `$AYOAI_SESSION_ID` non-empty AND file exists
+   Check: `_paths.py` Tier 2 guards on BOTH `sid` truthy AND `sf.exists()`
+   Bash: AYOAI_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent" (Tier 1 wins over files)
+
    # NO_AGENT state evidence checks (Section 4T continued)
    Bash: AYOAI_AGENT="" python3 core/scripts/session.py state get → verify prints "NO_AGENT" (not crash)
    Bash: AYOAI_AGENT="" python3 core/scripts/session.py persona get → verify prints "no_agent" (not crash)
@@ -76,21 +88,47 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: Phase 0.5 outputs "WORLD PRIME (no agent)" header
 
    # Session binding evidence checks (Section SB)
-   Bash: echo $AYOAI_SESSION_ID → verify non-empty (SessionStart hook wrote to CLAUDE_ENV_FILE)
-   Check: `.active-agent-$AYOAI_SESSION_ID` file exists and contains current agent name
-   Bash: echo $AYOAI_AGENT → verify matches the agent directory name
-   Check: `core/scripts/set-active-agent-env.sh` exists (FileChanged hook handler)
-   Check: `core/scripts/session-save-id.sh` writes AYOAI_SESSION_ID to CLAUDE_ENV_FILE
-   Check: `.claude/settings.json` has FileChanged hook with matcher `.active-agent-*`
-   Check: `.gitignore` contains `.active-agent-*` pattern
-   Check: `set-active-agent-env.sh` does NOT clear AYOAI_AGENT when another session's file changes (no elif/else branch)
+   Bash: cat .latest-session-id → verify non-empty UUID (SessionStart hook wrote it)
+   Bash: echo $AYOAI_AGENT → verify matches the agent directory name (LLM prefix contract)
+   Check: `.active-agent-$SID` file exists and contains current agent name (where SID = .latest-session-id content)
+   Check: `core/scripts/session-save-id.sh` writes SID to `.latest-session-id`
+   Check: `.gitignore` contains `.active-agent-*` and `.latest-session-id` patterns
+   Check: `set-active-agent-env.sh` is a no-op (exit 0 only)
    IF session was resumed (not first start):
-       Check: SessionStart hook auto-restored AYOAI_AGENT from `.active-agent-<sid>` file
+       Check: SessionStart hook carried forward agent from `.active-agent-$OLD_SID` to `.active-agent-$NEW_SID`
+
+   # Autocompact carry-forward evidence checks (Section SB continued)
+   # When autocompact fires, session-save-id.sh must preserve the agent binding
+   # across the SID change using the OLD SID from .latest-session-id.
+   Check: `session-save-id.sh` reads OLD SID from `.latest-session-id` BEFORE overwriting with new SID
+   Check: `session-save-id.sh` carries forward agent from `.active-agent-$OLD_SID` to `.active-agent-$NEW_SID`
+   Check: `session-save-id.sh` guards on agent directory existence (`-d` test)
+   Check: No `.active-agent-nosession` file exists
+
+   # Agent resolution checks (Section SE)
+   # Dual-mechanism: LLM passes AYOAI_AGENT prefix (Tier 1), hooks use SID from stdin (Tier 2).
+   # No shared env files. No CLAUDE_ENV_FILE.
+   Check: `_paths.sh` reads `.latest-session-id` for SID when AYOAI_SESSION_ID not in env
+   Check: `_paths.py` reads `.latest-session-id` for SID when not in os.environ
+   Check: No `.claude/.session-env` file exists (eliminated)
+   Bash: grep -r "CLAUDE_ENV_FILE\|session-env" core/scripts/ .claude/skills/start/ .claude/skills/stop/ 2>/dev/null | grep -v '.pyc' | grep -v 'no-op\|previously\|eliminated' → verify ZERO functional matches
+   Check: `start/SKILL.md` binding commands read SID from `.latest-session-id`
+   Check: `start/SKILL.md` includes LLM prefix contract instruction (AYOAI_AGENT=<name>)
+   Check: `stop/SKILL.md` rebind reads SID from `.latest-session-id`
+   Check: Stop hook recovery message includes agent name and AYOAI_AGENT prefix instruction
+
+   # /start IDLE rebinding evidence checks (Section SB continued)
+   # When /start resumes an IDLE agent, it must rebind the session to that agent.
+   # Without this, a different agent started in another window could still be bound.
+   Check: `start/SKILL.md` IDLE path has Step 0 "Rebind Agent to Session" that writes BOTH `.active-agent` and `.active-agent-$AYOAI_SESSION_ID`
+   Check: `start/SKILL.md` UNINITIALIZED Phase A2 writes BOTH `.active-agent` and `.active-agent-$AYOAI_SESSION_ID` (same pattern as IDLE)
+   Check: `start/SKILL.md` has Step 1 that uses `AYOAI_AGENT=<agent-name>` env prefix on `session-state-get.sh`
+   Check: `start/SKILL.md` RUNNING path does NOT change any state (no-op, warning only)
 
    # Dual-queue aspiration evidence checks (Section DQ)
    Bash: aspirations-read.sh --active → verify world aspirations exist (asp-001 Explore and Learn)
    Bash: agent-aspirations-read.sh --active → verify agent aspirations exist (asp-001 Maintain Agent Health)
-   Bash: goal-selector.sh select 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); sources=set(r.get('source','') for r in d); print('world' in sources, 'agent' in sources)" → verify both sources present
+   Bash: goal-selector.sh select 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); sources=set(r.get('source','') for r in d if isinstance(d,list)); print('PASS: both sources' if 'world' in sources and 'agent' in sources else 'PASS: world present, agent goals in cooldown' if isinstance(d,list) and 'world' in sources else 'PASS: structural' if isinstance(d,dict) else 'FAIL')" → verify source tagging works (agent goals may be in cooldown)
    Check: goal-selector.sh output includes `source` field on every scored goal
    Check: `core/config/conventions/aspirations.md` documents both world and agent script families
    Check: `agent-aspirations-read.sh` exists in core/scripts/ (agent queue access)
@@ -102,6 +140,23 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # JSONL list-field normalization regression check
    Check: `goal-selector.py` defines `_ensure_list()` and every operational `.get("blocked_by")`, `.get("participants")`, `.get("tags")` call is wrapped in it. Only passthrough stores (goal_map building) may use raw `.get()`. Read the file and verify no unguarded iteration of these fields.
 
+   # 3-tier outcome classification evidence checks (Section OC)
+   # outcome_class has exactly 3 valid values: "deep" (default), "standard", "routine"
+   Check: `aspirations-execute/SKILL.md` Phase 4-post sets `outcome_class = "deep"` as default (not "productive")
+   Check: Only `goal.recurring AND goal_succeeded` can demote to "standard" or "routine"
+   Check: Non-recurring goals cannot reach "standard" — they stay "deep" (structural constraint)
+   Check: `aspirations-state-update/SKILL.md` Step 8 has `IF outcome_class == "deep":` and `ELIF outcome_class == "standard":` branches
+   Check: Standard path Step 8 has `COMPOSE PRECISION BLOCK` (not WRITE) before the branch — no tree write before branching
+   Check: Standard path queues to encoding_queue via `wm-append.sh encoding_queue` with `source_type: "standard_tier_deferred"`
+   Check: Standard path sets `step_8_wrote_insight = true` AND `step_8_tree_encoded = false` (insight computed, tree not written)
+   Check: Deep path sets `step_8_wrote_insight = true` AND `step_8_tree_encoded = true` (both computed and written)
+   Check: `aspirations-learning-gate/SKILL.md` Phase 9.5 has 3 branches: routine (bypass), standard (check encoding_queue), deep (check tree)
+   Check: `aspirations/SKILL.md` Spark call gates on `outcome_class in ("standard", "deep")` (not `== "productive"`)
+   Check: `core/config/memory-pipeline.yaml` `replay_priority_order` includes `standard_deferred` entry
+   Check: `core/config/memory-pipeline.yaml` `encoding_queue` array limit is `40` (not 20)
+   Check: `aspirations-consolidate/SKILL.md` Step 2a has `IF item.source_type == "standard_tier_deferred":` branch for node lookup
+   Bash: grep -c '"productive"' .claude/skills/aspirations-execute/SKILL.md .claude/skills/aspirations/SKILL.md .claude/skills/aspirations-state-update/SKILL.md core/config/execute-protocol-digest.md → verify ALL return 0 (no remaining "productive" references)
+
    # Experience archive evidence checks
    IF <agent>/experience.jsonl exists:
        Bash: experience-read.sh --summary → verify experience records were created
@@ -109,10 +164,21 @@ Focus on what actually happened during the test — did the agent USE the new fe
        Check: do experience records have corresponding .md files at content_path?
        Check: do pipeline records with experience_ref point to valid experience IDs?
 
+   # Bootstrap template integrity check (recurring goals excluded from total_goals)
+   Bash: python3 -c "
+import json; asp=json.loads(open('core/config/agent-aspirations-initial.jsonl').readline())
+p = asp['progress']; goals = asp['goals']
+non_rec = [g for g in goals if not g.get('recurring')]
+rec = [g for g in goals if g.get('recurring')]
+assert p['total_goals'] == len(non_rec), 'total_goals %d != non-recurring %d' % (p['total_goals'], len(non_rec))
+assert p.get('recurring_goals', 0) == len(rec), 'recurring_goals %d != actual %d' % (p.get('recurring_goals', 0), len(rec))
+print('PASS: total_goals=%d, recurring_goals=%d, actual=%d' % (len(non_rec), len(rec), len(goals)))
+" → verify template progress matches actual goal counts
+
    # Recurring goal evidence checks
    IF asp-001 (Maintain Agent Health) exists in agent-aspirations-read.sh --active:
        Check: asp-001 goals have recurring: true and interval_hours set
-       Check: any recurring goal with status completed has lastAchievedAt as full ISO timestamp
+       Check: NO recurring goal has status=completed (data layer should prevent this)
        Check: any recurring goal with achievedCount > 0 has updated streak counters
        Bash: goal-selector.sh → verify recurring goals appear/don't appear based on interval elapsed
        Check: if any recurring goal has achievedCount > 1, verify currentStreak is consistent
@@ -125,6 +191,14 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: Recurring branch does NOT set `status = "completed"` (keeps goal pending for next cycle)
    Check: Recurring branch clears `claimed_by` and `claimed_at` (returns goal to pool)
    Check: `complete-by` is NOT in `WORLD_ONLY_COMMANDS` (agents need it for local recurring goals)
+
+   # Recurring goal data-layer guard checks (prevents LLM drift from killing recurring goals)
+   Check: `aspirations.py` `cmd_update_goal` blocks `status=completed` on `recurring: true` goals
+   Check: `aspirations.py` `cmd_complete` blocks archival of aspirations with `recurring: true` goals (unless --force)
+   Check: `aspirations.py` `cmd_archive_sweep` auto-recovers aspirations with recurring goals to active
+   Check: `aspirations.py` `recompute_progress` excludes recurring goals from completed/total counts
+   Check: `aspirations-read.sh --summary` shows `+ N recurring` suffix for recurring aspirations
+   Check: No recurring goals across all live aspirations have status=completed (scan both world and agent JSONL)
 
    # Exploration noise evidence checks
    Bash: goal-selector.sh → parse first result
@@ -148,17 +222,24 @@ Focus on what actually happened during the test — did the agent USE the new fe
        Bash: goal-selector.sh 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); ids=[g['goal_id'] for g in d] if isinstance(d,list) else []; print('PASS: defer_reason goals filtered')" → verify deferred goals absent from candidates
        Bash: goal-selector.sh blocked 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); dr=[g for g in d['blocked_goals'] if g['block_reason']=='deferred']; print(f'PASS: {len(dr)} deferred goals in blocked output')" → verify defer_reason goals appear in blocked
 
-   # All-blocked idle path evidence checks (Section IWD)
+   # All-blocked path evidence checks (Section PWB — productive while blocked)
    Check: `goal-selector.py` cmd_select prints JSON object with `all_blocked: true` when candidates empty but blocked goals exist
    Check: `goal-selector.py` cmd_select prints `[]` when no goals exist at all (not the object)
    Check: `aspirations-select/SKILL.md` Algorithmic Scoring has blocked-goals detection checking for `all_blocked` object
    Check: `aspirations-select/SKILL.md` Phase 2.5b exhaustion check is AFTER the FOR loop (not inside it)
    Check: `aspirations-select/SKILL.md` returns `selection_reason` with value `"all_blocked"` or `"all_blocked_by_gate"`
-   Check: `aspirations/SKILL.md` return contract comment (line ~138) includes `selection_reason`
+   Check: `aspirations-select/SKILL.md` all_blocked RETURN includes `selection_context = parsed_output` (orchestrator reads blocked_goals from it)
+   Check: `aspirations-select/SKILL.md` all_blocked_by_gate RETURN includes `selection_context` (even if empty)
+   Check: `aspirations-select/SKILL.md` Outputs section lists `selection_context` and `selection_reason`
+   Check: `aspirations/SKILL.md` return contract comment (line ~138) includes `selection_context` and `selection_reason`
    Check: `aspirations/SKILL.md` all-blocked path is BEFORE the no-goals path (checked first)
-   Check: `aspirations/SKILL.md` all-blocked path does NOT invoke create-aspiration, research-topic, or reflect (no busywork)
-   Check: `aspirations/SKILL.md` all-blocked path has `sleep 600` with `timeout 600000` (10 min, matches Bash tool max)
-   Check: `core/config/stop-skip-conditions.md` "All goals blocked" line mentions 10-minute wait
+   Check: `aspirations/SKILL.md` all-blocked evolve invocation does NOT pass constraint_context (evolve builds its own via wm known_blockers)
+   Check: `evolution-triggers.yaml` has `idle_blocked` trigger with `cooldown_sessions: 0`
+   Check: `aspirations/SKILL.md` all-blocked path invokes /create-aspiration with constraint_context (avoids blocked resources), then evolution, then research, then reflect as cascading fallbacks
+   Check: `aspirations/SKILL.md` all-blocked path only sleeps (sleep 300, timeout 300000) as absolute last resort after ALL generation attempts fail
+   Check: `aspirations/SKILL.md` all-blocked path extracts blocked_skills and blocked_resources from selection_context before generation
+   Check: `aspirations/SKILL.md` all-blocked path respects max_evolutions_per_session cap for evolution step
+   Check: `core/config/stop-skip-conditions.md` "All goals blocked" line mentions constraint-aware generation cascade
    Bash: goal-selector.sh 2>/dev/null | python3 -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -179,10 +260,10 @@ else:
    Check: Phase 9.5c calls `pipeline-read.sh --unreflected` and invokes `--learn` when count > 0
    Check: Phase 9.5c is MANDATORY for all outcomes (not gated by productive-only)
    Bash: python3 core/scripts/aspirations.py --source agent read --id asp-001 2>/dev/null | python3 -c "
-import sys,json; asp=json.load(sys.stdin); goals={g['id']:g for g in asp['goals']}
-g8=goals.get('g-001-08',{})
-ok = g8.get('skill')=='/review-hypotheses --learn' and g8.get('recurring')==True and g8.get('interval_hours')==2
-print(f'PASS: g-001-08 exists, learn goal, 2h interval' if ok else 'FAIL: g-001-08 missing or misconfigured')
+import sys,json; asp=json.load(sys.stdin)
+matches=[g for g in asp['goals'] if g.get('skill')=='/review-hypotheses --learn' and g.get('recurring')]
+if matches: g=matches[0]; print(f'PASS: {g[\"id\"]} is recurring --learn goal, interval={g.get(\"interval_hours\",\"?\")}h')
+else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
 " → verify dedicated --learn recurring goal exists
    Check: `pipeline-read.sh --unreflected` flag exists and returns resolved records with reflected=false
    Check: `boot/SKILL.md` Step 1.5 runs `--resolve` only (learning is downstream — consolidation + learning-gate catch it)
@@ -467,8 +548,10 @@ print(f'PASS: g-001-08 exists, learn goal, 2h interval' if ok else 'FAIL: g-001-
    Check: `core/scripts/session-save-id.sh` skips auto-resume if agent directory does not exist
    Check: No `factory-reset.sh` exists in core/scripts/
    Check: No `.claude/skills/reset/` directory exists
-   Bash: grep -r "factory-reset" core/scripts/ .claude/skills/ 2>/dev/null | grep -v "verify-learning/SKILL.md" | wc -l → verify 0 results
+   Bash: grep -r "factory-reset" core/scripts/ .claude/skills/ core/config/ .env.example CLAUDE.md 2>/dev/null | grep -v "verify-learning/SKILL.md" | wc -l → verify 0 results
    Bash: grep -r "/reset" CLAUDE.md .claude/rules/ 2>/dev/null | grep -v "git reset" | wc -l → verify 0 results
+   Bash: grep -rn "domain reset\|wiped on reset" CLAUDE.md core/scripts/ core/config/ .env.example 2>/dev/null | wc -l → verify 0 results
+   Bash: grep -c "MIND_DIR" core/scripts/_paths.sh core/scripts/_paths.py core/scripts/_platform.sh 2>/dev/null → verify 0 in all files
    IF <agent>/local-paths.conf exists:
        Check: contains WORLD_PATH= line pointing to a valid directory
        Check: contains META_PATH= line pointing to a valid directory
@@ -597,8 +680,9 @@ print(f'PASS: g-001-08 exists, learn goal, 2h interval' if ok else 'FAIL: g-001-
    # Text rules in stop-hook-compliance.md
    Check: `.claude/rules/stop-hook-compliance.md` Rule 2 heading is "Never manually change state" (not old "Never manually set stop-loop")
    Check: stop-hook-compliance.md Rule 2 lists `session-state-set.sh`, `session-signal-set.sh stop-loop`, `session-counter-increment.sh`
-   # Consistency: no stale references to removed factory-reset.sh
+   # Consistency: no stale references to removed factory-reset.sh or legacy mind/ aliases
    Bash: grep -c "factory-reset" .claude/rules/user-interaction.md .claude/rules/stop-hook-compliance.md 2>/dev/null → verify 0 in both files
+   Bash: grep -rn "MIND_DIR" core/scripts/ 2>/dev/null | wc -l → verify 0 results
 
    # AVO-inspired plateau detection, trajectory view, cycle detection (Section AVO)
    Check: `core/config/aspirations.yaml` has `plateau_detection` section with `velocity_window`, `plateau_threshold`, `diminishing_returns_window`
@@ -646,6 +730,28 @@ print(f'PASS: g-001-08 exists, learn goal, 2h interval' if ok else 'FAIL: g-001-
    **Runtime**: After 15+ productive goals in a session, journal should show "OBLIGATION: full-cycle reflection" entry
    **Runtime**: After 15+ goals without evolution in a session, evolution log should show `evolution_goal_cadence` trigger
 
+   # Post-execution pipeline compliance evidence checks (Section PX)
+   # The execute protocol digest must include post-execution obligations (Phases 5-9).
+   # Without this, agents complete Phase 4 execution and skip directly to the next iteration,
+   # never invoking verify, spark, state-update, or learning-gate as literal Skill() calls.
+   Check: `core/config/execute-protocol-digest.md` has "POST-EXECUTION OBLIGATIONS" section after Phase 4.5
+   Check: `core/config/execute-protocol-digest.md` lists `Skill(aspirations-verify)` as Phase 5
+   Check: `core/config/execute-protocol-digest.md` lists `Skill(aspirations-state-update)` as Phase 8
+   Check: `core/config/execute-protocol-digest.md` lists `Skill(aspirations-learning-gate)` as LEARN
+   Check: `core/config/execute-protocol-digest.md` lists `Skill(aspirations-spark)` as conditional on productive
+   Check: `core/config/execute-protocol-digest.md` enforcement says "NEXT action must be Skill(aspirations-verify)"
+   Check: `aspirations/SKILL.md` PER-ITERATION OBLIGATIONS says "literal Skill() tool call" (not "invoke /")
+   Check: `aspirations/SKILL.md` Phase 5 line uses `Skill(aspirations-verify)` syntax
+   Check: `aspirations/SKILL.md` Phase 6 line uses `Skill(aspirations-spark)` syntax
+   Check: `aspirations/SKILL.md` Phase 8 line uses `Skill(aspirations-state-update)` syntax
+   Check: `aspirations/SKILL.md` Phase 9.5-9.8 line uses `Skill(aspirations-learning-gate)` syntax
+   IF agent ran 3+ goals in an autonomous session:
+       **Runtime**: After each productive goal, session output should contain `Skill(aspirations-verify)` tool call
+       **Runtime**: After each productive goal, session output should contain `Skill(aspirations-spark)` tool call
+       **Runtime**: After each productive goal, session output should contain `Skill(aspirations-state-update)` tool call
+       **Runtime**: After each productive goal, session output should contain `Skill(aspirations-learning-gate)` tool call
+       **Runtime**: Manual journal writes or WM updates between Phase 4 and Phase 5 indicate the pipeline is being inlined (FAIL)
+
    # WM goal tracking evidence checks (Section WT)
    # State-update Step 3 must have explicit wm-append/wm-set calls (not prose directives).
    # guard-022 + rb-037 document the root cause: implicit writes don't survive autocompact.
@@ -671,9 +777,69 @@ print(f'PASS: g-001-08 exists, learn goal, 2h interval' if ok else 'FAIL: g-001-
    Check: `aspirations-learning-gate/SKILL.md` conventions list includes `retrieval-escalation`
    Check: `aspirations-learning-gate/SKILL.md` Phase 9.5b has "Escalation quality check" block
    Check: `core/config/conventions/tree-retrieval.md` opens with cross-reference to `retrieval-escalation.md`
-   Bash: grep -rl "Knowledge Tree Retrieval" CLAUDE.md .claude/rules/ .claude/skills/ 2>/dev/null → verify NO files (all renamed)
+   Bash: grep -rl "Knowledge Tree Retrieval" CLAUDE.md .claude/rules/ .claude/skills/ 2>/dev/null | grep -v verify-learning → verify NO files (all renamed)
+
+   # Background jobs subsystem evidence checks (Section BG)
+   Check: `core/scripts/background-jobs.py` exists with `register`, `deregister`, `check`, `list`, `has-pending`, `clear` subcommands
+   Check: `core/scripts/background-jobs.sh` exists and sources `_paths.sh` + `_platform.sh`
+   Check: `core/scripts/background-jobs.sh` exports `AYOAI_SHELL` via cygpath (Windows Git Bash compatibility)
+   Check: `core/config/conventions/session-state.md` has "Background External Jobs" section
+   Check: `session-state.md` documents `completion_check` delegation pattern
+   Check: CLAUDE.md Core Systems table includes `Background jobs` entry
+   Check: CLAUDE.md session signals table includes `background-jobs.yaml` entry
+   Check: CLAUDE.md Convention Index `session-state.md` row mentions "background jobs tracker"
+   Check: `.claude/skills/run-processor/SKILL.md` has `sub_commands: [launch, monitor, collect, status]`
+   Check: `run-processor/SKILL.md` `companion_scripts` includes `core/scripts/background-jobs.sh`
+   Check: `run-processor/SKILL.md` has LAUNCH, MONITOR, and COLLECT mode sections
+   Check: `run-processor/SKILL.md` LAUNCH step 7 creates monitor goal BEFORE step 8 registers background job
+   Check: `alpha/scripts/processor-run.sh` has `check-complete` command with exit codes 0/1/2
+   Bash: AYOAI_AGENT=alpha bash core/scripts/background-jobs.sh list 2>&1 → should output "No background jobs." (not crash)
+
+   # OMNI-EPIC-inspired aspiration generation evidence checks (Section OE)
+   # Stepping-stone retrieval, interestingness filter, failure stepping-stones, ANNECS, pipeline depth
+   Check: `core/scripts/aspirations.py` has `--stepping-stones` in read subcommand (mutually exclusive group)
+   Check: `core/scripts/aspirations.py` has `--limit` arg on read subparser with `default=5`
+   Bash: python3 core/scripts/aspirations.py read --stepping-stones --limit 3 2>/dev/null → verify returns valid JSON array (even if empty)
+   Check: `core/scripts/aspirations.py` stepping-stones sort key uses `or ""` (not `.get(key, default)`) — retired aspirations have `completed_at=None` (key exists), `.get()` returns None not default, sort crashes on None vs str comparison
+   Check: `core/config/aspirations.yaml` has `stepping_stones` section with `default_limit: 5`
+   Check: `core/config/aspirations.yaml` has `open_ended_progress` section with `metric: annecs`
+   Check: `core/config/aspirations.yaml` has `pipeline_low_water_mark: 3` (top-level)
+   Check: `core/config/aspirations.yaml` modifiable section has `pipeline_low_water_mark` with bounds {min: 1, max: 10, default: 3}
+   Check: `core/config/meta.yaml` initial_state.aspiration_generation_strategy has `stepping_stone_preferences` with `partial_visibility_k: 5`
+   Check: `core/config/meta.yaml` initial_state.aspiration_generation_strategy has `interestingness_criteria` with 4 weights summing to 1.0
+   Check: `core/config/spark-questions.yaml` has `sq-c08` with `category: failure_stepping_stone` in both `seed_candidates` and `initial_state.candidates`
+   Check: `create-aspiration/SKILL.md` has "Phase A.5" with `aspirations-read.sh --stepping-stones`
+   Check: `create-aspiration/SKILL.md` Phase A has interestingness criteria block (NOVELTY, LEARNABILITY, WORTHWHILENESS, DIVERSITY)
+   Check: `create-aspiration/SKILL.md` Step 5 heading contains "Interestingness Filter" (not just "Validate")
+   Check: `create-aspiration/SKILL.md` Step 5 has ACCEPT/REFINE/REJECT scoring and evolution-log event
+   Check: `create-aspiration/SKILL.md` invocation patterns table says "5-phase" (not "4-phase")
+   Check: `create-aspiration/SKILL.md` says "all five phases" (not "all four phases")
+   Check: `aspirations-spark/SKILL.md` has sq-c08 handler with "Failure Stepping-Stone" heading
+   Check: `aspirations-spark/SKILL.md` sq-c08 handler has guard: title starts with "Stepping stone:" → SKIP (prevents infinite regression)
+   Check: `aspirations-evolve/SKILL.md` Step 4 says "All aspiration creation in evolve routes through `/create-aspiration`" (single source of truth, no duplicate filter)
+   Check: `aspirations-evolve/SKILL.md` Step 6 has "ANNECS metric update" block with read-then-set pattern (not increment)
+   Check: `aspirations-evolve/SKILL.md` ANNECS comment says "meta-update is SET, not increment — read first" (prevents silent counter reset)
+   Check: `aspirations-precheck/SKILL.md` has "Phase 0.5.1: Pipeline Depth Check" between Phase 0.5 and Phase 0.5a
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 reads `pipeline_low_water_mark` from config
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 counts only `status == "pending"` goals (not in-progress)
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 invokes `from-self` WITHOUT `--plan` (fast tactical, not deep research)
 
 ## Step 4: Summary Report
+
+   # Priority review skill integrity checks (Section PR)
+   Check: `.claude/skills/priority-review/SKILL.md` exists (core skill file)
+   Check: `.claude/skills/_tree.yaml` has `priority-review` entry with `model_invocable: true`
+   Check: `.claude/settings.json` deny array contains `Edit(*/.claude/skills/priority-review/*)` and `Write(*/.claude/skills/priority-review/*)`
+   Check: `CLAUDE.md` lists `/priority-review` in Hybrid skills line
+   Check: `CLAUDE.md` User Control Commands table has `/priority-review` row
+   Check: `respond/SKILL.md` Step 4b has "Priority Review Surfacing" section BEFORE "Pending Questions" section
+   Check: `respond/SKILL.md` Step 5 table has "Priority review" directive type that invokes `/priority-review`
+   Check: `create-aspiration/SKILL.md` has Step 8.6 with `from-self` mode gate
+   Check: `priority-review/SKILL.md` Phase 4 update uses stdin pipe pattern (`echo | aspirations-update.sh`), NOT command-line JSON arg
+   # This last check guards against the critical bug found during initial code review:
+   # aspirations-update.sh does FULL REPLACEMENT from stdin, not partial merge.
+   # Passing partial JSON as a CLI arg destroys all other aspiration fields.
+   Check: `priority-review/SKILL.md` Phase 1 reads BOTH world (`load-aspirations-compact.sh`) AND agent-local (`agent-aspirations-read.sh`) aspirations
 
 Provide a summary table:
 - Total PASS / FAIL / N/A per section

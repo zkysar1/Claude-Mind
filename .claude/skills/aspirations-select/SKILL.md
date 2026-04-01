@@ -34,6 +34,8 @@ plus metacognitive assessment (model judgment on familiarity, value, cost, infra
 - `batch`: Array of batched goals (if batch_mode)
 - `ranked_goals`: Full ranked list from selector
 - `prefetch_goals`: Goals for pre-fetch research agents
+- `selection_context`: Raw parsed output from goal-selector.sh (includes `by_reason`, `blocked_goals`, `blocked_count` when all_blocked)
+- `selection_reason`: Why no goal was returned (`"all_blocked"`, `"all_blocked_by_gate"`, or absent when goal selected)
 
 ## Phase 2: Select Next Goal
 
@@ -58,7 +60,8 @@ parsed_output = parse JSON output
 IF parsed_output is a JSON object with "all_blocked": true:
     Output: "▸ ALL GOALS BLOCKED: {blocked_count} goals — {by_reason summary}"
     FOR EACH goal in blocked_goals: Output: "  {goal_id}: {detail}"
-    RETURN (goal = None, selection_reason = "all_blocked")
+    # parsed_output contains blocked_goals, blocked_count, by_reason — orchestrator needs these
+    RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)
 
 ranked_goals = parsed_output  # JSON array of scored candidates
 # Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw}
@@ -180,7 +183,8 @@ FOR goal in ranked_goals (iterate if current goal is blocked):
 # After FOR loop: if every ranked goal was skipped by the blocker gate
 IF all ranked_goals exhausted by blocker gate:
     Output: "▸ ALL CANDIDATES BLOCKED BY GATE"
-    RETURN (goal = None, selection_reason = "all_blocked_by_gate")
+    # No goal-selector-level blocked_goals data — gate rejections are skill-level infrastructure blocks
+    RETURN (goal = None, selection_reason = "all_blocked_by_gate", selection_context = {blocked_goals: [], blocked_count: 0, by_reason: {}})
 ```
 
 ## Phase 2.6: Pre-Fetch Context

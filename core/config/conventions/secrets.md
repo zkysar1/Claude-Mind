@@ -2,7 +2,7 @@
 
 ## File Locations
 - `.env.example` — Committed template at repo root. Key names + descriptions.
-- `.env.local` — Gitignored values at repo root. User-managed. Survives factory reset.
+- `.env.local` — Gitignored values at repo root. User-managed.
 
 ## Access Pattern
 - Check: `env-read.sh has KEY_NAME` (exit 0 = present)

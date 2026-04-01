@@ -48,7 +48,9 @@ consolidation:
   replay_trigger: "session_end"
   replay_priority_order:
     - violations
+    - context_gap_corrections
     - high_surprise
+    - standard_deferred          # Standard-tier deferred encodings (full fidelity, unwritten to tree)
     - high_outcome_impact
     - goal_completions
     - routine_observations
@@ -63,6 +65,15 @@ consolidation_budget:
   min: 5
   max: 15
   ranking_mode: top_k
+
+deferred_encoding:
+  description: >
+    Standard-tier goals compute encoding content inline but defer the tree write
+    to consolidation. The encoding_queue item contains full-fidelity data:
+    precision_manifest, narrative, decision_rules, metadata_updates.
+    Consolidation processes these identically to deep-tier inline encoding.
+  source_type_tag: "standard_tier_deferred"
+  priority_in_replay: "standard_deferred"
 
 long_term:
   tree_structure: "K=4, D=4"
@@ -106,7 +117,7 @@ working_memory_pruning:
   stale_threshold_minutes: 30       # Flag for refresh in Phase 11
   evict_threshold_minutes: 120      # Auto-null untouched scalar slots after 2 hours
   array_limits:
-    encoding_queue: 20              # Matches sensory_buffer max_items
+    encoding_queue: 40              # Increased for standard-tier deferred items (was 20)
     sensory_buffer: 20
     micro_hypotheses: 30
     knowledge_debt: 15

@@ -118,7 +118,16 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 ```
 2. For top items (up to dynamic budget) in encoding_queue:
    a. Determine target leaf node:
-      node=$(bash core/scripts/tree-find-node.sh --text "{item.target_article}" --leaf-only --top 1)
+      IF item.source_type == "standard_tier_deferred":
+          # Standard-tier items already have target node info from inline computation
+          node = {key: item.target_node_key, file: item.target_node_file}
+          # Verify node still exists (tree may have been rebalanced during session)
+          verify = bash core/scripts/tree-find-node.sh --key {item.target_node_key}
+          IF verify is empty:
+              # Node was rebalanced/merged — find new target by text search
+              node=$(bash core/scripts/tree-find-node.sh --text "{item.observation}" --leaf-only --top 1)
+      ELSE:
+          node=$(bash core/scripts/tree-find-node.sh --text "{item.target_article}" --leaf-only --top 1)
       # Returns: {key, score, file, depth, summary, node_type}
    b. EXTRACT PRECISION from encoding queue item:
       IF item has precision_manifest AND it is non-empty:
@@ -156,6 +165,22 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
         If root-level domain summary changed:
           bash core/scripts/tree-update.sh --set root summary "<updated>"
         - Update <agent>/developmental-stage.yaml highest_capability if exceeded
+
+   # Standard-tier deferred: apply metadata updates that were skipped inline
+   IF item.source_type == "standard_tier_deferred" AND item.metadata_updates:
+       echo '{"operations": [
+         {"op": "set", "key": "<node.key>", "field": "confidence", "value": <item.metadata_updates.confidence>},
+         {"op": "set", "key": "<node.key>", "field": "capability_level", "value": "<item.metadata_updates.capability_level>"}
+       ]}' | bash core/scripts/tree-update.sh --batch
+       # Growth triggers for deferred items
+       Read core/config/tree.yaml for decompose_threshold, split_threshold
+       line_count = count lines in node .md body (excluding YAML front matter)
+       If line_count > decompose_threshold AND node depth < D_max:
+           bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose
+       # Capability event logging (same as State Update Step 8 inline path)
+       IF item.metadata_updates.capability_level crosses threshold:
+           Log capability event via evolution-log-append.sh
+           Update <agent>/developmental-stage.yaml highest_capability if exceeded
 
 2.25. Knowledge Debt Sweep:
    Bash: wm-read.sh knowledge_debt --json
@@ -216,29 +241,6 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                    Append to node's Key Insights: "Judgment correction: {conclusion.conclusion} was wrong — {outcome_source}"
                    bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
        Log summary: "Judgment quality: {total} conclusions ({negative} negative), {correct} correct, {wrong} wrong, {pending} pending. Avg signals: {avg_signals:.1f}"
-
-2.8. Insight Consolidation:
-   Bash: insights-read.sh --count
-   IF count > 0:
-     insights_json = Bash: insights-read.sh  # returns unprocessed as JSON array
-     encoded_count = 0
-     buffered_count = 0
-     FOR EACH insight in insights_json:
-       node = bash core/scripts/tree-find-node.sh --text "{insight.content}" --leaf-only --top 1
-       IF node found AND node.score > 0.3:
-         Read node file
-         Append compressed insight (1-2 sentences) to "Key Insights" section
-         bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
-         Log: "INSIGHT ENCODED: {insight.id} → {node.key}"
-         encoded_count += 1
-       ELSE:
-         echo '{"observation": "{insight.content}", "source": "insight-capture", "insight_id": "{insight.id}"}' | bash core/scripts/wm-append.sh sensory_buffer
-         Log: "INSIGHT BUFFERED: {insight.id} — no matching tree node"
-         buffered_count += 1
-     Bash: insights-read.sh --mark-processed
-     Output: "▸ CONSOLIDATION: {encoded_count} insights → tree, {buffered_count} buffered"
-   ELSE:
-     Log: "No unprocessed insights"
 
 3. **MANDATORY** — run even if all earlier steps had empty data:
    Bash: wm-read.sh sensory_buffer --json
@@ -460,7 +462,6 @@ CONSOLIDATION CHECKLIST:
   Step 2.6  Experience Archive:    {done}
   Step 2.6  Encoding Weights:      {done|skipped (insufficient data)|skipped (file missing)}
   Step 2.7  Conclusion Quality:    {done|empty}
-  Step 2.8  Insight Consolidation: {done|empty}
   Step 3  Journal (structured):    {done}    ← MANDATORY
   Step 4  WM Archive:              {done}    ← MANDATORY
   Step 5  WM Reset:                {done}

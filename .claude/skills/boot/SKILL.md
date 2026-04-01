@@ -612,7 +612,6 @@ If no L1 nodes have sufficient data, output: "Domain health: insufficient data a
 - Research queue items pending > 14 days: {list}
 - Accuracy dropping (last 5 below last 10): {flag}
 - Confidence calibration significantly off: {flag}
-- Captured insights pending: {count} (Bash: insights-read.sh --count)
 - Status report: last generated {from <agent>/session/last-report-timestamp or "never"}
 
 ### Triggered Reviews

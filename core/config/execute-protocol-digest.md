@@ -76,13 +76,16 @@ ELSE:
 
 Execute primary goal: `result = invoke goal.skill with goal.args`
 
-## Outcome Classification
+## Outcome Classification (3-Tier)
 
 ```
-outcome_class = "productive"  # default
+outcome_class = "deep"  # default: immediate tree encoding
 IF goal.recurring AND goal_succeeded AND no actionable items/new info:
     outcome_class = "routine"
-# Non-recurring, failed, or uncertain → always "productive"
+ELIF goal.recurring AND goal_succeeded:
+    outcome_class = "standard"  # recurring with findings → deferred tree encoding
+# Non-recurring, failed, or uncertain → always "deep"
+# Standard tier: ALL steps run, ALL sparks fire, but tree write deferred to consolidation
 ```
 
 ## Phase 4.0: SKIP Fast-Path
@@ -108,7 +111,7 @@ IF guardrail_found_issues OR (goal failed AND infrastructure):
     4.1e: If not fixed → CREATE_BLOCKER protocol
     IF goal failed: set pending, continue (skip Phases 4.25-9)
 
-IF guardrail_found_issues: outcome_class = "productive"  # override routine
+IF guardrail_found_issues: outcome_class = "deep"  # override routine/standard
 ```
 
 ## Phase 4.2: Domain Post-Execution Steps
@@ -150,3 +153,23 @@ IF external_changes (from Phase 4.2):
 ELIF hypothesis CORRECTED:
     Reconcile affected nodes (HIGH priority — knowledge was wrong)
 ```
+
+---
+
+## ═══ POST-EXECUTION OBLIGATIONS (Phases 5-11) ═══
+
+After Phase 4.5 completes, execute these phases **in this order**.
+Each Skill() below is a **literal tool call** — do NOT inline them manually.
+Writing a manual journal entry or WM update does NOT satisfy these obligations.
+
+1. **Phase 5 VERIFY** ← MANDATORY: `Skill(aspirations-verify)` — pass goal + result
+2. **Phase 6 SPARK** ← IF productive: `Skill(aspirations-spark)` — pass goal, result, effort_level
+3. **Phase 7 COMPLETION REVIEW** ← IF aspiration fully complete: `Skill(aspirations-complete-review)`
+4. **Phase 8 STATE** ← MANDATORY: `Skill(aspirations-state-update)` — pass goal, result, session_count, outcome_class
+5. **Phase 9 EVOLUTION** ← IF cadence triggers fire: per orchestrator
+6. **Phase 9.5 LEARN** ← MANDATORY: `Skill(aspirations-learning-gate)` — learning gate, retrieval gate, reflection
+7. **Phase 10 STOP CHECK**: `session-state-get.sh` — if not RUNNING, break
+8. **Phase 11 MAINTAIN** ← MANDATORY: Working memory maintenance — sensory buffer aging, prune stale slots
+
+After Phase 4.5, the NEXT action must be `Skill(aspirations-verify)` — not a journal write, not a WM update, not a stop check.
+If ANY mandatory phase is skipped, output: `"OBLIGATION SKIPPED: {phase}"` before continuing.

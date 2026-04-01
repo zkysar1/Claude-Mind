@@ -4,12 +4,12 @@
 #
 # 4-tier architecture:
 #   core/          — Framework (immutable)
-#   meta/          — Meta-strategies (domain-agnostic, survives domain reset)
+#   meta/          — Meta-strategies (domain-agnostic, independent of domain data)
 #   world/         — Collective domain state (shared across agents)
 #   <agent-name>/  — Per-agent private state (one directory per agent)
 #
 # Sets: SCRIPT_DIR, CORE_ROOT, PROJECT_ROOT, CONFIG_DIR, REPO_ROOT
-#       WORLD_DIR, META_DIR, AGENT_NAME, AGENT_DIR, MIND_DIR
+#       WORLD_DIR, META_DIR, AGENT_NAME, AGENT_DIR
 #
 # BASH_SOURCE[0] resolves to THIS file's location (not the caller's $0).
 # This is critical — it anchors all paths to core/scripts/ regardless of cwd.
@@ -44,12 +44,27 @@ elif ! python3 -c "pass" &>/dev/null; then
 fi
 unset _PY_SHIM_DIR
 
+# --- Session ID fallback (for /start and single-agent use) ---
+# Only read when SID not already in env. Concurrent agents use AYOAI_AGENT prefix instead.
+if [ -z "${AYOAI_SESSION_ID:-}" ]; then
+    _SID_FILE="$PROJECT_ROOT/.latest-session-id"
+    if [ -f "$_SID_FILE" ]; then
+        AYOAI_SESSION_ID=$(cat "$_SID_FILE" 2>/dev/null | tr -d '\r\n')
+        export AYOAI_SESSION_ID
+    fi
+    unset _SID_FILE
+fi
+
 # --- Tier 4: Per-agent private state ---
-# Priority: AYOAI_AGENT env var > .active-agent file. /start writes the file.
+# Priority: AYOAI_AGENT env > .active-agent-$SESSION_ID > .active-agent global > empty
 # AGENT_NAME must be resolved FIRST because local-paths.conf lives inside <agent>/.
 # +x detects "set, even to empty" vs "unset". Do NOT simplify to :- or -n.
+# Session-keyed file (.active-agent-$SID) prevents cross-agent contamination
+# when multiple agents run in separate Claude Code windows.
 if [ -n "${AYOAI_AGENT+x}" ]; then
     AGENT_NAME="$AYOAI_AGENT"
+elif [ -n "${AYOAI_SESSION_ID:-}" ] && [ -f "$PROJECT_ROOT/.active-agent-$AYOAI_SESSION_ID" ]; then
+    AGENT_NAME="$(cat "$PROJECT_ROOT/.active-agent-$AYOAI_SESSION_ID" 2>/dev/null | tr -d '\r\n')"
 elif [ -f "$PROJECT_ROOT/.active-agent" ]; then
     AGENT_NAME="$(cat "$PROJECT_ROOT/.active-agent" 2>/dev/null | tr -d '\r\n')"
 else
@@ -77,7 +92,3 @@ if [ -n "$AGENT_NAME" ]; then
 else
     AGENT_DIR=""
 fi
-
-# Legacy alias — points to AGENT_DIR when set. Scripts being migrated from
-# MIND_DIR should switch to WORLD_DIR (collective) or AGENT_DIR (per-agent).
-MIND_DIR="$AGENT_DIR"

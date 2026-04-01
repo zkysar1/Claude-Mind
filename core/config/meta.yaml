@@ -178,6 +178,15 @@ initial_state:
       project: 0.4
       initiative: 0.2
     category_saturation: {}
+    # OMNI-EPIC-inspired stepping-stone and interestingness preferences
+    stepping_stone_preferences:
+      use_stepping_stones: true       # Enable Phase A.5 stepping-stone retrieval
+      partial_visibility_k: 5        # Show only K archived aspirations (not full archive)
+    interestingness_criteria:
+      novelty_weight: 0.3            # How different from prior work
+      learnability_weight: 0.3       # Within reach of current capabilities
+      worthwhileness_weight: 0.25    # Advances Self's purpose meaningfully
+      diversity_weight: 0.15         # Explores different category/approach
 
   encoding_strategy:
     version: 1

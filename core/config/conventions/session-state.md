@@ -177,3 +177,46 @@ the parent agent, which collects results in Phase -0.5a.
 
 **Staleness guard**: agents past their `timeout_minutes` (default 10) are auto-pruned by
 `has-pending` and `list`, preventing orphaned registrations from permanently disabling the stop hook.
+
+---
+
+# Background External Jobs
+
+Tracks long-running external OS processes (hours+) so the aspirations loop can monitor
+them via recurring goals and collect results on completion. Complements `pending-agents.yaml`
+(which tracks short-lived Claude Code sub-agents).
+
+- **File**: `<agent>/session/background-jobs.yaml`
+- **Written by**: Skills that launch external processes (e.g., `/run-processor` launch mode)
+- **Read by**: Skills that monitor external processes (e.g., `/run-processor` monitor mode)
+- **Cleaned by**: The monitoring skill on job completion or failure
+
+**Scripts**: `core/scripts/background-jobs.sh` (thin wrapper), `core/scripts/background-jobs.py`
+
+| Subcommand | Purpose |
+|-----------|---------|
+| `register --id <id> --type <type> --goal <goal-id> --pid <pid> --monitor-goal <id> --completion-check <cmd> [--metadata <json>]` | Register job before launch |
+| `deregister --id <id>` | Remove completed/failed job |
+| `check --id <id>` | Check job status: PID alive → running; PID dead → run completion_check |
+| `list [--json]` | Show all registered jobs |
+| `has-pending` | Exit 0 if any jobs exist, exit 1 if not |
+| `clear` | Delete file entirely |
+
+**Completion check delegation**: The `completion_check` field stores a command (resolved
+relative to project root) that determines whether a dead process completed successfully
+(exit 0) or failed (exit 2). This makes the tracker domain-agnostic — process-specific
+completion logic lives in the skill's companion script, not in the framework.
+
+**No staleness timeout**: Unlike `pending-agents.yaml`, background jobs have no automatic
+timeout pruning. Jobs can legitimately run for hours. Cleanup is the responsibility of
+the monitoring skill (via `deregister`) when the job completes, fails, or is abandoned.
+
+**Recurring monitor goal pattern**: The launching skill creates a recurring goal with
+`interval_hours: 0.5` that periodically invokes the skill in monitor mode. On each check,
+the skill calls `background-jobs.sh check --id <job_id>` and branches on the result.
+When the job completes, the monitor goal sets `recurring: false` and marks itself completed.
+
+**Autocompact survival**: The YAML file persists on disk across context compression.
+The recurring monitor goal persists in `aspirations.jsonl`. Phase 0 (aspirations-precheck)
+resets completed recurring goals to `pending` after `interval_hours` elapses. No checkpoint
+integration needed.

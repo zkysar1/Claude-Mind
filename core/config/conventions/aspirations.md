@@ -85,3 +85,14 @@ Goal-selector reads from BOTH queues and tags candidates with `source: "world"` 
 - Archive file is append-only — never modify archived records
 - Live file stays small (only active aspirations)
 - `max_active` cap enforced by evolve phase: if over limit, complete lowest-priority/oldest first
+- **Recurring goal protection (data layer enforced):**
+  - `aspirations-complete.sh` and `aspirations-retire.sh` **refuse** aspirations with recurring goals (exit 1 with BLOCKED message). Use `--force` to override.
+  - `aspirations-archive.sh` (sweep) auto-recovers such aspirations to `active` status and resets corrupted recurring goals to `pending`.
+  - `aspirations-update-goal.sh` **blocks** setting `status=completed` on recurring goals. Use `complete-by` for cycle tracking.
+  - `recompute_progress` excludes recurring goals from completion counts. Summary shows `+ N recurring` suffix.
+  - These guards prevent LLM drift from killing recurring goals by archiving their parent aspiration.
+- **Premature-archival protection (data layer enforced):**
+  - `aspirations-complete.sh` **refuses** aspirations where any non-recurring goal is not in a terminal status (`completed`, `skipped`, `expired`, `decomposed`). Exit 1 with BLOCKED message listing unfinished goals. Use `--force` to override.
+  - `aspirations-retire.sh` **warns** (stderr) when retiring aspirations with unfinished goals, but does not block — retirement is intentional abandonment.
+  - `aspirations-archive.sh` (sweep) auto-recovers completed aspirations with unfinished non-recurring goals to `active` status (same pattern as recurring-goal recovery).
+  - These guards prevent post-autocompact narrative fabrication from archiving aspirations before their goals are actually done.

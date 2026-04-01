@@ -8,7 +8,7 @@ These are NOT stop conditions (the loop MUST continue through them):
 - Context filling up → autocompact handles it
 - No agent-executable goals → gap analysis → generate new goals
 - All aspirations complete → evolve → create new aspirations
-- All goals blocked → log status, wait 10 minutes, re-check (precheck reprobes blockers each cycle)
+- All goals blocked → constraint-aware aspiration generation → evolution gap analysis → research → reflection → wait 5 min only as last resort (precheck reprobes blockers each cycle)
 - API rate limit → cooldown 60s → retry
 - Running out of ideas → reflect, replay, research
 - Wanting to ask a question → pending-questions.yaml, execute default_action, continue

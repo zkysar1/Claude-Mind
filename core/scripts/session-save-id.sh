@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# SessionStart hook — save session UUID and set agent env var.
+# SessionStart hook — save session UUID and carry forward agent binding.
 #
-# 1. Writes AYOAI_SESSION_ID to CLAUDE_ENV_FILE (persists to all Bash calls)
-# 2. Auto-resumes agent if .active-agent-<session_id> exists (session reconnect)
-# 3. Writes session_id to <agent>/session/latest-session-id (+ syncs running-session-id)
+# 1. Writes SID to .latest-session-id (read by _paths.sh for Tier 2 resolution)
+# 2. Carries forward agent binding across autocompact (old SID → new SID)
+# 3. Writes SID to <agent>/session/latest-session-id (+ syncs running-session-id)
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
@@ -11,32 +11,52 @@ source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 [ -n "$SID" ] || exit 0
 
-# --- 1. Persist session ID to env (all Bash calls will have $AYOAI_SESSION_ID) ---
-if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-    echo "export AYOAI_SESSION_ID=\"$SID\"" > "$CLAUDE_ENV_FILE"
+# --- 1. Read OLD SID before overwriting, then persist new SID ---
+OLD_SID=""
+if [ -f "$PROJECT_ROOT/.latest-session-id" ]; then
+    OLD_SID=$(cat "$PROJECT_ROOT/.latest-session-id" 2>/dev/null | tr -d '\r\n')
+fi
+echo "$SID" > "$PROJECT_ROOT/.latest-session-id"
+
+# --- Breadcrumb from stop hook (authoritative for autocompact) ---
+# The stop hook resolves the correct agent from .active-agent-$OLD_SID and writes
+# .compact-agent. This is more reliable than carry-forward for concurrent agents.
+COMPACT_AGENT=""
+if [ -f "$PROJECT_ROOT/.compact-agent" ]; then
+    COMPACT_AGENT=$(cat "$PROJECT_ROOT/.compact-agent" 2>/dev/null | tr -d '\r\n')
+    rm -f "$PROJECT_ROOT/.compact-agent"
 fi
 
-# --- 2. Auto-resume: restore agent binding from previous session ---
-# Skip if agent directory was deleted (user removed the agent).
+# --- 2. Resolve agent binding for the new SID ---
+# Priority: existing binding > breadcrumb > carry-forward from old SID
 ACTIVE_FILE="$PROJECT_ROOT/.active-agent-$SID"
+RESTORED_AGENT=""
 if [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; then
+    # Session reconnect: .active-agent-$SID already exists
     RESTORED_AGENT=$(cat "$ACTIVE_FILE" | tr -d '\r\n')
-    if [ -n "$RESTORED_AGENT" ] && [ -d "$PROJECT_ROOT/$RESTORED_AGENT" ] && [ -n "${CLAUDE_ENV_FILE:-}" ]; then
-        echo "export AYOAI_AGENT=\"$RESTORED_AGENT\"" >> "$CLAUDE_ENV_FILE"
+elif [ -n "$COMPACT_AGENT" ] && [ -d "$PROJECT_ROOT/$COMPACT_AGENT" ]; then
+    # Breadcrumb: stop hook identified the correct agent for this autocompact
+    echo "$COMPACT_AGENT" > "$PROJECT_ROOT/.active-agent-$SID"
+    RESTORED_AGENT="$COMPACT_AGENT"
+elif [ -n "$OLD_SID" ] && [ -f "$PROJECT_ROOT/.active-agent-$OLD_SID" ]; then
+    # Carry-forward: copy old SID's agent to new SID (single-agent reliable)
+    # CONCURRENT LIMITATION: OLD_SID from .latest-session-id may be wrong.
+    # The LLM prefix (AYOAI_AGENT) compensates for concurrent agents.
+    CARRIED_AGENT=$(cat "$PROJECT_ROOT/.active-agent-$OLD_SID" 2>/dev/null | tr -d '\r\n')
+    if [ -n "$CARRIED_AGENT" ] && [ -d "$PROJECT_ROOT/$CARRIED_AGENT" ]; then
+        echo "$CARRIED_AGENT" > "$PROJECT_ROOT/.active-agent-$SID"
+        RESTORED_AGENT="$CARRIED_AGENT"
     fi
 fi
 
-# --- 3. Write session_id to agent session dir (if agent is active) ---
-# AGENT_DIR may be set from env (AYOAI_AGENT) or from the auto-resume above.
-# Re-resolve since CLAUDE_ENV_FILE writes don't take effect until NEXT Bash call.
-RESOLVED_AGENT="${AYOAI_AGENT:-${RESTORED_AGENT:-}}"
+# --- 3. Write SID to agent session dir (if agent is active) ---
+RESOLVED_AGENT="${COMPACT_AGENT:-${AYOAI_AGENT:-${RESTORED_AGENT:-}}}"
 if [ -n "$RESOLVED_AGENT" ]; then
     AGENT_SESSION_DIR="$PROJECT_ROOT/$RESOLVED_AGENT/session"
     if [ -d "$AGENT_SESSION_DIR" ]; then
         echo "$SID" > "$AGENT_SESSION_DIR/latest-session-id"
-        # If the autonomous loop is running, keep running-session-id in sync.
-        # Without this, autocompact (which generates a new session UUID) causes
-        # Gate 0 in stop-hook.sh to see a mismatch and allow premature stops.
+        # Keep running-session-id in sync across autocompact.
+        # Without this, Gate 0 in stop-hook.sh sees a SID mismatch and allows premature stops.
         if [ -f "$AGENT_SESSION_DIR/running-session-id" ]; then
             echo "$SID" > "$AGENT_SESSION_DIR/running-session-id"
         fi

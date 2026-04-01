@@ -270,6 +270,10 @@ Aspirations:
 Blocked: {N} goals, {B} bottlenecks
 Hypotheses: {H} ready to test
 
+Read <agent>/session/pending-questions.yaml
+IF any entry has type: "priority-review" AND status: "pending":
+  Output: "Priority review pending — run /priority-review to reorder"
+
 Full report written to: {absolute_path_to_<agent>/BACKLOG.md}
 ═══════════════════════════════════════════════
 ```

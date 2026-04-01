@@ -36,12 +36,13 @@ to archive or reopen the aspiration with new goals.
 ## Phase 7: Aspiration-Level Check
 
 Re-read the goal's parent aspiration via compact loader.
-GUARD: Aspirations where ALL goals are recurring can never "complete" — they're perpetual.
+GUARD: Aspirations containing ANY recurring goals cannot be archived — the data layer
+(`aspirations-complete.sh`) will block it. Check here to avoid wasted work.
 
 ```
 asp = get_aspiration(goal)
-all_recurring = all(g.get("recurring", False) for g in asp.goals)
-if all_recurring: RETURN (should_archive = false, goals_added = 0)  # perpetual
+has_recurring = any(g.get("recurring", False) for g in asp.goals)
+if has_recurring: RETURN (should_archive = false, goals_added = 0)  # perpetual — has recurring goals
 if not aspiration_fully_complete(asp): RETURN (should_archive = false, goals_added = 0)
 
 run_aspiration_spark(goal.aspiration)

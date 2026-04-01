@@ -97,7 +97,8 @@ goals_since_last_alignment_check = 0
 aspirations_touched_this_session = set()
 session_signals = {
     routine_streak_global: 0,
-    productive_streak: 0
+    productive_streak: 0,
+    goals_since_last_tree_update: 0    # encoding drift counter (all outcome types)
 }
 
 # Phase -0.5a: Background Agent Result Collection
@@ -122,10 +123,13 @@ Read world/program.md (skip if empty/missing)
 
 ## ═══ PER-ITERATION OBLIGATIONS (MANDATORY — never skip) ═══
 
-After every goal execution, these MUST complete before `continue`:
-1. **VERIFY**: `invoke /aspirations-verify` — did the goal succeed?
-2. **STATE**: `invoke /aspirations-state-update` — tree encoding, journal, capability
-3. **LEARN**: `invoke /aspirations-learning-gate` — learning gate, retrieval gate, reflection
+After every goal execution, these MUST complete before `continue`.
+Each line below is a **literal `Skill()` tool call** — not an inline approximation.
+Writing a manual journal entry or WM update does NOT satisfy these obligations.
+
+1. **VERIFY**: `Skill(aspirations-verify)` — did the goal succeed?
+2. **STATE**: `Skill(aspirations-state-update)` — tree encoding, journal, capability
+3. **LEARN**: `Skill(aspirations-learning-gate)` — learning gate, retrieval gate, reflection
 4. **MAINTAIN**: Working memory maintenance — sensory buffer, aging, prune
 
 Skip rules:
@@ -143,17 +147,83 @@ FOREVER:
 
     # ── GOAL SELECTION (Phases 2-2.9) ──
     invoke /aspirations-select
-    # Returns: goal, effort_level, batch_mode, batch, ranked_goals, prefetch_goals, selection_reason
+    # Returns: goal, effort_level, batch_mode, batch, ranked_goals, prefetch_goals, selection_context, selection_reason
 
     if goal is None AND selection_reason starts with "all_blocked":
-        # ── ALL-BLOCKED PATH ("idle with dignity") ──
+        # ── ALL-BLOCKED PATH ("deep while blocked") ──
         # Goals exist but all are blocked on external dependencies.
-        # Principle: "real advancement over apparent activity"
-        # Don't manufacture busywork. Wait, then check again.
+        # Principle: "No Terminal State" — generate new work that avoids blocked resources.
+        # Only sleep as absolute LAST RESORT after all generation attempts fail.
         Output: "▸ ALL BLOCKED — goals waiting on external dependencies"
         Output: blocked goal summaries from selection context
-        Output: "▸ Waiting 10 minutes before next check"
-        Bash (timeout 600000): sleep 600
+        blocked_idle_attempts = []
+
+        # Step B1: Extract constraint context from selection data
+        blocked_skills = set()
+        blocked_resources = set()
+        FOR EACH bg in selection_context.blocked_goals:
+            IF bg.reason == "infrastructure":
+                blocked_skills.add(extract_skill_from(bg.detail))
+                blocked_resources.add(extract_reason_from(bg.detail))
+            ELIF bg.reason == "dependency" OR bg.reason == "explicit_status":
+                blocked_resources.add(bg.detail)
+        Bash: wm-read.sh known_blockers --json
+        FOR EACH blocker in known_blockers:
+            FOR EACH skill in blocker.affected_skills:
+                blocked_skills.add(skill)
+        constraint_context = {
+            blocked_resources: list(blocked_resources),
+            avoid_skills: list(blocked_skills),
+            trigger: "all_blocked",
+            blocked_count: selection_context.blocked_count,
+            by_reason: selection_context.by_reason
+        }
+
+        # Step B2: Constraint-aware aspiration generation
+        Output: "▸ Attempting constraint-aware aspiration generation..."
+        invoke /create-aspiration from-self --plan with: constraint_context
+        if new_aspirations_generated:
+            blocked_idle_attempts.append("create-aspiration: SUCCESS")
+            Output: "▸ Generated new aspirations avoiding blocked resources"
+            continue
+        blocked_idle_attempts.append("create-aspiration: no viable aspirations found")
+
+        # Step B3: Evolution gap analysis (even outside normal triggers)
+        IF evolutions_this_session < max_evolutions_per_session:
+            Output: "▸ Attempting idle evolution gap analysis..."
+            invoke /aspirations-evolve with: ["idle_blocked"]
+            evolutions_this_session += 1
+            last_evolution_goal_count = goals_completed_this_session
+            # Check if evolution created new executable goals
+            Bash: goal-selector.sh
+            IF parsed_output is a JSON array with length > 0:
+                blocked_idle_attempts.append("evolve: SUCCESS — new executable goals")
+                Output: "▸ Evolution created new executable goals"
+                continue
+            blocked_idle_attempts.append("evolve: completed but no new executable goals")
+        ELSE:
+            blocked_idle_attempts.append("evolve: skipped (session cap reached)")
+
+        # Step B4: Exploratory research
+        Output: "▸ Attempting exploratory research..."
+        invoke /research-topic (explore broadly based on Self's purpose, avoiding blocked domains)
+        blocked_idle_attempts.append("research: completed")
+
+        # Step B5: Full-cycle reflection
+        Output: "▸ Running full-cycle reflection..."
+        invoke /reflect --full-cycle
+        blocked_idle_attempts.append("reflect: completed")
+
+        # Step B6: Check if B4/B5 produced new goals (via spark/findings)
+        Bash: goal-selector.sh
+        IF parsed_output is a JSON array with length > 0:
+            Output: "▸ Research/reflection produced new executable goals"
+            continue
+
+        # Step B7: Last resort — short sleep, then re-check
+        Output: "▸ All generation attempts exhausted. Waiting 5 minutes."
+        Output: "  Attempts: " + "; ".join(blocked_idle_attempts)
+        Bash (timeout 300000): sleep 300
         continue
 
     if goal is None:
@@ -175,7 +245,7 @@ FOREVER:
     Bash: aspirations-update-goal.sh <goal-id> status in-progress
     Bash: aspirations-update-goal.sh <goal-id> started <today>
     echo "Working on: ${goal.title}" | Bash: board-post.sh --channel coordination
-    # Load the execute protocol DIGEST (144 lines) — NOT the full 883-line skill.
+    # Load the execute protocol DIGEST (~170 lines) — NOT the full 883-line skill.
     # The digest contains the complete execution protocol. Follow it inline.
     # For rare edge cases (CREATE_BLOCKER, Cognitive Primitives JSON):
     #   Read .claude/skills/aspirations-execute/SKILL.md directly.
@@ -189,9 +259,10 @@ FOREVER:
     IF outcome_class == "routine":
         routine_streaks[goal.id] += 1
         IF routine_streaks[goal.id] >= 5:
-            outcome_class = "productive"  # force full pipeline
+            outcome_class = "deep"  # force DEEP after 5 consecutive routine
             routine_streaks[goal.id] = 0
-    ELIF outcome_class == "productive":
+            Log: "PER-GOAL ANTI-DRIFT: forced deep after 5 consecutive routine for {goal.id}"
+    ELIF outcome_class in ("standard", "deep"):
         routine_streaks[goal.id] = 0
 
     # Session signal tracking (streak counters for global anti-drift)
@@ -203,32 +274,50 @@ FOREVER:
         session_signals.productive_streak += 1
 
     # Global anti-drift safeguard (across ALL goals, not per-goal-id)
-    # Threshold 8 is higher than per-goal threshold (5) because cycling through
-    # different recurring goals is less concerning than one goal going stale.
     IF session_signals.routine_streak_global >= 8:
-        outcome_class = "productive"  # force full pipeline
+        outcome_class = "deep"  # force DEEP pipeline
         session_signals.routine_streak_global = 0
-        Log: "GLOBAL ANTI-DRIFT: forced productive after 8 consecutive routine outcomes"
+        Log: "GLOBAL ANTI-DRIFT: forced deep after 8 consecutive routine outcomes"
 
-    # Count productive goals AFTER all reclassification (per-goal + global anti-drift)
-    IF outcome_class == "productive":
+    # Count productive goals AFTER all reclassification (standard + deep both count)
+    IF outcome_class in ("standard", "deep"):
         productive_goals_this_session += 1
 
-    # ── VERIFY (Phase 5) ── ← OBLIGATION
-    invoke /aspirations-verify with: goal, result
+    # ── VERIFY (Phase 5) ── ← OBLIGATION (literal Skill() tool call — not inline)
+    Skill(aspirations-verify) with: goal, result
 
-    # ── SPARK (Phase 6) ──
-    IF outcome_class == "productive":
-        invoke /aspirations-spark with: goal, result, effort_level
+    # ── SPARK (Phase 6) ── (literal Skill() tool call for non-routine outcomes)
+    IF outcome_class in ("standard", "deep"):
+        Skill(aspirations-spark) with: goal, result, effort_level, outcome_class
 
     # ── COMPLETION REVIEW (Phase 7-7.6) ──
     asp = get_aspiration(goal)
-    all_recurring = all(g.get("recurring", False) for g in asp.goals)
-    if not all_recurring and aspiration_fully_complete(asp):
+    has_recurring = any(g.get("recurring", False) for g in asp.goals)
+    if not has_recurring and aspiration_fully_complete(asp):
         invoke /aspirations-complete-review with: asp, goal
+    # NOTE: aspirations with ANY recurring goals skip completion review — they are perpetual.
+    # The data layer (aspirations-complete.sh) also blocks archival of such aspirations.
 
-    # ── STATE UPDATE (Phase 8) ── ← OBLIGATION
-    invoke /aspirations-state-update with: goal, result, session_count, outcome_class
+    # ── STATE UPDATE (Phase 8) ── ← OBLIGATION (literal Skill() tool call — not inline)
+    Skill(aspirations-state-update) with: goal, result, session_count, outcome_class
+
+    # ── Encoding drift tracking (Phase 8.0.5) ──
+    # Track whether Step 8 wrote to the tree. step_8_wrote_insight is set by
+    # aspirations-state-update when it successfully encodes to a tree node.
+    IF step_8_wrote_insight:
+        session_signals.goals_since_last_tree_update = 0
+    ELSE:
+        session_signals.goals_since_last_tree_update += 1
+
+    # ── Encoding drift safeguard (Phase 8.0.6) ─────────────────────────
+    # Fires when 4+ goals pass without ANY tree update (regardless of outcome type).
+    # Sets a WM flag that aspirations-state-update Step 8 reads to bypass
+    # the subjective "new insight" gate on the NEXT iteration.
+    IF session_signals.goals_since_last_tree_update >= 4:
+        echo '"true"' | Bash: wm-set.sh force_tree_encoding
+        session_signals.goals_since_last_tree_update = 0
+        Log: "ENCODING ANTI-DRIFT: {N} goals without tree update — forcing encoding on next state update"
+    # ── End encoding drift safeguard ───────────────────────────────────
 
     # Phase 8.1: Session touch tracking
     IF asp.id not in aspirations_touched_this_session:
@@ -246,17 +335,17 @@ FOREVER:
         invoke /aspirations-evolve with: cadence_triggers
         evolutions_this_session += 1
         last_evolution_goal_count = goals_completed_this_session
-    # Part B: Performance triggers (productive only)
-    IF outcome_class == "productive":
+    # Part B: Performance triggers (standard + deep only)
+    IF outcome_class in ("standard", "deep"):
         performance_triggers = check_performance_triggers()
         if performance_triggers and evolutions_this_session < max_evolutions_per_session:
             invoke /aspirations-evolve with: performance_triggers
             evolutions_this_session += 1
             last_evolution_goal_count = goals_completed_this_session
 
-    # ── LEARNING GATE (Phase 9.5-9.8) ── ← OBLIGATION
+    # ── LEARNING GATE (Phase 9.5-9.8) ── ← OBLIGATION (literal Skill() tool call — not inline)
     goals_completed_this_session += 1
-    invoke /aspirations-learning-gate with: goal, outcome_class, goals_completed_this_session, productive_goals_this_session, batch_mode, prefetch_goals
+    Skill(aspirations-learning-gate) with: goal, outcome_class, goals_completed_this_session, productive_goals_this_session, batch_mode, prefetch_goals, session_signals.goals_since_last_tree_update
 
     # ── STOP CHECK (Phase 10) ──
     Bash: `session-state-get.sh`
@@ -269,6 +358,27 @@ FOREVER:
     # ── WORKING MEMORY MAINTENANCE (Phase 11) ── ← OBLIGATION
     Bash: wm-read.sh sensory_buffer --json
     If sensory_buffer.length > 20: encode overflow (score ≥ 0.40 → encoding_queue, < 0.15 → discard)
+
+    # ── Mid-session encoding queue drain ──────────────────────────────
+    # Prevents encoding loss from interrupted sessions by draining incrementally.
+    # Budget: 1 item per iteration to avoid overhead. Only fires when queue >= 3
+    # (below that, session-end consolidation is sufficient).
+    Bash: wm-read.sh encoding_queue --json
+    IF encoding_queue is non-empty AND len(encoding_queue) >= 3:
+        top_item = max(encoding_queue, key=encoding_score)
+        node=$(bash core/scripts/tree-find-node.sh --text "{top_item.target_article or top_item.category}" --leaf-only --top 1)
+        IF node found:
+            Read node.file
+            IF top_item has precision_manifest AND precision_manifest non-empty:
+                Append precision items to "## Verified Values" section
+            Compress top_item.observation into "Key Insights" section (1-3 sentences)
+            Edit node.file with updates
+            bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+            Remove encoded item from encoding_queue
+            session_signals.goals_since_last_tree_update = 0
+            Output: "▸ MID-SESSION DRAIN: encoded 1 item to {node.key} (score {top_item.encoding_score:.2f}, {len(encoding_queue)-1} remaining)"
+    # ── End mid-session drain ─────────────────────────────────────────
+
     Bash: wm-ages.sh --json → flag stale slots (> 30 min)
     Bash: wm-prune.sh
 
@@ -335,7 +445,7 @@ invoke /aspirations-evolve with: fired_triggers, aspiration state
 | `/aspirations-select` | Every iteration (Phases 2-2.9) | goal, effort_level, batch |
 | `/aspirations-execute` | Phase 4: via digest (load-execute-protocol.sh), full SKILL.md only for edge cases | result, outcome_class, infrastructure_failure |
 | `/aspirations-verify` | Phase 5: verification | goal_completed, aspiration_complete |
-| `/aspirations-spark` | Phase 6: productive outcomes only | New goals, guardrails |
+| `/aspirations-spark` | Phase 6: standard+deep outcomes (all sparks for both) | New goals, guardrails |
 | `/aspirations-complete-review` | Phase 7: aspiration completion | goals_added, should_archive |
 | `/aspirations-state-update` | Phase 8: every iteration | Tree encoding, journal |
 | `/aspirations-evolve` | Phase 9: triggered evolution | New aspirations, parameter tuning |

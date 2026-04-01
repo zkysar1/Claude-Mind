@@ -116,7 +116,7 @@ def read_tracker(session_id=None):
 def append_tracker(normalized, session_id=None):
     """Append a single path to the tracker file."""
     if SESSION_DIR is None or not SESSION_DIR.is_dir():
-        return  # No agent bound, or dir gone after factory reset
+        return  # No agent bound, or dir gone
 
     if not TRACKER_PATH.exists() or TRACKER_PATH.stat().st_size == 0:
         # New tracker — write session header + first path

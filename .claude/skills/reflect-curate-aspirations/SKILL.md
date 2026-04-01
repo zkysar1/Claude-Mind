@@ -157,7 +157,9 @@ After all decisions executed:
   # Auto-complete aspirations where all goals are now done
   For each aspiration touched:
     Bash: aspirations-read.sh --id {asp_id}
-    IF all goals have status in (completed, skipped):
+    IF any goal has recurring == true:
+      SKIP — aspirations with recurring goals are perpetual (data layer blocks archival)
+    ELIF all goals have status in (completed, skipped):
       Bash: aspirations-complete.sh {asp_id}
 
   # Knowledge reconciliation (M.11-12 pattern)

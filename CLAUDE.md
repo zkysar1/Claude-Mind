@@ -14,7 +14,7 @@ This is a **Claude-native data repository** — no traditional source code or bu
 
 - **`core/config/`** — Framework definitions and parameter bounds (immutable). Contains templates, thresholds, pipeline configs, `initial_state:` sections, and convention reference files in `core/config/conventions/`.
 - **`core/scripts/`** — Framework infrastructure scripts. All JSONL stores accessed exclusively via these scripts — the LLM never reads/edits JSONL files directly.
-- **`meta/`** — Agent-editable meta-strategies and domain-agnostic data (survives domain reset). Metacognitive self-modification layer inspired by HyperAgents. Also includes: `spark-questions.jsonl`, `skill-quality.yaml`, `skill-gaps.yaml`, `evolution-log.jsonl`, `reflection-templates.yaml`, `strategy-archive.yaml`, `config-overrides.yaml`, `config-changes.yaml`, `step-attribution.yaml`, `meta-knowledge/`.
+- **`meta/`** — Agent-editable meta-strategies and domain-agnostic data (independent of domain data). Metacognitive self-modification layer inspired by HyperAgents. Also includes: `spark-questions.jsonl`, `skill-quality.yaml`, `skill-gaps.yaml`, `evolution-log.jsonl`, `reflection-templates.yaml`, `strategy-archive.yaml`, `config-overrides.yaml`, `config-changes.yaml`, `step-attribution.yaml`, `meta-knowledge/`.
 - **`world/`** — Collective domain state shared across agents within a domain. Lives at an **external user-supplied path** (shared drive, NAS, etc.), configured in `<agent>/local-paths.conf`. Contains the knowledge tree, aspirations, pipeline, reasoning bank, guardrails, pattern signatures, message board, file history, changelog, conventions, sources, `program.md` (The Program — shared purpose), etc.
 - **`<agent-name>/`** — Per-agent private state (e.g., `alpha/`). Contains session state, journal, experience traces, `self.md` (agent identity), curriculum, developmental stage, profile, forged skills, skill relations, infra health, and the agent's local aspiration queue.
 
@@ -28,7 +28,7 @@ core/                # Shareable cognitive framework (copy to any project)
   config/            # Framework definitions (immutable)
     conventions/     # On-demand convention reference files
   scripts/           # Utility scripts (framework infrastructure)
-meta/                # Agent-editable meta-strategies (survives domain reset)
+meta/                # Agent-editable meta-strategies (independent of domain data)
   goal-selection-strategy.yaml, reflection-strategy.yaml  # Strategy files
   evolution-strategy.yaml, aspiration-generation-strategy.yaml
   encoding-strategy.yaml, improvement-instructions.md
@@ -123,6 +123,7 @@ Not mutually exclusive. A single event can spawn all three. See `aspirations-exe
 | Message board | `world/board/*.jsonl`, `core/scripts/board.py` |
 | File history | `world/.history/`, `meta/.history/`, `core/scripts/history.py` |
 | Changelog | `world/changelog.jsonl`, `core/scripts/changelog.py` |
+| Background jobs | `<agent>/session/background-jobs.yaml`, `core/scripts/background-jobs.sh` |
 | External paths | `<agent>/local-paths.conf`, `core/scripts/_paths.sh`, `core/scripts/_paths.py` |
 | File operations | `core/scripts/_fileops.py` (locking, history, changelog) |
 
@@ -142,7 +143,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `tree-retrieval.md` | Unified retrieval, tree scripts, category suggestion |
 | `goal-schemas.md` | Goal verification, recurring/deferred fields, goal scoring |
 | `goal-selection.md` | Mandatory goal-selector.sh, post-compaction fabrication guard |
-| `session-state.md` | Agent state machine, session scripts, generic YAML store |
+| `session-state.md` | Agent state machine, session scripts, generic YAML store, background jobs tracker |
 | `infrastructure.md` | Error response protocol, infra health, verify-before-assuming details, knowledge reconciliation details |
 | `secrets.md` | Credentials convention, env-read.sh, security rules |
 | `working-memory.md` | Working memory schema, wm-*.sh script API, slot_meta, pruning rules |
@@ -210,7 +211,7 @@ The shared purpose lives in `world/program.md` (The Program). Each agent's ident
 ### Skill Invocation Rules
 - **Control skills** (/start, /stop, /open-questions): user-invocable only — Claude MUST NOT invoke these
 - **Mode control**: `/start --mode <mode>` to enter a mode, `/stop` to return to reader baseline
-- **Hybrid skills** (/agent-completion-report, /backlog-report, /verify-learning): user-invocable AND agent-callable
+- **Hybrid skills** (/agent-completion-report, /backlog-report, /priority-review, /verify-learning): user-invocable AND agent-callable
 - **Internal skills**: `user-invocable: false` — invoked by agent during RUNNING state
 - **No blocking on user input in RUNNING state** — skills must never wait for, request, or depend on user input during autonomous execution
 
@@ -249,7 +250,7 @@ Everything else is **read-only**. Only the user may modify framework files.
 ### Agent-Session Binding
 
 Each Claude Code session is bound to at most one agent via a session-keyed file:
-- `AYOAI_SESSION_ID` — set by SessionStart hook via `CLAUDE_ENV_FILE` (persists to all Bash calls)
+- `AYOAI_SESSION_ID` — set by SessionStart hook via `.latest-session-id`, read by `_paths.sh`
 - `.active-agent-<session_id>` — maps this session to an agent name
 - `AYOAI_AGENT` — set by FileChanged hook when `.active-agent-*` changes (persists to all Bash calls)
 - `/start <name>` writes the binding
@@ -274,11 +275,12 @@ without attempting all eligible tiers.
 | `/start <name>` | Create/resume agent in autonomous mode (default) | UNINITIALIZED, IDLE |
 | `/start <name> --mode reader` | Create/resume agent in reader mode (read-only) | UNINITIALIZED, IDLE |
 | `/start <name> --mode assistant` | Create/resume agent in assistant mode (user-directed learning) | UNINITIALIZED, IDLE |
-| `/stop` | Consolidate → drop to reader mode → IDLE | RUNNING, IDLE |
+| `/stop [agent-name]` | Consolidate → drop to reader mode → IDLE | RUNNING, IDLE |
 | `/verify-learning` | Post-test verification | ANY |
 | `/open-questions` | Show open questions | ANY |
 | `/agent-completion-report` | Show what changed *(also agent-callable)* | ANY |
 | `/backlog-report` | Sprint planning backlog *(also agent-callable)* | ANY |
+| `/priority-review` | Priority dashboard — reorder aspirations *(also agent-callable)* | ANY |
 
 ### Enforcement Rules
 
@@ -311,6 +313,7 @@ Signal files (all in `<agent>/session/`):
 | `stop-loop` | Allow exit | /stop, /recover |
 | `handoff.yaml` | Cross-session state | aspirations consolidation |
 | `pending-agents.yaml` | Background agent tracking (stop hook Gate 2.5) | aspirations-execute Phase 4 |
+| `background-jobs.yaml` | Long-running external process tracking | /run-processor launch mode |
 
 Other session signals (`loop-active`, `stop-block-count`, `compact-checkpoint.yaml`, `context-reads.txt`, `pending-questions.yaml`, `aspirations-compact.json`): see `core/config/conventions/session-state.md`.
 

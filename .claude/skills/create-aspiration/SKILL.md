@@ -19,7 +19,7 @@ Creates aspirations aligned with the agent's Self (core purpose). Two modes:
 
 | Call Pattern | Behavior |
 |-------------|----------|
-| `from-self` (default) | Current 4-phase introspective scan. Unchanged. |
+| `from-self` (default) | 5-phase introspective scan (A, A.5, B, C, D). |
 | `from-self --plan` | Full planning cycle: introspective scan + Self-grounded web research + structured deliberation |
 | `from-self` with context params | Context is available — the LLM decides how much introspective scanning to add. No flag needed. |
 
@@ -71,7 +71,7 @@ Align with Self:
 
 ### Mode: from-self
 
-Four-phase autonomous generation:
+Five-phase autonomous generation (Phases A-D + A.5 stepping stones):
 
 ```
 Phase A — Purpose scan:
@@ -88,6 +88,8 @@ Phase A — Purpose scan:
     # - preferred_scope_ratio: learned balance of sprint/project/initiative
     # - category_saturation: categories already well-covered
     # - generation_heuristics: learned rules for aspiration generation
+    # - stepping_stone_preferences: whether to use stepping stones, K value
+    # - interestingness_criteria: weights for novelty/learnability/worthwhileness/diversity
     # These are advisory — the agent uses judgment on whether to follow.
 
     # Constraint awareness
@@ -96,6 +98,44 @@ Phase A — Purpose scan:
       - Avoid generating goals that require blocked resources/skills
       - Prefer goals executable with currently available infrastructure
       - If constraint_context was passed from evolve: strictly exclude avoid_skills
+
+    # Interestingness criteria (OMNI-EPIC-inspired, Stage 1: generation-time)
+    # When generating candidates in ALL phases (A-D), explicitly consider:
+    #   NOVELTY:        How different is this from what we've done before?
+    #   LEARNABILITY:   Is this within reach given current capabilities?
+    #                   (not so easy it's trivial, not so hard it'll fail)
+    #   WORTHWHILENESS: Does this advance Self's purpose in a meaningful way?
+    #   DIVERSITY:      Does this explore a different category/approach than recent work?
+    # These criteria shape generation — the post-generation filter (Step 5) evaluates them.
+
+Phase A.5 — Stepping-stone retrieval (OMNI-EPIC-inspired):
+    # Key insight from OMNI-EPIC (arXiv 2405.15568): nearby completed work
+    # is the best creative substrate for generating novel directions.
+    # Retrieve similar archived aspirations as "stepping stones" — not to
+    # repeat them, but to riff off them.
+
+    Bash: aspirations-read.sh --stepping-stones --limit 5
+    # Returns: K=5 most recently completed aspirations with their:
+    #   - title, motivation, scope, tags
+    #   - goal titles + statuses + categories (what was attempted)
+    #   - completion counts (what was learned)
+
+    # Partial archive visibility (OMNI-EPIC: showing everything constrains
+    # creativity). The script returns only K aspirations, not the full archive.
+    # The LLM sees enough context to build on, but not so much that it constrains.
+
+    IF stepping stones returned (archive is non-empty):
+      For each stepping stone, ask:
+        "What ADJACENT direction does this completed work suggest?
+         What variation, extension, or contrast would be novel and learnable?
+         What follow-up question does this work raise that wasn't answered?"
+
+      Generate stepping-stone candidates from these reflections.
+      # These candidates join the pool alongside Phases A-D candidates.
+      # They are additive, NOT replacements for introspective scanning.
+
+    IF archive is empty (new agent, no completed aspirations yet):
+      SKIP — no stepping stones available. Phases A-D provide sufficient generation.
 
 Phase B — Data acquisition scan:
     Read world/knowledge/tree/_tree.yaml → node summaries + entity_index
@@ -134,7 +174,7 @@ Phase D — Pain scan:
     Skip if no pain signals found — not every session has problems.
 ```
 
-Combine results from all four phases. Deduplicate and prioritize.
+Combine results from all five phases (A, A.5, B, C, D). Deduplicate and prioritize.
 
 ### Step 3.7: Scope Classification
 
@@ -406,22 +446,57 @@ Don't copy these — use them to calibrate scope-based planning.
 *Phase 3 planned (sessions 5+): cross-pipeline integration, user review, production deployment*
 - *Initiative scope: phased delivery. Only Phase 1 goals generated now. Testing is ~40% of goals.*
 
-## Step 5: Validate
+## Step 5: Interestingness Filter + Validate (OMNI-EPIC two-stage)
+
+The original novelty check is replaced by a two-stage Model of Interestingness
+inspired by OMNI-EPIC (arXiv 2405.15568). Stage 1 (generation-time) shapes
+candidate generation in Phases A-D via interestingness criteria. Stage 2
+(post-generation) evaluates candidates against the archive.
 
 ```
-1. Novelty check:
+1. Interestingness filter (Stage 2 — post-generation evaluation):
+   # Stage 1 already ran during Phases A-D (interestingness criteria in prompting).
+   # Stage 2 compares candidates against the archive for structured evaluation.
+
+   # Use stepping stones already retrieved in Phase A.5 (avoid re-fetching)
+   # If Phase A.5 was skipped (empty archive), use aspirations-read.sh --summary instead
+
    For each candidate aspiration:
-     Compare title + description against aspirations-read.sh --summary
-     IF too similar to existing active aspiration → REJECT
-     IF too similar to recently archived aspiration → REJECT (unless explicitly requested)
+     a. Identify the 3 most similar items from stepping stones or active aspirations
+        (by category overlap, title similarity, domain affinity)
+
+     b. Evaluate against interestingness criteria:
+        NOVEL:       Is this sufficiently different from the 3 most similar?
+                     (different angle, different scope, different approach)
+        LEARNABLE:   Given developmental stage + tree coverage, can we make progress?
+                     (not so easy it's trivial, not so hard it'll fail)
+        WORTHWHILE:  Does Self endorse this direction? (re-read Self as "judge")
+        NON-TRIVIAL: Would completing this teach something non-obvious?
+
+     c. Score: ACCEPT (interesting — proceed to cap check)
+              REFINE (good direction but needs sharpening — attempt to sharpen)
+              REJECT (redundant, trivial, or unlearnable — drop from candidates)
+
+     d. For REFINE candidates: attempt to sharpen the aspiration
+        (more specific scope, different angle, harder variant, adjacent problem)
+        Re-evaluate sharpened version. If still REFINE → REJECT.
+
+     e. Log filter decisions to evolution-log for meta-learning:
+        echo '{"date":"<today>","event":"interestingness_filter","details":"<title>: <verdict> — <reason>","trigger_reason":"create-aspiration"}' | bash core/scripts/evolution-log-append.sh
+
+   # Also reject if too similar to existing ACTIVE aspiration (original novelty check preserved)
+   Compare accepted candidates against aspirations-read.sh --summary
+   IF too similar to existing active aspiration → REJECT
 
 2. Cap check:
    Read core/config/aspirations.yaml → max_active
    current_count = count of active aspirations from Step 2
-   new_count = count of candidate aspirations
+   new_count = count of ACCEPTED candidate aspirations
    IF current_count + new_count > max_active:
      Remove lowest-priority/oldest aspirations first:
-       IF aspiration has no completed goals and last_worked is null:
+       # Guard: NEVER archive aspirations with recurring goals (data layer blocks it)
+       IF any goal has recurring == true: SKIP this aspiration
+       ELIF aspiration has no completed goals and last_worked is null:
          Bash: aspirations-retire.sh <asp-id>   # never started
        ELSE:
          Bash: aspirations-complete.sh <asp-id>  # had progress
@@ -476,9 +551,45 @@ For each created aspiration:
   If unable to reach the user, create a participants: [user] goal to inform them. Do NOT block aspiration creation.
 ```
 
+## Step 8.6: Priority Review Request (from-self only)
+
+After notifying about individual aspirations (Step 8.5), present the full priority picture
+so the user can reorder if needed. Only fires for `from-self` mode — `from-user` aspirations
+already reflect the user's intent.
+
+IF invocation mode is NOT "from-self": SKIP this step.
+
+```
+1. Build ranked list of ALL active aspirations:
+   Bash: aspirations-read.sh --active-compact
+   Sort by: priority (HIGH→MEDIUM→LOW), then aspiration ID
+   Format each as: "[{priority}] {asp-id}: {title} ({completed}/{total} goals)"
+
+2. Write priority-review pending question to <agent>/session/pending-questions.yaml:
+   - id: pq-NNN (next available)
+   - date: "{today}"
+   - context: "priority-review"
+   - question: |
+       I just created new aspirations. Current priority ranking:
+       {numbered ranked list}
+       NEW this batch: {list of newly created asp-ids and titles}
+       Does this match your priorities? Say which should be higher/lower,
+       or "looks good" to confirm. You can also run /priority-review.
+   - default_action: "Proceeding with current ranking"
+   - status: pending
+   - type: priority-review
+
+3. Notify user via /notify-user:
+   category: decision-needed
+   subject: "Priority Review: {N} Active Aspirations ({M} new)"
+   body: the ranked list + "Reply or run /priority-review to reorder"
+
+4. Continue immediately — do NOT block.
+```
+
 ## Chaining
 
 - **Called by**: `/start`, `/aspirations evolve` (`--plan` for gap analysis), `/aspirations loop` (Phase 0.5/2/7 with `--plan`, no-goals with `--plan`), `/aspirations-spark` (sq-007, sq-c05, sq-013 with context), `/aspirations-consolidate` (with `batch_context`), `/reflect-hypothesis` (with `forge_context`), `/respond`
-- **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5)
+- **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5), priority-review pending question + `/notify-user` (Step 8.6)
 - **Reads**: `<agent>/self.md`, `aspirations-read.sh`, `tree-read.sh`, `<agent>/developmental-stage.yaml`, `core/config/aspirations.yaml`
 - **Web research** (`--plan` only): WebSearch for Self-grounded queries (Step 2.5)

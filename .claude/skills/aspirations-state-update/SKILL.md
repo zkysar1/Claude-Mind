@@ -1,6 +1,6 @@
 ---
 name: aspirations-state-update
-description: "State Update Protocol — 9 steps + Step 8.5 Actionable Findings Gate + Step 8.75 Execution Reflection + Step 8.76 Skill Quality Assessment after every goal execution (routine outcomes: Steps 1-4 + abbreviated journal only)"
+description: "State Update Protocol — 9 steps + Step 8.5 Actionable Findings Gate + Step 8.75 Execution Reflection + Step 8.76 Skill Quality Assessment after every goal execution (routine: Steps 1-4 + abbreviated journal; standard: all steps, deferred tree encoding; deep: all steps, immediate tree encoding)"
 user-invocable: false
 parent-skill: aspirations
 triggers:
@@ -11,9 +11,11 @@ minimum_mode: autonomous
 
 # State Update Protocol
 
-Invoked after EVERY goal execution as Phase 8 of the aspirations loop. Accepts `outcome_class` (default: `"productive"`).
+Invoked after EVERY goal execution as Phase 8 of the aspirations loop. Accepts `outcome_class` (default: `"deep"`).
 
-For **productive** outcomes: all steps run (1-8, 8.5, 8.75). Step 8 (REFRESH MEMORY TREE) is the single most critical learning step — without it, the agent learns NOTHING from goal execution. Step 8.5 (ACTIONABLE FINDINGS GATE) ensures encoded findings get tracked as goals. Step 8.75 (EXECUTION REFLECTION) cross-references outcomes against institutional knowledge.
+For **deep** outcomes (default — non-recurring, failures, surprises): all steps run (1-8, 8.5, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Step 8.5 (ACTIONABLE FINDINGS GATE) ensures encoded findings get tracked as goals. Step 8.75 (EXECUTION REFLECTION) cross-references outcomes against institutional knowledge.
+
+For **standard** outcomes (recurring with incremental findings): all steps run (1-8, 8.5, 8.75). Step 8 computes the FULL encoding payload inline (identical fidelity to deep) then QUEUES it to encoding_queue for deferred tree writing during consolidation. The encoding content is computed NOW at full fidelity — only the file I/O of writing to the tree node is deferred.
 
 For **routine** outcomes (recurring goal, no findings): Steps 1-4 run (bookkeeping), then an abbreviated Step 7 (journal), then RETURN. Steps 5-8.75 are skipped because there is genuinely no insight to encode, no triggers to check, and no capability to propagate.
 
@@ -25,7 +27,7 @@ The loop MUST NOT continue to Phase 9 until state update is complete.
 
 ## State Update Protocol
 
-After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for productive outcomes):
+After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for standard/deep outcomes):
 
 ```
 1. UPDATE goal status via Bash: `aspirations-update-goal.sh <goal-id> status <status>`
@@ -105,17 +107,47 @@ IF outcome_class == "routine":
    Read meta/encoding-strategy.yaml
    # Apply precision_emphasis_categories, narrative_compression_level,
    # and decision_rule_preference as advisory guidance for tree encoding.
-   - If goal produced new insight:
+
+   # ── Investigation encoding obligation ──────────────────────────────
+   # Investigation/research/audit goals produce findings as their PRIMARY output.
+   # Unlike development goals that change external state, investigation goals
+   # produce understanding. The "new insight" gate must account for this:
+   # findings in the execution trace ARE the insight, even if nothing external changed.
+   is_investigation_goal = goal.title starts with (Investigate, Research, Audit, Analyze, Diagnose, Trace, Review)
+                        OR goal.category in ("analysis", "diagnosis", "research")
+   IF is_investigation_goal AND len(result_text) > 500:
+       force_encoding = true
+       Log: "▸ Investigation encoding obligation: forcing insight branch ({len(result_text)} chars)"
+   ELSE:
+       force_encoding = false
+
+   # ── Encoding anti-drift override (set by orchestrator Phase 8.0.6) ──
+   Bash: wm-read.sh force_tree_encoding 2>/dev/null
+   IF force_tree_encoding == "true":
+       force_encoding = true
+       echo '"false"' | Bash: wm-set.sh force_tree_encoding
+       Log: "▸ Step 8: forced encoding from anti-drift safeguard"
+   # ── End encoding obligation checks ─────────────────────────────────
+
+   - If goal produced new insight OR force_encoding:
      a. EXTRACT PRECISION: Scan execution context for exact values. Build precision manifest —
         each item: {type, label, value (VERBATIM), unit, context}. Types: threshold, formula,
         constant, reference, measurement, config_value. Include ALL numbers, code refs, error codes,
         thresholds, formulas, config values, commit hashes, line numbers. When in doubt, INCLUDE.
         See core/config/conventions/precision-encoding.md for schema and extraction heuristics.
-     b. WRITE PRECISION BLOCK: IF precision manifest non-empty, append to or create
-        "## Verified Values" section in node. Format: - **{label}**: `{value}` {unit} — {context}
-     c. WRITE NARRATIVE: Compress qualitative insight into "Key Insights" section. Brief is OK
-        because Verified Values carries the exact data.
-     c.5. CURATOR QUALITY GATE (AutoContext-inspired):
+     b. COMPOSE PRECISION BLOCK: Build candidate "## Verified Values" entries from manifest.
+        Format: - **{label}**: `{value}` {unit} — {context}
+        # DO NOT write to tree yet — the deep/standard branch below controls when writing happens.
+     c. COMPOSE NARRATIVE: Compress qualitative insight into candidate "Key Insights" text.
+
+     # ══ BRANCH: Standard vs Deep tree encoding ══════════════════════
+     # Standard: full content computed inline, tree write deferred to consolidation
+     # Deep: full content computed inline, tree write performed immediately
+     # Both tiers: same curator quality gate, same fidelity. Only timing differs.
+
+     IF outcome_class == "deep":
+         # ── IMMEDIATE TREE WRITE (full inline encoding) ──
+         c.5. CURATOR QUALITY GATE (AutoContext-inspired):
         Read core/config/memory-pipeline.yaml curator_gate section
         IF curator_gate.enabled:
             Evaluate the compressed insight (from step c) against the target node:
@@ -125,7 +157,12 @@ IF outcome_class == "routine":
               procedure from this insight?" Exact values → 0.8+, vague feelings → 0.2
             CURATOR Q3 (Actionability, 0-1): "What specific action does this tell me to
               take in similar situations?" "be more careful" → 0.1, "check X before Y" → 0.8
-            curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
+            # Investigation-aware scoring: reweight for investigation goals
+            # (higher coverage weight, lower actionability — understanding IS the output)
+            IF is_investigation_goal:
+                curator_score = (coverage * 0.50) + (specificity * 0.30) + (actionability * 0.20)
+            ELSE:
+                curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
             IF curator_score < pass_threshold (default 0.45):
                 Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f} < {pass_threshold}) — demoted to overflow"
                 echo '{"observation": "<insight_text>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
@@ -177,6 +214,66 @@ IF outcome_class == "routine":
      c. Announce: "CAPABILITY UNLOCK: {topic} → {new_level}"
      d. Read <agent>/developmental-stage.yaml
      e. If new level > highest_capability → update highest_capability
+
+   # CRITICAL — set flags at the deep branch level, not inside capability check.
+   # Orchestrator drift tracking, Step 8.5, and Step 8.75 all gate on step_8_wrote_insight.
+   step_8_wrote_insight = true
+   step_8_tree_encoded = true
+
+     ELIF outcome_class == "standard":
+         # ── DEFERRED TREE ENCODING (full-fidelity payload → encoding_queue) ──
+         # Content computed NOW at full fidelity. Tree write deferred to consolidation.
+         # This saves the expensive Read+Edit+propagate cycle per goal.
+
+         c.5. CURATOR QUALITY GATE (same gate as deep — same quality bar):
+             Read core/config/memory-pipeline.yaml curator_gate section
+             IF curator_gate.enabled:
+                 CURATOR Q1 (Coverage, 0-1), Q2 (Specificity, 0-1), Q3 (Actionability, 0-1)
+                 IF is_investigation_goal:
+                     curator_score = (coverage * 0.50) + (specificity * 0.30) + (actionability * 0.20)
+                 ELSE:
+                     curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
+                 IF curator_score < pass_threshold (default 0.45):
+                     Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f}) — demoted to overflow"
+                     echo '{"observation": "<insight>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
+                     step_8_wrote_insight = false
+                     step_8_tree_encoded = false
+                     SKIP to Step 8.5
+                 ELSE:
+                     Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f}) — queuing for consolidation"
+
+         # Build full-fidelity encoding payload (same content as deep, different destination)
+         encoding_payload = {
+             source_goal: goal.id,
+             source_type: "standard_tier_deferred",
+             target_node_key: node.key,
+             target_node_file: node.file,
+             observation: compressed_narrative,         # The full Key Insights text
+             precision_manifest: precision_manifest,    # COMPLETE — every item
+             decision_rules: candidate_rules,           # Full IF-THEN rules
+             episode_progression: episode_context or null,
+             encoding_score: 0.65,                      # Default for standard tier
+             curator_score: curator_score,
+             priority_class: "standard_deferred",
+             target_article: node.file,
+             metadata_updates: {
+                 confidence: <computed new value>,
+                 capability_level: <computed new value>
+             },
+             timestamp: now
+         }
+
+         echo '<encoding_payload_json>' | wm-append.sh encoding_queue
+         Output: "▸ Step 8: DEFERRED encoding queued for {node.key} (standard tier)"
+         step_8_wrote_insight = true    # Content WAS computed (Steps 8.5, 8.75 fire)
+         step_8_tree_encoded = false    # Tree NOT yet written (Learning Gate aware)
+         # Skip: node metadata update, growth triggers, propagation, capability events
+         # These will be handled by consolidation when the encoding_queue item is processed
+
+   ELSE:
+     # No new insight from this goal — both standard and deep
+     step_8_wrote_insight = false
+     step_8_tree_encoded = false
 
 # ── Step 8.5: Actionable Findings Gate ──────────────────────────────
 # Catches findings encoded to tree (Step 8) that need their own goal.
@@ -329,11 +426,11 @@ IF goal.skill is set AND outcome_class != "routine":
 ```
 # ── Step 8.8: Improvement Velocity Update ──────────────────────────
 # Track learning output per goal for meta-strategy evaluation.
-# Runs for all productive outcomes. Lightweight: compute one score, append one line.
+# Runs for all non-routine outcomes. Lightweight: compute one score, append one line.
 
 IF outcome_class != "routine":
     learning_value components (0-1 each):
-      tree_updated: 1.0 if Step 8 wrote insight to tree, 0.0 otherwise → weight 0.3
+      tree_updated: 1.0 if Step 8 wrote insight to tree OR queued to encoding_queue (standard tier), 0.0 otherwise → weight 0.3
       artifacts_created: min(1.0, count(reasoning_bank + guardrails + pattern_sigs created) × 0.2) → weight 0.3
       encoding_score: from Step 2.7 encoding gate if available, else 0.0 → weight 0.2
       findings_gated: min(1.0, count(Step 8.5 findings) × 0.25) → weight 0.2

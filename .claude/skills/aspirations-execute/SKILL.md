@@ -308,8 +308,9 @@ It controls whether the expensive cognitive phases (experience archival,
 spark checks, tree encoding) fire afterward.
 
 ```
-outcome_class = "productive"  # default: full pipeline
+outcome_class = "deep"  # default: full pipeline with immediate tree encoding
 
+# ── ROUTINE/STANDARD demotion (only recurring goals can be demoted) ──
 IF goal.recurring AND goal_succeeded (no errors, no timeouts):
     # Assess the ACTUAL execution result:
     #   - Did the skill find items to process? (emails, alerts, stale data, issues)
@@ -318,10 +319,19 @@ IF goal.recurring AND goal_succeeded (no errors, no timeouts):
     # If the answer to ALL is "no" → routine check with no findings.
     IF result produced no actionable items and no new information:
         outcome_class = "routine"
+    ELSE:
+        # Recurring goal WITH incremental findings → standard (deferred tree encoding)
+        outcome_class = "standard"
+        Log: "▸ Outcome: STANDARD — recurring with incremental findings"
 
-# SAFETY: Non-recurring goals ALWAYS remain "productive"
-# SAFETY: Failed goals ALWAYS remain "productive" (failures are learning events)
-# SAFETY: If uncertain, remain "productive"
+IF outcome_class == "routine":
+    Log: "▸ Outcome: ROUTINE — recurring, no findings"
+IF outcome_class == "deep":
+    Log: "▸ Outcome: DEEP — full pipeline with immediate tree encoding"
+
+# SAFETY: Non-recurring goals ALWAYS remain "deep" (inherently novel)
+# SAFETY: Failed goals ALWAYS remain "deep" (failures are learning events)
+# SAFETY: If uncertain, remain "deep" — bias toward full treatment
 ```
 
 ## Phase 4-chain: Episode Chain Protocol (MR-Search)
@@ -341,7 +351,7 @@ Read core/config/aspirations.yaml → episode_chaining section
 chain_trigger = false
 IF result is INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
     chain_trigger = false  # Let Phase 4.0 handle infrastructure failures
-ELIF outcome_class == "productive" AND NOT goal_succeeded:
+ELIF outcome_class in ("standard", "deep") AND NOT goal_succeeded:
     IF "failed" in episode_chaining.chain_on_outcomes:
         chain_trigger = true
 
@@ -705,7 +715,7 @@ IF guardrail_found_issues OR (NOT goal_succeeded AND involved_infrastructure):
 # Phase 4-post classified before guardrails ran — if guardrails found
 # real issues, this IS new information regardless of skill result.
 IF guardrail_found_issues:
-    outcome_class = "productive"
+    outcome_class = "deep"  # guardrail issues → override to deep
 ```
 
 ## Phase 4.2: Post-Execution Domain Steps
@@ -738,7 +748,7 @@ This preserves evidence that tree node encoding compresses away.
 SKIP: outcome_class == "routine" — nothing meaningful to archive.
 
 ```
-IF outcome_class == "productive":
+IF outcome_class != "routine":
     experience_id = "exp-{goal.id}-{goal.skill_name_slug}"
     Write <agent>/experience/{experience_id}.md with:
         - Full reasoning trace from goal execution
@@ -787,7 +797,7 @@ feedback silently doesn't fire and the system never learns what helps.
 # Read the durable manifest — not transient LLM state
 Bash: wm-read.sh active_context.retrieval_manifest --json
 
-IF outcome_class == "productive" AND retrieval_manifest exists AND retrieval_manifest.goal_id == current goal.id:
+IF outcome_class != "routine" AND retrieval_manifest exists AND retrieval_manifest.goal_id == current goal.id:
     FOR EACH item in retrieval_manifest.deliberation.active_items:
         # STRUCTURAL HELPFULNESS: item is helpful if referenced in execution trace.
         # Replaces vague "helped" judgment — the LLM never evaluated this (0/32 helpful).
@@ -818,7 +828,7 @@ IF outcome_class == "productive" AND retrieval_manifest exists AND retrieval_man
             Bash: tree-update.sh --increment {node_key} times_noise
     Output: "▸ Tree utilization: {TH} helpful, {TN} noise out of {T} nodes"
 
-ELIF outcome_class == "productive":
+ELIF outcome_class != "routine":
     Output: "▸ Utilization feedback: SKIPPED — no retrieval manifest (retrieval was skipped!)"
 # else: routine outcome — no feedback needed, just clear the flag below
 
@@ -836,7 +846,7 @@ When execution succeeds and retrieved items were structurally helpful,
 identify prior experiences that causally enabled this success.
 
 ```
-IF outcome_class == "productive" AND goal_succeeded:
+IF outcome_class != "routine" AND goal_succeeded:
     # Apply the same structural helpfulness criteria used by Phase 4.26
     FOR EACH item in retrieval_manifest.deliberation.active_items:
         IF item met structural helpfulness criteria (same test as Phase 4.26: referenced in influence text, matched guardrails, or cited in execution):
@@ -931,7 +941,7 @@ IF batch_mode AND more goals in batch:
     - Phase 5: Verify completion (always runs)
     - Phase 6: Spark check (SKIP if routine)
     - Phase 7: Aspiration-level check (always runs)
-    - Phase 8: State Update Protocol — full 9 steps if productive,
+    - Phase 8: State Update Protocol — full steps if standard/deep (deferred encoding for standard),
       Steps 1-4 + abbreviated Step 7 if routine
     Complete ALL phases for this goal before starting the next batched goal.
 ```

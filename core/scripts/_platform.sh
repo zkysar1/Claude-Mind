@@ -22,7 +22,6 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     fi
     if [ -n "$AGENT_DIR" ]; then
         AGENT_DIR="$(cygpath -m "$AGENT_DIR")"
-        MIND_DIR="$AGENT_DIR"
     fi
     export MSYS_NO_PATHCONV=1
 fi

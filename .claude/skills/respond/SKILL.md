@@ -101,10 +101,20 @@ sufficient knowledge. Context manifests and quality ratings are NOT needed for c
 
 ## Step 4b: Surfacing
 
+### Priority Review Surfacing (check first — surface before other items)
+
+Read `<agent>/session/pending-questions.yaml`
+IF any entry has `type: priority-review` AND `status: pending`:
+  Surface prominently:
+  "I've been creating aspirations autonomously and would value your input on
+   priorities — say '/priority-review' or just tell me what matters most."
+  (Surface once per conversation — skip if already shown this session)
+
 ### Pending Questions
 
 - Read `<agent>/session/pending-questions.yaml`
-- For `status: pending` items, weave 1-2 into conversation naturally
+- For `status: pending` items (excluding `type: priority-review` already surfaced above),
+  weave 1-2 into conversation naturally
 - Or append: "By the way, I had a question: {question}"
 - When user answers, update status to `answered` and record the answer
 
@@ -130,7 +140,7 @@ Applies in ALL states, persona on or off. When a user message contains a directi
 | Self update | "Change your purpose to..." / "You're actually a..." | Edit `<agent>/self.md`, update `last_update_trigger: user-correction`, confirm change |
 | New aspiration | "Learn about cooking" | Invoke `/create-aspiration from-user` with the user's description |
 | Remove/pause aspiration | "Stop learning about politics" | Mark aspiration as `paused` via `aspirations-update.sh`, mark its goals as `skipped` |
-| Reprioritize | "Focus more on X than Y" | Update aspiration priorities (HIGH/MEDIUM/LOW) via `aspirations-update.sh` |
+| Priority review | "Focus more on X than Y" / "show me priorities" / "reorder aspirations" / "asp-125 is most important" / response to priority-review pq | Invoke `/priority-review` with user's input. If a `type: priority-review` pending question exists with `status: pending`, pass its context to the skill. For simple single-aspiration priority changes (e.g., "make asp-125 HIGH"), update directly via `aspirations-update.sh` without invoking the full skill. |
 | Persona change | "Be more casual" | Update persona settings in `<agent>/profile.yaml` |
 | Remember fact/preference | "Remember I prefer Python" | Write to knowledge tree (via `/tree add`) or working memory if session-scoped (`echo '<json>' | wm-set.sh domain_data`). NEVER use platform auto-memory. |
 | Recurring task | "Check news every week" | Add as recurring goal to an appropriate aspiration |

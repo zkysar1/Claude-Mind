@@ -30,6 +30,15 @@ On resume (agent already exists):
 
 **Step 0.5: Parse Mode** — Extract `--mode` argument if present. Valid values: `reader`, `assistant`, `autonomous`. If omitted: default to `autonomous` (both new and existing agents).
 
+**Step 1: Check Requested Agent's State** — The agent name comes from the `/start <name>` argument.
+Check THIS agent's state specifically (not whatever the global `.active-agent` file points to):
+
+Bash: `AYOAI_AGENT=<agent-name> bash core/scripts/session-state-get.sh`
+
+The `AYOAI_AGENT=<agent-name>` env prefix ensures we read `<agent-name>/session/agent-state`,
+not another agent's state. If no `<agent-name>` was provided (bare `/start` or `/start --mode`),
+omit the prefix — use the current session binding.
+
 ## Behavior by Current State
 
 ### RUNNING (agent-state contains "RUNNING")
@@ -57,6 +66,18 @@ but autonomous mode must be stopped before restarting.
 DONE. No state changes. No-op.
 
 ### IDLE (agent-state contains "IDLE")
+
+0. **Rebind Agent to Session**
+
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); echo "<agent-name>" > .active-agent && if [ -n "$SID" ]; then echo "<agent-name>" > ".active-agent-$SID"; fi`
+
+   Reads SID from `.latest-session-id` (written by SessionStart hook), then writes both
+   the global fallback and the session-keyed binding file.
+
+   **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
+   Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This ensures correct agent resolution
+   when multiple agents run concurrently. Example:
+     `AYOAI_AGENT=<agent-name> bash core/scripts/aspirations-read.sh --active`
 
 1. Determine target mode:
    - If `--mode` flag provided: use that mode
@@ -97,11 +118,12 @@ A1. Validate the agent name (from the `/start <name>` argument):
 
 A2. **Bind Agent to Session**
 
-   Bash: `echo "<agent-name>" > .active-agent && echo "<agent-name>" > .active-agent-${AYOAI_SESSION_ID:-nosession}`
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); echo "<agent-name>" > .active-agent && if [ -n "$SID" ]; then echo "<agent-name>" > ".active-agent-$SID"; fi`
 
-   The `.active-agent` file is the primary binding — read by `_paths.sh` / `_paths.py`
-   on every script call. Works on all platforms without hooks or CLAUDE_ENV_FILE.
-   The session-keyed file is kept for hook-based auto-resume when available.
+   The `.active-agent` file is the global fallback — read by `_paths.sh` / `_paths.py`
+   when no session-specific binding exists. The session-keyed file (`.active-agent-<SID>`)
+   is the per-session binding used by hooks and autocompact recovery to prevent
+   cross-agent contamination when multiple agents run in separate windows.
 
 A3. Create the agent directory (if it doesn't exist):
 

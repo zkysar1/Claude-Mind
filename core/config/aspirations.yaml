@@ -233,6 +233,10 @@ goal_templates:
           target: "world/knowledge/tree/_tree.yaml"
           condition: "Node updated with spike findings"
 
+# Proactive starvation prevention — create work BEFORE the pipeline empties.
+# Phase 0.5.1 counts executable goals and triggers /create-aspiration when below this.
+pipeline_low_water_mark: 3      # create new work when executable goals drop below this
+
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals
   novelty_drought_hours: 48     # hours since last first-time goal completion
@@ -328,10 +332,32 @@ exploration_mode:
     - tree_encoding                       # Knowledge encoded regardless of outcome
     - pattern_signatures                  # Patterns still matched and recorded
 
+# --- STEPPING-STONE RETRIEVAL (OMNI-EPIC-inspired: arXiv 2405.15568) ---
+# When generating new aspirations, retrieve K most recently completed aspirations
+# from the archive as creative stepping stones. Nearby successes are the best
+# substrate for novel task generation. Partial archive visibility (showing only K,
+# not everything) supports creativity — OMNI-EPIC's key design choice.
+
+stepping_stones:
+  default_limit: 5              # K — number of archived aspirations to retrieve
+  source: archive               # Where to pull stepping stones from
+
+# --- OPEN-ENDED PROGRESS (OMNI-EPIC-inspired: ANNECS metric) ---
+# Tracks accumulated number of Novel, Interesting aspirations Created and Solved.
+# "Novel" = passed interestingness filter. "Solved" = completed with learning artifacts.
+# Used by evolution to detect stagnation in aspiration QUALITY, not just velocity.
+
+open_ended_progress:
+  metric: annecs                # Accumulated Novel Aspirations Created and Solved
+  novelty_window: 10            # Compare against last N archived aspirations for novelty
+  track_in: aspirations-meta.json
+
 modifiable:
   max_active: {min: 3, max: 25, default: 20}
   # Agent delegation
   max_concurrent_goals: {min: 1, max: 3, default: 3}
+  # Pipeline starvation prevention
+  pipeline_low_water_mark: {min: 1, max: 10, default: 3}
   # Planning thresholds (guidelines for LLM, not hard gates)
   check_interval_goals: {min: 1, max: 10, default: 3}
   novelty_drought_hours: {min: 12, max: 168, default: 48}

@@ -11,7 +11,31 @@ minimum_mode: any
 
 USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 
+## Syntax
+
+```
+/stop                  # Stop the currently-bound agent
+/stop <agent-name>     # Stop a specific agent (fixes cross-session binding issues)
+```
+
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
+
+**Step 0.5: Resolve Target Agent** — If `<agent-name>` argument provided:
+
+1. Validate agent directory exists: `ls <agent-name>/session/agent-state`
+   - If not found: output "Agent '<agent-name>' not found or has no session state." DONE.
+
+2. Rebind this session to the target agent:
+   ```bash
+   SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); AGENT="<agent-name>" && echo "$AGENT" > .active-agent && if [ -n "$SID" ]; then echo "$AGENT" > ".active-agent-$SID"; fi
+   ```
+
+   Reads SID from `.latest-session-id`, then writes both binding files.
+
+If no `<agent-name>` provided: use current session binding (existing behavior).
+
+**Step 1: Check State** — Bash: `session-state-get.sh`
+(If agent-name was provided in Step 0.5, the rebinding ensures this reads the target agent's state.)
 
 ## Behavior by Current State
 
