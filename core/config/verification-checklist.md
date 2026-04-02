@@ -491,7 +491,8 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 1. `core/scripts/goal-selector.py` has `hours_since()` helper handling both `YYYY-MM-DD` and `YYYY-MM-DDTHH:MM:SS`
 2. `core/scripts/goal-selector.py` has `get_interval_hours()` helper with `remind_days * 24` fallback
 3. `core/scripts/goal-selector.py` `collect_candidates()` uses `interval_hours`/`hours_since` for recurring time gate
-4. `core/scripts/goal-selector.py` `score_goal()` `recurring_urgency` uses 2.0 baseline + capped overdue ratio: `min(2.0 + (hours_overdue - interval_hours) / interval_hours, 5.0)`
+4. `core/scripts/goal-selector.py` `score_goal()` `recurring_urgency` uses 1.5 baseline + capped overdue ratio: `min(1.5 + (hours_overdue - interval_hours) / interval_hours, 5.0)`
+4b. `core/scripts/goal-selector.py` `score_goal()` `recurring_saturation` penalizes recurring goals when recent completions are recurring-heavy: `-(recurring_ratio * 4.0)` with weight 0.8
 5. `core/scripts/aspirations.py` `validate_goal()` accepts `interval_hours` (positive int) and `recurring` (bool)
 
 ### R2. Recurring Goal Lifecycle (Skill)
@@ -608,16 +609,16 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 ## U. Communication Obligations
 
 ### U1. Scoring System
-1. `core/scripts/goal-selector.py` recurring_urgency formula has 2.0 baseline when due
+1. `core/scripts/goal-selector.py` recurring_urgency formula has 1.5 baseline when due
 2. `core/scripts/goal-selector.py` treats `lastAchievedAt: null` as due (never-completed = needs doing)
 3. `core/scripts/goal-selector.py` uses `>=` not `>` for interval comparison
-4. `aspirations/SKILL.md` Goal Selection Algorithm documents the 2.0 baseline formula
+4. `aspirations/SKILL.md` Goal Selection Algorithm documents the 1.5 baseline formula
 5. `core/config/agent-aspirations-initial.jsonl` asp-001 includes g-001-04 (Generate progress report) at HIGH priority with interval_hours: 4
 5b. Bootstrap g-001-04 `skill` = `/agent-completion-report` (core framework skill)
 5c. Domain-specific wrappers (e.g., email delivery) are forged at runtime and override g-001-04 skill field
 
 ### U4. Runtime
-11. **Runtime**: `goal-selector.sh` output shows g-001-04 with recurring_urgency raw >= 2.0 when due
+11. **Runtime**: `goal-selector.sh` output shows g-001-04 with recurring_urgency raw >= 1.5 when due
 12. **Runtime**: g-001-04 scores competitively with HIGH domain goals when due (score >= 7.0)
 13. **Runtime**: After 4+ hours of operation, g-001-04 has been selected and executed at least once
 

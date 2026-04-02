@@ -22,7 +22,7 @@ goal_templates:
     title: "Short descriptive title"
     description: "What this goal does, why it matters, and key context"
     status: pending
-    participants: [agent]            # [agent], [user], or [agent, user]
+    participants: [agent]            # [agent] (any), [user], [alpha], [bravo], or combinations
     blocked_by: []                   # IDs of prerequisite goals
     verification:                    # unified field (replaces desiredEndState + completion_check)
       outcomes: ["Measurable outcome that agent can verify"]  # human-readable
@@ -237,6 +237,15 @@ goal_templates:
 # Phase 0.5.1 counts executable goals and triggers /create-aspiration when below this.
 pipeline_low_water_mark: 3      # create new work when executable goals drop below this
 
+# Hypothesis pipeline starvation prevention — ensure the prediction pipeline stays active.
+# Phase 0.5.2 counts discovered+evaluating+active pipeline records and triggers investigation when below this.
+hypothesis_pipeline_low_water_mark: 2   # create prediction review goal when active hypotheses drop below this
+
+# Accuracy health gate — create investigation work when prediction accuracy drops critically.
+# Phase 0.5.3 reads pipeline accuracy and triggers investigation when below this threshold.
+accuracy_critical_threshold: 0.40       # trigger investigation when accuracy drops below 40%
+accuracy_min_sample: 5                  # require at least 5 resolved hypotheses before gate activates
+
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals
   novelty_drought_hours: 48     # hours since last first-time goal completion
@@ -358,6 +367,11 @@ modifiable:
   max_concurrent_goals: {min: 1, max: 3, default: 3}
   # Pipeline starvation prevention
   pipeline_low_water_mark: {min: 1, max: 10, default: 3}
+  # Hypothesis pipeline starvation prevention
+  hypothesis_pipeline_low_water_mark: {min: 0, max: 5, default: 2}
+  # Accuracy health gate
+  accuracy_critical_threshold: {min: 0.20, max: 0.60, default: 0.40}
+  accuracy_min_sample: {min: 3, max: 15, default: 5}
   # Planning thresholds (guidelines for LLM, not hard gates)
   check_interval_goals: {min: 1, max: 10, default: 3}
   novelty_drought_hours: {min: 12, max: 168, default: 48}

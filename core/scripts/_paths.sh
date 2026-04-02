@@ -44,32 +44,17 @@ elif ! python3 -c "pass" &>/dev/null; then
 fi
 unset _PY_SHIM_DIR
 
-# --- Session ID fallback (for /start and single-agent use) ---
-# Only read when SID not already in env. Concurrent agents use AYOAI_AGENT prefix instead.
-if [ -z "${AYOAI_SESSION_ID:-}" ]; then
-    _SID_FILE="$PROJECT_ROOT/.latest-session-id"
-    if [ -f "$_SID_FILE" ]; then
-        AYOAI_SESSION_ID=$(cat "$_SID_FILE" 2>/dev/null | tr -d '\r\n')
-        export AYOAI_SESSION_ID
-    fi
-    unset _SID_FILE
-fi
+# --- Session ID ---
+# AYOAI_SESSION_ID is set by the caller (hooks extract from stdin JSON,
+# LLM Bash calls use AYOAI_AGENT prefix which bypasses SID resolution).
+# No shared-file fallback — .latest-session-id was a single-writer design
+# that broke when multiple terminals ran in the same directory.
 
 # --- Tier 4: Per-agent private state ---
-# Priority: AYOAI_AGENT env > .active-agent-$SESSION_ID > .active-agent global > empty
-# AGENT_NAME must be resolved FIRST because local-paths.conf lives inside <agent>/.
-# +x detects "set, even to empty" vs "unset". Do NOT simplify to :- or -n.
-# Session-keyed file (.active-agent-$SID) prevents cross-agent contamination
-# when multiple agents run in separate Claude Code windows.
-if [ -n "${AYOAI_AGENT+x}" ]; then
-    AGENT_NAME="$AYOAI_AGENT"
-elif [ -n "${AYOAI_SESSION_ID:-}" ] && [ -f "$PROJECT_ROOT/.active-agent-$AYOAI_SESSION_ID" ]; then
-    AGENT_NAME="$(cat "$PROJECT_ROOT/.active-agent-$AYOAI_SESSION_ID" 2>/dev/null | tr -d '\r\n')"
-elif [ -f "$PROJECT_ROOT/.active-agent" ]; then
-    AGENT_NAME="$(cat "$PROJECT_ROOT/.active-agent" 2>/dev/null | tr -d '\r\n')"
-else
-    AGENT_NAME=""
-fi
+# Resolution: AYOAI_AGENT env var. That's it. One path.
+# The LLM sets this on every Bash call. Hooks set it from .active-agent-$SID.
+# If not set, AGENT_NAME is empty and scripts degrade gracefully.
+AGENT_NAME="${AYOAI_AGENT:-}"
 
 # --- External path configuration ---
 # world/ and meta/ live at user-supplied external paths (shared drive, NAS, etc.).

@@ -53,3 +53,5 @@ node_modules/
 # Hook coordination files (one-shot breadcrumbs, consumed after reading)
 .stop-hook-stdin.json
 .compact-agent
+# Crash recovery markers (written by StopFailure hook, consumed by /boot)
+*/session/crash-marker

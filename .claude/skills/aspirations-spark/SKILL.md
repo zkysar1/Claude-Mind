@@ -16,6 +16,10 @@ Invoked after every goal completion as Phase 6 (spark check) and Phase 6.5 (imme
 
 ---
 
+## Inputs
+
+- `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
+
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
 ## Phase 6.5: Immediate Learning (reasoning bank + guardrails)
@@ -102,7 +106,7 @@ SKIP: goal outcome was routine/expected with no new insight.
                 Route to target aspiration (current → matching category → /create-aspiration)
                 Build goal: title "Forge skill: {gap.procedure_name}",
                   skill "/forge-skill", args "skill {gap.id}", priority "MEDIUM"
-                Add via aspirations-update.sh
+                Add via aspirations-update.sh --source {source}
                 Log in journal: "Forge-ready gap detected during execution: {gap.id}"
                 Log: echo '{"date":"...","event":"forge-ready","details":"Gap {gap.id} detected in Phase 6.5 from {goal.id}","trigger_reason":"immediate-learning-forge"}' | bash core/scripts/evolution-log-append.sh
 ```
@@ -176,11 +180,11 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
         reduce confidence by 0.15 (the "well-engineered codebase" prior).
      d. Record the pre-mortem in the experience archive (Step 2.5 content).
      SKIP this step only if the prediction is about external systems
-     (AWS behavior, third-party APIs) rather than AyoAI code quality.
+     (AWS behavior, third-party APIs) rather than project code quality.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
 2. Add goal to aspiration: read current aspiration via `aspirations-read.sh --id <asp-id>`,
    add new goal with hypothesis fields, then pipe updated aspiration JSON to
-   `echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh <asp-id>`
+   `echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh --source {source} <asp-id>`
    Goal fields:
    - `participants: [agent]`
    - `skill: "/review-hypotheses --hypothesis {hypothesis_id}"`
@@ -315,7 +319,7 @@ When sq-013 fires after goal completion:
      - For `capability_gap` or `opportunity` discoveries: consider whether a companion
        test/verification goal should also be created (same pattern as Step 4c in create-aspiration)
 6. Add new goal to the target aspiration's `goals` array
-7. Pipe the updated aspiration JSON to: `bash core/scripts/aspirations-update.sh <target-asp-id>`
+7. Pipe the updated aspiration JSON to: `bash core/scripts/aspirations-update.sh --source {source} <target-asp-id>`
 8. If discovery type is `dependency`: add new goal ID to `blocked_by` on dependent goals
 9. Log spark event: `echo '{"event":"spark","details":"sq-013: Goal <completed-id> discovered <type>: <title> → <target-asp-id>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
 10. Increment `sparks_generated` on the spark question
@@ -409,7 +413,7 @@ When sq-c08 fires after a FAILED goal:
 
 3. Add via aspirations-add-goal.sh to the same aspiration:
    ```
-   echo '{"title":"Stepping stone: {simpler variant title}","description":"Easier variant of {failed.id}: {failed.title}. {what makes this simpler}. Original failure mode: {failure_analysis}.","priority":"{same as failed}","category":"{failed.category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh {asp.id}
+   echo '{"title":"Stepping stone: {simpler variant title}","description":"Easier variant of {failed.id}: {failed.title}. {what makes this simpler}. Original failure mode: {failure_analysis}.","priority":"{same as failed}","category":"{failed.category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {source} {asp.id}
    ```
 
 4. Log: `echo '{"date":"<today>","event":"stepping_stone_created","details":"Easier variant of {failed.id} → {new.title}","trigger_reason":"sq-c08 failure stepping-stone"}' | bash core/scripts/evolution-log-append.sh`

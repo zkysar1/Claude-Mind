@@ -271,10 +271,11 @@ COMPACT_GOAL_KEEP = {
 }
 
 
-def compact_aspiration(asp):
+def compact_aspiration(asp, source="world"):
     """Project an aspiration to compact form (no descriptions, no verification)."""
     result = {k: v for k, v in asp.items() if k != "goals"}
     result.pop("description", None)
+    result["source"] = source  # routing tag — skills use this to select correct queue
     result["goals"] = [
         {k: v for k, v in g.items() if k in COMPACT_GOAL_KEEP}
         for g in asp.get("goals", [])
@@ -285,7 +286,7 @@ def compact_aspiration(asp):
 def cmd_read(args):
     if args.active_compact:
         items = read_jsonl(LIVE_PATH)
-        compact = [compact_aspiration(a) for a in items]
+        compact = [compact_aspiration(a, source=args.source) for a in items]
         print(json.dumps(compact, indent=2, ensure_ascii=True))
     elif args.active:
         items = read_jsonl(LIVE_PATH)
@@ -625,6 +626,20 @@ def cmd_archive_sweep(args):
                         continue
                 to_archive.append(a)
         else:
+            # Scan non-archivable aspirations for corrupted recurring goals.
+            # Recurring goals must never have status=completed. If found, reset
+            # to pending — same recovery as the completed/retired path above.
+            recurring = find_recurring_goals(a)
+            if recurring:
+                corrupted = [g for g in recurring if g.get("status") == "completed"]
+                if corrupted:
+                    c_ids = ", ".join(g["id"] for g in corrupted)
+                    print(f"WARNING: Recovering {len(corrupted)} corrupted recurring goal(s) "
+                          f"in {a['id']}: {c_ids}. Resetting to pending.", file=sys.stderr)
+                    for g in corrupted:
+                        g["status"] = "pending"
+                    recompute_progress(a)
+                    recovered += 1
             remaining.append(a)
 
     if not to_archive:

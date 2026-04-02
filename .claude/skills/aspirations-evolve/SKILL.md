@@ -233,20 +233,20 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                    Log: "Cannot archive {asp.id} — contains recurring goals. Adding exploration goal instead."
                ELSE:
                    Log: "STRATEGIC REDIRECT: {asp.id} — prolonged plateau, recommending archival"
-                   Bash: aspirations-complete.sh {asp.id}
+                   Bash: aspirations-complete.sh --source {asp.source} {asp.id}
                invoke /create-aspiration from-self --plan with:
                    context: "Pivoting from '{asp.title}' after learning plateau. Prior trajectory: {trajectory.summary}. Explore directions NOT yet tried."
            ELSE:
                # Recent plateau — add investigation goal
                Log: "STRATEGIC REDIRECT: {asp.id} — adding exploration goal"
-               echo '{"title":"Investigate: Fresh directions for {asp.title}","description":"Learning velocity has plateaued. Review trajectory, identify untried approaches, propose alternative exploration directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh {asp.id}
+               echo '{"title":"Investigate: Fresh directions for {asp.title}","description":"Learning velocity has plateaued. Review trajectory, identify untried approaches, propose alternative exploration directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
 
        ELIF trajectory.diminishing_returns:
            Log: "DIMINISHING RETURNS: {asp.id} '{asp.title}' — learning yield declining monotonically over {diminishing_returns_window} goals"
            # Flag for review but don't auto-redirect — diminishing returns
            # may be acceptable near completion
            IF asp.progress.completed_goals / asp.progress.total_goals < 0.80:
-               echo '{"title":"Investigate: Diminishing returns on {asp.title}","description":"Learning yield declining over last {diminishing_returns_window} goals despite continued effort. Check if approach needs adjustment or if aspiration is near its knowledge frontier.","priority":"MEDIUM","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh {asp.id}
+               echo '{"title":"Investigate: Diminishing returns on {asp.title}","description":"Learning yield declining over last {diminishing_returns_window} goals despite continued effort. Check if approach needs adjustment or if aspiration is near its knowledge frontier.","priority":"MEDIUM","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
    ```
 
 2. **Evolve-first**: For each active aspiration, ask:
@@ -267,7 +267,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
              merge_context: {cluster asp-ids, combined titles, combined goals}
          # Retire the small aspirations (goals migrated to new aspiration)
          FOR EACH asp in cluster:
-             Bash: aspirations-retire.sh {asp.id}
+             Bash: aspirations-retire.sh --source {asp.source} {asp.id}
      ```
 2.5. **Constraint-Aware Rebalancing**:
    Bash: wm-read.sh known_blockers --json
@@ -308,14 +308,14 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    (Stage 1: generation-time criteria, Stage 2: post-generation archive comparison).
    See create-aspiration Step 5. No separate filtering needed here.
 5. **Aspiration cap enforcement**: If > `max_active` aspirations exist:
-   - Use `aspirations-retire.sh <asp-id>` for never-started aspirations (no goals completed, last_worked is null)
-   - Use `aspirations-complete.sh <asp-id>` for aspirations that had progress
+   - Use `aspirations-retire.sh --source {asp.source} <asp-id>` for never-started aspirations (no goals completed, last_worked is null)
+   - Use `aspirations-complete.sh --source {asp.source} <asp-id>` for aspirations that had progress
    - Then `aspirations-archive.sh` for sweep
    - Never exceed the cap
 6. Log all changes via `echo '{"date":"...","event":"...","details":"...","trigger_reason":"..."}' | bash core/scripts/evolution-log-append.sh` with:
    - `date`, `event`, `details`, `trigger_reason`
    - `aspirations_created`, `aspirations_completed`, `aspirations_archived`
-   - Update last_evolution timestamp: `Bash: aspirations-meta-update.sh last_evolution "$(date +%Y-%m-%d)"`
+   - Update last_evolution timestamp: `Bash: aspirations-meta-update.sh --source {asp.source} last_evolution "$(date +%Y-%m-%d)"`
 
    **ANNECS metric update** (OMNI-EPIC-inspired open-ended progress tracking):
    ```
@@ -330,12 +330,12 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    #
    # For each aspiration CREATED this evolution cycle that passed interestingness filter:
    new_created = current_created + {count_created_this_cycle}
-   Bash: aspirations-meta-update.sh annecs_created {new_created}
+   Bash: aspirations-meta-update.sh --source {asp.source} annecs_created {new_created}
    #
    # For each aspiration COMPLETED this cycle with learning artifacts:
    #   (check: did completion produce tree node updates, pattern signatures, or reasoning bank entries?)
    new_solved = current_solved + {count_solved_this_cycle}
-   Bash: aspirations-meta-update.sh annecs_solved {new_solved}
+   Bash: aspirations-meta-update.sh --source {asp.source} annecs_solved {new_solved}
    #
    # Log ANNECS snapshot:
    echo '{"date":"<today>","event":"annecs_update","details":"created={new_created} solved={new_solved} ratio={new_solved/new_created} trend={improving|stable|declining}","trigger_reason":"evolve-annecs"}' | bash core/scripts/evolution-log-append.sh
@@ -436,3 +436,9 @@ This will:
   - If not all pass: report gate status (no action needed)
   - If curriculum not configured: skip silently
 ```
+
+### Chaining
+
+- **Called by**: `/aspirations` orchestrator (Phase 9 evolution triggers)
+- **Calls**: `aspirations-complete.sh --source`, `aspirations-retire.sh --source`, `aspirations-add-goal.sh --source`, `aspirations-meta-update.sh --source`, `/create-aspiration`, `/forge-skill check`, `/curriculum-gates`
+- **Source routing**: All `aspirations-*.sh` calls receive `--source {asp.source}` from the aspiration's compact data

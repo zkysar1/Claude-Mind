@@ -405,6 +405,10 @@ def main():
                         help="Skip tree node matching, only return supplementary stores")
     parser.add_argument("--read-only", action="store_true",
                         help="Skip retrieval counter increments (for reader mode)")
+    parser.add_argument("--goal", type=str, default=None,
+                        help="Goal ID — auto-writes retrieval-session.json for utilization tracking")
+    parser.add_argument("--tree-nodes", type=str, default=None,
+                        help="Comma-separated tree node keys loaded in Step 3 (recorded in session file)")
     args = parser.parse_args()
 
     # Support comma-separated multi-category
@@ -464,6 +468,61 @@ def main():
     }
 
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # Auto-write retrieval session file for utilization tracking (Layer 1 of
+    # programmatic enforcement). When --goal is set, persist what was retrieved
+    # so utilization-feedback.sh can close the feedback loop without relying on
+    # the LLM to manually construct a manifest.
+    if args.goal and not read_only and AGENT_DIR:
+        tree_node_keys = []
+        if args.tree_nodes:
+            tree_node_keys = [k.strip() for k in args.tree_nodes.split(",") if k.strip()]
+        # Also include any nodes loaded by this retrieve call (non-supplementary mode)
+        for tn in tree_nodes:
+            k = tn.get("key", "")
+            if k and k not in tree_node_keys:
+                tree_node_keys.append(k)
+
+        supp_items = []
+        for item in reasoning_bank:
+            iid = item.get("id", "")
+            if iid:
+                supp_items.append({"id": iid, "type": "reasoning_bank"})
+        for item in guardrails:
+            iid = item.get("id", "")
+            if iid:
+                supp_items.append({"id": iid, "type": "guardrail"})
+        for item in pattern_signatures:
+            iid = item.get("id", "")
+            if iid:
+                supp_items.append({"id": iid, "type": "pattern_signature"})
+
+        session_record = {
+            "goal_id": args.goal,
+            "timestamp": now_str(),
+            "categories": categories,
+            "tree_nodes_loaded": tree_node_keys,
+            "supplementary_items": supp_items,
+            "counts": {
+                "tree_nodes": len(tree_node_keys),
+                "reasoning_bank": len(reasoning_bank),
+                "guardrails": len(guardrails),
+                "pattern_signatures": len(pattern_signatures),
+                "experiences": len(experiences),
+            },
+            "utilization_pending": True,
+            "utilization_completed_at": None,
+        }
+
+        session_path = AGENT_DIR / "session" / "retrieval-session.json"
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = Path(str(session_path) + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(session_record, f, ensure_ascii=False, indent=2)
+        os.replace(str(tmp_path), str(session_path))
+        print(f"[retrieve] Wrote retrieval-session.json for goal {args.goal} "
+              f"({len(tree_node_keys)} tree, {len(supp_items)} supplementary)",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

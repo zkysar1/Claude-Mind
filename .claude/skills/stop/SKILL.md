@@ -25,12 +25,8 @@ USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 1. Validate agent directory exists: `ls <agent-name>/session/agent-state`
    - If not found: output "Agent '<agent-name>' not found or has no session state." DONE.
 
-2. Rebind this session to the target agent:
-   ```bash
-   SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); AGENT="<agent-name>" && echo "$AGENT" > .active-agent && if [ -n "$SID" ]; then echo "$AGENT" > ".active-agent-$SID"; fi
-   ```
-
-   Reads SID from `.latest-session-id`, then writes both binding files.
+2. Set agent prefix for this session:
+   All subsequent Bash calls use `AYOAI_AGENT=<agent-name>` prefix.
 
 If no `<agent-name>` provided: use current session binding (existing behavior).
 
@@ -54,6 +50,8 @@ If no `<agent-name>` provided: use current session binding (existing behavior).
    sweep, knowledge debt sweep, experience archive maintenance, journal, working memory
    archive + reset, aspiration archive sweep, continuation handoff) while skipping
    non-essential steps (tree rebalancing, skill reports, user recap, restart).
+4b. Session cleanup (remove transient loop files):
+   Bash: `rm -f <agent>/session/running-session-id <agent>/session/aspirations-compact.json <agent>/session/context-budget.json <agent>/session/context-reads.txt <agent>/session/background-jobs.yaml`
 5. Reset to reader mode (safe baseline):
    Bash: `session-mode-set.sh reader`
 6. Output:

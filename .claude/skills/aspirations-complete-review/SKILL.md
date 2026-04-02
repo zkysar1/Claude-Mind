@@ -27,6 +27,7 @@ to archive or reopen the aspiration with new goals.
 - `asp`: The completing aspiration object (from compact loader)
 - `goal`: The goal that triggered completion (last completed goal)
 - `goals_completed_this_session`: Counter for maturity check
+- `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
 
 ## Outputs (to orchestrator)
 
@@ -117,7 +118,7 @@ Read asp.motivation. Given completed goals and outcomes:
 
 IF NOT fulfilled AND aspiration had < 10 completed goals:
     Generate 1-3 follow-up goals advancing the motivation
-    Add via: aspirations-add-goal.sh <asp.id>
+    Add via: aspirations-add-goal.sh --source {source} <asp.id>
     goals_added_to_completing_asp += count
     Output: "▸ Motivation check: not yet fulfilled — added {count} goal(s)"
 ELSE:
@@ -148,7 +149,7 @@ IF deduplicated:
 
         # Route: A) fits completing asp → add here, B) fits another → add there
         #         C) new work → /create-aspiration with context
-        echo '<goal_json>' | aspirations-add-goal.sh <target_asp>
+        echo '<goal_json>' | aspirations-add-goal.sh --source {source} <target_asp>
 ```
 
 ### Steps 7.5.6-7.5.8: Notify, Journal, Archival Gate
@@ -197,7 +198,7 @@ IF goals_added_to_completing_asp == 0:
 
 ```
 IF goals_added_to_completing_asp == 0:
-    Bash: aspirations-complete.sh <asp-id>
+    Bash: aspirations-complete.sh --source {source} <asp-id>
     invoke /create-aspiration from-self --plan
     RETURN (should_archive = true, goals_added = 0)
 ELSE:
@@ -207,5 +208,6 @@ ELSE:
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (when aspiration fully completes)
-- **Calls**: `experience-read.sh`, `aspirations-add-goal.sh`, `aspirations-complete.sh`, `aspiration-trajectory.sh`, `/create-aspiration`, user notification
+- **Calls**: `experience-read.sh`, `aspirations-add-goal.sh --source`, `aspirations-complete.sh --source`, `aspiration-trajectory.sh`, `/create-aspiration`, user notification
 - **Reads**: Aspiration data (compact), experience entries, knowledge tree (for motivation check), trajectory data (for maturity gate)
+- **Source routing**: All `aspirations-*.sh` calls receive `--source {source}` from the orchestrator input

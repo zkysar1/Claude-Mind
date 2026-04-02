@@ -31,7 +31,7 @@ On resume (agent already exists):
 **Step 0.5: Parse Mode** — Extract `--mode` argument if present. Valid values: `reader`, `assistant`, `autonomous`. If omitted: default to `autonomous` (both new and existing agents).
 
 **Step 1: Check Requested Agent's State** — The agent name comes from the `/start <name>` argument.
-Check THIS agent's state specifically (not whatever the global `.active-agent` file points to):
+Check THIS agent's state specifically:
 
 Bash: `AYOAI_AGENT=<agent-name> bash core/scripts/session-state-get.sh`
 
@@ -69,14 +69,13 @@ DONE. No state changes. No-op.
 
 0. **Rebind Agent to Session**
 
-   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); echo "<agent-name>" > .active-agent && if [ -n "$SID" ]; then echo "<agent-name>" > ".active-agent-$SID"; fi`
+   Bash: `echo "<agent-name>" > ".active-agent-$(cat .claude/settings.local.json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo unknown)"`
 
-   Reads SID from `.latest-session-id` (written by SessionStart hook), then writes both
-   the global fallback and the session-keyed binding file.
+   Writes the session-keyed binding file (used by hooks to resolve agent from session ID).
 
    **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
-   Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This ensures correct agent resolution
-   when multiple agents run concurrently. Example:
+   Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This is the ONLY mechanism for
+   agent resolution in scripts. Example:
      `AYOAI_AGENT=<agent-name> bash core/scripts/aspirations-read.sh --active`
 
 1. Determine target mode:
@@ -101,6 +100,7 @@ DONE. No state changes. No-op.
 
    **Autonomous mode:**
    - Bash: `session-state-set.sh RUNNING`
+   - Bash: `echo "$AYOAI_SESSION_ID" > <agent>/session/running-session-id`
    - Bash: `session-signal-clear.sh stop-loop`
    - Output: "Agent resumed. Learning loop starting."
    - Invoke `/boot`
@@ -118,12 +118,10 @@ A1. Validate the agent name (from the `/start <name>` argument):
 
 A2. **Bind Agent to Session**
 
-   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); echo "<agent-name>" > .active-agent && if [ -n "$SID" ]; then echo "<agent-name>" > ".active-agent-$SID"; fi`
+   Bash: `echo "<agent-name>" > ".active-agent-$(cat <agent-name>/session/latest-session-id 2>/dev/null || echo unknown)"`
 
-   The `.active-agent` file is the global fallback — read by `_paths.sh` / `_paths.py`
-   when no session-specific binding exists. The session-keyed file (`.active-agent-<SID>`)
-   is the per-session binding used by hooks and autocompact recovery to prevent
-   cross-agent contamination when multiple agents run in separate windows.
+   The session-keyed file (`.active-agent-<SID>`) is used by hooks to resolve
+   which agent a session belongs to. One file per session, no shared global file.
 
 A3. Create the agent directory (if it doesn't exist):
 
@@ -148,8 +146,8 @@ B1. Ask for the **world directory** path:
    - An existing world directory (I'll connect to it)
 
    Examples:
-   - C:/Users/Shared/ayoai/world
-   - /mnt/nas/projects/ayoai/world
+   - C:/Users/Shared/my-project/world
+   - /mnt/nas/projects/my-project/world
    - ./world  (local, relative to this repo)
 
    Where should the world directory be?
@@ -291,7 +289,7 @@ every agent.
 Examples:
 - "Build and ship the best project management tool in the market."
 - "Research and synthesize machine learning papers into actionable knowledge."
-- "Develop a multiplayer game with intelligent NPCs."
+- "Develop a robust home automation system with adaptive routines."
 
 What should The Program be? (Or say "skip" to leave it blank for now.)
 ```
@@ -505,6 +503,7 @@ C7. Write `<agent>/self.md` with parsed Self (where `<agent>` is the active agen
 C8. Set mode and state:
     - Bash: `session-mode-set.sh autonomous`
     - Bash: `session-state-set.sh RUNNING`
+    - Bash: `echo "$AYOAI_SESSION_ID" > <agent>/session/running-session-id`
     - Bash: `session-signal-clear.sh stop-loop`
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.

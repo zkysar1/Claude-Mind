@@ -13,6 +13,11 @@ minimum_mode: autonomous
 
 Invoked after EVERY goal execution as Phase 8 of the aspirations loop. Accepts `outcome_class` (default: `"deep"`).
 
+## Inputs (from orchestrator)
+
+- `outcome_class`: Outcome tier (`"routine"`, `"standard"`, or `"deep"`) — default `"deep"`
+- `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
+
 For **deep** outcomes (default — non-recurring, failures, surprises): all steps run (1-8, 8.5, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Step 8.5 (ACTIONABLE FINDINGS GATE) ensures encoded findings get tracked as goals. Step 8.75 (EXECUTION REFLECTION) cross-references outcomes against institutional knowledge.
 
 For **standard** outcomes (recurring with incremental findings): all steps run (1-8, 8.5, 8.75). Step 8 computes the FULL encoding payload inline (identical fidelity to deep) then QUEUES it to encoding_queue for deferred tree writing during consolidation. The encoding content is computed NOW at full fidelity — only the file I/O of writing to the tree node is deferred.
@@ -30,28 +35,30 @@ The loop MUST NOT continue to Phase 9 until state update is complete.
 After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for standard/deep outcomes):
 
 ```
-1. UPDATE goal status via Bash: `aspirations-update-goal.sh <goal-id> status <status>`
-   - `aspirations-update-goal.sh <goal-id> completed_date <today>` if completed
-   - `aspirations-update-goal.sh <goal-id> achievedCount <N+1>`
+1. UPDATE goal status via Bash: `aspirations-update-goal.sh --source {source} <goal-id> status <status>`
+   - `aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>` if completed
+   - `aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>`
    - Update streak counters via additional update-goal calls
    - If recurring: compute elapsed = hours_since(lastAchievedAt) BEFORE updating.
-     Bash: `aspirations-update-goal.sh <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"`
+     Bash: `aspirations-update-goal.sh --source {source} <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"`
      If elapsed > 2 * interval_hours: new_streak = 1.
      Otherwise: new_streak = currentStreak + 1.
      ALWAYS update both: currentStreak = new_streak, longestStreak = max(new_streak, longestStreak).
 
 2. Aspiration progress is updated automatically by update-goal when status changes
 
-3. UPDATE last_session via Bash: `aspirations-meta-update.sh last_updated <today>`
+3. UPDATE last_session via Bash: `aspirations-meta-update.sh --source {source} last_updated <today>`
    - Append goal completion to goals_completed_this_session in working memory:
-     # Keys read by goal-selector.py streak_momentum — do not rename
-     Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>"}' | wm-append.sh goals_completed_this_session
+     # Keys read by goal-selector.py streak_momentum + recurring_saturation — do not rename
+     Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring":<true|false>}' | wm-append.sh goals_completed_this_session
    - Set aspiration_touched_last in working memory:
      Bash: echo '"<aspiration-id>"' | wm-set.sh aspiration_touched_last
+   - Set current_goal_source in working memory:
+     echo '"{source}"' | Bash: wm-set.sh current_goal_source
    - Set last_goal_category = goal's resolved category (from goal-selector.py output):
      Bash: echo '"<category>"' | wm-set.sh last_goal_category
 
-4. INCREMENT session_count via Bash: `aspirations-meta-update.sh session_count <N>`
+4. INCREMENT session_count via Bash: `aspirations-meta-update.sh --source {source} session_count <N>`
    (Note: session_count increments once per /aspirations loop invocation,
     NOT once per goal. Goals within the same loop share a session.)
 
@@ -75,7 +82,7 @@ IF outcome_class == "routine":
        Log: "▸ Evolution triggers: SKIPPED (exploration mode — shielded from negative triggers)"
    # Standard goals: check all triggers normally
 
-6. UPDATE readiness gates via Bash: `aspirations-meta-update.sh readiness_gates '<JSON>'`
+6. UPDATE readiness gates via Bash: `aspirations-meta-update.sh --source {source} readiness_gates '<JSON>'`
    - Re-run gate checks after any state change
 
 7. WRITE journal entry
@@ -96,7 +103,7 @@ IF outcome_class == "routine":
    # MR-Search episode chain encoding (Priority 1):
    # When episode_history is present, encode the PROGRESSION of understanding,
    # not just the final outcome. The chain shows how the agent's approach evolved.
-   # episode_history is already in context from Phase 4-chain (set via aspirations-update-goal.sh).
+   # episode_history is already in context from Phase 4-chain (set via aspirations-update-goal.sh --source {source}).
    IF goal has episode_history AND episode_history is non-empty (multi-episode goal):
        Include episode progression in tree encoding:
        - "## Episode Progression" section: summarize how approach evolved
@@ -349,7 +356,7 @@ IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insight
                 discovery_type: signal.type
             }
             target_asp = goal's parent aspiration
-            echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh <target_asp>
+            echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <target_asp>
             Output: "▸ FINDINGS GATE: Created {title} in {target_asp} from {goal.id}"
 
         Append to journal: "Findings gate: {N} signal(s) → {M} new goal(s)"
@@ -532,3 +539,9 @@ IF outcome_class != "routine":
             Output: "▸ Relative advantage: {relative_advantage:.3f} (below category mean)"
         # else: within normal range, no output
 ```
+
+## Chaining
+
+- **Called by**: `/aspirations` orchestrator (Phase 8)
+- **Calls**: `aspirations-update-goal.sh --source {source}`, `aspirations-meta-update.sh --source {source}`, `aspirations-add-goal.sh --source {source}`, `wm-set.sh`, `wm-append.sh`, `skill-evaluate.sh`, `meta-impk.sh`, `meta-backpressure.sh`, `experience-update-field.sh`
+- **Reads**: Goal object, execution result, `core/config/evolution-triggers.yaml`, `core/config/memory-pipeline.yaml`, `meta/encoding-strategy.yaml`

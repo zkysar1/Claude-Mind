@@ -58,23 +58,11 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `core/scripts/_platform.sh` has `WORLD_DIR="$(cygpath -m "$WORLD_DIR")"` (Windows path fix)
    Check: No `mind/` directory exists (fully migrated to 4-tier)
 
-   # AYOAI_AGENT env var priority evidence checks (Section 4T continued)
-   # _paths.py and _paths.sh must use set-vs-unset detection so AYOAI_AGENT="" overrides .active-agent file.
-   # The +x idiom and "in os.environ" pattern are critical — do NOT simplify (see code comments).
-   Check: `core/scripts/_paths.py` `_resolve_agent_name` uses `"AYOAI_AGENT" in os.environ` (not `os.environ.get`)
-   Check: `core/scripts/_paths.sh` uses `${AYOAI_AGENT+x}` for agent name resolution (not `:-` or `-n`)
-
-   # 3-tier agent resolution chain (Section 4T continued)
-   # Both _paths.sh and _paths.py MUST implement identical 3-tier fallback:
-   #   Tier 1: AYOAI_AGENT env var (set-vs-unset, even if empty)
-   #   Tier 2: .active-agent-$AYOAI_SESSION_ID (session-keyed file)
-   #   Tier 3: .active-agent (global last-resort fallback)
-   # Prevents cross-agent state contamination when multiple agents run concurrently.
-   Check: `_paths.sh` has 3-tier chain: `${AYOAI_AGENT+x}` THEN `.active-agent-$AYOAI_SESSION_ID` THEN `.active-agent` (in that order)
-   Check: `_paths.py` `_resolve_agent_name` has 3-tier chain: `"AYOAI_AGENT" in os.environ` THEN `.active-agent-{sid}` THEN `.active-agent` (in that order)
-   Check: `_paths.sh` Tier 2 guards on BOTH `$AYOAI_SESSION_ID` non-empty AND file exists
-   Check: `_paths.py` Tier 2 guards on BOTH `sid` truthy AND `sf.exists()`
-   Bash: AYOAI_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent" (Tier 1 wins over files)
+   # Agent resolution: AYOAI_AGENT env var is the ONLY mechanism (Section 4T continued)
+   # No fallback files, no .active-agent global, no .latest-session-id.
+   Check: `core/scripts/_paths.py` `_resolve_agent_name` reads only `os.environ.get("AYOAI_AGENT")`
+   Check: `core/scripts/_paths.sh` resolves `AGENT_NAME="${AYOAI_AGENT:-}"` (one line, no fallbacks)
+   Bash: AYOAI_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent"
 
    # NO_AGENT state evidence checks (Section 4T continued)
    Bash: AYOAI_AGENT="" python3 core/scripts/session.py state get → verify prints "NO_AGENT" (not crash)
@@ -88,44 +76,60 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: Phase 0.5 outputs "WORLD PRIME (no agent)" header
 
    # Session binding evidence checks (Section SB)
-   Bash: cat .latest-session-id → verify non-empty UUID (SessionStart hook wrote it)
    Bash: echo $AYOAI_AGENT → verify matches the agent directory name (LLM prefix contract)
-   Check: `.active-agent-$SID` file exists and contains current agent name (where SID = .latest-session-id content)
-   Check: `core/scripts/session-save-id.sh` writes SID to `.latest-session-id`
-   Check: `.gitignore` contains `.active-agent-*` and `.latest-session-id` patterns
-   Check: `set-active-agent-env.sh` is a no-op (exit 0 only)
-   IF session was resumed (not first start):
-       Check: SessionStart hook carried forward agent from `.active-agent-$OLD_SID` to `.active-agent-$NEW_SID`
+   Check: `.gitignore` contains `.active-agent-*` pattern
+   Check: No `.latest-session-id` file exists (eliminated — broke concurrent sessions)
+   Check: No `.active-agent` global file exists (eliminated — one mechanism only)
 
    # Autocompact carry-forward evidence checks (Section SB continued)
-   # When autocompact fires, session-save-id.sh must preserve the agent binding
-   # across the SID change using the OLD SID from .latest-session-id.
-   Check: `session-save-id.sh` reads OLD SID from `.latest-session-id` BEFORE overwriting with new SID
-   Check: `session-save-id.sh` carries forward agent from `.active-agent-$OLD_SID` to `.active-agent-$NEW_SID`
-   Check: `session-save-id.sh` guards on agent directory existence (`-d` test)
-   Check: No `.active-agent-nosession` file exists
+   # stop-hook.sh writes .compact-agent breadcrumb, session-save-id.sh reads it.
+   Check: `stop-hook.sh` writes `.compact-agent` before blocking (breadcrumb for SessionStart)
+   Check: `session-save-id.sh` reads `.compact-agent` and creates `.active-agent-$SID` from it
+   Check: `session-save-id.sh` does NOT read/write `.latest-session-id`
 
    # Agent resolution checks (Section SE)
-   # Dual-mechanism: LLM passes AYOAI_AGENT prefix (Tier 1), hooks use SID from stdin (Tier 2).
-   # No shared env files. No CLAUDE_ENV_FILE.
-   Check: `_paths.sh` reads `.latest-session-id` for SID when AYOAI_SESSION_ID not in env
-   Check: `_paths.py` reads `.latest-session-id` for SID when not in os.environ
-   Check: No `.claude/.session-env` file exists (eliminated)
-   Bash: grep -r "CLAUDE_ENV_FILE\|session-env" core/scripts/ .claude/skills/start/ .claude/skills/stop/ 2>/dev/null | grep -v '.pyc' | grep -v 'no-op\|previously\|eliminated' → verify ZERO functional matches
-   Check: `start/SKILL.md` binding commands read SID from `.latest-session-id`
+   # One mechanism: AYOAI_AGENT env var. Hooks resolve from .active-agent-$SID.
+   Check: `_paths.sh` does NOT read `.latest-session-id`
+   Check: `_paths.py` does NOT read `.latest-session-id`
    Check: `start/SKILL.md` includes LLM prefix contract instruction (AYOAI_AGENT=<name>)
-   Check: `stop/SKILL.md` rebind reads SID from `.latest-session-id`
    Check: Stop hook recovery message includes agent name and AYOAI_AGENT prefix instruction
-
-   # /start IDLE rebinding evidence checks (Section SB continued)
-   # When /start resumes an IDLE agent, it must rebind the session to that agent.
-   # Without this, a different agent started in another window could still be bound.
-   Check: `start/SKILL.md` IDLE path has Step 0 "Rebind Agent to Session" that writes BOTH `.active-agent` and `.active-agent-$AYOAI_SESSION_ID`
-   Check: `start/SKILL.md` UNINITIALIZED Phase A2 writes BOTH `.active-agent` and `.active-agent-$AYOAI_SESSION_ID` (same pattern as IDLE)
-   Check: `start/SKILL.md` has Step 1 that uses `AYOAI_AGENT=<agent-name>` env prefix on `session-state-get.sh`
+   Check: `start/SKILL.md` has Step 1 that uses `AYOAI_AGENT=<agent-name>` env prefix
    Check: `start/SKILL.md` RUNNING path does NOT change any state (no-op, warning only)
 
-   # Dual-queue aspiration evidence checks (Section DQ)
+   # Stop hook integrity checks (Section SH)
+   # The Stop hook MUST be a single entry — Claude Code runs hooks in parallel,
+   # so multiple hooks race for stdin. The $VAR bash pattern does NOT work as an
+   # env assignment prefix (bash only recognizes literal VAR=val, not expanded).
+   Check: `.claude/settings.json` Stop array has exactly ONE hook entry (no parallel hooks)
+   Check: `.claude/settings.json` Stop hook command is `bash core/scripts/stop-hook.sh` (not capture-insights.sh)
+   Check: `.claude/settings.json` StopFailure hook exists with `bash core/scripts/stop-failure-hook.sh`
+   Check: `stop-hook.sh` uses `export AYOAI_AGENT=` (not `_A=` variable expansion pattern)
+   Bash: grep -c '\$_A bash' core/scripts/stop-hook.sh → verify returns 0 (no $\_A pattern)
+   Bash: grep -c 'export AYOAI_AGENT=' core/scripts/stop-hook.sh → verify returns 1
+   Check: `stop-hook.sh` reads stdin exactly once via `STDIN_JSON=$(cat)` — no `.stop-hook-stdin.json` sharing
+   Check: `stop-hook.sh` has early exit when HOOK_AGENT is empty (line: `if [ -z "$HOOK_AGENT" ]`)
+   Check: `stop-hook.sh` `_write_breadcrumb` does NOT use `[ -n ]` guard (would fail with set -e)
+   Check: `stop-failure-hook.sh` writes crash marker to `<agent>/session/crash-marker`
+   Check: `boot/SKILL.md` Phase -2.5 detects and cleans crash-marker
+   Check: `boot/SKILL.md` Phase -1.5 whitelist includes `crash-marker` and `running-session-id`
+   Check: No `core/scripts/capture-insights.sh` file exists (deleted — caused parallel race condition)
+   Bash: test ! -f core/scripts/capture-insights.sh && echo "PASS" || echo "FAIL: capture-insights.sh still exists"
+   Check: `core/scripts/capture-insights.py` still exists (preserved for inline use by stop-hook.sh)
+
+   # Stop hook lifecycle checks (Section SH continued — running-session-id)
+   # running-session-id is the anchor file that tells the stop hook which session
+   # is the autonomous loop runner. ONE creator (/start), ONE reader (stop hook),
+   # ONE syncer (session-save-id.sh on autocompact), ONE deleter (/stop).
+   Check: `start/SKILL.md` IDLE autonomous path writes `running-session-id` after `session-state-set.sh RUNNING`
+   Check: `start/SKILL.md` UNINITIALIZED autonomous path (C8) writes `running-session-id` after `session-state-set.sh RUNNING`
+   Check: `stop/SKILL.md` step 4b deletes `running-session-id` (symmetric with /start creation)
+   Check: `boot/SKILL.md` Phase -1.5 whitelist includes `running-session-id` (boot must NOT delete it)
+   Bash: grep -c 'rm.*running-session-id' .claude/skills/boot/SKILL.md -> verify returns 0 (boot never deletes it)
+   Bash: grep -c 'running-session-id' .claude/skills/aspirations/SKILL.md -> verify returns 0 (aspirations does not manage it)
+   Check: `session-save-id.sh` lines 60-62 sync `running-session-id` on autocompact (update-only, not create)
+   Check: `stop-hook.sh` comment on line 54 says "set by /start" (not "Phase -0.5")
+
+      # Dual-queue aspiration evidence checks (Section DQ)
    Bash: aspirations-read.sh --active → verify world aspirations exist (asp-001 Explore and Learn)
    Bash: agent-aspirations-read.sh --active → verify agent aspirations exist (asp-001 Maintain Agent Health)
    Bash: goal-selector.sh select 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); sources=set(r.get('source','') for r in d if isinstance(d,list)); print('PASS: both sources' if 'world' in sources and 'agent' in sources else 'PASS: world present, agent goals in cooldown' if isinstance(d,list) and 'world' in sources else 'PASS: structural' if isinstance(d,dict) else 'FAIL')" → verify source tagging works (agent goals may be in cooldown)
@@ -163,6 +167,20 @@ Focus on what actually happened during the test — did the agent USE the new fe
        Bash: experience-read.sh --meta → verify metadata tracking
        Check: do experience records have corresponding .md files at content_path?
        Check: do pipeline records with experience_ref point to valid experience IDs?
+
+   # Experience archival gate evidence checks (Section EG)
+   Check: `aspirations-learning-gate/SKILL.md` has Phase 9.5-exp "Experience Archival Gate"
+   Check: Phase 9.5-exp gates on `outcome_class in ("standard", "deep")` (not routine)
+   Check: Phase 9.5-exp checks `wm-read.sh active_context.experience_refs` (matches Phase 4.25 WM key)
+   Check: Phase 9.5-exp recovery writes to `<agent>/experience/` AND calls `experience-add.sh`
+   Check: Phase 9.5-exp is positioned BEFORE Phase 9.5c (unreflected hypothesis check)
+   Check: `aspirations-learning-gate/SKILL.md` Chaining Calls list includes `experience-add.sh`
+
+   # Archive-sweep recurring corruption scan evidence checks (Section AS)
+   Check: `aspirations.py` `cmd_archive_sweep` else-branch scans for corrupted recurring goals (not just completed/retired aspirations)
+   Check: else-branch calls `find_recurring_goals(a)` and checks for `status == "completed"`
+   Check: else-branch resets corrupted goals to `"pending"` and calls `recompute_progress`
+   Check: `remaining.append(a)` is OUTSIDE the `if recurring:` block (aspirations without recurring goals must not be dropped)
 
    # Bootstrap template integrity check (recurring goals excluded from total_goals)
    Bash: python3 -c "
@@ -379,7 +397,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -c "Verified Values" .claude/skills/*/SKILL.md → verify >= 5 files
    Bash: grep -c "precision_manifest" .claude/skills/*/SKILL.md → verify >= 3 files
    Bash: grep -c "PRECISION AUDIT" .claude/skills/*/SKILL.md → verify >= 3 files
-   Bash: grep -r "world/conventions/precision-encoding" .claude/skills/ 2>/dev/null | wc -l → verify 0 (no stale path references; convention lives in core/config/conventions/)
+   Bash: grep -r "world/conventions/precision-encoding" .claude/skills/ --exclude-dir=verify-learning 2>/dev/null | wc -l → verify 0 (no stale path references; convention lives in core/config/conventions/)
    Check: CLAUDE.md Convention Index includes `precision-encoding.md`
    IF agent has run 3+ productive goal cycles since precision encoding was deployed:
        Check: at least 1 tree node has a "## Verified Values" section
@@ -414,8 +432,26 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: FULL=$(bash core/scripts/aspirations-read.sh --active 2>/dev/null | wc -c) && COMPACT=$(bash core/scripts/aspirations-read.sh --active-compact 2>/dev/null | wc -c) && echo "$FULL $COMPACT" → verify compact < full
    Bash: bash core/scripts/aspirations-read.sh --active-compact 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); g=d[0]['goals'][0]; assert 'id' in g; assert 'description' not in g; assert 'verification' not in g; print('OK')" → verify compact strips heavy fields
    Bash: rm -f <agent>/session/aspirations-compact.json && bash core/scripts/load-aspirations-compact.sh 2>/dev/null → verify returns path
+   Check: `load-aspirations-compact.sh` loads BOTH world and agent queues (two aspirations.py calls, then merge)
    Check: 16+ skill files reference `load-aspirations-compact.sh` (grep count)
    Check: `boot/SKILL.md`, `backlog-report/SKILL.md`, `decompose/SKILL.md` KEEP `aspirations-read.sh --active` (need full detail)
+
+   # Source routing evidence checks (Section SR)
+   # All world-side aspiration wrappers must accept --source for dual-queue routing.
+   # Without this, agent-queue goals selected by goal-selector fail at read/update/complete.
+   Bash: bash core/scripts/aspirations-read.sh --source agent --active 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'PASS: {len(d)} agent aspirations')" → verify --source passthrough works on read
+   Bash: bash core/scripts/aspirations-read.sh --active-compact 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); assert all('source' in a for a in d), 'missing source field'; print(f'PASS: all {len(d)} have source')" → verify compact output has source field
+   Bash: rm -f <agent>/session/aspirations-compact.json && bash core/scripts/load-aspirations-compact.sh 2>/dev/null; cat <agent>/session/aspirations-compact.json | python3 -c "import sys,json; d=json.load(sys.stdin); sources=set(a['source'] for a in d); print(f'PASS: sources={sources}' if 'world' in sources else 'PASS: world-only (no agent aspirations)' if d else 'PASS: empty (fresh setup)')" → verify compact cache merges both queues
+   Check: `core/scripts/agent-aspirations-meta-update.sh` exists (completes the agent wrapper set)
+   Check: `core/config/conventions/aspirations.md` has "Source Routing Protocol" section with 4 rules
+   # Skill-layer routing: every Bash: invocation of aspirations scripts must have --source
+   Bash: grep -rn 'Bash:.*aspirations-\(update-goal\|complete\|add-goal\|retire\|update\|meta-update\)\.sh' .claude/skills/*/SKILL.md | grep -v '\-\-source' | wc -l → verify returns 0 (no unrouted invocations)
+   Check: `aspirations-select/SKILL.md` outputs list includes `source` field
+   Check: `aspirations-select/SKILL.md` Phase 2.9 uses `--source {goal.source}` on aspirations-read.sh
+   Check: `aspirations/SKILL.md` Phase 4 uses `--source {source}` on aspirations-update-goal.sh
+   Check: `aspirations-verify/SKILL.md` inputs include `source`
+   Check: `aspirations-state-update/SKILL.md` inputs include `source`
+   Check: `aspirations-state-update/SKILL.md` persists source to working memory via `wm-set.sh current_goal_source`
 
    # First-principles thinking evidence checks (Section BK)
    Check: `.claude/rules/first-principles.md` exists with "When To Apply" scope limiter and 4 numbered rules
@@ -757,9 +793,15 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # guard-022 + rb-037 document the root cause: implicit writes don't survive autocompact.
    Bash: grep -c "wm-append.sh goals_completed_this_session" .claude/skills/aspirations-state-update/SKILL.md → verify >= 1 (explicit call exists)
    Bash: grep -c "wm-set.sh aspiration_touched_last" .claude/skills/aspirations-state-update/SKILL.md → verify >= 1 (explicit call exists)
-   Check: `aspirations-state-update/SKILL.md` Step 3 wm-append uses dict format `{"goal_id":..., "aspiration_id":...}` (not bare string)
+   Check: `aspirations-state-update/SKILL.md` Step 3 wm-append uses dict format `{"goal_id":..., "aspiration_id":..., "recurring":...}` (not bare string)
+   Check: `aspirations-state-update/SKILL.md` Step 3 wm-append comment mentions both streak_momentum and recurring_saturation
    Check: `goal-selector.py` streak_momentum comment references "aspirations-state-update Step 3" as data source
    Check: `goal-selector.py` streak_momentum uses `s.get("aspiration_id")` matching the dict format from Step 3
+   Check: `goal-selector.py` recurring_saturation uses `s.get("recurring", False)` with backward-compat default
+   Check: `goal-selector.py` recurring_saturation window is 4 (last 4 completions)
+   Check: `goal-selector.py` recurring_saturation penalty range is 0 to -4.0 (capped by ratio * 4.0)
+   Bash: grep -c "recurring_saturation" core/scripts/goal-selector.py → verify >= 2 (criterion + raw assignment)
+   Bash: grep -c "recurring_saturation" core/config/goal-selection-algorithm.md → verify >= 1 (documented)
 
    # Retrieval escalation evidence checks (Section RX)
    Check: `core/config/conventions/retrieval-escalation.md` exists with "The Three Tiers" and "Mode Gates" sections
@@ -823,6 +865,72 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 reads `pipeline_low_water_mark` from config
    Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 counts only `status == "pending"` goals (not in-progress)
    Check: `aspirations-precheck/SKILL.md` Phase 0.5.1 invokes `from-self` WITHOUT `--plan` (fast tactical, not deep research)
+
+   # Hypothesis pipeline health evidence checks (Section HPH)
+   # Phase 0.5.2 creates investigation goals when hypothesis pipeline is starved.
+   # Phase 0.5.3 creates investigation goals when accuracy drops critically.
+   Check: `core/config/aspirations.yaml` has `hypothesis_pipeline_low_water_mark: 2` (top-level)
+   Check: `core/config/aspirations.yaml` has `accuracy_critical_threshold: 0.40` (top-level)
+   Check: `core/config/aspirations.yaml` has `accuracy_min_sample: 5` (top-level)
+   Check: `core/config/aspirations.yaml` modifiable section has `hypothesis_pipeline_low_water_mark` with bounds {min: 0, max: 5, default: 2}
+   Check: `core/config/aspirations.yaml` modifiable section has `accuracy_critical_threshold` with bounds {min: 0.20, max: 0.60, default: 0.40}
+   Check: `core/config/aspirations.yaml` modifiable section has `accuracy_min_sample` with bounds {min: 3, max: 15, default: 5}
+   Check: `aspirations-precheck/SKILL.md` has "Phase 0.5.2: Hypothesis Pipeline Health Check" between Phase 0.5.1 and Phase 0.5a
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.2 reads `hypothesis_pipeline_low_water_mark` from config
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.2 calls `pipeline-read.sh --counts` and sums discovered+evaluating+active
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.2 dedup checks both "pending" and "in-progress" (not just pending)
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.2 uses `{target_asp.source}` (not `{asp.source}`) in --source flag
+   Check: `aspirations-precheck/SKILL.md` has "Phase 0.5.3: Accuracy Health Gate" between Phase 0.5.2 and Phase 0.5a
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.3 reads `accuracy_critical_threshold` and `accuracy_min_sample` from config
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.3 calls `pipeline-read.sh --accuracy`
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.3 requires `total_resolved >= accuracy_min_sample` before firing (prevents false alarms)
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.3 dedup checks both "pending" and "in-progress"
+   Check: `aspirations-precheck/SKILL.md` Phase 0.5.3 uses `{target_asp.source}` (not `{asp.source}`) in --source flag
+   Bash: python3 core/scripts/pipeline.py read --counts 2>/dev/null → verify returns JSON with discovered, evaluating, active, resolved, archived keys
+   Bash: python3 core/scripts/pipeline.py read --accuracy 2>/dev/null → verify returns JSON with total_resolved, confirmed, corrected, accuracy_pct keys
+
+   # Forged skill resolution evidence checks (Section FSR)
+   # Agents must resolve natural-language pseudocode ("notify the user") to forged skills
+   # via triggers in forged-skills.yaml. Single source of truth — no guardrail duplication.
+   Check: `.claude/rules/forged-skill-resolution.md` exists (core rule, domain-agnostic)
+   Check: Rule points to `<agent>/forged-skills.yaml` as THE resolution source (not guardrails)
+   Check: Rule has exactly 2 rules (no fallback logic, no guardrail precedence)
+   Check: `<agent>/forged-skills.yaml` `notify-user` entry has non-empty `triggers` list
+   Check: `notify-user` triggers include "notify the user", "notify user", "reach out to the user", "alert the user"
+   Bash: python3 -c "
+   import yaml
+   with open('alpha/forged-skills.yaml') as f: d=yaml.safe_load(f)
+   t=d['skills']['notify-user']['triggers']
+   assert len(t)>=4, f'Expected 4+ triggers, got {len(t)}'
+   assert 'notify the user' in t, 'Missing key trigger phrase'
+   print(f'PASS: notify-user has {len(t)} triggers')
+   " → verify triggers populated
+   Check: No active guardrail with category `skill-resolution` exists (guard-050 retired — single source of truth)
+   Bash: guardrail-check.sh --context any --dry-run 2>/dev/null | python3 -c "
+   import sys,json; d=json.load(sys.stdin)
+   sr=[m for m in d['matched'] if m.get('category')=='skill-resolution']
+   print('PASS: no active skill-resolution guardrails' if len(sr)==0 else f'FAIL: {len(sr)} active skill-resolution guardrails (should be retired)')
+   " → verify no dual-source guardrails
+
+   # Programmatic utilization enforcement evidence checks (Section PU)
+   # Three-layer enforcement: auto-manifest (retrieve.py), script feedback (utilization-feedback.sh), hook backstop (utilization-gate.sh)
+   Bash: grep -c "\-\-goal" core/scripts/retrieve.py → verify >= 2 (argparse definition + session file guard)
+   Bash: grep -c "\-\-tree-nodes" core/scripts/retrieve.py → verify >= 1 (argparse definition exists)
+   Bash: grep -c "retrieval-session.json" core/scripts/retrieve.py → verify >= 1 (session file write exists)
+   Check: `core/scripts/utilization-feedback.py` exists with `_recompute_utility_ratio` function
+   Check: `core/scripts/utilization-feedback.py` `_recompute_utility_ratio` docstring references `tree.py cmd_increment` as canonical source
+   Check: `core/scripts/utilization-feedback.py` has `add_mutually_exclusive_group(required=True)` with `--helpful`, `--all-helpful`, `--all-noise`
+   Check: `core/scripts/utilization-feedback.sh` sources both `_paths.sh` and `_platform.sh` (guard-051)
+   Check: `core/scripts/utilization-gate.sh` sources both `_paths.sh` and `_platform.sh` (CRITICAL: without _platform.sh, hook is dead on Windows)
+   Check: `core/scripts/utilization-gate.sh` only acts on skill `aspirations-state-update` (all other skills exit 0 immediately)
+   Bash: python3 -c "import json; d=json.load(open('.claude/settings.json')); hooks=[h for e in d['hooks']['PreToolUse'] if e['matcher']=='Skill' for h in e['hooks']]; assert any('utilization-gate' in h['command'] for h in hooks)" 2>&1 → verify no error (hook registered)
+   Check: `aspirations-execute/SKILL.md` Step 4 retrieve call includes `--goal {goal.id}` and `--tree-nodes`
+   Check: `aspirations-execute/SKILL.md` Phase 4.26 has `utilization-feedback.sh` as PRIMARY PATH
+   Check: `aspirations-execute/SKILL.md` Step 5b says "AUTO-GENERATED by retrieve.sh" (not "MANDATORY — construct JSON manifest")
+   Check: `aspirations-learning-gate/SKILL.md` Phase 9.5b references `retrieval-session.json` as primary source
+   Check: `core/config/execute-protocol-digest.md` Step 4 includes `--goal` flag in retrieve.sh call
+   **Runtime**: After goal execution with retrieval, `<agent>/session/retrieval-session.json` exists with `utilization_pending: false`
+   **Runtime**: After 5+ goals with retrieval, some tree nodes have `utility_ratio > 0` (data flowing through pipeline)
 
 ## Step 4: Summary Report
 

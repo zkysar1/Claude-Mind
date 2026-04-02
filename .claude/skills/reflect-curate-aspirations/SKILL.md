@@ -128,25 +128,25 @@ A goal that "feels done" is not done — the evidence must be traceable.
 
 ```
 For each COMPLETE decision:
-  Bash: aspirations-update-goal.sh {goal_id} status completed
+  Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status completed
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "completed", "goal_id": "{id}",
      "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
 
 For each SKIP decision:
-  Bash: aspirations-update-goal.sh {goal_id} status skipped
+  Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status skipped
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "skipped", "goal_id": "{id}",
      "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
 
 For each SCOPE-DOWN decision:
-  Bash: aspirations-update-goal.sh {goal_id} description "{revised description}"
+  Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} description "{revised description}"
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "scoped_down", "goal_id": "{id}",
      "reason": "{reason}", "date": "{today}"}
 
 For each UNBLOCK decision:
-  Bash: aspirations-update-goal.sh {goal_id} blocked_by "[]"
+  Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} blocked_by "[]"
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "unblocked", "goal_id": "{id}",
      "reason": "{reason}", "date": "{today}"}
@@ -156,11 +156,11 @@ After all decisions executed:
 
   # Auto-complete aspirations where all goals are now done
   For each aspiration touched:
-    Bash: aspirations-read.sh --id {asp_id}
+    Bash: aspirations-read.sh --source {asp.source} --id {asp_id}
     IF any goal has recurring == true:
       SKIP — aspirations with recurring goals are perpetual (data layer blocks archival)
     ELIF all goals have status in (completed, skipped):
-      Bash: aspirations-complete.sh {asp_id}
+      Bash: aspirations-complete.sh --source {asp.source} {asp_id}
 
   # Knowledge reconciliation (M.11-12 pattern)
   For each COMPLETE or SKIP decision:

@@ -111,6 +111,74 @@ IF executable_count < pipeline_low_water_mark:
     log "Pipeline depth: below low-water-mark ({executable_count} < {pipeline_low_water_mark}), created new work"
 ```
 
+## Phase 0.5.2: Hypothesis Pipeline Health Check
+
+Proactive hypothesis starvation prevention — ensure the prediction pipeline stays
+active. Hypotheses come from sq-009 sparks during goal execution, which only fire on
+standard/deep outcomes. If outcomes are mostly routine, hypothesis generation stalls.
+This gate detects starvation and creates a review goal that forces prediction formation.
+
+```
+Read core/config/aspirations.yaml → hypothesis_pipeline_low_water_mark (default 2)
+
+# Count active pipeline hypotheses (discovered + evaluating + active stages)
+Bash: pipeline-read.sh --counts
+pipeline_counts = parse JSON
+active_hypothesis_count = pipeline_counts.discovered + pipeline_counts.evaluating + pipeline_counts.active
+
+IF active_hypothesis_count < hypothesis_pipeline_low_water_mark:
+    Output: "▸ Hypothesis pipeline thin: {active_hypothesis_count} active hypotheses (threshold: {hypothesis_pipeline_low_water_mark})"
+
+    # Dedup: skip if a matching goal is already pending or in-progress
+    existing_review = false
+    FOR EACH active aspiration in compact data:
+        FOR EACH goal WHERE status in ("pending", "in-progress"):
+            IF title starts with "Investigate: Prediction opportunities":
+                existing_review = true
+                BREAK
+
+    IF NOT existing_review:
+        target_asp = first active aspiration from compact data
+        echo '{"title":"Investigate: Prediction opportunities in recent work","description":"Hypothesis pipeline is thin ({active_hypothesis_count} active). Review the last 3-5 completed goals for prediction opportunities. For each: what would we expect to see if we revisited this domain? What consequence of this work could we verify later? Form at least 1 testable prediction via sq-009 pattern.","priority":"HIGH","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {target_asp.source} {target_asp.id}
+        Log: "HYPOTHESIS PIPELINE: below low-water-mark ({active_hypothesis_count} < {hypothesis_pipeline_low_water_mark}), created review goal"
+```
+
+## Phase 0.5.3: Accuracy Health Gate
+
+Detects critically low hypothesis accuracy and creates diagnostic work. The calibration
+gate in aspirations-spark caps confidence at low accuracy (symptom management), but does
+not investigate WHY accuracy is low. This gate creates root-cause investigation work.
+
+```
+Read core/config/aspirations.yaml → accuracy_critical_threshold (default 0.40), accuracy_min_sample (default 5)
+
+Bash: pipeline-read.sh --accuracy
+accuracy_data = parse JSON
+total_resolved = accuracy_data.total_resolved
+accuracy_pct = accuracy_data.accuracy_pct
+
+IF total_resolved >= accuracy_min_sample AND accuracy_pct < (accuracy_critical_threshold * 100):
+    Output: "▸ Accuracy critically low: {accuracy_pct}% ({accuracy_data.confirmed}/{total_resolved} confirmed, threshold: {accuracy_critical_threshold * 100}%)"
+
+    # Dedup check: don't create if an existing pending/in-progress goal already addresses this
+    existing_investigation = false
+    FOR EACH active aspiration in compact data:
+        FOR EACH goal WHERE status in ("pending", "in-progress"):
+            IF title starts with "Investigate: Low hypothesis accuracy" OR title starts with "Investigate: Why accuracy":
+                existing_investigation = true
+                BREAK
+
+    IF NOT existing_investigation:
+        # Identify worst-performing strategies for targeted investigation
+        by_strategy = accuracy_data.by_strategy or {}
+        worst_strategies = [name for name, stats in by_strategy.items() if stats.pct < 40 and stats.total >= 3]
+        worst_detail = ", ".join(worst_strategies[:3]) if worst_strategies else "across all strategies"
+
+        target_asp = first active aspiration from compact data
+        echo '{"title":"Investigate: Low hypothesis accuracy ({accuracy_pct}%)","description":"Overall accuracy is {accuracy_pct}% ({accuracy_data.confirmed}/{total_resolved}), below critical threshold of {accuracy_critical_threshold * 100}%. Worst areas: {worst_detail}. Diagnose: (1) Are predictions too ambitious for current knowledge? (2) Is the domain changing faster than predictions can track? (3) Are pre-mortems being skipped or ineffective? (4) Is evidence quality poor at formation time? Produce at least one corrective action.","priority":"HIGH","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {target_asp.source} {target_asp.id}
+        Log: "ACCURACY GATE: critically low ({accuracy_pct}% < {accuracy_critical_threshold * 100}%), created investigation goal"
+```
+
 ## Phase 0.5a: Pre-Selection Guardrail Check
 
 ```
@@ -176,7 +244,7 @@ FOR EACH active aspiration with >= lookback_window completed/skipped goals:
     IF cycle_detected:
         Output: "▸ CYCLE DETECTED: {asp.id} — {cycle_reason} over last {lookback_window} goals"
         category = trajectory.primary_category if trajectory else recent_goals[0].category
-        echo '{"title":"Investigate: Why are we cycling on {asp.title}?","description":"Unproductive cycle detected ({cycle_reason}). Recent goals: {recent_goal_titles}. Apply first-principles thinking: surface assumptions, reduce to verifiable ground truth, rebuild approach from fundamentals.","priority":"HIGH","category":"{category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh {asp.id}
+        echo '{"title":"Investigate: Why are we cycling on {asp.title}?","description":"Unproductive cycle detected ({cycle_reason}). Recent goals: {recent_goal_titles}. Apply first-principles thinking: surface assumptions, reduce to verifiable ground truth, rebuild approach from fundamentals.","priority":"HIGH","category":"{category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
         Log: "CYCLE DETECTION: Created investigation goal for {asp.id} — {cycle_reason}"
 ```
 
@@ -190,5 +258,5 @@ check_recurring_goals()
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (every iteration, first phase)
-- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection), `/create-aspiration` (health + pipeline depth), CREATE_BLOCKER protocol
-- **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection), `core/config/aspirations.yaml` (pipeline_low_water_mark)
+- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection, hypothesis pipeline, accuracy gate), `pipeline-read.sh` (hypothesis pipeline + accuracy health), `/create-aspiration` (health + pipeline depth), CREATE_BLOCKER protocol
+- **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection), pipeline meta (hypothesis counts + accuracy), `core/config/aspirations.yaml` (pipeline_low_water_mark, hypothesis_pipeline_low_water_mark, accuracy_critical_threshold, accuracy_min_sample)

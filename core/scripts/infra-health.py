@@ -134,7 +134,7 @@ def _run_probe_script(script_path, component):
     start = time.time()
     try:
         result = subprocess.run(
-            ["bash", script_path.relative_to(PROJECT_ROOT).as_posix()],
+            ["bash", script_path.as_posix()],  # absolute path — world/ may be external to PROJECT_ROOT
             cwd=str(PROJECT_ROOT),
             capture_output=True, text=True, timeout=30,
         )

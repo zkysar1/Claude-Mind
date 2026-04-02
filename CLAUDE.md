@@ -157,6 +157,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `precision-encoding.md` | Precision manifest schema, extraction heuristics, Verified Values format |
 | `agent-spawning.md` | Agent spawning context injection, build-agent-context.sh API, repo safety tiers, anti-patterns |
 | `retrieval-escalation.md` | 3-tier retrieval escalation: tree → codebase → web search |
+| `exhaustive-search-before-negation.md` | Exhaustive knowledge search protocol before negative conclusions |
 
 Additional on-demand specs (not convention files):
 - `core/config/hypothesis-conventions.md` — Hypothesis record schemas, horizons, context manifests
@@ -249,12 +250,12 @@ Everything else is **read-only**. Only the user may modify framework files.
 
 ### Agent-Session Binding
 
-Each Claude Code session is bound to at most one agent via a session-keyed file:
-- `AYOAI_SESSION_ID` — set by SessionStart hook via `.latest-session-id`, read by `_paths.sh`
-- `.active-agent-<session_id>` — maps this session to an agent name
-- `AYOAI_AGENT` — set by FileChanged hook when `.active-agent-*` changes (persists to all Bash calls)
-- `/start <name>` writes the binding
-- Files persist for auto-resume across sessions; delete `<agent>/` to clean up.
+Each Claude Code session is bound to one agent via `AYOAI_AGENT` env var:
+- `AYOAI_AGENT` — the ONLY mechanism for agent resolution in scripts
+- `.active-agent-<session_id>` — maps session to agent name (used by hooks to set `AYOAI_AGENT`)
+- `/start <name>` writes the binding file and sets the env var
+- The LLM prefixes all Bash calls with `AYOAI_AGENT=<name>`
+- Multiple terminals work independently — no shared state files.
 
 ## Knowledge Retrieval (All States)
 
@@ -313,7 +314,7 @@ Signal files (all in `<agent>/session/`):
 | `stop-loop` | Allow exit | /stop, /recover |
 | `handoff.yaml` | Cross-session state | aspirations consolidation |
 | `pending-agents.yaml` | Background agent tracking (stop hook Gate 2.5) | aspirations-execute Phase 4 |
-| `background-jobs.yaml` | Long-running external process tracking | /run-processor launch mode |
+| `background-jobs.yaml` | Long-running external process tracking | background-jobs.sh |
 
 Other session signals (`loop-active`, `stop-block-count`, `compact-checkpoint.yaml`, `context-reads.txt`, `pending-questions.yaml`, `aspirations-compact.json`): see `core/config/conventions/session-state.md`.
 

@@ -36,6 +36,7 @@ plus metacognitive assessment (model judgment on familiarity, value, cost, infra
 - `prefetch_goals`: Goals for pre-fetch research agents
 - `selection_context`: Raw parsed output from goal-selector.sh (includes `by_reason`, `blocked_goals`, `blocked_count` when all_blocked)
 - `selection_reason`: Why no goal was returned (`"all_blocked"`, `"all_blocked_by_gate"`, or absent when goal selected)
+- `source`: Queue origin of the selected goal (`"world"` or `"agent"`) — from goal-selector output. Pass to all downstream `aspirations-*.sh` calls via `--source {source}`.
 
 ## Phase 2: Select Next Goal
 
@@ -153,7 +154,7 @@ Apply focus context to value assessment.
 ```
 IF capability_level < auto_designate_below_capability threshold:
     IF session exploration fraction < max_exploration_fraction:
-        Bash: aspirations-update-goal.sh <goal-id> execution_mode exploration
+        Bash: aspirations-update-goal.sh --source {goal.source} <goal-id> execution_mode exploration
         Output: "▸ EXPLORATION MODE: {goal.category} shielded"
 ```
 
@@ -198,12 +199,12 @@ IF host chooses to pre-fetch:
 ```
 # Compact data lacks description and verification. Load full goal for execution.
 # do NOT remove this step — without it, execution has no description or verification criteria
-Bash: aspirations-read.sh --id {goal.aspiration_id}
+Bash: aspirations-read.sh --source {goal.source} --id {goal.aspiration_id}
 goal = find by goal_id in returned aspiration's goals array
 ```
 
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 2, every iteration)
-- **Calls**: `goal-selector.sh`, `load-tree-summary.sh`, `work-alignment.sh`, `infra-health.sh`, `aspirations-read.sh`, `aspirations-update-goal.sh`, `/create-aspiration` (no-goals + alignment)
+- **Calls**: `goal-selector.sh`, `load-tree-summary.sh`, `work-alignment.sh`, `infra-health.sh`, `aspirations-read.sh --source`, `aspirations-update-goal.sh --source`, `/create-aspiration` (no-goals + alignment)
 - **Reads**: meta/goal-selection-strategy.yaml, profile.yaml (focus), working memory (blockers), context-budget.json, tree summary, handoff decisions

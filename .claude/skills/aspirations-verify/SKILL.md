@@ -26,6 +26,7 @@ structured escalation protocol for goals with empty checks.
 
 - `goal`: The executed goal object (with verification field)
 - `result`: Execution result (from Phase 4)
+- `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
 
 ## Outputs (to orchestrator)
 
@@ -38,16 +39,16 @@ structured escalation protocol for goals with empty checks.
 if goal.hypothesis_id:
     if result == "CONFIRMED" or result == "CORRECTED":
         if not goal.recurring:
-            Bash: aspirations-update-goal.sh <goal-id> status completed
-        Bash: aspirations-update-goal.sh <goal-id> completed_date <today>
-        Bash: aspirations-update-goal.sh <goal-id> achievedCount <N+1>
+            Bash: aspirations-update-goal.sh --source {source} <goal-id> status completed
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
         Update recurring streaks if applicable (see Recurring Streak Logic below)
         Unblock dependent goals
     elif result == "EXPIRED":
-        Bash: aspirations-update-goal.sh <goal-id> status expired
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> status expired
     else:
         # PENDING — hypothesis hasn't resolved yet
-        Bash: aspirations-update-goal.sh <goal-id> status pending
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> status pending
 ```
 
 ## Unified Verification Checks
@@ -87,9 +88,9 @@ IF len(checks) > 0:
 ```
 if all_passed:
     if not goal.recurring:
-        Bash: aspirations-update-goal.sh <goal-id> status completed
-    Bash: aspirations-update-goal.sh <goal-id> completed_date <today>
-    Bash: aspirations-update-goal.sh <goal-id> achievedCount <N+1>
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> status completed
+    Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
+    Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
     Update recurring streaks if applicable
     Unblock dependent goals
 ```
@@ -97,7 +98,7 @@ if all_passed:
 ### On Fail
 
 ```
-Bash: aspirations-update-goal.sh <goal-id> status pending  # retry next cycle
+Bash: aspirations-update-goal.sh --source {source} <goal-id> status pending  # retry next cycle
 log "Goal executed but verification check failed"
 ```
 
@@ -109,18 +110,18 @@ Goal-selector time gate prevents re-selection until `interval_hours` elapses.
 ```
 interval = goal.interval_hours (fallback: remind_days * 24, default: 24)
 elapsed = hours_since(goal.lastAchievedAt)
-Bash: aspirations-update-goal.sh <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"
+Bash: aspirations-update-goal.sh --source {source} <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"
 
 if elapsed is not None and elapsed > 2 * interval:
     new_streak = 1  # Missed interval — reset
 else:
     new_streak = currentStreak + 1
-Bash: aspirations-update-goal.sh <goal-id> currentStreak <new_streak>
-Bash: aspirations-update-goal.sh <goal-id> longestStreak <max(new_streak, longestStreak)>
+Bash: aspirations-update-goal.sh --source {source} <goal-id> currentStreak <new_streak>
+Bash: aspirations-update-goal.sh --source {source} <goal-id> longestStreak <max(new_streak, longestStreak)>
 ```
 
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 5)
-- **Calls**: `aspirations-update-goal.sh`
+- **Calls**: `aspirations-update-goal.sh --source {source}`
 - **Reads**: Goal verification field, hypothesis result

@@ -25,6 +25,10 @@ They are uniquely dangerous because they prevent work.
 - `curl -sf` returns empty = "service not running" (silent 404 ≠ connection refused)
 - SSH connection refused = "server is down" (could be stale host key)
 - "I tried and it didn't work" without trying an alternative approach
+- One tree search = "it's not built" (search multiple queries, categories, and data stores)
 
 **Detail:** `core/config/conventions/negative-conclusions.md` for enforcement points,
 verification tiers, and silent failure catalog.
+
+**Knowledge-specific:** `core/config/conventions/exhaustive-search-before-negation.md`
+for the exhaustive knowledge search protocol before concluding something doesn't exist.

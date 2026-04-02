@@ -88,7 +88,6 @@ if all slots null:
 # Phase -0.5: Session Marker + Recovery Counter Reset
 Bash: `session-signal-set.sh loop-active`
 Bash: `session-counter-clear.sh`
-Bash: `cp <agent>/session/latest-session-id <agent>/session/running-session-id 2>/dev/null || true`
 goals_completed_this_session = 0
 productive_goals_this_session = 0
 evolutions_this_session = 0
@@ -147,7 +146,7 @@ FOREVER:
 
     # ── GOAL SELECTION (Phases 2-2.9) ──
     invoke /aspirations-select
-    # Returns: goal, effort_level, batch_mode, batch, ranked_goals, prefetch_goals, selection_context, selection_reason
+    # Returns: goal, effort_level, batch_mode, batch, ranked_goals, prefetch_goals, selection_context, selection_reason, source
 
     if goal is None AND selection_reason starts with "all_blocked":
         # ── ALL-BLOCKED PATH ("deep while blocked") ──
@@ -242,8 +241,8 @@ FOREVER:
         if goal.status == "decomposed": continue  # re-select from sub-goals
 
     # ── EXECUTE (Phase 4) ──
-    Bash: aspirations-update-goal.sh <goal-id> status in-progress
-    Bash: aspirations-update-goal.sh <goal-id> started <today>
+    Bash: aspirations-update-goal.sh --source {source} <goal-id> status in-progress
+    Bash: aspirations-update-goal.sh --source {source} <goal-id> started <today>
     echo "Working on: ${goal.title}" | Bash: board-post.sh --channel coordination
     # Load the execute protocol DIGEST (~170 lines) — NOT the full 883-line skill.
     # The digest contains the complete execution protocol. Follow it inline.
@@ -284,22 +283,22 @@ FOREVER:
         productive_goals_this_session += 1
 
     # ── VERIFY (Phase 5) ── ← OBLIGATION (literal Skill() tool call — not inline)
-    Skill(aspirations-verify) with: goal, result
+    Skill(aspirations-verify) with: goal, result, source
 
     # ── SPARK (Phase 6) ── (literal Skill() tool call for non-routine outcomes)
     IF outcome_class in ("standard", "deep"):
-        Skill(aspirations-spark) with: goal, result, effort_level, outcome_class
+        Skill(aspirations-spark) with: goal, result, effort_level, outcome_class, source
 
     # ── COMPLETION REVIEW (Phase 7-7.6) ──
     asp = get_aspiration(goal)
     has_recurring = any(g.get("recurring", False) for g in asp.goals)
     if not has_recurring and aspiration_fully_complete(asp):
-        invoke /aspirations-complete-review with: asp, goal
+        invoke /aspirations-complete-review with: asp, goal, source
     # NOTE: aspirations with ANY recurring goals skip completion review — they are perpetual.
     # The data layer (aspirations-complete.sh) also blocks archival of such aspirations.
 
     # ── STATE UPDATE (Phase 8) ── ← OBLIGATION (literal Skill() tool call — not inline)
-    Skill(aspirations-state-update) with: goal, result, session_count, outcome_class
+    Skill(aspirations-state-update) with: goal, result, session_count, outcome_class, source
 
     # ── Encoding drift tracking (Phase 8.0.5) ──
     # Track whether Step 8 wrote to the tree. step_8_wrote_insight is set by
@@ -322,7 +321,7 @@ FOREVER:
     # Phase 8.1: Session touch tracking
     IF asp.id not in aspirations_touched_this_session:
         aspirations_touched_this_session.add(asp.id)
-        Increment asp.sessions_active via aspirations-update.sh
+        Increment asp.sessions_active via aspirations-update.sh (use --source {source})
 
     # ── EVOLUTION (Phase 9) ──
     # Part A: Cadence/lifecycle triggers (every iteration)
@@ -345,7 +344,7 @@ FOREVER:
 
     # ── LEARNING GATE (Phase 9.5-9.8) ── ← OBLIGATION (literal Skill() tool call — not inline)
     goals_completed_this_session += 1
-    Skill(aspirations-learning-gate) with: goal, outcome_class, goals_completed_this_session, productive_goals_this_session, batch_mode, prefetch_goals, session_signals.goals_since_last_tree_update
+    Skill(aspirations-learning-gate) with: goal, outcome_class, goals_completed_this_session, productive_goals_this_session, batch_mode, prefetch_goals, session_signals.goals_since_last_tree_update, source
 
     # ── STOP CHECK (Phase 10) ──
     Bash: `session-state-get.sh`

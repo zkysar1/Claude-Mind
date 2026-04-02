@@ -5,10 +5,11 @@ Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorith
 The LLM no longer computes scores — this script handles the arithmetic.
 The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
 
-Scoring criteria (12 deterministic + 1 stochastic weighted factors):
+Scoring criteria (13 deterministic + 1 stochastic weighted factors):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
   + variety_bonus × 0.7 + streak_momentum × 0.5 + novelty_bonus × 0.6
-  + recurring_urgency × 0.8 + reward_history × 0.5 + evidence_backing × 0.7
+  + recurring_urgency × 0.8 + recurring_saturation × 0.8
+  + reward_history × 0.5 + evidence_backing × 0.7
   + deferred_readiness × 0.6 + context_coherence × 1.0 + skill_affinity × 0.4
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
@@ -16,7 +17,8 @@ Scoring criteria (12 deterministic + 1 stochastic weighted factors):
     +1.0 if same category (tight zone), 0 otherwise.
     Reads context budget from <agent>/session/context-budget.json (written by status line).
 
-  recurring_urgency: 2.0 base when due + overdue_ratio, capped at 5.0
+  recurring_urgency: 1.5 base when due + overdue_ratio, capped at 5.0
+  recurring_saturation: -(ratio * 4.0) penalty when recurring goals dominate recent selections
   deferred_readiness: +1.5 when a deferred goal's time has arrived
   exploration_noise: random(0,1) scaled by developmental epsilon.
     At exploring stage (~0.85 epsilon): noise can reorder rankings.
@@ -49,7 +51,7 @@ PIPELINE_ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
 # Per-agent aspiration queue
 AGENT_ASP_PATH = AGENT_DIR / "aspirations.jsonl" if AGENT_DIR else None
 
-# Agent identity (for claim checking)
+# Agent identity (used for claim checking AND participant-based goal routing)
 AGENT_NAME = AGENT_DIR.name if AGENT_DIR else ""
 
 # Meta-strategies (meta/)
@@ -94,6 +96,28 @@ def _ensure_list(val, default=None):
     if isinstance(val, str):
         return [val]
     return default if default is not None else []
+
+
+def _is_agent_eligible(participants, agent_name):
+    """Check if current agent can execute a goal based on participants.
+
+    - ["agent"]: any agent (backward compatible wildcard)
+    - ["user"]: not eligible
+    - ["alpha"]: only alpha
+    - ["alpha", "user"]: alpha + user collaborative
+    - Empty/default: treated as ["agent"]
+    """
+    if not participants:
+        return True
+    if participants == ["user"]:
+        return False
+    if "agent" in participants:
+        return True
+    if agent_name and agent_name in participants:
+        return True
+    # Only specific agent names remain, and we're not one of them
+    non_user = [p for p in participants if p != "user"]
+    return not non_user  # True only if nothing but "user" entries
 
 
 # ---------------------------------------------------------------------------
@@ -316,8 +340,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
                 except (ValueError, TypeError):
                     pass  # Corrupt value — fail open
 
-            # User-only skip
-            if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
+            # Agent eligibility check (filters user-only AND other-agent goals)
+            if not _is_agent_eligible(_ensure_list(goal.get("participants"), ["agent"]), AGENT_NAME):
                 continue
 
             results.append({"goal": goal, "aspiration": asp, "source": source})
@@ -369,8 +393,8 @@ def collect_blocked(aspirations, known_blockers=None):
             if status in ("completed", "skipped", "expired", "decomposed", "in-progress"):
                 continue
 
-            # Skip user-only goals (shown in Phase 3 of open-questions)
-            if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
+            # Skip ineligible goals (user-only or other-agent)
+            if not _is_agent_eligible(_ensure_list(goal.get("participants"), ["agent"]), AGENT_NAME):
                 continue
 
             entry = {
@@ -517,8 +541,11 @@ def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited
             reason = blocker_by_skill[goal_skill].get("reason", "unknown")
             return (goal_id, "INFRA: {r}".format(r=reason))
 
-        if _ensure_list(goal.get("participants"), ["agent"]) == ["user"]:
-            return (goal_id, "NEEDS USER")
+        participants = _ensure_list(goal.get("participants"), ["agent"])
+        if not _is_agent_eligible(participants, AGENT_NAME):
+            if participants == ["user"]:
+                return (goal_id, "NEEDS USER")
+            return (goal_id, "OTHER AGENT ({})".format(", ".join(p for p in participants if p != "user")))
 
         return (goal_id, "READY")
 
@@ -626,15 +653,16 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         2 if remaining is not None and remaining <= 3 else
         1 if remaining is not None and remaining <= 7 else 0)
 
-    # 3. agent_executable (+2 if agent in participants)
-    raw["agent_executable"] = 2 if "agent" in _ensure_list(goal.get("participants"), ["agent"]) else 0
+    # 3. agent_executable (+2 if current agent is eligible)
+    participants = _ensure_list(goal.get("participants"), ["agent"])
+    raw["agent_executable"] = 2 if _is_agent_eligible(participants, AGENT_NAME) else 0
 
     # 4. variety_bonus (+1.5 if different aspiration than last touched)
     touched = wm.get("aspiration_touched_last", "")
     raw["variety_bonus"] = 1.5 if asp.get("id") != touched else 0
 
     # 5. streak_momentum (+0.5 if same aspiration had a goal completed this session)
-    # Each entry written by aspirations-state-update Step 3: {"goal_id", "aspiration_id", "_item_ts"}
+    # Each entry written by aspirations-state-update Step 3: {"goal_id", "aspiration_id", "recurring", "_item_ts"}
     asp_id = asp.get("id", "")
     raw["streak_momentum"] = (
         0.5 if any(s.get("aspiration_id") == asp_id for s in session_completions) else 0)
@@ -642,20 +670,34 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 6. novelty_bonus (+1.0 if never done before)
     raw["novelty_bonus"] = 1.0 if goal.get("achievedCount", 0) == 0 else 0
 
-    # 7. recurring_urgency (2.0 base when due + overdue ratio, capped at 5.0)
+    # 7. recurring_urgency (1.5 base when due + overdue ratio, capped at 5.0)
     rec = 0
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
         la = hours_since(goal.get("lastAchievedAt"))
         if la is None or (la >= interval and interval > 0):
-            # 2.0 base = "this goal is due now" signal
+            # 1.5 base = "this goal is due now" signal
             # + linear overdue growth
             # Cap at 5.0 prevents indefinite starvation of domain work
             overdue_ratio = 0.0
             if la is not None and interval > 0:
                 overdue_ratio = (la - interval) / interval
-            rec = min(2.0 + overdue_ratio, 5.0)
+            rec = min(1.5 + overdue_ratio, 5.0)
     raw["recurring_urgency"] = rec
+
+    # 7b. recurring_saturation (penalty when recurring goals dominate recent selections)
+    # Uses goals_completed_this_session from working memory. Each entry has an optional
+    # "recurring" flag (defaults to False for backward compat with older entries).
+    # Penalty scales from 0 (no saturation) to -4.0 (all recent completions were recurring).
+    # Truly overdue recurring goals overcome this via high recurring_urgency.
+    rec_sat = 0.0
+    if goal.get("recurring") and session_completions:
+        window = 4
+        recent = session_completions[-window:]
+        recurring_count = sum(1 for s in recent if s.get("recurring", False))
+        ratio = recurring_count / len(recent)
+        rec_sat = -(ratio * 4.0)
+    raw["recurring_saturation"] = rec_sat
 
     # 8. reward_history (+1.0 if previous goals in this aspiration had high success)
     completed = sum(1 for g in asp.get("goals", []) if g.get("status") == "completed")

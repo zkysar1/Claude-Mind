@@ -52,7 +52,7 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
          # Route using same logic as sq-013 handler step 2
          Determine target aspiration (current → other active → /create-aspiration)
          Build goal object with discovery_type: "micro_batch"
-         Add goal to target aspiration via aspirations-update.sh
+         Add goal to target aspiration via aspirations-update.sh --source {asp.source}
          Log: evolution-log-append.sh with event "micro-batch-discovery"
 
 0.5. Unreflected Hypothesis Sweep:

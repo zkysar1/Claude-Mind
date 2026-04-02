@@ -70,6 +70,7 @@ Two script families — world (default) and agent — operate on separate queues
 | `agent-aspirations-add-goal.sh <asp-id>` | Validate + append goal to agent aspiration | JSON |
 | `agent-aspirations-complete.sh <asp-id>` | Mark agent aspiration completed + archive | — |
 | `agent-aspirations-retire.sh <asp-id>` | Mark agent aspiration retired + archive | — |
+| `agent-aspirations-meta-update.sh <field> <value>` | Update agent aspirations metadata field | — |
 | `agent-aspirations-archive.sh` | Sweep completed/retired agent aspirations to archive | — |
 
 Scripts validate JSON schema before writing. On validation failure: exit non-zero with error.
@@ -79,6 +80,24 @@ Scripts validate JSON schema before writing. On validation failure: exit non-zer
 Both script families delegate to `aspirations.py` with a `--source {world|agent}` flag.
 Agent wrappers pass `--source agent`; world wrappers use the default (`world`).
 Goal-selector reads from BOTH queues and tags candidates with `source: "world"` or `source: "agent"`.
+
+### Source Routing Protocol
+
+When `goal-selector.sh` selects a goal, its output includes `"source": "world"` or
+`"source": "agent"`. This field tells downstream skills which queue the goal belongs to.
+
+**Rules:**
+1. **Propagate source to all script calls**: Append `--source {source}` to every
+   `aspirations-*.sh` call when operating on the selected goal's aspiration.
+   When source is `"world"` (default), `--source` may be omitted.
+2. **Same-queue for child operations**: Goals spawned during execution (blocker-unblock,
+   investigation, idea) go to the same queue as the parent aspiration.
+3. **Compact data includes source**: `load-aspirations-compact.sh` returns data from
+   both queues. Each entry has a `"source"` field. Use the aspiration variable's
+   `.source` field for routing (e.g., `{asp.source}`, `{target_asp.source}` — match
+   whatever variable name is in scope, not a hardcoded `asp`).
+4. **Cross-queue exception**: Creating a goal in a different queue than the parent is
+   valid but must use the explicit target script (no `--source` passthrough).
 
 ## Archival Rules
 - Completed/retired aspirations move from live → archive via `aspirations-complete.sh`, `aspirations-retire.sh`, or `aspirations-archive.sh`

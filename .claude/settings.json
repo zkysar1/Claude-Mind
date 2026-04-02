@@ -13,14 +13,10 @@
       "Bash(git rebase*)",
       "Bash(git cherry-pick*)",
       "Bash(git clean*)",
-
       "Edit(*/.claude/settings*)",
       "Write(*/.claude/settings*)",
-
       "AskUserQuestion(*)",
-
       "Read(*/.env.local)",
-
       "Edit(*/.claude/skills/aspirations/*)",
       "Write(*/.claude/skills/aspirations/*)",
       "Edit(*/.claude/skills/aspirations-consolidate/*)",
@@ -109,15 +105,12 @@
       "Write(*/core/scripts/*)",
       "Edit(*/CLAUDE.md)",
       "Write(*/CLAUDE.md)",
-
       "Edit(*/world/knowledge/tree/_tree.yaml)",
       "Write(*/world/knowledge/tree/_tree.yaml)",
       "Edit(*/world/*.jsonl)",
       "Write(*/world/*.jsonl)",
-
       "Edit(*/meta/*.jsonl)",
       "Write(*/meta/*.jsonl)",
-
       "Write(*/session/agent-state)",
       "Edit(*/session/agent-state)",
       "Write(*/session/persona-active)",
@@ -149,6 +142,11 @@
             "type": "command",
             "command": "bash core/scripts/context-reads-skill-gate.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/utilization-gate.sh",
+            "timeout": 10
           }
         ]
       }
@@ -235,12 +233,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/capture-insights.sh",
-            "timeout": 3
-          },
+            "command": "bash core/scripts/stop-hook.sh",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/stop-hook.sh",
+            "command": "bash core/scripts/stop-failure-hook.sh",
             "timeout": 5
           }
         ]

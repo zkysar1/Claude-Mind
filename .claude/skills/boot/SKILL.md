@@ -37,6 +37,19 @@ IF output is "RUNNING" → PROCEED.
 
 This gate means boot can ONLY run when /start has set agent-state to RUNNING.
 
+## Phase -2.5: Crash Recovery Detection
+
+Check for crash marker left by StopFailure hook (context exhaustion in previous session):
+
+```
+IF file exists <agent>/session/crash-marker:
+  Read content (format: "<timestamp> context_exhaustion sid=<session-id>")
+  Log: "⚠ Previous session ended abnormally — context exhaustion detected"
+  Log the crash-marker content for diagnostics
+  Delete <agent>/session/crash-marker
+  Bash: session-counter-clear.sh   (may be stale from the crashed session)
+```
+
 ## Phase -2: State Initialization (First Boot)
 
 Run the deterministic init scripts. They create world/ (collective state), <agent>/ (per-agent state),
@@ -59,12 +72,14 @@ Remove non-framework files from `<agent>/session/` left by previous goal executi
 
 ```
 WHITELISTED = [
-  "agent-state", "persona-active", "loop-active", "stop-loop", "stop-block-count",
+  "agent-state", "agent-mode", "persona-active", "loop-active", "stop-loop", "stop-block-count",
   "working-memory.yaml", "handoff.yaml",
   "pending-questions.yaml", "overflow-queue.yaml",
   "last-report-timestamp",
   "compact-checkpoint.yaml",
-  "pending-agents.yaml"
+  "pending-agents.yaml",
+  "running-session-id",
+  "crash-marker"
 ]
 
 For each file in <agent>/session/:
@@ -206,7 +221,6 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
     5. Delete handoff.yaml (consumed)
     6. Bash: `session-signal-clear.sh loop-active` (cleanup from previous cycle)
     6b. Bash: `session-counter-clear.sh` (stale counter cleanup)
-    6c. Bash: `rm -f <agent>/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
     6d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     7. Output abbreviated status:
        "## Auto-Continuation from Session {N}
@@ -229,7 +243,6 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
 IF <agent>/session/handoff.yaml NOT EXISTS (user-initiated):
     1. Bash: `session-signal-clear.sh loop-active` (cleanup from crashed session)
     1b. Bash: `session-counter-clear.sh` (stale counter cleanup)
-    1c. Bash: `rm -f <agent>/session/running-session-id` (stale runner cleanup — Phase -0.5 will set fresh)
     1d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     2. Proceed with full boot (Steps 1.5 through 12)
 ```

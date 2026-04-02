@@ -131,21 +131,30 @@ IF meta_insight_detected:
 
 Verify retrieval happened and utilization feedback completed.
 
-```
-Bash: wm-read.sh active_context.retrieval_manifest --json
+**NOTE: The `utilization-gate.sh` PreToolUse hook (Layer 3 programmatic enforcement)
+handles the critical path — it auto-applies all-noise feedback before state-update
+if Phase 4.26 was skipped. This gate is now a secondary check for escalation quality
+and retroactive retrieval when retrieval itself was skipped entirely.**
 
-IF retrieval_manifest missing AND goal.category maps to existing tree nodes:
-    # RETRIEVAL WAS SKIPPED — perform it NOW
+```
+# Check session file first (primary source), fall back to WM manifest (legacy)
+SESSION_FILE="<agent>/session/retrieval-session.json"
+IF session file exists:
+    IF utilization_pending == true:
+        # Hook should have caught this — run feedback as safety net
+        Bash: utilization-feedback.sh --goal {goal.id} --all-noise
+        Output: "▸ RETRIEVAL GATE: forced utilization feedback for {goal.id}"
+    # else: already processed by Phase 4.26 or hook — pass
+
+ELIF goal.category maps to existing tree nodes:
+    # RETRIEVAL WAS SKIPPED ENTIRELY — no session file written
     Bash: load-execute-protocol.sh → IF path returned: Read it
     Follow retrieval steps, then run Phase 4.26 utilization feedback
     Output: "▸ RETRIEVAL GATE: forced retroactive retrieval for {goal.id}"
 
-ELIF retrieval_manifest exists AND retrieval_manifest.utilization_pending == true:
-    # Phase 4.26 was interrupted — run it NOW
-    Run utilization feedback using retrieval_manifest
-    Output: "▸ RETRIEVAL GATE: forced utilization feedback for {goal.id}"
-
 # Escalation quality check (per retrieval-escalation convention)
+# Read WM manifest for enrichment data if available
+Bash: wm-read.sh active_context.retrieval_manifest --json
 IF retrieval_manifest exists AND retrieval_manifest.sufficient == false:
     max_tier = max(retrieval_manifest.tiers_used or [1])
     IF max_tier == 1 AND goal relates to codebase work:
@@ -157,6 +166,37 @@ IF retrieval_manifest exists AND retrieval_manifest.sufficient == false:
 # Escalation gaps are logged as learning signals for reflection, not hard blockers.
 
 # If goal genuinely has no matching tree nodes: pass silently.
+```
+
+## Phase 9.5-exp: Experience Archival Gate (MANDATORY for standard/deep outcomes)
+
+Verify Phase 4.25 experience archival completed for non-routine outcomes.
+
+```
+IF outcome_class in ("standard", "deep"):
+    Bash: wm-read.sh active_context.experience_refs --json
+    IF experience_refs is empty, missing, or null:
+        Output: "▸ EXPERIENCE GATE CATCH: Phase 4.25 skipped for {goal.id} — writing recovery record"
+        experience_id = "exp-{goal.id}-recovery"
+        Write <agent>/experience/{experience_id}.md with:
+            - Goal: {goal.title}
+            - Outcome: {outcome_summary}
+            - Note: Recovery record — Phase 4.25 was skipped during execution.
+              Full reasoning trace not available.
+        echo '<experience-json>' | bash core/scripts/experience-add.sh
+        Experience JSON:
+            id: "{experience_id}"
+            type: "goal_execution"
+            created: "{ISO timestamp}"
+            category: "{goal.category}"
+            summary: "Recovery: {goal.title} — {outcome_summary}"
+            goal_id: "{goal.id}"
+            tree_nodes_related: []
+            verbatim_anchors: []
+            content_path: "<agent>/experience/{experience_id}.md"
+        Output: "▸ EXPERIENCE GATE: recovery record written"
+    ELSE:
+        Log: "▸ Experience gate: PASS"
 ```
 
 ## Phase 9.5c: Unreflected Hypothesis Check (MANDATORY for all outcomes)
@@ -269,5 +309,5 @@ IF prefetch_goals had agents dispatched:
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 9.5-9.8, every iteration)
-- **Calls**: `wm-read.sh`, `wm-append.sh`, `meta-log-append.sh`, `pipeline-add.sh`, `pipeline-read.sh`, `load-execute-protocol.sh`, `/review-hypotheses --learn` (Phase 9.5c)
+- **Calls**: `wm-read.sh`, `wm-append.sh`, `meta-log-append.sh`, `pipeline-add.sh`, `pipeline-read.sh`, `load-execute-protocol.sh`, `experience-add.sh` (Phase 9.5-exp), `/review-hypotheses --learn` (Phase 9.5c)
 - **Reads**: Working memory, retrieval manifest, conclusions

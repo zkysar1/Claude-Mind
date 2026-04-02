@@ -9,8 +9,8 @@
 ```bash
 # Paths to external world and meta directories
 # Written by /start — edit manually to change locations
-WORLD_PATH=C:/Users/Shared/ayoai/world
-META_PATH=C:/Users/Shared/ayoai/meta
+WORLD_PATH=C:/Users/Shared/my-project/world
+META_PATH=C:/Users/Shared/my-project/meta
 ```
 
 - Location: inside each agent's directory (gitignored via `*/local-paths.conf`)
@@ -89,7 +89,7 @@ project-root/
 ## Shared Location Structure
 
 ```
-/shared/ayoai/
+/shared/my-project/
   world/              — Collective domain knowledge
     knowledge/tree/   — Browseable by office workers
     board/            — Message board channels
@@ -110,7 +110,7 @@ Forged skills in `.claude/skills/` are the one exception — check `<agent>/forg
 ## Path Format
 
 Use **forward slashes** on all platforms:
-- Good: `C:/Users/Shared/ayoai/world`
-- Bad: `C:\Users\Shared\ayoai\world` (backslashes are escape sequences when bash sources the file)
+- Good: `C:/Users/Shared/my-project/world`
+- Bad: `C:\Users\Shared\my-project\world` (backslashes are escape sequences when bash sources the file)
 
 Python handles both slash styles, but bash does not. Forward slashes work everywhere.

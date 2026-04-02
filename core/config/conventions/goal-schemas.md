@@ -125,3 +125,27 @@ To defer indefinitely (until condition resolves): `aspirations-update-goal.sh <g
 To un-defer: `aspirations-update-goal.sh <goal-id> defer_reason null`.
 
 Compatible with all goal types including recurring. A recurring goal with `deferred_until` delays only its first execution; subsequent cycles use `interval_hours` normally.
+
+---
+
+# Participant-Based Goal Routing
+
+Goals use the `participants` field to control which agents and users can execute them.
+The goal-selector filters candidates based on the current agent's identity (`AGENT_NAME`).
+
+**Values:**
+- `[agent]` — any agent can execute (default, backward compatible wildcard)
+- `[user]` — requires user action (agent skips entirely)
+- `[agent, user]` — collaborative, any agent + user
+- `["alpha"]` — only the agent named "alpha" can execute
+- `["bravo"]` — only "bravo" can execute
+- `["alpha", "bravo"]` — either alpha or bravo (explicit multi-agent)
+- `["alpha", "user"]` — alpha + user collaborative
+
+**Rule**: `"agent"` is the wildcard — it matches any agent. Specific agent names are restrictive.
+If a goal's participants contain specific names but NOT `"agent"`, only named agents see it.
+
+**Goal-selector behavior**:
+- COLLECT phase: ineligible goals are filtered out (never scored)
+- SCORE phase: eligible goals get `agent_executable: +2` (weight 0.8 → +1.6 effective)
+- Bottleneck trace: ineligible goals report `"OTHER AGENT (alpha)"` or `"NEEDS USER"`
