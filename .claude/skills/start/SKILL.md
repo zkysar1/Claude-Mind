@@ -72,7 +72,7 @@ DONE. No state changes. No-op.
    Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID"`
 
    Reads SID from `.latest-session-id` (written by SessionStart hook — the ONE bridge from hooks to LLM).
-   Writes the session-keyed binding file (used by hooks to resolve agent from session ID).
+   Writes the session-keyed binding file. `.latest-session-id` is consumed later in the mode-specific step.
 
    **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
    Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This is the ONLY mechanism for
@@ -89,19 +89,21 @@ DONE. No state changes. No-op.
 
    **Reader mode:**
    - Set persona: Bash: `session-persona-set.sh true`
+   - Bash: `rm -f .latest-session-id`
    - Invoke `/prime` (with `--read-only` context — reader mode)
    - Load mode instructions: Read `core/config/modes/reader.md`
    - Output: "Reader mode active. I have access to all accumulated knowledge. Ask me anything."
 
    **Assistant mode:**
    - Set persona: Bash: `session-persona-set.sh true`
+   - Bash: `rm -f .latest-session-id`
    - Invoke `/prime`
    - Load mode instructions: Read `core/config/modes/assistant.md`
    - Output: "Assistant mode active. I can learn when you teach me — give me directives like 'learn about X' or 'remember that Y'."
 
    **Autonomous mode:**
    - Bash: `session-state-set.sh RUNNING`
-   - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
+   - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id && rm -f .latest-session-id`
    - Bash: `session-signal-clear.sh stop-loop`
    - Output: "Agent resumed. Learning loop starting."
    - Invoke `/boot`
@@ -504,7 +506,7 @@ C7. Write `<agent>/self.md` with parsed Self (where `<agent>` is the active agen
 C8. Set mode and state:
     - Bash: `session-mode-set.sh autonomous`
     - Bash: `session-state-set.sh RUNNING`
-    - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
+    - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id && rm -f .latest-session-id`
     - Bash: `session-signal-clear.sh stop-loop`
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.
