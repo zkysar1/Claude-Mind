@@ -78,18 +78,18 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # Session binding evidence checks (Section SB)
    Bash: echo $AYOAI_AGENT → verify matches the agent directory name (LLM prefix contract)
    Check: `.gitignore` contains `.active-agent-*` pattern
-   Check: No `.latest-session-id` file exists (eliminated — broke concurrent sessions)
+   Check: `.latest-session-id` exists in project root (written by SessionStart, read ONLY by /start)
    Check: No `.active-agent` global file exists (eliminated — one mechanism only)
 
    # Autocompact carry-forward evidence checks (Section SB continued)
    # stop-hook.sh writes .compact-agent breadcrumb, session-save-id.sh reads it.
    Check: `stop-hook.sh` writes `.compact-agent` before blocking (breadcrumb for SessionStart)
    Check: `session-save-id.sh` reads `.compact-agent` and creates `.active-agent-$SID` from it
-   Check: `session-save-id.sh` does NOT read/write `.latest-session-id`
+   Check: `session-save-id.sh` WRITES `.latest-session-id` (the one bridge from hook SID to LLM)
 
    # Agent resolution checks (Section SE)
    # One mechanism: AYOAI_AGENT env var. Hooks resolve from .active-agent-$SID.
-   Check: `_paths.sh` does NOT read `.latest-session-id`
+   Check: `_paths.sh` does NOT read `.latest-session-id` (only /start reads it)
    Check: `_paths.py` does NOT read `.latest-session-id`
    Check: `start/SKILL.md` includes LLM prefix contract instruction (AYOAI_AGENT=<name>)
    Check: Stop hook recovery message includes agent name and AYOAI_AGENT prefix instruction

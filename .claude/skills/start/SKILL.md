@@ -69,8 +69,9 @@ DONE. No state changes. No-op.
 
 0. **Rebind Agent to Session**
 
-   Bash: `echo "<agent-name>" > ".active-agent-$(cat .claude/settings.local.json 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo unknown)"`
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID"`
 
+   Reads SID from `.latest-session-id` (written by SessionStart hook — the ONE bridge from hooks to LLM).
    Writes the session-keyed binding file (used by hooks to resolve agent from session ID).
 
    **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
@@ -100,7 +101,7 @@ DONE. No state changes. No-op.
 
    **Autonomous mode:**
    - Bash: `session-state-set.sh RUNNING`
-   - Bash: `echo "$AYOAI_SESSION_ID" > <agent>/session/running-session-id`
+   - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
    - Bash: `session-signal-clear.sh stop-loop`
    - Output: "Agent resumed. Learning loop starting."
    - Invoke `/boot`
@@ -118,7 +119,7 @@ A1. Validate the agent name (from the `/start <name>` argument):
 
 A2. **Bind Agent to Session**
 
-   Bash: `echo "<agent-name>" > ".active-agent-$(cat <agent-name>/session/latest-session-id 2>/dev/null || echo unknown)"`
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID"`
 
    The session-keyed file (`.active-agent-<SID>`) is used by hooks to resolve
    which agent a session belongs to. One file per session, no shared global file.
@@ -146,8 +147,8 @@ B1. Ask for the **world directory** path:
    - An existing world directory (I'll connect to it)
 
    Examples:
-   - C:/Users/Shared/my-project/world
-   - /mnt/nas/projects/my-project/world
+   - C:/Users/Shared/ayoai/world
+   - /mnt/nas/projects/ayoai/world
    - ./world  (local, relative to this repo)
 
    Where should the world directory be?
@@ -289,7 +290,7 @@ every agent.
 Examples:
 - "Build and ship the best project management tool in the market."
 - "Research and synthesize machine learning papers into actionable knowledge."
-- "Develop a robust home automation system with adaptive routines."
+- "Develop a multiplayer game with intelligent NPCs."
 
 What should The Program be? (Or say "skip" to leave it blank for now.)
 ```
@@ -503,7 +504,7 @@ C7. Write `<agent>/self.md` with parsed Self (where `<agent>` is the active agen
 C8. Set mode and state:
     - Bash: `session-mode-set.sh autonomous`
     - Bash: `session-state-set.sh RUNNING`
-    - Bash: `echo "$AYOAI_SESSION_ID" > <agent>/session/running-session-id`
+    - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
     - Bash: `session-signal-clear.sh stop-loop`
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.

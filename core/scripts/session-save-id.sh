@@ -4,7 +4,7 @@
 # 1. Resolves agent via .active-agent-$SID or .compact-agent breadcrumb
 # 2. Writes SID to <agent>/session/latest-session-id (+ syncs running-session-id)
 #
-# No shared .latest-session-id — each session resolves independently.
+# .latest-session-id is the bridge — written here, read ONLY by /start.
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
@@ -12,9 +12,12 @@ source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 [ -n "$SID" ] || exit 0
 
-# --- 1. No shared .latest-session-id (broken for concurrent sessions) ---
-# Each session resolves its agent via .active-agent-$SID or .compact-agent breadcrumb.
-OLD_SID=""
+# --- 1. Bridge hook SID to LLM ---
+# .latest-session-id is the ONLY shared file. Written here, read ONLY by /start.
+# /start reads it once to create per-agent session bindings, then everything
+# else uses those per-agent files. The concurrent race window is seconds
+# (between session open and user typing /start) — acceptable.
+echo "$SID" > "$PROJECT_ROOT/.latest-session-id"
 
 # --- Breadcrumb from stop hook (authoritative for autocompact) ---
 # The stop hook resolves the correct agent from .active-agent-$OLD_SID and writes
