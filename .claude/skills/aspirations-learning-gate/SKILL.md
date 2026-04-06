@@ -25,7 +25,7 @@ and the agent drifts into "busy but not learning" mode.
 ## Inputs (from orchestrator)
 
 - `goal`: The executed goal
-- `outcome_class`: "routine", "standard", or "deep"
+- `outcome_class`: "routine" or "deep"
 - `goals_completed_this_session`: Running counter (all goals)
 - `productive_goals_this_session`: Running counter (productive outcomes only)
 - `batch_mode`: Boolean (was this a batched execution?)
@@ -41,44 +41,11 @@ and the agent drifts into "busy but not learning" mode.
 
 **For routine outcomes**: Explicit bypass — no tree encoding needed.
 
-**For standard/deep outcomes**: The loop MUST NOT continue without confirming learning occurred.
+**For deep outcomes**: The loop MUST NOT continue without confirming learning occurred.
 
 ```
 IF outcome_class == "routine":
     Log: "▸ Learning gate: PASS — routine outcome, no encoding needed"
-
-ELIF outcome_class == "standard":
-    # Standard tier: tree write is DEFERRED. Verify encoding_queue was populated.
-    # Check 1: Was encoding_queue item added for this goal? (State Update Step 8 deferred path)
-    Bash: wm-read.sh encoding_queue --json
-    last_eq_item = encoding_queue[-1] if encoding_queue else null
-    IF last_eq_item AND last_eq_item.source_goal == goal.id:
-        Log: "▸ Learning gate: PASS — encoding queued for consolidation (standard tier)"
-    ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
-        Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
-    ELSE:
-        # ENCODING WAS MISSED — check sensory buffer before falling back
-        Bash: wm-read.sh sensory_buffer --json
-        related_items = [item for item in sensory_buffer
-                         if item.encoding_score >= 0.40
-                         AND (item.source_goal == goal.id OR item.category == goal.category)]
-        IF len(related_items) > 0:
-            Output: "▸ LEARNING GATE CATCH: found {len(related_items)} high-value buffer items — forcing inline encoding"
-            top = max(related_items, key=encoding_score)
-            node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or goal.category}" --leaf-only --top 1)
-            Read node.file → compress top.observation into "Key Insights" → Edit
-            Log: "▸ Learning gate: RECOVERED via buffer — inline encoding to {node.key}"
-        ELSE:
-            # Force inline recovery from execution context directly
-            Output: "▸ LEARNING GATE CATCH: encoding not queued for {goal.id} — forcing inline"
-            node=$(bash core/scripts/tree-find-node.sh --text "{goal.category}" --leaf-only --top 1)
-            # ... perform inline tree encoding as recovery ...
-            Log: "▸ Learning gate: RECOVERED — inline encoding completed for {goal.id}"
-
-    # Check 2: Was journal entry written? (State Update Step 7)
-    # Check 3: Was working memory updated with goal context?
-    Bash: wm-read.sh active_context --json
-    # Verify active_context reflects current goal execution.
 
 ELIF outcome_class == "deep":
     # Deep tier: tree write should have happened inline. Verify it did.
@@ -93,27 +60,34 @@ ELIF outcome_class == "deep":
 
     # ── HARDENED ESCAPE HATCH ─────────────────────────────────────────
     # "No tree encoding needed" requires STRUCTURAL justification, not self-assessment.
-    # Valid reasons: goal was blocked/skipped, goal produced <100 chars of output.
+    # Valid reasons: goal was blocked/skipped, goal produced <100 chars of output,
+    #   or encoding was coordination-deferred (queued to prevent multi-agent overwrite).
     # Invalid: "findings already known", "nothing new" (for investigation goals).
     IF tree_was_NOT_updated:
-        Bash: wm-read.sh sensory_buffer --json
-        related_items = [item for item in sensory_buffer
-                         if item.encoding_score >= 0.40
-                         AND (item.source_goal == goal.id OR item.category == goal.category)]
-        IF len(related_items) > 0:
-            Output: "▸ LEARNING GATE: rejected 'no insight' claim — {len(related_items)} high-value buffer items found for {goal.category}"
-            top = max(related_items, key=encoding_score)
-            node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or goal.category}" --leaf-only --top 1)
-            Read node.file
-            Compress top.observation into "Key Insights" section (1-3 sentences)
-            Edit node.file with updates
-            bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
-            Output: "▸ LEARNING GATE: forced encoding to {node.key}"
-        ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
-            Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
+        # Check if encoding was coordination-deferred (not a learning failure)
+        Bash: wm-read.sh encoding_queue --json
+        last_eq = encoding_queue[-1] if encoding_queue else null
+        IF last_eq AND last_eq.source_goal == goal.id AND last_eq.source_type == "coordination_deferred":
+            Log: "▸ Learning gate: PASS — encoding queued (coordination deferred to prevent overwrite)"
         ELSE:
-            Log: "▸ LEARNING GATE WARNING: no tree update despite substantive output — flagging as knowledge debt"
-            echo '{"node_key": "general", "reason": "deep_outcome_without_encoding", "source_goal": "'"${goal.id}"'", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
+            Bash: wm-read.sh sensory_buffer --json
+            related_items = [item for item in sensory_buffer
+                             if item.encoding_score >= 0.40
+                             AND (item.source_goal == goal.id OR item.category == goal.category)]
+            IF len(related_items) > 0:
+                Output: "▸ LEARNING GATE: rejected 'no insight' claim — {len(related_items)} high-value buffer items found for {goal.category}"
+                top = max(related_items, key=encoding_score)
+                node=$(bash core/scripts/tree-find-node.sh --text "{top.target_article or goal.category}" --leaf-only --top 1)
+                Read node.file
+                Compress top.observation into "Key Insights" section (1-3 sentences)
+                Edit node.file with updates
+                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                Output: "▸ LEARNING GATE: forced encoding to {node.key}"
+            ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
+                Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
+            ELSE:
+                Log: "▸ LEARNING GATE WARNING: no tree update despite substantive output — flagging as knowledge debt"
+                echo '{"node_key": "general", "reason": "deep_outcome_without_encoding", "source_goal": "'"${goal.id}"'", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
     # ── End hardened escape hatch ─────────────────────────────────────
 ```
 
@@ -168,12 +142,12 @@ IF retrieval_manifest exists AND retrieval_manifest.sufficient == false:
 # If goal genuinely has no matching tree nodes: pass silently.
 ```
 
-## Phase 9.5-exp: Experience Archival Gate (MANDATORY for standard/deep outcomes)
+## Phase 9.5-exp: Experience Archival Gate (MANDATORY for deep outcomes)
 
 Verify Phase 4.25 experience archival completed for non-routine outcomes.
 
 ```
-IF outcome_class in ("standard", "deep"):
+IF outcome_class == "deep":
     Bash: wm-read.sh active_context.experience_refs --json
     IF experience_refs is empty, missing, or null:
         Output: "▸ EXPERIENCE GATE CATCH: Phase 4.25 skipped for {goal.id} — writing recovery record"
@@ -256,6 +230,13 @@ IF goals_completed_this_session % 5 == 0:
             echo '{"node_key": "general", "reason": "encoding_drift_checkpoint", "source_goal": "periodic-5-goal", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
             Output: "▸ ENCODING DRIFT WARNING: no encodable items found — logged HIGH-priority knowledge debt"
 
+    # Q6: Tree growth check (are decompose candidates accumulating?)
+    Bash: tree-read.sh --decompose-candidates
+    IF candidates output is non-empty (at least 1 candidate):
+        Output: "▸ TREE GROWTH CHECK: {len(candidates)} nodes ready for decomposition"
+        Invoke /tree maintain
+        Log: "TREE GROWTH: triggered /tree maintain from learning gate ({len(candidates)} candidates)"
+
     # Q4 Conclusion Audit Detail:
     Bash: wm-read.sh conclusions --json
     FOR EACH conclusion:
@@ -306,8 +287,25 @@ IF prefetch_goals had agents dispatched:
     Bash: pending-agents.sh deregister-team --team "research-{session}"
 ```
 
+## Loop Re-Entry (MANDATORY — last action of this skill)
+
+After ALL gates and checks above are complete, this skill is the LAST phase of the
+iteration. It MUST end with LOOP_CONTINUE to re-enter the aspirations loop.
+
+```
+# LOOP_CONTINUE: save iteration state to WM, then re-invoke the loop.
+# This is the mechanical heartbeat — without this tool call, the session dies.
+echo '<loop_state as JSON>' | Bash: wm-set.sh loop_state
+Skill('aspirations') with args='loop'
+```
+
+NEVER end this skill with text output like "Returning to orchestrator."
+NEVER skip the Skill() call. The orchestrator does NOT continue after this skill — 
+control flows directly from here to the next iteration via LOOP_CONTINUE.
+
 ## Chaining
 
-- **Called by**: `/aspirations` orchestrator (Phase 9.5-9.8, every iteration)
+- **Called by**: `/aspirations` orchestrator (Phase 12, every iteration — last phase before loop re-entry)
 - **Calls**: `wm-read.sh`, `wm-append.sh`, `meta-log-append.sh`, `pipeline-add.sh`, `pipeline-read.sh`, `load-execute-protocol.sh`, `experience-add.sh` (Phase 9.5-exp), `/review-hypotheses --learn` (Phase 9.5c)
+- **Returns**: Does NOT return to orchestrator — calls LOOP_CONTINUE directly
 - **Reads**: Working memory, retrieval manifest, conclusions

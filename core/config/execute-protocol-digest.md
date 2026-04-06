@@ -91,16 +91,14 @@ ELSE:
 
 Execute primary goal: `result = invoke goal.skill with goal.args`
 
-## Outcome Classification (3-Tier)
+## Outcome Classification (Binary)
 
 ```
 outcome_class = "deep"  # default: immediate tree encoding
 IF goal.recurring AND goal_succeeded AND no actionable items/new info:
     outcome_class = "routine"
-ELIF goal.recurring AND goal_succeeded:
-    outcome_class = "standard"  # recurring with findings → deferred tree encoding
+# Everything else remains "deep" — learning is the mission.
 # Non-recurring, failed, or uncertain → always "deep"
-# Standard tier: ALL steps run, ALL sparks fire, but tree write deferred to consolidation
 ```
 
 ## Phase 4.0: SKIP Fast-Path
@@ -132,7 +130,7 @@ IF guardrail_found_issues OR (goal failed AND infrastructure):
         Bash: aspirations-update-goal.sh --source {source} <goal-id> status pending
         continue (skip Phases 4.25-9)
 
-IF guardrail_found_issues: outcome_class = "deep"  # override routine/standard
+IF guardrail_found_issues: outcome_class = "deep"  # override routine
 ```
 
 ## Phase 4.2: Domain Post-Execution Steps

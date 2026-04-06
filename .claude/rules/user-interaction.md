@@ -19,17 +19,16 @@ The following are restricted to specific callers:
 
 - `session-persona-set.sh false` — only /stop
 - `session-persona-set.sh true` — /start, /boot
-- `session-counter-increment.sh` — only the stop hook (not an LLM tool call)
-- `session-signal-set.sh stop-loop` — only /stop and /recover (existing rule, see stop-hook-compliance.md)
+- `session-signal-set.sh stop-loop` — only /stop (existing rule, see stop-hook-compliance.md)
 
 The agent retains full access to all **read-only** session scripts:
-`session-state-get.sh`, `session-mode-get.sh`, `session-persona-get.sh`, `session-signal-exists.sh`, `session-counter-get.sh`
+`session-state-get.sh`, `session-mode-get.sh`, `session-persona-get.sh`, `session-signal-exists.sh`
 
 And to these **write** scripts for legitimate loop operations:
-`session-signal-set.sh loop-active`, `session-signal-clear.sh *`, `session-counter-clear.sh`
+`session-signal-set.sh loop-active`, `session-signal-clear.sh *`
 
 Claude MUST NOT write to session state files directly (via Write, Edit, echo, cat, python, etc.):
-`agent-state`, `agent-mode`, `persona-active`, `stop-loop`, `stop-block-count`, `.active-agent-*`
+`agent-state`, `agent-mode`, `persona-active`, `stop-loop`, `.active-agent-*`
 
 ## Response Header (RUNNING state)
 

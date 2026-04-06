@@ -144,10 +144,37 @@ Pruning runs in Phase 11 of the aspirations loop via `Bash: wm-prune.sh`.
 
 ---
 
+## Proactive Persistence (Compaction Survival)
+
+During goal execution, important observations and reasoning should be written to disk
+proactively — not deferred until state update — so they survive autocompact:
+
+- **Sensory buffer**: Append significant observations via `wm-append.sh sensory_buffer`
+  AS THEY OCCUR during execution, not just at the end. This ensures observations are on
+  disk in the WM YAML file before autocompact fires. The existing Phase 11 overflow handler
+  processes excess items.
+
+- **Execution diary**: For decision points, failures, and approach changes, use
+  `execution-diary.sh append` to write structured breadcrumbs to the append-only diary
+  (`<agent>/session/execution-diary.jsonl`). Unlike WM slots (which are overwritten), the
+  diary is cumulative. See `core/config/conventions/compact-recovery.md`.
+
+- **Reasoning snapshot**: When context enters the tight zone (>=65%), proactively write a
+  synthesis of current reasoning state via `reasoning-snapshot.sh write`. This captures the
+  LLM's own synthesized understanding before autocompact fires at 80%.
+
+All three mechanisms survive compaction: WM slots via the full checkpoint (`all_slots`),
+the diary via the append-only JSONL file on disk, and the snapshot via its YAML file.
+The postcompact restore injects all three into the fresh context.
+
+---
+
 ## Cross-Session Persistence
 
 Only `known_blockers` and `knowledge_debt` survive sessions (via `handoff.yaml`).
 Everything else resets. `archived_context` provides compressed pointer to prior session.
+The execution diary is archived during consolidation and the last 20 entries from the
+prior session are available during boot.
 
 ---
 

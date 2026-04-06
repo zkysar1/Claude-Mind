@@ -5,7 +5,7 @@ user-invocable: false
 parent-skill: aspirations
 triggers:
   - "Session-End Consolidation Pass"
-conventions: [aspirations, pipeline, experience, journal, handoff-working-memory, session-state, tree-retrieval, goal-schemas]
+conventions: [aspirations, pipeline, experience, journal, handoff-working-memory, session-state, tree-retrieval, goal-schemas, coordination]
 minimum_mode: autonomous
 ---
 
@@ -22,8 +22,8 @@ If /stop's step ordering changes, this check will break. See /stop step 4 commen
 
 ## Parameters
 
-- `stop_mode` (boolean, default: false) — When true, skip Steps 6 (tree rebalancing),
-  7 (skill gap review), 7.5 (experience-to-skill mining), 8 (skill health report),
+- `stop_mode` (boolean, default: false) — When true, skip Steps 7 (skill gap review),
+  7.5 (experience-to-skill mining), 8 (skill health report),
   8.7 (user goal recap), and 10 (restart).
   Used by /stop to run proper consolidation without restarting the loop.
 
@@ -33,7 +33,59 @@ If /stop's step ordering changes, this check will break. See /stop step 4 commen
 
 ```
 # Consolidation — run before session exit
-Bash: wm-read.sh --json
+
+0.1. CONSOLIDATION TRIAGE GATE:
+   # This logic is duplicated in core/scripts/consolidation-precheck.py.
+   # If you change the checks here, update that script to match.
+   # ── PRE-SCAN (2 script calls + 1 file check) ────────────────────────
+   triage_wm      = Bash: wm-read.sh --json
+   triage_unrefl  = Bash: pipeline-read.sh --unreflected --counts
+   triage_overflow = test -f <agent>/session/overflow-queue.yaml
+
+   # ── EXTRACT COUNTS ──────────────────────────────────────────────────
+   micro_count       = len(triage_wm.slots.micro_hypotheses)     # null/[] → 0
+   encoding_count    = len(triage_wm.encoding_queue)              # null/[] → 0
+   debt_count        = len(triage_wm.slots.knowledge_debt)        # null/[] → 0
+   conclusions_count = len(triage_wm.slots.conclusions)           # null/[] → 0
+   violations_count  = len(triage_wm.slots.recent_violations)     # null/[] → 0
+   unreflected_count = triage_unrefl.active_unreflected           # 0 if none
+   has_overflow      = triage_overflow                            # boolean
+
+   data_total = micro_count + encoding_count + debt_count + conclusions_count + unreflected_count
+
+   # ── SAFETY RAILS ────────────────────────────────────────────────────
+   # Anti-suppression ceiling: max 3 consecutive lean sessions.
+   # Stored in a standalone file (NOT handoff.yaml, which boot deletes).
+   prior_lean = read <agent>/session/consolidation-lean-streak (integer, default 0 if missing)
+
+   IF prior_lean >= 3:
+       consolidation_tier = "full"
+       Log: "▸ TRIAGE: OVERRIDE → full (ceiling: {prior_lean} consecutive lean sessions)"
+   ELIF violations_count > 0:
+       consolidation_tier = "full"
+   ELIF has_overflow:
+       consolidation_tier = "full"
+   ELIF any pre-scan script call failed or returned unparseable output:
+       consolidation_tier = "full"
+   ELIF data_total == 0:
+       consolidation_tier = "lean"
+   ELSE:
+       consolidation_tier = "full"
+
+   Log: "▸ TRIAGE: {consolidation_tier} (micro={micro_count} enc={encoding_count} debt={debt_count} concl={conclusions_count} unrefl={unreflected_count} overflow={has_overflow} violations={violations_count})"
+
+# ── LEAN FAST PATH ─────────────────────────────────────────────────────
+# When all data queues are verified empty, skip Steps 0–2.8 entirely.
+# Step 2.9 (Experience Distillation) and mandatory steps (3+) still run.
+IF consolidation_tier == "lean":
+   Output: "▸ CONSOLIDATION: lean path — no session data to encode"
+   # Experience archive still runs (timer-based sweep, not session-dependent)
+   Bash: experience-archive.sh
+   # JUMP → Step 2.9 (experience distillation — runs on both paths)
+
+# ── FULL PATH ──────────────────────────────────────────────────────────
+IF consolidation_tier == "full":
+
 Read core/config/memory-pipeline.yaml (replay_priority_order)
 
 0. Micro-Hypothesis Sweep:
@@ -62,6 +114,25 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
      # This reflects on each unreflected hypothesis, sets reflected: true,
      # and pushes encoding items into encoding_queue for Step 1.
      Output: "▸ CONSOLIDATION: reflected on {count} unreflected hypotheses"
+
+0.7. Operational Gotcha Sweep (safety net):
+   # Catch error-then-fix patterns that Phase 6.5 missed (e.g., errors during
+   # boot, consolidation itself, or non-goal work). Budget: max 2 new entries.
+   #
+   Read today's journal: <agent>/journal/{YYYY}/{MM}/{YYYY-MM-DD}.md
+   Scan for co-occurring patterns:
+     (error|exception|traceback|failed|refused) AND (fixed|resolved|workaround|solution|root cause|turned out)
+   
+   IF potential gotcha patterns found (max 2):
+       FOR EACH pattern:
+           # Dedup against existing reasoning bank
+           Bash: reasoning-bank-read.sh --summary
+           IF not already encoded (no semantic overlap):
+               Determine store: prescriptive → guardrail, diagnostic → reasoning bank
+               Create entry via reasoning-bank-add.sh or guardrails-add.sh
+                 tags: ["ops-gotcha", "consolidation-sweep"]
+               Log: "CONSOLIDATION GOTCHA: {title} — encoded from session journal"
+   Output: "▸ CONSOLIDATION: gotcha sweep — {N} new entries encoded"
 
 1. Bash: wm-read.sh encoding_queue --json
    Sort encoding_queue by replay_priority_order:
@@ -118,13 +189,12 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 ```
 2. For top items (up to dynamic budget) in encoding_queue:
    a. Determine target leaf node:
-      IF item.source_type == "standard_tier_deferred":
-          # Standard-tier items already have target node info from inline computation
+      # Legacy: standard_tier_deferred items may exist from previous sessions.
+      # All items now use the same target resolution path.
+      IF item.target_node_key:
           node = {key: item.target_node_key, file: item.target_node_file}
-          # Verify node still exists (tree may have been rebalanced during session)
           verify = bash core/scripts/tree-find-node.sh --key {item.target_node_key}
           IF verify is empty:
-              # Node was rebalanced/merged — find new target by text search
               node=$(bash core/scripts/tree-find-node.sh --text "{item.observation}" --leaf-only --top 1)
       ELSE:
           node=$(bash core/scripts/tree-find-node.sh --text "{item.target_article}" --leaf-only --top 1)
@@ -166,18 +236,18 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
           bash core/scripts/tree-update.sh --set root summary "<updated>"
         - Update <agent>/developmental-stage.yaml highest_capability if exceeded
 
-   # Standard-tier deferred: apply metadata updates that were skipped inline
-   IF item.source_type == "standard_tier_deferred" AND item.metadata_updates:
+   # Legacy: apply metadata updates for items that have them (e.g., from previous sessions)
+   IF item.metadata_updates:
        echo '{"operations": [
          {"op": "set", "key": "<node.key>", "field": "confidence", "value": <item.metadata_updates.confidence>},
          {"op": "set", "key": "<node.key>", "field": "capability_level", "value": "<item.metadata_updates.capability_level>"}
        ]}' | bash core/scripts/tree-update.sh --batch
-       # Growth triggers for deferred items
+       # Growth triggers
        Read core/config/tree.yaml for decompose_threshold, split_threshold
        line_count = count lines in node .md body (excluding YAML front matter)
        If line_count > decompose_threshold AND node depth < D_max:
            bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose
-       # Capability event logging (same as State Update Step 8 inline path)
+       # Capability event logging
        IF item.metadata_updates.capability_level crosses threshold:
            Log capability event via evolution-log-append.sh
            Update <agent>/developmental-stage.yaml highest_capability if exceeded
@@ -189,14 +259,31 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        For each debt:
            Read target node .md file
            IF node was updated AFTER debt was created → mark resolved, skip
+
+           # ATTEMPT RESOLUTION — don't just check, actually try
            IF priority is HIGH or sessions_deferred >= 2:
-               Reconcile now: read node, update stale content, set last_update_trigger:
+               Reconcile now: read node, attempt the data acquisition that created this debt.
+               If the debt references infrastructure (shared filesystem, API, external service, etc.):
+                   Actually invoke the relevant skill/script to get the data.
+                   Do not assume infrastructure is still down — try it.
+               If data acquired: update node, set last_update_trigger:
                    {type: "debt-reconciliation", source: debt.source_goal, session: N}
                Propagate up parent chain if significant
                Log: "KNOWLEDGE DEBT RESOLVED: {node_key} — {reason}"
+               If data acquisition fails: carry forward (increment sessions_deferred)
+
            ELSE:
                Carry forward to handoff (increment sessions_deferred)
-       Report: "Knowledge debts: {resolved} resolved, {carried} carried forward"
+
+           # MAX-DEFER CEILING: drop stale debts that never resolve
+           IF sessions_deferred >= 10:
+               Log: "KNOWLEDGE DEBT DROPPED: {node_key} — {reason} (deferred {sessions_deferred} sessions, ceiling reached)"
+               Remove from debt list (do not carry forward)
+
+       Report: "Knowledge debts: {resolved} resolved, {carried} carried forward, {dropped} dropped"
+
+<!-- Steps 2.6-10 are mirrored in core/config/consolidation-housekeeping.md (fast-path digest) -->
+<!-- If editing steps below, update that file to match. Sync date: 2026-04-04 -->
 
 2.6. Experience Archive Maintenance + Encoding Weight Adjustment:
    # Sweep stale experiences to archive
@@ -210,7 +297,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        Log: "Encoding weight adjustment: insufficient data ({total} experiences, need >= 10)"
    ELSE (enough data):
        Read core/config/memory-pipeline.yaml → encoding_weight_adaptation section
-       Read world/memory-pipeline.yaml → current weight_performance_log
+       Bash: world-cat.sh memory-pipeline.yaml  # current weight_performance_log
        IF world/memory-pipeline.yaml does not exist: log "No weight performance log yet — skipping adjustment"
        ELSE:
            Compare: for experiences with high utility_ratio (>0.7), what encoding weights
@@ -242,6 +329,68 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                    bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
        Log summary: "Judgment quality: {total} conclusions ({negative} negative), {correct} correct, {wrong} wrong, {pending} pending. Avg signals: {avg_signals:.1f}"
 
+2.8. Pending Questions Re-evaluation:
+   Read <agent>/session/pending-questions.yaml
+   IF file exists AND has entries with status == "pending":
+       FOR EACH pending question:
+           # Re-evaluate: can the agent now answer this itself?
+           # Check knowledge tree, experience archive, and session learnings.
+           node=$(bash core/scripts/tree-find-node.sh --text "{question.question}" --leaf-only --top 3)
+           IF relevant knowledge found that answers the question:
+               Update question status to "resolved"
+               Set question.resolution = "Self-resolved: {one-line answer from knowledge}"
+               Set question.resolved_at = "$(date +%Y-%m-%dT%H:%M:%S)"
+               Log: "PENDING QUESTION RESOLVED: {question.id} — answered from accumulated knowledge"
+           ELIF question is still relevant but unanswerable:
+               # Keep pending — it genuinely needs user input
+               pass
+           ELIF question references infrastructure/state that has changed:
+               Update question status to "resolved"
+               Set question.resolution = "Stale: conditions changed since question was created"
+               Log: "PENDING QUESTION STALE: {question.id} — conditions changed"
+       Write updated <agent>/session/pending-questions.yaml
+       Report: "Pending questions: {resolved_count} self-resolved, {stale_count} stale, {remaining_count} still pending"
+
+# ── END FULL PATH (Steps 0–2.8 above only run when consolidation_tier == "full") ───
+
+# ── ALWAYS-RUN STEPS (both full and lean paths) ──────────────────────
+
+2.9. Experience Distillation (compile experiences into tree wiki):
+   # Reads from experience archive, NOT WM queues — runs on both full and lean paths.
+   # Experiences are raw data. The tree is the compiled wiki.
+   Bash: experience-read.sh --type goal_execution --recent 30 --summary
+   Group experiences by tree_nodes_related field.
+   
+   FOR EACH tree node with 3+ related experiences since last distillation:
+     # Read the FULL experience content files (not just JSONL summaries)
+     FOR EACH experience in cluster:
+       Read <agent>/experience/{exp.content_file}
+       Extract: verbatim_anchors, key findings, exact values, failure sequences
+     
+     # Synthesize into deep tree content (NOT 1-3 sentence compression)
+     Read the target tree node .md file
+     Compose a multi-paragraph synthesis that:
+       - Preserves specific technical detail (exact error messages, thresholds, sequences)
+       - Identifies patterns across experiences (what worked, what failed, why)
+       - Extracts decision rules with concrete conditions
+       - Notes contradictions or evolution in understanding over time
+     
+     Edit target node .md with synthesized content
+     Update node metadata via batch:
+       echo '{"operations": [
+         {"op": "set", "key": "<node-key>", "field": "last_updated", "value": "<today>"},
+         {"op": "increment", "key": "<node-key>", "field": "article_count"}
+       ]}' | bash core/scripts/tree-update.sh --batch
+     Set last_update_trigger: {type: "experience-distillation", session: N}
+     Check growth triggers (same as Step 2 growth trigger block):
+       line_count = count lines in node .md body
+       If line_count > decompose_threshold AND depth < D_max:
+         bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_decompose
+     Log: "EXPERIENCE DISTILLATION: {node_key} enriched from {count} experiences"
+   
+   Budget: max 5 nodes per consolidation (largest clusters first)
+   Report: "Experience distillation: {distilled_count} nodes enriched, {skipped_count} clusters below threshold"
+
 3. **MANDATORY** — run even if all earlier steps had empty data:
    Bash: wm-read.sh sensory_buffer --json
    Log consolidation to journal (use this EXACT format, with zeros for empty fields):
@@ -252,7 +401,8 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    Flagged for review: {review_count}
    Context gaps detected: {context_gap_count} (hypotheses where relevant context existed but wasn't loaded)
    Judgment quality: {total_conclusions} conclusions, {wrong_count} wrong
-   Articles updated: {list}"
+   Articles updated: {list}
+   Triage: {consolidation_tier} — {reason summary}"
 
 4. **MANDATORY** — must run BEFORE wm-reset (Step 5) to preserve state:
    Bash: wm-read.sh --json
@@ -260,15 +410,14 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    This captures any remaining WM state before it is destroyed by reset.
 5. Bash: wm-reset.sh
 
-6. Tree Rebalancing (skip in stop_mode):
-   IF stop_mode != true:
-     Invoke /tree maintain (run all checks: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
-     All 8 ops must be listed — DECOMPOSE grows tree depth, DISTILL concentrates low-utility nodes, RETIRE removes dead ones.
-     Report any structural changes to journal
+6. Tree Rebalancing:
+   Invoke /tree maintain (run all checks: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
+   All 8 ops must be listed — DECOMPOSE grows tree depth, DISTILL concentrates low-utility nodes, RETIRE removes dead ones.
+   Report any structural changes to journal
 
 7. Skill Gap Review (skip in stop_mode):
    IF stop_mode != true:
-     Read meta/skill-gaps.yaml
+     Bash: meta-read.sh skill-gaps.yaml
      Report: new gaps registered, gaps meeting forge threshold, dismissed gaps
      Highlight any gaps ready for "/forge-skill skill <gap-id>"
 
@@ -276,7 +425,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    IF stop_mode != true:
      # Mine experience records for repeated procedures that should be skills
      Bash: experience-read.sh --type goal_execution --recent 30 --summary
-     Read meta/skill-gaps.yaml
+     Bash: meta-read.sh skill-gaps.yaml
      Read core/config/skill-gaps.yaml (experience_mining config)
 
      Group experience records by category + skill.
@@ -327,11 +476,11 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    #   curriculum_gates_passed: {N}/{total}
 
 8.65. **Meta-Strategy Session Review**:
-   Read meta/meta.yaml
+   Bash: meta-read.sh meta.yaml
    IF meta/meta.yaml does not exist:
        Log: "Meta-strategy review: meta/meta.yaml not initialized — skipping"
        Continue to next step
-   Read meta/improvement-velocity.yaml
+   Bash: meta-read.sh improvement-velocity.yaml
    IF meta/improvement-velocity.yaml does not exist:
        Log: "Meta-strategy review: improvement-velocity.yaml not initialized — skipping"
        Continue to next step
@@ -349,7 +498,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        Log: "META SESSION: improvement velocity DOWN by {delta:.2f}"
 
    # Update meta.yaml rolling averages
-   Edit meta/meta.yaml:
+   Bash: meta-set.sh meta.yaml
        overall_imp_k: recomputed rolling average
        last_session_imp_k: session_imp_k
        sessions_evaluated: N + 1
@@ -370,6 +519,31 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        ═══════════════════════════════════════════════"
 
      Store user goal count for handoff (step 9)
+
+8.87. Team State Session Summary:
+   # Update shared team state with session-end summary
+   goals_this_session = count goals_completed_this_session from working memory
+
+   # Gather blocked data for critical path (used by both Step 8.87 and Step 9)
+   Bash: goal-selector.sh blocked
+   Parse JSON → blocked_data
+
+   Bash: team-state-update.sh --field agent_status.<AGENT_NAME> \
+     --value '{"last_active":"<now>","current_focus":"session ended","session_goals_completed":<goals_this_session>}'
+   Output: "▸ Team state: updated agent status (session ended, {goals_this_session} goals)"
+
+   IF blocked_data.bottlenecks is non-empty:
+       critical_blockers_payload = top 3 bottlenecks as JSON array with fields: goal_id, title, cause, downstream_count, updated_by, updated_at
+       Bash: team-state-update.sh --field critical_blockers --value '<critical_blockers_json>'
+       Output: "▸ Team state: updated critical blockers ({N} entries)"
+
+8.9. Release Held Claims (world goals only):
+   # Prevent stale claims when session ends normally. See coordination convention.
+   Bash: AYOAI_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name}
+   FOR EACH returned goal WHERE source == "world":
+       Bash: aspirations-release.sh <goal-id>
+       Log: "Released claim on {goal.id}"
+   echo "Session ending: released all held claims" | Bash: board-post.sh --channel coordination --type status
 
 9. Write Continuation Handoff:
    Bash: goal-selector.sh → get top-ranked goal for next session
@@ -413,6 +587,22 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
          reason: "{reason}"
          affected_skills: ["{skills}"]
          detected_session: {N}
+     critical_path:
+       # Populated from blocked_data gathered in Step 8.87 (or gathered here if 8.87 was skipped in stop_mode)
+       # IF blocked_data was not gathered yet: Bash: goal-selector.sh blocked → parse JSON → blocked_data
+       primary_blocker:
+         goal_id: "{bottlenecks[0].goal_id}"
+         title: "{bottlenecks[0].title}"
+         cause: "{bottlenecks[0].cause}"
+         downstream_count: {bottlenecks[0].downstream_count}
+         affected_aspirations: ["{asp_ids}"]
+       blocked_fraction: "{total_blocked}/{total_active_goals}"
+       top_bottlenecks:
+         - goal_id: "..."
+           title: "..."
+           downstream_count: N
+           cause: "..."
+       estimated_unblock_impact: "Resolving {primary_blocker.title} would unblock {N} goals across {M} aspirations"
      knowledge_debts_pending:
        # Use debt data carried forward from Step 2.25 (WM was reset in Step 5)
        - node_key: "{node-key}"
@@ -433,39 +623,50 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        Bash: meta-experiment.sh list --active → active_exp
        active_variant: "{active_exp variant_id or null}"
        meta_changes_this_session: {count of meta-log entries this session}
+     consolidation_meta:
+       triage_tier: "{lean|full}"
+       consecutive_lean_sessions: {N}  # informational copy (source of truth: consolidation-lean-streak file)
+   # Update the streak file (source of truth for anti-suppression ceiling)
+   Write <agent>/session/consolidation-lean-streak:
+     IF consolidation_tier == "lean": prior_lean + 1
+     IF consolidation_tier == "full": 0
 
 9.5. **Transfer Profile Update**:
-   Read meta/experiments/completed-experiments.yaml
+   Bash: meta-read.sh experiments/completed-experiments.yaml
    IF file does not exist: log "Transfer profile: no completed experiments — skipping" and continue
    ELSE:
        adopted = filter where outcome == "adopted"
        IF adopted is empty: log "Transfer profile: no adopted experiments — skipping" and continue
        ELSE:
-           Edit meta/transfer-profile.yaml (create if missing):
+           Edit transfer-profile.yaml via meta-set.sh (create if missing):
                validated_strategies: list of adopted strategy descriptions with imp@k data
                total_goals_at_export: total from aspirations-meta
 
 ### Execution Checklist (MANDATORY)
 
 Before proceeding to Step 10, output a checklist accounting for EVERY step.
-Each step must show one of: `done`, `empty` (ran but no data), `skipped (stop_mode)`, `skipped (file missing)`.
+Each step must show one of: `done`, `empty` (ran but no data), `skipped (stop_mode)`, `skipped (file missing)`, `skipped (lean)`.
 Do NOT proceed without outputting this checklist.
 
 ```
 CONSOLIDATION CHECKLIST:
-  Step 0  Micro-Hypothesis Sweep:  {done|empty}
-  Step 0.5 Unreflected Hyp Sweep:  {done|empty}
-  Step 1  Encoding Queue:          {done|empty}
-  Overflow Queue:                  {done|empty|skipped (file missing)}
-  Step 2  Tree Encoding:           {done|empty}
-  Step 2.25 Knowledge Debt:        {done|empty}
+  Triage:                          {lean|full}
+  Step 0  Micro-Hypothesis Sweep:  {done|empty|skipped (lean)}
+  Step 0.5 Unreflected Hyp Sweep:  {done|empty|skipped (lean)}
+  Step 0.7 Gotcha Sweep:           {done|empty|skipped (lean)}
+  Step 1  Encoding Queue:          {done|empty|skipped (lean)}
+  Overflow Queue:                  {done|empty|skipped (file missing)|skipped (lean)}
+  Step 2  Tree Encoding:           {done|empty|skipped (lean)}
+  Step 2.25 Knowledge Debt:        {done|empty|skipped (lean)}
   Step 2.6  Experience Archive:    {done}
-  Step 2.6  Encoding Weights:      {done|skipped (insufficient data)|skipped (file missing)}
-  Step 2.7  Conclusion Quality:    {done|empty}
+  Step 2.6  Encoding Weights:      {done|skipped (insufficient data)|skipped (file missing)|skipped (lean)}
+  Step 2.7  Conclusion Quality:    {done|empty|skipped (lean)}
+  Step 2.8  Pending Questions:     {done|empty|skipped (lean)}
+  Step 2.9  Experience Distill:    {done|empty}              ← runs on both paths
   Step 3  Journal (structured):    {done}    ← MANDATORY
   Step 4  WM Archive:              {done}    ← MANDATORY
   Step 5  WM Reset:                {done}
-  Step 6  Tree Rebalancing:        {done|skipped (stop_mode)}
+  Step 6  Tree Rebalancing:        {done}
   Step 7  Skill Gap Review:        {done|skipped (stop_mode)}
   Step 7.5 Experience Mining:      {done|skipped (stop_mode)}
   Step 8  Skill Health:            {done|skipped (stop_mode)}
@@ -473,6 +674,7 @@ CONSOLIDATION CHECKLIST:
   Step 8.6 Curriculum Gates:       {done}
   Step 8.65 Meta-Strategy Review:  {done|skipped (file missing)}
   Step 8.7 User Goal Recap:        {done|skipped (stop_mode)}
+  Step 8.87 Team State + Blockers: {done}
   Step 9  Handoff:                 {done}
   Step 9.5 Transfer Profile:       {done|skipped (file missing)}
 ```

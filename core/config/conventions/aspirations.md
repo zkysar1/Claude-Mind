@@ -30,6 +30,9 @@ Two script families — world (default) and agent — operate on separate queues
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `load-aspirations-compact.sh` | Cached compact active aspirations (dedup-aware) | — |
+| `aspirations-query.sh --goal-status <status>` | Query goals by status across both queues (lightweight) | — |
+| `aspirations-query.sh --goal-field <field> <value>` | Query goals by field value across both queues | — |
+| `aspirations-query.sh --title-contains <substr>` | Query goals by title substring across both queues | — |
 | `aspirations-read.sh --active` | Return active world aspirations as full JSON | — |
 | `aspirations-read.sh --active-compact` | Compact active aspirations (no descriptions/verification) | — |
 | `aspirations-read.sh --id <id>` | Return one world aspiration by ID | — |
@@ -50,9 +53,49 @@ Two script families — world (default) and agent — operate on separate queues
 
 | Script | Purpose |
 |--------|---------|
-| `aspirations.py claim <goal-id> <agent-name>` | Atomically claim a world goal for an agent |
-| `aspirations.py release <goal-id>` | Release a claimed world goal |
-| `aspirations.py complete-by <goal-id> <agent-name>` | Mark world goal completed with agent attribution |
+| `aspirations-claim.sh <goal-id> [agent-name]` | Atomically claim a world goal for an agent |
+| `aspirations-release.sh <goal-id>` | Release a claimed world goal |
+| `aspirations-complete-by.sh [--source world\|agent] <goal-id> [agent-name]` | Mark goal completed with agent attribution |
+
+Agent name defaults to `$AYOAI_AGENT` for claim and complete-by. Complete-by supports
+`--source agent` for recurring agent-health goals; claim and release are world-only.
+
+#### Claim Protocol (Goal Lifecycle)
+
+World goals MUST be claimed before execution to prevent duplicate work across agents.
+Agent queue goals do not need claims (single-agent access).
+
+| Step | Script | When |
+|------|--------|------|
+| **Claim** | `aspirations-claim.sh <goal-id>` | Before Phase 4 execution (world goals) |
+| **Release** | `aspirations-release.sh <goal-id>` | On execution failure, infrastructure failure, or goal revert |
+| **Complete-by** | `aspirations-complete-by.sh <goal-id>` | On verified completion (Phase 5.3) |
+
+**Rules:**
+1. `goal-selector.py` skips goals claimed by another agent — claims are respected at selection time.
+2. Claim is atomic — if another agent claimed first, the script exits non-zero. On conflict, re-enter the selection loop.
+3. Recurring world goals: `complete-by` auto-clears `claimed_by`, returning the goal to the pool.
+4. Session boundary: release all held claims at session end (consolidation/handoff).
+
+#### Claim Expiry (Straggler Mitigation)
+
+Claims have a configurable timeout (`multi_agent.claim_timeout_hours` in `aspirations.yaml`,
+default 4 hours). If a claim is older than this threshold, `goal-selector.py` treats it as
+expired — the goal becomes eligible for other agents to claim.
+
+This prevents indefinite blocking when a claiming agent's session crashes or ends without
+releasing. Based on ["Language Model Teams as Distributed Systems"](https://arxiv.org/abs/2603.12229)
+Finding 5: decentralized teams mitigate stragglers via dynamic work reallocation.
+
+### Cross-Aspiration Dependency Enforcement
+
+The `blocked_by` field on goals resolves **globally** across all active aspirations (both
+world and agent queues). If `g-170-03` has `blocked_by: ["g-168-06"]` where `g-168-06` is
+in a different aspiration, the block is enforced — `g-170-03` will not appear as a candidate
+until `g-168-06` is completed or decomposed.
+
+This prevents temporal consistency violations (Finding 3 of the distributed systems paper)
+where an agent starts work before its cross-aspiration dependencies are met.
 
 ### Agent Queue Scripts (operate on `<agent>/aspirations.jsonl`)
 

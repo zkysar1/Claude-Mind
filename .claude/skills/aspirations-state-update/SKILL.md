@@ -1,6 +1,6 @@
 ---
 name: aspirations-state-update
-description: "State Update Protocol — 9 steps + Step 8.5 Actionable Findings Gate + Step 8.75 Execution Reflection + Step 8.76 Skill Quality Assessment after every goal execution (routine: Steps 1-4 + abbreviated journal; standard: all steps, deferred tree encoding; deep: all steps, immediate tree encoding)"
+description: "State Update Protocol — 9 steps + Step 3.5 Team State + Step 8.5 Actionable Findings Gate + Step 8.75 Execution Reflection + Step 8.76 Skill Quality + Step 8.11 Execution Feedback after every goal execution (routine: Steps 1-4 + abbreviated journal; deep: all steps, immediate tree encoding)"
 user-invocable: false
 parent-skill: aspirations
 triggers:
@@ -15,12 +15,10 @@ Invoked after EVERY goal execution as Phase 8 of the aspirations loop. Accepts `
 
 ## Inputs (from orchestrator)
 
-- `outcome_class`: Outcome tier (`"routine"`, `"standard"`, or `"deep"`) — default `"deep"`
+- `outcome_class`: Outcome tier (`"routine"` or `"deep"`) — default `"deep"`
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
 
-For **deep** outcomes (default — non-recurring, failures, surprises): all steps run (1-8, 8.5, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Step 8.5 (ACTIONABLE FINDINGS GATE) ensures encoded findings get tracked as goals. Step 8.75 (EXECUTION REFLECTION) cross-references outcomes against institutional knowledge.
-
-For **standard** outcomes (recurring with incremental findings): all steps run (1-8, 8.5, 8.75). Step 8 computes the FULL encoding payload inline (identical fidelity to deep) then QUEUES it to encoding_queue for deferred tree writing during consolidation. The encoding content is computed NOW at full fidelity — only the file I/O of writing to the tree node is deferred.
+For **deep** outcomes (default — all non-routine goals): all steps run (1-8, 8.5, 8.75). Step 8 performs IMMEDIATE tree encoding — the full precision manifest, curator quality gate, consistency scan, and tree write. This is the highest-fidelity path. Learning is the mission — every non-routine outcome gets immediate encoding.
 
 For **routine** outcomes (recurring goal, no findings): Steps 1-4 run (bookkeeping), then an abbreviated Step 7 (journal), then RETURN. Steps 5-8.75 are skipped because there is genuinely no insight to encode, no triggers to check, and no capability to propagate.
 
@@ -32,7 +30,7 @@ The loop MUST NOT continue to Phase 9 until state update is complete.
 
 ## State Update Protocol
 
-After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for standard/deep outcomes):
+After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes):
 
 ```
 1. UPDATE goal status via Bash: `aspirations-update-goal.sh --source {source} <goal-id> status <status>`
@@ -58,21 +56,73 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for standard/deep
    - Set last_goal_category = goal's resolved category (from goal-selector.py output):
      Bash: echo '"<category>"' | wm-set.sh last_goal_category
 
+3.5. TEAM STATE UPDATE (multi-agent situational awareness)
+   # Update world/team-state.yaml with this goal completion.
+   # Gives the other agent instant awareness of what just happened.
+   Bash: team-state-update.sh --field recent_completions --operation append \
+     --value '{"goal_id":"<goal-id>","title":"<goal.title>","completed_by":"<AGENT_NAME>","completed_at":"<now>","key_finding":"<one-line factual summary of what was produced/discovered>"}'
+   Bash: team-state-update.sh --field agent_status.<AGENT_NAME>.last_active --value '"<now>"'
+   Bash: team-state-update.sh --field agent_status.<AGENT_NAME>.current_focus --value '"<goal.category or aspiration title>"'
+   # Increment session goal count in working memory (read current, +1)
+   # The actual agent_status.session_goals_completed is updated at consolidation
+
 4. INCREMENT session_count via Bash: `aspirations-meta-update.sh --source {source} session_count <N>`
    (Note: session_count increments once per /aspirations loop invocation,
     NOT once per goal. Goals within the same loop share a session.)
 
-# ── Routine outcome early return ──────────────────────────────────
+# ── Routine outcome learning path ──────────────────────────────────
+# Principle: we are here to learn. Even routine outcomes deserve a creative lens.
+# This replaces the bare early return with lightweight but meaningful reflection.
 IF outcome_class == "routine":
-    # Abbreviated journal entry (Step 7 only of remaining steps)
-    7r. WRITE abbreviated journal entry
+
+    # Step 5r: Lightweight creative reflection (NOT skipped for routine)
+    # Ask ONE creative question from the creative_lens template, rotating
+    # deterministically so each routine execution gets a different question.
+    Read core/config/reflection-templates.yaml → creative_lens.questions
+    question_index = hash(goal.id) % len(creative_lens.questions)
+    creative_q = creative_lens.questions[question_index]
+    Evaluate: {creative_q} applied to this routine goal's outcome
+    IF creative reflection produces a non-trivial insight (not a restatement of known facts):
+        # Capture as a lightweight reasoning bank entry
+        Bash: reasoning-bank-read.sh --category {goal.category}
+        IF NOT semantically overlapping with existing entries:
+            Create reasoning bank entry via reasoning-bank-add.sh:
+              title: "Routine insight: {concise name}"
+              type: success
+              category: goal's category
+              content: the creative insight
+              when_to_use: when this insight applies
+              source_goal: goal.id
+              tags: ["routine-creative-insight"]
+            Log: "ROUTINE CREATIVE INSIGHT: {title} from {goal.id}"
+        routine_insight_found = true
+        routine_insight_text = the creative insight (1-2 sentences)
+    ELSE:
+        routine_insight_found = false
+        routine_insight_text = "No new insight."
+
+    # 7r. WRITE enhanced journal entry
        - Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
-         "## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}."
+         "## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}. Creative lens ({creative_q[:60]}...): {routine_insight_text}"
        - Update journal index via scripts (same merge/add pattern as full journal):
          - If session entry exists: pipe update JSON to `bash core/scripts/journal-merge.sh <session-num>`
          - If session entry does not exist: pipe new entry JSON to `bash core/scripts/journal-add.sh`
-    RETURN  # Skip Steps 5-8.75 — no insight to encode, no triggers to check
-# ── End routine early return ──────────────────────────────────────
+
+    # Step 8r: Routine accumulation check (every 5th routine for this goal)
+    # Over time, accumulated routine executions can reveal trends worth encoding.
+    IF goal.achievedCount >= 5 AND goal.achievedCount % 5 == 0:
+        node=$(bash core/scripts/tree-find-node.sh --text "{goal.category}" --leaf-only --top 1)
+        IF node found:
+            Read node.file
+            # Check: does the pattern of routine execution reveal a trend?
+            # e.g., "always succeeds", "timing is consistent", "never produces findings"
+            IF routine execution pattern reveals an encodable trend:
+                Append one-line trend observation to node's Key Insights
+                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                Log: "ROUTINE ACCUMULATION: {goal.category} trend encoded to {node.key}"
+
+    RETURN  # Remaining deep-only steps (5-8.75) still skipped
+# ── End routine outcome learning path ─────────────────────────────
 
 5. CHECK evolution triggers — Read `core/config/evolution-triggers.yaml` (definitions) and `world/evolution-triggers.yaml` (state) and check performance-based triggers (see Phase 9 for full protocol). Fixed session-count trigger is DEPRECATED.
    # MR-Search exploration mode gating (Priority 3):
@@ -111,7 +161,7 @@ IF outcome_class == "routine":
        - Extract transferable lesson: "For similar goals, start with approach N"
        Log: "▸ Tree encoding: including {len(episode_history)} episode progression"
    # Meta-strategy encoding guidance
-   Read meta/encoding-strategy.yaml
+   Bash: meta-read.sh encoding-strategy.yaml
    # Apply precision_emphasis_categories, narrative_compression_level,
    # and decision_rule_preference as advisory guidance for tree encoding.
 
@@ -136,7 +186,29 @@ IF outcome_class == "routine":
        Log: "▸ Step 8: forced encoding from anti-drift safeguard"
    # ── End encoding obligation checks ─────────────────────────────────
 
-   - If goal produced new insight OR force_encoding:
+   # ── Encoding decision (default: ENCODE) ─────────────────────────
+   # The default is to ENCODE. Skip ONLY for structural reasons.
+   # "Nothing new learned" is NOT a valid skip reason — the curator gate (c.5) filters quality.
+   skip_encoding = false
+   IF len(result_text) < 100:
+       skip_encoding = true
+       Log: "▸ Step 8: skipping encoding — insufficient output ({len(result_text)} chars)"
+   ELIF goal.status in ("blocked", "skipped"):
+       skip_encoding = true
+       Log: "▸ Step 8: skipping encoding — goal was {goal.status}"
+   # ── End encoding decision ──────────────────────────────────────
+
+   - If NOT skip_encoding OR force_encoding:
+     # ── Load experience record for full-fidelity encoding ──────────
+     # Context window content fades by the time encoding runs.
+     # The experience file preserves verbatim_anchors and full reasoning traces.
+     IF goal has experience_ref (set by Phase 4.25):
+         experience_content = Read <agent>/experience/{experience_ref}.md
+         # Use verbatim_anchors and full reasoning trace for precision extraction below,
+         # supplementing whatever remains in the context window.
+         Log: "▸ Step 8: loaded experience {experience_ref} for full-fidelity encoding"
+     # ── End experience record loading ──────────────────────────────
+
      a. EXTRACT PRECISION: Scan execution context for exact values. Build precision manifest —
         each item: {type, label, value (VERBATIM), unit, context}. Types: threshold, formula,
         constant, reference, measurement, config_value. Include ALL numbers, code refs, error codes,
@@ -144,15 +216,33 @@ IF outcome_class == "routine":
         See core/config/conventions/precision-encoding.md for schema and extraction heuristics.
      b. COMPOSE PRECISION BLOCK: Build candidate "## Verified Values" entries from manifest.
         Format: - **{label}**: `{value}` {unit} — {context}
-        # DO NOT write to tree yet — the deep/standard branch below controls when writing happens.
+        # DO NOT write to tree yet — the branch below controls when writing happens.
      c. COMPOSE NARRATIVE: Compress qualitative insight into candidate "Key Insights" text.
 
-     # ══ BRANCH: Standard vs Deep tree encoding ══════════════════════
-     # Standard: full content computed inline, tree write deferred to consolidation
-     # Deep: full content computed inline, tree write performed immediately
-     # Both tiers: same curator quality gate, same fidelity. Only timing differs.
+     # ══ ENCODING COORDINATION CHECK (multi-agent semantic overwrite prevention) ══
+     # Before writing to a shared tree node, check if the other agent is encoding
+     # to the same node. If so, defer to consolidation queue instead of writing immediately.
+     # This prevents semantic overwrites where both agents encode different findings
+     # to the same node and the second write silently loses the first agent's insights.
+     # (Informed by "LLM Teams as Distributed Systems" Finding 3: concurrent writes.)
+     encoding_deferred_by_coordination = false
+     IF target node is identified (node.key is known):
+         Bash: board-read.sh --channel coordination --type encoding --since 30m --json
+         IF any message has a tag matching node.key AND author != current agent:
+             Output: "▸ Step 8: ENCODING DEFERRED — {other_agent} recently encoded to {node.key}"
+             encoding_deferred_by_coordination = true
+             # Defer encoding to consolidation when another agent recently wrote to same node
+     # Post own encoding intent BEFORE writing (other agent will see this in their check)
+     IF NOT encoding_deferred_by_coordination:
+         echo "Encoding: {node.key}" | Bash: board-post.sh --channel coordination --type encoding --tags {node.key}
 
-     IF outcome_class == "deep":
+     # ══ DEEP tree encoding (immediate write) ══════════════════════
+     # All non-routine outcomes get immediate tree encoding.
+     # Learning is the mission — never defer encoding.
+     # Exception: coordination deferral queues to encoding_queue to prevent
+     # semantic overwrites when another agent recently wrote to the same node.
+
+     IF outcome_class == "deep" AND NOT encoding_deferred_by_coordination:
          # ── IMMEDIATE TREE WRITE (full inline encoding) ──
          c.5. CURATOR QUALITY GATE (AutoContext-inspired):
         Read core/config/memory-pipeline.yaml curator_gate section
@@ -223,62 +313,42 @@ IF outcome_class == "routine":
      e. If new level > highest_capability → update highest_capability
 
    # CRITICAL — set flags at the deep branch level, not inside capability check.
-   # Orchestrator drift tracking, Step 8.5, and Step 8.75 all gate on step_8_wrote_insight.
+   # Orchestrator drift tracking (Phase 8.0.5) gates on step_8_tree_encoded.
+   # Step 8.5 and Step 8.75 gate on step_8_wrote_insight.
    step_8_wrote_insight = true
    step_8_tree_encoded = true
 
-     ELIF outcome_class == "standard":
-         # ── DEFERRED TREE ENCODING (full-fidelity payload → encoding_queue) ──
-         # Content computed NOW at full fidelity. Tree write deferred to consolidation.
-         # This saves the expensive Read+Edit+propagate cycle per goal.
-
-         c.5. CURATOR QUALITY GATE (same gate as deep — same quality bar):
-             Read core/config/memory-pipeline.yaml curator_gate section
-             IF curator_gate.enabled:
-                 CURATOR Q1 (Coverage, 0-1), Q2 (Specificity, 0-1), Q3 (Actionability, 0-1)
-                 IF is_investigation_goal:
-                     curator_score = (coverage * 0.50) + (specificity * 0.30) + (actionability * 0.20)
-                 ELSE:
-                     curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
-                 IF curator_score < pass_threshold (default 0.45):
-                     Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f}) — demoted to overflow"
-                     echo '{"observation": "<insight>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
-                     step_8_wrote_insight = false
-                     step_8_tree_encoded = false
-                     SKIP to Step 8.5
-                 ELSE:
-                     Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f}) — queuing for consolidation"
-
-         # Build full-fidelity encoding payload (same content as deep, different destination)
-         encoding_payload = {
-             source_goal: goal.id,
-             source_type: "standard_tier_deferred",
-             target_node_key: node.key,
-             target_node_file: node.file,
-             observation: compressed_narrative,         # The full Key Insights text
-             precision_manifest: precision_manifest,    # COMPLETE — every item
-             decision_rules: candidate_rules,           # Full IF-THEN rules
-             episode_progression: episode_context or null,
-             encoding_score: 0.65,                      # Default for standard tier
-             curator_score: curator_score,
-             priority_class: "standard_deferred",
-             target_article: node.file,
-             metadata_updates: {
-                 confidence: <computed new value>,
-                 capability_level: <computed new value>
-             },
-             timestamp: now
-         }
-
-         echo '<encoding_payload_json>' | wm-append.sh encoding_queue
-         Output: "▸ Step 8: DEFERRED encoding queued for {node.key} (standard tier)"
-         step_8_wrote_insight = true    # Content WAS computed (Steps 8.5, 8.75 fire)
-         step_8_tree_encoded = false    # Tree NOT yet written (Learning Gate aware)
-         # Skip: node metadata update, growth triggers, propagation, capability events
-         # These will be handled by consolidation when the encoding_queue item is processed
+   ELIF encoding_deferred_by_coordination:
+     # ── COORDINATION DEFERRAL: queue encoding for consolidation ──────
+     # Another agent recently encoded to the same node. Writing now would
+     # silently overwrite their insight. Queue for consolidation instead.
+     # DO NOT remove this branch — without it, insight is silently dropped
+     # and the learning gate forces inline encoding, causing the exact
+     # overwrite this check exists to prevent.
+     encoding_payload = {
+         source_goal: goal.id,
+         source_type: "coordination_deferred",
+         target_node_key: node.key,
+         target_node_file: node.file,
+         observation: compressed_narrative,
+         precision_manifest: precision_manifest,
+         decision_rules: candidate_rules,
+         encoding_score: 0.65,
+         curator_score: curator_score,
+         target_article: node.file,
+         metadata_updates: {
+             confidence: <computed new value>,
+             capability_level: <computed new value>
+         },
+         timestamp: now
+     }
+     echo '<encoding_payload_json>' | wm-append.sh encoding_queue
+     Output: "▸ Step 8: COORDINATION DEFERRED — encoding queued for {node.key}"
+     step_8_wrote_insight = true
+     step_8_tree_encoded = false
 
    ELSE:
-     # No new insight from this goal — both standard and deep
+     # No new insight from this goal
      step_8_wrote_insight = false
      step_8_tree_encoded = false
 
@@ -437,7 +507,7 @@ IF goal.skill is set AND outcome_class != "routine":
 
 IF outcome_class != "routine":
     learning_value components (0-1 each):
-      tree_updated: 1.0 if Step 8 wrote insight to tree OR queued to encoding_queue (standard tier), 0.0 otherwise → weight 0.3
+      tree_updated: 1.0 if Step 8 wrote insight to tree, 0.0 otherwise → weight 0.3
       artifacts_created: min(1.0, count(reasoning_bank + guardrails + pattern_sigs created) × 0.2) → weight 0.3
       encoding_score: from Step 2.7 encoding gate if available, else 0.0 → weight 0.2
       findings_gated: min(1.0, count(Step 8.5 findings) × 0.25) → weight 0.2
@@ -540,8 +610,49 @@ IF outcome_class != "routine":
         # else: within normal range, no output
 ```
 
+```
+# ── Step 8.11: Execution Feedback (Cross-Agent Goal Quality) ─────
+# When executing a goal created by another agent, post structured quality
+# feedback to world/board/feedback.jsonl. Creates a backward learning signal
+# so the goal creator can improve future goal descriptions.
+# See board.md Execution Feedback Schema for field definitions.
+
+IF outcome_class != "routine" AND source == "world":
+    # Determine who created the goal. For world goals, check if there's a
+    # created_by field or infer from the aspiration author / board handoff.
+    goal_created_by = goal.get("created_by") or goal.get("discovered_by") or "unknown"
+
+    IF goal_created_by != AGENT_NAME AND goal_created_by != "unknown":
+        # Rate the goal on three dimensions (1-5 each)
+        # Based on actual execution experience:
+        clarity = <1-5: was the description clear and actionable?>
+        scope_accuracy = <1-5: was the effort estimate right? 1=wildly off, 5=spot on>
+        verification_quality = <1-5: were checks testable and sufficient?>
+        friction = <"low"|"medium"|"high": overall execution friction>
+        notes = <optional: what was missing or wrong — only if friction >= medium>
+
+        feedback_json = {
+            "goal_id": goal.id,
+            "created_by": goal_created_by,
+            "executed_by": AGENT_NAME,
+            "clarity": clarity,
+            "scope_accuracy": scope_accuracy,
+            "verification_quality": verification_quality,
+            "friction": friction,
+            "notes": notes
+        }
+
+        echo '<feedback_json>' | Bash: board-post.sh --channel feedback \
+            --type execution-feedback --tags "{goal.id},created_by:{goal_created_by}"
+        Output: "▸ Execution feedback: clarity={clarity} scope={scope_accuracy} verify={verification_quality} friction={friction}"
+```
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 8)
-- **Calls**: `aspirations-update-goal.sh --source {source}`, `aspirations-meta-update.sh --source {source}`, `aspirations-add-goal.sh --source {source}`, `wm-set.sh`, `wm-append.sh`, `skill-evaluate.sh`, `meta-impk.sh`, `meta-backpressure.sh`, `experience-update-field.sh`
+- **Calls**: `aspirations-update-goal.sh --source {source}`, `aspirations-meta-update.sh --source {source}`, `aspirations-add-goal.sh --source {source}`, `wm-set.sh`, `wm-append.sh`, `skill-evaluate.sh`, `meta-impk.sh`, `meta-backpressure.sh`, `experience-update-field.sh`, `team-state-update.sh`, `board-post.sh`
 - **Reads**: Goal object, execution result, `core/config/evolution-triggers.yaml`, `core/config/memory-pipeline.yaml`, `meta/encoding-strategy.yaml`

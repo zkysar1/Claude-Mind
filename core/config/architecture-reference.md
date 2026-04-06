@@ -49,14 +49,12 @@ Detailed architectural documentation read on demand by skills. Contains the skil
   │     └── calls → /reflect --on-hypothesis (for each unlearned resolution)
   ├── /review-hypotheses --full-cycle → --resolve + --learn + --accuracy-report + /reflect --full-cycle
   │     └── calls → /replay (hippocampal replay during full-cycle)
-  ├── /reflect (ROUTER — ~140 lines, dispatches to mode sub-skills)
-  │     ├── /reflect-hypothesis → full single hypothesis reflection (Steps 0.5-9)
+  ├── /reflect (ROUTER — dispatches to mode sub-skills)
+  │     ├── /reflect-on-outcome → hypothesis ABC chains, execution patterns, batch micro (Steps 0.5-9)
   │     │     └── calls /reflect-tree-update for tree propagation
-  │     ├── /reflect-batch-micro → batch micro-hypothesis processing (Steps 1-7)
-  │     ├── /reflect-extract-patterns → pattern synthesis + strategy extraction (Steps 1-5)
+  │     ├── /reflect-on-self → pattern synthesis, strategy extraction, calibration (Steps 1-5)
   │     │     └── calls /reflect-tree-update for tree propagation
-  │     ├── /reflect-calibration → confidence calibration check (Steps 1-4)
-  │     ├── /reflect-curate-memory → memory curation + active forgetting
+  │     ├── /reflect-maintain → memory curation, aspiration grooming
   │     ├── /reflect-tree-update → shared tree update protocol (Steps 1-4)
   │     ├── updates → world/pattern-signatures.jsonl (DG/CA3 learning, via script)
   │     ├── updates → world/knowledge/beliefs.yaml (belief confidence)
@@ -107,7 +105,7 @@ The aspiration engine's evolution log (`meta/evolution-log.jsonl`) tracks when a
 Biologically-inspired learning mechanisms layered on top of the Memory Tree. Based on hippocampal memory mechanics and Piaget's cognitive development theory.
 
 ### Memory Pipeline (encoding stages)
-Observations flow through: **sensory buffer** (raw, ephemeral) → **working memory** (10 typed slots, session-scoped, including micro-hypothesis batch) → **encoding gate** (filters by novelty/surprise/impact/goal relevance, threshold 0.40) → **consolidation** (session-end replay, dynamic budget (5-15 items, scaled by violations/domains/surprise) compressed to leaf node articles) → **long-term tree** (dynamic random tree, K=4 MAX, D_max=6). Micro-hypotheses are batch-processed at session-end: only surprises (>= 7) enter the encoding gate. Config: `core/config/memory-pipeline.yaml`. Session state: `<agent>/session/working-memory.yaml`.
+Observations flow through: **sensory buffer** (raw, ephemeral) → **working memory** (10 typed slots, session-scoped, including micro-hypothesis batch) → **encoding gate** (filters by novelty/surprise/impact/goal relevance, threshold 0.40) → **consolidation** (session-end replay, dynamic budget (5-15 items, scaled by violations/domains/surprise) compressed to leaf node articles) → **long-term tree** (dynamic random tree, K=4 MAX, D_max=20). Micro-hypotheses are batch-processed at session-end: only surprises (>= 7) enter the encoding gate. Config: `core/config/memory-pipeline.yaml`. Session state: `<agent>/session/working-memory.yaml`.
 
 ### Pattern Separation & Completion (dentate gyrus + CA3)
 Pattern signatures (`world/pattern-signatures.jsonl`, script-accessed via `pattern-signatures-read.sh`) enable two operations: **separation** ("this looks like pattern X but key feature differs so it's actually pattern Y") and **completion** ("partial cue matches → retrieve full strategy context"). Used during hypothesis evaluation to route between System 1 (fast/intuitive) and System 2 (slow/deliberate) reasoning.
@@ -189,7 +187,8 @@ In addition to standard working memory consolidation (see `/aspirations` Session
 
 ### Forged Skill Lifecycle
 - Created by `/forge-skill skill <gap-id>`
-- Registered in `.claude/skills/_tree.yaml` and `.claude/skills/_triggers.yaml`
+- Registered in `world/forged-skills.yaml`, `.claude/skills/_tree.yaml`, and `.claude/skills/_triggers.yaml`
+- Companion scripts live in `world/scripts/`
 - Parent skill updated to reference new child
 - Test goal created: 3 real invocations to validate
 - Retire after 3+ underperformance events

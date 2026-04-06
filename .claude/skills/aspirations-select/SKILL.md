@@ -70,9 +70,51 @@ ranked_goals = parsed_output  # JSON array of scored candidates
 
 ### Phase 2.05: Meta-Strategy Adjustment
 ```
-Read meta/goal-selection-strategy.yaml
+Bash: meta-read.sh goal-selection-strategy.yaml
 IF selection_heuristics is non-empty: apply post-score adjustments, re-sort
 IF custom_criteria is non-empty: evaluate + add weighted score
+```
+
+### Phase 2.07: Directive & Insight Trigger Scan
+
+Scan for cross-agent directives and insight triggers before applying precondition gates.
+Directives influence scoring (handled mechanically by `goal-selector.py` `directive_boost`
+criterion). The LLM handles acknowledgment and insight trigger processing.
+
+```
+# Directive acknowledgment
+Bash: board-read.sh --channel coordination --type directive --since 24h --json
+FOR EACH directive WHERE no acknowledgment reply from this agent exists:
+    Output: "▸ DIRECTIVE: {directive.text} (from {directive.author}, weight: {parsed weight})"
+    echo "Acknowledged directive {directive.id}" | \
+      Bash: board-post.sh --channel coordination --type status \
+        --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}"
+
+# Insight trigger scan (cross-agent findings that affect our goals)
+Bash: board-read.sh --channel findings --type finding --since 24h --json
+FOR EACH finding WITH "insight_trigger" in tags:
+    Parse severity from tags (severity:invalidates|constrains|enables|informs)
+    Parse affected goals from tags (affects:<goal-id>)
+    Parse required action (requires_action_by:<agent>, action_type:<type>)
+
+    IF requires_action_by does not match this agent: SKIP
+    IF already processed (check for reply from this agent): SKIP
+
+    IF severity == "invalidates":
+        Output: "▸ INSIGHT TRIGGER (INVALIDATES): {finding.text}"
+        Create investigation goal: "Investigate: {affected goal title} — assumption invalidated"
+        Acknowledge: echo "Processed insight trigger" | board-post.sh --reply-to {finding.id}
+    ELIF severity == "constrains":
+        Output: "▸ INSIGHT TRIGGER (CONSTRAINS): {finding.text}"
+        Append constraint note to affected goal description via aspirations-update-goal.sh
+        Acknowledge reply
+    ELIF severity == "enables":
+        Output: "▸ INSIGHT TRIGGER (ENABLES): {finding.text}"
+        # Enabling insights are informational — the directive_boost handles scoring
+        Acknowledge reply
+    ELIF severity == "informs":
+        Output: "▸ INSIGHT TRIGGER (INFORMS): {finding.text}"
+        Acknowledge reply
 ```
 
 ### Precondition Gate
@@ -147,6 +189,12 @@ For selected goal, assess:
    IF needed: Bash: infra-health.sh check {component}
    IF provisionable: invoke provision_skill (unless goal IS the provision skill)
 
+5. CONSOLIDATION: Check consolidation_health from working memory.
+   IF near_complete aspirations exist (consolidation_health.near_complete > 0):
+       Bias toward goals in those aspirations — completion pull is strongest near the finish.
+   IF selected goal is from a stalled aspiration (consolidation_health.stalled > 0):
+       Consider effort_level = "full" (invest deeply to unstall, not skim).
+
 Apply focus context to value assessment.
 ```
 
@@ -158,6 +206,30 @@ IF capability_level < auto_designate_below_capability threshold:
         Output: "▸ EXPLORATION MODE: {goal.category} shielded"
 ```
 
+### Phase 2.55: Self-Abstention Check
+```
+# Can I add genuine value to this goal given my capabilities?
+# Not about effort — about capability match. (arXiv 2603.28990: 8.6% voluntary
+# abstention in top model improves overall system quality.)
+IF goal requires capabilities outside <agent>/self.md "What I Do" section:
+    IF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME:
+        # Both agents can't do this goal — defer with timestamp for expiry
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> defer_reason "Both agents abstained — needs user attention or capability expansion"
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> defer_reason_set_at "$(date +%Y-%m-%dT%H:%M:%S)"
+        Log: "DOUBLE-ABSTENTION: ${goal.id} — deferring (${goal.abstained_by} also abstained)"
+    ELSE:
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> abstained_by <AGENT_NAME>
+        Bash: aspirations-update-goal.sh --source {source} <goal-id> abstained_at "$(date +%Y-%m-%dT%H:%M:%S)"
+    echo "Abstaining: ${goal.id} — capability mismatch: {specific_gap}" | Bash: board-post.sh --channel coordination --type status --tags abstain,${goal.id},${goal.category}
+    Log: "SELF-ABSTENTION: ${goal.id} — {reason}"
+    continue to next ranked goal
+
+# Self-abstention expires after abstention_timeout_hours (default 72h).
+# goal-selector.py checks abstained_at timestamp — expired abstentions fall through.
+# If the original reason still holds, the agent will re-abstain with a fresh timestamp.
+# If both agents abstain, the goal is deferred to prevent ping-pong.
+```
+
 ### Determine effort_level
 ```
 full:     Thorough execution, full spark check + metacognitive Q
@@ -165,7 +237,7 @@ standard: Normal execution, normal sparks (default)
 skip:     Focus mismatch or zero expected value
 
 Token cost and wall-clock time are NOT valid skip reasons.
-Valid: focus mismatch, zero expected value, blocker gate.
+Valid: focus mismatch, zero expected value, blocker gate, self-abstention.
 ```
 
 ## Phase 2.5b: Blocker Gate (with verification probe)
@@ -179,6 +251,13 @@ FOR goal in ranked_goals (iterate if current goal is blocked):
             Bash: infra-health.sh check {component}
             IF ok: clear blocker, proceed with this goal
             ELIF provisionable: attempt provisioning
+            IF still blocked: effort_level = skip, try next goal in ranked_goals
+    ELIF goal.skill is null AND goal.category in [cat for b in known_blockers for cat in b.get("affected_categories", []) if b.get("resolution") is None]:
+        # Category-based block (fallback for skill=null goals): probe before trusting
+        component = map goal.category to infra component
+        IF component:
+            Bash: infra-health.sh check {component}
+            IF ok: proceed (category block may be stale)
             IF still blocked: effort_level = skip, try next goal in ranked_goals
 
 # After FOR loop: if every ranked goal was skipped by the blocker gate

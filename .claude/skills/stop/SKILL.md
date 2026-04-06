@@ -7,7 +7,7 @@ conventions: [session-state, handoff-working-memory]
 minimum_mode: any
 ---
 
-# /stop — Stop the Autonomous Learning Loop
+# /stop -- Stop the Autonomous Learning Loop
 
 USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 
@@ -18,9 +18,9 @@ USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 /stop <agent-name>     # Stop a specific agent (fixes cross-session binding issues)
 ```
 
-**Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
+**Step 0: Load Conventions** -- `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded -- proceed to next step.
 
-**Step 0.5: Resolve Target Agent** — If `<agent-name>` argument provided:
+**Step 0.5: Resolve Target Agent** -- If `<agent-name>` argument provided:
 
 1. Validate agent directory exists: `ls <agent-name>/session/agent-state`
    - If not found: output "Agent '<agent-name>' not found or has no session state." DONE.
@@ -30,35 +30,37 @@ USER-ONLY COMMAND. Claude must NEVER invoke this skill.
 
 If no `<agent-name>` provided: use current session binding (existing behavior).
 
-**Step 1: Check State** — Bash: `session-state-get.sh`
+**Step 1: Check State** -- Bash: `session-state-get.sh`
 (If agent-name was provided in Step 0.5, the rebinding ensures this reads the target agent's state.)
 
 ## Behavior by Current State
 
 ### RUNNING
-1. Bash: `session-state-set.sh IDLE`
-2. Bash: `session-signal-set.sh stop-loop`
-3. Reset in-progress goals to pending (they didn't complete):
-   Bash: `load-aspirations-compact.sh` → IF path returned: Read it
-   (compact data has IDs, titles, statuses — no descriptions/verification)
-   For each in-progress goal: Bash: `aspirations-update-goal.sh <goal-id> status pending`
-4. Run session-end consolidation:
-   # MODE ORDER: consolidation has minimum_mode: autonomous. Mode must still be
-   # autonomous here. Step 5 (reader mode) MUST come AFTER this step, not before.
-   invoke /aspirations-consolidate with: stop_mode = true
-   This runs the full consolidation pipeline (encoding queue flush, micro-hypothesis
-   sweep, knowledge debt sweep, experience archive maintenance, journal, working memory
-   archive + reset, aspiration archive sweep, continuation handoff) while skipping
-   non-essential steps (tree rebalancing, skill reports, user recap, restart).
-4b. Session cleanup (remove transient loop files):
-   Bash: `rm -f <agent>/session/running-session-id <agent>/session/aspirations-compact.json <agent>/session/context-budget.json <agent>/session/context-reads.txt <agent>/session/background-jobs.yaml`
-5. Reset to reader mode (safe baseline):
-   Bash: `session-mode-set.sh reader`
-6. Output:
-   "Agent stopped. Session consolidated — encoding, journal, and handoff saved.
-   Mode set to reader (read-only). You can now chat with me — I have full access to
-   all accumulated knowledge. Ask me anything.
-   Type `/start` to resume autonomous mode, or `/start --mode assistant` for user-directed learning."
+
+Graceful two-phase stop. The agent finishes its current iteration's obligations
+(verify, state-update, learning checks) before stopping. No learning is lost.
+
+**How it works**: This skill sets a `stop-requested` signal but does NOT change state
+to IDLE. The stop hook sees RUNNING + no stop-loop → BLOCKs → Claude re-enters the
+aspirations loop → the loop detects `stop-requested` at Phase -1.4 → completes any
+in-flight obligations from the iteration checkpoint → runs the full stop sequence
+(IDLE, consolidation, cleanup, reader mode).
+
+1. Idempotent guard:
+   Bash: `session-signal-exists.sh stop-requested`
+   IF exit 0 (signal already exists):
+       Output: "Stop already requested -- waiting for the loop to finish its current obligations."
+       DONE.
+
+2. Set the signal:
+   Bash: `session-signal-set.sh stop-requested`
+
+3. Output:
+   "Stop requested -- the loop will finish its current obligations and then stop.
+   This usually takes under 2 minutes. You'll see progress updates as each step completes."
+
+The actual stop sequence (IDLE, consolidation, cleanup, reader mode) is executed by the
+aspirations loop's Phase -1.4 Graceful Stop Handler. See aspirations/SKILL.md.
 
 ### IDLE (assistant or reader mode)
 1. Check current mode: Bash: `session-mode-get.sh`
@@ -72,5 +74,6 @@ If no `<agent-name>` provided: use current session binding (existing behavior).
 Output: "Agent has not been started yet. Type `/start <name>` to begin."
 
 ## Chaining
-- Calls: /aspirations-consolidate (with stop_mode=true)
+- Sets: `stop-requested` signal (the aspirations loop handles the actual stop sequence)
+- Does NOT call: /aspirations-consolidate (that's now handled by the loop's Phase -1.4)
 - Called by: User only. NEVER by Claude.

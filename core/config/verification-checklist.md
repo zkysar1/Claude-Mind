@@ -25,6 +25,9 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 10. Knowledge tree index: `world/knowledge/tree/_tree.yaml` — nodes registered with `article_count`, `growth_state`, `confidence`, `capability_level`, interior/leaf distinction via `node_type`. All scoring/structural metadata lives exclusively in `_tree.yaml` (split-by-nature schema).
 11. No `world/knowledge/research-queue.yaml` exists (queue eliminated — aspirations handles topic selection)
 12. No `world/knowledge/_index.yaml` exists (index consolidated into `_tree.yaml`)
+13. Graceful stop signal: `session-signal-set.sh stop-requested` succeeds while RUNNING (no guard blocks it). `session-signal-clear.sh stop-requested` succeeds. Signal lifecycle: set → exists (exit 0) → clear → exists (exit 1).
+14. Graceful stop cleanup: after `/stop` + `/start` cycle, no `<agent>/session/stop-requested` or `<agent>/session/iteration-checkpoint.json` files remain (cleaned by /start).
+15. **Runtime**: After `/stop` during mid-iteration execution, journal should contain entry for the interrupted goal (written by Phase -1.4 obligation recovery, not lost).
 
 ---
 
@@ -34,8 +37,8 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 2. `core/config/hypothesis-conventions.md` / `core/config/knowledge-conventions.md` context manifest has `context_quality` sub-section with 4 fields (usefulness, most_valuable_source, least_valuable_source, chain_note)
 3. `review-hypotheses` Step 4.1 initializes `context_quality: pending` on resolved records
 4. `review-hypotheses` Step 4.5 rates context quality after resolution
-5. `reflect-hypothesis` Step 7.7d finalizes pending context quality ratings
-6. `reflect-hypothesis` Step 7.7e aggregates quality data into experiential index (runs AFTER 7.7d)
+5. `reflect-on-outcome` (Hypothesis mode) Step 7.7d finalizes pending context quality ratings
+6. `reflect-on-outcome` (Hypothesis mode) Step 7.7e aggregates quality data into experiential index (runs AFTER 7.7d)
 7. `core/config/evolution-triggers.yaml` has 6th trigger `context_retrieval_ineffectiveness`
 8. `world/evolution-triggers.yaml` has matching initial state entry for trigger #6
 9. `aspirations` Phase 9 comments list trigger #6 with `gap_frequency` + `usefulness_rate` checks
@@ -49,7 +52,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 17. `aspirations/SKILL.md` Phase 9 Part A.1 checks `goals_since_last_evolution >= evolution_goal_cadence.goals_without_evolution`
 18. `aspirations/SKILL.md` Phase -0.5 initializes `productive_goals_this_session`, `last_evolution_goal_count`, and `session_signals`
 19. `aspirations/SKILL.md` `productive_goals_this_session` increment is AFTER all reclassification (per-goal + global anti-drift)
-20. `aspirations/SKILL.md` global anti-drift fires at threshold 5 (higher than per-goal threshold 3)
+20. `aspirations/SKILL.md` global anti-drift fires at threshold 8 (higher than per-goal threshold 5)
 21. `aspirations-learning-gate/SKILL.md` Phase 9.8 reads threshold from `meta/reflection-strategy.yaml` → `mode_preferences.full_cycle_cadence_goals`
 22. `aspirations-learning-gate/SKILL.md` Phase 9.8 has team-aware deferral (checks coordination board for orchestrator)
 23. `meta/reflection-strategy.yaml` has `mode_preferences.full_cycle_cadence_goals: 15`
@@ -163,8 +166,12 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 15. **Runtime**: `tree-update.sh --add-child` with minimal JSON (just key + summary) persists `article_count`, `growth_state`, and `node_type` on the new node (write-time defaults prevent H17/H18 regression)
 16. `tree-find-node.sh --text "environment processor" --top 3` returns JSON array with `key`, `score`, `file`, `depth`, `summary`, `node_type`
 17. `tree-find-node.sh --text "deployment" --leaf-only --top 1` returns only leaf nodes (no interior)
-18. `tree-update.sh --batch` accepts `{"operations":[...]}` on stdin with `set` and `increment` ops
-19. `tree-update.sh --batch` validates ALL keys exist before any mutation (atomic: all-or-nothing)
+18. `tree-update.sh --batch` accepts `{"operations":[...]}` on stdin with `set`, `increment`, `add-child`, `remove-child`, and `propagate` ops
+19. `tree-update.sh --batch` validates keys before mutation; `add-child` ops create new keys that later ops in the same batch can reference
+19a. `tree-update.sh --batch` with `add-child` creates child node with correct depth, parent, file path (same as standalone `--add-child`)
+19b. `tree-update.sh --batch` `propagate` ops run AFTER all mutation ops in the same batch
+19c. `tree-update.sh --batch` with only `set`/`increment` ops returns plain JSON array (backward compat); with `propagate` returns `{"updated_nodes":[], "propagate":[]}`
+19d. `write_tree()` retries `PermissionError`/`OSError` up to 5 times with exponential backoff (OneDrive sync safety)
 20. `tree-propagate.sh <node-key>` returns JSON with `source_node`, `ancestors_updated`, `capability_changes`
 21. `tree-propagate.sh root` returns empty `ancestors_updated` (root has no parent)
 22. `tree-read.sh --summary` returns compact JSON with `file`, `summary`, `depth`, `capability_level`, `confidence`, `children` per node (no counters, growth_state)
@@ -208,7 +215,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 2. `core/scripts/goal-selector.sh` is thin bash wrapper that routes subcommands (defaults to `select`)
 3. `goal-selector.sh` reads `world/aspirations.jsonl` via JSONL infrastructure
 4. `goal-selector.sh` returns JSON array of ranked goals with score breakdowns
-5. `goal-selector.sh` implements all 11 deterministic scoring criteria from aspirations/SKILL.md: priority, deadline_urgency, agent_executable, variety_bonus, streak_momentum, novelty_bonus, recurring_urgency, reward_history, evidence_backing, deferred_readiness, context_coherence
+5. `goal-selector.sh` implements all 16 deterministic scoring criteria: priority, deadline_urgency, agent_executable, variety_bonus, streak_momentum, novelty_bonus, recurring_urgency, recurring_saturation, reward_history, completion_pressure, depth_bonus, evidence_backing, deferred_readiness, context_coherence, skill_affinity, directive_boost
 5b. `goal-selector.py` reads epsilon from `<agent>/developmental-stage.yaml` and noise_scale from `core/config/developmental-stage.yaml`
 5c. `goal-selector.py` output includes `exploration_noise` in breakdown/raw, and `exploration_params` with epsilon/noise_scale/noise_weight
 5d. At epsilon=0.19 (mastering), max noise contribution < 0.6
@@ -571,8 +578,8 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 42. `core/config/conventions/handoff-working-memory.md` documents `kind` ("strategy"|"world_claim") and `evidence_strength` ("weak"|"moderate"|"strong") fields
 43. `boot/SKILL.md` Step 0.5.3 has world_claim challenge logic: weak expires after 1 session, moderate after 2
 44. `aspirations-consolidate/SKILL.md` Step 9 has classification instruction for `kind` and `evidence_strength`
-45. `reflect-curate-aspirations/SKILL.md` Step 1 has criterion 1e (orphaned deferral — defer_reason not backed by active decision)
-46. `reflect-curate-aspirations/SKILL.md` Step 2 UNBLOCK decision covers orphaned deferrals (clear deferred_until + defer_reason)
+45. `reflect-maintain/SKILL.md` (Aspirations mode) Step 1 has criterion 1e (orphaned deferral — defer_reason not backed by active decision)
+46. `reflect-maintain/SKILL.md` (Aspirations mode) Step 2 UNBLOCK decision covers orphaned deferrals (clear deferred_until + defer_reason)
 47. **Runtime**: Weak world_claim in handoff.yaml expires after 1 session (not 3)
 48. **Runtime**: Boot clears goal deferred_until/defer_reason when invalidating the supporting decision
 49. All `decisions_locked` entries have `kind` field — no entries without it (no fallback, single source of truth)
@@ -592,12 +599,12 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 6. `.claude/rules/*.md` files contain no domain-specific terms — verify by grepping key domain nouns
 7. Convention files (`core/config/conventions/*.md`) use generic examples, not domain-specific ones
 8. `core/config/verification-checklist-domain-specific.md` is a template (domain checks live in `world/verification-checklist.md`)
-9. `core/scripts/infra-health.py` has no hardcoded component names or probe functions — components come from `<agent>/infra-health.yaml`, probes from `<agent>/scripts/probe-{name}.sh`
+9. `core/scripts/infra-health.py` has no hardcoded component names or probe functions — components come from `<agent>/infra-health.yaml`, probes from `world/scripts/probe-{name}.sh`
 10. `core/scripts/init-agent.sh` creates `infra-health.yaml` with `components: {}` (empty, not domain-specific)
 11. `core/scripts/guardrail-check.py` `INFRASTRUCTURE_KEYWORDS` contains only generic terms (no domain product names)
 12. `core/scripts/guardrail-check.py` `extract_action_hint()` uses no auto-prefix magic — paths in guardrail text are used directly
 13. `.env.example` has only section headers, no domain-specific credential entries (agent registers keys via `env.py register`)
-14. `.gitignore` forged skill entries match `<agent>/forged-skills.yaml` (no orphan entries after reset)
+14. `.gitignore` forged skill entries match `world/forged-skills.yaml` (no orphan entries after reset)
 15. `boot/SKILL.md` discovers L1 tree nodes dynamically from `_tree.yaml` (no hardcoded filenames)
 16. `CLAUDE.md` Available Skills table has no domain-specific forged skill entries
 
@@ -765,9 +772,9 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 10. Both files have comments stating they are static framework — never modified during RUNNING state
 
 ### Y3. Forged Skills in <agent>/
-11. `<agent>/forged-skills.yaml` exists (created by `init-agent.sh` on first boot)
-12. Every `.claude/skills/` directory NOT registered in `_tree.yaml` has a matching entry in `<agent>/forged-skills.yaml`
-13. `forge-skill/SKILL.md` writes to `<agent>/forged-skills.yaml` (NOT `_tree.yaml` or `_triggers.yaml`)
+11. `world/forged-skills.yaml` exists (created by `init-world.sh` on first boot)
+12. Every `.claude/skills/` directory NOT registered in `_tree.yaml` has a matching entry in `world/forged-skills.yaml`
+13. `forge-skill/SKILL.md` writes to `world/forged-skills.yaml` (NOT `_tree.yaml` or `_triggers.yaml`)
 14. `forge-skill/SKILL.md` contains "Do NOT touch `_tree.yaml` or `_triggers.yaml`"
 
 ### Y4. Framework Protection (settings.json)
@@ -861,7 +868,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 3. `core/config/aspirations.yaml` has `user_action:` goal template (not `owner_action:`)
 4. `core/config/profile.yaml` has `surface_user_goals` (not `surface_owner_goals`)
 5. User notification skill (if forged) uses `user` naming, not `owner`
-6. `<agent>/forged-skills.yaml` entries use `user` naming, not `owner`
+6. `world/forged-skills.yaml` entries use `user` naming, not `owner`
 7. `aspirations-read.sh --active` contains zero "owner" references
 8. `core/config/conventions/handoff-working-memory.md` documents `user_goals_pending` in handoff schema
 
@@ -958,11 +965,9 @@ Verifies the aspirations and reflect skills were correctly decomposed into orche
 ### AI2. Reflect Sub-Skills Exist
 
 7. `reflect/SKILL.md` is the router (should be ~140 lines, NOT 1400+)
-8. `reflect-hypothesis/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
-9. `reflect-batch-micro/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
-10. `reflect-extract-patterns/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
-11. `reflect-calibration/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
-12. `reflect-curate-memory/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
+8. `reflect-on-outcome/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
+9. `reflect-on-self/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
+10. `reflect-maintain/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
 13. `reflect-tree-update/SKILL.md` exists with `parent-skill: reflect` and `user-invocable: false`
 
 ### AI3. Invoke Stubs in Orchestrators
@@ -972,23 +977,32 @@ Verifies the aspirations and reflect skills were correctly decomposed into orche
 16. `aspirations/SKILL.md` contains `aspirations-state-update` reference (Phase 8 invoke)
 17. `aspirations/SKILL.md` contains `aspirations-consolidate` reference (Session-End invoke)
 18. `aspirations/SKILL.md` contains `aspirations-evolve` reference (evolve invoke)
-19. `reflect/SKILL.md` contains `reflect-hypothesis` reference (--on-hypothesis dispatch)
-20. `reflect/SKILL.md` contains `reflect-batch-micro` reference (--batch-micro dispatch)
-21. `reflect/SKILL.md` contains `reflect-extract-patterns` reference (--extract-patterns dispatch)
-22. `reflect/SKILL.md` contains `reflect-calibration` reference (--calibration-check dispatch)
-23. `reflect/SKILL.md` contains `reflect-curate-memory` reference (--curate-memory dispatch)
-24. `reflect/SKILL.md` contains `reflect-tree-update` reference (Integration Points)
+19. `reflect/SKILL.md` contains `reflect-on-outcome` reference (--on-hypothesis dispatch)
+20. `reflect/SKILL.md` contains `reflect-on-outcome` reference (--on-execution dispatch)
+21. `reflect/SKILL.md` contains `reflect-on-outcome` reference (--batch-micro dispatch)
+22. `reflect/SKILL.md` contains `reflect-on-self` reference (--extract-patterns dispatch)
+23. `reflect/SKILL.md` contains `reflect-on-self` reference (--calibration-check dispatch)
+24. `reflect/SKILL.md` contains `reflect-maintain` reference (--curate-memory dispatch)
+25. `reflect/SKILL.md` contains `reflect-maintain` reference (--curate-aspirations dispatch)
+26. `reflect/SKILL.md` contains `reflect-tree-update` reference (Integration Points)
+
+### AI3b. Merged Skill Structure (mode sections present)
+
+27. `reflect-on-outcome/SKILL.md` has exactly 3 `## Mode:` sections (Hypothesis, Execution, Batch Micro)
+28. `reflect-on-self/SKILL.md` has exactly 2 `## Mode:` sections (Extract Patterns, Calibration)
+29. `reflect-maintain/SKILL.md` has exactly 2 `## Mode:` sections (Curate Memory, Curate Aspirations)
+30. Each `## Mode:` section header name matches the router's `Mode:` dispatch name exactly
 
 ### AI4. Settings Deny List
 
-25. `.claude/settings.json` has Edit+Write deny for all 11 sub-skills: aspirations-execute, aspirations-spark, aspirations-consolidate, aspirations-evolve, aspirations-state-update, reflect-hypothesis, reflect-batch-micro, reflect-extract-patterns, reflect-calibration, reflect-curate-memory, reflect-tree-update
+31. `.claude/settings.json` has Edit+Write deny for all 9 sub-skills: aspirations-execute, aspirations-spark, aspirations-consolidate, aspirations-evolve, aspirations-state-update, reflect-on-outcome, reflect-on-self, reflect-maintain, reflect-tree-update
 
 ### AI5. Keyword Coverage (No Dropped Steps)
 
-26. All phase markers (Phase 0 through Phase 11) appear across aspirations skill files
-27. All critical script calls (aspirations-update-goal.sh, aspirations-add-goal.sh, retrieve.sh, experience-add.sh, pipeline-add.sh, tree-update.sh, goal-selector.sh, journal-add.sh, evolution-log-append.sh, spark-questions-read.sh) appear across aspirations skill files
-28. All reflect step markers (Step 0.5 through Step 9) appear across reflect skill files
-29. All reflect concepts (ABC Chain, Differentiated Extraction, Contrastive Extraction, Pattern Signatures, Belief Registry, Context Gap Analysis, Decay Model, Propagate Upward) appear across reflect skill files
+32. All phase markers (Phase 0 through Phase 11) appear across aspirations skill files
+33. All critical script calls (aspirations-update-goal.sh, aspirations-add-goal.sh, retrieve.sh, experience-add.sh, pipeline-add.sh, tree-update.sh, goal-selector.sh, journal-add.sh, evolution-log-append.sh, spark-questions-read.sh) appear across aspirations skill files
+34. All reflect step markers (Step 0.5 through Step 9) appear across reflect skill files
+35. All reflect concepts (ABC Chain, Differentiated Extraction, Contrastive Extraction, Pattern Signatures, Belief Registry, Context Gap Analysis, Decay Model, Propagate Upward) appear across reflect skill files
 
 ### AI6. Cross-References Updated
 
@@ -1461,6 +1475,64 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 30. **Runtime**: g-001-07 (regular encoding flush) and Phase -0.5c (post-compaction encoding) complement each other without conflict
 31. **Runtime**: After autocompact, terminal shows `[precompact]` and `[postcompact]` stderr lines (user-visible hook feedback)
 
+### AR6. Blocked-Sleep Recovery (Phase -0.5e)
+32. `precompact-checkpoint.py` saves `blocked_sleep_until` from `slots.get("blocked_sleep_until")` in checkpoint dict
+33. `postcompact-restore.py` prints `BLOCKED-SLEEP ACTIVE` warning when checkpoint has non-null `blocked_sleep_until`
+34. `aspirations/SKILL.md` has Phase -0.5e between Phase -0.5c and Phase -0.5d
+35. Phase -0.5e reads `blocked_sleep_until` via `wm-read.sh`, resumes remaining sleep or expires if ≤15s, then clears slot
+36. `aspirations/SKILL.md` Step B7 writes `blocked_sleep_until` to working memory BEFORE `sleep 300` and clears AFTER normal completion
+37. Step B7 `wm-set.sh` precedes `sleep` — if compaction interrupts, the slot persists for Phase -0.5e recovery
+38. **Runtime**: During all-blocked with compaction, at most ONE sleep process is active (no orphaned accumulation)
+39. **Runtime**: After compaction during B7 sleep, Phase -0.5e resumes with decreasing remaining time across multiple compactions
+40. **Runtime**: Stale `blocked_sleep_until` from a crashed session is expired (timestamp in past → remaining=0 → cleared)
+
+### AR7. Full WM Snapshot (all_slots)
+41. `precompact-checkpoint.py` saves `all_slots: slots` — the FULL `slots` dict from working memory, not a cherry-picked subset
+42. `precompact-checkpoint.py` saves `slot_meta` dict — preserves slot age/activity tracking across compaction
+43. `precompact-checkpoint.py` saves top-level WM keys: `goals_completed_this_session`, `aspiration_touched_last`
+44. `postcompact-restore.py` reads `all_slots` from checkpoint and shows LOOP STATE (goals_completed, productive_goals, evolutions, etc.)
+45. `postcompact-restore.py` shows GOALS COMPLETED THIS SESSION with count and last 10 IDs
+46. `postcompact-restore.py` shows ADDITIONAL STATE for non-null scalar slots (active_strategy, session_goal, active_hypothesis, conclusions, sensory_buffer, episode_chain, domain_data, recent_violations)
+47. `postcompact-restore.py` shows ALL unresolved blockers (no truncation to first 3)
+48. `postcompact-restore.py` shows encoding queue up to 10 items (not 5)
+49. `postcompact-restore.py` does NOT truncate active_context.summary (full text injected into fresh context)
+50. Legacy checkpoint keys (active_context, micro_hypotheses, knowledge_debt, known_blockers) are retained alongside `all_slots` for backward compatibility
+
+### AR8. Compact Slot Restoration Script
+51. `core/scripts/compact-restore-slots.py` exists — reads `all_slots` from checkpoint, restores to WM with merge logic
+52. `core/scripts/compact-restore-slots.sh` exists — thin bash wrapper, delegates to .py
+53. Array merge: extends current WM arrays with checkpoint items not already present (dedup via JSON serialization)
+54. Map merge: checkpoint values take precedence for non-null keys
+55. Scalar overwrite: direct replacement when current is null/empty
+56. Skip list: `archived_context` is skipped (stale by definition after compaction)
+57. `slot_meta` timestamps restored from checkpoint (preserves age tracking accuracy)
+58. Top-level WM keys restored: `goals_completed_this_session`, `aspiration_touched_last`, `last_goal_category`
+59. Script outputs summary of restored/merged/skipped slots for LLM visibility
+60. Script exits cleanly with "no checkpoint" when checkpoint file is missing (not an error)
+
+### AR9. Execution Diary
+61. `core/scripts/execution-diary.py` exists with subcommands: append, read, summary, trim
+62. `core/scripts/execution-diary.sh` exists — thin bash wrapper, delegates to .py
+63. Diary file path: `<agent>/session/execution-diary.jsonl` (append-only JSONL)
+64. `append` subcommand: requires `content` field, auto-adds `timestamp` if missing, validates `entry_type`
+65. Valid entry types: decision, failure, finding, approach_change, observation, state_update
+66. `read` subcommand: supports `--limit`, `--since`, `--goal`, `--json` filters
+67. `trim` subcommand: removes entries older than N hours (default 8), uses atomic tmp+replace rewrite
+68. `trim` keeps entries with no parseable timestamp (fail-open, never silently discard)
+69. `postcompact-restore.py` reads last 10 diary entries and includes them in the EXECUTION DIARY section
+70. `core/config/conventions/compact-recovery.md` documents diary integration and boot whitelist requirement
+
+### AR10. Reasoning Snapshot
+71. `core/scripts/reasoning-snapshot.py` exists with subcommands: write, read, clear
+72. `core/scripts/reasoning-snapshot.sh` exists — thin bash wrapper, delegates to .py
+73. Snapshot file path: `<agent>/session/reasoning-snapshot.yaml`
+74. `write` subcommand: accepts JSON or YAML from stdin, auto-adds `snapshot_at` timestamp
+75. `write` subcommand: enriches with `context_used_pct` and `context_zone` from `context-budget.json` if available
+76. `write` uses atomic write (tmp + `os.replace`)
+77. `postcompact-restore.py` reads snapshot and includes REASONING SNAPSHOT section (current goal, approach, tried_and_failed, theory, next_step, key decisions, emerging patterns)
+78. `core/config/conventions/compact-recovery.md` documents snapshot as tight-zone proactive checkpoint
+79. `core/config/conventions/working-memory.md` references reasoning snapshot in Proactive Persistence section
+
 ---
 
 ## ARa. Pending Background Agent Tracking (Stop Hook Gate 2.5)
@@ -1514,16 +1586,16 @@ persistently and the stop hook allows graceful idle-waiting instead of forced lo
 
 ## AS. Routine Outcome Fast-Path (outcome_class)
 
-Recurring goals that find nothing to do (empty inbox, all healthy) skip expensive post-execution phases via `outcome_class`. Three tiers: `"deep"` (default — immediate tree encoding), `"standard"` (recurring with findings — deferred tree encoding), and `"routine"` (recurring, no findings — reduced pipeline). Only recurring goals on success can be demoted from deep.
+Recurring goals that find nothing to do (empty inbox, all healthy) skip expensive post-execution phases via `outcome_class`. Binary classification: `"deep"` (default — full pipeline with immediate tree encoding) and `"routine"` (recurring, no findings — reduced pipeline). Only recurring goals on success can be demoted from deep.
 
 ### AS1. Classification (aspirations-execute/SKILL.md)
 1. Phase 4-post sets `outcome_class = "deep"` as default before any conditional
-2. Only `goal.recurring AND goal_succeeded` can produce `outcome_class = "routine"` or `"standard"`
-3. Recurring goals WITH findings → `"standard"` (deferred tree encoding, all other steps run)
+2. Only `goal.recurring AND goal_succeeded AND no findings` can produce `outcome_class = "routine"`
+3. Recurring goals WITH findings remain `"deep"` (learning is the mission — no deferred encoding)
 4. Non-recurring goals ALWAYS remain `"deep"` (structural constraint)
 5. Failed goals ALWAYS remain `"deep"` (safety rule)
 6. If uncertain, remains `"deep"` (fail-open — bias toward full treatment)
-7. After Phase 4.1 guardrail check: `IF guardrail_found_issues: outcome_class = "deep"` (guardrails override routine/standard)
+7. After Phase 4.1 guardrail check: `IF guardrail_found_issues: outcome_class = "deep"` (guardrails override routine)
 8. `outcome_class` is listed in the Phase 4 return values comment
 
 ### AS2. Pipeline Gating (aspirations-execute/SKILL.md)
@@ -1532,18 +1604,18 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 10. Phase 4.26 (context utilization) feedback loop gated by `outcome_class != "routine"`, but `utilization_pending: false` clearing runs unconditionally for ALL outcomes
 
 ### AS3. Pipeline Gating (aspirations/SKILL.md)
-11. Phase 6 (spark check) wrapped with `IF outcome_class in ("standard", "deep"):`
+11. Phase 6 (spark check) wrapped with `IF outcome_class == "deep":`
 12. Phase 7 (aspiration-level check) runs unconditionally (NOT gated)
-13. Phase 8 passes `outcome_class` to `/aspirations-state-update` (3-tier: routine/standard/deep)
+13. Phase 8 passes `outcome_class` to `/aspirations-state-update` (binary: routine/deep)
 14. Phase 9 Part A (cadence/lifecycle triggers: `evolution_cadence`, `capability_unlock`) runs unconditionally — NOT gated by `outcome_class`
-15. Phase 9 Part B (performance triggers: `accuracy_drop`, `consecutive_losses`, `pattern_divergence`, `stale_strategy`, `context_retrieval_ineffectiveness`) wrapped with `IF outcome_class in ("standard", "deep"):`
+15. Phase 9 Part B (performance triggers: `accuracy_drop`, `consecutive_losses`, `pattern_divergence`, `stale_strategy`, `context_retrieval_ineffectiveness`) wrapped with `IF outcome_class == "deep":`
 16. Phase 9 Part B resets `evolution_cadence.last_fired` when performance triggers fire evolution — prevents cadence from ignoring performance-triggered evolutions
 17. Phase 9.5 (learning gate) has explicit routine bypass: `IF outcome_class == "routine": # No tree encoding needed`
 18. Phase 9.7 (reflection counter) increments unconditionally — routine goals count toward 5-goal checkpoint
 
 ### AS4. State Update (aspirations-state-update/SKILL.md)
 19. Skill description mentions `outcome_class` parameter (default: `"deep"`)
-20. Body text describes 3-tier paths: deep (all steps, immediate tree encoding), standard (all steps, deferred tree encoding), routine (Steps 1-4 + abbreviated Step 7)
+20. Body text describes binary paths: deep (all steps, immediate tree encoding), routine (Steps 1-4 + abbreviated Step 7)
 21. Routine early-return block exists between Step 4 and Step 5 with `IF outcome_class == "routine":`
 22. Routine path writes abbreviated journal: `"## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}."`
 23. Routine path still updates journal index via `journal-merge.sh` or `journal-add.sh`
@@ -1551,10 +1623,12 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 
 ### AS5. Anti-Drift Safeguard (aspirations/SKILL.md)
 25. `routine_streaks[goal.id]` counter increments on each routine outcome
-26. After 3 consecutive routine outcomes for same goal: `outcome_class` overridden to `"deep"`, counter reset to 0
-27. Any standard/deep outcome resets the per-goal counter to 0
+26. After 5 consecutive routine outcomes for same goal: `outcome_class` overridden to `"deep"`, counter reset to 0
+27. Any deep outcome resets the per-goal counter to 0
 28. Counter is ephemeral (in-memory) — autocompact reset fails open (more processing, not less)
-28a. Global anti-drift fires after 5 consecutive routine outcomes across ALL goals (not per-goal)
+28a. Global anti-drift fires after 8 consecutive routine outcomes across ALL goals (not per-goal)
+28a1. Ratio-based anti-drift: fires when `routine_count_total / goals_completed >= 0.80` and `goals_completed >= 6` — catches interleaving pattern where different recurring goals alternate routine outcomes
+28a2. `session_signals.routine_count_total` initialized to 0, incremented on every routine outcome (never resets mid-session), persisted across loop iterations via loop_state WM slot
 
 ### AS5a. Encoding Drift Safeguard (aspirations/SKILL.md + aspirations-state-update/SKILL.md)
 28b. `session_signals.goals_since_last_tree_update` counter initialized to 0 at session start
@@ -1570,14 +1644,14 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 28j. Title matching uses word-start (no colon required) — matches both "Audit web app..." and "Investigate: why..."
 28k. Investigation goals with >500 chars output get `force_encoding = true` — bypasses "new insight" gate
 28l. Investigation-aware curator weights: coverage 0.50, specificity 0.30, actionability 0.20 (vs default 0.40/0.35/0.25)
-28m. Investigation-aware weights apply in BOTH deep and standard curator gate branches
+28m. Investigation-aware weights apply in the deep curator gate branch
 
 ### AS5c. Hardened Learning Gate Escape Hatch (aspirations-learning-gate/SKILL.md)
 28n. Deep branch: "No tree encoding needed" requires structural justification (<100 chars output OR blocked/skipped status)
 28o. Deep branch: if tree was NOT updated, learning gate checks sensory buffer for items scored >= 0.40 related to goal
 28p. Deep branch: if high-value buffer items found, learning gate forces inline encoding (rejects "no insight" claim)
 28q. Deep branch: if no buffer items but substantive output, creates HIGH-priority knowledge debt
-28r. Standard branch: same buffer-check recovery before falling back to inline encoding from execution context
+28r. (Removed — standard branch no longer exists; deep branch handles all non-routine outcomes)
 
 ### AS5d. Mid-Session Encoding Queue Drain (aspirations/SKILL.md Phase 11)
 28s. Phase 11 reads encoding_queue from WM after sensory buffer overflow handling
@@ -1587,7 +1661,7 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 
 ### AS5e. Flag Consistency (aspirations-state-update/SKILL.md) — guard-046
 28w. Deep branch: `step_8_wrote_insight = true` AND `step_8_tree_encoded = true` set at branch level (NOT inside capability check)
-28x. Standard branch: `step_8_wrote_insight = true` (content computed) AND `step_8_tree_encoded = false` (tree write deferred)
+28x. (Removed — standard branch no longer exists; all non-routine outcomes use the deep branch)
 28y. Else branch (no insight): both flags set to false
 28z. Orchestrator drift tracking, Step 8.5, and Step 8.75 all gate on `step_8_wrote_insight` — never on `step_8_tree_encoded`
 
@@ -1595,13 +1669,40 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 29. Batched execution section mentions `outcome_class` classification per batched goal
 30. Phase 5 listed as "always runs", Phase 6 listed as "SKIP if routine"
 
+### AS6a. Routine Spark (aspirations/SKILL.md + aspirations-spark/SKILL.md)
+30a. `aspirations/SKILL.md` Phase 6 has ELIF branch: `outcome_class == "routine"` fires spark with `outcome_class="routine_spark"` every 3rd routine outcome (`routine_count_total % 3 == 0 AND > 0`)
+30b. `aspirations-spark/SKILL.md` has "Routine Spark Mode" section: filters active questions to categories `hypothesis_generation`, `forward_prediction`, `experiential_hypothesis` only
+30c. Routine spark handler ends with `RETURN` — skips full spark evaluation and Phase 6.5
+
+### AS6b. Hypothesis Pipeline Health (aspirations-precheck/SKILL.md)
+30d. Phase 0.5.2 uses `horizon` + `formed_date` for time-gate estimation — pipeline records do NOT have `resolves_no_earlier_than` (that field is on aspiration goals only)
+30e. Default windows: session=immediate, short=formed_date+12h, long=formed_date+24h (from `hypothesis-conventions.md`)
+30f. `hypothesis_pipeline_low_water_mark` is 4 (in `core/config/aspirations.yaml`)
+30g. Phase 0.5.2 dedup checks both "Investigate: Prediction opportunities" AND "Generate hypotheses" title prefixes
+
+### AS6c. Hypothesis Generation Goal (agent-aspirations-initial.jsonl)
+30h. `agent-aspirations-initial.jsonl` asp-001 has g-001-10: recurring hypothesis generation goal (interval_hours: 6, precondition: 3 non-recurring goals completed)
+30i. g-001-10 description steers toward user experience, system quality, emergent patterns over code behavior
+
+### AS6d. Replay Precondition (agent-aspirations-initial.jsonl)
+30j. g-001-05 precondition says "3 replay candidates" and instructs to run `pipeline-read.sh --replay-candidates` (counts resolved + archived)
+30k. Threshold is 3 (not 5)
+
+### AS6e. Spark Question Broadening (spark-questions.yaml)
+30l. sq-009 text includes "user experience, system quality, emergent patterns, and domain outcomes"
+30m. sq-c09 candidate exists with category `experiential_hypothesis`
+30n. `aspirations-spark/SKILL.md` sq-009 handler has Step 0.1 category steering: steers away from saturated categories (3+ hypotheses in same category)
+
 ### AS7. Runtime
 31. **Runtime**: After a recurring inbox check with no emails, journal shows `"Routine: Check inbox..."` (not full goal entry)
 32. **Runtime**: After a recurring inbox check that FINDS an email, full experience trace is archived
-33. **Runtime**: After 3 consecutive routine outcomes for a recurring goal, the 4th runs full pipeline (spark, tree, evolution)
+33. **Runtime**: After 5 consecutive routine outcomes for a recurring goal, the 6th runs full pipeline (spark, tree, evolution)
 33a. **Runtime**: After 4 consecutive goals without tree update, next state update reads `force_tree_encoding` from WM and bypasses "new insight" gate
 33b. **Runtime**: An "Audit..." goal with >500 chars output produces `is_investigation_goal = true` and forces encoding
 33c. **Runtime**: When encoding queue reaches 3 items, Phase 11 drains 1 item to tree and resets drift counter
+33d. **Runtime**: Every 3rd routine outcome fires a routine spark that evaluates only hypothesis-generating questions
+33e. **Runtime**: When >80% of session goals are routine (after 6+ goals), ratio anti-drift forces deep pipeline
+33f. **Runtime**: g-001-10 (or equivalent) fires every 6h and creates at least 1 hypothesis (or documents why none formable)
 
 ---
 
@@ -1678,6 +1779,22 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 38. **Runtime**: `load-execute-protocol.sh` first call outputs digest path; second call (after Read hook records) outputs nothing
 39. **Runtime**: After autocompact, tracker clears and digest is re-read (~136 lines instead of ~636)
 
+### AT5c. Consolidation Housekeeping Digest (graduated loading)
+
+40a. `core/config/consolidation-housekeeping.md` exists — compact digest of Steps 2.6-10
+40b. `core/scripts/consolidation-precheck.py` exists — checks all encoding queues in one shot
+40c. `core/scripts/consolidation-precheck.sh` exists — sources `_platform.sh` BEFORE deriving paths
+40d. `core/scripts/load-consolidation-housekeeping.sh` exists — uses `check-file` (same as execute digest)
+40e. `consolidation-precheck.py` checks: micro_hypotheses, encoding_queue, knowledge_debt, conclusions, violations (recent_violations), unreflected, overflow_queue, lean_ceiling (from handoff.yaml)
+40f. `consolidation-precheck.py` has sync comment: "must match Step 0.1 (CONSOLIDATION TRIAGE GATE)"
+40g. `aspirations-consolidate/SKILL.md` Step 0.1 has sync comment: "duplicated in consolidation-precheck.py"
+40h. `aspirations/SKILL.md` Session-End Consolidation calls `consolidation-precheck.sh` before routing
+40i. `stop/SKILL.md` Step 4 calls `consolidation-precheck.sh` before routing
+40j. `consolidation-housekeeping.md` handoff schema includes `consolidation_meta.consecutive_lean_sessions`
+40k. `consolidation-housekeeping.md` Step 6 (tree rebalancing) runs always — NOT gated by stop_mode
+40l. **Runtime**: `AYOAI_AGENT=<agent> consolidation-precheck.sh` returns valid JSON with `verdict` field
+40m. **Runtime**: When all WM queues empty and no lean ceiling, verdict is `"FAST"`
+
 ### AT6. Known Limitation
 40. Subagent Read calls share the tracker file — subagent reads may cause the main agent's gate to block files not in the main agent's context. Self-corrects at compaction.
 
@@ -1698,7 +1815,7 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 
 ### AF1. Gate Structure
 1. `aspirations-state-update/SKILL.md` Step 8.5 exists between Step 8 (tree encoding) and the closing block
-2. Step 8.5 runs for both standard and deep outcomes (after routine early-return block)
+2. Step 8.5 runs for deep outcomes (after routine early-return block)
 3. Step 8.5 has instant-skip when Step 8 did NOT write new insight (no `step_8_wrote_insight`)
 4. Investigation goals (title starts with Investigate, Research, Audit, etc.) get mandatory binary fallback check even without keyword match
 
@@ -1931,13 +2048,24 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 ---
 
-## FS. Forged Skills Gitignore
+## FS. Forged Skills Integrity
 
-1. Every entry in `<agent>/forged-skills.yaml` has a matching `.claude/skills/{name}/` line in `.gitignore`
+### FS1. Gitignore
+1. Every entry in `world/forged-skills.yaml` has a matching `.claude/skills/{name}/` line in `.gitignore`
 2. Base skills (e.g., `/tree`) are NOT in `.gitignore` — they are git-tracked
 3. `forge-skill/SKILL.md` Step 4 includes adding to `.gitignore`
 4. `forge-skill/SKILL.md` `/forge-skill check` audit verifies gitignore entries
 5. `forged-skills.yaml` entries with `gap_ref` cross-reference to matching `skill-gaps.yaml` entries with `forged_into`
+
+### FS2. World-Level Single Source of Truth
+6. `world/forged-skills.yaml` is the ONLY forged skills registry — no `<agent>/forged-skills.yaml` exists (except tombstone)
+7. Every entry in `world/forged-skills.yaml` has a `forged_by` field (provenance tracking)
+8. `world/skill-relations.yaml` is the ONLY skill relations store — no `<agent>/skill-relations.yaml` exists
+9. Companion scripts live in `world/scripts/` — no `<agent>/scripts/` directories exist
+10. `init-world.sh` creates `forged-skills.yaml`, `skill-relations.yaml`, and `scripts/` directory
+11. `init-agent.sh` does NOT create `forged-skills.yaml` or `skill-relations.yaml`
+12. `skill-relations.py` imports `WORLD_DIR` (not `AGENT_DIR`) for relations path
+13. `.claude/rules/forged-skill-resolution.md` points to `world/forged-skills.yaml`
 
 ---
 
@@ -1945,11 +2073,11 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 ### SC1. Skill Definitions
 
-1. `stop/SKILL.md` RUNNING section invokes `/aspirations-consolidate with: stop_mode = true` (not inline mini-consolidation)
-2. `stop/SKILL.md` resets in-progress goals to pending BEFORE invoking consolidation
+1. `stop/SKILL.md` RUNNING section runs `consolidation-precheck.sh` then routes to full skill or housekeeping digest
+2. `stop/SKILL.md` resets in-progress goals to pending via `aspirations-query.sh --goal-status in-progress` BEFORE invoking consolidation (does NOT load full compact file)
 3. `stop/SKILL.md` Chaining section lists `/aspirations-consolidate` as a callee
 4. `aspirations-consolidate/SKILL.md` has `## Parameters` section documenting `stop_mode`
-5. Steps 6, 7, 8, 8.7, 10 each have `(skip in stop_mode)` annotation and `IF stop_mode != true:` gate
+5. Steps 7, 7.5, 8, 8.7, 10 each have `(skip in stop_mode)` annotation and `IF stop_mode != true:` gate. Step 6 runs always.
 6. Step 8.7 "Store user goal count" is INSIDE the `IF stop_mode != true:` block (not dangling outside)
 7. Step 10 has early RETURN when `stop_mode == true` (before the `/boot` invocation)
 8. `aspirations/SKILL.md` Session-End Consolidation notes mention /stop as a caller with stop_mode
@@ -1965,10 +2093,10 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 ---
 
-## AZ. Aspiration Grooming (reflect-curate-aspirations)
+## AZ. Aspiration Grooming (reflect-maintain)
 
 ### AG1. Infrastructure
-1. `.claude/skills/reflect-curate-aspirations/SKILL.md` exists with `user-invocable: false`, `parent-skill: reflect`
+1. `.claude/skills/reflect-maintain/SKILL.md` (Aspirations mode) exists with `user-invocable: false`, `parent-skill: reflect`
 2. `.claude/skills/reflect/SKILL.md` has `--curate-aspirations` mode entry
 3. `.claude/skills/reflect/SKILL.md` `--full-cycle` includes step 1.75 curate-aspirations
 
@@ -2035,7 +2163,7 @@ Verifies that framework-critical settings (hooks, deny rules) live in the commit
 ### BC2. Framework Deny Rules
 
 4. `settings.json` `permissions.deny` includes deny entries for ALL base skill directories (35 total)
-5. `settings.json` `permissions.deny` does NOT contain `*/core/scripts/*` pattern — collides with writable `<agent>/scripts/`
+5. `settings.json` `permissions.deny` does NOT contain `*/core/scripts/*` pattern — collides with writable `world/scripts/`
 6. `settings.json` `permissions.deny` includes `Edit(*/core/config/*)`, `Edit(*/.claude/rules/*)`, `Edit(*/CLAUDE.md)`
 7. `settings.json` `permissions.deny` includes `Edit(*/world/knowledge/tree/_tree.yaml)` and `Edit(*/world/*.jsonl)` and `Edit(*/<agent>/*.jsonl)` — forces script access
 
@@ -2088,6 +2216,21 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 19. **Runtime**: After `aspirations-update-goal.sh`, next `load-aspirations-compact.sh` regenerates cache (staleness detected)
 20. **Runtime**: After autocompact, compact cache file is re-read (tracker cleared by PreCompact hook)
 21. **Runtime**: Phase 2.9 `--id` call provides goal with `description` and `verification` fields for execution
+
+### BE5. Targeted Goal Query (aspirations-query.sh)
+
+22. `core/scripts/aspirations.py` has `cmd_query` function and `query` subparser with `--goal-status`, `--goal-field`, `--title-contains` flags
+23. `core/scripts/aspirations-query.sh` exists as thin shell wrapper (same pattern as `aspirations-read.sh`)
+24. `aspirations-query.sh --goal-status in-progress` returns flat JSON array with `goal_id`, `asp_id`, `source`, `title`, `status` fields
+25. `aspirations-query.sh` searches BOTH world and agent queues (ignores `--source` flag)
+26. `aspirations-query.sh` with no filter flags exits with error (at least one filter required)
+27. `COMPACT_GOAL_KEEP` does NOT include `claimed_by` — comment documents this is intentional (use `aspirations-query.sh` for claim lookups)
+28. `core/config/conventions/aspirations.md` script table includes all three `aspirations-query.sh` modes
+29. `stop/SKILL.md` Step 3 uses `aspirations-query.sh --goal-status in-progress` (NOT `load-aspirations-compact.sh`)
+30. `aspirations-consolidate/SKILL.md` Step 8.9 uses `aspirations-query.sh --goal-field claimed_by` (NOT `aspirations-read.sh --active-compact`)
+31. `open-questions/SKILL.md` Phase 3 uses `aspirations-query.sh --goal-field participants user` (NOT `load-aspirations-compact.sh`)
+32. **Runtime**: `aspirations-query.sh --goal-status in-progress` output is << 1KB (vs ~238KB for full compact)
+33. **Runtime**: `aspirations-query.sh --goal-field participants user` returns goals with `status` field (LLM can post-filter)
 
 ## WM. Working Memory Script API
 
@@ -2195,7 +2338,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 5. Verification gap signal writes to `wm-append.sh sensory_buffer` with `verification_gap` key
 
 ### BG2. Reflect-Execution Verification Gap Signal
-6. `reflect-execution/SKILL.md` Step 0.5 header says "Four structural checks" (not Three)
+6. `reflect-on-outcome/SKILL.md` (Execution mode) Step 0.5 header says "Four structural checks" (not Three)
 7. Signal #4 `verification_gap` exists in the notability gate after signal #3
 8. Signal #4 reads sensory_buffer for Phase 5 escalation flags
 9. Signal #4 also fires independently when code edits occur without test execution
@@ -2238,7 +2381,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 14. `aspirations-consolidate/SKILL.md` Step 6 lists all 8 ops: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE
 15. `aspirations-state-update/SKILL.md` Step 8 has step 8e Decision Rules extraction
 16. `aspirations-consolidate/SKILL.md` Step 2 has step 2d.5 Decision Rules during encoding
-17. `reflect-curate-memory/SKILL.md` has Step 2.5 (Decision Rule auto-promotion to guardrails) and Step 2.6 (tree node utility curation)
+17. `reflect-maintain/SKILL.md` (Memory mode) has Step 2.5 (Decision Rule auto-promotion to guardrails) and Step 2.6 (tree node utility curation)
 18. `core/config/conventions/decision-rules.md` documents format, when to write, auto-promotion criteria
 19. `world/knowledge/archive/` directory exists for distilled/retired node content
 20. `core/scripts/tree.py` front matter parser uses counter (not toggle) — body `---` separators do not misfire
@@ -2304,8 +2447,8 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 36. `aspirations-execute/SKILL.md` Phase 4.25 experience JSON includes `enabled_by: []` and `temporal_credit: 0.0` fields
 37. `aspirations-state-update/SKILL.md` Step 8.9 propagates credit with `gamma = 0.9` discount per temporal distance unit
 38. `aspirations-state-update/SKILL.md` Step 8.9 has minimum credit threshold (`> 0.01`) to avoid noise
-39. `reflect-extract-patterns/SKILL.md` Step 3 has "Enabling Strategy Detection" subsection that filters experiences by `temporal_credit > 0.1`
-40. `reflect-extract-patterns/SKILL.md` enabling strategies have `strategy_type: "enabling"` (distinct from direct strategies)
+39. `reflect-on-self/SKILL.md` (Patterns mode) Step 3 has "Enabling Strategy Detection" subsection that filters experiences by `temporal_credit > 0.1`
+40. `reflect-on-self/SKILL.md` (Patterns mode) enabling strategies have `strategy_type: "enabling"` (distinct from direct strategies)
 41. **Runtime**: IF a goal succeeded using retrieved items from a prior goal's execution:
     Check: experience record has `enabled_by` with at least one entry
     Check: enabler entry has `experience_id`, `relationship`, `temporal_distance`
@@ -2360,8 +2503,8 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 6. `core/config/meta.yaml` improvement instructions first-principles section has "Apply when System 2 is active" guard
 7. `aspirations-execute/SKILL.md` episode chain mini-reflection says "four questions" (not "three")
 8. `aspirations-execute/SKILL.md` question 4 mentions "Strip to ground truth and rebuild approach"
-9. `reflect-hypothesis/SKILL.md` Step 7 has first-principles escalation gated by `root cause is "model-error" or "overconfidence"`
-10. `reflect-hypothesis/SKILL.md` first-principles escalation step 4 says "this becomes the guardrail/reasoning bank content"
+9. `reflect-on-outcome/SKILL.md` (Hypothesis mode) Step 7 has first-principles escalation gated by `root cause is "model-error" or "overconfidence"`
+10. `reflect-on-outcome/SKILL.md` (Hypothesis mode) first-principles escalation step 4 says "this becomes the guardrail/reasoning bank content"
 11. **Runtime**: IF `meta/improvement-instructions.md` exists (agent has booted):
     Check: file retains "First-Principles Analysis" section (not removed by agent evolution)
 12. **Runtime**: IF any hypothesis was reflected with root cause "model-error" or "overconfidence":
@@ -2375,7 +2518,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 
 1. `core/config/skill-relations.yaml` exists with `config.relation_types` defining 4 types: similar_to, compose_with, belong_to, depend_on
 2. `core/config/skill-relations.yaml` `config` section has `co_invocation_log_cap` and `discover_min_co_occurrences` (single source of truth for script thresholds)
-3. `core/config/skill-relations.yaml` `relations` list has entries for all sub-skill belong_to relations (aspirations-execute→aspirations, reflect-hypothesis→reflect, etc.)
+3. `core/config/skill-relations.yaml` `relations` list has entries for all sub-skill belong_to relations (aspirations-execute→aspirations, reflect-on-outcome→reflect, etc.)
 4. `core/config/skill-relations.yaml` `relations` list has compose_with chains for boot→prime→aspirations and aspirations-execute→aspirations-spark→aspirations-state-update
 5. `core/config/skill-relations.yaml` has `initial_state` section with `forged_relations: []` and `co_invocation_log: []`
 6. `core/scripts/skill-relations.sh` exists and delegates to `skill-relations.py`
@@ -2384,7 +2527,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 9. Bash: `skill-relations.sh read --composable boot` → returns JSON array containing prime and aspirations
 10. Bash: `skill-relations.sh read --similar research-topic` → returns JSON array containing replay
 11. Bash: `skill-relations.sh read --similar replay` → returns same relation (symmetric lookup works)
-12. `core/scripts/init-agent.sh` extracts `initial_state` from `skill-relations.yaml` to `<agent>/skill-relations.yaml`
+12. `core/scripts/init-world.sh` creates `world/skill-relations.yaml` with initial state
 
 ### BL2. Five-Dimension Skill Quality Evaluation
 
@@ -2460,7 +2603,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 ### BL10. Cross-Script Data Consistency
 
 60. `skill-evaluate.py` writes entries with key `"overall"` — `skill-analytics.py` reads `"overall"` — `goal-selector.py` reads `aggregate.overall` — ALL match
-61. `skill-relations.py` writes to `<agent>/skill-relations.yaml` under `forged_relations` and `co_invocation_log` — `skill-analytics.py` reads same keys
+61. `skill-relations.py` writes to `world/skill-relations.yaml` under `forged_relations` and `co_invocation_log` — `skill-analytics.py` reads same keys
 62. `core/config/meta.yaml` transfer section `exportable_strategies` includes `skill_quality.dimension_weights` and `skill_quality.learned_relations`
 63. `core/config/conventions/meta-strategies.md` file layout table includes `meta/skill-quality-strategy.yaml`
 
@@ -2470,8 +2613,57 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
     Bash: `skill-evaluate.sh report` → verify `total_skills_evaluated > 0` (Phase 8.76 fired)
     Check: `meta/skill-quality.yaml` has entries under `skills` with `evaluations[]` and `aggregate`
 65. **Runtime**: IF consolidation ran:
-    Check: `<agent>/skill-relations.yaml` `co_invocation_log` has entries (Phase 4.28 fired)
+    Check: `world/skill-relations.yaml` `co_invocation_log` has entries (Phase 4.28 fired)
     Check: journal mentions "Skill Health Report" or "skill-evaluate" (Step 8 used new scripts)
 66. **Runtime**: IF evolve Step 9.5 ran:
     Check: journal mentions "SKILL CURATION" or "underperforming" if any skills below threshold
 67. **Runtime**: Bash: `goal-selector.sh select 2>/dev/null` → verify `raw.skill_affinity` present on each result
+
+---
+
+## BM. External Path Resolution (guard-080)
+
+### BM1. No Local world/ or meta/ at Repo Root
+1. `ls -d world/ 2>/dev/null` at project root returns nothing (directory must not exist)
+2. `ls -d meta/ 2>/dev/null` at project root returns nothing (directory must not exist)
+3. `.gitignore` contains `/world/` and `/meta/` entries (safety net)
+
+### BM2. Auto-Detect When AYOAI_AGENT Unset
+4. `AYOAI_AGENT= python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` (from core/scripts/) prints the external OneDrive path, NOT PROJECT_ROOT/world
+5. `AYOAI_AGENT= bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
+6. Neither command produces stderr warnings (hooks call these hundreds of times per session)
+
+### BM3. Normal Resolution With AYOAI_AGENT Set
+7. `AYOAI_AGENT=alpha python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` prints the external path
+8. `AYOAI_AGENT=alpha bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
+
+### BM4. Script and Pseudocode Hygiene
+9. `grep -rn 'mkdir.*world/' .claude/skills/` returns zero matches using bare `world/` (all use `$WORLD_DIR`)
+10. `grep -rn 'PROJECT_ROOT.*world' core/scripts/` matches only `_paths.sh` and `_paths.py` fallback lines (no other script constructs world paths from PROJECT_ROOT)
+11. `.claude/settings.json` deny rules include patterns matching the actual external directory name (not just `*/world/*`)
+
+---
+
+## BN. Proactive Escalation (User Notification for Extended Blocks)
+
+### BN1. Config
+1. `core/config/aspirations.yaml` has `proactive_escalation:` section with `blocker_age_hours: 2`, `b7_notify: true`, `circuit_breaker_notify: true`
+2. `core/config/aspirations.yaml` `modifiable:` has `proactive_escalation.blocker_age_hours: {min: 1, max: 8, default: 2}`
+
+### BN2. Integration Points
+3. `.claude/skills/aspirations/SKILL.md` has Step B7.1 with "Notify the user" BEFORE `interruptible-sleep.sh` (not after)
+4. `.claude/skills/aspirations/SKILL.md` Phase 5.5 circuit breaker has "Notify the user" AFTER board-post and BEFORE defer
+5. `.claude/skills/aspirations-precheck/SKILL.md` Phase 0.5b.1 has blocker age notification AFTER reprobe loop, BEFORE `wm-set.sh known_blockers`
+6. All three "Notify the user:" invocations use `category: blocker` (not a different category)
+
+### BN3. Cooldown Tracking
+7. `core/config/conventions/handoff-working-memory.md` documents `proactive_escalation_log` WM slot with `blocker_id` + `sent_at` schema
+8. Step B7.1 uses synthetic `blocker_id: "_all_blocked"` (not a real blocker ID)
+9. Phase 0.5b.1 uses actual `blocker.blocker_id` from `known_blockers` entries
+10. Phase 5.5 circuit breaker does NOT use the `proactive_escalation_log` (natural cooldown via counter reset + defer)
+11. `core/config/conventions/infrastructure.md` has "Proactive Escalation Protocol" section with three-point integration table
+
+### BN4. Runtime
+12. **Runtime**: After B7 fires, `wm-read.sh proactive_escalation_log` should contain `{"blocker_id":"_all_blocked","sent_at":"..."}` entry
+13. **Runtime**: After a blocker persists > 2 hours, `wm-read.sh proactive_escalation_log` should contain an entry matching that blocker's ID
+14. **Runtime**: Circuit breaker notification email subject contains the failing goal's title

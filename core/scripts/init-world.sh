@@ -240,13 +240,26 @@ for channel in general findings coordination decisions; do
 done
 echo "  Created message board channels"
 
-# --- 9.5. Skill catalog ---
-cat > "$WORLD/skill-catalog.yaml" << 'EOF'
-# World Skill Catalog — shared registry of forged skills across all agents
-# Append-only. Each agent adds entries when forging new skills.
-skills: []
+# --- 9.5. Forged skills registry ---
+cat > "$WORLD/forged-skills.yaml" << 'EOF'
+# World Forged Skills Registry — shared across all agents
+# triggers: phrases from core pseudocode that resolve to forged skills
+skills: {}
 EOF
-echo "  Created skill catalog"
+echo "  Created forged skills registry"
+
+# --- 9.6. Skill relations ---
+cat > "$WORLD/skill-relations.yaml" << 'EOF'
+last_updated: null
+forged_relations: []
+co_invocation_log: []
+EOF
+mkdir -p "$WORLD/scripts"
+echo "  Created skill relations + scripts directory"
+
+# --- 9.7. Team state ---
+bash "$CORE_ROOT/scripts/team-state-init.sh"
+echo "  Initialized team-state.yaml"
 
 # --- 10. Changelog ---
 touch "$WORLD/changelog.jsonl"

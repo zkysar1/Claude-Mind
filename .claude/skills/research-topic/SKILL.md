@@ -132,8 +132,10 @@ After writing content, check growth triggers:
   line_count = count lines in node .md body (excluding YAML front matter)
   If line_count > decompose_threshold AND depth < D_max:
     bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_decompose
+    Invoke /tree maintain
   Elif article_count > split_threshold:
     bash core/scripts/tree-update.sh --set <node-key> growth_state ready_to_split
+    Invoke /tree maintain
 ```
 
 ### If creating new node (SPROUT):
@@ -199,7 +201,7 @@ Edit the tree node to include the updated front matter
 ```
 Extract named entities from findings (people, orgs, concepts, metrics, events)
 Normalize to lowercase-kebab-case
-Read world/knowledge/tree/_tree.yaml → entity_index
+Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index
   If entity exists: add this node's path, increment mention_count
   If entity is new AND total_entities < max_entities: create entry
   If entity is new AND over cap: skip
@@ -221,5 +223,5 @@ Caller handles: tree propagation, journal entry, spark check, tree maintenance t
 | Called by | `/reflect` | Knowledge gap identified during reflection |
 | Called by | `/replay` | Domain transfer generates research question |
 | Outputs | Tree node | New or updated `.md` file + `_tree.yaml` updates |
-| Does NOT call | `/tree maintain` | Caller checks growth triggers post-return |
+| Calls | `/tree maintain` | Invokes when growth triggers fire (decompose_threshold or split_threshold exceeded) |
 | Does NOT do | Journal, spark, propagation | Caller (aspirations) handles all downstream |

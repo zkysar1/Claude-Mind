@@ -5,12 +5,13 @@ Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorith
 The LLM no longer computes scores — this script handles the arithmetic.
 The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
 
-Scoring criteria (13 deterministic + 1 stochastic weighted factors):
+Scoring criteria (16 deterministic + 1 stochastic weighted factors):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
-  + variety_bonus × 0.7 + streak_momentum × 0.5 + novelty_bonus × 0.6
+  + variety_bonus × 0.5 + streak_momentum × 0.5 + novelty_bonus × 0.6
   + recurring_urgency × 0.8 + recurring_saturation × 0.8
-  + reward_history × 0.5 + evidence_backing × 0.7
-  + deferred_readiness × 0.6 + context_coherence × 1.0 + skill_affinity × 0.4
+  + reward_history × 0.5 + completion_pressure × 0.8 + depth_bonus × 0.6
+  + evidence_backing × 0.7 + deferred_readiness × 0.6
+  + context_coherence × 1.0 + skill_affinity × 0.4 + directive_boost × 1.5
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
   context_coherence: +2.0 if same category as last goal (fresh/normal zone),
@@ -78,6 +79,10 @@ def load_weights():
 
 
 WEIGHTS = load_weights()
+# Fallback defaults for agents seeded before consolidate-before-expand
+WEIGHTS.setdefault("completion_pressure", 0.8)
+WEIGHTS.setdefault("depth_bonus", 0.6)
+WEIGHTS.setdefault("directive_boost", 1.5)
 
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
@@ -255,24 +260,39 @@ def get_interval_hours(goal):
 # FILTER + COLLECT
 # ---------------------------------------------------------------------------
 
-def collect_candidates(aspirations, known_blockers=None, source="world"):
+def collect_candidates(aspirations, known_blockers=None, source="world",
+                       global_done_ids=None, claim_timeout_hours=None,
+                       reallocation_hours=None,
+                       abstention_timeout_hours=None,
+                       defer_reason_timeout_hours=None):
     """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT).
 
     Args:
         aspirations: list of aspiration dicts
         known_blockers: list of blocker dicts from working memory
         source: "world" or "agent" — tags each candidate with its origin queue
+        global_done_ids: set of completed/decomposed goal IDs across ALL aspirations
+            (both world and agent). Enables cross-aspiration blocked_by enforcement.
+            If None, falls back to per-aspiration done_ids (legacy behavior).
+        claim_timeout_hours: hours after which a stale claim is treated as expired.
+            If None, claims persist indefinitely (legacy behavior).
+        reallocation_hours: hours after which an unclaimed goal with reallocatable=true
+            targeted at another agent becomes eligible for any agent.
+            If None, reallocation is disabled (legacy behavior).
     """
     today = date.today()
     results = []
 
     # Build set of skills blocked by infrastructure blockers
     blocked_skills = set()
+    blocked_categories = set()
     if known_blockers:
         for b in known_blockers:
             if b.get("resolution") is None:
                 for skill in b.get("affected_skills", []):
                     blocked_skills.add(skill)
+                for cat in b.get("affected_categories", []):
+                    blocked_categories.add(cat)
 
     for asp in aspirations:
         if asp.get("status") != "active":
@@ -285,9 +305,13 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
             if lw is not None and lw < cooldown:
                 continue
 
-        # Build set of completed/decomposed goal IDs for blocking check
-        done_ids = {g["id"] for g in asp.get("goals", [])
-                    if g.get("status") in ("completed", "decomposed")}
+        # Use global done_ids if provided (cross-aspiration dependency enforcement),
+        # otherwise fall back to per-aspiration scope (legacy behavior).
+        if global_done_ids is not None:
+            done_ids = global_done_ids
+        else:
+            done_ids = {g["id"] for g in asp.get("goals", [])
+                        if g.get("status") in ("completed", "decomposed")}
 
         # Note: verification.preconditions are natural-language conditions
         # evaluated by the LLM in Phase 2 of SKILL.md, not here.
@@ -295,20 +319,47 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
             if goal.get("status") != "pending":
                 continue
 
-            # Claim check (world goals only): skip goals claimed by another agent
+            # Self-abstention check: skip goals this agent previously abstained from.
+            # The other agent sees them normally. (arXiv 2603.28990: voluntary abstention)
+            # Expiry: abstentions older than abstention_timeout_hours are ignored (fail-open).
+            # If no abstained_at timestamp exists (legacy), abstention expires immediately.
+            if goal.get("abstained_by") == AGENT_NAME:
+                if abstention_timeout_hours is not None:
+                    abstain_age = hours_since(goal.get("abstained_at"))
+                    if abstain_age is not None and abstain_age <= abstention_timeout_hours:
+                        continue  # Valid abstention — skip
+                    # else: expired or no timestamp — fall through (fail-open)
+                else:
+                    continue  # No expiry configured — legacy behavior
+
+            # Claim check (world goals only): skip goals claimed by another agent.
+            # Expiry makes stale claims (older than claim_timeout_hours) fall through
+            # so other agents can pick up abandoned work. The actual re-claim is still
+            # atomic via aspirations-claim.sh — this only controls VISIBILITY.
             if source == "world":
                 claimed = goal.get("claimed_by")
                 if claimed and claimed != AGENT_NAME:
-                    continue  # Claimed by a different agent
+                    if claim_timeout_hours is not None:
+                        claim_age = hours_since(goal.get("claimed_at"))
+                        if claim_age is not None and claim_age <= claim_timeout_hours:
+                            continue  # Valid claim — skip
+                        # else: claim expired or no claimed_at — fall through to include
+                    else:
+                        continue  # No expiry configured — legacy behavior
 
             # blocked_by check
             if any(b not in done_ids for b in _ensure_list(goal.get("blocked_by"))):
                 continue
 
-            # Infrastructure blocker check
+            # Infrastructure blocker check (skill-based, primary)
             goal_skill = goal.get("skill", "")
             if goal_skill and blocked_skills and goal_skill in blocked_skills:
                 continue
+            # Category fallback: when skill is null/empty, check goal.category
+            if not goal_skill and blocked_categories:
+                goal_cat = goal.get("category", "")
+                if goal_cat and goal_cat in blocked_categories:
+                    continue
 
             # Recurring time gate (hour-level precision)
             if goal.get("recurring"):
@@ -326,9 +377,18 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
                 except (ValueError, TypeError):
                     pass
 
-            # Defer reason (no date needed — textual deferral is sufficient)
+            # Defer reason: textual deferral blocks the goal.
+            # Expiry: defer_reason without deferred_until expires after defer_reason_timeout_hours.
+            # Goals WITH deferred_until are governed by the time gate below, not this expiry.
+            # If no defer_reason_set_at timestamp (legacy), deferral expires immediately (fail-open).
             if goal.get("defer_reason"):
-                continue
+                if not goal.get("deferred_until") and defer_reason_timeout_hours is not None:
+                    defer_age = hours_since(goal.get("defer_reason_set_at"))
+                    if defer_age is not None and defer_age <= defer_reason_timeout_hours:
+                        continue  # Valid deferral — skip
+                    # else: expired or no timestamp — fall through (fail-open)
+                else:
+                    continue  # Has deferred_until (time-gated below) or no expiry configured
 
             # Deferred time gate
             deferred = goal.get("deferred_until")
@@ -341,8 +401,23 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
                     pass  # Corrupt value — fail open
 
             # Agent eligibility check (filters user-only AND other-agent goals)
-            if not _is_agent_eligible(_ensure_list(goal.get("participants"), ["agent"]), AGENT_NAME):
-                continue
+            participants = _ensure_list(goal.get("participants"), ["agent"])
+            if not _is_agent_eligible(participants, AGENT_NAME):
+                # Straggler-aware reallocation: if the goal is marked reallocatable
+                # and hasn't been claimed by the targeted agent within reallocation_hours,
+                # any agent can pick it up. (Distributed Systems Finding 5: dynamic realloc.)
+                if (reallocation_hours is not None
+                        and goal.get("reallocatable")
+                        and not goal.get("claimed_by")):
+                    # Check if enough time has passed since goal creation/last status change
+                    created = goal.get("created") or asp.get("created")
+                    age = hours_since(created)
+                    if age is not None and age >= reallocation_hours:
+                        pass  # Fall through — goal is reallocatable and overdue
+                    else:
+                        continue  # Not yet eligible for reallocation
+                else:
+                    continue  # Not eligible and not reallocatable
 
             results.append({"goal": goal, "aspiration": asp, "source": source})
 
@@ -353,7 +428,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world"):
 # BLOCKED GOAL DIAGNOSTICS
 # ---------------------------------------------------------------------------
 
-def collect_blocked(aspirations, known_blockers=None):
+def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
+                    defer_reason_timeout_hours=None):
     """Return blocked goals with reasons (inverse of collect_candidates).
 
     Checks blocking conditions in priority order (first match = primary reason):
@@ -371,19 +447,28 @@ def collect_blocked(aspirations, known_blockers=None):
 
     # Map skill -> blocker info for infrastructure blocks
     blocker_by_skill = {}
+    blocker_by_category = {}
     if known_blockers:
         for b in known_blockers:
             if b.get("resolution") is None:
                 for skill in b.get("affected_skills", []):
                     blocker_by_skill[skill] = b
+                for cat in b.get("affected_categories", []):
+                    blocker_by_category[cat] = b
 
     for asp in aspirations:
         if asp.get("status") != "active":
             continue
 
         asp_id = asp.get("id", "")
-        done_ids = {g["id"] for g in asp.get("goals", [])
-                    if g.get("status") in ("completed", "decomposed")}
+        # Use global done_ids for cross-aspiration dependency resolution (must match
+        # collect_candidates — otherwise a goal can appear "unblocked" in selection
+        # but "blocked" in diagnostics for the same cross-aspiration dependency).
+        if global_done_ids is not None:
+            done_ids = global_done_ids
+        else:
+            done_ids = {g["id"] for g in asp.get("goals", [])
+                        if g.get("status") in ("completed", "decomposed")}
 
         for goal in asp.get("goals", []):
             status = goal.get("status", "")
@@ -420,7 +505,7 @@ def collect_blocked(aspirations, known_blockers=None):
             if status != "pending":
                 continue
 
-            # 2. Infrastructure blocker
+            # 2. Infrastructure blocker (skill-based, primary)
             goal_skill = goal.get("skill", "")
             if goal_skill and goal_skill in blocker_by_skill:
                 b = blocker_by_skill[goal_skill]
@@ -430,6 +515,18 @@ def collect_blocked(aspirations, known_blockers=None):
                 entry["blocker_id"] = b.get("blocker_id", "")
                 blocked.append(entry)
                 continue
+
+            # 2b. Infrastructure blocker (category fallback for skill=null goals)
+            if not goal_skill:
+                goal_cat = goal.get("category", "")
+                if goal_cat and goal_cat in blocker_by_category:
+                    b = blocker_by_category[goal_cat]
+                    entry["block_reason"] = "infrastructure"
+                    entry["block_detail"] = "{cat} category blocked: {reason}".format(
+                        cat=goal_cat, reason=b.get("reason", "unknown"))
+                    entry["blocker_id"] = b.get("blocker_id", "")
+                    blocked.append(entry)
+                    continue
 
             # 3. Dependency (blocked_by with unmet prerequisites)
             unmet = [bid for bid in _ensure_list(goal.get("blocked_by")) if bid not in done_ids]
@@ -456,13 +553,24 @@ def collect_blocked(aspirations, known_blockers=None):
                 except (ValueError, TypeError):
                     pass
 
-            # 4b. Defer reason (textual — blocks regardless of deferred_until state)
+            # 4b. Defer reason (textual — blocks unless expired)
             if goal.get("defer_reason"):
-                entry["block_reason"] = "deferred"
-                entry["block_detail"] = "Deferred: {reason}".format(
-                    reason=goal.get("defer_reason", ""))
-                blocked.append(entry)
-                continue
+                if not goal.get("deferred_until") and defer_reason_timeout_hours is not None:
+                    defer_age = hours_since(goal.get("defer_reason_set_at"))
+                    if defer_age is None or defer_age > defer_reason_timeout_hours:
+                        pass  # Expired — fall through to candidate pool
+                    else:
+                        entry["block_reason"] = "deferred"
+                        entry["block_detail"] = "Deferred: {reason}".format(
+                            reason=goal.get("defer_reason", ""))
+                        blocked.append(entry)
+                        continue
+                else:
+                    entry["block_reason"] = "deferred"
+                    entry["block_detail"] = "Deferred: {reason}".format(
+                        reason=goal.get("defer_reason", ""))
+                    blocked.append(entry)
+                    continue
 
             # 5. Hypothesis time gate
             rne = goal.get("resolves_no_earlier_than")
@@ -492,7 +600,7 @@ def collect_blocked(aspirations, known_blockers=None):
     return blocked
 
 
-def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited=None):
+def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, blocker_by_category=None, visited=None):
     """Walk dependency chains to find the ultimate root blocker.
 
     Returns (root_goal_id, cause_label) tuple.
@@ -524,7 +632,7 @@ def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited
         if unsatisfied:
             # Follow first dep only — preserves 1:1 goal→bottleneck invariant
             return trace_root_bottleneck(unsatisfied[0], goal_map, done_ids,
-                                         blocker_by_skill, visited)
+                                         blocker_by_skill, blocker_by_category, visited)
 
         # No unsatisfied deps — this IS the root. Classify it.
         deferred = goal.get("deferred_until")
@@ -540,6 +648,11 @@ def trace_root_bottleneck(goal_id, goal_map, done_ids, blocker_by_skill, visited
         if goal_skill and goal_skill in blocker_by_skill:
             reason = blocker_by_skill[goal_skill].get("reason", "unknown")
             return (goal_id, "INFRA: {r}".format(r=reason))
+        if not goal_skill and blocker_by_category:
+            goal_cat = goal.get("category", "")
+            if goal_cat and goal_cat in blocker_by_category:
+                reason = blocker_by_category[goal_cat].get("reason", "unknown")
+                return (goal_id, "INFRA: {cat} — {r}".format(cat=goal_cat, r=reason))
 
         participants = _ensure_list(goal.get("participants"), ["agent"])
         if not _is_agent_eligible(participants, AGENT_NAME):
@@ -632,12 +745,94 @@ def _resolve_category(goal, asp):
 
 
 # ---------------------------------------------------------------------------
+# Directive Boost (cross-agent priority influence)
+# ---------------------------------------------------------------------------
+
+BOARD_COORD_PATH = WORLD_DIR / "board" / "coordination.jsonl"
+
+
+def load_active_directives():
+    """Load active (non-expired) directive messages from the coordination board.
+
+    Returns a list of dicts: [{target_goals: [...], target_categories: [...], weight: float}]
+    Parses structured tags from directive messages (see board.md Directive Payload Schema).
+    """
+    if not BOARD_COORD_PATH.exists():
+        return []
+    directives = []
+    now = datetime.now()
+    for msg in read_jsonl(BOARD_COORD_PATH):
+        if msg.get("type") != "directive":
+            continue
+        tags = _ensure_list(msg.get("tags"))
+        # Parse expiry
+        expires = None
+        for tag in tags:
+            if tag.startswith("expires:"):
+                try:
+                    expires = datetime.fromisoformat(tag[8:])
+                except (ValueError, TypeError):
+                    pass
+        if expires and now > expires:
+            continue  # Expired
+        # Parse weight modifier
+        weight = 0.0
+        for tag in tags:
+            if tag.startswith("weight:"):
+                try:
+                    weight = float(tag[7:])
+                except (ValueError, TypeError):
+                    pass
+        if weight == 0.0:
+            continue  # No weight = no effect
+        # Parse targets
+        target_goals = []
+        target_categories = []
+        for tag in tags:
+            if tag.startswith("target:"):
+                target_goals.append(tag[7:])
+            elif tag.startswith("category:"):
+                target_categories.append(tag[9:])
+        if not target_goals and not target_categories:
+            continue  # No targets = no effect
+        directives.append({
+            "target_goals": target_goals,
+            "target_categories": target_categories,
+            "weight": weight,
+        })
+    return directives
+
+
+# Cache directives for the duration of a single selector run.
+# Safe without cleanup: each goal-selector.py invocation is a separate process.
+_ACTIVE_DIRECTIVES = None
+
+
+def _get_directives():
+    global _ACTIVE_DIRECTIVES
+    if _ACTIVE_DIRECTIVES is None:
+        _ACTIVE_DIRECTIVES = load_active_directives()
+    return _ACTIVE_DIRECTIVES
+
+
+def directive_boost_score(goal_id, category):
+    """Compute directive boost for a goal based on active directives."""
+    boost = 0.0
+    for d in _get_directives():
+        if goal_id in d["target_goals"]:
+            boost += d["weight"]
+        elif category in d["target_categories"]:
+            boost += d["weight"]
+    return boost
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
 def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scale=3.0,
                budget=None):
-    """Score a single goal using the multi-criteria weighted formula."""
+    """Score a single goal using the 15-criteria weighted formula."""
     goal, asp, source = cand["goal"], cand["aspiration"], cand.get("source", "world")
     raw = {}
 
@@ -703,6 +898,19 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     completed = sum(1 for g in asp.get("goals", []) if g.get("status") == "completed")
     raw["reward_history"] = 1.0 if completed > 0 else 0
 
+    # 8b. completion_pressure (nonlinear boost for near-complete aspirations)
+    # Quadratic: negligible for early aspirations, dominant for near-complete ones
+    #   1/15 = 0.01, 7/15 = 0.54, 10/15 = 1.11, 14/15 = 2.18
+    active_goals = [g for g in asp.get("goals", [])
+                    if g.get("status") not in ("skipped", "expired", "decomposed")]
+    total_goals = len(active_goals)
+    done_goals = sum(1 for g in active_goals if g.get("status") == "completed")
+    completion_ratio = done_goals / total_goals if total_goals > 0 else 0
+    raw["completion_pressure"] = (completion_ratio ** 2) * 2.5
+
+    # 8c. depth_bonus (reward continuing in same aspiration — counterbalances variety_bonus)
+    raw["depth_bonus"] = 1.0 if asp.get("id") == touched else 0
+
     # 9. evidence_backing (resolved hypothesis support score)
     raw["evidence_backing"] = evidence_score(asp, resolved)
 
@@ -740,7 +948,11 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     sq_overall = sq_aggregate.get("overall", 0.5)  # default neutral
     raw["skill_affinity"] = (sq_overall - 0.5) * 2  # maps [0,1] to [-1, +1]
 
-    # 13. exploration_noise (random value scaled by developmental epsilon)
+    # 13b. directive_boost (cross-agent priority influence from board directives)
+    raw["directive_boost"] = directive_boost_score(
+        goal.get("id", ""), category)
+
+    # 14. exploration_noise (random value scaled by developmental epsilon)
     raw["exploration_noise"] = random.random()
 
     # Weighted total — static criteria + dynamic exploration noise
@@ -803,13 +1015,60 @@ def cmd_select(args):
     if not isinstance(known_blockers, list):
         known_blockers = []
 
+    # Build global done_ids across ALL aspirations for cross-aspiration dependency enforcement.
+    # Without this, blocked_by references to goals in other aspirations are silently ignored.
+    # (Mirrors the global goal_map approach already used by collect_blocked/trace_root_bottleneck.)
+    all_aspirations = world_aspirations + agent_aspirations
+    global_done_ids = set()
+    for asp in all_aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []):
+            if g.get("status") in ("completed", "decomposed"):
+                global_done_ids.add(g["id"])
+
+    # Load multi-agent coordination config from aspirations.yaml
+    claim_timeout_hours = None
+    reallocation_hours = None
+    abstention_timeout_hours = None
+    defer_reason_timeout_hours = None
+    try:
+        asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
+        ma = asp_config.get("multi_agent", {})
+        if isinstance(ma, dict):
+            cth = ma.get("claim_timeout_hours")
+            if cth is not None:
+                claim_timeout_hours = float(cth)
+            rh = ma.get("reallocation_hours")
+            if rh is not None:
+                reallocation_hours = float(rh)
+            ath = ma.get("abstention_timeout_hours")
+            if ath is not None:
+                abstention_timeout_hours = float(ath)
+            drth = ma.get("defer_reason_timeout_hours")
+            if drth is not None:
+                defer_reason_timeout_hours = float(drth)
+    except Exception:
+        pass
+
     # Collect candidates from both queues
-    candidates = collect_candidates(world_aspirations, known_blockers=known_blockers, source="world")
-    candidates += collect_candidates(agent_aspirations, known_blockers=known_blockers, source="agent")
+    candidates = collect_candidates(
+        world_aspirations, known_blockers=known_blockers, source="world",
+        global_done_ids=global_done_ids, claim_timeout_hours=claim_timeout_hours,
+        reallocation_hours=reallocation_hours,
+        abstention_timeout_hours=abstention_timeout_hours,
+        defer_reason_timeout_hours=defer_reason_timeout_hours)
+    candidates += collect_candidates(
+        agent_aspirations, known_blockers=known_blockers, source="agent",
+        global_done_ids=global_done_ids, reallocation_hours=reallocation_hours,
+        abstention_timeout_hours=abstention_timeout_hours,
+        defer_reason_timeout_hours=defer_reason_timeout_hours)
     if not candidates:
         # Distinguish "no goals exist" from "goals exist but all blocked"
-        all_aspirations = world_aspirations + agent_aspirations
-        blocked = collect_blocked(all_aspirations, known_blockers=known_blockers)
+        # (all_aspirations already computed above for global_done_ids)
+        blocked = collect_blocked(all_aspirations, known_blockers=known_blockers,
+                                  global_done_ids=global_done_ids,
+                                  defer_reason_timeout_hours=defer_reason_timeout_hours)
         if blocked:
             summary = {}
             for b in blocked:
@@ -849,6 +1108,18 @@ def cmd_blocked(args):
     empty_reasons["dependency"]["head_count"] = 0
     empty_reasons["dependency"]["downstream_count"] = 0
 
+    # Load expiry config (same source as cmd_select)
+    defer_reason_timeout_hours = None
+    try:
+        asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
+        ma = asp_config.get("multi_agent", {})
+        if isinstance(ma, dict):
+            drth = ma.get("defer_reason_timeout_hours")
+            if drth is not None:
+                defer_reason_timeout_hours = float(drth)
+    except Exception:
+        pass
+
     # Read from both aspiration queues
     world_aspirations = read_jsonl(WORLD_ASP_PATH)
     agent_aspirations = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
@@ -865,7 +1136,18 @@ def cmd_blocked(args):
     if not isinstance(known_blockers, list):
         known_blockers = []
 
-    blocked = collect_blocked(aspirations, known_blockers=known_blockers)
+    # Build global done_ids for cross-aspiration dependency resolution
+    global_done_ids = set()
+    for asp in aspirations:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []):
+            if g.get("status") in ("completed", "decomposed"):
+                global_done_ids.add(g["id"])
+
+    blocked = collect_blocked(aspirations, known_blockers=known_blockers,
+                              global_done_ids=global_done_ids,
+                              defer_reason_timeout_hours=defer_reason_timeout_hours)
 
     # Count total non-terminal goals across active aspirations
     total_active = 0
@@ -908,13 +1190,16 @@ def cmd_blocked(args):
             if g.get("status") in ("completed", "decomposed"):
                 all_done_ids.add(gid)
 
-    # Build blocker_by_skill for INFRA classification
+    # Build blocker_by_skill and blocker_by_category for INFRA classification
     blocker_by_skill = {}
+    blocker_by_category = {}
     if known_blockers:
         for b in known_blockers:
             if b.get("resolution") is None:
                 for skill in b.get("affected_skills", []):
                     blocker_by_skill[skill] = b
+                for cat in b.get("affected_categories", []):
+                    blocker_by_category[cat] = b
 
     # Trace root bottleneck for each blocked goal
     for entry in blocked:
@@ -922,7 +1207,7 @@ def cmd_blocked(args):
         if entry["block_reason"] == "dependency":
             # Follow the chain to its root
             root_id, cause = trace_root_bottleneck(
-                gid, goal_map, all_done_ids, blocker_by_skill)
+                gid, goal_map, all_done_ids, blocker_by_skill, blocker_by_category)
             entry["root_bottleneck"] = {"goal_id": root_id, "cause": cause}
         else:
             # Non-dependency blocks: root is self, cause from block_detail

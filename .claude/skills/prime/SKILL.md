@@ -46,8 +46,8 @@ give the agent full domain awareness.
 Bash: session-state-get.sh
 IF output is "NO_AGENT":
   → World-only priming mode. Skip all agent-specific steps.
-  → Read world/program.md (The Program — shared purpose)
-  → Read world/knowledge/tree/_tree.yaml (collective knowledge overview)
+  → Bash: world-cat.sh program.md  # The Program — shared purpose
+  → Bash: world-cat.sh knowledge/tree/_tree.yaml  # collective knowledge overview
   → Bash: guardrails-read.sh --active (shared safety rules)
   → Bash: reasoning-bank-read.sh --active (shared lessons)
   → Display:
@@ -106,7 +106,7 @@ These are small, always relevant, and not category-specific. Load unconditionall
    ═══ SELF ══════════════════════════════════════
    {<agent>/self.md body content after YAML front matter}
 
-2. Read world/program.md → full content (if non-empty)
+2. Bash: world-cat.sh program.md  # full content (if non-empty)
    IF non-empty:
      Display:
      ═══ THE PROGRAM ════════════════════════════════
@@ -119,12 +119,20 @@ These are small, always relevant, and not category-specific. Load unconditionall
 4. Bash: reasoning-bank-read.sh --active → ALL active reasoning bank entries
    IF count > 30: note overflow but still load all
 
-5. Read world/knowledge/beliefs.yaml → filter status in (active, weakened)
+5. Bash: world-cat.sh knowledge/beliefs.yaml  # filter status in (active, weakened)
    IF file missing: beliefs = [] (skip silently)
 
-6. Bash: board-read.sh --channel coordination --since 2h
+6. Bash: board-read.sh --channel coordination --since 2h --json
    → Recent coordination messages from other agents (what they're working on)
    IF no messages or board not initialized: skip silently
+   Parse typed messages to build structured cross-agent state:
+     - type=claim → "{author} is working on {goal_id from tags}"
+     - type=complete → "{author} completed {goal_id from tags}"
+     - type=handoff → "{author} completed {goal_id}: {text}" (factual output — high value)
+     - type=blocked → "{author} is blocked: {text}"
+     - type=encoding → "{author} encoding {node_path from tags}"
+     - type=release → "{author} released {goal_id}: {text}" (includes failure reason)
+     - Untyped/status → display as-is (backward-compatible)
 
 7. Bash: board-read.sh --channel general --since 24h --tag forge
    → Recent skill forge announcements from other agents

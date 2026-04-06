@@ -10,7 +10,9 @@ compute paths, increment counters).
 import argparse
 import json
 import os
+import random
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -26,10 +28,31 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, WORLD_DIR, CONFIG_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, CONFIG_DIR, resolve_file_path
 
 REPO_ROOT = str(PROJECT_ROOT)
 TREE_PATH = str(WORLD_DIR / "knowledge" / "tree" / "_tree.yaml")
+TREE_CONFIG = str(CONFIG_DIR / "tree.yaml")
+
+
+def _config_threshold():
+    """Read decompose_threshold from core/config/tree.yaml. Single source of truth."""
+    try:
+        with open(TREE_CONFIG, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        return cfg.get("config", {}).get("decompose_threshold", 50)
+    except (OSError, yaml.YAMLError):
+        return 50
+
+
+def _config_d_max():
+    """Read D_max from core/config/tree.yaml. Single source of truth."""
+    try:
+        with open(TREE_CONFIG, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+        return cfg.get("config", {}).get("D_max", 20)
+    except (OSError, yaml.YAMLError):
+        return 20
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +85,22 @@ def write_tree(data):
         agent = _agent_name()
         if base_dir:
             save_history(path, base_dir, agent)
-        tmp = str(path) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=None, sort_keys=False,
-                      allow_unicode=True, width=200)
-        os.replace(tmp, TREE_PATH)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                tmp = str(path) + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, default_flow_style=None, sort_keys=False,
+                              allow_unicode=True, width=200)
+                os.replace(tmp, TREE_PATH)
+                break
+            except (PermissionError, OSError) as e:
+                if attempt == max_retries - 1:
+                    raise
+                wait = 0.05 * (2 ** attempt) + random.uniform(0, 0.1)
+                print("write_tree retry {}/{}: {} (waiting {:.2f}s)".format(
+                    attempt + 1, max_retries, e, wait), file=sys.stderr)
+                time.sleep(wait)
         if base_dir:
             append_changelog(base_dir, agent, path, "edit")
     finally:
@@ -197,7 +231,7 @@ def get_active_content(tree, key):
     file_path = node.get("file", "")
     if not file_path:
         return {"key": key, "active_content": None, "sections_found": []}
-    abs_path = os.path.join(REPO_ROOT, file_path)
+    abs_path = str(resolve_file_path(file_path))
     if not os.path.exists(abs_path):
         return {"key": key, "active_content": None, "sections_found": []}
 
@@ -261,7 +295,7 @@ def get_distill_candidates(tree):
         crit1 = rc >= min_ret and ur < threshold
         # Criterion 2: large node with mediocre payoff
         file_path = node.get("file", "")
-        abs_path = os.path.join(REPO_ROOT, file_path) if file_path else ""
+        abs_path = str(resolve_file_path(file_path)) if file_path else ""
         line_count = 0
         if abs_path and os.path.exists(abs_path):
             with open(abs_path, "r", encoding="utf-8") as f:
@@ -325,9 +359,9 @@ def compute_stats(tree):
     }
 
 
-def get_decompose_candidates(tree, threshold=80):
+def get_decompose_candidates(tree, threshold=50):
     """Return leaf nodes whose .md file exceeds threshold lines and depth < D_max."""
-    D_MAX = 6
+    D_MAX = _config_d_max()
     leaves = get_all_leaves(tree)
     candidates = []
     for leaf in leaves:
@@ -335,7 +369,7 @@ def get_decompose_candidates(tree, threshold=80):
         depth = leaf.get("depth", 0)
         if not file_path or depth >= D_MAX:
             continue
-        abs_path = os.path.join(REPO_ROOT, file_path)
+        abs_path = str(resolve_file_path(file_path))
         if not os.path.exists(abs_path):
             continue
         try:
@@ -355,12 +389,12 @@ def get_decompose_candidates(tree, threshold=80):
     return candidates
 
 
-def get_redistribute_candidates(tree, threshold=80):
+def get_redistribute_candidates(tree, threshold=50):
     """Return interior nodes whose .md body exceeds threshold lines and depth < D_max.
 
     These nodes have children but retain large body content that should be
     redistributed into those children or into new children."""
-    D_MAX = 6
+    D_MAX = _config_d_max()
     nodes = tree.get("nodes", {})
     candidates = []
     for key, node in nodes.items():
@@ -371,7 +405,7 @@ def get_redistribute_candidates(tree, threshold=80):
         depth = node.get("depth", 0)
         if not file_path or depth >= D_MAX:
             continue
-        abs_path = os.path.join(REPO_ROOT, file_path)
+        abs_path = str(resolve_file_path(file_path))
         if not os.path.exists(abs_path):
             continue
         try:
@@ -526,12 +560,12 @@ def cmd_read(args):
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
     elif args.decompose_candidates:
-        threshold = args.threshold if args.threshold is not None else 80
+        threshold = args.threshold if args.threshold is not None else _config_threshold()
         result = get_decompose_candidates(tree, threshold)
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
     elif args.redistribute_candidates:
-        threshold = args.threshold if args.threshold is not None else 80
+        threshold = args.threshold if args.threshold is not None else _config_threshold()
         result = get_redistribute_candidates(tree, threshold)
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
@@ -749,7 +783,12 @@ def cmd_increment(args):
 
 
 def cmd_batch(args):
-    """Batch update: read JSON operations from stdin and apply atomically."""
+    """Batch update: read JSON operations from stdin and apply atomically.
+
+    Supports 5 op types: set, increment, add-child, remove-child, propagate.
+    All mutations happen in a single read-write cycle. Propagate ops run LAST
+    so they see updated children from earlier ops in the same batch.
+    """
     if sys.stdin.isatty():
         print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
         sys.exit(1)
@@ -768,104 +807,213 @@ def cmd_batch(args):
         print("No operations in batch", file=sys.stderr)
         sys.exit(1)
 
+    valid_ops = ("set", "increment", "add-child", "remove-child", "propagate")
+
     tree = read_tree()
     nodes = tree.get("nodes", {})
 
-    # Validate all keys exist before any mutation
+    # Collect child keys that add-child ops will create (for forward-reference validation)
+    pending_child_keys = set()
+    for op in operations:
+        if op.get("op") == "add-child":
+            child = op.get("child", {})
+            if child.get("key"):
+                pending_child_keys.add(child["key"])
+
+    # Split into mutation ops and propagate ops
+    mutation_ops = []
+    propagate_ops = []
     for i, op in enumerate(operations):
         op_type = op.get("op")
         key = op.get("key")
-        field = op.get("field")
-        if not op_type or not key or not field:
-            print("Operation {} missing required fields (op, key, field)".format(i), file=sys.stderr)
+        if not op_type or not key:
+            print("Operation {} missing required fields (op, key)".format(i), file=sys.stderr)
             sys.exit(1)
-        if op_type not in ("set", "increment"):
-            print("Operation {} has invalid op '{}' (must be 'set' or 'increment')".format(i, op_type), file=sys.stderr)
+        if op_type not in valid_ops:
+            print("Operation {} has invalid op '{}' (must be one of: {})".format(
+                i, op_type, ", ".join(valid_ops)), file=sys.stderr)
             sys.exit(1)
-        if key not in nodes:
+        # Key existence check: skip for add-child (creates new nodes) and for keys
+        # that will be created by add-child ops earlier in this batch.
+        if op_type != "add-child" and key not in nodes and key not in pending_child_keys:
             print("Operation {} references non-existent node '{}'".format(i, key), file=sys.stderr)
             sys.exit(1)
+        # set/increment require field
+        if op_type in ("set", "increment") and not op.get("field"):
+            print("Operation {} ({}) missing required 'field'".format(i, op_type), file=sys.stderr)
+            sys.exit(1)
+        # add-child requires child dict with key
+        if op_type == "add-child":
+            child = op.get("child", {})
+            if not child.get("key"):
+                print("Operation {} (add-child) missing child.key".format(i), file=sys.stderr)
+                sys.exit(1)
+            if key not in nodes:
+                print("Operation {} (add-child) parent '{}' not found".format(i, key), file=sys.stderr)
+                sys.exit(1)
+        # remove-child requires child_key
+        if op_type == "remove-child" and not op.get("child_key"):
+            print("Operation {} (remove-child) missing 'child_key'".format(i), file=sys.stderr)
+            sys.exit(1)
 
-    # Apply all operations
+        if op_type == "propagate":
+            propagate_ops.append(op)
+        else:
+            mutation_ops.append(op)
+
+    # Phase 1: Apply mutation ops sequentially
     updated_keys = set()
-    for op in operations:
+    for op in mutation_ops:
+        op_type = op["op"]
         key = op["key"]
-        field = op["field"]
-        node = nodes[key]
 
-        if op["op"] == "set":
+        if op_type == "set":
+            node = nodes[key]
+            field = op["field"]
             value = op.get("value")
             if isinstance(value, str):
                 value = parse_value(value)
             node[field] = value
-        elif op["op"] == "increment":
+            nodes[key] = node
+            updated_keys.add(key)
+
+        elif op_type == "increment":
+            node = nodes[key]
+            field = op["field"]
             current = node.get(field, 0)
             if not isinstance(current, (int, float)):
                 current = 0
             node[field] = current + 1
-            # utility_ratio is ONLY recomputed here (and in cmd_batch). Never set it manually.
             if field in ("times_helpful", "retrieval_count", "times_noise"):
                 rc = node.get("retrieval_count", 0)
                 th = node.get("times_helpful", 0)
                 node["utility_ratio"] = round(th / max(rc, 1), 4)
+            nodes[key] = node
+            updated_keys.add(key)
 
-        nodes[key] = node
-        updated_keys.add(key)
+        elif op_type == "add-child":
+            parent_key = key
+            child_data = op["child"]
+            child_key = child_data["key"]
+            if child_key in nodes:
+                print("Batch add-child: node key already exists: " + child_key, file=sys.stderr)
+                sys.exit(1)
+            parent = nodes[parent_key]
+            parent_depth = parent.get("depth", 0)
+            child_node = {}
+            if "file" not in child_data:
+                child_node["file"] = compute_child_path(parent.get("file", ""), child_key)
+            else:
+                child_node["file"] = child_data["file"]
+            child_node["depth"] = parent_depth + 1
+            child_node["parent"] = parent_key
+            child_node["children"] = child_data.get("children", [])
+            child_node["child_count"] = len(child_node["children"])
+            for field in ("summary", "domain_confidence", "capability_level", "confidence",
+                          "article_count", "growth_state", "node_type"):
+                if field in child_data:
+                    child_node[field] = child_data[field]
+            child_node = apply_defaults(child_node)
+            nodes[child_key] = child_node
+            if child_key not in parent.get("children", []):
+                if "children" not in parent:
+                    parent["children"] = []
+                parent["children"].append(child_key)
+                parent["child_count"] = len(parent["children"])
+            nodes[parent_key] = parent
+            updated_keys.add(child_key)
+            updated_keys.add(parent_key)
+
+        elif op_type == "remove-child":
+            parent_key = key
+            child_key = op["child_key"]
+            parent = nodes[parent_key]
+            children = parent.get("children", [])
+            if child_key in children:
+                children.remove(child_key)
+                parent["children"] = children
+                parent["child_count"] = len(children)
+            if child_key in nodes:
+                del nodes[child_key]
+            nodes[parent_key] = parent
+            updated_keys.add(parent_key)
+
+    # Phase 2: Apply propagate ops LAST (sees all mutations)
+    propagate_results = []
+    if propagate_ops:
+        competence = _load_competence_config()
+        for op in propagate_ops:
+            key = op["key"]
+            ancestors_updated, capability_changes = _propagate_in_memory(nodes, key, competence)
+            propagate_results.append({
+                "source_node": key,
+                "ancestors_updated": ancestors_updated,
+                "capability_changes": capability_changes,
+            })
+            for anc in ancestors_updated:
+                updated_keys.add(anc["key"])
 
     tree["nodes"] = nodes
     write_tree(tree)
 
-    # Return updated nodes
-    result = []
+    # Build output
+    updated_nodes = []
     for key in updated_keys:
-        out = apply_defaults(nodes[key])
-        out["key"] = key
-        result.append(out)
+        if key in nodes:
+            out = apply_defaults(nodes[key])
+            out["key"] = key
+            updated_nodes.append(out)
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    # Backward compat: plain array if no propagate ops
+    if not propagate_results:
+        print(json.dumps(updated_nodes, indent=2, ensure_ascii=False))
+    else:
+        print(json.dumps({
+            "updated_nodes": updated_nodes,
+            "propagate": propagate_results,
+        }, indent=2, ensure_ascii=False))
 
 
-def cmd_propagate(args):
-    """Propagate confidence up parent chain from a node.
-
-    Walks ancestors from node to root (skipping self). For each ancestor,
-    computes avg confidence from its children, updates confidence +
-    domain_confidence, and detects capability_level threshold crossings.
-    Stops if confidence is unchanged at current level.
-    """
-    key = args.propagate
-
-    tree = read_tree()
-    nodes = tree.get("nodes", {})
-
-    # Read competence mapping from config
+def _load_competence_config():
+    """Load competence mapping from config, with defaults."""
     config_path = str(CONFIG_DIR / "tree.yaml")
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
-        competence = config.get("domain_health", {}).get("competence_mapping", {})
-    else:
-        competence = {"EXPLORE": 0.25, "CALIBRATE": 0.50, "EXPLOIT": 0.75, "MASTER": 1.00}
+        return config.get("domain_health", {}).get("competence_mapping", {})
+    return {"EXPLORE": 0.25, "CALIBRATE": 0.50, "EXPLOIT": 0.75, "MASTER": 1.00}
 
-    # Sort levels by threshold ascending for capability determination
+
+def _propagate_in_memory(nodes, key, competence):
+    """Propagate confidence up parent chain. Mutates nodes in place.
+    Returns (ancestors_updated, capability_changes).
+
+    Walks ancestors from key to root (skipping self). For each ancestor,
+    computes avg confidence from its children, updates confidence +
+    domain_confidence, and detects capability_level threshold crossings.
+    """
     levels_sorted = sorted(competence.items(), key=lambda x: x[1])
 
-    # Walk ancestors (skip self)
-    ancestors = walk_ancestors(tree, key)
-    if len(ancestors) < 2:
-        # Node is root or has no parent — nothing to propagate
-        print(json.dumps({
-            "source_node": key,
-            "ancestors_updated": [],
-            "capability_changes": []
-        }, indent=2, ensure_ascii=False))
-        return
+    # Walk ancestors using nodes dict directly (no tree wrapper needed)
+    if key not in nodes:
+        return [], []
+    result_chain = []
+    visited = set()
+    current = key
+    while current is not None:
+        if current in visited or current not in nodes:
+            break
+        visited.add(current)
+        result_chain.append(current)
+        current = nodes[current].get("parent")
+
+    if len(result_chain) < 2:
+        return [], []
 
     ancestors_updated = []
     capability_changes = []
 
-    for anc in ancestors[1:]:  # skip self (index 0)
-        anc_key = anc["key"]
+    for anc_key in result_chain[1:]:  # skip self (index 0)
         anc_node = nodes.get(anc_key)
         if not anc_node:
             break
@@ -874,7 +1022,6 @@ def cmd_propagate(args):
         if not children_keys:
             continue
 
-        # Compute average confidence from children
         child_confidences = []
         for ck in children_keys:
             if ck in nodes:
@@ -890,7 +1037,6 @@ def cmd_propagate(args):
         if old_confidence is not None:
             old_confidence = round(float(old_confidence), 4)
 
-        # Determine new capability level
         old_level = anc_node.get("capability_level", "EXPLORE")
         new_level = "EXPLORE"
         for level_name, threshold in levels_sorted:
@@ -899,7 +1045,6 @@ def cmd_propagate(args):
 
         capability_changed = old_level != new_level
 
-        # Update node
         anc_node["confidence"] = new_confidence
         anc_node["domain_confidence"] = new_confidence
         if capability_changed:
@@ -920,9 +1065,21 @@ def cmd_propagate(args):
                 "new_level": new_level,
             })
 
-        # Stop if confidence didn't change
         if old_confidence is not None and old_confidence == new_confidence:
             break
+
+    return ancestors_updated, capability_changes
+
+
+def cmd_propagate(args):
+    """Propagate confidence up parent chain from a node."""
+    key = args.propagate
+
+    tree = read_tree()
+    nodes = tree.get("nodes", {})
+    competence = _load_competence_config()
+
+    ancestors_updated, capability_changes = _propagate_in_memory(nodes, key, competence)
 
     tree["nodes"] = nodes
     write_tree(tree)

@@ -94,6 +94,38 @@ All data comes from framework scripts — no direct JSONL reads.
     If more exist, note: "... and {N} earlier messages"
     Store as board_messages = {channel: [messages], ...}
     (Any channel with zero messages is omitted from output)
+
+11. System Health Metrics
+    # Structural health indicators surfaced for meta-awareness
+
+    # 11a. Decompose candidates (tree nodes exceeding growth threshold)
+    Bash: bash core/scripts/tree-read.sh --decompose-candidates
+    → Parse output as JSON → decompose_candidate_count = len(result)
+
+    # 11b. Encoding drift (from session signals if available)
+    Bash: bash core/scripts/wm-read.sh loop_state --json
+    → Extract goals_since_last_tree_update from loop_state.signals (if exists)
+    → If WM has no loop_state (between sessions): encoding_drift = "N/A (between sessions)"
+
+    # 11c. Reflection ROI (from meta/reflection-strategy.yaml)
+    Bash: meta-read.sh reflection-strategy.yaml
+    → If file exists: extract roi_history (last 5 entries)
+    → If file missing: reflection_roi = "not initialized"
+
+    # 11d. Routine-to-productive ratio (from loop_state if available)
+    → If loop_state exists: routine_ratio = loop_state.signals.routine_count_total / loop_state.goals_completed
+    → Else: routine_ratio = "N/A"
+
+    # 11e. Knowledge debt items
+    Bash: bash core/scripts/wm-read.sh knowledge_debt --json
+    → knowledge_debt_count = count of items (0 if empty/null)
+    → knowledge_debt_high = count where priority == "HIGH"
+
+    # 11f. Hypothesis pipeline flow
+    # Uses pipeline counts already gathered in step 4/5
+    Bash: bash core/scripts/pipeline-read.sh --stage active
+    → time_gated = count hypotheses where formed_date + horizon window > now
+    → flowing = total active - time_gated
 ```
 
 ## Phase 3: Display Console Summary
@@ -142,6 +174,19 @@ Since: {since_timestamp} ({hours}h {min}m ago)
 
   If total_blocked == 0: omit entire section.
 
+## System Health
+  Decompose candidates: {decompose_candidate_count} nodes over threshold
+  Encoding drift: {encoding_drift} goals since last tree update{" ⚠" if >= 3 else ""}
+  Reflection ROI: {last 3-5 roi_history entries as "session N: ROI X.XX" lines, or "not initialized"}
+  Routine ratio: {routine_ratio formatted as percentage}{" ⚠ high" if > 0.70 else ""}
+  Knowledge debt: {knowledge_debt_count} items ({knowledge_debt_high} HIGH priority)
+  Pipeline flow: {flowing} flowing / {time_gated} time-gated
+
+  {IF decompose_candidate_count > 50 OR encoding_drift >= 3 OR routine_ratio > 0.70 OR knowledge_debt_high > 0:}
+    Overall: ATTENTION NEEDED — {list specific concerns}
+  {ELSE:}
+    Overall: HEALTHY
+
 ## Needs Attention
   {pending questions count, user goals count — or "None"}
 
@@ -157,6 +202,8 @@ If `since` is null, replace the "Since:" line with "Lifetime totals (no prior re
 1. Build the full report as a markdown document:
    - Header: "# Agent Completion Report" + "Generated: {timestamp}" + "Since: {since}"
    - Include all sections from Phase 3 as markdown (same content, formatted for file)
+   - Include the "## System Health" section (decompose candidates, encoding drift, reflection ROI,
+     routine ratio, knowledge debt, pipeline flow, and overall verdict)
 
 2. Ensure reports directory exists:
    Bash: mkdir -p <agent>/reports/

@@ -8,7 +8,7 @@ config:
   max_skills: 15                # ceiling to prevent sprawl
   developmental_gate: EXPLOIT   # minimum capability level before forging allowed
   control_skills: [start, stop, verify-learning]
-  # Forged skills tracked in <agent>/forged-skills.yaml (not here).
+  # Forged skills tracked in world/forged-skills.yaml (not here).
   # This file is STATIC framework — never modified during RUNNING state.
 
 # --- Control Skills (USER-ONLY — Claude must NEVER invoke these) ---
@@ -43,9 +43,8 @@ aspirations:
     - boot
     - decompose
     - forge-skill
-    - recover
     - create-aspiration
-    # Forged skills register as children in <agent>/forged-skills.yaml, not here.
+    # Forged skills register as children in world/forged-skills.yaml, not here.
   type: orchestrator
   user_invocable: false
   status: active
@@ -139,15 +138,6 @@ forge-skill:
   user_invocable: false
   status: active
 
-# --- Recovery ---
-
-recover:
-  file: .claude/skills/recover/SKILL.md
-  parent: aspirations
-  children: []
-  type: recovery
-  user_invocable: false
-  status: active
 
 # --- Planning (aspiration creation) ---
 

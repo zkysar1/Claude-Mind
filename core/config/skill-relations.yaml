@@ -2,7 +2,7 @@
 # SkillNet-inspired four relation types between skills.
 # Read by: /decompose (Step 5 skill assignment), goal-selector.py (skill_affinity criterion),
 #          /forge-skill (dedup check), /aspirations-consolidate (skill health report).
-# Immutable framework — forged skill relations tracked in <agent>/skill-relations.yaml.
+# Immutable framework — forged skill relations tracked in world/skill-relations.yaml.
 
 # --- FRAMEWORK ---
 
@@ -128,47 +128,23 @@ relations:
     evidence: "Phase 9 evolution sub-skill of aspirations loop"
 
   # Reflect sub-skills
-  - source: reflect-hypothesis
+  - source: reflect-on-outcome
     target: reflect
     type: belong_to
     confidence: 1.0
-    evidence: "Single hypothesis reflection mode"
+    evidence: "Outcome reflection: hypothesis, execution, batch micro modes"
 
-  - source: reflect-execution
+  - source: reflect-on-self
     target: reflect
     type: belong_to
     confidence: 1.0
-    evidence: "Execution reflection mode"
+    evidence: "Self-model reflection: pattern extraction, calibration modes"
 
-  - source: reflect-extract-patterns
+  - source: reflect-maintain
     target: reflect
     type: belong_to
     confidence: 1.0
-    evidence: "Pattern extraction mode"
-
-  - source: reflect-batch-micro
-    target: reflect
-    type: belong_to
-    confidence: 1.0
-    evidence: "Batch micro-hypothesis mode"
-
-  - source: reflect-calibration
-    target: reflect
-    type: belong_to
-    confidence: 1.0
-    evidence: "Confidence calibration mode"
-
-  - source: reflect-curate-memory
-    target: reflect
-    type: belong_to
-    confidence: 1.0
-    evidence: "Memory curation mode"
-
-  - source: reflect-curate-aspirations
-    target: reflect
-    type: belong_to
-    confidence: 1.0
-    evidence: "Aspiration grooming mode"
+    evidence: "Maintenance reflection: memory curation, aspiration grooming modes"
 
   - source: reflect-tree-update
     target: reflect
@@ -233,7 +209,7 @@ relations:
     evidence: "Both are planning skills that structure work"
 
 # --- INITIAL STATE ---
-# Seeded to <agent>/skill-relations.yaml by init-agent.sh.
+# Seeded to world/skill-relations.yaml by init-world.sh.
 
 initial_state:
   last_updated: null

@@ -47,6 +47,45 @@ IF <agent>/self.md is empty or missing:
     ABORT: "Cannot create aspirations — Self is not defined. Run /start to set up."
 ```
 
+## Step 1.5: Execution Feedback Review
+
+Before creating new goals, review feedback from agents who executed previous goals.
+This creates a learning loop on goal quality — if past goals had low clarity or
+wrong scope estimates, adjust the new ones accordingly.
+
+```
+Bash: board-read.sh --channel feedback --type execution-feedback --since 7d --json
+IF feedback messages exist:
+    Aggregate scores:
+      avg_clarity = mean(feedback.clarity for all messages)
+      avg_scope = mean(feedback.scope_accuracy for all messages)
+      avg_verify = mean(feedback.verification_quality for all messages)
+      high_friction_count = count where friction == "high"
+
+    IF avg_clarity < 3.0:
+        Output: "▸ FEEDBACK: Goal clarity averaging {avg_clarity}/5 — improving descriptions"
+        # Apply: write more detailed descriptions with explicit prerequisites and context
+    IF avg_scope < 3.0:
+        Output: "▸ FEEDBACK: Scope accuracy averaging {avg_scope}/5 — calibrating estimates"
+        # Apply: be more conservative on scope, break large goals into smaller ones
+    IF avg_verify < 3.0:
+        Output: "▸ FEEDBACK: Verification quality averaging {avg_verify}/5 — improving checks"
+        # Apply: write more specific, testable verification criteria
+
+    # Read any "notes" fields for specific improvement hints
+    FOR EACH feedback WHERE notes is non-empty:
+        Log pattern for this goal creation session
+```
+
+## Step 1.7: Team State Alignment
+
+```
+Bash: team-state-read.sh --field strategic_focus --json
+IF strategic_focus.primary is set:
+    Align new aspirations with team strategic focus where applicable
+    Output: "▸ Team focus: {strategic_focus.primary}"
+```
+
 ## Step 2: Read Current State
 
 ```
@@ -83,7 +122,7 @@ Phase A — Purpose scan:
     Generate aspirations that advance Self's mission.
 
     # Meta-strategy aspiration heuristics
-    Read meta/aspiration-generation-strategy.yaml
+    Bash: meta-read.sh aspiration-generation-strategy.yaml
     # Apply agent-learned generation preferences:
     # - preferred_scope_ratio: learned balance of sprint/project/initiative
     # - category_saturation: categories already well-covered
@@ -128,7 +167,9 @@ Phase A.5 — Stepping-stone retrieval (OMNI-EPIC-inspired):
       For each stepping stone, ask:
         "What ADJACENT direction does this completed work suggest?
          What variation, extension, or contrast would be novel and learnable?
-         What follow-up question does this work raise that wasn't answered?"
+         What follow-up question does this work raise that wasn't answered?
+         What in this completed work is fragile or could break under edge cases?
+         What assumptions were made that haven't been validated?"
 
       Generate stepping-stone candidates from these reflections.
       # These candidates join the pool alongside Phases A-D candidates.
@@ -138,7 +179,7 @@ Phase A.5 — Stepping-stone retrieval (OMNI-EPIC-inspired):
       SKIP — no stepping stones available. Phases A-D provide sufficient generation.
 
 Phase B — Data acquisition scan:
-    Read world/knowledge/tree/_tree.yaml → node summaries + entity_index
+    Bash: world-cat.sh knowledge/tree/_tree.yaml  # node summaries + entity_index
     For each node: does it reference data sources, systems, APIs,
     environments, or files that the agent hasn't directly accessed?
     "What data do I KNOW ABOUT in my knowledge tree that would be
@@ -174,7 +215,24 @@ Phase D — Pain scan:
     Skip if no pain signals found — not every session has problems.
 ```
 
-Combine results from all five phases (A, A.5, B, C, D). Deduplicate and prioritize.
+**Phase D.5 — Consolidation scan** ("What existing work could be made excellent?"):
+```
+    Bash: load-aspirations-compact.sh → IF path returned: Read it
+    FOR EACH active aspiration, compute completion_ratio (completed / total active goals):
+      IF completion_ratio > 0.50 AND < 1.0:
+        "What remaining goals need attention? What quality gaps exist?
+         What would make this aspiration's outcomes robust and durable?
+         What was done hastily that deserves a careful second pass?"
+      IF completion_ratio < 0.30 AND sessions_active > 2:
+        "Is this aspiration stuck? What's blocking progress?
+         Should goals be rescoped, dependencies resolved, or approach changed?"
+    Generate consolidation-focused candidates for existing aspirations.
+    These are ALTERNATIVES to new aspirations — prefer strengthening what
+    exists over starting something new.
+    Skip if all aspirations are either very new (<2 sessions) or nearly done (>90%).
+```
+
+Combine results from all six phases (A, A.5, B, C, D, D.5). Deduplicate and prioritize.
 
 ### Step 3.7: Scope Classification
 
@@ -223,7 +281,7 @@ IF scope == "sprint":
     SKIP this step — sprint aspirations don't need external research.
 
 Read <agent>/self.md → what are Self's priorities, curiosities, blind spots?
-Read world/knowledge/tree/_tree.yaml → where are the knowledge gaps?
+Bash: world-cat.sh knowledge/tree/_tree.yaml  # where are the knowledge gaps?
 
 IF scope == "project" or scope == "initiative":
     # DEEP RESEARCH MODE — genuine understanding of the problem space.
@@ -279,7 +337,7 @@ Quick orientation before generating goals:
 
 ```
 Read <agent>/self.md → what domain is this agent for?
-Read world/knowledge/tree/_tree.yaml → what does the agent already know?
+Bash: world-cat.sh knowledge/tree/_tree.yaml  # what does the agent already know?
 IF Self references an external codebase:
     Scan that project's CLAUDE.md for test frameworks (pytest, jest, gradle test, etc.)
 ```
@@ -316,6 +374,20 @@ For INITIATIVE scope — also plan WORK PHASES (temporal):
   - Phase 3 goals (sessions 5+): advanced, integration, transfer
   Only generate Phase 1 goals now. Record Phase 2-3 plans in
   the aspiration's description for future goal generation.
+
+6. COORDINATION MODE (multi-agent — Amdahl's Law awareness):
+   Classify this aspiration's parallelizability:
+   - "parallel": Goals are largely independent — multiple agents can work on
+     different goals simultaneously without blocking each other. Example:
+     research on 3 unrelated topics, independent bug fixes in different modules.
+   - "serial": Goals form a dependency chain — each depends on the previous
+     one's output. Example: research → design → implement → test → deploy.
+   - "mixed" (default): Some goals are independent, some are chained.
+     The blocked_by graph determines which. Example: research is parallel,
+     but implementation depends on research completing first.
+   Set coordination_mode on the aspiration JSON accordingly.
+   (Informed by "LLM Teams as Distributed Systems" Finding 1: speedup is
+   bounded by the parallelizable fraction — Amdahl's Law.)
 ```
 
 ### Step 4b: Generate Core Goals
@@ -360,6 +432,31 @@ Goal structure (pipe to aspirations-add.sh):
       preconditions: ["What must be true before execution"]
   - blocked_by: [goal-ids] if sequential dependency
 ```
+
+### Step 4b.5: Dependency Analysis (multi-agent coordination)
+
+For each generated goal, improve delegation quality for multi-agent execution:
+
+1. **Populate `blocked_by` explicitly**: Review all goals — does goal B require output
+   from goal A? Add `A.id` to `B.blocked_by`. Prefer over-specifying dependencies
+   (safe ordering) to under-specifying (race conditions).
+
+2. **File path annotations** (code-change goals only): Include a `Touches:` line at the
+   start of the description listing files the goal will modify. This enables other agents
+   to detect potential conflicts when scanning goals.
+   ```
+   description: |
+     Touches: src/main/java/FooVerticle.java, src/test/java/FooTest.java
+
+     Implement the new endpoint for ...
+   ```
+
+3. **Route via `participants`**: If a goal is clearly developer work (code changes,
+   deployments), set `participants: ["alpha"]`. If it's PM work (audits, research,
+   monitoring), set `participants: ["bravo"]`. Default `["agent"]` for either.
+
+(Informed by CAID finding: delegation quality is the #1 factor in multi-agent success.
+Explicit dependency chains prevent agents from executing work out of order.)
 
 ### Step 4c: Verification Reflection
 
@@ -471,6 +568,9 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
         LEARNABLE:   Given developmental stage + tree coverage, can we make progress?
                      (not so easy it's trivial, not so hard it'll fail)
         WORTHWHILE:  Does Self endorse this direction? (re-read Self as "judge")
+                     Improvement aspirations that deepen existing work score HIGH here.
+                     "Improve X" and "Harden X" are worthwhile — do not penalize for
+                     similarity to existing work. Similarity is the point for improvements.
         NON-TRIVIAL: Would completing this teach something non-obvious?
 
      c. Score: ACCEPT (interesting — proceed to cap check)
@@ -484,9 +584,12 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
      e. Log filter decisions to evolution-log for meta-learning:
         echo '{"date":"<today>","event":"interestingness_filter","details":"<title>: <verdict> — <reason>","trigger_reason":"create-aspiration"}' | bash core/scripts/evolution-log-append.sh
 
-   # Also reject if too similar to existing ACTIVE aspiration (original novelty check preserved)
+   # Reject if DUPLICATING existing work (same scope, same approach, same goals).
+   # Do NOT reject aspirations that DEEPEN, IMPROVE, or HARDEN existing work —
+   # "Improve X" is intentionally similar to "X" and that is correct.
    Compare accepted candidates against aspirations-read.sh --summary
-   IF too similar to existing active aspiration → REJECT
+   IF duplicates existing active aspiration (same scope + approach) → REJECT
+   IF deepens/improves existing active aspiration → KEEP (consolidate-before-expand)
 
 2. Cap check:
    Read core/config/aspirations.yaml → max_active
@@ -497,9 +600,9 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
        # Guard: NEVER archive aspirations with recurring goals (data layer blocks it)
        IF any goal has recurring == true: SKIP this aspiration
        ELIF aspiration has no completed goals and last_worked is null:
-         Bash: aspirations-retire.sh <asp-id>   # never started
+         Bash: aspirations-retire.sh --source {asp.source} <asp-id>   # never started
        ELSE:
-         Bash: aspirations-complete.sh <asp-id>  # had progress
+         Bash: aspirations-complete.sh --source {asp.source} <asp-id>  # had progress
      Until within cap
 
 3. ID assignment:
@@ -579,7 +682,7 @@ IF invocation mode is NOT "from-self": SKIP this step.
    - status: pending
    - type: priority-review
 
-3. Notify user via /notify-user:
+3. Notify the user (via forged notification skill if available, else pending-questions):
    category: decision-needed
    subject: "Priority Review: {N} Active Aspirations ({M} new)"
    body: the ranked list + "Reply or run /priority-review to reorder"
@@ -589,7 +692,7 @@ IF invocation mode is NOT "from-self": SKIP this step.
 
 ## Chaining
 
-- **Called by**: `/start`, `/aspirations evolve` (`--plan` for gap analysis), `/aspirations loop` (Phase 0.5/2/7 with `--plan`, no-goals with `--plan`), `/aspirations-spark` (sq-007, sq-c05, sq-013 with context), `/aspirations-consolidate` (with `batch_context`), `/reflect-hypothesis` (with `forge_context`), `/respond`
-- **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5), priority-review pending question + `/notify-user` (Step 8.6)
+- **Called by**: `/start`, `/aspirations evolve` (`--plan` for gap analysis), `/aspirations loop` (Phase 0.5/2/7 with `--plan`, no-goals with `--plan`), `/aspirations-spark` (sq-007, sq-c05, sq-013 with context), `/aspirations-consolidate` (with `batch_context`), `/reflect-on-outcome` (with `forge_context`), `/respond`
+- **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5), priority-review pending question (Step 8.6)
 - **Reads**: `<agent>/self.md`, `aspirations-read.sh`, `tree-read.sh`, `<agent>/developmental-stage.yaml`, `core/config/aspirations.yaml`
 - **Web research** (`--plan` only): WebSearch for Self-grounded queries (Step 2.5)

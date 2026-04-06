@@ -136,11 +136,8 @@ touch "$AGENT/journal.jsonl"
 echo "  Created journal"
 
 # --- 6. Domain-specific tools ---
-cat > "$AGENT/forged-skills.yaml" << 'EOF'
-skills: {}
-EOF
-
-extract_initial_state "$CONFIG/skill-relations.yaml" "$AGENT/skill-relations.yaml"
+# Note: forged-skills.yaml and skill-relations.yaml are world-level (shared across agents).
+# They are created by init-world.sh, not here.
 
 cat > "$AGENT/infra-health.yaml" << 'EOF'
 components: {}

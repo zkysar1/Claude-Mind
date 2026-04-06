@@ -59,7 +59,7 @@ The agent reads these to guide improvement procedures and writes to them during 
 
 ### When the agent may modify meta-strategies:
 1. During `/aspirations-evolve` Step 0.7 (Meta-Strategy Evaluation)
-2. During `/reflect-extract-patterns` Step 5 (Meta-Strategy Synthesis)
+2. During `/reflect-on-self` Patterns mode, Step 5 (Meta-Strategy Synthesis)
 3. During experiment resolution (after min_duration_goals data collected)
 4. During `/aspirations-spark` sq-c06 handler (meta-level signal capture to meta-log)
 

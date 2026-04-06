@@ -11,7 +11,7 @@ minimum_mode: assistant
 
 # /reflect-tree-update — Tree Update Protocol
 
-This sub-skill implements the shared Tree Update Protocol used by `/reflect-hypothesis` and `/reflect-extract-patterns`. It is invoked after any reflection that updates memory tree nodes, to propagate new insights upward through the tree hierarchy. After EVERY reflection, update the memory tree to propagate new insights upward.
+This sub-skill implements the shared Tree Update Protocol used by `/reflect-on-outcome` (Hypothesis mode) and `/reflect-on-self` (Patterns mode). It is invoked after any reflection that updates memory tree nodes, to propagate new insights upward through the tree hierarchy. After EVERY reflection, update the memory tree to propagate new insights upward.
 
 ## Step 0: Load Conventions
 
@@ -34,7 +34,7 @@ Also update performance nodes as needed:
 
 Behavior depends on whether the target node is a leaf or interior node:
 
-**If target is a LEAF node AND insight is substantial (>3 sentences) AND depth < D_max (6):**
+**If target is a LEAF node AND insight is substantial (>1 sentence) AND depth < D_max (20):**
 1. Create a NEW child .md file under the leaf's directory
 2. Register child and convert former leaf to interior:
    echo '{"key":"<child-key>","summary":"<summary>"}' | bash core/scripts/tree-update.sh --add-child <parent-key>
@@ -42,7 +42,7 @@ Behavior depends on whether the target node is a leaf or interior node:
 3. Move the original leaf content into a child if needed, then add the new child
 4. Invoke `/tree validate` to check the structural change
 
-**If target is a LEAF node AND insight is minor (<=3 sentences):**
+**If target is a LEAF node AND insight is brief (1 sentence or less):**
 1. Read the leaf's .md file (use `Edit` to update — never `Write` on existing node files)
 2. EXTRACT PRECISION: Scan insight for exact values (numbers, thresholds, code refs,
    formulas, error codes, config values). Build precision items:

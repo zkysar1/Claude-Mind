@@ -98,12 +98,30 @@ goal = {
 }
 ```
 
+### Cross-Agent Insight Goals — "This changes something for the other agent"
+When execution reveals something that invalidates, constrains, or enables another
+agent's work, post an insight trigger to the findings board. This is the reactive
+influence channel — discoveries during execution reshape the other agent's strategy.
+
+```
+# Post insight trigger finding (see board.md Insight Trigger Payload)
+echo "Description of what was discovered and why it matters" | \
+  bash core/scripts/board-post.sh --channel findings --type finding \
+    --tags "insight_trigger,severity:<invalidates|constrains|enables|informs>,affects:<goal-id>,requires_action_by:<agent>,action_type:<re-scope|re-prioritize|investigate>,<category>"
+```
+
+**Severity guide:**
+- `invalidates`: An assumption the other agent relies on is provably wrong
+- `constrains`: The other agent's approach needs modification (but isn't wrong)
+- `enables`: Something unblocked or became possible that the other agent should know about
+- `informs`: Interesting finding — no immediate action needed
+
 For all types: `echo '<JSON>' | bash core/scripts/aspirations-add-goal.sh --source {source} <aspiration_id>`
 Place in the RIGHT aspiration (read active aspirations, pick best fit).
 Dedup: check for existing goals with similar title before creating.
 
-These are NOT mutually exclusive. A single event can spawn all three:
-  Unblock: "fix the crash" + Investigate: "why does it crash?" + Idea: "add crash prevention"
+These are NOT mutually exclusive. A single event can spawn all four:
+  Unblock: "fix the crash" + Investigate: "why does it crash?" + Idea: "add crash prevention" + Cross-Agent Insight: "this crash affects bravo's testing goals"
 
 ---
 
@@ -317,7 +335,7 @@ spark checks, tree encoding) fire afterward.
 ```
 outcome_class = "deep"  # default: full pipeline with immediate tree encoding
 
-# ── ROUTINE/STANDARD demotion (only recurring goals can be demoted) ──
+# ── ROUTINE demotion (only recurring goals with zero findings) ──
 IF goal.recurring AND goal_succeeded (no errors, no timeouts):
     # Assess the ACTUAL execution result:
     #   - Did the skill find items to process? (emails, alerts, stale data, issues)
@@ -326,18 +344,16 @@ IF goal.recurring AND goal_succeeded (no errors, no timeouts):
     # If the answer to ALL is "no" → routine check with no findings.
     IF result produced no actionable items and no new information:
         outcome_class = "routine"
-    ELSE:
-        # Recurring goal WITH incremental findings → standard (deferred tree encoding)
-        outcome_class = "standard"
-        Log: "▸ Outcome: STANDARD — recurring with incremental findings"
 
 IF outcome_class == "routine":
     Log: "▸ Outcome: ROUTINE — recurring, no findings"
 IF outcome_class == "deep":
     Log: "▸ Outcome: DEEP — full pipeline with immediate tree encoding"
 
+# Binary classification: routine (recurring + no findings) or deep (everything else).
 # SAFETY: Non-recurring goals ALWAYS remain "deep" (inherently novel)
 # SAFETY: Failed goals ALWAYS remain "deep" (failures are learning events)
+# SAFETY: Recurring goals WITH findings remain "deep" (learning is the mission)
 # SAFETY: If uncertain, remain "deep" — bias toward full treatment
 ```
 
@@ -358,7 +374,7 @@ Read core/config/aspirations.yaml → episode_chaining section
 chain_trigger = false
 IF result is INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
     chain_trigger = false  # Let Phase 4.0 handle infrastructure failures
-ELIF outcome_class in ("standard", "deep") AND NOT goal_succeeded:
+ELIF outcome_class == "deep" AND NOT goal_succeeded:
     IF "failed" in episode_chaining.chain_on_outcomes:
         chain_trigger = true
 
@@ -473,7 +489,7 @@ IF result is INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
                     Log: "PROVISIONING SUCCESS: {component} started"
                     IF provision_skill == goal.skill:
                         # Provisioning IS the goal execution — do not re-execute.
-                        # Re-executing would run the same skill twice (e.g., provision twice).
+                        # Re-executing would run the same skill twice (e.g., start two game sessions).
                         result = provision_result
                         → return to Phase 5 (verify completion) with this result
                     ELSE:
@@ -905,7 +921,7 @@ After goal execution and knowledge reconciliation, post notable findings:
 ```
 IF goal produced actionable findings OR hypothesis was resolved:
     summary = one-line summary of what was learned or accomplished
-    echo "${summary}" | Bash: board-post.sh --channel findings --tags <goal.category>
+    echo "${summary}" | Bash: board-post.sh --channel findings --type finding --tags <goal.category>
 ```
 
 Skip for routine/maintenance goals that produce no new knowledge.
@@ -926,7 +942,7 @@ IF batch_mode AND more goals in batch:
     - Phase 5: Verify completion (always runs)
     - Phase 6: Spark check (SKIP if routine)
     - Phase 7: Aspiration-level check (always runs)
-    - Phase 8: State Update Protocol — full steps if standard/deep (deferred encoding for standard),
+    - Phase 8: State Update Protocol — full steps with immediate tree encoding if deep,
       Steps 1-4 + abbreviated Step 7 if routine
     Complete ALL phases for this goal before starting the next batched goal.
 ```

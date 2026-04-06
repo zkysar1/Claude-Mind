@@ -39,7 +39,7 @@ seed_questions:
     category: skill_gap_detection
 
   - id: sq-009
-    text: "Could we form a TESTABLE PREDICTION from this goal's findings? What would we expect to see, and when could we check?"
+    text: "Could we form a TESTABLE PREDICTION from this goal's findings? Consider not just code behavior, but user experience, system quality, emergent patterns, and domain outcomes. What would we expect to see, and when could we check?"
     category: hypothesis_generation
 
   - id: sq-010
@@ -58,6 +58,24 @@ seed_questions:
     text: "Did executing this goal reveal actionable work — a requirement, dependency, follow-up, fix, capability gap, or opportunity — that isn't already tracked?"
     category: work_discovery
 
+  # Promoted candidates get sequential IDs (sq-014+) via promote script.
+  # seed_questions uses these IDs to match runtime state exactly.
+  - id: sq-014
+    text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
+    category: memory_curation
+
+  - id: sq-015
+    text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
+    category: meta_improvement
+
+  - id: sq-016
+    text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
+    category: first_principles
+
+  - id: sq-017
+    text: "What would a USER or STAKEHOLDER notice differently as a result of this work? Can we predict a specific observable change in behavior, interaction quality, or experience — and verify it in a future test?"
+    category: experiential_hypothesis
+
 seed_candidates:
   - id: sq-c01
     text: "Did this goal reveal a timing pattern (time-of-day, day-of-week, seasonal)?"
@@ -67,10 +85,7 @@ seed_candidates:
     text: "Was there a data source that CONTRADICTED our primary source?"
     category: contradiction
 
-  - id: sq-c03
-    text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
-    proposed_session: 0
-    category: memory_curation
+  # sq-c03 promoted to active (consolidate-before-expand)
 
   - id: sq-c04
     text: "Is there knowledge in our memory tree that CONTRADICTS what we just learned, or that we now know is STALE?"
@@ -82,26 +97,22 @@ seed_candidates:
     proposed_session: 0
     category: data_acquisition
 
-  - id: sq-c06
-    text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
-    proposed_session: 0
-    category: meta_improvement
+  # sq-c06 promoted to active (consolidate-before-expand)
 
-  - id: sq-c07
-    text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
-    proposed_session: 0
-    category: first_principles
+  # sq-c07 promoted to active (creative-learning-expansion)
 
   - id: sq-c08
     text: "Did this goal fail in a way that suggests an easier stepping-stone variant? What simpler version of this goal would succeed and build toward the original?"
     proposed_session: 0
     category: failure_stepping_stone
 
+  # sq-c09 promoted to active (creative-learning-expansion)
+
 evolution_rules:
   retire_threshold: 0.03
   min_asks_before_retire: 20
   review_interval_sessions: 5
-  max_active_questions: 15
+  max_active_questions: 17
   promotion_rule: "Highest-category-need candidate replaces lowest-yield retired question"
 
 # --- INITIAL STATE ---
@@ -173,7 +184,7 @@ initial_state:
       category: skill_gap_detection
 
     - id: sq-009
-      text: "Could we form a TESTABLE PREDICTION from this goal's findings? What would we expect to see, and when could we check?"
+      text: "Could we form a TESTABLE PREDICTION from this goal's findings? Consider not just code behavior, but user experience, system quality, emergent patterns, and domain outcomes. What would we expect to see, and when could we check?"
       times_asked: 0
       sparks_generated: 0
       yield_rate: 0.0
@@ -212,6 +223,38 @@ initial_state:
       status: active
       category: work_discovery
 
+    - id: sq-014
+      text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: memory_curation
+
+    - id: sq-015
+      text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: meta_improvement
+
+    - id: sq-016
+      text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: first_principles
+
+    - id: sq-017
+      text: "What would a USER or STAKEHOLDER notice differently as a result of this work? Can we predict a specific observable change in behavior, interaction quality, or experience — and verify it in a future test?"
+      times_asked: 0
+      sparks_generated: 0
+      yield_rate: 0.0
+      status: active
+      category: experiential_hypothesis
+
   candidates:
     - id: sq-c01
       text: "Did this goal reveal a timing pattern (time-of-day, day-of-week, seasonal)?"
@@ -223,10 +266,7 @@ initial_state:
       proposed_session: 0
       category: contradiction
 
-    - id: sq-c03
-      text: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
-      proposed_session: 0
-      category: memory_curation
+    # sq-c03 promoted to active (consolidate-before-expand)
 
     - id: sq-c04
       text: "Is there knowledge in our memory tree that CONTRADICTS what we just learned, or that we now know is STALE?"
@@ -238,17 +278,13 @@ initial_state:
       proposed_session: 0
       category: data_acquisition
 
-    - id: sq-c06
-      text: "Did this outcome suggest a better improvement PROCEDURE — not just a better answer, but a better way to FIND answers?"
-      proposed_session: 0
-      category: meta_improvement
+    # sq-c06 promoted to active (consolidate-before-expand)
 
-    - id: sq-c07
-      text: "Did this goal's approach rest on inherited assumptions rather than verified ground truth? What changes if I strip away conventional framing and rebuild from fundamentals?"
-      proposed_session: 0
-      category: first_principles
+    # sq-c07 promoted to active (creative-learning-expansion)
 
     - id: sq-c08
       text: "Did this goal fail in a way that suggests an easier stepping-stone variant? What simpler version of this goal would succeed and build toward the original?"
       proposed_session: 0
       category: failure_stepping_stone
+
+    # sq-c09 promoted to active (creative-learning-expansion)

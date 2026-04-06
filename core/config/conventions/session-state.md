@@ -187,8 +187,8 @@ them via recurring goals and collect results on completion. Complements `pending
 (which tracks short-lived Claude Code sub-agents).
 
 - **File**: `<agent>/session/background-jobs.yaml`
-- **Written by**: Skills that launch external processes (e.g., `/run-processor` launch mode)
-- **Read by**: Skills that monitor external processes (e.g., `/run-processor` monitor mode)
+- **Written by**: Skills that launch external processes (e.g., forged skills with long-running background tasks)
+- **Read by**: Skills that monitor external processes (e.g., forged skills with monitoring modes)
 - **Cleaned by**: The monitoring skill on job completion or failure
 
 **Scripts**: `core/scripts/background-jobs.sh` (thin wrapper), `core/scripts/background-jobs.py`

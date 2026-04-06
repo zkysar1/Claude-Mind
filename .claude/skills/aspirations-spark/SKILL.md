@@ -30,6 +30,8 @@ This is for lessons learned during EXECUTION, not hypothesis resolution
 (which /reflect handles separately).
 
 SKIP: goal outcome was routine/expected with no new insight.
+Exception: the Operational Gotcha Auto-Detection block always runs (it uses
+structural keyword signals, not agent judgment about novelty).
 
 ```
     IF goal outcome revealed a reusable reasoning pattern (heuristic, procedure,
@@ -48,7 +50,7 @@ SKIP: goal outcome was routine/expected with no new insight.
         Create reasoning bank entry via reasoning-bank-add.sh:
           id: next rb-NNN (check existing IDs via reasoning-bank-read.sh --summary)
           title: concise name for the insight
-          type: heuristic | procedure | diagnostic | causal
+          type: success | failure   # success if from a working approach; failure if from debugging/fixing
           category: goal's category
           content: the insight — what to do and why
           when_to_use: when this insight applies
@@ -78,17 +80,62 @@ SKIP: goal outcome was routine/expected with no new insight.
           source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
         Log in journal: "Immediate guardrail: created {guard-id} from {goal.id}"
 
+    # ── Operational Gotcha Auto-Detection (MANDATORY) ──────────────────
+    # Structural trigger: if execution involved debugging/fixing an error,
+    # the resolution pattern MUST be encoded. Not optional agent judgment.
+    # Uses keyword scan on execution context (same pattern as Step 8.5).
+    #
+    # Signal detection (scan goal outcome summary + execution trace):
+    #   error_then_fix: (error|exception|traceback|failed|refused|permission denied|not found)
+    #                   AND (fixed by|resolved by|workaround|solution|the fix|root cause|turned out)
+    #   explicit_gotcha: (must use|always use|never use|don't forget|gotcha|caveat|pitfall|footgun)
+    #   environment_issue: (environment|env var|export|path|config|permission|port|firewall)
+    #                      AND (issue|problem|wrong|missing|incorrect|unexpected)
+    #
+    IF any gotcha signal detected in execution context:
+        # Determine store: prescriptive ("always/never/must") → guardrail; diagnostic → reasoning bank
+        IF lesson matches prescriptive pattern (always|never|must|do not):
+            existing_guards = Bash: guardrails-read.sh --category {goal.category}
+            IF semantic overlap with existing:
+                Bash: guardrails-increment.sh {guard.id} times_triggered
+                Log: "OPS GOTCHA: Strengthened existing {guard.id}"
+            ELIF no semantic overlap:
+                Create guardrail via guardrails-add.sh:
+                  id: next guard-NNN
+                  rule: the prescriptive lesson
+                  category: goal's category
+                  trigger_condition: when this gotcha applies
+                  source: goal.id
+                  tags: ["ops-gotcha"]
+                Log: "OPS GOTCHA (guardrail): {rule} from {goal.id}"
+        ELSE:
+            existing_rb = Bash: reasoning-bank-read.sh --category {goal.category}
+            IF no semantic overlap with existing:
+                Create reasoning bank entry via reasoning-bank-add.sh:
+                  id: next rb-NNN
+                  title: "Gotcha: {concise description}"
+                  type: failure
+                  category: goal's category
+                  content: what happened, why, and how it was fixed
+                  when_to_use: {conditions: ["{error pattern or symptom}"], category: "{goal.category}"}
+                  source_goal: goal.id
+                  tags: ["ops-gotcha"]
+                Log: "OPS GOTCHA (reasoning bank): {title} from {goal.id}"
+            ELIF semantic overlap found:
+                Bash: reasoning-bank-increment.sh {entry.id} utilization.times_helpful
+                Log: "OPS GOTCHA: Strengthened existing {entry.id}"
+
     # Forge awareness: detect recurring manual procedures that should be skills
     IF goal execution required a manual multi-step procedure that was repeated
        across goals, OR that would clearly benefit FUTURE goals as a discoverable
        skill (entry point) rather than inline code:
-        Read meta/skill-gaps.yaml
+        Bash: meta-read.sh skill-gaps.yaml
         IF gap already exists for this procedure:
             Increment times_encountered, append to encounter_log
         ELSE:
             Register new gap: id: gap-{next}, status: registered,
               times_encountered: 1, procedure_name, estimated_value
-        Write updated meta/skill-gaps.yaml
+        Write updated skill-gaps.yaml via meta-set.sh
 
         # Check forge criteria immediately
         # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
@@ -119,6 +166,37 @@ Run after EVERY goal completion. This is the recursive self-improvement mechanis
 
 ### Goal-Level Spark
 
+### Routine Spark Mode
+
+When `outcome_class == "routine_spark"`, evaluate creative + hypothesis questions.
+This keeps the hypothesis pipeline alive AND surfaces non-obvious insights from
+routine work. The expanded set is still limited (6 categories, self-selecting)
+so cost is bounded. Principle: we are here to learn — never skip.
+
+```
+IF outcome_class == "routine_spark":
+    Bash: spark-questions-read.sh --active
+    creative_routine_questions = [q for q in result if q.category in (
+        "hypothesis_generation",       # sq-009 — testable predictions
+        "forward_prediction",          # sq-011 — what would break/change
+        "experiential_hypothesis",     # sq-c09 — player perspective
+        "first_principles",            # sq-c07 — inherited assumptions
+        "transfer",                    # sq-003 — cross-domain transfer
+        "surprise"                     # sq-004 — did the outcome surprise us
+    )]
+    Log: "▸ Routine spark: evaluating {len(creative_routine_questions)} creative+hypothesis questions"
+    For each question in creative_routine_questions:
+        Ask the question about the just-completed goal
+        Bash: spark-questions-increment.sh <question.id> times_asked
+        If spark generated:
+            Bash: spark-questions-increment.sh <question.id> sparks_generated
+            Execute the spark action (hypothesis creation via sq-009 handler,
+            or first-principles via sq-c07 handler, or transfer insight log)
+    If any spark fires → log via:
+      echo '{"event":"routine_spark","details":"Goal {id} routine-sparked: {description}","date":"<today>"}' | bash core/scripts/evolution-log-append.sh
+    RETURN  # Skip full spark evaluation and Phase 6.5
+```
+
 ### Adaptive Spark Questions
 Read active spark questions via script instead of using hardcoded spark questions.
 1. `bash core/scripts/spark-questions-read.sh --active` → get active questions as JSON
@@ -133,7 +211,7 @@ Every `evolution_rules.review_interval_sessions` sessions:
 
 ```
 Bash: spark-questions-read.sh --active
-# ALL active spark questions evaluated for both standard and deep outcomes.
+# ALL active spark questions evaluated for deep outcomes.
 # No question count gating — full treatment regardless of outcome tier.
 Log: "▸ Spark: evaluating ALL {len(result)} questions (outcome: {outcome_class})"
 For each question in result:
@@ -150,7 +228,7 @@ If any spark fires → log via:
 
 #### Hypothesis Generation via sq-009
 
-When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypothesis goal:
+When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal:
 0. Load domain context for informed hypothesis formation:
    ```
    Bash: retrieve.sh --category {goal.category} --depth shallow
@@ -159,6 +237,15 @@ When sq-009 fires ("Could we form a TESTABLE PREDICTION..."), it creates a hypot
    ```
    Check retrieved active/discovered hypotheses for semantic overlap with the proposed prediction.
    IF a hypothesis already covers this prediction → SKIP creation, log: "sq-009: Duplicate of {existing_id}, skipped"
+0.1. Category steering (BEFORE forming the prediction):
+     Review the categories of existing active+discovered hypotheses from Step 0.
+     Count hypotheses per category.
+     IF 3+ existing hypotheses share the same category (e.g., "code", "infrastructure"):
+         Log: "sq-009: Category '{saturated_category}' saturated ({count} hypotheses) — steering toward under-represented categories"
+         Prefer forming predictions in under-represented categories, especially:
+           user-experience, system-behavior, domain-quality, engagement
+         over already-saturated categories like: code, infrastructure, pipeline
+         Reformulate: what USER-FACING or EXPERIENTIAL consequence follows from this work?
 0.5. Calibration gate (BEFORE assigning confidence):
      a. Read recent accuracy: `Bash: pipeline-read.sh --stage resolved`
         - Count CONFIRMED vs CORRECTED in this category (or overall if <3 in category)
@@ -258,7 +345,7 @@ When sq-012 fires after goal completion:
 **sq-c05**: "Does my knowledge tree reference external data sources, systems, files, APIs, or environments that I haven't directly accessed? What would I learn from obtaining that data?"
 
 When sq-c05 fires after goal completion:
-1. Read `world/knowledge/tree/_tree.yaml` — scan node summaries for data source references
+1. Bash: world-cat.sh knowledge/tree/_tree.yaml  # scan node summaries for data source references
 2. Read entity_index — look for external system references (SSH endpoints, file paths, APIs, databases)
 3. Identify accessible but unaccessed data sources
 4. IF found:
@@ -374,7 +461,7 @@ When sq-007 fires after goal completion:
 **Handler for sq-c06** — "Did this outcome suggest a better improvement PROCEDURE?"
 
 When sq-c06 fires after goal completion:
-1. Read meta/improvement-instructions.md
+1. Bash: meta-cat.sh improvement-instructions.md
 2. Compare: did the approach used in this goal deviate from the documented procedure?
    - Deviated AND succeeded: procedure may be outdated → note for evolve phase
    - Deviated AND failed: procedure may be correct → reinforcing signal
@@ -387,6 +474,42 @@ When sq-c06 fires after goal completion:
       "outcome":"<succeeded|failed>"}
    - Log: "META SPARK: {insight} from {goal.id}"
 4. Bash: spark-questions-increment.sh sq-c06 sparks_generated
+
+#### sq-c07: First-Principles Spark
+
+**Handler for sq-c07** — "Did this goal's approach rest on inherited assumptions rather than verified ground truth?"
+
+When sq-c07 fires after goal completion:
+1. Identify the goal's execution approach and framing
+2. Surface 2-3 assumptions embedded in the approach:
+   - What was taken for granted?
+   - What conventional wisdom was applied without verification?
+   - What "standard approach" was used because it is standard, not because it was derived?
+3. For each assumption, classify:
+   - **VERIFIED**: agent has direct evidence for this assumption (from tree, experience, or execution)
+   - **INHERITED**: assumption came from documentation, convention, or prior framing without independent verification
+   - **UNTESTED**: assumption was neither verified nor consciously inherited — it was implicit
+4. IF any assumption is INHERITED or UNTESTED:
+   a. Check existing reasoning bank for entries about this assumption:
+      Bash: reasoning-bank-read.sh --category {goal.category}
+   b. IF no existing entry covers this assumption:
+      Create reasoning bank entry via reasoning-bank-add.sh:
+        id: next rb-NNN
+        title: "Assumption: {concise description of the inherited assumption}"
+        type: failure
+        category: goal's category
+        content: "Goal {goal.id} used this assumption without verification: {assumption}. The approach {did/did not} succeed, but the assumption remains unverified. Ground truth check: {what would need to be true for this to be verified}."
+        when_to_use: "{conditions where this assumption is relevant}"
+        source_goal: goal.id
+        tags: ["first-principles", "inherited-assumption"]
+      Log: "FIRST PRINCIPLES: Surfaced inherited assumption from {goal.id}: {assumption}"
+   c. IF assumption is UNTESTED AND goal succeeded:
+      # Most dangerous case — success reinforces unchecked assumptions
+      Create a micro-hypothesis in working memory:
+      echo '{"claim":"Goal {goal.id} succeeded despite untested assumption: {assumption}. This assumption may fail when {condition}.","confidence":0.40,"source_goal":"{goal.id}","source_step":"sq-c07","horizon":"session"}' | Bash: wm-append.sh micro_hypotheses
+      Log: "FIRST PRINCIPLES -> HYPOTHESIS: untested assumption '{assumption}' may fail under {condition}"
+   # Only count as spark if at least one assumption was surfaced (step 4b or 4c fired)
+   Bash: spark-questions-increment.sh sq-c07 sparks_generated
 
 #### Failure Stepping-Stone Spark Handler (OMNI-EPIC-inspired)
 
@@ -438,9 +561,13 @@ Ask these 3 questions:
 4. Did completing this aspiration teach us something about HOW we generate aspirations?
    → IF yes:
        Bash: curriculum-contract-check.sh --action allow_meta_edits
-       IF permitted: Read and update meta/aspiration-generation-strategy.yaml with learned heuristic.
-     Append to meta/meta-log.jsonl: {"date":"<today>","event":"aspiration_meta_learning","aspiration":"<asp-id>","insight":"<insight>"}
+       IF permitted: Read via meta-read.sh and update via meta-set.sh: aspiration-generation-strategy.yaml with learned heuristic.
+     Append to meta-log.jsonl via meta-log-append.sh: {"date":"<today>","event":"aspiration_meta_learning","aspiration":"<asp-id>","insight":"<insight>"}
 
 Replacement aspiration generation is handled by Phase 7 archival in aspirations/SKILL.md
 (with --plan for full planning treatment). Do NOT duplicate generation here.
 ```
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.

@@ -515,7 +515,7 @@ learn_result:
 
 ```
 Bash: pipeline-read.sh --stage resolved  (all resolved records)
-Read meta/meta-knowledge/_index.yaml for existing meta-data
+Bash: meta-read.sh meta-knowledge/_index.yaml  # existing meta-data
 
 # Include micro-hypothesis batch stats from pipeline metadata.
 # Micro stats are stored in pipeline-meta.json under micro_hypothesis_stats.
@@ -599,7 +599,7 @@ world/knowledge/strategies/hypothesis-results.md
 ### Step 4: Update Meta-Memory
 
 ```
-Update meta/meta-knowledge/_index.yaml with all accuracy figures
+Bash: meta-set.sh meta-knowledge/_index.yaml  # update with all accuracy figures
 Update aspirations meta via Bash: `aspirations-meta-update.sh <field> <value>`
 ```
 
@@ -632,6 +632,10 @@ The comprehensive weekly review. Chains all modes plus deep reflection and repla
 **Idempotency note:** If `/boot` already ran `--resolve` this session, step 1 is a no-op (nothing new to resolve). If aspiration goals already ran `--learn`, step 2 is a no-op (all records already reflected). The full-cycle still adds value via steps 3-6 which operate at the aggregate level.
 
 ---
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 
 ## Chaining
 

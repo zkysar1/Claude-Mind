@@ -169,7 +169,7 @@ function decompose(goal, depth=0):
 ### Skill Inference Refinement (Relation Graph)
 
 After the static Skill Inference Table lookup, refine skill assignment using the
-skill relation graph (`core/config/skill-relations.yaml` + `<agent>/skill-relations.yaml`):
+skill relation graph (`core/config/skill-relations.yaml` + `world/skill-relations.yaml`):
 
 ```
 IF sg.skill is null OR confidence is low:

@@ -4,7 +4,7 @@
 Manages a graph of relations between skills: similar_to, compose_with,
 belong_to, depend_on. Base relations live in core/config/skill-relations.yaml
 (immutable). Forged relations and co-invocation logs live in
-<agent>/skill-relations.yaml (mutable).
+world/skill-relations.yaml (mutable, shared across agents).
 
 Subcommands:
   read      — Read and filter skill relations
@@ -32,10 +32,10 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import AGENT_DIR, CONFIG_DIR
+from _paths import CONFIG_DIR, WORLD_DIR
 
 BASE_RELATIONS_PATH = CONFIG_DIR / "skill-relations.yaml"
-AGENT_RELATIONS_PATH = AGENT_DIR / "skill-relations.yaml" if AGENT_DIR else None
+WORLD_RELATIONS_PATH = WORLD_DIR / "skill-relations.yaml"
 
 VALID_TYPES = {"similar_to", "compose_with", "belong_to", "depend_on"}
 
@@ -77,17 +77,17 @@ def load_all_relations():
     """Load and merge base + forged relations into a combined list.
 
     Base relations come from core/config/skill-relations.yaml under 'relations'.
-    Forged relations come from <agent>/skill-relations.yaml under 'forged_relations'.
+    Forged relations come from world/skill-relations.yaml under 'forged_relations'.
     Returns a list of relation dicts.
     """
     base = read_yaml(BASE_RELATIONS_PATH)
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
 
     base_relations = base.get("relations", [])
     if not isinstance(base_relations, list):
         base_relations = []
 
-    forged_relations = agent_data.get("forged_relations", [])
+    forged_relations = world_data.get("forged_relations", [])
     if not isinstance(forged_relations, list):
         forged_relations = []
 
@@ -154,9 +154,9 @@ def cmd_add(args):
     source = entry["source"]
     target = entry["target"]
 
-    # Load existing agent relations
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
-    forged = agent_data.get("forged_relations", [])
+    # Load existing world relations
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
+    forged = world_data.get("forged_relations", [])
     if not isinstance(forged, list):
         forged = []
 
@@ -181,8 +181,8 @@ def cmd_add(args):
         relation["evidence"] = entry["evidence"]
 
     forged.append(relation)
-    agent_data["forged_relations"] = forged
-    write_yaml(AGENT_RELATIONS_PATH, agent_data)
+    world_data["forged_relations"] = forged
+    write_yaml(WORLD_RELATIONS_PATH, world_data)
 
     print("Added relation: {} --{}--> {}".format(source, rel_type, target))
 
@@ -196,8 +196,8 @@ def cmd_co_invoke(args):
         print("Error: co-invoke requires at least 2 skills", file=sys.stderr)
         sys.exit(1)
 
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
-    log = agent_data.get("co_invocation_log", [])
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
+    log = world_data.get("co_invocation_log", [])
     if not isinstance(log, list):
         log = []
 
@@ -213,16 +213,16 @@ def cmd_co_invoke(args):
     if len(log) > cap:
         log = log[-cap:]
 
-    agent_data["co_invocation_log"] = log
-    write_yaml(AGENT_RELATIONS_PATH, agent_data)
+    world_data["co_invocation_log"] = log
+    write_yaml(WORLD_RELATIONS_PATH, world_data)
 
     print("Logged co-invocation: {} skills for goal {}".format(len(skills), goal_id))
 
 
 def cmd_discover(args):
     """Analyze co-invocation log and propose new compose_with relations."""
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
-    log = agent_data.get("co_invocation_log", [])
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
+    log = world_data.get("co_invocation_log", [])
     if not isinstance(log, list):
         log = []
 

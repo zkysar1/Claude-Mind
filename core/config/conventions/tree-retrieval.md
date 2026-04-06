@@ -70,7 +70,7 @@ and for semantic matching (choosing which node fits a category).
 | `tree-update.sh --increment <key> <field>` | Atomic increment of numeric field | — |
 | `tree-find-node.sh --text <text> [--top N] [--leaf-only]` | Find best-matching node(s) for text query | — |
 | `tree-read.sh --summary` | Compact tree: keys, file paths, summaries, depth, capability, confidence, children | — |
-| `tree-update.sh --batch` | Batch set/increment operations (one parse/write cycle) | JSON |
+| `tree-update.sh --batch` | Batch set/increment/add-child/remove-child/propagate (one parse/write cycle) | JSON |
 | `tree-propagate.sh <node-key>` | Propagate confidence up parent chain, detect capability changes | — |
 
 Scripts apply defaults for missing fields: `article_count` (0), `growth_state` ("stable"),
@@ -80,16 +80,38 @@ All backed by `core/scripts/tree.py` (Python 3 + PyYAML).
 
 ### Batch Update
 
-Single parse/write cycle for multiple field updates. Validates all node keys before mutating.
+Single parse/write cycle for multiple operations. Validates all node keys before mutating.
+Supports five operation types: `set`, `increment`, `add-child`, `remove-child`, `propagate`.
+`propagate` ops always execute LAST, after all mutations, so they see updated child confidences.
 
 ```bash
+# Simple set/increment (returns plain JSON array — backward compatible)
 echo '{"operations": [
   {"op": "set", "key": "node-key", "field": "confidence", "value": 0.85},
   {"op": "increment", "key": "node-key", "field": "article_count"}
 ]}' | bash core/scripts/tree-update.sh --batch
+
+# Full decompose (atomic — returns {"updated_nodes": [...], "propagate": [...]})
+echo '{"operations": [
+  {"op": "set", "key": "parent", "field": "node_type", "value": "interior"},
+  {"op": "set", "key": "parent", "field": "article_count", "value": 0},
+  {"op": "add-child", "key": "parent", "child": {"key": "child-1", "summary": "First child"}},
+  {"op": "add-child", "key": "parent", "child": {"key": "child-2", "summary": "Second child"}},
+  {"op": "propagate", "key": "parent"}
+]}' | bash core/scripts/tree-update.sh --batch
+
+# Remove child
+echo '{"operations": [
+  {"op": "remove-child", "key": "parent-key", "child_key": "child-key"},
+  {"op": "propagate", "key": "parent-key"}
+]}' | bash core/scripts/tree-update.sh --batch
 ```
 
-Only `set` and `increment` ops supported. Returns JSON array of updated nodes.
+Output: plain JSON array if no propagate ops (backward compat), or
+`{"updated_nodes": [...], "propagate": [{source_node, ancestors_updated, capability_changes}]}` if propagate ops included.
+
+`write_tree()` includes retry-with-backoff (5 attempts, exponential 50-800ms) for transient
+`PermissionError`/`OSError` from OneDrive file sync locking.
 
 ### Propagate
 

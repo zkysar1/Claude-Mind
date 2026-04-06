@@ -16,7 +16,7 @@ Knowledge articles ARE tree node `.md` files — there is no separate article st
 - Always include Key Insights section
 - Fields that live ONLY in `_tree.yaml` (never in .md front matter): `confidence`, `capability_level`, `accuracy`, `sample_size`, `article_count`, `node_type`, `domain_confidence`, `depth`, `parent`, `last_updated`, `children`, `retrieval_count`, `last_retrieved`, `growth_state`
 
-## Memory Tree (K=4 MAX, D=4 retrieval, D_max=6 structural)
+## Memory Tree (K=4 MAX, D=4 retrieval, D_max=20 structural)
 
 The system's memory is organized as a **dynamic random tree** inspired by the *Random Tree Model of Meaningful Memory* (Zhong et al., PRL 2025). Each node compresses its descendants, producing sublinear memory growth. The tree grows organically via `/tree maintain` operations: DECOMPOSE, REDISTRIBUTE, SPLIT, SPROUT, MERGE, PRUNE.
 
@@ -40,7 +40,7 @@ L0: _tree.yaml root node (virtual root — summary field)
 
 Directory nesting: interior nodes at depth N have a same-named directory
 containing their children at depth N+1. Retrieval descends to D_retrieval=4.
-Structural depth may extend to D_max=6 for fine-grained storage.
+Structural depth may extend to D_max=20 for fine-grained storage.
 ```
 
 **Capability Levels** gate what operations are permitted per category AND what growth operations are allowed:

@@ -6,15 +6,12 @@ init-world.sh. Customize for your domain or delete if not needed.
 
 ## Section Z: Domain Infrastructure
 
-<!-- Add domain-specific infrastructure checks here -->
-<!-- Example: Check that test suites pass, infra-health components are registered, etc. -->
+_(Add domain-specific infrastructure checks here)_
 
 ## Section ZZ: Domain Behavior
 
-<!-- Add domain-specific behavioral invariants here -->
-<!-- Example: ordering constraints, schema consistency checks, etc. -->
+_(Add domain-specific behavior verification items here)_
 
 ## Section ZZZ: Domain Testing Infrastructure
 
-<!-- Add domain-specific test infrastructure checks here -->
-<!-- Example: required test files exist, mock data covers key scenarios, etc. -->
+_(Add domain-specific testing infrastructure checks here)_

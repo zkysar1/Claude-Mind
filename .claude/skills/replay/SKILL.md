@@ -32,9 +32,8 @@ Based on: Hippocampal sharp-wave ripples (Buzsaki 2015), systems consolidation t
 | Related Skill | Relationship |
 |---------------|-------------|
 | [/reflect](../reflect/SKILL.md) | Parent — calls /replay during `--full-cycle` |
-| [/reflect-hypothesis](../reflect-hypothesis/SKILL.md) | Hypothesis reflection feeds replay candidates |
-| [/reflect-execution](../reflect-execution/SKILL.md) | Execution reflection feeds pattern signatures |
-| [/reflect-extract-patterns](../reflect-extract-patterns/SKILL.md) | Pattern extraction mines replayed hypotheses |
+| [/reflect-on-outcome](../reflect-on-outcome/SKILL.md) | Hypothesis + execution reflection feeds replay candidates |
+| [/reflect-on-self](../reflect-on-self/SKILL.md) | Pattern extraction mines replayed hypotheses |
 | [/aspirations-consolidate](../aspirations-consolidate/SKILL.md) | Calls /replay during session-end consolidation |
 
 ## Parameters

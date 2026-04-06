@@ -1,0 +1,35 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash core/scripts/context-budget-status.sh"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(gh *)",
+	  "Bash(*)",
+      "Read(*)",
+      "Glob(*)",
+      "Grep(*)",
+      "WebSearch(*)",
+      "WebFetch(*)",
+      "Edit(//C:/ZakNoCloud/GitHub/**)",
+      "MultiEdit(//C:/ZakNoCloud/GitHub/**)",
+      "Write(//C:/ZakNoCloud/GitHub/**)",
+      "Edit(//C:/Users/Zachary/OneDrive/Zak/SmartNPCs/Ayoai-Mind/Ayoai-World/**)",
+      "Write(//C:/Users/Zachary/OneDrive/Zak/SmartNPCs/Ayoai-Mind/Ayoai-World/**)",
+      "Edit(//C:/Users/Zachary/OneDrive/Zak/SmartNPCs/Ayoai-Mind/Ayoai-Meta/**)",
+      "Write(//C:/Users/Zachary/OneDrive/Zak/SmartNPCs/Ayoai-Mind/Ayoai-Meta/**)"
+    ],
+    "deny": [
+      "Write(*/.claude/projects/*/memory/*)",
+      "Edit(*/.claude/projects/*/memory/*)"
+    ]
+  },
+  "autoMemoryEnabled": false,
+  "outputStyle": "Explanatory",
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "claude-opus-4-6",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "500000"
+  }
+}

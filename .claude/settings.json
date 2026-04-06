@@ -2,9 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(mkdir -p .claude/skills/*)",
-      "Write(*/.claude/skills/*)",
-      "Write(*/.claude/skills/*/SKILL.md)",
-      "Edit(*/.claude/skills/*/SKILL.md)"
+      "Write(**/.claude/skills/**)",
+      "Edit(**/.claude/skills/**)"
     ],
     "deny": [
       "Bash(git reset --hard*)",
@@ -61,20 +60,12 @@
       "Write(*/.claude/skills/recover/*)",
       "Edit(*/.claude/skills/reflect/*)",
       "Write(*/.claude/skills/reflect/*)",
-      "Edit(*/.claude/skills/reflect-batch-micro/*)",
-      "Write(*/.claude/skills/reflect-batch-micro/*)",
-      "Edit(*/.claude/skills/reflect-calibration/*)",
-      "Write(*/.claude/skills/reflect-calibration/*)",
-      "Edit(*/.claude/skills/reflect-curate-aspirations/*)",
-      "Write(*/.claude/skills/reflect-curate-aspirations/*)",
-      "Edit(*/.claude/skills/reflect-curate-memory/*)",
-      "Write(*/.claude/skills/reflect-curate-memory/*)",
-      "Edit(*/.claude/skills/reflect-execution/*)",
-      "Write(*/.claude/skills/reflect-execution/*)",
-      "Edit(*/.claude/skills/reflect-extract-patterns/*)",
-      "Write(*/.claude/skills/reflect-extract-patterns/*)",
-      "Edit(*/.claude/skills/reflect-hypothesis/*)",
-      "Write(*/.claude/skills/reflect-hypothesis/*)",
+      "Edit(*/.claude/skills/reflect-on-outcome/*)",
+      "Write(*/.claude/skills/reflect-on-outcome/*)",
+      "Edit(*/.claude/skills/reflect-on-self/*)",
+      "Write(*/.claude/skills/reflect-on-self/*)",
+      "Edit(*/.claude/skills/reflect-maintain/*)",
+      "Write(*/.claude/skills/reflect-maintain/*)",
       "Edit(*/.claude/skills/reflect-tree-update/*)",
       "Write(*/.claude/skills/reflect-tree-update/*)",
       "Edit(*/.claude/skills/replay/*)",

@@ -31,7 +31,7 @@ System skill (NOT user-invocable) that provides all knowledge tree operations as
 discoverable sub-commands. Replaces the former `/tree-growth` skill and extends it
 with granular read/write operations that any skill can call.
 
-Supports recursive knowledge tree at arbitrary depth up to D_max=6.
+Supports recursive knowledge tree at arbitrary depth up to D_max=20.
 
 ## Mode Gate for Write Operations
 For sub-commands: add, edit, set, decompose, distill, maintain
@@ -60,12 +60,12 @@ Read-only sub-commands (read, find, stats, validate) work in all modes.
 Node files live at paths derived from their ancestry in `_tree.yaml`:
 
 ```
-L1: world/knowledge/tree/{L1-domain}.md
-L2: world/knowledge/tree/{L1}/{L2-topic}.md
-L3: world/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}.md
-L4: world/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}/{L4-detail}.md
-L5: world/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5-detail}.md
-L6: world/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4}/{L5}/{L6-detail}.md
+L1:  world/knowledge/tree/{L1-domain}.md
+L2:  world/knowledge/tree/{L1}/{L2-topic}.md
+L3:  world/knowledge/tree/{L1}/{L2-topic}/{L3-subtopic}.md
+L4:  world/knowledge/tree/{L1}/{L2-topic}/{L3}/{L4-detail}.md
+...
+LN:  world/knowledge/tree/{L1}/{L2}/.../{LN-detail}.md   (up to D_max=20)
 ```
 
 Path construction rule: compute the child file path from the parent's `file` field
@@ -108,16 +108,12 @@ results=$(bash core/scripts/tree-find-node.sh --text "<query>" --top 3)
 Atomic node creation: registers in `_tree.yaml` AND creates the `.md` file.
 
 ```
-# 1. Register child in _tree.yaml
-echo '{"key":"<key>","summary":"<summary>"}' | bash core/scripts/tree-update.sh --add-child <parent>
-# This sets: depth, parent, node_type=leaf, capability_level, children=[], article_count=0
-
-# 2. Compute file path from parent's file field
+# 1. Get parent metadata (for file path computation in step 3)
 parent_node=$(bash core/scripts/tree-read.sh --node <parent>)
 # Strip .md from parent file, use as directory, append {key}.md
 child_path = parent_node.file with .md stripped + "/" + key + ".md"
 
-# 3. Create the .md file with YAML front matter
+# 2. Create the .md file with YAML front matter
 Write {child_path}:
 ---
 topic: <key in title case>
@@ -130,8 +126,11 @@ last_update_trigger:
 
 {summary}
 
-# 4. Propagate confidence upward
-bash core/scripts/tree-propagate.sh <parent>
+# 3. Register child + propagate (atomic single write)
+echo '{"operations": [
+  {"op": "add-child", "key": "<parent>", "child": {"key": "<key>", "summary": "<summary>"}},
+  {"op": "propagate", "key": "<parent>"}
+]}' | bash core/scripts/tree-update.sh --batch
 ```
 
 ## Sub-Command: /tree edit <key>
@@ -183,18 +182,19 @@ IF node.depth + 1 > 6: abort "Cannot decompose — at max depth"
 # 3. Identify ## sections, cluster into 2-4 groups
 # 4. For each cluster:
 #    a. Choose kebab-case child name
-#    b. Compute child path from parent file field
+#    b. Compute child path from parent file field (strip .md, use as dir)
 #    c. Create child .md with front matter
 #    d. Move relevant ## sections into child
-# 5. Convert parent to interior:
-bash core/scripts/tree-update.sh --set <key> node_type interior
-bash core/scripts/tree-update.sh --set <key> article_count 0
-# 6. Register children:
-echo '{"key":"<child-key>","summary":"<summary>"}' | bash core/scripts/tree-update.sh --add-child <key>
-# 7. Log:
+# 5-8. Atomically convert parent + register children + propagate (ONE batch call):
+echo '{"operations": [
+  {"op": "set", "key": "<key>", "field": "node_type", "value": "interior"},
+  {"op": "set", "key": "<key>", "field": "article_count", "value": 0},
+  {"op": "add-child", "key": "<key>", "child": {"key": "<child-1>", "summary": "<summary-1>"}},
+  {"op": "add-child", "key": "<key>", "child": {"key": "<child-2>", "summary": "<summary-2>"}},
+  {"op": "propagate", "key": "<key>"}
+]}' | bash core/scripts/tree-update.sh --batch
+# 9. Log:
 #    Append to tree_growth_log: {op: DECOMPOSE, node: <key>, children: [...], date, reason}
-# 8. Propagate:
-bash core/scripts/tree-propagate.sh <key>
 ```
 
 ## Sub-Command: /tree distill <key>
@@ -209,8 +209,8 @@ node=$(bash core/scripts/tree-read.sh --node <key>)
 Read {node.file}
 
 # 2. Archive full original content
-mkdir -p world/knowledge/archive
-Write world/knowledge/archive/{key}-{date}.md:
+mkdir -p "$WORLD_DIR/knowledge/archive"    # WORLD_DIR from _paths.sh — NEVER use bare world/
+Write $WORLD_DIR/knowledge/archive/{key}-{date}.md:
   ---
   distilled_from: <key>
   distilled_date: <date>
@@ -254,7 +254,7 @@ as the former `/tree-growth` skill.
 
 **Trigger**: leaf node where ALL of the following are true:
 - `.md` body > `decompose_threshold` (80 lines)
-- `depth < D_max` (6)
+- `depth < D_max` (20)
 
 article_count is NOT a gating condition — if a node is too big, decompose it
 regardless of how many articles it has.
@@ -272,12 +272,16 @@ If `growth_state` field is missing from the node, check `decompose_threshold` di
       directory name
    d. Create child leaf files in the new subdirectory, one per cluster:
       - Each child gets minimal YAML front matter: `topic`, `last_update_trigger`
-        (node_type, depth, parent, capability_level set via `tree-update.sh --add-child`)
+        (node_type, depth, parent, capability_level set automatically by `add-child` batch op)
       - Move the relevant `##` sections into each child file
-   e. Convert parent to interior node:
-      bash core/scripts/tree-update.sh --set <parent-key> node_type interior
-      bash core/scripts/tree-update.sh --set <parent-key> article_count 0
-   f. Register children in `_tree.yaml` using `tree-update.sh --add-child`
+   e-f. Atomically convert parent + register all children + propagate (ONE batch call):
+      echo '{"operations": [
+        {"op": "set", "key": "<parent-key>", "field": "node_type", "value": "interior"},
+        {"op": "set", "key": "<parent-key>", "field": "article_count", "value": 0},
+        {"op": "add-child", "key": "<parent-key>", "child": {"key": "<child-1>", "summary": "..."}},
+        ...repeat for each child...
+        {"op": "propagate", "key": "<parent-key>"}
+      ]}' | bash core/scripts/tree-update.sh --batch
    g. Append to `tree_growth_log`: `{op: DECOMPOSE, node, children, date, reason}`
    Cap: process up to `config.max_decompose_per_invocation` candidates (default 7, largest first).
 
@@ -323,7 +327,7 @@ of utility tracking have accumulated signal.
 
 **Steps**:
 1. Find nodes where `growth_state: ready_to_split`
-2. Depth guard: abort if `parent.depth + 1 > D_max` (6)
+2. Depth guard: abort if `parent.depth + 1 > D_max` (20)
 3. Read all articles, cluster into 2-4 groups
 4. Create child nodes (compute paths from parent `file` field)
 5. Ensure `min_articles_per_child` (2) is met
@@ -338,7 +342,7 @@ of utility tracking have accumulated signal.
 **Steps**:
 1. Check `_tree.yaml` `unmapped_categories`
 2. Find best parent at any depth
-3. Depth guard: abort if `parent.depth + 1 > D_max` (6)
+3. Depth guard: abort if `parent.depth + 1 > D_max` (20)
 4. Compute child file path from parent's `file` field
 5. Create node, register via `tree-update.sh --add-child`
 6. Log to tree_growth_log. K_max is soft limit.
@@ -414,6 +418,32 @@ If validation fails: log errors, attempt auto-repair for common issues.
 - "Will decompose later" / "next cycle" deferral
 - Report-only output with no file mutations
 
+### /tree maintain --backlog
+
+One-time backlog cleanup mode for trees with accumulated structural debt.
+Same operations as `/tree maintain` but with elevated caps:
+
+- DECOMPOSE cap: 15 (vs standard 10)
+- REDISTRIBUTE cap: 10 (vs standard 5)
+- Processes ALL candidates regardless of `growth_state` field value
+  (standard mode requires `growth_state: ready_to_decompose` or checks threshold;
+  backlog mode checks threshold directly for every leaf node)
+- Processes candidates largest-first (by .md line count)
+
+**When to use**: After deploying threshold changes, or when `tree-read.sh --decompose-candidates`
+shows a large backlog (10+ candidates). Not needed for routine maintenance.
+
+**Steps**:
+1. `Bash: tree-read.sh --decompose-candidates` (uses current decompose_threshold)
+2. `Bash: tree-read.sh --redistribute-candidates`
+3. Process DECOMPOSE candidates (up to 15, largest first) — same steps as standard DECOMPOSE
+4. Process REDISTRIBUTE candidates (up to 10, largest first) — same steps as standard REDISTRIBUTE
+5. Run standard DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE with normal caps
+6. Log: "BACKLOG CLEANUP: {decomposed} decompositions, {redistributed} redistributions, {total_new_nodes} new nodes created"
+7. `Bash: tree-read.sh --validate` — verify structural integrity after bulk changes
+
+After backlog cleanup, subsequent `/tree maintain` calls use standard caps.
+
 ## Sub-Command: /tree stats
 
 Return tree health overview.
@@ -450,7 +480,7 @@ ELSE:
 ## Constraints
 
 - `K_max` (4): soft limit at all levels (can exceed when justified, log reason)
-- `D_max` (6): hard limit — never create nodes beyond depth 6
+- `D_max` (20): hard limit — never create nodes beyond depth 20
 - Never prune L1 domain nodes
 - Always append to `tree_growth_log` for every structural change
 - Always verify `min_articles_per_child` (2) before creating split children

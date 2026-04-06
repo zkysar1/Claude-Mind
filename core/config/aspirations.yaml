@@ -5,7 +5,7 @@
 
 # --- FRAMEWORK ---
 
-max_active: 20
+max_active: 100
 
 # Team-based goal delegation
 max_concurrent_goals: 3   # Max concurrent goals per iteration (primary + parallel)
@@ -33,6 +33,8 @@ goal_templates:
     category: null                    # Tree category for retrieval — set via category-suggest.sh
     deferred_until: null              # ISO 8601 timestamp — goal skipped in COLLECT until this time
     defer_reason: null                # Why deferred — non-null value filters goal from selection
+    review_requested: null            # ISO 8601 timestamp — set when code-change goal completes, needs peer review
+    review_completed: null            # ISO 8601 timestamp — set when reviewing agent approves
 
   # Build knowledge — deep-dives, audits, topic exploration
   research:
@@ -239,7 +241,7 @@ pipeline_low_water_mark: 3      # create new work when executable goals drop bel
 
 # Hypothesis pipeline starvation prevention — ensure the prediction pipeline stays active.
 # Phase 0.5.2 counts discovered+evaluating+active pipeline records and triggers investigation when below this.
-hypothesis_pipeline_low_water_mark: 2   # create prediction review goal when active hypotheses drop below this
+hypothesis_pipeline_low_water_mark: 4   # create prediction review goal when flowing hypotheses drop below this
 
 # Accuracy health gate — create investigation work when prediction accuracy drops critically.
 # Phase 0.5.3 reads pipeline accuracy and triggers investigation when below this threshold.
@@ -329,6 +331,14 @@ cycle_detection:
     - repeated_failure             # Almost all recent goals skipped/blocked
     - zero_learning_velocity       # Same-category goals producing no learning artifacts
 
+# --- PROACTIVE ESCALATION ---
+# Notify user (via forged notification skill or pending-questions) when blocked beyond these thresholds.
+# Caller-side cooldown via proactive_escalation_log WM slot prevents spam.
+proactive_escalation:
+  blocker_age_hours: 2          # Phase 0.5b: notify when blocker active > N hours
+  b7_notify: true               # B7: notify before exponential backoff sleep
+  circuit_breaker_notify: true   # Phase 5.5: notify when circuit breaker fires
+
 exploration_mode:
   auto_designate_below_capability: 0.30  # Categories below this capability_level
   max_exploration_fraction: 0.25          # Max fraction of goals in exploration mode per session
@@ -361,14 +371,37 @@ open_ended_progress:
   novelty_window: 10            # Compare against last N archived aspirations for novelty
   track_in: aspirations-meta.json
 
+# --- MULTI-AGENT COORDINATION (Distributed Systems Theory) ---
+# Informed by "Language Model Teams as Distributed Systems" (Mieczkowski et al., 2026).
+# LLM teams are structurally distributed systems — governed by the same scalability laws,
+# consistency requirements, and coordination overhead tradeoffs.
+
+multi_agent:
+  # Claim expiry: stale claims from crashed/abandoned sessions are auto-released.
+  # Without expiry, a claimed goal persists forever if the claiming agent's session ends
+  # without releasing. This implements straggler mitigation (Finding 5 of the paper).
+  claim_timeout_hours: 4            # Claims older than this are treated as expired
+  abstention_timeout_hours: 72      # Abstentions older than this expire (fail-open: re-attempt)
+  defer_reason_timeout_hours: 120   # defer_reason without deferred_until expires after this
+
+  # Parallelizability classification: aspirations declare whether their goals are
+  # independent (parallel), chained (serial), or mixed. Advisory field — blocked_by
+  # remains the enforcement mechanism. Implements Amdahl's Law awareness (Finding 1).
+  coordination_modes: [parallel, serial, mixed]
+  default_coordination_mode: mixed
+
+  # Goal reallocation: when a targeted goal hasn't been claimed within this window,
+  # other agents may pick it up (if the goal has reallocatable: true).
+  reallocation_hours: 8             # Hours before unclaimed targeted goals become eligible
+
 modifiable:
-  max_active: {min: 3, max: 25, default: 20}
+  max_active: {min: 3, max: 100, default: 100}
   # Agent delegation
   max_concurrent_goals: {min: 1, max: 3, default: 3}
   # Pipeline starvation prevention
   pipeline_low_water_mark: {min: 1, max: 10, default: 3}
   # Hypothesis pipeline starvation prevention
-  hypothesis_pipeline_low_water_mark: {min: 0, max: 5, default: 2}
+  hypothesis_pipeline_low_water_mark: {min: 2, max: 8, default: 4}
   # Accuracy health gate
   accuracy_critical_threshold: {min: 0.20, max: 0.60, default: 0.40}
   accuracy_min_sample: {min: 3, max: 15, default: 5}
@@ -388,3 +421,8 @@ modifiable:
   plateau_detection.diminishing_returns_window: {min: 3, max: 10, default: 5}
   # Cycle detection bounds (AVO-inspired)
   cycle_detection.lookback_window: {min: 2, max: 5, default: 3}
+  # Proactive escalation bounds
+  proactive_escalation.blocker_age_hours: {min: 1, max: 8, default: 2}
+  # Multi-agent coordination bounds
+  multi_agent.claim_timeout_hours: {min: 1, max: 24, default: 4}
+  multi_agent.reallocation_hours: {min: 2, max: 48, default: 8}

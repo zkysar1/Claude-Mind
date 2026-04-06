@@ -79,3 +79,34 @@ Output: JSON with `matched` array (each entry: `id`, `rule`, `category`, `action
 Side effects: increments `utilization.times_active` on matched, `times_skipped` on unmatched (unless `--dry-run`).
 
 All backed by `core/scripts/guardrail-check.py` (Python 3, stdlib only).
+
+---
+
+# Operational Gotcha Convention
+
+Entries representing operational friction knowledge — error patterns, environment
+quirks, debugging lessons, infrastructure footguns — SHOULD include the tag
+`ops-gotcha` in their `tags` array. This applies to both reasoning bank and
+guardrail entries.
+
+Examples of operational gotchas:
+- "Always use `export` for env vars when scripts call Python subprocesses"
+- "boto3 mock must patch at the import location, not the definition location"
+- "Compact checkpoint file can exceed expected size after 50+ goals"
+
+## Store Selection
+
+- **Reasoning bank** for diagnostic gotchas ("when you see X, the cause is Y"):
+  `type: "failure"` (self-discovered) or `type: "user_provided"` (told by user).
+  Include the error pattern or symptom in `when_to_use.conditions`.
+- **Guardrails** for prescriptive gotchas ("always do X" / "never do Y"):
+  use `trigger_condition` to describe when the rule applies.
+
+Both: include `"ops-gotcha"` in `tags`.
+
+## Encoding Triggers
+
+Operational gotchas are encoded by three paths:
+1. **Phase 6.5 auto-detection** — structural keyword scan after goal execution (mandatory when signals present)
+2. **`/respond` Step 7.5 OPS_GOTCHA** — when user shares operational friction knowledge
+3. **Consolidation Step 0.7** — safety net sweep of session journal for unencoded error-then-fix patterns

@@ -42,6 +42,30 @@ def write_yaml(path, data):
     locked_write_yaml(path, data)
 
 
+def validate_velocity_structure(data, label=""):
+    """Validate structural integrity of improvement-velocity data."""
+    prefix = f"[{label}] " if label else ""
+    if not isinstance(data, dict):
+        raise ValueError(f"{prefix}Expected dict, got {type(data).__name__}")
+    allowed_keys = {"entries", "rolling_averages"}
+    unexpected = set(data.keys()) - allowed_keys
+    if unexpected:
+        raise ValueError(f"{prefix}Unexpected top-level keys: {unexpected}")
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{prefix}'entries' is {type(entries).__name__}, expected list")
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{prefix}entries[{i}] is {type(entry).__name__}, expected dict")
+        if "goal_id" not in entry:
+            raise ValueError(f"{prefix}entries[{i}] missing 'goal_id'")
+        if "learning_value" not in entry:
+            raise ValueError(f"{prefix}entries[{i}] missing 'learning_value'")
+    ra = data.get("rolling_averages")
+    if ra is not None and not isinstance(ra, dict):
+        raise ValueError(f"{prefix}'rolling_averages' is {type(ra).__name__}, expected dict")
+
+
 def cmd_compute(args):
     """Compute improvement velocity over a window."""
     vel = read_yaml(META_DIR / "improvement-velocity.yaml")
@@ -83,6 +107,8 @@ def cmd_compute(args):
 def cmd_snapshot(args):
     """Record a learning_value entry for a goal."""
     vel = read_yaml(META_DIR / "improvement-velocity.yaml")
+    validate_velocity_structure(vel, "post-read")
+
     if "entries" not in vel:
         vel["entries"] = []
 
@@ -107,6 +133,9 @@ def cmd_snapshot(args):
             vel.setdefault("rolling_averages", {})[key] = round(avg, 4)
         else:
             vel.setdefault("rolling_averages", {})[key] = 0.0
+
+    # Validate structure before write
+    validate_velocity_structure(vel, "pre-write")
 
     write_yaml(META_DIR / "improvement-velocity.yaml", vel)
     print(json.dumps({"status": "recorded", "goal_id": args.goal_id, "learning_value": entry["learning_value"]}))

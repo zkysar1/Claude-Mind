@@ -28,6 +28,24 @@ from _paths import WORLD_DIR
 BOARD_DIR = WORLD_DIR / "board"
 DEFAULT_CHANNELS = ["general", "findings", "coordination", "decisions"]
 
+# Reference list — not enforced (any string accepted as --type).
+# Source of truth: core/config/conventions/board.md → Message Types table.
+VALID_MESSAGE_TYPES = [
+    "claim",           # Agent claimed a goal for execution
+    "release",         # Agent released a goal (failed/abandoned)
+    "complete",        # Agent finished a goal
+    "blocked",         # Agent is blocked on something
+    "encoding",        # Agent is encoding to a tree node
+    "finding",         # Agent discovered something
+    "review-request",  # Code change needs peer review
+    "escalation",      # Goal stuck after repeated failures
+    "handoff",         # Goal done, follow-up needed by other agent
+    "blocker-alert",   # Shared resource blocked
+    "directive",           # Strategic direction or priority change
+    "execution-feedback",  # Cross-agent goal quality feedback
+    "status",              # General update (backward-compatible default)
+]
+
 
 def require_board():
     """Ensure board directory exists."""
@@ -86,11 +104,15 @@ def cmd_post(args):
     author = args.author or os.environ.get("AYOAI_AGENT", "system")
     channel = args.channel
 
+    # Structured message type (optional, defaults to "status" for backward compat)
+    msg_type = getattr(args, "type", None) or "status"
+
     msg = {
         "id": generate_message_id(channel, author),
         "author": author,
         "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "channel": channel,
+        "type": msg_type,
         "text": text,
         "reply_to": args.reply_to,
         "tags": [t.strip() for t in args.tags.split(",")] if args.tags else [],
@@ -130,6 +152,11 @@ def cmd_read(args):
     if args.author:
         messages = [m for m in messages if m["author"] == args.author]
 
+    # Filter by --type (structured message type)
+    msg_type_filter = getattr(args, "type", None)
+    if msg_type_filter:
+        messages = [m for m in messages if m.get("type") == msg_type_filter]
+
     # Filter by --tag
     if args.tag:
         messages = [m for m in messages if args.tag in m.get("tags", [])]
@@ -146,7 +173,9 @@ def cmd_read(args):
         for msg in messages:
             tags = f" [{', '.join(msg.get('tags', []))}]" if msg.get("tags") else ""
             reply = f" (reply to {msg['reply_to']})" if msg.get("reply_to") else ""
-            print(f"[{msg['timestamp']}] {msg['author']}: {msg['text']}{tags}{reply}")
+            mtype = msg.get("type", "status")
+            type_label = f" ({mtype})" if mtype and mtype != "status" else ""
+            print(f"[{msg['timestamp']}] {msg['author']}{type_label}: {msg['text']}{tags}{reply}")
             print(f"  id: {msg['id']}")
             print()
 
@@ -202,6 +231,8 @@ def build_parser():
     post_p.add_argument("--author", help="Author name (defaults to AYOAI_AGENT)")
     post_p.add_argument("--reply-to", help="Message ID to reply to")
     post_p.add_argument("--tags", help="Comma-separated tags")
+    post_p.add_argument("--type", help="Message type (claim, complete, blocked, encoding, finding, status)",
+                        default="status")
 
     # read
     read_p = sub.add_parser("read", help="Read messages from a channel")
@@ -209,6 +240,7 @@ def build_parser():
     read_p.add_argument("--since", help="Duration filter (e.g., 1h, 30m, 2d)")
     read_p.add_argument("--author", help="Filter by author")
     read_p.add_argument("--tag", help="Filter by tag")
+    read_p.add_argument("--type", help="Filter by message type (claim, complete, blocked, encoding, finding, status)")
     read_p.add_argument("--last", type=int, help="Show only last N messages")
     read_p.add_argument("--json", dest="json_output", action="store_true",
                         help="Output as JSONL")

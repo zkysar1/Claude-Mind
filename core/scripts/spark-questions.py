@@ -18,7 +18,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import META_DIR
+from _paths import META_DIR, CONFIG_DIR
 
 LIVE_PATH = META_DIR / "spark-questions.jsonl"
 
@@ -373,7 +373,33 @@ def cmd_promote(args):
 
     items[idx] = rec
     write_jsonl(LIVE_PATH, items)
+
+    # Sync framework config so new agents get the promoted question as active.
+    # This keeps core/config/spark-questions.yaml and runtime in agreement.
+    _sync_framework_promotion(candidate_id, new_id, rec)
+
     print(json.dumps(rec, indent=2, ensure_ascii=False))
+
+
+def _sync_framework_promotion(candidate_id, new_id, rec):
+    """Warn when framework YAML needs updating after a runtime promotion.
+
+    Checks if the candidate ID still exists in core/config/spark-questions.yaml.
+    If so, prints a stderr warning with the exact update needed. Does not modify
+    the YAML (runtime state is authoritative; YAML is for new-agent seeding).
+    """
+    yaml_path = CONFIG_DIR / "spark-questions.yaml"
+    if not yaml_path.exists():
+        return
+    try:
+        content = yaml_path.read_text(encoding="utf-8")
+        if f"id: {candidate_id}" not in content:
+            return  # Already promoted or never in framework
+        print(f"Note: Framework YAML sync needed for {candidate_id} -> {new_id}. "
+              f"Update core/config/spark-questions.yaml: move {candidate_id} to "
+              f"seed_questions as {new_id} and update initial_state.", file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not check framework YAML: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

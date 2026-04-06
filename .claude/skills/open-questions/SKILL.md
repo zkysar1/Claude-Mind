@@ -39,12 +39,8 @@ Valid from ANY state (RUNNING, IDLE, UNINITIALIZED).
 ## Phase 3: Scan User-Participant Goals
 
 ```
-1. Bash: load-aspirations-compact.sh → IF path returned: Read it
-   (compact data has IDs, titles, statuses, participants — no descriptions/verification)
-   → Iterate all aspirations and goals
-   → Filter goals where:
-     - "user" in participants
-     - status NOT in ("completed", "skipped", "expired")
+1. Bash: `aspirations-query.sh --goal-field participants user`
+   → Filter returned goals where status NOT in ("completed", "skipped", "expired")
    Store as user_goals list
 
 2. Bash: aspirations-read.sh --archive
