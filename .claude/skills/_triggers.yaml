@@ -112,4 +112,4 @@ aspirations_evolution:
 routing_notes:
   - "Priority 1 = always invoke when condition met; Priority 2 = invoke if time/budget allows; Priority 3 = optional"
   - "Conditions are evaluated by the parent skill at runtime using pattern matching on context"
-  - "This file is STATIC framework — forged skill triggers tracked in <agent>/forged-skills.yaml"
+  - "This file is STATIC framework — forged skill triggers tracked in world/forged-skills.yaml"

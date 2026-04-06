@@ -7,13 +7,13 @@
 
 config:
   K_max: 4
-  D_max: 6
+  D_max: 20
   D_retrieval: 4
   split_threshold: 3
   merge_threshold: 1
   min_articles_per_child: 2
   decompose_threshold: 80               # line count triggering DECOMPOSE of monolith files
-  max_decompose_per_invocation: 7      # max DECOMPOSE ops per /tree maintain run
+  max_decompose_per_invocation: 30     # max DECOMPOSE ops per /tree maintain run
   max_redistribute_per_invocation: 5   # max REDISTRIBUTE ops per /tree maintain run
   compression_ratio_formula: "10 * 1.5^(depth - 2)"  # target compression at each depth
   growth_approval:
@@ -46,13 +46,13 @@ domain_health:
 # Bounds for self-tuning. Each 'default' MUST match the actual config value above.
 modifiable:
   K_max: {min: 3, max: 6, default: 4}
-  D_max: {min: 4, max: 8, default: 6}
-  D_retrieval: {min: 3, max: 6, default: 4}
+  D_max: {min: 4, max: 20, default: 20}
+  D_retrieval: {min: 3, max: 20, default: 4}
   split_threshold: {min: 3, max: 10, default: 3}
   merge_threshold: {min: 1, max: 3, default: 1}
   min_articles_per_child: {min: 1, max: 4, default: 2}
   decompose_threshold: {min: 50, max: 300, default: 80}
-  max_decompose_per_invocation: {min: 1, max: 15, default: 7}
+  max_decompose_per_invocation: {min: 1, max: 50, default: 30}
   max_redistribute_per_invocation: {min: 1, max: 10, default: 5}
   max_entities: {min: 50, max: 500, default: 200}
   domain_health_capability_weight: {min: 0.20, max: 0.80, default: 0.50}

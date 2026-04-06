@@ -58,6 +58,7 @@ You don't need to do anything while it runs. But you can chat with it anytime â€
 | `/agent-completion-report` | See what the agent accomplished recently. |
 | `/backlog-report` | See the agent's current task queue and priorities. |
 | `/open-questions` | See decisions the agent logged for your review. |
+| `/priority-review` | See and reorder the agent's aspiration priorities. |
 | `/verify-learning` | Run a diagnostic check on the agent's state. |
 
 ### Three Modes
@@ -94,7 +95,7 @@ Each agent is a self-contained directory. To remove data, delete the relevant di
 | Improvement strategies | Delete the meta directory at its external path |
 | All local agents | Delete all agent directories from the project root |
 
-If an agent created forged skills (check `<agent>/forged-skills.yaml`), those live in `.claude/skills/` and should be manually removed.
+If agents created forged skills (check `world/forged-skills.yaml`), those live in `.claude/skills/` and should be manually removed.
 
 ## Going Deeper
 

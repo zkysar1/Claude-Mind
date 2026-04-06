@@ -52,8 +52,8 @@ unset _PY_SHIM_DIR
 
 # --- Tier 4: Per-agent private state ---
 # Resolution: AYOAI_AGENT env var. That's it. One path.
-# The LLM sets this on every Bash call. Hooks set it from .active-agent-$SID.
-# If not set, AGENT_NAME is empty and scripts degrade gracefully.
+# The LLM sets this on every Bash call. Hooks don't have it — they
+# fall through to the auto-detect block below.
 AGENT_NAME="${AYOAI_AGENT:-}"
 
 # --- External path configuration ---
@@ -63,6 +63,12 @@ AGENT_NAME="${AYOAI_AGENT:-}"
 # this keeps all scripts importable before /start.
 if [ -n "$AGENT_NAME" ] && [ -f "$PROJECT_ROOT/$AGENT_NAME/local-paths.conf" ]; then
     source "$PROJECT_ROOT/$AGENT_NAME/local-paths.conf"
+else
+    # AYOAI_AGENT unset — use first available conf (hooks don't have the env var)
+    for _CONF in "$PROJECT_ROOT"/*/local-paths.conf; do
+        [ -f "$_CONF" ] && source "$_CONF" && break
+    done
+    unset _CONF
 fi
 
 # --- Tier 2: Meta-strategies ---

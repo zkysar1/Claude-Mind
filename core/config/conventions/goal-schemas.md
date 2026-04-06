@@ -1,7 +1,7 @@
 # Goal Scoring Script Access
 
 Goal selection scoring is implemented by `core/scripts/goal-selector.py` with exploration noise.
-The script computes 10 deterministic criteria plus 1 stochastic criterion (`exploration_noise`)
+The script computes 16 deterministic criteria plus 1 stochastic criterion (`exploration_noise`)
 scaled by the developmental stage's epsilon. The LLM never computes goal scores — the script
 handles all arithmetic. The LLM reads the ranked output and applies metacognitive assessment
 (Phase 2.5), which may override.
@@ -121,7 +121,7 @@ Goals that should not execute until a specific future time use these fields:
 - `defer_reason`: string or `null` — why this goal is deferred. **Functional filter**: a non-null `defer_reason` prevents the goal from appearing as a candidate in `goal-selector.sh`, regardless of `deferred_until`. Must be explicitly cleared (set to `null`) to re-enable the goal. Cleared automatically by aspiration grooming (check 1e) when the reason is no longer backed by an active decision.
 
 To defer a goal with a time gate: `aspirations-update-goal.sh <goal-id> deferred_until "2026-03-13T20:00:00"` and `aspirations-update-goal.sh <goal-id> defer_reason "Waiting for test results"`.
-To defer indefinitely (until condition resolves): `aspirations-update-goal.sh <goal-id> defer_reason "EFS not mounted"` (no `deferred_until` needed).
+To defer indefinitely (until condition resolves): `aspirations-update-goal.sh <goal-id> defer_reason "Dependency not available"` (no `deferred_until` needed).
 To un-defer: `aspirations-update-goal.sh <goal-id> defer_reason null`.
 
 Compatible with all goal types including recurring. A recurring goal with `deferred_until` delays only its first execution; subsequent cycles use `interval_hours` normally.
@@ -149,3 +149,77 @@ If a goal's participants contain specific names but NOT `"agent"`, only named ag
 - COLLECT phase: ineligible goals are filtered out (never scored)
 - SCORE phase: eligible goals get `agent_executable: +2` (weight 0.8 → +1.6 effective)
 - Bottleneck trace: ineligible goals report `"OTHER AGENT (alpha)"` or `"NEEDS USER"`
+
+### Straggler-Aware Goal Reallocation
+
+Goals targeted at a specific agent can be marked `reallocatable: true` to allow other agents
+to pick them up if the targeted agent hasn't claimed them within `reallocation_hours` (default 8,
+configurable in `aspirations.yaml` → `multi_agent.reallocation_hours`).
+
+- `reallocatable`: `true`/`false` (default: `false`) — whether this goal can be picked up by
+  non-targeted agents after the reallocation window.
+- The window is measured from the goal's `created` timestamp (or parent aspiration's `created`).
+- Once the window expires and the goal has no `claimed_by`, any agent can execute it.
+- Based on ["Language Model Teams as Distributed Systems"](https://arxiv.org/abs/2603.12229)
+  Finding 5: decentralized teams dynamically reallocate straggler work.
+
+---
+
+# Output-Passing Dependencies (`depends_on`)
+
+For cross-agent workflows where a downstream goal needs the factual output of an
+upstream goal, use `depends_on` alongside `blocked_by`. Based on arXiv 2603.28990:
+downstream agents that see factual completed outputs outperform those seeing
+intentions or status by +44%.
+
+```yaml
+depends_on:
+  - goal_id: "g-005-01"
+    expects: "List of discovered API endpoints"
+  - goal_id: "g-005-02"
+    expects: "Test coverage report for auth module"
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| goal_id | string | yes | ID of the prerequisite goal (must also appear in `blocked_by`) |
+| expects | string | no | Human-readable description of what output this goal needs from the dep |
+
+**Rules:**
+- Each `depends_on.goal_id` MUST also appear in `blocked_by` (structural consistency)
+- When a dependency resolves, the verify skill reads the `handoff` board message for the
+  completed goal and prepends the factual output to the dependent goal's description
+  as a `## Predecessor Output` section
+- See `aspirations-verify/SKILL.md` "Unblock Dependent Goals" for the output injection protocol
+
+---
+
+# Review Gate Fields
+
+Async peer review for code-change goals. Set by the executing agent after Phase 5 verify,
+picked up by the reviewing agent during idle/all-blocked board scans.
+
+- `review_requested`: ISO 8601 timestamp or `null` — set when a completed world goal with
+  code changes posts a `review-request` to the coordination board (Phase 5.7).
+- `review_completed`: ISO 8601 timestamp or `null` — set when the reviewing agent finishes
+  reviewing the experience trace and approves or flags issues (Step B0 board scan).
+- Both fields are informational — goals are NOT blocked pending review. Review is async.
+- Set via: `aspirations-update-goal.sh --source world <goal-id> review_requested <timestamp>`
+- See `coordination.md` Review Gate section and `aspirations/SKILL.md` Phase 5.7 + Step B0.
+
+# Self-Abstention Field
+
+When an agent determines it cannot add genuine value to a goal (capability mismatch),
+it records this via the `abstained_by` field. Based on arXiv 2603.28990: 8.6% voluntary
+abstention rate in the top model improves overall system quality.
+
+- `abstained_by`: string or `null` — agent name that abstained. The abstaining agent's
+  goal-selector skips this goal; other agents see it normally.
+  Expires after `abstention_timeout_hours` (default 72h) — script-enforced in goal-selector.py.
+- `abstained_at`: ISO timestamp — when abstention was recorded. Required for expiry.
+  If missing (legacy), abstention expires immediately (fail-open).
+- `defer_reason_set_at`: ISO timestamp — when defer_reason was set. Required for expiry.
+  defer_reason without deferred_until expires after `defer_reason_timeout_hours` (default 120h).
+  If missing (legacy), deferral expires immediately (fail-open).
+- Set via: `aspirations-update-goal.sh <goal-id> abstained_by <agent_name>` + `abstained_at <timestamp>`
+- See `aspirations-select/SKILL.md` Phase 2.55 for the abstention check protocol

@@ -57,4 +57,4 @@ temporal_credit: 0.0                 # Accumulated backward credit from downstre
 
 **Note:** `source_reflection_id` is set on **reasoning bank and guardrail records** (not experience records) by Phase 6.5. Phase 4.26 reads it from those records to track which reflections produced helpful artifacts downstream.
 
-Temporal credit informs strategy extraction (`/reflect-extract-patterns` Step 3): experiences with high temporal_credit represent "enabling strategies" that set up later success.
+Temporal credit informs strategy extraction (`/reflect-on-self` Patterns mode, Step 3): experiences with high temporal_credit represent "enabling strategies" that set up later success.

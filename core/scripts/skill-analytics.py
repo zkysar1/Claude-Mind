@@ -30,14 +30,14 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import META_DIR, AGENT_DIR, CONFIG_DIR
+from _paths import META_DIR, AGENT_DIR, CONFIG_DIR, WORLD_DIR
 
 # Meta-strategies (meta/) — domain-agnostic
 QUALITY_PATH = META_DIR / "skill-quality.yaml"
 SKILL_GAPS_PATH = META_DIR / "skill-gaps.yaml"
 
-# Per-agent state
-AGENT_RELATIONS_PATH = AGENT_DIR / "skill-relations.yaml" if AGENT_DIR else None
+# World-level shared state
+WORLD_RELATIONS_PATH = WORLD_DIR / "skill-relations.yaml"
 BASE_RELATIONS_PATH = CONFIG_DIR / "skill-relations.yaml"
 EXPERIENCE_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
 
@@ -76,17 +76,17 @@ def load_all_relations():
     """Load and merge base + forged relations into a combined list.
 
     Base relations come from core/config/skill-relations.yaml under 'relations'.
-    Forged relations come from <agent>/skill-relations.yaml under 'forged_relations'.
+    Forged relations come from world/skill-relations.yaml under 'forged_relations'.
     Returns a list of relation dicts.
     """
     base = read_yaml(BASE_RELATIONS_PATH)
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
 
     base_relations = base.get("relations", [])
     if not isinstance(base_relations, list):
         base_relations = []
 
-    forged_relations = agent_data.get("forged_relations", [])
+    forged_relations = world_data.get("forged_relations", [])
     if not isinstance(forged_relations, list):
         forged_relations = []
 
@@ -153,8 +153,8 @@ def cmd_reuse_report(args):
 
 def cmd_co_invocation(args):
     """Which skills are commonly used together."""
-    agent_data = read_yaml(AGENT_RELATIONS_PATH)
-    log = agent_data.get("co_invocation_log", [])
+    world_data = read_yaml(WORLD_RELATIONS_PATH)
+    log = world_data.get("co_invocation_log", [])
     if not isinstance(log, list):
         log = []
 

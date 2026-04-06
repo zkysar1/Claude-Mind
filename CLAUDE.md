@@ -16,7 +16,7 @@ This is a **Claude-native data repository** — no traditional source code or bu
 - **`core/scripts/`** — Framework infrastructure scripts. All JSONL stores accessed exclusively via these scripts — the LLM never reads/edits JSONL files directly.
 - **`meta/`** — Agent-editable meta-strategies and domain-agnostic data (independent of domain data). Metacognitive self-modification layer inspired by HyperAgents. Also includes: `spark-questions.jsonl`, `skill-quality.yaml`, `skill-gaps.yaml`, `evolution-log.jsonl`, `reflection-templates.yaml`, `strategy-archive.yaml`, `config-overrides.yaml`, `config-changes.yaml`, `step-attribution.yaml`, `meta-knowledge/`.
 - **`world/`** — Collective domain state shared across agents within a domain. Lives at an **external user-supplied path** (shared drive, NAS, etc.), configured in `<agent>/local-paths.conf`. Contains the knowledge tree, aspirations, pipeline, reasoning bank, guardrails, pattern signatures, message board, file history, changelog, conventions, sources, `program.md` (The Program — shared purpose), etc.
-- **`<agent-name>/`** — Per-agent private state (e.g., `alpha/`). Contains session state, journal, experience traces, `self.md` (agent identity), curriculum, developmental stage, profile, forged skills, skill relations, infra health, and the agent's local aspiration queue.
+- **`<agent-name>/`** — Per-agent private state (e.g., `alpha/`). Contains session state, journal, experience traces, `self.md` (agent identity), curriculum, developmental stage, profile, infra health, and the agent's local aspiration queue.
 
 **External paths**: `world/` and `meta/` live at user-supplied external paths configured per-agent in `<agent>/local-paths.conf` (gitignored). The local repo only contains `core/`, `.claude/`, and `<agent>/` directories. Each agent can point to different locations. See `core/config/conventions/external-paths.md` for details.
 
@@ -50,6 +50,9 @@ world/               # Collective domain state (shared across agents, external p
   .history/          # Self-contained file version history (copy-on-write snapshots)
   changelog.jsonl    # Auto-appended audit trail of all writes
   conventions/       # Domain-specific conventions
+  forged-skills.yaml # Forged skills registry (shared across agents)
+  skill-relations.yaml # Skill relationship graph (shared across agents)
+  scripts/           # Domain-specific scripts (shared across agents)
 <agent-name>/        # Per-agent private state (e.g., alpha/)
   self.md            # Agent identity and specialization
   aspirations.jsonl  # Agent's local work queue
@@ -57,7 +60,6 @@ world/               # Collective domain state (shared across agents, external p
   journal.jsonl      # Agent's activity log
   session/           # Ephemeral session state (working memory, handoff, signal files)
   curriculum.yaml    # Agent's progression
-  forged-skills.yaml # Agent's domain-specific forged skills
 .claude/skills/      # Skill definitions
 .claude/rules/       # Rule definitions
 ```
@@ -67,6 +69,15 @@ world/               # Collective domain state (shared across agents, external p
 The system is a perpetual loop. Completion of one thing seeds the next. `/aspirations loop` is the heartbeat — it never exits, it always has work to create.
 
 *(Full rules in `core/config/modes/autonomous.md`)*
+
+### Core Design Principle: Consolidate Before Expand
+
+Depth over breadth. Completion of existing work takes priority over starting new.
+An aspiration 90% complete has more gravitational pull than a brand-new aspiration.
+New directions require healthy existing completion rates (>25% average) or explicit
+justification (user directive, critical blocker, all existing work blocked).
+
+*(Full rules in `.claude/rules/consolidate-before-expand.md`)*
 
 ### Mode System
 
@@ -118,7 +129,7 @@ Not mutually exclusive. A single event can spawn all three. See `aspirations-exe
 | Curriculum | `<agent>/curriculum.yaml`, `core/config/curriculum.yaml` |
 | Domain conventions | `world/conventions/*.md` |
 | Meta-strategies | `meta/*.yaml`, `core/config/meta.yaml` |
-| Skill relations | `core/config/skill-relations.yaml`, `<agent>/skill-relations.yaml` |
+| Skill relations | `core/config/skill-relations.yaml`, `world/skill-relations.yaml` |
 | Skill quality | `meta/skill-quality.yaml`, `meta/skill-quality-strategy.yaml` |
 | Message board | `world/board/*.jsonl`, `core/scripts/board.py` |
 | File history | `world/.history/`, `meta/.history/`, `core/scripts/history.py` |
@@ -126,6 +137,10 @@ Not mutually exclusive. A single event can spawn all three. See `aspirations-exe
 | Background jobs | `<agent>/session/background-jobs.yaml`, `core/scripts/background-jobs.sh` |
 | External paths | `<agent>/local-paths.conf`, `core/scripts/_paths.sh`, `core/scripts/_paths.py` |
 | File operations | `core/scripts/_fileops.py` (locking, history, changelog) |
+| Team state | `world/team-state.yaml`, `core/scripts/team-state.py`, `team-state-update.sh`, `team-state-read.sh` |
+| Execution diary | `<agent>/session/execution-diary.jsonl`, `core/scripts/execution-diary.sh` |
+| Reasoning snapshot | `<agent>/session/reasoning-snapshot.yaml`, `core/scripts/reasoning-snapshot.sh` |
+| Compact recovery | `<agent>/session/compact-checkpoint.yaml`, `core/scripts/compact-restore-slots.sh` |
 
 ## Convention Index
 
@@ -148,16 +163,19 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `secrets.md` | Credentials convention, env-read.sh, security rules |
 | `working-memory.md` | Working memory schema, wm-*.sh script API, slot_meta, pruning rules |
 | `curriculum.md` | Curriculum YAML schema, script API, gate types, contract checks |
-| `handoff-working-memory.md` | Handoff schema, working memory integration, blocker tracking |
+| `handoff-working-memory.md` | Handoff schema, working memory integration, blocker tracking, reasoning trajectory |
+| `compact-recovery.md` | Full-fidelity compact recovery protocol, slot restoration, execution diary, reasoning snapshot |
 | `meta-strategies.md` | Meta-strategy schemas, modification protocol, experiments, imp@k, transfer |
 | `skill-quality.md` | Skill quality five-dimension evaluation, skill-evaluate.sh API, quality thresholds |
-| `board.md` | Message board JSONL schema, script API, agent integration points |
+| `board.md` | Message board JSONL schema, script API, agent integration points, directive payload, execution feedback, insight triggers |
 | `history.md` | File versioning `.history/` schema, script API, changelog, pruning |
 | `external-paths.md` | External path configuration, `local-paths.conf` format, `/start` flow |
 | `precision-encoding.md` | Precision manifest schema, extraction heuristics, Verified Values format |
 | `agent-spawning.md` | Agent spawning context injection, build-agent-context.sh API, repo safety tiers, anti-patterns |
 | `retrieval-escalation.md` | 3-tier retrieval escalation: tree → codebase → web search |
 | `exhaustive-search-before-negation.md` | Exhaustive knowledge search protocol before negative conclusions |
+| `coordination.md` | Multi-agent coordination: claim protocol, board types/tags, circuit breaker, review gate, dependency chains, self-abstention, directive protocol, team state protocol |
+| `constitutional-rings.md` | Three-ring governance model: Ring 1 (immutable mission), Ring 2 (standards), Ring 3 (autonomous protocols) |
 
 Additional on-demand specs (not convention files):
 - `core/config/hypothesis-conventions.md` — Hypothesis record schemas, horizons, context manifests
@@ -179,7 +197,7 @@ Additional on-demand specs (not convention files):
 Everything in `world/` is collective domain state (shared across agents). Everything in `<agent>/` is per-agent private state. Everything in `meta/` is domain-agnostic improvement strategy. Everything in `core/` and `.claude/` is immutable framework.
 The cognitive core (base skills, rules, `core/`) describes INTENT, never domain-specific
 implementation. Domain knowledge lives in `world/`: conventions (`world/conventions/*.md`),
-guardrails, reasoning bank, knowledge tree. Agent-specific state lives in `<agent>/`: forged skills (registered in `<agent>/forged-skills.yaml`), experience, journal, session.
+guardrails, reasoning bank, knowledge tree, forged skills (`world/forged-skills.yaml`). Agent-specific state lives in `<agent>/`: experience, journal, session.
 
 ### Naming Rules
 - All filenames: **lowercase, kebab-case** (hyphens, no spaces, no underscores except pipeline/experience record IDs)
@@ -290,7 +308,7 @@ without attempting all eligible tiers.
 3. In reader mode: read-only assistant. May read state but MUST NOT execute write operations or workflow skills.
 4. In assistant mode: user-directed assistant. May read and write when asked but MUST NOT self-initiate or run the loop.
 5. In autonomous mode (RUNNING state): autonomous via aspirations loop.
-6. Auto-resume after autocompact is handled by the stop hook (Tier 1-3 recovery), NOT by the Session Start Protocol. A new session that finds RUNNING state must show the error, not auto-resume.
+6. Auto-resume after autocompact is handled by the stop hook (unconditional BLOCK + LOOP_CONTINUE), NOT by the Session Start Protocol. A new session that finds RUNNING state must show the error, not auto-resume.
 
 ### Autonomous Loop Rules
 
@@ -311,12 +329,14 @@ Signal files (all in `<agent>/session/`):
 | `agent-state` | "RUNNING" or "IDLE" | /start, /stop only |
 | `agent-mode` | "reader", "assistant", or "autonomous" | /start, /stop |
 | `persona-active` | "true" or "false" | /start, /stop, /boot |
-| `stop-loop` | Allow exit | /stop, /recover |
+| `stop-loop` | Allow exit (set after obligations complete) | /stop Phase -1.4 |
+| `stop-requested` | Graceful stop signal (set immediately by /stop) | /stop |
+| `iteration-checkpoint.json` | In-flight obligation tracker for graceful stop recovery | aspirations loop |
 | `handoff.yaml` | Cross-session state | aspirations consolidation |
 | `pending-agents.yaml` | Background agent tracking (stop hook Gate 2.5) | aspirations-execute Phase 4 |
-| `background-jobs.yaml` | Long-running external process tracking | background-jobs.sh |
+| `background-jobs.yaml` | Long-running external process tracking | forged skills with background tasks |
 
-Other session signals (`loop-active`, `stop-block-count`, `compact-checkpoint.yaml`, `context-reads.txt`, `pending-questions.yaml`, `aspirations-compact.json`): see `core/config/conventions/session-state.md`.
+Other session signals (`loop-active`, `compact-checkpoint.yaml`, `context-reads.txt`, `pending-questions.yaml`, `aspirations-compact.json`): see `core/config/conventions/session-state.md`.
 
 ### Compact Checkpoint Protocol
 
@@ -350,19 +370,14 @@ User control commands: see User Control Commands table above.
 | Respond | Handle user messages — persona, knowledge search, directive routing |
 | Review Hypotheses | Resolve hypotheses, learn from outcomes, accuracy stats |
 | Reflect | ABC chains, violations, hierarchical reflection, strategy extraction |
-| *Reflect Hypothesis* | *Full single hypothesis reflection pipeline* |
-| *Reflect Execution* | *Pattern signatures + contradiction detection + investigation goals from execution outcomes* |
-| *Reflect Batch Micro* | *Batch micro-hypothesis reflection* |
-| *Reflect Extract Patterns* | *Pattern synthesis and strategy extraction* |
-| *Reflect Calibration* | *Confidence calibration check* |
-| *Reflect Curate Memory* | *Memory curation and active forgetting* |
-| *Reflect Curate Aspirations* | *Aspiration grooming — stuck goal detection, evidence cross-reference* |
+| *Reflect On Outcome* | *Hypothesis ABC chains, execution pattern signatures, batch micro-hypothesis processing* |
+| *Reflect On Self* | *Pattern synthesis, strategy extraction, confidence calibration* |
+| *Reflect Maintain* | *Memory curation, active forgetting, aspiration grooming* |
 | *Reflect Tree Update* | *Shared tree update protocol (propagate upward)* |
 | Replay | Compressed review, reconsolidation, domain transfer |
 | Research Topic | Build knowledge base via web research |
 | Decompose | Break compound goals into primitives |
 | Forge Skill | Create new skills from capability gaps |
-| Recover | Last-resort recovery |
 | Tree | Knowledge tree operations: read, find, add, edit, set, decompose, maintain, stats, validate |
 
-*(Forged skills created via /forge-skill appear here after creation — see <agent>/forged-skills.yaml)*
+*(Forged skills created via /forge-skill appear here after creation — see world/forged-skills.yaml)*

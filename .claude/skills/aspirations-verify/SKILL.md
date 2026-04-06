@@ -92,7 +92,27 @@ if all_passed:
     Bash: aspirations-update-goal.sh --source {source} <goal-id> completed_date <today>
     Bash: aspirations-update-goal.sh --source {source} <goal-id> achievedCount <N+1>
     Update recurring streaks if applicable
-    Unblock dependent goals
+
+    # OUTPUT-CENTRIC HANDOFF (arXiv 2603.28990: factual outputs > status)
+    # Generate output_summary BEFORE unblocking — dependent goals need it.
+    IF source == "world":
+        output_summary = one-line factual summary of WHAT was produced/found/changed
+        echo "${output_summary}" | Bash: board-post.sh --channel coordination --type handoff --tags ${goal.id},${goal.category}
+
+    Unblock dependent goals (with output passing — see below)
+```
+
+### Unblock Dependent Goals (with Output Passing)
+
+When unblocking goals that depend on this completed goal, inject the output
+into dependent goals that declared `depends_on` (see goal-schemas.md):
+
+```
+FOR EACH goal across all active aspirations WHERE blocked_by contains completed_goal_id:
+    Remove completed_goal_id from blocked_by (via aspirations-update-goal.sh)
+    IF dependent_goal has depends_on entry for completed_goal_id:
+        # Use the output_summary already in context from the handoff post above
+        Bash: aspirations-update-goal.sh --source {dep_source} <dep-goal-id> description "## Predecessor Output (${completed_goal_id})\n${output_summary}\n\n${existing_description}"
 ```
 
 ### On Fail
@@ -100,6 +120,10 @@ if all_passed:
 ```
 Bash: aspirations-update-goal.sh --source {source} <goal-id> status pending  # retry next cycle
 log "Goal executed but verification check failed"
+# Post what was learned from the failure (not just "failed")
+IF source == "world":
+    failure_summary = one-line summary of what was attempted and why it failed
+    echo "${failure_summary}" | Bash: board-post.sh --channel coordination --type release --tags ${goal.id},${goal.category}
 ```
 
 ## Recurring Streak Logic
@@ -119,6 +143,10 @@ else:
 Bash: aspirations-update-goal.sh --source {source} <goal-id> currentStreak <new_streak>
 Bash: aspirations-update-goal.sh --source {source} <goal-id> longestStreak <max(new_streak, longestStreak)>
 ```
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 
 ## Chaining
 

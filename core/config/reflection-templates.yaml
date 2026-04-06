@@ -13,6 +13,44 @@ default_template:
     - "Were there biases that should have been accounted for?"
   focus: "General calibration and edge assessment"
 
+# Creative Lens — universal supplement that fires for ALL reflections alongside
+# the domain template. Prompts divergent/lateral thinking before convergent encoding.
+creative_lens:
+  questions:
+    - "What is the OPPOSITE of this conclusion, and under what conditions would the opposite be true?"
+    - "What UNRELATED domain has a pattern that resembles what just happened here? What does that analogy suggest?"
+    - "If this outcome is correct for the WRONG reasons, what is the real explanation?"
+    - "What would someone who DISAGREES with this conclusion say? What evidence would they cite?"
+    - "What HIDDEN VARIABLE might explain this outcome that we haven't considered?"
+  focus: "Lateral thinking, contrarian reframing, cross-domain analogy, alternative explanation generation"
+
+# Domain-specific templates — replace default for their category.
+# Each includes 2 standard calibration questions + 2 domain-specific creative questions.
+domain_templates:
+  code:
+    questions:
+      - "What was the primary information edge (or lack thereof)?"
+      - "Was confidence calibrated correctly vs the outcome?"
+      - "What architectural assumption does this outcome validate or invalidate?"
+      - "What would break first if this code had 10x the load?"
+    focus: "Code quality calibration and architectural edge assessment"
+
+  infrastructure:
+    questions:
+      - "What was the primary information edge (or lack thereof)?"
+      - "Was confidence calibrated correctly vs the outcome?"
+      - "What failure mode does this outcome make more or less likely?"
+      - "What monitoring gap would prevent us from detecting this issue in production?"
+    focus: "Infrastructure calibration with operational reliability assessment"
+
+  research:
+    questions:
+      - "What was the primary information edge (or lack thereof)?"
+      - "Was confidence calibrated correctly vs the outcome?"
+      - "What did we learn that contradicts something we previously believed?"
+      - "What question does this answer raise that we haven't asked yet?"
+    focus: "Research calibration with knowledge frontier extension"
+
 # --- INITIAL STATE ---
 
 initial_state:
@@ -24,3 +62,36 @@ initial_state:
         - "What context was missing that would have changed the hypothesis?"
         - "Were there biases that should have been accounted for?"
       focus: "General calibration and edge assessment"
+
+    creative_lens:
+      questions:
+        - "What is the OPPOSITE of this conclusion, and under what conditions would the opposite be true?"
+        - "What UNRELATED domain has a pattern that resembles what just happened here? What does that analogy suggest?"
+        - "If this outcome is correct for the WRONG reasons, what is the real explanation?"
+        - "What would someone who DISAGREES with this conclusion say? What evidence would they cite?"
+        - "What HIDDEN VARIABLE might explain this outcome that we haven't considered?"
+      focus: "Lateral thinking, contrarian reframing, cross-domain analogy, alternative explanation generation"
+
+    code:
+      questions:
+        - "What was the primary information edge (or lack thereof)?"
+        - "Was confidence calibrated correctly vs the outcome?"
+        - "What architectural assumption does this outcome validate or invalidate?"
+        - "What would break first if this code had 10x the load?"
+      focus: "Code quality calibration and architectural edge assessment"
+
+    infrastructure:
+      questions:
+        - "What was the primary information edge (or lack thereof)?"
+        - "Was confidence calibrated correctly vs the outcome?"
+        - "What failure mode does this outcome make more or less likely?"
+        - "What monitoring gap would prevent us from detecting this issue in production?"
+      focus: "Infrastructure calibration with operational reliability assessment"
+
+    research:
+      questions:
+        - "What was the primary information edge (or lack thereof)?"
+        - "Was confidence calibrated correctly vs the outcome?"
+        - "What did we learn that contradicts something we previously believed?"
+        - "What question does this answer raise that we haven't asked yet?"
+      focus: "Research calibration with knowledge frontier extension"

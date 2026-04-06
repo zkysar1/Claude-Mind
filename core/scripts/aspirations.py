@@ -112,6 +112,13 @@ def validate_aspiration(asp):
     if "scope" in asp and asp["scope"] not in VALID_SCOPES:
         raise ValueError(f"Invalid scope: {asp['scope']} (expected one of {VALID_SCOPES})")
 
+    # Parallelizability classification (multi-agent coordination)
+    valid_coordination_modes = ("parallel", "serial", "mixed")
+    if "coordination_mode" in asp and asp["coordination_mode"] not in valid_coordination_modes:
+        raise ValueError(
+            f"Invalid coordination_mode: {asp['coordination_mode']} "
+            f"(expected one of {valid_coordination_modes})")
+
     if "sessions_active" in asp and not isinstance(asp["sessions_active"], (int, float)):
         raise ValueError("sessions_active must be a number")
 
@@ -173,6 +180,27 @@ def validate_goal(goal):
         val = goal["defer_reason"]
         if val is not None and not isinstance(val, str):
             raise ValueError(f"Goal {goal['id']}: defer_reason must be a string or null")
+    # Validate reallocatable field (multi-agent straggler mitigation)
+    if "reallocatable" in goal:
+        if not isinstance(goal["reallocatable"], bool):
+            raise ValueError(f"Goal {goal['id']}: reallocatable must be a boolean")
+    # Validate depends_on field (output-passing dependencies, arXiv 2603.28990)
+    if "depends_on" in goal:
+        deps = goal["depends_on"]
+        if not isinstance(deps, list):
+            raise ValueError(f"Goal {goal['id']}: depends_on must be a list")
+        raw_blocked = goal.get("blocked_by", [])
+        blocked_by = set(raw_blocked if isinstance(raw_blocked, list) else [raw_blocked])
+        for dep in deps:
+            if not isinstance(dep, dict) or "goal_id" not in dep:
+                raise ValueError(f"Goal {goal['id']}: each depends_on entry must have 'goal_id'")
+            if dep["goal_id"] not in blocked_by:
+                raise ValueError(f"Goal {goal['id']}: depends_on goal_id '{dep['goal_id']}' must also appear in blocked_by")
+    # Validate abstained_by field (self-abstention, arXiv 2603.28990)
+    if "abstained_by" in goal:
+        val = goal["abstained_by"]
+        if val is not None and not isinstance(val, str):
+            raise ValueError(f"Goal {goal['id']}: abstained_by must be a string or null")
 
 
 def validate_evolution_event(evt):
@@ -268,7 +296,8 @@ COMPACT_GOAL_KEEP = {
     "currentStreak", "longestStreak",
     "participants", "blocked_by", "deferred_until", "defer_reason",
     "args", "parent_goal", "discovered_by", "started",
-}
+    "depends_on", "abstained_by",
+}   # claimed_by intentionally excluded — use aspirations-query.sh to find claimed goals
 
 
 def compact_aspiration(asp, source="world"):
@@ -352,6 +381,68 @@ def cmd_read(args):
     else:
         print("Specify one of: --active, --id, --summary, --archive, --stepping-stones, --meta", file=sys.stderr)
         sys.exit(1)
+
+
+def cmd_query(args):
+    """Query goals by field filters across both queues.
+
+    Returns a flat JSON array of matching goals with identity fields
+    (goal_id, asp_id, source, title, status) always included.
+    Searches both world and agent queues by default.
+    """
+    # Require at least one filter
+    has_filter = any([args.goal_status, args.goal_field, args.title_contains])
+    if not has_filter:
+        print("Error: specify at least one filter (--goal-status, --goal-field, --title-contains)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # Always read both queues directly (ignore global --source override)
+    sources = []
+    world_path = WORLD_DIR / "aspirations.jsonl"
+    if world_path.exists():
+        sources.append(("world", read_jsonl(world_path)))
+    if AGENT_DIR:
+        agent_path = AGENT_DIR / "aspirations.jsonl"
+        if agent_path.exists():
+            sources.append(("agent", read_jsonl(agent_path)))
+
+    results = []
+    for source_name, aspirations in sources:
+        for asp in aspirations:
+            asp_id = asp.get("id", "")
+            for goal in asp.get("goals", []):
+                if _goal_matches(goal, args):
+                    results.append({
+                        "goal_id": goal.get("id", ""),
+                        "asp_id": asp_id,
+                        "source": source_name,
+                        "title": goal.get("title", ""),
+                        "status": goal.get("status", ""),
+                    })
+
+    print(json.dumps(results, indent=2, ensure_ascii=True))
+
+
+def _goal_matches(goal, args):
+    """Check if a goal matches all specified filters (AND semantics)."""
+    if args.goal_status:
+        if goal.get("status") != args.goal_status:
+            return False
+    if args.goal_field:
+        field, value = args.goal_field
+        actual = goal.get(field)
+        if isinstance(actual, list):
+            if value not in actual:
+                return False
+        else:
+            if str(actual) != value:
+                return False
+    if args.title_contains:
+        title = goal.get("title", "")
+        if args.title_contains.lower() not in title.lower():
+            return False
+    return True
 
 
 def recompute_progress(asp):
@@ -771,49 +862,101 @@ def cmd_add_goal(args):
 
 
 def cmd_claim(args):
-    """Atomically claim a world goal for this agent."""
+    """Atomically claim a world goal for this agent.
+
+    Uses a single lock scope around the entire read-check-write cycle to prevent
+    TOCTOU race conditions when two agents try to claim the same goal simultaneously.
+    (Fix based on arXiv 2603.28990 multi-agent coordination analysis.)
+    """
+    import tempfile
+    from _fileops import acquire_lock, release_lock, save_history, append_changelog
     goal_id = args.goal_id
     agent_name = args.agent_name
+    # MUST match _fileops.locked_write_jsonl convention: path.with_suffix(".lock")
+    # so this lock coordinates with cmd_release, cmd_update_goal, etc.
+    lock_path = LIVE_PATH.with_suffix(".lock")
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_goal_in_aspirations(items, goal_id)
-    if result is None:
-        print(f"Goal {goal_id} not found", file=sys.stderr)
-        sys.exit(1)
+    try:
+        acquire_lock(lock_path)
 
-    asp_idx, goal_idx, asp = result
-    goal = asp["goals"][goal_idx]
+        items = read_jsonl(LIVE_PATH)
+        result = find_goal_in_aspirations(items, goal_id)
+        if result is None:
+            print(f"Goal {goal_id} not found", file=sys.stderr)
+            sys.exit(1)
 
-    # Check not already claimed by someone else
-    existing = goal.get("claimed_by")
-    if existing and existing != agent_name:
-        print(f"Goal {goal_id} already claimed by {existing}", file=sys.stderr)
-        sys.exit(1)
+        asp_idx, goal_idx, asp = result
+        goal = asp["goals"][goal_idx]
 
-    goal["claimed_by"] = agent_name
-    goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    items[asp_idx] = asp
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(goal, indent=2, ensure_ascii=False))
+        existing = goal.get("claimed_by")
+        if existing and existing != agent_name:
+            print(f"Goal {goal_id} already claimed by {existing}", file=sys.stderr)
+            sys.exit(1)
+
+        goal["claimed_by"] = agent_name
+        goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        items[asp_idx] = asp
+
+        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
+        save_history(LIVE_PATH, WORLD_DIR, agent_name, f"claim {goal_id}")
+        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
+                                          suffix=".tmp", delete=False, encoding="utf-8")
+        try:
+            for item in items:
+                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
+            tmp.close()
+            os.replace(tmp.name, str(LIVE_PATH))
+        except Exception:
+            os.unlink(tmp.name)
+            raise
+        append_changelog(WORLD_DIR, agent_name, LIVE_PATH, "update", f"claim {goal_id}")
+        print(json.dumps(goal, indent=2, ensure_ascii=False))
+    finally:
+        release_lock(lock_path)
 
 
 def cmd_release(args):
-    """Release a claimed goal (clear claimed_by and claimed_at)."""
+    """Release a claimed goal (clear claimed_by and claimed_at).
+
+    Uses single lock scope (same pattern as cmd_claim) to prevent TOCTOU races.
+    """
+    import tempfile
+    from _fileops import acquire_lock, release_lock, save_history, append_changelog
     goal_id = args.goal_id
+    lock_path = LIVE_PATH.with_suffix(".lock")
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_goal_in_aspirations(items, goal_id)
-    if result is None:
-        print(f"Goal {goal_id} not found", file=sys.stderr)
-        sys.exit(1)
+    try:
+        acquire_lock(lock_path)
 
-    asp_idx, goal_idx, asp = result
-    goal = asp["goals"][goal_idx]
-    goal.pop("claimed_by", None)
-    goal.pop("claimed_at", None)
-    items[asp_idx] = asp
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(goal, indent=2, ensure_ascii=False))
+        items = read_jsonl(LIVE_PATH)
+        result = find_goal_in_aspirations(items, goal_id)
+        if result is None:
+            print(f"Goal {goal_id} not found", file=sys.stderr)
+            sys.exit(1)
+
+        asp_idx, goal_idx, asp = result
+        goal = asp["goals"][goal_idx]
+        goal.pop("claimed_by", None)
+        goal.pop("claimed_at", None)
+        items[asp_idx] = asp
+
+        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
+        agent = AGENT_DIR.name if AGENT_DIR else "unknown"
+        save_history(LIVE_PATH, WORLD_DIR, agent, f"release {goal_id}")
+        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
+                                          suffix=".tmp", delete=False, encoding="utf-8")
+        try:
+            for item in items:
+                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
+            tmp.close()
+            os.replace(tmp.name, str(LIVE_PATH))
+        except Exception:
+            os.unlink(tmp.name)
+            raise
+        append_changelog(WORLD_DIR, agent, LIVE_PATH, "update", f"release {goal_id}")
+        print(json.dumps(goal, indent=2, ensure_ascii=False))
+    finally:
+        release_lock(lock_path)
 
 
 def cmd_complete_by(args):
@@ -821,40 +964,66 @@ def cmd_complete_by(args):
 
     Recurring goals stay 'pending' with updated lastAchievedAt/achievedCount —
     they must NOT be permanently marked 'completed'.
+
+    Uses single lock scope (same pattern as cmd_claim) to prevent TOCTOU races.
     """
+    import tempfile
+    from _fileops import acquire_lock, release_lock, save_history, append_changelog, resolve_base_dir
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     goal_id = args.goal_id
     agent_name = args.agent_name
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    base_dir = resolve_base_dir(LIVE_PATH)  # None for agent paths — skip history/changelog
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_goal_in_aspirations(items, goal_id)
-    if result is None:
-        print(f"Goal {goal_id} not found", file=sys.stderr)
-        sys.exit(1)
+    try:
+        acquire_lock(lock_path)
 
-    asp_idx, goal_idx, asp = result
-    goal = asp["goals"][goal_idx]
-    goal["completed_by"] = agent_name
+        items = read_jsonl(LIVE_PATH)
+        result = find_goal_in_aspirations(items, goal_id)
+        if result is None:
+            print(f"Goal {goal_id} not found", file=sys.stderr)
+            sys.exit(1)
 
-    if goal.get("recurring"):
-        # Recurring: cycle back to pending, update tracking fields.
-        # Clear claim so the goal returns to the pool for any agent's next cycle.
-        goal.pop("claimed_by", None)
-        goal.pop("claimed_at", None)
-        goal["lastAchievedAt"] = now
-        goal["achievedCount"] = goal.get("achievedCount", 0) + 1
-        goal["currentStreak"] = goal.get("currentStreak", 0) + 1
-        goal["longestStreak"] = max(
-            goal.get("longestStreak", 0), goal.get("currentStreak", 0))
-        # Status stays 'pending' — the interval gate in goal-selector handles timing
-    else:
-        goal["status"] = "completed"
-        goal["completed_date"] = now
+        asp_idx, goal_idx, asp = result
+        goal = asp["goals"][goal_idx]
+        goal["completed_by"] = agent_name
 
-    recompute_progress(asp)
-    items[asp_idx] = asp
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(goal, indent=2, ensure_ascii=False))
+        if goal.get("recurring"):
+            # Recurring: cycle back to pending, update tracking fields.
+            # Clear claim so the goal returns to the pool for any agent's next cycle.
+            goal.pop("claimed_by", None)
+            goal.pop("claimed_at", None)
+            goal["lastAchievedAt"] = now
+            goal["achievedCount"] = goal.get("achievedCount", 0) + 1
+            goal["currentStreak"] = goal.get("currentStreak", 0) + 1
+            goal["longestStreak"] = max(
+                goal.get("longestStreak", 0), goal.get("currentStreak", 0))
+            # Status stays 'pending' — the interval gate in goal-selector handles timing
+        else:
+            goal["status"] = "completed"
+            goal["completed_date"] = now
+
+        recompute_progress(asp)
+        items[asp_idx] = asp
+
+        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
+        if base_dir:
+            save_history(LIVE_PATH, base_dir, agent_name, f"complete-by {goal_id}")
+        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
+                                          suffix=".tmp", delete=False, encoding="utf-8")
+        try:
+            for item in items:
+                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
+            tmp.close()
+            os.replace(tmp.name, str(LIVE_PATH))
+        except Exception:
+            os.unlink(tmp.name)
+            raise
+        if base_dir:
+            append_changelog(base_dir, agent_name, LIVE_PATH, "update", f"complete-by {goal_id}")
+        print(json.dumps(goal, indent=2, ensure_ascii=False))
+    finally:
+        release_lock(lock_path)
 
 
 def cmd_evolution_append(args):
@@ -905,6 +1074,17 @@ def main():
     read_group.add_argument("--meta", action="store_true", help="Show aspirations metadata")
     p_read.add_argument("--limit", type=int, default=5,
                         help="Limit results (used with --stepping-stones)")
+
+    # query (cross-queue goal filter — lightweight alternative to full compact load)
+    p_query = subparsers.add_parser("query", help="Query goals by field filters (cross-queue)")
+    p_query.add_argument("--goal-status", dest="goal_status",
+                         choices=sorted(VALID_GOAL_STATUSES),
+                         help="Filter goals by status")
+    p_query.add_argument("--goal-field", dest="goal_field", nargs=2,
+                         metavar=("FIELD", "VALUE"),
+                         help="Filter where goal[FIELD] == VALUE (list fields use 'contains')")
+    p_query.add_argument("--title-contains", dest="title_contains",
+                         help="Case-insensitive substring match on goal title")
 
     # add
     subparsers.add_parser("add", help="Add aspiration from stdin JSON")
@@ -981,6 +1161,7 @@ def main():
 
     dispatch = {
         "read": cmd_read,
+        "query": cmd_query,
         "add": cmd_add,
         "update": cmd_update,
         "update-goal": cmd_update_goal,

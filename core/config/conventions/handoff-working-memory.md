@@ -52,6 +52,57 @@ First iteration skips Phase 2 scoring.
 
 `kind` is required on all entries. Missing `kind` is a schema violation.
 
+**Consolidation triage metadata** (written by Step 9, read by boot for status reporting):
+```yaml
+consolidation_meta:
+  triage_tier: "lean"               # "lean" or "full" — which path was taken
+  consecutive_lean_sessions: 2      # informational copy for boot status output
+```
+
+Anti-suppression ceiling source of truth: `<agent>/session/consolidation-lean-streak` (plain integer).
+Written by consolidation Step 9, read by Step 0.1 triage. If >= 3, forces `full` tier.
+This file is NOT consumed by boot (unlike handoff.yaml itself).
+See `aspirations-consolidate/SKILL.md` Step 0.1.
+
+---
+
+# Reasoning Trajectory (Cross-Session Context)
+
+The handoff captures the reasoning *journey*, not just the end-state. Built from the
+execution diary (`<agent>/session/execution-diary.jsonl`) during consolidation Step 9.
+
+```yaml
+reasoning_trajectory:
+  diary_entry_count: 42              # Total entries this session
+  key_decisions:
+    - context: "g-206-03: API domain exploration"
+      decision: "Depth-first over breadth"
+      rationale: "CALIBRATE level reached, focused exploration more productive"
+      outcome: "3 tree nodes encoded"
+  failed_approaches:
+    - goal: "g-206-05"
+      approach: "Direct API invocation for task seeding"
+      failure: "Firewall blocks port — switched to API Gateway"
+  emerging_patterns:
+    - "Deploys require integration test to propagate to shared state"
+  open_threads:
+    - "Task seeding deployed but not yet verified via integration test"
+```
+
+Boot Step 0.5 reads `reasoning_trajectory` and includes key decisions and open threads
+in the boot status output, giving the agent continuity of reasoning across sessions.
+
+**Construction**: Consolidation Step 9 reads `execution-diary.sh read --json`, filters
+entries by type, and synthesizes:
+- `key_decisions` from `decision` entries
+- `failed_approaches` from `failure` + `approach_change` entries
+- `emerging_patterns` from `finding` entries with cross-goal relevance
+- `open_threads` from the last 5 `observation` entries that reference incomplete work
+
+**Diary archival**: Consolidation renames `execution-diary.jsonl` to
+`execution-diary-session-{N}.jsonl`. Boot reads last 20 entries from the prior session
+diary. After 3 sessions, old diary files are deleted (keep current + previous).
+
 ---
 
 # Working Memory Experience Integration
@@ -85,6 +136,7 @@ slots:
       reason: "Required service unavailable"
       type: "infrastructure"
       affected_skills: ["/some-forged-skill"]
+      affected_categories: ["processor-pipeline"]   # Optional. Fallback when goal.skill is null
       affected_goals: ["g-136-03", "g-169-08"]
       unblocking_goal: "g-136-NN"
       detected_session: 48
@@ -101,6 +153,7 @@ Fields:
 - `reason` — human-readable description
 - `type` — `infrastructure` | `resource` | `user_action`
 - `affected_skills` — list of skill paths
+- `affected_categories` — list of goal categories (optional). When a goal has skill=null, goal-selector falls back to checking if goal.category matches. Secondary to affected_skills.
 - `affected_goals` — list of goal IDs (appended as new goals hit this blocker)
 - `unblocking_goal` — goal ID created to resolve this blocker (null for legacy backfills)
 - `detected_session`, `detected_at` — when first detected
@@ -108,3 +161,27 @@ Fields:
 - `diagnostic_context` — object with `error_emails` (count), `cascade_chain` (report or null), `attempted_fix` (description or null)
 
 Blockers persist across sessions via `handoff.yaml.known_blockers_active`. Blockers also clear when their linked `unblocking_goal` completes (Phase 0.5b primary check). Other resolution paths: user goal completion, 3-session expiry (tentative retry), infra-health probe success.
+
+---
+
+# Proactive Escalation Log
+
+Tracks when proactive user notifications were sent to prevent spam. Written by
+Phase 0.5b.1 (blocker age) and Step B7.1 (all-blocked sleep). Phase 5.5 (circuit
+breaker) does not use this slot — it has natural cooldown via counter reset + defer.
+
+```yaml
+slots:
+  proactive_escalation_log:
+    - blocker_id: "infra-some-service-2026-03-15"  # matches known_blockers entry
+      sent_at: "2026-04-04T14:30:00"
+    - blocker_id: "_all_blocked"                   # synthetic ID for B7 notifications
+      sent_at: "2026-04-04T16:00:00"
+```
+
+Session-scoped (cleared on session reset). Cross-session reset is intentional —
+if a blocker persists into a new session, the user should hear about it again.
+Cooldown period: `proactive_escalation.blocker_age_hours` from `core/config/aspirations.yaml`.
+
+The phrase "Notify the user" in the pseudocode resolves via forged-skill-resolution
+to a forged notification skill (if available), which may handle email → pending-question → participant-goal fallback.

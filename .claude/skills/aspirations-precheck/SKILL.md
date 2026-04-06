@@ -114,33 +114,61 @@ IF executable_count < pipeline_low_water_mark:
 ## Phase 0.5.2: Hypothesis Pipeline Health Check
 
 Proactive hypothesis starvation prevention — ensure the prediction pipeline stays
-active. Hypotheses come from sq-009 sparks during goal execution, which only fire on
-standard/deep outcomes. If outcomes are mostly routine, hypothesis generation stalls.
-This gate detects starvation and creates a review goal that forces prediction formation.
+active AND flowing. Checks whether hypotheses are genuinely progressing, not just
+existing in stale or time-gated states. Stale discovered records and time-gated
+active records do NOT count as healthy pipeline flow.
 
 ```
-Read core/config/aspirations.yaml → hypothesis_pipeline_low_water_mark (default 2)
+Read core/config/aspirations.yaml → hypothesis_pipeline_low_water_mark (default 4)
 
-# Count active pipeline hypotheses (discovered + evaluating + active stages)
+# ── FLOW CHECK: count only hypotheses that are genuinely progressing ──
 Bash: pipeline-read.sh --counts
 pipeline_counts = parse JSON
-active_hypothesis_count = pipeline_counts.discovered + pipeline_counts.evaluating + pipeline_counts.active
 
-IF active_hypothesis_count < hypothesis_pipeline_low_water_mark:
-    Output: "▸ Hypothesis pipeline thin: {active_hypothesis_count} active hypotheses (threshold: {hypothesis_pipeline_low_water_mark})"
+# Discovered: only those created within last 7 days (stale discovered = stuck)
+Bash: pipeline-read.sh --stage discovered
+fresh_discovered = [h for h in result if days_since(h.formed_date) <= 7]
+
+# Active: only those whose time gate has passed (resolvable NOW)
+# Pipeline records have horizon + formed_date (required), NOT resolves_no_earlier_than.
+# Use default resolution windows: session=immediate, short=+12h, long=+24h.
+Bash: pipeline-read.sh --stage active
+now = current datetime
+resolvable_active = []
+time_gated_active = []
+for h in result:
+    if h.horizon == "session" or h.horizon == "micro":
+        resolvable_active.append(h)
+    elif h.horizon == "short" and parse(h.formed_date) + 12h <= now:
+        resolvable_active.append(h)
+    elif h.horizon == "long" and parse(h.formed_date) + 24h <= now:
+        resolvable_active.append(h)
+    else:
+        time_gated_active.append(h)
+
+flowing_count = len(fresh_discovered) + pipeline_counts.evaluating + len(resolvable_active)
+
+IF flowing_count < hypothesis_pipeline_low_water_mark:
+    Output: "▸ Hypothesis pipeline stalled: {flowing_count} flowing hypotheses (threshold: {hypothesis_pipeline_low_water_mark})"
+    IF time_gated_active:
+        Output: "  ({len(time_gated_active)} active hypotheses still within time gate)"
+    IF len(fresh_discovered) < pipeline_counts.discovered:
+        Output: "  ({pipeline_counts.discovered - len(fresh_discovered)} discovered hypotheses are stale (>7 days old))"
 
     # Dedup: skip if a matching goal is already pending or in-progress
     existing_review = false
     FOR EACH active aspiration in compact data:
         FOR EACH goal WHERE status in ("pending", "in-progress"):
-            IF title starts with "Investigate: Prediction opportunities":
+            IF title starts with "Investigate: Prediction opportunities" OR title starts with "Generate hypotheses":
                 existing_review = true
                 BREAK
 
     IF NOT existing_review:
         target_asp = first active aspiration from compact data
-        echo '{"title":"Investigate: Prediction opportunities in recent work","description":"Hypothesis pipeline is thin ({active_hypothesis_count} active). Review the last 3-5 completed goals for prediction opportunities. For each: what would we expect to see if we revisited this domain? What consequence of this work could we verify later? Form at least 1 testable prediction via sq-009 pattern.","priority":"HIGH","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {target_asp.source} {target_asp.id}
-        Log: "HYPOTHESIS PIPELINE: below low-water-mark ({active_hypothesis_count} < {hypothesis_pipeline_low_water_mark}), created review goal"
+        echo '{"title":"Investigate: Prediction opportunities in recent work","description":"Hypothesis pipeline is stalled ({flowing_count} flowing, {len(time_gated_active)} time-gated). Review the last 3-5 completed goals for prediction opportunities. Steer toward user experience, system quality, and domain outcome predictions — not just code behavior. Form at least 1 testable prediction via sq-009 pattern.","priority":"HIGH","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {target_asp.source} {target_asp.id}
+        Log: "HYPOTHESIS PIPELINE: stalled ({flowing_count} flowing < {hypothesis_pipeline_low_water_mark}), created review goal"
+ELSE:
+    Output: "▸ Hypothesis pipeline healthy: {flowing_count} flowing ({len(fresh_discovered)} discovered, {pipeline_counts.evaluating} evaluating, {len(resolvable_active)} resolvable active)"
 ```
 
 ## Phase 0.5.3: Accuracy Health Gate
@@ -179,6 +207,41 @@ IF total_resolved >= accuracy_min_sample AND accuracy_pct < (accuracy_critical_t
         Log: "ACCURACY GATE: critically low ({accuracy_pct}% < {accuracy_critical_threshold * 100}%), created investigation goal"
 ```
 
+## Phase 0.5.4: Consolidation Health Gate
+
+Assess aspiration portfolio health. Prevents accumulating many shallow aspirations.
+*(consolidate-before-expand principle)*
+
+```
+Bash: load-aspirations-compact.sh → IF path returned: Read it
+
+active_aspirations = [asp for asp in compact_data where status == "active"]
+IF active_aspirations is empty: SKIP
+
+completion_ratios = []
+FOR EACH asp in active_aspirations:
+    total = count(goals where status not in ["skipped", "expired", "decomposed"])
+    completed = count(goals where status == "completed")
+    IF total > 0: completion_ratios.append(completed / total)
+
+avg_completion = mean(completion_ratios)
+near_complete = count(ratios where ratio > 0.75)
+stalled = count(ratios where ratio < 0.15 AND asp.sessions_active > 2)
+
+# Write to working memory for downstream use (create-aspiration, evolve gap analysis)
+echo '{"avg_completion": {avg_completion}, "near_complete": {near_complete}, "stalled": {stalled}, "active_count": {len(active_aspirations)}}' | Bash: wm-set.sh consolidation_health
+
+IF avg_completion < 0.25 AND len(active_aspirations) >= 3:
+    Output: "▸ CONSOLIDATION WARNING: avg completion {avg_completion:.0%} across {len(active_aspirations)} aspirations"
+    Output: "  Near-complete: {near_complete}, Stalled: {stalled}"
+    Output: "  Existing aspirations need attention before creating new ones."
+
+IF stalled > 0:
+    Output: "▸ STALLED ASPIRATIONS: {stalled} aspiration(s) with <15% completion after 2+ sessions"
+    FOR EACH stalled asp:
+        Output: "  {asp.id}: {asp.title} ({completed}/{total} goals)"
+```
+
 ## Phase 0.5a: Pre-Selection Guardrail Check
 
 ```
@@ -199,12 +262,39 @@ IF known_blockers is non-empty:
         # PRIMARY: Did unblocking goal complete?
         IF blocker.unblocking_goal completed: resolve
 
-        # SECONDARY: User goal, expiry (3-session), infra-health success
-        # ACTIVE REPROBING: probe every iteration
+        # SECONDARY: Probe infrastructure — but no_probe means "unknown", not "broken"
         Bash: result=$(bash core/scripts/infra-health.sh check {component})
         IF status == "ok": resolve
         ELIF status == "provisionable": attempt provisioning
+        ELIF status == "no_probe":
+            # No probe exists — can't verify either way.
+            # After 3 sessions, clear the blocker and let goals fail-fast if still broken.
+            # Re-encountering the failure will re-create the blocker with fresh evidence.
+            IF blocker.detected_session + 3 <= current_session:
+                resolve with reason "no_probe: cleared after 3-session expiry (fail-open)"
+                Log: "BLOCKER EXPIRED (no_probe): {blocker.blocker_id} — letting goals attempt"
         ELSE: log probe failed
+
+    # Phase 0.5b.1: Proactive escalation for aged blockers
+    IF config.proactive_escalation.blocker_age_hours:
+        Bash: wm-read.sh proactive_escalation_log --json
+        FOR EACH blocker WHERE resolution is null:
+            age_hours = hours_since(blocker.detected_at)
+            IF age_hours >= config.proactive_escalation.blocker_age_hours:
+                last_escalation = find entry in proactive_escalation_log where blocker_id == blocker.blocker_id
+                IF last_escalation is null OR hours_since(last_escalation.sent_at) >= config.proactive_escalation.blocker_age_hours:
+                    Notify the user:
+                        category: blocker
+                        subject: "Blocker persisting {age_hours:.0f}h: {blocker.reason}"
+                        message: |
+                            Blocker {blocker.blocker_id} has been active for {age_hours:.0f} hours.
+                            Type: {blocker.type}
+                            Affected goals: {blocker.affected_goals}
+                            Unblocking goal: {blocker.unblocking_goal}
+
+                            The one thing that would unblock this:
+                            {action_description_based_on_blocker_type}
+                    echo '{"blocker_id":"{blocker.blocker_id}","sent_at":"{now}"}' | Bash: wm-append.sh proactive_escalation_log
 
     echo '<updated_blockers_json>' | Bash: wm-set.sh known_blockers
 ```

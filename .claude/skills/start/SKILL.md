@@ -69,10 +69,10 @@ DONE. No state changes. No-op.
 
 0. **Rebind Agent to Session**
 
-   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID"`
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID" && mkdir -p <agent-name>/session && echo "$SID" > <agent-name>/session/latest-session-id && rm -f .latest-session-id`
 
    Reads SID from `.latest-session-id` (written by SessionStart hook — the ONE bridge from hooks to LLM).
-   Writes the session-keyed binding file. `.latest-session-id` is consumed later in the mode-specific step.
+   Writes the session-keyed binding file, saves SID to `<agent>/session/latest-session-id` (per-agent, race-safe), and deletes the shared `.latest-session-id`.
 
    **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
    Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This is the ONLY mechanism for
@@ -103,8 +103,10 @@ DONE. No state changes. No-op.
 
    **Autonomous mode:**
    - Bash: `session-state-set.sh RUNNING`
-   - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id && rm -f .latest-session-id`
+   - Bash: `SID=$(cat <agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
    - Bash: `session-signal-clear.sh stop-loop`
+   - Bash: `session-signal-clear.sh stop-requested`
+   - Bash: `rm -f <agent>/session/iteration-checkpoint.json`
    - Output: "Agent resumed. Learning loop starting."
    - Invoke `/boot`
 
@@ -121,7 +123,7 @@ A1. Validate the agent name (from the `/start <name>` argument):
 
 A2. **Bind Agent to Session**
 
-   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID"`
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID" && mkdir -p <agent-name>/session && echo "$SID" > <agent-name>/session/latest-session-id && rm -f .latest-session-id`
 
    The session-keyed file (`.active-agent-<SID>`) is used by hooks to resolve
    which agent a session belongs to. One file per session, no shared global file.
@@ -149,8 +151,8 @@ B1. Ask for the **world directory** path:
    - An existing world directory (I'll connect to it)
 
    Examples:
-   - C:/Users/Shared/ayoai/world
-   - /mnt/nas/projects/ayoai/world
+   - C:/Users/Shared/claude-mind/world
+   - /mnt/nas/projects/my-project/world
    - ./world  (local, relative to this repo)
 
    Where should the world directory be?
@@ -292,7 +294,7 @@ every agent.
 Examples:
 - "Build and ship the best project management tool in the market."
 - "Research and synthesize machine learning papers into actionable knowledge."
-- "Develop a multiplayer game with intelligent NPCs."
+- "Develop a multiplayer game with intelligent AI characters."
 
 What should The Program be? (Or say "skip" to leave it blank for now.)
 ```
@@ -506,8 +508,10 @@ C7. Write `<agent>/self.md` with parsed Self (where `<agent>` is the active agen
 C8. Set mode and state:
     - Bash: `session-mode-set.sh autonomous`
     - Bash: `session-state-set.sh RUNNING`
-    - Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id && rm -f .latest-session-id`
+    - Bash: `SID=$(cat <agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
     - Bash: `session-signal-clear.sh stop-loop`
+    - Bash: `session-signal-clear.sh stop-requested`
+    - Bash: `rm -f <agent>/session/iteration-checkpoint.json`
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.
     When connecting to an existing world, this ensures goal decomposition

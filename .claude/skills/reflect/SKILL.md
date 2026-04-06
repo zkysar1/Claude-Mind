@@ -31,13 +31,9 @@ Based on: Reflexion (Shinn 2023), ABC Method, Generative Agents (Park 2023), VoE
 
 | Sub-skill | Mode | Purpose |
 |-----------|------|---------|
-| [/reflect-hypothesis](../reflect-hypothesis/SKILL.md) | `--on-hypothesis <id>` | Full single hypothesis reflection pipeline |
-| [/reflect-execution](../reflect-execution/SKILL.md) | `--on-execution` | Pattern signatures + contradiction detection from execution |
-| [/reflect-batch-micro](../reflect-batch-micro/SKILL.md) | `--batch-micro` | Batch micro-hypothesis reflection |
-| [/reflect-extract-patterns](../reflect-extract-patterns/SKILL.md) | `--extract-patterns` | Mine resolved hypotheses for strategies |
-| [/reflect-calibration](../reflect-calibration/SKILL.md) | `--calibration-check` | Confidence calibration analysis |
-| [/reflect-curate-memory](../reflect-curate-memory/SKILL.md) | `--curate-memory` | Retire stale strategies/guardrails |
-| [/reflect-curate-aspirations](../reflect-curate-aspirations/SKILL.md) | `--curate-aspirations` | Groom stuck goals via evidence cross-reference |
+| [/reflect-on-outcome](../reflect-on-outcome/SKILL.md) | `--on-hypothesis`, `--on-execution`, `--batch-micro` | Outcome reflection: hypothesis ABC chains, execution patterns, batch micro |
+| [/reflect-on-self](../reflect-on-self/SKILL.md) | `--extract-patterns`, `--calibration-check` | Self-model: pattern synthesis, strategy extraction, calibration |
+| [/reflect-maintain](../reflect-maintain/SKILL.md) | `--curate-memory`, `--curate-aspirations` | Maintenance: memory curation, aspiration grooming |
 | [/reflect-tree-update](../reflect-tree-update/SKILL.md) | *(shared protocol)* | Propagate tree changes upward |
 
 **Related skills:** [/replay](../replay/SKILL.md) (hippocampal replay), [/aspirations-spark](../aspirations-spark/SKILL.md) (Phase 6.5 immediate learning)
@@ -78,7 +74,7 @@ Step 0 runs ONCE per /reflect invocation. Context is available to the invoked su
 
 ```
 # Step 0.3: Load Meta-Reflection Strategy
-Read meta/reflection-strategy.yaml
+Bash: meta-read.sh reflection-strategy.yaml
 # The agent's learned reflection preferences:
 # - depth_allocation: episode/pattern/strategic weight distribution
 #   (overrides developmental stage defaults when non-default)
@@ -126,7 +122,7 @@ Reflect on one resolved hypothesis with full ABC chain analysis, pattern extract
 belief updates, and knowledge reconciliation. Handles horizon gating (micro → error,
 session → lightweight path, short/long → full pipeline).
 
-invoke /reflect-hypothesis with: hypothesis-id, retrieval_context from Step 0
+invoke /reflect-on-outcome Mode: Hypothesis with: hypothesis-id, retrieval_context from Step 0
 # Sub-skill handles Steps 0.5-9: horizon gate, load, ABC chain, differentiated extraction,
 # contrastive extraction, experience archival, encoding score, textual reflection,
 # domain-specific, violation, source tracking, journal, accuracy, pattern signatures,
@@ -141,7 +137,7 @@ pattern). Handles pattern signatures and contradiction detection that Phase 6.5
 that need follow-up. Lightweight — no ABC chains, no horizon gating.
 
 ```
-invoke /reflect-execution with: goal, result, outcome_class, retrieval_context from Step 0
+invoke /reflect-on-outcome Mode: Execution with: goal, result, outcome_class, retrieval_context from Step 0
 # Sub-skill handles Steps 0.5-5: notability gate, pattern signatures, contradiction
 # detection, investigation goal creation, experience archival, journal entry.
 ```
@@ -151,7 +147,7 @@ invoke /reflect-execution with: goal, result, outcome_class, retrieval_context f
 Batch-process micro-hypotheses from working memory (session-end).
 Computes batch stats, promotes surprises, updates aggregate pipeline stats.
 
-invoke /reflect-batch-micro with: retrieval_context from Step 0
+invoke /reflect-on-outcome Mode: Batch Micro with: retrieval_context from Step 0
 # Sub-skill handles Steps 1-7: load micros, batch stats, surprise promotion,
 # aggregate stats, journal, actionable work check, return batch result.
 
@@ -159,7 +155,7 @@ invoke /reflect-batch-micro with: retrieval_context from Step 0
 
 Mine all resolved hypotheses for reusable strategies and Level 2 strategic self-model.
 
-invoke /reflect-extract-patterns with: retrieval_context from Step 0
+invoke /reflect-on-self Mode: Extract Patterns with: retrieval_context from Step 0
 # Sub-skill handles Steps 1-5: load resolved, Level 1 pattern synthesis,
 # strategy extraction, Level 2 strategic self-model, update knowledge base.
 
@@ -167,7 +163,7 @@ invoke /reflect-extract-patterns with: retrieval_context from Step 0
 
 Analyze confidence calibration across all hypotheses.
 
-invoke /reflect-calibration with: retrieval_context from Step 0
+invoke /reflect-on-self Mode: Calibration with: retrieval_context from Step 0
 # Sub-skill handles Steps 1-4: bin by confidence, calculate accuracy,
 # self-consistency check, update calibration data.
 
@@ -176,7 +172,7 @@ invoke /reflect-calibration with: retrieval_context from Step 0
 Retire stale/low-utilization strategies, guardrails, reasoning bank entries,
 and pattern signatures. Includes active forgetting reference formulas.
 
-invoke /reflect-curate-memory with: retrieval_context from Step 0, scope (if provided)
+invoke /reflect-maintain Mode: Curate Memory with: retrieval_context from Step 0, scope (if provided)
 # Sub-skill handles Steps 1-4: gather candidates, evaluate (agent judgment),
 # execute retirements, journal. Plus active forgetting: decay model,
 # retrieval strengthening, interference detection, reconsolidation.
@@ -187,7 +183,7 @@ Detect stuck goals whose evidence has converged. Cross-reference pending/blocked
 goals against experience archive and knowledge tree. Complete, skip, or re-scope
 goals that can be resolved from existing data.
 
-invoke /reflect-curate-aspirations with: retrieval_context from Step 0, scope (if provided)
+invoke /reflect-maintain Mode: Curate Aspirations with: retrieval_context from Step 0, scope (if provided)
 # Sub-skill handles Steps 1-4: gather candidates, evidence cross-reference,
 # execute decisions, journal.
 
@@ -195,16 +191,19 @@ invoke /reflect-curate-aspirations with: retrieval_context from Step 0, scope (i
 
 Run all reflection modes in sequence. This is the comprehensive learning pass.
 
-1. Bash: wm-read.sh micro_hypotheses --json → if non-empty, invoke /reflect-batch-micro
-1.5. invoke /reflect-execution for goals completed this session with notable outcomes
+# Phase A: Outcome Reflection
+1. Bash: wm-read.sh micro_hypotheses --json → if non-empty, invoke /reflect-on-outcome Mode: Batch Micro
+1.5. invoke /reflect-on-outcome Mode: Execution for goals completed this session with notable outcomes
      (only if not already reflected via --on-hypothesis pathway — check goal IDs)
-1.75. invoke /reflect-curate-aspirations (groom stuck goals before reflecting on hypotheses)
+1.75. invoke /reflect-maintain Mode: Curate Aspirations (groom stuck goals before reflecting on hypotheses)
 2. Bash: pipeline-read.sh --unreflected → get unreflected resolved hypotheses
 3. For each unreflected hypothesis:
-   invoke /reflect-hypothesis with: hypothesis-id
-4. invoke /reflect-extract-patterns
-5. invoke /reflect-calibration
-5.5. invoke /reflect-curate-memory (light sweep scoped to categories touched this session)
+   invoke /reflect-on-outcome Mode: Hypothesis with: hypothesis-id
+# Phase B: Self-Model Reflection
+4. invoke /reflect-on-self Mode: Extract Patterns
+5. invoke /reflect-on-self Mode: Calibration
+# Phase C: Maintenance
+5.5. invoke /reflect-maintain Mode: Curate Memory (light sweep scoped to categories touched this session)
 5.55. **Weakness Analysis (AutoContext-inspired)**:
      # Aggregates signals from pattern signatures, guardrails, experience archive,
      # and backpressure rollbacks into a coherent weakness report. HIGH-severity
@@ -301,7 +300,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      - Did it add an encoding queue item?
      - Did it change a belief or knowledge node?
      Compute: reflection_roi = artifacts_produced / modes_invoked
-     Append to meta/reflection-strategy.yaml roi_history:
+     Append via meta-yaml.py append to reflection-strategy.yaml roi_history:
        {date: today, modes_invoked: N, artifacts_produced: N, roi: N, session: N}
 
 5.8. **Reflection Quality Consolidation (MR-Search Priority 2)**:
@@ -316,6 +315,33 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      Bash: meta-set.sh reflection-strategy.yaml reflection_effectiveness_by_type '<updated_json>'
      This closes the meta-learning loop: reflection quality → depth allocation → better reflections
 6. invoke /replay --sharp-wave --selective (if violations detected)
+7. **Tree Health Lint (wiki integrity check)**:
+     # Periodically verify the knowledge tree's structural and content health.
+     # Inspired by Karpathy's wiki "health checks": find inconsistencies,
+     # flag stale data, discover missing cross-references.
+     Bash: tree-read.sh --stats
+     
+     # Staleness check: heavily-used nodes that haven't been updated recently
+     FOR EACH node where retrieval_count > 10 AND last_updated older than 5 sessions:
+         echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "sessions_since_update": <M>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
+         Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {sessions_ago} sessions ago)"
+     
+     # Cross-reference discovery: nodes that share entities but aren't linked
+     Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index
+     IF entity_index is non-empty:
+         FOR EACH entity appearing in 2+ nodes:
+             Check if those nodes have cross-references to each other in their .md files
+             IF no cross-reference exists:
+                 Add "See also: [{other_node}]({other_node.file})" to both nodes
+                 Log: "▸ Tree lint: cross-reference added between {node_a.key} and {node_b.key} (shared entity: {entity})"
+     
+     # Width check: interior nodes exceeding K_max children
+     Read core/config/tree.yaml for K_max
+     FOR EACH interior node where child_count > K_max * 2:
+         Log: "▸ Tree lint: {node.key} has {child_count} children (K_max={K_max}) — consider reorganization"
+         bash core/scripts/tree-update.sh --set <node.key> growth_state ready_to_decompose
+     
+     Report: "Tree lint: {stale_count} stale nodes flagged, {xref_count} cross-references added, {wide_count} wide nodes flagged"
 
 ---
 
@@ -327,7 +353,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 - **Calls `/replay`**: During full-cycle mode (Step 2.5) for hippocampal replay
 - **Calls `/research-topic`**: When a knowledge gap is identified
 - **Calls `/aspirations add`**: When a new aspiration emerges from patterns
-- **Calls `/reflect-tree-update`**: Shared tree update protocol used by reflect-hypothesis and reflect-extract-patterns
+- **Calls `/reflect-tree-update`**: Shared tree update protocol used by reflect-on-outcome (Hypothesis mode) and reflect-on-self (Patterns mode)
 - **Calls `/tree maintain`**: When new categories detected or article counts cross thresholds (Step 8.5)
 - **Updates discovery filters**: Adds new trap types to discovery lessons-learned
 - **Updates evaluation calibration**: Adjusts evaluation weights based on calibration data
@@ -343,5 +369,9 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 retention_score = base_decay^days_since_last_access × (1 + retrieval_count × retrieval_boost)
 
 Default parameters: base_decay=0.95, retrieval_boost=0.15.
-See /reflect-curate-memory for full active forgetting procedures (interference detection,
+See /reflect-maintain (Memory Curation mode) for full active forgetting procedures (interference detection,
 reconsolidation windows, protection rules).
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.

@@ -40,6 +40,7 @@ DEFAULT_FIELDS = {
     "hypothesis_id": None,
     "tree_nodes_related": [],
     "verbatim_anchors": [],
+    "reasoning_chain": [],             # Decision trajectory from execution diary
     "retrieval_stats": {
         "retrieval_count": 0,
         "times_useful": 0,

@@ -52,6 +52,12 @@ node_modules/
 .latest-session-id
 # Hook coordination files (one-shot breadcrumbs, consumed after reading)
 .stop-hook-stdin.json
-.compact-agent
+# Stop hook audit log (persistent, diagnoses why sessions die)
+.stop-hook-log
 # Crash recovery markers (written by StopFailure hook, consumed by /boot)
 */session/crash-marker
+
+# Safety net: world/ and meta/ should never exist at repo root
+# (they live at external paths configured in local-paths.conf)
+/world/
+/meta/

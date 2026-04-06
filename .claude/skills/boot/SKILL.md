@@ -13,7 +13,7 @@ execution_history:
   last_invocation: null
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
-conventions: [aspirations, pipeline, session-state, handoff-working-memory, secrets, reasoning-guardrails, tree-retrieval, pattern-signatures, journal, curriculum]
+conventions: [aspirations, pipeline, session-state, handoff-working-memory, secrets, reasoning-guardrails, tree-retrieval, pattern-signatures, journal, curriculum, coordination]
 minimum_mode: autonomous
 ---
 
@@ -47,7 +47,6 @@ IF file exists <agent>/session/crash-marker:
   Log: "⚠ Previous session ended abnormally — context exhaustion detected"
   Log the crash-marker content for diagnostics
   Delete <agent>/session/crash-marker
-  Bash: session-counter-clear.sh   (may be stale from the crashed session)
 ```
 
 ## Phase -2: State Initialization (First Boot)
@@ -72,7 +71,7 @@ Remove non-framework files from `<agent>/session/` left by previous goal executi
 
 ```
 WHITELISTED = [
-  "agent-state", "agent-mode", "persona-active", "loop-active", "stop-loop", "stop-block-count",
+  "agent-state", "agent-mode", "persona-active", "loop-active", "stop-loop",
   "working-memory.yaml", "handoff.yaml",
   "pending-questions.yaml", "overflow-queue.yaml",
   "last-report-timestamp",
@@ -170,7 +169,7 @@ Check for `<agent>/session/handoff.yaml` to detect auto-continuation from a prev
 IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
     1. Read handoff.yaml for previous session state
     1b. Read <agent>/self.md (Self must be in working context even during fast auto-resume)
-    1b2. Read world/program.md (The Program must be in working context even during fast auto-resume)
+    1b2. Bash: world-cat.sh program.md  # The Program must be in working context even during fast auto-resume
     1c. User Goals Resume:
         IF handoff.user_goals_pending exists and count > 0:
             Output: "USER GOALS: {count} items waiting for your input"
@@ -218,9 +217,14 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
             echo '<carried_debts_json>' | wm-set.sh knowledge_debt
             Promote any debts with sessions_deferred >= 2 to priority: HIGH
             Report: "KNOWLEDGE DEBTS CARRIED: {N} pending ({H} HIGH)"
+    4c. Critical Path Resume:
+        IF handoff.critical_path exists and critical_path.primary_blocker is not null:
+            Output: "CRITICAL PATH: {primary_blocker.title} [{primary_blocker.goal_id}] — blocks {downstream_count} goals ({blocked_fraction} of active work)"
+            Output: "  Cause: {primary_blocker.cause}"
+            IF top_bottlenecks length > 1:
+                Output: "  Also blocking: {b.title} ({b.downstream_count} downstream)" for each additional bottleneck
     5. Delete handoff.yaml (consumed)
     6. Bash: `session-signal-clear.sh loop-active` (cleanup from previous cycle)
-    6b. Bash: `session-counter-clear.sh` (stale counter cleanup)
     6d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     7. Output abbreviated status:
        "## Auto-Continuation from Session {N}
@@ -228,6 +232,7 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
        Previous: {session_summary.goals_completed} goals completed.
        Key outcomes: {session_summary.key_outcomes}.
        Curriculum: {curriculum_stage_name} ({gates_passed}/{gates_total} gates).
+       Last consolidation: {consolidation_meta.triage_tier} ({consolidation_meta.consecutive_lean_sessions} consecutive lean).  ← omit line if consolidation_meta absent
        First action: {first_action.goal_id} ({first_action.reason}).
        Meta: imp@k {last_session_imp_k} ({trend}) | {active_variant or 'baseline'} | {meta_changes} changes.
        Resuming aspirations loop."
@@ -242,7 +247,6 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
 
 IF <agent>/session/handoff.yaml NOT EXISTS (user-initiated):
     1. Bash: `session-signal-clear.sh loop-active` (cleanup from crashed session)
-    1b. Bash: `session-counter-clear.sh` (stale counter cleanup)
     1d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     2. Proceed with full boot (Steps 1.5 through 12)
 ```
@@ -262,6 +266,31 @@ This will:
 
 Store resolve_result for use in report steps below.
 If no active hypotheses exist, this is a no-op.
+```
+
+## Step 1.7: Team State (Situational Awareness)
+
+Read the shared team state for instant cross-agent context:
+
+```
+Bash: team-state-read.sh --json
+IF team-state.yaml exists (non-empty output):
+    Parse strategic_focus, recent_completions, active_blockers, agent_status
+
+    Output:
+    "### Team State
+    **Strategic Focus**: {strategic_focus.primary} ({strategic_focus.set_by})
+    **Recent**: {last 3 from recent_completions — goal_id: title (completed_by)}
+    **Blockers**: {active_blockers count} active"
+
+    # Acknowledge strategic focus if not already acknowledged by this agent
+    IF AGENT_NAME not in strategic_focus.acknowledged_by:
+        Bash: team-state-update.sh --field strategic_focus.acknowledged_by \
+          --operation append --value '"<AGENT_NAME>"'
+ELSE:
+    Output: "Team state: not initialized"
+    # Initialize on first boot
+    Bash: team-state-init.sh
 ```
 
 ## Step 2: Gather All State
@@ -286,11 +315,11 @@ world/knowledge/patterns/violations.md       → recent violations (if exists)
 <agent>/experiential-index.yaml               → experiential memory cross-references
 Bash: journal-read.sh --meta                → session-level totals for episodic retrieval
 Bash: journal-read.sh --latest              → context from last session
-world/knowledge/tree/_tree.yaml              → identify all depth-1 nodes
+Bash: world-cat.sh knowledge/tree/_tree.yaml → identify all depth-1 nodes
 For each depth-1 node: read its .md file    → capability level summaries
 Bash: curriculum-status.sh                  → curriculum stage, unlocks, gates
-Read meta/meta.yaml                             → meta-strategy state (imp@k, evaluations)
-Read meta/improvement-velocity.yaml             → last 5 entries for trend
+Bash: meta-read.sh meta.yaml                    → meta-strategy state (imp@k, evaluations)
+Bash: meta-read.sh improvement-velocity.yaml    → last 5 entries for trend
 Bash: meta-experiment.sh list --active          → active A/B experiments
 ```
 
@@ -413,7 +442,9 @@ Monitor knowledge freshness, contradiction, and declining reliability:
 ```
 ### Context Health
 
-Read world/knowledge/patterns/_index.yaml, world/knowledge/tree/_tree.yaml, world/sources.yaml
+Bash: world-cat.sh knowledge/patterns/_index.yaml
+Bash: world-cat.sh knowledge/tree/_tree.yaml
+Bash: world-cat.sh sources.yaml
 
 1. STALE KNOWLEDGE CHECK:
    For each node article at any depth with last_updated > 14 days:
@@ -690,7 +721,7 @@ Boot creates the session's journal .md entry; the aspirations loop creates/updat
 
 Check `core/config/evolution-triggers.yaml` performance-based triggers (accuracy drop, consecutive losses, pattern divergence, capability unlock, stale strategy).
 Read aspiration state: Bash: `aspirations-read.sh --active`
-Read evolution history: `meta/evolution-log.jsonl`
+Read evolution history: Bash: meta-cat.sh evolution-log.jsonl
 1. Review accuracy trends
 2. Review meta-memory changes since last evolution
 3. Propose aspiration changes

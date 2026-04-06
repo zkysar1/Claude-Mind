@@ -39,7 +39,15 @@ Bash: `session-state-get.sh` → read output:
 2. Read `<agent>/profile.yaml` → use persona settings (tone, verbosity)
 3. **MANDATORY**: Execute knowledge search (Step 4) — do NOT skip this step
 4. Surface 1-2 pending questions or user goals (Step 4b)
-5. Resume aspirations loop after responding
+5. Process directives (Steps 5-7.5) if applicable
+6. **NEVER ask the user a question and wait for a response.** If you need user
+   input, write a pending question to `<agent>/session/pending-questions.yaml`
+   (with `default_action` describing what you'll do autonomously) or create a
+   goal with `participants: [user]`. Then immediately continue to step 7.
+7. **Re-enter the loop**: `Skill('aspirations') with args='loop'`
+   This is NOT optional. This Skill() call MUST be your FINAL action.
+   NEVER produce text-only output after steps 4-6 without calling this.
+   NEVER say "should I continue?" — just continue.
 
 ## Step 3b: IDLE State Response
 
@@ -126,10 +134,11 @@ IF any entry has `type: priority-review` AND `status: pending`:
 - Mention relevant ones in context
 - Occasionally: "There are {N} items waiting for your input — ask me about them anytime."
 
-### Mode Gate (Steps 5-7.5)
+### Mode Gate (Directive & Learning Steps)
 Bash: `session-mode-get.sh`
 - If mode is `reader`: SKIP Steps 5, 6, 7, 7.5 entirely (read-only mode, no directive processing or learning). RETURN after Step 4b.
 - If mode is `assistant` or `autonomous`: PROCEED with Steps 5-7.5.
+- **RUNNING state only**: After ALL steps complete (including 7.5), execute Step 3a.7 (loop re-entry). This is the LAST thing that happens — always.
 
 ## Step 5: Directive Detection & Routing
 
@@ -275,7 +284,7 @@ evaluate whether this interaction warrants persistent learning artifacts.
 ### Notability Assessment
 
 Quick assessment of the user's message — same pattern as Step 7's mental pass.
-The agent uses its judgment to answer three questions:
+The agent uses its judgment to answer four questions:
 
 ```
 1. Did the user share DOMAIN KNOWLEDGE worth preserving?
@@ -293,6 +302,12 @@ The agent uses its judgment to answer three questions:
    happens, predictions about what will happen — something the agent
    could later confirm or correct)
    → If yes: note as HYPOTHESIS
+
+4. Did the user share an OPERATIONAL LESSON or warning?
+   (Error patterns, environment quirks, "gotcha" knowledge, debugging tips,
+   "always do X when Y", "watch out for Z" — procedural friction knowledge
+   that causes repeated pain across sessions)
+   → If yes: note as OPS_GOTCHA
 
 IF none apply: RETURN — most interactions are simple Q&A. No script calls needed.
 ```
@@ -350,9 +365,55 @@ from "how does X work?" (question).
    }
    ```
 
+**From OPS_GOTCHA → reasoning bank entry (and optionally guardrail):**
+
+Operational gotchas are procedural friction knowledge that causes repeated pain
+across sessions (error patterns, environment quirks, debugging lessons). These
+get MANDATORY encoding — the whole point is to stop re-discovering them.
+
+1. Determine relevant category from conversation topic
+2. Dedup: `Bash: reasoning-bank-read.sh --category {category}` — scan for semantic overlap
+3. If existing entry covers it: `Bash: reasoning-bank-increment.sh {entry.id} utilization.times_helpful` → done
+4. Otherwise create:
+   ```
+   echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
+   ```
+   JSON structure (id and created are required — determine next rb-NNN from dedup read):
+   ```json
+   {
+       "id": "rb-{NNN}",
+       "title": "Gotcha: {brief title}",
+       "type": "user_provided",
+       "category": "{relevant category}",
+       "content": "{user's operational lesson with context and resolution}",
+       "created": "{today}",
+       "when_to_use": {
+           "conditions": ["{error pattern, symptom, or trigger scenario}"],
+           "category": "{category}"
+       },
+       "tags": ["user-provided", "ops-gotcha"]
+   }
+   ```
+5. IF the gotcha is prescriptive ("always do X" / "never do Y") → ALSO create a guardrail:
+   ```
+   echo '<JSON>' | bash core/scripts/guardrails-add.sh
+   ```
+   ```json
+   {
+       "id": "guard-{NNN}",
+       "rule": "{the prescriptive rule from the user's gotcha}",
+       "category": "{relevant category}",
+       "trigger_condition": "{when this gotcha applies}",
+       "source": "user-interaction",
+       "created": "{today}",
+       "tags": ["ops-gotcha"]
+   }
+   ```
+
 Not every insight needs a reasoning bank entry and not every piece of feedback needs
 a guardrail. Use judgment — create artifacts for things that are **reusable across
-future interactions**, not one-off clarifications.
+future interactions**, not one-off clarifications. OPS_GOTCHA is the exception:
+always encode these — the user shared them specifically because they keep getting lost.
 
 ### Sub-step 7.5b: Hypothesis Formation
 

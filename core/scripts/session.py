@@ -30,7 +30,7 @@ SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
 
 VALID_STATES = {"RUNNING", "IDLE"}
 VALID_PERSONA = {"true", "false"}
-VALID_SIGNALS = {"loop-active", "stop-loop"}
+VALID_SIGNALS = {"loop-active", "stop-loop", "stop-requested"}
 VALID_MODES = {"reader", "assistant", "autonomous"}
 DEFAULT_MODE = "reader"
 
@@ -156,19 +156,18 @@ def cmd_signal_set(args):
         print(f"ERROR: Invalid signal name '{name}'. Must be one of: {', '.join(sorted(VALID_SIGNALS))}", file=sys.stderr)
         sys.exit(1)
 
-    # Guard: stop-loop requires non-RUNNING state OR recovery counter >= 4 (/recover context)
+
+    # Guard: stop-loop requires non-RUNNING state.
+    # /stop's deferred stop handler sets IDLE first, then sets stop-loop.
+    # This prevents the LLM from accidentally setting stop-loop while the loop is active.
+    # NOTE: stop-requested has NO guard — it must be settable while RUNNING.
+    # The graceful stop mechanism depends on this: /stop sets stop-requested while
+    # RUNNING, the stop hook blocks, the loop re-enters, Phase -1.4 handles the stop.
     if name == "stop-loop":
         state = read_file(SESSION_DIR / "agent-state")
         if state == "RUNNING":
-            counter_val = read_file(SESSION_DIR / COUNTER_FILE)
-            counter = 0 if counter_val is None else int(counter_val)
-            if counter < 4:  # 4 = Tier 4 where /recover runs; do not lower
-                print(
-                    f"REJECTED: Cannot set stop-loop while RUNNING (recovery tier {counter}/3). "
-                    f"Follow the stop hook instruction: invoke /aspirations loop to re-enter.",
-                    file=sys.stderr
-                )
-                sys.exit(1)
+            print("REJECTED: Cannot set stop-loop while RUNNING. Use /stop to stop the agent.", file=sys.stderr)
+            sys.exit(1)
 
     ensure_session_dir()
     (SESSION_DIR / name).touch()

@@ -25,7 +25,7 @@ minimum_mode: autonomous
 
 Meta-skill that creates new skills from recurring capability gaps tracked in
 `meta/skill-gaps.yaml`. Forged skill SKILL.md files go in `.claude/skills/` for
-Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not `_tree.yaml`).
+Claude Code discovery. Metadata is tracked in `world/forged-skills.yaml` (not `_tree.yaml`).
 
 ## Sub-commands
 
@@ -35,10 +35,10 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
 
 ### `/forge-skill list` — Show gaps and forged skills
 
-1. Read `meta/skill-gaps.yaml`
+1. Bash: meta-read.sh skill-gaps.yaml
 2. Display table of all gaps:
    | ID | Name | Encounters | Value | Status | Forge-eligible? |
-3. Read `<agent>/forged-skills.yaml` → list forged skills
+3. Bash: world-cat.sh forged-skills.yaml  # list forged skills
 4. Display list of previously forged skills with creation dates
 5. Show forge eligibility summary (how many gaps meet threshold)
 
@@ -51,7 +51,7 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
 - `estimated_value >= medium`
 - No existing skill covers the same procedure
 - System developmental gate (type-dependent):
-  - Read gap `type` from `meta/skill-gaps.yaml` (default: `analytical`)
+  - Read gap `type` from skill-gaps.yaml via meta-read.sh (default: `analytical`)
   - Read `forge_gate` threshold from `core/config/skill-gaps.yaml` → `gap_types[type]`
   - `utility` gaps require CALIBRATE+ (confidence >= 0.30)
   - `analytical` gaps require EXPLOIT+ (confidence >= 0.60)
@@ -76,7 +76,7 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
    - Map file creation to Write (within <agent>/ or .claude/skills/ for forged skills)
    - **Companion scripts**: If the procedure involves restricted or deterministic
      data access (SSH, API calls with read-only enforcement), create companion
-     shell scripts in `<agent>/scripts/`:
+     shell scripts in `world/scripts/` (resolved as `$WORLD_DIR/scripts/`):
      - Scripts enforce access boundaries the LLM cannot bypass (e.g., read-only
        SSH commands, download-only SCP, specific API scopes)
      - Scripts use `core/scripts/env-read.sh` for all credentials — no hardcoded secrets
@@ -84,10 +84,10 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
      - The forged SKILL.md MUST reference companion scripts for restricted
        operations and MUST say "MUST use companion scripts, never raw [tool]"
      - Script naming: `{resource}-{verb}.sh` (e.g., `data-list.sh`, `data-download.sh`)
-     - Scripts go in `<agent>/scripts/` — a new directory for agent-forged scripts.
-       Lives under `<agent>/` so it's writable and removed when the agent directory
-       is deleted. The forge process creates the directory: `mkdir -p <agent>/scripts/`
-     - Mark scripts executable: `chmod +x <agent>/scripts/*.sh`
+     - Scripts go in `world/scripts/` — shared across all agents in the domain.
+       The forge process creates the directory: `mkdir -p "$WORLD_DIR/scripts/"`
+     - PID files live alongside scripts in `world/scripts/` (single-writer, `kill -0` liveness checks)
+     - Mark scripts executable: `chmod +x "$WORLD_DIR/scripts/"*.sh`
 
 3. **Create SKILL.md** — Write new skill file:
    ```
@@ -97,15 +97,15 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
    - YAML front matter: name, description, triggers (internal only), parameters, tools_used
    - `user_invocable: false` (sub-skills are called by parents, not users)
    - `tools_used: [Bash, WebFetch, ...]` — which Claude Code tools this skill requires
-   - `companion_scripts: [<agent>/scripts/xxx.sh, ...]` — if companion scripts exist
+   - `companion_scripts: [world/scripts/xxx.sh, ...]` — if companion scripts exist
    - If companion scripts exist: add "## Restricted Operations" section mandating
-     their use. Example: "MUST use `<agent>/scripts/data-list.sh`, never raw access"
+     their use. Example: "MUST use `world/scripts/data-list.sh`, never raw access"
    - Step-by-step procedure extracted from encounters
    - Input/output contract with parent skill
    - Error handling section
 
-4. **Register in Forged Skills** (`<agent>/forged-skills.yaml` + `.gitignore`):
-   - Add entry under `skills:` with `parent`, `type`, `forged_date`, `gap_ref`, `triggers`
+4. **Register in Forged Skills** (`world/forged-skills.yaml` + `.gitignore`):
+   - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
    - Add `.claude/skills/{new-skill-name}/` to `.gitignore` under the forged skills section
    - Do NOT touch `_tree.yaml` or `_triggers.yaml` — those are static framework files
 
@@ -120,30 +120,7 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
    ```
    IF board post fails: log warning, do NOT abort — board is non-critical.
 
-7. **Register in World Skill Catalog** (`world/skill-catalog.yaml`):
-   - IF file does not exist: create with header:
-     ```yaml
-     # World Skill Catalog — shared registry of forged skills across all agents
-     # Append-only. Each agent adds entries when forging new skills.
-     skills: []
-     ```
-   - Read file, append entry under `skills:`:
-     ```yaml
-     - name: {skill-name}
-       forged_by: {agent-name}
-       forged_date: "{today}"
-       type: {type}
-       parent: {parent-skill}
-       gap_ref: {gap-id}
-       skill_path: .claude/skills/{skill-name}/SKILL.md
-       companion_scripts_private: true
-       description: "{one-line from forged SKILL.md front matter}"
-     ```
-   - `companion_scripts_private: true` signals companion scripts live in `<agent>/scripts/`
-     (agent-private). Another agent adopting this skill must create its own scripts.
-   - IF write fails: log warning, do NOT abort — catalog is non-critical.
-
-8. **Notify User** — Send dedicated notification about the newly forged skill:
+7. **Notify User** — Send dedicated notification about the newly forged skill:
    - Category: `info`
    - Subject: `"New Skill Forged: {skill-name}"`
    - Message body:
@@ -158,10 +135,10 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
 
      A validation goal will be created to test this skill over 3 invocations.
      ```
-   - Invoke `/notify-user` with the above
-   - IF notification fails: continue (notify-user has its own fallback cascade)
+   - Notify the user with the above (via forged notification skill if available, else pending-questions)
+   - IF notification fails: continue (use pending-questions as fallback)
 
-9. **Create Test Goal** — Add a goal to the relevant aspiration:
+8. **Create Test Goal** — Add a goal to the relevant aspiration:
    - Find relevant aspiration: Bash: `load-aspirations-compact.sh` → IF path returned: Read it
      (compact data has IDs, titles, categories — no descriptions/verification)
    - Read the target aspiration: Bash: `aspirations-read.sh --id <asp-id>`
@@ -170,22 +147,23 @@ Claude Code discovery. Metadata is tracked in `<agent>/forged-skills.yaml` (not 
    - desiredEndState: "Skill invoked 3 times successfully by parent"
    - Priority: MEDIUM
    - Pipe updated aspiration JSON: `echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh <asp-id>`
-   - (User notification already sent in Step 8 — do not send a second notification here.)
+   - (User notification already sent in Step 7 — do not send a second notification here.)
 
-10. **Report** — Summarize what was created, where it lives, and what triggers it.
+9. **Report** — Summarize what was created, where it lives, and what triggers it.
    - If companion scripts were created: list them with their purpose and usage
 
 ### `/forge-skill check` — Audit both trees for coherence
 
 Run structural integrity checks across all system registries:
 
-1. **Forged skills audit** (`<agent>/forged-skills.yaml`):
+1. **Forged skills audit** (`world/forged-skills.yaml`):
    - Every entry has a matching SKILL.md in `.claude/skills/{name}/`
    - Every entry has a matching `.claude/skills/{name}/` line in `.gitignore`
+   - Every entry has a `forged_by` field
    - No orphaned `.claude/skills/` directories missing from the registry
 
 2. **Skill gaps audit** (`meta/skill-gaps.yaml`):
-   - Gaps with `status: forged` have matching entry in `<agent>/forged-skills.yaml`
+   - Gaps with `status: forged` have matching entry in `world/forged-skills.yaml`
    - No gaps exceed `config.max_gaps` (20)
    - Encounter logs respect `config.encounter_log_limit` (5)
 
@@ -196,7 +174,7 @@ Run structural integrity checks across all system registries:
 
 ### `/forge-skill dismiss <gap-id>` — Reject a gap
 
-1. Read `meta/skill-gaps.yaml`
+1. Bash: meta-read.sh skill-gaps.yaml
 2. Set gap `status: dismissed`
 3. Set `dismissed_reason: "manual dismiss via /forge-skill dismiss"`
 4. Set `dismissed_date: {today}`

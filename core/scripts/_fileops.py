@@ -9,7 +9,9 @@ Imported by all write scripts to provide:
 
 import json
 import os
+import random
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,21 +24,29 @@ from _paths import WORLD_DIR, META_DIR
 # ---------------------------------------------------------------------------
 
 def acquire_lock(lock_path, timeout=10):
-    """Acquire a file lock. Breaks stale locks older than 30 seconds."""
+    """Acquire a file lock using atomic create. Breaks stale locks >30s."""
     lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    while lock_path.exists():
-        # Break stale locks (older than 30 seconds)
+    while True:
         try:
-            if time.time() - lock_path.stat().st_mtime > 30:
-                lock_path.unlink(missing_ok=True)
-                break
-        except FileNotFoundError:
-            break  # Lock was released between exists() and stat()
-        if time.time() - start > timeout:
-            raise TimeoutError(f"Could not acquire lock: {lock_path}")
-        time.sleep(0.1)
-    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+            # O_CREAT | O_EXCL is atomic: create-if-absent in one syscall.
+            # Do NOT replace with exists() + write_text() — that has a TOCTOU race.
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode("utf-8"))
+            os.close(fd)
+            return  # Lock acquired
+        except FileExistsError:
+            # Lock file already exists — check if stale
+            try:
+                if time.time() - lock_path.stat().st_mtime > 30:
+                    lock_path.unlink(missing_ok=True)
+                    continue  # Retry immediately after breaking stale lock
+            except FileNotFoundError:
+                continue  # Lock was released between open() and stat()
+            if time.time() - start > timeout:
+                raise TimeoutError(f"Could not acquire lock: {lock_path}")
+            time.sleep(0.1)
 
 
 def release_lock(lock_path):
@@ -166,10 +176,22 @@ def locked_write_jsonl(path, items):
         if base_dir:
             save_history(path, base_dir, agent)
         tmp = Path(str(path) + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            for item in items:
-                f.write(json.dumps(item, ensure_ascii=True) + "\n")
-        os.replace(str(tmp), str(path))
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    for item in items:
+                        f.write(json.dumps(item, ensure_ascii=True) + "\n")
+                os.replace(str(tmp), str(path))
+                break
+            except (PermissionError, OSError) as e:
+                if attempt == max_retries - 1:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                wait = 0.05 * (2 ** attempt) + random.uniform(0, 0.1)
+                print(f"locked_write_jsonl retry {attempt+1}/{max_retries}: {e} "
+                      f"(waiting {wait:.2f}s)", file=sys.stderr)
+                time.sleep(wait)
         if base_dir:
             append_changelog(base_dir, agent, path, "edit",
                              lines_changed=len(items))
@@ -178,7 +200,10 @@ def locked_write_jsonl(path, items):
 
 
 def locked_append_jsonl(path, item):
-    """Lock → history → JSONL append → changelog → unlock."""
+    """Lock → history → JSONL append → changelog → unlock.
+
+    No retry loop here — retrying an append risks writing duplicate records.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     base_dir = resolve_base_dir(path)
@@ -209,10 +234,22 @@ def locked_write_json(path, data):
         if base_dir:
             save_history(path, base_dir, agent)
         tmp = Path(str(path) + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=True)
-            f.write("\n")
-        os.replace(str(tmp), str(path))
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=True)
+                    f.write("\n")
+                os.replace(str(tmp), str(path))
+                break
+            except (PermissionError, OSError) as e:
+                if attempt == max_retries - 1:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                wait = 0.05 * (2 ** attempt) + random.uniform(0, 0.1)
+                print(f"locked_write_json retry {attempt+1}/{max_retries}: {e} "
+                      f"(waiting {wait:.2f}s)", file=sys.stderr)
+                time.sleep(wait)
         if base_dir:
             append_changelog(base_dir, agent, path, "edit")
     finally:
@@ -232,10 +269,22 @@ def locked_write_yaml(path, data):
         if base_dir:
             save_history(path, base_dir, agent)
         tmp = path.with_suffix(".yaml.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, allow_unicode=True,
-                      sort_keys=False)
-        os.replace(str(tmp), str(path))
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    yaml.dump(data, f, default_flow_style=False, allow_unicode=True,
+                              sort_keys=False)
+                os.replace(str(tmp), str(path))
+                break
+            except (PermissionError, OSError) as e:
+                if attempt == max_retries - 1:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                wait = 0.05 * (2 ** attempt) + random.uniform(0, 0.1)
+                print(f"locked_write_yaml retry {attempt+1}/{max_retries}: {e} "
+                      f"(waiting {wait:.2f}s)", file=sys.stderr)
+                time.sleep(wait)
         if base_dir:
             append_changelog(base_dir, agent, path, "edit")
     finally:

@@ -91,9 +91,24 @@ invoke CREATE_BLOCKER directly (no email check, no inline fix — problem is at 
 **CREATE_BLOCKER protocol** (single source of truth, invoked by 4.0, 4.1e, and 0.5a):
 Dedup existing blocker → create unblocking goal (HIGH) → create blocker entry → cascade-block same-skill goals → alert user → write working memory → journal.
 
+## Proactive Escalation Protocol
+
+CREATE_BLOCKER alerts the user once at blocker creation. The proactive escalation protocol
+re-notifies the user when blocks persist, via three integration points:
+
+| Point | Location | Trigger | Cooldown |
+|-------|----------|---------|----------|
+| Phase 0.5b.1 | `aspirations-precheck/SKILL.md` | Blocker active > `blocker_age_hours` | Per-blocker, same threshold |
+| Step B7.1 | `aspirations/SKILL.md` | All self-remediation exhausted (B0-B6 failed) | Per `_all_blocked` synthetic ID |
+| Phase 5.5 | `aspirations/SKILL.md` | Circuit breaker fires (3+ consecutive failures) | Natural (counter resets) |
+
+Each point uses "Notify the user" which resolves via forged-skill-resolution to a notification skill if one exists.
+Caller-side spam prevention via `proactive_escalation_log` WM slot (see `handoff-working-memory.md`).
+Config: `core/config/aspirations.yaml` → `proactive_escalation` section (tunable by evolution engine).
+
 ## Reference
 Full protocol: Phase 4.0 + Phase 4.1 + CREATE_BLOCKER in `.claude/skills/aspirations-execute/SKILL.md`
-Broad sweep: Phase 0.5a + blocker resolution: Phase 0.5b in `.claude/skills/aspirations/SKILL.md`
+Broad sweep: Phase 0.5a + blocker resolution: Phase 0.5b in `.claude/skills/aspirations-precheck/SKILL.md`
 Script: error check script configured in `<agent>/infra-health.yaml` `error_check` section
 
 ---
@@ -109,7 +124,7 @@ error_check:
 ```
 
 Fresh agents start with `error_check: null` (no alert checking configured).
-Domain-specific scripts (e.g., email-based, webhook-based) are placed in `<agent>/scripts/`.
+Domain-specific scripts (e.g., email-based, webhook-based) are placed in `world/scripts/`.
 
 ---
 

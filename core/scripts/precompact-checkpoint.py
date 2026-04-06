@@ -80,13 +80,21 @@ def main():
         "encoding_queue": wm.get("encoding_queue", []),
         "prior_encoding_items": prior_encoding if compact_count > 1 else [],
         "last_goal_category": wm.get("last_goal_category", ""),
-        # Slots that may be lost during compaction
+        # --- Full WM snapshot (captures ALL slots including dynamic ones) ---
+        "all_slots": slots,
+        "slot_meta": wm.get("slot_meta", {}),
+        # Top-level WM keys that carry session state
+        "goals_completed_this_session": wm.get("goals_completed_this_session", []),
+        "aspiration_touched_last": wm.get("aspiration_touched_last", ""),
+        # --- Legacy keys (backward compat with existing postcompact-restore) ---
         "active_context": slots.get("active_context"),
         "micro_hypotheses": slots.get("micro_hypotheses", []),
         "knowledge_debt": slots.get("knowledge_debt", []),
         "known_blockers": slots.get("known_blockers", []),
         # Retrieval manifest — survives compaction for Phase 4.26 utilization feedback
         "retrieval_manifest": retrieval_manifest,
+        # Blocked-sleep timer — survives compaction for Phase -0.5e recovery
+        "blocked_sleep_until": slots.get("blocked_sleep_until"),
         # Pending background agents — count only (file persists on disk)
         "pending_agents_count": pending_agents_count,
     }
@@ -101,15 +109,10 @@ def main():
 
     eq_count = len(checkpoint.get("encoding_queue") or [])
     prior_count = len(prior_encoding) if compact_count > 1 else 0
-    slot_count = sum(1 for v in [
-        checkpoint["active_context"],
-        checkpoint["micro_hypotheses"],
-        checkpoint["knowledge_debt"],
-        checkpoint["known_blockers"],
-        checkpoint["retrieval_manifest"],
-    ] if v)
+    total_slots = len(slots)
+    non_null_slots = sum(1 for v in slots.values() if v is not None and v != [] and v != {})
     pa_msg = f", {pending_agents_count} agents" if pending_agents_count else ""
-    log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {slot_count} slots, {prior_count} prior{pa_msg}")
+    log(f"saved checkpoint #{compact_count}: {eq_count} encoding, {non_null_slots}/{total_slots} slots, {prior_count} prior{pa_msg}")
 
     # Clear context reads tracker — post-compaction context may not retain file contents
     context_reads_path = AGENT_DIR / "session" / "context-reads.txt"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SessionStart hook — carry forward agent binding across autocompact.
 #
-# 1. Resolves agent via .active-agent-$SID or .compact-agent breadcrumb
+# 1. Resolves agent via .active-agent-$SID or <agent>/session/compact-pending breadcrumb
 # 2. Writes SID to <agent>/session/latest-session-id (+ syncs running-session-id)
 #
 # .latest-session-id is the bridge — written here, read ONLY by /start.
@@ -17,19 +17,29 @@ SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id','
 # /start reads it once to create per-agent session bindings, then everything
 # else uses those per-agent files. The concurrent race window is seconds
 # (between session open and user typing /start) — acceptable.
-echo "$SID" > "$PROJECT_ROOT/.latest-session-id"
+echo "$SID" > "$PROJECT_ROOT/.latest-session-id.tmp" && mv "$PROJECT_ROOT/.latest-session-id.tmp" "$PROJECT_ROOT/.latest-session-id"
 
-# --- Breadcrumb from stop hook (authoritative for autocompact) ---
-# The stop hook resolves the correct agent from .active-agent-$OLD_SID and writes
-# .compact-agent. This is more reliable than carry-forward for concurrent agents.
+# --- Breadcrumb from stop hook (lives in each agent's session dir — no shared files) ---
+# WHY: The stop hook wrote the OLD SID to <agent>/session/compact-pending before blocking.
+# If that OLD SID matches running-session-id, this is the agent that just compacted.
+# We update running-session-id to the NEW SID so the stop hook recognizes us next time.
+# Each agent's breadcrumb is in its own directory — no multi-agent race possible.
 COMPACT_AGENT=""
-if [ -f "$PROJECT_ROOT/.compact-agent" ]; then
-    COMPACT_AGENT=$(cat "$PROJECT_ROOT/.compact-agent" 2>/dev/null | tr -d '\r\n')
-    rm -f "$PROJECT_ROOT/.compact-agent"
-fi
+for _CP in "$PROJECT_ROOT"/*/session/compact-pending; do
+    [ -f "$_CP" ] || continue
+    _SESSION_DIR=$(dirname "$_CP")
+    _OLD_SID=$(cat "$_CP" 2>/dev/null | tr -d '\r\n')
+    _RUNNER_SID=$(cat "$_SESSION_DIR/running-session-id" 2>/dev/null | tr -d '\r\n')
+    if [ -n "$_OLD_SID" ] && [ "$_OLD_SID" = "$_RUNNER_SID" ]; then
+        COMPACT_AGENT=$(basename "$(dirname "$_SESSION_DIR")")
+        rm -f "$_CP"
+        break
+    fi
+done
+unset _CP _SESSION_DIR _OLD_SID _RUNNER_SID
 
 # --- 2. Resolve agent binding for the new SID ---
-# Priority: existing binding > breadcrumb > carry-forward from old SID
+# Priority: existing binding > breadcrumb
 ACTIVE_FILE="$PROJECT_ROOT/.active-agent-$SID"
 RESTORED_AGENT=""
 if [ -f "$ACTIVE_FILE" ] && [ -s "$ACTIVE_FILE" ]; then
@@ -39,9 +49,6 @@ elif [ -n "$COMPACT_AGENT" ] && [ -d "$PROJECT_ROOT/$COMPACT_AGENT" ]; then
     # Breadcrumb: stop hook identified the correct agent for this autocompact
     echo "$COMPACT_AGENT" > "$PROJECT_ROOT/.active-agent-$SID"
     RESTORED_AGENT="$COMPACT_AGENT"
-# OLD_SID carry-forward removed — it depended on .latest-session-id which
-# broke for concurrent sessions. The .compact-agent breadcrumb (above) is
-# the reliable mechanism for autocompact carry-forward.
 fi
 
 # --- 3. Write SID to agent session dir (if agent is active) ---

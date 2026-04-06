@@ -81,7 +81,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 0.5. **Config Parameter Tuning**:
    ```
    Read core/config/ files with modifiable: sections (tree, memory-pipeline, aspirations, skill-gaps, evolution-triggers)
-   Read meta/config-overrides.yaml (current overrides)
+   Bash: meta-read.sh config-overrides.yaml  # current overrides
 
    For each modifiable parameter:
      Assess: Does performance data suggest this parameter should change?
@@ -94,9 +94,9 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 
      If change warranted:
        Validate new_value is within [min, max] bounds from config modifiable section
-       Write override to meta/config-overrides.yaml:
+       Write override via meta-set.sh to config-overrides.yaml:
          {param}: {value: new_value, previous: old_value, changed_date: today}
-       Append to meta/config-changes.yaml:
+       Append via meta-yaml.py append to config-changes.yaml:
          - param: "{param}"
            config_file: "{source config file}"
            old_value: {old}
@@ -118,12 +118,12 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        SKIP to Step 1
 
    # Read current state
-   Read meta/goal-selection-strategy.yaml
-   Read meta/reflection-strategy.yaml
-   Read meta/evolution-strategy.yaml
-   Read meta/encoding-strategy.yaml
-   Read meta/improvement-instructions.md
-   Read meta/improvement-velocity.yaml (last 20 entries)
+   Bash: meta-read.sh goal-selection-strategy.yaml
+   Bash: meta-read.sh reflection-strategy.yaml
+   Bash: meta-read.sh evolution-strategy.yaml
+   Bash: meta-read.sh encoding-strategy.yaml
+   Bash: meta-cat.sh improvement-instructions.md
+   Bash: meta-read.sh improvement-velocity.yaml  # last 20 entries
    Bash: meta-impk.sh compute --window 10 --metric pipeline_accuracy
    Bash: meta-impk.sh compute --window 10 --metric goal_completion_rate
 
@@ -139,7 +139,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # Dead ends will block specific value ranges when proposing changes below
 
    # 3. Credit assignment context — prioritize modifying low-attribution parameters
-   Read meta/credit-assignment.yaml
+   Bash: meta-read.sh credit-assignment.yaml
    # High-attribution parameters should be preserved; low-attribution modified first
 
    # 4. Strategy generation history — what configurations performed best
@@ -158,7 +158,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        Log: "META ALERT: improvement velocity declining — review needed"
        # Diagnose: Which strategy area is underperforming?
        # Cross-reference meta-log signals with velocity segments.
-       Read meta/meta-log.jsonl (last 20 entries)
+       Bash: meta-cat.sh meta-log.jsonl  # review last 20 entries
        Cluster signals by strategy_file to identify problematic area.
 
        # Propose change or A/B experiment
@@ -189,7 +189,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            # Result: adopted (variant wins), reverted (baseline wins), or inconclusive
 
    # Update master meta-state
-   Edit meta/meta.yaml: last_evaluation = today, evaluation_count += 1
+   Bash: meta-set.sh meta.yaml last_evaluation "$(date +%Y-%m-%d)" && meta-set.sh meta.yaml evaluation_count {+1}
    ```
 
 1. Read all state: Bash: load-aspirations-compact.sh → IF path returned: Read it (compact aspirations data), pipeline, knowledge, meta-memory, journal
@@ -235,11 +235,11 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                    Log: "STRATEGIC REDIRECT: {asp.id} — prolonged plateau, recommending archival"
                    Bash: aspirations-complete.sh --source {asp.source} {asp.id}
                invoke /create-aspiration from-self --plan with:
-                   context: "Pivoting from '{asp.title}' after learning plateau. Prior trajectory: {trajectory.summary}. Explore directions NOT yet tried."
+                   context: "Learning plateau in '{asp.title}' after {trajectory.goals_since_inflection} goals. Prior trajectory: {trajectory.summary}. FIRST: identify what existing work can be strengthened, deepened, or made more robust. Only pivot to genuinely new directions if deepening is exhausted."
            ELSE:
                # Recent plateau — add investigation goal
                Log: "STRATEGIC REDIRECT: {asp.id} — adding exploration goal"
-               echo '{"title":"Investigate: Fresh directions for {asp.title}","description":"Learning velocity has plateaued. Review trajectory, identify untried approaches, propose alternative exploration directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
+               echo '{"title":"Investigate: Root causes of plateau in {asp.title}","description":"Learning velocity has plateaued. Diagnose WHY velocity dropped — is the approach wrong, are prerequisites missing, or is the problem harder than expected? Try a different approach within the same domain before pivoting to new directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
 
        ELIF trajectory.diminishing_returns:
            Log: "DIMINISHING RETURNS: {asp.id} '{asp.title}' — learning yield declining monotonically over {diminishing_returns_window} goals"
@@ -290,9 +290,14 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    Ask: "Given this Self and the current aspirations, what is Self missing?
    What would a person with this purpose naturally want to do next that
    isn't covered? What data sources do I know about that I haven't accessed?"
-   If gap found: invoke /create-aspiration from-self --plan
-     with: default_scope = "project"  # gap-analysis aspirations default to project scope
-   Accept "no gap" as valid — only create when genuinely needed.
+   # Consolidation guard — gate aspiration creation, not the analysis itself
+   Bash: wm-read.sh consolidation_health --json 2>/dev/null
+   IF consolidation_health exists AND consolidation_health.avg_completion < 0.25 AND consolidation_health.active_count >= 3:
+       Log: "GAP ANALYSIS: aspiration creation deferred — consolidation health poor (avg {avg_completion:.0%}). Existing aspirations need attention first."
+   ELSE:
+       If gap found: invoke /create-aspiration from-self --plan
+         with: default_scope = "project"  # gap-analysis aspirations default to project scope
+       Accept "no gap" as valid — only create when genuinely needed.
 
    **Meta-gap analysis**: Given the current improvement velocity and meta-log signals,
    is there a procedural gap in how I improve? Am I missing a meta-strategy for some
@@ -374,8 +379,8 @@ underperforming = parse JSON output
 
 FOR EACH skill in underperforming:
     IF skill.total_evaluations >= quality_thresholds.min_evaluations (5):
-        Read <agent>/forged-skills.yaml
-        IF skill is a forged skill (exists in forged-skills.yaml):
+        Bash: world-cat.sh forged-skills.yaml
+        IF skill is a forged skill (exists in world/forged-skills.yaml):
             # Check if any pending goals depend on this skill
             Bash: load-aspirations-compact.sh
             IF no pending goals use this skill:
@@ -396,7 +401,7 @@ FOR EACH skill in underperforming:
 Bash: skill-evaluate.sh report
 avg_quality = parse summary.avg_overall
 IF avg_quality > 0.80 AND summary.total_skills_evaluated >= 5:
-    Read meta/skill-quality-strategy.yaml
+    Bash: meta-read.sh skill-quality-strategy.yaml
     IF review_threshold < 0.60:
         Bash: meta-set.sh skill-quality-strategy.yaml review_threshold 0.60 \
             --reason "Average quality {avg_quality} supports higher bar"
@@ -436,6 +441,10 @@ This will:
   - If not all pass: report gate status (no action needed)
   - If curriculum not configured: skip silently
 ```
+
+### Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 
 ### Chaining
 
