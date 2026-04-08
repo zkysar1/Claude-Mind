@@ -184,4 +184,4 @@ if a blocker persists into a new session, the user should hear about it again.
 Cooldown period: `proactive_escalation.blocker_age_hours` from `core/config/aspirations.yaml`.
 
 The phrase "Notify the user" in the pseudocode resolves via forged-skill-resolution
-to a forged notification skill (if available), which may handle email → pending-question → participant-goal fallback.
+to a forged notification skill (if available), which handles email → pending-question → participant-goal fallback.

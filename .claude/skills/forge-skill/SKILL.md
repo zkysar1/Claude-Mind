@@ -135,8 +135,8 @@ Claude Code discovery. Metadata is tracked in `world/forged-skills.yaml` (not `_
 
      A validation goal will be created to test this skill over 3 invocations.
      ```
-   - Notify the user with the above (via forged notification skill if available, else pending-questions)
-   - IF notification fails: continue (use pending-questions as fallback)
+   - Notify the user (via forged notification skill if available, else pending-questions)
+   - IF notification fails: continue (best-effort)
 
 8. **Create Test Goal** — Add a goal to the relevant aspiration:
    - Find relevant aspiration: Bash: `load-aspirations-compact.sh` → IF path returned: Read it

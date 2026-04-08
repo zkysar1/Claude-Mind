@@ -58,7 +58,7 @@ You don't need to do anything while it runs. But you can chat with it anytime â€
 | `/agent-completion-report` | See what the agent accomplished recently. |
 | `/backlog-report` | See the agent's current task queue and priorities. |
 | `/open-questions` | See decisions the agent logged for your review. |
-| `/priority-review` | See and reorder the agent's aspiration priorities. |
+| `/priority-review` | Review and reorder the agent's aspiration priorities. |
 | `/verify-learning` | Run a diagnostic check on the agent's state. |
 
 ### Three Modes

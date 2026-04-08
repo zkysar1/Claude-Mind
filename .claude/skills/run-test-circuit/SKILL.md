@@ -41,7 +41,6 @@ IF RepoName argument given:
 ELSE:
     # Scan for repos with uncommitted changes
     repos = []
-    # Scan the primary workspace (from <agent>/self.md) for repos with changes
     Bash: for d in "$PRIMARY_WORKSPACE"/*/; do
             if [ -n "$(git -C "$d" status --porcelain 2>/dev/null)" ]; then
               basename "$d"

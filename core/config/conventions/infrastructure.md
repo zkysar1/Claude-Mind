@@ -102,7 +102,7 @@ re-notifies the user when blocks persist, via three integration points:
 | Step B7.1 | `aspirations/SKILL.md` | All self-remediation exhausted (B0-B6 failed) | Per `_all_blocked` synthetic ID |
 | Phase 5.5 | `aspirations/SKILL.md` | Circuit breaker fires (3+ consecutive failures) | Natural (counter resets) |
 
-Each point uses "Notify the user" which resolves via forged-skill-resolution to a notification skill if one exists.
+Each point uses "Notify the user" which resolves to a notification skill if one exists (via forged-skill-resolution), else falls back to pending-questions.
 Caller-side spam prevention via `proactive_escalation_log` WM slot (see `handoff-working-memory.md`).
 Config: `core/config/aspirations.yaml` → `proactive_escalation` section (tunable by evolution engine).
 

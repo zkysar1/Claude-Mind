@@ -44,6 +44,9 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # ---------------------------------------------------------------------------
 # Helpers: file I/O
 # ---------------------------------------------------------------------------
+# Lock ordering: LIVE_PATH.lock first, ARCHIVE_PATH.lock second.
+# Never reverse this or commands that touch both files will deadlock.
+# ---------------------------------------------------------------------------
 
 def read_jsonl(path):
     """Read a JSONL file and return a list of dicts. Returns [] if missing/empty."""
@@ -69,6 +72,46 @@ def append_jsonl(path, item):
     """Append one JSON line to a JSONL file with locking and history."""
     from _fileops import locked_append_jsonl
     locked_append_jsonl(path, item)
+
+
+def _write_live_under_lock(items, action_desc, agent_name=None):
+    """Write items to LIVE_PATH when the caller already holds its lock.
+
+    Performs: save_history → atomic tempfile write → os.replace → changelog.
+    MUST only be called while holding LIVE_PATH.with_suffix('.lock').
+    """
+    import tempfile
+    from _fileops import save_history, append_changelog, resolve_base_dir
+    base_dir = resolve_base_dir(LIVE_PATH)
+    agent = agent_name or (AGENT_DIR.name if AGENT_DIR else "unknown")
+    if base_dir:
+        save_history(LIVE_PATH, base_dir, agent, action_desc)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", dir=LIVE_PATH.parent, suffix=".tmp",
+        delete=False, encoding="utf-8")
+    try:
+        for item in items:
+            tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
+        tmp.close()
+        os.replace(tmp.name, str(LIVE_PATH))
+    except Exception:
+        os.unlink(tmp.name)
+        raise
+    if base_dir:
+        append_changelog(base_dir, agent, LIVE_PATH, "update", action_desc)
+
+
+def _check_not_archived(asp_id, *, action="modify"):
+    """Refuse if asp_id exists in the archive. Call under lock."""
+    archived = read_jsonl(ARCHIVE_PATH)
+    if any(a.get("id") == asp_id for a in archived):
+        if action == "add":
+            print(f"REFUSED: {asp_id} already exists in archive — pick a higher ID.",
+                  file=sys.stderr)
+        else:
+            print(f"REFUSED: {asp_id} is already archived — cannot modify.",
+                  file=sys.stderr)
+        sys.exit(1)
 
 
 def read_json(path):
@@ -484,15 +527,24 @@ def cmd_add(args):
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
+    # Full-cycle lock: archive-check + dup-check + write are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
     try:
-        check_no_duplicate_id(items, asp["id"])
-    except ValueError as e:
-        print(f"Duplicate error: {e}", file=sys.stderr)
-        sys.exit(1)
+        acquire_lock(lock_path)
+        _check_not_archived(asp["id"], action="add")
+        items = read_jsonl(LIVE_PATH)
+        try:
+            check_no_duplicate_id(items, asp["id"])
+        except ValueError as e:
+            print(f"Duplicate error: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    recompute_progress(asp)
-    append_jsonl(LIVE_PATH, asp)
+        recompute_progress(asp)
+        items.append(asp)
+        _write_live_under_lock(items, f"add {asp['id']}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(asp, indent=2, ensure_ascii=False))
 
 
@@ -516,16 +568,24 @@ def cmd_update(args):
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_aspiration_by_id(items, args.asp_id)
-    if result is None:
-        print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
+    # Full-cycle lock: read + archive cross-check + write are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path)
+        _check_not_archived(args.asp_id)
+        items = read_jsonl(LIVE_PATH)
+        result = find_aspiration_by_id(items, args.asp_id)
+        if result is None:
+            print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
+            sys.exit(1)
 
-    idx = result[0]
-    recompute_progress(asp)
-    items[idx] = asp
-    write_jsonl(LIVE_PATH, items)
+        idx = result[0]
+        recompute_progress(asp)
+        items[idx] = asp
+        _write_live_under_lock(items, f"update {args.asp_id}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(asp, indent=2, ensure_ascii=False))
 
 
@@ -535,37 +595,46 @@ def cmd_update_goal(args):
     field = args.field
     value = parse_value(args.value)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_goal_in_aspirations(items, goal_id)
-    if result is None:
-        print(f"Goal {goal_id} not found in any aspiration", file=sys.stderr)
-        sys.exit(1)
+    # Full-cycle lock: read + archive cross-check + write are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path)
+        items = read_jsonl(LIVE_PATH)
+        result = find_goal_in_aspirations(items, goal_id)
+        if result is None:
+            print(f"Goal {goal_id} not found in any aspiration", file=sys.stderr)
+            sys.exit(1)
 
-    asp_idx, goal_idx, asp = result
-    goal = asp["goals"][goal_idx]
+        asp_idx, goal_idx, asp = result
+        _check_not_archived(asp["id"])
+        goal = asp["goals"][goal_idx]
 
-    # Guard: recurring goals must never reach status=completed (LLM drift protection)
-    if field == "status" and value == "completed" and goal.get("recurring"):
-        print(f"BLOCKED: Cannot set status=completed on recurring goal {goal_id}. "
-              f"Recurring goals stay 'pending'. Use complete-by for cycle tracking, "
-              f"or set recurring=false first to permanently stop it.",
-              file=sys.stderr)
-        sys.exit(1)
+        # Guard: recurring goals must never reach status=completed (LLM drift protection)
+        if field == "status" and value == "completed" and goal.get("recurring"):
+            print(f"BLOCKED: Cannot set status=completed on recurring goal {goal_id}. "
+                  f"Recurring goals stay 'pending'. Use complete-by for cycle tracking, "
+                  f"or set recurring=false first to permanently stop it.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    goal[field] = value
-
-    recompute_progress(asp)
-
-    items[asp_idx] = asp
-    write_jsonl(LIVE_PATH, items)
+        goal[field] = value
+        # Clear blocked_by refs when goal reaches a terminal status
+        if field == "status" and value in ("completed", "skipped", "expired", "decomposed"):
+            _clear_stale_blockers(items, {goal_id})
+        recompute_progress(asp)
+        items[asp_idx] = asp
+        _write_live_under_lock(items, f"update-goal {goal_id} {field}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(asp, indent=2, ensure_ascii=False))
 
 
-def _clear_stale_blockers(items, archived_goal_ids):
-    """Remove blocked_by references to goals that are being archived.
+def _clear_stale_blockers(items, resolved_goal_ids):
+    """Remove blocked_by references to goals that are resolved (completed/archived/terminal).
 
-    Called after archiving an aspiration — its goal IDs vanish from live data,
-    so any remaining blocked_by references to them would be stale forever.
+    Called from: cmd_complete/cmd_retire/cmd_archive_sweep (archival),
+    cmd_complete_by (goal completion), cmd_update_goal (terminal status).
     """
     for asp in items:
         for goal in asp.get("goals", []):
@@ -573,187 +642,208 @@ def _clear_stale_blockers(items, archived_goal_ids):
             if isinstance(bb, str):
                 bb = [bb]
             if bb:
-                cleaned = [b for b in bb if b not in archived_goal_ids]
+                cleaned = [b for b in bb if b not in resolved_goal_ids]
                 if len(cleaned) != len(bb):
                     goal["blocked_by"] = cleaned
 
 
 def cmd_complete(args):
-    items = read_jsonl(LIVE_PATH)
-    result = find_aspiration_by_id(items, args.asp_id)
-    if result is None:
-        print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
+    # Full-cycle lock: read + guards + archive + remove are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path)
+        items = read_jsonl(LIVE_PATH)
+        result = find_aspiration_by_id(items, args.asp_id)
+        if result is None:
+            print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
+            sys.exit(1)
 
-    idx, asp = result
+        idx, asp = result
 
-    # Guard: refuse to archive aspirations containing recurring goals (LLM drift protection)
-    recurring = find_recurring_goals(asp)
-    if recurring and not getattr(args, 'force', False):
-        rg_ids = ", ".join(g["id"] for g in recurring)
-        print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
-              f"Recurring goals run perpetually and must not be archived. "
-              f"Set recurring=false on goals to stop, or use --force.",
-              file=sys.stderr)
-        sys.exit(1)
+        # Guard: refuse to archive aspirations containing recurring goals (LLM drift protection)
+        recurring = find_recurring_goals(asp)
+        if recurring and not getattr(args, 'force', False):
+            rg_ids = ", ".join(g["id"] for g in recurring)
+            print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
+                  f"Recurring goals run perpetually and must not be archived. "
+                  f"Set recurring=false on goals to stop, or use --force.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    # Guard: refuse to archive if any non-recurring goals are unfinished (premature-archival protection)
-    unfinished = find_unfinished_goals(asp)
-    if unfinished and not getattr(args, 'force', False):
-        uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
-        print(f"BLOCKED: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
-              f"All non-recurring goals must be completed/skipped/expired/decomposed before archival. "
-              f"Use --force to override.",
-              file=sys.stderr)
-        sys.exit(1)
+        # Guard: refuse to archive if any non-recurring goals are unfinished (premature-archival protection)
+        unfinished = find_unfinished_goals(asp)
+        if unfinished and not getattr(args, 'force', False):
+            uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
+            print(f"BLOCKED: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
+                  f"All non-recurring goals must be completed/skipped/expired/decomposed before archival. "
+                  f"Use --force to override.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    # Maturity warning: check if aspiration has been active long enough for its scope
-    scope = asp.get("scope", "project")
-    sessions_active = asp.get("sessions_active", 0)
-    min_sessions_map = {"sprint": 1, "project": 2, "initiative": 4}
-    min_sessions = min_sessions_map.get(scope, 2)
-    if sessions_active < min_sessions and scope != "sprint":
-        print(f"MATURITY WARNING: {asp['id']} completing after {sessions_active} session(s) "
-              f"but scope={scope} expects {min_sessions}. Consider adding depth goals.",
-              file=sys.stderr)
+        # Maturity warning: check if aspiration has been active long enough for its scope
+        scope = asp.get("scope", "project")
+        sessions_active = asp.get("sessions_active", 0)
+        min_sessions_map = {"sprint": 1, "project": 2, "initiative": 4}
+        min_sessions = min_sessions_map.get(scope, 2)
+        if sessions_active < min_sessions and scope != "sprint":
+            print(f"MATURITY WARNING: {asp['id']} completing after {sessions_active} session(s) "
+                  f"but scope={scope} expects {min_sessions}. Consider adding depth goals.",
+                  file=sys.stderr)
 
-    asp["status"] = "completed"
-    asp["completed_at"] = date.today().isoformat()
-    asp["archived"] = True
+        asp["status"] = "completed"
+        asp["completed_at"] = date.today().isoformat()
+        asp["archived"] = True
 
-    archived_goal_ids = {g["id"] for g in asp.get("goals", [])}
+        archived_goal_ids = {g["id"] for g in asp.get("goals", [])}
 
-    # Archive BEFORE removing from live — if crash between writes,
-    # aspiration exists in both (benign) rather than neither (data loss).
-    append_jsonl(ARCHIVE_PATH, asp)
-    items.pop(idx)
-    _clear_stale_blockers(items, archived_goal_ids)
-    write_jsonl(LIVE_PATH, items)
-
+        # Archive BEFORE removing from live — if crash between writes,
+        # aspiration exists in both (benign) rather than neither (data loss).
+        # append_jsonl acquires ARCHIVE lock (different file) — no deadlock.
+        append_jsonl(ARCHIVE_PATH, asp)
+        items.pop(idx)
+        _clear_stale_blockers(items, archived_goal_ids)
+        _write_live_under_lock(items, f"complete {args.asp_id}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(asp, indent=2, ensure_ascii=False))
 
 
 def cmd_retire(args):
-    items = read_jsonl(LIVE_PATH)
-    result = find_aspiration_by_id(items, args.asp_id)
-    if result is None:
-        print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
+    # Full-cycle lock: read + guards + archive + remove are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path)
+        items = read_jsonl(LIVE_PATH)
+        result = find_aspiration_by_id(items, args.asp_id)
+        if result is None:
+            print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
+            sys.exit(1)
 
-    idx, asp = result
+        idx, asp = result
 
-    # Guard: refuse to retire aspirations containing recurring goals (LLM drift protection)
-    recurring = find_recurring_goals(asp)
-    if recurring and not getattr(args, 'force', False):
-        rg_ids = ", ".join(g["id"] for g in recurring)
-        print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
-              f"Recurring goals run perpetually and must not be archived. "
-              f"Set recurring=false on goals to stop, or use --force.",
-              file=sys.stderr)
-        sys.exit(1)
+        # Guard: refuse to retire aspirations containing recurring goals (LLM drift protection)
+        recurring = find_recurring_goals(asp)
+        if recurring and not getattr(args, 'force', False):
+            rg_ids = ", ".join(g["id"] for g in recurring)
+            print(f"BLOCKED: {args.asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
+                  f"Recurring goals run perpetually and must not be archived. "
+                  f"Set recurring=false on goals to stop, or use --force.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    # Warning: retiring with unfinished goals is intentional but worth noting
-    unfinished = find_unfinished_goals(asp)
-    if unfinished:
-        uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
-        print(f"RETIREMENT NOTE: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
-              f"Proceeding with retirement (abandonment is intentional for retire).",
-              file=sys.stderr)
+        # Warning: retiring with unfinished goals is intentional but worth noting
+        unfinished = find_unfinished_goals(asp)
+        if unfinished:
+            uf_summary = "; ".join(f"{g['id']} ({g.get('status', '?')})" for g in unfinished)
+            print(f"RETIREMENT NOTE: {args.asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
+                  f"Proceeding with retirement (abandonment is intentional for retire).",
+                  file=sys.stderr)
 
-    asp["status"] = "retired"
-    asp["completed_at"] = None  # Explicitly clear — retired means never completed
-    asp["archived"] = True
+        asp["status"] = "retired"
+        asp["completed_at"] = None  # Explicitly clear — retired means never completed
+        asp["archived"] = True
 
-    archived_goal_ids = {g["id"] for g in asp.get("goals", [])}
+        archived_goal_ids = {g["id"] for g in asp.get("goals", [])}
 
-    append_jsonl(ARCHIVE_PATH, asp)
-    items.pop(idx)
-    _clear_stale_blockers(items, archived_goal_ids)
-    write_jsonl(LIVE_PATH, items)
-
+        # Archive first (crash-safety), then remove from live.
+        # append_jsonl acquires ARCHIVE lock (different file) — no deadlock.
+        append_jsonl(ARCHIVE_PATH, asp)
+        items.pop(idx)
+        _clear_stale_blockers(items, archived_goal_ids)
+        _write_live_under_lock(items, f"retire {args.asp_id}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(asp, indent=2, ensure_ascii=False))
 
 
 def cmd_archive_sweep(args):
-    items = read_jsonl(LIVE_PATH)
-    to_archive = []
-    remaining = []
-    recovered = 0
+    # Full-cycle lock: read + classify + archive + write are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path)
+        items = read_jsonl(LIVE_PATH)
+        to_archive = []
+        remaining = []
+        recovered = 0
 
-    for a in items:
-        if a.get("status") in ("completed", "retired"):
-            recurring = find_recurring_goals(a)
-            if recurring:
-                # Safety net: aspirations with recurring goals should never be archived.
-                # Reset to active and warn — prevents LLM drift from killing recurring goals.
-                rg_ids = ", ".join(g["id"] for g in recurring)
-                print(f"WARNING: Recovering {a['id']} — has {len(recurring)} recurring goal(s): "
-                      f"{rg_ids}. Resetting to active.", file=sys.stderr)
-                a["status"] = "active"
-                a["archived"] = False
-                a.pop("completed_at", None)
-                # Also reset any recurring goals that were incorrectly set to completed
-                for g in recurring:
-                    if g.get("status") == "completed":
-                        g["status"] = "pending"
-                recompute_progress(a)
-                remaining.append(a)
-                recovered += 1
-            else:
-                # Safety net: aspirations marked completed but with unfinished goals
-                # should be recovered (same pattern as recurring-goal recovery above)
-                if a.get("status") == "completed":
-                    unfinished = find_unfinished_goals(a)
-                    if unfinished:
-                        uf_ids = ", ".join(g["id"] for g in unfinished)
-                        print(f"WARNING: Recovering {a['id']} — has {len(unfinished)} unfinished "
-                              f"goal(s): {uf_ids}. Resetting to active.", file=sys.stderr)
-                        a["status"] = "active"
-                        a["archived"] = False
-                        a.pop("completed_at", None)
-                        recompute_progress(a)
-                        remaining.append(a)
-                        recovered += 1
-                        continue
-                to_archive.append(a)
-        else:
-            # Scan non-archivable aspirations for corrupted recurring goals.
-            # Recurring goals must never have status=completed. If found, reset
-            # to pending — same recovery as the completed/retired path above.
-            recurring = find_recurring_goals(a)
-            if recurring:
-                corrupted = [g for g in recurring if g.get("status") == "completed"]
-                if corrupted:
-                    c_ids = ", ".join(g["id"] for g in corrupted)
-                    print(f"WARNING: Recovering {len(corrupted)} corrupted recurring goal(s) "
-                          f"in {a['id']}: {c_ids}. Resetting to pending.", file=sys.stderr)
-                    for g in corrupted:
-                        g["status"] = "pending"
+        for a in items:
+            if a.get("status") in ("completed", "retired"):
+                recurring = find_recurring_goals(a)
+                if recurring:
+                    # Safety net: aspirations with recurring goals should never be archived.
+                    # Reset to active and warn — prevents LLM drift from killing recurring goals.
+                    rg_ids = ", ".join(g["id"] for g in recurring)
+                    print(f"WARNING: Recovering {a['id']} — has {len(recurring)} recurring goal(s): "
+                          f"{rg_ids}. Resetting to active.", file=sys.stderr)
+                    a["status"] = "active"
+                    a["archived"] = False
+                    a.pop("completed_at", None)
+                    # Also reset any recurring goals that were incorrectly set to completed
+                    for g in recurring:
+                        if g.get("status") == "completed":
+                            g["status"] = "pending"
                     recompute_progress(a)
+                    remaining.append(a)
                     recovered += 1
-            remaining.append(a)
+                else:
+                    # Safety net: aspirations marked completed but with unfinished goals
+                    # should be recovered (same pattern as recurring-goal recovery above)
+                    if a.get("status") == "completed":
+                        unfinished = find_unfinished_goals(a)
+                        if unfinished:
+                            uf_ids = ", ".join(g["id"] for g in unfinished)
+                            print(f"WARNING: Recovering {a['id']} — has {len(unfinished)} unfinished "
+                                  f"goal(s): {uf_ids}. Resetting to active.", file=sys.stderr)
+                            a["status"] = "active"
+                            a["archived"] = False
+                            a.pop("completed_at", None)
+                            recompute_progress(a)
+                            remaining.append(a)
+                            recovered += 1
+                            continue
+                    to_archive.append(a)
+            else:
+                # Scan non-archivable aspirations for corrupted recurring goals.
+                # Recurring goals must never have status=completed. If found, reset
+                # to pending — same recovery as the completed/retired path above.
+                recurring = find_recurring_goals(a)
+                if recurring:
+                    corrupted = [g for g in recurring if g.get("status") == "completed"]
+                    if corrupted:
+                        c_ids = ", ".join(g["id"] for g in corrupted)
+                        print(f"WARNING: Recovering {len(corrupted)} corrupted recurring goal(s) "
+                              f"in {a['id']}: {c_ids}. Resetting to pending.", file=sys.stderr)
+                        for g in corrupted:
+                            g["status"] = "pending"
+                        recompute_progress(a)
+                        recovered += 1
+                remaining.append(a)
 
-    if not to_archive:
-        if recovered:
-            write_jsonl(LIVE_PATH, remaining)  # persist recovered aspirations
-        print("0")
-        return
+        if not to_archive:
+            if recovered:
+                _write_live_under_lock(remaining, "archive-sweep (recovery only)")
+            print("0")
+            return  # finally block still runs, releasing lock
 
-    # Collect all goal IDs from aspirations being archived
-    archived_goal_ids = set()
-    for asp in to_archive:
-        for g in asp.get("goals", []):
-            archived_goal_ids.add(g["id"])
+        # Collect all goal IDs from aspirations being archived
+        archived_goal_ids = set()
+        for asp in to_archive:
+            for g in asp.get("goals", []):
+                archived_goal_ids.add(g["id"])
 
-    # Append to archive
-    archive = read_jsonl(ARCHIVE_PATH)
-    archive.extend(to_archive)
-    write_jsonl(ARCHIVE_PATH, archive)
+        # Append to archive — write_jsonl acquires ARCHIVE lock (different file, no deadlock)
+        archive = read_jsonl(ARCHIVE_PATH)
+        archive.extend(to_archive)
+        write_jsonl(ARCHIVE_PATH, archive)
 
-    # Clean stale blockers before writing
-    _clear_stale_blockers(remaining, archived_goal_ids)
-    write_jsonl(LIVE_PATH, remaining)
-
+        # Clean stale blockers before writing
+        _clear_stale_blockers(remaining, archived_goal_ids)
+        _write_live_under_lock(remaining, f"archive-sweep ({len(to_archive)} archived)")
+    finally:
+        release_lock(lock_path)
     print(str(len(to_archive)))
 
 
@@ -799,30 +889,10 @@ def cmd_add_goal(args):
         print(f"Invalid JSON: {e}", file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_aspiration_by_id(items, args.asp_id)
-    if result is None:
-        print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
-
-    idx, asp = result
-    goals = asp.get("goals", [])
-
-    # Auto-assign goal ID if not provided
-    if "id" not in goal or not goal["id"]:
-        asp_num = args.asp_id.replace("asp-", "")
-        max_seq = 0
-        for g in goals:
-            gid = g.get("id", "")
-            match = re.match(r"^g-\d{3}-(\d{2})", gid)
-            if match:
-                max_seq = max(max_seq, int(match.group(1)))
-        goal["id"] = f"g-{asp_num}-{max_seq + 1:02d}"
-
-    # Apply defaults for required fields
+    # Apply defaults for required fields (before lock — no file dependency)
     goal.setdefault("status", "pending")
 
-    # Auto-assign category via category-suggest if not provided (or "uncategorized")
+    # Auto-assign category via subprocess (before lock — no file dependency, up to 5s)
     if not goal.get("category") or goal.get("category") == "uncategorized":
         text = "{t}. {d}".format(t=goal.get("title", ""), d=goal.get("description", ""))
         try:
@@ -841,23 +911,51 @@ def cmd_add_goal(args):
         if not goal.get("category"):
             goal["category"] = "uncategorized"
 
+    # Full-cycle lock: read + auto-ID + validate + dup-check + write are atomic
+    from _fileops import acquire_lock, release_lock
+    lock_path = LIVE_PATH.with_suffix(".lock")
     try:
-        validate_goal(goal)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Check for duplicate goal ID
-    for g in goals:
-        if g.get("id") == goal["id"]:
-            print(f"Duplicate goal ID: {goal['id']} already exists in {args.asp_id}", file=sys.stderr)
+        acquire_lock(lock_path)
+        _check_not_archived(args.asp_id)
+        items = read_jsonl(LIVE_PATH)
+        result = find_aspiration_by_id(items, args.asp_id)
+        if result is None:
+            print(f"Aspiration {args.asp_id} not found in live file", file=sys.stderr)
             sys.exit(1)
 
-    goals.append(goal)
-    asp["goals"] = goals
-    recompute_progress(asp)
-    items[idx] = asp
-    write_jsonl(LIVE_PATH, items)
+        idx, asp = result
+        goals = asp.get("goals", [])
+
+        # Auto-assign goal ID (MUST be under lock — reads current goal list)
+        if "id" not in goal or not goal["id"]:
+            asp_num = args.asp_id.replace("asp-", "")
+            max_seq = 0
+            for g in goals:
+                gid = g.get("id", "")
+                match = re.match(r"^g-\d{3}-(\d{2})", gid)
+                if match:
+                    max_seq = max(max_seq, int(match.group(1)))
+            goal["id"] = f"g-{asp_num}-{max_seq + 1:02d}"
+
+        try:
+            validate_goal(goal)
+        except ValueError as e:
+            print(f"Validation error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        # Check for duplicate goal ID
+        for g in goals:
+            if g.get("id") == goal["id"]:
+                print(f"Duplicate goal ID: {goal['id']} already exists in {args.asp_id}", file=sys.stderr)
+                sys.exit(1)
+
+        goals.append(goal)
+        asp["goals"] = goals
+        recompute_progress(asp)
+        items[idx] = asp
+        _write_live_under_lock(items, f"add-goal {goal['id']} to {args.asp_id}")
+    finally:
+        release_lock(lock_path)
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 
 
@@ -868,12 +966,9 @@ def cmd_claim(args):
     TOCTOU race conditions when two agents try to claim the same goal simultaneously.
     (Fix based on arXiv 2603.28990 multi-agent coordination analysis.)
     """
-    import tempfile
-    from _fileops import acquire_lock, release_lock, save_history, append_changelog
+    from _fileops import acquire_lock, release_lock
     goal_id = args.goal_id
     agent_name = args.agent_name
-    # MUST match _fileops.locked_write_jsonl convention: path.with_suffix(".lock")
-    # so this lock coordinates with cmd_release, cmd_update_goal, etc.
     lock_path = LIVE_PATH.with_suffix(".lock")
 
     try:
@@ -896,23 +991,10 @@ def cmd_claim(args):
         goal["claimed_by"] = agent_name
         goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         items[asp_idx] = asp
-
-        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
-        save_history(LIVE_PATH, WORLD_DIR, agent_name, f"claim {goal_id}")
-        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
-                                          suffix=".tmp", delete=False, encoding="utf-8")
-        try:
-            for item in items:
-                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
-            tmp.close()
-            os.replace(tmp.name, str(LIVE_PATH))
-        except Exception:
-            os.unlink(tmp.name)
-            raise
-        append_changelog(WORLD_DIR, agent_name, LIVE_PATH, "update", f"claim {goal_id}")
-        print(json.dumps(goal, indent=2, ensure_ascii=False))
+        _write_live_under_lock(items, f"claim {goal_id}", agent_name)
     finally:
         release_lock(lock_path)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
 
 
 def cmd_release(args):
@@ -920,8 +1002,7 @@ def cmd_release(args):
 
     Uses single lock scope (same pattern as cmd_claim) to prevent TOCTOU races.
     """
-    import tempfile
-    from _fileops import acquire_lock, release_lock, save_history, append_changelog
+    from _fileops import acquire_lock, release_lock
     goal_id = args.goal_id
     lock_path = LIVE_PATH.with_suffix(".lock")
 
@@ -939,24 +1020,10 @@ def cmd_release(args):
         goal.pop("claimed_by", None)
         goal.pop("claimed_at", None)
         items[asp_idx] = asp
-
-        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
-        agent = AGENT_DIR.name if AGENT_DIR else "unknown"
-        save_history(LIVE_PATH, WORLD_DIR, agent, f"release {goal_id}")
-        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
-                                          suffix=".tmp", delete=False, encoding="utf-8")
-        try:
-            for item in items:
-                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
-            tmp.close()
-            os.replace(tmp.name, str(LIVE_PATH))
-        except Exception:
-            os.unlink(tmp.name)
-            raise
-        append_changelog(WORLD_DIR, agent, LIVE_PATH, "update", f"release {goal_id}")
-        print(json.dumps(goal, indent=2, ensure_ascii=False))
+        _write_live_under_lock(items, f"release {goal_id}")
     finally:
         release_lock(lock_path)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
 
 
 def cmd_complete_by(args):
@@ -967,13 +1034,11 @@ def cmd_complete_by(args):
 
     Uses single lock scope (same pattern as cmd_claim) to prevent TOCTOU races.
     """
-    import tempfile
-    from _fileops import acquire_lock, release_lock, save_history, append_changelog, resolve_base_dir
+    from _fileops import acquire_lock, release_lock
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     goal_id = args.goal_id
     agent_name = args.agent_name
     lock_path = LIVE_PATH.with_suffix(".lock")
-    base_dir = resolve_base_dir(LIVE_PATH)  # None for agent paths — skip history/changelog
 
     try:
         acquire_lock(lock_path)
@@ -1005,25 +1070,11 @@ def cmd_complete_by(args):
 
         recompute_progress(asp)
         items[asp_idx] = asp
-
-        # Write directly — lock already held, don't use locked_write_jsonl (deadlock)
-        if base_dir:
-            save_history(LIVE_PATH, base_dir, agent_name, f"complete-by {goal_id}")
-        tmp = tempfile.NamedTemporaryFile(mode="w", dir=LIVE_PATH.parent,
-                                          suffix=".tmp", delete=False, encoding="utf-8")
-        try:
-            for item in items:
-                tmp.write(json.dumps(item, ensure_ascii=True) + "\n")
-            tmp.close()
-            os.replace(tmp.name, str(LIVE_PATH))
-        except Exception:
-            os.unlink(tmp.name)
-            raise
-        if base_dir:
-            append_changelog(base_dir, agent_name, LIVE_PATH, "update", f"complete-by {goal_id}")
-        print(json.dumps(goal, indent=2, ensure_ascii=False))
+        _clear_stale_blockers(items, {goal_id})
+        _write_live_under_lock(items, f"complete-by {goal_id}", agent_name)
     finally:
         release_lock(lock_path)
+    print(json.dumps(goal, indent=2, ensure_ascii=False))
 
 
 def cmd_evolution_append(args):
