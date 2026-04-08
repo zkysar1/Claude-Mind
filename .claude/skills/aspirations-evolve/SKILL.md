@@ -308,6 +308,83 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    (title starts with "Idea:"). If 3+ idea goals cluster in one domain/category,
    this signals a potential new aspiration direction. Consider creating an aspiration
    to explore that cluster. Ideas are proto-aspirations.
+
+3.5. **Convention Health Audit**:
+   Evaluate the health of domain execution conventions. Are steps earning their cost?
+   Are there recurring failures a convention should catch? Are pending proposals mature?
+
+   ```
+   # 3.5a: Load convention state
+   Bash: source core/scripts/_paths.sh
+   pre_exists=$(test -f "$WORLD_DIR/conventions/pre-execution.md" && echo "yes")
+   post_exists=$(test -f "$WORLD_DIR/conventions/post-execution.md" && echo "yes")
+
+   IF neither exists:
+       Log: "CONVENTION HEALTH: no domain conventions configured — skip audit"
+       SKIP to Step 4
+
+   IF pre_exists: Read $WORLD_DIR/conventions/pre-execution.md
+   IF post_exists: Read $WORLD_DIR/conventions/post-execution.md
+
+   # 3.5b: Step utilization analysis
+   # Scan recent journal/experience for evidence of each convention step executing
+   Bash: journal-read.sh --last 20
+   FOR EACH convention step in loaded conventions:
+       Estimate: times_relevant (step's IF condition was true), times_executed (step ran)
+       IF times_relevant == 0 AND goals_analyzed >= 10:
+           Log: "CONVENTION HEALTH: {convention}/{step} condition never matched in {goals_analyzed} goals — candidate for removal"
+       IF times_relevant >= 5 AND (times_executed / times_relevant) < 0.50:
+           Log: "CONVENTION HEALTH: {convention}/{step} skipped {skipped}/{times_relevant} times — needs clarification"
+
+   # 3.5c: Missing convention gap detection
+   # Find guardrails that fire frequently AND are universal/procedural → convention candidates
+   Bash: guardrails-read.sh --active
+   FOR EACH guardrail where utilization.times_active >= 5:
+       IF guardrail rule is universal (applies to most goals) AND procedural (a step to perform):
+           Log: "CONVENTION GAP: guardrail {guard.id} fires frequently ({times_active}x) and is procedural — convention candidate"
+           # Check if already tracked in convention-changes.jsonl
+           IF NOT already_proposed(guard.id):
+               target = "pre-execution" if rule maps to pre-execution else "post-execution"
+               echo '{"date":"<today>","type":"promote_guardrail","target":"{target}","proposed_step":{"title":"{guard.title}","condition":"IF {guard.when_to_use.conditions}:","action":"{guard.description}"},"source":"evolve-health-audit","source_hypothesis":null,"source_guardrails":["{guard.id}"],"reinforcement_count":1,"confidence":0.7,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+
+   # 3.5d: Pending proposal review — auto-apply mature proposals
+   IF file_exists($WORLD_DIR/conventions/convention-changes.jsonl):
+       Read convention-changes.jsonl
+       Read core/config/aspirations.yaml → modifiable.convention_learning.auto_apply_confidence (default 0.8)
+       pending = [c for c in changes where c.status == "pending"]
+       FOR EACH change in pending:
+           IF change.confidence >= auto_apply_confidence OR change.reinforcement_count >= 2:
+               # Read target convention, check for duplication and cost cap
+               current_step_count = count steps in target convention file
+               max_steps = aspirations.yaml → convention_learning.max_steps_per_convention (default 8)
+               IF current_step_count >= max_steps:
+                   Update change.status = "pending_capacity" in convention-changes.jsonl
+                   Log: "CONVENTION HEALTH: proposal '{change.proposed_step.title}' mature but at capacity — flagged"
+               ELIF proposed step overlaps with existing convention step:
+                   Update change.status = "rejected" in convention-changes.jsonl
+                   Log: "CONVENTION HEALTH: proposal '{change.proposed_step.title}' overlaps existing — rejected"
+               ELSE:
+                   Bash: bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{change.target}.md" {agent_name} "Evolve: auto-applying convention step"
+                   Edit $WORLD_DIR/conventions/{change.target}.md:
+                       Append step at appropriate position
+                   Update change.status = "applied" in convention-changes.jsonl
+                   # Retire subsumed guardrails
+                   FOR EACH guard_id in change.source_guardrails:
+                       Bash: guardrails-update-field.sh {guard_id} status retired
+                   Log: "CONVENTION APPLIED: '{change.proposed_step.title}' added to {change.target} (confidence {change.confidence}, reinforcements {change.reinforcement_count})"
+
+   # 3.5e: Cost-benefit review — flag underperforming steps
+   FOR EACH convention step:
+       IF step has been active for 20+ goals AND rarely helpful (efficiency ratio < 0.1):
+           Write to <agent>/session/pending-questions.yaml:
+               question: "Convention step '{step_title}' in {convention} has run {times} times but rarely prevents failures. Remove?"
+               default_action: "Will remove after 1 more evolution cycle if no improvement"
+               status: pending
+
+   # 3.5f: Log health snapshot
+   echo '{"date":"<today>","event":"convention_health_audit","details":"pre_steps:{N} post_steps:{N} utilization_flags:{flag_count} gap_candidates:{gap_count} pending_proposals:{pending_count}","trigger_reason":"evolve-convention-audit"}' | bash core/scripts/evolution-log-append.sh
+   ```
+
 4. **Interestingness filter** (OMNI-EPIC two-stage): All aspiration creation in evolve
    routes through `/create-aspiration`, which runs the two-stage interestingness filter
    (Stage 1: generation-time criteria, Stage 2: post-generation archive comparison).

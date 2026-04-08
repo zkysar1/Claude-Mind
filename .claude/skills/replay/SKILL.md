@@ -157,6 +157,69 @@ After individual replays, analyze the batch as a whole:
    Flag categories performing significantly above or below overall
 ```
 
+## Step 3.5: Convention Pattern Mining
+
+After cross-hypothesis pattern mining, check if shared conditions in corrected
+hypotheses map to missing procedural execution steps (convention candidates).
+
+```
+# Prerequisite: only runs if Step 3 found shared conditions in corrected hypotheses
+IF no shared_condition groups from Step 3 with N >= 2 corrected hypotheses:
+    SKIP convention pattern mining
+
+FOR EACH shared_condition group where N >= 2 corrected hypotheses:
+    # Does this shared condition map to a missing execution step?
+    # Scan OUTCOME fields for procedural gap indicators
+    lesson_texts = [h.outcome_lesson for h in shared_condition.hypotheses]
+
+    procedural_gap_indicators = [
+        "should have checked", "forgot to", "didn't verify",
+        "missed the step", "would have caught", "if we had run",
+        "always need to", "next time must", "should always"
+    ]
+
+    is_procedural_gap = any(
+        any(indicator in lesson.lower() for indicator in procedural_gap_indicators)
+        for lesson in lesson_texts
+    )
+
+    IF NOT is_procedural_gap:
+        CONTINUE  # Not a convention candidate
+
+    # Phase classification
+    IF shared_condition relates to setup/prerequisites before execution:
+        target = "pre-execution"
+    ELIF shared_condition relates to cleanup/verification after execution:
+        target = "post-execution"
+    ELSE:
+        CONTINUE  # Ambiguous — skip
+
+    # Check for existing proposals to reinforce
+    Bash: source core/scripts/_paths.sh
+    IF file_exists($WORLD_DIR/conventions/convention-changes.jsonl):
+        Read convention-changes.jsonl
+        similar_proposal = find entry where target matches AND proposed_step is semantically similar
+        IF similar_proposal exists AND similar_proposal.status == "pending":
+            # Reinforce existing proposal
+            Update similar_proposal: reinforcement_count += 1, confidence += 0.15
+            Log: "REPLAY CONVENTION: reinforced proposal for {target} — '{similar_proposal.proposed_step.title}' now confidence {new_confidence}, reinforcements {new_count}"
+            CONTINUE
+
+    # New proposal from cross-hypothesis pattern
+    proposed_step = {
+        title: synthesize concise title from shared_condition,
+        condition: "IF {shared_condition.common_antecedent}:",
+        action: synthesize procedural step from lesson_texts
+    }
+
+    hypothesis_ids = [h.id for h in shared_condition.hypotheses]
+    echo '{"date":"<today>","type":"add","target":"{target}","proposed_step":<proposed_step JSON>,"source":"replay-pattern-mining","source_hypothesis":"{hypothesis_ids[0]}","source_guardrails":[],"reinforcement_count":1,"confidence":0.5,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+
+    Log: "REPLAY CONVENTION: proposed new {target} step from {N} corrected hypotheses sharing condition '{shared_condition.description}'"
+
+# Pass any convention proposals to Step 4 for reconsolidation context
+```
+
 ## Step 4: Reconsolidation Window
 
 When a strategy is recalled during replay, it enters a reconsolidation window. The strategy becomes temporarily "labile" — updatable based on new evidence.

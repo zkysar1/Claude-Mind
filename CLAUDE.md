@@ -263,7 +263,7 @@ Everything else is **read-only**. Only the user may modify framework files.
 2. Branch on state (check state BEFORE loading mode — avoids contradictions):
    - **If NO_AGENT**: No agent bound. Suggest: `/start <agent-name>` to create/resume. DONE.
    - **If UNINITIALIZED**: Follow `.claude/rules/user-interaction.md` UNINITIALIZED protocol. DONE.
-   - **If RUNNING**: Agent is in autonomous mode (another window or crashed session). Show error with recovery instructions (same as `/start` RUNNING branch). DONE — do not invoke boot.
+   - **If RUNNING**: Agent is in autonomous mode (another window or crashed session). If this is a new session (not an autocompact resume), suggest `/start <agent> --mode reader` for read-only access or `/start <agent> --mode assistant` for user-directed access. DONE — do not invoke boot or auto-resume.
    - **If IDLE**: Bash: `session-mode-get.sh` → read mode (default: `reader`). Read `core/config/modes/{mode}.md`. Invoke `/prime`, then ready for user.
 
 ### Agent-Session Binding
@@ -292,14 +292,18 @@ without attempting all eligible tiers.
 | Command | Effect | Valid From |
 |---------|--------|-----------|
 | `/start <name>` | Create/resume agent in autonomous mode (default) | UNINITIALIZED, IDLE |
-| `/start <name> --mode reader` | Create/resume agent in reader mode (read-only) | UNINITIALIZED, IDLE |
-| `/start <name> --mode assistant` | Create/resume agent in assistant mode (user-directed learning) | UNINITIALIZED, IDLE |
+| `/start <name> --mode reader` | Create/resume agent in reader mode (read-only) | UNINITIALIZED, IDLE, RUNNING* |
+| `/start <name> --mode assistant` | Create/resume agent in assistant mode (user-directed learning) | UNINITIALIZED, IDLE, RUNNING* |
 | `/stop [agent-name]` | Consolidate → drop to reader mode → IDLE | RUNNING, IDLE |
 | `/verify-learning` | Post-test verification | ANY |
 | `/open-questions` | Show open questions | ANY |
 | `/agent-completion-report` | Show what changed *(also agent-callable)* | ANY |
 | `/backlog-report` | Sprint planning backlog *(also agent-callable)* | ANY |
 | `/priority-review` | Priority dashboard — reorder aspirations *(also agent-callable)* | ANY |
+
+\*When started from RUNNING state, reader/assistant create an **observer session** that coexists
+with the autonomous loop. Observer sessions do not write to agent-state, agent-mode, or
+persona-active. See `/start` RUNNING branch and `core/config/conventions/session-state.md`.
 
 ### Enforcement Rules
 
@@ -308,7 +312,7 @@ without attempting all eligible tiers.
 3. In reader mode: read-only assistant. May read state but MUST NOT execute write operations or workflow skills.
 4. In assistant mode: user-directed assistant. May read and write when asked but MUST NOT self-initiate or run the loop.
 5. In autonomous mode (RUNNING state): autonomous via aspirations loop.
-6. Auto-resume after autocompact is handled by the stop hook (unconditional BLOCK + LOOP_CONTINUE), NOT by the Session Start Protocol. A new session that finds RUNNING state must show the error, not auto-resume.
+6. Auto-resume after autocompact is handled by the stop hook (unconditional BLOCK + LOOP_CONTINUE), NOT by the Session Start Protocol. A new session that finds RUNNING state must show the error (or start an observer session if `--mode reader|assistant` is requested), not auto-resume.
 
 ### Autonomous Loop Rules
 

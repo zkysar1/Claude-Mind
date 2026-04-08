@@ -125,6 +125,27 @@ def _find_probe_script(component):
     return None
 
 
+def _find_bash():
+    """Find a bash binary that can handle Windows absolute paths.
+
+    On Windows, Python may find MSYS2 bash (Git/usr/bin/bash.EXE) which
+    cannot resolve Windows paths like C:/Users/... passed as arguments.
+    Git Bash (Git/bin/bash.exe) handles both Windows and POSIX paths.
+    Prefer bin/bash.exe when available; fall back to PATH bash on non-Windows.
+    """
+    if sys.platform == "win32":
+        for candidate in [
+            Path("C:/Program Files/Git/bin/bash.exe"),
+            Path("C:/Program Files (x86)/Git/bin/bash.exe"),
+        ]:
+            if candidate.exists():
+                return str(candidate)
+    return "bash"
+
+
+_BASH_CMD = _find_bash()
+
+
 def _run_probe_script(script_path, component):
     """Run a domain-specific probe script and parse its JSON output.
 
@@ -134,7 +155,7 @@ def _run_probe_script(script_path, component):
     start = time.time()
     try:
         result = subprocess.run(
-            ["bash", script_path.as_posix()],  # absolute path — world/ may be external to PROJECT_ROOT
+            [_BASH_CMD, str(script_path)],  # str() — Git Bash handles Windows paths
             cwd=str(PROJECT_ROOT),
             capture_output=True, text=True, timeout=30,
         )

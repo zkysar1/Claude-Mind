@@ -7,10 +7,10 @@ the autonomous session — the turn ends, and the loop dies.
 ## Rule
 
 Your LAST action before returning MUST be a Bash tool call, not text output.
-NEVER end with text like "Returning to orchestrator" or "Phase complete."
+NEVER end with text like "Phase complete." or "All done."
 If your last substantive action was text output, make a final Bash call:
-  `Bash: echo "DONE"`
-The caller continues immediately after this skill returns.
+  `Bash: echo "Return to orchestrator — continue to next phase"`
+Do NOT produce any text output after this Bash call.
 
 ## Applies To
 

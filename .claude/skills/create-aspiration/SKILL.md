@@ -90,7 +90,7 @@ IF strategic_focus.primary is set:
 
 ```
 Bash: load-aspirations-compact.sh          → IF path returned: Read it (compact aspirations data — IDs, titles, statuses, priorities, categories, skills, recurring, participants, blocked_by, deferred, args, parent_goal, discovered_by, started — no descriptions/verification)
-Bash: aspirations-read.sh --summary       → all including archived (for dedup)
+Bash: aspirations-read.sh --summary       → active aspirations only (one-liner per aspiration)
 Bash: tree-read.sh --stats                → knowledge coverage
 Read <agent>/developmental-stage.yaml        → maturity level
 Read core/config/aspirations.yaml              → max_active cap, aspiration_scopes, default_scope
@@ -606,7 +606,12 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
      Until within cap
 
 3. ID assignment:
-   Determine next asp-NNN ID from existing aspirations
+   Determine next asp-NNN ID from BOTH active AND archived aspirations.
+   Active IDs: from --summary output (Step 2).
+   Archived IDs: from stepping-stones output (Phase A.5), or if archive
+   may have more: aspirations-read.sh --archive | grep '"id"'
+   Pick the highest NNN across both sets, then use NNN+1.
+   If the script rejects with "already exists in archive", increment and retry.
    Assign sequential goal IDs: g-NNN-01, g-NNN-02, etc.
 ```
 

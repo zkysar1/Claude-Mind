@@ -215,7 +215,7 @@ this additional structure in the tags.
 
 **Example:**
 ```bash
-echo "The config.yaml file is empty — all goals assuming configuration exists are invalid" | \
+echo "The config.yaml file is empty — all goals assuming configuration data exists are invalid" | \
   bash core/scripts/board-post.sh --channel findings --type finding \
     --tags "insight_trigger,severity:invalidates,affects:g-166-06,requires_action_by:bravo,action_type:re-scope,infrastructure"
 ```

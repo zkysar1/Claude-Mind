@@ -71,18 +71,18 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes
     NOT once per goal. Goals within the same loop share a session.)
 
 # ── Routine outcome learning path ──────────────────────────────────
-# Principle: we are here to learn. Even routine outcomes deserve a creative lens.
+# Principle: we are here to learn. Even routine outcomes deserve operational scrutiny.
 # This replaces the bare early return with lightweight but meaningful reflection.
 IF outcome_class == "routine":
 
-    # Step 5r: Lightweight creative reflection (NOT skipped for routine)
-    # Ask ONE creative question from the creative_lens template, rotating
-    # deterministically so each routine execution gets a different question.
-    Read core/config/reflection-templates.yaml → creative_lens.questions
-    question_index = hash(goal.id) % len(creative_lens.questions)
-    creative_q = creative_lens.questions[question_index]
-    Evaluate: {creative_q} applied to this routine goal's outcome
-    IF creative reflection produces a non-trivial insight (not a restatement of known facts):
+    # Step 5r: Lightweight operational reflection (NOT skipped for routine)
+    # Ask ONE question from the routine_lens template, rotating so each
+    # execution of a recurring goal gets a DIFFERENT question over time.
+    Read core/config/reflection-templates.yaml → routine_lens.questions
+    question_index = hash(goal.id + str(goal.achievedCount)) % len(routine_lens.questions)
+    routine_q = routine_lens.questions[question_index]
+    Evaluate: {routine_q} applied to this routine goal's outcome
+    IF reflection produces a non-trivial insight (not a restatement of known facts):
         # Capture as a lightweight reasoning bank entry
         Bash: reasoning-bank-read.sh --category {goal.category}
         IF NOT semantically overlapping with existing entries:
@@ -90,20 +90,20 @@ IF outcome_class == "routine":
               title: "Routine insight: {concise name}"
               type: success
               category: goal's category
-              content: the creative insight
+              content: the operational insight
               when_to_use: when this insight applies
               source_goal: goal.id
-              tags: ["routine-creative-insight"]
-            Log: "ROUTINE CREATIVE INSIGHT: {title} from {goal.id}"
+              tags: ["routine-operational-insight"]
+            Log: "ROUTINE OPERATIONAL INSIGHT: {title} from {goal.id}"
         routine_insight_found = true
-        routine_insight_text = the creative insight (1-2 sentences)
+        routine_insight_text = the operational insight (1-2 sentences)
     ELSE:
         routine_insight_found = false
         routine_insight_text = "No new insight."
 
     # 7r. WRITE enhanced journal entry
        - Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
-         "## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}. Creative lens ({creative_q[:60]}...): {routine_insight_text}"
+         "## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}. Routine lens ({routine_q[:60]}...): {routine_insight_text}"
        - Update journal index via scripts (same merge/add pattern as full journal):
          - If session entry exists: pipe update JSON to `bash core/scripts/journal-merge.sh <session-num>`
          - If session entry does not exist: pipe new entry JSON to `bash core/scripts/journal-add.sh`

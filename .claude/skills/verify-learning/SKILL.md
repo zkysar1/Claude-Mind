@@ -94,7 +94,20 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `start/SKILL.md` includes LLM prefix contract instruction (AYOAI_AGENT=<name>)
    Check: Stop hook recovery message includes agent name and AYOAI_AGENT prefix instruction
    Check: `start/SKILL.md` has Step 1 that uses `AYOAI_AGENT=<agent-name>` env prefix
-   Check: `start/SKILL.md` RUNNING path does NOT change any state (no-op, warning only)
+   Check: `start/SKILL.md` RUNNING+autonomous sub-branch is a no-op (no state changes, warning only)
+
+   # Observer session checks (Section OBS)
+   # Observer sessions (reader/assistant started during RUNNING) coexist with the runner.
+   # They MUST NOT touch agent-state, agent-mode, persona-active, or running-session-id.
+   Check: `start/SKILL.md` RUNNING branch splits on requested mode (autonomous vs reader/assistant)
+   Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch does NOT call `session-state-set.sh`
+   Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch does NOT call `session-mode-set.sh`
+   Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch does NOT call `session-persona-set.sh`
+   Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch does NOT write to `running-session-id`
+   Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch DOES bind session (`.active-agent-<SID>`)
+   Check: `session-state.md` has "Observer Sessions" section with rules and concurrency safety
+   Check: `stop-hook.sh` Gate 0 allows non-runner SIDs (HOOK_SID != RUNNER_SID → exit 0)
+   Check: CLAUDE.md User Control Commands table shows `RUNNING*` for reader and assistant rows
 
    # Stop hook integrity checks (Section SH)
    # The stop hook has ONE job: BLOCK unconditionally when RUNNING with no stop signal.
@@ -182,6 +195,11 @@ Focus on what actually happened during the test — did the agent USE the new fe
        Check: `claimed_by` value matches `$AYOAI_AGENT`
    # JSONL list-field normalization regression check
    Check: `goal-selector.py` defines `_ensure_list()` and every operational `.get("blocked_by")`, `.get("participants")`, `.get("tags")` call is wrapped in it. Only passthrough stores (goal_map building) may use raw `.get()`. Read the file and verify no unguarded iteration of these fields.
+
+   # Aspiration ID archive collision guard (Section DQ continued)
+   Check: `aspirations.py` `cmd_add` calls `_check_not_archived` inside lock scope (prevents creating aspirations with IDs that exist in the archive)
+   Check: `aspirations.py` `_check_not_archived` has `action` keyword param — `action="add"` gives "pick a higher ID" message, default gives "cannot modify" message
+   Check: `create-aspiration/SKILL.md` Step 5 item 3 says "BOTH active AND archived" (not just "existing aspirations")
 
    # Binary outcome classification evidence checks (Section OC)
    # outcome_class has exactly 2 valid values: "deep" (default) and "routine"
@@ -688,6 +706,13 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `start/SKILL.md` has Phase C0.5 "Configure domain conventions" between C0 and C1
    Check: `start/SKILL.md` Phase C0.5 only runs when `world/conventions/` has no `.md` files (existing world skips)
    Bash: bash core/scripts/guardrails-read.sh --id guard-006 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='active'; assert all(ord(c)<128 for c in d['rule']); print('OK')" → verify guard-006 exists, is active, has no non-ASCII
+   # Fresh eyes code review step (DC continued)
+   Bash: source core/scripts/_paths.sh && grep -c "Step 1.75" "$WORLD_DIR/conventions/post-execution.md" → verify returns >= 1 (fresh eyes step exists)
+   Check: `$WORLD_DIR/conventions/post-execution.md` Step 1.75 is between Step 1.5 (testing) and Step 2 (commit)
+   Check: `$WORLD_DIR/conventions/post-execution.md` Step 1.5 PASS case says "Proceed to Step 1.75" (not "Step 2")
+   Check: `$WORLD_DIR/conventions/post-execution.md` Step 1.5 PARTIAL case says "Proceed to Step 1.75" (not "Step 2")
+   #   Without this, PARTIAL test results bypass code review entirely — the original Step 2 reference
+   #   was not updated when Step 1.75 was inserted. Both PASS and PARTIAL must flow through fresh eyes.
    IF agent ran goals after post-execution convention was deployed:
        Check: journal mentions "Committed and pushed" for goals that produced code changes
        Check: no pending-questions with status=pending about uncommitted changes
@@ -696,6 +721,35 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: bash core/scripts/load-conventions.sh pre-execution → verify returns a non-empty path
    Check: `aspirations-execute/SKILL.md` has Phase 3.9 "Pre-Execution Domain Steps" before Phase 4
    Check: `execute-protocol-digest.md` has Phase 3.9 before Intelligent Retrieval Protocol
+
+   # Convention learning evidence checks (Section DCL)
+   # The convention learning system allows the agent to learn new convention steps during
+   # reflection, replay, and evolution — promoting recurring guardrails to procedural steps.
+   # Config bounds
+   Bash: grep -c "convention_learning.max_steps_per_convention" core/config/aspirations.yaml → verify returns >= 1
+   Bash: grep -c "convention_learning.auto_apply_confidence" core/config/aspirations.yaml → verify returns >= 1
+   Bash: grep -c "convention_learning.cooldown_goals" core/config/aspirations.yaml → verify returns >= 1
+   # Skill integration points
+   Check: `reflect-on-outcome/SKILL.md` has "Step 2.5b: Convention Routing Check" between Step 2.5 and Step 2.6
+   Check: Step 2.5b classifies lessons as universal/procedural and maps to pre/post execution
+   Check: Step 2.5b has cost gate checking `max_steps_per_convention` before adding
+   Check: Step 2.5b has recurrence check (`>= 2` similar guardrails triggers auto-apply)
+   Check: Step 2.5b auto-apply path calls `history-save.sh` before editing convention file
+   Check: Step 2.5b auto-apply retires subsumed guardrails via `guardrails-update-field.sh`
+   Check: Step 2.5b appends to `$WORLD_DIR/conventions/convention-changes.jsonl` (lifecycle log)
+   Check: `aspirations-evolve/SKILL.md` has "Step 3.5: Convention Health Audit" between Step 3 and Step 4
+   Check: Step 3.5 loads both convention files and scans for utilization/skipping patterns
+   Check: Step 3.5c detects guardrails with `times_active >= 5` as convention promotion candidates
+   Check: Step 3.5d reviews pending proposals from `convention-changes.jsonl` for auto-apply maturity
+   Check: Step 3.5d checks confidence >= threshold OR reinforcement_count >= 2 before auto-applying
+   Check: Step 3.5f logs health snapshot to `evolution-log.jsonl`
+   Check: `replay/SKILL.md` has "Step 3.5: Convention Pattern Mining" between Step 3 and Step 4
+   Check: Step 3.5 fires only when Step 3 found shared conditions in 2+ corrected hypotheses
+   Check: Step 3.5 scans for procedural gap indicators in OUTCOME fields
+   Check: Step 3.5 reinforces existing proposals (confidence += 0.15) before creating new ones
+   # Convention file structure integrity
+   Bash: source core/scripts/_paths.sh && grep -c "^## Step" "$WORLD_DIR/conventions/post-execution.md" → verify step count is <= 12 (max_steps upper bound)
+   #   If this exceeds the configured max, convention learning will be unable to add new steps.
 
    # File history evidence checks (Section FH)
    Check: `core/scripts/_fileops.py` has `save_history()` function
@@ -749,7 +803,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `core/config/conventions/board.md` Agent Integration Points lists forge-skill Step 6
    Check: `core/scripts/init-world.sh` creates `world/forged-skills.yaml`
    Check: `forge-skill/SKILL.md` Step 4 writes to `world/forged-skills.yaml` with forged_by field
-   Check: `forge-skill/SKILL.md` Step 7 notifies the user (via forged notification skill if available, else pending-questions)
+   Check: `forge-skill/SKILL.md` Step 7 notifies the user about newly forged skill (via forged notification skill or pending-questions)
    Bash: bash core/scripts/board-channels.sh → verify lists channels (or says no board)
    IF world/board/ exists with .jsonl files:
        Bash: echo "verify-learning test message" | bash core/scripts/board-post.sh --channel general → verify returns message ID
@@ -925,8 +979,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: CLAUDE.md Core Systems table includes `Background jobs` entry
    Check: CLAUDE.md session signals table includes `background-jobs.yaml` entry
    Check: CLAUDE.md Convention Index `session-state.md` row mentions "background jobs tracker"
-   Check: Background jobs framework scripts exist: `core/scripts/background-jobs.sh`, `core/scripts/background-jobs.py`
-   Check: Background jobs convention documented in `core/config/conventions/session-state.md`
+   Check: `core/scripts/background-jobs.py` has register, deregister, check, list, has-pending, clear subcommands
    Bash: AYOAI_AGENT=alpha bash core/scripts/background-jobs.sh list 2>&1 → should output "No background jobs." (not crash)
 
    # OMNI-EPIC-inspired aspiration generation evidence checks (Section OE)
@@ -987,8 +1040,9 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `.claude/rules/forged-skill-resolution.md` exists (core rule, domain-agnostic)
    Check: Rule points to `world/forged-skills.yaml` as THE resolution source (not guardrails)
    Check: Rule has exactly 2 rules (no fallback logic, no guardrail precedence)
-   Check: `world/forged-skills.yaml` exists (may be empty initially — forged skills are domain-specific)
-   Check: If any forged skills exist, each entry has non-empty `triggers` list
+   IF world/forged-skills.yaml exists and has entries:
+       Check: Each forged skill entry has non-empty `triggers` list
+       Check: Each forged skill entry has `forged_by` and `created` fields
    Check: No active guardrail with category `skill-resolution` exists (guard-050 retired — single source of truth)
    Bash: guardrail-check.sh --context any --dry-run 2>/dev/null | python3 -c "
    import sys,json; d=json.load(sys.stdin)
@@ -1010,17 +1064,50 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # Check world/skill-relations.yaml exists
    assert pathlib.Path(f'{world_dir}/skill-relations.yaml').exists(), 'FAIL: world/skill-relations.yaml missing'
    print('PASS: world/skill-relations.yaml exists')
-   # Check no per-agent forged-skills.yaml (except tombstone)
-   for agent_dir in pathlib.Path('.').glob('*/forged-skills.yaml'):
-       content = agent_dir.read_text().strip()
-       assert content.startswith('# MIGRATED'), f'FAIL: {agent_dir} is not a tombstone'
-   print('PASS: no per-agent forged-skills.yaml (only tombstones)')
+   # Check no per-agent forged-skills.yaml (migration complete — tombstones should be deleted too)
+   stale = list(pathlib.Path('.').glob('*/forged-skills.yaml'))
+   assert len(stale) == 0, f'FAIL: per-agent forged-skills.yaml found: {stale} (delete — world/ is the single source)'
+   print('PASS: no per-agent forged-skills.yaml')
    # Check no per-agent skill-relations.yaml
    for sr in pathlib.Path('.').glob('*/skill-relations.yaml'):
        if sr.parts[0] == 'core': continue
        assert False, f'FAIL: per-agent {sr} still exists'
    print('PASS: no per-agent skill-relations.yaml')
    " → verify world-level single source of truth
+
+   # Agent directory structural hygiene checks (Section AH)
+   # Catches common cruft patterns: misplaced journals, per-agent script dirs, stale migration stubs.
+   # Root causes: early-boot naming before conventions stabilized, consolidation path bugs, migration leftovers.
+   Bash: python3 -c "
+   import pathlib, json, sys
+   errors = []
+   # 1. No loose journal files at <agent>/journal/ level (must be in YYYY/MM/)
+   for agent in [p.parent for p in pathlib.Path('.').glob('*/.initialized')]:
+       journal_dir = agent / 'journal'
+       if journal_dir.is_dir():
+           loose = [f for f in journal_dir.iterdir() if f.is_file() and f.suffix == '.md']
+           if loose:
+               errors.append(f'Loose journal files in {journal_dir}/: {[f.name for f in loose]} (should be in YYYY/MM/)')
+   # 2. No <agent>/scripts/ directory (domain scripts belong in world/scripts/)
+   for agent in [p.parent for p in pathlib.Path('.').glob('*/.initialized')]:
+       scripts_dir = agent / 'scripts'
+       if scripts_dir.is_dir():
+           errors.append(f'{scripts_dir}/ exists (domain scripts belong in world/scripts/)')
+   # 3. Journal index entries point to existing files
+   for agent in [p.parent for p in pathlib.Path('.').glob('*/.initialized')]:
+       jfile = agent / 'journal.jsonl'
+       if jfile.exists():
+           for i, line in enumerate(jfile.open(), 1):
+               rec = json.loads(line)
+               jpath = rec.get('journal_file', '')
+               if jpath and not pathlib.Path(jpath).exists():
+                   errors.append(f'{agent.name}/journal.jsonl line {i}: journal_file \"{jpath}\" does not exist')
+                   break  # one broken ref is enough to flag
+   if errors:
+       for e in errors: print(f'FAIL: {e}')
+       sys.exit(1)
+   print('PASS: agent directory structure clean (no loose journals, no per-agent scripts/, journal index intact)')
+   " → verify agent directory hygiene
 
    # Programmatic utilization enforcement evidence checks (Section PU)
    # Three-layer enforcement: auto-manifest (retrieve.py), script feedback (utilization-feedback.sh), hook backstop (utilization-gate.sh)
@@ -1067,12 +1154,15 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: python3 -c "import ast; ast.parse(open('core/scripts/goal-selector.py', encoding='utf-8').read()); print('OK')" → verify goal-selector.py parses
    Bash: python3 -c "import ast; ast.parse(open('core/scripts/board.py', encoding='utf-8').read()); print('OK')" → verify board.py parses
 
-   # MAC9: Claim lifecycle shell wrappers and TOCTOU-safe locking
+   # MAC9: Claim lifecycle shell wrappers and full-cycle TOCTOU-safe locking (guard-102)
    Check: `core/scripts/aspirations-claim.sh` exists and exec line contains `aspirations.py` and `claim`
    Check: `core/scripts/aspirations-release.sh` exists and exec line contains `aspirations.py` and `release`
    Check: `core/scripts/aspirations-complete-by.sh` exists and exec line contains `aspirations.py` and `complete-by`
-   Check: `aspirations.py` `cmd_release` uses `acquire_lock(lock_path)` before `read_jsonl` (TOCTOU-safe, matches cmd_claim)
-   Check: `aspirations.py` `cmd_complete_by` uses `acquire_lock(lock_path)` before `read_jsonl` (TOCTOU-safe, matches cmd_claim)
+   Check: ALL 10 write commands in `aspirations.py` use full-cycle locking (acquire_lock before read_jsonl, _write_live_under_lock for LIVE writes):
+     cmd_add, cmd_update, cmd_update_goal, cmd_add_goal, cmd_complete, cmd_retire, cmd_archive_sweep, cmd_claim, cmd_release, cmd_complete_by
+   Check: NO calls to `write_jsonl(LIVE_PATH` remain in `aspirations.py` (all LIVE writes use _write_live_under_lock under caller-held lock)
+   Check: `_check_not_archived` called in cmd_update, cmd_update_goal, cmd_add_goal (archive cross-check prevents stale resurrection)
+   Check: Lock ordering comment near file I/O helpers: "LIVE_PATH.lock first, ARCHIVE_PATH.lock second"
 
    # MAC10: Claim integration in orchestrator
    Check: `aspirations/SKILL.md` has "CLAIM + EXECUTE (Phase 4)" section with `aspirations-claim.sh` call
@@ -1280,19 +1370,21 @@ print(f'PASS: guard-056 active')
    Bash: AYOAI_AGENT=$AYOAI_AGENT spark-questions-read.sh --active → verify 17 active questions
    Bash: verify `first_principles` and `experiential_hypothesis` categories are present in active list
 
-   # CLE2: Creative lens template exists
+   # CLE2: Creative lens and routine lens templates exist
    Check: `reflection-templates.yaml` has `creative_lens:` section with 5 questions
+   Check: `reflection-templates.yaml` has `routine_lens:` section with 8 questions
    Check: `reflection-templates.yaml` has `domain_templates:` with code, infrastructure, research
-   Check: `reflection-templates.yaml` `initial_state.templates` mirrors the framework section
+   Check: `reflection-templates.yaml` `initial_state.templates` mirrors the framework section (including routine_lens)
 
    # CLE3: Routine spark expanded
    Check: `aspirations-spark/SKILL.md` routine_spark mode filters 6 categories (not 3)
    Check: categories include `first_principles`, `transfer`, `surprise` alongside the original 3
    Check: `aspirations/SKILL.md` has NO `% 3` gate on routine spark (fires every routine)
 
-   # CLE4: Routine state-update has creative reflection
-   Check: `aspirations-state-update/SKILL.md` routine path has "Step 5r" creative-lens question
-   Check: routine path reads `creative_lens.questions` from `reflection-templates.yaml`
+   # CLE4: Routine state-update has operational reflection
+   Check: `aspirations-state-update/SKILL.md` routine path has "Step 5r" routine-lens question
+   Check: routine path reads `routine_lens.questions` from `reflection-templates.yaml`
+   Check: routine path uses `hash(goal.id + str(goal.achievedCount))` for question rotation
    Check: routine path has "Step 8r" accumulation check (every 5th routine)
 
    # CLE5: Divergent alternatives in reflection pipeline

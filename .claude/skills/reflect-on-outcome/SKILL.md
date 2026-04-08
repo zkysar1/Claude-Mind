@@ -186,6 +186,84 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
      ```
 
+## Step 2.5b: Convention Routing Check
+
+For CORRECTED hypotheses (not `unlucky_corrected`), evaluate whether the lesson extracted
+in Step 2.5 is better expressed as a domain convention step rather than a guardrail.
+
+Convention steps are **procedural** (run every goal via Phase 3.9/4.2). Guardrails are
+**consultative** (keyword-matched, fire for specific contexts). If the lesson is process-level
+("always do X before/after execution"), it belongs in a convention, not a guardrail.
+
+```
+lesson_text = the guardrail description / preventive lesson from Step 2.5
+
+# 1. CLASSIFICATION — Is this lesson universal and procedural?
+is_universal = lesson applies to ALL or MOST goals (not conditional on specific category/context)
+  Signal words: "always", "every goal", "before any", "after every", "every time"
+is_procedural = lesson describes a STEP TO PERFORM (not a check to consult)
+  Signal words: "run", "execute", "pull", "commit", "push", "test", "scan", "review", "verify"
+
+# 2. PHASE MAPPING — Pre or post execution?
+maps_to_pre = lesson relates to setup/prerequisites before goal execution
+  Signal words: "before executing", "before starting", "prerequisite", "check first", "pull latest"
+maps_to_post = lesson relates to cleanup/verification after goal execution
+  Signal words: "after executing", "after finishing", "commit", "push", "clean up", "record", "verify result"
+
+IF NOT (is_universal AND is_procedural AND (maps_to_pre OR maps_to_post)):
+    Log: "CONVENTION ROUTING: lesson stays as guardrail (not universal/procedural enough)"
+    SKIP to Step 2.6
+
+target_convention = "pre-execution" if maps_to_pre else "post-execution"
+
+# 3. RECURRENCE CHECK — Do similar guardrails already exist?
+Bash: guardrails-read.sh --active
+similar_guards = [g for g in active_guardrails where g.description is semantically similar to lesson_text]
+recurrence_count = len(similar_guards)
+
+# 4. DUPLICATION CHECK — Is this already a convention step?
+Bash: source core/scripts/_paths.sh && cat "$WORLD_DIR/conventions/{target_convention}.md" 2>/dev/null
+IF proposed step semantically overlaps with existing convention step:
+    Log: "CONVENTION ROUTING: lesson overlaps existing {target_convention} step — skipped"
+    SKIP to Step 2.6
+
+# 5. COST GATE — Check step count against max
+current_step_count = count lines matching "^## Step" in the convention file
+Read core/config/aspirations.yaml → modifiable.convention_learning.max_steps_per_convention (default 8)
+IF current_step_count >= max_steps_per_convention:
+    Log: "CONVENTION ROUTING: at step limit ({current_step_count}/{max_steps_per_convention}) — keeping as guardrail"
+    SKIP to Step 2.6
+
+# 6. DECISION — Propose or auto-apply
+proposed_step = {
+    title: concise title from lesson,
+    condition: "IF {condition from ABC antecedents}:",
+    action: lesson_text reformulated as procedural step
+}
+
+IF recurrence_count >= 2:
+    # Auto-apply: multiple guardrails cover the same lesson → promote to convention
+    Bash: bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{target_convention}.md" {agent_name} "Convention learning: adding step from hypothesis {hypothesis.id}"
+    Edit $WORLD_DIR/conventions/{target_convention}.md:
+        Append new step at appropriate position (before session-boundary sweep if post-execution)
+    # Retire subsumed guardrails
+    FOR EACH guard in similar_guards:
+        Bash: guardrails-update-field.sh {guard.id} status retired
+        Log: "CONVENTION SUBSUME: retired {guard.id} — now covered by {target_convention} step"
+    # Log the change
+    echo '{"date":"<today>","type":"promote_guardrail","target":"{target_convention}","proposed_step":<proposed_step JSON>,"source":"reflect-on-outcome","source_hypothesis":"{hypothesis.id}","source_guardrails":[<similar_guard IDs>],"reinforcement_count":{recurrence_count},"confidence":0.85,"status":"applied"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+    Log: "CONVENTION ADDED: promoted to {target_convention} — '{proposed_step.title}' (auto-applied: {recurrence_count} similar guardrails)"
+ELSE:
+    # Propose: single occurrence, needs reinforcement before applying
+    echo '{"date":"<today>","type":"add","target":"{target_convention}","proposed_step":<proposed_step JSON>,"source":"reflect-on-outcome","source_hypothesis":"{hypothesis.id}","source_guardrails":[],"reinforcement_count":1,"confidence":0.6,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
+    # Create pending question for user awareness
+    Write to <agent>/session/pending-questions.yaml:
+        question: "Convention learning: Propose adding step to {target_convention}.md — '{proposed_step.title}'. Source: hypothesis {hypothesis.id} correction. Will auto-apply after reinforcement."
+        default_action: "Will add after 2+ reinforcing signals from reflect/replay/evolve"
+        status: pending
+    Log: "CONVENTION ROUTING: proposed new step for {target_convention} — '{proposed_step.title}' (pending reinforcement)"
+```
+
 ## Step 2.6: Contrastive Extraction (CONFIRMED/CORRECTED Pairing)
 
 After differentiated extraction, check if a contrastive pair exists — a CONFIRMED and CORRECTED in the same category that can be compared to extract what distinguished success from failure.

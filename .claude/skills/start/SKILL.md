@@ -45,9 +45,12 @@ omit the prefix — use the current session binding.
 
 The agent is in autonomous mode. This could mean another Claude Code window is
 actively running the loop, OR a previous session crashed/closed without `/stop`.
-Either way, `/start` cannot proceed — autonomous mode must be stopped first.
 
-Output:
+Branch on the **requested mode** (parsed in Step 0.5):
+
+#### RUNNING + requested mode is `autonomous` (or no `--mode` flag)
+
+Cannot start a second autonomous session. Output:
 
 ```
 ⚠ Agent '<agent-name>' is in autonomous mode (RUNNING state).
@@ -59,11 +62,44 @@ To recover:
   2. If the previous session crashed — run /stop here to clean up
   3. Then: /start <agent-name> [--mode <mode>]
 
-Reader and assistant modes are safe to run in multiple windows,
-but autonomous mode must be stopped before restarting.
+Or open a read-only/assistant window alongside the running loop:
+  /start <agent-name> --mode reader
+  /start <agent-name> --mode assistant
 ```
 
 DONE. No state changes. No-op.
+
+#### RUNNING + requested mode is `reader` or `assistant` (Observer Session)
+
+The observer session coexists with the autonomous loop. It does NOT write to
+agent-state, agent-mode, persona-active, or running-session-id.
+
+0. **Bind session** (same as IDLE step 0):
+
+   Bash: `SID=$(cat .latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "<agent-name>" > ".active-agent-$SID" && mkdir -p <agent-name>/session && echo "$SID" > <agent-name>/session/latest-session-id && rm -f .latest-session-id`
+
+   **CRITICAL — Agent Prefix Contract**: For the remainder of this session, prefix ALL
+   Bash tool calls with `AYOAI_AGENT="<agent-name>"`. This is the ONLY mechanism for
+   agent resolution in scripts.
+
+1. **Skip all state-writing scripts** — do NOT call:
+   - `session-mode-set.sh` (would overwrite autonomous mode)
+   - `session-state-set.sh` (state stays RUNNING for the runner)
+   - `session-persona-set.sh` (would interfere with runner)
+
+2. **Mode-specific setup:**
+
+   **Reader observer:**
+   - Bash: `rm -f .latest-session-id`
+   - Invoke `/prime` (with `--read-only` context — reader mode)
+   - Load mode instructions: Read `core/config/modes/reader.md`
+   - Output: "Reader mode active (observer). The autonomous loop continues in its session. I have read-only access to all accumulated knowledge. Ask me anything."
+
+   **Assistant observer:**
+   - Bash: `rm -f .latest-session-id`
+   - Invoke `/prime`
+   - Load mode instructions: Read `core/config/modes/assistant.md`
+   - Output: "Assistant mode active (observer). The autonomous loop continues in its session. I can learn when you teach me — give me directives like 'learn about X' or 'remember that Y'.\n\n⚠ Note: Concurrent writes to working memory or the knowledge tree may conflict with the running loop. Reader mode is safer for observation only."
 
 ### IDLE (agent-state contains "IDLE")
 
@@ -106,7 +142,8 @@ DONE. No state changes. No-op.
    - Bash: `SID=$(cat <agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && echo "$SID" > <agent>/session/running-session-id`
    - Bash: `session-signal-clear.sh stop-loop`
    - Bash: `session-signal-clear.sh stop-requested`
-   - Bash: `rm -f <agent>/session/iteration-checkpoint.json`
+   - Bash: `rm -f <agent>/session/iteration-checkpoint.json <agent>/session/compact-pending <agent>/session/compact-checkpoint.yaml`
+   - Bash: `session-signal-clear.sh loop-active`
    - Output: "Agent resumed. Learning loop starting."
    - Invoke `/boot`
 
@@ -152,7 +189,7 @@ B1. Ask for the **world directory** path:
 
    Examples:
    - C:/Users/Shared/claude-mind/world
-   - /mnt/nas/projects/my-project/world
+   - /mnt/nas/projects/claude-mind/world
    - ./world  (local, relative to this repo)
 
    Where should the world directory be?

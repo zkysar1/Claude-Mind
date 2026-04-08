@@ -6,12 +6,18 @@ init-world.sh. Customize for your domain or delete if not needed.
 
 ## Section Z: Domain Infrastructure
 
-_(Add domain-specific infrastructure checks here)_
+<!-- Add domain-specific infrastructure checks here. Examples:
+1. Check: build tool passes compilation
+2. Check: test suite passes (all existing + new tests)
+3. Check: `<agent>/infra-health.yaml` has component entries for your infrastructure
+4. IF any goal was skipped due to infrastructure blocker:
+   Check: `infra-health.sh check <component>` was called BEFORE the blocker was accepted
+-->
 
 ## Section ZZ: Domain Behavior
 
-_(Add domain-specific behavior verification items here)_
+<!-- Add domain-specific behavioral verification checks here. -->
 
 ## Section ZZZ: Domain Testing Infrastructure
 
-_(Add domain-specific testing infrastructure checks here)_
+<!-- Add checks for domain-specific testing infrastructure. -->

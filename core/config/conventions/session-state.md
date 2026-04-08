@@ -18,12 +18,37 @@
 - Skills check mode at entry via `session-mode-get.sh` and refuse if insufficient
 - All reads via `session-mode-get.sh`, all writes via `session-mode-set.sh`
 
-Mode is the single user-facing control. State and persona are derived:
+Mode is the single user-facing control. State and persona are derived at the agent level:
 - reader → IDLE, persona light (knowledge access, no agent character)
 - assistant → IDLE, persona full (agent identity, tone, personality)
 - autonomous → RUNNING, persona full + perpetual loop
 
+Observer sessions (see below) are the exception: they run reader/assistant mode while the
+agent-level state remains RUNNING. They do not write to mode or state files.
+
 Mode-specific behavioral rules live in `core/config/modes/{mode}.md`.
+
+---
+
+# Observer Sessions
+
+When an agent is RUNNING (autonomous mode), other sessions can connect as **observers**
+via `/start <agent> --mode reader` or `/start <agent> --mode assistant`.
+
+## Rules
+
+1. Observer sessions MUST NOT write to: `agent-state`, `agent-mode`, `persona-active`, `running-session-id`
+2. Observer sessions MUST NOT call: `session-state-set.sh`, `session-mode-set.sh`, `session-persona-set.sh`
+3. Observer sessions still bind via `.active-agent-<SID>` (per-session, no contention)
+4. Mode is tracked in-memory from the `/start` flow — no file needed
+5. The stop hook Gate 0 handles observers automatically (SID ≠ runner SID → allow stop)
+
+## Concurrency Safety
+
+- **Reader observers**: Fully safe — zero writes, zero contention
+- **Assistant observers**: Writes to knowledge tree (`.md` files) and JSONL stores
+  (via append-only scripts) are generally safe. Working memory (`wm-*.sh`) has no
+  cross-process locking — concurrent writes may silently overwrite. User is warned.
 
 ---
 
@@ -187,8 +212,8 @@ them via recurring goals and collect results on completion. Complements `pending
 (which tracks short-lived Claude Code sub-agents).
 
 - **File**: `<agent>/session/background-jobs.yaml`
-- **Written by**: Skills that launch external processes (e.g., forged skills with long-running background tasks)
-- **Read by**: Skills that monitor external processes (e.g., forged skills with monitoring modes)
+- **Written by**: Forged skills with long-running background tasks (e.g., processor launch skills)
+- **Read by**: Forged skills that monitor background tasks (e.g., processor monitor skills)
 - **Cleaned by**: The monitoring skill on job completion or failure
 
 **Scripts**: `core/scripts/background-jobs.sh` (thin wrapper), `core/scripts/background-jobs.py`

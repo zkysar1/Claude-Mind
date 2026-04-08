@@ -24,6 +24,21 @@ creative_lens:
     - "What HIDDEN VARIABLE might explain this outcome that we haven't considered?"
   focus: "Lateral thinking, contrarian reframing, cross-domain analogy, alternative explanation generation"
 
+# Routine Lens — operational self-audit that fires for ROUTINE outcomes only (Step 5r).
+# Unlike creative_lens (which reframes outcomes), this probes the agent's own process health.
+# One question per execution, rotating via hash(goal.id + achievedCount).
+routine_lens:
+  questions:
+    - "What am I NOT checking here that could silently degrade or break without me noticing?"
+    - "What data passes through this execution that I'm ignoring? What data should I be collecting but am not?"
+    - "What would be the first signal that this routine outcome is about to change, and am I watching for it?"
+    - "Have my pre-execution assumptions or post-execution checks gone stale — am I verifying things that no longer matter, or skipping things that now do?"
+    - "Is there friction in how I execute this goal — unnecessary steps, stale assumptions, or tools I'm fighting against?"
+    - "Is this goal earning its execution slot? What would make it more valuable without increasing its cost?"
+    - "What is one change that would make this routine produce learning, not just confirmation?"
+    - "Am I doing this because it produces learning, or just because it's on the list? What would I learn if I did it differently?"
+  focus: "Operational self-audit, blind spot detection, process health, execution quality, value justification"
+
 # Domain-specific templates — replace default for their category.
 # Each includes 2 standard calibration questions + 2 domain-specific creative questions.
 domain_templates:
@@ -71,6 +86,18 @@ initial_state:
         - "What would someone who DISAGREES with this conclusion say? What evidence would they cite?"
         - "What HIDDEN VARIABLE might explain this outcome that we haven't considered?"
       focus: "Lateral thinking, contrarian reframing, cross-domain analogy, alternative explanation generation"
+
+    routine_lens:
+      questions:
+        - "What am I NOT checking here that could silently degrade or break without me noticing?"
+        - "What data passes through this execution that I'm ignoring? What data should I be collecting but am not?"
+        - "What would be the first signal that this routine outcome is about to change, and am I watching for it?"
+        - "Have my pre-execution assumptions or post-execution checks gone stale — am I verifying things that no longer matter, or skipping things that now do?"
+        - "Is there friction in how I execute this goal — unnecessary steps, stale assumptions, or tools I'm fighting against?"
+        - "Is this goal earning its execution slot? What would make it more valuable without increasing its cost?"
+        - "What is one change that would make this routine produce learning, not just confirmation?"
+        - "Am I doing this because it produces learning, or just because it's on the list? What would I learn if I did it differently?"
+      focus: "Operational self-audit, blind spot detection, process health, execution quality, value justification"
 
     code:
       questions:
