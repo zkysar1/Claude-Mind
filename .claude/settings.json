@@ -3,6 +3,7 @@
     "allow": [
       "Bash(mkdir -p .claude/skills/*)",
       "Write(**/.claude/skills/**)",
+	  "Monitor(*)",
       "Edit(**/.claude/skills/**)"
     ],
     "deny": [
