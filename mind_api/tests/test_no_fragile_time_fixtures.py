@@ -42,7 +42,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TARGET_FILE = REPO_ROOT / "tests" / "runtime" / "test_runtime_aspirations_complete_by.py"
+TARGET_FILE = REPO_ROOT / "mind_api" / "tests" / "test_runtime_aspirations_complete_by.py"
 HELPER_NAME = "_make_asp_with_recurring_goal"
 
 

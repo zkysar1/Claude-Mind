@@ -353,8 +353,12 @@ the user" and invoke it with:
 - subject: build a stats-summary subject from the report data, e.g.,
   `"Completion Report ({since_label}, {N} goals, {N_deep} deep)"`
   (real example: `"Completion Report (31h, 6 goals, 1 deep)"`)
-- message-file: the timestamped archive file written in Phase 4 Step 3:
-  `agents/<agent>/reports/completion-report-{YYYY-MM-DDTHH-MM-SS}.md`
+- message-file: `agents/<agent>/COMPLETION-REPORT.md`
+  This is the latest-pointer file overwritten in Phase 4 Step 4 — it
+  always reflects the just-finished report. Using the pointer (rather
+  than the timestamped archive `agents/<agent>/reports/completion-report-{ts}.md`)
+  eliminates timestamp-threading drift between Phase 4 and Phase 5.5.
+  (N2 fresh-eyes finding, 2026-05-20.)
 
 The notify skill MUST consume the file via `--message-file` (not via a
 re-constructed prose summary). The 2026-05-20 incident — completion

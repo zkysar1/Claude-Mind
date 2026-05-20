@@ -138,7 +138,7 @@ def test_info_update_decision_categories(fake_root):
             "--agent", "alpha",
             "--category", cat,
             "--subject", f"Test {cat}",
-            "--message", "Long enough to clear the 50-char minimum body threshold easily.",
+            "--message", "Long enough to clear the 20-char minimum body threshold easily.",
             "--project-root", str(fake_root),
         ])
         assert rc == 0, f"category={cat}: stderr: {err}"
@@ -157,7 +157,7 @@ def test_double_front_matter_self_md(fake_root):
         "--agent", "bravo",
         "--category", "completion",
         "--subject", "Test",
-        "--message", "Long enough to clear the 50-char minimum body threshold easily.",
+        "--message", "Long enough to clear the 20-char minimum body threshold easily.",
         "--project-root", str(fake_root),
     ])
     assert rc == 0, f"stderr: {err}"
@@ -177,7 +177,7 @@ def test_first_sentence_wraps_lines(fake_root):
         "--agent", "echo",
         "--category", "info",
         "--subject", "Test",
-        "--message", "Long enough to clear the 50-char minimum body threshold easily.",
+        "--message", "Long enough to clear the 20-char minimum body threshold easily.",
         "--project-root", str(fake_root),
     ])
     assert rc == 0, f"stderr: {err}"
@@ -288,7 +288,7 @@ def test_agent_from_env_var(fake_root):
         [
             "--category", "info",
             "--subject", "EnvAgentTest",
-            "--message", "Long enough to clear the 50-char minimum body threshold easily.",
+            "--message", "Long enough to clear the 20-char minimum body threshold easily.",
             "--project-root", str(fake_root),
         ],
         env_extra={"MIND_AGENT": "alpha"},
@@ -339,7 +339,7 @@ def test_sections_and_next_steps_passthrough(fake_root):
         "--agent", "alpha",
         "--category", "completion",
         "--subject", "Test",
-        "--message", "Long enough to clear the 50-char minimum body threshold easily.",
+        "--message", "Long enough to clear the 20-char minimum body threshold easily.",
         "--sections-json", sections,
         "--next-steps-json", next_steps,
         "--project-root", str(fake_root),

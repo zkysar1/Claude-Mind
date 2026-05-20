@@ -62,11 +62,18 @@ CATEGORY_TO_INFOTYPE = {
     "decision-needed": "Decision Needed",
 }
 
-# Minimum message length AFTER the identity opener. The silent-empty-email
-# failure mode produced payloads with Body=empty or just the template
-# placeholder. 50 chars of actual message content is the floor — shorter
-# than that and the email arrives with no substance for the user to read.
-MIN_MESSAGE_CHARS = 50
+# Minimum message length AFTER stripping. The silent-empty-email failure
+# mode produced payloads with Body=empty or just the template placeholder.
+# 20 chars is the floor — high enough to catch truly empty ("", placeholder
+# "<message>" = 9 chars, "TODO" = 4 chars, "test send" = 9 chars) but low
+# enough not to reject legitimate brief notifications callers actually send:
+#   - "Bridge unreachable on dev" (blocker alert)      = 25 chars
+#   - "Created asp-XXX: widget enhancements" (aspir.)  = 36 chars
+#   - "Decomposed g-NNN into 3 subgoals" (decompose)   = 32 chars
+#   - "Forged skill 'foo' for category bar" (forge)    = 35 chars
+# Calibrated 2026-05-20 (N1 fresh-eyes finding) — original 50-char floor
+# rejected all four of the above shapes.
+MIN_MESSAGE_CHARS = 20
 
 
 def extract_self_identity(agent: str, project_root: Path) -> str:
@@ -205,8 +212,9 @@ def main():
             f"minimum is {MIN_MESSAGE_CHARS}. "
             f"Silent-empty-email guard refuses send (2026-05-20 incident: "
             f"completion emails arrived with only Title + UTC + reply-footer "
-            f"because Body was empty). Investigate the caller — completion "
-            f"reports and blocker alerts should have substantive body text.",
+            f"because Body was empty). The floor catches truly empty or "
+            f"placeholder content; a real notification — even a brief one — "
+            f"should easily exceed it. Investigate the caller.",
             file=sys.stderr,
         )
         sys.exit(2)
