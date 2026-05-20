@@ -1,6 +1,6 @@
 ---
 name: review-hypotheses
-description: "Resolve hypotheses, learn from outcomes, calculate accuracy, and generate reports"
+description: "Resolves open hypotheses whose horizons have elapsed, extracts lessons from each outcome, calculates per-category accuracy stats, and generates a calibration report. Use whenever the aspirations loop hits the hypothesis-review cadence, the user says \"how accurate are my predictions\" or \"review my hypotheses\", or enough hypotheses have reached their horizon to warrant a batch resolve. Modes: --resolve, --learn, --accuracy-report, --full-cycle, --category-comparison."
 user-invocable: false
 triggers:
   - "/review-hypotheses"
@@ -19,6 +19,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, aspirations, tree-retrieval, reasoning-guardrails, pattern-signatures]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-review-hypotheses-9490ec"
+previous_revision_id: null
 ---
 
 # /review-hypotheses — Hypothesis Review & Resolution Engine
@@ -58,20 +60,17 @@ Detects which active hypotheses have resolved, records outcomes, moves records, 
 # Primary source: all active hypotheses
 Bash: pipeline-read.sh --stage active
 
-# Defensive check: catch hypotheses that weren't moved to active/
-evaluating_records = Bash: pipeline-read.sh --stage evaluating
-Filter evaluating records to ONLY those with stage: active or a recorded hypothesis
-
-If any evaluating records should be active:
-    Log: "NOTE: {N} hypotheses found in evaluating stage — should be in active"
-    Add them to the candidate list (they will be resolved and moved to resolved)
+# Also re-probe measurement-pending hypotheses (g-115-465 / rb-754) — these are
+# shelved waiting for measurement infrastructure to appear. Re-checking the channel
+# every cycle is cheap and lets them resolve as soon as data shows up.
+Bash: pipeline-read.sh --stage measurement-pending
+APPEND to candidate list
 
 # Horizon filter: micro-hypotheses never enter this pipeline.
 # Session-horizon hypotheses use self-check verification (Step 2 handles this).
 # Filter OUT any records with horizon: micro (shouldn't exist in pipeline, but defensive).
 Filter out records where horizon == "micro"
 
-Combine into single candidate list
 Sort by resolves_no_earlier_than (soonest first), then end_date for legacy records
 ```
 
@@ -227,6 +226,64 @@ ELSE:  # 2+ sources
 
 This does NOT block resolution. Contested sources are noted but the agent still makes a judgment call on the outcome.
 
+### Step 2.6: Measurement-Pending Transition (g-115-465 / rb-754)
+
+Catches hypotheses that are past `resolves_no_earlier_than` but whose
+measurement_channel produced no usable data. Without this step, such
+hypotheses stay in `active` status indefinitely, bloating the active pool
+and producing recurring INCONCLUSIVE results every cycle.
+
+Five gap subtypes (catalog at `world/knowledge/tree/system/system-constraints-loop/hypothesis-measurement-gap.md`):
+- **infra-missing**: writer/source emitter doesn't exist
+- **session-empty**: infrastructure exists but no events produced
+- **schema-missing**: source records exist, specific field absent
+- **log-inaccessible**: log path not at world root, agent can't read it
+- (catch-all): new shapes flagged for taxonomy update
+
+```
+After Steps 2 + 2.5 complete for a hypothesis:
+
+IF actual_outcome was determined: continue to Step 3 (resolved path)
+
+ELIF threshold (resolves_no_earlier_than) has passed AND
+     resolution attempt completed AND
+     no value was observable in measurement_channel:
+
+    # Classify the gap subtype based on attempt failure mode
+    gap_subtype = (
+        "infra-missing"     IF writer/script doesn't exist OR returned no records
+        "session-empty"     IF source schema present but zero matching records
+        "schema-missing"    IF source records exist but expected field absent
+        "log-inaccessible"  IF log file not findable at expected path
+        "other"             otherwise
+    )
+
+    # Build measurement-pending merge JSON
+    merge = {
+        "stage": "measurement-pending",  # set by pipeline-move
+        "measurement_pending": true,
+        "measurement_pending_set_at": "<now-iso>",
+        "measurement_gap_subtype": gap_subtype,
+        "measurement_gap_detail": "<one-sentence explanation of what was probed and what came back>",
+        "context_consulted": <as in Step 4.1>,
+    }
+
+    echo '<merge-json>' | bash core/scripts/pipeline-move.sh <id> measurement-pending
+
+    # Skip Step 3, Step 4. The hypothesis is shelved until evidence appears.
+    Add to resolve_result.measurement_pending list (separate from newly_resolved).
+    Continue to next hypothesis.
+
+ELSE: leave in active (resolution date arrived but channel returned a value
+      that could not be classified — judgment call still possible next cycle)
+```
+
+Migration: on first run after this step ships, all 5 hypotheses listed in
+`g-115-462` investigation report transition automatically. Subsequent runs
+re-probe the channel — if data appears, the hypothesis moves through the
+normal Step 2/3/4 path (now starting from `measurement-pending` instead of
+`active`).
+
 ### Step 3: Record Outcome
 
 ```
@@ -253,10 +310,77 @@ For each resolved hypothesis:
        or "Result: CORRECTED — predicted YES with 72% confidence, actual was NO"
 ```
 
+### Step 3.5: Broad Re-Retrieve on High Surprise (G3 / R5)
+
+When a resolution carries `surprise_level >= 7`, the just-recorded outcome likely
+falsifies one or more downstream beliefs / reasoning-bank entries / pattern
+signatures that the hypothesis was implicitly endorsing. Step 1.5's batch
+retrieval was shallow-to-medium — adequate for predicting outcomes, but
+insufficient for finding ALL the entries a surprising correction may affect.
+
+Per `.claude/rules/retrieve-before-deciding.md` decision point 3 ("resolving a
+surprising hypothesis"), this step retrieves category-broadly BEFORE the
+atomic move so the Tree Update Protocol (Steps 4.5 + Tree Steps 1-5) and any
+downstream `/reflect` calls operate on a complete reconciliation candidate set.
+
+```
+IF surprise_level >= 7:
+    # Broad retrieve at deep depth — supplementary stores AND tree nodes
+    Bash: retrieve.sh --category {hypothesis.category} --depth deep
+
+    From the returned JSON, mark candidates for reconciliation review:
+      - beliefs[] whose claim predicts or depends on the just-falsified outcome
+      - reasoning_bank[] entries whose content endorses the (now-falsified) prediction
+      - pattern_signatures[] whose trigger matches the resolution shape
+      - tree_nodes[] whose capability_level was anchored on this outcome class
+
+    Append to the merge JSON built in Step 4.1:
+      reconciliation_candidates:
+        beliefs: [bel-NNN, ...]            # IDs only — /reflect dereferences later
+        reasoning_bank: [rb-NNN, ...]
+        pattern_signatures: [sig-NNN, ...]
+        tree_nodes: [<node.key>, ...]
+
+    If retrieve.sh returns nothing relevant to the falsification:
+      reconciliation_candidates: { beliefs: [], reasoning_bank: [],
+                                   pattern_signatures: [], tree_nodes: [] }
+      (still record the empty manifest — proof retrieval was attempted)
+
+    # E10: Cross-reference confidence recalibration on high-surprise CORRECTED
+    # outcomes. Phase 8 will encode the ONE node it picks; this loop touches
+    # ALL cited nodes that didn't make it into the encoding bundle but were
+    # implicitly endorsing the falsified prediction. Without this, the cited
+    # nodes retain their pre-correction confidence and look authoritative on
+    # the next retrieve.
+    IF outcome == "CORRECTED" AND context_consulted.tree_nodes_read is non-empty:
+        For each node_key in context_consulted.tree_nodes_read:
+            Bash: bash core/scripts/tree-read.sh --node <node_key>
+            IF read failed (node missing or error): SKIP this node
+            Parse result JSON → old_confidence = result.confidence (default 0.0)
+            new_confidence = max(0.0, round(old_confidence - 0.05, 2))
+            IF new_confidence == old_confidence: SKIP (already at floor)
+            Bash: echo '{"operations": [{"op": "set", "key": "<node_key>", "field": "confidence", "value": <new_confidence>}, {"op": "set", "key": "<node_key>", "field": "last_update_trigger", "value": "surprise-recalibration"}]}' | bash core/scripts/tree-update.sh --batch
+            Log: "RECALIBRATED {node_key}: confidence {old_confidence} → {new_confidence} (hypothesis {hypothesis.id} surprise={surprise_level})"
+
+        # Fail-open: if a tree-update call errors, log and continue. Do NOT
+        # block the atomic resolve in Step 4 on a recalibration failure.
+
+ELIF surprise_level >= 5:
+    # Medium-surprise — re-use Step 1.5 cached batch retrieval, no new probe
+    Carry forward the same context_consulted manifest; do not extend it
+
+ELSE:
+    # Low surprise (≤4): hypothesis was well-calibrated, no broad re-retrieve
+    Skip this step entirely
+```
+
+This step is fail-open: if the retrieve.sh call errors, log the failure and
+record `reconciliation_candidates: { error: "<message>" }` — proceed to Step 4.
+A failed broad retrieve must NOT block the atomic resolve write.
+
 ### Step 4: Move Resolved Hypotheses (ATOMIC — complete ALL steps for each hypothesis)
 
 For each resolved hypothesis, execute this checklist IN ORDER.
-`{source}` = the directory where the record currently lives (active/ or evaluating/).
 
 ```
 □ 4.0  CHECK EXPIRATION (hypothesis goals only):
@@ -489,7 +613,15 @@ When calling /reflect for each unlearned resolution:
   - A reasoning bank entry was created via `reasoning-bank-read.sh --id rb-NNN`
   - For corrected outcomes: a guardrail was added via `guardrails-read.sh --id guard-NNN`
 - If /reflect did not create expected entries, create them directly:
-  - Reasoning bank entry: pipe JSON to `reasoning-bank-add.sh` (stdin)
+  - Reasoning bank entry: pipe JSON to `reasoning-bank-add.sh` (stdin).
+    Required JSON fields: `title`, `content`, `category`, `type`, `when_to_use`,
+    `tags`, **`applies_to`** (one of `any|framework|domain|specific`).
+    Hypothesis-derived entries: pick `applies_to` by hypothesis subject —
+    framework-quality / pipeline-coordination hypotheses → `framework`;
+    deployment-domain hypotheses (the specific services, products, or
+    workflows this agent is deployed into) → `domain`; methodology
+    insights (calibration, pattern-recognition) → `any`; single-record
+    diagnostic with no transferable shape → `specific`.
   - Guardrail entry: pipe JSON to `guardrails-add.sh` (stdin)
 
 ### Step 3: Return Learn Result
@@ -600,7 +732,7 @@ world/knowledge/strategies/hypothesis-results.md
 
 ```
 Bash: meta-set.sh meta-knowledge/_index.yaml  # update with all accuracy figures
-Update aspirations meta via Bash: `aspirations-meta-update.sh <field> <value>`
+Update aspirations meta via Bash: `aspirations-meta-update.sh --source agent <field> <value>`
 ```
 
 ### Step 5: Strategy Recommendations
@@ -627,6 +759,7 @@ The comprehensive weekly review. Chains all modes plus deep reflection and repla
 4. invoke /reflect --full-cycle               (pattern extraction, calibration, replay)
 5. Run spark check for new aspirations/goals
 6. Propose strategy adjustments to /aspirations evolve
+Bash: echo "review-hypotheses phase documented"
 ```
 
 **Idempotency note:** If `/boot` already ran `--resolve` this session, step 1 is a no-op (nothing new to resolve). If aspiration goals already ran `--learn`, step 2 is a no-op (all records already reflected). The full-cycle still adds value via steps 3-6 which operate at the aggregate level.

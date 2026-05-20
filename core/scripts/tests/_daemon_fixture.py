@@ -1,0 +1,180 @@
+"""Shared in-process daemon fixture for daemon-aware script tests.
+
+Background (g-115-887, Cat B+C of g-115-874):
+Six tests across five files invoke scripts that call _rt internally,
+where _rt's daemon-port resolution reads PROJECT_ROOT/mind_api/state/daemon.port
+(the REAL daemon's port) — bypassing the test's temp world. The result
+is that Investigate goals filed by the script land in the real
+world/aspirations.jsonl, not the test's temp world, and the test
+assertion fails (the seeded test aspirations never see the new goal).
+
+The canonical fix pattern was developed in test_window_streak.py
+(g-115-756, 2026-05-14 daemon-only cutover). This module extracts the
+helpers so the remaining 4-5 tests can adopt the pattern without
+duplicating ~80 lines each.
+
+Usage:
+    from _daemon_fixture import DaemonFixture, make_project_root
+
+    def test_thing():
+        with tempfile.TemporaryDirectory() as tmpd:
+            world = setup_world(Path(tmpd))
+            with DaemonFixture(world) as df:
+                # df.runtime_dir, df.project_root, df.port available
+                # _rt calls now hit the test's daemon
+                # subprocess.run invocations need env["RT_DIR"]=str(df.runtime_dir)
+                ...
+
+Cross-references:
+  - test_window_streak.py — canonical pattern (lines 48-136)
+  - mind_api/src/server.py — Server class spawned in-process
+  - core/scripts/_rt.py:45-49 — RT_DIR env resolution
+  - g-115-874 (zeta investigation) — Cat B + Cat C failure analysis
+  - g-115-887 (this Apply) — alpha's migration
+"""
+from __future__ import annotations
+
+import os
+import socket
+import sys
+import threading
+import time
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CORE_SCRIPTS = SCRIPT_DIR.parent
+PROJECT_ROOT = CORE_SCRIPTS.parent.parent
+if str(CORE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(CORE_SCRIPTS))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def make_project_root(tmp: Path, world: Path, agent: str = "alpha",
+                      agent_dir: Path | None = None) -> Path:
+    """Build a minimal project root with local-paths.conf pointing at world.
+
+    If ``agent_dir`` is provided, also seeds the project's agent directory
+    structure so test scripts using MIND_AGENT_DIR env continue to work.
+    """
+    pr = tmp / "repo"
+    pr.mkdir(exist_ok=True)
+    # Phase 2.5.D layout: agent dirs live under agents/ parent. Must match
+    # AGENTS_PARENT_DIR in core/scripts/_paths.py / mind_api/src/agent_paths.py.
+    agents_parent = pr / "agents"
+    agents_parent.mkdir(exist_ok=True)
+    agent_pr = agents_parent / agent
+    agent_pr.mkdir(exist_ok=True)
+    (agent_pr / "session").mkdir(exist_ok=True)
+    meta = pr / "meta"
+    meta.mkdir(exist_ok=True)
+    (agent_pr / "local-paths.conf").write_text(
+        f"WORLD_PATH={world.as_posix()}\nMETA_PATH={meta.as_posix()}\n",
+        encoding="utf-8",
+    )
+    # If caller passed a separate agent_dir (e.g. for MIND_AGENT_DIR
+    # env-override scripts), expose its session dir alongside as well so the
+    # canonical agent_dir/session/<file>.jsonl probes work.
+    if agent_dir is not None:
+        (agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    return pr
+
+
+def _start_daemon(project_root: Path) -> tuple:
+    """Start an in-process daemon; return (httpd, port).
+
+    Mirrors test_window_streak.py:_start_daemon — kept here to keep the
+    shared fixture self-contained.
+    """
+    from mind_api.src.server import Server, _Handler
+    from mind_api.src import lifecycle
+
+    server = Server(project_root=project_root, port=0)
+    handler_cls = type(
+        "_BoundHandler", (_Handler,), {
+            "routes": server.routes,
+            "resolver": server.resolver,
+            "access_log_path": lifecycle.access_log(project_root),
+            "pid": 0,
+            "port": 0,
+        },
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    port = httpd.server_address[1]
+    handler_cls.port = port
+    handler_cls.pid = os.getpid()
+
+    rt_dir = project_root / "mind_api" / "state"
+    rt_dir.mkdir(parents=True, exist_ok=True)
+    (rt_dir / "daemon.port").write_text(str(port), encoding="utf-8")
+
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                break
+        except OSError:
+            time.sleep(0.02)
+    return httpd, port
+
+
+class DaemonFixture:
+    """Context manager: spins up an in-process daemon for a temp world.
+
+    Exposes ``project_root``, ``runtime_dir``, and ``port`` for callers that
+    need to point subprocesses at the test's daemon via env vars
+    (typically RT_DIR=str(fixture.runtime_dir) for _rt.py to find it).
+
+    Restores prior env on __exit__ so cross-test isolation holds (mirrors
+    test_applies_to_required.py's g-115-888 capture-restore pattern).
+    """
+
+    def __init__(self, world: Path, agent: str = "alpha",
+                 agent_dir: Path | None = None):
+        self.world = world
+        self.agent = agent
+        self.agent_dir = agent_dir
+        self._httpd = None
+        self._port = None
+        self._pr = None
+        self._prev_env = {}
+
+    @property
+    def project_root(self) -> Path:
+        return self._pr
+
+    @property
+    def runtime_dir(self) -> Path:
+        return self._pr / "mind_api" / "state"
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    def __enter__(self):
+        tmp = self.world.parent
+        self._pr = make_project_root(tmp, self.world, self.agent,
+                                     agent_dir=self.agent_dir)
+        self._httpd, self._port = _start_daemon(self._pr)
+
+        self._prev_env = {
+            "RT_DIR": os.environ.get("RT_DIR"),
+            "RT_PORT_FILE": os.environ.get("RT_PORT_FILE"),
+            "MIND_AGENT": os.environ.get("MIND_AGENT"),
+        }
+        os.environ["RT_DIR"] = str(self.runtime_dir)
+        os.environ["MIND_AGENT"] = self.agent
+        return self
+
+    def __exit__(self, *exc):
+        if self._httpd:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+        for k, v in self._prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v

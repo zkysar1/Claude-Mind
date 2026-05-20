@@ -10,15 +10,44 @@ Aspirations use JSONL (one JSON object per line) with script-based access:
 - `world/aspirations-meta.json` — Metadata (session_count, readiness_gates)
 
 ### Agent Queue (per-agent local tasks — `<agent>/`)
-- `<agent>/aspirations.jsonl` — Agent's local work queue (maintenance, decomposed sub-goals)
-- `<agent>/aspirations-archive.jsonl` — Agent's completed local tasks
-- `<agent>/aspirations-meta.json` — Agent aspiration metadata
+- `agents/<agent>/aspirations.jsonl` — Agent's local work queue (maintenance, decomposed sub-goals)
+- `agents/<agent>/aspirations-archive.jsonl` — Agent's completed local tasks
+- `agents/<agent>/aspirations-meta.json` — Agent aspiration metadata
 
 ### Shared
 - `meta/evolution-log.jsonl` — Evolution events (append-only)
 - `core/config/world-aspirations-initial.jsonl` — World bootstrap aspirations (copied by init-world.sh)
 - `core/config/agent-aspirations-initial.jsonl` — Agent maintenance goals (copied by init-agent.sh)
 - `core/config/agent-aspirations-onboard.jsonl` — Onboarding aspiration for subsequent agents
+
+## Dual-Scope Bootstrap IDs
+
+The world queue and agent queue each have a bootstrap aspiration seeded at init
+time, and they **share the ID `asp-001`** by convention:
+
+| Source | ID | Title | Seeded by |
+|---|---|---|---|
+| `world/aspirations.jsonl` | `asp-001` | Explore and Learn | `init-world.sh` (copies `core/config/world-aspirations-initial.jsonl`) |
+| `agents/<agent>/aspirations.jsonl` | `asp-001` | Maintain Agent Health | `init-agent.sh` (copies `core/config/agent-aspirations-initial.jsonl`) |
+| `agents/<agent>/aspirations.jsonl` | `asp-003` | Orient and Specialize | `init-agent.sh` (appends `core/config/agent-aspirations-onboard.jsonl` for subsequent agents) |
+
+These are **canonically different aspirations** in different files, sharing the
+bootstrap ID by convention. Goal IDs similarly share namespace across scopes:
+`g-001-01` in `world/aspirations.jsonl` is "Identify learning domain," while
+`g-001-01` in `agents/<agent>/aspirations.jsonl` is "Reflect and journal." The parent
+aspiration's source (`--source world` vs `--source agent`) disambiguates.
+
+### Rules
+
+1. **Always use `--source world` or `--source agent`** when reading or writing
+   aspirations programmatically. The scripts enforce scope — omitting `--source`
+   defaults to world, which is correct only when you intend the world queue.
+2. **Qualify scope in narrative contexts** (board posts, journal entries, reports,
+   goal descriptions): write "world asp-001" or "`<agent>` asp-001," not bare
+   "asp-001." A bare ID in prose is ambiguous when both scopes exist.
+3. **Goal-selector already handles this**: `goal-selector.py` reads from BOTH
+   queues and tags each candidate with `source: "world"` or `source: "agent"`.
+   Downstream skills propagate `source` per the Source Routing Protocol below.
 
 ## Script-Based Access (Exclusive Data Layer)
 
@@ -44,6 +73,7 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-update-goal.sh <goal-id> <field> <value>` | Update single goal field in world queue | — |
 | `aspirations-add-goal.sh <asp-id>` | Validate + append goal to world aspiration (auto-assigns ID) | JSON |
 | `aspirations-complete.sh <asp-id>` | Mark world aspiration completed + archive | — |
+| `aspirations-complete-intent.sh <asp-id>` | Close world aspiration via intent-satisfaction pathway (evidence-gated) | JSON |
 | `aspirations-retire.sh <asp-id>` | Mark world aspiration retired + archive | — |
 | `aspirations-archive.sh` | Sweep completed/retired world aspirations to archive | — |
 | `aspirations-meta-update.sh <field> <value>` | Update world aspirations metadata | — |
@@ -57,7 +87,7 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-release.sh <goal-id>` | Release a claimed world goal |
 | `aspirations-complete-by.sh [--source world\|agent] <goal-id> [agent-name]` | Mark goal completed with agent attribution |
 
-Agent name defaults to `$AYOAI_AGENT` for claim and complete-by. Complete-by supports
+Agent name defaults to `$MIND_AGENT` for claim and complete-by. Complete-by supports
 `--source agent` for recurring agent-health goals; claim and release are world-only.
 
 #### Claim Protocol (Goal Lifecycle)
@@ -74,8 +104,16 @@ Agent queue goals do not need claims (single-agent access).
 **Rules:**
 1. `goal-selector.py` skips goals claimed by another agent — claims are respected at selection time.
 2. Claim is atomic — if another agent claimed first, the script exits non-zero. On conflict, re-enter the selection loop.
-3. Recurring world goals: `complete-by` auto-clears `claimed_by`, returning the goal to the pool.
+3. Claim-clearing invariant: any transition to a terminal status (`completed`,
+   `skipped`, `expired`, `decomposed`, `superseded`), AND each successful cycle
+   of a recurring goal via `complete-by`, clears `claimed_by` and `claimed_at`.
+   Only `pending`, `in-progress`, `blocked` goals may carry a live claim.
+   Enforced in `cmd_complete_by` and `cmd_update_goal`.
 4. Session boundary: release all held claims at session end (consolidation/handoff).
+   Release query filters `--goal-status pending,in-progress,blocked` as defense
+   in depth — terminal goals should already be claim-free per Rule 3.
+5. Self-heal: `aspirations-clear-stale-claims.sh [--dry-run]` sweeps any residue
+   left by past writers. Idempotent; zero-effect when no residue exists.
 
 #### Claim Expiry (Straggler Mitigation)
 
@@ -97,7 +135,7 @@ until `g-168-06` is completed or decomposed.
 This prevents temporal consistency violations (Finding 3 of the distributed systems paper)
 where an agent starts work before its cross-aspiration dependencies are met.
 
-### Agent Queue Scripts (operate on `<agent>/aspirations.jsonl`)
+### Agent Queue Scripts (operate on `agents/<agent>/aspirations.jsonl`)
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
@@ -152,9 +190,111 @@ When `goal-selector.sh` selects a goal, its output includes `"source": "world"` 
   - `aspirations-archive.sh` (sweep) auto-recovers such aspirations to `active` status and resets corrupted recurring goals to `pending`.
   - `aspirations-update-goal.sh` **blocks** setting `status=completed` on recurring goals. Use `complete-by` for cycle tracking.
   - `recompute_progress` excludes recurring goals from completion counts. Summary shows `+ N recurring` suffix.
+  - `recompute_progress` also emits `progress.fan_out_ratio` = `total_goals / initial_goal_count` (2 dp), recomputed on every goal add/update. `initial_goal_count` is the non-recurring goal count stamped once at aspiration creation (daemon `add` endpoint in `mind_api/src/endpoints/aspirations_write.py`; idempotent — never overwritten). `fan_out_ratio` is `null` when `initial_goal_count` is absent (aspiration predates the metric — added 2026-05-15; no inferred backfill of legacy aspirations) or `0` (growth ratio from an empty seed is undefined). Interpretation: ≈1.0 = specced upfront; >1.5 = discovery-heavy / fanned-out (Charlie/Zeta-shaped work). **Dual-mirror invariant:** the `progress` dict shape in `recompute_progress` (`core/scripts/aspirations.py`) and `_recompute_progress` (`mind_api/src/endpoints/aspirations_write.py`) MUST stay identical — changing one without the other desyncs the CLI and daemon write paths.
   - These guards prevent LLM drift from killing recurring goals by archiving their parent aspiration.
 - **Premature-archival protection (data layer enforced):**
-  - `aspirations-complete.sh` **refuses** aspirations where any non-recurring goal is not in a terminal status (`completed`, `skipped`, `expired`, `decomposed`). Exit 1 with BLOCKED message listing unfinished goals. Use `--force` to override.
+  - `aspirations-complete.sh` **refuses** aspirations where any non-recurring goal is not in a terminal status (`completed`, `skipped`, `expired`, `decomposed`, `superseded`). Exit 1 with BLOCKED message listing unfinished goals. Use `--force` to override, or `aspirations-complete-intent.sh` for the intent-satisfaction pathway.
   - `aspirations-retire.sh` **warns** (stderr) when retiring aspirations with unfinished goals, but does not block — retirement is intentional abandonment.
   - `aspirations-archive.sh` (sweep) auto-recovers completed aspirations with unfinished non-recurring goals to `active` status (same pattern as recurring-goal recovery).
   - These guards prevent post-autocompact narrative fabrication from archiving aspirations before their goals are actually done.
+
+## Intent-Satisfied Closure
+
+The framework measures BOTH goal completion (*what did we do?*) AND intent satisfaction
+(*what did we achieve?*). When an aspiration's `motivation` has been met by already-completed
+goals but trailing goals are blocked on external factors or turned out unnecessary, the
+intent-satisfaction pathway allows archival without per-goal completion of the remainder.
+
+**Pathway:** `aspirations-complete-intent.sh <asp-id>` reads an `intent_satisfaction` JSON
+block on stdin and atomically (a) validates evidence, (b) transitions trailing goals listed
+in `superseded_goal_ids` to `status=superseded`, (c) persists the block on the aspiration,
+and (d) archives the aspiration via the normal completion gate.
+
+### `intent_satisfaction` schema (aspiration-level field)
+
+```yaml
+intent_satisfaction:
+  claimed_at: ISO-8601            # auto-stamped by script (do not supply)
+  evidence_goal_ids: [goal_id]    # completed goals whose outcomes map to motivation
+  rationale: string               # >=40 chars, must quote motivation text
+  superseded_goal_ids: [goal_id]  # non-recurring, non-terminal goals being mooted
+```
+
+### Validation (structural, script-enforced — not LLM-trusted)
+
+1. **Evidence cardinality**: `len(evidence_goal_ids) >= max(scope_min, ceil(0.5 * non_recurring_goal_count))`. Scope floors in `core/config/aspirations.yaml` under `intent_satisfaction.min_evidence_by_scope` (sprint=2, project=3, initiative=5).
+2. **Evidence quality**: every evidence goal must exist in this aspiration, be non-recurring, have `status=completed`, and have non-empty `verification.outcomes`.
+3. **Superseded goals**: must exist in this aspiration, be non-recurring, and be currently non-terminal. No goal may appear in both `evidence_goal_ids` and `superseded_goal_ids`.
+4. **Post-supersession closure**: after applying supersession, every non-recurring goal must be in terminal status. If any remain, the command exits non-zero.
+5. **Rationale length**: >=40 chars.
+6. **Rationale-motivation token overlap**: rationale must share at least one 4+ char token with `motivation`, forcing the LLM to quote the intent text rather than paraphrase freely.
+
+### New goal terminal status: `superseded`
+
+`superseded` is distinct from `skipped` (abandoned), `expired` (past deadline), and
+`decomposed` (broken up). It means the goal was mooted by aspiration-level intent
+satisfaction — the aspiration's outcome made this work unnecessary. The trailing-goal
+transition can ONLY happen via `aspirations-complete-intent.sh`; `aspirations-update-goal.sh`
+rejects direct `status=superseded` writes to keep the evidence gate enforceable.
+
+Superseded goals carry a `superseded_by_aspiration: <asp-id>` backref for trajectory
+analysis. Goal-selector's `completion_pressure` scoring treats `superseded` as terminal —
+zombie aspirations that close via this pathway stop distorting priority signals automatically.
+
+## Goal-ID Argument Convention (unified)
+
+Every script in this repo that takes a goal ID accepts ALL of these flag forms
+interchangeably, regardless of which form the script's docstring shows:
+
+```
+<script>.sh --goal g-115-03        # canonical flag
+<script>.sh --goal-id g-115-03     # alias of --goal
+<script>.sh --goal=g-115-03        # equals form
+<script>.sh --goal-id=g-115-03     # equals form
+```
+
+Bare positional `g-NNN-NN` ALSO works on the 6 scripts whose underlying API is
+positional (see list below) — that's their natural argument handling, not a
+normalizer feature. For the 6 flag-API scripts, an explicit `--goal`/`--goal-id`
+flag is required.
+
+**Recommended canonical form for new pseudocode:** `--goal <id>`. Reads identically
+whether the script's underlying API is positional or flag-based and removes the
+LLM cognitive load of remembering which scripts use which style.
+
+### Why dual-accept exists
+
+Historical: 6 data-layer scripts (`aspirations-claim.sh`, `-release.sh`,
+`-complete-by.sh`, `-update-goal.sh`, `agent-aspirations-update-goal.sh`,
+`goal-completion-evidence.sh`) take a positional `<goal-id>`. 6 orchestration
+scripts (`iteration-close.sh`, `predicate-eval.sh`, `utilization-feedback.sh`,
+`background-jobs.sh`, `pending-agents.sh`, `meta-impk.sh`) take `--goal` (and
+`meta-impk.sh` historically used `--goal-id`). Within a single loop iteration the
+LLM bounced between three styles. The dual-accept normalizer removes that
+friction without breaking any pre-existing call site.
+
+### Implementation
+
+`core/scripts/_goal-arg-normalize.sh` — a sourceable shell library. Each of
+the 12 wrappers above sources it with `GOAL_NORMALIZE_TARGET={positional|--goal|--goal-id}`
+to declare its underlying API. The library reads `$@`, extracts the goal value
+from any of the four flag forms, and rewrites `$@` into the target form before
+the script reaches its parse logic. Adding a new goal-id-accepting script
+requires only:
+
+```bash
+GOAL_NORMALIZE_TARGET=--goal source "$CORE_ROOT/scripts/_goal-arg-normalize.sh"
+```
+
+inserted before the script reads its arguments.
+
+### What dual-accept does NOT do
+
+- It does NOT inspect bare positional values. The earlier draft auto-detected
+  `^g-[0-9]+-[0-9]+$`, but that broke `iteration-close.sh --summary "g-NNN-NN"`
+  by hijacking the summary value as a goal id. Single source of truth: the goal
+  id arrives via an explicit flag, OR via the script's own positional contract.
+- It does NOT change the underlying Python script's API. Wrappers still forward
+  the canonicalised form to Python via `--goal`/`--goal-id`/positional as before.
+- It does NOT guard against malformed goal IDs — that validation happens in the
+  Python layer.

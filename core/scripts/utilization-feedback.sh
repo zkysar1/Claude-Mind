@@ -6,4 +6,5 @@ set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 cd "$PROJECT_ROOT"
 source "$CORE_ROOT/scripts/_platform.sh"
+GOAL_NORMALIZE_TARGET=--goal source "$CORE_ROOT/scripts/_goal-arg-normalize.sh"
 exec python3 "$CORE_ROOT/scripts/utilization-feedback.py" "$@"

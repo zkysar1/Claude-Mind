@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# post-commit — recycle the runtime daemon ONLY when this commit touched the
+# daemon's code surface (mind_api/src/** or core/scripts/_*.py).
+#
+# WHY a git hook and not a Claude Code hook: Claude hooks are tool-lifecycle
+# scoped (PreToolUse/PostToolUse) — the wrong grain. A git post-commit hook
+# fires exactly once per commit, on EVERY commit path (LLM, loop, manual),
+# and is the natural place to react to "HEAD moved".
+#
+# WHY narrow: the daemon caches code in memory; on-disk fixes have no effect
+# until kill+respawn (guard-554). Before this hook, recycling depended on the
+# per-shell RT_STALENESS_RESTART_PENDING sentinel, which dies with each
+# wrapper subprocess and never fires for a stale-but-200 daemon (guard-559).
+# This hook closes that gap proactively — but ONLY for daemon-code commits.
+# A docs/world/meta/agent/*.sh/non-underscore-CLI commit leaves the running
+# daemon current; recycling it then would be the exact "restart for every
+# change in the broad directory" churn we are avoiding.
+#
+# Tracked + propagated via core.hooksPath=core/githooks (install-git-hooks.sh,
+# auto-installed by sessionstart-orchestrator.sh Step 0.5) — same mechanism
+# as the Layer B pre-commit gate beside it. No copy step: git reads
+# core/githooks/ directly.
+#
+# SINGLE SOURCE OF TRUTH for "is this a daemon-code change?":
+# core/scripts/mind-api-code-changed.sh. Do NOT inline the pathspec here.
+#
+# Fail-open: a commit must NEVER fail because the daemon could not be
+# recycled. Every path exits 0.
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$ROOT" ] || exit 0
+
+# Did THIS commit (HEAD~1..HEAD) change daemon code? mind-api-code-changed.sh
+# exits 0 = changed, 1 = unchanged, and fails toward 0 (restart) on any git
+# error — including the first-commit case where HEAD~1 does not resolve.
+if bash "$ROOT/core/scripts/mind-api-code-changed.sh" "HEAD~1" >/dev/null 2>&1; then
+    # Fully detach so `git commit` returns immediately: mind-api-start.sh does
+    # a kill + respawn + up-to-10s readiness wait, which must NOT block the
+    # commit. The ( ... & ) subshell orphans the job; </dev/null guards the
+    # Git-for-Windows console-handle-inheritance hang. --restart is required
+    # because plain mind-api-start.sh is health-only idempotent (guard-559).
+    ( bash "$ROOT/core/scripts/mind-api-start.sh" --restart >/dev/null 2>&1 </dev/null & ) >/dev/null 2>&1 </dev/null
+fi
+exit 0

@@ -1,6 +1,6 @@
 ---
 name: reflect-maintain
-description: "Maintenance reflection — memory curation, active forgetting, aspiration grooming, stuck goal detection"
+description: "Performs maintenance reflection: curates memory (reasoning-bank entries, tree nodes, pattern signatures), applies active forgetting to low-utility items, grooms aspirations, and detects stuck goals that may need unblock conversion or archival. Use whenever the loop hits the maintenance cadence, the reasoning bank exceeds healthy size, the knowledge tree accumulates low-confidence nodes, or goals have stalled without progress. Invoked via /reflect --curate-memory or /reflect --curate-aspirations."
 user-invocable: false
 parent-skill: reflect
 triggers:
@@ -9,6 +9,8 @@ triggers:
   - "/reflect --curate-aspirations"
 conventions: [aspirations, experience, tree-retrieval, reasoning-guardrails, pattern-signatures, goal-schemas]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-reflect-maintain-369223"
+previous_revision_id: null
 ---
 
 # /reflect-maintain — Maintenance Reflection
@@ -47,28 +49,49 @@ For each strategy with status: active:
 
 ### 1b: Low-Utilization Guardrails
 ```
+# rb-245 pre-read: verify counter fields exist before aggregating. Exit 1
+# means the pseudocode field path has drifted from the live schema — SKIP
+# this sub-phase only (other phases continue), log the mismatch for
+# investigation. Do NOT --override: that silences the signal the gate exists
+# to produce. Fix the field paths in the pseudocode below instead.
+Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+        --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
+        --field-names "utilization.utilization_score,utilization.retrieval_count"
+
 Bash: guardrails-read.sh --active
 For each guardrail with status: active:
-  low_util = utilization_score < 0.20 AND retrieval_count >= 5
+  low_util = utilization.utilization_score < 0.20 AND utilization.retrieval_count >= 5
   If low_util: add to candidates with reason "low utilization after sufficient retrievals"
 ```
 
 ### 1c: Low-Utilization Reasoning Bank Entries
 ```
+# rb-245 pre-read: same contract as 1b.
+Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+        --jsonl-path "$WORLD_DIR/reasoning-bank.jsonl" \
+        --field-names "utilization.utilization_score,utilization.retrieval_count"
+
 Bash: reasoning-bank-read.sh --active
 For each reasoning bank entry with status: active:
-  low_util = utilization_score < 0.20 AND retrieval_count >= 5
+  low_util = utilization.utilization_score < 0.20 AND utilization.retrieval_count >= 5
   If low_util: add to candidates with reason "low utilization after sufficient retrievals"
 ```
 
 ### 1d: Contradicted/Stale/Noisy Pattern Signatures
 ```
+# Live schema (verified 2026-04-18 via sig-001 probe, g-115-61):
+#   outcome_stats: {confirmed, total, accuracy}
+#   utilization: {retrieval_count, last_retrieved}
+Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+        --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
+        --field-names "outcome_stats.accuracy,outcome_stats.total,utilization.retrieval_count"
+
 Bash: pattern-signatures-read.sh --active
 For each signature with status: active:
-  contradicted = hit_rate < 0.30 AND times_triggered >= 10
-  noise = utility_ratio < 0.20 AND times_retrieved >= 10
+  contradicted = outcome_stats.accuracy < 0.30 AND outcome_stats.total >= 10
+  noise = utilization.retrieval_count >= 10 AND outcome_stats.total < 2   # retrieved often but never matched
   session_count = aspirations-read.sh --meta → session_count
-  stale = times_triggered == 0 AND created_session is not null AND (session_count - created_session) >= 10
+  stale = outcome_stats.total == 0 AND created_session is not null AND (session_count - created_session) >= 10
   If any condition met: add to candidates with reason
 ```
 
@@ -113,15 +136,52 @@ For each leaf with utility_ratio >= 0.5 AND retrieval_count >= 5:
     Read node .md, check for ## Decision Rules section
     For each rule NOT already marked [promoted: guard-NNN]:
         IF rule has been in the node for 2+ sessions (check last_update_trigger.session):
-            Convert to guardrail format:
-                id: next guard-NNN
+            Convert to guardrail format (omit `id` and `created` — auto-set
+            by the script; capture assigned id from stdout's full record):
                 rule: "{the IF-THEN rule text}"
                 category: "{node category from _tree.yaml}"
                 trigger_condition: "{the IF condition}"
                 source: "auto-promoted from tree node {node_key}"
             echo '<guardrail_json>' | bash core/scripts/guardrails-add.sh
-            Mark rule in node: append [promoted: {guard-id}] to the rule line
+            Read assigned id from stdout, mark rule in node: append
+            [promoted: {guard-id}] to the rule line
             Log: "DECISION RULE PROMOTED: {rule summary} → {guard-id}"
+```
+
+### Step 2.55: Decision Rule Active Forgetting (E8)
+
+Tree-node Decision Rules with `applied: 0` (or no `applied:` suffix) that
+have aged past `decision_rule_retire_days` (default 60) are candidates for
+retirement. The counter is maintained by aspirations-execute Phase 4.04
+(E8): if a rule has never been cited as informing execution after 60 days
+of being present, it's dead weight and should be removed so retrieval
+surfaces fewer noisy rules.
+
+```
+Bash: tree-read.sh --leaves
+For each leaf:
+    Read node .md, parse `## Decision Rules` section
+    For each rule line:
+        Parse the `— applied: N (YYYY-MM-DD)` suffix if present
+        applied_count = N (default 0 if suffix absent)
+        last_applied = date from suffix (default null)
+        Parse the `— source: g-NNN-NN` field
+        # source goal carries creation timing; derive rule age from the
+        # source goal's completed date (aspirations-read.sh --id <gid>)
+        # OR from node.last_updated as a fallback
+
+        IF applied_count == 0 AND rule_age_days > 60:
+            Mark for retirement (delete the rule line from the section)
+            Log: "DECISION RULE RETIRED (never applied): {rule_text[:80]}... in {node.key}"
+
+After scanning all leaves, emit one Edit per node with retirements to
+remove the dead rule lines. Keep Step 2.5 (auto-promotion) and Step 2.55
+(active-forgetting) symmetric — they read the same lines but trigger
+opposite actions based on the `applied` counter.
+
+Fail-open: if the source-goal lookup fails for a rule, default to
+node.last_updated as the age proxy. Never retire a rule whose age cannot
+be determined at all (treat unknown age as fresh).
 ```
 
 ### Step 2.6: Tree Node Utility Curation
@@ -230,7 +290,7 @@ When new knowledge contradicts existing knowledge:
    interference_with: ["path/to/contradicting-article.md"]
 2. During next /replay session, prioritize resolving the interference
 3. Resolution: one article strengthened (evidence wins), other weakened or accommodation triggered
-4. Log schema operation to <agent>/developmental-stage.yaml:
+4. Log schema operation to agents/<agent>/developmental-stage.yaml:
    type: "accommodation" if framework changes, "assimilation" if framework holds
 ```
 
@@ -365,26 +425,63 @@ A goal that "feels done" is not done — the evidence must be traceable.
 
 ## Step 3: Execute Decisions
 
+### Multi-Agent Safety Pre-Check (claimed_by guard)
+
+Before executing ANY status mutation (COMPLETE / SKIP / SCOPE-DOWN / UNBLOCK),
+read `claimed_by` from the candidate goal and short-circuit if a partner agent
+holds the claim:
+
+1. **Read `claimed_by` first** (it's already in the goal record from Step 1's
+   load). If `claimed_by` is set AND `claimed_by != $MIND_AGENT`, the goal is
+   partner work — SKIP this candidate entirely. Do NOT execute COMPLETE, SKIP,
+   SCOPE-DOWN, or UNBLOCK. Log the skip reason ("partner-claimed") in the
+   grooming_result.details so the audit trail shows what was deferred.
+2. **Only mutate** when `claimed_by` is null OR `claimed_by == $MIND_AGENT`.
+3. The check is per-goal — a single grooming pass can mutate goals I own
+   while skipping partner-held ones.
+
+Same multi-agent safety class as `felt-sense-checkin` Phase 2 (g-115-687,
+2026-05-13). Sister skill audited a parallel race surface: even though
+reflect-maintain scans `pending|blocked` (not `in-progress`), a partner that
+CLAIMED a pending goal but hasn't yet flipped status to in-progress can race
+a COMPLETE write. The `claimed_by` field is set at claim time (before
+status flip), so this guard catches the race window. Origin: g-115-685
+zeta investigation + g-115-687 sibling-scan audit. See
+`.claude/rules/check-team-state-before-silent.md` for the team-state probe
+pattern that complements per-goal claimed_by.
+
 ```
 For each COMPLETE decision:
+  IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
+    SKIP — partner-claimed; record skip in grooming_result.details
+    CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status completed
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "completed", "goal_id": "{id}",
      "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
 
 For each SKIP decision:
+  IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
+    SKIP — partner-claimed; record skip in grooming_result.details
+    CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status skipped
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "skipped", "goal_id": "{id}",
      "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
 
 For each SCOPE-DOWN decision:
+  IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
+    SKIP — partner-claimed; record skip in grooming_result.details
+    CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} description "{revised description}"
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "scoped_down", "goal_id": "{id}",
      "reason": "{reason}", "date": "{today}"}
 
 For each UNBLOCK decision:
+  IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
+    SKIP — partner-claimed; record skip in grooming_result.details
+    CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} blocked_by "[]"
   Bash: evolution-log-append.sh with:
     {"event": "aspiration_grooming", "action": "unblocked", "goal_id": "{id}",
@@ -428,6 +525,7 @@ grooming_result:
       decision: {COMPLETE|SKIP|SCOPE-DOWN|UNBLOCK|KEEP}
       reason: "{explanation}"
       evidence_refs: ["{experience_id}", "{tree_node_key}", "{sibling_goal_id}"]
+Bash: echo "reflect-maintain phase documented"
 ```
 
 ---
@@ -452,3 +550,9 @@ grooming_result:
 | Calls | `journal-merge.sh` | Both | Activity logging |
 | Does NOT call | `/aspirations`, `/reflect`, `/boot` | — | No recursive skill invocations |
 | Does NOT modify | agent-state, session signals, working memory | — | Clean boundaries |
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is the last `aspirations-update-goal.sh`, `aspirations-complete.sh`,
+or `journal-merge.sh` call. Never end with a text summary of maintenance decisions.

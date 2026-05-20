@@ -15,6 +15,8 @@ Not every goal. Apply when:
 - Gap analysis during evolution (questioning what Self is missing)
 - Deep research on new topics (building understanding from ground truth)
 - Decomposing goals whose framing feels inherited rather than derived
+- Implementation decisions where "the standard approach" is complex and a
+  simpler alternative might exist (challenge the inherited solution)
 
 ## Rules
 
@@ -26,6 +28,10 @@ Not every goal. Apply when:
    truths. Note where the rebuilt approach diverges from the conventional one.
 4. **Log the delta**: Record what changed when inherited thinking was removed.
    This is the highest-value learning output.
+5. **Apply to implementation, not just research**: When a goal's implementation
+   approach feels inherited ("everyone uses X for this"), apply the same rigor.
+   Surface the assumptions in the approach. Check if a simpler path exists that
+   still satisfies the verification criteria. Log the analysis if you deviate.
 
 ## Anti-patterns
 

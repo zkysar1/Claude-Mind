@@ -1,13 +1,138 @@
 #!/usr/bin/env bash
+# DAEMON-ONLY as of 2026-05-14. No Python CLI fallback. See:
+#   .claude/rules/no-python-cli-fallback.md
+#   world/knowledge/tree/system/daemon-only-architecture.md
+# aspirations-update — daemon-aware wrapper (PR 54).
+#
+# Hot path:
+#   1. Skinny PROJECT_ROOT resolve (no _paths.sh)
+#   2. Parse args (positional asp_id, field, value + --source flag)
+#   3. JSON-encode value via py -3 (mirrors aspirations.py parse_value)
+#   4. POST /v1/aspirations/update with {field: encoded_value} body
+#   5. On 200, print `aspiration` field from response to stdout (matches
+#      legacy `json.dumps(asp, indent=2, ensure_ascii=False)`)
+#
 set -euo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
-cd "$PROJECT_ROOT"
-source "$CORE_ROOT/scripts/_platform.sh"
-# Support --source flag before the subcommand
-SOURCE_ARGS=""
-while [[ "${1:-}" == --source ]]; do
-    SOURCE_ARGS="--source $2"
-    shift 2
+
+# --- Skinny PROJECT_ROOT resolve ------------------------------------------
+_RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
+CORE_ROOT="$PROJECT_ROOT/core"
+
+# --- Parse args -----------------------------------------------------------
+SOURCE_VAL="world"
+declare -a PASSTHROUGH=()
+declare -a PASSTHROUGH_SOURCE=()
+declare -a POSITIONALS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)
+            SOURCE_VAL="${2-}"
+            PASSTHROUGH_SOURCE=(--source "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        -*)
+            PASSTHROUGH+=("$1"); shift;;
+        *)
+            POSITIONALS+=("$1")
+            PASSTHROUGH+=("$1"); shift;;
+    esac
 done
-# shellcheck disable=SC2086
-exec python3 "$CORE_ROOT/scripts/aspirations.py" $SOURCE_ARGS update "$@"
+
+ASP_ID="${POSITIONALS[0]-}"
+FIELD="${POSITIONALS[1]-}"
+VALUE="${POSITIONALS[2]-}"
+
+# Missing positionals → error
+if [ -z "$ASP_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
+    echo "Error: asp_id, field, and value are all required." >&2
+    exit 1
+fi
+
+# --- Daemon path ---------------------------------------------------------
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_runtime.sh"
+
+# Encode value as JSON, mirroring aspirations.py parse_value.
+ENCODED_VALUE=$($(rt_python_launcher) -c '
+import json, sys
+v = sys.argv[1]
+if v == "true":
+    r = True
+elif v == "false":
+    r = False
+elif v == "null":
+    r = None
+elif v == "[]":
+    r = []
+elif v.startswith("{") or v.startswith("["):
+    try:
+        r = json.loads(v)
+    except json.JSONDecodeError:
+        r = v
+else:
+    try:
+        r = int(v)
+    except ValueError:
+        try:
+            r = float(v)
+        except ValueError:
+            r = v
+sys.stdout.write(json.dumps(r))
+' "$VALUE")
+
+QUERY="asp_id=${ASP_ID}&source=${SOURCE_VAL}"
+
+# Build body: single JSON object {field: value}
+BODY=$($(rt_python_launcher) -c "
+import json, sys
+sys.stdout.write(json.dumps({sys.argv[1]: json.loads(sys.argv[2])}))
+" "$FIELD" "$ENCODED_VALUE")
+
+rc=0
+RESPONSE="$(rt_call POST /v1/aspirations/update \
+    --query "$QUERY" \
+    --body-string "$BODY")" || rc=$?
+
+case $rc in
+    0)
+        # 200: print `aspiration` to stdout (legacy CLI shape).
+        # shellcheck disable=SC2086
+        printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+import json, sys
+resp = json.load(sys.stdin)
+asp = resp.get('aspiration')
+if asp is None:
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+else:
+    print(json.dumps(asp, indent=2, ensure_ascii=False))
+"
+        exit 0;;
+    2)
+        printf '%s\n' "$RESPONSE" >&2
+        exit 1;;
+    3)
+        # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
+        if rt_try_autospawn; then
+            rc=0
+            RESPONSE="$(rt_call POST /v1/aspirations/update \
+                --query "$QUERY" \
+                --body-string "$BODY")" || rc=$?
+            if [ "$rc" = "0" ]; then
+                # shellcheck disable=SC2086
+                printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+import json, sys
+resp = json.load(sys.stdin)
+asp = resp.get('aspiration')
+if asp is None:
+    print(json.dumps(resp, indent=2, ensure_ascii=False))
+else:
+    print(json.dumps(asp, indent=2, ensure_ascii=False))
+"
+                exit 0
+            fi
+        fi
+        rt_no_daemon_error "aspirations-update.sh";;
+    *)
+        exit $rc;;
+esac

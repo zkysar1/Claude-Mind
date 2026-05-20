@@ -23,6 +23,9 @@ strategy_schemas:
     max_trigger_overrides: 15
     max_skip_conditions: 5
     depth_allocation_constraint: "episode + pattern + strategic must sum to 1.0"
+    # Adversarial review pattern — originated from rb-356 release-scope bug catch
+    max_adversarial_trigger_substrings: 12
+    max_adversarial_protocol_questions: 8
 
   evolution:
     file: "meta/evolution-strategy.yaml"
@@ -52,6 +55,59 @@ strategy_schemas:
     graduation_window: 15           # goals above baseline before graduating (stop monitoring)
     baseline_tolerance: -0.10       # how far below baseline before counting as regression
     max_active_monitors: 5          # don't monitor more than 5 changes simultaneously
+    #  / rb-504: per-strategy-file allowlist of append-only audit
+    # fields that backpressure must NOT roll back. Append-only logs
+    # (roi_history, reflection_quality_log, step_attribution) record
+    # observability about how the agent has been doing — rolling them back
+    # loses evidence without changing system behavior. 14 rollbacks on
+    # roi_history during April were all misapplications. cmd_check skips
+    # rollbacks when (strategy_file, field) matches; the monitor is marked
+    # audit_only_skipped, removed from the active list, AND the skip is
+    # recorded under audit_only_skips for parity with rollback_history.
+    # To extend: add another file → field-list mapping. Empty / missing list
+    # = no exclusion (legacy behavior).
+    audit_only_fields:
+      "reflection-strategy.yaml":
+        - roi_history
+        - reflection_quality_log
+      "step-attribution.yaml":
+        - step_attribution
+
+  self_program_backpressure:
+    # Per world/conventions/self-program-evolution.md
+    # Multi-metric backpressure for Self/Program/Skill/Rule autonomous edits.
+    # Single-file merge (D4): all monitors live in meta/backpressure.yaml with
+    # the monitor_kind discriminator. Configuration is per-kind because the
+    # 4 file classes have different blast radii and edit velocities.
+    file: "meta/backpressure.yaml"
+    description: "Multi-metric backpressure for Self/Program/Skill/Rule autonomous edits — extends meta-backpressure via monitor_kind discriminator (D4)"
+    max_active_monitors: 15           # raised from 5 (D4 + §14.5)
+    aggregation:
+      worst_case_floor: 0.15          # worst single signal below baseline by >0.15 → regression vote
+      majority_threshold: 0.10        # majority of signals below baseline-0.10 → regression vote
+      majority_count_self: 8          # 8 of 15 signals must vote regression
+      majority_count_program: 11      # 11 of 21
+      majority_count_skill: 6         # 6 of 10
+      majority_count_rule: 5          # 5 of 9
+    per_kind:
+      self_evolution:
+        regression_window: 8          # consecutive degraded-vote windows to trigger rollback
+        graduation_window: 25
+        signal_count: 15
+      program_evolution:
+        regression_window: 6
+        graduation_window: 50
+        signal_count: 21
+      skill_evolution:
+        regression_window: 6          # tighter — skill edits have broader execution surface
+        graduation_window: 15
+        signal_count: 10
+      rule_evolution:
+        regression_window: 6
+        graduation_window: 20
+        signal_count: 9               # drops skill_quality_5dim (#5) — not applicable to rules
+    dead_end_threshold: 3             # same file rolled back 3× in 60d → file Investigate goal
+    dead_end_window_days: 60          # rolling window for dead-end detection
 
   improvement_instructions:
     file: "meta/improvement-instructions.md"
@@ -131,6 +187,8 @@ initial_state:
       completion_pressure: 0.8       # boost goals in near-complete aspirations
       depth_bonus: 0.6               # reward continuing in same aspiration
       directive_boost: 1.5           # cross-agent priority influence from board directives
+      tail_bonus: 0.8                # surface frontier goals as aspiration nears completion
+      handoff_bonus: 1.0             # prioritize cross-agent handoff goals
     custom_criteria: []
     selection_heuristics: []
 
@@ -164,6 +222,28 @@ initial_state:
       scale_on_chain_length: true    # multi-episode goals → deeper reflection
       scale_on_importance: true      # HIGH priority completed → deeper reflection
       max_depth_multiplier: 2.0      # never exceed 2x standard depth
+    # Adversarial review pattern (rb-356 origin).
+    # When goal categories/topics match risky code-path substrings AND the goal
+    # touched multiple files, surface verification questions that cross-check
+    # the just-shipped work — the methodology that catches bugs tests miss.
+    adversarial_review:
+      triggers:
+        category_substrings:
+          - serialization
+          - locking
+          - cross-agent
+          - hook
+          - session-binding
+          - coordination
+        min_files_touched: 2
+      protocol:
+        - what predicate gates the acquire/start path?
+        - what predicate gates the release/end path?
+        - is the release predicate a superset of the acquire predicate?
+        - does any test exercise the release path without prior acquire-success?
+      last_triggered: null
+      times_fired: 0
+      times_caught_bug: 0
 
   evolution_strategy:
     version: 1

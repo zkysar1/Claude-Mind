@@ -4,7 +4,8 @@
       "Bash(mkdir -p .claude/skills/*)",
       "Write(**/.claude/skills/**)",
 	  "Monitor(*)",
-      "Edit(**/.claude/skills/**)"
+      "Edit(**/.claude/skills/**)",
+      "MultiEdit(**/.claude/skills/**)"
     ],
     "deny": [
       "Bash(git reset --hard*)",
@@ -13,108 +14,48 @@
       "Bash(git rebase*)",
       "Bash(git cherry-pick*)",
       "Bash(git clean*)",
-      "Edit(*/.claude/settings*)",
-      "Write(*/.claude/settings*)",
       "AskUserQuestion(*)",
       "Read(*/.env.local)",
-      "Edit(*/.claude/skills/aspirations/*)",
-      "Write(*/.claude/skills/aspirations/*)",
-      "Edit(*/.claude/skills/aspirations-consolidate/*)",
-      "Write(*/.claude/skills/aspirations-consolidate/*)",
-      "Edit(*/.claude/skills/aspirations-evolve/*)",
-      "Write(*/.claude/skills/aspirations-evolve/*)",
-      "Edit(*/.claude/skills/aspirations-execute/*)",
-      "Write(*/.claude/skills/aspirations-execute/*)",
-      "Edit(*/.claude/skills/aspirations-spark/*)",
-      "Write(*/.claude/skills/aspirations-spark/*)",
-      "Edit(*/.claude/skills/aspirations-state-update/*)",
-      "Write(*/.claude/skills/aspirations-state-update/*)",
-      "Edit(*/.claude/skills/aspirations-precheck/*)",
-      "Write(*/.claude/skills/aspirations-precheck/*)",
-      "Edit(*/.claude/skills/aspirations-select/*)",
-      "Write(*/.claude/skills/aspirations-select/*)",
-      "Edit(*/.claude/skills/aspirations-verify/*)",
-      "Write(*/.claude/skills/aspirations-verify/*)",
-      "Edit(*/.claude/skills/aspirations-complete-review/*)",
-      "Write(*/.claude/skills/aspirations-complete-review/*)",
-      "Edit(*/.claude/skills/aspirations-learning-gate/*)",
-      "Write(*/.claude/skills/aspirations-learning-gate/*)",
-      "Edit(*/.claude/skills/backlog-report/*)",
-      "Write(*/.claude/skills/backlog-report/*)",
-      "Edit(*/.claude/skills/boot/*)",
-      "Write(*/.claude/skills/boot/*)",
-      "Edit(*/.claude/skills/agent-completion-report/*)",
-      "Write(*/.claude/skills/agent-completion-report/*)",
-      "Edit(*/.claude/skills/create-aspiration/*)",
-      "Write(*/.claude/skills/create-aspiration/*)",
-      "Edit(*/.claude/skills/decompose/*)",
-      "Write(*/.claude/skills/decompose/*)",
-      "Edit(*/.claude/skills/forge-skill/*)",
-      "Write(*/.claude/skills/forge-skill/*)",
-      "Edit(*/.claude/skills/open-questions/*)",
-      "Write(*/.claude/skills/open-questions/*)",
-      "Edit(*/.claude/skills/prime/*)",
-      "Write(*/.claude/skills/prime/*)",
-      "Edit(*/.claude/skills/priority-review/*)",
-      "Write(*/.claude/skills/priority-review/*)",
-      "Edit(*/.claude/skills/recover/*)",
-      "Write(*/.claude/skills/recover/*)",
-      "Edit(*/.claude/skills/reflect/*)",
-      "Write(*/.claude/skills/reflect/*)",
-      "Edit(*/.claude/skills/reflect-on-outcome/*)",
-      "Write(*/.claude/skills/reflect-on-outcome/*)",
-      "Edit(*/.claude/skills/reflect-on-self/*)",
-      "Write(*/.claude/skills/reflect-on-self/*)",
-      "Edit(*/.claude/skills/reflect-maintain/*)",
-      "Write(*/.claude/skills/reflect-maintain/*)",
-      "Edit(*/.claude/skills/reflect-tree-update/*)",
-      "Write(*/.claude/skills/reflect-tree-update/*)",
-      "Edit(*/.claude/skills/replay/*)",
-      "Write(*/.claude/skills/replay/*)",
-      "Edit(*/.claude/skills/research-topic/*)",
-      "Write(*/.claude/skills/research-topic/*)",
-      "Edit(*/.claude/skills/respond/*)",
-      "Write(*/.claude/skills/respond/*)",
-      "Edit(*/.claude/skills/review-hypotheses/*)",
-      "Write(*/.claude/skills/review-hypotheses/*)",
       "Edit(*/.claude/skills/start/*)",
       "Write(*/.claude/skills/start/*)",
+      "MultiEdit(*/.claude/skills/start/*)",
       "Edit(*/.claude/skills/stop/*)",
       "Write(*/.claude/skills/stop/*)",
-      "Edit(*/.claude/skills/tree/*)",
-      "Write(*/.claude/skills/tree/*)",
-      "Edit(*/.claude/skills/verify-learning/*)",
-      "Write(*/.claude/skills/verify-learning/*)",
-      "Edit(*/.claude/skills/_tree.yaml)",
-      "Write(*/.claude/skills/_tree.yaml)",
-      "Edit(*/.claude/skills/_triggers.yaml)",
-      "Write(*/.claude/skills/_triggers.yaml)",
-      "Edit(*/.claude/rules/*)",
-      "Write(*/.claude/rules/*)",
-      "Edit(*/core/config/*)",
-      "Write(*/core/config/*)",
-      "Edit(*/core/scripts/*)",
-      "Write(*/core/scripts/*)",
-      "Edit(*/CLAUDE.md)",
-      "Write(*/CLAUDE.md)",
+      "MultiEdit(*/.claude/skills/stop/*)",
+      "Edit(*/.claude/skills/boot/*)",
+      "Write(*/.claude/skills/boot/*)",
+      "MultiEdit(*/.claude/skills/boot/*)",
       "Edit(*/world/knowledge/tree/_tree.yaml)",
       "Write(*/world/knowledge/tree/_tree.yaml)",
+      "MultiEdit(*/world/knowledge/tree/_tree.yaml)",
       "Edit(*/world/*.jsonl)",
       "Write(*/world/*.jsonl)",
+      "MultiEdit(*/world/*.jsonl)",
       "Edit(*/meta/*.jsonl)",
       "Write(*/meta/*.jsonl)",
+      "MultiEdit(*/meta/*.jsonl)",
       "Write(*/session/agent-state)",
       "Edit(*/session/agent-state)",
+      "MultiEdit(*/session/agent-state)",
       "Write(*/session/persona-active)",
       "Edit(*/session/persona-active)",
+      "MultiEdit(*/session/persona-active)",
       "Write(*/session/stop-loop)",
       "Edit(*/session/stop-loop)",
+      "MultiEdit(*/session/stop-loop)",
       "Write(*/session/stop-block-count)",
       "Edit(*/session/stop-block-count)",
+      "MultiEdit(*/session/stop-block-count)",
       "Write(*.active-agent-*)",
-      "Edit(*.active-agent-*)"
+      "Edit(*.active-agent-*)",
+      "MultiEdit(*.active-agent-*)"
     ]
   },
+  "env": {
+    "PYTHONUTF8": "1",
+    "PYTHONIOENCODING": "utf-8"
+  },
+  "skillListingBudgetFraction": 0.05,
   "hooks": {
     "PreToolUse": [
       {
@@ -123,7 +64,7 @@
           {
             "type": "command",
             "command": "bash core/scripts/context-reads-gate.sh",
-            "timeout": 5
+            "timeout": 20
           }
         ]
       },
@@ -133,11 +74,136 @@
           {
             "type": "command",
             "command": "bash core/scripts/context-reads-skill-gate.sh",
-            "timeout": 5
+            "timeout": 15
           },
           {
             "type": "command",
             "command": "bash core/scripts/utilization-gate.sh",
+            "timeout": 20
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/bash-agent-inject.sh",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "ScheduleWakeup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/schedule-wakeup-gate.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/path-resolution-hook.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/marker-placement-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-prepare.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/settings-structural-validator.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/path-resolution-hook.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/marker-placement-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-prepare.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/settings-structural-validator.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/path-resolution-hook.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/marker-placement-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-prepare.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/settings-structural-validator.sh",
             "timeout": 10
           }
         ]
@@ -161,6 +227,26 @@
             "type": "command",
             "command": "bash core/scripts/context-reads-invalidate.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/tree-sync-check.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-record.sh",
+            "timeout": 15
           }
         ]
       },
@@ -171,6 +257,76 @@
             "type": "command",
             "command": "bash core/scripts/context-reads-invalidate.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/tree-sync-check.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-record.sh",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/tree-sync-check.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/evolution-record.sh",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/iteration-close-reminder.sh",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/presence-tick.sh",
+            "timeout": 5
           }
         ]
       }
@@ -179,6 +335,11 @@
       {
         "matcher": "auto",
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash core/scripts/precompact-serialize.sh",
+            "timeout": 90
+          },
           {
             "type": "command",
             "command": "bash core/scripts/precompact-checkpoint.sh",
@@ -192,30 +353,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/session-save-id.sh",
-            "timeout": 3
-          }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash core/scripts/postcompact-restore.sh",
-            "timeout": 10
+            "command": "bash core/scripts/sessionstart-orchestrator.sh",
+            "timeout": 95
           }
         ]
       }
     ],
-    "FileChanged": [
+    "UserPromptExpansion": [
       {
-        "matcher": ".active-agent-*",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/set-active-agent-env.sh",
-            "timeout": 3
+            "command": "bash core/scripts/user-prompt-skill-record.sh",
+            "timeout": 15
           }
         ]
       }
@@ -226,7 +377,7 @@
           {
             "type": "command",
             "command": "bash core/scripts/stop-hook.sh",
-            "timeout": 8
+            "timeout": 60
           }
         ]
       }

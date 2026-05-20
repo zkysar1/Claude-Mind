@@ -96,3 +96,25 @@ When something fails or a goal is blocked:
 ✗ BLOCKED: {goal title} — {reason}
 ✗ ERROR: {what went wrong}
 ```
+
+## Partner Status (live cross-agent snapshot)
+
+Surfaced once per iteration at the precheck top (the canonical write site is
+`aspirations-precheck` Phase 0-pre.0). Source: `team-state-read.sh --json`,
+field `agent_status.<partner>.in_flight`. The board claim posts are the audit
+trail; this is the live snapshot — see
+`core/config/conventions/coordination.md` "in_flight Field".
+
+```
+▸ Partner ({partner-name}): in_flight {goal_id} '{short title}' phase={N} ({Nm/h} ago)
+```
+
+When the partner is between goals (no in_flight, but last_active is recent):
+
+```
+▸ Partner ({partner-name}): no in_flight | last_active {Nm/h ago}
+```
+
+When concluding partner-silent (per `.claude/rules/check-team-state-before-silent.md`),
+the inverse must always be derived from this same field — never from "I haven't
+heard anything." If `last_active` is within 6h, the partner is NOT silent.

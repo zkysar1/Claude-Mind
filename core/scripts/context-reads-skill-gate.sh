@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # PreToolUse[Skill] hook — gate AND record skill invocations.
 # Reads JSON from stdin (tool_input.skill), checks context-reads tracker.
 # Exit 0 = allow skill (and record it), Exit 2 = block (already in context).
@@ -54,4 +55,32 @@ fi
 
 # First invocation — record and allow
 python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$skill_path" 2>/dev/null || true
+
+# Long-term invocation telemetry — append to per-agent JSONL ledger.
+# Fail-open: any failure here must NOT block the skill from running.
+# Knowledge tree: world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md
+if [ -n "${AGENT_DIR:-}" ] && [ -n "$skill_name" ]; then
+    AGENT_DIR="$AGENT_DIR" AGENT_NAME="${AGENT_NAME:-}" SKILL_NAME="$skill_name" SESSION_ID="$session_id" \
+        python3 - <<'PY' 2>/dev/null || true
+import json, datetime, os
+agent_dir = os.environ.get('AGENT_DIR', '')
+agent_name = os.environ.get('AGENT_NAME', '')
+skill = os.environ.get('SKILL_NAME', '')
+sid = os.environ.get('SESSION_ID', '')
+if agent_dir and skill:
+    row = {
+        'ts': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+        'skill': skill,
+        'agent': agent_name,
+        'sid': sid,
+        'invocation_source': 'model',
+    }
+    try:
+        with open(os.path.join(agent_dir, 'skill-invocations.jsonl'), 'a', encoding='utf-8') as f:
+            f.write(json.dumps(row) + chr(10))
+    except Exception:
+        pass
+PY
+fi
+
 exit 0

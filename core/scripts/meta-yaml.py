@@ -14,10 +14,10 @@ import json
 import sys
 from datetime import datetime
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 try:
     import yaml
@@ -33,10 +33,25 @@ from _paths import META_DIR, CONFIG_DIR
 # ---------------------------------------------------------------------------
 
 def resolve_path(rel_path):
-    """Resolve a path relative to meta/, rejecting traversal outside meta/."""
+    """Resolve a path relative to meta/, rejecting traversal outside meta/.
+
+    Enforces a .yaml suffix on the final basename to close the ghost-file
+    trap (g-115-122 / rb-335): a call like `meta-set.sh tree decompose_threshold 100`
+    previously created `meta/tree` (no extension) that no reader ever loaded.
+    Fail loud instead of silently creating a dead file. Callers that want
+    to write a subdir index file pass e.g. `meta-knowledge/index.yaml`;
+    the suffix check is on the basename, not the whole path.
+    """
     target = (META_DIR / rel_path).resolve()
     if not target.is_relative_to(META_DIR.resolve()):
         print(f"ERROR: Path '{rel_path}' resolves outside meta/", file=sys.stderr)
+        sys.exit(1)
+    if target.suffix != ".yaml":
+        print(
+            f"ERROR: meta/ targets must end in .yaml — got '{rel_path}' "
+            f"(resolved basename: {target.name}). Add the .yaml suffix.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     return target
 

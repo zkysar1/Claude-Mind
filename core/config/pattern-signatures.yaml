@@ -48,20 +48,17 @@ signature_templates:
       confidence_boost: 0.0                # how much to adjust confidence when pattern matches
 
     # Tracking fields — updated by /reflect and /replay
-    times_triggered: 0
-    true_positives: 0
-    false_positives: 0
-    hit_rate: 0.0                          # true_positives / times_triggered
-    false_positive_rate: 0.0               # false_positives / times_triggered
+    outcome_stats:                         # replaces prior times_triggered/true_positives/false_positives/hit_rate/false_positive_rate
+      confirmed: 0                         # confirmed matches (analogous to true_positives)
+      total: 0                             # total times matched (analogous to times_triggered)
+      accuracy: 0.0                        # confirmed / max(total, 1)
     created_session: null
-    last_triggered: null
+    last_matched: null                     # replaces last_triggered (live field name)
 
-    # Utility tracking — updated by retrieve.sh (increments counters on each retrieval)
-    utility_stats:
-      times_retrieved: 0
-      times_useful: 0
-      times_noise: 0
-      utility_ratio: 0.0                   # times_useful / max(times_retrieved, 1)
+    # Utilization tracking — updated by retrieve.sh (increments counter on each retrieval)
+    utilization:
+      retrieval_count: 0                   # total retrievals (replaces times_retrieved)
+      last_retrieved: null                 # ISO date of last retrieval (new; no utility_ratio — use outcome_stats.accuracy instead)
 
 # --- INITIAL STATE ---
 

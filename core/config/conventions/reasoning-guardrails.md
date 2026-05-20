@@ -8,7 +8,28 @@ Reasoning bank entries use JSONL (one JSON object per line) with script-based ac
 ## Record Schema
 Required: `id`, `title`, `type`, `category`, `content`, `created`
 Defaults: `status` ("active"), `when_to_use` (""), `utilization` (zeros)
-Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`
+Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`, `experience_ref`, `preventive_guardrail`
+
+`experience_ref` (format `exp-SLUG`, see `experience.md`) links the lesson
+to the full-fidelity trace it was learned from. Completes the evidence
+chain `guardrail → reasoning bank → experience → goal`. Optional — may be
+null when the lesson is user-provided or not tied to a specific execution.
+
+`preventive_guardrail` is intentionally dual-purpose:
+
+- **Linked form**: a `guard-NNN` ID (optionally a comma-separated list
+  like `"guard-340,guard-341"`) pointing at already-filed guardrails that
+  enforce the RB entry's lesson.
+- **Candidate form**: prose describing the rule that *should* become a
+  guardrail but has not been filed yet (e.g., rb-464's "guard-stale-narrative
+  (to be filed): ..."). This is a backlog signal — the author is capturing
+  the rule text inline so it can be filed later in a guardrail-mining pass.
+
+Both shapes are schema-valid. The `learning-routing-audit.sh` script classifies
+them at read time: linked-form IDs that don't resolve are true drift; prose
+values surface under `guardrail_candidates_unfiled` as an opportunity queue,
+not a schema error. Mining candidate-form prose into real guardrails drains
+the queue over time without forced migration.
 
 ID format: `rb-NNN` (zero-padded 3-digit, regex: `^rb-\d{3}$`)
 Valid types: `success`, `failure`, `user_provided`
@@ -41,8 +62,12 @@ Guardrails use JSONL (one JSON object per line) with script-based access:
 
 ## Record Schema
 Required: `id`, `rule`, `category`, `trigger_condition`, `source`, `created`
-Defaults: `status` ("active"), `times_triggered` (0), `utilization` (zeros)
-Optional: `tags`, `related_patterns`, `violation_history`
+Defaults: `status` ("active"), `utilization` ({`times_active`: 0, `times_skipped`: 0, `times_helpful`: 0, `times_noise`: 0, `retrieval_count`: 0, `utilization_score`: 0.0}). Authoritative field list: `core/scripts/reasoning-bank.py` `UTILIZATION_COUNTERS`. No top-level `times_triggered` — that field belongs to `pattern-signatures.jsonl`, not guardrails.
+Optional: `tags`, `related_patterns`, `violation_history`, `experience_ref`
+
+`experience_ref` (format `exp-SLUG`, see `experience.md`) links the
+prescriptive rule to the full-fidelity trace it was learned from. Same
+schema and semantics as on reasoning-bank records. Optional.
 
 ID format: `guard-NNN` (zero-padded 3-digit, regex: `^guard-\d{3}$`)
 Valid statuses: `active`, `retired`
@@ -60,7 +85,7 @@ The LLM NEVER reads or edits `world/guardrails.jsonl` directly. All operations g
 | `guardrails-update-field.sh <id> <field> <value>` | Update single field | — |
 | `guardrails-increment.sh <id> <field>` | Atomic increment of utilization/trigger field | — |
 
-All backed by `core/scripts/guardrails.py` (Python 3, stdlib only).
+All backed by the `core/scripts/guardrails-*.sh` wrappers above (Python 3, stdlib only). Direct read/write of `world/guardrails.jsonl` is prohibited — use the wrappers exclusively.
 
 ---
 
@@ -76,7 +101,7 @@ using keyword matching on guardrail text fields. Replaces manual LLM matching.
 
 Output: JSON with `matched` array (each entry: `id`, `rule`, `category`, `action_hint`) and `matched_count`.
 `action_hint` extracts executable script commands from rule text (e.g., `domain-check.sh check --since 30`).
-Side effects: increments `utilization.times_active` on matched, `times_skipped` on unmatched (unless `--dry-run`).
+Side effects: increments `utilization.times_active` on matched (unless `--dry-run`). Pre-2026-05-09 also incremented `times_skipped` on every non-matching active record per call; the audit found this fired hundreds of times per session and inflated skip counters by 2-15x retrieval count, so the increment was removed. The semantically correct `times_skipped` writer is `reflect-bookkeeping.py` `cmd_utilization_delta` (LLM deliberation marks items as skipped). The `utilization-stats.py` exposure floor was simultaneously narrowed to `retrieval_count` alone — see that script's docstring.
 
 All backed by `core/scripts/guardrail-check.py` (Python 3, stdlib only).
 
@@ -91,7 +116,7 @@ guardrail entries.
 
 Examples of operational gotchas:
 - "Always use `export` for env vars when scripts call Python subprocesses"
-- "boto3 mock must patch at the import location, not the definition location"
+- "Mock must patch at the import location, not the definition location"
 - "Compact checkpoint file can exceed expected size after 50+ goals"
 
 ## Store Selection
@@ -103,6 +128,11 @@ Examples of operational gotchas:
   use `trigger_condition` to describe when the rule applies.
 
 Both: include `"ops-gotcha"` in `tags`.
+
+For routing beyond this RB-vs-guardrail pair (tree, pipeline, experience,
+locators, journal, working memory, etc.), see
+`core/config/conventions/learning-routing.md`. Multi-store encoding pairs
+(e.g., RB + guardrail linked via `preventive_guardrail`) are documented there.
 
 ## Encoding Triggers
 

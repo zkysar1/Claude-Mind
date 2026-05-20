@@ -14,15 +14,15 @@ Slot addressing:
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 try:
     import yaml
@@ -30,10 +30,42 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import AGENT_DIR, CONFIG_DIR
+from _paths import AGENT_DIR, CONFIG_DIR, WORLD_DIR, assert_agent_dir
+from _fileops import acquire_lock, release_lock
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("wm")
 
 WM_PATH = AGENT_DIR / "session" / "working-memory.yaml"
+WM_LOCK_PATH = WM_PATH.with_suffix(".lock")
 CONFIG_PATH = CONFIG_DIR / "memory-pipeline.yaml"
+
+# Cross-writer advisory lock for working-memory.yaml read-modify-write
+# cycles. See  / rb-508 / . wm.py's commands and the
+# direct-writer paths (e.g. tree-encoding-drift-gate.py) MUST acquire
+# this lock around any sequence that reads WM, mutates state in memory,
+# then writes back — without it, two writers can race and one overwrites
+# the other's update with stale data, and a reader can observe a slot
+# mid-rewrite (which is what the productivity-gate "Expecting value..."
+# noise pointed at). The lock file is the SAME logical resource as the
+# .lock used by `_fileops.locked_modify_yaml`; so wm.py-mediated writes
+# and any direct writer that uses locked_modify_yaml will mutually
+# exclude as long as both target the same `<file>.lock` path.
+import contextlib
+
+@contextlib.contextmanager
+def wm_lock():
+    """Hold the WM advisory lock across a read-modify-write cycle.
+
+    stale_seconds=10: WM RMW is sub-100ms; 30s default would block 6+ aspiration
+    iterations on a crashed mid-RMW writer. 10s is still 100x cycle time.
+    """
+    acquire_lock(WM_LOCK_PATH, stale_seconds=10)
+    try:
+        yield
+    finally:
+        release_lock(WM_LOCK_PATH)
 
 # Top-level keys (not inside slots:)
 TOP_LEVEL_KEYS = {
@@ -41,6 +73,15 @@ TOP_LEVEL_KEYS = {
     "goals_completed_this_session", "aspiration_touched_last",
     "last_goal_category",
 }
+
+# Session-identity fields: survive `wm reset` (which runs mid-session at
+# autocompact via consolidate Step 5), cleared only by `wm clear-identity`
+# (which runs post-consolidate from /stop's graceful-stop D4.5). Add a field
+# here only when its semantic is "describes the current session" — not
+# "holds ephemeral slot state." Wrong classification either loses data
+# across autocompact (identity→slot) or leaks stale state across sessions
+# (slot→identity).
+SESSION_IDENTITY_FIELDS = {"session_start"}
 
 # Default slot types — used by init/reset when config is unavailable
 DEFAULT_SLOT_TYPES = [
@@ -63,6 +104,35 @@ MAP_SLOTS = {
     "archived_context": {"summary": None, "experience_refs": []},
 }
 
+# Structured-dict slots: top-level writes must be a dict or None (clear).
+# Non-JSON stdin that falls through cmd_set's int/float scalar fallbacks
+# (e.g. a Python traceback piped via `echo "$(py -3 ... 2>&1)"`) would
+# otherwise land as a raw string in the slot, breaking downstream consumers
+# (loop-state-bump-counters.py, productivity-gate.sh, compact-restore-slots.sh).
+#  traced the exact pattern;  is the structural refusal.
+STRUCTURED_DICT_SLOTS = {"loop_state"}
+
+# Cadence-tracker slot patterns — stale by design (fire every N goals or N hours,
+# often much longer than evict_threshold_minutes). wm-prune must not evict these
+# or the cadence memory is destroyed and the next cadence-check duplicate-fires.
+# Discovered  (2026-04-21): wm-prune evicted last_fresh_eyes_review at
+# 132 min age; cadence-check then read last=0 and would have fired a duplicate
+# briefing. Patterns match slot names like last_fresh_eyes_review,
+# last_evolution_at_time, last_strategic_scan, last_strategic_scan_tick, etc.
+CADENCE_TRACKER_PATTERNS = (
+    re.compile(r"^last_.*_review$"),
+    re.compile(r"^last_.*_at$"),
+    re.compile(r"^last_.*_at_time$"),
+    re.compile(r"^last_.*_tick$"),
+    re.compile(r"^last_.*_check$"),
+    re.compile(r"^last_.*_checkin$"),
+    re.compile(r"^last_.*_scan$"),
+    re.compile(r"^last_.*_fire$"),
+)
+
+def _is_cadence_tracker(slot_name):
+    """True if slot name matches a cadence-tracker pattern — do not evict."""
+    return any(p.match(slot_name) for p in CADENCE_TRACKER_PATTERNS)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -72,7 +142,6 @@ def now_iso():
     """Local ISO timestamp."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-
 def read_yaml(path):
     """Read a YAML file, return parsed dict. Returns {} if missing."""
     if not path.exists():
@@ -80,7 +149,6 @@ def read_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data if data is not None else {}
-
 
 def write_yaml(path, data):
     """Atomically write data as YAML."""
@@ -90,21 +158,57 @@ def write_yaml(path, data):
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     tmp.replace(path)
 
-
 def read_wm():
     """Read working memory file."""
     return read_yaml(WM_PATH)
-
 
 def write_wm(data):
     """Write working memory file atomically."""
     write_yaml(WM_PATH, data)
 
-
 def read_config():
     """Read memory pipeline config."""
     return read_yaml(CONFIG_PATH)
 
+
+def _default_wm_data():
+    """Build a fresh working-memory dict from the memory-pipeline config.
+
+    Single source of truth for the canonical empty-WM shape — consumed by
+    cmd_init, cmd_reset, and cmd_set (g-115-748 self-heal path). Extracting
+    this helper closes the cmd_read/cmd_set asymmetry from g-115-737: a
+    missing or empty working-memory.yaml previously caused cmd_set to exit 1
+    with "Working memory not initialized" while cmd_read returned {} exit 0.
+    The asymmetry made fresh-eyes-cadence-check seed-stagger (g-270-02)
+    fail-open and fire all 4 sibling rituals on the same iteration.
+    Single-writer rule: any future change to the empty-WM shape edits this
+    helper (and its consumers automatically inherit it).
+    """
+    config = read_config()
+    wm_config = config.get("working_memory", {})
+    slot_types = wm_config.get("slot_types", DEFAULT_SLOT_TYPES)
+
+    slots = {}
+    slot_meta = {}
+    for st in slot_types:
+        if st in ARRAY_SLOTS:
+            slots[st] = []
+        elif st in MAP_SLOTS:
+            slots[st] = dict(MAP_SLOTS[st])  # shallow copy
+        else:
+            slots[st] = None
+        slot_meta[st] = {"updated_at": None, "accessed_at": None, "update_count": 0}
+
+    return {
+        "encoding_queue": [],
+        "session_id": None,
+        "session_start": None,
+        "goals_completed_this_session": [],
+        "aspiration_touched_last": "",
+        "last_goal_category": "",
+        "slots": slots,
+        "slot_meta": slot_meta,
+    }
 
 def resolve_slot(data, slot_path):
     """Resolve a slot path to (parent_dict, final_key, is_top_level).
@@ -142,7 +246,6 @@ def resolve_slot(data, slot_path):
                 return None, None, False
         return current, parts[-1], False
 
-
 def get_slot_meta(data, slot_name):
     """Get or create slot_meta entry for a slot."""
     meta = data.setdefault("slot_meta", {})
@@ -151,19 +254,16 @@ def get_slot_meta(data, slot_name):
         meta[root] = {"updated_at": None, "accessed_at": None, "update_count": 0}
     return meta[root]
 
-
 def update_accessed(data, slot_name):
     """Mark a slot as accessed."""
     m = get_slot_meta(data, slot_name)
     m["accessed_at"] = now_iso()
-
 
 def update_modified(data, slot_name):
     """Mark a slot as modified."""
     m = get_slot_meta(data, slot_name)
     m["updated_at"] = now_iso()
     m["update_count"] = m.get("update_count", 0) + 1
-
 
 def get_pruning_config(config):
     """Get pruning configuration with defaults."""
@@ -187,56 +287,77 @@ def get_pruning_config(config):
     }
     return config.get("working_memory_pruning", defaults)
 
+# ---------------------------------------------------------------------------
+# Schema gates
+# ---------------------------------------------------------------------------
+
+def _validate_knowledge_debt_entry(item):
+    """Reject knowledge_debt entries with unresolvable node_keys.
+
+    Valid forms:
+      A) node_key resolves to a real _tree.yaml entry (string key)
+      B) priority == "housekeeping" (debt is framework-scoped, not node-scoped)
+      C) node_key is explicitly null AND reason is present
+
+    See rb-248 and g-115-59. Rejects loudly rather than silently tagging —
+    silent coercion would violate rb-215 single-source-of-truth.
+    """
+    priority = item.get("priority")
+    node_key = item.get("node_key")
+    reason = item.get("reason")
+
+    if priority == "housekeeping":
+        if not reason:
+            print("ERROR: knowledge_debt housekeeping entry requires 'reason'", file=sys.stderr)
+            sys.exit(1)
+        return  # valid — housekeeping form
+
+    if node_key is None:
+        if not reason:
+            print("ERROR: knowledge_debt entry with node_key=null requires 'reason'", file=sys.stderr)
+            sys.exit(1)
+        return  # valid — explicit null with reason
+
+    if not isinstance(node_key, str) or not node_key.strip():
+        print(f"ERROR: knowledge_debt node_key must be non-empty string or null, got {node_key!r}", file=sys.stderr)
+        sys.exit(1)
+
+    # Must resolve against _tree.yaml
+    tree_path = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
+    try:
+        with open(tree_path, encoding="utf-8") as f:
+            tree = yaml.safe_load(f) or {}
+    except OSError as e:
+        print(f"ERROR: cannot read {tree_path} for knowledge_debt validation: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    nodes = tree.get("nodes", {})
+    if node_key not in nodes:
+        print(
+            f"ERROR: knowledge_debt node_key '{node_key}' does not resolve to a tree node.\n"
+            f"       Valid forms: (A) real node_key from _tree.yaml, (B) priority='housekeeping' + reason,\n"
+            f"       (C) node_key=null + reason. See core/config/conventions/working-memory.md.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
 
-def cmd_read(args):
-    """Read a slot or the entire working memory."""
-    data = read_wm()
-    if not data:
-        if args.json:
-            print("{}")
-        return
-
-    if not args.slot:
-        # Full dump — no accessed_at tracking for full reads
-        if args.json:
-            print(json.dumps(data, ensure_ascii=False, default=str))
-        else:
-            yaml.dump(data, sys.stdout, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        return
-
-    parent, key, is_top = resolve_slot(data, args.slot)
-    if parent is None or key not in parent:
-        print("null")
-        return
-
-    value = parent[key]
-
-    # Output first — reads must succeed even if tracking write fails
-    if args.json:
-        print(json.dumps(value, ensure_ascii=False, default=str))
-    else:
-        if isinstance(value, (dict, list)):
-            yaml.dump(value, sys.stdout, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        else:
-            print(value if value is not None else "null")
-
-    # Track access (after output — this is a side effect, not the primary operation)
-    if not is_top:
-        update_accessed(data, args.slot)
-        write_wm(data)
-
-
 def cmd_set(args):
-    """Set a slot value from stdin (JSON)."""
-    data = read_wm()
-    if not data:
-        print("ERROR: Working memory not initialized. Run wm-init.sh first.", file=sys.stderr)
-        sys.exit(1)
+    """Set a slot value from stdin (JSON).
 
+    Reads stdin OUTSIDE the WM lock (no I/O on WM yet), then acquires the
+    advisory lock for the read-modify-write cycle on working-memory.yaml.
+    g-115-206 — closes the race that surfaced as productivity-gate noise.
+
+    rb-715 subdict-clobber gate (g-275-02): when slot == 'loop_state' and the
+    incoming value is a dict, run loop_state_merge_gate.check() against the
+    on-disk loop_state.signals subkeys. If incoming.signals would clobber
+    bash-written subkeys (quiescence, goals_since_last_tree_update, etc.),
+    refuse the write unless --override-merge-gate <justification> is passed.
+    """
     raw = sys.stdin.read().strip()
     if not raw:
         print("ERROR: No input on stdin", file=sys.stderr)
@@ -262,26 +383,85 @@ def cmd_set(args):
                 except ValueError:
                     value = raw
 
-    parent, key, is_top = resolve_slot(data, args.slot)
-    if parent is None:
-        print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
+    # : refuse non-dict-or-null writes to structured-dict slots.
+    # Without this, a Python traceback piped via `echo "$(py -3 ... 2>&1)"`
+    # falls through the scalar fallbacks above and lands as a 700+ char
+    # string in loop_state, breaking productivity-gate / bump-counters /
+    # compact-restore. The merge-gate at line 410 catches subdict-clobber
+    # (rb-715) but pass-throughs non-dict, so this writer-side check is
+    # the only structural defense against type-transition.
+    if args.slot in STRUCTURED_DICT_SLOTS and value is not None and not isinstance(value, dict):
+        shape = type(value).__name__
+        preview = (raw[:80] + "...") if len(raw) > 80 else raw
+        print(
+            f"BLOCKED: structured-dict slot '{args.slot}' refuses non-dict-or-null "
+            f"write (got {shape}, len={len(raw)}, prefix={preview!r})",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    parent[key] = value
+    with wm_lock():
+        data = read_wm()
+        if not data:
+            #  self-heal: a missing or empty working-memory.yaml is
+            # not a writer's failure mode — it is a fresh agent dir, a wiped
+            # session, or a runner that called wm-set BEFORE wm-init had a
+            # chance to fire. Seed the canonical empty-WM shape and proceed
+            # with the requested set. The cmd_read counterpart already
+            # returns {} exit 0 on empty WM; cmd_set previously diverged
+            # by exit 1 (rb-748 / ), which made
+            # fresh-eyes-cadence-check seed-stagger () fail-open
+            # and fire all 4 sibling rituals simultaneously on a fresh dir.
+            # cmd_append (~line 473) keeps the exit-1 behavior — array
+            # writes against a missing WM are ambiguous (append-to-what?)
+            # and the goal description scopes the self-heal to cmd_set only.
+            data = _default_wm_data()
 
-    if not is_top:
-        update_modified(data, args.slot)
+        parent, key, is_top = resolve_slot(data, args.slot)
+        if parent is None:
+            print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
+            sys.exit(1)
 
-    write_wm(data)
+        # rb-715 subdict-clobber gate: only fires for top-level loop_state writes.
+        # Subfield writes (e.g. loop_state.signals.quiescence) are bash-side
+        # surgical updates by design — those are exactly what the gate protects.
+        if args.slot == "loop_state":
+            on_disk_loop_state = parent.get(key)
+            override = getattr(args, "override_merge_gate", None)
+            try:
+                # Import via importlib because the module filename uses
+                # hyphens (kebab-case is the project convention for *.py
+                # under core/scripts/), which prevents `import loop_state_merge_gate`.
+                import importlib.util
+                gate_path = Path(__file__).resolve().parent / "loop-state-merge-gate.py"
+                spec = importlib.util.spec_from_file_location("loop_state_merge_gate", gate_path)
+                gate_mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(gate_mod)
+                gate_result = gate_mod.check(value, on_disk_loop_state, override=override)
+            except (ImportError, OSError, AttributeError) as e:
+                # Fail-open on gate-load failure (don't block the loop on a broken gate)
+                print(f"[loop-state-merge-gate] WARN: gate load failed ({e}) — fail-open", file=sys.stderr)
+                gate_result = {"would_block": False, "reason": "gate load failed", "missing_subkeys": []}
 
+            if gate_result.get("would_block"):
+                print(f"BLOCKED: {gate_result['reason']}", file=sys.stderr)
+                sys.exit(1)
+            if gate_result.get("override_applied"):
+                # Echo override to stderr for audit trail
+                print(f"[loop-state-merge-gate] {gate_result['reason']}", file=sys.stderr)
+
+        parent[key] = value
+
+        if not is_top:
+            update_modified(data, args.slot)
+
+        write_wm(data)
 
 def cmd_append(args):
-    """Append an item to an array slot from stdin (JSON)."""
-    data = read_wm()
-    if not data:
-        print("ERROR: Working memory not initialized. Run wm-init.sh first.", file=sys.stderr)
-        sys.exit(1)
+    """Append an item to an array slot from stdin (JSON).
 
+    Read-modify-write protected by wm_lock — see g-115-206.
+    """
     raw = sys.stdin.read().strip()
     if not raw:
         print("ERROR: No input on stdin", file=sys.stderr)
@@ -293,65 +473,78 @@ def cmd_append(args):
     if isinstance(item, dict):
         item["_item_ts"] = now_iso()
 
-    parent, key, is_top = resolve_slot(data, args.slot)
-    if parent is None:
-        print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
-        sys.exit(1)
+    # knowledge_debt schema gate (, rb-248): node_key must either resolve
+    # to a real tree node OR the entry must tag itself as housekeeping. Brittle
+    # placeholders like "multiple" or "tree_maintenance" produce false positives
+    # in debt-closure matchers that use simple string containment.
+    root_slot_for_validation = args.slot.split(".")[0]
+    if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
+        _validate_knowledge_debt_entry(item)
 
-    arr = parent.get(key)
-    if arr is None:
-        parent[key] = []
-        arr = parent[key]
-    if not isinstance(arr, list):
-        print(f"ERROR: '{args.slot}' is {type(arr).__name__}, not a list", file=sys.stderr)
-        sys.exit(1)
+    with wm_lock():
+        data = read_wm()
+        if not data:
+            print("ERROR: Working memory not initialized. Run wm-init.sh first.", file=sys.stderr)
+            sys.exit(1)
 
-    arr.append(item)
+        parent, key, is_top = resolve_slot(data, args.slot)
+        if parent is None:
+            print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
+            sys.exit(1)
 
-    # Enforce array limits
-    config = read_config()
-    pruning = get_pruning_config(config)
-    limits = pruning.get("array_limits", {})
-    root_slot = args.slot.split(".")[0]
-    limit = limits.get(root_slot)
-    if limit and len(arr) > limit:
-        # Remove oldest items (those without _item_ts first, then by _item_ts)
-        arr.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
-        while len(arr) > limit:
-            arr.pop(0)
+        arr = parent.get(key)
+        if arr is None:
+            parent[key] = []
+            arr = parent[key]
+        if not isinstance(arr, list):
+            print(f"ERROR: '{args.slot}' is {type(arr).__name__}, not a list", file=sys.stderr)
+            sys.exit(1)
 
-    if not is_top:
-        update_modified(data, args.slot)
+        arr.append(item)
 
-    write_wm(data)
+        # Enforce array limits
+        config = read_config()
+        pruning = get_pruning_config(config)
+        limits = pruning.get("array_limits", {})
+        root_slot = args.slot.split(".")[0]
+        limit = limits.get(root_slot)
+        if limit and len(arr) > limit:
+            # Remove oldest items (those without _item_ts first, then by _item_ts)
+            arr.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
+            while len(arr) > limit:
+                arr.pop(0)
 
+        if not is_top:
+            update_modified(data, args.slot)
+
+        write_wm(data)
 
 def cmd_clear(args):
-    """Clear (null out) a slot."""
-    data = read_wm()
-    if not data:
-        print("ERROR: Working memory not initialized.", file=sys.stderr)
-        sys.exit(1)
+    """Clear (null out) a slot. RMW protected by wm_lock — see ."""
+    with wm_lock():
+        data = read_wm()
+        if not data:
+            print("ERROR: Working memory not initialized.", file=sys.stderr)
+            sys.exit(1)
 
-    parent, key, is_top = resolve_slot(data, args.slot)
-    if parent is None:
-        print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
-        sys.exit(1)
+        parent, key, is_top = resolve_slot(data, args.slot)
+        if parent is None:
+            print(f"ERROR: Cannot resolve path '{args.slot}'", file=sys.stderr)
+            sys.exit(1)
 
-    # Clear to [] if currently a list, None otherwise — handles both
-    # slot arrays (known_blockers) and top-level arrays (encoding_queue)
-    current_val = parent.get(key) if isinstance(parent, dict) else None
-    root_slot = args.slot.split(".")[0]
-    if isinstance(current_val, list) or root_slot in ARRAY_SLOTS:
-        parent[key] = []
-    else:
-        parent[key] = None
+        # Clear to [] if currently a list, None otherwise — handles both
+        # slot arrays (known_blockers) and top-level arrays (encoding_queue)
+        current_val = parent.get(key) if isinstance(parent, dict) else None
+        root_slot = args.slot.split(".")[0]
+        if isinstance(current_val, list) or root_slot in ARRAY_SLOTS:
+            parent[key] = []
+        else:
+            parent[key] = None
 
-    if not is_top:
-        update_modified(data, args.slot)
+        if not is_top:
+            update_modified(data, args.slot)
 
-    write_wm(data)
-
+        write_wm(data)
 
 def cmd_ages(args):
     """Report slot ages (minutes since last update/access)."""
@@ -409,9 +602,17 @@ def cmd_ages(args):
             items = f", {info['item_count']} items" if info['item_count'] is not None else ""
             print(f"  {name}: updated {upd} ago, accessed {acc} ago, {info['update_count']} writes{items}")
 
-
 def cmd_prune(args):
-    """Mid-session pruning based on config thresholds."""
+    """Mid-session pruning based on config thresholds.
+
+    RMW protected by wm_lock — see g-115-206. Prune touches every slot, so
+    a concurrent wm-set from any source could clobber pruning output (or
+    vice versa) without the lock.
+    """
+    with wm_lock():
+        _do_prune(args)
+
+def _do_prune(args):
     data = read_wm()
     if not data:
         print("Working memory not initialized.", file=sys.stderr)
@@ -449,10 +650,14 @@ def cmd_prune(args):
                 "minutes_stale": int(mins_since),
             })
 
-        # Evict stale scalar slots (non-protected, non-array, non-map)
+        # Evict stale scalar slots (non-protected, non-array, non-map,
+        # non-cadence-tracker). Cadence trackers are stale BY DESIGN — fire
+        # every N goals or N hours; eviction destroys cadence memory and
+        # causes duplicate firings. See CADENCE_TRACKER_PATTERNS above.
         if (slot_name not in protected
                 and slot_name not in ARRAY_SLOTS
                 and slot_name not in MAP_SLOTS
+                and not _is_cadence_tracker(slot_name)
                 and slot_val is not None
                 and mins_since is not None
                 and mins_since > evict_mins):
@@ -538,70 +743,89 @@ def cmd_prune(args):
 
     print(json.dumps(report, ensure_ascii=False, default=str))
 
-
 def cmd_init(args):
-    """Initialize working memory from template."""
-    config = read_config()
-    wm_config = config.get("working_memory", {})
-    slot_types = wm_config.get("slot_types", DEFAULT_SLOT_TYPES)
+    """Initialize working memory from template.
 
-    slots = {}
-    slot_meta = {}
-    for st in slot_types:
-        if st in ARRAY_SLOTS:
-            slots[st] = []
-        elif st in MAP_SLOTS:
-            slots[st] = dict(MAP_SLOTS[st])  # shallow copy
-        else:
-            slots[st] = None
-        slot_meta[st] = {"updated_at": None, "accessed_at": None, "update_count": 0}
+    Lock-protected (g-115-206): pure write, but a concurrent wm-set could
+    otherwise clobber init or vice versa during the rare window where init
+    fires while the loop is starting another writer.
+    """
+    data = _default_wm_data()
+    slot_count = len(data.get("slots", {}))
 
-    data = {
-        "encoding_queue": [],
-        "session_id": None,
-        "session_start": None,
-        "goals_completed_this_session": [],
-        "aspiration_touched_last": "",
-        "last_goal_category": "",
-        "slots": slots,
-        "slot_meta": slot_meta,
-    }
-
-    write_wm(data)
-    print(f"Working memory initialized with {len(slot_types)} slots.")
-
+    with wm_lock():
+        write_wm(data)
+    print(f"Working memory initialized with {slot_count} slots.")
 
 def cmd_reset(args):
-    """Reset working memory to template state (session-end)."""
-    config = read_config()
-    wm_config = config.get("working_memory", {})
-    slot_types = wm_config.get("slot_types", DEFAULT_SLOT_TYPES)
+    """Reset working memory to template state. Preserves SESSION_IDENTITY_FIELDS.
 
-    slots = {}
-    slot_meta = {}
-    for st in slot_types:
-        if st in ARRAY_SLOTS:
-            slots[st] = []
-        elif st in MAP_SLOTS:
-            slots[st] = dict(MAP_SLOTS[st])
-        else:
-            slots[st] = None
-        slot_meta[st] = {"updated_at": None, "accessed_at": None, "update_count": 0}
+    RMW protected by wm_lock — see g-115-206. The read of `existing` for
+    identity-field preservation must happen INSIDE the same lock as the
+    write, otherwise a concurrent writer's update to those fields could
+    be observed-then-clobbered.
+    """
+    data = _default_wm_data()
+    slot_types = data.get("slots", {}).keys()
 
-    data = {
-        "encoding_queue": [],
-        "session_id": None,
-        "session_start": None,
-        "goals_completed_this_session": [],
-        "aspiration_touched_last": "",
-        "last_goal_category": "",
-        "slots": slots,
-        "slot_meta": slot_meta,
-    }
+    with wm_lock():
+        existing = read_wm()
+        preserved = []
+        for k in SESSION_IDENTITY_FIELDS:
+            v = existing.get(k)
+            if v is not None:
+                data[k] = v
+                preserved.append(k)
 
-    write_wm(data)
-    print(f"Working memory reset to template state ({len(slot_types)} slots).")
+        # Preserve cadence-tracker slots — they hold "last X fired at"
+        # timestamps that drive iteration cadences (last_felt_sense_checkin,
+        # last_strategic_scan, etc). Eviction at reset causes duplicate
+        # firings the next time their gate evaluates. Mirrors the cadence-
+        # tracker exemption in maintain prune (see _is_cadence_tracker and
+        # the _is_cadence_tracker check in cmd_maintain). Iterates existing
+        # slots (not slot_types) because cadence-trackers are typically
+        # added dynamically and may not appear in slot_types config.
+        existing_slots = existing.get("slots", {})
+        existing_meta = existing.get("slot_meta", {})
+        cadence_preserved = []
+        for slot_name, slot_val in existing_slots.items():
+            if _is_cadence_tracker(slot_name) and slot_val is not None:
+                data["slots"][slot_name] = slot_val
+                if slot_name in existing_meta:
+                    data["slot_meta"][slot_name] = existing_meta[slot_name]
+                cadence_preserved.append(slot_name)
 
+        write_wm(data)
+    status_parts = []
+    if preserved:
+        status_parts.append(", ".join(sorted(preserved)))
+    if cadence_preserved:
+        status_parts.append(f"{len(cadence_preserved)} cadence trackers")
+    if status_parts:
+        print(f"Working memory reset to template state ({len(slot_types)} slots; preserved: {'; '.join(status_parts)}).")
+    else:
+        print(f"Working memory reset to template state ({len(slot_types)} slots).")
+
+def cmd_clear_identity(args):
+    """Clear SESSION_IDENTITY_FIELDS. Authorized caller: /stop graceful-stop D4.5.
+
+    RMW protected by wm_lock — see g-115-206.
+    """
+    with wm_lock():
+        data = read_wm()
+        if not data:
+            print("Working memory not initialized; nothing to clear.")
+            return
+        cleared = []
+        for k in SESSION_IDENTITY_FIELDS:
+            if data.get(k) is not None:
+                data[k] = None
+                cleared.append(k)
+        if not cleared:
+            print("Session-identity fields already clear.")
+            return
+        write_wm(data)
+    print(f"Cleared session-identity fields: {', '.join(sorted(cleared))}.")
 
 # ---------------------------------------------------------------------------
 # Argument parser
@@ -611,14 +835,17 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Working memory access layer")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- read ---
-    p_read = sub.add_parser("read", help="Read a slot or full working memory")
-    p_read.add_argument("slot", nargs="?", default=None, help="Slot name (e.g. 'active_context', 'encoding_queue', 'active_context.retrieval_manifest')")
-    p_read.add_argument("--json", action="store_true", help="Output as JSON")
-
     # --- set ---
     p_set = sub.add_parser("set", help="Set a slot value (JSON from stdin)")
     p_set.add_argument("slot", help="Slot path (e.g. 'active_context', 'active_context.retrieval_manifest')")
+    p_set.add_argument(
+        "--override-merge-gate",
+        default=None,
+        help="rb-715 subdict-clobber gate override. Pass a justification string "
+             "(e.g. 'session boundary signal reset') to bypass the merge gate "
+             "when intentionally clearing on-disk loop_state.signals subkeys. "
+             "Each override is appended to world/loop-state-merge-overrides.jsonl.",
+    )
 
     # --- append ---
     p_app = sub.add_parser("append", help="Append item to array slot (JSON from stdin)")
@@ -640,13 +867,14 @@ def build_parser():
     sub.add_parser("init", help="Initialize working memory from template")
 
     # --- reset ---
-    sub.add_parser("reset", help="Reset working memory to template state")
+    sub.add_parser("reset", help="Reset working memory to template state (preserves session-identity)")
+
+    # --- clear-identity ---
+    sub.add_parser("clear-identity", help="Clear SESSION_IDENTITY_FIELDS (session_id, session_start). Called by /stop post-consolidate.")
 
     return parser
 
-
 DISPATCH = {
-    "read": cmd_read,
     "set": cmd_set,
     "append": cmd_append,
     "clear": cmd_clear,
@@ -654,14 +882,13 @@ DISPATCH = {
     "prune": cmd_prune,
     "init": cmd_init,
     "reset": cmd_reset,
+    "clear-identity": cmd_clear_identity,
 }
-
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
     DISPATCH[args.command](args)
-
 
 if __name__ == "__main__":
     main()

@@ -12,23 +12,62 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import WORLD_DIR
+from _jsonl_helpers import set_nested_field
 
 LIVE_PATH = WORLD_DIR / "pipeline.jsonl"
 ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
 META_PATH = WORLD_DIR / "pipeline-meta.json"
 
-VALID_STAGES = {"discovered", "evaluating", "active", "resolved", "archived"}
+# Pipeline stages — single source of truth for the enum (drives validate_record,
+# cmd_read --stage, cmd_move, compute_meta stage_counts, and position-typo reject).
+# "evaluating" was retired 2026-04-19 (rb-363) — zero writers ever existed; do not
+# re-add without identifying a real writer call site first.
+# "measurement-pending" added 2026-05-08 ( / rb-754) — distinguishes
+# hypotheses past resolves_no_earlier_than whose measurement_channel returned
+# no data from genuinely-active hypotheses. Transitions: active→measurement-pending
+# (set by /review-hypotheses --resolve when channel produces no value),
+# measurement-pending→resolved (when channel finally produces data),
+# measurement-pending→archived (at resolves_by absolute deadline).
+VALID_STAGES = {"discovered", "active", "measurement-pending", "resolved", "archived"}
 VALID_HORIZONS = {"micro", "session", "short", "long"}
 VALID_TYPES = {"high-conviction", "calibration", "exploration", "contrarian"}
 VALID_OUTCOMES = {"CONFIRMED", "CORRECTED", "EXPIRED", "UNRESOLVABLE"}
 ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$")
+
+# Single source of truth for the `add` schema — used as both the argparse
+# epilog (visible via --help) AND the schema dump on validation error /
+# explicit --schema flag. Eliminates the discover-by-failure round-trips
+# the LLM hits when authoring pipeline records (rb-512 pattern).
+PIPELINE_ADD_SCHEMA_TEXT = (
+    "Stdin JSON fields:\n"
+    "  REQUIRED:\n"
+    "    id           — must match YYYY-MM-DD_{slug} (slug = lowercase a-z0-9-)\n"
+    "    title        — short hypothesis statement\n"
+    "    stage        — one of: discovered, active, measurement-pending,\n"
+    "                   resolved, archived\n"
+    "    horizon      — one of: micro, session, short, long\n"
+    "    type         — one of: high-conviction, calibration, exploration,\n"
+    "                   contrarian\n"
+    "    confidence   — float [0.0, 1.0]\n"
+    "    position     — narrative claim (string); not the stage enum value\n"
+    "    formed_date  — ISO date YYYY-MM-DD\n"
+    "    category     — domain category string\n"
+    "  AUTO-DEFAULTED if absent: stage='discovered', slug, rationale,\n"
+    "    outcome, evidence_for, evidence_against, mitigations, links,\n"
+    "    notes, last_reviewed\n"
+    "\n"
+    "Example:\n"
+    "  echo '{\"id\":\"2026-04-25_foo\",\"title\":\"...\",\"stage\":\"discovered\",\n"
+    "    \"horizon\":\"session\",\"type\":\"calibration\",\"confidence\":0.5,\n"
+    "    \"position\":\"...\",\"formed_date\":\"2026-04-25\",\n"
+    "    \"category\":\"npc\"}' | pipeline-add.sh"
+)
 
 REQUIRED_FIELDS = {"id", "title", "stage", "horizon", "type", "confidence", "position", "formed_date", "category"}
 DEFAULT_FIELDS = {
@@ -43,20 +82,11 @@ DEFAULT_FIELDS = {
 # Archive sweep: resolved records older than this many days get archived
 ARCHIVE_AGE_DAYS = 3
 
-
 # ---------------------------------------------------------------------------
 # Helpers: nested field access
 # ---------------------------------------------------------------------------
 
-def set_nested_field(obj, field_path, value):
-    """Set a nested field using dot notation (e.g., 'process_score.dual_classification')."""
-    parts = field_path.split(".")
-    for part in parts[:-1]:
-        if part not in obj or not isinstance(obj[part], dict):
-            obj[part] = {}
-        obj = obj[part]
-    obj[parts[-1]] = value
-
+# set_nested_field now lives in _jsonl_helpers.py () — imported at top.
 
 # ---------------------------------------------------------------------------
 # Helpers: file I/O (same as aspirations.py)
@@ -75,30 +105,25 @@ def read_jsonl(path):
                 items.append(json.loads(stripped))
     return items
 
-
 def write_jsonl(path, items):
     """Atomically write a list of dicts as JSONL with locking and history."""
     from _fileops import locked_write_jsonl
     locked_write_jsonl(path, items)
-
 
 def append_jsonl(path, item):
     """Append one JSON line to a JSONL file with locking and history."""
     from _fileops import locked_append_jsonl
     locked_append_jsonl(path, item)
 
-
 def read_json(path):
     """Read a JSON file and return a dict."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def write_json(path, data):
     """Atomically write a dict as pretty-printed JSON with locking and history."""
     from _fileops import locked_write_json
     locked_write_json(path, data)
-
 
 def parse_value(value_str):
     """Parse a string value into the appropriate Python type."""
@@ -128,7 +153,6 @@ def parse_value(value_str):
         pass
     return value_str
 
-
 # ---------------------------------------------------------------------------
 # Helpers: validation
 # ---------------------------------------------------------------------------
@@ -154,10 +178,139 @@ def validate_record(rec):
     if rec.get("outcome") is not None and rec["outcome"] not in VALID_OUTCOMES:
         raise ValueError(f"Invalid outcome: {rec['outcome']}")
 
+    # Surprise field must be int or None. Qualifier strings ("none"/"mild"/
+    # "low"/"moderate"/"high") were drift from /review-hypotheses --resolve;
+    # 18 records accumulated over 3 weeks before  remediated via
+    # QUALIFIER_MAP backfill (rb-493). This gate closes the write-time hole.
+    # isinstance(True, int) == True, so exclude booleans explicitly.
+    surprise = rec.get("surprise")
+    if surprise is not None:
+        if isinstance(surprise, bool) or not isinstance(surprise, int):
+            raise ValueError(
+                f"Invalid surprise: {surprise!r} (must be int or null; "
+                f"qualifier strings like 'low'/'moderate' were the g-002-13 "
+                f"drift class — see rb-493 for backfill pattern)"
+            )
+
     confidence = rec["confidence"]
     if not isinstance(confidence, (int, float)) or confidence < 0 or confidence > 1:
         raise ValueError(f"Invalid confidence: {confidence} (must be 0.0-1.0)")
 
+    # Position content validation — rejects prompt-template artifacts that look like
+    # valid strings but are actually the wrong field value. Encoded from the 2026-04-10
+    # to 2026-04-13 malformed-cohort incident (): 6 hypotheses had position
+    # fields containing "for", stage names, or category names. Accepts: (a) YES/NO
+    # prefixes (any case), (b) length >=20 (genuine multi-word claim), or
+    # (c) multi-word short answers — rejects everything else.
+    position = rec.get("position")
+    if isinstance(position, str):
+        pos_stripped = position.strip()
+        if pos_stripped.lower() in VALID_STAGES:
+            raise ValueError(
+                f"Invalid position: '{position}' (matches a pipeline stage name — "
+                f"the stage field was likely written to position by mistake)"
+            )
+        if pos_stripped.lower() in VALID_TYPES:
+            raise ValueError(
+                f"Invalid position: '{position}' (matches a hypothesis type — "
+                f"the type field was likely written to position by mistake)"
+            )
+        starts_with_verdict = pos_stripped.upper().startswith(("YES", "NO"))
+        is_long_claim = len(pos_stripped) >= 20
+        is_multi_word = len(pos_stripped.split()) >= 2
+        if not (starts_with_verdict or is_long_claim or is_multi_word):
+            raise ValueError(
+                f"Invalid position: '{position}' (must be YES/NO, >=20 chars, or "
+                f"a multi-word claim — likely a prompt-template artifact)"
+            )
+
+def validate_formation_quality(rec):
+    """Formation-quality gate (). Rejects hypotheses with formation
+    problems that distort downstream health metrics: empty claim, missing
+    resolution anchor, short-horizon without measurement channel.
+
+    Source: bravo session-53 iter-17 expired 6/11 active hypotheses with
+    formation-quality problems (not prediction failures) — 3 had empty
+    claim, 3 had no resolution method. These filled the pipeline with
+    philosophical assertions that made flowing-count drop while
+    active-count stayed high.
+
+    Gate is soft-exempt for stage='discovered' so draft records can still
+    be seeded before fleshing out. Strict for active/resolved stages.
+
+    Raises ValueError on invalid.
+    """
+    stage = rec.get("stage", "discovered")
+    horizon = rec.get("horizon", "")
+
+    # (a) claim field: if present, must be non-empty and >=20 chars. If
+    # absent, require the title to carry the claim (title is already a
+    # REQUIRED_FIELDS check). Skeletal discovered records with missing
+    # claim fall back to title; active/resolved records must have claim.
+    claim = rec.get("claim")
+    if stage != "discovered":
+        if not isinstance(claim, str) or len(claim.strip()) < 20:
+            raise ValueError(
+                "Invalid claim: non-discovered hypotheses must carry a "
+                "claim field >=20 chars (got "
+                f"{'missing' if claim is None else repr(claim)[:40]}). "
+                "Populate 'claim' with the testable assertion before "
+                "moving to active/resolved."
+            )
+    elif isinstance(claim, str) and claim.strip() and len(claim.strip()) < 20:
+        # discovered-stage claim field present but too short — reject
+        # (allow missing, but not malformed).
+        raise ValueError(
+            f"Invalid claim: '{claim}' — if claim field is present it "
+            f"must be >=20 chars; leave it unset to seed a skeletal "
+            f"discovered record, or write the full testable assertion."
+        )
+
+    # (b) resolution anchor: short/long horizons must name a resolution
+    # date AND a resolution method (criteria / rationale). Micro/session
+    # horizons have implicit self-check verification so are exempt.
+    if horizon in ("short", "long"):
+        if stage != "discovered":
+            if not rec.get("resolves_by"):
+                raise ValueError(
+                    f"Missing resolves_by: {horizon}-horizon hypotheses at "
+                    f"stage={stage} must name a resolution date."
+                )
+            resolution_method = (
+                rec.get("resolution_criteria")
+                or rec.get("resolution_method")
+                or rec.get("rationale")
+                or ""
+            )
+            if not isinstance(resolution_method, str) or len(resolution_method.strip()) < 10:
+                raise ValueError(
+                    f"Missing resolution method: {horizon}-horizon "
+                    f"hypotheses at stage={stage} must populate one of "
+                    f"resolution_criteria / resolution_method / rationale "
+                    f"with >=10 chars explaining HOW the outcome gets "
+                    f"decided. Empty or <10-char rationale treated as "
+                    f"missing."
+                )
+
+    # (c) short-horizon measurement channel — short horizon (hours to days)
+    # hypotheses at active stage must declare a measurement channel so the
+    # review loop has something to read. Long-horizon exempt (external
+    # events). Discovered-stage exempt (still drafting).
+    if horizon == "short" and stage == "active":
+        channel = (
+            rec.get("measurement_channel")
+            or rec.get("verification_channel")
+            or rec.get("resolution_source")
+            or ""
+        )
+        if not isinstance(channel, str) or len(channel.strip()) < 5:
+            raise ValueError(
+                "Missing measurement_channel: short-horizon active "
+                "hypotheses must declare a measurement_channel (or "
+                "verification_channel / resolution_source) naming the "
+                "artifact, log, script, or metric that will settle the "
+                "prediction. Empty or <5-char field treated as missing."
+            )
 
 def stringify_dates(obj):
     """Recursively convert date/datetime values to ISO strings in a dict."""
@@ -168,7 +321,6 @@ def stringify_dates(obj):
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     return obj
-
 
 def normalize_record(rec):
     """Normalize field names from legacy formats. Mutates and returns rec."""
@@ -211,7 +363,6 @@ def normalize_record(rec):
 
     return rec
 
-
 # ---------------------------------------------------------------------------
 # Helpers: search
 # ---------------------------------------------------------------------------
@@ -223,7 +374,6 @@ def find_record_by_id(items, rec_id):
             return (i, rec)
     return None
 
-
 def check_no_duplicate_id(items, rec_id, archive_items=None):
     """Raise ValueError if rec_id already exists in items or archive."""
     for item in items:
@@ -233,7 +383,6 @@ def check_no_duplicate_id(items, rec_id, archive_items=None):
         for item in archive_items:
             if item.get("id") == rec_id:
                 raise ValueError(f"Duplicate record ID (in archive): {rec_id}")
-
 
 # ---------------------------------------------------------------------------
 # Helpers: meta
@@ -245,8 +394,8 @@ def empty_meta():
         "last_updated": None,
         "stage_counts": {
             "discovered": 0,
-            "evaluating": 0,
             "active": 0,
+            "measurement-pending": 0,
             "resolved": 0,
             "archived": 0,
         },
@@ -261,7 +410,6 @@ def empty_meta():
         },
         "micro_hypothesis_stats": {},
     }
-
 
 def compute_meta(live_items, archive_items):
     """Recompute meta from all records."""
@@ -333,313 +481,9 @@ def compute_meta(live_items, archive_items):
     meta["last_updated"] = date.today().isoformat()
     return meta
 
-
 # ---------------------------------------------------------------------------
 # Subcommands: read
 # ---------------------------------------------------------------------------
-
-def cmd_read(args):
-    if args.stage:
-        if args.stage not in VALID_STAGES:
-            print(f"Invalid stage: {args.stage}", file=sys.stderr)
-            sys.exit(1)
-        if args.stage == "archived":
-            items = read_jsonl(ARCHIVE_PATH)
-        else:
-            items = read_jsonl(LIVE_PATH)
-            items = [r for r in items if r.get("stage") == args.stage]
-        print(json.dumps(items, indent=2, ensure_ascii=False))
-
-    elif args.id:
-        # Search live first, then archive
-        items = read_jsonl(LIVE_PATH)
-        result = find_record_by_id(items, args.id)
-        if result is None:
-            items = read_jsonl(ARCHIVE_PATH)
-            result = find_record_by_id(items, args.id)
-        if result is None:
-            print(f"Record {args.id} not found", file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result[1], indent=2, ensure_ascii=False))
-
-    elif args.summary:
-        items = read_jsonl(LIVE_PATH)
-        for rec in items:
-            stage = rec.get("stage", "?").upper()
-            outcome = rec.get("outcome", "")
-            outcome_str = f" → {outcome}" if outcome else ""
-            title = rec.get("title", "(untitled)")
-            print(f"{rec.get('id', '?')}: {title} [{stage}]{outcome_str}")
-
-    elif args.counts:
-        if META_PATH.exists():
-            meta = read_json(META_PATH)
-            print(json.dumps(meta.get("stage_counts", {}), indent=2, ensure_ascii=False))
-        else:
-            # Compute from data
-            items = read_jsonl(LIVE_PATH)
-            archive = read_jsonl(ARCHIVE_PATH)
-            counts = {"discovered": 0, "evaluating": 0, "active": 0, "resolved": 0, "archived": len(archive)}
-            for r in items:
-                stage = r.get("stage", "discovered")
-                if stage in counts:
-                    counts[stage] += 1
-            print(json.dumps(counts, indent=2, ensure_ascii=False))
-
-    elif args.accuracy:
-        if META_PATH.exists():
-            meta = read_json(META_PATH)
-            print(json.dumps(meta.get("accuracy", {}), indent=2, ensure_ascii=False))
-        else:
-            print("{}")
-
-    elif args.unreflected:
-        items = read_jsonl(LIVE_PATH)
-        unreflected = [r for r in items if r.get("stage") == "resolved" and not r.get("reflected", False)]
-        print(json.dumps(unreflected, indent=2, ensure_ascii=False))
-
-    elif args.replay_candidates:
-        items = read_jsonl(LIVE_PATH)
-        archive = read_jsonl(ARCHIVE_PATH)
-        all_resolved = [r for r in items + archive if r.get("stage") in ("resolved", "archived")]
-        # Filter: reflected=true, and spaced repetition scheduling
-        candidates = []
-        today = date.today()
-        for r in all_resolved:
-            if not r.get("reflected", False):
-                continue
-            replay = r.get("replay_metadata") or {}
-            next_review = replay.get("next_review_date")
-            if next_review:
-                try:
-                    review_date = date.fromisoformat(next_review)
-                    if review_date > today:
-                        continue
-                except ValueError:
-                    pass
-            candidates.append(r)
-        print(json.dumps(candidates, indent=2, ensure_ascii=False))
-
-    elif args.archive:
-        items = read_jsonl(ARCHIVE_PATH)
-        print(json.dumps(items, indent=2, ensure_ascii=False))
-
-    elif args.meta:
-        if not META_PATH.exists():
-            print("{}")
-        else:
-            data = read_json(META_PATH)
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-    else:
-        print("Specify one of: --stage, --id, --summary, --counts, --accuracy, --unreflected, --replay-candidates, --archive, --meta", file=sys.stderr)
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Subcommands: write
-# ---------------------------------------------------------------------------
-
-def cmd_add(args):
-    if sys.stdin.isatty():
-        print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
-        sys.exit(1)
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("No input provided on stdin", file=sys.stderr)
-        sys.exit(1)
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Apply defaults
-    if "stage" not in rec:
-        rec["stage"] = "discovered"
-    rec = normalize_record(rec)
-
-    try:
-        validate_record(rec)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    archive = read_jsonl(ARCHIVE_PATH)
-    try:
-        check_no_duplicate_id(items, rec["id"], archive)
-    except ValueError as e:
-        print(f"Duplicate error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    append_jsonl(LIVE_PATH, rec)
-
-    # Update meta counts
-    _update_meta_counts()
-
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_update(args):
-    if sys.stdin.isatty():
-        print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
-        sys.exit(1)
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("No input provided on stdin", file=sys.stderr)
-        sys.exit(1)
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    rec = normalize_record(rec)
-
-    try:
-        validate_record(rec)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, args.rec_id)
-    if result is None:
-        print(f"Record {args.rec_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
-
-    idx = result[0]
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_update_field(args):
-    rec_id = args.rec_id
-    field = args.field
-    value = parse_value(args.value)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-
-    # Also check archive for field updates
-    in_archive = False
-    if result is None:
-        items = read_jsonl(ARCHIVE_PATH)
-        result = find_record_by_id(items, rec_id)
-        in_archive = True
-
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-
-    # Support dot-notation for nested fields (e.g., process_score.dual_classification)
-    if "." in field:
-        set_nested_field(rec, field, value)
-    else:
-        rec[field] = value
-
-    # Auto-set reflected_date when reflected becomes true
-    if field == "reflected" and value is True and not rec.get("reflected_date"):
-        rec["reflected_date"] = date.today().isoformat()
-
-    items[idx] = rec
-    target_path = ARCHIVE_PATH if in_archive else LIVE_PATH
-    write_jsonl(target_path, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_move(args):
-    rec_id = args.rec_id
-    target_stage = args.stage
-
-    if target_stage not in VALID_STAGES:
-        print(f"Invalid target stage: {target_stage}", file=sys.stderr)
-        sys.exit(1)
-
-    # Read optional merge data from stdin
-    merge_data = {}
-    if not sys.stdin.isatty():
-        raw = sys.stdin.read().strip()
-        if raw:
-            try:
-                merge_data = json.loads(raw)
-            except json.JSONDecodeError as e:
-                print(f"Invalid merge JSON: {e}", file=sys.stderr)
-                sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-    if result is None:
-        print(f"Record {rec_id} not found in live file", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-
-    # Merge additional data
-    for key, val in merge_data.items():
-        rec[key] = val
-
-    # Set the new stage
-    rec["stage"] = target_stage
-
-    if target_stage == "archived":
-        # Append to archive BEFORE removing from live (crash-safe: duplicate > data loss)
-        rec = normalize_record(rec)
-        append_jsonl(ARCHIVE_PATH, rec)
-        items.pop(idx)
-        write_jsonl(LIVE_PATH, items)
-    else:
-        # Stay in live file with new stage
-        rec = normalize_record(rec)
-        items[idx] = rec
-        write_jsonl(LIVE_PATH, items)
-
-    # Update meta
-    _update_meta_counts()
-
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_archive_sweep(args):
-    items = read_jsonl(LIVE_PATH)
-    today = date.today()
-
-    to_archive = []
-    remaining = []
-    for rec in items:
-        if rec.get("stage") == "resolved":
-            outcome_date = rec.get("outcome_date")
-            if outcome_date:
-                try:
-                    od = date.fromisoformat(outcome_date)
-                    if (today - od).days >= ARCHIVE_AGE_DAYS:
-                        rec["stage"] = "archived"
-                        to_archive.append(rec)
-                        continue
-                except ValueError:
-                    pass
-        remaining.append(rec)
-
-    if not to_archive:
-        print("0")
-        return
-
-    # Append to archive first (crash-safe ordering)
-    archive = read_jsonl(ARCHIVE_PATH)
-    archive.extend(to_archive)
-    write_jsonl(ARCHIVE_PATH, archive)
-
-    # Rewrite live
-    write_jsonl(LIVE_PATH, remaining)
-
-    _update_meta_counts()
-
-    print(str(len(to_archive)))
-
 
 def cmd_recompute_meta(args):
     items = read_jsonl(LIVE_PATH)
@@ -655,22 +499,6 @@ def cmd_recompute_meta(args):
     write_json(META_PATH, meta)
     print(json.dumps(meta, indent=2, ensure_ascii=False))
 
-
-def cmd_meta_update(args):
-    field = args.field
-    value = parse_value(args.value)
-
-    if META_PATH.exists():
-        data = read_json(META_PATH)
-    else:
-        data = empty_meta()
-
-    data[field] = value
-    data["last_updated"] = date.today().isoformat()
-    write_json(META_PATH, data)
-    print(json.dumps(data, indent=2, ensure_ascii=False))
-
-
 def _update_meta_counts():
     """Recompute full meta (counts + accuracy) from current data."""
     items = read_jsonl(LIVE_PATH)
@@ -685,7 +513,6 @@ def _update_meta_counts():
 
     write_json(META_PATH, meta)
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -694,59 +521,13 @@ def main():
     parser = argparse.ArgumentParser(description="Hypothesis pipeline engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # read
-    p_read = subparsers.add_parser("read", help="Read pipeline records")
-    read_group = p_read.add_mutually_exclusive_group(required=True)
-    read_group.add_argument("--stage", type=str, help="List records in stage")
-    read_group.add_argument("--id", type=str, help="Find record by ID")
-    read_group.add_argument("--summary", action="store_true", help="One-liner summary per record")
-    read_group.add_argument("--counts", action="store_true", help="Stage counts")
-    read_group.add_argument("--accuracy", action="store_true", help="Accuracy report")
-    read_group.add_argument("--unreflected", action="store_true", help="Resolved + reflected=false")
-    read_group.add_argument("--replay-candidates", action="store_true", help="Spaced repetition filter")
-    read_group.add_argument("--archive", action="store_true", help="Archived records")
-    read_group.add_argument("--meta", action="store_true", help="Full metadata")
-
-    # add
-    subparsers.add_parser("add", help="Add record from stdin JSON")
-
-    # update
-    p_update = subparsers.add_parser("update", help="Update record from stdin JSON")
-    p_update.add_argument("rec_id", type=str, help="Record ID to update")
-
-    # update-field
-    p_uf = subparsers.add_parser("update-field", help="Update a single record field")
-    p_uf.add_argument("rec_id", type=str, help="Record ID")
-    p_uf.add_argument("field", type=str, help="Field to update")
-    p_uf.add_argument("value", type=str, help="New value")
-
-    # move
-    p_move = subparsers.add_parser("move", help="Move record to a different stage (optional stdin JSON merge)")
-    p_move.add_argument("rec_id", type=str, help="Record ID to move")
-    p_move.add_argument("stage", type=str, help="Target stage")
-
-    # archive-sweep
-    subparsers.add_parser("archive-sweep", help="Sweep old resolved records to archive")
-
     # recompute-meta
     subparsers.add_parser("recompute-meta", help="Full recount from records")
-
-    # meta-update
-    p_meta = subparsers.add_parser("meta-update", help="Update a metadata field")
-    p_meta.add_argument("field", type=str, help="Field to update")
-    p_meta.add_argument("value", type=str, help="New value")
 
     args = parser.parse_args()
 
     dispatch = {
-        "read": cmd_read,
-        "add": cmd_add,
-        "update": cmd_update,
-        "update-field": cmd_update_field,
-        "move": cmd_move,
-        "archive-sweep": cmd_archive_sweep,
         "recompute-meta": cmd_recompute_meta,
-        "meta-update": cmd_meta_update,
     }
 
     try:
@@ -754,7 +535,6 @@ def main():
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

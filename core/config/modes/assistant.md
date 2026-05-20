@@ -25,11 +25,11 @@ May read anywhere. May write to:
 | `world/guardrails.jsonl` | Add entries via `guardrails-add.sh` |
 | `world/pattern-signatures.jsonl` | Add entries via `pattern-signatures-add.sh` |
 | `world/pipeline.jsonl` | Move entries via `pipeline-move.sh` |
-| `<agent>/experience.jsonl` | Archive experiences via script |
-| `<agent>/experience/` | Write experience detail files |
-| `<agent>/journal.jsonl` | Append journal entries via script |
-| `<agent>/journal/` | Write journal detail files |
-| `<agent>/session/working-memory.yaml` | Update via `wm-*.sh` scripts |
+| `agents/<agent>/experience.jsonl` | Archive experiences via script |
+| `agents/<agent>/experience/` | Write experience detail files |
+| `agents/<agent>/journal.jsonl` | Append journal entries via script |
+| `agents/<agent>/journal/` | Write journal detail files |
+| `agents/<agent>/session/working-memory.yaml` | Update via `wm-*.sh` scripts |
 
 Hybrid and reporting skills (agent-completion-report, backlog-report) write their declared
 output files (see each skill's Chaining/Modifies section) in all modes, beyond this table.

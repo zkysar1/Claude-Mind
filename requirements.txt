@@ -1,0 +1,17 @@
+# Python dependencies for the Mind framework.
+#
+# Install on a fresh deployment:
+#     pip install -r requirements.txt
+#
+# OR on Windows with the `py` launcher:
+#     py -3 -m pip install -r requirements.txt
+#
+# The check-prerequisites.sh script (run at /start time) verifies these
+# are importable and prints a friendly consolidated error if not.
+
+# REQUIRED — every init script that reads YAML config will fail without this
+pyyaml>=6.0
+
+# OPTIONAL — agent-watchdog.py uses psutil for richer process inspection;
+# degrades gracefully if unavailable
+psutil>=5.9

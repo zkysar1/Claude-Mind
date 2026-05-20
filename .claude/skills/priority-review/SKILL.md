@@ -1,12 +1,14 @@
 ---
 name: priority-review
-description: "Priority dashboard — show ranked aspirations, accept reordering, update priorities"
+description: "Shows the priority dashboard (all active aspirations ranked by aggregate goal score) and lets the user interactively reorder priorities to update the aspiration queue. Use whenever the user says \"what are you working on next\", \"re-rank my priorities\", \"show me the priority dashboard\", \"show the queue\", or invokes /priority-review directly. Closes the feedback loop between autonomous goal selection and user strategic direction. Valid in any mode including reader."
 user-invocable: true
 triggers:
   - "/priority-review"
 tools_used: [Bash, Read, Edit]
 conventions: [aspirations, goal-selection]
 minimum_mode: reader
+revision_id: "skill-bootstrap-priority-review-3714f6"
+previous_revision_id: null
 ---
 
 # /priority-review — Aspiration Priority Dashboard
@@ -17,6 +19,11 @@ aspiration creation and user intent.
 
 **Hybrid skill**: user-invocable AND agent-callable (from `/respond`). Valid from ANY state.
 In reader mode: display only (no updates). In assistant/autonomous: full reordering.
+
+**Related**: This is the user's anytime portfolio **pull**. See
+`.claude/skills/fresh-eyes-review/SKILL.md` for the every-25-goals scheduled
+**push** that asks the Self + portfolio meta-questions together. Priority
+ranking changes flow naturally from either entry point.
 
 ## Sub-commands
 
@@ -46,10 +53,49 @@ In reader mode: display only (no updates). In assistant/autonomous: full reorder
      For each aspiration, sum the scores of its eligible (pending/in-progress) goals
      Sort aspirations by: aggregate score (descending)
 
-4. Read <agent>/session/pending-questions.yaml
+4. Read agents/<agent>/session/pending-questions.yaml
    Check for any entries with type: "priority-review" AND status: "pending"
    Note their IDs for Phase 4 consumption
+
+5. OHS-delta rollup per aspiration (g-245-03)
+   Bash: meta-read.sh improvement-velocity.yaml
+   → Parse YAML → velocity_map[goal_id] = ohs_delta_since_previous_ohs_run
+   → For each aspiration, sum numeric deltas across its completed goals
+   → ohs_delta_map[asp_id] = signed 2-decimal float OR "n/a" (when no numeric deltas)
+   → Display: "+0.45" / "-0.12" / "n/a" (compact — reports are width-constrained)
+   → Gracefully handle entries missing the field (pre-schema data) as 'no_ohs_data'
 ```
+
+## Phase 1.5: Score-Priority Mismatch Detection (g-244-19)
+
+Detects aspirations whose aggregate score persistently exceeds the median score
+of HIGH-priority aspirations — a signal that EITHER the priority field is mis-set
+OR the score formula is over-weighting that aspiration's work pattern. Persistence
+requires 3+ consecutive priority-review runs above the threshold (avoids
+exploration_noise false positives from single observations). Either signal is
+useful: the user decides whether to bump priority or whether the formula needs
+tuning. Skips silently when fewer than 3 HIGH-priority aspirations exist (no
+stable median to compare against).
+
+State persists across runs in `meta/priority-review-mismatch-history.yaml`,
+maintained exclusively by `core/scripts/priority-review-mismatch.py`.
+
+```
+# Build the input payload from Phase 1 step 3 aggregate scores. Include BOTH
+# world and agent-local aspirations — score-priority drift can occur in either
+# queue. Each entry: {asp_id, priority, score}
+payload_json = json-encode the list of {asp_id, priority, score} for all active aspirations
+
+# Run the detector. It updates history (idempotent — safe to call multiple times).
+echo "$payload_json" | Bash: priority-review-mismatch.sh
+parsed = JSON output
+flagged_map = {f.asp_id: f for f in parsed.flagged}
+high_median = parsed.high_median  # may be null if <3 HIGH aspirations
+```
+
+Flagged aspirations are surfaced as a sub-line under their dashboard row in
+Phase 2. The history file purges entries automatically when an aspiration drops
+at-or-below the HIGH median, becomes HIGH-priority itself, or becomes inactive.
 
 ## Phase 2: Render Dashboard
 
@@ -60,20 +106,20 @@ Build a numbered, ranked view showing both world and agent-local aspirations:
 
 World Aspirations (shared queue — all agents):
 
- #  Pri    ID       Title                                          Goals    Source
- 1. HIGH   asp-126  Close the Learning Loop: Fix Aggregate Co...   0/4      user
- 2. HIGH   asp-127  Fix Ebbinghaus Memory Decay Mismatch (14...   0/3      user
- 3. HIGH   asp-130  Strengthen the Adaptive Learning Moat          0/5      user
- 4. HIGH   asp-128  Verify Strategy-to-Behavior Impact             0/4      user
- 5. HIGH   asp-129  Bootstrap Environment Server Test Suite         0/6      user
- 6. HIGH   asp-115  Recurring Infrastructure Monitoring             0/0+3r   agent
- 7. MEDIUM asp-078  Audit and Improve Web App Admin Dashboard       9/10     agent
- 8. MEDIUM asp-131  Production Observability: CloudWatch Metr...   0/4      user
+ #  Pri    ID       Title                                       Goals    OHS Δ   Source
+ 1. HIGH   asp-126  Close the Learning Loop: Fix Aggregate...   0/4      n/a     user
+ 2. HIGH   asp-127  Fix Ebbinghaus Memory Decay Mismatch ...    0/3      n/a     user
+ 3. HIGH   asp-130  Strengthen the Adaptive Learning Moat       0/5      +0.12   user
+ 4. HIGH   asp-128  Verify Strategy-to-Behavior Impact          0/4      -0.08   user
+ 5. HIGH   asp-129  Bootstrap Environment Server Test Suite     0/6      n/a     user
+ 6. HIGH   asp-115  Recurring Infrastructure Monitoring         0/0+3r   n/a     agent
+ 7. MEDIUM asp-078  Audit and Improve Web App Admin Dash...     9/10     +0.45   agent
+ 8. MEDIUM asp-131  Production Observability: Monitoring ...    0/4      n/a     user
 
 Agent-Local Aspirations ({agent-name} private queue):
 
- #  Pri    ID       Title                                          Goals
- 9. MEDIUM asp-L01  Framework maintenance and health checks         0/2+1r
+ #  Pri    ID       Title                                       Goals    OHS Δ
+ 9. MEDIUM asp-L01  Framework maintenance and health checks     0/2+1r   n/a
 
 To reorder:
   - "asp-125 should be HIGH" / "make 3 higher than 1"
@@ -88,6 +134,23 @@ Rules for the dashboard:
 - Show priority level (HIGH/MEDIUM/LOW), aspiration ID, title (truncated to fit), goal progress (completed/total + recurring count), source (user/agent for world; omitted for agent-local)
 - If an aspiration was created in the current session, mark it with `NEW`
 - If a `type: priority-review` pending question exists, note it above the table: "Priority review requested — your input shapes what I work on next."
+- **OHS Δ column** (g-245-03): signed 2-decimal float when aspiration has completed
+  goals with numeric OHS deltas in `meta/improvement-velocity.yaml`
+  (`ohs_delta_since_previous_ohs_run`). Shows `n/a` when no numeric deltas
+  exist yet (aspirations completed before `ohs-trend.jsonl` started
+  populating, or recent work where OHS runs haven't bracketed the
+  completion timestamp). This is the "does this aspiration actually
+  move product quality" signal — pair it with priority to detect
+  aspirations that feel urgent but don't shift product outcomes.
+- **Score-priority mismatch flag** (g-244-19): when `flagged_map` from Phase 1.5
+  contains the row's aspiration id, append a sub-line under that row:
+  ```
+      Δ priority candidate: aggregate score persistently exceeds HIGH median (run_count={f.run_count}, score={f.score} vs HIGH-median {f.high_median})
+  ```
+  The flag means: either bump priority or revisit the score formula. Either
+  decision is valuable. Indented two spaces under the row to keep the table
+  alignment clean. Renders for BOTH world and agent-local sections (mismatches
+  occur in either queue).
 
 ## Phase 3: Present
 
@@ -131,7 +194,7 @@ After all updates:
 
 ```
 IF any pending question has type: "priority-review" AND status: "pending":
-  Read <agent>/session/pending-questions.yaml
+  Read agents/<agent>/session/pending-questions.yaml
   Update matching entries: set status to "answered", add answer field with summary of changes
   Write back the file via Edit
 ```
@@ -143,18 +206,26 @@ IF any pending question has type: "priority-review" AND status: "pending":
    "Updated priorities:"
    {new dashboard}
 
-2. Post to decisions board:
+2. Post to decisions board (single source of observability — the board post
+   is cross-agent visible and archived; a separate journal-add here was
+   redundant AND was silently failing on the argv form, since journal-add.sh
+   requires stdin JSON):
    Bash: echo '{"subject":"Priority review: {summary of changes}","tags":["priority-review"]}' | board-post.sh --channel decisions
 
-3. Journal entry:
-   Bash: journal-add.sh --type "priority-review" --summary "User reordered priorities: {changes}"
-
-4. Output: "Priorities updated. These changes take effect on the next goal selection cycle."
+3. Output: "Priorities updated. These changes take effect on the next goal selection cycle."
+Bash: echo "priority-review phase documented"
 ```
 
 ## Chaining
 
 - **Called by**: User (`/priority-review`), `/respond` (priority directive routing)
 - **Calls**: `load-aspirations-compact.sh`, `aspirations-read.sh`, `agent-aspirations-read.sh`, `goal-selector.sh`, `aspirations-update.sh`, `agent-aspirations-update.sh`, `board-post.sh`, `journal-add.sh`
-- **Reads**: `<agent>/session/pending-questions.yaml`, world aspiration compact data, agent aspiration data
+- **Reads**: `agents/<agent>/session/pending-questions.yaml`, world aspiration compact data, agent aspiration data
 - **Modifies**: Aspiration priorities in world queue (via `aspirations-update.sh`) and/or agent queue (via `agent-aspirations-update.sh`), pending-questions status, decisions board, journal
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+When called mid-loop (`/respond` priority routing), the terminal action is
+`aspirations-update.sh`, `journal-add.sh`, or `board-post.sh`. Never end with a
+text summary of reorderings.

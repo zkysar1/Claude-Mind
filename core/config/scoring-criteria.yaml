@@ -1,0 +1,224 @@
+# Scoring Criteria Registry
+#
+# Single source of truth for "which goal/aspiration fields each scoring
+# criterion in core/scripts/goal-selector.py score_goal() reads, and what
+# coverage we expect."
+#
+# Pairs with:
+#   - meta/goal-selection-strategy.yaml  (criterion weights — single source)
+#   - core/scripts/scoring-criterion-audit.py  (the recommender that consumes
+#     this file + scans the live goal corpus)
+#   - meta/scoring-criterion-audit.jsonl  (append-only audit log)
+#
+# Mirrors core/config/gates.yaml shape for consistency with the gate
+# retirement evaluator pattern. The recommender is descriptive — it never
+# auto-edits score_goal() or weights, only emits recommendations a reviewer
+# (or follow-up goal) decides on.
+#
+# Field semantics:
+#   id                  matches the raw[k] key in score_goal() AND the weight
+#                       key in goal-selection-strategy.yaml weights.
+#   weight_key          duplicates id today; explicit so a future rename of
+#                       the weight key without renaming the criterion can
+#                       still resolve.
+#   fields_read         list of {path, source, role, default?} entries.
+#                       source ∈ {goal, aspiration}. role ∈ {gating,
+#                       discriminator}. gating=presence is necessary for the
+#                       criterion to fire; discriminator=value differentiates
+#                       between goals once the criterion fires.
+#   discriminability_floor   minimum non_null_count / total fraction below
+#                            which the recommender flags sparse_below_floor.
+#                            Set to 0.0 when the criterion is sparse-by-design
+#                            (the gating-field role).
+#   expected_distinct_min    optional. If set AND distinct_count < this value
+#                            on a discriminator field, recommender flags
+#                            degenerate_field. Catches "field has 1 value
+#                            across 600 goals" — criterion can't differentiate.
+#   sparse_by_design    when true, low presence is the spec, not a bug.
+#                       Recommender uses sparse_by_design rec instead of
+#                       sparse_below_floor / dead_field. Coverage is still
+#                       reported for visibility.
+#   notes               human-readable context for reviewers.
+#
+# pending_audit:
+#   Criteria that exist in score_goal() but do NOT read goal/aspiration
+#   scalar fields (and therefore cannot be evaluated by the field-coverage
+#   recommender). Listed here so the unmapped check distinguishes
+#   "intentionally out of scope" from "drift — criterion was added without
+#   updating this file." Each entry names what it reads instead.
+
+schema_version: 1
+last_updated: "2026-04-23"
+
+criteria:
+
+  # ─── Universal goal scalars (high-coverage discriminators) ──────────────
+
+  - id: priority
+    weight_key: priority
+    fields_read:
+      - { path: priority, source: goal, role: discriminator, default: "MEDIUM" }
+      - { path: priority, source: aspiration, role: discriminator, default: "MEDIUM" }
+    discriminability_floor: 0.50
+    expected_distinct_min: 2
+    sparse_by_design: false
+    notes: "Goal-priority overrides asp-priority; both default to MEDIUM. Distinct < 2 means everything is one priority — the criterion isn't ranking."
+
+  - id: agent_executable
+    weight_key: agent_executable
+    fields_read:
+      - { path: participants, source: goal, role: discriminator, default: "[\"agent\"]" }
+    discriminability_floor: 0.50
+    expected_distinct_min: 2
+    sparse_by_design: false
+    notes: "When everyone has the default participants:[agent], this criterion gives every goal +0.8 — not actually ranking."
+
+  - id: class_balance_bonus
+    weight_key: class_balance_bonus
+    fields_read:
+      - { path: work_class, source: goal, role: discriminator }
+    discriminability_floor: 0.50
+    expected_distinct_min: 3
+    sparse_by_design: false
+    notes: "Computes deficit between observed work_class distribution and configured targets. distinct < 3 means classes have collapsed."
+
+  - id: per_goal_saturation
+    weight_key: per_goal_saturation
+    fields_read:
+      - { path: id, source: goal, role: gating }
+    discriminability_floor: 1.00
+    sparse_by_design: false
+    notes: "Reads goal.id; every goal must have one. < 100% presence is a corrupt-store signal."
+
+  # ─── Sparse-by-design gating fields (rare-by-spec) ──────────────────────
+
+  - id: deadline_urgency
+    weight_key: deadline_urgency
+    fields_read:
+      - { path: resolves_by, source: goal, role: gating }
+      - { path: deadline,    source: goal, role: gating }
+    discriminability_floor: 0.0
+    sparse_by_design: true
+    notes: "Most goals have no deadline. resolves_by is the canonical field; deadline is a legacy alternative read via 'or' fallback. If deadline is 0% across the corpus, the fallback path is dead and could be removed."
+
+  - id: novelty_bonus
+    weight_key: novelty_bonus
+    fields_read:
+      - { path: achievedCount, source: goal, role: gating }
+    discriminability_floor: 0.0
+    sparse_by_design: true
+    notes: "achievedCount tracks recurring-goal completion count. Non-recurring goals don't have it — sparse is the spec. Source-skew here is interesting (recurring goals concentrated in one source)."
+
+  - id: recurring_urgency
+    weight_key: recurring_urgency
+    fields_read:
+      - { path: recurring,      source: goal, role: gating }
+      - { path: lastAchievedAt, source: goal, role: gating }
+    discriminability_floor: 0.0
+    sparse_by_design: true
+    notes: "Only fires when goal.recurring is truthy. ~5-10% of goals are recurring across the corpus."
+
+  - id: recurring_saturation
+    weight_key: recurring_saturation
+    fields_read:
+      - { path: recurring, source: goal, role: gating }
+    discriminability_floor: 0.0
+    sparse_by_design: true
+    notes: "Penalty applied to recurring goals when recurring class dominates recent completions. Same gating field as recurring_urgency."
+
+  - id: deferred_readiness
+    weight_key: deferred_readiness
+    fields_read:
+      - { path: deferred_until, source: goal, role: gating }
+    discriminability_floor: 0.0
+    sparse_by_design: true
+    notes: "Deferred goals are by definition rare. Audit only checks that the field is being written when present; sparsity is the spec."
+
+  - id: handoff_bonus
+    weight_key: handoff_bonus
+    fields_read:
+      - { path: handoff_to,         source: goal, role: discriminator }
+      - { path: handoff_created_at, source: goal, role: gating }
+    discriminability_floor: 0.0
+    expected_distinct_min: 2
+    sparse_by_design: true
+    notes: "handoff_to is sparse-by-design (only filed when one agent routes work to another), but distinct < 2 means routing is one-way only — legitimate finding (e.g., bravo→alpha works but alpha→bravo is missing a writer)."
+
+  # ─── Discriminator fields where coverage matters ───────────────────────
+
+  - id: user_signal_boost
+    weight_key: user_signal_boost
+    fields_read:
+      # Path A retired 2026-04-24 (): user_thread_id, user_signal_kind
+      # removed as gating fields. Only snapshot-level Path B contributes.
+      - { path: silent_48h_goal_ids, source: snapshot, role: discriminator }
+    discriminability_floor: 0.05
+    sparse_by_design: true
+    notes: "Path A retired 2026-04-24 (g-252-03). Path B (silent_48h_goal_ids) is wired and operates per signal-refresh.md convention; structurally sparse — fires only when pending-questions with goal_id age past 48h. Audit dead_field flag suppressed via sparse_by_design=true (g-252-06, 2026-04-30)."
+
+  - id: context_coherence
+    weight_key: context_coherence
+    fields_read:
+      - { path: category, source: goal, role: discriminator }
+    discriminability_floor: 0.50
+    expected_distinct_min: 5
+    sparse_by_design: false
+    notes: |
+      _resolve_category() falls back through three strategies (goal.category > category-suggest
+      from text > first asp tag > 'uncategorized'), so direct goal.category presence isn't
+      strictly required. Still useful to track: a goal corpus with low direct goal.category
+      coverage means the suggester runs more often (slower selection, less stable).
+
+  # ─── Universal goal scalars (low-information but checked) ───────────────
+
+  - id: variety_bonus
+    weight_key: variety_bonus
+    fields_read:
+      - { path: id, source: aspiration, role: discriminator }
+    discriminability_floor: 1.00
+    sparse_by_design: false
+    notes: "Reads asp.id; should always be present. Listed for completeness — drift here means the JSONL store is corrupt."
+
+  - id: streak_momentum
+    weight_key: streak_momentum
+    fields_read:
+      - { path: id, source: aspiration, role: discriminator }
+    discriminability_floor: 1.00
+    sparse_by_design: false
+    notes: "Same gating as variety_bonus — both compare asp.id against working-memory state."
+
+  - id: depth_bonus
+    weight_key: depth_bonus
+    fields_read:
+      - { path: id, source: aspiration, role: discriminator }
+    discriminability_floor: 1.00
+    sparse_by_design: false
+    notes: "Counterbalance to variety_bonus. Same field read."
+
+
+# Criteria that exist in score_goal() but read external state, not goal /
+# aspiration scalar fields. Out of scope for the field-coverage recommender;
+# listed here so the unmapped check distinguishes intentional exclusion from
+# drift. Each entry names what it reads instead.
+pending_audit:
+
+  - id: reward_history
+    reads: "asp.goals[].status (derived from sibling goals, not a scalar field on this goal)"
+
+  - id: completion_pressure
+    reads: "asp.goals[].status (derived count; sibling-goal aggregation)"
+
+  - id: tail_bonus
+    reads: "asp.goals[].status (derived count; sibling-goal aggregation)"
+
+  - id: evidence_backing
+    reads: "world/pipeline.jsonl (resolved hypothesis support score)"
+
+  - id: skill_affinity
+    reads: "meta/skill-quality.yaml (skill quality aggregate)"
+
+  - id: directive_boost
+    reads: "world/board/coordination.jsonl (cross-agent priority directives)"
+
+  - id: exploration_noise
+    reads: "RNG (no field reads)"

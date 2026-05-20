@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
+# agent-aspirations-meta-update — thin wrapper that forces --source agent.
+# Delegates to aspirations-meta-update.sh (daemon-aware since PR 52).
 set -euo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
-cd "$PROJECT_ROOT"
-source "$CORE_ROOT/scripts/_platform.sh"
-exec python3 "$CORE_ROOT/scripts/aspirations.py" --source agent meta-update "$@"
+exec "$(cd "$(dirname "$0")" && pwd)/aspirations-meta-update.sh" --source agent "$@"

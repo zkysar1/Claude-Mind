@@ -1,6 +1,6 @@
 ---
 name: tree-reader
-description: "Read-only knowledge tree viewer — portable, no scripts needed"
+description: "Portable, read-only viewer for the knowledge tree using only built-in file tools — no framework scripts required. Use whenever the agent needs to browse tree structure without triggering retrieval counters, when operating in reader mode, during observer sessions that must stay side-effect-free, or when debugging tree content on a stripped-down environment where core/scripts are unavailable. Prefer /tree read for normal write-capable contexts."
 type: system
 user-invocable: true
 minimum_mode: reader
@@ -8,6 +8,8 @@ reads:
   - world/knowledge/tree/_tree.yaml
   - world/knowledge/tree/**/*.md
 writes: []
+revision_id: "skill-bootstrap-tree-reader-d52f16"
+previous_revision_id: null
 ---
 
 # /tree-reader — Read-Only Knowledge Tree Viewer
@@ -17,7 +19,7 @@ Portable read-only viewer for a knowledge tree. Uses ONLY built-in tools
 
 ## Setup
 
-**In an Ayoai-Mind project** (with `local-paths.conf`): works automatically.
+**In a Mind-framework project** (with `local-paths.conf`): works automatically.
 
 **Standalone** (shared with another agent):
 1. Copy this directory to `.claude/skills/tree-reader/`
@@ -46,8 +48,8 @@ Run this before every sub-command to set TREE_DIR.
 
 **Dynamic mode** (default) — resolve from project config:
 ```
-1. Read: {AYOAI_AGENT}/local-paths.conf
-   (if AYOAI_AGENT not set: Glob for */local-paths.conf → use first match)
+1. Read: {MIND_AGENT}/local-paths.conf
+   (if MIND_AGENT not set: Glob for */local-paths.conf → use first match)
 2. Extract the value after "WORLD_PATH=" on the matching line
 3. TREE_DIR = {WORLD_PATH}/knowledge/tree
 ```
@@ -57,8 +59,8 @@ Run this before every sub-command to set TREE_DIR.
 Node `file:` values in `_tree.yaml` use the virtual prefix `world/knowledge/tree/`.
 To get the real path, replace that prefix with `{TREE_DIR}/`.
 
-Example: `file: "world/knowledge/tree/intelligence/ayoai-core-engine.md"`
-becomes `{TREE_DIR}/intelligence/ayoai-core-engine.md`.
+Example: `file: "world/knowledge/tree/intelligence/core-engine.md"`
+becomes `{TREE_DIR}/intelligence/core-engine.md`.
 
 ## _tree.yaml Structure
 
@@ -205,3 +207,38 @@ ELSE (no key — show root):
 4. Display:
    root > {L1} > {L2} > ... > {key}
 ```
+
+## Limitations
+
+`/tree-reader` is the **portable, side-effect-free** path. It deliberately
+trades retrieval quality for portability and zero-write semantics. When
+high-quality results matter (running an actual goal, priming a session,
+deciding what to read first), use `retrieve.sh` instead. Concrete deltas:
+
+| Capability | `/tree-reader find` | `retrieve.sh` |
+|---|---|---|
+| Channel matching | substring on key + summary only | exact_key, substring, entity_index, word_prefix, concept, sibling/parent at deep |
+| Ranking signal | exact-key > partial-key > summary match | channel base score + TF-IDF cosine bonus + utility weight + recency decay |
+| Diversity | none (siblings cluster freely in top-K) | MMR rerank when top-K cap binds |
+| Multi-query | single string only | comma-separated categories, best-channel dedup |
+| Depth budget | unbounded | SUPPLEMENTARY_CAPS / DEPTH_LIMITS per shallow/medium/deep |
+| Counter side effects | none (by design) | bumps retrieval_count, last_retrieved on returned items |
+| Supplementary stores | tree only | tree + reasoning bank + guardrails + patterns + beliefs + experiences |
+| Default field handling | raw YAML (missing fields show as missing) | apply_defaults fills (EXPLORE, etc.) |
+| Read consistency | plain Read (may catch mid-write transitional state) | reads after the same lock that gates writes |
+
+When to prefer `/tree-reader`:
+- Reader-mode observer sessions that must stay write-free
+- Stripped-down environments where `core/scripts/` is unavailable
+- Debugging tree content (you want raw YAML, not the score-weighted view)
+- Browsing structure without nudging utility metrics
+
+When to prefer `retrieve.sh` (or `/prime`, `/tree read`):
+- Anything informing a goal selection, hypothesis, or decision
+- Session priming
+- Asking "what do I know about X" with quality ranking
+- Multi-store retrieval (tree + reasoning bank + guardrails)
+
+This skill's `find` output is intentionally close to raw `grep` — it tells
+you whether a token appears in the tree, not which node best answers a
+query. Don't treat it as a retrieval substitute.

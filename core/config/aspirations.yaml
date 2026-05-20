@@ -24,6 +24,7 @@ goal_templates:
     status: pending
     participants: [agent]            # [agent] (any), [user], [alpha], [bravo], or combinations
     blocked_by: []                   # IDs of prerequisite goals
+    blocked_since: null               # ISO 8601 — when blocked_by was first populated (for timeout)
     verification:                    # unified field (replaces desiredEndState + completion_check)
       outcomes: ["Measurable outcome that agent can verify"]  # human-readable
       checks: []                     # machine-verifiable conditions
@@ -83,6 +84,12 @@ goal_templates:
     achievedCount: 0
     currentStreak: 0
     longestStreak: 0
+    windowStreak: 0                 # tolerant streak — counts cycles within
+                                    # windowStreakMultiplier × interval_hours
+    longestWindowStreak: 0
+    windowStreakMultiplier: 7        # default tolerance: 7× interval. Set
+                                    # higher for "fire at least once per week"
+                                    # goals; lower for stricter cadences.
     verification:
       outcomes: ["Task completed successfully"]
       checks: []
@@ -240,13 +247,76 @@ goal_templates:
 pipeline_low_water_mark: 3      # create new work when executable goals drop below this
 
 # Hypothesis pipeline starvation prevention — ensure the prediction pipeline stays active.
-# Phase 0.5.2 counts discovered+evaluating+active pipeline records and triggers investigation when below this.
+# Phase 0.5.2 counts discovered+active pipeline records and triggers investigation when below this.
 hypothesis_pipeline_low_water_mark: 4   # create prediction review goal when flowing hypotheses drop below this
 
 # Accuracy health gate — create investigation work when prediction accuracy drops critically.
 # Phase 0.5.3 reads pipeline accuracy and triggers investigation when below this threshold.
 accuracy_critical_threshold: 0.40       # trigger investigation when accuracy drops below 40%
 accuracy_min_sample: 5                  # require at least 5 resolved hypotheses before gate activates
+
+# Tree-encoding drift threshold (): iteration-close.sh tree-encoding-drift-gate fires
+# force_tree_encoding=true sentinel + resets counter when goals_since_last_tree_update >= this.
+# Lower → more frequent forced encoding; higher → tolerates longer deep-without-encoding streaks.
+tree_encoding_drift_threshold: 3
+
+# --- STALE-SENTINEL CANARY () ---
+# Defense-in-depth for Cat C sentinels (bash writer + SKILL-only consumer).
+# If the consumer SKILL is skipped mid-iteration (graceful-stop interruption,
+# compact recovery, LLM omission), the sentinel accumulates a set value and
+# goes unread. The canary counts consecutive canary-runs in which each
+# tracked sentinel remains set, then files an Investigate goal at threshold.
+#
+# Tracked sentinels (force_* counter-gate family, set/clear semantics):
+#   - force_tree_encoding              (consumer: aspirations-state-update Step 8)
+#   - force_tree_maintain              (consumer: aspirations-precheck Phase 0-pre)
+#   - fresh_eyes_dispatch_pending      (consumer: aspirations-precheck Phase 0-pre3)
+#   - force_metric_encoding_pending    (consumer: aspirations-precheck Phase 0-pre4)
+#
+# Not tracked: consolidation_health (refresh-snapshot, no set/clear) and
+# known_blockers (list-shaped, handled by blocker-recheck.sh).
+#
+# Invoked from: iteration-close.sh do_productivity_check() (fail-open).
+# Source: core/scripts/stale-sentinel-canary.py
+stale_sentinel:
+  threshold_iterations: 3   # consecutive canary runs with the sentinel still set before filing Investigate
+
+# --- PRECHECK BUDGET CAP (Magic Wand 2 — ) ---
+# Budget cap on aspirations-precheck wall-clock cost. When cumulative precheck
+# elapsed-ms exceeds budget_pct of iteration_budget_ms, deferrable sweeps are
+# dropped. Always-run sweeps NEVER drop regardless of budget. The cost-meter
+# (core/scripts/aspirations-precheck-budget-meter.sh) tracks per-sweep cost
+# and logs decisions to <agent>/session/precheck-drops.jsonl for visibility.
+#
+# Why wall-clock and not tokens: within a single turn, context-budget.json's
+# token counters are stable (only update at turn boundaries), so per-sweep
+# token-delta is structurally zero. Wall-clock seconds give a meaningful,
+# real-time signal. The "context budget" framing in the goal description is
+# preserved via the zone-drop fallback below.
+#
+# Sweep tiers (priority order):
+#   always-run:  Phase 0-pre (tree-debt), 0-pre2 (experience-archival),
+#                0-pre3 (fresh-eyes-code-dispatch). Safety-critical sentinels.
+#   medium:      aspirations-recover-recurring, monitor-stale-check,
+#                precheck-eval (run-all), blocker-recheck (Phase 0.5b.0.5),
+#                defer-recheck (Phase 0.5b.4).
+#   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
+#                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
+#                (0.5e.5), felt-sense-cadence (0.5f). All are themselves
+#                cadence-gated, so dropping them in tight zones is safe.
+#
+# Always-run sweeps fire 100% of the time regardless of zone or budget. If
+# precheck-drops.jsonl ever shows an always-run drop, that's a bug — raise
+# budget_pct or move the sweep up the priority order.
+precheck:
+  enabled: true                # global on/off
+  budget_pct: 15               # informational target — drop deferrable when zone==tight OR elapsed > budget
+  iteration_budget_ms: 600000  # nominal iteration wall-clock cap (10 min); budget = 15% = 90s. Raised 2026-05-10 (g-115-559) — observed precheck cost 100-300s under OneDrive sync; 9s cap (60s nominal) was dropping all deferrable sweeps every cycle. 90s allows fast cycles to complete deferrables, still drops slow/stalled cycles.
+  zone_drop_rules:
+    fresh: []                  # run all
+    normal: []                 # run all (under autocompact 50%)
+    tight: [deferrable]        # drop deferrable sweeps in tight zone
+  drop_log: precheck-drops.jsonl  # appended under <agent>/session/
 
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals
@@ -282,6 +352,52 @@ aspiration_scopes:
 
 default_scope: project
 
+# --- INTENT-SATISFIED CLOSURE ---
+# Aspirations can close via the intent-satisfaction pathway (aspirations-complete-intent.sh)
+# when the `motivation` has been met by already-completed goals, even if trailing goals
+# are blocked or no longer necessary. Structural evidence gates prevent abuse:
+#   1. Evidence cardinality (this block's scope floor + 50% of non-recurring goals)
+#   2. Evidence quality (every evidence goal is status=completed with verification.outcomes)
+#   3. Rationale >=40 chars with >=1 token overlap with motivation
+# Trailing goals listed in superseded_goal_ids transition to status=superseded.
+# See: core/scripts/aspirations.py cmd_complete, aspirations-complete-review Phase 7.4.
+
+intent_satisfaction:
+  min_evidence_by_scope:
+    sprint: 2         # sprint: small; 2 completed goals is a meaningful majority
+    project: 3        # project: default; 3 completed goals is a credible record
+    initiative: 5     # initiative: don't cheaply close a multi-session strategic arc
+  # Phase 7.4 (Intent-Satisfaction Pre-Gate) only triggers when trailing blocked goals
+  # have been blocked_since longer than this (coarse age gate — fresh blockers don't count).
+  phase_7_4_min_blocked_hours: 24
+  # Zombie scan threshold — aspirations matching this in precheck get routed to Phase 7.4.
+  zombie_completion_ratio: 0.80
+
+# Post-state-update gate cooldown (). Suppresses /fresh-eyes-code
+# dispatch re-fires when the gate's flagged file set is a subset of the last
+# fire's set AND the last fire was within `cooldown_hours`. Prevents the
+# dispatch-loop observed across iter 37/42/45 where each deep state-update
+# re-listed cumulative files already covered by a recent review. Set to 0 to
+# disable cooldown (dispatch fires every iteration that crosses threshold).
+# Raised 4 → 12 ( / iter-109 finding): cooldown_hours=4 was too tight
+# for cross-agent inter-arrival. iter-109 case: bravo /fresh-eyes-code at 02:48,
+# alpha gate fired 07:17 (4h 29m later — peer cooldown expired by 29 min).
+# Alpha's intermediate ships had not touched bravo's 7 reviewed files, so the
+# duplicate review was waste. 12h covers the natural 4-8h cross-agent gap with
+# margin. If own-cadence regression observed (own work needing re-review within
+# 12h), split into peer_cooldown_hours: 12 + own_cooldown_hours: 4.
+post_state_update_gate:
+  cooldown_hours: 12
+
+# Consolidation-health snapshot thresholds (). Centralizes constants
+# previously hardcoded in core/scripts/consolidation-health.py. Three readers
+# consume the derived counts (create-aspiration Step 1, aspirations-select
+# Phase 2.55, aspirations-evolve Step E) via the consolidation_health WM slot.
+# Keep both thresholds in [0.0, 1.0]; NEAR must exceed STALLED.
+consolidation_health:
+  near_complete_threshold: 0.75   # ratio at/above which an aspiration is "nearly done"
+  stalled_threshold: 0.25         # ratio below which an aspiration is "stalled"
+
 # --- EPISODE CHAINING (MR-Search: Meta-RL with Self-Reflection) ---
 # When a goal fails or produces a surprising outcome, chain multiple attempts
 # with structured reflection between each. Context accumulates:
@@ -291,7 +407,9 @@ default_scope: project
 # deferring retry to a future loop iteration with no structured memory.
 
 episode_chaining:
-  max_episodes_per_goal: 3           # Max retry attempts with reflection
+  # max_episodes_per_goal removed  — context_zone_override is the live
+  # source of truth; see aspirations-execute/SKILL.md:507 "do not add a
+  # fallback to max_episodes_per_goal; that hides config drift."
   reflection_budget_per_episode: "mini"  # mini | standard — controls reflection depth between episodes
   chain_on_outcomes:                 # Which outcomes trigger chaining
     - "failed"                       # Goal execution failed (NOT infrastructure — Phase 4.0 handles those)
@@ -327,6 +445,7 @@ plateau_detection:
 
 cycle_detection:
   lookback_window: 3              # Number of recent goals to check for cycles
+  report_signal_age_days: 7       # zero_learning_velocity suppression: any <agent>/reports/*.md mtime within N days for recent goal IDs counts as substantive learning artifact (g-115-188 false-positive fix)
   checks:                         # What the precheck skill looks for
     - repeated_failure             # Almost all recent goals skipped/blocked
     - zero_learning_velocity       # Same-category goals producing no learning artifacts
@@ -338,6 +457,20 @@ proactive_escalation:
   blocker_age_hours: 2          # Phase 0.5b: notify when blocker active > N hours
   b7_notify: true               # B7: notify before exponential backoff sleep
   circuit_breaker_notify: true   # Phase 5.5: notify when circuit breaker fires
+  inbox_alert_age_hours:        # Phase 0.5b.1b (g-115-848): notify when an alert-sweep-filed Unblock has aged unclaimed.
+    high: 4                     #   Aged > high → fire HIGH-severity notification (>= these many hours since created_at).
+    medium: 12                  #   Aged > medium with no prior HIGH fire → fire MEDIUM-severity notification.
+                                #   Cooldown via wm.proactive_escalation_log keyed on f"inbox_alert_{goal.id}". Closes  finding (2).
+
+# --- PORTFOLIO HEALTH REVIEW ---
+# Periodic portfolio-level assessment during evolution. Catches drift that
+# per-aspiration mechanisms miss: priority inflation, completed aspirations
+# lingering unarchived, recurring goals trapped in project aspirations.
+# Runs as Step 2.75 in aspirations-evolve (same cadence as evolution).
+
+portfolio_review:
+  priority_concentration_warn: 0.70 # Warn when >70% of active aspirations share the same priority level
+  stale_threshold_sessions: 2       # Demote HIGH aspirations with 0 aggregate score for N+ sessions
 
 exploration_mode:
   auto_designate_below_capability: 0.30  # Categories below this capability_level
@@ -350,6 +483,147 @@ exploration_mode:
     - experience_archive                  # Full-fidelity trace preserved
     - tree_encoding                       # Knowledge encoded regardless of outcome
     - pattern_signatures                  # Patterns still matched and recorded
+
+# --- STRATEGIC SCAN (Environmental Observation) ---
+# Periodic "step back and look" phase that reads world signals
+# and generates work from environmental observation rather than
+# introspection. Runs conditionally — not every iteration.
+
+strategic_scan:
+  goal_cadence: 5               # Run scan every N completed goals (tightened from 8 to surface "is this serving the Program?" at ~60% higher frequency)
+  hours_cadence: 4              # Run scan every N hours (regardless of goal count)
+  recurring_ratio_trigger: 0.80 # Run scan when this fraction of recent goals are recurring
+  knowledge_staleness_days: 14  # Flag tree nodes not updated in this many days
+  concentration_threshold: 0.70 # Flag when this fraction of work is in one category
+  max_signals_per_scan: 10      # Cap signals to prevent over-generation
+
+# --- FRESH-EYES REVIEW (Periodic user-facing joint Self + portfolio review) ---
+# Every N completed goals, the agent assembles a briefing and pushes it to
+# the user via email with two meta-questions:
+#   1. Is the current Self still right?
+#   2. Are we working on the right problems?
+#
+# Deliberately goal-count cadence ONLY — no session/hour triggers. If the
+# agent did nothing between firings, there is nothing new to review.
+#
+# Cadence is the SINGLE source of truth: goal-count threshold only.
+# (skip_if_pending gate removed 2026-05-19 — rituals no longer file
+# pending-questions, so the gate had nothing valid to read.)
+# See .claude/skills/fresh-eyes-review/SKILL.md for the ritual; gated by
+# core/scripts/fresh-eyes-cadence-check.sh.
+
+fresh_eyes_review:
+  goal_cadence: 25              # Every N completed goals — goal-count cadence only
+  wm_slot: last_fresh_eyes_review
+  first_fire_offset: 5          # Stagger first-fire 5 goals out from now when
+                                # this slot is null on a mature world ().
+                                # Lowest cadence → smallest offset → fires first
+                                # of the three sibling rituals after a fresh seed
+                                # event (new agent dir / migration / slot wipe).
+                                # See fresh-eyes-cadence-check.py seed-stagger
+                                # branch for the implementation.
+
+# --- FRESH-EYES PROGRAM (Periodic local shared-purpose self-audit) ---
+# Sibling ritual to fresh_eyes_review. Targets world/program.md (The Program —
+# the world's shared purpose) instead of <agent>/self.md. Examines:
+#   1. Is The Program still the right shared purpose for this world?
+#   2. Do both agents' Selfs still serve The Program (are we drifting)?
+#
+# Lower cadence than the per-agent Self review because shared purpose changes
+# much less frequently than individual identity — ~100 goals is "every 2-3
+# weeks at observed 50 goals/day pace" for each agent, and the first agent to
+# hit cadence fires the review. Closes the "program.md has no systematic
+# evolution path" gap called out in
+# core/config/conventions/domain-hooks.md → Directional Context.
+
+fresh_eyes_program:
+  goal_cadence: 100             # Every N completed goals — lower than review's 25
+  wm_slot: last_fresh_eyes_program_review
+  first_fire_offset: 30         # Stagger first-fire 30 goals out (g-270-02).
+                                # Highest cadence → largest offset → fires LAST
+                                # of the three sibling rituals after a fresh
+                                # seed event. Spreads first-fires by ~10-15
+                                # goals between siblings (5 / 15 / 30).
+
+# Sibling ritual to fresh_eyes_review and fresh_eyes_program. Targets the
+# knowledge tree's top-level taxonomy — the L1 set. Periodic local self-audit;
+# the user invokes l1-domain-add.sh / l1-domain-rename.sh manually if any
+# taxonomy change is warranted after reading the briefing.
+# Lower frequency than program (200 vs 100) because L1 changes are
+# high-blast-radius and the skew + pick-rate evidence needs accumulation
+# time. See `.claude/skills/fresh-eyes-tree/SKILL.md`.
+fresh_eyes_tree:
+  goal_cadence: 200             # Every N completed goals
+  wm_slot: last_fresh_eyes_tree_review
+  first_fire_offset: 50         # Stagger first-fire 50 goals out — well clear
+                                # of review (+5), felt-sense (+15), program (+30).
+
+# --- FELT-SENSE CHECK-IN (Periodic structured 7-lane self-audit) ---
+# Every N completed goals, the agent runs a structured 7-lane sweep that
+# converts the user's proven-high-yield diagnostic question into an
+# autonomous routine. The seven lanes:
+#   1. Memory hygiene (tree/reasoning-bank/guardrails/experience from recent mistakes)
+#   2. Out-of-cycle completions (close work already done but still pending/in-progress)
+#   3. Unblocks (flip blocked goals whose premise resolved back to pending)
+#   4. Forward backlog (file new goals/aspirations surfaced by this diagnosis)
+#   5. Framework tests (extend /verify-learning if recent changes warrant new checks)
+#   6. Meta tuning (edit meta/* strategy files if cycle revealed drift)
+#   7. Felt sense (where is the pain, what would I change — material findings route
+#      through Self-update protocol per guard-380; cosmetic → journal only)
+#
+# Distinct from fresh-eyes-review (preemptive joint user+agent meta-Q&A) — this
+# is an autonomous structured self-audit that writes directly. No user ping.
+# Cadence is lower frequency (75 goals vs 25) because the seven lanes are
+# expensive and Lane 7 needs room to feel earned rather than ritual.
+
+felt_sense:
+  goal_cadence: 75              # Every N completed goals — anchored by user 2026-04-22
+  wm_slot: last_felt_sense_checkin
+  first_fire_offset: 15         # Stagger first-fire 15 goals out (g-270-02).
+                                # Middle cadence → middle offset → fires SECOND
+                                # of the three sibling rituals after a fresh
+                                # seed event (after review @ +5, before program @ +30).
+
+# --- L1 DISTRIBUTION SKEW CHECK (S1 — Phase 1 of tree taxonomy review) ---
+# Periodic passive check: every N completed goals, compute per-L1 distribution
+# (structural mass, retrieval volume, mature capability mass) and flag skews
+# above `threshold`x via coordination-board post. Surfaces "L1 X has 10x the
+# leaves of L1 Y — is the boundary right?" signals that no other trigger
+# asks. Consumed by /fresh-eyes-tree (S5) when that ritual fires.
+#
+# NOT a user-facing ritual — no email, no pending-question. Quiet on balanced
+# state. Designed to accumulate evidence the taxonomy review can act on.
+# Implementation: core/scripts/l1-skew-check.py --cadence --post-board
+l1_skew_check:
+  goal_cadence: 50              # Every N completed goals — passive observability
+  wm_slot: last_l1_skew_check
+  threshold: 5.0                # Skew ratio that triggers a board post
+  first_fire_offset: 20         # Stagger first-fire so it doesn't collide with
+                                # fresh-eyes (+5) or felt-sense (+15) on a fresh
+                                # seed event — 20 goals out lands distinctly.
+
+# --- MAINTENANCE CADENCE (Protected time-based maintenance) ---
+# Protects maintenance work (tree curation, evolution) from goal-execution budget
+# competition. Patterned on strategic_scan.hours_cadence + last_strategic_scan WM slot.
+# Fires as Phase 8.8 of the aspirations loop AFTER state-update, BEFORE evolution cadence.
+#
+# Rationale: /tree maintain had 7 call sites, all gated on goal-count or growth
+# thresholds — none fire on time alone. Under context pressure, goals always won
+# and tree debt accumulated across sessions (157 decompose + 85 distill candidates
+# after 3 sessions in session 47). This adds a time-based safety net with a
+# debt-floor override so backlog-triggered runs don't wait for the cadence clock.
+
+maintenance_cadence:
+  tree_maintain:
+    hours_cadence: 8            # Fire /tree maintain every N hours of wall-clock agent-up time
+    tight_zone_skip: false      # Tree maintain runs even in tight zone (too critical to defer)
+    debt_floor: 50              # Force-fire when (decompose + distill) candidates exceed this count
+  evolution:
+    hours_cadence: 12           # Fire /aspirations-evolve every N hours regardless of goal count
+    tight_zone_skip: true       # Skip in tight; normal+ only
+  full_cycle_reflection:
+    hours_cadence: 24           # Fire /reflect --full-cycle daily
+    tight_zone_skip: true       # Skip in tight; normal+ only
 
 # --- STEPPING-STONE RETRIEVAL (OMNI-EPIC-inspired: arXiv 2405.15568) ---
 # When generating new aspirations, retrieve K most recently completed aspirations
@@ -371,6 +645,430 @@ open_ended_progress:
   novelty_window: 10            # Compare against last N archived aspirations for novelty
   track_in: aspirations-meta.json
 
+# --- RECURRING GOAL SCORING ---
+# Controls how recurring goals are scored, penalized during saturation, and how
+# non-recurring work gets boosted during debt recovery (agent comes online after gap).
+# All values are read by goal-selector.py at scoring time.
+
+recurring:
+  urgency_base: 1.5              # Base score when a recurring goal becomes due
+  urgency_log_scale: 1.5         # Multiplier for log2(1 + overdue_ratio)
+  saturation_window: 4            # Recent completions window for saturation check
+  saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring
+  debt_threshold: 0.80            # Candidate ratio triggering debt recovery bonus
+  debt_bonus: 3.0                 # Score bonus for non-recurring goals during recovery
+  streak_mult: 2.0                # Streak resets when elapsed > this * interval_hours.
+                                  # Single source of truth for two readers
+                                  # (, 2026-05-18):
+                                  # - mind_api/src/endpoints/aspirations_write.py
+                                  #   cmd_complete_by — fires the streak-break
+                                  #   signal that produces an Investigate canary.
+                                  # - core/scripts/streak-break-reflector.py
+                                  #   _auto_resolve_recovered_canaries — defines
+                                  #   the "recovered cadence" window for the
+                                  #   forward-looking auto-resolve sweep.
+                                  # Renamed from streak_reset_multiplier
+                                  # ( / rb-335) — the prior name had a
+                                  # loader in goal-selector.py but no consumer;
+                                  # the rename consolidates with the literal
+                                  # variable name (streak_mult) used at both
+                                  # readers and in the zeta journals where the
+                                  # constant's role was characterized.
+  cargo_cult_threshold: 3         # consecutive routine outcomes before auto-filing Idea
+                                  # (see rb-335: YAML duplicate-key collision fix 2026-04-20)
+  routine_streak_flip_threshold: 5  # In-session per-goal routine streak ceiling. When a
+                                    # recurring goal closes routine N times in a row WITHIN
+                                    # one session and N >= this threshold, signal-mutation
+                                    # Block A flips outcome to deep (forcing the productive
+                                    # counter + reflection paths). Independent of
+                                    # cargo_cult_threshold, which is cross-session and
+                                    # triggers interval calibration. Read by
+                                    # core/scripts/recurring-loop-state-mutate.py — Magic
+                                    # Wand #1 single-writer for loop_state during recurring
+                                    # close (alpha session-60 reflection, 2026-05-07).
+                                    # MOVED from strategic_pulse: block 2026-05-12 ();
+                                    # the script always reads `recurring:` not `strategic_pulse:`.
+  routine_streak_global_ceiling: 5  # Cross-goal session-wide routine streak ceiling. When
+                                    # the agent closes routine N times in a row across ANY
+                                    # mix of recurring goals within one session and N >=
+                                    # this threshold, signal-mutation Block C forces the
+                                    # next routine close to flip to deep AND resets the
+                                    # counter to 0. Independent of the per-goal Block A
+                                    # threshold (routine_streak_flip_threshold) — Block A
+                                    # targets one goal repeating; Block C targets a broad
+                                    # routine pattern across goals. Lowered from 8 → 5
+                                    # 2026-05-12 per bravo session-66 feedback: "by 7
+                                    # routines I'm already in pattern-mode." Read by
+                                    # core/scripts/recurring-loop-state-mutate.py.
+
+  # --- AUTO-CONTRACT (LifingPolls plan item 4 — 2026-05-08) ---
+  # Inverse of cargo-cult auto-extend. When a recurring goal consistently
+  # produces deep outcomes (issues found on every fire), the cadence is too
+  # loose — shrink it. Mirror semantics to the extend path:
+  #
+  #   threshold:  N consecutive deep closes before auto-contract fires
+  #   divisor:    interval_hours / divisor on each contract
+  #   floor:      never contract below floor_ratio × original_interval_hours
+  #               (1/3 default, symmetric to extend cap_ratio of 3.0)
+  #
+  # Past the floor, fall through to the Idea path (parallel to extend cap):
+  # human decides whether to rebase the original interval or accept the
+  # natural cadence as a config-level edit.
+  deep_streak_contract_threshold: 3
+  deep_streak_contract_divisor: 1.5
+  contract_floor_ratio: 0.33
+
+# --- STRATEGIC PULSE (LifingPolls plan item 10 — 2026-05-08) ---
+# Cadence and thresholds for /strategic-pulse autonomous surface.
+# The skill itself is hybrid (user-invocable AND agent-callable);
+# this block governs the autonomous cadence, not the user-pull path.
+strategic_pulse:
+  cadence_goals: 50            # auto-fire every N completed goals
+  min_quiet_hours: 6           # don't re-fire within this window even if cadence met
+
+# cargo_cult: block lives below (~line 687). rb-335: YAML duplicate-keys
+# collide silently — keep exactly one block in this file.
+
+# --- PER-GOAL RAPID-REPEAT SUPPRESSION (Tranche B 2026-04-20 — rb-390) ---
+# Distinct from the recurring.saturation_* block above, which penalizes
+# recurring goals dominating recent selections at the CLASS level (any
+# recurring goal counts toward the ratio). This block suppresses the SAME
+# goal_id firing multiple times within a small window — the concrete
+# failure mode observed in the 2026-04-20 user session:  fired
+# 4 times in 2 minutes before the cargo-cult detector caught it.
+#
+# Operates on `goals_completed_this_session` working-memory entries, which
+# carry `goal_id` but no timestamp — so the window is COUNT-based
+# (last N session completions), not wall-clock. A fire of goal X followed
+# by 7 other goals and then X again will NOT trigger (the prior X fell
+# out of the count window). A fire of X followed by 1 other goal and
+# then X WILL trigger. Count-based is intentional: it measures "is this
+# goal_id dominating recent work" rather than "was this goal recently
+# done," which is what the user cares about.
+#
+per_goal_saturation:
+  window_size: 8                  # look back at last N session completions
+  consecutive_threshold: 1        # ≥N prior fires of this goal_id in window → suppress
+  suppress_penalty: -5.0          # raw score penalty when threshold hit
+                                  # Weight: meta/goal-selection-strategy.yaml → per_goal_saturation
+                                  # (default 0.8; -5.0 * 0.8 = -4.0 weighted penalty)
+
+# --- USER-SIGNAL BOOST (Tranche C — rb-390) ---
+# Reweights goals based on fresh user-signal evidence collected by the
+# signal-refresh hook (<agent>/session/user-signal-snapshot.yaml).
+# Consumed by goal-selector.py criterion 7d (user_signal_boost).
+#
+# Snapshot shape:
+#   sources.email.replies_last_24h / replies_last_72h  — active thread indicator
+#   sources.pending_questions.silent_48h_goal_ids      — per-goal silence list
+#   sources.board_directives.directives_last_24h       — active directive indicator
+#
+# Goals carry three optional fields populated by the scanner (see
+# goal-schemas.md "Optional Outcome & User-Signal Fields"):
+#   user_thread_id       — stable thread identifier
+#   user_signal_kind     — reply / directive / silence_48h / override
+#   user_signal_last     — ISO timestamp of most recent signal
+#
+# The natural gate for this criterion is snapshot existence — no separate
+# `enabled` flag. Missing snapshot, missing fields, or all-zero counts →
+# zero contribution to the scorer. No goal ever penalized for lacking
+# signal metadata.
+user_signal_boost:
+  reply_boost: 2.5                  # user_signal_kind == "reply" — user answered on this thread
+  directive_boost: 3.0              # user_signal_kind == "directive" — user explicitly requested
+  silence_48h_boost: 1.5            # pending-question silent ≥48h — surface the ask
+  override_penalty: -2.0            # user_signal_kind == "override" — user superseded this thread
+  thread_active_boost: 1.0          # user_thread_id present AND recent replies/directives observed
+                                    # Weight: meta/goal-selection-strategy.yaml → user_signal_boost
+                                    # (default 1.2)
+
+# --- WORK-CLASS BALANCE (Tranche C — rb-390) ---
+# Pulls under-represented work_class values up when the last-N session
+# completions distribution drifts from the configured targets. Addresses
+# work-mix skew (framework maintenance accumulating gravity unopposed).
+# Consumed by goal-selector.py criterion 7e (class_balance_bonus).
+#
+# The natural gate is `targets` non-empty — no separate `enabled` flag.
+# Domains MUST supply their own `targets` map — empty targets = disabled.
+# Missing work_class on a goal defaults to "unclassified" (excluded from
+# both distribution and bonus). Session completions without work_class
+# are excluded from the denominator.
+class_balance:
+  window_size: 20                   # look back at last N completions
+  max_boost: 2.0                    # cap when work_class is severely under-represented
+  max_penalty: -2.0                 # cap when work_class is severely over-represented
+  targets:                          # {work_class: fraction} — domain supplies this.
+    product: 0.40                   # end-user product value (domain-specific; see world/program.md)
+    framework: 0.25                 # cognitive engine (skills, scripts, conventions)
+    hygiene: 0.15                   # ops plumbing (infra, monitoring, data integrity)
+    research: 0.20                  # investigation, landscape, analysis
+                                    # Set 2026-04-21 via  (alpha session 55).
+                                    # Taxonomy from core/config/work-class-mapping.yaml.
+                                    # Agent-authored decision (participants:[agent,user]) —
+                                    # override by editing these fractions if the user
+                                    # wants a different portfolio steering target.
+                                    # Weight: meta/goal-selection-strategy.yaml → class_balance_bonus
+                                    # (default 0.8)
+
+# --- SELF-DRIFT GATE (Tranche C.5 — rb-390) ---
+# class_balance_bonus (scorer criterion 7e) nudges under-represented classes
+# UP at selection time. When that nudge is insufficient — the class stays
+# below a CRITICAL fraction of its target for multiple iterations — this
+# gate escalates by filing an Unblock goal. Consumer:
+# core/scripts/self-drift-gate.py, wired into aspirations-precheck.
+#
+# Natural gates (SSOT, rb-395): the gate is inactive whenever
+# class_balance.targets is empty OR target_aspiration_id is empty. No
+# redundant `enabled` flag — the values that already govern behavior
+# ARE the on/off switch. Fail-open: missing config = no-op, not error.
+#
+# Fires per work_class independently; each fire is subject to a cooldown
+# (so the same drift does not spawn goal after goal). Domain-agnostic —
+# operates only on classes listed in class_balance.targets above.
+self_drift_gate:
+  window_size: 30                   # look back at last N completions
+  critical_ratio: 0.50              # observed < (target × ratio) counts as "drifted"
+  min_iterations_before_fire: 20    # gate stays silent until the agent has this much data
+  cooldown_hours: 48                # suppress re-fire for the same class for this long
+  target_aspiration_id: ""          # REQUIRED to activate: aspiration under which Unblock
+                                    # goals get filed. Empty string = natural-gated, gate
+                                    # silently no-ops (script comment L18: "empty
+                                    # target_aspiration_id = natural gate"). Set 2026-04-21
+                                    # via  to "asp-244" (portfolio-steering
+                                    # aspiration itself), but asp-244 reached status=completed
+                                    # 2026-04-21→2026-05-03 — the gate's lookup at
+                                    # self-drift-gate.py L241 requires status=="active",
+                                    # so post-completion every fire returned "Aspiration
+                                    # asp-244 not found" (5+ errors logged in
+                                    # bravo/session/self-drift-log.jsonl from 2026-05-03
+                                    # onwards).  disabled rather than repointed
+                                    # because no currently-active aspiration is a clean
+                                    # semantic fit for cross-class drift Unblocks (work_class
+                                    # families span product/research/framework/hygiene; pinning
+                                    # to a single aspiration mis-routes the others). Re-enable
+                                    # by setting an aspiration id when a portfolio-steering
+                                    # aspiration is reactivated or a new one is created.
+
+# --- CROSS-AGENT HANDOFF SCORING (Item 3) ---
+# Goals tagged `handoff_to: <agent-name>` get scoring bonus on the named agent's
+# selector. Prevents cross-agent handoffs from rotting in the world queue.
+# See goal-selector.py criterion 13c (handoff_bonus). Schema: goal-schemas.md.
+#
+# Sender-side take-back penalty (handoff_sender_penalty) applies when the goal
+# is tagged for a DIFFERENT agent. It decays only while the routed partner is
+# silent (agent_status.<partner>.last_active in world/team-state.yaml is older
+# than partner_active_threshold_min). This moves the decision from a magic
+# constant drifting on the clock to a signal derivable from observed partner
+# liveness. FAIL-OPEN on missing inputs: if team-state is missing/corrupt or
+# either last_active or handoff_created_at is absent, the penalty is 0 — the
+# feature disengages rather than fake-protecting. No fallback branch, single
+# source of truth (observed partner state).
+scoring:
+  handoff_bonus: 0.30             # added to score when goal.handoff_to == current agent
+  handoff_sender_penalty: -2.5    # applied when goal.handoff_to names ANOTHER agent
+
+handoff_aging:
+  warn_hours: 48                     # aged handoffs get an escalating scoring bonus from here
+  escalate_hours: 72                 # aspirations-precheck posts to board + notifies at this age
+  sender_decay_hours: 4              # partner-silence window for full penalty decay (sender side)
+  partner_active_threshold_min: 30   # if partner last_active within this, penalty stays full
+
+# --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
+# Composite productivity score computed at end of each iteration (via
+# iteration-close.sh → productivity-stop-gate.sh). If the agent is padding the
+# session with routine/ritual work rather than producing encoded learning,
+# gracefully self-stop so the user gets a clean hand-off instead of stale tokens.
+# Score formula (see core/scripts/productivity-stop-gate.sh):
+#   score = (1 - routine_ratio) * 0.4 + encoding_ratio * 0.3 + deep_ratio * 0.3
+# Trigger: goals_completed >= min_iterations AND score < stop_threshold
+#          AND no stop-requested signal already pending.
+productivity_gate:
+  min_iterations: 10              # session must have ≥N completed goals before gate arms
+  stop_threshold: 0.25            # score strictly below this triggers self-stop
+  # Trigger notification is board post (type=self-stop) + journal append —
+  # both unconditional in productivity-stop-gate.sh. No notify_user toggle:
+  # notify-user is an LLM-invoked skill, not shell-callable, so a config key
+  # here would lie about what the script can do.
+  #
+  # --- Per-artifact weights for encoding_ratio (Fix D — 2026-04-22) ---
+  # The gate scores a session by summing COUNTS × WEIGHTS across all artifact
+  # kinds produced since session_start, then dividing by goals_completed.
+  # Weights encode the framework's value hierarchy:
+  #   tree_writes 1.0 — highest-durability encoding (collective knowledge)
+  #   guards      0.9 — active cross-session safety rules
+  #   rb          0.8 — reasoning-bank lessons learned
+  #   patsigs     0.8 — pattern signatures that match across future goals
+  #   hyp_created 0.6 — prediction formed (calibration input)
+  #   hyp_resolved 0.6 — prediction resolved (calibration output)
+  #   experience  0.3 — raw interaction trace (1-per-goal baseline credit)
+  #
+  # EXCLUDED from the counter by design (do NOT add without re-reading this
+  # block — silent double-counting risk):
+  #   spark questions — already captured downstream via the rb/tree/guard
+  #     entries they spawn. Counting sparks AND the resulting rb would
+  #     double-credit the same learning event.
+  #   journal entries — 1+ per goal baseline, not a learning signal.
+  #   skill forges — rare high-value events stored in a YAML file without
+  #     per-entry timestamps that map cleanly to session_start. Would be
+  #     worth adding if the schema gains created_at; currently the
+  #     downstream guardrail/rb entries from a forge already count.
+  #   beliefs — schema supports per-entry last_updated but file is typically
+  #     empty for active agents. Zero signal; skip rather than no-op count.
+  #
+  # Bravo session-56 calibration (1 tree_writes + 1 rb + 2 hyp_resolved +
+  # ~4 experience across 8 goals, routine~0.10, deep~0.70):
+  #   weighted = 1*1.0 + 1*0.8 + 2*0.6 + 4*0.3 = 4.2
+  #   ratio = min(1.0, 4.2 / 8) = 0.525
+  #   score = 0.9*0.4 + 0.525*0.3 + 0.70*0.3 = 0.36 + 0.16 + 0.21 = 0.73
+  #   (well above 0.25 floor — bravo would have continued)
+  #
+  # Adversarial-padding calibration (0 artifacts + 10 experience, 10 goals,
+  # routine=0.9, deep=0.1): weighted=3.0, ratio=0.30, score=0.16 → STOPS.
+  # Experience baseline buffers good sessions but doesn't save padded ones.
+  artifact_weights:
+    tree_writes: 1.0              # highest-quality durable encoding
+    guards: 0.9                   # active safety rules, cross-session
+    rb: 0.8                       # reasoning bank entries (lessons)
+    patsigs: 0.8                  # pattern signatures (cross-goal match)
+    hyp_created: 0.6              # predictions formed (calibration input)
+    hyp_resolved: 0.6             # predictions resolved (calibration output)
+    experience: 0.3               # raw traces — baseline credit, per-goal
+    forges: 1.0                   # new skills forged — cross-session durable, high value (g-251-09)
+    structural_progress: 1.0      # tree maintain ops actioned + work_class=framework goals (Lane D Magic Wand #1, 2026-05-08). Weight 1.0 matches tree_writes/forges — structural reorganization is durable cross-session work even though it doesn't create new files. The previous 8 axes measured WRITTEN artifacts; this axis measures DONE structural work. See session_artifacts_count.count_structural_progress().
+  #
+  # --- Cool-down ladder (Fix E — 2026-04-22) ---
+  # A single sub-threshold score should not fire stop-requested immediately.
+  # The gate runs at the end of every iteration — one bad iteration between
+  # artifact landings (e.g. a recurring-goal streak before the next tree
+  # write) is a normal within-session fluctuation, not a session-ending
+  # signal. The ladder introduces trend detection: the gate writes
+  # `blocked_sleep_until` (reuses Phase -0.5e's existing sleep-wake
+  # machinery) and increments `productivity_cooldown_streak` in WM. Stop
+  # only fires after the streak saturates the ladder — the agent has been
+  # consistently sub-threshold across N cool-down windows AND the breaks
+  # did not produce recovery.
+  #
+  # Mirror of the B7 backoff ladder in aspirations-all-blocked SKILL.md,
+  # with longer steps because productivity cooldown is a higher-level
+  # trend signal than "selector returned empty once". 1800/3600/7200 =
+  # 30m/1h/2h — three chances to recover before hard stop.
+  #
+  # Reset: any iteration where score >= stop_threshold resets the streak
+  # to 0. A single recovering iteration is enough — the gate doesn't need
+  # hysteresis beyond the ladder itself (which already is the hysteresis).
+  #
+  # The sentinel is `blocked_sleep_until` (reused, not a new WM slot).
+  # Reuse is safe because B7 and productivity-gate never fire in the same
+  # iteration — B7 runs at selector-empty, productivity runs at
+  # iteration-close after a completed goal. The post-wake light-precheck
+  # in Phase -0.5e finds no blockers and falls through cleanly.
+  cooldown_ladder:
+    ladder_seconds: [1800, 3600, 7200]  # 30m, 1h, 2h — stop fires on 4th sub-threshold read
+    # WM slot name is hardcoded in productivity-stop-gate.sh (COOLDOWN_SLOT)
+    # and must match the session_signals initializer in
+    # .claude/skills/aspirations/SKILL.md Phase -0.5 — not tunable via config.
+
+# --- QUIESCENCE GATE ---
+# Script-gated "confidently idle" state. When the queue is HONESTLY
+# user-gated (every blocked goal has a structured blocker_ref with an
+# observable external_id and future expires_at), the loop earns the right
+# to sleep longer than the default B7 backoff — without running B3/B4/B5
+# work-generation every iteration and without forcing idle_fallback fabrication.
+#
+# Prevents the lazy-escape risk: the LLM does NOT decide quiescence; the queue
+# structurally IS quiet (as computed by quiescence-gate.py against structured
+# blocker_refs). Narrative defers without blocker_ref are rejected by
+# aspirations.py at write-time, so the gate cannot be gamed by writing
+# defer_reason="awaiting user feedback" on every goal.
+#
+# First wake-miss emits an Investigate goal; three consecutive misses
+# auto-disable quiescence for the session.
+quiescence_gate:
+  hysteresis_iters: 2             # same blocker-set hash required across N iters
+  budget_pct: 0.40                # max fraction of session wall-clock in quiescence
+  sleep_seconds_min: 1800         # 30 min floor when quiescence approved
+  sleep_seconds_max: 3600         # 60 min cap (wake signals can break sooner)
+  wake_miss_cooldown: 3           # N consecutive wake-misses → auto-disable session
+  log_file: quiescence-log.jsonl  # relative to <agent>/session/ — decision trail
+  audit_file: quiescence-audit.jsonl  # relative to <agent>/session/ — wake-miss record
+
+  # --- Magic Wand #3 (alpha session-60, 2026-05-07) — fragmentation downgrade ---
+  # When quiescence approves a sleep but external signals (board posts, claim
+  # releases, partner activity) break it early, the agent burns precheck tokens
+  # waking up only to re-quiesce. MW#2 (wake-signal class split) demotes
+  # informational signals during quiescent sleep, but blocker-class signals can
+  # still legitimately fragment a sleep — and over time, repeated fragmentation
+  # means the 1800s approval is wishful thinking.
+  #
+  # MW#3 tracks actual_sleep_s in a rolling window (signals.quiescence.actual_sleep_history,
+  # last fragmentation_window entries). When the AVG of that window falls below
+  # fragmentation_threshold_s, the gate downgrades the next approval's
+  # sleep_seconds to fragmented_sleep_seconds (an "ack-and-yield" pattern):
+  # acknowledge the queue is user-gated, yield briefly, but don't pretend a
+  # 30-minute sleep is achievable when bursty signal makes the agent surface
+  # within minutes anyway.
+  fragmentation_threshold_s: 600    # avg actual_sleep_s below this → fragmented
+  fragmentation_window: 5            # how many recent sleeps to average
+  fragmentation_min_samples: 3       # need this many samples before decision
+  fragmented_sleep_seconds: 600      # downgraded sleep duration (10 min)
+  fragmented_history_max: 10         # cap on the rolling history length
+
+  # --- Magic Wand 2 (bravo session-61, 2026-05-07) — newly-arrived-work ---
+  # The blocker-hash drift check at verify-wake catches changes in STRUCTURAL
+  # state (a blocker resolved, expired, or got rehashed). It does NOT catch
+  # "did better work arrive while I was asleep" — a goal created during sleep
+  # that is not blocked, not deferred, and not time-gated would otherwise be
+  # invisible to verify-wake until the next iteration's selector runs.
+  #
+  # MW#2 captures total goal count in active_snapshot at quiescence-entry,
+  # then at wake-verify compares the count and re-runs the selector if the
+  # delta exceeds min_delta. If the selector returns >= min_executable
+  # candidates, drift is flagged via "__new_work_arrived__" — the
+  # orchestrator's existing miss-handling path (file Investigate, increment
+  # misses) breaks the quiescence cycle. Two-tier on purpose: cheap count
+  # delta gates the expensive selector run.
+  newly_arrived_work:
+    enabled: true
+    min_delta: 2          # require >= N new goals before running selector
+    min_executable: 2     # require selector to return >= N candidates to flag
+
+# --- BATCH CALIBRATION SWEEP (Change 3) ---
+# When a single recurring goal hits cargo_cult_threshold, redirect to a
+# batch sweep instead of filing a per-goal Idea. The sweep evaluates EVERY
+# recurring goal in one pass (world + agent queues) and emits ONE ranked
+# Idea — collapses symptom-chasing into a single calibration. Dedupe gates
+# re-filing when a recent batch Idea is still outstanding.
+#
+# Set batch_audit_dedupe_hours: 0 to disable the batch mode entirely and
+# fall back to the legacy per-goal Idea path. See
+# core/scripts/cargo-cult-detector.py --audit-all.
+cargo_cult:
+  multiplier: 1.5                 # per-goal auto-extend: new_interval = current * this
+  cap_ratio: 3.0                  # per-goal auto-extend: max ratio new/original before Idea fallback
+  batch_audit_dedupe_hours: 24    # caller-side (recurring-close.sh) suppress: filters pending/in-progress only
+  # Self-side temporal dedup (): cargo-cult-detector.py audit_all() suppresses
+  # emission when ANY batch goal (regardless of status — completed/skipped/expired included)
+  # was created within this window. Defense-in-depth against the caller-side gap that let
+  # three duplicate batches land in 4 iterations during bravo session 58 (,
+  # , ). Set 0 to disable; default 72h spans typical recurring-cycle period.
+  audit_all_batch_dedup_hours: 72
+
+# --- RECURRING-GOAL CARGO-CULT DETECTION ---
+# Per the plan improve-recurring-goals-kind-yao.md (2026-04-19):
+# A recurring goal that returns outcome=routine N consecutive times is
+# probably running on a wrong-fit interval, wrong skill, or has nothing
+# left to do. After N hits, recurring-close.sh fires cargo-cult-detector.py
+# to auto-file an Idea goal proposing to extend the interval, change the
+# skill, or retire the recurring goal entirely.
+#
+# Counter lives on the goal record as `consecutive_routine` (cross-session
+# — distinct from loop_state.routine_streaks which resets each session).
+# recurring-close.sh increments on routine, resets on deep, and resets again
+# after auto-filing the Idea (so the detector does not re-fire while the
+# Idea sits in the queue). `cargo_cult_threshold` now lives in the primary
+# `recurring:` block above (merged 2026-04-20 — was a duplicate-key bug that
+# silently wiped urgency_base / saturation_window / debt_bonus / etc.).
+
 # --- MULTI-AGENT COORDINATION (Distributed Systems Theory) ---
 # Informed by "Language Model Teams as Distributed Systems" (Mieczkowski et al., 2026).
 # LLM teams are structurally distributed systems — governed by the same scalability laws,
@@ -383,6 +1081,7 @@ multi_agent:
   claim_timeout_hours: 4            # Claims older than this are treated as expired
   abstention_timeout_hours: 72      # Abstentions older than this expire (fail-open: re-attempt)
   defer_reason_timeout_hours: 120   # defer_reason without deferred_until expires after this
+  dependency_timeout_hours: 48      # blocked_by deps older than this expire (fail-open: attempt goal)
 
   # Parallelizability classification: aspirations declare whether their goals are
   # independent (parallel), chained (serial), or mixed. Advisory field — blocked_by
@@ -395,6 +1094,7 @@ multi_agent:
   reallocation_hours: 8             # Hours before unclaimed targeted goals become eligible
 
 modifiable:
+  multi_agent.dependency_timeout_hours: {min: 12, max: 168, default: 48}
   max_active: {min: 3, max: 100, default: 100}
   # Agent delegation
   max_concurrent_goals: {min: 1, max: 3, default: 3}
@@ -410,8 +1110,9 @@ modifiable:
   novelty_drought_hours: {min: 12, max: 168, default: 48}
   maintenance_threshold: {min: 0.50, max: 0.95, default: 0.70}
   default_scope: {values: [sprint, project, initiative], default: project}
-  # Episode chaining bounds
-  max_episodes_per_goal: {min: 1, max: 5, default: 3}
+  # Episode chaining bounds — max_episodes_per_goal removed  (dead knob;
+  # see episode_chaining section). Modifiable entries for context_zone_override
+  # would need per-zone bounds; not added because current values are uncontentious.
   # Exploration mode bounds
   auto_designate_below_capability: {min: 0.10, max: 0.50, default: 0.30}
   max_exploration_fraction: {min: 0.10, max: 0.50, default: 0.25}
@@ -423,6 +1124,14 @@ modifiable:
   cycle_detection.lookback_window: {min: 2, max: 5, default: 3}
   # Proactive escalation bounds
   proactive_escalation.blocker_age_hours: {min: 1, max: 8, default: 2}
+  # Recurring goal scoring bounds
+  recurring.urgency_base: {min: 0.5, max: 3.0, default: 1.5}
+  recurring.urgency_log_scale: {min: 0.5, max: 3.0, default: 1.5}
+  recurring.saturation_window: {min: 2, max: 10, default: 4}
+  recurring.saturation_max_penalty: {min: 2.0, max: 8.0, default: 4.0}
+  recurring.debt_threshold: {min: 0.60, max: 0.95, default: 0.80}
+  recurring.debt_bonus: {min: 1.0, max: 5.0, default: 3.0}
+  recurring.streak_mult: {min: 1.5, max: 5.0, default: 2.0}
   # Multi-agent coordination bounds
   multi_agent.claim_timeout_hours: {min: 1, max: 24, default: 4}
   multi_agent.reallocation_hours: {min: 2, max: 48, default: 8}
@@ -430,3 +1139,148 @@ modifiable:
   convention_learning.max_steps_per_convention: {min: 4, max: 12, default: 8}
   convention_learning.auto_apply_confidence: {min: 0.6, max: 1.0, default: 0.8}
   convention_learning.cooldown_goals: {min: 5, max: 20, default: 10}
+  # Strategic scan bounds
+  strategic_scan.goal_cadence: {min: 3, max: 20, default: 8}
+  strategic_scan.hours_cadence: {min: 1, max: 12, default: 4}
+  strategic_scan.recurring_ratio_trigger: {min: 0.50, max: 0.95, default: 0.80}
+  strategic_scan.knowledge_staleness_days: {min: 7, max: 60, default: 14}
+  strategic_scan.concentration_threshold: {min: 0.50, max: 0.90, default: 0.70}
+  strategic_scan.max_signals_per_scan: {min: 3, max: 20, default: 10}
+  felt_sense.goal_cadence: {min: 25, max: 200, default: 75}
+  fresh_eyes_program.goal_cadence: {min: 50, max: 400, default: 100}
+  # Portfolio health review bounds
+  portfolio_review.priority_concentration_warn: {min: 0.50, max: 0.95, default: 0.70}
+  portfolio_review.stale_threshold_sessions: {min: 1, max: 5, default: 2}
+  # Productivity-gate tuning bounds (Fix D — 2026-04-22)
+  productivity_gate.min_iterations: {min: 5, max: 30, default: 10}
+  productivity_gate.stop_threshold: {min: 0.10, max: 0.50, default: 0.25}
+  productivity_gate.artifact_weights.tree_writes: {min: 0.5, max: 1.0, default: 1.0}
+  productivity_gate.artifact_weights.guards: {min: 0.3, max: 1.0, default: 0.9}
+  productivity_gate.artifact_weights.rb: {min: 0.3, max: 1.0, default: 0.8}
+  productivity_gate.artifact_weights.patsigs: {min: 0.3, max: 1.0, default: 0.8}
+  productivity_gate.artifact_weights.hyp_created: {min: 0.2, max: 1.0, default: 0.6}
+  productivity_gate.artifact_weights.hyp_resolved: {min: 0.2, max: 1.0, default: 0.6}
+  productivity_gate.artifact_weights.experience: {min: 0.1, max: 0.6, default: 0.3}
+  productivity_gate.artifact_weights.forges: {min: 0.5, max: 1.0, default: 1.0}
+  # Cool-down ladder bounds (Fix E). ladder_seconds is a list — evolution
+  # can't tune list elements via the modifiable flat-key scheme, so it's
+  # documented here but not bounds-tuned.
+  # Learning-ratio dashboard targets (core/scripts/learning-ratio.py).
+  # framework_max_ratio: upper bound on framework-meta share of active
+  #   guardrails + reasoning-bank entries (below = healthy).
+  # domain_min_ratio: lower bound on domain-class share (above = healthy).
+  #   Renamed from npc_min_ratio on 2026-05-18 (packaging plan Phase 2.7) —
+  #   "domain" is the framework-universal term; the prior name leaked an
+  #   the framework-specific category into the framework knob registry. Old key
+  #   still tolerated by learning-ratio.py for one cycle (back-compat).
+  # Neither is a hard gate — the dashboard reports drift against these.
+  domain_class_targets.framework_max_ratio: {min: 0.10, max: 0.50, default: 0.25}
+  domain_class_targets.domain_min_ratio: {min: 0.10, max: 0.70, default: 0.30}
+
+# --- RUNNER HEARTBEAT (crashed-session liveness) ---
+# The runner stamps <agent>/session/runner-heartbeat mtime on every aspirations
+# iteration (Phase -0.5). Observer /stop and /start RUNNING+autonomous check
+# this mtime via core/scripts/heartbeat-stale.sh to detect crashed runners.
+# Missing file counts as stale (fail-open on crashed-runner edge case).
+# No hardcoded default in scripts — a missing block here fails loud so misconfig
+# is visible instead of silently using a magic number (rb-313: script-authoritative
+# decisions beat LLM narration; same principle applies to config-authoritative).
+runner_heartbeat:
+  # Observer /stop and /start RUNNING+autonomous treat the runner as crashed when
+  # runner-heartbeat mtime is older than this many minutes. Set generously — long
+  # goals (research, consolidation, /run-processor) legitimately take 20+ minutes.
+  # Bumped 30->60 on 2026-05-14 after bravo recovered mid-deep-close at iter 36
+  # (). Deep-close LLM work (precision extraction, multi-tree-node
+  # edits, encoding) regularly runs 30-45 min between iteration-close.sh phase
+  # invocations with no diary writes -- both heartbeat AND diary-stale signals
+  # triggered. 60 min absorbs that without forcing per-tool-call heartbeat
+  # instrumentation. Trade-off: genuine zombie recovery takes ~2x longer.
+  # Tunable; raise further if 60 still false-positives.
+  stale_minutes: 60
+
+# --- Recovery gate (script-gated crashed-runner auto-recovery) ---
+# core/scripts/recovery-gate.sh fires from the SessionStart hook when ALL FOUR
+# conditions hold: state=RUNNING + heartbeat stale + stop-requested NOT set +
+# `background-jobs.sh has-pending` exits 1 (no Tier-A registered job).
+# When all four pass, the gate calls session-manifest-clear.sh (same script
+# /start --recover Phase 0.7 calls), transitions state to IDLE, writes
+# <agent>/session/recovery-notice for /prime to surface, and appends to
+# recovery-log.jsonl.
+#
+# Plan called for a 5th condition (PID liveness via runner-alive.sh) but it
+# was removed: the LLM has no honest way to write a stable runner PID
+# ($PPID from LLM-bash resolves to init/1 — the launcher decouples). A
+# layer that systematically mis-reports DEAD would auto-recover healthy
+# sessions whenever heartbeat staled (long subagent calls). Heartbeat is
+# the canonical liveness signal; we trust it.
+#
+# This is the SECOND authorized caller of session-state-set.sh outside /start
+# and /stop (productivity-stop-gate is the first). LLM remains locked out —
+# only the SessionStart hook may invoke recovery-gate.sh. See:
+#   .claude/rules/stop-hook-compliance.md  (exception block)
+#   .claude/rules/user-interaction.md      (Script-Level Restrictions)
+#
+# Long-running Processor jobs (3-7h) suppress the gate via
+# background-jobs.sh has-pending (single source of truth — NOT via inflating
+# stale_minutes above). Manual /start --recover provides the explicit entry
+# when the auto-gate's 4 conditions don't match.
+
+# --- Stale background-process scanner ---
+# The scanner is a WORLD script (`world/scripts/stale-jobs-scan.py`) — it
+# identifies registered background jobs past their lifetime and unregistered
+# OS-level orphans matching known signatures. Kills are logged to
+# core/logs/stale-scanner-kills.jsonl.
+#
+# Process-type thresholds were the framework-specific (Processor, roblox-bridge,
+# llama-server, ssh-efs) and lived here as a leak. Moved 2026-05-18 (packaging
+# plan Phase 2.7) to `world/config/stale-scanner.yaml`. The world script reads
+# its own thresholds from there with internal hardcoded fallbacks — core no
+# longer ships the domain process names. A fresh deployment without a stale
+# scanner inherits the world script's defaults or skips the scanner entirely.
+
+# ------------------------------------------------------------------
+# Infra-health failing-streak alerting ( — asp-249)
+# ------------------------------------------------------------------
+# When infra-health.py records repeated probe failures for the same component,
+# the counter increments silently. Without a surfacing signal, recurring infra
+# probe goals happily report "completed" while their target service is down —
+# exactly the failure mode asp-249 exists to prevent (: an infra
+# probe rotted for weeks). The streak-alert subcommand reads this config and routes
+# components exceeding threshold to a surfaced notification.
+#
+# failing_streak_threshold: min consecutive_failures before alert fires (default 3).
+# window_hours: only alert if last_failure is within this recency window — keeps
+#   historically-broken components from spamming after they're known-blocked.
+infra_health:
+  failing_streak_threshold: 3
+  window_hours: 6
+  # : when a component crosses failing_streak_threshold, sync a
+  # known_blocker entry into per-agent WM so goal-selector's blocker gate
+  # (aspirations-precheck Phase 0.5b) can suppress dependent goals. Without
+  # this map, cmd_failing_streak fires alerts but only via JSON output /
+  # log file — never reaching the selector. Lookup is by component name;
+  # missing entries route to empty list (blocker filed without
+  # affected_categories, harmless to selector). Maintain alongside
+  # world/scripts/probe-*.sh additions.
+  #
+  # The component_categories map was deployment-specific (named the host
+  # deployment's probe components inline) and moved 2026-05-18
+  # (packaging plan Phase 2.7) to `world/config/infra-health-categories.yaml`.
+  # infra-health.py reads from the world overlay; core ships an empty
+  # component_categories dict here as schema documentation. A fresh deployment
+  # without an infra-health overlay gets an empty map (alerts fire but never
+  # reach the selector — same as the legacy "missing entry" path).
+  component_categories: {}
+
+# ------------------------------------------------------------------
+# Experience-archival compliance gate (rb-428 — asp-248 follow-up)
+# ------------------------------------------------------------------
+# Phase 4.25 Experience Archival is LLM-orchestrated (payload needs
+# retrieval_audit, verbatim_anchors, content_path — cognitive fields bash
+# cannot compose). When staleness is detected, experience-staleness-check.sh
+# writes the force_experience_archival WM sentinel; aspirations-precheck
+# Phase 0-pre2 reads the sentinel and blocks goal selection until the LLM
+# composes the missed experience record retroactively (pattern mirrors
+# force_tree_maintain / Phase 0-pre at precheck:57-75).
+experience_archival_gate:
+  staleness_hours: 12              # mirrors EXPERIENCE_STALENESS_HOURS default

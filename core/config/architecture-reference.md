@@ -88,7 +88,7 @@ The system tracks its own accuracy over time, identifies patterns in what it rea
 - **Three-level reflection**: episode → pattern → strategic (Park et al. Generative Agents architecture)
 - **Hypothesis testing**: after 20+ resolved hypotheses, statistically test what drives accuracy
 - **Meta-memory**: explicit self-model of strengths, weaknesses, blind spots, and calibration bias
-- **Capability gap detection**: recurring gaps logged to `<agent>/skill-gaps.yaml` → `/forge-skill` creates new skills when threshold met (times_encountered >= 2, value >= medium, type-dependent gate: CALIBRATE+ for utility gaps, EXPLOIT+ for analytical gaps)
+- **Capability gap detection**: recurring gaps logged to `agents/<agent>/skill-gaps.yaml` → `/forge-skill` creates new skills when threshold met (times_encountered >= 2, value >= medium, type-dependent gate: CALIBRATE+ for utility gaps, EXPLOIT+ for analytical gaps)
 - **Performance-based evolution triggers**: Responsive triggers — accuracy drops, consecutive failures, pattern divergence, capability unlocks (`core/config/evolution-triggers.yaml`)
 - **Adaptive spark questions**: Track question productivity (yield rate) and retire low-yield questions, promote candidates (`core/config/spark-questions.yaml`)
 - **Strategy archive**: When strategies change, old versions are preserved with performance data in `meta/strategy-archive.yaml`
@@ -96,7 +96,7 @@ The system tracks its own accuracy over time, identifies patterns in what it rea
 - **Preventive guardrails**: Failure-extracted "check this before acting" rules loaded during evaluation (`world/guardrails.jsonl`, script-accessed via `guardrails-read.sh`)
 - **Belief registry**: Formally separates beliefs from facts, tracks confidence trajectories, detects contradictions (`world/knowledge/beliefs.yaml`, `world/knowledge/transitions.yaml`)
 - **Horizon-gated hypotheses**: `micro` (seconds, in working memory), `session` (hours, lightweight pipeline), `short` (days, standard), `long` (weeks+, full suite). Overhead scales with time horizon.
-- **Self-regulated effort**: Per-goal metacognitive assessment determines effort_level (`full`, `standard`, `skip`). Controls execution thoroughness and spark depth, not retrieval (retrieval is always intelligent and full). Optional user focus directive (`<agent>/profile.yaml` `focus` field) steers value assessment.
+- **Self-regulated effort**: Per-goal metacognitive assessment determines effort_level (`full`, `standard`, `skip`). Controls execution thoroughness and spark depth, not retrieval (retrieval is always intelligent and full). Optional user focus directive (`agents/<agent>/profile.yaml` `focus` field) steers value assessment.
 
 The aspiration engine's evolution log (`meta/evolution-log.jsonl`) tracks when and why strategies change.
 
@@ -105,7 +105,7 @@ The aspiration engine's evolution log (`meta/evolution-log.jsonl`) tracks when a
 Biologically-inspired learning mechanisms layered on top of the Memory Tree. Based on hippocampal memory mechanics and Piaget's cognitive development theory.
 
 ### Memory Pipeline (encoding stages)
-Observations flow through: **sensory buffer** (raw, ephemeral) → **working memory** (10 typed slots, session-scoped, including micro-hypothesis batch) → **encoding gate** (filters by novelty/surprise/impact/goal relevance, threshold 0.40) → **consolidation** (session-end replay, dynamic budget (5-15 items, scaled by violations/domains/surprise) compressed to leaf node articles) → **long-term tree** (dynamic random tree, K=4 MAX, D_max=20). Micro-hypotheses are batch-processed at session-end: only surprises (>= 7) enter the encoding gate. Config: `core/config/memory-pipeline.yaml`. Session state: `<agent>/session/working-memory.yaml`.
+Observations flow through: **sensory buffer** (raw, ephemeral) → **working memory** (10 typed slots, session-scoped, including micro-hypothesis batch) → **encoding gate** (filters by novelty/surprise/impact/goal relevance, threshold 0.40) → **consolidation** (session-end replay, dynamic budget (5-15 items, scaled by violations/domains/surprise) compressed to leaf node articles) → **long-term tree** (dynamic random tree, K=4 MAX, D_max=20). Micro-hypotheses are batch-processed at session-end: only surprises (>= 7) enter the encoding gate. Config: `core/config/memory-pipeline.yaml`. Session state: `agents/<agent>/session/working-memory.yaml`.
 
 ### Pattern Separation & Completion (dentate gyrus + CA3)
 Pattern signatures (`world/pattern-signatures.jsonl`, script-accessed via `pattern-signatures-read.sh`) enable two operations: **separation** ("this looks like pattern X but key feature differs so it's actually pattern Y") and **completion** ("partial cue matches → retrieve full strategy context"). Used during hypothesis evaluation to route between System 1 (fast/intuitive) and System 2 (slow/deliberate) reasoning.
@@ -114,7 +114,7 @@ Pattern signatures (`world/pattern-signatures.jsonl`, script-accessed via `patte
 `/replay` skill runs compressed (3-line) reviews of resolved hypotheses, prioritizing violations, surprises, and high-impact outcomes. During replay, recalled strategies enter a **reconsolidation window** — they become temporarily updatable based on new evidence (reinforced, flagged for revision, or extended with new conditions). Includes domain transfer: patterns from strong domains (MASTER level) are abstracted and tested for applicability in weak domains (CALIBRATE level).
 
 ### Developmental Stages (Competence-Based)
-System maturity tracked in `<agent>/developmental-stage.yaml` (framework: `core/config/developmental-stage.yaml`). Stage labels derived from average domain competence: **exploring** (avg < 0.30) → **developing** (0.30-0.55) → **applying** (0.55-0.80) → **mastering** (> 0.80). Exploration budget computed dynamically: `max(0.15, min(0.85, 1.0 - average_domain_competence))`. Per-domain capability_level gates hypothesis types and System 1/2 routing. `resolved_hypotheses` count is tracked as a diagnostic metric but does not gate progression. Schema operations (assimilation vs accommodation) are logged explicitly.
+System maturity tracked in `agents/<agent>/developmental-stage.yaml` (framework: `core/config/developmental-stage.yaml`). Stage labels derived from average domain competence: **exploring** (avg < 0.30) → **developing** (0.30-0.55) → **applying** (0.55-0.80) → **mastering** (> 0.80). Exploration budget computed dynamically: `max(0.15, min(0.85, 1.0 - average_domain_competence))`. Per-domain capability_level gates hypothesis types and System 1/2 routing. `resolved_hypotheses` count is tracked as a diagnostic metric but does not gate progression. Schema operations (assimilation vs accommodation) are logged explicitly.
 
 ### Active Forgetting
 Enhanced decay model: `retention = e^(-days / (lambda * importance * type_decay))`. Retrieval strengthens memories (resets decay timer). Interference between contradictory articles is detected and prioritized for resolution. Active pruning during `/aspirations evolve` archives validated but stale knowledge.
@@ -125,14 +125,14 @@ Maps the filesystem structure to memory types (inspired by "Everything is Contex
 
 | Memory Type | Location | Access Pattern | Update Trigger |
 |---|---|---|---|
-| Scratchpad | `<agent>/session/working-memory.yaml` | Session-scoped R/W, consolidated at end | Every goal execution |
-| Micro-predictions | `<agent>/session/working-memory.yaml` → `micro_hypotheses` | Inline R/W within session, batch-reflected at end | Inline during goal execution |
-| Episodic | `<agent>/journal/` + `<agent>/journal.jsonl` | Append-only, indexed by session/date/tags via `journal-read.sh` | State Update Protocol Step 7 |
+| Scratchpad | `agents/<agent>/session/working-memory.yaml` | Session-scoped R/W, consolidated at end | Every goal execution |
+| Micro-predictions | `agents/<agent>/session/working-memory.yaml` → `micro_hypotheses` | Inline R/W within session, batch-reflected at end | Inline during goal execution |
+| Episodic | `agents/<agent>/journal/` + `agents/<agent>/journal.jsonl` | Append-only, indexed by session/date/tags via `journal-read.sh` | State Update Protocol Step 7 |
 | Fact | `world/knowledge/tree/` node articles (any depth) | Tree navigation via `_tree.yaml`, write via consolidation | Reflection, research, consolidation |
-| Experiential | `pipeline-read.sh --stage resolved` + `<agent>/experiential-index.yaml` | Pattern matching by category/violation cause | `/reflect` |
-| Procedural | `.claude/skills/` + `<agent>/skill-gaps.yaml` | Read at invocation, forged via `/forge-skill` | Capability gap detection |
+| Experiential | `pipeline-read.sh --stage resolved` + `agents/<agent>/experiential-index.yaml` | Pattern matching by category/violation cause | `/reflect` |
+| Procedural | `.claude/skills/` + `agents/<agent>/skill-gaps.yaml` | Read at invocation, forged via `/forge-skill` | Capability gap detection |
 | User | `core/config/profile.yaml`, `CLAUDE.md` | Read at session start (auto-loaded) | Manual or evolution |
-| Historical | `<agent>/journal/` + `meta/evolution-log.jsonl` + `world/pipeline.jsonl` | Immutable audit trail | Append-only |
+| Historical | `agents/<agent>/journal/` + `meta/evolution-log.jsonl` + `world/pipeline.jsonl` | Immutable audit trail | Append-only |
 | Signatures | `world/pattern-signatures.jsonl` | DG separation + CA3 completion via `pattern-signatures-read.sh` | `/reflect`, `/replay` |
 | Reasoning | `world/reasoning-bank.jsonl` | Category + tag matching via `reasoning-bank-read.sh` | `/reflect` differentiated extraction |
 | Guardrails | `world/guardrails.jsonl` | Category filter via `guardrails-read.sh` | `/reflect` failure extraction |
@@ -149,16 +149,16 @@ In addition to standard working memory consolidation (see `/aspirations` Session
 0. **Micro-Hypothesis Sweep**: Invoke `/reflect --batch-micro` to process any micro-predictions from working memory.
 1. **Aspiration Archive Sweep**: Run `aspirations-archive.sh` to move completed/retired aspirations from live to archive JSONL.
 2. **Tree Rebalancing**: Invoke `/tree maintain` to check for DECOMPOSE, REDISTRIBUTE, SPLIT, SPROUT, MERGE, PRUNE opportunities.
-3. **Skill Gap Review**: Read `<agent>/skill-gaps.yaml` and evaluate if any gaps meet forge criteria.
+3. **Skill Gap Review**: Read `agents/<agent>/skill-gaps.yaml` and evaluate if any gaps meet forge criteria.
 4. **Skill Health Report**: Review active/forged/underperforming skills and flag any for retirement (3+ underperformance events).
-5. **Write Continuation Handoff**: Write `<agent>/session/handoff.yaml` with session state snapshot.
+5. **Write Continuation Handoff**: Write `agents/<agent>/session/handoff.yaml` with session state snapshot.
 6. **Preserve critical control signals**: Session-end consolidation MUST NOT modify:
-   - `<agent>/session/agent-state` (only /start and /stop may change it)
-   - `<agent>/session/persona-active` (only /start and /stop may change it)
+   - `agents/<agent>/session/agent-state` (only /start and /stop may change it)
+   - `agents/<agent>/session/persona-active` (only /start and /stop may change it)
 
 ## Focus Directive
 
-- `focus` in `<agent>/profile.yaml`: `null` (self-regulate) or natural language string
+- `focus` in `agents/<agent>/profile.yaml`: `null` (self-regulate) or natural language string
 - User sets via conversation: "focus on coding", "explore everything", "go back to normal"
 - Agent uses focus as context for per-goal metacognitive effort assessment
 - Agent MUST NOT set focus — it is a user preference
@@ -179,7 +179,7 @@ In addition to standard working memory consolidation (see `/aspirations` Session
 ## Skill Forging Conventions
 
 ### Gap Registry
-- Capability gaps tracked in `<agent>/skill-gaps.yaml` (forge criteria in `core/config/skill-gaps.yaml`)
+- Capability gaps tracked in `agents/<agent>/skill-gaps.yaml` (forge criteria in `core/config/skill-gaps.yaml`)
 - Gap IDs: `gap-NNN` (zero-padded 3-digit)
 - Gap statuses: `registered`, `under-review`, `forging`, `forged`, `dismissed`
 - Forge criteria: times_encountered >= 2, value >= medium, distinct, type-dependent gate (utility: CALIBRATE+, analytical: EXPLOIT+)
@@ -196,11 +196,11 @@ In addition to standard working memory consolidation (see `/aspirations` Session
 ### Skill Tree Index
 - All skills registered in `.claude/skills/_tree.yaml`
 - Trigger routing in `.claude/skills/_triggers.yaml`
-- Max skills ceiling: 15 (prevents sprawl)
+- Max skills ceiling: see `_tree.yaml` config.max_skills
 
 ## Session Files
 
-- `<agent>/session/working-memory.yaml` — ephemeral, created fresh each session, consolidated at session end
+- `agents/<agent>/session/working-memory.yaml` — ephemeral, created fresh each session, consolidated at session end
 - Pattern signatures: `sig-NNN` (zero-padded 3-digit)
 - Schema operations: `assimilation` or `accommodation`
 - Developmental stages: `exploring`, `developing`, `applying`, `mastering`

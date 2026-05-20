@@ -1,18 +1,20 @@
 ---
 name: backlog-report
-description: "Sprint planning backlog — aspirations, goals, scores, blockers, and user action items as copy-pasteable markdown"
+description: "Generates a complete sprint-planning backlog as copy-pasteable markdown: all aspirations, goals, scores, blockers, and user action items, written to {agent}/BACKLOG.md with a compact terminal summary. Use whenever the user says \"show me the backlog\", \"give me sprint planning material\", \"what's in the queue\", or needs pasteable content for a planning doc or standup. User-invocable AND agent-callable; valid in any mode including reader."
 user-invocable: true
 triggers:
   - "/backlog-report"
 tools_used: [Bash, Read, Write]
 conventions: [aspirations, goal-schemas, goal-selection, pipeline]
 minimum_mode: reader
+revision_id: "skill-bootstrap-backlog-report-d7df00"
+previous_revision_id: null
 ---
 
 # /backlog-report — Sprint Planning Backlog
 
 Generates a complete, copy-pasteable markdown backlog of all aspirations, goals,
-scores, blockers, and user action items. Writes `<agent>/BACKLOG.md` and displays a compact terminal summary.
+scores, blockers, and user action items. Writes `agents/<agent>/BACKLOG.md` and displays a compact terminal summary.
 
 **Hybrid skill**: user-invocable AND agent-callable. Valid from ANY state.
 Safe: read-only with respect to agent state (only writes the output file).
@@ -45,13 +47,19 @@ Run these in parallel where possible:
    → Parse JSON → store as blocked_data
 
 4. Pending questions (user review items)
-   Read: <agent>/session/pending-questions.yaml
+   Read: agents/<agent>/session/pending-questions.yaml
    → Parse YAML → filter status == "pending" → store as pending_questions[]
    → IF file missing or empty: pending_questions = []
 
 5. Active hypotheses
    Bash: pipeline-read.sh --stage active
    → Parse JSON → store as active_hypotheses[]
+
+6. OHS-delta rollup per aspiration (g-245-03)
+   Bash: meta-read.sh improvement-velocity.yaml
+   → Parse YAML → for each entry, record {goal_id, ohs_delta_since_previous_ohs_run}
+   → Build velocity_map[goal_id] = ohs_delta (float OR 'no_ohs_data')
+   → IF field missing from entry: treat as 'no_ohs_data' (pre-schema entries)
 ```
 
 ## Phase 2: Build Indexes
@@ -64,8 +72,21 @@ Run these in parallel where possible:
      blocked_map[goal_id] = {reason_group, block_detail}
 
 3. USER GOALS — Scan all goals across aspirations[]:
-     IF "user" in goal.participants → add to user_goals[]
-     Include: goal_id, aspiration_id, aspiration_title, title, priority, score (from score_map), category
+     # Two passes: (a) all user-routed goals (for the historical-count note),
+     # (b) only actionable goals (pending|deferred|blocked) for the dashboard.
+     # Without the status filter, the renderer reports completed historical
+     # records as "needing you" — observed pollution: 22 of 24 entries
+     # were status=completed (g-115-210 / rb-526). Status filter applies
+     # ONLY to the "Goals Needing You" surface in section 3b — completed
+     # records remain queryable via aspirations-read.sh for audit.
+     ACTIONABLE_STATUSES = {"pending", "in-progress", "deferred", "blocked"}
+     all_user_goals = [g for g in <all goals> if "user" in g.participants]
+     user_goals = [g for g in all_user_goals if g.status in ACTIONABLE_STATUSES]
+     # Counts for the render-time note (used in section 3b):
+     total_user_routed = len(all_user_goals)
+     historical_user_routed = total_user_routed - len(user_goals)
+     # Each user_goals entry includes: goal_id, aspiration_id, aspiration_title,
+     # title, priority, score (from score_map), category, status
 
 4. RECURRING HEALTH — Scan all goals across aspirations[]:
      IF goal.recurring == true:
@@ -78,6 +99,22 @@ Run these in parallel where possible:
      IF resolves_no_earlier_than is null/missing OR resolves_no_earlier_than <= today:
        add to testable_hypotheses[]
      Sort by confidence descending
+
+6. OHS_DELTA_MAP — For each active aspiration, sum OHS deltas of its completed goals:
+     ohs_delta_map[asp_id] = {"sum": float_or_na, "scored": int, "total_completed": int}
+     FOR EACH asp in aspirations[]:
+       numeric_deltas = []
+       completed_count = 0
+       FOR EACH goal in asp.goals WHERE status == "completed":
+         completed_count += 1
+         delta = velocity_map.get(goal.id, 'no_ohs_data')
+         IF isinstance(delta, (int, float)):
+           numeric_deltas.append(delta)
+       IF numeric_deltas:
+         ohs_delta_map[asp.id] = {"sum": round(sum(numeric_deltas), 2), "scored": len(numeric_deltas), "total_completed": completed_count}
+       ELSE:
+         ohs_delta_map[asp.id] = {"sum": "n/a", "scored": 0, "total_completed": completed_count}
+     # Display: "+0.45 (3/12)" when scored > 0; "n/a" when no OHS-tracked goals yet
 ```
 
 ## Phase 3: Render Markdown
@@ -90,9 +127,16 @@ Construct the full markdown document. Use these section templates:
 # Backlog Report
 
 > Generated: {YYYY-MM-DDTHH:MM:SS}
+> {output of `bash core/scripts/learning-ratio.sh` — artifact ratio (guardrails+rb)}
+> {output of `bash core/scripts/learning-ratio.sh --scope goals` — goal-scope ratio (pending+in-progress)}
 
 ---
 ```
+
+The two ratios intentionally differ in shape: artifacts show accumulated
+learning distribution, goals show the in-flight portfolio split. A session
+can be rebalancing (goal ratio healthier than artifact ratio) or drifting
+(goal ratio worse than artifact ratio) — both signals belong in the header.
 
 ### 3b: Your Action Items
 
@@ -113,6 +157,9 @@ IF pending_questions[] is empty: omit "Pending Decisions" subsection.
 ```markdown
 ### Goals Needing You
 
+(showing {len(user_goals)} of {total_user_routed} total user-routed goals;
+{historical_user_routed} are completed historical records)
+
 | Goal | Aspiration | Title | Priority | Score | Category |
 |------|------------|-------|----------|-------|----------|
 | g-001-05 | asp-001 | Review deployment... | HIGH | 6.2 | infrastructure |
@@ -120,6 +167,9 @@ IF pending_questions[] is empty: omit "Pending Decisions" subsection.
 
 IF user_goals[] is empty: omit "Goals Needing You" subsection.
 IF both are empty: omit entire "Your Action Items" section.
+The historical-count note (line 2 above) is omitted when
+historical_user_routed == 0 (clean state — every user-routed goal is
+still actionable).
 
 ### 3c: Recommended Next Actions
 
@@ -157,7 +207,7 @@ Sort by overdue_by descending (most overdue first), then on-time goals by next-d
 ### 3e: Aspirations (one section per active aspiration)
 
 ```markdown
-## asp-001: Maintain Agent Health [ACTIVE] (3/12 goals)
+## asp-001: Maintain Agent Health [ACTIVE] (3/12 goals) | OHS Δ: +0.45 (3/12)
 
 **Priority**: MEDIUM | **Motivation**: Keep the agent's knowledge fresh...
 
@@ -178,6 +228,11 @@ Rules:
 - Terminal goals (completed/skipped/expired): show as a summary count below the table,
   not as full rows. E.g., "3 completed, 1 skipped"
 - Aspirations ordered by priority (HIGH → MEDIUM → LOW), then by asp-NNN id
+- OHS Δ header format: `| OHS Δ: <sum> (<scored>/<total_completed>)` when scored > 0;
+  `| OHS Δ: n/a` when no goals have numeric deltas (e.g. aspirations closed before
+  ohs-trend.jsonl started populating). Sum format: signed 2-decimal float (e.g.
+  `+0.45`, `-0.12`). Render BEFORE the **Priority** line to make product-impact
+  visible at a glance alongside goal-progress (g-245-03).
 
 ### 3f: Blocked Goals
 
@@ -238,9 +293,9 @@ Window: "{resolves_no_earlier_than} – {resolves_by}" formatted as short dates.
 ## Phase 4: Write File
 
 ```
-Write: <agent>/BACKLOG.md ← rendered markdown from Phase 3
+Write: agents/<agent>/BACKLOG.md ← rendered markdown from Phase 3
 
-IF <agent>/BACKLOG.md already exists: overwrite (regenerated snapshot, not append-only)
+IF agents/<agent>/BACKLOG.md already exists: overwrite (regenerated snapshot, not append-only)
 ```
 
 ## Phase 5: Terminal Summary
@@ -270,11 +325,11 @@ Aspirations:
 Blocked: {N} goals, {B} bottlenecks
 Hypotheses: {H} ready to test
 
-Read <agent>/session/pending-questions.yaml
+Read agents/<agent>/session/pending-questions.yaml
 IF any entry has type: "priority-review" AND status: "pending":
-  Output: "Priority review pending — run /priority-review to reorder"
+  Bash: echo "Priority review pending — run /priority-review to reorder"
 
-Full report written to: {absolute_path_to_<agent>/BACKLOG.md}
+Full report written to: {absolute_path_to_agents/<agent>/BACKLOG.md}
 ═══════════════════════════════════════════════
 ```
 
@@ -282,4 +337,10 @@ Full report written to: {absolute_path_to_<agent>/BACKLOG.md}
 
 - **Called by**: User directly (`/backlog-report`), OR by agent during RUNNING state
 - **Calls**: No other skills — only framework scripts (`aspirations-read.sh`, `goal-selector.sh`, `pipeline-read.sh`) and file reads
-- **Modifies**: Writes/overwrites `<agent>/BACKLOG.md`
+- **Modifies**: Writes/overwrites `agents/<agent>/BACKLOG.md`
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+When called mid-loop (agent mode), the terminal action is the Write of BACKLOG.md.
+Never end with a text summary after the Write.

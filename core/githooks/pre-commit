@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Layer B pre-commit gates — daemon-only drift defense.
+#
+# Tracked and version-controlled so it propagates to every clone via
+# `git config core.hooksPath core/githooks` (installed idempotently by
+# core/scripts/install-git-hooks.sh, invoked from sessionstart-orchestrator.sh
+# Step 0.5).
+#
+# See .claude/rules/no-python-cli-fallback.md (CLI-fallback gate) and
+# zeta/reports/g-115-802-design.md (endpoint-registry gate).
+set -e
+REPO="$(git rev-parse --show-toplevel)"
+
+# Gate 1: Python CLI fallback regression (existing).
+bash "$REPO/core/scripts/check-no-python-cli-fallback.sh"
+
+# Gate 1b: Daemon-wrapper reparse regression (g-115-740 sister gate,
+# 2026-05-18). Catches the SUBTLER shape — wrapper calls rt_call AND
+# also opens daemon data files directly to second-guess responses.
+# Sister to Gate 1; that gate catches `_fallback_exec` /
+# `python3 -m core.scripts.X`, this one catches `rt_call` + inline
+# `py -3 -c` block reading `Path(WORLD_PATH|META_PATH|AGENT_DIR)/*.jsonl`.
+bash "$REPO/core/scripts/check-no-daemon-wrapper-reparse.sh"
+
+# Gate 2: Daemon endpoint registry vs filesystem (g-115-802).
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) PY="py -3" ;;
+    *) PY="python3" ;;
+esac
+$PY "$REPO/core/scripts/check-mind-api-endpoint-registry.py"
+
+# Gate 3: Phase-5 meta -> world import invariant (sec15; see
+# mind_api/src/INTERFACE.md). Refuses commits where mind_api/src/meta/**
+# imports mind_api.src.world or any world-domain endpoint module.
+$PY "$REPO/core/scripts/meta-imports-world-gate.py"
+
+# Gate 4: Phase-6 Layer-1 -> Layer-2 import invariant (sec15; see
+# core/BOUNDARY.md). Refuses commits where a Layer-1 file imports/sources
+# mind_api.src (daemon-launcher `python -m mind_api.src` is whitelisted).
+$PY "$REPO/core/scripts/layer1-no-runtime-imports-gate.py"
+
+# Gate 5: settings.json deny-baseline net (constitutional anchor, 2026-05-16).
+# Independent second net behind the PreToolUse settings-structural-validator;
+# reuses its _validate() (single source of truth for PROTECTED_DENY). No-op
+# unless .claude/settings.json is staged. See CLAUDE.md "two-file settings
+# rule", core/config/conventions/constitutional-rings.md Ring 0, rb-931.
+$PY "$REPO/core/scripts/check-settings-deny-baseline.py"
+
+# Gate 6: Domain-leak surveillance (ADVISORY, 2026-05-18 packaging plan
+# Phase 4.4). Runs core/scripts/domain-leak-check.sh on every commit to
+# surface domain terms leaking into core/scripts/, core/config/, or
+# .claude/rules/. Gate is advisory — exit code from the leak check is
+# NOT propagated, so existing leaks don't block commits. The signal
+# surfaces on stderr so authors notice when they introduce new leaks;
+# /verify-learning Section DLK (planned) elevates persistent leaks to
+# Investigate goals on the regular learning-gate cadence. Switch to
+# blocking by removing the `|| true` once existing leaks are fixed
+# (packaging plan Phase 6).
+bash "$REPO/core/scripts/domain-leak-check.sh" >&2 || true
+
+# Gate 7: Phase 2.6 bare-agent-prefix regression (2026-05-19). After
+# Phase 2.5.D, `<agent>/X/` references in SKILL.md/rule/convention
+# markdown without the `agents/` parent silently produce wrong paths
+# when the LLM substitutes the placeholder (the 2026-05-19 bravo/
+# cruft incident shape). Refuses commits introducing the regression
+# in staged .md files. See .claude/rules/path-resolution.md.
+bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"

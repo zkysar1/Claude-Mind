@@ -7,10 +7,19 @@ It survives autocompact because it's on disk, and the postcompact restore reads
 the last N entries to inject into fresh context.
 
 Subcommands:
-  append  — Add a diary entry from stdin JSON
-  read    — Read recent entries (--limit, --since, --goal)
-  summary — Generate compressed summary for post-compact injection
-  trim    — Remove entries older than N hours
+  append       — Add a diary entry from stdin JSON
+  read         — Read recent entries (--limit, --since, --goal)
+  summary      — Generate compressed summary for post-compact injection
+  trim         — Remove entries older than N hours
+  phase-start  — Emit a phase-start marker (Tier 0 token-cost telemetry)
+  phase-end    — Emit a phase-end marker (Tier 0 token-cost telemetry)
+
+Phase markers (Tier 0, plan: i-had-one-agent-luminous-reddy.md):
+  Each phase-start/phase-end pair brackets a loop phase. phase-cost-report.py
+  consumes these to compute per-phase wall-clock duration (token-cost proxy).
+  Pairing is greedy by time order on (phase_name, iteration) key.
+  Nested phases are allowed — a sub-phase can start while its parent is open.
+  Name convention: "phase-<num>[-<sub>]" chosen by the emitting SKILL.md.
 """
 
 import argparse
@@ -19,19 +28,95 @@ import os
 import sys
 from datetime import datetime, timedelta
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, assert_agent_dir
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("execution-diary")
 
 DIARY_PATH = AGENT_DIR / "session" / "execution-diary.jsonl"
+
+
+def _advance_heartbeat():
+    """Sync the runner-heartbeat with this diary write.
+
+    Recovery-gate.sh Condition 2 (heartbeat-stale) and Condition 2.7 (diary-
+    stale) are designed as independent multi-signal liveness probes. They
+    drifted apart in practice: heartbeat-tick fires ONLY at Phase -0.5 of each
+    iteration, but diary appends fire at every phase boundary and finding
+    emission. A single goal spanning >30 min between iteration boundaries
+    (zeta g-271-19 took 75 min on 2026-05-13) staled heartbeat while diary
+    appends kept happening, triggering false-positive recovery.
+
+    Re-sync mechanism: every successful diary write ticks the heartbeat by
+    direct file touch. The two staleness signals now move together.
+
+    Why direct touch (not heartbeat-tick.sh subprocess): on Windows + Git
+    Bash, Python's subprocess.run cannot propagate env vars (including
+    MIND_AGENT) reliably to the bash child — empirically verified
+    2026-05-14. Calling heartbeat-tick.sh that way produces an empty
+    AGENT_DIR and a touch failure. The state gate below (refuse when
+    state=IDLE) mirrors heartbeat-tick.sh's guard, so the contract is
+    preserved. team-state.agent_status.last_active is not synced from
+    here — Phase -0.5 (the canonical heartbeat-tick caller) covers that on
+    each iteration boundary, and team-state staleness has its own thresholds.
+
+    Fail-open: any error swallowed. A diary write must NEVER fail because
+    heartbeat propagation had an opinion.
+    """
+    # DO NOT add a mkdir(parents=True) call here — every caller of this
+    # function (cmd_append, _emit_phase_marker) has already created the
+    # session/ parent dir before its diary write. Adding it here would be
+    # cognitive-load dead code: the second writer never observes the dir
+    # absent.
+    try:
+        state_file = AGENT_DIR / "session" / "agent-state"
+        if state_file.exists():
+            state = state_file.read_text(encoding="utf-8").strip()
+            if state == "IDLE":
+                return  # mirrors heartbeat-tick.sh:67-70 state gate
+        hb = AGENT_DIR / "session" / "runner-heartbeat"
+        hb.touch()
+    except Exception:
+        pass
 
 VALID_ENTRY_TYPES = {
     "decision", "failure", "finding", "approach_change",
     "observation", "state_update",
+    "phase_start", "phase_end",
 }
+
+
+def _is_observer_session():
+    """Return True if MIND_SID is set and differs from running-session-id.
+
+    Parallel to guard-135, guard-340, guard-517 and the 7th witness in
+    session-save-id.sh: observer sessions (assistant/reader coexisting with
+    the autonomous runner on the same agent) must not write to runner-owned
+    diary entries — their phase markers create dangling pairs and their
+    writes interleave with the runner's stream (canonical incident:
+    2026-05-10 bravo observer phase_start phase-4-execute for g-001-01).
+
+    Fail-open at every degraded condition (MIND_SID empty, file absent,
+    file unreadable) to match stop-hook.sh Gate 0 / session-save-id.sh
+    witness fallbacks. Bootstrap (no runner yet) is fall-through.
+    """
+    sid = os.environ.get("MIND_SID", "")
+    if not sid:
+        return False
+    runner_file = AGENT_DIR / "session" / "running-session-id"
+    if not runner_file.exists():
+        return False
+    try:
+        runner_sid = runner_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return bool(runner_sid) and runner_sid != sid
 
 
 def now_iso():
@@ -57,6 +142,8 @@ def read_entries():
 
 def cmd_append(args):
     """Add a diary entry from stdin JSON."""
+    if _is_observer_session():
+        sys.exit(0)
     raw = sys.stdin.read().strip()
     if not raw:
         print("ERROR: No input on stdin", file=sys.stderr)
@@ -72,11 +159,15 @@ def cmd_append(args):
         print("ERROR: Entry must be a JSON object", file=sys.stderr)
         sys.exit(1)
 
-    # Validate entry_type
+    # Validate entry_type — fail-close (). Previously fail-open (WARN + write)
+    # let coop_stop slip through in session 54. rb-387 captured the pattern; this flip
+    # makes the allow-list authoritative at write time, matching the defence-in-depth
+    # verify-learning lint at .claude/skills/verify-learning/SKILL.md Section 308.
     etype = entry.get("entry_type", "")
     if etype and etype not in VALID_ENTRY_TYPES:
-        print(f"WARNING: Unknown entry_type '{etype}' — valid types: {', '.join(sorted(VALID_ENTRY_TYPES))}",
+        print(f"ERROR: Unknown entry_type '{etype}' — valid types: {', '.join(sorted(VALID_ENTRY_TYPES))}",
               file=sys.stderr)
+        sys.exit(1)
 
     # Auto-add timestamp if missing
     if "timestamp" not in entry:
@@ -92,6 +183,7 @@ def cmd_append(args):
     with open(DIARY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
+    _advance_heartbeat()
     print(f"ok: {entry.get('entry_type', '?')} @ {entry['timestamp']}")
 
 
@@ -103,13 +195,20 @@ def cmd_read(args):
     if args.goal:
         entries = [e for e in entries if e.get("goal_id") == args.goal]
 
-    # Filter by time
+    # Filter by time. Parse first so an invalid --since fails fast instead of
+    # silently returning the unfiltered list (violates caller intent — see 
+    # audit,  fix). Exit 2 follows the "usage error" convention.
     if args.since:
         try:
             since_dt = datetime.fromisoformat(args.since)
-            entries = [e for e in entries if _parse_ts(e) and _parse_ts(e) >= since_dt]
         except ValueError:
-            print(f"WARNING: Invalid --since timestamp: {args.since}", file=sys.stderr)
+            print(
+                f"ERROR: Invalid --since timestamp: {args.since}. "
+                "Use ISO format (e.g., 2026-04-17T12:00:00).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        entries = [e for e in entries if _parse_ts(e) and _parse_ts(e) >= since_dt]
 
     # Apply limit (from the end)
     if args.limit and args.limit > 0:
@@ -192,6 +291,38 @@ def cmd_trim(args):
     print(f"trimmed {removed} entries older than {hours}h, {len(kept)} remaining")
 
 
+def _emit_phase_marker(kind, phase, iteration, goal_id, note):
+    """Shared implementation for phase-start / phase-end markers."""
+    if _is_observer_session():
+        sys.exit(0)
+    if not phase:
+        print("ERROR: --phase (or positional name) is required", file=sys.stderr)
+        sys.exit(2)
+    entry = {
+        "entry_type": kind,
+        "phase": phase,
+        "timestamp": now_iso(),
+        "content": note or f"{kind} {phase}",
+    }
+    if iteration is not None:
+        entry["iteration"] = iteration
+    if goal_id:
+        entry["goal_id"] = goal_id
+    DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(DIARY_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    _advance_heartbeat()
+    print(f"ok: {kind} {phase} @ {entry['timestamp']}")
+
+
+def cmd_phase_start(args):
+    _emit_phase_marker("phase_start", args.phase, args.iter, args.goal, args.note)
+
+
+def cmd_phase_end(args):
+    _emit_phase_marker("phase_end", args.phase, args.iter, args.goal, args.note)
+
+
 def _parse_ts(entry):
     """Parse timestamp from entry, return datetime or None."""
     ts = entry.get("timestamp", "")
@@ -225,6 +356,17 @@ def build_parser():
     p_trim = sub.add_parser("trim", help="Remove entries older than N hours")
     p_trim.add_argument("--hours", type=int, default=8, help="Hours threshold (default: 8)")
 
+    # phase-start / phase-end (Tier 0 telemetry)
+    for name, helptxt in (
+        ("phase-start", "Emit a phase-start marker"),
+        ("phase-end", "Emit a phase-end marker"),
+    ):
+        p = sub.add_parser(name, help=helptxt)
+        p.add_argument("phase", type=str, help="Canonical phase name, e.g. phase-0 or phase-0-zombies")
+        p.add_argument("--iter", type=int, default=None, help="Iteration id (optional; for pairing across nested phases)")
+        p.add_argument("--goal", type=str, default=None, help="Current goal_id (optional)")
+        p.add_argument("--note", type=str, default=None, help="Optional short note")
+
     return parser
 
 
@@ -233,6 +375,8 @@ DISPATCH = {
     "read": cmd_read,
     "summary": cmd_summary,
     "trim": cmd_trim,
+    "phase-start": cmd_phase_start,
+    "phase-end": cmd_phase_end,
 }
 
 

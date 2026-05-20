@@ -1,12 +1,14 @@
 ---
 name: aspirations-evolve
-description: "Evolution engine — developmental stage assessment, config parameter tuning, gap analysis, novelty filter, cap enforcement, pattern calibration, strategy archive, forge check, skill curation"
+description: "Runs the autonomous evolution engine: assesses developmental stage, tunes config parameters, performs self-driven gap analysis, applies novelty filters, enforces caps, calibrates pattern signatures, archives strategies, runs the /forge-skill check, and curates skill health. Use whenever Phase 9 performance-based triggers fire, the user runs /aspirations evolve, or the orchestrator schedules a mandatory evolution pass. Internal sub-skill of /aspirations."
 user-invocable: false
 parent-skill: aspirations
 triggers:
   - "/aspirations evolve"
 conventions: [aspirations, pipeline, pattern-signatures, reasoning-guardrails, spark-questions]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-aspirations-evolve-26d9dc"
+previous_revision_id: null
 ---
 
 # Evolution Engine (`evolve` sub-command)
@@ -24,7 +26,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 0. **Developmental Stage Assessment** (competence-based):
    ```
    Read core/config/developmental-stage.yaml (stage definitions, competence_mapping)
-   Read <agent>/developmental-stage.yaml (current assessment, epsilon, schema log)
+   Read agents/<agent>/developmental-stage.yaml (current assessment, epsilon, schema log)
    leaves_json=$(bash core/scripts/tree-read.sh --leaves)
    # Filter to entries where depth >= 2, extract capability_level from each
 
@@ -47,7 +49,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      # Use same leaves_json from above (already has all depth >= 2 nodes)
      highest = max(leaf.capability_level for all leaves at depth >= 2)
      lowest = min(leaf.capability_level for all leaves at depth >= 2)
-     If highest != <agent>/developmental-stage.yaml.highest_capability:
+     If highest != agents/<agent>/developmental-stage.yaml.highest_capability:
        Update highest_capability
        Log: "DEVELOPMENTAL UPDATE: highest_capability → {highest}"
 
@@ -69,7 +71,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      For each finding that confirms existing framework:
        Log as ASSIMILATION in schema_operations.log
 
-   Update <agent>/developmental-stage.yaml:
+   Update agents/<agent>/developmental-stage.yaml:
      overall_stage, average_competence, exploration_budget, evidence
 
    Run active forgetting pruning:
@@ -107,6 +109,49 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            triggered_by: "{what performance signal prompted this}"
 
    Log summary: "CONFIG TUNING: {N} parameters adjusted"
+   ```
+
+0.5b. **Structural Modifiable Surfacing (S8 — tree taxonomy changes)**:
+   ```
+   # The `modifiable:` block above is numeric-only. Categorical / structural
+   # changes (e.g., renaming an L1, adding a new L1) live in
+   # `structural_modifiable:` blocks and require user approval before any
+   # apply script runs. Evolution engine PROPOSES; the user GATES.
+   #
+   # This step surfaces strong candidates as pending-questions — never as
+   # auto-writes. The candidates come from passive evidence accumulated
+   # elsewhere (S1 board posts, S9 l1-pick-log).
+   #
+   # Trigger conditions for filing a pending-question:
+   #   - The latest l1-skew-check board post had a flagged ratio > 10x
+   #     AND no l1-taxonomy-* pending-question is currently open
+   #   - OR the l1-pick-log shows the same NEW node-cluster going to one
+   #     L1 repeatedly while not fitting siblings (signal for ADD)
+   #   - OR a fresh-eyes-tree briefing surfaced a candidate the user has
+   #     not yet been asked about
+
+   Read core/config/tree.yaml `structural_modifiable.l1_domains`
+   IF block missing OR requires_user_approval != true:
+     SKIP — feature disabled or misconfigured
+   Bash: pending-questions-read.sh --prefix l1-taxonomy- --status pending
+   IF any pending l1-taxonomy- question already open:
+     SKIP — do not stack proposals; let the user clear the queue first.
+
+   Read meta/l1-pick-log.jsonl (last 200 entries) for ADD candidates.
+   Read latest l1-skew-check board post (channel=coordination, tag=l1-skew)
+     for RENAME / boundary candidates.
+
+   IF strong candidate found:
+     Compose proposal text (current state, proposed state, evidence,
+     blast radius — see l1-taxonomy-changes.md "Propose" section).
+     Bash: pending-questions-add.sh \
+         --id "l1-taxonomy-$(date +%Y-%m-%d)-{rename|add}-{key}" \
+         --question "<proposal>" \
+         --default-action "no-change" \
+         --priority HIGH
+     Log: "STRUCTURAL PROPOSAL: filed l1-taxonomy- pending-question"
+   ELSE:
+     SKIP silently — no candidates ripe for proposal this iteration.
    ```
 
 0.7. **Meta-Strategy Evaluation** *(metacognitive self-modification — the HyperAgents core)*:
@@ -148,8 +193,8 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # "Generation {gen_status.peak_generation} was peak (avg {gen_status.peak_score:.4f}). Current gen {gen_status.current_generation} at {gen_status.current_avg_lv:.4f}."
 
    # 5. Weakness report context
-   IF file_exists(<agent>/weakness-report.yaml):
-       Read <agent>/weakness-report.yaml
+   IF file_exists(agents/<agent>/weakness-report.yaml):
+       Read agents/<agent>/weakness-report.yaml
        high_weaknesses = filter weaknesses where severity == "HIGH" and status == "active"
        # Active HIGH weaknesses should inform meta-strategy changes
 
@@ -239,14 +284,14 @@ Trigger evolution check — the system evaluates its own strategy and generates 
            ELSE:
                # Recent plateau — add investigation goal
                Log: "STRATEGIC REDIRECT: {asp.id} — adding exploration goal"
-               echo '{"title":"Investigate: Root causes of plateau in {asp.title}","description":"Learning velocity has plateaued. Diagnose WHY velocity dropped — is the approach wrong, are prerequisites missing, or is the problem harder than expected? Try a different approach within the same domain before pivoting to new directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
+               echo '{"title":"Investigate: Root causes of plateau in {asp.title}","description":"Learning velocity has plateaued. Diagnose WHY velocity dropped — is the approach wrong, are prerequisites missing, or is the problem harder than expected? Try a different approach within the same domain before pivoting to new directions. Prior trajectory summary: {trajectory.summary}","priority":"HIGH","category":"{trajectory.primary_category}","participants":["agent"],"origin_signal":"investigate:{asp.id}"}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
 
        ELIF trajectory.diminishing_returns:
            Log: "DIMINISHING RETURNS: {asp.id} '{asp.title}' — learning yield declining monotonically over {diminishing_returns_window} goals"
            # Flag for review but don't auto-redirect — diminishing returns
            # may be acceptable near completion
            IF asp.progress.completed_goals / asp.progress.total_goals < 0.80:
-               echo '{"title":"Investigate: Diminishing returns on {asp.title}","description":"Learning yield declining over last {diminishing_returns_window} goals despite continued effort. Check if approach needs adjustment or if aspiration is near its knowledge frontier.","priority":"MEDIUM","category":"{trajectory.primary_category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
+               echo '{"title":"Investigate: Diminishing returns on {asp.title}","description":"Learning yield declining over last {diminishing_returns_window} goals despite continued effort. Check if approach needs adjustment or if aspiration is near its knowledge frontier.","priority":"MEDIUM","category":"{trajectory.primary_category}","participants":["agent"],"origin_signal":"investigate:{asp.id}"}' | Bash: aspirations-add-goal.sh --source {asp.source} {asp.id}
    ```
 
 2. **Evolve-first**: For each active aspiration, ask:
@@ -278,6 +323,103 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        Invoke /create-aspiration from-self with constraint_context:
            blocked_resource, avoid_skills, focus on executable alternatives
        echo '<json>' | wm-set.sh active_constraints
+
+2.75. **Portfolio Health Review** *(periodic portfolio-level assessment)*:
+   The loop handles individual aspirations well (completion review, plateau detection),
+   but portfolio-level drift — priority inflation, completed aspirations lingering,
+   recurring goals trapped in project aspirations — requires a holistic sweep.
+
+   ```
+   Read core/config/aspirations.yaml → portfolio_review config
+
+   # Check if strategic scan flagged portfolio issues (runs more frequently than evolve)
+   Bash: wm-read.sh portfolio_health_signal --json 2>/dev/null
+   IF signal exists and non-null:
+       Log: "PORTFOLIO REVIEW: triggered with scan signal — inflation:{signal.priority_inflation} unarchived:{signal.completed_unarchived}"
+       Bash: wm-clear.sh portfolio_health_signal  # consumed — clear for next cycle
+
+   # --- 2.75a: Archive Sweep ---
+   # Find aspirations where all non-recurring goals are terminal (completed/skipped/expired)
+   # but the aspiration itself hasn't been archived yet. This catches cases missed by
+   # per-goal completion review (e.g., goals completed across sessions or by other agents).
+   FOR EACH active aspiration:
+       non_recurring = [g for g in asp.goals if not g.recurring]
+       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
+       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
+           # All non-recurring goals are done — check for recurring goals
+           recurring = [g for g in asp.goals if g.recurring]
+           IF len(recurring) == 0:
+               Log: "PORTFOLIO ARCHIVE: {asp.id} '{asp.title}' — all goals terminal, archiving"
+               Bash: aspirations-complete.sh --source {asp.source} {asp.id}
+           ELSE:
+               # Has recurring goals — flag for relocation (Step 2.75c), don't archive yet
+               Log: "PORTFOLIO FLAG: {asp.id} '{asp.title}' — non-recurring complete but {len(recurring)} recurring goals remain"
+
+   # --- 2.75b: Recurring-Only Demotion ---
+   # Aspirations whose only remaining work is recurring goals don't need HIGH priority.
+   # Recurring urgency scoring ensures they execute on cadence at any priority level.
+   FOR EACH active aspiration where priority == "HIGH":
+       non_recurring = [g for g in asp.goals if not g.recurring]
+       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
+       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
+           # All non-recurring goals done, only recurring remain
+           Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH→MEDIUM (recurring-only)"
+           Read full aspiration: Bash: aspirations-read.sh --id {asp.id}
+           Set priority to "MEDIUM" in parsed JSON
+           Pipe full modified JSON to: aspirations-update.sh {asp.id}
+
+   # --- 2.75c: Misplaced Recurring Goal Detection ---
+   # Recurring monitoring goals in sprint/project aspirations should live in the
+   # maintenance aspiration (asp-001 pattern). They prevent archival and inflate
+   # active aspiration count.
+   FOR EACH active aspiration where scope in (sprint, project):
+       non_recurring = [g for g in asp.goals if not g.recurring]
+       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
+       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
+           recurring = [g for g in asp.goals if g.recurring]
+           IF len(recurring) > 0:
+               Log: "PORTFOLIO RELOCATE: {asp.id} has {len(recurring)} recurring goals preventing archival"
+               # Find the agent's maintenance aspiration (asp-001 or equivalent)
+               # Create equivalent recurring goals there, then stop+complete originals
+               FOR EACH recurring_goal in recurring:
+                   # Create copy in maintenance aspiration
+                   new_goal = copy recurring_goal fields (title, description, category,
+                       skill, interval_hours, lastAchievedAt, achievedCount,
+                       currentStreak, longestStreak, priority, participants)
+                   new_goal.description += " Relocated from {asp.id}."
+                   new_goal.origin_signal = "recurring_cadence:{recurring_goal.id}"
+                   echo '{new_goal as JSON}' | Bash: agent-aspirations-add-goal.sh asp-001
+                   # Stop recurring on original and complete it
+                   Bash: aspirations-update-goal.sh --source {asp.source} {goal.id} recurring false
+                   Bash: aspirations-update-goal.sh --source {asp.source} {goal.id} status completed
+               # Now archive the aspiration (all goals terminal)
+               Bash: aspirations-complete.sh --source {asp.source} {asp.id}
+
+   # --- 2.75d: Priority Distribution Check ---
+   # If too many aspirations share the same priority, the signal is meaningless.
+   # HIGH should mean "strategically important right now" — not the default.
+   IF portfolio_review.priority_concentration_warn > 0:
+       active_count = count of active aspirations
+       high_count = count where priority == "HIGH"
+       IF active_count > 0 AND (high_count / active_count) > portfolio_review.priority_concentration_warn:
+           Log: "PORTFOLIO WARN: {high_count}/{active_count} aspirations are HIGH — priority inflation detected"
+           # Identify demotion candidates: HIGH aspirations with no recent activity
+           # last_worked is available in compact data (null = never worked on)
+           stale_hours = portfolio_review.stale_threshold_sessions * 24
+           FOR EACH HIGH aspiration:
+               IF asp has no in-progress goals:
+                   IF asp.last_worked is null OR hours_since(asp.last_worked) > stale_hours:
+                       Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH with no activity for {stale_hours}+ hours"
+                       Read full aspiration: Bash: aspirations-read.sh --id {asp.id}
+                       Set priority to "MEDIUM" in parsed JSON
+                       Pipe full modified JSON to: aspirations-update.sh {asp.id}
+
+   # --- 2.75e: Log portfolio health snapshot ---
+   active_after = count of active aspirations (after archival/demotion)
+   high_after = count where priority == "HIGH" (after changes)
+   echo '{"date":"<today>","event":"portfolio_review","details":"active:{active_after} high:{high_after} archived:{archived_count} demoted:{demoted_count} relocated:{relocated_count}","trigger_reason":"evolve-portfolio-review"}' | bash core/scripts/evolution-log-append.sh
+   ```
+
 3. **Self-driven gap analysis**:
    ```
    # Retrieve broad domain context for gap analysis.
@@ -286,7 +428,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # Pick the L1 node(s) with most children/articles as the primary domain category
    Bash: retrieve.sh --category {primary_domain_node} --depth medium
    ```
-   Read <agent>/self.md
+   Read agents/<agent>/self.md
    Ask: "Given this Self and the current aspirations, what is Self missing?
    What would a person with this purpose naturally want to do next that
    isn't covered? What data sources do I know about that I haven't accessed?"
@@ -328,7 +470,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 
    # 3.5b: Step utilization analysis
    # Scan recent journal/experience for evidence of each convention step executing
-   Bash: journal-read.sh --last 20
+   Bash: journal-read.sh --recent 20
    FOR EACH convention step in loaded conventions:
        Estimate: times_relevant (step's IF condition was true), times_executed (step ran)
        IF times_relevant == 0 AND goals_analyzed >= 10:
@@ -338,6 +480,11 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 
    # 3.5c: Missing convention gap detection
    # Find guardrails that fire frequently AND are universal/procedural → convention candidates
+   # rb-245 pre-read gate: verify schema before aggregating. If the gate fails,
+   # SKIP this sub-phase (3.5d continues). Do NOT --override: fix field paths instead.
+   Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+           --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
+           --field-names "utilization.times_active"
    Bash: guardrails-read.sh --active
    FOR EACH guardrail where utilization.times_active >= 5:
        IF guardrail rule is universal (applies to most goals) AND procedural (a step to perform):
@@ -376,7 +523,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # 3.5e: Cost-benefit review — flag underperforming steps
    FOR EACH convention step:
        IF step has been active for 20+ goals AND rarely helpful (efficiency ratio < 0.1):
-           Write to <agent>/session/pending-questions.yaml:
+           Write to agents/<agent>/session/pending-questions.yaml:
                question: "Convention step '{step_title}' in {convention} has run {times} times but rarely prevents failures. Remove?"
                default_action: "Will remove after 1 more evolution cycle if no improvement"
                status: pending
@@ -426,13 +573,13 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    #   Log: "ANNECS STAGNATION: novel aspiration solve rate declining"
    #   This signals aspiration quality issues — interestingness filter may need tuning
    ```
-7. Update `<agent>/profile.yaml` if strategy parameters change
+7. Update `agents/<agent>/profile.yaml` if strategy parameters change
 8. Update `meta/meta-knowledge/_index.yaml` with any new self-model insights
 9. **Forge check**: Audit registries, then create goals for forge-ready gaps:
    - **Integrity audit**: invoke `/forge-skill check` (orphan detection, max_gaps, encounter log limits, tree cross-check)
    - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap where `status != "forged"`:
      - Read `core/config/skill-gaps.yaml` → `forge_threshold` (default: 2)
-     - Read `<agent>/developmental-stage.yaml` → current stage
+     - Read `agents/<agent>/developmental-stage.yaml` → current stage
      - IF `gap.times_encountered >= forge_threshold`
           AND `gap.estimated_value >= "medium"`
           AND developmental stage >= EXPLOIT (developing+):
@@ -469,7 +616,7 @@ FOR EACH skill in underperforming:
         ELSE:
             # Base skill — cannot retire. Flag for user attention.
             Log: "SKILL ALERT: Base skill {skill.name} quality {skill.overall} — user review recommended"
-            Write to <agent>/session/pending-questions.yaml:
+            Write to agents/<agent>/session/pending-questions.yaml:
                 question: "Base skill {skill.name} has quality {skill.overall}. Should I create a better forged alternative?"
                 default_action: "Monitoring — will create improvement goal if quality drops further"
                 status: pending
@@ -484,16 +631,146 @@ IF avg_quality > 0.80 AND summary.total_skills_evaluated >= 5:
             --reason "Average quality {avg_quality} supports higher bar"
 ```
 
+### Skill Discovery Audit (Step 9.5.5 — after Skill Curation)
+
+Behavioral counterpart to per-execution Skill Curation above. Per-execution
+quality scoring cannot detect the rb-314 failure mode: a skill that never
+fires produces zero evaluations, so the five quality dimensions have no data
+to score. This step measures absence of invocation against time-since-forge
+and prior-rate-of-use, then files Investigate/Idea goals for skills past
+their action window.
+
+Strategy + thresholds: `meta/skill-discovery-strategy.yaml`.
+Static authoring counterpart (description quality, XML-safety): already
+enforced by verify-learning Section FSR-D — do NOT duplicate here.
+
+Calibration caveat: a flagged skill is "zero invocations across all logged
+sources," which is an UPPER BOUND on real silence — under-logging (skill
+fires but neither skill-quality.yaml, co_invocation_log, nor journal.jsonl
+captures the call) is indistinguishable from genuine silence. The
+triage_hints emitted by the script already direct the agent to rule out
+under-logging in step 1; this is by design.
+
+```
+Bash: skill-discovery.sh flagged --action-required-only
+flagged = parse JSON output → {generated_at, count, skills: [...]}
+
+# Read goals.target_aspiration + goals.priority from strategy. The script
+# does not echo these into its output (they are filing policy, not
+# measurement), so read the YAML directly.
+Read meta/skill-discovery-strategy.yaml → strategy.goals
+
+FOR EACH skill in flagged.skills:
+    # Bounded: one goal per skill at a time. The goal-selector and
+    # aspirations-execute prevent duplicate execution; this guard prevents
+    # duplicate FILING while a prior follow-up is still active. Resolved
+    # goals do not block re-filing — if a prior investigation closed
+    # without addressing the silence, we want a fresh signal.
+    Bash: load-aspirations-compact.sh
+    IF any goal exists with skill.name in its title AND status in
+       (pending, in-progress, blocked) AND title contains any of
+       ("silent", "discovery", "cold", "declining"):
+        Log: "DISCOVERY AUDIT: {skill.name} already has active follow-up — skipping"
+        continue
+
+    # Map status → primitive + title. Primitives are encoded by title prefix
+    # ("Investigate:" / "Idea:") per CLAUDE.md "Cognitive Primitives".
+    IF skill.status == "silently_undertriggering":
+        title = "Investigate: forged skill " + skill.name + " silent for " + skill.days_since_forge + "d (0 invocations logged)"
+    ELIF skill.status == "cold_after_use":
+        title = "Idea: review forged skill " + skill.name + " — last invoked " + skill.days_since_last_invocation + "d ago"
+    ELIF skill.status == "declining":
+        # decline_signal.ratio is a fraction (0.0-1.0); multiply for display.
+        decline_pct = round(skill.decline_signal.ratio * 100)
+        title = "Idea: investigate declining usage of " + skill.name + " (rate " + decline_pct + "% of prior window)"
+    ELSE:
+        continue
+
+    priority = strategy.goals.priority[skill.status]
+    target_asp = strategy.goals.target_aspiration  # default asp-115
+
+    # Build description with the triage hints emitted by the script. The
+    # hints already cross-reference FSR-D, gap analysis, etc — copying them
+    # verbatim avoids re-deriving the triage path inside this pseudocode.
+    description = (
+        "Forged skill: " + skill.name + "\n"
+        "Forged: " + skill.forged_date + " (" + skill.days_since_forge + " days ago)\n"
+        "Total invocations: " + skill.total_invocations + " (sources: " + json(skill.invocation_sources) + ")\n"
+        "Confidence: " + skill.confidence + "\n"
+        "Last invocation: " + (skill.last_invocation_date or "never") + "\n"
+        "Invocations/week: " + skill.invocations_per_week + "\n"
+        "\n"
+        "Triage:\n"
+        + skill.triage_hints + "\n"
+        "Source: aspirations-evolve Step 9.5.5 (Skill Discovery Audit)\n"
+        "Strategy: meta/skill-discovery-strategy.yaml\n"
+    )
+
+    # aspirations-add-goal.sh reads goal JSON from stdin and takes asp_id
+    # positional. NO --title / --priority / --category flags — those are
+    # JSON fields in the stdin payload (see CLAUDE.md "Cognitive Primitives"
+    # and the script's --schema output for the full field list).
+    goal_json = {
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "category": "framework-meta",
+        "participants": ["agent"],
+        "origin_signal": "skill-discovery-audit:" + skill.name + ":" + skill.status,
+    }
+    Bash: echo '<goal_json>' | aspirations-add-goal.sh --source world {target_asp}
+
+    Log: "DISCOVERY AUDIT: filed goal for " + skill.name + " (" + skill.status + ")"
+    echo '<{"date":"...","event":"discovery-audit-fire","skill":skill.name,"status":skill.status}>' \
+        | bash core/scripts/evolution-log-append.sh
+```
+
 ### Pattern Signature Calibration (during evolve or weekly)
+# rb-245 pre-read gate: verify schema before aggregating. If the gate fails,
+# SKIP this calibration block (other sub-phases continue). Do NOT --override:
+# fix the field paths below instead.
+`source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+        --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
+        --field-names "outcome_stats.accuracy,outcome_stats.total,outcome_stats.confirmed,utilization.retrieval_count"`
+
 `bash core/scripts/pattern-signatures-read.sh --active` → get active patterns as JSON. For each pattern:
-1. Check calibration rules from the `calibration_protocol` section:
-   - `false_positives / times_triggered > 0.20` → flag for condition tightening
-   - `times_triggered == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
-   - `true_positives >= 5 AND false_positive_rate < 0.10` → graduate to `validated`, increase weight
-   - `utility_stats.utility_ratio < 0.2 after 10+ retrievals` → prune candidate
+1. Check calibration rules from the `calibration_protocol` section (live schema):
+   - `outcome_stats.accuracy < 0.80 AND outcome_stats.total >= 3` → flag for condition tightening (was false_positives/times_triggered > 0.20) <!-- DRIFT-EXEMPT: rename-documentation -->
+   - `outcome_stats.total == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
+   - `outcome_stats.confirmed >= 5 AND outcome_stats.accuracy >= 0.90` → graduate to `validated`, increase weight
+   - `utilization.retrieval_count >= 10 AND outcome_stats.total < 2` → retrieved but never matched; prune candidate
 2. For flagged patterns: propose specific condition changes
 3. Update `validation_status` based on current stats
 4. Log changes to pattern calibration via `echo '<json>' | bash core/scripts/evolution-log-append.sh`
+
+### Gate Retirement Evaluation (during evolve or weekly)
+Phase 5 of the gate audit/retirement plan — gate-side parallel of Pattern
+Signature Calibration above. Reads `meta/gate-firings.jsonl` +
+`core/config/gates.yaml` and produces per-gate recommendations.
+
+`bash core/scripts/gate-retirement-eval.sh --output json` → JSON with
+per-gate recommendation in {retire | tighten | widen | investigate | keep |
+insufficient_data | uninstrumented} plus the raw counts that justify it.
+
+For each `recommendation` in {retire, tighten, widen, investigate}:
+1. Append the full record to `meta/gate-eval-recommendations.jsonl`
+   (append-only journal — preserves the recommendation lineage so trends
+   over evolutions are visible). Append via:
+   `echo '<json-record>' >> "$META_DIR/gate-eval-recommendations.jsonl"`
+2. For `retire`: file an Investigate goal naming the gate. Do NOT
+   auto-delete — gate code paths often have downstream consumers; review
+   first. Goal title: `"Investigate: gate-retirement-eval recommends retiring {gate_id}"`.
+3. For `tighten`: file an Idea goal proposing tighter trigger patterns.
+   Include the override-rate evidence in the description.
+4. For `widen`: file an Idea goal proposing additional trigger patterns.
+   Quote the gate's `fn_description` from gates.yaml as a hint about what's
+   escaping.
+5. For `investigate`: file a HIGH-priority Investigate goal — fail_open
+   means the gate code itself has a bug.
+
+Bounded: only one goal per gate per evolution pass. If a goal already
+exists for `{gate_id}` from a prior evolution, skip — wait for that goal
+to resolve before re-flagging. Check via grep on the live aspirations file.
 
 ### Strategy Archive
 When a strategy changes during evolution:
@@ -519,6 +796,23 @@ This will:
   - If curriculum not configured: skip silently
 ```
 
+### Maintenance Cadence Write (before return)
+
+Before returning to the caller, write the wall-clock timestamp to the maintenance
+cadence slot. The aspirations loop Phase 8.8 reads this to decide whether a
+time-based evolution fire is due on subsequent iterations. Any evolve invocation
+(cadence-triggered, performance-triggered, all-blocked idle, maintenance tick)
+updates the clock — preventing double-fires.
+
+<!-- RESOLVED 2026-04-20 (asp-246 g-246-02): last_evolution_at_time now has a
+     reader in core/config/aspirations-loop-digest.md Phase 8.8 MAINTENANCE TICK
+     block (see the `wm-read.sh last_evolution_at_time` call). Writer + reader
+     are now paired — this line is the single source of truth for evolution
+     cadence timestamps (rb-254 single-writer principle). -->
+```
+echo '"'"$(date +%Y-%m-%dT%H:%M:%S)"'"' | bash core/scripts/wm-set.sh last_evolution_at_time
+```
+
 ### Return Protocol
 
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
@@ -526,5 +820,12 @@ See `.claude/rules/return-protocol.md` — last action must be a tool call, not 
 ### Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 9 evolution triggers)
-- **Calls**: `aspirations-complete.sh --source`, `aspirations-retire.sh --source`, `aspirations-add-goal.sh --source`, `aspirations-meta-update.sh --source`, `/create-aspiration`, `/forge-skill check`, `/curriculum-gates`
+- **Calls**: `aspirations-complete.sh --source`, `aspirations-retire.sh --source`, `aspirations-add-goal.sh --source`, `aspirations-update.sh`, `aspirations-update-goal.sh`, `agent-aspirations-add-goal.sh`, `aspirations-meta-update.sh --source`, `wm-read.sh`, `wm-clear.sh`, `/create-aspiration`, `/forge-skill check`, `/curriculum-gates`
+- **Reads**: Working memory (`portfolio_health_signal` — written by strategic scan S3c)
 - **Source routing**: All `aspirations-*.sh` calls receive `--source {asp.source}` from the aspiration's compact data
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `wm-set.sh last_evolution_at_time` or the last
+`aspirations-*.sh` call. Never end with a text summary of evolution decisions.

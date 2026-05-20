@@ -1,6 +1,6 @@
 ---
 name: aspirations-learning-gate
-description: "Obligation enforcement — learning gate, retrieval gate, meta-learning signal, periodic reflection, conclusion audit, batch reflection"
+description: "Enforces learning obligations inside the aspirations loop: the learning gate, retrieval gate, meta-learning signal, periodic reflection cadence, conclusion audit, and batch reflection. Use whenever a goal completes and the loop must verify that encoding, retrieval, and reflection actually happened before moving to the next goal. Catches sessions that ship commits without producing tree encodings or hypothesis resolutions. Internal sub-skill — never invoke directly."
 user-invocable: false
 parent-skill: aspirations
 conventions: [aspirations, tree-retrieval, retrieval-escalation, goal-schemas, working-memory]
@@ -12,6 +12,8 @@ execution_history:
     unsuccessful: 0
     success_rate: 0.0
   last_invocation: null
+revision_id: "skill-bootstrap-aspirations-learning-gate-634fc1"
+previous_revision_id: null
 ---
 
 # /aspirations-learning-gate — Obligation Enforcement Gates
@@ -19,6 +21,28 @@ execution_history:
 **CRITICAL**: This is the obligation enforcement sub-skill. It prevents the loop from
 continuing without learning. If this sub-skill is skipped, knowledge debt accumulates
 and the agent drifts into "busy but not learning" mode.
+
+## Abbreviation Policy
+
+Mandatory writes for this obligation: see `core/config/obligation-schema.yaml`
+→ `obligations.learn`. Abbreviation is permitted only when
+`context_budget.zone == tight`. The zone is distance-to-autocompact, not raw
+usage — see `core/scripts/context-budget-status.py` `classify_zone` for the
+source of truth. Before abbreviating, `Bash: bash
+core/scripts/context-budget-banner.sh` and quote its output; the banner line
+is the evidence that makes the "tight" claim verifiable. When abbreviating,
+log TWO lines in the journal entry (in this order):
+  `OBLIGATION ABBREVIATED: learn — {condition}`
+  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+The banner line must be the actual output captured from the banner script in
+this iteration. `core/scripts/context-citation-audit.sh` scans for the pair
+and reports any tight-zone claim that lacks its banner line. Then satisfy
+`minimum_inline` (sensory-buffer append OR reasoning-bank-add, then
+`wm-set loop_state`). Otherwise invoke this Skill literally. Phase 9.5d
+(below) audits the PREVIOUS iteration's abbreviation claims against the
+context-budget state captured at that time; false claims accumulate in
+`agents/<agent>/session/obligation-audit.jsonl` and 3+ in a session auto-file a
+single `Investigate: false-abbreviation-claims` goal.
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter.
 
@@ -81,7 +105,8 @@ ELIF outcome_class == "deep":
                 Read node.file
                 Compress top.observation into "Key Insights" section (1-3 sentences)
                 Edit node.file with updates
-                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                # T21 PostToolUse hook auto-bumps last_updated — no explicit
+                # `tree-update.sh --set last_updated` call required.
                 Output: "▸ LEARNING GATE: forced encoding to {node.key}"
             ELIF goal produced <100 chars of output OR goal.status in (blocked, skipped):
                 Log: "▸ Learning gate: PASS — no encoding needed (insufficient output or blocked goal)"
@@ -106,17 +131,19 @@ IF meta_insight_detected:
 Verify retrieval happened and utilization feedback completed.
 
 **NOTE: The `utilization-gate.sh` PreToolUse hook (Layer 3 programmatic enforcement)
-handles the critical path — it auto-applies all-noise feedback before state-update
-if Phase 4.26 was skipped. This gate is now a secondary check for escalation quality
-and retroactive retrieval when retrieval itself was skipped entirely.**
+handles the critical path — it auto-applies `--all-unknown` feedback before
+state-update if Phase 4.26 was skipped. (Pre-2026-05-07 this used `--all-noise`,
+which silently poisoned times_noise on unattested-but-relevant nodes.) This gate
+is now a secondary check for escalation quality and retroactive retrieval when
+retrieval itself was skipped entirely.**
 
 ```
 # Check session file first (primary source), fall back to WM manifest (legacy)
-SESSION_FILE="<agent>/session/retrieval-session.json"
+SESSION_FILE="agents/<agent>/session/retrieval-session.json"
 IF session file exists:
     IF utilization_pending == true:
         # Hook should have caught this — run feedback as safety net
-        Bash: utilization-feedback.sh --goal {goal.id} --all-noise
+        Bash: utilization-feedback.sh --goal {goal.id} --all-unknown
         Output: "▸ RETRIEVAL GATE: forced utilization feedback for {goal.id}"
     # else: already processed by Phase 4.26 or hook — pass
 
@@ -152,7 +179,7 @@ IF outcome_class == "deep":
     IF experience_refs is empty, missing, or null:
         Output: "▸ EXPERIENCE GATE CATCH: Phase 4.25 skipped for {goal.id} — writing recovery record"
         experience_id = "exp-{goal.id}-recovery"
-        Write <agent>/experience/{experience_id}.md with:
+        Write agents/<agent>/experience/{experience_id}.md with:
             - Goal: {goal.title}
             - Outcome: {outcome_summary}
             - Note: Recovery record — Phase 4.25 was skipped during execution.
@@ -167,7 +194,7 @@ IF outcome_class == "deep":
             goal_id: "{goal.id}"
             tree_nodes_related: []
             verbatim_anchors: []
-            content_path: "<agent>/experience/{experience_id}.md"
+            content_path: "agents/<agent>/experience/{experience_id}.md"
         Output: "▸ EXPERIENCE GATE: recovery record written"
     ELSE:
         Log: "▸ Experience gate: PASS"
@@ -181,6 +208,36 @@ IF unreflected_count > 0:
     Output: "▸ UNREFLECTED HYPOTHESES: {unreflected_count} resolved but unlearned"
     invoke /review-hypotheses --learn
 ```
+
+## Phase 9.5d: Abbreviated-Obligation Audit (NON-BLOCKING)
+
+Audit is performed by `abbreviated-obligation-audit.sh --apply`. The script
+parses today's journal, regex-matches `OBLIGATION ABBREVIATED:` claims in
+the current iteration's section, validates each against
+`obligation-schema.yaml` + `iteration-checkpoint.json`, appends records to
+`agents/<agent>/session/obligation-audit.jsonl`, and flags `threshold_breached`
+when cumulative false claims reach the configured threshold.
+
+```
+Bash: bash core/scripts/abbreviated-obligation-audit.sh --apply
+Read JSON result:
+  flags = []:                              no false claims; proceed
+  flags = ["false_claims"]:                false claim(s) this iter — log, continue (non-blocking)
+  flags = ["false_claims", "threshold_breached"]:
+                                           file ONE `Investigate: false-abbreviation-claims`
+                                           goal if investigate_goal_already_exists is false
+```
+
+On `threshold_breached`, the LLM caller files the
+`Investigate: false-abbreviation-claims` goal (script emits the flag; goal
+creation stays with the LLM per the capability-before-user routing). Per-claim
+detail is always logged to `agents/<agent>/session/obligation-audit.jsonl`
+regardless of threshold state.
+
+Why NOT read `agents/<agent>/session/context-budget.json` in the audit: it is
+rewritten every statusLine fire. The banner line embedded in the journal
+entry (captured AT claim time by `context-budget-banner.sh`) is the only
+faithful claim-time capture. See rb-313, guard-301.
 
 ## Post-Batch Reflection (when batch_mode is true)
 
@@ -224,7 +281,7 @@ IF goals_completed_this_session % 5 == 0:
                 Read node.file
                 Compress top.observation into "Key Insights" section (1-3 sentences)
                 Edit node.file with updates
-                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                # T21 PostToolUse hook auto-bumps last_updated.
                 Output: "▸ ENCODING DRIFT RECOVERY: forced encoding to {node.key} (score {top.encoding_score:.2f})"
         ELSE:
             echo '{"node_key": "general", "reason": "encoding_drift_checkpoint", "source_goal": "periodic-5-goal", "priority": "HIGH", "created": "'"$(date +%Y-%m-%d)"'"}' | Bash: wm-append.sh knowledge_debt
@@ -309,3 +366,9 @@ control flows directly from here to the next iteration via LOOP_CONTINUE.
 - **Calls**: `wm-read.sh`, `wm-append.sh`, `meta-log-append.sh`, `pipeline-add.sh`, `pipeline-read.sh`, `load-execute-protocol.sh`, `experience-add.sh` (Phase 9.5-exp), `/review-hypotheses --learn` (Phase 9.5c)
 - **Returns**: Does NOT return to orchestrator — calls LOOP_CONTINUE directly
 - **Reads**: Working memory, retrieval manifest, conclusions
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+Structurally safe: the terminal action is LOOP_CONTINUE (Skill call to /aspirations
+with args='loop'). Never add a text summary after LOOP_CONTINUE.

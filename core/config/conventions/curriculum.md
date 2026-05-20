@@ -3,15 +3,15 @@
 Curriculum uses YAML state + JSONL promotion log with script-based access:
 
 ## File Layout
-- `<agent>/curriculum.yaml` — Mutable curriculum state (current stage, stages, gate status)
-- `<agent>/curriculum-promotions.jsonl` — Append-only promotion log
+- `agents/<agent>/curriculum.yaml` — Mutable curriculum state (current stage, stages, gate status)
+- `agents/<agent>/curriculum-promotions.jsonl` — Append-only promotion log
 - `core/config/curriculum.yaml` — Framework definition (immutable: stage schema, gate types, defaults)
 
 ## Relationship to Developmental Stage
 
 Two complementary systems:
 - **Curriculum** = prescribed trajectory (user-defined stages with explicit graduation gates)
-- **Developmental Stage** (`<agent>/developmental-stage.yaml`) = emergent competence (computed from tree capability levels)
+- **Developmental Stage** (`agents/<agent>/developmental-stage.yaml`) = emergent competence (computed from tree capability levels)
 
 Curriculum gates can reference developmental-stage metrics (e.g., `metric: "developmental-stage.current_assessment.average_competence"`), bridging both systems.
 
@@ -28,7 +28,7 @@ All operations go through scripts:
 | `curriculum-contract-check.sh --action <name>` | Is action permitted in current stage? | JSON + exit code |
 | `curriculum-audit.sh` | Verify log consistency | JSON |
 
-## State Schema (`<agent>/curriculum.yaml`)
+## State Schema (`agents/<agent>/curriculum.yaml`)
 
 ```yaml
 current_stage: cur-01              # ID of active stage (null before /start)
@@ -60,7 +60,7 @@ stages:
         current_value: null
 ```
 
-## Promotion Log Schema (`<agent>/curriculum-promotions.jsonl`)
+## Promotion Log Schema (`agents/<agent>/curriculum-promotions.jsonl`)
 
 Each line is one JSON object — append-only:
 
@@ -99,7 +99,7 @@ Run a shell command; gate passes if exit code is 0.
 
 | Capability | Description | Default |
 |-----------|-------------|---------|
-| `allow_self_edits` | Agent may edit <agent>/self.md via sq-012 | false |
+| `allow_self_edits` | Agent may edit agents/<agent>/self.md via sq-012 | false |
 | `allow_forge_skill` | Agent may invoke /forge-skill | false |
 | `allow_multi_goal_parallelism` | Agent may use TeamCreate for parallel goals | false |
 | `allow_meta_edits` | Agent may edit meta/ strategy files | false |
@@ -110,7 +110,7 @@ Enforcement points call `curriculum-contract-check.sh --action <capability>`:
 - Exit 0 + `{"permitted": true}` → action allowed
 - Exit 1 + `{"permitted": false, "current_stage": "...", "stage_name": "..."}` → action blocked
 
-If `<agent>/curriculum.yaml` is missing (pre-curriculum agent): all actions permitted (graceful degradation).
+If `agents/<agent>/curriculum.yaml` is missing (pre-curriculum agent): all actions permitted (graceful degradation).
 
 ## Enforcement Points
 

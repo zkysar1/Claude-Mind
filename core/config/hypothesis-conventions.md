@@ -57,7 +57,7 @@ Every hypothesis has a `horizon` field that controls its overhead level. Default
 | `long` | 7+ days | Standard pipeline record | Full verification suite | Full + pattern extraction |
 
 ### Micro-Hypothesis Format (working memory batch)
-Micro-hypotheses live in `<agent>/session/working-memory.yaml` under the `micro_hypotheses` slot — no pipeline records, no stage moves.
+Micro-hypotheses live in `agents/<agent>/session/working-memory.yaml` under the `micro_hypotheses` slot — no pipeline records, no stage moves.
 ```yaml
 micro_hypotheses:
   - claim: "Short natural-language prediction"

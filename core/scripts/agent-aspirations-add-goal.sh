@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
+# agent-aspirations-add-goal — thin wrapper that forces --source agent.
+# Delegates to aspirations-add-goal.sh (daemon-aware). aspirations.py
+# `add-goal` was deleted in the 2026-05-14 cutover; see
+# .claude/rules/no-python-cli-fallback.md
 set -euo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
-cd "$PROJECT_ROOT"
-source "$CORE_ROOT/scripts/_platform.sh"
-exec python3 "$CORE_ROOT/scripts/aspirations.py" --source agent add-goal "$@"
+exec "$(cd "$(dirname "$0")" && pwd)/aspirations-add-goal.sh" --source agent "$@"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # Consolidation precheck — check all encoding queues in one shot.
 # Returns JSON verdict: FULL (encoding work exists) or FAST (queues empty).
 # Called by aspirations orchestrator and /stop before deciding whether to

@@ -1,12 +1,14 @@
 ---
 name: reflect-tree-update
-description: "Shared Tree Update Protocol — identify affected node, update target, propagate upward, log capability events"
+description: "Implements the Shared Tree Update Protocol used by every reflection path: identifies the affected knowledge-tree node, updates the target's content and metadata, propagates signals upward through parent nodes, and logs capability events. Use whenever any reflection or encoding writes to a tree node and parents must reflect the change (confidence rollup, capability-level propagation). Called automatically by /reflect-on-outcome (Hypothesis mode) and /reflect-on-self (Patterns mode)."
 user-invocable: false
 parent-skill: reflect
 triggers:
   - "/reflect-tree-update"
 conventions: [tree-retrieval]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-reflect-tree-update-7eae29"
+previous_revision_id: null
 ---
 
 # /reflect-tree-update — Tree Update Protocol
@@ -37,7 +39,16 @@ Behavior depends on whether the target node is a leaf or interior node:
 **If target is a LEAF node AND insight is substantial (>1 sentence) AND depth < D_max (20):**
 1. Create a NEW child .md file under the leaf's directory
 2. Register child and convert former leaf to interior:
-   echo '{"key":"<child-key>","summary":"<summary>"}' | bash core/scripts/tree-update.sh --add-child <parent-key>
+   echo '{"key":"<child-key>","summary":"<summary>"}' | bash core/scripts/tree-update.sh --add-child <parent-key> --encoding-source reflect-tree-update
+   # --encoding-source attributes the new child to the Shared Tree Update Protocol
+   # in meta/l1-pick-log.jsonl (S9). Auto-logging fires regardless; this enriches
+   # the entry. Pass --encoding-reason "<why this L1>" when there's a 1-line
+   # semantic justification worth capturing.
+   # The add-child enforces a pre-create dedup gate (Phase 2 curation).
+   # On exit 3 (summary overlap with an existing sibling under the new parent),
+   # read the rejected JSON from stderr for `sibling_key` and UPDATE that sibling
+   # in place with the new insight — do NOT retry with a different key.
+   # Exit 2 (exact key match) signals the new-child name collides with a sibling.
    bash core/scripts/tree-update.sh --set <former-leaf-key> node_type interior
 3. Move the original leaf content into a child if needed, then add the new child
 4. Invoke `/tree validate` to check the structural change
@@ -99,6 +110,11 @@ If propagation reaches root and triggers domain-level shift:
 
 If a capability level changed:
 ```
-Append to journal: "CAPABILITY UNLOCK: {topic} upgraded from {old_level} to {new_level}"
-Log via: echo '{"date":"<today>","event":"capability_unlock","details":"..."}' | bash core/scripts/evolution-log-append.sh
+Bash: echo '{"date":"<today>","event":"capability_unlock","details":"{topic} upgraded from {old_level} to {new_level}"}' | bash core/scripts/evolution-log-append.sh
 ```
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `evolution-log-append.sh` (capability unlock) or the last
+`tree-set.sh` propagation write. Never end with a text summary of the update.

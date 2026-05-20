@@ -1,6 +1,6 @@
 ---
 name: aspirations-select
-description: "Goal selection — scoring, metacognitive assessment, batching, blocker gate, pre-fetch, and full goal detail loading"
+description: "Selects the next goal for execution: runs the mandatory goal-selector.sh scoring pass, metacognitive assessment, batch candidacy check, blocker gate, context pre-fetch, and full goal-detail loading. Use whenever the aspirations loop needs the highest-priority unclaimed unblocked goal for the next iteration. Always called immediately after /aspirations-precheck; never invoked directly by the user. Output determines whether execution, all-blocked handling, or evolution fires next."
 user-invocable: false
 parent-skill: aspirations
 conventions: [aspirations, goal-selection, goal-schemas, infrastructure, reasoning-guardrails]
@@ -12,6 +12,8 @@ execution_history:
     unsuccessful: 0
     success_rate: 0.0
   last_invocation: null
+revision_id: "skill-bootstrap-aspirations-select-d5f0ce"
+previous_revision_id: null
 ---
 
 # /aspirations-select — Goal Selection + Metacognitive Assessment
@@ -66,6 +68,20 @@ IF parsed_output is a JSON object with "all_blocked": true:
 
 ranked_goals = parsed_output  # JSON array of scored candidates
 # Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw}
+
+# Partner-claim filter: drop any goal the partner is already in_flight on.
+# This is the live claim-conflict HINT — it avoids wasting decomposition and
+# context-fetch effort on a goal we would lose at the Phase 4 claim-conflict
+# gate anyway. The authoritative gate still runs in the orchestrator (digest
+# Phase 4) immediately before aspirations-claim.sh, because partner state can
+# flip between this filter and the claim attempt.
+Bash: team-state-read.sh --field agent_status.<partner>.in_flight.goal_id --json
+IF returned value is a non-null string:
+    partner_in_flight_id = returned value
+    ranked_goals = [g for g in ranked_goals if g.goal_id != partner_in_flight_id]
+    IF len(ranked_goals) == 0:
+        Output: "▸ Partner holds the only candidate goal ({partner_in_flight_id}) — yielding"
+        RETURN (goal = None, selection_reason = "all_blocked", selection_context = {by_reason: {partner_held: 1}, blocked_count: 1})
 ```
 
 ### Phase 2.05: Meta-Strategy Adjustment
@@ -117,37 +133,107 @@ FOR EACH finding WITH "insight_trigger" in tags:
         Acknowledge reply
 ```
 
-### Precondition Gate
+### Precondition Gate (strings only — structured preconditions filtered in COLLECT)
 ```
 For each goal in ranked_goals:
-    if goal.verification.preconditions exist:
-        Evaluate each against current session state
-        if any not met: remove from ranked_goals
+    string_pcs = [p for p in goal.verification.preconditions if isinstance(p, str)]
+    # Structured dict preconditions are already filtered by goal-selector.py
+    # COLLECT via predicate.evaluate_all (see conventions/preconditions.md).
+    if string_pcs:
+        Evaluate each against current session state (LLM judgment)
+        if any not met:
+            # SHAPE-RECURRING TRAP — string-precondition twin (g-241-04 / rb-441).
+            # When a recurring goal's string precondition fails AFTER the time
+            # gate elapsed, advancing lastAchievedAt prevents overdue_ratio
+            # runaway. Without this branch, a string precondition that
+            # consistently returns "not met" leaves the goal pinned at
+            # increasing urgency every cycle, mirroring the structured-
+            # precondition trap that recurring-precondition-sweep.py
+            # already handles. The structural fix lives in the sweep
+            # script; this branch handles the LLM-evaluated path that
+            # the sweep cannot reach.
+            #
+            # MUST NOT increment consecutive_routine — the goal was never
+            # closed, only shelved by the precondition filter. Cargo-cult-
+            # detector reads consecutive_routine as the "this goal keeps
+            # getting closed cheaply" signal; bumping it on a not-run
+            # would corrupt the calibration logic.
+            #
+            # The time-gate check matches recurring-precondition-sweep.py's
+            # _iter_recurring_past_gate predicate: lastAchievedAt is not
+            # null AND elapsed_hours >= interval_hours. Goals that are
+            # recurring but have never run (no lastAchievedAt) skip the
+            # advance — they have no urgency-runaway problem yet.
+            if goal.recurring and goal.lastAchievedAt is not null:
+                elapsed_h = hours_since(goal.lastAchievedAt)
+                interval_h = goal.interval_hours OR (goal.remind_days * 24) OR 24
+                if elapsed_h >= interval_h:
+                    Bash: aspirations-update-goal.sh --source {goal.source} {goal.id} lastAchievedAt "<now-iso>"
+                    Output: "▸ STRING-PC-FAIL recurring shelved: {goal.id} ({elapsed_h:.1f}h ≥ {interval_h}h, lastAchievedAt advanced)"
+            remove from ranked_goals
 ```
 
 ### Context-Aware Batching
 ```
-Bash: cat <agent>/session/context-budget.json 2>/dev/null || echo '{"zone":"normal"}'
+# Status line writes context-budget.json every prompt; a missing file is real
+# infrastructure breakage, not a condition to paper over with a default. Read
+# without a fallback — fail loud (guard-160, g-243-01, rb-215 single-source-of-truth).
+# Zones are distance-to-autocompact (pct_to_autocompact), NOT raw usage — see
+# core/scripts/context-budget-status.py classify_zone for the source of truth.
+Bash: bash core/scripts/context-budget-banner.sh   # required — quote this line in your response
+Bash: cat agents/<agent>/session/context-budget.json
 zone = parsed zone field
 
 batch = [ranked_goals[0]] if ranked_goals else []
 batch_mode = False
 
-IF zone == "fresh" (<40%): batch up to 3 same-category goals
-ELIF zone == "normal" (40-65%): batch up to 2 same-category + same-aspiration
-ELSE zone == "tight" (>65%): batch only if same-category + same-aspiration + same-skill + minimal effort
+IF zone == "fresh" (pct_to_autocompact < 50): batch up to 3 same-category goals
+ELIF zone == "normal" (50-85 pct_to_autocompact): batch up to 2 same-category + same-aspiration
+ELSE zone == "tight" (pct_to_autocompact >= 85): batch only if same-category + same-aspiration + same-skill + minimal effort
 ```
 
 ### Self-Alignment Check
 ```
 goals_since_last_alignment_check += 1
 all_recurring = every entry in ranked_goals has recurring == true
+recurring_heavy = len(ranked_goals) >= 5 and (sum(1 for g in ranked_goals if g.recurring) / len(ranked_goals)) > 0.90
 
-IF all_recurring OR goals_since_last_alignment_check >= check_interval_goals:
+IF all_recurring OR recurring_heavy OR goals_since_last_alignment_check >= check_interval_goals:
     goals_since_last_alignment_check = 0
     Bash: work-alignment.sh check --ranked-goals '<ranked_goals_json>'
     IF alignment data suggests planning valuable OR all_recurring:
         invoke /create-aspiration from-self --plan with: alignment_data
+
+    # Program-alignment probe (turns world/program.md from passive context into
+    # an active per-alignment query — counters tactical-drift by forcing the
+    # agent to justify the top goal against the shared Program every N goals).
+    # The Program describes WHY this world exists; Self describes WHO this
+    # agent is — work-alignment above covers the Self-side; this step covers
+    # the Program-side.
+    Bash: world-cat.sh program.md
+    Ask (LLM, in-turn reflection): "Does the top-ranked goal ({ranked_goals[0].id} —
+      {ranked_goals[0].title}) materially serve The Program's stated purpose? If no,
+      what goal would better serve the Program right now?"
+    Log the answer via a board post (journal-add.sh requires stdin JSON and
+    was silently failing on the argv form; board-post is cross-agent visible
+    and tagged for later retrieval):
+      Bash: echo "goal=<top-id>; aligned=<true|false>; note=<brief justification or dissent>" | board-post.sh --channel findings --type finding --tags "program-alignment"
+    # Persist a misalignment streak so 3 consecutive misalignments auto-boost
+    # aspiration_generation sparks on the next spark cycle. wm.py has no
+    # built-in increment — read, add, write.
+    # wm-read.sh prints "null" + exit 0 when the key is missing (see wm.py
+    # cmd_read). Treat "null" as 0; DO NOT add `|| echo 0` — it never fires
+    # (exit was 0) and masks real read errors.
+    IF answer indicates misalignment:
+        raw = Bash: wm-read.sh program_misalignment_streak
+        current = 0 if raw.strip() == "null" else int(raw)
+        next_val = current + 1
+        Bash: echo "$next_val" | wm-set.sh program_misalignment_streak
+        IF next_val >= 3:
+            Bash: echo 'true' | wm-set.sh boost_generative_sparks
+            Bash: echo '0' | wm-set.sh program_misalignment_streak
+    ELSE:
+        Bash: echo '0' | wm-set.sh program_misalignment_streak
 
     # Ambition check: sprint-scope proliferation
     small_count = count active aspirations where scope == "sprint" or (null and ≤4 goals)
@@ -169,10 +255,44 @@ IF output non-empty: Read the returned path
 selection_context = match ranked_goals[:5] categories
 ```
 
+## Phase 2.27: Cross-Cutting Guardrail Probe (G1 / R8)
+
+Tree summary (Phase 2.25) is shallow — it lists capability levels and node
+summaries, not the reasoning-bank or guardrail entries that might constrain
+WHICH goal in this category to pick now. Per
+`.claude/rules/retrieve-before-deciding.md` decision point 1 ("picking the
+next goal"), the selector should retrieve cross-cutting RB/G against the
+top-ranked goal's category before metacognitive assessment commits to it.
+
+```
+top_goal = ranked_goals[0]
+Bash: retrieve.sh --category "{top_goal.category} {top_goal.title[:60]}" --depth shallow
+
+From the returned JSON, surface to Phase 2.5:
+  - guardrails[] whose rule constrains work in this category right now
+    (e.g., "do not run goal X while blocker Y exists", recently-failed
+    aspiration patterns)
+  - reasoning_bank[] entries describing prior attempts at this goal class
+    that should adjust effort_level or expected value
+  - beliefs[] that the goal's outcome would reinforce or contradict
+
+Decision overrides this phase can apply:
+  - If a guardrail explicitly forbids this goal now: skip to ranked_goals[1]
+    and re-run Phase 2.27 for the next candidate
+  - If a recent RB entry shows the same goal failed 2+ times this week:
+    log "RECENT FAILURE DETECTED — pre-flight check required" and pass the
+    RB IDs into Phase 2.5 effort_level decision (escalate to "full")
+  - Otherwise: carry the loaded entries forward as
+    selection_context.cross_cutting_constraints
+
+Fail-open: if retrieve.sh errors, log and proceed to Phase 2.5 with empty
+cross_cutting_constraints. Goal selection must not block on retrieval.
+```
+
 ## Phase 2.5: Metacognitive Assessment
 
 ```
-Read <agent>/profile.yaml → focus
+Read agents/<agent>/profile.yaml → focus
 Read decisions_locked from handoff context
 
 For selected goal, assess:
@@ -211,7 +331,7 @@ IF capability_level < auto_designate_below_capability threshold:
 # Can I add genuine value to this goal given my capabilities?
 # Not about effort — about capability match. (arXiv 2603.28990: 8.6% voluntary
 # abstention in top model improves overall system quality.)
-IF goal requires capabilities outside <agent>/self.md "What I Do" section:
+IF goal requires capabilities outside agents/<agent>/self.md "What I Do" section:
     IF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME:
         # Both agents can't do this goal — defer with timestamp for expiry
         Bash: aspirations-update-goal.sh --source {source} <goal-id> defer_reason "Both agents abstained — needs user attention or capability expansion"
@@ -282,8 +402,57 @@ Bash: aspirations-read.sh --source {goal.source} --id {goal.aspiration_id}
 goal = find by goal_id in returned aspiration's goals array
 ```
 
+## Phase 2.95: Anchor Selection for Autocompact Resilience
+
+Write an iteration checkpoint with the selected goal id. Survives autocompact
+so `postcompact-restore.py` can tell the model exactly which goal was picked —
+prevents post-compact goal-substitution drift (bug traced 2026-04-22 alpha
+session-56: pre-compact selected g-115-22, post-compact resumed as /decompose
+g-250-13 because the compact summary reconstructed the wrong in-flight goal).
+
+Cleared in `/aspirations-execute` Phase 8 on goal completion and in
+`/start --recover` / `aspirations-graceful-stop` D6.
+
+```
+# Cross-agent source translation (g-115-978 Option 3). collect_cross_agent_candidates
+# emits source='cross-agent:<sib>' for goals pulled from a sibling agent's queue
+# (g-115-946 stranding fix). Daemon validators reject that value and
+# aspirations-*.sh wrappers expect strict 'world' or 'agent'. Translate at the
+# orchestrator boundary: split the prefix into (effective_source='agent',
+# cross_agent_owner='<sib>'); leave non-cross-agent sources unchanged. Phase 4's
+# claim block reads cross_agent_owner from the checkpoint and env-prefixes
+# downstream subprocess calls with MIND_AGENT=<owner> so writes route to the
+# sibling's directory tree.
+IF goal.source.startswith('cross-agent:'):
+    cross_agent_owner = goal.source.split(':', 1)[1]
+    effective_source  = 'agent'
+ELSE:
+    cross_agent_owner = None
+    effective_source  = goal.source   # 'world' or 'agent'
+
+Bash: NOW="$(date +%Y-%m-%dT%H:%M:%S)";
+      # When cross_agent_owner is set, splice the extra field into the JSON;
+      # otherwise emit the base shape. loop-state-save.py rejects unknown keys,
+      # so the conditional shape stays validated either way.
+      if [[ -n "{cross_agent_owner}" ]]; then
+        printf '{"goal_id":"%s","aspiration_id":"%s","source":"%s","phase":"selected","selected_at":"%s","selector_score":%s,"skill":"%s","cross_agent_owner":"%s"}' \
+          "{goal.goal_id}" "{goal.aspiration_id}" "{effective_source}" "$NOW" "{goal.score}" "{goal.skill or ''}" "{cross_agent_owner}"
+      else
+        printf '{"goal_id":"%s","aspiration_id":"%s","source":"%s","phase":"selected","selected_at":"%s","selector_score":%s,"skill":"%s"}' \
+          "{goal.goal_id}" "{goal.aspiration_id}" "{effective_source}" "$NOW" "{goal.score}" "{goal.skill or ''}"
+      fi | bash core/scripts/loop-state-save.sh init
+# Single-writer wrapper (g-248-36): typed-key validation, atomic tempfile+rename.
+# Replaces the prior inline `py -3 -c` write — same semantics, validated schema.
+```
+
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 2, every iteration)
 - **Calls**: `goal-selector.sh`, `load-tree-summary.sh`, `work-alignment.sh`, `infra-health.sh`, `aspirations-read.sh --source`, `aspirations-update-goal.sh --source`, `/create-aspiration` (no-goals + alignment)
 - **Reads**: meta/goal-selection-strategy.yaml, profile.yaml (focus), working memory (blockers), context-budget.json, tree summary, handoff decisions
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `goal-selector.sh` or an `aspirations-update-goal.sh` claim.
+Never end with a text summary of the selected goal.

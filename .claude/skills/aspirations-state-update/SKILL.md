@@ -1,17 +1,40 @@
 ---
 name: aspirations-state-update
-description: "State Update Protocol — 9 steps + Step 3.5 Team State + Step 8.5 Actionable Findings Gate + Step 8.75 Execution Reflection + Step 8.76 Skill Quality + Step 8.11 Execution Feedback after every goal execution (routine: Steps 1-4 + abbreviated journal; deep: all steps, immediate tree encoding)"
+description: "Runs the State Update Protocol (Phase 8 of the aspirations loop) after EVERY goal execution: 9 steps plus Step 3.5 Team State, Step 8.5 Actionable Findings Gate, Step 8.75 Execution Reflection, Step 8.76 Skill Quality, Step 8.77 User-Notable Event Push Classifier, and Step 8.11 Execution Feedback. Use whenever a goal finishes executing. Outcome_class controls depth — routine: Steps 1-4 + abbreviated journal; deep: full protocol with immediate tree encoding. MANDATORY — skipping or abbreviating kills the learning loop."
 user-invocable: false
 parent-skill: aspirations
 triggers:
   - "run_state_update()"
 conventions: [aspirations, tree-retrieval, goal-schemas]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-aspirations-state-update-4155f1"
+previous_revision_id: null
 ---
 
 # State Update Protocol
 
 Invoked after EVERY goal execution as Phase 8 of the aspirations loop. Accepts `outcome_class` (default: `"deep"`).
+
+## Abbreviation Policy
+
+Mandatory writes for this obligation: see `core/config/obligation-schema.yaml`
+→ `obligations.state`. Abbreviation is permitted only when
+`context_budget.zone == tight`. Zone is distance-to-autocompact, not raw
+usage — see `core/scripts/context-budget-status.py` `classify_zone` for the
+source of truth. Before abbreviating, `Bash: bash
+core/scripts/context-budget-banner.sh` and quote its output; that line is
+the evidence that makes the "tight" claim verifiable. (Routine outcomes
+follow the Steps 1-4 + 7r path below — that is a scope-of-work distinction,
+NOT the abbreviated pattern.) When abbreviating, log TWO lines in the
+journal entry (in this order):
+  `OBLIGATION ABBREVIATED: state — {condition}`
+  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+The banner line must be the actual output captured from the banner script.
+`core/scripts/context-citation-audit.sh` audits the pair. Then satisfy
+`minimum_inline`.
+Otherwise invoke this Skill literally. The learning-gate audit (Phase 9.5d)
+scans those journal lines and logs false claims to
+`agents/<agent>/session/obligation-audit.jsonl`.
 
 ## Inputs (from orchestrator)
 
@@ -43,12 +66,25 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes
      Otherwise: new_streak = currentStreak + 1.
      ALWAYS update both: currentStreak = new_streak, longestStreak = max(new_streak, longestStreak).
 
+1.1. CLEAR iteration-checkpoint (goal is finished — anchor no longer applies).
+     The checkpoint was written by `/aspirations-select` Phase 2.95 and must be
+     cleared now so a post-autocompact restart doesn't resume a completed goal.
+     Fires for ALL outcome classes (routine and deep) — Step 1's goal-status
+     update is the point-of-no-return. See `core/scripts/postcompact-restore.py`
+     for the read side.
+     Bash: rm -f agents/<agent>/session/iteration-checkpoint.json
+
 2. Aspiration progress is updated automatically by update-goal when status changes
 
 3. UPDATE last_session via Bash: `aspirations-meta-update.sh --source {source} last_updated <today>`
    - Append goal completion to goals_completed_this_session in working memory:
-     # Keys read by goal-selector.py streak_momentum + recurring_saturation — do not rename
-     Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring":<true|false>}' | wm-append.sh goals_completed_this_session
+     # Keys read by goal-selector.py streak_momentum + recurring_saturation +
+     # per_goal_saturation + class_balance_bonus — do not rename.
+     # work_class is optional (Tranche C, rb-390): scorer's class_balance_bonus
+     # reads it when present, excludes the entry from the distribution when absent.
+     # Goals with no work_class field on the goal record: omit the key entirely
+     # (do NOT write "work_class":"unclassified" — empty key = excluded).
+     Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring":<true|false>[,"work_class":"<class>"]}' | wm-append.sh goals_completed_this_session
    - Set aspiration_touched_last in working memory:
      Bash: echo '"<aspiration-id>"' | wm-set.sh aspiration_touched_last
    - Set current_goal_source in working memory:
@@ -69,6 +105,21 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5 and 8.75 for deep outcomes
 4. INCREMENT session_count via Bash: `aspirations-meta-update.sh --source {source} session_count <N>`
    (Note: session_count increments once per /aspirations loop invocation,
     NOT once per goal. Goals within the same loop share a session.)
+
+# ── Step 4.5: Outcome-Metrics Cadence Guard (routine outcomes) ─────
+# Step 8.12 fires the outcome-observation hook for non-routine outcomes only.
+# Routine-only sessions would otherwise skip the hook indefinitely and leave
+# outcome-metrics.yaml silently stale (20-day window observed 2026-04-24 to
+# 2026-05-14, see world/conventions/outcome-observation.md "Cadence Guarantee").
+# This guard fires the same wrapper opportunistically when the metrics file
+# is missing or > 24h stale. Wrapper exits 0 unconditionally — fail-open.
+IF outcome_class == "routine":
+    Bash: source core/scripts/_paths.sh && \
+          METRICS_FILE="$WORLD_DIR/outcome-metrics.yaml"; \
+          if [ ! -f "$METRICS_FILE" ] || \
+             [ $(( ( $(date +%s) - $(stat -c %Y "$METRICS_FILE") ) / 3600 )) -ge 24 ]; then \
+              bash core/scripts/outcome-observation-run.sh "{goal.id}" routine; \
+          fi
 
 # ── Routine outcome learning path ──────────────────────────────────
 # Principle: we are here to learn. Even routine outcomes deserve operational scrutiny.
@@ -91,6 +142,7 @@ IF outcome_class == "routine":
               type: success
               category: goal's category
               content: the operational insight
+              applies_to: <any|framework|domain|specific>  # REQUIRED. routine ops insights about external services → domain; framework-internal → framework; cross-cutting → any
               when_to_use: when this insight applies
               source_goal: goal.id
               tags: ["routine-operational-insight"]
@@ -101,12 +153,18 @@ IF outcome_class == "routine":
         routine_insight_found = false
         routine_insight_text = "No new insight."
 
-    # 7r. WRITE enhanced journal entry
-       - Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
-         "## {timestamp} — Routine: {goal.title}\nNo new items. Streak: {currentStreak}. Routine lens ({routine_q[:60]}...): {routine_insight_text}"
-       - Update journal index via scripts (same merge/add pattern as full journal):
-         - If session entry exists: pipe update JSON to `bash core/scripts/journal-merge.sh <session-num>`
-         - If session entry does not exist: pipe new entry JSON to `bash core/scripts/journal-add.sh`
+    # 7r. WRITE enhanced journal entry — delegated to journal-append.sh
+    #     (g-248-35, rb-428 family). The wrapper handles templating + citation
+    #     scan + journal-index merge/add fallback as a single bash-enforced unit.
+    #     iteration-close.sh do_state_update calls it automatically — this
+    #     pseudocode documents the LLM-residue path for /reflect and ad-hoc
+    #     callers that bypass iteration-close.
+    Bash: `journal-append.sh --goal {goal.id} --outcome-class routine --summary "{routine_q[:60]}: {routine_insight_text}"`
+    # The wrapper appends to agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md with
+    # stable section headers (## title, Outcome:, Summary:) AND tries
+    # journal-merge.sh first, falling back to journal-add.sh on no-existing-
+    # session-record. NEVER inline the markdown assembly + index call here —
+    # /verify-learning Section BE checks the wrapper is the single writer.
 
     # Step 8r: Routine accumulation check (every 5th routine for this goal)
     # Over time, accumulated routine executions can reveal trends worth encoding.
@@ -118,7 +176,9 @@ IF outcome_class == "routine":
             # e.g., "always succeeds", "timing is consistent", "never produces findings"
             IF routine execution pattern reveals an encodable trend:
                 Append one-line trend observation to node's Key Insights
-                bash core/scripts/tree-update.sh --set <node.key> last_updated $(date +%Y-%m-%d)
+                # T21 PostToolUse hook (tree-front-matter-sync.py) bumps
+                # both the .md front matter AND _tree.yaml last_updated
+                # automatically — no explicit register call needed.
                 Log: "ROUTINE ACCUMULATION: {goal.category} trend encoded to {node.key}"
 
     RETURN  # Remaining deep-only steps (5-8.75) still skipped
@@ -135,17 +195,52 @@ IF outcome_class == "routine":
 6. UPDATE readiness gates via Bash: `aspirations-meta-update.sh --source {source} readiness_gates '<JSON>'`
    - Re-run gate checks after any state change
 
-7. WRITE journal entry
-   - Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md
-   - Format: "## {timestamp} — Goal: {goal.title}\nSkill: {skill}\nResult: {outcome}\nSpark: {spark_result}"
-   - Update journal index via scripts (AUTHORITATIVE OWNER — only exception: /stop step 3.e for emergency cleanup):
-     - If session entry exists: pipe update JSON to `bash core/scripts/journal-merge.sh <session-num>`:
-       `echo '{"goals_completed":["g-001-01"],"key_events":["..."],"tags":["..."]}' | bash core/scripts/journal-merge.sh <session-num>`
-     - If session entry does not exist: pipe new entry JSON to `bash core/scripts/journal-add.sh`:
-       `echo '{"session":<N>,"date":"YYYY-MM-DD","journal_file":"<agent>/journal/YYYY/MM/YYYY-MM-DD.md"}' | bash core/scripts/journal-add.sh`
-     - /boot Step 11 writes journal .md content only — it does NOT touch the journal index
+7. WRITE journal entry — delegated to journal-append.sh (g-248-35, rb-428 family)
+   The wrapper handles markdown templating + citation scan + journal-index
+   merge/add fallback as a single bash-enforced unit. iteration-close.sh
+   do_state_update calls it automatically — this pseudocode documents the
+   LLM-residue path for /reflect, /aspirations-consolidate, and ad-hoc
+   callers that bypass iteration-close.
+
+   Bash: `journal-append.sh --goal {goal.id} --outcome-class {routine|deep} --summary "..."`
+
+   The wrapper:
+     - Appends to agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md with stable section
+       headers (## title, Outcome:, Summary:) — /verify-learning Section BE
+       checks this contract.
+     - Scans summary for rb-NNN / guard-NNN citations and increments
+       utilization.times_cited via reasoning-bank-increment.sh /
+       guardrails-increment.sh.
+     - Tries journal-merge.sh first, falls back to journal-add.sh on no
+       existing session record (AUTHORITATIVE OWNER — only exception is
+       /stop step 3.e for emergency cleanup).
+     - Fail-open: write failures log to stderr but never block the iteration.
+
+   NEVER inline the markdown assembly + index call here. Drift between this
+   pseudocode and the wrapper is the failure mode rb-428 was filed against;
+   keeping the wrapper as the single source of truth is the fix.
+   /boot Step 11 writes journal .md content only — it does NOT touch the
+   journal index.
 
 8. REFRESH memory tree (dynamic lookup)
+
+   The encoding mechanics from this step onward — scoring formula, curator
+   gate, precision-manifest extraction, decision-rule append, capability
+   propagation, and cross-agent coordination — live in
+   `core/config/encoding-protocol-digest.md` (E16). This step is the
+   autonomous-mode consumer of that digest; `/encode-session` Lane 1 is
+   the chat-mode consumer. **Edit the digest BEFORE editing this step —
+   drift between the two skills is what the digest exists to prevent.**
+
+   PLACEMENT CHECK (rules vs. conventions): Before writing to
+   `.claude/rules/*.md` or `core/config/conventions/*.md` (as part of an
+   encoding side-effect), determine scope. If the content mentions a
+   brand, product, domain-specific identifier, or external service name,
+   it belongs in `world/conventions/` (the Pattern B hook slot per
+   `domain-hooks.md`), NOT in a core rule or core convention. Core rules
+   and conventions must remain domain-agnostic per
+   `.claude/rules/domain-free-examples.md`.
+
    - Find target node:
      node=$(bash core/scripts/tree-find-node.sh --text "{goal.category}" --leaf-only --top 1)
      # Returns: {key, score, file, depth, summary, node_type}
@@ -203,11 +298,35 @@ IF outcome_class == "routine":
      # Context window content fades by the time encoding runs.
      # The experience file preserves verbatim_anchors and full reasoning traces.
      IF goal has experience_ref (set by Phase 4.25):
-         experience_content = Read <agent>/experience/{experience_ref}.md
+         experience_content = Read agents/<agent>/experience/{experience_ref}.md
          # Use verbatim_anchors and full reasoning trace for precision extraction below,
          # supplementing whatever remains in the context window.
          Log: "▸ Step 8: loaded experience {experience_ref} for full-fidelity encoding"
      # ── End experience record loading ──────────────────────────────
+
+     # ── E13 chunked-encoding consumer ──────────────────────────────
+     # Phase 4.05 may have emitted chunked observations to sensory_buffer
+     # when the execution was long-form. Each chunk is scored independently
+     # against the encoding gate so multi-finding executions surface as
+     # multiple tree updates instead of one collapsed paragraph. Schema
+     # and pipeline: encoding-protocol-digest.md Section F.
+     Bash: wm-read.sh sensory_buffer --json
+     chunks_for_this_goal = [e for e in sensory_buffer
+                             if e.source_goal == goal.id AND e.chunk_idx is defined]
+     IF chunks_for_this_goal is non-empty:
+         Log: "▸ Step 8: E13 found {len(chunks)} chunks for this goal — encoding each independently"
+         For each chunk in chunks_for_this_goal:
+             Run Section A encoding-gate against chunk.scores
+             IF passes:
+                 Build a per-chunk precision payload from chunk.chunk_text
+                 Run Section B (curator) + Section C (tree write) on this chunk
+             ELSE:
+                 Drop (overflow handles re-consideration)
+         # The chunked path REPLACES the single-bundle encoding below for
+         # this goal. SKIP steps a-f after the chunk loop completes.
+     # If no chunks: continue to step a (single-bundle encoding, the
+     # original path).
+     # ── End E13 chunked consumer ───────────────────────────────────
 
      a. EXTRACT PRECISION: Scan execution context for exact values. Build precision manifest —
         each item: {type, label, value (VERBATIM), unit, context}. Types: threshold, formula,
@@ -246,37 +365,55 @@ IF outcome_class == "routine":
          # ── IMMEDIATE TREE WRITE (full inline encoding) ──
          c.5. CURATOR QUALITY GATE (AutoContext-inspired):
         Read core/config/memory-pipeline.yaml curator_gate section
-        IF curator_gate.enabled:
-            Evaluate the compressed insight (from step c) against the target node:
-            CURATOR Q1 (Coverage, 0-1): "What specific info does this add that isn't
-              already in the target node?" Vague/reinforcing → 0.2, concrete new info → 0.8+
-            CURATOR Q2 (Specificity, 0-1): "Can I state a concrete fact, threshold, or
-              procedure from this insight?" Exact values → 0.8+, vague feelings → 0.2
-            CURATOR Q3 (Actionability, 0-1): "What specific action does this tell me to
-              take in similar situations?" "be more careful" → 0.1, "check X before Y" → 0.8
-            # Investigation-aware scoring: reweight for investigation goals
-            # (higher coverage weight, lower actionability — understanding IS the output)
-            IF is_investigation_goal:
-                curator_score = (coverage * 0.50) + (specificity * 0.30) + (actionability * 0.20)
-            ELSE:
-                curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
-            IF curator_score < pass_threshold (default 0.45):
-                Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f} < {pass_threshold}) — demoted to overflow"
-                echo '{"observation": "<insight_text>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
-                SKIP steps d through f for this insight (do NOT write to tree)
-                # Overflow items get second chance during session-end consolidation
-            ELSE:
-                Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f})"
-                # Proceed to step d (PRECISION AUDIT)
+        Evaluate the compressed insight (from step c) against the target node:
+        CURATOR Q1 (Coverage, 0-1): "What specific info does this add that isn't
+          already in the target node?" Vague/reinforcing → 0.2, concrete new info → 0.8+
+        CURATOR Q2 (Specificity, 0-1): "Can I state a concrete fact, threshold, or
+          procedure from this insight?" Exact values → 0.8+, vague feelings → 0.2
+        CURATOR Q3 (Actionability, 0-1): "What specific action does this tell me to
+          take in similar situations?" "be more careful" → 0.1, "check X before Y" → 0.8
+        # Investigation-aware scoring: reweight for investigation goals
+        # (higher coverage weight, lower actionability — understanding IS the output)
+        IF is_investigation_goal:
+            curator_score = (coverage * 0.50) + (specificity * 0.30) + (actionability * 0.20)
+        ELSE:
+            curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
+        IF curator_score < pass_threshold (default 0.45):
+            Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f} < {pass_threshold}) — demoted to overflow"
+            echo '{"observation": "<insight_text>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
+            SKIP steps d through f for this insight (do NOT write to tree)
+            # Overflow items get second chance during session-end consolidation
+        ELSE:
+            Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f})"
+            # Proceed to step d (PRECISION AUDIT)
      d. PRECISION AUDIT: Re-read node. Verify each manifest item appears in Verified Values.
-     e. EXTRACT DECISION RULES: IF execution produced a clear behavioral rule (IF X THEN Y):
-        Append to or create "## Decision Rules" section in node.
-        Format: `- IF {observable condition} THEN {specific action} — source: {goal.id}`
-        Rules must be concrete (no vague "consider"), testable (condition is observable),
-        and actionable (action is a specific step, not "be careful").
-        Do NOT duplicate existing rules — check for semantic overlap first.
-        Not every goal produces decision rules — only write when a clear IF-THEN emerges.
-        See core/config/conventions/decision-rules.md for full format spec.
+     e. EXTRACT DECISION RULES: Bash-enforced via decision-rules-append.sh
+        (rb-428 / guard-365). LLM residue: compose the IF clause (observable
+        condition) and THEN clause (specific action). The wrapper does the
+        format, token-overlap dedup (>=70% → skip), and insert. Empty stdin
+        is legitimate ("no rule emerged") and emits a staleness signal for
+        aggregate drift detection — see core/config/conventions/decision-rules.md.
+
+        Rules must be concrete (no vague "consider"), testable (condition
+        is observable), and actionable (a specific step, not "be careful").
+        Not every goal produces decision rules — only emit when a clear
+        IF-THEN emerges.
+
+        IF a clear behavioral rule emerged:
+            echo '{"if": "<observable condition>", "then": "<specific action>"}' \
+              | bash core/scripts/decision-rules-append.sh \
+                  --goal {goal.id} --node-path <node-md-path>
+            # For multiple rules: echo a JSON array instead of a single object.
+        ELSE:
+            # Signal "no rule" explicitly so the staleness probe counts it.
+            echo '' | bash core/scripts/decision-rules-append.sh \
+                --goal {goal.id} --node-path <node-md-path>
+
+        # Wrapper emits one line per rule:
+        #   ▸ DECISION RULE: appended: - IF ... THEN ... — source: g-NNN-NN
+        #   ▸ DECISION RULE: skipped (duplicate): - IF ... THEN ...
+        # Final line: decision_rules_count=<N> appended=<M> skipped=<K>
+        #   (reason=no_rule_passed when stdin was empty)
      f. CONSISTENCY SCAN: If the insight changes a factual claim already stated elsewhere
         in the node (count, threshold, formula, status), search the full node for stale
         references to the old value and update them. Use Edit replace_all for unambiguous
@@ -309,7 +446,7 @@ IF outcome_class == "routine":
      a. bash core/scripts/tree-update.sh --set root summary "<updated domain summary>"
      b. Log capability event via `echo '<json>' | bash core/scripts/evolution-log-append.sh`
      c. Announce: "CAPABILITY UNLOCK: {topic} → {new_level}"
-     d. Read <agent>/developmental-stage.yaml
+     d. Read agents/<agent>/developmental-stage.yaml
      e. If new level > highest_capability → update highest_capability
 
    # CRITICAL — set flags at the deep branch level, not inside capability check.
@@ -317,6 +454,23 @@ IF outcome_class == "routine":
    # Step 8.5 and Step 8.75 gate on step_8_wrote_insight.
    step_8_wrote_insight = true
    step_8_tree_encoded = true
+
+   # ── Knowledge-debt auto-detect fallback (anti-pattern 2) ─────────
+   # A goal may resolve a knowledge_debt without having declared it at
+   # decomposition time. If the node we just wrote matches an entry in
+   # working-memory knowledge_debt[], back-populate closes_knowledge_debt
+   # on the goal so the classifier's semantic override (in the NEXT goal's
+   # Phase 4-post, or in reflection) can see the link. Also log for the
+   # current session's debt-sweep.
+   debt_match = $(bash core/scripts/wm-read.sh knowledge_debt --json | \
+                  jq -r --arg k "<node.key>" '.[] | select(.node_key == $k) | .node_key')
+   IF debt_match is non-empty:
+     existing_field = goal.closes_knowledge_debt or []
+     IF node.key not in existing_field:
+       updated = existing_field + [node.key]
+       bash core/scripts/aspirations-update-goal.sh --source {source} <goal.id> \
+            closes_knowledge_debt "$(jq -c -n --argjson v '<updated_json>' '$v')"
+       Log: "▸ Step 8: auto-detected debt closure — back-populated closes_knowledge_debt=[{node.key}] on {goal.id}"
 
    ELIF encoding_deferred_by_coordination:
      # ── COORDINATION DEFERRAL: queue encoding for consolidation ──────
@@ -358,80 +512,43 @@ IF outcome_class == "routine":
 # sq-013 (Phase 6) is complementary — it catches obvious work BEFORE
 # encoding; this gate catches what crystallizes DURING encoding.
 #
-# Design: structural keyword scan, not open-ended LLM judgment.
-# Investigation goals get a mandatory binary fallback check.
+# Bash-enforced (rb-428 / guard-365). The wrapper does the 4-signal
+# keyword scan with resolution filters, dedup against active + sibling-
+# completed titles (reads aspirations-compact.json), and dispatches via
+# aspirations-add-goal.sh. Emits `findings_count=N created=M` for
+# downstream accounting. LLM residue: (a) the insight text itself (comes
+# from Step 8), (b) the investigation-override binary — for
+# Investigate: goals where no keyword fires, answer "does this finding
+# require action?" and pass it as a flag.
 
 IF step_8_wrote_insight:   # True when Step 8 entered "compress into Key Insights" branch
     insight_text = the compressed insight just written to the tree node  # Already in context
     is_investigation = goal.title.startsWith("Investigate:")
+    parent_asp = goal's parent aspiration
 
-    # ── Signal detection (keyword scan on insight_text) ─────────────
-    # Negative filters prevent false positives when the insight itself reports the issue as resolved.
-    # "Within 50 chars" window prevents distant resolution language from suppressing real signals.
-    signals = []
-    IF insight_text matches (root cause|caused by|due to|because of|stems from) + specific reference
-       AND NOT within 50 chars followed by (fixed|resolved|applied|addressed|patched|corrected|updated|removed):
-        signals.append({type: "root_cause", match: extracted_reference})
-    IF insight_text matches (bug|defect|mismatch|incorrect|wrong|broken) + (in|at|of) + location
-       AND NOT within 50 chars followed by (fixed|resolved|patched|corrected):
-        signals.append({type: "bug_identified", match: extracted_reference})
-    IF insight_text matches (fix by|should be changed|needs to be|replace with|update to)
-       AND NOT within 50 chars followed by (done|completed|applied|implemented|changed|updated):
-        signals.append({type: "proposed_fix", match: extracted_reference})
-    IF insight_text matches (needs|requires|must|should) + (to be|updating|fixing|adding|removing)
-       AND NOT within 50 chars followed by (done|completed|applied|implemented|resolved):
-        signals.append({type: "unimplemented_action", match: extracted_reference})
+    # Write the insight to a temporary file for --insight-file.
+    Write agents/<agent>/session/findings-gate-insight.tmp.md with insight_text
 
-    # ── Investigation override ──────────────────────────────────────
-    # Completed investigations with findings are inherently actionable.
-    # If no keywords matched, ask the reduced binary question.
-    IF is_investigation AND len(signals) == 0:
-        # Binary: "Is this finding purely informational, or does it need action?"
-        IF finding_requires_action(insight_text):
-            signals.append({type: "investigation_finding", match: insight_text})
+    # LLM residue: investigation-override binary. Only answer if
+    # is_investigation AND the insight contains NO keyword signals
+    # (the wrapper runs the scan too — answer here just provides the
+    # override). Conservative default: omit the flag if not certain.
+    investigation_needs_action = (is_investigation AND finding_requires_action(insight_text))
 
-    # ── Goal creation from signals ──────────────────────────────────
-    IF len(signals) > 0:
-        # Dedup: scan goal titles to avoid duplicates
-        Bash: load-aspirations-compact.sh → IF path returned: Read it
-        (compact aspirations now in context for dedup)
-        active_titles = extract goal titles with status pending/in-progress from ALL aspirations
-        # Cross-goal sibling check: completed goals in the SAME aspiration may have already fixed the finding
-        parent_asp = goal's parent aspiration
-        sibling_completed_titles = extract goal titles with status completed from parent_asp ONLY
-        dedup_titles = active_titles + sibling_completed_titles
+    # Single dispatch — wrapper handles scan + dedup + goal creation.
+    flags = "--goal {goal.id} --aspiration {parent_asp} --category {goal.category} --source {source} --insight-file agents/<agent>/session/findings-gate-insight.tmp.md"
+    IF is_investigation: flags += " --is-investigation"
+    IF investigation_needs_action: flags += " --investigation-needs-action"
 
-        FOR EACH signal:
-            IF signal.type in ("root_cause", "bug_identified", "investigation_finding"):
-                title = "Unblock: Fix {signal.match (50 chars)}"
-                priority = "HIGH"
-            ELSE:
-                title = "Idea: {signal.match (50 chars)}"
-                priority = "MEDIUM"
+    Bash: bash core/scripts/findings-gate.sh <flags>
 
-            IF similar title already exists in dedup_titles:
-                Output: "▸ Step 8.5: {signal.type} detected but goal already exists — skipped"
-                continue
+    # Wrapper output format (one line per signal + final summary):
+    #   ▸ FINDINGS GATE: created <title> in <asp_id> from <goal.id>
+    #   ▸ FINDINGS GATE: skipped (dup) <title>
+    #   findings_count=<N> created=<M>
+    # If M > 0, append to journal: "Findings gate: N signal(s) → M new goal(s)"
 
-            goal_json = {
-                title, status: "pending", priority,
-                skill: null, participants: ["agent"],
-                category: goal.category,
-                description: "Found during {goal.id}: {signal.match}\n\nSource: {insight_text}\n\nDiscovered by: Step 8.5 Actionable Findings Gate",
-                verification: {
-                    outcomes: ["Finding addressed — fix applied or determined not actionable with reasoning"],
-                    checks: []
-                },
-                discovered_by: goal.id,
-                discovery_type: signal.type
-            }
-            target_asp = goal's parent aspiration
-            echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <target_asp>
-            Output: "▸ FINDINGS GATE: Created {title} in {target_asp} from {goal.id}"
-
-        Append to journal: "Findings gate: {N} signal(s) → {M} new goal(s)"
-    ELSE:
-        Output: "▸ Step 8.5: No actionable signals — passed"
+    Delete agents/<agent>/session/findings-gate-insight.tmp.md
 # If Step 8 did not write insight: silent pass (no output)
 ```
 
@@ -455,6 +572,14 @@ IF step_8_wrote_insight:
     # pattern signature matching/creation, contradiction detection,
     # investigation goal creation, experience archival, journal entry.
     # Guardrails and reasoning bank are NOT created here (Phase 6.5 owns those).
+    #
+    # Positive-state claim discipline (verify-before-assuming.md
+    # Positive File-State Claims): any file-state assertion the reflection
+    # makes ("handoff.yaml reflects N", "X.jsonl was updated to Y") must be
+    # backed by an in-turn Read. Belt-and-suspenders — the verify gate
+    # (aspirations-verify Q1) is the hard check; this note is the advisory
+    # reminder for reflection narratives. If a file-state claim appears
+    # without a supporting Read in this turn, re-read before stating.
 ```
 
 ```
@@ -466,148 +591,304 @@ IF step_8_wrote_insight:
 # window of the last 20 evaluations per skill.
 # Skipped by routine outcome early return (same as 8.75).
 # Skipped when goal has no linked skill.
-
-IF goal.skill is set AND outcome_class != "routine":
-    # Map execution signals to five quality dimensions
-    # See core/config/conventions/skill-quality.md for dimension definitions
-    skill_name = goal.skill stripped of "/" prefix and any parameters
-
-    safety = "good"
-    IF guardrail violations occurred during this execution:
-        safety = "average"  # caught violation
-    IF uncaught harmful side effect detected:
-        safety = "poor"
-
-    completeness = "good"
-    IF all verification.outcomes were met: completeness = "good"
-    ELIF partial results achieved: completeness = "average"
-    ELSE: completeness = "poor"
-
-    executability = "good"
-    IF episode_chain_count == 0: executability = "good"
-    ELIF episode_chain_count == 1: executability = "average"
-    ELSE: executability = "poor"
-
-    maintainability = "good"  # Default for base skills; forged skills assessed at forge time
-
-    cost_awareness = "good"
-    # Assess from retrieval manifest: items loaded vs items actually used
-    IF retrieval was disproportionate to task (loaded >> used): cost_awareness = "average"
-    IF excessive redundant reads or bloated context: cost_awareness = "poor"
-
-    Bash: skill-evaluate.sh score --skill {skill_name} --goal {goal.id} \
-        --safety {safety} --completeness {completeness} --executability {executability} \
-        --maintainability {maintainability} --cost-awareness {cost_awareness}
-```
-
-```
-# ── Step 8.8: Improvement Velocity Update ──────────────────────────
-# Track learning output per goal for meta-strategy evaluation.
-# Runs for all non-routine outcomes. Lightweight: compute one score, append one line.
-
-IF outcome_class != "routine":
-    learning_value components (0-1 each):
-      tree_updated: 1.0 if Step 8 wrote insight to tree, 0.0 otherwise → weight 0.3
-      artifacts_created: min(1.0, count(reasoning_bank + guardrails + pattern_sigs created) × 0.2) → weight 0.3
-      encoding_score: from Step 2.7 encoding gate if available, else 0.0 → weight 0.2
-      findings_gated: min(1.0, count(Step 8.5 findings) × 0.25) → weight 0.2
-
-    learning_value = (tree_updated × 0.3) + (artifacts_created × 0.3) + (encoding_score × 0.2) + (findings_gated × 0.2)
-
-    # MR-Search exploration mode flag (Priority 3):
-    IF goal.execution_mode == "exploration":
-        Add exploration_mode: true to the snapshot
-    # Get active backpressure monitors for credit assignment tagging
-    bp_status = Bash: meta-backpressure.sh status
-    active_change_ids = comma-join [m.meta_change_id for m in bp_status.active_monitors]
-    Bash: meta-impk.sh snapshot --goal-id {goal.id} --learning-value {learning_value} --category {goal.category} --active-changes "{active_change_ids}"
-```
-
-```
-# ── Step 8.85: Backpressure Gate Check (AutoContext-inspired) ──────────
-# Checks if any active meta-strategy monitors detect regression.
-# Auto-reverts changes that consistently degrade performance.
-# Runs after imp@k snapshot (Step 8.8) so learning_value is fresh.
-
-IF outcome_class != "routine":
-    # active_change_ids already computed in Step 8.8 (from bp_status)
-
-    # Check for regression — processes all active monitors internally
-    bp_result = Bash: meta-backpressure.sh check --learning-value {learning_value}
-    parse bp_result as JSON
-
-    # Execute any rollback actions
-    FOR EACH action in bp_result.rollback_actions:
-        Bash: meta-set.sh {action.strategy_file} {action.field} {action.rollback_to} --reason "BACKPRESSURE ROLLBACK: {action.reason}"
-        echo '{"date":"...","event":"backpressure_rollback","details":"{action.meta_change_id}: {action.field} reverted from {action.failed_value} to {action.rollback_to}","trigger_reason":"regression detected"}' | bash core/scripts/evolution-log-append.sh
-        Output: "▸ BACKPRESSURE ROLLBACK: {action.field} reverted to {action.rollback_to} ({action.reason})"
-
-    # Register dead end candidates (only reported when a NEW rollback pushes field to 2+ rollbacks)
-    FOR EACH candidate in bp_result.dead_end_candidates:
-        # failed_values contains the actual values that caused regression
-        value_lo = min(candidate.failed_values)
-        value_hi = max(candidate.failed_values)
-        echo '{"strategy_file":"{candidate.strategy_file}","field":"{candidate.field}","value_range":[{value_lo},{value_hi}],"evidence":{candidate.evidence},"failure_pattern":"Rolled back {candidate.rollback_count} times","category":"meta_weight"}' | bash core/scripts/meta-dead-ends.sh add
-        Output: "▸ DEAD END REGISTERED: {candidate.field} (rolled back {candidate.rollback_count}x)"
-
-    # Report graduations
-    FOR EACH grad_id in bp_result.graduated:
-        Output: "▸ Backpressure graduated: {grad_id} (sustained improvement)"
-
-    # Update generation metrics
-    Bash: meta-generations.sh update --learning-value {learning_value}
-```
-
-```
-# ── Step 8.9: Temporal Credit Propagation (MR-Search) ─────────────
-# When this goal succeeded because of a prior goal's research/exploration,
-# propagate discounted credit backward. Inspired by MR-Search's discounted
-# temporal credit: A_{i,n} = Σ γ^(n'-n) × r̃_{i,n'}.
 #
-# This creates a feedback signal for "enabling strategies" — approaches
-# that set up later success even when their own immediate outcome was weak.
-
-IF outcome_class != "routine":
-    # Read the experience record just created in Phase 4.25
-    Bash: experience-read.sh --goal {goal.id}
-    IF experience has enabled_by entries (non-empty):
-        gamma = 0.9  # Discount factor per temporal distance unit
-        FOR EACH enabler in enabled_by:
-            credit = learning_value * gamma^(enabler.temporal_distance)
-            IF credit > 0.01:  # Minimum meaningful credit
-                # Accumulate credit on the enabling experience
-                Bash: experience-read.sh --id {enabler.experience_id}
-                current_credit = enabler_record.temporal_credit or 0.0
-                new_credit = current_credit + credit
-                Bash: experience-update-field.sh {enabler.experience_id} temporal_credit {new_credit}
-                Output: "▸ Temporal credit: {enabler.experience_id} += {credit:.3f} (γ^{enabler.temporal_distance} × {learning_value:.3f})"
-```
-
-```
-# ── Step 8.10: Relative Advantage Scoring (MR-Search) ────────────
-# Compare this goal's learning_value against historical baselines for
-# similar goals in the same category. MR-Search uses RLOO to compare
-# same-position episodes across parallel trajectories. Since we execute
-# sequentially, we compare against historical category means.
+# Bash-enforced auto-derivation (g-248-34, rb-428 pattern): the wrapper
+# computes 4-of-5 dimensions mechanically from execution signals, and
+# the LLM supplies ONLY cost_awareness (semantic retrieval-proportionality
+# judgment that genuinely cannot be derived from counters).
 #
-# This provides a relative (not absolute) quality signal for strategy
-# evaluation — did this approach outperform the typical approach?
+#   Mechanical:     safety (from guardrail violations),
+#                   completeness (from outcomes-met/total ratio),
+#                   executability (from episode-chain count),
+#                   maintainability (base → "good"; forged → registry lookup)
+#   LLM residue:    cost_awareness
+#
+# See core/config/conventions/skill-quality.md for dimension definitions
+# and core/scripts/skill-quality-score.py for derivation rules.
 
+# Sampling-bias fix (skill-telemetry-signal-master-plan Layer 3, 2026-05-12):
+# The original gate excluded routine outcomes AND null goal.skill, causing the
+# pipeline to silently dry up when the workload shifted to recurring/infra
+# goals (2026-04-16 silence root cause). Per the master plan, routine outcomes
+# still produce mechanical quality signal — only cost_awareness (LLM judgment)
+# is skipped; everything else fires. Null goal.skill on a non-routine outcome
+# now surfaces as an explicit warning (goal-creation gap upstream).
+#
+# Name canonicalization: skill-quality-score.py strips leading "/", drops
+# post-whitespace, validates against canonical name list. LLM passes goal.skill
+# raw — no pre-normalization needed. See rb-885, guard-535.
+
+IF goal.skill is set:
+    skill_arg = goal.skill  # raw; script.canonicalize_skill_name handles it
+
+    # Four mechanical execution-signal inputs (LLM gathers from this iteration):
+    outcomes_met   = count of goal.verification.outcomes met during verify
+    outcomes_total = len(goal.verification.outcomes)
+    episodes       = episode_chain_count from execute phase (0 if clean)
+    violations     = guardrail-fire count during execute (0 if none)
+
+    # cost_awareness: deep outcomes earn full LLM judgment; routine outcomes
+    # get the default "good" (fast-path — keeps eval firing without spending
+    # judgment cycles on expected-routine work).
+    IF outcome_class == "routine":
+        cost_awareness = "good"  # default — routine doesn't warrant LLM cycles
+    ELSE:
+        # One semantic-judgment input (LLM decides; no mechanical proxy exists):
+        #   good    = items loaded proportional to items used; no wasted reads
+        #   average = loaded >> used, OR redundant reads of the same file
+        #   poor    = excessive bloat, repeated reads of unused context
+        cost_awareness = LLM judgment on retrieval proportionality this iteration
+
+    Bash: skill-quality-score.sh score \
+        --skill {skill_arg} --goal {goal.id} \
+        --outcomes-met {outcomes_met} --outcomes-total {outcomes_total} \
+        --episode-chain-count {episodes} --guardrail-violations {violations} \
+        --cost-awareness {cost_awareness}
+    # Wrapper acquires <meta>/skill-quality.yaml.lock before invoking
+    # skill-evaluate.py — protects against concurrent-agent write races.
+    # Emits a human-readable score line plus a machine-readable JSON trailer
+    # with the derived grades (auditable + consumable by downstream steps).
+    # On invalid skill name: script exits 1 with explicit error rather than
+    # silently writing a denormalized YAML key (previous bad-state mode).
+
+ELIF outcome_class != "routine":
+    # Deep outcome with null goal.skill = goal-creation gap. Surface it loud
+    # so upstream goal creators learn to tag skill on creation. This was the
+    # 2026-04-16 silence root cause — pipeline silently dried up on null-skill
+    # workload. Do not silently skip when the outcome is deep.
+    Report: "WARN: Step 8.76 skipped — deep outcome on goal {goal.id} with no goal.skill. Tag the skill at goal-creation time for proper quality signal."
+
+# IF outcome_class == "routine" AND goal.skill is null: silently skip (expected
+# for some routine infra goals; no novel signal to score, no warning needed).
+```
+
+### Scripted Audit Pass (Steps 8.8-8.10)
+
+`state-update-audit.sh run-all` runs velocity (8.8), backpressure (8.85),
+temporal credit (8.9), and relative advantage (8.10) in one Python pass —
+pure arithmetic, no LLM judgment. This is the ONLY path. The previous
+toggle + LLM-fallback pseudocode was removed 2026-04-20 — the script is
+the single source of truth. Any bug in `state-update-audit.py` MUST be
+fixed in the script, not patched around by reintroducing a shadow LLM
+path here.
+
+Steps 8.5 (Actionable Findings Gate), 8.75 (Execution Reflection), 8.76
+(Skill Quality), and 8.11 (Execution Feedback) stay on the LLM path —
+those require judgment that `run-all` does not cover.
+
+```
 IF outcome_class != "routine":
-    # Uses learning_value computed in Step 8.8 (same execution context).
-    # Compares against imp@k snapshots from prior goals in same category.
-    Bash: meta-read.sh improvement-velocity.yaml --field entries --json
-    similar_snapshots = filter entries for category == {goal.category}, last 10
-    IF len(similar_snapshots) >= 3:
-        mean_learning_value = mean(snapshot.learning_value for snapshot in similar_snapshots)
-        relative_advantage = learning_value - mean_learning_value
-        # Store advantage on experience record
-        Bash: experience-update-field.sh {experience_id} relative_advantage {relative_advantage}
-        IF relative_advantage > 0.1:
-            Output: "▸ Relative advantage: +{relative_advantage:.3f} (above category mean)"
-        ELIF relative_advantage < -0.1:
-            Output: "▸ Relative advantage: {relative_advantage:.3f} (below category mean)"
-        # else: within normal range, no output
+    # LLM gathers four inputs from this iteration's state. These MUST be
+    # passed — omitting any flag silently produces learning_value=0
+    # (state-update-audit.compute_learning_value uses argparse defaults).
+    # The script owns the arithmetic; the LLM owns the inputs.
+    tree_updated    = true iff Step 8 wrote an insight node to the tree
+    artifacts_count = count(reasoning_bank + guardrails + pattern_sigs created this iteration)
+    encoding_score  = from Step 2.7 encoding gate if it fired, else 0.0
+    findings_count  = count(Step 8.5 Actionable Findings gated this iteration)
+
+    Bash: bash core/scripts/state-update-audit.sh run-all \
+        --goal {goal.id} \
+        --outcome-class {outcome_class} \
+        --category {goal.category} \
+        --experience-id {experience_id} \
+        [--tree-updated if tree_updated] \
+        --artifacts-count {artifacts_count} \
+        --encoding-score {encoding_score} \
+        --findings-count {findings_count} \
+        [--exploration if goal.execution_mode == "exploration"]
+    # Reads the JSON. Flags to watch for (each prefixed by subcommand):
+    #   velocity:impk_snapshot_failed  → meta-impk.sh unreachable; investigate stderr
+    #   backpressure:rollbacks_applied → one or more meta-strategy fields
+    #                                    auto-reverted — note in output
+    #   backpressure:check_failed      → meta-backpressure.sh unreachable; investigate stderr
+```
+
+```
+# ── Step 8.86: Self/Program/Skill/Rule Evolution Backpressure ───────
+# Per world/conventions/self-program-evolution.md
+# Runs AFTER 8.10 (meta-strategy backpressure) and BEFORE 8.77.
+#
+# Re-samples the metric vector for every active evolution monitor
+# (monitor_kind ∈ {self_evolution, program_evolution, skill_evolution,
+#  rule_evolution}). Fires auto-rollback when consecutive_below_baseline
+# crosses the per-kind regression_window. Fires graduation when
+# consecutive_above_baseline crosses graduation_window.
+#
+# Skips entirely when outcome_class == "routine" — routine goals do not
+# perturb the metric vector enough to be informative, and sampling on
+# every routine iteration would flood the script. The §14.5 windows
+# (6-15 iterations) are sized for deep/exploration iterations only.
+
+IF outcome_class == "routine":
+    SKIP silent
+
+Bash: bash core/scripts/meta-backpressure.sh evolution-check
+    # Returns JSON with:
+    #   rollback_actions[]    → each: {revision_id, monitor_kind, file_path,
+    #                                  worst_signal, worst_drop, rolled_back,
+    #                                  rollback_error?}
+    #   graduated[]           → each: {revision_id, monitor_kind, file_path,
+    #                                  samples_collected}
+    #   active_monitors_count → total post-check (rolled_back + graduated removed)
+    #
+    # If rollback_actions is non-empty: surface in iteration close output —
+    # e.g., "ROLLBACK: skill_evolution {rev_id} reverted — worst signal
+    # {worst_signal} dropped {worst_drop}". The rollback record is already
+    # appended to the corresponding <kind>-evolution.jsonl by the engine.
+    #
+    # If subprocess fails (timeout, ImportError): log "WARN: 8.86 evolution-
+    # check failed: {stderr}" and continue. NEVER block iteration close on
+    # backpressure infra failure — the monitors will resume on the next
+    # successful iteration.
+```
+
+```
+# ── Step 8.77: User-Notable Event Push Classifier ────────────────────
+# Proactive user notification on goal outcomes that cross a "user would
+# want to know" threshold. Catches the gap Alpha named 2026-04-23:
+# coordination-board updates flow constantly, but user-facing signal
+# fires only via fresh-eyes-review (cadence 25) + blocker alerts +
+# explicit invocations. No per-goal middle tier — until now.
+#
+# This step is a CLASSIFIER, not a new transport. Dispatch routes through
+# the existing /notify-user skill (which owns self-identification,
+# 30m same-subject dedup, email + fallback cascade, and
+# wm.notification_log append). This step decides WHEN to fire; /notify-user
+# decides HOW to deliver.
+#
+# Runs AFTER Step 8.76 (skill quality) and BEFORE Step 8.78 (fresh-eyes
+# gate) — placed so reflection/quality outputs are in context but the
+# more expensive fresh-eyes dispatch is still downstream.
+
+# ── Skip conditions (fail-closed; default is NO push) ──
+IF outcome_class == "routine":
+    SKIP silent  # routine outcomes already degate via Part A's auto-deep at 8
+IF NOT goal_succeeded:
+    SKIP silent  # failures route via CREATE_BLOCKER → /notify-user category=blocker
+IF goal.category == "blocker" OR goal.title starts with "Blocker:":
+    SKIP silent  # double-push avoidance — CREATE_BLOCKER already dispatched
+# ── Skip condition #4: user-only mute ──
+# User can mute Step 8.77 entirely by writing the slot:
+#   bash core/scripts/wm-set.sh suppress_user_push true
+# Useful when on-call / focusing — agent keeps working but stops pushing
+# user-notable events. Clear with `... wm-set.sh suppress_user_push false`
+# (or wm-clear.sh suppress_user_push). Intentionally has no programmatic
+# writer — agent must never auto-mute itself. Whitelisted in
+# signal-lifecycle-gate.py phantom-reads CATEGORY 2.
+Bash: wm-read.sh suppress_user_push
+IF signal is not null AND signal == "true":
+    Output: "▸ Step 8.77: suppress_user_push set (user-muted) — skipping classifier"
+    SKIP
+
+# ── Trigger evaluation (match any — multiple triggers per goal is valid) ──
+triggers = []   # list of (trigger_id, category, subject, message)
+
+# ---- Trigger 1: shipped — a new capability landed ----
+# Signal: deep outcome AND ship-verb title OR insight_text contains shipping language.
+# Keeps false-positive rate low by requiring the deep-outcome precondition
+# (only non-routine, verified-successful, material outcomes reach here).
+IF outcome_class == "deep":
+    title_matches_ship = re.match(r"^(ship|deploy|release|build|create|add)\b", goal.title, re.I)
+    insight_has_ship = any(s in (insight_text or "").lower()
+                            for s in ["shipped", "deployed", "released to", "landed in"])
+    IF title_matches_ship OR insight_has_ship:
+        subject = f"Alpha shipped: {goal.title[:60]}"
+        message = (insight_text or goal.title)[:400]
+        triggers.append(("shipped", "info", subject, message))
+
+# ---- Trigger 2: resolved-long-blocker — Unblock goal closed after >= 7d open ----
+# Single source of truth for age = goal.created_at (aspirations schema).
+# DO NOT add fallback fields (created, created_date, blocked_since) — if
+# created_at is missing, the age signal is untrustworthy and the trigger
+# MUST skip. Fail-open matches user-stated design rule ("when in doubt,
+# don't protect"). 40/50 Unblock goals in the live store lack created_at
+# as of 2026-04-23 — guard-first or crash (datetime - None → TypeError).
+IF goal.title starts with "Unblock:" AND goal.created_at is not None:
+    age_days = (now - parse_iso(goal.created_at)).days
+    IF age_days >= 7:
+        title_trimmed = goal.title[9:65].strip() if len(goal.title) > 9 else goal.title
+        subject = f"Unblocked after {age_days}d: {title_trimmed}"
+        message = (insight_text or "")[:400] + f"\n\nBlocker had been open {age_days} days."
+        triggers.append(("resolved-long-blocker", "info", subject, message))
+
+# ---- Trigger 3: recovered — infra/session/job recovery ----
+# Matches output language from recovery-gate, stale-scanner, crash recovery
+# notices. Same keyword set used by Part A's recovery-notice display.
+IF goal.title starts with "Recover:" OR any(
+    k in (insight_text or "").lower() for k in [
+        "crashed runner recovered",
+        "stale_scanner killed",
+        "stale scanner killed",
+        "reaped",
+        "infrastructure recovered",
+        "recovery-gate fired",
+    ]
+):
+    subject = f"Recovered: {goal.title[:60]}"
+    message = (insight_text or goal.title)[:400]
+    triggers.append(("recovered", "info", subject, message))
+
+# ---- Future extensions (NOT shipped in this MVP — documented for next pass) ──
+# Trigger 4: hypothesis-confirmed — requires /review-hypotheses integration
+#            (read outcome + confidence from pipeline record resolved this
+#            iteration). Would fire for correct high-conviction resolutions
+#            AND for wrong-but-high-confidence (surprise) resolutions.
+# Trigger 5: participant-user-goal-created — requires a goal-creation delta
+#            (compact snapshot before/after this iteration) OR a WM counter
+#            that aspirations-add-goal bumps when --participants includes user.
+#            Collapses the original "something to say" flag into the push
+#            classifier. MVP omits because the delta signal isn't wired.
+
+# ── Short-circuit if nothing triggered ──
+IF triggers is empty:
+    SKIP silent
+
+# ── Rate cap: max 3 immediate pushes per rolling hour ──
+# SINGLE SOURCE OF TRUTH for send history: wm.notification_log (owned by
+# /notify-user; written on successful send only). DO NOT introduce a
+# parallel counter — dual stores drift. Entry shape: {subject, category,
+# sent_at: <ISO 8601 string>}. LLM parses sent_at via datetime.fromisoformat
+# before comparing.
+Bash: wm-read.sh notification_log
+recent_pushes = [e for e in (notification_log or [])
+                 if datetime.fromisoformat(e.sent_at) >= now - timedelta(seconds=3600)]
+push_slots_remaining = max(0, 3 - len(recent_pushes))
+
+# ── Dispatch (preserve trigger order; first N under cap go out immediate) ──
+# Over-cap pushes are DROPPED, not queued. Rationale: a user-notable moment
+# has decay — a push 6h later stamps the wrong time (rb-464 stale-narrative).
+# Suppression surfaces in the iteration Output line only; do NOT write a
+# shadow journal entry (orphaned — no index via journal-add.sh).
+FOR (trigger_id, category, subject, message) in triggers:
+    IF push_slots_remaining <= 0:
+        Output: f"▸ Step 8.77: user-push suppressed ({trigger_id}, rate cap) — {subject}"
+        CONTINUE
+    # Canonical prose form per .claude/rules/forged-skill-resolution.md so a
+    # domain-registered notify forge-override can intercept. /notify-user owns
+    # 30m same-subject dedup AND the notification_log append — this step
+    # decides WHEN, /notify-user decides HOW.
+    Notify the user about {trigger_id} with category={category}, subject={subject}, message={message}.
+    push_slots_remaining -= 1
+    Output: f"▸ Step 8.77: user-push fired ({trigger_id}) — {subject}"
+```
+
+```
+# ── Step 8.78: Post-State-Update Fresh-Eyes Gate (guard-343 bash-enforced) ─
+# Bash decides WHETHER (threshold gate), LLM decides WHAT (Skill dispatch).
+# The gate fires only for deep outcomes with material core/ changes. See
+# core/scripts/post-state-update-gate.sh for the threshold spec (core_files>=3,
+# loc>=100, or new script in core/scripts). If the gate fires, the LLM
+# dispatches /fresh-eyes-code on the returned file list. rb-393 + guard-343.
+
+IF outcome_class == "deep":
+    Bash: core/scripts/post-state-update-gate.sh deep
+    gate_json = parse stdout as JSON
+    IF gate_json.fired:
+        Output: "▸ Step 8.78: fresh-eyes gate fired ({gate_json.reason})"
+        Skill('fresh-eyes-code') with args: space-separated paths from gate_json.files
+    # ELSE: silent pass — gate.reason already logged in gate_json for audit
+# ELSE: gate is always false for routine — skip silently
 ```
 
 ```
@@ -647,6 +928,36 @@ IF outcome_class != "routine" AND source == "world":
         Output: "▸ Execution feedback: clarity={clarity} scope={scope_accuracy} verify={verification_quality} friction={friction}"
 ```
 
+```
+# ── Step 8.12: Outcome-Observation Hook (Tranche C — rb-390) ──────
+# Hook slot for domain-supplied outcome observation after state update. The
+# process side (goals completed, productive_ratio) can inflate while nothing
+# material moves; an outcome-observation convention PULLS evidence from the
+# actual systems the work is supposed to affect, producing the process-vs-
+# outcome divergence signal downstream consumers (agent-completion-report
+# "Outcome Delta" section) report on.
+#
+# Pattern B hook slot (`outcome-observation`). See
+# core/config/conventions/domain-hooks.md. Core names the slot, the world
+# convention (if it exists) names what to run. Skipped for routine outcomes
+# (the routine early-return above already returned). Fail-open — a missing
+# or broken convention does NOT abort state-update.
+
+IF outcome_class != "routine":
+    Bash: paths=$(bash core/scripts/load-conventions.sh outcome-observation 2>/dev/null)
+    IF paths is non-empty:
+        Read the file at the returned path
+    # Procedural convention — gate on file EXISTENCE, not load status.
+    Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/outcome-observation.md" && echo "exists"
+    IF exists:
+        Follow each Step in the convention.
+        Any step that fails SHOULD be logged and swallowed — never abort state-update.
+    ELSE:
+        # No domain outcome-observation convention exists (fresh agent).
+        # Nothing to do — downstream Outcome Delta section will show
+        # "no outcome signal configured" and consumers degrade gracefully.
+```
+
 ## Return Protocol
 
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
@@ -654,5 +965,5 @@ See `.claude/rules/return-protocol.md` — last action must be a tool call, not 
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 8)
-- **Calls**: `aspirations-update-goal.sh --source {source}`, `aspirations-meta-update.sh --source {source}`, `aspirations-add-goal.sh --source {source}`, `wm-set.sh`, `wm-append.sh`, `skill-evaluate.sh`, `meta-impk.sh`, `meta-backpressure.sh`, `experience-update-field.sh`, `team-state-update.sh`, `board-post.sh`
+- **Calls**: `aspirations-update-goal.sh --source {source}`, `aspirations-meta-update.sh --source {source}`, `aspirations-add-goal.sh --source {source}`, `wm-set.sh`, `wm-read.sh`, `wm-append.sh`, `skill-evaluate.sh`, `meta-impk.sh`, `meta-backpressure.sh`, `experience-update-field.sh`, `team-state-update.sh`, `board-post.sh`, `/notify-user` (Step 8.77 user-notable event push classifier)
 - **Reads**: Goal object, execution result, `core/config/evolution-triggers.yaml`, `core/config/memory-pipeline.yaml`, `meta/encoding-strategy.yaml`

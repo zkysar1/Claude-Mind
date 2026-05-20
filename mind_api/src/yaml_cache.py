@@ -1,0 +1,105 @@
+"""mtime-based cache for YAML reads.
+
+Mirrors jsonl_cache.py for YAML files. yaml.safe_load is the expensive
+operation (~50-100ms on a 270KB tree). Caching it amortises parse cost
+across calls.
+
+Cache invariant: cache hit ⇒ file mtime AND size unchanged since the
+cached read. On every request we stat the file. If mtime changed, we
+reload. Concurrent reloads serialise per file via a per-file lock.
+
+WARNING: get() returns the SHARED cache copy. Do not mutate the
+returned dict/list — clone with copy.deepcopy first if you need to
+modify. The cache does NOT track writes by other processes outside the
+daemon; the fallback-to-direct-python path can write while the daemon
+is reading. The stat check catches that on the next request.
+"""
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+from typing import Any, Dict
+
+try:
+    import yaml
+except ImportError as e:  # pragma: no cover — install-time error
+    raise RuntimeError("PyYAML required for yaml_cache") from e
+
+
+# YAML parse cost grows nonlinearly with size; cache aggressively.
+SMALL_FILE_BYTES = 4 * 1024
+
+
+class _Entry:
+    __slots__ = ("mtime_ns", "size", "data", "lock")
+
+    def __init__(self) -> None:
+        self.mtime_ns: int = -1
+        self.size: int = -1
+        self.data: Any = None
+        self.lock = threading.Lock()
+
+
+class YamlCache:
+    """Per-file mtime-keyed cache. Thread-safe."""
+
+    def __init__(self) -> None:
+        self._entries: Dict[Path, _Entry] = {}
+        self._table_lock = threading.Lock()
+
+    def get(self, path: Path) -> Any:
+        """Return parsed YAML for `path`, reloading if mtime changed.
+
+        Returns None if the file is missing. Skips the cache for small
+        files. See module docstring for the no-mutation contract.
+        """
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return None
+
+        if st.st_size < SMALL_FILE_BYTES:
+            return self._load(path)
+
+        with self._table_lock:
+            entry = self._entries.get(path)
+            if entry is None:
+                entry = _Entry()
+                self._entries[path] = entry
+
+        with entry.lock:
+            if entry.mtime_ns == st.st_mtime_ns and entry.size == st.st_size:
+                return entry.data
+            entry.data = self._load(path)
+            entry.mtime_ns = st.st_mtime_ns
+            entry.size = st.st_size
+            return entry.data
+
+    def invalidate(self, path: Path) -> None:
+        with self._table_lock:
+            entry = self._entries.get(path)
+        if entry is None:
+            return
+        with entry.lock:
+            entry.mtime_ns = -1
+            entry.size = -1
+
+    def clear(self) -> None:
+        with self._table_lock:
+            self._entries.clear()
+
+    @staticmethod
+    def _load(path: Path) -> Any:
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return yaml.safe_load(f)
+        except FileNotFoundError:
+            return None
+
+
+_GLOBAL_CACHE = YamlCache()
+
+
+def cache() -> YamlCache:
+    """Module-singleton cache. Endpoints use this for YAML reads."""
+    return _GLOBAL_CACHE

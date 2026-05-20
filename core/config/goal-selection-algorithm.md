@@ -17,17 +17,19 @@ The LLM reads ranked output and applies Phase 2.5 metacognitive assessment.
    - if deferred_until set: now >= deferred_until
    - if not agent-eligible by participants: skip (user-only OR other-agent goals)
 
-3. SCORE (16 deterministic + 1 stochastic):
+3. SCORE (17 deterministic + 1 stochastic):
    priority_score:       HIGH=3, MEDIUM=2, LOW=1            (weight: 1.0)
    deadline_urgency:     +3/+2/+1 for 1/3/7 day deadlines   (weight: 1.0)
    agent_executable:     +2 if current agent eligible         (weight: 0.8)
    variety_bonus:        +1.5 if different aspiration         (weight: 0.5)
    streak_momentum:      +0.5 if same aspiration this session (weight: 0.5)
    novelty_bonus:        +1.0 if achievedCount == 0           (weight: 0.6)
-   recurring_urgency:    1.5 base + overdue ratio, cap 5.0    (weight: 0.8)
-   recurring_saturation: -(ratio * 4.0) penalty               (weight: 0.8)
+   recurring_urgency:    base + log2(1+overdue_ratio)*scale    (weight: 0.8, config: recurring.*)
+   recurring_saturation: -(ratio * max_penalty) penalty        (weight: 0.8, config: recurring.*)
+   recurring_debt_bonus: +bonus to non-recurring during debt   (post-scoring, config: recurring.*)
    reward_history:       aspiration success rate               (weight: 0.5)
    completion_pressure:  (completion_ratio² * 2.5) quadratic  (weight: 0.8)
+   tail_bonus:           (ratio-0.70)/remaining*3.0 when ≥70% (weight: 0.8)
    depth_bonus:          +1.0 if same aspiration as last       (weight: 0.6)
    evidence_backing:     resolved hypothesis support           (weight: 0.7)
    deferred_readiness:   +1.5 if deferred and now due          (weight: 0.6)

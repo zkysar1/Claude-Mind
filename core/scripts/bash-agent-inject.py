@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""PreToolUse[Bash] hook -- auto-stamp MIND_AGENT on every Bash command.
+
+Resolves the agent binding for the current SID via the canonical resolver
+(Phase 2.6: tries agents/<name>/sessions/<SID>/binding.yaml first, falls back
+to the legacy .active-agent-<SID> file at PROJECT_ROOT). Prepends
+`export MIND_AGENT=<name>; ` to tool_input.command, unless the LLM already
+wrote MIND_AGENT= explicitly (override) or the resolved name is invalid.
+
+SAFETY: fail open on ANY error. sys.exit(0) with no stdout on every reject
+path. Claude Code treats "exit 0 with empty stdout" as "approve with no
+mutation".
+
+Invoked by bash-agent-inject.sh, which handles Python discovery on Windows.
+"""
+
+import sys
+import json
+import re
+from datetime import datetime
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+# Hooks run with cwd set by Claude Code, not this file's dir, so the resolver
+# module is not importable by relative name without a sys.path hint.
+sys.path.insert(0, str(SCRIPT_DIR))
+from _resolve_agent_from_sid import resolve as resolve_agent
+
+# Shared helpers (): approve_no_mutation, stdin_json_or_approve.
+# emit_deny added 2026-05-19 for the F4 cruft gate below — bash-agent-inject
+# now has a deny path for agent-dir-shaped Bash cruft creation, in addition
+# to its primary auto-injection role.
+from hook_helpers import approve_no_mutation, stdin_json_or_approve, emit_deny  # noqa: E402
+
+
+def _log_binding_miss_once(sid: str, project_root: Path) -> None:
+    """Defense-in-depth diagnostic when binding resolution returns no agent.
+
+    Fires only when bash-agent-inject attempted to resolve `.active-agent-<SID>`
+    AND the caller did NOT write an explicit `MIND_AGENT=` override. Per-SID
+    one-shot via a zero-byte sentinel — long NO_AGENT sessions log exactly once,
+    not once per Bash call.
+
+    Discoverability path (the whole reason this exists):
+      1. User notices that MIND_AGENT injection isn't happening for some session.
+      2. User greps `core/logs/bash-inject-misses.jsonl`.
+      3. Each line names a SID that hit this hook with no binding resolved.
+      4. The `hint` field tells them the two fixes: `/start <agent-name>` to
+         create the binding, or prefix the Bash command with `MIND_AGENT=<name>`
+         for one-off cross-agent probes.
+
+    Why per-SID one-shot rather than every-call:
+      A NO_AGENT session running 50+ Bash commands would otherwise produce 50+
+      identical log lines for the same SID. The sentinel collapses that to one.
+      The sentinel files are zero bytes; their accumulation cost is negligible.
+
+    Sink location (2026-05-19 relocation, plan v1 step 0.13-0.14):
+      Previously sentinel + log lived at PROJECT_ROOT/ (`.bash-inject-no-binding-<sid>`
+      + `.bash-inject-misses.jsonl`) — that produced 28-file repo-root clutter and
+      a perpetually-growing root-level log. Both now route to `core/logs/`, the
+      canonical telemetry sink (already gitignored, already hosts watchdog logs).
+      Sentinels under `core/logs/bash-inject-sentinels/<sid>`; log at
+      `core/logs/bash-inject-misses.jsonl`. Cleanup sweep applies to the new path.
+
+    Fail-open invariant (PreToolUse hook contract):
+      ANY exception here is swallowed. The hook MUST never block the Bash call
+      because of a diagnostic write. The whole function is wrapped in try/except.
+
+    SID-shape protection: rejects path-traversal characters before constructing
+    the sentinel path. Mirrors `_resolve_agent_from_sid.resolve()`'s validation,
+    so a malicious SID can't write outside the project root.
+    """
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return
+        logs_dir = project_root / "core" / "logs"
+        sentinels_dir = logs_dir / "bash-inject-sentinels"
+        sentinels_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = sentinels_dir / sid
+        if sentinel.exists():
+            return
+        # Touch first so a concurrent hook instance sees the sentinel and
+        # short-circuits, even before our log-line append flushes. Race-tolerant
+        # by design: if two hooks both write the same record, that's a single
+        # extra line — not a correctness problem.
+        sentinel.touch()
+        log_path = logs_dir / "bash-inject-misses.jsonl"
+        # Rotation (2026-05-19, plan v1 step 0.4): cap the log at ~100 KB by
+        # truncating to the last 200 lines before append. Without this the
+        # file grew forever (one record per unique NO_AGENT SID across the
+        # repo's lifetime). 200 lines is plenty for diagnostic context — every
+        # entry is a single SID + reason + hint. Rotation failure is swallowed
+        # so it never blocks the log write (PreToolUse fail-open contract).
+        try:
+            if log_path.exists() and log_path.stat().st_size > 100_000:
+                lines = log_path.read_text(encoding="utf-8").splitlines()
+                if len(lines) > 200:
+                    log_path.write_text(
+                        "\n".join(lines[-200:]) + "\n", encoding="utf-8"
+                    )
+        except Exception:
+            pass
+        record = json.dumps({
+            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "sid": sid,
+            "reason": "no_active_agent_binding",
+            "hint": "Run /start <agent-name>, or prefix the Bash command with MIND_AGENT=<name>.",
+        })
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(record + "\n")
+    except Exception:
+        pass
+
+
+_AGENT_DIR_CRUFT_PATTERNS_CACHE = {}
+
+
+def _strip_bash_strings(command: str) -> str:
+    """Approximate bash quote-stripping: replace contents of '...', "...", and
+    `...` literals with empty markers so a regex scan doesn't false-positive
+    on patterns that appear ONLY inside string arguments to other commands.
+
+    Limitations: doesn't handle backslash-escaped quotes, $'...' ANSI-C
+    quoting, or heredoc bodies. Good enough for the F4 gate's purpose —
+    the common false positives (echo '... bravo/session ...', python -c
+    "...bravo/session...", grep "bravo/session" file) all use straight
+    quoting and get neutralized.
+
+    Heredoc bodies (<<EOF ... EOF) are NOT stripped here — content piped
+    into a tool via heredoc is exactly the case F4 wants to catch (e.g.,
+    `cat <<EOF > bravo/session/X`), so leaving heredoc content visible to
+    the regex is correct. The redirect target `> bravo/session/X` lives
+    on the heredoc opener line, NOT inside the heredoc body.
+    """
+    out = []
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        if c == "'":
+            j = command.find("'", i + 1)
+            if j == -1:
+                break  # unterminated string — stop, don't mangle the rest
+            out.append("''")
+            i = j + 1
+        elif c == '"':
+            j = command.find('"', i + 1)
+            if j == -1:
+                break
+            out.append('""')
+            i = j + 1
+        elif c == '`':
+            j = command.find('`', i + 1)
+            if j == -1:
+                break
+            out.append('``')
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
+def _detect_agent_dir_cruft(command: str, project_root: Path):
+    """F4 cruft gate (2026-05-19): detect Bash commands that would create
+    `<agentname>/session/...` at PROJECT_ROOT instead of the canonical
+    `agents/<agentname>/session/...`. The L1 path-resolution hook gates
+    Write/Edit/MultiEdit; Bash redirects + mkdir bypass it. This Bash-level
+    gate closes that hole.
+
+    Two write-context patterns are detected:
+      A. `mkdir [-flags] <agent>/session[/...]`
+      B. `>` or `>>` redirect target `<agent>/session/...`
+
+    String literals are stripped first via _strip_bash_strings so patterns
+    that appear ONLY inside quoted arguments to other commands (test data
+    in echo, search patterns in grep, JSON content in python -c) don't
+    fire the gate. The L1 path-resolution hook applies the same regex
+    strategy implicitly by only inspecting tool_input.file_path — the
+    F4 gate has to do quote-stripping explicitly because Bash command
+    text is a string blob.
+
+    Negative lookbehind on the agent name excludes path-component characters
+    (alphanumeric, /, ., -, _, \\) so `agents/bravo/session/...` and
+    `./bravo/session/...` and `lib/bravo/session/...` are NOT matched —
+    only the bare `bravo/session/...` cruft form.
+
+    Returns the matched agent name on hit, None otherwise. Fail-open on
+    any exception — F4 is preventive, not a safety gate.
+    """
+    try:
+        if not command or "/session" not in command:
+            return None
+        agents_dir = project_root / "agents"
+        if not agents_dir.is_dir():
+            return None
+        # Cache per project_root; agents/ dirlist is stable across a single
+        # session and re-reading on every Bash call is wasted I/O.
+        cache_key = str(agents_dir)
+        names = _AGENT_DIR_CRUFT_PATTERNS_CACHE.get(cache_key)
+        if names is None:
+            names = sorted(
+                d.name for d in agents_dir.iterdir()
+                if d.is_dir() and not d.name.startswith('.')
+            )
+            _AGENT_DIR_CRUFT_PATTERNS_CACHE[cache_key] = names
+        if not names:
+            return None
+        # Strip quoted strings before scanning. See _strip_bash_strings.
+        scan_text = _strip_bash_strings(command)
+        if "/session" not in scan_text:
+            return None
+        name_alt = '|'.join(re.escape(n) for n in names)
+        # Pattern A: mkdir with -flags then bare <agent>/session
+        pat_mkdir = re.compile(
+            r'\bmkdir\b\s+(?:-[a-zA-Z]+\s+)*'
+            r'(?<![A-Za-z0-9_/.\\-])(' + name_alt + r')/session\b'
+        )
+        # Pattern B: redirect target — > or >> followed by bare <agent>/session
+        pat_redirect = re.compile(
+            r'>>?\s*(?<![A-Za-z0-9_/.\\-])(' + name_alt + r')/session(?:/|\b)'
+        )
+        m = pat_mkdir.search(scan_text) or pat_redirect.search(scan_text)
+        if m:
+            return m.group(1)
+    except Exception:
+        return None
+    return None
+
+
+def main():
+    data = stdin_json_or_approve()
+
+    tool_input = data.get("tool_input") or {}
+    command = tool_input.get("command", "") or ""
+    sid = data.get("session_id", "") or ""
+
+    # F4 cruft gate (2026-05-19) — fires regardless of SID. A Bash command
+    # without a SID context is still capable of creating PROJECT_ROOT
+    # cruft via the agent-dir-shaped pattern, and the educational message
+    # below tells the caller exactly how to fix it. Runs BEFORE the SID
+    # short-circuit so the gate covers all Bash invocations.
+    cruft_agent = _detect_agent_dir_cruft(command, SCRIPT_DIR.parent.parent)
+    if cruft_agent:
+        emit_deny(
+            f"Bash cruft gate (F4) refused command: detected "
+            f"`{cruft_agent}/session/` pattern without the required "
+            f"`agents/` parent prefix.\n\n"
+            f"Canonical path: agents/{cruft_agent}/session/...\n"
+            f"Or via helper:  $(bash -c 'source core/scripts/_paths.sh && "
+            f"agent_dir {cruft_agent}')/session/...\n\n"
+            f"Background: the L1 path-resolution hook gates Write/Edit/"
+            f"MultiEdit tools but NOT Bash, so a `mkdir -p {cruft_agent}/"
+            f"session && echo X > {cruft_agent}/session/Y` would silently "
+            f"create PROJECT_ROOT/{cruft_agent}/ cruft. This Bash-level "
+            f"gate was added 2026-05-19 (fresh-eyes-code F4) to catch the "
+            f"missing-prefix case. If your intent is to write under the "
+            f"canonical location, add `agents/` before `{cruft_agent}`; "
+            f"if you have a legitimate non-cruft use, restructure to avoid "
+            f"the bare-name shape (e.g., use the canonical `agents/...` "
+            f"path or invoke a helper that resolves it)."
+        )
+
+    # Without a session_id we have nothing useful to inject. Approve as-is.
+    if not sid:
+        approve_no_mutation()
+
+    # CRITICAL (do not "simplify" back to bare .as_posix()): MSYS bash's
+    # directory lookup resolves only POSIX drive form (/c/...) — a PATH
+    # entry in Windows form (C:/...) survives the export string intact
+    # but executables inside it are unreachable (stat fails). Empirically
+    # verified 2026-04-19 on this machine: `PATH="C:/tmp/x:$P" which ...`
+    # reports "not found" while `PATH="/c/tmp/x:$P" which ...` succeeds.
+    # On POSIX systems the regex doesn't match → identity → no-op.
+    _posix = (SCRIPT_DIR / ".python-shim").as_posix()
+    _m = re.match(r"^([A-Za-z]):(.*)", _posix)
+    shim_path = f"/{_m.group(1).lower()}{_m.group(2)}" if _m else _posix
+
+    # INJECTION POLICY — session-scoped vs agent-scoped:
+    #   PATH (shim)    → ALWAYS injected when SID is set. Makes bare `python`
+    #                    work without sourcing _paths.sh (Windows Store stub
+    #                    eats system `python` otherwise).
+    #   MIND_SID      → ALWAYS injected when SID is set. It is the authoritative
+    #                    this-session SID for skill pseudocode (/stop runner vs
+    #                    observer detection, /start Step 0 binding). See
+    #                    guard-341 / rb-386. DO NOT make MIND_SID conditional —
+    #                    it is the single source of truth for the current SID.
+    #   MIND_AGENT    → CONDITIONAL. Skipped when (a) caller wrote an explicit
+    #                    `MIND_AGENT=` at a command boundary (override — caller
+    #                    chose the agent context), or (b) no `.active-agent-$SID`
+    #                    binding exists yet (first Bash call of /start Step 0).
+    agent_clause = ""
+    if not re.search(r"(^|[\s;&|(])MIND_AGENT=", command):
+        agent = resolve_agent(sid, SCRIPT_DIR.parent.parent)
+        if agent:
+            agent_clause = f"export MIND_AGENT={agent}; "
+        else:
+            # Defense-in-depth: surface SIDs that ran without a binding so the
+            # silent-no-injection failure class becomes greppable instead of
+            # invisible. The hook still fails open — no exception path here can
+            # block the Bash call. See _log_binding_miss_once for the rationale.
+            _log_binding_miss_once(sid, SCRIPT_DIR.parent.parent)
+
+    expected_prefix = f'export PATH="{shim_path}:$PATH"; {agent_clause}export MIND_SID={sid};'
+    if command.startswith(expected_prefix):
+        approve_no_mutation()
+
+    new_command = f"{expected_prefix} {command}"
+
+    # updatedInput replaces the whole tool_input per Claude Code's hook
+    # contract, so preserve any other fields the LLM set.
+    updated = {"command": new_command}
+    for key in ("description", "timeout", "run_in_background"):
+        if key in tool_input:
+            updated[key] = tool_input[key]
+
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": updated,
+        }
+    }))
+
+
+try:
+    main()
+except Exception:
+    pass
+
+sys.exit(0)

@@ -11,15 +11,21 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+#  / : force utf-8 on stdin/stdout/stderr (covers Windows
+# cp1252 fallback when callers bypass the _platform.sh PYTHONIOENCODING=utf-8
+# shim). Replaces the prior stdout/stderr-only inline fix — stdin was the
+# gap that  acceptance (4) closes. Helper is idempotent.
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 import yaml
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, assert_agent_dir
 from wm import read_wm, WM_PATH  # noqa: E402
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("precompact-checkpoint")
 
 CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
 

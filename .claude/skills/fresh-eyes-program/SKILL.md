@@ -1,0 +1,353 @@
+---
+name: fresh-eyes-program
+description: "Periodic local self-audit of world/program.md (cadence: every 100 goals). Assembles a briefing (The Program body, both agents' Self summaries, cross-agent aspiration portfolio, recent completions, drift signals), writes it to agents/<agent>/reports/, and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Sibling to /fresh-eyes-review (per-agent Self, 25 goals). Closes the 'program.md has no systematic evolution path' gap."
+user-invocable: true
+triggers:
+  - "/fresh-eyes-program"
+  - "fresh eyes program"
+  - "program review"
+  - "shared purpose review"
+tools_used: [Bash, Read, Write, Edit, Skill]
+companion_scripts: [core/scripts/fresh-eyes-cadence-check.sh, core/scripts/fresh-eyes-record-tick.sh]
+conventions: [aspirations, session-state, working-memory]
+minimum_mode: assistant
+execution_history:
+  total_invocations: 0
+  outcome_tracking:
+    successful: 0
+    unsuccessful: 0
+    success_rate: 0.0
+  last_invocation: null
+revision_id: "skill-bootstrap-fresh-eyes-program-e01d9e"
+previous_revision_id: null
+---
+
+# /fresh-eyes-program — Periodic Shared-Purpose Self-Audit
+
+Every 100 completed goals (or on user demand), step back and produce a
+shared-purpose briefing examining two questions:
+
+1. **Is The Program still the right shared purpose for this world?**
+2. **Do both agents' Selfs still serve The Program, or are they drifting?**
+
+The ritual runs autonomously, writes the briefing to `agents/<agent>/reports/`,
+and posts a one-line summary to the coordination board. No email push, no
+user-approval gate. The user reviews changes via git log and tracked signals
+at their own pace.
+
+## Sibling Relationship
+
+Sibling to `/fresh-eyes-review`. Both rituals share infrastructure
+(`fresh-eyes-cadence-check.sh`, `fresh-eyes-record-tick.sh`) but target
+different scopes:
+
+| Ritual | Scope | Cadence | WM slot |
+|---|---|---|---|
+| `/fresh-eyes-review` | Per-agent Self + portfolio | 25 goals | `last_fresh_eyes_review` |
+| `/fresh-eyes-program` | World shared purpose + team alignment | 100 goals | `last_fresh_eyes_program_review` |
+
+## Sub-commands
+
+```
+/fresh-eyes-program                 — User-forced review, bypasses cadence gate
+/fresh-eyes-program --cadence       — Check cadence; run only if gate passes
+                                      (agent-invoked path from precheck)
+```
+
+## Step 0: Load Conventions
+
+`Bash: load-conventions.sh` with each name from the `conventions:` front
+matter. Read only the paths returned. If output is empty, all conventions
+already loaded — proceed.
+
+## Phase 1: Cadence Gate
+
+```
+IF invoked with --cadence:
+    Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program
+    IF exit 1: Output "Fresh-eyes-program: cadence not crossed — noop." → DONE (return)
+    IF exit 0: proceed
+ELSE (user-invoked, no --cadence flag):
+    Proceed directly — user override.
+```
+
+The cadence script enforces the 100-goal threshold. User invocation
+bypasses it.
+
+## Phase 2: Briefing Assembly (read-only)
+
+Read the inputs. Cache each result so Phase 3 can synthesize without
+re-reading.
+
+```
+# 2.1 The Program — the world's shared purpose
+Bash: world-cat.sh program.md
+  → capture full body content
+  → compute program_length_lines (roughly — stability proxy; short program = abstract)
+
+# 2.2 Self of this agent — current identity
+Read agents/<agent>/self.md
+  → capture body content (after YAML front matter) and last_updated
+  → compute days_since_self_updated = (today - last_updated).days
+
+# 2.3 Self of partner agent(s) — cross-agent alignment check
+Bash: team-state-read.sh --json
+  → capture list of agents in agent_status
+FOR EACH partner_agent in agent_status.keys() where partner_agent != <current agent>:
+    Read <partner_agent>/self.md (if exists)
+      → capture body content + last_updated
+      → compute days_since_partner_self_updated
+
+# 2.4 Cross-agent aspiration portfolio — the world queue
+Bash: load-aspirations-compact.sh
+IF path returned: Read it
+Extract for each active aspiration:
+  - id, title, priority, source (created_by)
+  - goals: (completed / total), category
+Compute:
+  - category_distribution (fraction of active goals per category)
+  - aspiration_source_distribution (how many created by each agent vs user)
+  - completion_histogram (fraction of aspirations at <20%, 20-80%, >80% complete)
+
+# 2.5 Recent cross-agent completions — what the team has actually done
+Bash: team-state-read.sh --json (reuse cached result from 2.3)
+  → capture recent_completions (last 20 entries across both agents)
+  → group by completed_by agent; summarize key_finding themes
+
+# 2.6 Drift signals — sq-012 history and program-vs-self divergence
+Read agents/<agent>/session/pending-questions.yaml
+  → capture entries where id starts with 'sq-012' OR tags include 'self_evolution'
+    AND created within last 60 days (longer window than fresh-eyes-review since
+    program cadence is 4x longer)
+ALSO read <partner_agent>/session/pending-questions.yaml if accessible
+
+# 2.7 Goal-count context — how much work backs this review
+Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program --verbose
+  → capture current goals-completed count, last-fire count, diff
+```
+
+## Phase 3: Synthesis
+
+Build the briefing text (plain Markdown, no external links) with sections:
+
+```markdown
+# Fresh-eyes PROGRAM review — {today ISO date}
+
+{One paragraph: N goals completed since last program review (or "first
+program review"). How The Program has or hasn't changed. What both agents
+have been working on across this window. Two or three sentences.}
+
+## Is The Program still the right shared purpose?
+
+Current Program (world/program.md, {program_length_lines} lines, stable since
+`git log -1 --format=%ad world/program.md`):
+
+> {world/program.md body, full text — inline, no link}
+
+Observations from recent team work:
+- {Evidence-backed bullet — e.g., "85% of active goals sit in category X;
+  The Program emphasizes X and Y equally but Y has received 12% of effort."}
+- {Evidence-backed bullet — e.g., "Alpha completed 47 code goals; Bravo
+  completed 58 PM goals; team ratio matches The Program's Team Model."}
+- {Evidence-backed bullet — e.g., "Strategic-scan flagged 'is this serving
+  The Program?' 8 times this window — pattern: {theme}."}
+
+Candidate Program refinements (if any):
+{Inline diff preview of what might change in world/program.md. None if
+the evidence is neutral — say so.}
+
+## Do both agents' Selfs still serve The Program?
+
+**<current agent>'s Self** (last updated {N} days ago):
+> {agents/<agent>/self.md body, summarized to 3 sentences}
+
+**<partner>'s Self** (last updated {M} days ago):
+> {<partner>/self.md body, summarized to 3 sentences}
+
+Alignment observations:
+- {Evidence-backed bullet — e.g., "<agent>'s Self says 'primary driver: X';
+  X received 60% of <agent>'s goal budget this window. Aligned."}
+- {Evidence-backed bullet — e.g., "<partner>'s Self lists 'audit production
+  quality' as first principle; 0 production audits fired this window."}
+- {Evidence-backed bullet — e.g., "Neither Self references the team model
+  explicitly; The Program defines it. Consider whether Self should cite
+  its role in the Team Model."}
+
+Candidate Self refinements (if any):
+- {Per-agent proposal with rationale. None if the evidence is neutral —
+  say so. Self changes route through sq-012 / guard-380, not this ritual —
+  this briefing only flags candidates for the user to consider.}
+
+## Assessment
+
+1. Is The Program still the right shared purpose for this world, or does
+   it need to refine (or narrow, or broaden)?
+2. Do both agents' Selfs still serve The Program, or is one drifting
+   away from shared purpose?
+
+{Agent's own assessment based on Phase 5.5 decision: act_now / act_later /
+no_change, with rationale. No user response requested.}
+```
+
+All observations must follow `.claude/rules/communication-clarity.md` rule 6:
+state what the evidence shows, do not hedge. If evidence is ambiguous, say
+"the evidence shows X but does not show Y."
+
+## Phase 4: Archive Copy
+
+Write the briefing body to
+`agents/<agent>/reports/fresh-eyes-program-{YYYY-MM-DDTHH-MM-SS}.md` for historical
+reference. Timestamp includes HH-MM-SS so multiple same-day invocations
+(cadence fire + user-forced review) do not collide.
+
+```
+Bash: mkdir -p agents/<agent>/reports
+Write the briefing body (from Phase 3) to agents/<agent>/reports/fresh-eyes-program-{today-isotime}.md
+  (where {today-isotime} = `date +%Y-%m-%dT%H-%M-%S` — colons replaced with
+   hyphens for Windows filesystem compatibility)
+```
+
+## Phase 5.5: Self-Assess Decision
+
+Classify the review outcome via the deterministic helper and act on it.
+No escalation to the user — the agent decides and proceeds autonomously.
+
+For fresh-eyes-program, Program (shared purpose) edits are special: they
+require cross-agent ack per world/conventions/self-program-evolution.md. An
+`act_now` decision here does NOT mean "apply inline immediately" — it
+means "propose the edit; partners ack/reject before it finalizes." The
+existing autonomous edit path on `world/program.md` triggers the Phase 2
+hooks which detect file_kind=program + material and route through the
+cross-agent ack flow in `evolution-complete.py` (calls
+`program-change-propose.py`). The LLM merely applies the Edit; the
+infrastructure handles the proposal lifecycle.
+
+Extract signals from the Phase 3 briefing synthesis (scored 0..1 unless
+noted) and pass to the helper. Note `partner_alignment_score` is REQUIRED
+for fresh-eyes-program — derived from comparing per-agent Self emphases
+and recent goal portfolios:
+
+```
+# Build signals JSON from Phase 3 briefing content
+SIGNALS_JSON='{
+  "portfolio_drift_score":          {0..1 — degree cross-agent portfolio has drifted from Program emphasis since last review},
+  "completion_health":              {0..1 — average completion ratio across active aspirations (both agents)},
+  "self_evolution_signals_count":   {int — Program-related drift indicators across both agents (sq-012 hits citing purpose, etc.)},
+  "self_last_updated_days":         {int — days since world/program.md last_updated},
+  "partner_alignment_score":        {0..1 — cross-agent agreement on Program emphasis; LOW = misalignment},
+  "explicit_user_directive":        {true|false — outstanding /respond about The Program or shared purpose},
+  "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Program edit}
+}'
+Bash: echo "$SIGNALS_JSON" | bash core/scripts/self-assess-and-decide.sh --review-type fresh-eyes-program
+  → capture decision, rationale, recommended_action from JSON output
+```
+
+Branch on decision:
+
+- **`act_now`** — apply the Program edit inline via Edit on
+  `world/program.md`. The Phase 2 hooks
+  (`evolution-prepare.sh` → `evolution-record.sh`) capture as a
+  program-evolution stub; invoke `bash
+  core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning
+  "<≥80-char rationale citing fresh-eyes-program briefing signals + Phase
+  3 evidence>" --signal-source fresh-eyes-program` to finalize. For
+  material classification, `evolution-complete.py` will automatically
+  route through `program-change-propose.py` to file ack goals for partner
+  agents (D2 protocol). The proposal sits in `awaiting_acks` until
+  `program-ack-sweep.py` (asp-115 recurring) sees the partners ack or
+  reject.
+- **`act_later`** — file an Idea goal:
+  `bash core/scripts/aspirations-add-goal.sh asp-115` with stdin
+  `{"title":"Idea: Program refinement - <one-line>",
+  "priority":"MEDIUM","origin_signal":"idea:fresh-eyes-program-followup",
+  "description":"<copy briefing observations + recommended_action>"}`.
+- **`no_change`** — silent no-op. Phase 8 cadence stamp still fires.
+
+ALWAYS log the decision to `agents/<agent>/journal` (one-line tagged
+`fresh-eyes-program-decision`) and post to the `reasoning` board summarizing
+decision + rationale. The audit trail is the guardrail's evidence path.
+
+## Phase 8: Record the Tick
+
+Update the WM slot so the cadence gate stops firing until 100 more goals
+have completed.
+
+**Critical invariant**: the stamp write is LOAD-BEARING. The cadence gate
+reads `last_fresh_eyes_program_review` to decide whether to fire again. If
+this step silently fails, the gate re-fires every iteration. Same
+failure-mode lesson as fresh-eyes-review (see its Phase 8 rationale — the
+g-240-60 incident applies here too).
+
+### Step 1: Record the stamp (LOAD-BEARING — never skip)
+
+```
+Bash: bash core/scripts/fresh-eyes-record-tick.sh last_fresh_eyes_program_review
+```
+
+The positional slot-name arg routes the tick to this ritual's slot instead
+of `last_fresh_eyes_review`. The wrapper reads the current completed-goals
+count via `fresh-eyes-cadence-check.sh --print-current` (slot-agnostic),
+writes the slot atomically, and verifies the slot is non-null after the
+write (fails exit 1 on silent write failure). One script call, one failure
+mode — no chaining.
+
+### Step 2: Post to board (best-effort, must not block)
+
+```
+Bash: echo "Fresh-eyes PROGRAM review completed; briefing archived. Decision: {decision from Phase 5.5}." | bash core/scripts/board-post.sh --channel general --type status --tags fresh-eyes-program || true
+```
+
+The `|| true` ensures board-post failure (board file locked, quota
+issue, etc.) does NOT propagate back through the skill and does NOT
+affect the already-completed stamp write. Board-post is
+cross-agent-visibility nice-to-have, not load-bearing.
+
+The board-post is the terminal action — per Return Protocol requirements,
+the skill does NOT end with text output.
+
+## Chaining
+
+- **Called by**: User (`/fresh-eyes-program`), `/aspirations-precheck`
+  Phase 0.5e.5 (`/fresh-eyes-program --cadence`)
+- **Calls**: `fresh-eyes-cadence-check.sh --config-block fresh_eyes_program`,
+  `load-aspirations-compact.sh`,
+  `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`, `world-cat.sh`,
+  `self-assess-and-decide.sh`, `fresh-eyes-record-tick.sh
+  last_fresh_eyes_program_review`, `board-post.sh`, `journal-add.sh`
+- **Reads**: `world/program.md`, `agents/<agent>/self.md`, `<partner>/self.md`
+  (for each partner agent in team-state), `agents/<agent>/session/pending-questions.yaml`,
+  world aspirations compact, `agents/<agent>/session/working-memory.yaml`
+- **Modifies**: `agents/<agent>/reports/fresh-eyes-program-*.md` (new),
+  `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_program_review slot),
+  `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort)
+- **Does NOT modify**: `world/program.md` (unless Phase 5.5 returns act_now),
+  `agents/<agent>/self.md`, `<partner>/self.md`, aspiration priorities,
+  pending-questions. No email is sent.
+
+## Relationship to Existing Mechanisms
+
+| Mechanism | Scope | Trigger | User-facing? |
+|-----------|-------|---------|--------------|
+| `sq-012` | Per-agent single-outcome self-purpose check | Post-goal | Only for material changes |
+| `aspirations-strategic-scan` S3b | Portfolio category coverage | Autonomous cadence (5 goals / 4h) | No |
+| `aspirations-evolve` | Portfolio gap + dev-stage tuning | Autonomous cadence (15 goals / 12h) | No |
+| `/priority-review` | Portfolio ranking | User pull | Yes, but pull-only |
+| `/fresh-eyes-review` | **Per-agent Self + portfolio** | **25 goals cadence** | **No — local audit** |
+| `/fresh-eyes-program` | **World shared purpose + team alignment** | **100 goals cadence** | **No — local audit** |
+
+Fresh-eyes-program is the periodic self-audit at the world-purpose scope.
+It does NOT replace any of the above. sq-012 catches per-goal purpose
+drift, fresh-eyes-review catches per-agent Self drift every 25 goals,
+strategic-scan watches category concentration autonomously, evolution runs
+gap analysis, priority-review is the user's anytime portfolio pull.
+Fresh-eyes-program is the less-frequent "step back and examine the shared
+purpose" that the per-agent rituals never surface because their scope is
+Self, not Program. The user reviews all changes via git log and tracked
+signals.
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call,
+not text. The terminal action is the Phase 8 Step 2 board-post Bash call.
+Never end this skill with a text summary of the briefing — the briefing
+is in the archive, the agent's job is to record the tick and return control.

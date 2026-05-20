@@ -1,12 +1,14 @@
 ---
 name: aspirations-consolidate
-description: "Session-End Consolidation — hippocampal sleep replay, encoding, debt sweep, tree rebalancing, experience-to-skill mining, skill health, archive, user recap, handoff, restart"
+description: "Runs session-end consolidation — the hippocampal sleep-replay pass that compresses session observations into long-term memory. Handles micro-hypothesis sweep, encoding queue processing, knowledge debt sweep, tree rebalancing, experience-to-skill mining, skill health check, aspiration archive, user recap, handoff writeout, and restart loop cycle. Use whenever the aspirations loop stops (any stop condition), before agent-state transitions to IDLE, or when the orchestrator hits an explicit consolidation checkpoint."
 user-invocable: false
 parent-skill: aspirations
 triggers:
   - "Session-End Consolidation Pass"
 conventions: [aspirations, pipeline, experience, journal, handoff-working-memory, session-state, tree-retrieval, goal-schemas, coordination]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-aspirations-consolidate-ad0fdd"
+previous_revision_id: null
 ---
 
 # Session-End Consolidation Pass
@@ -16,9 +18,9 @@ Run when the aspirations loop stops (any stop condition). This is the hippocampa
 Note: Consolidation MUST NOT call session-state-set.sh.
 Only /start and /stop may change agent-state.
 
-Note: minimum_mode is `autonomous` but /stop invokes this AFTER setting state to IDLE
-and BEFORE setting mode to reader. The mode is still `autonomous` at invocation time.
-If /stop's step ordering changes, this check will break. See /stop step 4 comment.
+Note: minimum_mode is `autonomous` but /stop's deferred sequence (Phase -1.4 in aspirations/SKILL.md)
+invokes this AFTER setting state to IDLE (D1) and BEFORE setting mode to reader (D7).
+The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step ordering changes, this breaks.
 
 ## Parameters
 
@@ -40,7 +42,7 @@ If /stop's step ordering changes, this check will break. See /stop step 4 commen
    # ── PRE-SCAN (2 script calls + 1 file check) ────────────────────────
    triage_wm      = Bash: wm-read.sh --json
    triage_unrefl  = Bash: pipeline-read.sh --unreflected --counts
-   triage_overflow = test -f <agent>/session/overflow-queue.yaml
+   triage_overflow = test -f agents/<agent>/session/overflow-queue.yaml
 
    # ── EXTRACT COUNTS ──────────────────────────────────────────────────
    micro_count       = len(triage_wm.slots.micro_hypotheses)     # null/[] → 0
@@ -56,7 +58,7 @@ If /stop's step ordering changes, this check will break. See /stop step 4 commen
    # ── SAFETY RAILS ────────────────────────────────────────────────────
    # Anti-suppression ceiling: max 3 consecutive lean sessions.
    # Stored in a standalone file (NOT handoff.yaml, which boot deletes).
-   prior_lean = read <agent>/session/consolidation-lean-streak (integer, default 0 if missing)
+   prior_lean = read agents/<agent>/session/consolidation-lean-streak (integer, default 0 if missing)
 
    IF prior_lean >= 3:
        consolidation_tier = "full"
@@ -119,7 +121,7 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
    # Catch error-then-fix patterns that Phase 6.5 missed (e.g., errors during
    # boot, consolidation itself, or non-goal work). Budget: max 2 new entries.
    #
-   Read today's journal: <agent>/journal/{YYYY}/{MM}/{YYYY-MM-DD}.md
+   Read today's journal: agents/<agent>/journal/{YYYY}/{MM}/{YYYY-MM-DD}.md
    Scan for co-occurring patterns:
      (error|exception|traceback|failed|refused) AND (fixed|resolved|workaround|solution|root cause|turned out)
    
@@ -130,6 +132,12 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
            IF not already encoded (no semantic overlap):
                Determine store: prescriptive → guardrail, diagnostic → reasoning bank
                Create entry via reasoning-bank-add.sh or guardrails-add.sh
+                 applies_to: <any|framework|domain|specific>  # REQUIRED on rb-add.
+                   # Ops gotchas about external services / domain infra → domain
+                   # (this agent's deployment-specific services, products, integrations).
+                   # Framework-internal gotchas (skill protocols, gates, hooks) → framework.
+                   # Cross-cutting methodological gotchas → any.
+                   # Single-incident with no transferable shape → specific.
                  tags: ["ops-gotcha", "consolidation-sweep"]
                Log: "CONSOLIDATION GOTCHA: {title} — encoded from session journal"
    Output: "▸ CONSOLIDATION: gotcha sweep — {N} new entries encoded"
@@ -151,9 +159,9 @@ Use this budget instead of fixed top-10 for consolidation item selection.
 
 ### Overflow Queue Management
 After selecting the top items for consolidation (based on dynamic budget):
-1. Items NOT selected but with encoding score >= 0.25: write to `<agent>/session/overflow-queue.yaml`
+1. Items NOT selected but with encoding score >= 0.25: write to `agents/<agent>/session/overflow-queue.yaml`
    - Set `original_score`, `current_score` (same initially), `deferred_count: 1`, `first_seen`, `session_first_seen`, `category`, `source_goal`
-2. Before consolidation, read existing `<agent>/session/overflow-queue.yaml`:
+2. Before consolidation, read existing `agents/<agent>/session/overflow-queue.yaml`:
    - **IF file does not exist**: log "No overflow queue from prior sessions" and continue (no overflow items to merge)
    - IF file exists:
      - Items re-encountered this session: boost `current_score` by +0.15, reset `deferred_count`
@@ -193,7 +201,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
       # All items now use the same target resolution path.
       IF item.target_node_key:
           node = {key: item.target_node_key, file: item.target_node_file}
-          verify = bash core/scripts/tree-find-node.sh --key {item.target_node_key}
+          verify = bash core/scripts/tree-find-node.sh --node {item.target_node_key}
           IF verify is empty:
               node=$(bash core/scripts/tree-find-node.sh --text "{item.observation}" --leaf-only --top 1)
       ELSE:
@@ -217,8 +225,10 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
         Format: `- IF {observable condition} THEN {specific action} — source: {item.source_goal}`
         Same criteria as state-update Step 8e: concrete, testable, actionable, no duplicates.
    e. PRECISION AUDIT: Verify each precision item appears in Verified Values
-   f. bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
-   g. If leaf node changed significantly:
+   # T21 PostToolUse hook (`tree-front-matter-sync.py`) atomically bumps
+   # _tree.yaml last_updated on every Edit of a tree node .md — no
+   # explicit `tree-update.sh --set last_updated` call needed here.
+   f. If leaf node changed significantly:
       - Update the node via batch:
         echo '{"operations": [
           {"op": "set", "key": "<node.key>", "field": "confidence", "value": <new-value>},
@@ -234,7 +244,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
           Update .md body text (capability map table)
         If root-level domain summary changed:
           bash core/scripts/tree-update.sh --set root summary "<updated>"
-        - Update <agent>/developmental-stage.yaml highest_capability if exceeded
+        - Update agents/<agent>/developmental-stage.yaml highest_capability if exceeded
 
    # Legacy: apply metadata updates for items that have them (e.g., from previous sessions)
    IF item.metadata_updates:
@@ -250,7 +260,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        # Capability event logging
        IF item.metadata_updates.capability_level crosses threshold:
            Log capability event via evolution-log-append.sh
-           Update <agent>/developmental-stage.yaml highest_capability if exceeded
+           Update agents/<agent>/developmental-stage.yaml highest_capability if exceeded
 
 2.25. Knowledge Debt Sweep:
    Bash: wm-read.sh knowledge_debt --json
@@ -326,11 +336,11 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                node=$(bash core/scripts/tree-find-node.sh --text "{conclusion category or related domain}" --leaf-only --top 1)
                IF node found:
                    Append to node's Key Insights: "Judgment correction: {conclusion.conclusion} was wrong — {outcome_source}"
-                   bash core/scripts/tree-update.sh --set <node.key> last_updated <today>
+                   # T21 hook auto-bumps last_updated on the Append above.
        Log summary: "Judgment quality: {total} conclusions ({negative} negative), {correct} correct, {wrong} wrong, {pending} pending. Avg signals: {avg_signals:.1f}"
 
 2.8. Pending Questions Re-evaluation:
-   Read <agent>/session/pending-questions.yaml
+   Read agents/<agent>/session/pending-questions.yaml
    IF file exists AND has entries with status == "pending":
        FOR EACH pending question:
            # Re-evaluate: can the agent now answer this itself?
@@ -348,7 +358,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                Update question status to "resolved"
                Set question.resolution = "Stale: conditions changed since question was created"
                Log: "PENDING QUESTION STALE: {question.id} — conditions changed"
-       Write updated <agent>/session/pending-questions.yaml
+       Write updated agents/<agent>/session/pending-questions.yaml
        Report: "Pending questions: {resolved_count} self-resolved, {stale_count} stale, {remaining_count} still pending"
 
 # ── END FULL PATH (Steps 0–2.8 above only run when consolidation_tier == "full") ───
@@ -364,7 +374,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    FOR EACH tree node with 3+ related experiences since last distillation:
      # Read the FULL experience content files (not just JSONL summaries)
      FOR EACH experience in cluster:
-       Read <agent>/experience/{exp.content_file}
+       Read agents/<agent>/experience/{exp.content_file}
        Extract: verbatim_anchors, key findings, exact values, failure sequences
      
      # Synthesize into deep tree content (NOT 1-3 sentence compression)
@@ -410,9 +420,34 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    This captures any remaining WM state before it is destroyed by reset.
 5. Bash: wm-reset.sh
 
-6. Tree Rebalancing:
-   Invoke /tree maintain (run all checks: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
-   All 8 ops must be listed — DECOMPOSE grows tree depth, DISTILL concentrates low-utility nodes, RETIRE removes dead ones.
+5.5. Presence file truncation (g-115-411 — cross-agent presence). For each
+   `world/presence/<agent>.jsonl`, keep the last 1000 entries via locked
+   rewrite. Bounds storage to ~140KB per agent at the 1000-entry cap
+   (~672KB/day write rate is what motivates the truncation). Dormant when
+   the PostToolUse * hook is not wired — the loop is idempotent on empty.
+
+   Bash: for _PRES in "$WORLD_DIR"/presence/*.jsonl; do [ -f "$_PRES" ] || continue; py -3 -c "import sys,os,pathlib; sys.path.insert(0, os.environ['CORE_ROOT']+'/scripts'); from _fileops import locked_modify_jsonl; locked_modify_jsonl(pathlib.Path('$_PRES'), lambda recs: recs[-1000:])" 2>/dev/null || true; done; unset _PRES
+
+6. Tree Rebalancing — runs always, including stop_mode. Symmetric with the
+   FAST consolidation path in `core/config/consolidation-housekeeping.md`
+   Step 6: both invoke `/tree maintain --stop-mode` (small caps from
+   `core/config/tree.yaml` `stop_mode_caps`) under stop_mode=true so /stop
+   stays fast. Skipping this step in any context is a guardrail violation.
+
+   distill_json=$(bash core/scripts/tree-read.sh --distill-candidates)
+   decompose_json=$(bash core/scripts/tree-read.sh --decompose-candidates)
+   debt_count = length(distill_json) + length(decompose_json)
+   debt_threshold = tree_debt_check.debt_threshold from core/config/tree.yaml (default 40)
+
+   IF stop_mode == true:
+     Invoke /tree maintain --stop-mode   # small caps (stop_mode_caps), fast /stop
+   ELIF debt_count > debt_threshold * 3:
+     Invoke /tree maintain --backlog     # elevated caps, largest-first
+   ELSE:
+     Invoke /tree maintain                # standard caps
+
+   All three paths run all 8 ops: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE.
+   DECOMPOSE grows tree depth, DISTILL concentrates low-utility nodes, RETIRE removes dead ones.
    Report any structural changes to journal
 
 7. Skill Gap Review (skip in stop_mode):
@@ -449,6 +484,14 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 8. Skill Health Report (skip in stop_mode):
    IF stop_mode != true:
      Read .claude/skills/_tree.yaml
+     # Skill-quality pipeline staleness guard (skill-telemetry-signal-master-plan
+     # Layer 3). Catches Step 8.76 sampling-bias silences within 7 days instead
+     # of the 25 days it took during the 2026-04-16 → 2026-05-12 silence.
+     # With --file-goal, files an Investigate goal automatically when stale so
+     # the next iteration probes it. Exit code 0=fresh, 2=stale (goal filed),
+     # 3=missing file. Knowledge tree:
+     # world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md
+     Bash: skill-quality-staleness-check.sh --file-goal --json
      # Quality-enriched report using skill analytics
      Bash: skill-evaluate.sh report
      Bash: skill-relations.sh discover
@@ -461,6 +504,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        Quality summary: avg={avg_overall}, min={min_overall}
        Relation discoveries: {proposed new relations from co-invocation patterns}
        Recommendations: {forge/retire/improve suggestions}
+       Skill-quality pipeline: {fresh|stale (Investigate goal filed)|missing} from staleness-check JSON
 
 8.5. Aspiration Archive Sweep:
    Bash: aspirations-archive.sh  (sweep completed/retired aspirations to archive)
@@ -539,95 +583,92 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 
 8.9. Release Held Claims (world goals only):
    # Prevent stale claims when session ends normally. See coordination convention.
-   Bash: AYOAI_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name}
+   # Status filter excludes terminal-status goals — claim-clearing on completion
+   # is enforced in cmd_complete_by/cmd_update_goal; this filter is defense in
+   # depth so any future writer regression can't flood the release loop.
+   Bash: MIND_AGENT={agent} aspirations-query.sh --goal-field claimed_by {agent_name} --goal-status pending,in-progress,blocked
    FOR EACH returned goal WHERE source == "world":
        Bash: aspirations-release.sh <goal-id>
        Log: "Released claim on {goal.id}"
    echo "Session ending: released all held claims" | Bash: board-post.sh --channel coordination --type status
 
 9. Write Continuation Handoff:
+   # Tier 0 phase-cost telemetry (plan: ~/.claude/plans/i-had-one-agent-luminous-reddy.md).
+   # TWO-STEP under Windows bash. Previous single-pipeline (`script | py -c ... || echo`)
+   # silently fell through to the `||` fallback under autocompact pressure, so alpha's
+   # handoff showed "skipped (no markers)" despite 773 captured markers. The env-var
+   # pattern below matches `iteration-close.sh:114` — robust against MSYS pipe issues.
+   Bash: bash core/scripts/phase-cost-report.sh --write-report > "$MIND_AGENT/session/last-phase-cost.json" 2>/dev/null || echo '{}' > "$MIND_AGENT/session/last-phase-cost.json"
+   Bash: MIND_AGENT="$MIND_AGENT" py -3 -c "import json,os; p=os.environ['MIND_AGENT']+'/session/last-phase-cost.json'; d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p)>2 else {}; print(d.get('written_to') or 'none'); print(d.get('summary') or 'skipped (no markers)')"
+   → capture first line as phase_cost_report_path, second line as phase_cost_summary
    Bash: goal-selector.sh → get top-ranked goal for next session
    Read decisions_locked from current session context (if any)
-   Write <agent>/session/handoff.yaml with:
-     session_number: {session_count}
-     timestamp: "{ISO 8601 now}"
-     last_goal_completed: "{last goal id from this session}"
-     goals_in_progress: [{list of in-progress goal IDs}]
-     hypotheses_pending: {count from Bash: pipeline-read.sh --counts → active}
-     next_focus: "{recommendation based on session results}"
-     first_action:
-       goal_id: "{top-ranked goal from goal-selector.sh}"
-       score: {score from goal-selector.sh output}
-       effort_level: "{estimated effort for this goal}"
-       reason: "{why this goal is top priority for next session}"
-     decisions_locked:
-       # Carry forward unexpired decisions from previous handoff
-       # Add any new strategic decisions made this session
-       # Expire entries where current_session - made_session > 3
-       # CLASSIFY each decision:
-       #   kind: "strategy" if about approach/priority/sequencing
-       #   kind: "world_claim" if about infrastructure/availability/external state
-       #   For world_claims: evidence_strength "weak"|"moderate"|"strong"
-       #   based on how the conclusion was reached (single error = weak)
-       - decision: "{decision text}"
-         made_session: {session_number}
-         reason: "{rationale}"
-         kind: "{strategy|world_claim}"
-         evidence_strength: "{weak|moderate|strong}"  # world_claim only
-     session_summary:
-       goals_completed: {count of goals completed this session}
-       goals_failed: {count of goals that failed this session}
-       key_outcomes:
-         - "{notable outcome 1}"
-         - "{notable outcome 2}"
-     known_blockers_active:
-       # Use blocker data from Step 4 WM archive (WM was reset in Step 5)
-       # Carry forward unresolved blockers where resolution is null
-       - blocker_id: "{id}"
-         reason: "{reason}"
-         affected_skills: ["{skills}"]
-         detected_session: {N}
-     critical_path:
-       # Populated from blocked_data gathered in Step 8.87 (or gathered here if 8.87 was skipped in stop_mode)
-       # IF blocked_data was not gathered yet: Bash: goal-selector.sh blocked → parse JSON → blocked_data
-       primary_blocker:
-         goal_id: "{bottlenecks[0].goal_id}"
-         title: "{bottlenecks[0].title}"
-         cause: "{bottlenecks[0].cause}"
-         downstream_count: {bottlenecks[0].downstream_count}
-         affected_aspirations: ["{asp_ids}"]
-       blocked_fraction: "{total_blocked}/{total_active_goals}"
-       top_bottlenecks:
-         - goal_id: "..."
-           title: "..."
-           downstream_count: N
-           cause: "..."
-       estimated_unblock_impact: "Resolving {primary_blocker.title} would unblock {N} goals across {M} aspirations"
-     knowledge_debts_pending:
-       # Use debt data carried forward from Step 2.25 (WM was reset in Step 5)
-       - node_key: "{node-key}"
-         reason: "{why this node needs updating}"
-         source_goal: "{goal-id}"
-         priority: "{HIGH/MEDIUM}"
-         created: "{ISO date}"
-         sessions_deferred: {N}
-     user_goals_pending:
-       # From Step 8.7, or from aspirations compact data if 8.7 was skipped (stop_mode)
-       count: {N}
-       goals:
-         - id: "{goal-id}"
-           title: "{goal title}"
-     meta_state:
-       improvement_velocity_trend: "{improving|stable|declining}"
-       # Read active experiments for handoff
-       Bash: meta-experiment.sh list --active → active_exp
-       active_variant: "{active_exp variant_id or null}"
-       meta_changes_this_session: {count of meta-log entries this session}
-     consolidation_meta:
-       triage_tier: "{lean|full}"
-       consecutive_lean_sessions: {N}  # informational copy (source of truth: consolidation-lean-streak file)
+   ### Scripted Handoff Build
+
+   The LLM assembles a payload JSON with the prose fields (next_focus,
+   reasons, key_outcomes, decisions_locked) plus the structured fields
+   already gathered above (phase_cost_report, goal-selector output,
+   blockers, debts, user_goals), then pipes it to `handoff-yaml-build.sh`
+   which validates required fields, defaults optionals, and writes the
+   handoff.yaml atomically via `locked_write_yaml`.
+
+   Required payload fields (all others optional — script defaults them):
+   `session_number`, `next_focus`, `first_action.goal_id`,
+   `first_action.reason`, `session_summary.goals_completed`,
+   `session_summary.goals_failed`,
+   `consolidation_meta.triage_tier` (the `consolidation_tier` value from
+   the triage block at Step 0.1 — `"lean"` or `"full"`),
+   `consolidation_meta.consecutive_lean_sessions` (the NEW streak count:
+   `prior_lean + 1` when triage_tier is lean, `0` when full — same value
+   written to `agents/<agent>/session/consolidation-lean-streak` below).
+   Without these two, handoff.yaml's `consolidation_meta` defaults to
+   `{}`, which reads as "nothing happened" even when Phase 8 inline-
+   encoded a full session's worth of work — boot's status line at
+   `boot/SKILL.md:226` then silently omits the "Last consolidation"
+   row, losing the signal.
+
+   Decision-classification convention (LLM responsibility when composing
+   `decisions_locked`):
+   - `kind: "strategy"` for approach / priority / sequencing decisions
+   - `kind: "world_claim"` for infrastructure / availability / external
+     state conclusions; also set `evidence_strength` to `weak|moderate|strong`
+     (single error or single probe = weak)
+   - Carry forward unexpired entries from the previous handoff; expire
+     entries where `current_session - made_session > 3`
+
+   Critical-path sourcing convention (LLM responsibility when composing
+   `critical_path`) — mandatory, no narrative freedom:
+   - `primary_blocker.goal_id`, `.title`, `.cause` MUST be read directly
+     from `world/aspirations.jsonl`. The `cause` field MUST be the goal's
+     actual `defer_reason` (for `status: pending` with non-null
+     `defer_reason`) OR `blocked_reason` (for `status: blocked`). If both
+     are null/empty, the goal is NOT a blocker — do not list it.
+   - Do NOT narrate a `cause` that cannot be quoted verbatim from the
+     goal record. Hallucinating a plausible-sounding defer reason (e.g.,
+     "blocked on user-initiated X") when the field is null is a
+     capability-routing violation per `.claude/rules/probe-before-defer.md`
+     and `.claude/rules/capability-before-user.md`. The consumer (`/boot`
+     Step 0.5 sub-step 4c) displays this string to the resuming session;
+     a fabricated cause steers the next session toward the wrong work.
+   - `blocked_fraction` MUST be computed from a single pass over
+     `world/aspirations.jsonl`: `pending_with_defer_reason +
+     status_blocked + status_hypothesis_gate` over total
+     non-completed-non-archived goals. No "~" approximation — the data
+     is authoritative and cheap to count.
+   - `top_bottlenecks[]` entries follow the same sourcing rule as
+     `primary_blocker`. Rank by `downstream_count` computed from
+     `blocked_by` / `depends_on` edges, not by subjective importance.
+   - If no goal has a non-null `defer_reason` AND no goal has
+     `status: blocked`, emit `critical_path: {}` — an empty object is
+     the correct representation of "nothing blocks the frontier",
+     not a fabricated placeholder.
+
+   ```
+   Bash: echo '<payload>' | bash core/scripts/handoff-yaml-build.sh
+   Read JSON: summary + written_path for confirmation.
+   ```
    # Update the streak file (source of truth for anti-suppression ceiling)
-   Write <agent>/session/consolidation-lean-streak:
+   Write agents/<agent>/session/consolidation-lean-streak:
      IF consolidation_tier == "lean": prior_lean + 1
      IF consolidation_tier == "full": 0
 
@@ -642,10 +683,36 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
                validated_strategies: list of adopted strategy descriptions with imp@k data
                total_goals_at_export: total from aspirations-meta
 
+9.7. **Notify the User About Session End** (stop_mode ONLY):
+
+   IF stop_mode != true: SKIP (mid-loop consolidations recur every few
+   iterations — emailing each one floods the user's inbox, and the subject
+   would include a changing goal count so notify-user's 30-min rate limiter
+   cannot dedupe. Progress reporting mid-session is the job of
+   /agent-completion-report Phase 5.5, not consolidation.)
+
+   ELSE (session is actually ending — /stop or productivity-stop-gate):
+     Notify the user about the session end.
+     (Check `world/forged-skills.yaml` for a skill whose triggers match
+     "notify the user" and invoke it with:
+     - subject: "Session ended — <goals_completed_this_session> goals closed"
+     - message: a concise wrap-up — goals completed, aspirations
+       completed/archived, tree nodes encoded, knowledge debt delta, any
+       blockers surfacing in the handoff, and the fact that the loop has
+       stopped (user can resume via /start).
+
+     If no matching skill is registered, fall back to a
+     `participants: [agent, user]` goal via `aspirations-add-goal.sh`
+     titled `"User Notice: Session ended"` with
+     `origin_signal: "idea:session-end-notification"`. Never block
+     consolidation on notification failure — the handoff and archive
+     are already persisted.)
+
 ### Execution Checklist (MANDATORY)
 
 Before proceeding to Step 10, output a checklist accounting for EVERY step.
-Each step must show one of: `done`, `empty` (ran but no data), `skipped (stop_mode)`, `skipped (file missing)`, `skipped (lean)`.
+Each step must show a value from its own inline `{…}` enumeration (the row
+defines the allowed values for that row — don't invent new ones).
 Do NOT proceed without outputting this checklist.
 
 ```
@@ -676,15 +743,26 @@ CONSOLIDATION CHECKLIST:
   Step 8.7 User Goal Recap:        {done|skipped (stop_mode)}
   Step 8.87 Team State + Blockers: {done}
   Step 9  Handoff:                 {done}
+  Step 9  Phase Cost Report:       {done|skipped (no markers)}
   Step 9.5 Transfer Profile:       {done|skipped (file missing)}
+  Step 9.7 Notify User (stop_mode): {done|skipped (mid-loop)|skipped (no matching forged skill)}
 ```
 
 10. Restart Loop Cycle (skip in stop_mode):
     IF stop_mode == true:
-        Output: "Consolidation complete (stop mode — no restart)."
+        # Message is emitted via the Bash echo itself — never as a preceding
+        # text step. Return-protocol: last action must be a tool call.
+        Bash: echo "Consolidation complete (stop mode — no restart)."
         RETURN
     # INTENTIONAL RECURSIVE CALL: aspirations → boot → aspirations.
     # Context compression prevents unbounded growth. Do not "fix" this cycle.
     Invoke /boot
     Boot detects handoff.yaml → continuation mode (abbreviated report → fast loop handoff).
 ```
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+Normal path: `Invoke /boot` (Skill call) is the terminal action. Stop-mode path:
+the `Bash: echo ...` in Step 10 above IS the terminal action — the message is
+emitted from inside the Bash call, not as a preceding text step.

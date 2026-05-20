@@ -24,13 +24,26 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from _paths import AGENT_DIR
 
-# AGENT_DIR is None when AYOAI_AGENT is not set (no-agent mode).
+# AGENT_DIR is None when MIND_AGENT is not set (no-agent mode).
 # Session scripts return "NO_AGENT" instead of crashing.
 SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
 
 VALID_STATES = {"RUNNING", "IDLE"}
 VALID_PERSONA = {"true", "false"}
-VALID_SIGNALS = {"loop-active", "stop-loop", "stop-requested"}
+# DO NOT remove entries — interruptible-sleep.sh polls these by file presence.
+# Add new quiescence-wake signals here; writers must use session-signal-set.sh
+# so the manifest stays authoritative (reader side is raw [ -f ] in the sleep loop).
+VALID_SIGNALS = {
+    "loop-active", "stop-loop", "stop-requested", "blocker-cleared", "pq-resolved",
+    "board-activity", "email-received", "goal-claim-released",
+}
+# Runtime session modes — values written to session/agent-mode and read by
+# session-mode-get/set. Strict triad. NOTE: skill-structure-gate.py declares
+# a SUPERSET ({reader, assistant, autonomous, any, internal}) for the
+# `minimum_mode:` front-matter field on SKILL.md files; "any" and "internal"
+# are framework-control escape hatches that are NEVER valid runtime modes.
+# When adding a new runtime mode, update BOTH this set AND the one at
+# skill-structure-gate.py:76. Source of truth for runtime modes: this file.
 VALID_MODES = {"reader", "assistant", "autonomous"}
 DEFAULT_MODE = "reader"
 
@@ -38,7 +51,7 @@ DEFAULT_MODE = "reader"
 def require_agent():
     """Exit with clear error if no agent is bound to this session."""
     if SESSION_DIR is None:
-        print("Error: no agent active (AYOAI_AGENT not set). Use /start <name> first.", file=sys.stderr)
+        print("Error: no agent active (MIND_AGENT not set). Use /start <name> first.", file=sys.stderr)
         sys.exit(1)
 
 

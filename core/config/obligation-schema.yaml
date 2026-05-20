@@ -1,0 +1,112 @@
+# Obligation Schema — authoritative spec for per-iteration ABBREVIABLE obligations.
+#
+# The orchestrator declares four mandatory obligations (verify, state, maintain,
+# learn — see aspirations/SKILL.md "PER-ITERATION OBLIGATIONS"). Of those,
+# MAINTAIN is pure working-memory housekeeping (scripts, no skill) and has no
+# abbreviation policy. This file covers the abbreviable ones plus SPARK (which
+# is skippable per skip-rule, distinct from the four mandatory obligations but
+# worth a minimum-inline spec for the cases where the agent chooses to spark
+# briefly during a routine outcome).
+#
+# For each obligation this file declares:
+#
+#   mandatory_writes       — state locations that MUST be written regardless of
+#                            context budget. Skipping these = knowledge debt.
+#   skill_preferred        — the Skill() call that is the canonical way to
+#                            satisfy the obligation. Use this when the budget
+#                            allows the full cascade.
+#   abbreviated_allowed_when — conditions under which the agent may inline an
+#                            abbreviated pattern instead of invoking the full
+#                            Skill. MUST be accompanied by an
+#                            `OBLIGATION ABBREVIATED: {phase} — {condition}`
+#                            journal line; the learning-gate audits those lines.
+#   minimum_inline         — the minimum set of writes/operations the agent
+#                            MUST perform if abbreviating. Less than this is
+#                            NOT abbreviation, it's skipping.
+#
+# Non-blocking enforcement: abbreviation is legal when the condition holds.
+# The learning gate runs an audit pass each iteration that scans the previous
+# iteration's journal entry for `OBLIGATION ABBREVIATED:` lines and verifies
+# the claimed condition was true at that time. False claims are logged; 3+
+# false claims in a session auto-file an Investigate goal. See
+# aspirations-learning-gate Phase 9.5d.
+#
+# Outcome classes (used below):
+#   routine  — recurring goal producing no new findings (see aspirations-state-update)
+#   deep     — every non-routine outcome
+#
+# Context budget zones (from <agent>/session/context-budget.json):
+#   fresh, normal, tight — anchored on distance-to-autocompact, NOT raw usage.
+# Source of truth: core/scripts/context-budget-status.py classify_zone.
+# Do NOT duplicate the numeric thresholds here — they drift. The script reads
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE at
+# statusLine time so zones track whatever the user has configured.
+#
+# Adding a new obligation: append a block below, then add a reference to
+# obligation-schema.yaml in the corresponding SKILL.md "Mandatory writes"
+# section. Keep the vocabulary short — this file is read at audit time.
+
+obligations:
+
+  verify:
+    mandatory_writes:
+      - goal.status
+      - goal.streaks_if_recurring
+    skill_preferred: aspirations-verify
+    abbreviated_allowed_when:
+      - outcome_class == routine
+      - context_budget.zone == tight
+    minimum_inline: >
+      update goal.status via aspirations-update-goal.sh; if recurring,
+      update currentStreak / longestStreak / achievedCount.
+
+  state:
+    mandatory_writes:
+      - journal_entry
+      - goal_completion_attribution
+      - wm.goals_completed
+      - team_state
+      - wm.loop_state
+    skill_preferred: aspirations-state-update
+    abbreviated_allowed_when:
+      - context_budget.zone == tight
+    minimum_inline: >
+      journal entry via journal-merge.sh or journal-add.sh;
+      aspirations-complete-by.sh for world-queue goals;
+      wm-append goals_completed; team-state-update; wm-set loop_state.
+
+  learn:
+    mandatory_writes:
+      - sensory_buffer_or_reasoning_bank
+      - wm.loop_state_persisted
+    skill_preferred: aspirations-learning-gate
+    abbreviated_allowed_when:
+      - context_budget.zone == tight
+    minimum_inline: >
+      append a sensory-buffer observation (wm-append.sh sensory_buffer)
+      OR reasoning-bank-add.sh entry; then wm-set loop_state so the
+      next iteration re-enters with current counters.
+
+  spark:
+    mandatory_writes: []
+    skill_preferred: aspirations-spark
+    abbreviated_allowed_when:
+      - outcome_class == routine
+    minimum_inline: >
+      if a creative insight was detected, record a one-line journal note;
+      else no writes required (spark is discretionary for routine outcomes).
+
+# Silent-failure catalog — text markers that would make an abbreviated claim
+# UNFALSIFIABLE. If any of these appear in the `OBLIGATION ABBREVIATED:` line
+# without evidence, the learning-gate audit treats the claim as suspect.
+abbreviation_audit:
+  journal_line_format: "OBLIGATION ABBREVIATED: {phase} — {condition}"
+  must_include:
+    - phase_name_from_obligations_above
+    - one_of_the_abbreviated_allowed_when_conditions
+  false_claim_threshold: 3
+  false_claim_response: >
+    Auto-file a single `Investigate: false-abbreviation-claims` goal
+    (HIGH, category framework-maintenance) per session. Reset the counter
+    at session-end consolidation.
+  per_session_log_path: "<agent>/session/obligation-audit.jsonl"

@@ -1,6 +1,6 @@
 ---
 name: reflect
-description: "Reflexion-based learning from hypothesis outcomes — ABC chains, violation tracking, hierarchical reflection, strategy extraction"
+description: "Orchestrates Reflexion-based learning: dispatches to /reflect-on-outcome (hypothesis ABC chains, execution patterns, batch micro-hypotheses), /reflect-on-self (pattern synthesis, Level 2 self-model, calibration), or /reflect-maintain (memory curation, active forgetting, aspiration grooming) based on --mode. Use whenever the aspirations loop hits a reflection cadence, a hypothesis resolves, the user asks to \"reflect on recent work\", or after major outcomes that warrant pattern extraction."
 user-invocable: false
 triggers:
   - "/reflect"
@@ -19,6 +19,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, reasoning-guardrails, pattern-signatures, handoff-working-memory]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-reflect-8f539f"
+previous_revision_id: null
 ---
 
 # /reflect — Reflexion-Based Self-Learning Engine
@@ -53,6 +55,10 @@ Based on: Reflexion (Shinn 2023), ABC Method, Generative Agents (Park 2023), VoE
 ## Step 0: Load Conventions
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
+
+## Step 0.1: Stamp reflection cadence (G5 of Phase 1.5)
+
+**Step 0.1: Stamp reflection cadence** — `Bash: reflection-cadence-stamp.sh <mode>` (mode is the --mode arg, e.g. "on-hypothesis", "on-execution", "full-cycle", "batch-micro", etc.). Records this reflection in `wm.last_reflection_at` AND appends to `world/reflection-history.jsonl`. Signal #13 of the Self/Program evolution metric vector (world/conventions/self-program-evolution.md) reads the history file to compute "reflection_cadence — fraction of expected reflection windows that contained ≥1 fire over the last 50 goals." Fail-silent — never blocks /reflect. Runs BEFORE Step 0.5 context retrieval so cadence accounting captures the reflection regardless of downstream success.
 
 ## Step 0.5: Load Context for Reflection
 
@@ -112,6 +118,43 @@ IF adaptive_depth exists AND goal context is available:
     IF adaptive_depth.scale_on_importance AND goal.priority == "HIGH":
         depth_multiplier = min(depth_multiplier * 1.25, adaptive_depth.max_depth_multiplier)
     # Apply multiplier as advisory guidance to sub-skill invocations
+```
+
+## Step 0.35: Adversarial Review Check (rb-356 origin)
+
+Originated from the PreCompact-gate release-scope bug: tests passed 15/15 while
+the release predicate was a strict subset of the acquire predicate. The bug
+was only caught by adversarial self-review with verification questions. This
+step automates the trigger so the protocol fires without the user having to
+ask for it.
+
+```
+# Step 0.35: Adversarial Review trigger check
+# Only applies when goal context is available (--on-execution, --on-hypothesis)
+IF adversarial_review exists AND goal context is available:
+    goal_category = goal.category OR ""
+    goal_topic    = goal.description OR goal.title OR ""
+    combined      = lowercase(goal_category + " " + goal_topic)
+    files_touched = length(goal.files_changed OR [])
+
+    matched_substring = first(s for s in adversarial_review.triggers.category_substrings
+                              if s in combined)
+    IF matched_substring is not null
+       AND files_touched >= adversarial_review.triggers.min_files_touched:
+        # Surface the protocol questions so the sub-skill incorporates them
+        # into its ABC chain / pattern synthesis / encoded lessons.
+        Emit: "ADVERSARIAL_REVIEW_TRIGGERED (matched: {matched_substring}, files: {files_touched})"
+        Emit: adversarial_review.protocol  # the 4 questions
+
+        # Bump counters — tracks whether the pattern pays for itself over time.
+        Bash: meta-set.sh reflection-strategy.yaml adversarial_review.last_triggered "$(date +%Y-%m-%dT%H:%M:%S)"
+        Bash: meta-set.sh reflection-strategy.yaml adversarial_review.times_fired $(($OLD_VALUE + 1))
+        # If the sub-skill surfaces a bug through the protocol, the sub-skill
+        # bumps adversarial_review.times_caught_bug via the same mechanism.
+
+# These questions are advisory guidance for the reflection sub-skill — they do
+# not block the reflection or change routing. They join retrieval_context so
+# the sub-skill naturally addresses them during pattern extraction.
 ```
 
 ## Mode Routing
@@ -210,19 +253,31 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # weaknesses auto-create investigation goals.
      # Only runs during --full-cycle.
 
-     Read <agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: []} if missing)
+     Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: []} if missing)
 
      # Gather signals from multiple sources
      signals = []
 
      # 1. Pattern signatures with high false positive rate
+     # Live schema: outcome_stats.{confirmed, total, accuracy}.
+     # false_positive_rate = 1 - accuracy; gate on sufficient sample size. (DRIFT-EXEMPT: rename-documentation)
+     # rb-245 pre-read gate: verify schema before aggregating. If the gate fails,
+     # SKIP this sub-phase (other phases continue). Do NOT --override: that
+     # silences the signal the gate exists to produce. Fix field paths below instead.
+     Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+             --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
+             --field-names "outcome_stats.accuracy,outcome_stats.total"
      Bash: pattern-signatures-read.sh --active
-     FOR EACH sig WHERE sig.false_positive_rate > 0.3 AND sig.times_triggered >= 3:
+     FOR EACH sig WHERE sig.outcome_stats.accuracy < 0.70 AND sig.outcome_stats.total >= 3:
          signals.append({source: "pattern_signature", id: sig.id, detail: sig})
 
      # 2. Guardrails that fired frequently
+     # rb-245 pre-read gate: same contract as above.
+     Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
+             --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
+             --field-names "utilization.times_active"
      Bash: guardrails-read.sh --active
-     FOR EACH guard WHERE guard.times_triggered >= 3:
+     FOR EACH guard WHERE guard.utilization.times_active >= 3:
          signals.append({source: "guardrail", id: guard.id, detail: guard})
 
      # 3. Experience records with negative relative_advantage clustered by approach
@@ -281,7 +336,8 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
                      title: "Investigate: {weakness.description (60 chars)}",
                      status: "pending", priority: "MEDIUM",
                      skill: null, participants: ["agent"],
-                     description: "Weakness detected by aggregated failure analysis.\nType: {weakness.type}\nEvidence: {weakness.evidence}\nDiscovered by: Step 5.55 Weakness Analysis"
+                     description: "Weakness detected by aggregated failure analysis.\nType: {weakness.type}\nEvidence: {weakness.evidence}\nDiscovered by: Step 5.55 Weakness Analysis",
+                     origin_signal: "investigate:weakness-{weakness.type}"
                  }
                  # Route to most relevant aspiration
                  target_asp = aspiration matching weakness category, or most recent active
@@ -291,7 +347,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 
      weakness_report.last_analyzed = now
      weakness_report.analysis_count += 1
-     Edit <agent>/weakness-report.yaml with updated content
+     Edit agents/<agent>/weakness-report.yaml with updated content
 
      Output: "▸ Weakness analysis: {len(signals)} signals, {new_weakness_count} new weakness(es), {goal_count} investigation goal(s)"
 5.7. **Meta-Reflection ROI Tracking**:
@@ -359,7 +415,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 - **Updates evaluation calibration**: Adjusts evaluation weights based on calibration data
 - **Updates pattern signatures** (via `pattern-signatures-add.sh`, `pattern-signatures-record-outcome.sh`): New signatures, accuracy updates, separation markers
 - **Updates working memory** (via `wm-append.sh`): Encoding queue items from Step 2.5
-- **Updates `<agent>/developmental-stage.yaml`**: Schema operations (assimilation/accommodation)
+- **Updates `agents/<agent>/developmental-stage.yaml`**: Schema operations (assimilation/accommodation)
 - **Updates `meta/skill-gaps.yaml`**: Capability gap detection (Spark Q6) and skill underperformance (Spark Q7)
 
 ---

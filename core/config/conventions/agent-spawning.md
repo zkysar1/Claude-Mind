@@ -25,6 +25,17 @@ receive context as data — they do NOT invoke `/prime` or any other skill.
 **Output:** Plain text to stdout. Self-contained context block with section headers.
 Read-only — no retrieval counter increments, no state file modifications.
 
+**Output sections (in order):**
+
+1. `AGENT CONTEXT` header — role, category
+2. `── IDENTITY ──` — first lines of `agents/<agent>/self.md`
+3. `── PROGRAM ──` — first lines of `world/program.md`
+4. `── RESOLVED PATHS ──` — PROJECT_ROOT, WORLD_DIR, META_DIR, AGENT_DIR (always rendered, never truncated). Sub-agents grepping JSONL stores or tree nodes MUST use these resolved paths rather than searching only the local repo.
+5. `── REPO: <name> ──` — conditional on `--repo`; safety tier + test command + first 20 meaningful lines of the repo's CLAUDE.md
+6. `── CONSTRAINTS (N guardrails) ──` — category-matched guardrails (+ operation-tagged guardrails for executor role)
+7. `── LESSONS (N from reasoning bank) ──` — category-matched reasoning-bank entries
+8. `── KNOWLEDGE (N nodes) ──` — category-matched knowledge-tree nodes by confidence desc
+
 ## Mandatory Spawning Pattern
 
 All agent spawning MUST follow this 3-step pattern:

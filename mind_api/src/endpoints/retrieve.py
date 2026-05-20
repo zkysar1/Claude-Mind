@@ -1,0 +1,526 @@
+"""GET /v1/retrieve — full retrieve.py parity (read-only AND counter-bump).
+
+Query parameters:
+    category=<cat>            required (comma-separated for multi-category)
+    depth=<shallow|medium|deep>   default `deep` (matches CLI default)
+    supplementary_only=1      skip tree node matching
+    full_content=1            include long-form body fields
+    include_framework=1       include framework rules + conventions
+    read_only=1               optional — absent ⇒ counter-bump path
+    goal=<goal-id>            optional — scopes the retrieval-session manifest
+    tree_nodes=<k1,k2>        optional — extra node keys recorded in manifest
+
+Equivalence target: stdout JSON of
+    py -3 core/scripts/retrieve.py --category <c> [--depth ...] [--read-only] \\
+        [--goal G] [--tree-nodes k1,k2] [--full-content] \\
+        [--include-framework] [--supplementary-only]
+
+Counter-bump path (Decision #58 — supersedes #24 and extends #25):
+  retrieve.py fans into seven backing stores; the non-read-only path bumps
+  retrieval counters on five (tree, rb, guard, sigs, exp) and writes
+  retrieval-session.json under AGENT_DIR. Decision #24 deferred daemonising
+  this ("a strictly larger PR; keep the CLI byte-identical") and the wrapper
+  fell through to `python3 retrieve.py`. The 2026-05-14 daemon-only cutover
+  (commit 25d6520) then DELETED retrieve.py's argparse + main() + __main__
+  — the very CLI #24 relied on — so every autonomous-mode retrieve (prime
+  Phase 3, learning-gate, goal-execution) silently returned nothing from
+  2026-05-14 until this fix. Both blockers #24 named are now resolved in
+  production: `_fileops` locked writers run in-daemon (aspirations_write /
+  pipeline_write), and per-request paths are handled by the #25 path-swap.
+  This endpoint therefore serves BOTH paths; there is no direct-python
+  fallback and no `read_only_required` 400 anymore.
+
+Path-swap pattern (Decision #25, extended by #58):
+  retrieve.py holds ten module-level globals derived from WORLD_DIR /
+  AGENT_DIR at import time (TREE_PATH, RB_PATH, GUARD_PATH, SIGS_PATH,
+  BELIEFS_PATH, EXP_PATH, EI_PATH, FRAMEWORK_WORLD_CONVENTIONS_DIR, plus
+  WORLD_DIR + AGENT_DIR). The endpoint serialises swap + load_* + (for the
+  counter-bump path) the session-manifest write + restore under one daemon-
+  wide lock so concurrent requests for different agents cannot clobber each
+  other's globals. #58 additionally swaps os.environ["MIND_AGENT"] inside
+  the same lock: the counter-bump path calls _infer_in_flight_goal_id()
+  (reads the env + WORLD_DIR/team-state.yaml) and _fileops save_history /
+  append_changelog (_agent_name() = os.environ["MIND_AGENT"]) — without
+  the env swap a bravo request would infer alpha's goal and attribute alpha
+  in the changelog. retrieve.py's _log_retrieval_trace was also fixed to
+  read the swappable module-global WORLD_DIR instead of re-importing _paths.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import threading
+from pathlib import Path
+
+# Make core/scripts/ importable so we can call retrieve.load_* directly.
+_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "core" / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+# Import the module ONCE at startup. The daemon will swap its path globals
+# per request under `_swap_lock` below. Import-time side effects of
+# retrieve.py: reconfigures stdout/stderr to utf-8 (harmless — the daemon
+# already does this), imports tree_match + _rb_helpers + _fileops (all path-
+# stable except for the WORLD_DIR-derived paths we already plan to swap).
+import retrieve as _r  # noqa: E402
+# Import build_concept_index from tree_match DIRECTLY so a future
+# importlib.reload of this module can't capture our patched _r.build_concept_
+# index as the "real" function (which would create infinite recursion on the
+# first cache miss). tree_match.build_concept_index is never patched.
+from tree_match import build_concept_index as _real_build_concept_index  # noqa: E402
+
+from ..yaml_cache import cache as _yaml_cache
+
+
+# Serialises (snapshot, swap, call, restore) so concurrent requests for
+# different agents do not race on retrieve's module globals. The whole call
+# is held — load_* functions read TREE_PATH / RB_PATH / etc. as module
+# globals on every call, so any mid-call swap would corrupt results.
+_swap_lock = threading.Lock()
+
+
+# --- Hot-path caches (installed once at module load) -----------------------
+# Without these, retrieve takes ~7-10s per call on OneDrive worlds because:
+#   1. read_yaml() reparses _tree.yaml (~270KB, 50-100ms) on every call.
+#   2. build_concept_index() reads every node's .md file (~94 files, ~9-47s
+#      cold, ~250ms warm) on every call.
+# The CLI hides both costs behind Python-startup amortisation (one read per
+# subprocess). The daemon can't — without caches, every endpoint call is
+# essentially a cold CLI call.
+#
+# Strategy: patch retrieve's module-level names so its internal callers
+# (load_tree_nodes / load_beliefs / load_experiential_index / _detect_
+# coverage_gap) automatically pick up the cached versions. The patch is
+# process-wide and monotonic (caches strictly add information; original
+# behaviour is preserved when caches miss). No per-request undo needed.
+
+# Each entry is (idx, anchor) where `anchor` is a strong reference to the
+# nodes dict that produced this idx. Holding the dict strongly is LOAD-BEARING:
+# without it, after yaml_cache invalidates a tree.yaml entry, the old dict
+# becomes GC-eligible. CPython's small-object pool reuses freed addresses, so
+# a new dict can land at the same memory address — at which point id(new_nodes)
+# would collide with our cache key and return the STALE idx. Do not remove
+# the anchor.
+_concept_cache: dict = {}
+_concept_cache_lock = threading.Lock()
+_CONCEPT_CACHE_MAX = 8  # bounded; ~1 entry per agent
+
+
+def _cached_build_concept_index(nodes):
+    """id(nodes)-keyed wrapper. Misses naturally when yaml_cache reloads
+    _tree.yaml (mtime change → new dict identity → cache miss → real rebuild).
+    The anchor in the cache entry prevents id reuse from causing stale hits."""
+    nodes_id = id(nodes)
+    with _concept_cache_lock:
+        entry = _concept_cache.get(nodes_id)
+    if entry is not None:
+        return entry[0]
+    # Build outside the lock — file I/O can be slow on cold caches.
+    idx = _real_build_concept_index(nodes)
+    with _concept_cache_lock:
+        _concept_cache[nodes_id] = (idx, nodes)  # anchor pins the dict
+        if len(_concept_cache) > _CONCEPT_CACHE_MAX:
+            _concept_cache.pop(next(iter(_concept_cache)))
+    return idx
+
+
+def _cached_read_yaml(path):
+    """Daemon-cached replacement for retrieve.read_yaml. Routes through
+    yaml_cache (mtime+size keyed). Returns {} for missing files to match
+    the original read_yaml's contract.
+
+    Mutation contract: yaml_cache returns the SHARED reference. retrieve's
+    read_yaml callers (load_tree_nodes, load_beliefs, load_experiential_
+    index, _detect_coverage_gap, _load_retrieval_cfg) read from the dict
+    but do NOT mutate it — verified by audit before installing this patch.
+    """
+    data = _yaml_cache().get(path)
+    return data if isinstance(data, dict) else {}
+
+
+# Install the patches. From this point on, any code that calls
+# `retrieve.build_concept_index(...)` or `retrieve.read_yaml(...)` — which
+# includes all of retrieve's internal load_* functions — gets the cached
+# versions. The direct-python fallback path is unaffected because it imports
+# retrieve fresh in its own process.
+_r.build_concept_index = _cached_build_concept_index
+_r.read_yaml = _cached_read_yaml
+
+
+def _flag(q, name: str) -> bool:
+    v = q.get(name)
+    if v is None:
+        return False
+    return v.lower() not in ("", "0", "false", "no")
+
+
+def handle(ctx) -> "Response":  # type: ignore[name-defined]
+    from ..server import Response
+
+    q = ctx.query
+    category = (q.get("category") or "").strip()
+    if not category:
+        return Response.error(400, "missing_param",
+                              "query parameter 'category' is required")
+
+    depth = (q.get("depth") or "deep").lower()
+    if depth not in ("shallow", "medium", "deep"):
+        return Response.error(400, "invalid_param",
+                              f"depth must be shallow/medium/deep, got {depth!r}")
+
+    # source=agent semantics — retrieve always operates against the bound
+    # agent. Require an explicit header (mirrors aspirations.read for source=
+    # agent; without it the resolver picks "first available agent" which
+    # would silently route to the wrong store). Required on BOTH paths now —
+    # the counter-bump path needs it to swap MIND_AGENT env correctly.
+    explicit_agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    if not explicit_agent:
+        return Response.error(400, "agent_unset",
+                              "X-Mind-Agent header required for /v1/retrieve")
+
+    # read_only is now HONOURED, not required (Decision #58 supersedes #24).
+    # Absent ⇒ counter-bump path: runs in-daemon under the same path-swap
+    # lock as the read path, with MIND_AGENT env also swapped so
+    # _infer_in_flight_goal_id() + _fileops attribution resolve to the
+    # REQUESTING agent. The `read_only_required` 400 that used to live here
+    # is gone.
+    read_only = _flag(q, "read_only")
+    goal = (q.get("goal") or "").strip() or None
+    tree_nodes_param = (q.get("tree_nodes") or "").strip()
+
+    supplementary_only = _flag(q, "supplementary_only")
+    full_content = _flag(q, "full_content")
+    include_framework = _flag(q, "include_framework")
+
+    categories = [c.strip() for c in category.split(",") if c.strip()]
+    if not categories:
+        return Response.error(400, "missing_param",
+                              "category must contain at least one non-empty value")
+
+    world = ctx.paths.world
+    agent_dir = ctx.paths.agent
+
+    coverage_gap = None
+    with _swap_lock:
+        # Snapshot the globals we will swap. CAPTURED INSIDE THE LOCK —
+        # concurrency-critical. server.py runs a ThreadingHTTPServer, so if
+        # this baseline were captured before acquiring the lock, a concurrent
+        # request B could snapshot request A's ALREADY-SWAPPED paths/env
+        # (while A holds the lock) as B's "baseline", then restore the module
+        # globals to A's values in B's finally — persistently corrupting the
+        # daemon's globals for every later request. With the lock held, every
+        # prior holder has already restored in its own finally (which runs
+        # before the lock is released), so these reads are guaranteed to see
+        # the true daemon-startup baseline. Captured BEFORE the `try:` so the
+        # `finally` always has `saved` + `_saved_env_agent` bound even if a
+        # swap-in line below raises.
+        #
+        # Listed verbatim so a future reader can see the entire blast radius.
+        # If retrieve.py grows another WORLD_DIR-derived module global, add it
+        # to BOTH this dict AND the swap-in block below — otherwise the new
+        # path is read from the daemon's startup-time value and serves stale
+        # data.
+        saved = {
+            "WORLD_DIR": _r.WORLD_DIR,
+            "AGENT_DIR": _r.AGENT_DIR,
+            "TREE_PATH": _r.TREE_PATH,
+            "RB_PATH": _r.RB_PATH,
+            "GUARD_PATH": _r.GUARD_PATH,
+            "SIGS_PATH": _r.SIGS_PATH,
+            "BELIEFS_PATH": _r.BELIEFS_PATH,
+            "EXP_PATH": _r.EXP_PATH,
+            "EI_PATH": _r.EI_PATH,
+            "FRAMEWORK_WORLD_CONVENTIONS_DIR": _r.FRAMEWORK_WORLD_CONVENTIONS_DIR,
+        }
+        # Decision #58: also swap MIND_AGENT env. _infer_in_flight_goal_id()
+        # reads os.environ["MIND_AGENT"] + WORLD_DIR/team-state.yaml; _fileops
+        # _agent_name() (save_history / append_changelog attribution on the
+        # counter-bump path) = os.environ.get("MIND_AGENT","system"). The
+        # daemon process env holds its STARTUP agent, not the requester's.
+        # Saved-as-None means "was unset" → pop on restore (never write "").
+        # Same lock-scope rule as `saved` above — capture inside the lock.
+        _saved_env_agent = os.environ.get("MIND_AGENT")
+        try:
+            os.environ["MIND_AGENT"] = explicit_agent
+            _r.WORLD_DIR = world
+            _r.AGENT_DIR = agent_dir
+            _r.TREE_PATH = world / "knowledge" / "tree" / "_tree.yaml"
+            _r.RB_PATH = world / "reasoning-bank.jsonl"
+            _r.GUARD_PATH = world / "guardrails.jsonl"
+            _r.SIGS_PATH = world / "pattern-signatures.jsonl"
+            _r.BELIEFS_PATH = world / "knowledge" / "beliefs.yaml"
+            _r.EXP_PATH = (agent_dir / "experience.jsonl") if agent_dir else None
+            _r.EI_PATH = (agent_dir / "experiential-index.yaml") if agent_dir else None
+            _r.FRAMEWORK_WORLD_CONVENTIONS_DIR = world / "conventions"
+
+            # effective_goal computed ONCE (mirrors retrieve.py main()
+            #  / ). MUST be inside the swap — it reads the
+            # swapped MIND_AGENT env + WORLD_DIR/team-state.yaml.
+            effective_goal = goal or _r._infer_in_flight_goal_id()
+
+            #  gate: no goal context (no ?goal and no in-flight goal
+            # inferable from team-state) → auto-read-only, so we never bump
+            # retrieval_count without a goal to classify it against
+            # ("retrieved but never classified" drift). Symmetric with the
+            # session-manifest gate below — bumps and manifest skip together.
+            if not read_only and not effective_goal:
+                read_only = True
+                try:
+                    _r.record_firing(
+                        "retrieve.no_goal_gate",
+                        context={"category": category, "depth": depth})
+                except Exception:
+                    pass
+
+            # Load tree nodes unless supplementary_only. Returns ([], set())
+            # in the supplementary-only branch — matches main() parity.
+            if supplementary_only:
+                tree_nodes, retrieval_channels = [], set()
+            else:
+                tree_nodes, retrieval_channels = _r.load_tree_nodes(
+                    categories, depth, read_only=read_only)
+
+            # Coverage-gap detection (E12) — only when tree returned empty.
+            if not supplementary_only and not tree_nodes:
+                coverage_gap = _r._detect_coverage_gap(categories)
+
+            # read_only is now the post-gate value. When False, these load_*
+            # calls run _locked_bump_jsonl / locked_modify_yaml against the
+            # SWAPPED module-global paths (TREE_PATH/RB_PATH/...). Decision
+            # #24's "wrong agent's WORLD_DIR baked in" fear is handled by the
+            # path swap + the MIND_AGENT env swap above.
+            reasoning_bank, meta_lessons = _r.load_reasoning_bank(
+                categories, depth, read_only=read_only)
+            guardrails = _r.load_guardrails(categories, depth,
+                                            read_only=read_only)
+            pattern_signatures = _r.load_pattern_signatures(
+                categories, depth, read_only=read_only)
+            experiences = _r.load_experiences(categories, depth,
+                                              read_only=read_only)
+            beliefs = _r.load_beliefs(categories)
+            experiential_index = _r.load_experiential_index(categories)
+
+            framework_rules = (_r.load_framework_rules(categories)
+                               if include_framework else [])
+
+            # Timestamp INSIDE the lock so meta + the session manifest are
+            # consistent with what was just loaded.
+            timestamp = _r.now_str()
+
+            items_returned = {
+                "tree_nodes": len(tree_nodes),
+                "reasoning_bank": len(reasoning_bank),
+                "meta_lessons": len(meta_lessons),
+                "guardrails": len(guardrails),
+                "pattern_signatures": len(pattern_signatures),
+                "experiences": len(experiences),
+                "beliefs": len(beliefs),
+            }
+            if include_framework:
+                items_returned["framework_rules"] = len(framework_rules)
+
+            # Counter-bump session manifest (Layer 1 utilization tracking),
+            # ported from the deleted retrieve.py main(). ORDER IS LOAD-
+            # BEARING: build this BEFORE _strip_long_form (which runs after
+            # the lock) — strip nulls content/description in the SAME dicts,
+            # halving the utilization-feedback token signal. Gate is
+            # symmetric with : effective_goal AND not read_only AND
+            # an agent dir to write under.
+            if effective_goal and not read_only and agent_dir:
+                tree_node_keys = []
+                if tree_nodes_param:
+                    tree_node_keys = [k.strip() for k in
+                                      tree_nodes_param.split(",") if k.strip()]
+                for tn in tree_nodes:
+                    k = tn.get("key", "")
+                    if k and k not in tree_node_keys:
+                        tree_node_keys.append(k)
+
+                tree_summary_by_key = {
+                    tn.get("key", ""): tn.get("summary", "") or ""
+                    for tn in tree_nodes if tn.get("key")}
+                tree_nodes_detail = [{
+                    "key": k,
+                    "summary": tree_summary_by_key.get(k, ""),
+                    "distinctive_tokens": _r._distinctive_tokens(
+                        tree_summary_by_key.get(k, "")),
+                } for k in tree_node_keys]
+
+                def _times_active(rec):
+                    u = (rec.get("utilization")
+                         if isinstance(rec, dict) else None)
+                    if isinstance(u, dict):
+                        v = u.get("times_active", 0)
+                        if isinstance(v, int) and not isinstance(v, bool):
+                            return v
+                    return 0
+
+                supp_items = []
+                supp_detail = []
+                for item in reasoning_bank:
+                    iid = item.get("id", "")
+                    if not iid:
+                        continue
+                    if not (_r.is_universal_rb(item)
+                            or _r._entry_matches_category(item, categories)):
+                        continue
+                    supp_items.append({"id": iid, "type": "reasoning_bank"})
+                    text = _r._item_text_for_tokens(item, "reasoning_bank")
+                    supp_detail.append({
+                        "id": iid, "type": "reasoning_bank",
+                        "summary": text[:300],
+                        "distinctive_tokens": _r._distinctive_tokens(text),
+                        "times_active_at_retrieve": _times_active(item),
+                    })
+                for item in meta_lessons:
+                    iid = item.get("id", "")
+                    if not iid:
+                        continue
+                    # meta_lessons IS the universal partition — unconditional.
+                    supp_items.append({"id": iid, "type": "meta_lesson"})
+                    text = _r._item_text_for_tokens(item, "reasoning_bank")
+                    supp_detail.append({
+                        "id": iid, "type": "meta_lesson",
+                        "summary": text[:300],
+                        "distinctive_tokens": _r._distinctive_tokens(text),
+                        "times_active_at_retrieve": _times_active(item),
+                    })
+                for item in guardrails:
+                    iid = item.get("id", "")
+                    if not iid:
+                        continue
+                    if not _r._entry_matches_category(item, categories):
+                        continue
+                    supp_items.append({"id": iid, "type": "guardrail"})
+                    text = _r._item_text_for_tokens(item, "guardrail")
+                    supp_detail.append({
+                        "id": iid, "type": "guardrail",
+                        "summary": text[:300],
+                        "distinctive_tokens": _r._distinctive_tokens(text),
+                        "times_active_at_retrieve": _times_active(item),
+                    })
+                for item in pattern_signatures:
+                    iid = item.get("id", "")
+                    if not iid:
+                        continue
+                    if not _r._entry_matches_category(item, categories):
+                        continue
+                    supp_items.append({"id": iid,
+                                       "type": "pattern_signature"})
+                    text = _r._item_text_for_tokens(item,
+                                                    "pattern_signature")
+                    supp_detail.append({
+                        "id": iid, "type": "pattern_signature",
+                        "summary": text[:300],
+                        "distinctive_tokens": _r._distinctive_tokens(text),
+                    })
+
+                session_record = {
+                    "schema_version": 2,
+                    "goal_id": effective_goal,
+                    "timestamp": timestamp,
+                    "categories": categories,
+                    "tree_nodes_loaded": tree_node_keys,
+                    "supplementary_items": supp_items,
+                    "tree_nodes_detail": tree_nodes_detail,
+                    "supplementary_detail": supp_detail,
+                    "counts": {
+                        "tree_nodes": len(tree_node_keys),
+                        "reasoning_bank": len(reasoning_bank),
+                        "meta_lessons": len(meta_lessons),
+                        "guardrails": len(guardrails),
+                        "pattern_signatures": len(pattern_signatures),
+                        "experiences": len(experiences),
+                    },
+                    "utilization_pending": True,
+                    "utilization_completed_at": None,
+                }
+                try:
+                    from _fileops import locked_write_json
+                    locked_write_json(
+                        agent_dir / "session" / "retrieval-session.json",
+                        session_record)
+                except Exception:
+                    # Best-effort: a manifest write failure must not fail the
+                    # retrieve — the data the caller asked for is ready. The
+                    # CLI treated this write as fatal-on-error; the daemon
+                    # serves many agents and must not 500 a good retrieval
+                    # over a utilization-telemetry write.
+                    pass
+
+            # G3 telemetry — one line per invocation, fail-silent inside.
+            # Inside the lock because (post retrieve.py #58 fix) it reads the
+            # swapped module-global WORLD_DIR. retrieve.py main() called this
+            # unconditionally on BOTH paths; the read-only daemon path
+            # previously omitted it (a PR5 parity gap) — restored here.
+            _r._log_retrieval_trace(
+                category=category,
+                depth=depth,
+                read_only=read_only,
+                items_returned=items_returned,
+                effective_goal=effective_goal,
+                supplementary_only=supplementary_only,
+                include_framework=include_framework,
+            )
+        finally:
+            # CRITICAL: restore on EVERY exit path, including exceptions.
+            # Without this, alpha's paths/env leak into bravo's next call
+            # (the daemon is long-lived; module globals + os.environ persist
+            # across requests). Path globals first, then env — env saved-as-
+            # None means "was unset" → pop, never set "".
+            for k, v in saved.items():
+                setattr(_r, k, v)
+            if _saved_env_agent is None:
+                os.environ.pop("MIND_AGENT", None)
+            else:
+                os.environ["MIND_AGENT"] = _saved_env_agent
+
+    meta = {
+        "category": category,
+        "depth": depth,
+        "read_only": read_only,
+        "full_content": full_content,
+        "timestamp": timestamp,
+        "retrieval_channels": sorted(retrieval_channels),
+        "items_returned": items_returned,
+    }
+    if coverage_gap:
+        meta["empty_with_populated_siblings"] = coverage_gap
+
+    result = {
+        "meta": meta,
+        "tree_nodes": tree_nodes,
+        "reasoning_bank": reasoning_bank,
+        "meta_lessons": meta_lessons,
+        "guardrails": guardrails,
+        "pattern_signatures": pattern_signatures,
+        "experiences": experiences,
+        "beliefs": beliefs,
+        "experiential_index": experiential_index,
+    }
+
+    # Framework asymmetry: meta-marker AND list both included only when the
+    # flag is on. Callers that don't opt in see no `framework_rules` key
+    # and no `include_framework` meta marker. Mirrors retrieve.py main().
+    if include_framework:
+        meta["include_framework"] = True
+        result["framework_rules"] = framework_rules
+
+    # Strip long-form last. The session-manifest block above already ran
+    # (inside the lock) on the un-stripped records — preserving the
+    # utilization-feedback token signal exactly as retrieve.py main() did.
+    if not full_content:
+        _r._strip_long_form(result)
+
+    # ensure_ascii=True + indent=2 mirrors retrieve.py (rb-597 hardening).
+    # Output equivalence with the pre-cutover CLI is the acceptance test;
+    # do not silently switch to ensure_ascii=False here.
+    return Response.text(
+        json.dumps(result, ensure_ascii=True, indent=2),
+        content_type="application/json",
+    )
+
+
+def register(routes) -> None:
+    routes[("GET", "/v1/retrieve")] = handle

@@ -181,10 +181,10 @@ Experiences store complete interaction traces, tool outputs, and evidence indexe
 
 Experiences are **operational state** (lifecycle, retrieval stats, archival) not **reference knowledge**. A single experience may span multiple tree node topics. They live separately from the tree but cross-link to it.
 
-- Experience records: `<agent>/experience.jsonl` (JSONL, script-accessed only)
-- Full content files: `<agent>/experience/{id}.md` (markdown, read via Read tool)
-- Experience archive: `<agent>/experience-archive.jsonl` (append-only)
-- Experience metadata: `<agent>/experience-meta.json`
+- Experience records: `agents/<agent>/experience.jsonl` (JSONL, script-accessed only)
+- Full content files: `agents/<agent>/experience/{id}.md` (markdown, read via Read tool)
+- Experience archive: `agents/<agent>/experience-archive.jsonl` (append-only)
+- Experience metadata: `agents/<agent>/experience-meta.json`
 
 ### JSONL Record Schema
 
@@ -224,7 +224,7 @@ retrieval_stats:
 
 ### Content Files
 
-Full interaction trace stored at `content_path` (e.g., `<agent>/experience/exp-g001-05-research.md`). Created alongside the JSONL record. Contains complete reasoning traces, tool outputs, decisions, and outcomes. Read via standard `Read` tool when dereferencing.
+Full interaction trace stored at `content_path` (e.g., `agents/<agent>/experience/exp-g001-05-research.md`). Created alongside the JSONL record. Contains complete reasoning traces, tool outputs, decisions, and outcomes. Read via standard `Read` tool when dereferencing.
 
 ### Cross-Linking to Tree Nodes
 
@@ -234,7 +234,7 @@ Full interaction trace stored at `content_path` (e.g., `<agent>/experience/exp-g
 
 ### Staleness & Archival
 
-Experiences are records of what happened — the event doesn't become less true, but its relevance decays. Staleness triggers archival (move JSONL record to `experience-archive.jsonl`), not deletion. Content `.md` files stay in `<agent>/experience/` and remain dereferenceable.
+Experiences are records of what happened — the event doesn't become less true, but its relevance decays. Staleness triggers archival (move JSONL record to `experience-archive.jsonl`), not deletion. Content `.md` files stay in `agents/<agent>/experience/` and remain dereferenceable.
 
 Archive triggers (via `experience-archive.sh`, called during session-end consolidation):
 - `created` > 30 days AND `retrieval_count == 0` → never used → archive

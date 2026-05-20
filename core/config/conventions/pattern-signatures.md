@@ -6,9 +6,21 @@ Pattern signatures use JSONL (one JSON object per line) with script-based access
 - `world/pattern-signatures.jsonl` — Live pattern signature entries
 
 ## Record Schema
-Required: `id`, `name`, `description`, `conditions`, `expected_outcome`, `created`
-Defaults: `status` ("active"), `confidence` (0.5), `outcome_history` ([]), `utilization` (zeros)
-Optional: `category`, `capability_level`, `confused_with`, `tags`
+
+**Canonical field list lives in `core/config/schema-registry.yaml`** (single source of
+truth). The registry is what `schema-drift-sweep.py` validates against every week; edit
+it when the live record schema changes, and update pseudocode in SKILL.md files in the
+same change. The sweep catches anyone who forgets.
+
+Quick reference (see registry for the full list):
+- Core: `id`, `name`, `description`, `conditions`, `expected_outcome`, `created`, `status`
+- Outcome tracking: `outcome_stats.{confirmed, total, accuracy}` — nested counters
+- Utilization: `utilization.{retrieval_count, last_retrieved}`
+- Optional: `category`, `capability_level`, `confused_with`, `tags`, `validation_status`
+
+Legacy field names (`hit_rate`, `times_triggered`, `false_positive_rate`, `false_positives`)
+were replaced by `outcome_stats.*` and are actively tracked for drift in the registry's
+`stale_fields` map. DO NOT use these names in new pseudocode.
 
 ID format: `sig-NNN` (zero-padded 3-digit, regex: `^sig-\d{3}$`)
 Valid statuses: `active`, `retired`, `contradicted`

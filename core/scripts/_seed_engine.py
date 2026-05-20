@@ -1,0 +1,976 @@
+"""Seed engine — orchestrator for /seed transplant + verify + diff sub-commands.
+
+CLI sub-commands (consumed by core/scripts/seed-*.sh wrappers):
+  build-plan        — parse manifest + walk source, emit JSON plan
+  copy-staged       — copy + transform source to <dest>/.seed-staging/
+  swap              — atomically move staging contents to <dest>/
+  backup            — back up dest framework files before overwrite
+  clean-cruft       — remove cruft_patterns at destination
+  verify-completeness  — assert manifest includes exist at destination
+  diff              — source-vs-destination diff (post-transform aware)
+  list-includes     — list resolved include file set (debug helper)
+
+The engine NEVER touches source content. It reads source, transforms in memory
+or via staging, then writes destination.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+from pathlib import Path
+
+# Allow import from sibling modules
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import _seed_transforms as xform  # noqa: E402
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("ERROR: PyYAML required (pip install pyyaml)\n")
+    sys.exit(2)
+
+
+PROJECT_ROOT = SCRIPT_DIR.parent.parent  # core/scripts/ -> core/ -> repo root
+STAGING_DIRNAME = ".seed-staging"
+
+
+# ============================================================================
+# Manifest parsing
+# ============================================================================
+
+def load_manifest(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        m = yaml.safe_load(f)
+    if not isinstance(m, dict):
+        raise ValueError(f"Manifest at {path} is not a YAML mapping")
+    return m
+
+
+def check_skill_version(manifest: dict, skill_version: int = 1):
+    minv = int(manifest.get("min_skill_version", 1))
+    maxv = int(manifest.get("max_skill_version", 1))
+    if not (minv <= skill_version <= maxv):
+        raise SystemExit(
+            f"Skill version {skill_version} is outside manifest range [{minv},{maxv}]. "
+            f"Upgrade skill or downgrade manifest."
+        )
+
+
+# ============================================================================
+# Path resolution / glob matching (parallel to _seed_transforms but for plan walk)
+# ============================================================================
+
+def _norm(p: str) -> str:
+    return p.replace("\\", "/")
+
+
+def _glob_match(rel_path: str, pattern: str) -> bool:
+    return xform._glob_match(rel_path, pattern)
+
+
+def _matches_any(rel_path: str, patterns) -> bool:
+    return any(_glob_match(rel_path, p) for p in (patterns or []))
+
+
+# ============================================================================
+# Include / exclude resolution
+# ============================================================================
+
+def _dir_name_only(pattern: str) -> str | None:
+    """If pattern is a bare directory name with trailing /, return the dir name.
+
+    Returns None for patterns with slashes, wildcards, or no trailing /.
+      "__pycache__/"  → "__pycache__"
+      "logs/"         → "logs"
+      "scripts/foo/"  → None  (contains /)
+      "tmp_*/"        → None  (contains wildcard)
+      ".pytest_cache/" → ".pytest_cache"
+    """
+    if not pattern.endswith("/"):
+        return None
+    inner = pattern.rstrip("/")
+    if "/" in inner or "*" in inner or "?" in inner:
+        return None
+    return inner
+
+
+def walk_include_entry(entry: dict, source_root: Path) -> list:
+    """Walk one `include` entry and return relative paths to copy.
+
+    Honors `exclude_patterns` (glob, plus directory-name-anywhere semantics for
+    bare-dir-name patterns like `__pycache__/`) and `exclude_children`
+    (top-level child dir names under the entry's path).
+    """
+    path = entry["path"]
+    etype = entry.get("type", "file")
+    abs_path = source_root / path
+
+    if etype == "file":
+        if not abs_path.exists():
+            if entry.get("required", False):
+                raise SystemExit(f"Required include missing: {path}")
+            return []
+        return [path]
+
+    if not abs_path.is_dir():
+        if entry.get("required", False):
+            raise SystemExit(f"Required include directory missing: {path}")
+        return []
+
+    raw_patterns = entry.get("exclude_patterns", [])
+    exclude_children = set(entry.get("exclude_children", []))
+
+    # Pre-compute the set of bare directory names to exclude anywhere
+    excluded_dir_names = set()
+    other_patterns = []
+    for pat in raw_patterns:
+        dn = _dir_name_only(pat)
+        if dn is not None:
+            excluded_dir_names.add(dn)
+        else:
+            other_patterns.append(pat)
+
+    results = []
+    for root, dirs, files in os.walk(abs_path):
+        root_path = Path(root)
+        try:
+            rel_to_entry = root_path.relative_to(abs_path)
+        except ValueError:
+            continue
+
+        rel_parts = rel_to_entry.parts
+
+        # If any ancestor dir component is excluded, skip this entire subtree
+        if any(part in excluded_dir_names for part in rel_parts):
+            dirs[:] = []
+            continue
+
+        # Top-level child exclusion (exclude_children)
+        if len(rel_parts) >= 1:
+            if rel_parts[0] in exclude_children:
+                dirs[:] = []
+                continue
+
+        # At depth 0, also prune top-level children listed in exclude_children
+        # and any dirs whose name is in excluded_dir_names
+        if rel_to_entry == Path("."):
+            dirs[:] = [
+                d for d in dirs
+                if d not in exclude_children and d not in excluded_dir_names
+            ]
+        else:
+            # Prune nested dirs by name (catches __pycache__ etc. at any depth)
+            dirs[:] = [d for d in dirs if d not in excluded_dir_names]
+
+        for fname in files:
+            full = root_path / fname
+            try:
+                rel = full.relative_to(source_root)
+            except ValueError:
+                continue
+            rel_str = _norm(str(rel))
+            # Pattern-based exclude (globs like scripts/tests/_tmp_*/)
+            if _matches_any(rel_str, other_patterns):
+                continue
+            try:
+                rel_in_entry = full.relative_to(abs_path)
+                if _matches_any(_norm(str(rel_in_entry)), other_patterns):
+                    continue
+            except ValueError:
+                pass
+            results.append(rel_str)
+    return results
+
+
+def resolve_include_set(manifest: dict, source_root: Path) -> list:
+    """Resolve all `include` entries to a flat list of repo-relative paths.
+
+    Applies `exclude_always` as a final filter so things like `__pycache__/`
+    are stripped regardless of which include entry surfaced them.
+    """
+    all_paths = []
+    seen = set()
+    for entry in manifest.get("include", []):
+        for p in walk_include_entry(entry, source_root):
+            if p in seen:
+                continue
+            if is_excluded_always(p, manifest):
+                continue
+            seen.add(p)
+            all_paths.append(p)
+    return sorted(all_paths)
+
+
+def is_excluded_always(rel_path: str, manifest: dict) -> bool:
+    """True if rel_path matches any exclude_always glob.
+
+    Supports four pattern shapes:
+      1. `foo/`              — directory name `foo` ANYWHERE in path (path-component match)
+      2. `a/b/`              — path prefix `a/b/`
+      3. `*.stackdump`       — fnmatch glob on basename
+      4. `path/to/file.ext`  — exact path match
+    """
+    rel = _norm(rel_path)
+    patterns = manifest.get("exclude_always", [])
+    parts = rel.split("/")
+    for p in patterns:
+        if p.endswith("/"):
+            inner = p.rstrip("/")
+            # Bare directory name (no slashes, no wildcards) → component match
+            if "/" not in inner and "*" not in inner and "?" not in inner:
+                if inner in parts:
+                    return True
+                continue
+            # Otherwise, prefix match
+            if rel.startswith(inner + "/") or rel == inner:
+                return True
+        else:
+            # Exact path or glob on full path
+            if fnmatch.fnmatch(rel, p):
+                return True
+            # Glob on basename for patterns without /
+            if "/" not in p and fnmatch.fnmatch(parts[-1], p):
+                return True
+    return False
+
+
+# ============================================================================
+# Plan building
+# ============================================================================
+
+def build_plan(manifest: dict, source_root: Path) -> dict:
+    """Produce a JSON-serializable plan.
+
+    Plan shape:
+      {
+        "version": 1,
+        "source_root": "<abs path>",
+        "manifest_version": <int>,
+        "files": [
+          {
+            "rel_path": "...",
+            "is_binary": bool,
+            "transformations": [<rule_id>, ...],   # ids that WILL apply (best-effort)
+            "pending_template_skip": bool,
+          },
+          ...
+        ],
+        "excludes": [{"path": "...", "reason": "exclude_always | pattern"}],
+        "cruft_patterns": [...],
+        "post_copy_actions": [...],
+      }
+
+    The plan is informational; the actual transformations re-run at copy time
+    (so the plan doesn't need to capture transformed CONTENT, only WHICH rules
+    will apply).
+    """
+    check_skill_version(manifest)
+    files_in = resolve_include_set(manifest, source_root)
+    transformations = manifest.get("transformations", [])
+
+    files = []
+    for rel in files_in:
+        if is_excluded_always(rel, manifest):
+            # Shouldn't happen if includes are right, but defensive
+            continue
+        rules = xform.select_rules_for_file(rel, transformations)
+        applied_ids = []
+        if rules["file_replace"]:
+            applied_ids.append(rules["file_replace"]["id"])
+        else:
+            applied_ids.extend([r["id"] for r in rules["inline_edit"]])
+            applied_ids.extend([r["id"] for r in rules["global_regex"]])
+            applied_ids.extend([r["id"] for r in rules["word_list_strip"]])
+        files.append({
+            "rel_path": rel,
+            "is_binary": xform.is_binary_path(rel),
+            "transformations": applied_ids,
+            "pending_template_skip": rules["pending_template_skip"],
+        })
+
+    return {
+        "version": 1,
+        "source_root": str(source_root),
+        "manifest_version": int(manifest.get("version", 1)),
+        "files": files,
+        "cruft_patterns": manifest.get("cruft_patterns", []),
+        "post_copy_actions": manifest.get("post_copy_actions", []),
+        "exclude_always": manifest.get("exclude_always", []),
+    }
+
+
+# ============================================================================
+# Backup
+# ============================================================================
+
+def do_backup(dest_root: Path, manifest: dict, source_root: Path) -> Path:
+    """Copy currently-manifested files at destination into a timestamped backup dir.
+
+    Returns the backup dir path. Skips files that don't exist at destination yet.
+    """
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    backup_dir = dest_root / f".seed-backup-{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    files_in = resolve_include_set(manifest, source_root)
+    backed_up = 0
+    for rel in files_in:
+        src_at_dest = dest_root / rel
+        if not src_at_dest.exists() or src_at_dest.is_dir():
+            continue
+        backup_target = backup_dir / rel
+        backup_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_at_dest, backup_target)
+        backed_up += 1
+    return backup_dir
+
+
+# ============================================================================
+# Staged copy
+# ============================================================================
+
+def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict) -> dict:
+    """Copy include set to <dest>/.seed-staging/ applying transformations.
+
+    Returns: {"staged": int, "transformed": int, "binary": int, "pending_skip": [rel,...], "failures": [...]}.
+    Raises SystemExit on failure (after cleaning staging dir).
+    """
+    staging = dest_root / STAGING_DIRNAME
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True, exist_ok=True)
+
+    files_in = resolve_include_set(manifest, source_root)
+    transformations = manifest.get("transformations", [])
+
+    stats = {"staged": 0, "transformed": 0, "binary": 0, "pending_skip": [], "failures": []}
+
+    for rel in files_in:
+        src = source_root / rel
+        dst = staging / rel
+        try:
+            if not src.exists():
+                # required-flagged missing already caught in resolve; non-required just skip
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+
+            if xform.is_binary_path(rel):
+                shutil.copy2(src, dst)
+                stats["binary"] += 1
+                stats["staged"] += 1
+                continue
+
+            # Read as bytes first to check for embedded NUL (likely binary).
+            raw = src.read_bytes()
+            if xform.is_likely_binary_content(raw):
+                shutil.copy2(src, dst)
+                stats["binary"] += 1
+                stats["staged"] += 1
+                continue
+
+            content = raw.decode("utf-8", errors="strict")
+            new_content, applied_ids, pending_skip = xform.transform_file(
+                rel, content, transformations, source_root,
+            )
+            dst.write_text(new_content, encoding="utf-8", newline="")  # preserve content as-is
+            stats["staged"] += 1
+            if applied_ids:
+                stats["transformed"] += 1
+            if pending_skip:
+                stats["pending_skip"].append(rel)
+        except UnicodeDecodeError as e:
+            # Treat as binary fallback
+            shutil.copy2(src, dst)
+            stats["binary"] += 1
+            stats["staged"] += 1
+        except Exception as e:
+            stats["failures"].append({"rel_path": rel, "error": str(e)})
+
+    if stats["failures"]:
+        # Clean up the partial staging dir
+        shutil.rmtree(staging, ignore_errors=True)
+        raise SystemExit(
+            "Staged copy failed:\n"
+            + "\n".join(f"  {f['rel_path']}: {f['error']}" for f in stats["failures"])
+        )
+    return stats
+
+
+# ============================================================================
+# Atomic swap
+# ============================================================================
+
+def do_swap(dest_root: Path) -> dict:
+    """Move staged files from <dest>/.seed-staging/ to <dest>/, overwriting.
+
+    Walks the staging tree, copies each file to its real path. We use
+    copy-then-replace (not rename) because cross-filesystem moves on Windows
+    can fail for files held open by editors. After all copies succeed, we
+    remove the staging dir.
+
+    On Windows, file replace can fail if the target is locked. We attempt
+    up to 3 retries with short sleeps before reporting a fail.
+    """
+    import time
+    staging = dest_root / STAGING_DIRNAME
+    if not staging.is_dir():
+        raise SystemExit(f"No staging dir to swap: {staging}")
+
+    # Defensive: sweep any orphan .seed-tmp files from a prior failed swap.
+    # These can be left behind on Windows when os.replace fails after the
+    # copy succeeded — see BUG 3 from fresh-eyes review (2026-05-19).
+    for orphan in dest_root.rglob("*.seed-tmp"):
+        try:
+            orphan.unlink()
+        except OSError:
+            pass
+
+    moved = 0
+    failures = []
+
+    for root, dirs, files in os.walk(staging):
+        root_p = Path(root)
+        try:
+            rel_dir = root_p.relative_to(staging)
+        except ValueError:
+            continue
+        for fname in files:
+            src = root_p / fname
+            dst = dest_root / rel_dir / fname
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    # On Windows, copy2 + replace via os.replace is safest.
+                    if dst.exists():
+                        # Use os.replace for atomicity where supported
+                        tmp = dst.with_suffix(dst.suffix + ".seed-tmp")
+                        shutil.copy2(src, tmp)
+                        os.replace(tmp, dst)
+                        tmp = None  # consumed by replace
+                    else:
+                        shutil.copy2(src, dst)
+                    last_err = None
+                    moved += 1
+                    break
+                except (OSError, PermissionError) as e:
+                    last_err = e
+                    time.sleep(0.25 * (attempt + 1))
+            # If retries exhausted with a temp file still on disk, clean it
+            if tmp is not None and tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            if last_err:
+                failures.append({"rel_path": str(rel_dir / fname), "error": str(last_err)})
+
+    if failures:
+        return {"moved": moved, "failures": failures}
+
+    # Success — remove staging dir
+    shutil.rmtree(staging, ignore_errors=True)
+    return {"moved": moved, "failures": []}
+
+
+# ============================================================================
+# Cruft cleanup
+# ============================================================================
+
+def do_clean_cruft(dest_root: Path, manifest: dict) -> dict:
+    """Remove cruft_patterns at destination."""
+    patterns = manifest.get("cruft_patterns", [])
+    removed = []
+    for p in patterns:
+        # Patterns can be exact paths, glob, or directory paths with trailing /
+        if p.endswith("/"):
+            target = dest_root / p.rstrip("/")
+            if target.exists() and target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                removed.append(p)
+        else:
+            # Try exact file first
+            target = dest_root / p
+            if target.exists() and target.is_file():
+                target.unlink()
+                removed.append(p)
+                continue
+            # Glob match. To recurse, callers must use a `**/` prefix
+            # explicitly (e.g., `**/__pycache__/`). The plain pattern only
+            # matches at the top level — prevents accidental destruction of
+            # user data deep in the tree (BUG 5 from fresh-eyes review).
+            if "*" in p or "?" in p:
+                if p.startswith("**/"):
+                    matches = list(dest_root.rglob(p[3:]))
+                else:
+                    matches = list(dest_root.glob(p))
+                for m in matches:
+                    try:
+                        if m.is_dir():
+                            shutil.rmtree(m, ignore_errors=True)
+                        else:
+                            m.unlink()
+                        removed.append(str(m.relative_to(dest_root)))
+                    except (OSError, FileNotFoundError):
+                        pass
+    return {"removed": removed}
+
+
+# ============================================================================
+# Orphan removal — mirror semantics
+# ============================================================================
+# Files removed from source's manifest-resolved include set must also disappear
+# at destination. Without this step, destination accumulates files that were
+# refactored away upstream — a classic "dev vs prod" drift.
+
+# Top-level paths the engine MUST NEVER walk during orphan detection, even if
+# they happen to exist at destination. Each is preserved for a specific reason.
+_ORPHAN_SCAN_SKIP_TOP = {
+    ".git",                 # version control
+    ".seed-staging",        # transient staging from current/in-flight transplant
+    "agents",               # per-deployment state (created by /start)
+    "world",                # per-deployment domain state (external path in source)
+    "meta",                 # per-deployment strategy state (external path in source)
+}
+
+# Specific destination paths that survive every transplant regardless of
+# manifest membership. Single source of truth for "preserved at dest".
+_ORPHAN_PRESERVE_FILES = {
+    ".env.local",
+    ".claude/settings.local.json",
+}
+
+
+def _is_preserved_at_dest(rel: str) -> bool:
+    if rel in _ORPHAN_PRESERVE_FILES:
+        return True
+    # .seed-backup-<timestamp>/ from prior transplants
+    first = rel.split("/", 1)[0]
+    if first.startswith(".seed-backup-"):
+        return True
+    if first in _ORPHAN_SCAN_SKIP_TOP:
+        return True
+    return False
+
+
+def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
+                      dry_run: bool = False) -> dict:
+    """Remove files at destination that are NOT in the manifest-resolved include set.
+
+    Semantics: destination = mirror of (manifest ∩ source). Files that exist at
+    destination but no longer at source (or are now excluded by manifest) are
+    deleted. Preserved paths (.git, .env.local, .claude/settings.local.json,
+    .seed-backup-*, agents/, world/, meta/) are never touched.
+
+    Returns {"removed": [...], "kept_preserved": [...], "dry_run": bool}.
+    """
+    expected = set(resolve_include_set(manifest, source_root))
+
+    removed = []
+    preserved = []
+
+    # Walk destination, collecting all files outside the preserve set
+    for path in dest_root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            rel = str(path.relative_to(dest_root)).replace("\\", "/")
+        except ValueError:
+            continue
+        if _is_preserved_at_dest(rel):
+            preserved.append(rel)
+            continue
+        if rel in expected:
+            continue
+        # Orphan — would be removed
+        if dry_run:
+            removed.append(rel)
+        else:
+            try:
+                path.unlink()
+                removed.append(rel)
+            except (OSError, FileNotFoundError):
+                pass
+
+    # Second pass: remove empty directories left behind (skip preserved tops)
+    if not dry_run:
+        for path in sorted(dest_root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if not path.is_dir():
+                continue
+            try:
+                rel = str(path.relative_to(dest_root)).replace("\\", "/")
+            except ValueError:
+                continue
+            first = rel.split("/", 1)[0]
+            if first in _ORPHAN_SCAN_SKIP_TOP or first.startswith(".seed-backup-"):
+                continue
+            try:
+                if not any(path.iterdir()):
+                    path.rmdir()
+            except OSError:
+                pass
+
+    return {"removed": sorted(removed), "kept_preserved_count": len(preserved),
+            "dry_run": dry_run}
+
+
+# ============================================================================
+# Completeness verification
+# ============================================================================
+
+def do_verify_completeness(dest_root: Path, manifest: dict, source_root: Path) -> dict:
+    """For each include entry, verify it exists at destination."""
+    results = []
+    for entry in manifest.get("include", []):
+        path = entry["path"]
+        etype = entry.get("type", "file")
+        abs_dst = dest_root / path
+
+        # Check what we EXPECT at destination
+        if etype == "file":
+            ok = abs_dst.exists() and abs_dst.is_file()
+        else:
+            ok = abs_dst.exists() and abs_dst.is_dir()
+
+        results.append({
+            "path": path,
+            "type": etype,
+            "required": entry.get("required", False),
+            "exists": ok,
+        })
+
+    # Aggregate
+    missing_required = [r for r in results if r["required"] and not r["exists"]]
+    return {
+        "results": results,
+        "missing_required": missing_required,
+        "pass": len(missing_required) == 0,
+    }
+
+
+def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
+    """Verify that exclude_always paths did NOT land at destination.
+
+    Special-cases per-deployment / per-machine paths that the destination is
+    EXPECTED to own its own copy of:
+      - Domain dirs (agents/, world/, meta/) — agent runtime state
+      - .git/                                — destination has its own git history
+      - .env.local                           — per-machine secrets file
+      - .claude/settings.local.json          — per-machine Claude Code config
+
+    These appear in `exclude_always` to prevent COPYING from source, but they
+    SHOULD exist at destination. Report as INFO, not leaks.
+    """
+    PRESERVED_AT_DEST = {
+        # Directory basenames (matched against target.name)
+        "agents", "world", "meta",
+    }
+    PRESERVED_PATHS = {
+        # Full repo-relative paths (matched against `p`)
+        ".git/",
+        ".env.local",
+        ".claude/settings.local.json",
+    }
+    leaked = []
+    info = []
+    for p in manifest.get("exclude_always", []):
+        if p in PRESERVED_PATHS:
+            target = dest_root / p.rstrip("/")
+            if target.exists():
+                info.append(p)
+            continue
+        if p.endswith("/"):
+            inner = p.rstrip("/")
+            target = dest_root / inner
+            if target.exists() and target.is_dir():
+                if target.name in PRESERVED_AT_DEST:
+                    info.append(p)
+                    continue
+                leaked.append(p)
+        else:
+            if "*" in p or "?" in p:
+                # Top-level glob only (don't rglob — too aggressive)
+                if list(dest_root.glob(p)):
+                    leaked.append(p)
+            else:
+                if (dest_root / p).exists():
+                    leaked.append(p)
+    return {"leaked": leaked, "info": info, "pass": len(leaked) == 0}
+
+
+def do_verify_cruft(dest_root: Path, manifest: dict) -> dict:
+    """Verify that cruft_patterns are NOT present at destination."""
+    present = []
+    for p in manifest.get("cruft_patterns", []):
+        if p.endswith("/"):
+            inner = p.rstrip("/")
+            if (dest_root / inner).exists():
+                present.append(p)
+        elif "*" in p or "?" in p:
+            if p.startswith("**/"):
+                if list(dest_root.rglob(p[3:])):
+                    present.append(p)
+            else:
+                if list(dest_root.glob(p)):
+                    present.append(p)
+        else:
+            if (dest_root / p).exists():
+                present.append(p)
+    return {"present": present, "pass": len(present) == 0}
+
+
+def do_verify_integrity(dest_root: Path, manifest: dict, source_root: Path) -> dict:
+    """SHA-256 sample integrity: source post-transform vs destination current."""
+    samples_default = [
+        "CLAUDE.md",
+        "core/scripts/_paths.sh",
+        ".claude/settings.json",
+        "core/config/tree.yaml",
+    ]
+    # Include mind_api sample if present
+    mind_sample = "mind_api/src/server.py"
+    if (source_root / mind_sample).exists():
+        samples_default.append(mind_sample)
+
+    transformations = manifest.get("transformations", [])
+    results = []
+    for rel in samples_default:
+        src = source_root / rel
+        dst = dest_root / rel
+        if not src.exists() or not dst.exists():
+            results.append({
+                "file": rel, "status": "MISSING",
+                "src_exists": src.exists(), "dst_exists": dst.exists(),
+            })
+            continue
+        try:
+            raw = src.read_bytes()
+            if xform.is_binary_path(rel) or xform.is_likely_binary_content(raw):
+                src_h = hashlib.sha256(raw).hexdigest()
+                dst_h = hashlib.sha256(dst.read_bytes()).hexdigest()
+            else:
+                content = raw.decode("utf-8")
+                transformed, _, _ = xform.transform_file(rel, content, transformations, source_root)
+                src_h = hashlib.sha256(transformed.encode("utf-8")).hexdigest()
+                dst_h = hashlib.sha256(dst.read_bytes()).hexdigest()
+            results.append({
+                "file": rel,
+                "status": "MATCH" if src_h == dst_h else "MISMATCH",
+                "src": src_h[:12],
+                "dst": dst_h[:12],
+            })
+        except Exception as e:
+            results.append({"file": rel, "status": "ERROR", "error": str(e)})
+    mismatches = sum(1 for r in results if r["status"] == "MISMATCH")
+    matches = sum(1 for r in results if r["status"] == "MATCH")
+    return {
+        "results": results,
+        "match_count": matches,
+        "mismatch_count": mismatches,
+        "pass": mismatches == 0,
+    }
+
+
+# ============================================================================
+# Diff
+# ============================================================================
+
+def _sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def do_diff(source_root: Path, dest_root: Path, manifest: dict) -> dict:
+    """Per-file diff: source post-transform vs destination current."""
+    files_in = resolve_include_set(manifest, source_root)
+    transformations = manifest.get("transformations", [])
+
+    new_at_dest = []
+    modified = []
+    missing_at_dest = []
+    identical = 0
+
+    for rel in files_in:
+        src = source_root / rel
+        dst = dest_root / rel
+        if not src.exists():
+            continue
+
+        if xform.is_binary_path(rel):
+            # Compare raw bytes
+            if not dst.exists():
+                missing_at_dest.append(rel)
+                continue
+            if src.read_bytes() == dst.read_bytes():
+                identical += 1
+            else:
+                modified.append(rel)
+            continue
+
+        try:
+            raw = src.read_bytes()
+            if xform.is_likely_binary_content(raw):
+                if not dst.exists():
+                    missing_at_dest.append(rel)
+                    continue
+                if raw == dst.read_bytes():
+                    identical += 1
+                else:
+                    modified.append(rel)
+                continue
+            content = raw.decode("utf-8")
+            transformed, _, _ = xform.transform_file(rel, content, transformations, source_root)
+            if not dst.exists():
+                missing_at_dest.append(rel)
+                continue
+            dst_content = dst.read_text(encoding="utf-8", errors="replace")
+            if transformed == dst_content:
+                identical += 1
+            else:
+                modified.append(rel)
+        except Exception as e:
+            modified.append(f"{rel} (error: {e})")
+
+    return {
+        "missing_at_dest": missing_at_dest,
+        "modified": modified,
+        "identical_count": identical,
+        "new_at_dest": new_at_dest,  # populated by scan-dest if requested; empty by default
+    }
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def _parse_args():
+    p = argparse.ArgumentParser(prog="_seed_engine")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("build-plan")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+
+    sp = sub.add_parser("backup")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("copy-staged")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("swap")
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("clean-cruft")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("remove-orphans")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+    sp.add_argument("--dry-run", action="store_true",
+                    help="Report orphans without deleting")
+
+    sp = sub.add_parser("verify-completeness")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("verify-leak-check")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("verify-cruft")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("verify-integrity")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("diff")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("list-includes")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+
+    return p.parse_args()
+
+
+def main():
+    args = _parse_args()
+    manifest_path = Path(args.manifest) if hasattr(args, "manifest") else None
+    source_root = Path(getattr(args, "source", PROJECT_ROOT)).resolve()
+    dest_root = Path(args.dest).resolve() if hasattr(args, "dest") else None
+
+    if manifest_path is not None and not manifest_path.is_absolute():
+        manifest_path = (PROJECT_ROOT / manifest_path).resolve()
+
+    manifest = load_manifest(manifest_path) if manifest_path else None
+
+    if args.cmd == "build-plan":
+        plan = build_plan(manifest, source_root)
+        print(json.dumps(plan, indent=2))
+    elif args.cmd == "backup":
+        bd = do_backup(dest_root, manifest, source_root)
+        print(json.dumps({"backup_dir": str(bd)}, indent=2))
+    elif args.cmd == "copy-staged":
+        stats = do_copy_staged(source_root, dest_root, manifest)
+        print(json.dumps(stats, indent=2))
+    elif args.cmd == "swap":
+        result = do_swap(dest_root)
+        print(json.dumps(result, indent=2))
+        if result["failures"]:
+            sys.exit(1)
+    elif args.cmd == "clean-cruft":
+        result = do_clean_cruft(dest_root, manifest)
+        print(json.dumps(result, indent=2))
+    elif args.cmd == "remove-orphans":
+        result = do_remove_orphans(dest_root, manifest, source_root,
+                                   dry_run=args.dry_run)
+        print(json.dumps(result, indent=2))
+    elif args.cmd == "verify-completeness":
+        result = do_verify_completeness(dest_root, manifest, source_root)
+        print(json.dumps(result, indent=2))
+        if not result["pass"]:
+            sys.exit(1)
+    elif args.cmd == "verify-leak-check":
+        result = do_verify_leak_check(dest_root, manifest)
+        print(json.dumps(result, indent=2))
+        if not result["pass"]:
+            sys.exit(1)
+    elif args.cmd == "verify-cruft":
+        result = do_verify_cruft(dest_root, manifest)
+        print(json.dumps(result, indent=2))
+        # cruft is a WARN not a FAIL — exit 0 even with hits
+    elif args.cmd == "verify-integrity":
+        result = do_verify_integrity(dest_root, manifest, source_root)
+        print(json.dumps(result, indent=2))
+        if not result["pass"]:
+            sys.exit(1)
+    elif args.cmd == "diff":
+        result = do_diff(source_root, dest_root, manifest)
+        print(json.dumps(result, indent=2))
+    elif args.cmd == "list-includes":
+        files = resolve_include_set(manifest, source_root)
+        print(json.dumps({"count": len(files), "files": files}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

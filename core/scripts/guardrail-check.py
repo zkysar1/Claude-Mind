@@ -6,8 +6,16 @@ and phase (post-execution/pre-selection), returns guardrails whose text matches.
 This replaces the LLM's manual "read all guardrails and decide which apply" step.
 
 Output is JSON with matched guardrails and action hints extracted from rule text.
-Side effect: increments utilization.times_active on matched, times_skipped on
-unmatched (unless --dry-run).
+Side effect: increments utilization.times_active on matched (unless --dry-run).
+
+PRE-2026-05-09 also incremented `times_skipped` on every non-matching active
+entry per call. Knowledge-system audit found this fires hundreds of times per
+session (every check call × every non-matching active guardrail) and inflates
+the skip counter by 2-15x the retrieval count. The semantic was "evaluated and
+not chosen by the engine" but in practice it dominated all other skip signals.
+The semantically correct `times_skipped` writer is `reflect-bookkeeping.py`'s
+`cmd_utilization_delta` (LLM deliberation marks items as skipped). This module
+no longer writes `times_skipped` — only `times_active` on matches.
 
 All JSONL I/O goes through reasoning-bank.py (the shared guardrails data layer).
 """
@@ -35,6 +43,7 @@ _rb = importlib.util.module_from_spec(_rb_spec)
 _rb_spec.loader.exec_module(_rb)
 
 GUARD_PATH = _rb.GUARD_PATH
+RB_PATH = _rb.RB_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -98,15 +107,32 @@ ACTION_HINT_RE = re.compile(
 # Searchable text extraction
 # ---------------------------------------------------------------------------
 
-def get_searchable_text(guard):
-    """Combine all text fields of a guardrail into one lowercase string."""
-    parts = [
-        guard.get("rule", ""),
-        guard.get("trigger_condition", ""),
-        guard.get("category", ""),
-    ]
+def get_searchable_text(record, record_type="guardrail"):
+    """Combine text fields of a guardrail or reasoning-bank entry into one lowercase string.
 
-    when = guard.get("when_to_use")
+    Guardrails surface `rule` + `trigger_condition`; reasoning-bank entries surface
+    `title` + `content` + free-form outcome fields. Category, when_to_use, and tags
+    are shared across both types.
+    """
+    parts = []
+    if record_type == "reasoning_bank":
+        parts.extend([
+            record.get("title", ""),
+            record.get("content", ""),
+            record.get("failure_lesson", "") or "",
+            record.get("category", ""),
+        ])
+        wtu = record.get("when_to_use")
+        if isinstance(wtu, str):
+            parts.append(wtu)
+    else:
+        parts.extend([
+            record.get("rule", ""),
+            record.get("trigger_condition", ""),
+            record.get("category", ""),
+        ])
+
+    when = record.get("when_to_use")
     if isinstance(when, dict):
         conditions = when.get("conditions", [])
         if isinstance(conditions, list):
@@ -115,7 +141,7 @@ def get_searchable_text(guard):
         if wcat:
             parts.append(wcat)
 
-    tags = guard.get("tags", [])
+    tags = record.get("tags", [])
     if isinstance(tags, list):
         parts.extend(tags)
 
@@ -181,50 +207,115 @@ def extract_action_hint(rule_text):
     return None
 
 
-def check_guardrails(context, outcome, phase, dry_run):
-    """Match guardrails against the given filters. Returns matched list."""
-    all_guards = _rb.read_jsonl(GUARD_PATH)
-    active = [g for g in all_guards if g.get("status") == "active"]
+def _check_store(path, record_type, context, outcome, phase, dry_run):
+    """Generic matcher for one store (guardrails.jsonl or reasoning-bank.jsonl).
+
+    Returns list of matched entries. Side effect: increments times_active on
+    matched records (only). Pre-2026-05-09 also incremented times_skipped on
+    non-matching records — see module docstring for the audit-driven removal.
+
+    The matching pass runs on a snapshot read OUTSIDE the lock so the
+    returned `matched` list reflects the records as they were when the
+    caller asked. The counter-increment write runs INSIDE the lock via
+    locked_modify_jsonl so concurrent guardrail checks from alpha+bravo
+    don't clobber each other's times_active increments.
+    The matched IDs from the snapshot are the increment targets — if a
+    record's status changed between snapshot and lock acquisition, the
+    "active" filter inside the modifier still gates the increment, so
+    the worst case is a guardrail that flipped to retired during the
+    iteration receives no increment (correct).
+    """
+    all_records = _rb.read_jsonl(path)
+    active = [r for r in all_records if r.get("status") == "active"]
 
     matched = []
     matched_ids = set()
 
-    for guard in active:
-        text = get_searchable_text(guard)
+    for rec in active:
+        text = get_searchable_text(rec, record_type)
 
         if (matches_context(text, context)
                 and matches_phase(text, phase)
                 and matches_outcome(text, outcome)):
-            entry = {
-                "id": guard["id"],
-                "rule": guard.get("rule", ""),
-                "category": guard.get("category", ""),
-            }
-            hint = extract_action_hint(guard.get("rule", ""))
-            if hint:
-                entry["action_hint"] = hint
+            if record_type == "reasoning_bank":
+                entry = {
+                    "id": rec["id"],
+                    "type": "reasoning_bank",
+                    "title": rec.get("title", ""),
+                    "category": rec.get("category", ""),
+                }
+            else:
+                entry = {
+                    "id": rec["id"],
+                    "type": "guardrail",
+                    "rule": rec.get("rule", ""),
+                    "category": rec.get("category", ""),
+                }
+                hint = extract_action_hint(rec.get("rule", ""))
+                if hint:
+                    entry["action_hint"] = hint
             matched.append(entry)
-            matched_ids.add(guard["id"])
+            matched_ids.add(rec["id"])
 
-    # Side effect: update utilization counters (unless dry-run).
-    # Must iterate all_guards (not active) so retired records survive the write.
     if not dry_run:
-        modified = False
-        for guard in all_guards:
-            if guard.get("status") != "active":
-                continue
-            util = guard.get("utilization")
-            if not isinstance(util, dict):
-                continue
-            if guard["id"] in matched_ids:
+        from _fileops import locked_modify_jsonl
+        defaults = _rb.RB_DEFAULT_FIELDS if record_type == "reasoning_bank" else _rb.GUARD_DEFAULT_FIELDS
+
+        def _modifier(records):
+            modified = False
+            for rec in records:
+                if rec.get("status") != "active":
+                    continue
+                # Increment fires only on MATCHED records (2026-05-09 audit).
+                # Pre-fix iterated every active record incrementing
+                # times_skipped on non-matches; that was 99% of records per
+                # call and inflated the skip counter dramatically. We now skip
+                # entirely (no normalize, no recompute) on non-matches —
+                # cheaper and avoids touching records that shouldn't change.
+                if rec["id"] not in matched_ids:
+                    continue
+                # Normalize before recompute — recompute_utilization_score
+                # contract requires all counter keys present
+                # (reasoning-bank.py:234). Without this, records missing
+                # times_helpful/times_inferred_helpful raise KeyError and
+                # Phase 0.5a's 2>/dev/null silences it ().
+                _rb.normalize_record(rec, defaults)
+                util = rec.get("utilization")
+                if not isinstance(util, dict):
+                    continue
                 util["times_active"] = util.get("times_active", 0) + 1
                 modified = True
-            else:
-                util["times_skipped"] = util.get("times_skipped", 0) + 1
-                modified = True
-            _rb.recompute_utilization_score(guard)
-        if modified:
-            _rb.write_jsonl(GUARD_PATH, all_guards)
+                _rb.recompute_utilization_score(rec)
+            return records if modified else None
+
+        locked_modify_jsonl(path, _modifier)
+
+    return matched
+
+
+def check_guardrails(context, outcome, phase, dry_run, types=("guardrail",)):
+    """Match against one or more stores. Returns guardrail matches in output.
+
+    Side effect (times_active) fires for EVERY store in `types`. Pre-2026-05-09
+    also touched times_skipped on non-matches; that increment was removed in
+    P0 #4 (audit-driven — see module docstring).
+    The returned `matched` list, however, only includes guardrail entries —
+    callers iterate this list to execute `action_hint` commands, and rb entries
+    have no action_hint (they are lessons, not commands). Surfacing rb in the
+    output would force every caller to null-check action_hint; cleaner to keep
+    rb purely as a counter side-effect here. To enumerate rb matches, call
+    with types=("reasoning_bank",) exclusively.
+    """
+    matched = []
+    if "guardrail" in types:
+        matched.extend(_check_store(GUARD_PATH, "guardrail",
+                                    context, outcome, phase, dry_run))
+    if "reasoning_bank" in types:
+        rb_matches = _check_store(RB_PATH, "reasoning_bank",
+                                  context, outcome, phase, dry_run)
+        # Only surface rb matches when rb was the ONLY store requested.
+        if "guardrail" not in types:
+            matched.extend(rb_matches)
 
     return {
         "matched": matched,
@@ -263,9 +354,23 @@ def main():
         action="store_true",
         help="Match without updating utilization counters",
     )
+    parser.add_argument(
+        "--type",
+        choices=["guardrail", "reasoning-bank", "both"],
+        default="guardrail",
+        help="Which store(s) to match against (default: guardrail only). "
+             "'both' also increments reasoning-bank entries' times_active — "
+             "closes the symmetric feedback loop that rb entries previously lacked.",
+    )
 
     args = parser.parse_args()
-    result = check_guardrails(args.context, args.outcome, args.phase, args.dry_run)
+    if args.type == "both":
+        types = ("guardrail", "reasoning_bank")
+    elif args.type == "reasoning-bank":
+        types = ("reasoning_bank",)
+    else:
+        types = ("guardrail",)
+    result = check_guardrails(args.context, args.outcome, args.phase, args.dry_run, types)
     print(json.dumps(result, indent=2, ensure_ascii=True))
 
 

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Cadence gate for /felt-sense-checkin.
+
+Exits 0 when the ritual should fire (goal-count since last fire has
+reached `goal_cadence`). Exits 1 on any noop or error (fail-open — must
+not block the loop).
+
+Invoked from aspirations-precheck Phase 0.5f and from
+/felt-sense-checkin Phase 8 (tick-record readout via --print-current).
+
+Pattern mirror of fresh-eyes-cadence-check.py — same mechanism
+(goal-count cadence + WM slot), different cadence (75 vs 25) and
+different question surface (7-lane structured self-audit vs the
+Self-and-portfolio briefing). Kept as a sibling script rather than a
+shared one so each ritual can evolve independently.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import _paths  # noqa: E402
+import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+
+CONFIG_PATH = _paths.CONFIG_DIR / "aspirations.yaml"
+SLOT_NAME = "last_felt_sense_checkin"
+
+
+def _load_yaml(path: Path):
+    try:
+        import yaml  # type: ignore
+    except ImportError:
+        return None
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return None
+
+
+def count_completed_goals() -> int:
+    """Sum of status=='completed' goals across world+agent aspirations & archive."""
+    agent = os.environ.get("MIND_AGENT", "")
+    candidates = [
+        _paths.WORLD_DIR / "aspirations.jsonl",
+        _paths.WORLD_DIR / "aspirations-archive.jsonl",
+    ]
+    if agent:
+        candidates.extend([
+            _paths.agent_dir(agent) / "aspirations.jsonl",
+            _paths.agent_dir(agent) / "aspirations-archive.jsonl",
+        ])
+    total = 0
+    for p in candidates:
+        if not p.exists():
+            continue
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        asp = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    for g in asp.get("goals", []):
+                        if g.get("status") == "completed":
+                            total += 1
+        except OSError:
+            continue
+    return total
+
+
+def wm_slot_value():
+    """Read last_felt_sense_checkin via daemon. --json semantics preserved
+    (wm_read as_json=True returns the same JSON text the deleted wm.py CLI printed)."""
+    try:
+        raw = _rt.wm_read(slot=SLOT_NAME, as_json=True)
+    except _rt.RtError:
+        return None
+    raw = (raw or "").strip()
+    if not raw or raw == "null":
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument(
+        "--print-current",
+        action="store_true",
+        help="Print current completed-goals count and exit 0 (skill Phase 8 tick-record uses this).",
+    )
+    args = ap.parse_args()
+
+    if args.print_current:
+        print(count_completed_goals())
+        return 0
+
+    cfg = _load_yaml(CONFIG_PATH)
+    if cfg is None:
+        print("felt-sense-cadence-check: config read failed — noop", file=sys.stderr)
+        return 1
+    fs = cfg.get("felt_sense") or {}
+    if not fs.get("enabled", True):
+        print("felt-sense-cadence-check: disabled in config — noop")
+        return 1
+    goal_cadence = int(fs.get("goal_cadence", 75))
+
+    current = count_completed_goals()
+    last = wm_slot_value() or {}
+    last_count = int(last.get("goals_count_at_last_fire", 0) or 0)
+
+    # Seed-stagger fix (, mirror of fresh-eyes-cadence-check.py
+    # ): when the WM slot is unset (last_count==0) AND
+    # `first_fire_offset` is configured, write a staggered seed in-place
+    # and return noop this iteration. Next iteration reads the seeded
+    # slot via normal cadence math.
+    #
+    # Rationale: zeta session 64 fired hollow felt-sense Phase 1 (0 goals
+    # to sweep) on iteration 1 because the cadence had nothing to anchor
+    # against. The  cap below prevents "infinitely overdue"
+    # narration but still fires on iter 1, producing a no-op ritual.
+    # Seeding pushes the first fire out by `first_fire_offset` goals so
+    # there's substantive material to sweep.
+    #
+    # Backward-compat: when `first_fire_offset` is missing/0, this branch
+    # is skipped and the  first-fire cap behavior is preserved
+    # (immediate fire on first detection of an unseeded slot).
+    first_fire_offset = int(fs.get("first_fire_offset", 0) or 0)
+    if last_count == 0 and first_fire_offset > 0 and current >= goal_cadence:
+        seed_count = current - goal_cadence + first_fire_offset
+        seed_payload = json.dumps({
+            "timestamp": "0000-00-00T00:00:00",  # sentinel: ritual never fired
+            "goals_count_at_last_fire": seed_count,
+            "seeded_for_stagger": True,
+            "seeded_offset": first_fire_offset,
+        })
+        try:
+            subprocess.run(
+                [sys.executable, str(HERE / "wm.py"), "set", SLOT_NAME],
+                input=seed_payload,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            print(
+                f"felt-sense-cadence-check: seeded {SLOT_NAME} for stagger "
+                f"(offset={first_fire_offset}, seed_count={seed_count}, "
+                f"current={current}, cadence={goal_cadence}) — noop this iter"
+            )
+            return 1  # noop — seed written, next iter reads it normally
+        except (subprocess.CalledProcessError, OSError) as exc:
+            # Fail-open: if the seed write fails, fall through to the
+            # legacy cap behavior so the ritual still fires (better than
+            # never firing because of a transient write failure).
+            print(
+                f"felt-sense-cadence-check: seed write to {SLOT_NAME} failed "
+                f"({exc!r}) — falling through to legacy first-fire cap",
+                file=sys.stderr,
+            )
+
+    diff = current - last_count
+    # First-fire normalization (): when the WM slot is unset (last_count==0)
+    # but the world has accumulated history, raw diff equals the full goal count
+    # (e.g., 2132 vs cadence 75), making the ritual present as infinitely-overdue.
+    # Cap at cadence so first-fire reads as "exactly due" — fires once
+    # deterministically, doesn't trigger emergency narration.
+    #
+    # Reached when first_fire_offset is unset/0 (legacy behavior) OR when the
+    # seed-write above failed (fail-open).
+    if last_count == 0:
+        diff = min(diff, goal_cadence)
+    if args.verbose:
+        print(
+            f"felt-sense-cadence-check: current={current} last={last_count} "
+            f"diff={diff} cadence={goal_cadence}"
+        )
+    if diff >= goal_cadence:
+        if not args.verbose:
+            print(
+                f"felt-sense-cadence-check: fire "
+                f"(current={current}, last={last_count}, diff={diff}, cadence={goal_cadence})"
+            )
+        return 0
+    if not args.verbose:
+        print(
+            f"felt-sense-cadence-check: noop "
+            f"(diff={diff} < cadence={goal_cadence})"
+        )
+    return 1
+
+
+if __name__ == "__main__":
+    # DO NOT REMOVE the bare-except outer guard below. The precheck loop
+    # treats exit 1 as "noop, continue" — ANY crash must be converted to
+    # exit 1, otherwise a bug in this cadence gate would block the entire
+    # aspirations loop. Fail-open is load-bearing here, not defensive fluff.
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        print(f"felt-sense-cadence-check: unexpected error: {exc} — noop", file=sys.stderr)
+        sys.exit(1)

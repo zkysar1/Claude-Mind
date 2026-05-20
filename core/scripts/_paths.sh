@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # Centralized path resolution for the cognitive core.
 # Source this at the top of every shell script.
 #
@@ -27,6 +28,12 @@ REPO_ROOT="$PROJECT_ROOT"                        # legacy alias
 _PY_SHIM_DIR="$SCRIPT_DIR/.python-shim"
 if [ -x "$_PY_SHIM_DIR/python3" ]; then
     export PATH="$_PY_SHIM_DIR:$PATH"
+    # Backfill: older shim dirs only had python3 — also expose `python` for
+    # LLM-issued bare `python` pipes (Windows Store stub eats the system one).
+    if [ ! -x "$_PY_SHIM_DIR/python" ]; then
+        cp "$_PY_SHIM_DIR/python3" "$_PY_SHIM_DIR/python" 2>/dev/null && \
+            chmod +x "$_PY_SHIM_DIR/python"
+    fi
 elif ! python3 -c "pass" &>/dev/null; then
     _PY_TARGET=""
     if command -v py &>/dev/null; then
@@ -38,48 +45,178 @@ elif ! python3 -c "pass" &>/dev/null; then
         mkdir -p "$_PY_SHIM_DIR"
         printf '#!/usr/bin/env bash\nexec %s "$@"\n' "$_PY_TARGET" > "$_PY_SHIM_DIR/python3"
         chmod +x "$_PY_SHIM_DIR/python3"
+        cp "$_PY_SHIM_DIR/python3" "$_PY_SHIM_DIR/python"
+        chmod +x "$_PY_SHIM_DIR/python"
         export PATH="$_PY_SHIM_DIR:$PATH"
     fi
     unset _PY_TARGET
 fi
 unset _PY_SHIM_DIR
 
+# --- Centralized Python bytecode cache (2026-05-19, plan v1 step 0.20) ---
+# Without this, Python writes __pycache__/ subdirs next to every .py file —
+# producing scattered cache dirs across core/scripts/, mind_api/src/, tests/,
+# every agent's reports/, etc. PYTHONPYCACHEPREFIX (Python 3.8+) routes ALL
+# bytecode caches to a single mirrored tree under core/.pycache/, keeping
+# the source tree clean. Already gitignored. Inherited by every subprocess
+# that sources _paths.sh.
+export PYTHONPYCACHEPREFIX="$PROJECT_ROOT/core/.pycache"
+
 # --- Session ID ---
-# AYOAI_SESSION_ID is set by the caller (hooks extract from stdin JSON,
-# LLM Bash calls use AYOAI_AGENT prefix which bypasses SID resolution).
-# No shared-file fallback — .latest-session-id was a single-writer design
-# that broke when multiple terminals ran in the same directory.
+# MIND_SESSION_ID is set by the caller (hooks extract from stdin JSON,
+# LLM Bash calls use MIND_AGENT prefix which bypasses SID resolution).
+# No shared-file fallback — that path was retired with the bridge file
+# (rb-386); multi-terminal race made it a single-writer design that
+# broke under concurrent agents.
 
 # --- Tier 4: Per-agent private state ---
-# Resolution: AYOAI_AGENT env var. That's it. One path.
-# The LLM sets this on every Bash call. Hooks don't have it — they
-# fall through to the auto-detect block below.
-AGENT_NAME="${AYOAI_AGENT:-}"
+# Resolution: MIND_AGENT env var. That's it. One path.
+# The PreToolUse[Bash] hook (bash-agent-inject.sh) auto-injects this env var
+# on LLM Bash calls by reading .active-agent-<SID>. Hooks called directly by
+# Claude Code (SessionStart, Stop, etc.) don't have the env var — they fall
+# through to the auto-detect block below.
+AGENT_NAME="${MIND_AGENT:-}"
+
+# --- Agent-dir resolution (Phase 2.5.C/D) ---
+# Empty string = agent dirs at PROJECT_ROOT (legacy layout, pre-2026-05-19).
+# Currently "agents" — agent dirs live at PROJECT_ROOT/agents/<name>.
+# AGENTS_PARENT_DIR MUST stay in sync across all 3 resolver layers:
+#   core/scripts/_paths.py
+#   core/scripts/_paths.sh       (this file)
+#   mind_api/src/agent_paths.py
+# Plus 2 import-cycle-proof inlined copies:
+#   core/scripts/_agents.py
+#   core/scripts/path-resolution-hook.py
+# See CLAUDE.md "Agent-dir Resolution" section.
+AGENTS_PARENT_DIR="agents"
+
+agents_root() {
+    if [ -n "$AGENTS_PARENT_DIR" ]; then
+        printf '%s/%s' "$PROJECT_ROOT" "$AGENTS_PARENT_DIR"
+    else
+        printf '%s' "$PROJECT_ROOT"
+    fi
+}
+
+agent_dir() {
+    if [ -n "$AGENTS_PARENT_DIR" ]; then
+        printf '%s/%s/%s' "$PROJECT_ROOT" "$AGENTS_PARENT_DIR" "$1"
+    else
+        printf '%s/%s' "$PROJECT_ROOT" "$1"
+    fi
+}
+
+# --- Per-session dirs (Phase 2.6) ---
+# Each agent has agents/<name>/sessions/<SID>/ for that session's snapshot
+# state (binding, runner-token, scratch, iteration-checkpoint, etc.).
+# Cross-session state stays in agents/<name>/session/ (singular).
+SESSIONS_DIRNAME="sessions"
+SESSION_DIRNAME="session"
+
+agent_sessions_root() {
+    # Parent dir for all per-session dirs for one agent.
+    # Args: $1=agent_name
+    printf '%s/%s' "$(agent_dir "$1")" "$SESSIONS_DIRNAME"
+}
+
+agent_session_dir() {
+    # Per-session dir for one (agent, sid). Dir name IS the sid.
+    # Args: $1=agent_name, $2=sid
+    printf '%s/%s/%s' "$(agent_dir "$1")" "$SESSIONS_DIRNAME" "$2"
+}
+
+agent_state_dir() {
+    # Cross-session state dir (the singular 'session/' dir).
+    # Holds files that survive across sessions (agent-state, agent-mode,
+    # persona-active, handoff.yaml, pending-questions.yaml, etc.).
+    # Args: $1=agent_name
+    printf '%s/%s' "$(agent_dir "$1")" "$SESSION_DIRNAME"
+}
 
 # --- External path configuration ---
 # world/ and meta/ live at user-supplied external paths (shared drive, NAS, etc.).
 # Each agent stores its own config in <agent>/local-paths.conf.
-# Falls back to PROJECT_ROOT/world and PROJECT_ROOT/meta when unconfigured —
-# this keeps all scripts importable before /start.
-if [ -n "$AGENT_NAME" ] && [ -f "$PROJECT_ROOT/$AGENT_NAME/local-paths.conf" ]; then
-    source "$PROJECT_ROOT/$AGENT_NAME/local-paths.conf"
+#
+# Plan v1 step 0.1 (2026-05-19) — HARD CUT: NO fallback to PROJECT_ROOT/world
+# or PROJECT_ROOT/meta when unconfigured. See _paths.py header for the full
+# rationale. The shell variant mirrors the Python behavior: WORLD_DIR/META_DIR
+# resolve to empty strings when no conf is found, and `$WORLD_DIR/foo`
+# expansions produce `/foo` — clearly broken paths that fail loudly on the
+# next filesystem operation rather than silently writing into PROJECT_ROOT.
+if [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
+    source "$(agent_dir "$AGENT_NAME")/local-paths.conf"
 else
-    # AYOAI_AGENT unset — use first available conf (hooks don't have the env var)
-    for _CONF in "$PROJECT_ROOT"/*/local-paths.conf; do
+    # MIND_AGENT unset — use first available conf (hooks don't have the env var)
+    for _CONF in "$(agents_root)"/*/local-paths.conf; do
         [ -f "$_CONF" ] && source "$_CONF" && break
     done
     unset _CONF
 fi
 
 # --- Tier 2: Meta-strategies ---
-# Priority: env var > config file > PROJECT_ROOT/meta
-META_DIR="${AYOAI_META:-${META_PATH:-$PROJECT_ROOT/meta}}"
+# Priority: env var MIND_META > _local-conf META_PATH > empty.
+# Plan v1 step 0.1 (2026-05-19): removed PROJECT_ROOT/meta fallback.
+META_DIR="${MIND_META:-${META_PATH:-}}"
 
 # --- Tier 3: Collective domain state ---
-# Priority: env var > config file > PROJECT_ROOT/world
-WORLD_DIR="${AYOAI_WORLD:-${WORLD_PATH:-$PROJECT_ROOT/world}}"
+# Priority: env var MIND_WORLD > _local-conf WORLD_PATH > empty.
+# Plan v1 step 0.1 (2026-05-19): removed PROJECT_ROOT/world fallback.
+WORLD_DIR="${MIND_WORLD:-${WORLD_PATH:-}}"
 if [ -n "$AGENT_NAME" ]; then
-    AGENT_DIR="$PROJECT_ROOT/$AGENT_NAME"
+    AGENT_DIR="$(agent_dir "$AGENT_NAME")"
 else
     AGENT_DIR=""
 fi
+
+# --- Windows shell auto-detect ---
+# Python subprocess helpers (state-update-audit.py, precheck-eval.py, etc.) read
+# MIND_SHELL with fallback to 'bash'. On Windows the default /usr/bin/bash
+# under MINGW64/MSYS doesn't accept `C:/...` drive-letter paths when invoked
+# as a bare name via PATH lookup, causing silent "No such file or directory"
+# failures for helper .sh calls. Fix: auto-detect and export MIND_SHELL as
+# the Windows-style absolute path of the local bash via `cygpath -m`. Same
+# pattern as background-jobs.sh — when `bash_path` is absolute, Python
+# subprocess invokes it directly (no PATH lookup) and the MSYS/Git-Bash
+# binary parses `C:/...` script args correctly. See
+# world/conventions/windows-shell-config.md.
+# --- git_available — cached probe (Phase 2.2 packaging cleanup) -------------
+# Returns 0 if git is installed AND PROJECT_ROOT is a git work tree; 1 else.
+# Cached per-process via MIND_GIT_AVAILABLE so repeat callers don't re-fork
+# `git rev-parse`. Framework degrades gracefully without git — iteration-commit.sh
+# soft-exits, pre-commit gates don't fire (hooks don't exist), post-commit
+# daemon recycle is lost. Learning loop is git-independent.
+git_available() {
+    if [ -n "${MIND_GIT_AVAILABLE:-}" ]; then
+        [ "$MIND_GIT_AVAILABLE" = "1" ]
+        return $?
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        export MIND_GIT_AVAILABLE=0
+        return 1
+    fi
+    if ! (cd "$PROJECT_ROOT" && git rev-parse --git-dir >/dev/null 2>&1); then
+        export MIND_GIT_AVAILABLE=0
+        return 1
+    fi
+    export MIND_GIT_AVAILABLE=1
+    return 0
+}
+
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+        if [ -z "${MIND_SHELL:-}" ] && command -v cygpath &>/dev/null; then
+            _bash_abs="$(cygpath -m "$(command -v bash)" 2>/dev/null)"
+            if [ -n "$_bash_abs" ] && [ -x "$(cygpath -u "$_bash_abs" 2>/dev/null)" ]; then
+                export MIND_SHELL="$_bash_abs"
+            fi
+            unset _bash_abs
+        fi
+        # If auto-detect failed AND stderr is a TTY, surface to the user
+        # once per interactive shell. Subprocess invocations (stderr
+        # captured, not a TTY) stay silent to avoid the thousand-plus
+        # stderr spam per aspirations-loop iteration.
+        if [ -z "${MIND_SHELL:-}" ] && [ -t 2 ]; then
+            echo "WARN: MIND_SHELL unset on Windows and auto-detect failed — Python subprocess helpers may fail silently. See world/conventions/windows-shell-config.md" >&2
+        fi
+        ;;
+esac

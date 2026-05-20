@@ -80,7 +80,7 @@ broke during startup. The agent sees symptom #3 and must look for causes #1 and
 invoke CREATE_BLOCKER directly (no email check, no inline fix — problem is at preflight).
 
 **Phase 4.1 (full diagnosis)**: Goal ran and failed or guardrail found issues →
-1. **SEEK ERROR ALERTS** — via `error_check` config in `<agent>/infra-health.yaml`
+1. **SEEK ERROR ALERTS** — via `error_check` config in `agents/<agent>/infra-health.yaml`
 2. **CASCADE DETECTION** — sort alerts by timestamp ascending, earliest = root cause
 3. **DETERMINE SEVERITY** — confirmed_infrastructure, explicit_failure, or soft_failure
 4. **TRY FIX INLINE** — search knowledge tree, reasoning bank, experience for solutions. One attempt.
@@ -109,13 +109,13 @@ Config: `core/config/aspirations.yaml` → `proactive_escalation` section (tunab
 ## Reference
 Full protocol: Phase 4.0 + Phase 4.1 + CREATE_BLOCKER in `.claude/skills/aspirations-execute/SKILL.md`
 Broad sweep: Phase 0.5a + blocker resolution: Phase 0.5b in `.claude/skills/aspirations-precheck/SKILL.md`
-Script: error check script configured in `<agent>/infra-health.yaml` `error_check` section
+Script: error check script configured in `agents/<agent>/infra-health.yaml` `error_check` section
 
 ---
 
 # Error Alerts Configuration
 
-Error alert checking is configured in `<agent>/infra-health.yaml` under `error_check`:
+Error alert checking is configured in `agents/<agent>/infra-health.yaml` under `error_check`:
 ```yaml
 error_check:
   script: <path to error check script>
@@ -130,17 +130,17 @@ Domain-specific scripts (e.g., email-based, webhook-based) are placed in `world/
 
 # Infrastructure Health Tracking
 
-Infrastructure health state is tracked in `<agent>/infra-health.yaml`.
+Infrastructure health state is tracked in `agents/<agent>/infra-health.yaml`.
 Updated automatically by `core/scripts/infra-health.sh` on every probe.
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `infra-health.sh check <component>` | Probe component health (auto-records result) | — |
 | `infra-health.sh check-all` | Probe all components | — |
-| `infra-health.sh status` | Current state from <agent>/infra-health.yaml | — |
+| `infra-health.sh status` | Current state from agents/<agent>/infra-health.yaml | — |
 | `infra-health.sh stale [--hours N]` | Components not checked within N hours (default: 2) | — |
 
-Components are domain-specific — defined in `<agent>/infra-health.yaml` under `components:`.
+Components are domain-specific — defined in `agents/<agent>/infra-health.yaml` under `components:`.
 
 Schema per component:
 ```yaml
@@ -151,10 +151,10 @@ consecutive_failures: 0
 session_last_checked: 40              # or null
 ```
 
-Side effects: `check` and `check-all` automatically update `<agent>/infra-health.yaml`
+Side effects: `check` and `check-all` automatically update `agents/<agent>/infra-health.yaml`
 with success/failure timestamps. No separate record call needed from the agent.
 
-Skill-to-component mapping lives in `<agent>/infra-health.yaml` (`skill_mapping` + `category_mapping`).
+Skill-to-component mapping lives in `agents/<agent>/infra-health.yaml` (`skill_mapping` + `category_mapping`).
 Used by Phase 0.5b/2.5b blocker gates and Phase 4.2 domain post-execution steps.
 
 All backed by `core/scripts/infra-health.py` (Python 3, PyYAML).
@@ -168,7 +168,7 @@ All backed by `core/scripts/infra-health.py` (Python 3, PyYAML).
 1. **Probe before concluding** — Before saying "X is down/unreachable/unavailable",
    run `infra-health.sh check <component>`. SSH timeout, curl failure,
    connection refused — these are evidence. Assumptions are not.
-2. **Check recency** — Read `<agent>/infra-health.yaml` for last successful contact.
+2. **Check recency** — Read `agents/<agent>/infra-health.yaml` for last successful contact.
    If a component succeeded recently (current session or last 2 hours), it
    likely still works. Probe anyway if about to skip a goal over it.
 3. **Stale host keys are not outages** — SSH "REMOTE HOST IDENTIFICATION HAS
@@ -182,7 +182,7 @@ When this applies:
 - Any moment the agent considers deferring a goal due to infrastructure
 - Any moment the agent is about to declare infrastructure unavailable
 
-Reference: `core/scripts/infra-health.sh`, `<agent>/infra-health.yaml`
+Reference: `core/scripts/infra-health.sh`, `agents/<agent>/infra-health.yaml`
 
 ---
 
@@ -193,7 +193,7 @@ Reference: `core/scripts/infra-health.sh`, `<agent>/infra-health.yaml`
 After ANY of these events, ask: "Which knowledge nodes informed this action, and
 do they need updating?"
 
-1. **External code change** — editing files outside world/<agent>/meta/ (bug fix, feature, refactor)
+1. **External code change** — editing files outside world/agents/<agent>/meta/ (bug fix, feature, refactor)
 2. **Hypothesis resolution** — an outcome contradicts or refines what a node says
 3. **User correction** — the user provides information that supersedes stored knowledge
 4. **Research discovery** — new research reveals a node's content is outdated or wrong

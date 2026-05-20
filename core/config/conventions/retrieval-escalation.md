@@ -23,7 +23,7 @@ This is the primary knowledge source. Most questions should be answerable here.
 ### Tier 2: Codebase Exploration (Verify/Supplement)
 
 When the tree doesn't have enough, search the actual codebase for evidence.
-The primary workspace is defined in `<agent>/self.md` (e.g., a repo path).
+The primary workspace is defined in `agents/<agent>/self.md` (e.g., a repo path).
 If no workspace is configured, skip Tier 2.
 
 **Techniques**:

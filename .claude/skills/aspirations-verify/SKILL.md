@@ -1,6 +1,6 @@
 ---
 name: aspirations-verify
-description: "Phase 5: Verification — hypothesis outcomes, unified checks, Q1/Q2/Q3 escalation, streak tracking, dependent unblocking"
+description: "Phase 5 of the aspirations loop: verifies a just-executed goal using hypothesis outcomes, unified outcome/check evaluation, Q1/Q2/Q3 verification escalation, streak tracking, and dependent-goal unblocking. Use whenever /aspirations-execute finishes and the loop must confirm the goal actually met its verification criteria before state-update fires. Internal sub-skill — never invoke outside the aspirations loop; assumes the just-executed goal is still in working context."
 user-invocable: false
 parent-skill: aspirations
 conventions: [aspirations, goal-schemas]
@@ -12,6 +12,8 @@ execution_history:
     unsuccessful: 0
     success_rate: 0.0
   last_invocation: null
+revision_id: "skill-bootstrap-aspirations-verify-c60403"
+previous_revision_id: null
 ---
 
 # /aspirations-verify — Goal Completion Verification
@@ -20,6 +22,27 @@ Verifies whether a goal achieved its desired end state after execution.
 Handles hypothesis goals, unified verification checks, and the Q1/Q2/Q3
 structured escalation protocol for goals with empty checks.
 
+## Abbreviation Policy
+
+Mandatory writes for this obligation: see `core/config/obligation-schema.yaml`
+→ `obligations.verify`. Abbreviation is permitted only when one of the
+`abbreviated_allowed_when` conditions holds (routine outcome, or
+`context_budget.zone == tight`). Zone is distance-to-autocompact, not raw
+usage — see `core/scripts/context-budget-status.py` `classify_zone`. When
+the tight-zone condition is the basis for abbreviation, `Bash: bash
+core/scripts/context-budget-banner.sh` and quote its output before claiming
+the condition. When abbreviating on the tight-zone condition, log TWO lines
+in the iteration journal entry (in this order):
+  `OBLIGATION ABBREVIATED: verify — {condition}`
+  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+The banner line must be the actual output captured from the banner script.
+`core/scripts/context-citation-audit.sh` audits the pair. For other
+conditions (routine outcome), the banner line is not required.
+Then satisfy `minimum_inline`. Otherwise invoke this Skill literally — a
+bare status write is NOT a verify. The learning-gate audit (Phase 9.5d)
+scans those journal lines and logs false claims to
+`agents/<agent>/session/obligation-audit.jsonl`.
+
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter.
 
 ## Inputs (from orchestrator)
@@ -27,6 +50,7 @@ structured escalation protocol for goals with empty checks.
 - `goal`: The executed goal object (with verification field)
 - `result`: Execution result (from Phase 4)
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
+- `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
 
 ## Outputs (to orchestrator)
 
@@ -53,34 +77,182 @@ if goal.hypothesis_id:
 
 ## Unified Verification Checks
 
+### Scripted Check Evaluation
+
+Structured `verification.checks[]` entries are evaluated by
+`verify-check-eval.sh` (sister script to `predicate.py`). Empty `checks[]`
+falls through to the Q1/Q2/Q3 Empty-Checks Escalation Protocol below — the
+scripted path handles structured checks only; Q1/Q2/Q3 is the LLM-judgment
+path for investigation / novel-research goals that legitimately lack
+structured checks.
+
 ```
-checks = goal.verification.checks if goal.verification else [goal.completion_check]
+Bash: bash core/scripts/verify-check-eval.sh --goal <goal-id> --all
+Read JSON result:
+  flags = []:                     all_passed → standard-pass path
+  flags = ["checks_empty"]:       fall through to Q1/Q2/Q3 (LLM evidence)
+  flags = ["checks_failed"]:      goal fails verification; mark pending; record blocker if warranted
+  flags = ["has_string_checks"]:  structured passed but string checks exist; run Q1/Q2/Q3 too
+```
+
+### Sub-Phase Checkpoint Helper (shared by Q1/Q2/Q3 and standard checks)
+
+Each Q-check and the standard-checks block writes its outcome to
+`agents/<agent>/session/iteration-checkpoint.json` via the single-writer wrapper
+(g-248-36). This makes verify resumable mid-phase: if autocompact or graceful
+stop interrupts after Q1 passes but before Q3 runs, the re-invoked verify
+sees `prior_checks.q1_passed` and skips Q1. Pattern (reused below, one line
+per write — dotted `phase_progress.<key>` paths deep-merge into existing
+phase_progress dict):
+
+```bash
+bash core/scripts/loop-state-save.sh update --set "phase_progress.<key>=<value>"
+```
+
+The wrapper provides typed-key validation, atomic tempfile+rename, and
+deep-merge into nested dicts. The checkpoint auto-deletes at `LOOP_CONTINUE`,
+so `phase_progress` resets on any successful iteration.
+
+Each check also appends a diary breadcrumb (`execution-diary.sh append`, JSON
+on stdin) so `postcompact-restore` surfaces Q-check outcomes in fresh context.
+
+### Pre-Escalation Retrieval (G2 / R6)
+
+Before answering Q1/Q2/Q3, load verification-related guardrails and
+reasoning-bank entries so the answers are checked against accumulated
+anti-patterns rather than written from memory.
+
+Per `.claude/rules/retrieve-before-deciding.md` decision point 2 ("verifying
+a goal's outcome"), this retrieval is mandatory whenever `checks` is empty
+AND no prior_checks shortcut applies. Fail-open: if retrieve.sh errors,
+log the failure and proceed to Q1/Q2/Q3 anyway — verify must not block.
+
+```
+IF len(checks) == 0 AND NOT (prior_checks.q1_passed AND prior_checks.q2_passed AND prior_checks.q3_scope):
+    # Token-overlap match against verification anti-patterns
+    Bash: retrieve.sh --category "verification escalation Q1 Q2 Q3 evidence anti-pattern" --depth shallow
+
+    From the returned JSON, surface to the Q1/Q2/Q3 answers:
+      - guardrails[] whose rule mentions positive-state, negation-claim,
+        artifact-evidence, schema-probe, exhaustive-search, or canonical-probe
+      - reasoning_bank[] entries flagged with verification or
+        verify-before-assuming categories
+
+    Use the loaded entries to:
+      1. Sharpen Q1: does the claimed artifact match an entry's "what counts
+         as evidence" pattern? If a guardrail (e.g., guard-346 output-completeness,
+         positive-state-gate companion) flags the claim shape, Q1 must run
+         the explicit probe before passing.
+      2. Sharpen Q2: do any retrieved entries describe failure modes for this
+         goal's category that the agent should explicitly check?
+      3. Sharpen Q3: do any entries warn about unit-only verification for this
+         class of work?
+
+    Diary breadcrumb:
+      echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Verification retrieval: rb=<N> guard=<M> loaded"}' | bash core/scripts/execution-diary.sh append
+
+ELSE:
+    # checks[] is non-empty (scripted path) OR all Q-checks already passed via prior_checks.
+    # Skip pre-escalation retrieval — checks evaluation is already structured,
+    # and prior_checks means a prior turn loaded what it needed.
+    Skip
 ```
 
 ### Empty-Checks Escalation Protocol (Q1/Q2/Q3)
 
-When `len(checks) == 0`, the agent MUST answer three structured questions:
+When `len(checks) == 0`, the agent MUST answer three structured questions.
+Each Q respects `prior_checks` — a Q already passed in a prior turn is skipped.
+
+**Assertion format requirement** (communication-clarity.md Rule 6): Every
+verification statement in Q1/Q2/Q3 responses MUST use the form "X is Y
+because Z" — cite the concrete evidence source (script output, file read,
+command result, artifact path). Hedging language on observed evidence —
+"possibly", "might be", "could be", "seems to", "appears to" — on an
+outcome the execution actually produced triggers re-verification: the
+reviewer cannot distinguish "evidence was genuinely ambiguous" from "agent
+didn't look carefully enough," so hedge detection forces another pass.
+When evidence is truly partial, state what was observed and what is
+unknown as two separate claims, not one hedged claim.
 
 **Q1 EVIDENCE**: "What concrete artifact (file, output, state change, commit) proves
 this goal succeeded?" Must reference a checkable artifact.
-- If references concrete artifact: attempt to verify (Read file, check existence)
-- If artifact verification fails: `all_passed = false`, status → pending
-- If no concrete reference: `all_passed = false`
+- `IF prior_checks.q1_passed`: log `"Q1 skipped (prior checkpoint: artifact={prior_checks.q1_artifact})"`; skip to Q2.
+- Else: if references concrete artifact → attempt to verify (Read file, check existence).
+  - If artifact verification fails: `all_passed = false`, status → pending.
+  - If no concrete reference: `all_passed = false`.
+- **On Q1 PASS** (artifact verified):
+  ```bash
+  bash core/scripts/loop-state-save.sh update --set "phase_progress.q1_passed=true" --set "phase_progress.q1_artifact=<artifact-path>"
+  echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q1 passed: artifact=<artifact-path>"}' | bash core/scripts/execution-diary.sh append
+  ```
+- **Positive-state audit on Q1 claim** (verify-before-assuming.md Positive
+  File-State Claims): if the Q1 artifact claim references a specific file
+  (e.g., "handoff.yaml reflects session N", "config.yaml contains Y"), the
+  claim must be backed by an in-turn Read/ls/stat of that file — not narrated
+  from prior-session memory. Run:
+  ```bash
+  py core/scripts/positive-state-gate.py --claim "<Q1 artifact claim>" --evidence "<concatenated in-turn Read/ls outputs referencing the file>"
+  ```
+  Exit 1 = claim unverified → `all_passed = false`, status → pending, and
+  append `verification_gap` to sensory_buffer citing the gate reason. Re-read
+  the file before re-verifying. Known false positive → re-call with
+  `--override "<justification>"`.
 
 **Q2 NEGATIVE CHECK** (only when Q1 passes): "What would it look like if this
 APPEARED to succeed but actually failed? Did I check for that?"
-- HARD GATE: if you CAN name a failure mode but DIDN'T check → check NOW
-- If check reveals problem: `all_passed = false`, status → pending
-- If vague/empty: soft signal → append `verification_gap` to sensory_buffer
+- `IF prior_checks.q2_passed`: log `"Q2 skipped (prior checkpoint: failure-mode={prior_checks.q2_failure_mode_checked})"`; skip to Q3.
+- Else: HARD GATE — if you CAN name a failure mode but DIDN'T check → check NOW.
+  - If check reveals problem: `all_passed = false`, status → pending.
+  - If vague/empty: soft signal → append `verification_gap` to sensory_buffer.
+- **Automated negation check (rb-229 capability-gate extensions, g-115-44/g-115-45 wire-up, rb-245 zero-count extension):**
+  Extract any negation claim from the result text or your Q2 failure-mode answer. Three classes:
+  - **Knowledge / capability** ("isn't built", "doesn't exist", "can't be done") → exhaustive-search-gate.py
+  - **Infrastructure / operational** ("is down", "not responding", "connection refused") → verify-before-assuming-gate.py
+  - **Statistical / audit** ("N% have X=0", "0 records have Y", "missing field", "zero-utilization") → zero-count-gate.py (requires a jsonl-field-probe.py run first)
+  ```bash
+  # ALL gates are Python scripts — invoke with `py` (or `python3`), NEVER `bash`.
+  # `bash <file>.py` silently fails: bash tries to parse Python as shell, exits 2,
+  # stdout is empty, and the caller can't see `would_block` or `reason`.
+  # Knowledge / capability negations:
+  py core/scripts/exhaustive-search-gate.py --claim-text "<negation>" --tiers-used "<csv>" --queries-count <N>
+  # AND (for infrastructure negations only):
+  py core/scripts/verify-before-assuming-gate.py --claim-text "<negation>" --signals-count <N_nonsilent> [--infra-check-run]
+  # AND (for statistical/audit negations — rb-245): run probe FIRST, then gate.
+  py core/scripts/jsonl-field-probe.py --file <jsonl-path> --field <dot.path>
+  #   → capture field_present into <found|missing>
+  py core/scripts/zero-count-gate.py --claim-text "<negation>" --file-probed "<jsonl-path>" --field-probed "<dot.path>" --probe-result "<found|missing>"
+  ```
+  A claim may trigger multiple gates (knowledge + statistical for "no records found with field X"). ALL triggered gates must pass (exit 0). Overlap is intentional defense-in-depth, not a bug.
+  Interpret exit codes: `0` = evidence sufficient (or no trigger matched — no-op), pass; `1` = evidence insufficient, treat as Q2 FAIL → `all_passed = false`, status → pending, and append `verification_gap` to sensory_buffer citing the gate reason. If a gate's `would_block=true` is a known false positive, re-call with `--override "<justification>"` (audit trail on stderr is automatic). No negation claim in the result → skip; the gates are no-ops on non-negation text.
+- **On Q2 PASS** (failure mode named and checked, no problem revealed):
+  ```bash
+  bash core/scripts/loop-state-save.sh update --set "phase_progress.q2_passed=true" --set "phase_progress.q2_failure_mode_checked=<one-liner>"
+  echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q2 passed: failure-mode=<one-liner>"}' | bash core/scripts/execution-diary.sh append
+  ```
 
 **Q3 INTEGRATION SCOPE**: "Did I verify at the integration level
 (caller → target → side effect), or only the unit level?"
+- `IF prior_checks.q3_scope is set`: log `"Q3 skipped (prior: {prior_checks.q3_scope})"`; proceed.
+- Else: assess scope → `"unit"` or `"integration"`.
+- **On Q3 assessed**:
+  ```bash
+  bash core/scripts/loop-state-save.sh update --set "phase_progress.q3_scope=<unit|integration>"
+  echo '{"entry_type":"observation","goal_id":"<goal.id>","content":"Q3 scope: <unit|integration>"}' | bash core/scripts/execution-diary.sh append
+  ```
 
 ### Standard Checks
 
 ```
 IF len(checks) > 0:
-    all_passed = all(check_passes(c) for c in checks)
+    IF prior_checks.standard_checks_passed matches "<N>/<N>" where N == len(checks):
+        log "Standard checks skipped (prior checkpoint: <N>/<N>)"
+        all_passed = true
+    ELSE:
+        all_passed = all(check_passes(c) for c in checks)
+        passed_count = sum(1 for c in checks if check_passes(c))
+        # Record outcome to checkpoint + diary
+        bash core/scripts/loop-state-save.sh update --set "phase_progress.standard_checks_passed=<passed_count>/<len(checks)>"
+        echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Verify: <passed_count>/<len(checks)> standard checks passed"}' | bash core/scripts/execution-diary.sh append
 ```
 
 ### On Pass
@@ -105,21 +277,36 @@ if all_passed:
 ### Unblock Dependent Goals (with Output Passing)
 
 When unblocking goals that depend on this completed goal, inject the output
-into dependent goals that declared `depends_on` (see goal-schemas.md):
+into dependent goals that declared `depends_on` (see goal-schemas.md). This
+is bash-enforced via `dependent-unblock.sh` (rb-428 lineage; siblings:
+experience-archive-goal.sh, findings-gate.sh, decision-rules-append.sh,
+loop-state-save.sh, skill-quality-score.sh, journal-append.sh). The wrapper
+walks both world and agent aspirations.jsonl, removes `<completed-goal-id>`
+from any goal's `blocked_by`, and prepends `## Predecessor Output (<id>)\n
+<summary>\n\n` to the description of any goal whose `depends_on` lists this
+id. Idempotent via the marker check; per-goal failures are reported in the
+returned `skipped[]` array without aborting the loop.
 
 ```
-FOR EACH goal across all active aspirations WHERE blocked_by contains completed_goal_id:
-    Remove completed_goal_id from blocked_by (via aspirations-update-goal.sh)
-    IF dependent_goal has depends_on entry for completed_goal_id:
-        # Use the output_summary already in context from the handoff post above
-        Bash: aspirations-update-goal.sh --source {dep_source} <dep-goal-id> description "## Predecessor Output (${completed_goal_id})\n${output_summary}\n\n${existing_description}"
+Bash: bash core/scripts/dependent-unblock.sh --goal <completed-goal-id> --summary "${output_summary}"
 ```
+
+The wrapper stamps `unblocked_by = <completed-goal-id>` and
+`unblocked_summary = ${output_summary}` on each dependent goal so consumers
+(downstream agents, audit tooling, postcompact-restore) can see which
+predecessor produced the injected text. Replaces the prior LLM-orchestrated
+loop that was silently drifting (early sessions skipped the description
+prepend; the rb-428 family hoists each such loop into a single bash unit).
 
 ### On Fail
 
 ```
 Bash: aspirations-update-goal.sh --source {source} <goal-id> status pending  # retry next cycle
 log "Goal executed but verification check failed"
+
+# Breadcrumb: postcompact-restore surfaces the last 10 diary entries to the next turn
+echo '{"entry_type":"failure","goal_id":"<goal.id>","content":"Verify failed: <reason>"}' | bash core/scripts/execution-diary.sh append
+
 # Post what was learned from the failure (not just "failed")
 IF source == "world":
     failure_summary = one-line summary of what was attempted and why it failed

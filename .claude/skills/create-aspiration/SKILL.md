@@ -1,19 +1,22 @@
 ---
 name: create-aspiration
-description: "Self-driven aspiration creation — from user input, autonomous generation, or full planning cycle"
+description: "Creates new aspirations from three source modes — from-user (parse user text), from-self (autonomous gap-driven, optionally --plan for research-backed deliberation), and from-followup (fast-path: one aspiration with a single 'Design implementation plan and file sub-goals here' seed goal). USE WHENEVER you catch yourself saying 'I'll note this for later', 'worth investigating', 'deserves its own aspiration', 'follow up on', 'file as an idea', 'circle back', or 'noting for later' DURING goal execution — invoke from-followup IMMEDIATELY with the observation, do not defer to insights.jsonl (those accumulate unprocessed). ALSO USE when the user says 'create an aspiration', 'add a project', 'start a new effort', 'capture this', or 'file for later'. The from-followup path defaults to sprint scope + MEDIUM priority, auto-derives title, and skips introspective-scan + interestingness-filter + priority-review. Writes to aspirations.jsonl via aspirations-add.sh."
 user-invocable: false
-triggers: []
+triggers: [aspiration, create-aspiration, aspiration-planning, new-aspiration, aspiration-generation, tactical-aspiration]
 conventions: [aspirations, goal-schemas, tree-retrieval]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-create-aspiration-0db17c"
+previous_revision_id: null
 ---
 
 # /create-aspiration — Self-Driven Aspiration Creation
 
-Creates aspirations aligned with the agent's Self (core purpose). Two modes:
+Creates aspirations aligned with the agent's Self (core purpose). Three modes:
 
 - **from-user**: Parse user's natural language into aspirations + goals
 - **from-self**: Autonomous generation — "Given Self and current state, what's needed?"
   - **`--plan`**: Full planning cycle: introspective scan + Self-grounded web research + structured deliberation
+- **from-followup**: Fast-path capture of in-flight observations that deserve dedicated follow-through. One aspiration with a single exploratory seed goal ("Design implementation plan and file sub-goals under this aspiration"). No introspective scan, no web research, no interestingness filter, no priority-review. Sprint scope, MEDIUM priority. Fires when the agent catches itself saying "I'll note this for later" during goal execution — invoke IMMEDIATELY with the observation text.
 
 ## Invocation Patterns
 
@@ -22,6 +25,7 @@ Creates aspirations aligned with the agent's Self (core purpose). Two modes:
 | `from-self` (default) | 5-phase introspective scan (A, A.5, B, C, D). |
 | `from-self --plan` | Full planning cycle: introspective scan + Self-grounded web research + structured deliberation |
 | `from-self` with context params | Context is available — the LLM decides how much introspective scanning to add. No flag needed. |
+| `from-followup "<text>"` | Fast-path: 1 aspiration + 1 exploratory seed goal. Skips Steps 1.5, 1.7, 2–8.6. Sprint scope + MEDIUM priority by default. Optional `--source-goal g-XXX-YY` stamps origin_signal with the goal being executed. Returns in under a second. |
 
 ## Called By
 
@@ -34,6 +38,7 @@ Creates aspirations aligned with the agent's Self (core purpose). Two modes:
 - `/aspirations-spark` sq-013 (passes `discovery_context`, auto-detected)
 - `/aspirations-consolidate` (passes `batch_context`, auto-detected)
 - `/respond` directive routing (user says "add aspiration about X")
+- Agent self-observation during goal execution (Phase 4 — "I'll note this for later" / "worth investigating" trigger → `from-followup` fast-path)
 
 ## Step 0: Load Conventions
 
@@ -42,10 +47,108 @@ Creates aspirations aligned with the agent's Self (core purpose). Two modes:
 ## Step 1: Read Self
 
 ```
-Read <agent>/self.md → extract Self (body content after front matter)
-IF <agent>/self.md is empty or missing:
+Read agents/<agent>/self.md → extract Self (body content after front matter)
+IF agents/<agent>/self.md is empty or missing:
     ABORT: "Cannot create aspirations — Self is not defined. Run /start to set up."
 ```
+
+## Step 1.2: Fast-Path — from-followup
+
+**Purpose**: capture in-flight observations that deserve dedicated follow-through, without
+derailing the current goal. No research, no deliberation, sub-500ms round-trip.
+
+```
+IF mode == "from-followup":
+    Execute the fast-path below, then EXIT the skill.
+    SKIP Steps 1.5, 1.7, 2, 3 (other modes), 4, 5, 7, 8.5, 8.6.
+    Self was already read in Step 1 — use it for motivation alignment.
+
+    Inputs:
+      text           : required (positional, free-form observation)
+      --source-goal  : optional (g-XXX-YY of the goal the agent was executing)
+
+    Derive fields:
+      title         = "Follow-up: " + first 60 chars of text (word-boundary cut)
+      motivation    = first sentence of text (truncate to 200 chars at word boundary)
+      description   = full text verbatim
+                      IF --source-goal was passed: prepend "Source goal: <g-id>\n\n"
+      category      = Bash: category-suggest.sh --text "<text>" --top 1
+                      IF script returns empty array: "uncategorized"
+      origin_signal = (MUST match a prefix in core/scripts/origin-signal-gate.py
+                       ALLOWED_PREFIXES. Aspiration-level values aren't gate-checked
+                       at add time, but downstream audits/reports consume this —
+                       non-allowed values create forward-compat debt. Do not invent
+                       new prefixes without extending ALLOWED_PREFIXES first.)
+                      IF --source-goal provided: "idea:<source-goal-id>"
+                      ELSE: "user_directive"
+
+    Determine next asp-NNN ID:
+      Bash: bash core/scripts/aspirations-read.sh --summary   → active IDs
+      Bash: bash core/scripts/aspirations-read.sh --archive   → archived IDs
+      asp-NNN = max(NNN across active ∪ archive) + 1
+      # aspirations-add.sh REFUSES on archive ID collision (aspirations.py:156) —
+      # there is no auto-retry. MUST read archive to pick a safe ID.
+
+    Build aspiration JSON (pipe to aspirations-add.sh):
+      {
+        "id": "asp-NNN",
+        "title": <derived>,
+        "motivation": <derived>,
+        "description": <derived>,
+        "scope": "sprint",
+        "priority": "MEDIUM",
+        "source": "followup-capture",
+        "origin_signal": <derived>,
+        "sessions_active": 0,
+        "status": "active",
+        "goals": [
+          {
+            "id": "g-NNN-01",
+            "title": "Design implementation plan and file sub-goals under this aspiration",
+            "description": "Review the motivation, outline the work lifecycle (research / build / test / integrate / encode as applicable), then EITHER file at least 2 concrete sub-goals under this aspiration OR archive the aspiration via aspirations-retire.sh as not-worth-pursuing. This seed goal forces a decision at pickup so from-followup aspirations cannot silently coast.",
+            "skill": null,
+            "type": "idea",
+            "category": <same as aspiration>,
+            "status": "pending",
+            "priority": "MEDIUM",
+            "origin_signal": "parent_aspiration:asp-NNN",
+            "participants": ["agent"],
+            "verification": {
+              "outcomes": [
+                "Implementation plan documented in the aspiration description (via aspirations-update.sh)",
+                "At least 2 concrete sub-goals filed under this aspiration OR aspiration archived via aspirations-retire/complete as not-worth-pursuing"
+              ],
+              "checks": [],
+              "preconditions": []
+            },
+            "blocked_by": []
+          }
+        ]
+      }
+
+    Create:
+      Bash: echo '<aspiration-json>' | bash core/scripts/aspirations-add.sh
+      # Failures surface as-is. Do NOT auto-retry with --override-signal or
+      # --override-duplication — the error text is the signal the caller needs
+      # to see and act on.
+
+    Log:
+      Bash: echo '{"date":"<today>","event":"aspiration_created","details":"<asp-id>: <title>","trigger_reason":"from-followup","origin_signal":"<origin_signal>"}' | bash core/scripts/evolution-log-append.sh
+
+    Notify user (lean — single-line subject, no priority-review):
+      Check world/forged-skills.yaml for a skill whose triggers match
+      "notify the user" and invoke with:
+        subject: "New follow-up: <title>"
+        message: "<motivation>\n\nFiled as <asp-id> with 1 seed goal. Loop will pick up and decompose into sub-goals at next selection."
+
+    Return: <asp-id> and g-NNN-01. Exit the skill.
+Bash: echo "from-followup fast-path complete — <asp-id>"
+```
+
+**Why the seed goal's verification forces a decision**: `from-followup` captures are
+cheap, which means the queue can fill with them. The "2 sub-goals OR archive" outcome
+ensures every follow-up aspiration either proves its worth by decomposing into real
+work or is honestly retired. Without this, `from-followup` becomes a landfill.
 
 ## Step 1.5: Execution Feedback Review
 
@@ -92,7 +195,7 @@ IF strategic_focus.primary is set:
 Bash: load-aspirations-compact.sh          → IF path returned: Read it (compact aspirations data — IDs, titles, statuses, priorities, categories, skills, recurring, participants, blocked_by, deferred, args, parent_goal, discovered_by, started — no descriptions/verification)
 Bash: aspirations-read.sh --summary       → active aspirations only (one-liner per aspiration)
 Bash: tree-read.sh --stats                → knowledge coverage
-Read <agent>/developmental-stage.yaml        → maturity level
+Read agents/<agent>/developmental-stage.yaml        → maturity level
 Read core/config/aspirations.yaml              → max_active cap, aspiration_scopes, default_scope
 ```
 
@@ -113,6 +216,105 @@ Align with Self:
 Five-phase autonomous generation (Phases A-D + A.5 stepping stones):
 
 ```
+Phase A.0 — Consolidation gate (hard block, from-self only):
+    # Read portfolio-health data written by aspirations-precheck Phase 0.5.4.
+    # The precheck writes {active_count, avg_completion, near_complete,
+    # stalled, computed_at} to this WM slot via core/scripts/consolidation-
+    # health.sh every iteration. Absent slot = treat as pass-through (fail
+    # open) — the loop may be running in a context without precheck (e.g.
+    # direct /aspirations evolve invocation).
+    # wm-read.sh emits `null` + exit 0 when the slot is absent — no
+    # fallback needed. The downstream `!= "null"` guard fails open, so
+    # missing-slot passes through without blocking.
+    Bash: health_json = wm-read.sh consolidation_health --json
+    IF health_json != "null" AND health_json is a well-formed object:
+        active_count = health_json.active_count (default 0)
+        avg_completion = health_json.avg_completion (default 1.0)
+        IF active_count >= 6 AND avg_completion < 0.35:
+            # Portfolio is fragmented. Refuse to create a new from-self
+            # aspiration; this would violate consolidate-before-expand.
+            # User-directed paths (from-user via /respond) are exempt because
+            # they don't route through this skill's from-self branch — they
+            # call the from-user mode path above, which has its own logic.
+            Log refusal message to stderr:
+              "▸ CONSOLIDATION GATE: refusing from-self aspiration creation
+               (active_count={N}, avg_completion={X:.2%}, thresholds=6/35%).
+               Drain the existing tail before adding new work. Override by
+               passing --override-consolidation-gate '<justification>', or
+               request this work via /respond (from-user path is exempt)."
+
+            # Audit trail — every gate fire is logged with the live thresholds
+            # and the portfolio snapshot that triggered it. Reviewable via
+            # meta/config-changes.yaml.
+            Bash: echo '{"date":"<today>","event":"consolidation_gate_fired","details":"from-self refused: active_count='$active_count', avg_completion='$avg_completion'","thresholds":"active_count>=6 AND avg_completion<0.35"}' | bash core/scripts/evolution-log-append.sh
+
+            # Instead of creating, route to Unblock/Complete-Review work so
+            # the existing tail gets attention. Create a HIGH-priority Unblock
+            # goal in the most stale active aspiration (highest completion but
+            # has unfinished blocked goals — likely a zombie candidate).
+            Bash: aspirations-add-goal.sh --source world ... (HIGH-priority Unblock goal
+              titled "Unblock: drain tail to close aspiration — {asp-id}"
+              targeting the most completion-ready stale aspiration)
+
+            # Return early — the caller (sq-007 handler, evolve gap-analysis,
+            # idle playbook) observes NO new aspiration was created. The
+            # next loop iteration runs aspirations-precheck Phase 0.5.0a
+            # zombie scan, which routes to aspirations-complete-review.
+            RETURN {created: 0, gate: "consolidation", action: "routed_to_unblock"}
+
+    # Override path: --override-consolidation-gate "<justification>" bypasses
+    # the block but logs the override for audit.
+    IF --override-consolidation-gate "<justification>" was passed:
+        Log: "▸ Consolidation gate overridden: {justification}"
+        Bash: echo '{"date":"<today>","event":"consolidation_gate_override","details":"from-self override: '$justification'","thresholds":"active_count>=6 AND avg_completion<0.35"}' | bash core/scripts/evolution-log-append.sh
+        (proceed to Phase A.evidence)
+
+Phase A.evidence — Evidence-citation requirement (from-self only, governs ALL phases A-D):
+
+    **Mandatory rule for every candidate aspiration generated in Phases A,
+    A.5, B, C, D below.** Before adding a candidate to the pool, write
+    one sentence of the form:
+
+        "The user will see value from this because <specific evidence>."
+
+    `<specific evidence>` must reference ONE of:
+      - A named file, test, metric, or deploy artifact that is currently
+        broken, stale, or under-performing (cite the path)
+      - A specific coordination or findings board post (cite the post id)
+      - A specific pending-question (cite the pq-NNN id)
+      - A specific user statement from the last 30 days of journal entries
+        (cite the journal entry or session id)
+      - A specific resolved hypothesis whose outcome implies follow-up
+        work (cite the h-YYYY-MM-DD-slug id)
+      - A specific low-confidence tree node with recent retrieval hits
+        (cite the node path)
+
+    **Category labels are NOT evidence.** A candidate whose evidence reduces
+    to "the category 'research' has low coverage" or "Self mentions code
+    quality, so test coverage" is REJECTED at this phase. The B2.5
+    idle-playbook used exactly that pattern and produced session after
+    session of make-work; this gate prevents the same failure mode at the
+    aspiration level.
+
+    If you cannot write a specific evidence sentence for a candidate,
+    DROP the candidate. An empty pool at the end of Phase D is an
+    acceptable outcome — Step 6 and downstream handlers can act on an
+    empty result. Do NOT backfill with generic candidates to avoid
+    returning empty; that IS the failure mode.
+
+    Every surviving candidate carries its evidence sentence forward as
+    the aspiration's `motivation` field (or is prefixed to it). This makes
+    the cited evidence auditable in aspirations.jsonl — a reader can
+    trace any agent-generated aspiration back to the concrete signal that
+    produced it.
+
+    When a child goal of this aspiration reaches `aspirations-add-goal.sh`,
+    set `origin_signal` to `parent_aspiration:<parent-asp-id>` so the
+    origin-signal gate (core/scripts/origin-signal-gate.py) accepts it —
+    the parent aspiration's evidence transitively licenses its goals.
+    (Works for both from-user and from-self parents — the name is
+    semantically parent-centric, not source-centric.)
+
 Phase A — Purpose scan:
     "What does Self need that isn't covered by current aspirations?"
     Read Self carefully. Consider:
@@ -129,7 +331,29 @@ Phase A — Purpose scan:
     # - generation_heuristics: learned rules for aspiration generation
     # - stepping_stone_preferences: whether to use stepping stones, K value
     # - interestingness_criteria: weights for novelty/learnability/worthwhileness/diversity
-    # These are advisory — the agent uses judgment on whether to follow.
+    # - domain_class_targets: per-class portfolio steering (asp-244 E1, g-001-196).
+    #   For each candidate aspiration whose primary domain class can be inferred,
+    #   invoke the bash-enforced gate (replaces prior LLM-advisory pseudocode —
+    #   rb-616 / rb-428 family: recurring portfolio decisions drift when left to
+    #   per-cycle judgment; bash gate makes the threshold math the SSOT):
+    Bash: bash core/scripts/domain-class-gate.sh check --candidate-class <class>
+    #   The gate emits structured JSON. Consume per the `action` field:
+    #     - "warn": current_ratio has reached/exceeded the class's max. Candidate
+    #       may still be added, but justification MUST be logged. The gate
+    #       returns log_payload pre-filled with {date, event, class, current_ratio,
+    #       max, reason: null}; fill the `reason` field with a one-line
+    #       justification, then:
+    Bash: bash core/scripts/domain-class-gate.sh log --payload '<payload-with-reason>'
+    #     - "bias": class is below min. Surface preferentially in Phases A-D
+    #       (additive, not exclusive — other classes still eligible). The gate
+    #       also returns `bias_below_classes`: a list of every under-min class
+    #       across the portfolio. Bias extends to candidates in any of them, not
+    #       just the queried class.
+    #     - "none": no gating — proceed normally.
+    #   Fail-open: missing strategy / broken learning-ratio / YAML errors all
+    #   return action="none" with `fail_open_reason` populated. The gate's job
+    #   is to catch portfolio drift, not block aspiration generation when its
+    #   dependencies break.
 
     # Constraint awareness
     Bash: wm-read.sh active_constraints --json && Bash: wm-read.sh known_blockers --json
@@ -198,7 +422,7 @@ Phase D — Pain scan:
     "What is broken, blocked, or degraded right now?"
     Bash: wm-read.sh known_blockers --json
     Bash: journal-read.sh --recent 3        → recent failures, skipped goals
-    Read <agent>/experiential-index.yaml       → categories with declining accuracy
+    Read agents/<agent>/experiential-index.yaml       → categories with declining accuracy
 
     For each pain signal found:
     - Unresolved blockers → blocker_resolution goals
@@ -206,10 +430,19 @@ Phase D — Pain scan:
     - Declining category accuracy → research or diagnosis goals
     - Stale/contradicted knowledge → cleanup goals
 
-    If pain requires user input (access grants, design decisions, external
-    system changes the agent can't make): create user_action goal AND
-    attempt to notify user with the pain context.
-    Don't just queue it silently — surface it.
+    If pain requires resolution:
+      Apply Capability Check Before User Routing (.claude/rules/capability-before-user.md):
+      check skill registry, forged skills, companion scripts, provisionability,
+      and domain convention (world/conventions/capability-routing.md) before
+      assigning participants. ONLY genuinely human-only actions get
+      participants: [user]. If BOTH agent and human work needed: [agent, user].
+    Notify the user about the urgent pain.
+    (Check world/forged-skills.yaml for a skill whose triggers match
+    "notify the user" and invoke it with a short subject ("Urgent pain: <one-line>")
+    and message (the pain signals and proposed goals). If no matching skill is
+    registered, fall back to a `participants: [agent, user]` goal via
+    aspirations-add-goal.sh. Don't just queue silently. Never block on
+    notification failure.)
 
     Pain-driven aspirations default to priority: HIGH (they're blocking real work).
     Skip if no pain signals found — not every session has problems.
@@ -232,7 +465,54 @@ Phase D — Pain scan:
     Skip if all aspirations are either very new (<2 sessions) or nearly done (>90%).
 ```
 
-Combine results from all six phases (A, A.5, B, C, D, D.5). Deduplicate and prioritize.
+```
+Phase E — World observation ("What has the world shown me?"):
+    # Unlike Phases A-D which ask "what does Self need?" (introspective, exhaustible),
+    # Phase E asks "what has the world TOLD me that I haven't acted on?" (observational,
+    # inexhaustible). Self is finite. The world is not. This phase reads dynamic state
+    # that refreshes every iteration — it can never run dry.
+
+    # E1: Strategic scan signals (if available in working memory)
+    Bash: wm-read.sh strategic_scan_signals --json
+    IF strategic_scan_signals is not null and len > 0:
+        For each signal, generate aspiration candidates that ADDRESS the signal:
+          - regression → investigation + fix aspiration
+          - anomaly → research + understanding aspiration
+          - stale_knowledge → refresh + deepening aspiration
+          - thin_knowledge → exploration aspiration
+          - unexplored_territory → discovery aspiration
+          - uncovered_priorities → purpose-advancing aspiration
+          - cross_pollination → transfer learning aspiration
+
+    # E2: Recent experience themes (cross-goal pattern detection)
+    # Look for themes across the last N goal executions — not just one goal.
+    Bash: experience-read.sh --recent 10
+    recent_experiences = parse result
+    IF recent_experiences:
+        Cluster by category/theme. Ask: "What theme is emerging from
+        recent work that deserves its own aspiration? What question
+        keeps coming up? What concern keeps appearing across goals?"
+        Generate aspiration candidates from emerging themes.
+
+    # E3: Caller-provided scan context (from strategic scan medium signals)
+    IF scan_context was passed by caller:
+        For each signal in scan_context:
+            Generate aspiration candidates directly from signal data.
+            These are higher-confidence candidates (already triaged as MEDIUM severity).
+
+    # E4: Curiosity-driven generation (intrinsic motivation)
+    # This is pure intrinsic motivation — not reactive to problems, not derived
+    # from gaps, just genuine intellectual curiosity about the domain.
+    Read agents/<agent>/self.md
+    Ask: "Given Self and everything I now know, what am I genuinely
+          CURIOUS about? What would be fascinating to explore?
+          What counterintuitive hypothesis would I love to test?
+          What adjacent domain might illuminate mine?"
+    Generate 1-2 curiosity-driven aspiration candidates.
+    Tag these as source: "curiosity" for tracking.
+```
+
+Combine results from all seven phases (A, A.5, B, C, D, D.5, E). Deduplicate and prioritize.
 
 ### Step 3.7: Scope Classification
 
@@ -280,7 +560,7 @@ Self drives the research — ask Self what it WANTS to know.
 IF scope == "sprint":
     SKIP this step — sprint aspirations don't need external research.
 
-Read <agent>/self.md → what are Self's priorities, curiosities, blind spots?
+Read agents/<agent>/self.md → what are Self's priorities, curiosities, blind spots?
 Bash: world-cat.sh knowledge/tree/_tree.yaml  # where are the knowledge gaps?
 
 IF scope == "project" or scope == "initiative":
@@ -313,7 +593,7 @@ IF scope == "project" or scope == "initiative":
 Self is the judge — re-read Self and evaluate candidates against it.
 
 ```
-Read <agent>/self.md (explicit re-read — Self anchors the deliberation)
+Read agents/<agent>/self.md (explicit re-read — Self anchors the deliberation)
 
 # The LLM now has: introspective candidates (Phases A-D) + web findings
 # Self decides what matters. The LLM should:
@@ -336,7 +616,7 @@ Journal the planning cycle for future reflection:
 Quick orientation before generating goals:
 
 ```
-Read <agent>/self.md → what domain is this agent for?
+Read agents/<agent>/self.md → what domain is this agent for?
 Bash: world-cat.sh knowledge/tree/_tree.yaml  # what does the agent already know?
 IF Self references an external codebase:
     Scan that project's CLAUDE.md for test frameworks (pytest, jest, gradle test, etc.)
@@ -426,6 +706,11 @@ Goal structure (pipe to aspirations-add.sh):
     # Use the top match's key. If no match (score 0): use "uncategorized"
   - status: pending
   - priority: HIGH/MEDIUM/LOW
+  - origin_signal: "parent_aspiration:<this-asp-id>"
+    # REQUIRED. The origin-signal gate (core/scripts/origin-signal-gate.py)
+    # rejects goals without this field at aspirations-add.sh time. The
+    # parent aspiration's own origin_signal (evidence cited in Phase A.evidence
+    # or "user_directive" for from-user) transitively licenses its goals.
   - verification:
       outcomes: ["Human-readable success criteria"]
       checks: [{type, target, condition}]
@@ -591,6 +876,37 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
    IF duplicates existing active aspiration (same scope + approach) → REJECT
    IF deepens/improves existing active aspiration → KEEP (consolidate-before-expand)
 
+1.5. Cross-store contradiction check (G7 / R9):
+   Title-matching against active aspirations catches obvious duplicates but
+   misses contradictions encoded in reasoning-bank or guardrails — e.g.,
+   "we already tried this approach and it failed for reason X" or
+   "guardrail Y forbids this class of work right now". Per
+   `.claude/rules/retrieve-before-deciding.md` decision point 5 ("adding a
+   new aspiration") and `.claude/rules/consolidate-before-expand.md`.
+
+   For each ACCEPTED candidate:
+     Bash: retrieve.sh --category "{candidate.category} {candidate.title}" --depth shallow
+
+     From the returned JSON, evaluate:
+       - guardrails[] whose rule constrains this category right now
+         (e.g., "no new X aspirations while blocker Y exists")
+         → If a guardrail blocks: REJECT, log the guard-NNN ID
+       - reasoning_bank[] entries describing failed attempts at this aspiration
+         shape in the last 30 days (look for failure_lesson + same category)
+         → If 2+ recent failures: DOWNGRADE priority by one level
+         (HIGH→MEDIUM, MEDIUM→LOW); add a precondition goal that addresses
+         the failure pattern before the main work
+       - reasoning_bank[] entries that describe a SIMPLER alternative that
+         would achieve the same outcome
+         → If a simpler alternative is named: REFINE the aspiration to use
+         that approach instead of the originally generated one
+
+     Log filter decisions to evolution-log:
+       echo '{"date":"<today>","event":"crossstore_contradiction_check","details":"<title>: <verdict> — guards=<count> rb=<count>","trigger_reason":"create-aspiration"}' | bash core/scripts/evolution-log-append.sh
+
+     Fail-open: if retrieve.sh errors, log and proceed with the candidate
+     unchanged. A retrieval failure must not block aspiration creation.
+
 2. Cap check:
    Read core/config/aspirations.yaml → max_active
    current_count = count of active aspirations from Step 2
@@ -624,11 +940,33 @@ For each validated aspiration:
   IF exit code != 0: report validation error, skip this aspiration
 ```
 
+**Goal-duplication gate (asp-248 / g-248-01)** fires automatically inside
+`aspirations.py cmd_add` — for each goal in the aspiration, it cross-checks
+against (1) partner's team-state `recent_completions`, (2) partner's git
+commits in last 48h, (3) active `insight_trigger` findings on the board.
+If ANY goal overlaps with partner work, the whole aspiration is blocked.
+Pass `--override-duplication "<justification>"` to `aspirations-add.sh`
+when the overlap is intentional (e.g. different scope on the same file);
+the override is audited to `world/goal-duplication-overrides.jsonl`.
+
 ## Step 7: Log
 
 ```
-For each created aspiration:
-  echo '{"date":"<today>","event":"aspiration_created","details":"<asp-id>: <title>","trigger_reason":"<from-user|from-self: phase>"}' | bash core/scripts/evolution-log-append.sh
+For each created aspiration, emit one evolution-log event. The `origin_signal`
+field carries forward the evidence cited in Phase A.evidence — or `user_directive`
+for from-user mode. Downstream audits (`/backlog-report`, `/agent-completion-report`)
+surface the distribution of origin_signal values so `idle_fallback` and similar
+soft signals are visible rather than hidden in the goal stream.
+
+  origin_signal_value:
+    - from-user mode                → "user_directive"
+    - from-self with cited evidence → the evidence token (e.g. "board_post:f-218",
+                                      "failing_test:widget-task-001",
+                                      "pending_question:pq-042", "resolved_hypothesis:h-...")
+    - from-self, no evidence        → this should not happen; Phase A.evidence
+                                      drops candidates rather than backfill.
+
+  echo '{"date":"<today>","event":"aspiration_created","details":"<asp-id>: <title>","trigger_reason":"<from-user|from-self: phase>","origin_signal":"<origin_signal_value>"}' | bash core/scripts/evolution-log-append.sh
 ```
 
 ## Step 8: Report
@@ -653,10 +991,14 @@ After creating aspirations, notify the user so they have visibility into what th
 ```
 For each created aspiration:
   Build a concise summary: asp-id, title, motivation, goal count, goal titles
-  Reach out to the user about the new aspiration:
-    Subject: "New Aspiration Created: <asp-title>"
-    Message: "<summary>"
-  If unable to reach the user, create a participants: [user] goal to inform them. Do NOT block aspiration creation.
+  Notify the user about the new aspiration.
+  (Check world/forged-skills.yaml for a skill whose triggers match
+  "notify the user" and invoke it with:
+    subject: "New Aspiration Created: <asp-title>"
+    message: "<summary>"
+  If no matching skill is registered, fall back to a `participants: [agent, user]`
+  goal via aspirations-add-goal.sh. Never block aspiration creation on
+  notification failure.)
 ```
 
 ## Step 8.6: Priority Review Request (from-self only)
@@ -673,7 +1015,7 @@ IF invocation mode is NOT "from-self": SKIP this step.
    Sort by: priority (HIGH→MEDIUM→LOW), then aspiration ID
    Format each as: "[{priority}] {asp-id}: {title} ({completed}/{total} goals)"
 
-2. Write priority-review pending question to <agent>/session/pending-questions.yaml:
+2. Write priority-review pending question to agents/<agent>/session/pending-questions.yaml:
    - id: pq-NNN (next available)
    - date: "{today}"
    - context: "priority-review"
@@ -693,11 +1035,18 @@ IF invocation mode is NOT "from-self": SKIP this step.
    body: the ranked list + "Reply or run /priority-review to reorder"
 
 4. Continue immediately — do NOT block.
+Bash: echo "create-aspiration phase documented"
 ```
 
 ## Chaining
 
 - **Called by**: `/start`, `/aspirations evolve` (`--plan` for gap analysis), `/aspirations loop` (Phase 0.5/2/7 with `--plan`, no-goals with `--plan`), `/aspirations-spark` (sq-007, sq-c05, sq-013 with context), `/aspirations-consolidate` (with `batch_context`), `/reflect-on-outcome` (with `forge_context`), `/respond`
 - **Calls**: `aspirations-add.sh`, `aspirations-complete.sh`, `aspirations-retire.sh`, `evolution-log-append.sh`, user notification (Step 8.5), priority-review pending question (Step 8.6)
-- **Reads**: `<agent>/self.md`, `aspirations-read.sh`, `tree-read.sh`, `<agent>/developmental-stage.yaml`, `core/config/aspirations.yaml`
+- **Reads**: `agents/<agent>/self.md`, `aspirations-read.sh`, `tree-read.sh`, `agents/<agent>/developmental-stage.yaml`, `core/config/aspirations.yaml`
 - **Web research** (`--plan` only): WebSearch for Self-grounded queries (Step 2.5)
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The pending-question write (Step 8.6) and notification call are tool calls and satisfy
+this when present. If neither fires, end with `Bash: echo "create-aspiration complete"`.

@@ -1,6 +1,6 @@
 ---
 name: decompose
-description: "HTN goal decomposition — break compound goals into primitive executable sub-goals"
+description: "Performs HTN (Hierarchical Task Network) decomposition: breaks a compound goal into a sequence of primitive, directly-executable sub-goals. Use whenever a selected goal is too abstract or multi-step to execute as-is (selector or Phase 4 flags it as compound), the user says \"break down this goal\", or /aspirations-execute encounters a goal whose primary action would span multiple atomic operations. Produces child goals linked back to the parent."
 user-invocable: false
 triggers:
   - "/decompose"
@@ -19,6 +19,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [aspirations, goal-schemas, tree-retrieval, pipeline]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-decompose-b06641"
+previous_revision_id: null
 ---
 
 # /decompose — Hierarchical Task Network Goal Decomposition
@@ -43,6 +45,29 @@ Find goal by ID in the output (search all aspirations' goals for the goal_id)
 Read any files listed in goal.context_needed
 ```
 
+## Step 1.5: Idempotency Check (fast exit for already-decomposed goals)
+
+Before Step 2's primitiveness test, check whether this goal was decomposed in
+a prior session. Re-decomposing would duplicate work.
+
+```
+IF goal.status == "decomposed" OR (goal.decomposed_into is a non-empty list):
+    # Verify at least one child is still live.
+    Bash: aspirations-read.sh --active  (locate children by ID)
+    live_children = [c for c in children if c.status in {pending, in-progress, blocked}]
+    IF live_children is non-empty:
+        # No-op — prior decomposition is intact and children are actionable.
+        # Emit a terminal Bash call and RETURN. Do NOT output any text,
+        # insight block, table, or summary paragraph after this call.
+        # Return-protocol rule (.claude/rules/return-protocol.md): text after
+        # the final Bash kills the autonomous session.
+        Bash: echo "decompose no-op — g-{id} already decomposed into {N} live children: {child-ids}"
+        RETURN
+    # If all children are terminal (completed/expired/skipped), fall through
+    # to Step 2 for fresh primitiveness evaluation — parent may warrant
+    # re-decomposition under new constraints.
+```
+
 ## Step 2: Primitiveness Test
 
 A goal is **primitive** (does NOT need decomposition) if ALL five criteria are met:
@@ -53,7 +78,14 @@ A goal is **primitive** (does NOT need decomposition) if ALL five criteria are m
 4. **No hidden decisions**: Doesn't require choosing between approaches mid-execution
 5. **Concrete output**: Produces a specific artifact (file, record, index update)
 
-If ALL five → goal is primitive → STOP, return as-is.
+```
+IF ALL five met → goal is primitive:
+    # Terminal Bash per .claude/rules/return-protocol.md — no text output
+    # may follow this call. Naming the satisfied criteria makes the no-op
+    # diagnosable from the execution diary without re-reading the goal.
+    Bash: echo "decompose no-op — g-{id} is primitive (criteria met: single-actor, single-session, clear-completion, no-hidden-decisions, concrete-output)"
+    RETURN
+```
 
 ## Step 3: Compound Detection Test
 
@@ -90,7 +122,7 @@ Before decomposing, load the minimum context needed. Map goal keywords to files:
 | evaluate, score, predict | `core/config/profile.yaml` (evaluation framework), `pipeline-read.sh --stage discovered` |
 | research, learn, document | `world/knowledge/tree/_tree.yaml` |
 | review, accuracy, resolve | `pipeline-read.sh --stage active`, `pipeline-read.sh --stage resolved` |
-| reflect, pattern, learn | `world/knowledge/patterns/`, `<agent>/journal/` (most recent) |
+| reflect, pattern, learn | `world/knowledge/patterns/`, `agents/<agent>/journal/` (most recent) |
 | evolve, strategy, adjust | `aspirations-read.sh --active`, `meta/meta-knowledge/_index.yaml` |
 
 Only read what's needed — minimize context window usage.
@@ -100,7 +132,8 @@ Only read what's needed — minimize context window usage.
 ```
 function decompose(goal, depth=0):
     if depth >= MAX_DEPTH (4):
-        return [goal]  # safety valve — stop recursing
+        return [goal]  # safety valve — stop recursing (caller inspects result; if top-level
+                       # returned unchanged single-element list, Step 5.5 flags it for human review)
 
     if is_primitive(goal):
         return [goal]  # base case
@@ -116,6 +149,11 @@ function decompose(goal, depth=0):
         sg.parent_goal = goal.id
         sg.participants = [agent]  # default, override if user action needed
         sg.status = "pending"
+        # origin-signal gate: child goal cites the parent it decomposes from.
+        # REQUIRED — core/scripts/origin-signal-gate.py rejects unsigned goals
+        # at aspirations-add-goal.sh time. "decomposition:<parent_goal_id>"
+        # is the canonical signal for HTN decomposition children.
+        sg.origin_signal = "decomposition:{parent_id}"
         sg.achievedCount = 0
         sg.currentStreak = 0
         sg.longestStreak = 0
@@ -133,6 +171,19 @@ function decompose(goal, depth=0):
 
         # Set dependencies (sequential sub-goals block each other)
         sg.blocked_by = [prev_sg.id] if sequential else []
+
+        # Knowledge-debt cross-reference (anti-pattern 2): if the sub-goal's
+        # description or category references a node_key that currently appears
+        # in working-memory knowledge_debt[], pre-populate the
+        # closes_knowledge_debt field so the classifier's semantic override
+        # can force deep treatment on completion.
+        # See goal-schemas.md "Knowledge-Debt Closure Field" and
+        # aspirations-execute/SKILL.md Phase 4-post SEMANTIC OVERRIDE.
+        debts = Bash: wm-read.sh knowledge_debt --json  # list of entries
+        sg.closes_knowledge_debt = [
+            d.node_key for d in debts
+            if d.node_key appears in sg.title, sg.description, or sg.category
+        ]
 
         # Recurse
         result.extend(decompose(sg, depth + 1))
@@ -198,11 +249,29 @@ For each sub-goal, infer the `verification` field using these patterns:
 |---|---|---|
 | Knowledge article | "Article exists at {path} with {topic} content" | `{type: file_check, target: "{path}", condition: "exists"}` |
 | Pipeline records | "Pipeline has {N}+ records in {stage}" | `{type: pipeline_count, stage: "{stage}", min: N}` |
-| Journal entry | "Journal entry for {date} documents {topic}" | `{type: file_check, target: "<agent>/journal/{path}", condition: "exists"}` |
+| Journal entry | "Journal entry for {date} documents {topic}" | `{type: file_check, target: "agents/<agent>/journal/{path}", condition: "exists"}` |
 | Config update | "Config field {field} set to {value}" | `{type: config_check, file: "{path}", field: "{field}", value: "{val}"}` |
 | Pattern identified | "Pattern documented in patterns article" | `{type: file_check, target: "world/knowledge/patterns/...", condition: "updated"}` |
 | Script/code artifact | "File {path} exists and is functional" | `{type: file_check, target: "{path}", condition: "exists"}` |
 | Hypothesis resolved | "Hypothesis {id} has outcome" | `{type: pipeline_check, id: "{id}", field: "outcome", not_null: true}` |
+
+### Step 5.5: Post-Decomposition Empty-Result Guard
+
+After Step 5's recursive decomposition completes, verify it actually produced
+new sub-goals. If the top-level call returned `[goal]` unchanged — caused by
+max-depth safety valve firing at depth 0, or by no sub-goals being generated —
+fall through WITHOUT running Step 6 (which would rewrite the aspiration with
+no new children and potentially corrupt state).
+
+```
+IF decompose() returned [goal] unchanged (single-element list containing only the input):
+    # Safety valve fired at top level OR sub-goal generation produced nothing.
+    # Either is a skill-level failure, not silently-correct behavior. Log it
+    # and emit terminal Bash — do NOT write changes via aspirations-update.sh.
+    Bash: echo "decompose safety — g-{id} recursion produced no new sub-goals (max_depth={MAX_DEPTH}, initial_depth=0). Flagged for human review. No aspiration changes written."
+    # TERMINAL BASH per .claude/rules/return-protocol.md — no text output may follow.
+    RETURN
+```
 
 ### Companion Hypothesis Generation
 
@@ -228,10 +297,14 @@ If yes, create a companion hypothesis goal alongside the sub-goals:
 5. Update aspiration progress.total_goals count
 6. Pipe updated aspiration JSON: echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh <asp-id>
 7. Update _index files if needed
-8. Reach out to the user about the decomposition:
-   Subject: "Aspiration Updated: <asp-title>"
-   Message: "Aspiration updated: <asp-id>: <asp-title>. Decomposed <parent-goal> into <N> sub-goals: <sub-goal-titles>"
-   If unable to reach the user, create a participants: [user] goal to inform them. Do NOT block.
+8. Notify the user about the decomposition.
+   (Check world/forged-skills.yaml for a skill whose triggers match
+   "notify the user" and invoke it with:
+     subject: "Aspiration Updated: <asp-title>"
+     message: "Aspiration updated: <asp-id>: <asp-title>. Decomposed <parent-goal> into <N> sub-goals: <sub-goal-titles>"
+   If no matching skill is registered, fall back to a `participants: [agent, user]`
+   goal via aspirations-add-goal.sh. Never block decomposition on notification failure.)
+Bash: echo "decompose phase documented"
 ```
 
 **All invocations**: Execute immediately, no approval needed. Show decomposition in report output.
@@ -262,3 +335,25 @@ Next: Execute first unblocked sub-goal via /aspirations next
 - **Auto-decompose always** — execute immediately in all contexts, no approval gates
 - **Preserve parent intent** — sub-goals must collectively achieve what the parent described
 - **Every sub-goal gets a skill** — if you can't assign a skill, the sub-goal is too vague
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+
+This skill has **four exit paths**, each with its own terminal Bash call. No path
+may end with text output, summary paragraph, insight block, or table after its
+final Bash call — that kills the autonomous session (incident 2026-04-22 alpha
+session-56: /decompose no-op emitted terminal Bash, then appended a summary
+paragraph, and the aspirations loop never re-entered).
+
+| Exit path | Where | Terminal Bash |
+|---|---|---|
+| Already-decomposed no-op | Step 1.5 | `echo "decompose no-op — g-{id} already decomposed..."` |
+| Primitive no-op | Step 2 | `echo "decompose no-op — g-{id} is primitive..."` |
+| Empty-result safety valve | Step 5.5 | `echo "decompose safety — g-{id} recursion produced no new sub-goals..."` |
+| Normal completion | Step 6 (main path) → Step 7 output → final `Bash: echo "decompose phase documented"` | see Step 6 line 256 |
+
+After ANY of the four terminal Bash calls: **no text output of any kind**. No
+"Decomposition: ..." table, no "Next: ..." hint, no "✶ Insight" block. Whatever
+needs to be said to the orchestrator or the user goes INTO the echo string
+before the Bash call, not into text after it.

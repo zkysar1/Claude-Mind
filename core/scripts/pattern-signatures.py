@@ -10,24 +10,32 @@ import json
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import WORLD_DIR
+from _jsonl_helpers import set_nested_field
 
 LIVE_PATH = WORLD_DIR / "pattern-signatures.jsonl"
 
 VALID_STATUSES = {"active", "retired", "contradicted"}
 VALID_VALIDATION_STATUSES = {"unvalidated", "calibrating", "validated"}
-ID_RE = re.compile(r"^sig-\d{3}$")
+ID_RE = re.compile(r"^sig-\d+$")  # allow 1+ digits — auto-id allocator
+                                   # produces sig-{max+1}; the prior \d{3}
+                                   # constraint would silently break on the
+                                   # 1000th signature.
 
-REQUIRED_FIELDS = {"id", "name", "description", "conditions", "expected_outcome", "created"}
+# `created` is SCRIPT-OWNED: stamped at add time by cmd_add from the system
+# clock, never read from stdin. Matches reasoning-bank.py / guardrails _stamp_now
+# pattern. Callers must NOT supply `created`; any stdin value is overwritten.
+# cmd_update preserves the original record's `created`; update-field rejects
+# `field == "created"`. This eliminates LLM-narrated timestamp drift.
+REQUIRED_FIELDS = {"id", "name", "description", "conditions", "expected_outcome"}
 DEFAULT_FIELDS = {
     "status": "active",
     "outcome_stats": {"total": 0, "confirmed": 0, "accuracy": 0.0},
@@ -37,7 +45,6 @@ DEFAULT_FIELDS = {
     "validation_status": "unvalidated",
     "last_matched": None,
 }
-
 
 # ---------------------------------------------------------------------------
 # Helpers: file I/O (same as pipeline.py / experience.py)
@@ -56,18 +63,24 @@ def read_jsonl(path):
                 items.append(json.loads(stripped))
     return items
 
-
 def write_jsonl(path, items):
     """Atomically write a list of dicts as JSONL with locking and history."""
     from _fileops import locked_write_jsonl
     locked_write_jsonl(path, items)
-
 
 def append_jsonl(path, item):
     """Append one JSON line to a JSONL file with locking and history."""
     from _fileops import locked_append_jsonl
     locked_append_jsonl(path, item)
 
+def _stamp_now():
+    """Return current local time as ISO 8601 without microseconds.
+
+    Matches reasoning-bank.py _stamp_now — CLAUDE.md "Timestamps: ALWAYS local
+    system time" + `$(date +%Y-%m-%dT%H:%M:%S)`. Callers MUST use this —
+    never trust an LLM-supplied `created` field.
+    """
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 def parse_value(value_str):
     """Parse a string value into the appropriate Python type."""
@@ -97,19 +110,24 @@ def parse_value(value_str):
         pass
     return value_str
 
-
 # ---------------------------------------------------------------------------
 # Helpers: validation
 # ---------------------------------------------------------------------------
 
-def validate_record(rec):
-    """Validate a pattern signature record dict. Raises ValueError on invalid."""
-    missing = REQUIRED_FIELDS - set(rec.keys())
+def validate_record(rec, *, skip_id_check=False):
+    """Validate a pattern signature record dict. Raises ValueError on invalid.
+
+    skip_id_check=True is used by the auto-id path in cmd_add — see
+    reasoning-bank.validate_rb_record for the same rationale.
+    """
+    required = REQUIRED_FIELDS - ({"id"} if skip_id_check else set())
+    missing = required - set(rec.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
 
-    if not ID_RE.match(rec["id"]):
-        raise ValueError(f"Invalid record ID format: {rec['id']} (expected sig-NNN)")
+    if not skip_id_check:
+        if not ID_RE.match(rec["id"]):
+            raise ValueError(f"Invalid record ID format: {rec['id']} (expected sig-NNN)")
 
     if not isinstance(rec["conditions"], list):
         raise ValueError("conditions must be a list")
@@ -122,7 +140,6 @@ def validate_record(rec):
     if validation_status not in VALID_VALIDATION_STATUSES:
         raise ValueError(f"Invalid validation_status: {validation_status}")
 
-
 def recompute_accuracy(rec):
     """Recompute outcome_stats.accuracy from total/confirmed. Mutates and returns rec."""
     stats = rec.get("outcome_stats", {})
@@ -131,7 +148,6 @@ def recompute_accuracy(rec):
     stats["accuracy"] = round(confirmed / total, 4) if total > 0 else 0.0
     rec["outcome_stats"] = stats
     return rec
-
 
 def normalize_record(rec):
     """Apply defaults for missing fields. Mutates and returns rec."""
@@ -145,7 +161,6 @@ def normalize_record(rec):
     rec = recompute_accuracy(rec)
     return rec
 
-
 # ---------------------------------------------------------------------------
 # Helpers: search
 # ---------------------------------------------------------------------------
@@ -157,172 +172,32 @@ def find_record_by_id(items, rec_id):
             return (i, rec)
     return None
 
-
 def check_no_duplicate_id(items, rec_id):
     """Raise ValueError if rec_id already exists in items."""
     for item in items:
         if item.get("id") == rec_id:
             raise ValueError(f"Duplicate record ID: {rec_id}")
 
-
 # ---------------------------------------------------------------------------
 # Helpers: nested field access
 # ---------------------------------------------------------------------------
 
-def set_nested_field(obj, field_path, value):
-    """Set a nested field using dot notation (e.g., 'outcome_stats.total')."""
-    parts = field_path.split(".")
-    for part in parts[:-1]:
-        if part not in obj or not isinstance(obj[part], dict):
-            obj[part] = {}
-        obj = obj[part]
-    obj[parts[-1]] = value
-
+# set_nested_field now lives in _jsonl_helpers.py () — imported at top.
 
 # ---------------------------------------------------------------------------
 # Subcommands: read
 # ---------------------------------------------------------------------------
 
-def cmd_read(args):
-    if args.all:
-        items = read_jsonl(LIVE_PATH)
-        print(json.dumps(items, indent=2, ensure_ascii=False))
 
-    elif args.active:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("status") == "active"]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.id:
-        items = read_jsonl(LIVE_PATH)
-        result = find_record_by_id(items, args.id)
-        if result is None:
-            print(f"Record {args.id} not found", file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result[1], indent=2, ensure_ascii=False))
-
-    elif args.summary:
-        items = read_jsonl(LIVE_PATH)
-        for rec in items:
-            sig_id = rec.get("id", "?")
-            name = rec.get("name", "(unnamed)")
-            vs = rec.get("validation_status", "?")
-            stats = rec.get("outcome_stats", {})
-            accuracy = stats.get("accuracy", 0.0)
-            confirmed = stats.get("confirmed", 0)
-            total = stats.get("total", 0)
-            print(f"{sig_id}: {name} [{vs}] accuracy={accuracy} ({confirmed}/{total})")
-
-    else:
-        print("Specify one of: --all, --active, --id, --summary", file=sys.stderr)
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Subcommands: write
-# ---------------------------------------------------------------------------
-
-def cmd_add(args):
-    if sys.stdin.isatty():
-        print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
-        sys.exit(1)
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("No input provided on stdin", file=sys.stderr)
-        sys.exit(1)
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    rec = normalize_record(rec)
-
-    try:
-        validate_record(rec)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    try:
-        check_no_duplicate_id(items, rec["id"])
-    except ValueError as e:
-        print(f"Duplicate error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    append_jsonl(LIVE_PATH, rec)
-
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_update(args):
-    if sys.stdin.isatty():
-        print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
-        sys.exit(1)
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("No input provided on stdin", file=sys.stderr)
-        sys.exit(1)
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    rec = normalize_record(rec)
-
-    try:
-        validate_record(rec)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Stdin record ID must match the target — prevent silent ID mutation
-    if rec.get("id") != args.rec_id:
-        print(f"Record ID mismatch: stdin has '{rec.get('id')}' but target is '{args.rec_id}'", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, args.rec_id)
-    if result is None:
-        print(f"Record {args.rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx = result[0]
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_update_field(args):
-    rec_id = args.rec_id
-    field = args.field
-    value = parse_value(args.value)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-
-    # Support dot-notation for nested fields (e.g., outcome_stats.total)
-    if "." in field:
-        set_nested_field(rec, field, value)
-    else:
-        rec[field] = value
-
-    # Recompute accuracy whenever outcome_stats fields change
-    if field.startswith("outcome_stats.") or field == "outcome_stats":
-        rec = recompute_accuracy(rec)
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+# --- cmd_add, cmd_update, cmd_update_field, cmd_set_status GUTTED ----------
+# Migrated to daemon store endpoint (H2 Wave 3, 2026-05-15). These
+# subcommands now route through POST /v1/store/{append,replace,set-field}
+# via thin .sh wrappers (pattern-signatures-{add,update,update-field,
+# set-status}.sh). Validators and helpers above are kept as they are
+# referenced by store_registry.py (lifted verbatim there, mirrored here
+# for the surviving bespoke cmd_record_outcome).
+# See: mind_api/src/store_registry.py, mind_api/src/endpoints/store.py
+# -----------------------------------------------------------------------
 
 def cmd_record_outcome(args):
     rec_id = args.rec_id
@@ -332,50 +207,36 @@ def cmd_record_outcome(args):
         print(f"Invalid outcome: {outcome} (must be CONFIRMED or CORRECTED)", file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
+    from _fileops import locked_modify_jsonl
 
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
+    written = {"rec": None}
+
+    def _modifier(items):
+        result = find_record_by_id(items, rec_id)
+        if result is None:
+            raise ValueError(f"Record {rec_id} not found")
+        idx, rec = result
+        stats = rec.get("outcome_stats", {"total": 0, "confirmed": 0, "accuracy": 0.0})
+        stats["total"] = stats.get("total", 0) + 1
+        if outcome == "CONFIRMED":
+            stats["confirmed"] = stats.get("confirmed", 0) + 1
+        stats["accuracy"] = round(stats["confirmed"] / stats["total"], 4) if stats["total"] > 0 else 0.0
+        rec["outcome_stats"] = stats
+        rec["last_matched"] = date.today().isoformat()
+        items[idx] = rec
+        written["rec"] = rec
+        return items
+
+    try:
+        locked_modify_jsonl(LIVE_PATH, _modifier)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         sys.exit(1)
-
-    idx, rec = result
-
-    stats = rec.get("outcome_stats", {"total": 0, "confirmed": 0, "accuracy": 0.0})
-    stats["total"] = stats.get("total", 0) + 1
-    if outcome == "CONFIRMED":
-        stats["confirmed"] = stats.get("confirmed", 0) + 1
-    stats["accuracy"] = round(stats["confirmed"] / stats["total"], 4) if stats["total"] > 0 else 0.0
-    rec["outcome_stats"] = stats
-    rec["last_matched"] = date.today().isoformat()
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
+    print(json.dumps(written["rec"], indent=2, ensure_ascii=False))
 
 
-def cmd_set_status(args):
-    rec_id = args.rec_id
-    new_status = args.status
-
-    if new_status not in VALID_STATUSES:
-        print(f"Invalid status: {new_status} (must be one of: {', '.join(sorted(VALID_STATUSES))})", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-    rec["status"] = new_status
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+# cmd_set_status GUTTED — migrated to daemon store endpoint (H2 Wave 3).
+# See pattern-signatures-set-status.sh.
 
 # ---------------------------------------------------------------------------
 # Subcommands: migrate-yaml (for init-mind.sh bootstrap)
@@ -405,6 +266,10 @@ def cmd_migrate_yaml(args):
     records = []
     for sig in data.get("signatures", []):
         rec = dict(sig)
+        # Stamp `created` if the YAML didn't provide one — migration should
+        # never produce records that can't pass post-fix validation.
+        if "created" not in rec:
+            rec["created"] = _stamp_now()
         if "status" not in rec:
             rec["status"] = "active"
         if "retrieval_cues" not in rec:
@@ -436,7 +301,6 @@ def cmd_migrate_yaml(args):
 
     print(f"  Seeded pattern-signatures.jsonl: {len(records)} signatures")
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -445,36 +309,13 @@ def main():
     parser = argparse.ArgumentParser(description="Pattern signatures engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # read
-    p_read = subparsers.add_parser("read", help="Read pattern signature records")
-    read_group = p_read.add_mutually_exclusive_group(required=True)
-    read_group.add_argument("--all", action="store_true", help="All records")
-    read_group.add_argument("--active", action="store_true", help="Records with status=active")
-    read_group.add_argument("--id", type=str, help="Find record by ID")
-    read_group.add_argument("--summary", action="store_true", help="One-liner summary per record")
+    # add, update, update-field, set-status: GUTTED — migrated to daemon
+    # store endpoint (H2 Wave 3). Wrappers now call POST /v1/store/*.
 
-    # add
-    subparsers.add_parser("add", help="Add record from stdin JSON")
-
-    # update
-    p_update = subparsers.add_parser("update", help="Full replace of record from stdin JSON")
-    p_update.add_argument("rec_id", type=str, help="Record ID to update")
-
-    # update-field
-    p_uf = subparsers.add_parser("update-field", help="Update a single record field")
-    p_uf.add_argument("rec_id", type=str, help="Record ID")
-    p_uf.add_argument("field", type=str, help="Field to update (supports dot notation)")
-    p_uf.add_argument("value", type=str, help="New value")
-
-    # record-outcome
+    # record-outcome (bespoke — counter+recompute, not pure CRUD)
     p_ro = subparsers.add_parser("record-outcome", help="Record a pattern match outcome")
     p_ro.add_argument("rec_id", type=str, help="Record ID")
     p_ro.add_argument("outcome", type=str, help="Outcome: CONFIRMED or CORRECTED")
-
-    # set-status
-    p_ss = subparsers.add_parser("set-status", help="Update status field")
-    p_ss.add_argument("rec_id", type=str, help="Record ID")
-    p_ss.add_argument("status", type=str, help="New status (active, retired, contradicted)")
 
     # migrate-yaml (for init-mind.sh bootstrap)
     p_mig = subparsers.add_parser("migrate-yaml", help="Convert YAML pattern-signatures to JSONL")
@@ -484,12 +325,7 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
-        "read": cmd_read,
-        "add": cmd_add,
-        "update": cmd_update,
-        "update-field": cmd_update_field,
         "record-outcome": cmd_record_outcome,
-        "set-status": cmd_set_status,
         "migrate-yaml": cmd_migrate_yaml,
     }
 
@@ -498,7 +334,6 @@ def main():
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

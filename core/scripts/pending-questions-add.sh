@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# pending-questions-add.sh — append a new pending question to the bound
+# agent's session/pending-questions.yaml.
+#
+# Created 2026-05-17 (Phase 1.1 packaging cleanup). Multiple consumers
+# (aspirations-evolve/SKILL.md, l1-taxonomy-changes.md convention) call
+# this script but it didn't exist on disk — so every l1-taxonomy proposal
+# and structural-modification surface was silently failing at runtime.
+#
+# CLI:
+#   bash pending-questions-add.sh \
+#       --id <question-id> \
+#       --question <text> \
+#       --default-action <text> \
+#       [--priority HIGH|MEDIUM|LOW] \
+#       [--type <category-tag>] \
+#       [--context <text>]
+#
+# Behavior:
+#   - Resolves the bound agent via MIND_AGENT env var (injected by the
+#     PreToolUse[Bash] hook). Refuses to run with no binding.
+#   - Reads <agent>/session/pending-questions.yaml. Two on-disk shapes
+#     are tolerated:
+#       (A) top-level dict with `questions:` list  (canonical / newer)
+#       (B) list whose single element is a dict with `questions:` key (legacy)
+#     New entries are appended to the existing shape; the script does not
+#     normalize between A and B (out of scope; would surprise readers
+#     mid-session).
+#   - Refuses duplicate IDs.
+#   - Sets `status: pending` and `created: <local ISO timestamp>`.
+#
+# Known limitation: yaml.safe_dump() does not preserve YAML comments
+# embedded in the source file (PyYAML lacks comment-preservation; that
+# requires ruamel.yaml). Currently safe because pending-questions.yaml
+# in this repo is data-only — no semantic comments observed. Re-evaluate
+# if agents start writing # comments into pending-questions entries.
+#
+# Exit codes:
+#   0  — appended successfully
+#   2  — input error / no agent binding / duplicate ID
+#   3  — write error
+#
+# Used by:
+#   - .claude/skills/aspirations-evolve/SKILL.md (l1-taxonomy proposals)
+#   - core/config/conventions/l1-taxonomy-changes.md (canonical add API)
+
+set -euo pipefail
+
+ID=""
+QUESTION=""
+DEFAULT_ACTION=""
+PRIORITY=""
+TYPE=""
+CONTEXT=""
+
+_require_value() {
+    [[ $# -ge 2 ]] || { echo "pending-questions-add: $1 requires a value" >&2; exit 2; }
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --id)              _require_value "$@"; ID="$2"; shift 2 ;;
+        --question)        _require_value "$@"; QUESTION="$2"; shift 2 ;;
+        --default-action)  _require_value "$@"; DEFAULT_ACTION="$2"; shift 2 ;;
+        --priority)        _require_value "$@"; PRIORITY="$2"; shift 2 ;;
+        --type)            _require_value "$@"; TYPE="$2"; shift 2 ;;
+        --context)         _require_value "$@"; CONTEXT="$2"; shift 2 ;;
+        --help|-h)         sed -n '2,30p' "$0"; exit 0 ;;
+        *)                 echo "pending-questions-add: unknown arg: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$ID" || -z "$QUESTION" || -z "$DEFAULT_ACTION" ]]; then
+    echo "pending-questions-add: --id, --question, --default-action are required" >&2
+    exit 2
+fi
+
+AGENT="${MIND_AGENT:-}"
+if [[ -z "$AGENT" ]]; then
+    echo "pending-questions-add: MIND_AGENT not set — no agent binding" >&2
+    exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/_paths.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/_paths.sh"
+fi
+PY="${PY_CMD:-python3}"
+
+# Resolve agent dir relative to PROJECT_ROOT (set by _paths.sh; fall back to cwd)
+PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
+PQ_FILE="$(agent_dir "$AGENT")/session/pending-questions.yaml"
+
+if [[ ! -f "$PQ_FILE" ]]; then
+    echo "pending-questions-add: $PQ_FILE not found — agent dir not initialized?" >&2
+    exit 2
+fi
+
+# Hand off to Python for YAML manipulation. Pass values via env so we don't
+# have to quote-escape user text through bash. (rb-774-class lesson:
+# never interpolate bash variables into a python heredoc.)
+export PQ_FILE ID QUESTION DEFAULT_ACTION PRIORITY TYPE CONTEXT
+
+"$PY" - <<'PYEOF'
+import os
+import sys
+from datetime import datetime
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write(
+        "pending-questions-add: PyYAML required (pip install pyyaml)\n"
+    )
+    sys.exit(3)
+
+pq_file = os.environ["PQ_FILE"]
+new_id = os.environ["ID"]
+question = os.environ["QUESTION"]
+default_action = os.environ["DEFAULT_ACTION"]
+priority = os.environ.get("PRIORITY", "")
+qtype = os.environ.get("TYPE", "")
+context = os.environ.get("CONTEXT", "")
+
+with open(pq_file, "r", encoding="utf-8") as f:
+    data = yaml.safe_load(f)
+
+# Detect on-disk shape. Two variants observed (2026-05-17 audit):
+#   shape A: {"questions": [ {...}, {...} ]}        — canonical / delta
+#   shape B: [ {"questions": [ {...}, {...} ]} ]    — legacy / alpha
+def get_list(d):
+    if isinstance(d, dict) and isinstance(d.get("questions"), list):
+        return d["questions"], "A"
+    if (
+        isinstance(d, list)
+        and len(d) >= 1
+        and isinstance(d[0], dict)
+        and isinstance(d[0].get("questions"), list)
+    ):
+        return d[0]["questions"], "B"
+    return None, None
+
+if data is None:
+    # Empty file — start as shape A.
+    data = {"questions": []}
+    questions, shape = data["questions"], "A"
+else:
+    questions, shape = get_list(data)
+    if questions is None:
+        sys.stderr.write(
+            f"pending-questions-add: {pq_file} schema not recognized\n"
+        )
+        sys.exit(2)
+
+# Refuse duplicate IDs.
+for q in questions:
+    if isinstance(q, dict) and q.get("id") == new_id:
+        sys.stderr.write(
+            f"pending-questions-add: duplicate id '{new_id}' "
+            f"already exists in {pq_file}\n"
+        )
+        sys.exit(2)
+
+# Build the entry. Use local-system time per CLAUDE.md convention.
+entry = {
+    "id": new_id,
+    "created": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    "question": question,
+    "default_action": default_action,
+    "status": "pending",
+}
+if priority:
+    entry["priority"] = priority
+if qtype:
+    entry["type"] = qtype
+if context:
+    entry["context"] = context
+
+questions.append(entry)
+
+# Preserve original shape on write.
+if shape == "A":
+    out = {"questions": questions}
+elif shape == "B":
+    data[0]["questions"] = questions
+    out = data
+else:
+    sys.stderr.write("pending-questions-add: internal shape error\n")
+    sys.exit(3)
+
+try:
+    with open(pq_file, "w", encoding="utf-8") as f:
+        yaml.safe_dump(
+            out,
+            f,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+            width=100,
+        )
+except Exception as exc:
+    sys.stderr.write(f"pending-questions-add: write failed: {exc}\n")
+    sys.exit(3)
+
+print(f"pending-questions-add: appended {new_id} to {pq_file}")
+PYEOF

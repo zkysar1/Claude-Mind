@@ -10,16 +10,16 @@ import json
 import os
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR
+from _jsonl_helpers import set_nested_field
 
 # Per-agent experience stores (agent directory)
 LIVE_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
@@ -31,10 +31,44 @@ INDEX_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 PIPELINE_LIVE_PATH = WORLD_DIR / "pipeline.jsonl"
 PIPELINE_ARCHIVE_PATH = WORLD_DIR / "pipeline-archive.jsonl"
 
-VALID_TYPES = {"goal_execution", "hypothesis_formation", "research", "reflection", "user_correction", "user_interaction", "execution_reflection"}
+VALID_TYPES = {"goal_execution", "hypothesis_formation", "research", "reflection", "user_correction", "user_interaction", "execution_reflection", "chat_session"}
 ID_RE = re.compile(r"^exp-[a-z0-9._-]+$")
 
-REQUIRED_FIELDS = {"id", "type", "created", "category", "summary", "content_path"}
+# `created` is SCRIPT-OWNED: stamped at add time by cmd_add / cmd_archive_goal
+# from the system clock via _stamp_now(), never read from stdin. Matches
+# reasoning-bank.py / guardrails pattern. Callers must NOT supply `created`;
+# any stdin value is overwritten. update-field rejects `field == "created"`.
+# Format: full ISO datetime (`YYYY-MM-DDTHH:MM:SS`) seconds precision local
+# time. Was date-only until  — that caused same-day false-positives
+# in experience-staleness-check.sh (parses date-only as midnight).
+# Single source of truth for the `add` schema — used as both the argparse
+# epilog (visible via --help) AND the schema dump on validation error /
+# explicit --schema flag. Eliminates the discover-by-failure round-trips
+# the LLM hits when authoring experience records (rb-512 pattern).
+EXPERIENCE_ADD_SCHEMA_TEXT = (
+    "Stdin JSON fields:\n"
+    "  REQUIRED:\n"
+    "    id            — must match exp-{slug} (lowercase a-z0-9._-)\n"
+    "    type          — one of: goal_execution, hypothesis_formation,\n"
+    "                    research, reflection, user_correction,\n"
+    "                    user_interaction, execution_reflection,\n"
+    "                    chat_session\n"
+    "    category      — domain category string\n"
+    "    summary       — one-line description\n"
+    "    content_path  — path to the .md trace file (must exist on disk)\n"
+    "  OPTIONAL: goal_id, hypothesis_id, tree_nodes_related (list of strs),\n"
+    "    verbatim_anchors (list of {key, content} objects),\n"
+    "    reasoning_chain (list of strs), retrieval_stats (object),\n"
+    "    archived (bool), archived_date\n"
+    "  SCRIPT-OWNED: created — stamped by the script, do NOT supply on stdin\n"
+    "\n"
+    "Example:\n"
+    "  echo '{\"id\":\"exp-foo\",\"type\":\"research\",\"category\":\"npc\",\n"
+    "    \"summary\":\"...\",\"content_path\":\"bravo/experience/foo.md\"}' \\\n"
+    "    | experience-add.sh"
+)
+
+REQUIRED_FIELDS = {"id", "type", "category", "summary", "content_path"}
 DEFAULT_FIELDS = {
     "goal_id": None,
     "hypothesis_id": None,
@@ -59,7 +93,6 @@ ARCHIVE_LOW_UTILITY_AFTER_DAYS = 90
 PROTECT_MIN_RETRIEVAL_COUNT = 5
 PROTECT_MIN_UTILITY_RATIO = 0.5
 
-
 # ---------------------------------------------------------------------------
 # Helpers: file I/O (same as pipeline.py)
 # ---------------------------------------------------------------------------
@@ -77,7 +110,6 @@ def read_jsonl(path):
                 items.append(json.loads(stripped))
     return items
 
-
 def write_jsonl(path, items):
     """Atomically write a list of dicts as JSONL (one JSON object per line)."""
     p = Path(path)
@@ -89,21 +121,24 @@ def write_jsonl(path, items):
             f.write(json.dumps(item, ensure_ascii=True) + "\n")
     os.replace(str(tmp), str(p))
 
-
 def append_jsonl(path, item):
-    """Append one JSON line to a JSONL file, creating it if needed."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a", encoding="utf-8") as f:
-        # ensure_ascii=True: prevents mojibake/surrogates from bricking the file
-        f.write(json.dumps(item, ensure_ascii=True) + "\n")
+    """Append one JSON line to a JSONL file, creating it if needed.
 
+    Delegates to _fileops.locked_append_jsonl so concurrent same-agent
+    writers (sq-018 racing Phase 4.25, parallel /encode-session firings,
+    subprocess+main interleaving) cannot interleave partial lines.
+    AGENT_DIR-rooted files (LIVE_PATH = <agent>/experience.jsonl) skip
+    history+changelog inside locked_append_jsonl via base_dir=None — net
+    behavior is open/append/close gated by a sibling .lock file.
+    g-115-447 / msg-20260508-150112-bravo-827 (fresh-eyes-code finding).
+    """
+    from _fileops import locked_append_jsonl
+    locked_append_jsonl(path, item)
 
 def read_json(path):
     """Read a JSON file and return a dict."""
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
 
 def write_json(path, data):
     """Atomically write a dict as pretty-printed JSON."""
@@ -115,7 +150,6 @@ def write_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=True)
         f.write("\n")
     os.replace(str(tmp), str(p))
-
 
 def parse_value(value_str):
     """Parse a string value into the appropriate Python type."""
@@ -144,7 +178,6 @@ def parse_value(value_str):
     except ValueError:
         pass
     return value_str
-
 
 # ---------------------------------------------------------------------------
 # Helpers: validation
@@ -182,17 +215,27 @@ def validate_record(rec):
     if not content_path.exists():
         raise ValueError(f"content_path file does not exist: {rec['content_path']}")
 
-
 def normalize_record(rec):
-    """Apply defaults for missing fields. Mutates and returns rec."""
+    """Apply defaults for missing fields. Mutates and returns rec.
+
+    Also fills in missing sub-keys inside dict-valued defaults (e.g.,
+    retrieval_stats.times_noise when a legacy record pre-dates that counter).
+    This lets new counters be added to DEFAULT_FIELDS without a migration
+    pass — existing records auto-backfill on their next read/write path.
+    Ported from reasoning-bank.py normalize_record (g-240-31, aligning
+    experience normalization with the reasoning-bank style).
+    """
     for field, default in DEFAULT_FIELDS.items():
         if field not in rec:
             if isinstance(default, (dict, list)):
                 rec[field] = json.loads(json.dumps(default))  # deep copy
             else:
                 rec[field] = default
+        elif isinstance(default, dict) and isinstance(rec[field], dict):
+            for sub_key, sub_default in default.items():
+                if sub_key not in rec[field]:
+                    rec[field][sub_key] = sub_default
     return rec
-
 
 # ---------------------------------------------------------------------------
 # Helpers: search
@@ -205,7 +248,6 @@ def find_record_by_id(items, rec_id):
             return (i, rec)
     return None
 
-
 def check_no_duplicate_id(items, rec_id, archive_items=None):
     """Raise ValueError if rec_id already exists in items or archive."""
     for item in items:
@@ -215,7 +257,6 @@ def check_no_duplicate_id(items, rec_id, archive_items=None):
         for item in archive_items:
             if item.get("id") == rec_id:
                 raise ValueError(f"Duplicate record ID (in archive): {rec_id}")
-
 
 # ---------------------------------------------------------------------------
 # Helpers: meta
@@ -230,7 +271,6 @@ def empty_meta():
         "by_type": {},
         "by_category": {},
     }
-
 
 def compute_meta(live_items, archive_items):
     """Recompute meta from all records."""
@@ -251,7 +291,6 @@ def compute_meta(live_items, archive_items):
     meta["last_updated"] = date.today().isoformat()
     return meta
 
-
 def _update_meta():
     """Recompute full meta from current data."""
     items = read_jsonl(LIVE_PATH)
@@ -259,104 +298,35 @@ def _update_meta():
     meta = compute_meta(items, archive)
     write_json(META_PATH, meta)
 
-
 # ---------------------------------------------------------------------------
 # Helpers: nested field access
 # ---------------------------------------------------------------------------
 
-def set_nested_field(obj, field_path, value):
-    """Set a nested field using dot notation (e.g., 'retrieval_stats.retrieval_count')."""
-    parts = field_path.split(".")
-    for part in parts[:-1]:
-        if part not in obj or not isinstance(obj[part], dict):
-            obj[part] = {}
-        obj = obj[part]
-    obj[parts[-1]] = value
-
+# set_nested_field now lives in _jsonl_helpers.py () — imported at top.
 
 # ---------------------------------------------------------------------------
 # Subcommands: read
 # ---------------------------------------------------------------------------
 
-def cmd_read(args):
-    if args.id:
-        # Search live first, then archive
-        items = read_jsonl(LIVE_PATH)
-        result = find_record_by_id(items, args.id)
-        if result is None:
-            items = read_jsonl(ARCHIVE_PATH)
-            result = find_record_by_id(items, args.id)
-        if result is None:
-            print(f"Record {args.id} not found", file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result[1], indent=2, ensure_ascii=False))
+def _stamp_now():
+    """Return now as ISO 8601 datetime (seconds precision, local time).
 
-    elif args.category:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("category") == args.category]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.goal:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("goal_id") == args.goal]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.hypothesis:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("hypothesis_id") == args.hypothesis]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.summary:
-        items = read_jsonl(LIVE_PATH)
-        for rec in items:
-            typ = rec.get("type", "?")
-            cat = rec.get("category", "?")
-            summary = rec.get("summary", "(no summary)")
-            print(f"{rec.get('id', '?')}: [{typ}] {cat} — {summary}")
-
-    elif args.type:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("type") == args.type]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.most_retrieved is not None:
-        n = args.most_retrieved if args.most_retrieved > 0 else 10
-        items = read_jsonl(LIVE_PATH)
-        items.sort(key=lambda r: r.get("retrieval_stats", {}).get("retrieval_count", 0), reverse=True)
-        print(json.dumps(items[:n], indent=2, ensure_ascii=False))
-
-    elif args.least_retrieved is not None:
-        n = args.least_retrieved if args.least_retrieved > 0 else 10
-        items = read_jsonl(LIVE_PATH)
-        items.sort(key=lambda r: r.get("retrieval_stats", {}).get("retrieval_count", 0))
-        print(json.dumps(items[:n], indent=2, ensure_ascii=False))
-
-    elif args.archive:
-        items = read_jsonl(ARCHIVE_PATH)
-        print(json.dumps(items, indent=2, ensure_ascii=False))
-
-    elif args.meta:
-        if not META_PATH.exists():
-            print("{}")
-        else:
-            data = read_json(META_PATH)
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-    elif args.validate_integrity:
-        # Inline validate — same as validate subcommand but accessible via read --validate
-        cmd_validate(args)
-
-    else:
-        print("Specify one of: --id, --category, --goal, --hypothesis, --summary, --type, "
-              "--most-retrieved, --least-retrieved, --archive, --meta, --validate", file=sys.stderr)
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Subcommands: write
-# ---------------------------------------------------------------------------
+    Single source of truth for experience `created` timestamps. Full
+    datetime required by experience-staleness-check.sh — date-only caused
+    same-day false-positives (g-248-37, rb-428 family): staleness check
+    parses date-only as midnight, so any entry older than the threshold
+    hours fired the force_experience_archival sentinel on the same day
+    it was written. Existing date-only entries in experience.jsonl remain
+    parseable by datetime.fromisoformat and their age-from-midnight is
+    correctly >threshold for older entries.
+    Callers MUST use this — never trust an LLM-supplied `created`.
+    """
+    return datetime.now().isoformat(timespec="seconds")
 
 def cmd_add(args):
+    if getattr(args, "schema", False):
+        print(EXPERIENCE_ADD_SCHEMA_TEXT)
+        return
     if sys.stdin.isatty():
         print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
         sys.exit(1)
@@ -372,18 +342,168 @@ def cmd_add(args):
 
     rec = normalize_record(rec)
 
+    # Script owns `created`: overwrite whatever stdin supplied. See _stamp_now
+    # and the REQUIRED_FIELDS comment. Matches rb_add / guard_add semantics.
+    rec["created"] = _stamp_now()
+
     try:
         validate_record(rec)
     except ValueError as e:
         print(f"Validation error: {e}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(EXPERIENCE_ADD_SCHEMA_TEXT, file=sys.stderr)
         sys.exit(1)
 
+    # Experience IDs are exp-{slug} strings supplied by the caller (slugs
+    # are derived from goal id / source). No auto-id path — only the dup
+    # check needs to move inside the lock to close the race window.
+    archive = read_jsonl(ARCHIVE_PATH)
+
+    from _fileops import locked_append_jsonl_with_allocator
+
+    def _build(items):
+        check_no_duplicate_id(items, rec["id"], archive)
+        return rec
+
+    try:
+        written = locked_append_jsonl_with_allocator(LIVE_PATH, _build)
+    except ValueError as e:
+        msg = str(e)
+        if "Duplicate" in msg:
+            print(f"Duplicate error: {msg}", file=sys.stderr)
+        else:
+            print(f"Validation error: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    _update_meta()
+
+    print(json.dumps(written, indent=2, ensure_ascii=False))
+
+def cmd_archive_goal(args):
+    """Phase 4.25 bash-enforced goal-execution experience archive.
+
+    Replaces the LLM-assembled write path with one subcommand call. The caller
+    pre-writes a reasoning-trace .md (to any path). This subcommand validates
+    the trace, moves it to the canonical content_path, assembles the record
+    from CLI args + optional stdin JSON, and appends to experience.jsonl via
+    the same add() path.
+
+    Stderr warnings fire when trace body or summary looks too short to be a
+    real archive (drift indicator — caller abbreviated under context pressure).
+    """
+    if AGENT_DIR is None:
+        print("Error: no agent bound (MIND_AGENT unset)", file=sys.stderr)
+        sys.exit(1)
+
+    # Optional stdin JSON for verbatim_anchors / tree_nodes_related / retrieval_audit / etc.
+    extra = {}
+    if not sys.stdin.isatty():
+        raw = sys.stdin.read().strip()
+        if raw:
+            try:
+                extra = json.loads(raw)
+            except json.JSONDecodeError as e:
+                print(f"Invalid stdin JSON: {e}", file=sys.stderr)
+                sys.exit(1)
+            if not isinstance(extra, dict):
+                print("Stdin JSON must be an object", file=sys.stderr)
+                sys.exit(1)
+
+    goal_id = args.goal
+    skill_slug = args.skill_slug
+    category = args.category
+    summary = args.summary
+    trace_src = Path(args.trace_file)
+
+    # Validate trace file exists and has content
+    if not trace_src.is_absolute():
+        trace_src = PROJECT_ROOT / trace_src
+    if not trace_src.exists():
+        print(f"Error: trace-file does not exist: {trace_src}", file=sys.stderr)
+        sys.exit(1)
+    trace_bytes = trace_src.stat().st_size
+    if trace_bytes == 0:
+        print(f"Error: trace-file is empty: {trace_src}", file=sys.stderr)
+        sys.exit(1)
+
+    # Drift warnings — do NOT block, just signal.
+    MIN_TRACE_BYTES = 200
+    MIN_SUMMARY_CHARS = 20
+    if trace_bytes < MIN_TRACE_BYTES:
+        print(f"WARN: trace-file is only {trace_bytes} bytes (<{MIN_TRACE_BYTES}). "
+              f"Phase 4.25 may have abbreviated under context pressure.",
+              file=sys.stderr)
+    if len(summary.strip()) < MIN_SUMMARY_CHARS:
+        print(f"WARN: summary is only {len(summary.strip())} chars (<{MIN_SUMMARY_CHARS}). "
+              f"Phase 4.25 summary looks truncated.",
+              file=sys.stderr)
+
+    experience_id = f"exp-{goal_id}-{skill_slug}"
+    if not ID_RE.match(experience_id):
+        print(f"Error: computed experience id fails validation: {experience_id}", file=sys.stderr)
+        sys.exit(1)
+
+    # Canonical content path, relative to PROJECT_ROOT for portability.
+    content_dir = AGENT_DIR / "experience"
+    content_dir.mkdir(parents=True, exist_ok=True)
+    canonical = content_dir / f"{experience_id}.md"
+    try:
+        content_path_rel = str(canonical.relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        content_path_rel = str(canonical).replace("\\", "/")
+
+    # Early duplicate-check BEFORE filesystem move — read JSONL and fail fast
+    # if the ID is already present. Catches the most common late-stage
+    # failure (re-archival of the same goal.skill_slug pair) without
+    # creating an orphan .md.
     items = read_jsonl(LIVE_PATH)
     archive = read_jsonl(ARCHIVE_PATH)
     try:
-        check_no_duplicate_id(items, rec["id"], archive)
+        check_no_duplicate_id(items, experience_id, archive)
     except ValueError as e:
         print(f"Duplicate error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Move trace file into canonical position — must happen BEFORE
+    # validate_record, because validate_record enforces that content_path
+    # resolves to an existing file. Any schema-validation failure after this
+    # point leaves an orphan .md at canonical; the user must manually rm
+    # and re-run. This is an accepted tradeoff with validate_record's
+    # contract — do NOT move os.replace past validate_record without also
+    # splitting the validator into schema-only and filesystem-only phases.
+    if trace_src.resolve() != canonical.resolve():
+        if canonical.exists():
+            print(f"Error: canonical content_path already exists: {canonical}. "
+                  f"Refusing to overwrite.", file=sys.stderr)
+            sys.exit(1)
+        os.replace(str(trace_src), str(canonical))
+
+    # Assemble record — defaults from DEFAULT_FIELDS fill in via normalize_record.
+    # Uses _stamp_now() for single-source-of-truth stamping (shared with cmd_add).
+    rec = {
+        "id": experience_id,
+        "type": extra.get("type", "goal_execution"),
+        "created": _stamp_now(),
+        "category": category,
+        "summary": summary,
+        "goal_id": goal_id,
+        "hypothesis_id": extra.get("hypothesis_id"),
+        "tree_nodes_related": extra.get("tree_nodes_related", []),
+        "verbatim_anchors": extra.get("verbatim_anchors", []),
+        "reasoning_chain": extra.get("reasoning_chain", []),
+        "content_path": content_path_rel,
+    }
+    # Optional pass-throughs — only set when caller provided them; otherwise
+    # let normalize_record apply DEFAULT_FIELDS.
+    for k in ("retrieval_audit", "enabled_by", "temporal_credit"):
+        if k in extra:
+            rec[k] = extra[k]
+
+    rec = normalize_record(rec)
+    try:
+        validate_record(rec)
+    except ValueError as e:
+        print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
     append_jsonl(LIVE_PATH, rec)
@@ -391,54 +511,112 @@ def cmd_add(args):
 
     print(json.dumps(rec, indent=2, ensure_ascii=False))
 
-
 def cmd_update_field(args):
     rec_id = args.rec_id
     field = args.field
     value = parse_value(args.value)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
+    # `created` is immutable post-write — see _stamp_now. Back-door edits
+    # through update-field are rejected. Matches rb_update_field / guard_update_field.
+    if field == "created" or field.startswith("created."):
+        print("Error: `created` is script-stamped at add time and cannot be updated.", file=sys.stderr)
+        sys.exit(1)
 
-    # Also check archive for field updates
-    in_archive = False
-    if result is None:
-        items = read_jsonl(ARCHIVE_PATH)
-        result = find_record_by_id(items, rec_id)
-        in_archive = True
-
-    if result is None:
+    # Probe live + archive to determine target. See pipeline.cmd_update_field
+    # for the same probe-then-locked-modify pattern and stale-probe rationale.
+    if find_record_by_id(read_jsonl(LIVE_PATH), rec_id) is not None:
+        target_path = LIVE_PATH
+    elif find_record_by_id(read_jsonl(ARCHIVE_PATH), rec_id) is not None:
+        target_path = ARCHIVE_PATH
+    else:
         print(f"Record {rec_id} not found", file=sys.stderr)
         sys.exit(1)
 
-    idx, rec = result
+    from _fileops import locked_modify_jsonl
 
-    # Support dot-notation for nested fields (e.g., retrieval_stats.retrieval_count)
-    if "." in field:
-        set_nested_field(rec, field, value)
-    else:
+    written = {"rec": None}
+
+    def _modifier(items):
+        result = find_record_by_id(items, rec_id)
+        if result is None:
+            raise ValueError(f"Record {rec_id} not found")
+        idx, rec = result
+        # Self-heal legacy records missing default fields added after creation.
+        rec = normalize_record(rec)
+        # Symmetric Option A reject ( / zeta/reports/-decision).
+        # Pre-2026-05-10 this site silently honored dotted paths via
+        # set_nested_field; per the decision, dotted paths now fail loud.
+        if "." in field:
+            print(
+                f"BLOCKED: dotted field name '{field}' is not supported by "
+                f"experience.py update-field. This script writes flat top-level "
+                f"keys only. To write a nested value, pass the parent field "
+                f"with a full nested JSON. For dotted-path navigation, use "
+                f"team-state.py.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         rec[field] = value
+        # DO NOT REMOVE: full-record validation after any field update — see
+        # guard-330 / rb-364. Update-field must not be a back-door around
+        # add-time validation. ORDER MATTERS: validate BEFORE recompute, so
+        # direct writes to derived fields (e.g., utility_ratio) are caught
+        # instead of silently clobbered by the recompute step.
+        validate_record(rec)
+        # Recalculate utility_ratio when retrieval stats change (after validate
+        # — recompute output is deterministic). Strict lookups: normalize_record
+        # deep-backfills missing sub-keys, so retrieval_count/times_useful are
+        # guaranteed present here. Fail loud if not ().
+        stats = rec.get("retrieval_stats")
+        if stats and isinstance(stats, dict) and field.startswith("retrieval_stats."):
+            rc = stats["retrieval_count"]
+            tu = stats["times_useful"]
+            stats["utility_ratio"] = round(tu / max(rc, 1), 4)
+        items[idx] = rec
+        written["rec"] = rec
+        return items
 
-    # Recalculate utility_ratio when retrieval stats change
-    stats = rec.get("retrieval_stats")
-    if stats and isinstance(stats, dict) and field.startswith("retrieval_stats."):
-        rc = stats.get("retrieval_count", 0)
-        tu = stats.get("times_useful", 0)
-        stats["utility_ratio"] = round(tu / max(rc, 1), 4)
-
-    items[idx] = rec
-    target_path = ARCHIVE_PATH if in_archive else LIVE_PATH
-    write_jsonl(target_path, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+    try:
+        locked_modify_jsonl(target_path, _modifier)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg:
+            print(msg, file=sys.stderr)
+        else:
+            print(f"Validation error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    _update_meta()
+    print(json.dumps(written["rec"], indent=2, ensure_ascii=False))
 
 def cmd_archive_sweep(args):
-    """Sweep old/low-utility experience records to archive."""
+    """Sweep old/low-utility experience records to archive.
+
+    Pre-work: snapshot LIVE (unlocked read) and pick archive candidates.
+    Phase 1: append candidates to ARCHIVE under archive's lock (in-lock dedup
+    against existing archive ids).
+    Phase 2: rewrite LIVE under live's lock, filtering by archived_ids
+    against a FRESH in-lock read — so concurrent appends or non-archived-
+    record mutations during the sweep are preserved.
+
+    Two locks total (one per file), no nesting. Concurrent writers to LIVE
+    during phases 1-2 see the live records still present until phase 2
+    completes. Worst case: a record is BOTH selected for archival AND
+    concurrently mutated between snapshot and phase 2 — the archive copy
+    is the snapshot version (mutation lost in archive), and the record is
+    removed from live regardless of mutation (mutation lost in live).
+    Mitigation: archive-sweep targets records that are by definition stale
+    (age >= 30 days, retrieval_count == 0), so concurrent mutation of
+    candidate records is exceptionally unlikely.
+    """
     items = read_jsonl(LIVE_PATH)
     today = date.today()
 
+    # Only to_archive is computed here; the live-file rewrite in phase 2 below
+    # filters by archived_ids against a fresh in-lock read, so a separate
+    # `remaining` list would be both redundant AND stale (it would miss
+    # concurrent appends that landed between the snapshot above and the lock
+    # in phase 2).
     to_archive = []
-    remaining = []
 
     for rec in items:
         if rec.get("archived", False):
@@ -450,7 +628,6 @@ def cmd_archive_sweep(args):
         try:
             created_date = date.fromisoformat(created_str[:10])
         except (ValueError, TypeError):
-            remaining.append(rec)
             continue
 
         age_days = (today - created_date).days
@@ -460,7 +637,6 @@ def cmd_archive_sweep(args):
 
         # Protection: never archive high-value experiences
         if retrieval_count >= PROTECT_MIN_RETRIEVAL_COUNT and utility_ratio >= PROTECT_MIN_UTILITY_RATIO:
-            remaining.append(rec)
             continue
 
         # Archive: never retrieved after 30 days
@@ -477,24 +653,37 @@ def cmd_archive_sweep(args):
             to_archive.append(rec)
             continue
 
-        remaining.append(rec)
-
     if not to_archive:
         print("0")
         return
 
-    # Append to archive first (crash-safe ordering)
-    archive = read_jsonl(ARCHIVE_PATH)
-    archive.extend(to_archive)
-    write_jsonl(ARCHIVE_PATH, archive)
+    from _fileops import locked_modify_jsonl
 
-    # Rewrite live
-    write_jsonl(LIVE_PATH, remaining)
+    # Phase 1: append to archive under archive's lock. Read-modify-write
+    # so concurrent archive operations don't clobber each other.
+    archived_ids = {r["id"] for r in to_archive}
+
+    def _archive_modifier(arch_items):
+        existing = {r.get("id") for r in arch_items}
+        for r in to_archive:
+            if r["id"] not in existing:
+                arch_items.append(r)
+        return arch_items
+
+    locked_modify_jsonl(ARCHIVE_PATH, _archive_modifier)
+
+    # Phase 2: rewrite live with archived records filtered out, under
+    # live's lock. The remaining set is computed afresh from live's current
+    # state — concurrent appends or updates to live between the snapshot
+    # above and now are preserved. Only records in archived_ids are dropped.
+    def _live_modifier(live_items):
+        return [r for r in live_items if r.get("id") not in archived_ids]
+
+    locked_modify_jsonl(LIVE_PATH, _live_modifier)
 
     _update_meta()
 
     print(str(len(to_archive)))
-
 
 def cmd_validate(args):
     """Check for orphaned JSONL records and .md files."""
@@ -539,7 +728,6 @@ def cmd_validate(args):
     print(json.dumps(result, indent=2, ensure_ascii=False))
     sys.exit(0 if result["valid"] else 1)
 
-
 def cmd_meta_update(args):
     field = args.field
     value = parse_value(args.value)
@@ -549,11 +737,19 @@ def cmd_meta_update(args):
     else:
         data = empty_meta()
 
+    # Symmetric Option A reject (). See update-field comment above.
+    if "." in field:
+        print(
+            f"BLOCKED: dotted field name '{field}' is not supported by "
+            f"experience.py meta-update. This script writes flat top-level "
+            f"keys only. For dotted-path navigation, use team-state.py.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     data[field] = value
     data["last_updated"] = date.today().isoformat()
     write_json(META_PATH, data)
     print(json.dumps(data, indent=2, ensure_ascii=False))
-
 
 # ---------------------------------------------------------------------------
 # Subcommands: recompute-index
@@ -650,7 +846,6 @@ def cmd_recompute_index(args):
     # Print result as JSON to stdout
     print(json.dumps(index_data, indent=2, ensure_ascii=False))
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -659,24 +854,32 @@ def main():
     parser = argparse.ArgumentParser(description="Experience archive engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # read
-    p_read = subparsers.add_parser("read", help="Read experience records")
-    read_group = p_read.add_mutually_exclusive_group(required=True)
-    read_group.add_argument("--id", type=str, help="Find record by ID (searches live then archive)")
-    read_group.add_argument("--category", type=str, help="Filter by category (live only)")
-    read_group.add_argument("--goal", type=str, help="Filter by goal_id")
-    read_group.add_argument("--hypothesis", type=str, help="Filter by hypothesis_id")
-    read_group.add_argument("--summary", action="store_true", help="One-liner summary per record")
-    read_group.add_argument("--type", type=str, help="Filter by type")
-    read_group.add_argument("--most-retrieved", type=int, nargs="?", const=10, help="Top N by retrieval_count")
-    read_group.add_argument("--least-retrieved", type=int, nargs="?", const=10, help="Bottom N by retrieval_count")
-    read_group.add_argument("--archive", action="store_true", help="Archived records")
-    read_group.add_argument("--meta", action="store_true", help="Full metadata")
-    read_group.add_argument("--validate", dest="validate_integrity", action="store_true",
-                            help="Check for orphan JSONL records and .md files")
-
     # add
-    subparsers.add_parser("add", help="Add record from stdin JSON")
+    p_add = subparsers.add_parser(
+        "add",
+        help="Add record from stdin JSON",
+        epilog=EXPERIENCE_ADD_SCHEMA_TEXT,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_add.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print stdin JSON schema and exit (no record written)",
+    )
+
+    # archive-goal (Phase 4.25 bash-enforced write path)
+    p_ag = subparsers.add_parser(
+        "archive-goal",
+        help="Phase 4.25: archive a goal_execution experience record from a pre-written trace file + CLI args + optional stdin JSON",
+    )
+    p_ag.add_argument("--goal", type=str, required=True, help="Goal ID (e.g., g-001-12)")
+    p_ag.add_argument("--skill-slug", type=str, required=True,
+                      help="Skill name slug (no slash, no spaces — e.g., aspirations-execute)")
+    p_ag.add_argument("--category", type=str, required=True, help="Experience category")
+    p_ag.add_argument("--summary", type=str, required=True,
+                      help="One-line summary of what was learned (min ~20 chars)")
+    p_ag.add_argument("--trace-file", type=str, required=True,
+                      help="Path to pre-written markdown trace file (will be moved to canonical content_path)")
 
     # update-field
     p_uf = subparsers.add_parser("update-field", help="Update a single record field")
@@ -701,8 +904,8 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
-        "read": cmd_read,
         "add": cmd_add,
+        "archive-goal": cmd_archive_goal,
         "update-field": cmd_update_field,
         "archive-sweep": cmd_archive_sweep,
         "validate": cmd_validate,
@@ -715,7 +918,6 @@ def main():
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

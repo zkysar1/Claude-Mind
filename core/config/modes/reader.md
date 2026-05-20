@@ -33,7 +33,7 @@ Respond to user questions using knowledge tree retrieval:
 2. Read matching `.md` files for content.
 3. Synthesize an answer from retrieved knowledge.
 
-If persona is active, use agent identity (`<agent>/self.md`) for context but do not adopt full agent character.
+If persona is active, use agent identity (`agents/<agent>/self.md`) for context but do not adopt full agent character.
 
 ## Escalation
 
