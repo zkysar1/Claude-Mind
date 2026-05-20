@@ -288,6 +288,13 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (save-id-verify-after-write): grep -q "_SID_ATTEMPT" core/scripts/session-save-id.sh && grep -q ".write-failures.jsonl" core/scripts/session-save-id.sh && echo "PASS: session-save-id.sh verifies after write with retry+log" || echo "FAIL: session-save-id.sh missing verify-after-write (Tier 2b)"
    Bash (recovery-retry-counter): grep -q "recovery-failure-count" core/scripts/recovery-gate.sh && grep -q "recovery-failed-permanent" core/scripts/recovery-gate.sh && echo "PASS: recovery-gate.sh has retry counter + permanent-fail signal" || echo "FAIL: recovery-gate.sh missing retry counter (Tier 2c)"
    Bash (manifest-runner-token): grep -q "^  - file: runner-token$" core/config/session-manifest.yaml && echo "PASS: manifest registers runner-token" || echo "FAIL: manifest missing runner-token entry (Tier 3a)"
+   # /start B10 AYOAI_AGENT-prefix on permissions-add.sh (g-115-1014, rb-1105, guard-307)
+   # B10 invokes `AYOAI_AGENT=<agent-name> bash core/scripts/permissions-add.sh` per the
+   # post-aac64d27 hardening. If a future edit silently removes the prefix, the failure mode is
+   # invisible on UNINITIALIZED first-run (only one local-paths.conf exists so first-conf
+   # fallback resolves correctly) but produces wrong-agent path resolution on multi-agent
+   # installs. This grep catches the regression at edit time.
+   Bash (start-b10-ayoai-agent-prefix): grep -qE 'AYOAI_AGENT=<agent-name> bash core/scripts/permissions-add\.sh' .claude/skills/start/SKILL.md && echo "PASS: /start B10 invocation carries explicit AYOAI_AGENT=<agent-name> prefix on permissions-add.sh (g-115-1014, guard-307)" || echo "FAIL: /start B10 invocation missing AYOAI_AGENT=<agent-name> prefix on permissions-add.sh — silent multi-agent-install regression risk (g-115-1014, rb-1105)"
    Bash (start-writes-runner-token): test "$(grep -c 'RUNNER_TOKEN=\$(' .claude/skills/start/SKILL.md)" -ge 2 && echo "PASS: /start writes runner-token at IDLE Step 3 + UNINITIALIZED C8" || echo "FAIL: /start missing runner-token write at one of the two canonical sites (Tier 3a)"
    Bash (stop-hook-logs-runner-token): test "$(grep -c 'runner_token=' core/scripts/stop-hook.sh)" -ge 6 && echo "PASS: stop-hook logs runner_token in BLOCK/ALLOW lines" || echo "FAIL: stop-hook missing runner_token logging (Tier 3a)"
    Bash (watchdog-correlates-runner-token): grep -q '"runner_token":' core/scripts/agent-watchdog.py && echo "PASS: watchdog RunningSidProbe includes runner_token in correlated context" || echo "FAIL: watchdog missing runner_token (Tier 3a)"
@@ -730,8 +737,10 @@ else:
    Check: `boot/SKILL.md` Phase -1.5 whitelist includes `running-session-id` (boot must NOT delete it)
    Bash: grep -c 'rm.*running-session-id' .claude/skills/boot/SKILL.md -> verify returns 0 (boot never deletes it)
    Bash: grep -c 'running-session-id' .claude/skills/aspirations/SKILL.md -> verify returns 0 (aspirations does not manage it)
-   Check: `session-save-id.sh` lines 60-62 sync `running-session-id` on autocompact (update-only, not create)
-   Check: `stop-hook.sh` comment on line 54 says "set by /start" (not "Phase -0.5")
+   Check: `session-save-id.sh` syncs `running-session-id` on autocompact (update-only, not create)
+   Bash: grep -c 'running-session-id' core/scripts/session-save-id.sh → verify >= 3 (sync logic references the file at least 3 times)
+   Check: `stop-hook.sh` comment says "set by /start" (not "Phase -0.5")
+   Bash: grep -cE 'running-session-id is set by /start' core/scripts/stop-hook.sh → verify >= 1 (canonical attribution comment present)
 
    # Loop survival checks (Section SH continued — LOOP_CONTINUE + Return Protocol)
    # Every iteration must end with a tool call. LOOP_CONTINUE is the mechanical heartbeat.
@@ -1437,7 +1446,7 @@ print('PASS: total_goals=%d, recurring_goals=%d, actual=%d' % (len(non_rec), len
    Check: No recurring goals across all live aspirations have status=completed (scan both world and agent JSONL)
 
    # Recurring-shape-leak prevention (improve-recurring-goals-kind-yao plan, 2026-04-19)
-   # Cascading clear at the data primitive (aspirations.py:686 region) prevents `recurring=false` goals
+   # Cascading clear at the data primitive (aspirations.py cmd_update_goal — search for `if field == "recurring"`) prevents `recurring=false` goals
    # from leaving orphan timing fields that mislead goal-selector. Removing this cascade resurrects
    # the g-001-01 cargo-cult re-selection bug. Verify both the code AND the data are clean.
    Check: `core/scripts/aspirations.py` `cmd_update_goal` contains `if field == "recurring" and not value:` followed by `goal.pop("interval_hours", None)` and `goal.pop("lastAchievedAt", None)`
@@ -2625,7 +2634,8 @@ sys.exit(1)
 
    # File history evidence checks (Section FH)
    Check: `core/scripts/_fileops.py` has `save_history()` function
-   Check: `core/scripts/_fileops.py` `save_history` resolves BOTH path and base_dir (`.resolve()` on lines 63-64)
+   Check: `core/scripts/_fileops.py` `save_history` resolves BOTH path and base_dir (calls `.resolve()` on both arguments)
+   Bash: py -3 -c "import re; src=open('core/scripts/_fileops.py').read(); fn=re.search(r'def save_history\b.*?(?=\ndef |\Z)', src, re.S); assert fn, 'no save_history'; b=fn.group(0); assert 'path = Path(path).resolve()' in b and 'base_dir = Path(base_dir).resolve()' in b, 'missing .resolve() on path or base_dir'; print('PASS')"
    #   Without this, `relative_to` fails on Windows when path formats differ (forward vs back slashes, case)
    Check: `core/scripts/_fileops.py` has `acquire_lock()` and `release_lock()` functions
    Check: `core/scripts/_fileops.py` `acquire_lock` uses `os.O_CREAT | os.O_EXCL` for atomic lock creation (NOT `exists()` + `write_text()`)
@@ -4764,7 +4774,9 @@ else:
    # still tagged, or a registry entry whose SKILL.md was rewritten without
    # the tag. add-npc-task established the canonical pattern; 14 others were
    # back-filled 2026-05-17.
-   Check: forged-skill tag matches world/forged-skills.yaml bidirectionally. Bash: `py -3 -c "import sys,re,pathlib; sys.path.insert(0,'core/scripts'); from _paths import WORLD_DIR; import yaml; reg=yaml.safe_load((WORLD_DIR/'forged-skills.yaml').read_text(encoding='utf-8')) or {}; registered=set((reg.get('skills') or {}).keys()); skills_dir=pathlib.Path('.claude/skills'); tagged={p.parent.name for p in skills_dir.glob('*/SKILL.md') if re.search(r'^forged:\s*true\b', p.read_text(encoding='utf-8'), re.MULTILINE)}; missing_tag=registered-tagged; missing_reg=tagged-registered; ok=(not missing_tag and not missing_reg); print(f'PASS: forged-skill tagging consistent ({len(tagged)} skills tagged, all in registry)') if ok else (print(f'FAIL: registered-but-untagged={sorted(missing_tag)}; tagged-but-unregistered={sorted(missing_reg)} — fix per .claude/rules/forged-skill-resolution.md') or sys.exit(1))"`
+   Check: forged-skill tag matches world/forged-skills.yaml bidirectionally. Bash: `bash core/scripts/audit-forged-skill-tagging.sh`
+   # Implementation extracted 2026-05-20 — same logic, callable from /verify-learning AND
+   # seed-preflight without duplication. Edit the script, not this section.
 
    # Section TPL: Agent-Aspirations Template Cleanliness (Phase 4.5 packaging cleanup, 2026-05-18)
    # The two starter templates (core/config/agent-aspirations-initial.jsonl
@@ -4776,7 +4788,9 @@ else:
    # the templates — any hit is a regression of the Phase 2.3 cleanup. New
    # domain-specific starter goals belong in the host's own world overlay,
    # not in core templates.
-   Check: agent-aspirations templates contain no domain terms. Bash: `py -3 -c "import re,sys,pathlib; blocklist=pathlib.Path('core/config/domain-term-blocklist.txt'); terms=[ln.strip() for ln in blocklist.read_text(encoding='utf-8').splitlines() if ln.strip() and not ln.startswith('#')]; targets=[pathlib.Path('core/config/agent-aspirations-initial.jsonl'),pathlib.Path('core/config/agent-aspirations-onboard.jsonl')]; hits=[]; [hits.append((str(t),term)) for t in targets if t.is_file() for term in terms if re.search(r'\b'+re.escape(term)+r'\b', t.read_text(encoding='utf-8'))]; ok=(len(hits)==0); print(f'PASS: agent-aspirations templates clean ({len(targets)} files scanned, 0 domain leaks)') if ok else (print(f'FAIL: domain residue in starter templates: {hits[:5]} — domain-specific starter goals belong in world overlay, not core templates (packaging plan Phase 2.3/4.5)') or sys.exit(1))"`
+   Check: agent-aspirations templates contain no domain terms. Bash: `bash core/scripts/audit-aspirations-templates-clean.sh`
+   # Implementation extracted 2026-05-20 — same logic, callable from /verify-learning AND
+   # seed-preflight without duplication. Edit the script, not this section.
 
    # Section CFE: Core Framework Entries surveillance (Phase 4.1 packaging cleanup, 2026-05-18)
    # The path-resolution L1 hook covers WORLD/META/agent-dir top-level cruft
@@ -4789,8 +4803,11 @@ else:
    # redirect/touch/cp/mkdir. Either way the human needs to see it. Catches
    # the same failure mode as the L1 hook's WORLD-side check but at audit
    # cadence instead of write time.
-   Check: core/ and .claude/ have only expected top-level entries. Bash: `py -3 -c "import sys,subprocess,pathlib; allow={'core': {'BOUNDARY.md','config','runtime','scripts','githooks','logs'}, '.claude': {'rules','skills','settings.json','settings.local.json','_tree.yaml','agents','hooks','memory','output-styles','plugins','statusline','worktrees','scheduled_tasks.lock'}}; ignored=set(); 
-[ignored.add(p) for p in subprocess.run(['git','ls-files','--others','--ignored','--exclude-standard','--directory','-z','core','.claude'], capture_output=True, text=True, encoding='utf-8').stdout.split('\0') if p]; hits=[]; [hits.append(f'{root}/{p.name}') for root in allow for p in pathlib.Path(root).iterdir() if p.name not in allow[root] and not p.name.startswith('.') and f'{root}/{p.name}' not in ignored and f'{root}/{p.name}/' not in ignored]; ok=(len(hits)==0); print(f'PASS: core/ and .claude/ top-level entries on allowlist (gitignored entries skipped)') if ok else (print(f'FAIL: unexpected top-level entries: {hits[:10]} — either extend the Section CFE allowlist (intentional framework addition) or remove the cruft (Bash redirect/touch/cp/mkdir bypassing the file-save gate)') or sys.exit(1))"`
+   Check: core/ and .claude/ have only expected top-level entries. Bash: `bash core/scripts/audit-toplevel-allowlist.sh`
+   # Implementation extracted 2026-05-20 — same logic, callable from /verify-learning AND
+   # seed-preflight without duplication. Edit the script, not this section.
+   # The allowlist itself lives inside the script (a single source of truth for both
+   # consumers); intentional framework extensions update the script, not this section.
 
    # Section DPS: Dotted-path syntax against fail-loud update-field scripts
    # (g-115-928, g-115-529 lineage). experience-update-field.sh (and
@@ -4810,6 +4827,56 @@ else:
    because this check authors illustrative examples of the rejected pattern
    in prose (the check is for consumers of the wrapper, not its own spec).
    Bash: `py -3 -c "import sys,pathlib,re; pat=re.compile(r'experience-update-field\.sh\s+\S+\s+([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)\b'); hits=[(str(p), n+1, m.group(1)) for p in pathlib.Path('.claude/skills').rglob('SKILL.md') if 'verify-learning' not in str(p) for n, line in enumerate(p.read_text(encoding='utf-8').splitlines()) for m in [pat.search(line)] if m]; ok = not hits; print('PASS: no dotted-path experience-update-field.sh call sites in SKILL.md') if ok else (print(f'FAIL: dotted-path experience-update-field.sh call sites detected (will fail-loud at runtime per experience.py:549 — replace with whole-object JSON, see g-115-928): {hits[:5]}') or sys.exit(1))"`
+
+   # Section TPD: Test Pollution Defense — conftest autouse env-restore fixture
+   # (commit 7f05915d, rb-1096, guard-588, tree node test-pollution-defense, 2026-05-19)
+   # Pytest's collection phase imports ALL test modules before any test runs,
+   # so a module-level `os.environ.pop("AYOAI_AGENT", None)` in any single
+   # test file contaminates the env that every other test sees — even tests
+   # that sort earlier alphabetically. This produced 18 of 20 baseline
+   # failures (Clusters B-G, H) before the two-layer fix shipped.
+   #
+   # Layer 1 is per-file capture-restore in 11 polluter files (g-115-888) —
+   # enforced by guard-588 discipline, not automation.
+   # Layer 2 is the autouse `_restore_env_per_test` fixture in conftest.py
+   # that snapshots AYOAI_AGENT + AYOAI_WORLD at conftest load time (before
+   # any polluter module imports) and restores them before every test.
+   # This check guards Layer 2 — without it, any future test file with
+   # module-level env mutation will silently re-introduce the 18-failure
+   # regression, and the failure may not surface immediately (only when a
+   # downstream test depends on AYOAI_AGENT or AYOAI_WORLD).
+   Check: `core/scripts/tests/conftest.py` contains the `_restore_env_per_test` autouse fixture (Layer 2 of the test-pollution defense).
+   Bash: `grep -q '_restore_env_per_test' core/scripts/tests/conftest.py && grep -q '@pytest.fixture(autouse=True)' core/scripts/tests/conftest.py && echo "PASS: conftest.py has _restore_env_per_test autouse fixture (Layer 2 test-pollution defense intact)" || (echo "FAIL: conftest.py is missing the _restore_env_per_test autouse fixture — Layer 2 of the test-pollution defense has regressed. See tree node test-pollution-defense, rb-1096, guard-588, commit 7f05915d. Without this fixture, module-level os.environ.pop in any new test file will re-contaminate the suite via pytest's collection-time imports." && exit 1)`
+
+   # Section TPD Layer 1 — per-file capture-restore enforcement
+   # (encode-session 2026-05-20, complements the Layer 2 check above)
+   # Layer 2 (autouse fixture) is the safety net; Layer 1 (per-file
+   # capture-restore around the mutation) is the right fix at the source.
+   # This check enforces Layer 1: any pytest test file containing a
+   # module-level os.environ.pop / setdefault / update / [X]=Y MUST also
+   # contain capture-restore evidence (_SAVED, _ORIG_, _BOOTSTRAP, an
+   # autouse fixture, or @pytest.fixture) in the same file. Per-file
+   # (not per-line) because the restore typically lives several lines
+   # away from the mutation. Module-level = no leading whitespace =
+   # truly top-level (vs. inside a def/class which is fine).
+   # Mirror of guard-588's prescription; this is the static-grep enforcement.
+   Check: pytest test files under core/scripts/tests/ and core/tests/ have no module-level os.environ mutation without capture-restore evidence (Layer 1 of the test-pollution defense).
+   Bash: `py -3 -c "import sys,pathlib,re; mut=re.compile(r'^os\.environ\.(pop|setdefault|update)|^os\.environ\['); ev=re.compile(r'_SAVED|_ORIG_|_BOOTSTRAP|autouse|@pytest\.fixture'); viol=[]; [viol.append(f'{f}:{n+1}: {line.strip()[:80]}') for root in ('core/scripts/tests','core/tests') if pathlib.Path(root).exists() for f in pathlib.Path(root).rglob('test_*.py') for text in [f.read_text(encoding='utf-8',errors='replace')] for n,line in enumerate(text.splitlines()) if mut.match(line) and not ev.search(text)]; ok=not viol; print('PASS: no module-level os.environ mutation regressions in pytest files (Layer 1 test-pollution defense intact)') if ok else (print(f'FAIL: module-level os.environ mutation without capture-restore evidence in pytest test files (regression of the test_cmd_set_auto_propagate.py contaminator class — see rb-1096, guard-588, tree node test-pollution-defense, commit 7f05915d): {viol[:10]}') or sys.exit(1))"`
+
+   # Section APD: Inlined _APD constants mirror canonical AGENTS_PARENT_DIR (g-115-984, commit 520e9375, 2026-05-19)
+   # Four hot-path shell scripts (session-state-get.sh, session-mode-get.sh,
+   # session-signal-exists.sh, cleanup-stale-bindings.sh) inline `_APD="agents"`
+   # rather than sourcing _paths.sh — the IRREDUCIBLY LOCAL annotation in each
+   # file documents the latency/bridge constraint. These inlined copies MUST
+   # mirror _paths.sh's AGENTS_PARENT_DIR; drift between them silently
+   # produces wrong agent-dir resolution on the hot path (state probes,
+   # session-signal-exists, mode probes). The 2026-05-19 incident was caught
+   # manually when working-tree drift showed `_APD=""` after a partial Phase
+   # 2.5.C cleanup — a verify-learning check would have surfaced it
+   # immediately. CLAUDE.md "Agent-dir Resolution" lists these 4 files as
+   # sites that MUST stay in sync. See rb-1092, guard-587.
+   Check: 4 inlined _APD constants in session-* hot-path scripts mirror _paths.sh's AGENTS_PARENT_DIR.
+   Bash: `canon=$(grep -E '^AGENTS_PARENT_DIR=' core/scripts/_paths.sh | head -1 | sed 's/AGENTS_PARENT_DIR=//; s/^"//; s/"$//'); fail=0; for f in session-state-get.sh session-mode-get.sh session-signal-exists.sh cleanup-stale-bindings.sh; do v=$(grep -E '^_APD=' core/scripts/$f | head -1 | sed 's/_APD=//; s/^"//; s/"$//'); if [ "$v" != "$canon" ]; then echo "FAIL: $f _APD=\"$v\" drifted from canonical AGENTS_PARENT_DIR=\"$canon\" (see CLAUDE.md Agent-dir Resolution, rb-1092, guard-587, commit 520e9375)"; fail=1; fi; done; [ $fail -eq 0 ] && echo "PASS: all 4 inlined _APD constants mirror canonical AGENTS_PARENT_DIR=\"$canon\""`
 
 ## Step 4: Summary Report
 

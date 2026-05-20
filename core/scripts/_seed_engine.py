@@ -212,16 +212,45 @@ def resolve_include_set(manifest: dict, source_root: Path) -> list:
 def is_excluded_always(rel_path: str, manifest: dict) -> bool:
     """True if rel_path matches any exclude_always glob.
 
-    Supports four pattern shapes:
-      1. `foo/`              — directory name `foo` ANYWHERE in path (path-component match)
-      2. `a/b/`              — path prefix `a/b/`
-      3. `*.stackdump`       — fnmatch glob on basename
-      4. `path/to/file.ext`  — exact path match
+    Supports five pattern shapes:
+      1. `/foo/`             — ANCHORED dir at top-level only (gitignore-style).
+                                `/world/` excludes top-level `world/...` but NOT
+                                `mind_api/src/world/...`. Use this when the same
+                                basename also appears nested as legitimate code.
+      2. `foo/`              — directory name `foo` ANYWHERE in path
+                                (path-component match — legacy semantics; use
+                                for cache dirs like `__pycache__/` that must be
+                                excluded at every depth).
+      3. `a/b/`              — path prefix `a/b/`
+      4. `*.stackdump`       — fnmatch glob on basename
+      5. `path/to/file.ext`  — exact path match
+
+    The anchoring distinction matters because the seed transplant ships a
+    Python package at `mind_api/src/world/` (and `mind_api/src/meta/`) that
+    shares basenames with the top-level domain dirs `world/` and `meta/`.
+    Bare-name `world/` over-matches both; `/world/` matches only the top.
     """
     rel = _norm(rel_path)
     patterns = manifest.get("exclude_always", [])
     parts = rel.split("/")
     for p in patterns:
+        # Shape 1: leading-`/` anchored (gitignore-style) — top-level only
+        if p.startswith("/"):
+            anchored = p[1:]  # strip leading slash; rest is top-level-relative
+            if anchored.endswith("/"):
+                inner = anchored.rstrip("/")
+                # Prefix match against rel only; never matches mid-path
+                if rel.startswith(inner + "/") or rel == inner:
+                    return True
+            else:
+                # Anchored file: exact match against rel; or basename glob
+                # restricted to top-level files (no slash in rel).
+                if rel == anchored:
+                    return True
+                if ("*" in anchored or "?" in anchored) and "/" not in anchored:
+                    if "/" not in rel and fnmatch.fnmatch(rel, anchored):
+                        return True
+            continue
         if p.endswith("/"):
             inner = p.rstrip("/")
             # Bare directory name (no slashes, no wildcards) → component match
@@ -669,13 +698,18 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
 
     These appear in `exclude_always` to prevent COPYING from source, but they
     SHOULD exist at destination. Report as INFO, not leaks.
+
+    Anchored patterns (leading `/`, gitignore-style introduced 2026-05-20)
+    are normalized before matching against the special-case sets so `/world/`,
+    `/agents/`, `/meta/`, `/.git/` route to the same preservation logic as
+    their legacy bare-name forms.
     """
     PRESERVED_AT_DEST = {
         # Directory basenames (matched against target.name)
         "agents", "world", "meta",
     }
     PRESERVED_PATHS = {
-        # Full repo-relative paths (matched against `p`)
+        # Full repo-relative paths (matched against normalized pattern)
         ".git/",
         ".env.local",
         ".claude/settings.local.json",
@@ -683,13 +717,18 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
     leaked = []
     info = []
     for p in manifest.get("exclude_always", []):
-        if p in PRESERVED_PATHS:
-            target = dest_root / p.rstrip("/")
+        # Normalize leading `/` (anchored gitignore-style) — semantically
+        # equivalent at top level, which is the only place anchored patterns
+        # can match. This keeps the preservation special-cases insensitive
+        # to whether the manifest opts into anchoring.
+        norm = p[1:] if p.startswith("/") else p
+        if norm in PRESERVED_PATHS:
+            target = dest_root / norm.rstrip("/")
             if target.exists():
                 info.append(p)
             continue
-        if p.endswith("/"):
-            inner = p.rstrip("/")
+        if norm.endswith("/"):
+            inner = norm.rstrip("/")
             target = dest_root / inner
             if target.exists() and target.is_dir():
                 if target.name in PRESERVED_AT_DEST:
@@ -697,12 +736,12 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
                     continue
                 leaked.append(p)
         else:
-            if "*" in p or "?" in p:
+            if "*" in norm or "?" in norm:
                 # Top-level glob only (don't rglob — too aggressive)
-                if list(dest_root.glob(p)):
+                if list(dest_root.glob(norm)):
                     leaked.append(p)
             else:
-                if (dest_root / p).exists():
+                if (dest_root / norm).exists():
                     leaked.append(p)
     return {"leaked": leaked, "info": info, "pass": len(leaked) == 0}
 

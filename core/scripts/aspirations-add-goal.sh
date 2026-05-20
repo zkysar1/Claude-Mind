@@ -23,6 +23,51 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# --- Help (must precede main parse so it works even with no args) ---------
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<'USAGE'
+Usage: aspirations-add-goal.sh [options] <asp_id>
+       echo '<json-goal-body>' | aspirations-add-goal.sh [options] <asp_id>
+
+Files a single goal under <asp_id>. The goal body comes from STDIN as JSON,
+NOT as CLI flags.
+
+Required:
+  <asp_id>                     The aspiration to file under (e.g. asp-115).
+                               Or pass via --aspiration <id>.
+  <JSON body via stdin>        Goal object with at least: title, priority,
+                               participants. Optional: description, category,
+                               skill, origin_signal, etc.
+
+Options:
+  --help, -h                       Show this help.
+  --aspiration <id>                Alias for positional <asp_id>.
+  --source world|<agent>           Source aspirations file (default: world).
+  --override-signal <reason>       Bypass origin-signal gate.
+  --override-duplication <reason>  Bypass goal-duplication gate.
+  --override-stale-read <reason>   Bypass stale-read gate.
+  --override-no-investigate <reason>  Bypass no-investigate-slots gate.
+  --override-all <reason>          Bulk-override all gates (audited).
+
+Goal fields go in the JSON body — NOT as CLI flags. The following are
+rejected as flags with an explicit error:
+  --title, --description, --priority, --status, --participants,
+  --category, --skill, --asp-id
+
+Example:
+  printf '%s' '{
+    "title": "Idea: ...",
+    "priority": "MEDIUM",
+    "participants": ["agent"],
+    "description": "...",
+    "category": "framework-architecture"
+  }' | bash core/scripts/aspirations-add-goal.sh asp-115
+
+For full goal schema see core/config/conventions/aspirations.md.
+USAGE
+    exit 0
+fi
+
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 ASP_ID=""
@@ -43,6 +88,21 @@ while [[ $# -gt 0 ]]; do
             SOURCE_VAL="${2-}"
             PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --aspiration)
+            # Named alias for the positional asp_id. Discoverable via --help;
+            # common LLM-typed form. First --aspiration wins (matches positional
+            # behavior below).
+            [ -z "$ASP_ID" ] && ASP_ID="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --title|--description|--priority|--status|--participants|--category|--skill|--asp-id|--asp_id)
+            # Field-shaped flags belong in the JSON body, not on the CLI.
+            # Pre-cutover code silently passed these through to a now-removed
+            # argparse fallback, producing an opaque "empty body" failure when
+            # the LLM-typed --title pattern reached the daemon (alpha 2026-05-20).
+            # Explicit reject + help pointer.
+            echo "Error: '$1' is not a CLI flag for this script — goal fields go in the JSON body via stdin." >&2
+            echo "Run: bash $0 --help" >&2
+            exit 2;;
         --schema)
             SCHEMA=1
             PASSTHROUGH+=("$1"); shift;;
@@ -67,8 +127,10 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
-            # Unknown flag — passthrough; argparse on the fallback path
-            # surfaces a canonical error message.
+            # Unknown flag — passthrough to daemon. The 2026-05-14 cutover
+            # removed the Python CLI fallback, so unknown flags now just hit
+            # the daemon (which rejects unknown query/header params silently).
+            # If you suspect a typo, run --help.
             PASSTHROUGH+=("$1"); shift;;
         *)
             # Positional asp_id (first non-flag wins)

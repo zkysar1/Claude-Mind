@@ -23,9 +23,23 @@ STDIN_JSON=$(cat 2>/dev/null || echo "{}")
 SID=$(printf '%s' "$STDIN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 [ -n "$SID" ] || exit 0
 
-ACTIVE_FILE="$PROJECT_ROOT/.active-agent-$SID"
-[ -f "$ACTIVE_FILE" ] || exit 0
-MY_AGENT=$(cat "$ACTIVE_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
+MY_AGENT=""
+# Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+# Without this check, the autocompact serialization gate exits early for
+# new sessions, RE-OPENING the cross-agent breadcrumb-stomp race (rb-348)
+# that this script was specifically designed to prevent. Critical.
+for _BF in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/sessions/"$SID"/binding.yaml; do
+    [ -f "$_BF" ] || continue
+    _BD="${_BF%/sessions/*}"
+    MY_AGENT="${_BD##*/}"
+    break
+done
+# Legacy fallback: pre-Phase-2.6 .active-agent-<SID> at PROJECT_ROOT.
+if [ -z "$MY_AGENT" ]; then
+    ACTIVE_FILE="$PROJECT_ROOT/.active-agent-$SID"
+    [ -f "$ACTIVE_FILE" ] || exit 0
+    MY_AGENT=$(cat "$ACTIVE_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
+fi
 [ -n "$MY_AGENT" ] || exit 0
 
 LOCK_DIR="$PROJECT_ROOT/.autocompact-serialize-lock"

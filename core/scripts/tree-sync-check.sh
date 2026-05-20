@@ -17,6 +17,16 @@
 # Claude Code hooks MUST fail open on every error path. A `cd` to a missing
 # directory or a piped-command failure must not abort the hook — that would
 # block the user's edit. Use explicit `|| true` / conditional checks instead.
+#
+# TIMEOUT BUDGET (2026-05-20, observed Windows + python-shim): the full hook
+# chain (json-parse + binding-lookup + uncommitted-edits-record chained call
+# + _tree.yaml grep + tree-front-matter-sync.py with file lock) measures
+# ~8 seconds on Windows. The `.claude/settings.json` timeout for this hook
+# is set to 30s as a safety margin. The previous 5s timeout caused silent
+# kills before tree-front-matter-sync.py could run, leaving _tree.yaml's
+# last_updated stale relative to .md front matter (observed across multiple
+# nodes during Phase 3.6 / 2026-05-20). If you add work to the chain,
+# re-measure and bump the timeout — `5` is no longer safe.
 set -u
 
 # CRITICAL — `_paths.sh` MUST be sourced before any python3 call below.
@@ -54,10 +64,24 @@ session_id=$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.st
 # we hoist it here to share the lookup.
 agent=""
 if [ -n "$session_id" ]; then
-    binding="$PROJECT_ROOT/.active-agent-$session_id"
-    if [ -f "$binding" ]; then
-        read -r agent < "$binding" || true
-        agent="${agent//[[:space:]]/}"
+    # Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+    # Without this, every Phase 2.6 session's tree-node front-matter
+    # auto-sync silently fails (last_updated, trigger.session stay stale)
+    # AND uncommitted-edits-record chained call receives MIND_AGENT=""
+    # → breaks cross-agent attribution.
+    for _bf in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/sessions/"$session_id"/binding.yaml; do
+        [ -f "$_bf" ] || continue
+        _bd="${_bf%/sessions/*}"
+        agent="${_bd##*/}"
+        break
+    done
+    # Legacy fallback: pre-Phase-2.6 .active-agent-<SID>.
+    if [ -z "$agent" ]; then
+        binding="$PROJECT_ROOT/.active-agent-$session_id"
+        if [ -f "$binding" ]; then
+            read -r agent < "$binding" || true
+            agent="${agent//[[:space:]]/}"
+        fi
     fi
 fi
 

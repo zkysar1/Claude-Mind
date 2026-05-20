@@ -450,19 +450,53 @@ files:
     required_when_idle: false
     required_when_running: false
 
-  # NOTE: user-signal-snapshot.yaml found as orphan but no writer could be
-  # identified via grep across core/ .claude/ world/. (goal-selector.py READS it
-  # via load_user_signal_snapshot() but does not write it; that writer is absent.)
-  # Left unregistered by design — session-desync-check.sh continues to flag it as
-  # [info] orphan, which is the correct signal while writer status is unknown.
-  # Tracked by asp-253.
-  #
+  - file: uncommitted-edits.jsonl
+    purpose: append-only log of file edits between commits (cross-agent attribution + commit gate evidence)
+    writer: uncommitted-edits-record.sh (invoked by iteration-commit.sh, post-state-update-gate.sh, tree-sync-check.sh)
+    recovery_action: clear
+    required_when_idle: false
+    required_when_running: false
+
+  - file: stop-block-count
+    purpose: integer counter of stop-hook BLOCK decisions this session (absence = 0); read by /verify-learning, /agent-completion-report, and the stop-block-audit recurring goal
+    writer: session.py (session-counter-set/inc/clear wrappers, called from stop-hook.sh)
+    recovery_action: clear
+    required_when_idle: false
+    required_when_running: false
+
+  - file: user-signal-snapshot.yaml
+    purpose: cached snapshot of the user's most-recent signal (from UserPromptSubmit hook); read by goal-selector.py load_user_signal_snapshot() for directive boost
+    writer: world/scripts/user-signal-scan.sh (signal-refresh hook, Pattern B — see world/conventions/signal-refresh.md)
+    recovery_action: preserve
+    required_when_idle: false
+    required_when_running: false
+
   # sc-snapshot.json (resolved 2026-04-26 via ): writer WAS the
   # previous-version iteration-close.sh; data migrated to working-memory.yaml
   # goals_completed_this_session slot. Current writers (iteration-close.sh
   # wm-append goals_completed_this_session) and readers (self-drift-gate.py,
   # goal-selector.py session_completions parameter) both use WM. The orphan
   # file was debris from the migration and has been deleted ().
+
+  # ── Orphans registered 2026-05-20 (1 triage) ───────────────
+  # Surfaced by session-desync-check.sh in alpha/session/. Both are
+  # append-only audit logs with confirmed framework writers, missing
+  # only their manifest entries. Preserve across recovery for cross-
+  # iteration trend analysis (consistent with desync-warnings.jsonl,
+  # recovery-log.jsonl, self-drift-log.jsonl).
+  - file: loop-stall-warnings.jsonl
+    purpose: append-only log of detected loop-stall events (BLOCK clusters indicating turn-end-with-text-only stalls); consumed by stall-goal-filer.py to file Unblock goals on asp-240
+    writer: stop-hook-analyze.sh
+    recovery_action: preserve
+    required_when_idle: false
+    required_when_running: false
+
+  - file: yaml-lint-errors.jsonl
+    purpose: append-only log of YAML lint errors detected in session-state files (cross-iteration tracking; not load-bearing)
+    writer: session-yaml-lint.sh (invoked from iteration-close.sh)
+    recovery_action: preserve
+    required_when_idle: false
+    required_when_running: false
 
 # ── Desync invariants ───────────────────────────────────────────────
 # Rules checked by session-desync-check.sh. Violations are logged advisory

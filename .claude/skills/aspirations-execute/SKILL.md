@@ -65,6 +65,52 @@ similar titles first.
 
 ---
 
+## Phase 4 Setup: Cross-Agent Env Routing (g-115-978 Option 3)
+
+When the selector pulled this goal from a sibling agent's queue,
+`aspirations-select` Phase 2.95 split `source='cross-agent:<sib>'` into
+`effective_source='agent'` + `cross_agent_owner='<sib>'` and wrote the latter
+into `iteration-checkpoint.json` (validated by `loop-state-save.py` SCHEMA).
+This setup fires BEFORE the precondition re-check so every subprocess call
+in Phase 4 — including pre-claim update-goal and depth-estimate — routes
+through the owner's identity. Without it, calls write to THIS agent's queue
+and the cross-pulled goal never lands back in the sibling's `aspirations.jsonl`.
+
+```
+# Read cross_agent_owner from the iteration checkpoint. Empty/absent means
+# this is a normal (non-cross-agent) execution; ENV_PREFIX stays empty and
+# every downstream call behaves exactly as before.
+Bash: cross_agent_owner=$(py -3 -c "import json; d=json.load(open(r'agents/$MIND_AGENT/session/iteration-checkpoint.json',encoding='utf-8')); print(d.get('cross_agent_owner','') or '')" 2>/dev/null || echo "")
+
+IF cross_agent_owner is non-empty:
+    # ENV_PREFIX applies ONLY to subprocess calls whose AGENT_DIR resolves
+    # via MIND_AGENT. Affected (write the owner's state):
+    #   - aspirations-update-goal.sh --source agent <goal-id> <field> <value>
+    #   - aspirations-complete-by.sh <goal-id> (when --source agent)
+    #   - aspirations-release.sh <goal-id> (when --source agent)
+    #   - iteration-close.sh --phase * (operations against the owner's queues)
+    #   - recurring-close.sh <goal-id> (wraps iteration-close internally)
+    # NOT affected (use the calling agent's identity):
+    #   - team-state-in-flight.sh --agent <SELF>   (NEVER swap — this is the
+    #     world-level liveness record; partner observers need to see ALPHA
+    #     claimed BRAVO's goal, not BRAVO claimed it)
+    #   - board-post.sh (board entries are authored by the calling agent)
+    #   - heartbeat-tick.sh (ticks THIS runner's heartbeat)
+    #   - aspirations-claim.sh (--source world is world-scoped — no swap)
+    # Pattern: prefix the affected subprocess invocations with
+    #   MIND_AGENT={cross_agent_owner} <command>
+    # rather than the global env-prefix the PreToolUse[Bash] hook applies.
+    # Explicit per-call prefix wins (`bash-agent-inject.sh` detects and
+    # preserves user-supplied MIND_AGENT=*).
+    ENV_PREFIX="MIND_AGENT=${cross_agent_owner}"
+ELSE:
+    ENV_PREFIX=""   # normal execution; no swap
+```
+
+`ENV_PREFIX` is the variable name every downstream Bash invocation in this
+SKILL.md references when calling an affected script. A non-cross-agent
+iteration sets it to empty string and the calls behave exactly as before.
+
 ## Phase 4 Preamble: Cost-Ordered Precondition Checking
 
 Before expensive data retrieval (SSH, large files, APIs), check local/cheap
@@ -88,11 +134,11 @@ exit_code = $?
 IF exit_code == 1:
     # At least one structured precondition failed.
     failed_ids = [r.predicate_id or r.type for r in parsed.results if not r.passed]
-    Bash: aspirations-update-goal.sh --source {source} {goal.id} \
+    Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} \
         defer_reason "precondition_unmet:{','.join(failed_ids)}"
-    Bash: aspirations-update-goal.sh --source {source} {goal.id} \
+    Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} \
         defer_reason_set_at "$(date +%Y-%m-%dT%H:%M:%S)"
-    Bash: aspirations-release.sh {goal.id}     # release the claim
+    Bash: ${ENV_PREFIX} aspirations-release.sh {goal.id}     # release the claim
     Journal: "pre-claim precondition unmet for {goal.id}: {failed_ids}"
     GOTO Phase 7 (select next goal)
 # Exit 0 = all passed (vacuous empty-list included). Exit 2 = id not found, warn and proceed.
@@ -164,8 +210,8 @@ estimated_depth =
 estimated_seconds = midpoint of tier range (routine 30-120s, standard 120-600s, deep 600-3600s);
                     narrow if prior pattern-signature evidence exists.
 
-Bash: aspirations-update-goal.sh --source {source} {goal.id} estimated_depth {tier}
-Bash: aspirations-update-goal.sh --source {source} {goal.id} estimated_seconds {sec}
+Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} estimated_depth {tier}
+Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} estimated_seconds {sec}
 ```
 
 ## Phase 3.97: Inbound Signal Sweep (G6 / R10)
@@ -220,8 +266,8 @@ IF inbound_signals is non-empty:
 ## Phase 4: Execute (with intelligent retrieval)
 
 ```
-Bash: aspirations-update-goal.sh --source {source} <goal-id> status in-progress
-Bash: aspirations-update-goal.sh --source {source} <goal-id> started <today>
+Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> status in-progress
+Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> started <today>
 
 # ── Intelligent Retrieval Protocol ──────────────────────────────────
 # Full pseudocode lives in the execute-protocol digest. Load on-demand:

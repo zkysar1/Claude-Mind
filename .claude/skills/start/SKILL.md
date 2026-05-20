@@ -91,10 +91,32 @@ Preconditions (all must hold, else fail loud — do NOT change any state):
    **IF exit code 1 AND `force = true`**: print "FORCING recovery despite live
    signals (--force):" followed by the helper's stderr per-condition list.
    Append a JSON audit record to `agents/<agent-name>/session/recovery-force-audit.jsonl`
-   containing the full helper stdout JSON plus `{"timestamp": "<iso-now>",
-   "agent": "<name>", "trigger": "/start --recover --force"}`. Use
-   `locked_append_jsonl` semantics (file may not exist — create it). Then
-   proceed to cleanup.
+   using the explicit locked-append helper so the write is race-safe even when
+   two terminals attempt `--recover --force` concurrently:
+
+   ```bash
+   AGENT_NAME="<agent-name>" \
+   HELPER_JSON='<full stdout JSON from runner-dead-check.sh>' \
+   py -3 -c "
+   import json, os, sys, datetime
+   sys.path.insert(0, 'core/scripts')
+   from _fileops import locked_append_jsonl
+   record = json.loads(os.environ['HELPER_JSON'])
+   record.update({
+       'timestamp': datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+       'agent':     os.environ['AGENT_NAME'],
+       'trigger':   '/start --recover --force',
+   })
+   locked_append_jsonl(
+       f'agents/{os.environ[\"AGENT_NAME\"]}/session/recovery-force-audit.jsonl',
+       record,
+   )
+   "
+   ```
+
+   `_fileops.locked_append_jsonl` creates the file if missing and uses the
+   same lockfile protocol as every other JSONL writer in the framework —
+   single source of truth for race-safe appends. Then proceed to cleanup.
 
    **Origin (g-115-947, 2026-05-19)**: replaced the single-signal heartbeat-stale
    precondition with the 6-condition helper. Prior to this, `/start --recover`
@@ -531,13 +553,17 @@ agent-state, agent-mode, persona-active, or running-session-id.
      **HALT ON RUNNER_TOKEN_GEN_FAILED** — if output contains `ERROR:RUNNER_TOKEN_GEN_FAILED`, STOP. Both `py -3` and `python3` failed to generate a UUID. Display to the user:
      > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
 
-   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
-     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment.)
    - Bash: `rm -f agents/<agent-name>/session/iteration-checkpoint.json agents/<agent-name>/session/compact-pending agents/<agent-name>/session/compact-checkpoint.yaml`
+     (F4 reorder, 2026-05-20: moved BEFORE the state-set RUNNING below so the
+     critical section between RUNNING and /boot is truly empty. These are
+     pure-Bash cleanups of stale per-session files; safe to run at IDLE.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-signal-clear.sh loop-active`
+     (F4 reorder: same rationale — moved before the state flip.)
    - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
-     (Populates the WM top-level `session_start` key declared in wm.py:41.
-     Consumed by `session-artifacts-count.sh` to bound artifact counts for the
+     (F4 reorder: moved before the state flip — wm-set is a pure-Bash write
+     of a top-level WM key, safe to run at IDLE. Populates the WM top-level
+     `session_start` key declared in wm.py:41. Consumed by
+     `session-artifacts-count.sh` to bound artifact counts for the
      productivity-stop-gate encoding_ratio. Seeded HERE on /start IDLE→autonomous;
      /boot does NOT re-seed on autocompact restart because
      `wm.py::SESSION_IDENTITY_FIELDS` makes cmd_reset preserve session_start
@@ -545,6 +571,18 @@ agent-state, agent-mode, persona-active, or running-session-id.
      autocompact boundary without a re-seed. /stop clears it explicitly
      via `wm-clear-identity.sh` in graceful-stop D4.5 — the ONE authorized
      clear site.)
+   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
+     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment.)
+
+     **HALT ON NON-ZERO EXIT (F1, 2026-05-20)** — if the script exits non-zero
+     (write permission error, _paths.sh resolution failure, daemon endpoint
+     error, etc.), STOP. Do NOT proceed to `/boot`. State remains IDLE; the
+     observer-paired signals seeded above are harmless (fresh heartbeat at
+     IDLE means nothing to observers). Display:
+     > Cannot transition agent `<agent-name>` to RUNNING (session-state-set.sh
+     > exited non-zero). The agent stays IDLE; investigate stderr above and
+     > retry `/start <agent-name>`. Without this halt, `/boot` would read
+     > state=IDLE and abort with "Agent is stopped" — confusing failure mode.
    - (Watchdog setup is no longer needed at /start. The agent-watchdog runs
      as a periodic probe from `iteration-close.sh` productivity-check phase —
      `agent-watchdog.py --tick`. State persists across iterations via
@@ -626,12 +664,73 @@ A3. Create the agent directory (if it doesn't exist):
 
    Bash: `mkdir -p agents/<agent-name>`
 
-**Phase B: Configure External Paths** (only if `agents/<agent>/local-paths.conf` does not exist)
+**Phase B: Configure Paths** (only if `agents/<agent>/local-paths.conf` does not yet contain `WORLD_PATH=`).
 
-Each agent stores its own path configuration. `world/` and `meta/` live at external
-user-supplied paths (shared drive, NAS, OneDrive, or local directory).
+Each agent stores its own path configuration. `world/` and `meta/` can live
+inside the project root (simplest, single-machine) OR at external user-supplied
+paths (shared drive / NAS / cloud-sync folder for multi-machine sharing).
 
-B1. Ask for the **world directory** path:
+**Why a content check, not an existence check (F3, 2026-05-20)**: A2 above
+calls `touch local-paths.conf` to satisfy `session-binding-write.py:77`'s
+"conf-file-must-exist" gate (the binding writer refuses to write the binding
+without a conf file present, even if empty). That leaves an EMPTY conf on
+disk after A2. A literal-minded reading of an existence check would conclude
+"conf exists, skip Phase B" — bypassing path elicitation entirely and leaving
+`_paths.sh:164` resolving `WORLD_DIR` to empty string. Phase B's check (here
+and at "skip Phase B entirely" below) is content-aware: empty conf from A2
+fails the WORLD_PATH= grep, so Phase B runs and B7 populates the conf.
+Populated conf passes the grep, so Phase B skips on legitimate resume.
+
+**B0.5. BOOTSTRAP PATHS GATE — NON-SKIPPABLE (mirrors C1.9 semantics).**
+
+This gate exists because of the 2026-05-20 testy incident: the agent invented
+`<project_root>-world` and `-meta` sibling paths as "reasonable defaults"
+between A6 and B7, without prompting the user — because Auto Mode triggered
+"make the reasonable call" reasoning. The invented paths then propagated
+through B7 (conf write), B10 (permission grants), C0 (init), and the user
+had to manually clean up the test repo to retry. Path choices are
+unrecoverable once written: directories get created, settings.local.json
+gets seeded with those paths, and reverting requires a manual delete.
+
+Rules — ALL mandatory, in order, BEFORE B7 (the conf write):
+
+1. **NEVER invent paths.** Even in auto mode, even with the suggested default
+   visible in the prompt — the agent MUST NOT write `local-paths.conf`
+   without explicit user authorization. "Reasonable default" reasoning is
+   the documented testy-incident failure mode. The bar is identical to
+   C1.9: "fabricating identity by inference" became "fabricating paths by
+   inference" — same shape, same gate.
+
+2. **Suggest, then ask.** Show the suggested default (`./world` and `./meta`
+   inside the project root, alongside `core/`, `mind_api/`, `agents/`) AND
+   the alternative shapes (shared remote / cloud-sync for multi-machine).
+   Always pose the question — even if the user is expected to accept the
+   default.
+
+3. **What counts as user authorization** (any one is sufficient):
+   - **Explicit path**: "use /Users/me/foo" — proceed with that path
+   - **Confirm suggestion**: "yes, use the default", "go with `./world`",
+     "the suggestion is fine" — proceed with default
+   - **Explicit delegation**: "you pick", "I don't care", "this is a test,
+     do whatever", "make it simple", "use whatever makes sense" — proceed
+     with default
+   - **NOT sufficient**: silence, prior unrelated permissions, the
+     existence of Auto Mode, or any inferred preference — STOP and ask.
+
+4. **Auto Mode does NOT override this gate.** When the system reminder says
+   "Work without stopping for clarifying questions" — paths are the
+   exception, same class as bootstrap identity (C1.9). Stop and ask anyway.
+   Proceed only if rule 3 conditions are met.
+
+5. **Why stopping here is safe.** At Phase B, agent-state is still
+   UNINITIALIZED. The stop hook does not force-enter the loop until C9.9.
+   Pausing for user input is fully interruptible. After B7/B10 write the
+   conf + seed permissions, reverting the path choice requires manual
+   filesystem cleanup — which is exactly the cost the testy incident paid.
+
+Only after this gate passes (rules 1-4 satisfied), proceed to B1.
+
+B1. Ask for the **world directory** path. NON-SKIPPABLE per B0.5 gate:
 
    ```
    First, I need to know where to store collective knowledge.
@@ -640,17 +739,27 @@ B1. Ask for the **world directory** path:
    the knowledge tree, hypotheses, reasoning bank, aspirations, and more.
    Multiple agents and machines can share this directory.
 
-   Point me to a directory. It can be:
-   - An empty directory (I'll set up a fresh world)
-   - An existing world directory (I'll connect to it)
+   **Suggested default** (simplest — single machine, single repo):
+     ./world  →  expands to <project_root>/world, alongside core/, mind_api/, agents/
 
-   Examples (use FORWARD slashes on every platform — backslashes get
-   interpreted as escape sequences when bash sources the path):
-   - C:/Users/you/OneDrive/my-mind-world   (Windows — OneDrive sync, sharable across machines)
+   Everything stays inside the project — no external paths to manage. The
+   trade-off: agents in OTHER repos or on OTHER machines can't see this
+   world. If you want multi-repo or multi-machine collaboration, put world/
+   on a shared remote (NAS, OneDrive, SharePoint, Dropbox, iCloud) instead.
+
+   Other valid examples (use FORWARD slashes on every platform —
+   backslashes get interpreted as escape sequences when bash sources the
+   path file):
+   - C:/Users/you/OneDrive/my-mind-world   (Windows, OneDrive — sharable across machines)
    - /Users/you/Documents/my-mind-world    (macOS — local single-machine)
    - /home/you/mind-world                  (Linux — local single-machine)
 
    Where should the world directory be?
+   - Reply `./world` (or just "default", "use the suggestion", "yes") to
+     accept the in-project default
+   - Reply with an absolute/relative path to use a different location
+   - Reply "you pick" / "I don't care" / "make it simple" to delegate
+     (= proceed with the in-project default per B0.5 rule 3)
    ```
 
    If the user pastes a Windows path with backslashes (e.g.,
@@ -658,7 +767,12 @@ B1. Ask for the **world directory** path:
    silently convert backslashes to forward slashes before validation in B3.
    Do not bounce the user back — the conversion is part of normalization.
 
-B2. AskUserQuestion (allowed — agent-state is not RUNNING yet)
+B2. AskUserQuestion (allowed — agent-state is not RUNNING yet).
+
+   **DO NOT PRESUME** — per B0.5 gate: even in auto mode, do NOT advance
+   past B2 without an explicit response that matches one of the
+   authorization shapes in B0.5 rule 3. The instinct to "make the
+   reasonable call" is the testy-incident failure mode; resist it.
 
 B3. Validate the world path:
    - Resolve relative paths against PROJECT_ROOT
@@ -668,7 +782,7 @@ B3. Validate the world path:
    - If **populated** (has `knowledge/` or `.initialized`): confirm "Found an existing world at {path} — I'll connect to it"
    - If **not writable**: tell user, ask for a different path
 
-B4. Ask for the **meta directory** path:
+B4. Ask for the **meta directory** path. NON-SKIPPABLE per B0.5 gate:
 
    ```
    **Meta Directory** — This is where domain-agnostic improvement strategies
@@ -678,14 +792,24 @@ B4. Ask for the **meta directory** path:
    Same rules as the world path: empty directory for fresh start, or existing
    meta directory; forward slashes only.
 
-   Example (typically next to the world directory):
+   **Suggested default** (matches world layout):
+     ./meta  →  expands to <project_root>/meta, alongside core/, mind_api/, agents/, world/
+
+   Other valid examples (typically next to the world directory):
    - C:/Users/you/OneDrive/my-mind-meta    (Windows)
    - /Users/you/Documents/my-mind-meta     (macOS)
 
    Where should the meta directory be?
+   - Reply `./meta` / "default" / "yes" to accept the in-project default
+   - Reply with an absolute/relative path for a different location
+   - Reply "you pick" / "same place as world" to delegate (per B0.5 rule 3)
    ```
 
-B5. AskUserQuestion
+B5. AskUserQuestion.
+
+   **DO NOT PRESUME** — same enforcement as B2: per B0.5 gate, even in auto
+   mode, an explicit user response matching one of the B0.5 rule 3
+   authorization shapes is required before B6/B7.
 
 B6. Validate the meta path (same rules as B3)
 
@@ -772,7 +896,7 @@ B10. AskUserQuestion for confirmation
    - If no: warn that file access to external paths may require per-call
      permission approval throughout the session.
 
-If `agents/<agent>/local-paths.conf` already exists, skip Phase B entirely — paths are already configured.
+If `agents/<agent>/local-paths.conf` already contains `WORLD_PATH=`, skip Phase B entirely — paths are already configured. Use a content check, not bare existence (see "Why a content check" rationale at Phase B header — A2's `touch` leaves an empty conf on disk before Phase B runs). Concrete probe: `grep -q '^WORLD_PATH=' agents/<agent>/local-paths.conf` — exit 0 means populated, skip; exit 1 means empty or absent, run Phase B.
 
 **Phase C: The Program and Agent Identity**
 
@@ -801,6 +925,71 @@ Per-slot detection (NOT whole-directory): C0.5 used to short-circuit if
 when the canonical `post-execution.md` / `pre-execution.md` slots were missing.
 Now each slot is checked independently. Canonical slot table:
 `core/config/conventions/domain-hooks.md` → "Canonical Hook Slots (Pattern B)".
+
+**C0.5 GATE — NON-SKIPPABLE (mirrors B0.5 / C1.9 semantics).** Applies ONLY
+when at least one canonical slot is missing (i.e., the AskUserQuestion below
+is going to fire). When both slots already exist from a prior /start, this
+gate is moot — the procedure short-circuits at the "skip prompt-and-seed"
+branch and no question is asked.
+
+This gate exists because of the 2026-05-20 hooks-prompt-skipped observation:
+the user explicitly designed C0.5 (commits `d0f32aa5` / `0aaf3163`, May 16) so
+they would be ASKED whether to add domain-specific pre/post-execution steps
+on first-touch. But Auto Mode caused the agent to treat the AskUserQuestion at
+C0.5 as a "make the reasonable call" moment and silently pick "no" — the
+question was never surfaced to the user. Unlike B0.5 (paths) and C1.9
+(identity), the underlying choice ("no domain additions, defaults only") is
+technically safe for correctness — the framework defaults install by
+construction either way. But the user explicitly wanted the **opportunity to
+decide** at this moment, and silently answering for them denies that
+opportunity. That alone is the failure.
+
+Rules — ALL mandatory, in order, BEFORE the AskUserQuestion at the
+"Optional: add domain-specific steps?" prompt below:
+
+1. **NEVER auto-answer the C0.5 prompt.** Even in auto mode, even when "no"
+   would be a perfectly safe answer, the agent MUST surface the prompt to
+   the user and wait for an explicit reply. "Make the reasonable call"
+   reasoning is the documented failure mode. The bar is the same as B0.5
+   and C1.9: a moment the user explicitly designed to be theirs.
+
+2. **The defaults install BEFORE the question runs — that is by design.**
+   The `cp` commands below install framework-essential conventions by
+   construction (per `d0f32aa5`'s design: verify-learning Section DC
+   structural invariants hold ONLY because the template is installed
+   verbatim). The question is purely about whether the user wants to ADD
+   domain layers under `## Domain Additions`, NOT whether the defaults
+   install. This is why "no" is safe — but still must be asked.
+
+3. **What counts as user authorization for the answer** (any one is sufficient):
+   - **Explicit yes**: "yes", "add steps", "I want to customize" — proceed
+     to collect domain content
+   - **Explicit no**: "no", "defaults are fine", "skip", "later" — proceed
+     without additions
+   - **Show first**: "show me", "show-me-the-defaults" — display files,
+     then re-ask (loop is built into the procedure below)
+   - **Explicit delegation**: "you pick", "I don't care", "this is a test,
+     do whatever", "make it simple" — proceed with "no" (defaults
+     installed, no additions)
+   - **NOT sufficient**: silence, prior unrelated permissions, the
+     existence of Auto Mode, or any inferred preference — STOP and ask.
+
+4. **Auto Mode does NOT override this gate.** When the system reminder says
+   "Work without stopping for clarifying questions" — the domain-conventions
+   prompt is an exception, same class as B0.5 and C1.9. Stop and ask anyway.
+   Proceed only if rule 3 conditions are met.
+
+5. **Why stopping here is safe.** At C0.5, agent-state is still
+   UNINITIALIZED. The stop hook does not force-enter the aspirations loop
+   until C9.9 (per the same reasoning as C1.9 rule 5). Pausing for user
+   input is fully interruptible. Unlike paths and identity, the cost of an
+   auto-picked "no" is NOT data corruption — it's the loss of a
+   deliberately-designed user moment. That alone justifies the gate.
+
+Only after this gate is acknowledged, proceed to the existence check below.
+The gate triggers ONLY when the existence check finds at least one missing
+slot; when both slots exist, the procedure skips the AskUserQuestion entirely
+(line "IF both slots already exist" below) and rules 1-4 do not apply.
 
 Bash: `source core/scripts/_paths.sh && \
   pre_missing=$([ -f "$WORLD_DIR/conventions/pre-execution.md" ] && echo "no" || echo "yes") && \
@@ -841,7 +1030,10 @@ IF either slot is missing:
     Log: "Seeded $WORLD_DIR/conventions/<slot>.md from framework default
           (core/config/templates/<slot>-default.md)."
 
-  AskUserQuestion (one prompt covering whichever slots were just installed):
+  AskUserQuestion (one prompt covering whichever slots were just installed).
+  **DO NOT AUTO-ANSWER** — per C0.5 gate rule 1: even in auto mode, do NOT
+  pick "no" silently. Surface the question and wait for an explicit response
+  matching one of rule 3's authorization shapes.
   ```
   Optional: add domain-specific steps to the convention(s) just installed?
     - yes:  I'll ask what to add and append under '## Domain Additions'
@@ -956,14 +1148,30 @@ C3. If user provided an identity (not "skip"), write `agents/<agent>/self.md`:
    ```
 
 C4. Set mode and state:
-   - Bash: `session-mode-set.sh reader`
-   - Bash: `session-state-set.sh IDLE`
-   - Bash: `session-persona-set.sh true`
+   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-mode-set.sh reader`
+   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
+
+     **HALT ON NON-ZERO EXIT (G2, 2026-05-20)** — if `session-state-set.sh`
+     exits non-zero, STOP. Do NOT proceed to C5/C6/C7. State remains
+     UNINITIALIZED; the persona-set below is harmless. Display:
+     > Cannot initialize agent `<agent-name>` in reader mode
+     > (session-state-set.sh exited non-zero). Investigate stderr above and
+     > retry `/start <agent-name> --mode reader`. Without this halt, C7's
+     > "Agent initialized in reader mode" message would lie about success.
+   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-persona-set.sh true`
    - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
      (Consumed by `session-artifacts-count.sh` → productivity-stop-gate.
      Helper exits non-zero if unset, which makes the gate treat total
      artifacts as 0. Seed on every session entry — IDLE-branch reader
      step 3 / assistant step 3 / autonomous step 3 all do the same.)
+
+     **MIND_AGENT prefix rationale (G1, 2026-05-20)** — the three state setters
+     above carry the explicit `MIND_AGENT=<agent-name>` prefix for the same
+     belt-and-suspenders reason `wm-set.sh` does (PreToolUse hook cold-start
+     race). The IDLE-branch reader/assistant variants (under the IDLE section
+     above — Step 3 of the IDLE flow) already use this prefix consistently;
+     the UNINITIALIZED variants now match. (H2, 2026-05-20: tightened from
+     "Step 3 above" — the UNINITIALIZED branch has no Step 3 of its own.)
 
 C5. Invoke `/prime` (reader context — pass `--read-only` to retrieve.sh)
 
@@ -1023,11 +1231,21 @@ confirmation is mandatory before the C6 curriculum / C7 self.md writes,
 and Self is never derived from The Program (C1.9 rules 2-3).
 
 C8. Set mode and state:
-    - Bash: `session-mode-set.sh assistant`
-    - Bash: `session-state-set.sh IDLE`
-    - Bash: `session-persona-set.sh true`
+    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-mode-set.sh assistant`
+    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
+
+      **HALT ON NON-ZERO EXIT (G2, 2026-05-20)** — if `session-state-set.sh`
+      exits non-zero, STOP. Do NOT proceed to C8.5/C9/C10. State remains
+      UNINITIALIZED; the persona-set below is harmless. Display:
+      > Cannot initialize agent `<agent-name>` in assistant mode
+      > (session-state-set.sh exited non-zero). Investigate stderr above and
+      > retry `/start <agent-name> --mode assistant`. Without this halt,
+      > C10's success message would lie and C9's `/create-aspiration` would
+      > also fire against an uninitialized agent.
+    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-persona-set.sh true`
     - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
-      (Same rationale as Phase C reader mode C4.)
+      (Same rationale as Phase C reader mode C4. MIND_AGENT prefix on the
+      three state setters above matches G1's reader-C4 fix.)
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.
 
@@ -1342,14 +1560,28 @@ C9.9. RUNNER CLAIM — the agent-state RUNNING flip (Fix 2 critical section).
       bravo/ cruft.)
       **HALT ON RUNNER_TOKEN_GEN_FAILED** — same as IDLE Step 3. State is
       still IDLE here, so a halt is a clean retry (no half-claimed zombie).
+    - Bash: `rm -f agents/<agent-name>/session/iteration-checkpoint.json`
+      (F4 reorder, 2026-05-20: moved BEFORE the state-set RUNNING below so
+      the critical section between RUNNING and /boot is truly empty — making
+      the C9.9 comment "NOTHING stoppable between RUNNING and /boot" literal,
+      not just spirit. Safe to run at IDLE.)
+    - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
+      (F4 reorder: moved before the state flip. Same rationale as IDLE→autonomous
+      step 3 — wm-set is a pure-Bash write to a top-level WM key, safe at IDLE.)
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
       (State flip — final write in the RUNNING-claim sequence. heartbeat-tick
       + triple-write are seeded first per rb-323/guard-403 so observers never
       see RUNNING with a stale heartbeat or empty SID files. From THIS line
       the stop hook is armed — C10 + C11 MUST follow with no interruption.)
-    - Bash: `rm -f agents/<agent-name>/session/iteration-checkpoint.json`
-    - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
-      (Same rationale as IDLE→autonomous step 3.)
+
+      **HALT ON NON-ZERO EXIT (F1, 2026-05-20)** — if the script exits non-zero,
+      STOP. Do NOT proceed to C10/C11. State remains IDLE; the observer-paired
+      signals seeded above are harmless (fresh heartbeat at IDLE means nothing
+      to observers). Display:
+      > Cannot transition agent `<agent-name>` to RUNNING at C9.9 (session-state-set.sh
+      > exited non-zero). The agent stays IDLE; investigate stderr above and retry
+      > `/start <agent-name>`. Without this halt, `/boot` (C11) would read state=IDLE
+      > and abort with "Agent is stopped" — confusing failure mode.
 
 C10. Output: "Agent initialized. Learning loop starting."
 

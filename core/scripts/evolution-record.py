@@ -209,6 +209,24 @@ def resolve_agent(project_root, session_id, env_agent):
         return None
     if any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) or ".." in session_id:
         return None
+    # Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+    # Without this, the entire self-program-evolution recording pipeline is
+    # silently dead for Write/Edit/MultiEdit PostToolUse hooks (those hooks
+    # don't get MIND_AGENT env-injected, so the session_id path is primary).
+    agents_parent = Path(project_root) / "agents"
+    if agents_parent.is_dir():
+        try:
+            for child in agents_parent.iterdir():
+                if not child.is_dir():
+                    continue
+                binding_p26 = child / "sessions" / session_id / "binding.yaml"
+                if binding_p26.is_file():
+                    name = child.name
+                    if re.match(r"^[a-z][a-z0-9-]*$", name):
+                        return name
+        except OSError:
+            pass
+    # Legacy fallback: pre-Phase-2.6 .active-agent-<SID>.
     binding = Path(project_root) / f".active-agent-{session_id}"
     if not binding.exists():
         return None
@@ -222,7 +240,10 @@ def resolve_agent(project_root, session_id, env_agent):
 
 
 def resolve_world_dir(project_root, agent):
-    conf = Path(project_root) / agent / "local-paths.conf"
+    # Phase 2.5.D: agent dirs live under agents/ parent. Was previously
+    # Path(project_root) / agent / "local-paths.conf" — resolved to a
+    # non-existent path → world_dir always None → no event-stream writes.
+    conf = Path(project_root) / "agents" / agent / "local-paths.conf"
     if not conf.exists():
         return None
     try:
@@ -268,7 +289,8 @@ def main():
         approve_no_mutation()
 
     abs_path = str(Path(file_path).resolve())
-    sidecar_dir = Path(project_root) / agent / "session"
+    # Phase 2.5.D: agent dirs under agents/ parent.
+    sidecar_dir = Path(project_root) / "agents" / agent / "session"
     sidecar_path = sidecar_dir / f"pending-evolution-{path_key(abs_path)}.json"
 
     if not sidecar_path.exists():

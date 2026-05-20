@@ -128,6 +128,11 @@
           },
           {
             "type": "command",
+            "command": "bash core/scripts/post-recovery-edit-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash core/scripts/evolution-prepare.sh",
             "timeout": 15
           },
@@ -163,6 +168,11 @@
           },
           {
             "type": "command",
+            "command": "bash core/scripts/post-recovery-edit-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
             "command": "bash core/scripts/evolution-prepare.sh",
             "timeout": 15
           },
@@ -194,6 +204,11 @@
           {
             "type": "command",
             "command": "bash core/scripts/marker-placement-gate.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash core/scripts/post-recovery-edit-gate.sh",
             "timeout": 10
           },
           {
@@ -231,7 +246,7 @@
           {
             "type": "command",
             "command": "bash core/scripts/tree-sync-check.sh",
-            "timeout": 5
+            "timeout": 30
           },
           {
             "type": "command",
@@ -261,7 +276,7 @@
           {
             "type": "command",
             "command": "bash core/scripts/tree-sync-check.sh",
-            "timeout": 5
+            "timeout": 30
           },
           {
             "type": "command",
@@ -291,7 +306,7 @@
           {
             "type": "command",
             "command": "bash core/scripts/tree-sync-check.sh",
-            "timeout": 5
+            "timeout": 30
           },
           {
             "type": "command",

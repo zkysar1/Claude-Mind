@@ -136,16 +136,42 @@ def main():
     if any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) or ".." in session_id:
         sys.exit(0)
 
-    binding_path = os.path.join(project_root, f".active-agent-{session_id}")
-    try:
-        with open(binding_path, "r", encoding="utf-8") as fh:
-            agent = fh.read().strip()
-    except Exception:
-        sys.exit(0)
+    # Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+    # The directory parent IS the agent name. Glob via os.listdir to avoid
+    # PyYAML dependency in this hot-path hook. Without this check, /start
+    # --retire-legacy retires the .active-agent-<SID> file and this hook
+    # silently exits — leaving the Skill(aspirations) Return Protocol nudge
+    # un-fired for every Phase 2.6 session. Matches stop-hook.sh fix
+    # (ff6e71c6) + recovery-gate.sh / stop-failure-hook.sh fix (938ca231).
+    agent = ""
+    agents_parent = os.path.join(project_root, "agents")
+    if os.path.isdir(agents_parent):
+        try:
+            for candidate_agent in os.listdir(agents_parent):
+                binding_p26 = os.path.join(
+                    agents_parent, candidate_agent, "sessions", session_id, "binding.yaml"
+                )
+                if os.path.isfile(binding_p26):
+                    agent = candidate_agent
+                    break
+        except OSError:
+            pass
+    # Legacy fallback: pre-Phase-2.6 .active-agent-<SID> file at PROJECT_ROOT.
+    if not agent:
+        binding_path = os.path.join(project_root, f".active-agent-{session_id}")
+        try:
+            with open(binding_path, "r", encoding="utf-8") as fh:
+                agent = fh.read().strip()
+        except Exception:
+            sys.exit(0)
     if not agent:
         sys.exit(0)
 
-    session_dir = os.path.join(project_root, agent, "session")
+    # Phase 2.5.D: agent dirs live under agents/ parent — was previously
+    # os.path.join(project_root, agent, "session") which resolved to a
+    # non-existent path on disk → every read below failed → reminder
+    # silently suppressed.
+    session_dir = os.path.join(project_root, "agents", agent, "session")
     try:
         with open(os.path.join(session_dir, "agent-state"), "r", encoding="utf-8") as fh:
             state = fh.read().strip()

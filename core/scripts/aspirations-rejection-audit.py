@@ -17,9 +17,13 @@ Run modes:
   --exit-on-hits         # exit 1 if any hits in window (cron regression shape)
 
 Wrapper goal usage (the "files an Investigate goal" part of Layer C lives
-HERE, not in this script):
+HERE, not in this script). Goal fields go in the JSON body via stdin, not
+as CLI flags — `--title`/`--description`/etc. are rejected with exit 2 (see
+`aspirations-add-goal.sh --help`):
     if ! py -3 core/scripts/aspirations-rejection-audit.py --exit-on-hits; then
-        bash core/scripts/aspirations-add-goal.sh ... --description "..."
+        printf '%s' '{"title":"Investigate: ...","priority":"MEDIUM",
+            "participants":["agent"],"description":"..."}' \
+            | bash core/scripts/aspirations-add-goal.sh asp-115
     fi
 
 What it counts (per agent transcript):
@@ -77,11 +81,40 @@ def _parse_args():
 
 
 def _load_agent_map(project_root: Path) -> dict:
-    """Map SID -> agent name from .active-agent-* files at project root."""
+    """Map SID -> agent name from session bindings.
+
+    Phase 2.6: prefers agents/<name>/sessions/<SID>/binding.yaml (the SID is
+    the directory name; the agent is the parent dir's parent). Falls back to
+    the legacy .active-agent-<SID> file at project root for migration-era
+    sessions. Without Phase 2.6, new-session transcript hits are attributed
+    to "(unknown)".
+    """
     out = {}
+    agents_parent = project_root / "agents"
+    if agents_parent.is_dir():
+        try:
+            for agent_dir in agents_parent.iterdir():
+                if not agent_dir.is_dir():
+                    continue
+                sessions_dir = agent_dir / "sessions"
+                if not sessions_dir.is_dir():
+                    continue
+                try:
+                    for session_dir in sessions_dir.iterdir():
+                        if not session_dir.is_dir():
+                            continue
+                        if (session_dir / "binding.yaml").is_file():
+                            out[session_dir.name] = agent_dir.name
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    # Legacy fallback (do not overwrite Phase 2.6 entries):
     try:
         for f in project_root.glob(".active-agent-*"):
             sid = f.name.replace(".active-agent-", "")
+            if sid in out:
+                continue
             try:
                 out[sid] = f.read_text(encoding="utf-8").strip()
             except OSError:

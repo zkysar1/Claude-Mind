@@ -156,7 +156,10 @@ if os.path.exists(detections_path):
         pass
 
 for agent, latest in warnings.items():
-    agent_dir = os.path.join(proj_root, agent, "session")
+    # Phase 2.5.D: agent dirs live under agents/ parent — was previously
+    # os.path.join(proj_root, agent, "session") which resolved to a
+    # non-existent path → every warning skipped with "no session dir".
+    agent_dir = os.path.join(proj_root, "agents", agent, "session")
     if not os.path.isdir(agent_dir):
         print(f"stop-hook-analyze: no session dir for {agent}, skipping", file=sys.stderr)
         continue

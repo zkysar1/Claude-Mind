@@ -349,10 +349,24 @@ receive it, not just find it on disk.
 Notify the user about the completion report.
 (Check `world/forged-skills.yaml` for a skill whose triggers match "notify
 the user" and invoke it with:
-- subject: "Completion Report: <since_label>" (e.g., "last 4h 7m" or "Lifetime")
-- message: a concise summary — goals completed, aspirations completed,
-  hypothesis accuracy, top highlights, and the path to the full report file
-  (`agents/<agent>/COMPLETION-REPORT.md`).
+- category: `completion`
+- subject: build a stats-summary subject from the report data, e.g.,
+  `"Completion Report ({since_label}, {N} goals, {N_deep} deep)"`
+  (real example: `"Completion Report (31h, 6 goals, 1 deep)"`)
+- message-file: the timestamped archive file written in Phase 4 Step 3:
+  `agents/<agent>/reports/completion-report-{YYYY-MM-DDTHH-MM-SS}.md`
+
+The notify skill MUST consume the file via `--message-file` (not via a
+re-constructed prose summary). The 2026-05-20 incident — completion
+emails arriving with only Title + UTC + reply-footer because the LLM
+hand-constructed an empty Body — was caused by re-summarizing the
+already-rich report file into a prose blurb that got dropped. The file
+on disk IS the deliverable; pass its path through.
+
+The `notify-build-payload.py` helper (called by /notify-user Step 2)
+will refuse the send with rc=2 if the message body is too short, so a
+missing or trivial report file fails loud instead of producing a blank
+email.
 
 If no matching skill is registered, fall back to a `participants: [agent, user]`
 goal via `aspirations-add-goal.sh` with title

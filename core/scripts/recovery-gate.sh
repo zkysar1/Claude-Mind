@@ -137,7 +137,21 @@ SESSION_ID="$(printf '%s' "$PAYLOAD" | python3 -c 'import json,sys; d=json.loads
 # Fail-open: missing payload, missing binding file, framework dir match —
 # all exit 0 (no action). The gate never blocks session start.
 BOUND_AGENT=""
-if [ -n "$SESSION_ID" ] && [ -f "$PROJECT_ROOT/.active-agent-$SESSION_ID" ]; then
+# Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+# Without this check, Phase 2.6 sessions whose .active-agent-<SID> form
+# was retired by /start --retire-legacy never get auto-recovered from
+# zombie state — recovery-gate exits silently at the empty BOUND_AGENT
+# check below. Matches the stop-hook.sh fix (ff6e71c6).
+if [ -n "$SESSION_ID" ]; then
+    for _BF in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/sessions/"$SESSION_ID"/binding.yaml; do
+        [ -f "$_BF" ] || continue
+        _BD="${_BF%/sessions/*}"
+        BOUND_AGENT="${_BD##*/}"
+        break
+    done
+fi
+# Legacy fallback: pre-Phase-2.6 .active-agent-<SID> file at PROJECT_ROOT.
+if [ -z "$BOUND_AGENT" ] && [ -n "$SESSION_ID" ] && [ -f "$PROJECT_ROOT/.active-agent-$SESSION_ID" ]; then
     BOUND_AGENT="$(tr -d '\r\n[:space:]' < "$PROJECT_ROOT/.active-agent-$SESSION_ID")"
 fi
 case "$BOUND_AGENT" in

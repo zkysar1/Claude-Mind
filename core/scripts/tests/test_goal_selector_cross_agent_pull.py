@@ -32,11 +32,20 @@ CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 # goal-selector.py requires MIND_AGENT to load (paths derive AGENT_DIR).
-# Set it before import; tests pass agent_name explicitly to the helper.
+# Capture-restore around the module-level mutation so collection-time env
+# pollution cannot leak to other tests (Layer 1 test-pollution defense —
+# rb-1096, guard-588, tree node test-pollution-defense). Tests pass
+# agent_name explicitly to the helper, so any binding works here.
+_SAVED_AGENT = os.environ.get("MIND_AGENT")
 os.environ.setdefault("MIND_AGENT", "bravo")
 
 gs = importlib.import_module("goal-selector")
 collect_cross_agent_candidates = gs.collect_cross_agent_candidates
+
+if _SAVED_AGENT is None:
+    os.environ.pop("MIND_AGENT", None)
+else:
+    os.environ["MIND_AGENT"] = _SAVED_AGENT
 
 
 def _write_aspirations(agent_dir: Path, aspirations: list[dict]) -> None:

@@ -674,6 +674,24 @@ recurring:
                                   # variable name (streak_mult) used at both
                                   # readers and in the zeta journals where the
                                   # constant's role was characterized.
+  session_gap_threshold_hours: 2.0  # Auto-resolve threshold for streak-break canaries
+                                    # that recover OUTSIDE the streak_mult window.
+                                    # When a canary's source goal fires again later than
+                                    # streak_mult * interval_hours after the canary was
+                                    # filed (would normally stay open as "real drift"),
+                                    # AND the agent's execution-diary shows a gap >= this
+                                    # threshold between canary-filing and recovery, the
+                                    # canary is reclassified as session-inactivity (the
+                                    # agent wasn't running, so cadence-miss was structural,
+                                    # not a bug) and auto-resolved with a session-gap note.
+                                    # Closes the streak-break-burst ratchet that fires when
+                                    # an agent returns after a multi-hour gap (bravo
+                                    # 2026-05-20 catch-up cluster: 6 Investigates from 30h
+                                    # session gap). Set very high (e.g., 999) to disable
+                                    # the gap-escape path entirely and keep the original
+                                    # streak_mult-only window.
+                                    # Single source of truth: streak-break-reflector.py
+                                    # _load_session_gap_threshold() is the sole reader.
   cargo_cult_threshold: 3         # consecutive routine outcomes before auto-filing Idea
                                   # (see rb-335: YAML duplicate-key collision fix 2026-04-20)
   routine_streak_flip_threshold: 5  # In-session per-goal routine streak ceiling. When a
@@ -1132,6 +1150,7 @@ modifiable:
   recurring.debt_threshold: {min: 0.60, max: 0.95, default: 0.80}
   recurring.debt_bonus: {min: 1.0, max: 5.0, default: 3.0}
   recurring.streak_mult: {min: 1.5, max: 5.0, default: 2.0}
+  recurring.session_gap_threshold_hours: {min: 0.5, max: 999.0, default: 2.0}
   # Multi-agent coordination bounds
   multi_agent.claim_timeout_hours: {min: 1, max: 24, default: 4}
   multi_agent.reallocation_hours: {min: 2, max: 48, default: 8}

@@ -20,6 +20,7 @@ MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
 FRESH_GIT=0
 DO_COMMIT=0
 NO_CLEAN_CRUFT=0
+SKIP_PREFLIGHT_JUSTIFICATION=""
 
 # Parse args
 while [ $# -gt 0 ]; do
@@ -34,6 +35,15 @@ while [ $# -gt 0 ]; do
         --commit) DO_COMMIT=1 ;;
         --no-clean-cruft) NO_CLEAN_CRUFT=1 ;;
         --clean-cruft) NO_CLEAN_CRUFT=0 ;;
+        --skip-preflight)
+            SKIP_PREFLIGHT_JUSTIFICATION="$2"
+            if [ -z "$SKIP_PREFLIGHT_JUSTIFICATION" ] || [[ "$SKIP_PREFLIGHT_JUSTIFICATION" == --* ]]; then
+                echo "ERROR: --skip-preflight requires a justification string" >&2
+                echo '  Example: --skip-preflight "emergency hotfix, publishability gates already verified manually"' >&2
+                exit 2
+            fi
+            shift
+            ;;
         -*) echo "Unknown flag: $1" >&2; exit 2 ;;
         *) if [ -z "$DEST" ]; then DEST="$1"; else echo "Extra arg: $1" >&2; exit 2; fi ;;
     esac
@@ -112,6 +122,36 @@ done
 # 3e. Source cleanliness
 if [ -n "$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null)" ]; then
     echo "  WARN: source has uncommitted changes — seed will include uncommitted modifications."
+fi
+
+# Step 3.5: Source publishability gate (preflight)
+# Six publishability invariants run as a single aggregated check. Any FAIL
+# refuses the transplant — the bad source state must be fixed first, not
+# carried into the destination. The --skip-preflight flag is an emergency
+# override that requires a written justification (audited to stderr).
+# See world/knowledge/tree/system/publication-pipeline.md for the gate
+# inventory and rb-1108/1109/1110 for the lessons that motivated each gate.
+if [ -n "$SKIP_PREFLIGHT_JUSTIFICATION" ]; then
+    echo "[seed-transplant] Source publishability gate SKIPPED via --skip-preflight" >&2
+    echo "  Justification: $SKIP_PREFLIGHT_JUSTIFICATION" >&2
+    echo "  Timestamp: $(date -Iseconds)" >&2
+    echo "  source=$PROJECT_ROOT  dest=$DEST" >&2
+    echo "  (override is a last resort, never routine — preflight protects the public repo from broken-source promotions)" >&2
+else
+    echo "[seed-transplant] Running source publishability gate..."
+    set +e
+    bash "$SCRIPT_DIR/seed-preflight.sh" --quiet
+    PREFLIGHT_RC=$?
+    set -e
+    if [ $PREFLIGHT_RC -ne 0 ]; then
+        echo "" >&2
+        echo "[seed-transplant] REFUSE: source publishability gate FAILED" >&2
+        echo "  Re-run \`bash $SCRIPT_DIR/seed-preflight.sh\` for full per-check output." >&2
+        echo "  Fix the failing checks at source, then re-attempt promotion." >&2
+        echo "  Emergency override: re-run with --skip-preflight \"<justification>\" (audited to stderr)." >&2
+        exit 7
+    fi
+    echo "  PASS: 6/6 publishability checks green"
 fi
 
 # Step 4: Build copy plan

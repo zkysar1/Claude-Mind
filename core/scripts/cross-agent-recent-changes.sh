@@ -66,7 +66,8 @@ paths = []
 if world_path:
     paths.append(os.path.join(world_path, "aspirations.jsonl"))
 if agent_name:
-    paths.append(os.path.join(project_root, agent_name, "aspirations.jsonl"))
+    # Phase 2.5.D: agent dirs under agents/ parent.
+    paths.append(os.path.join(project_root, "agents", agent_name, "aspirations.jsonl"))
 for p in paths:
     if not os.path.isfile(p):
         continue

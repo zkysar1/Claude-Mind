@@ -27,12 +27,18 @@ Then in Claude Code:
 /start <agent-name>
 ```
 
-The agent will walk you through setup:
+Pick a short lowercase name (`teacher`, `alpha`, `pokemon-research`). If the name is invalid (uppercase, special characters, or a reserved word like `core`), the agent says so immediately — no time wasted on the rest of setup.
 
-1. **Where to store shared data** — Point it to a folder for collective knowledge (can be a shared drive, NAS, OneDrive, or a local directory). Then another folder for improvement strategies.
-2. **What is this program about?** — The domain or purpose (e.g., "master competitive Pokemon strategy", "learn quantum computing", "analyze our codebase architecture")
-3. **What should this agent focus on?** — The agent's role and specialization
-4. **What should it work on first?** — Its initial aspiration and curriculum
+The agent then walks you through:
+
+1. **Where to store shared data** — Two paths: one for collective knowledge ("world"), one for improvement strategies ("meta").
+   > **Suggested default**: `./world` and `./meta` (inside the project root, alongside `core/`, `mind_api/`, `agents/`) — simplest single-machine / single-repo layout. For multi-machine or multi-repo sharing, point at a shared remote (NAS, OneDrive / SharePoint / Dropbox / iCloud) instead.
+   > **`/start` never picks for you** — it suggests the default and waits for your explicit reply. Even in "auto mode", path selection is a non-skippable user-confirmation gate.
+   > Use forward slashes on every platform, including Windows (`C:/Users/you/OneDrive/my-mind-world`). If you paste a Windows backslash path from Explorer, `/start` normalizes it for you.
+2. **Permissions confirmation** — The agent shows you the exact `.claude/settings.local.json` rules it wants to add (read/write on your world + meta + project paths, plus the framework's constitutional safety baseline). One yes/no.
+3. **What is this program about?** — The domain or purpose (e.g., "master competitive Pokemon strategy", "learn quantum computing", "analyze our codebase architecture")
+4. **What should this agent focus on?** — The agent's role and specialization
+5. **What should it work on first?** — Its initial aspiration and curriculum
 
 That's it. The agent runs itself from here. It continues across sessions automatically — just reopen Claude Code and it picks up where it left off.
 
@@ -66,6 +72,11 @@ You don't need to do anything while it runs. But you can chat with it anytime �
 | `/open-questions` | See decisions the agent logged for your review. |
 | `/priority-review` | Review and reorder the agent's aspiration priorities. |
 | `/verify-learning` | Run a diagnostic check on the agent's state. |
+| `/encode-session` | After a productive chat in assistant mode, run a structured pass that captures insights into the knowledge tree, reasoning bank, and guardrails so the work doesn't evaporate when the window closes. |
+| `/tree <subcommand>` | Knowledge tree operations: `read`, `find`, `add`, `edit`, `stats`, `validate`, and more. Always route tree edits through this — never edit `_tree.yaml` directly. |
+| `/strategic-pulse` | Surface portfolio-shape patterns: tail consolidation pressure, work-class skew, aged or all-blocked aspirations. Auto-fires every 50 completed goals; invoke directly for an on-demand readout. |
+| `/felt-sense-checkin` | Force a deep 7-lane self-audit: memory hygiene, insight curation, unblocks, forward backlog, `/verify-learning` gaps, meta tuning. Auto-fires every 75 completed goals. |
+| `/fresh-eyes-review` | Periodic portfolio self-audit — assembles a briefing under `agents/<agent-name>/reports/`. Auto-fires every 25 completed goals; invoke directly when you want the agent to step back. |
 | `/seed transplant <dest>` | Copy this framework into another repo (applies generic-name transforms). |
 
 ### Three Modes

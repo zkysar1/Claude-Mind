@@ -63,20 +63,41 @@ BUDGET_PATH = AGENT_DIR / "session" / "context-budget.json" if AGENT_DIR else No
 def _resolve_budget_path_from_session(session_id):
     """Fallback agent resolution for status-line subprocesses without MIND_AGENT.
 
-    Reads PROJECT_ROOT/.active-agent-<session_id> (the binding file written by
-    /start), which contains the agent name on a single line. Returns the
-    corresponding <agent>/session/context-budget.json path, or None if the
-    binding file is missing/malformed or the agent's session dir does not exist.
+    Tries Phase 2.6 binding (agents/<name>/sessions/<SID>/binding.yaml) first,
+    then falls back to legacy PROJECT_ROOT/.active-agent-<session_id>. Returns
+    the corresponding <agent>/session/context-budget.json path, or None if no
+    binding can be resolved.
     """
     if not session_id:
         return None
-    binding = PROJECT_ROOT / f".active-agent-{session_id}"
-    if not binding.is_file():
+    if any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) or ".." in session_id:
         return None
-    try:
-        name = binding.read_text(encoding="utf-8").strip()
-    except Exception:
-        return None
+    name = ""
+    # Phase 2.6 (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+    # Without this, status-line subprocesses (which don't inherit MIND_AGENT)
+    # cannot resolve the agent → context-budget.json is never written →
+    # zone-aware batching in goal-selector silently degrades.
+    agents_parent = PROJECT_ROOT / "agents"
+    if agents_parent.is_dir():
+        try:
+            for child in agents_parent.iterdir():
+                if not child.is_dir():
+                    continue
+                binding_p26 = child / "sessions" / session_id / "binding.yaml"
+                if binding_p26.is_file():
+                    name = child.name
+                    break
+        except OSError:
+            pass
+    # Legacy fallback: pre-Phase-2.6 .active-agent-<SID>.
+    if not name:
+        binding = PROJECT_ROOT / f".active-agent-{session_id}"
+        if not binding.is_file():
+            return None
+        try:
+            name = binding.read_text(encoding="utf-8").strip()
+        except Exception:
+            return None
     if not name:
         return None
     candidate = _agent_dir(name) / "session" / "context-budget.json"
