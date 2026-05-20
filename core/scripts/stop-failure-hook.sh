@@ -18,7 +18,21 @@ STDIN_JSON=$(cat)
 # --- Resolve agent (same pattern as stop-hook.sh) ---
 HOOK_SID=$(printf '%s' "$STDIN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 HOOK_AGENT=""
-if [ -n "$HOOK_SID" ] && [ -f "$PROJECT_ROOT/.active-agent-$HOOK_SID" ]; then
+# Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+# Without this check, crash markers are never written for Phase 2.6 sessions
+# whose .active-agent-<SID> form was retired by /start --retire-legacy —
+# /boot would report a "clean shutdown" after a context-exhaustion crash.
+# Matches the stop-hook.sh fix (ff6e71c6).
+if [ -n "$HOOK_SID" ]; then
+    for _BF in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/sessions/"$HOOK_SID"/binding.yaml; do
+        [ -f "$_BF" ] || continue
+        _BD="${_BF%/sessions/*}"
+        HOOK_AGENT="${_BD##*/}"
+        break
+    done
+fi
+# Legacy fallback: pre-Phase-2.6 .active-agent-<SID> file at PROJECT_ROOT.
+if [ -z "$HOOK_AGENT" ] && [ -n "$HOOK_SID" ] && [ -f "$PROJECT_ROOT/.active-agent-$HOOK_SID" ]; then
     HOOK_AGENT=$(cat "$PROJECT_ROOT/.active-agent-$HOOK_SID" 2>/dev/null | tr -d '\r\n')
 fi
 

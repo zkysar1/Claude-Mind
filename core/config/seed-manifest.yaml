@@ -134,15 +134,27 @@ include:
 # =============================================================================
 # EXCLUDE_ALWAYS — never copied, regardless of include rules
 # =============================================================================
+# Pattern semantics (see _seed_engine.py::is_excluded_always docstring):
+#   `/foo/`  — ANCHORED to top-level only (gitignore-style). Use for dirs
+#              whose basename can legitimately appear nested as a code path.
+#   `foo/`   — basename matches ANYWHERE in tree (legacy). Use for cache /
+#              transient dirs that must vanish at every depth.
+#   `a/b/`   — path prefix `a/b/` (no anchoring needed; already path-specific).
+#
+# Why this matters: `mind_api/src/world/` and `mind_api/src/meta/` are real
+# Python packages that the daemon imports. A bare `world/` exclusion
+# over-matches those packages and breaks the daemon at the destination
+# (testy-incident 2026-05-20). Anchored `/world/` excludes the top-level
+# domain dir while leaving the nested Python package intact.
 exclude_always:
-  # Domain state (whole dirs)
-  - "agents/"
-  - "world/"
-  - "meta/"
+  # Domain state (whole dirs — anchored: top-level only)
+  - "/agents/"
+  - "/world/"
+  - "/meta/"
 
   # Per-deployment / runtime
-  - ".git/"
-  - ".history/"
+  - "/.git/"        # anchored — destination owns its own .git/
+  - "/.history/"    # anchored — destination's own version history
   - "mind_api/state/"
   - "mind_api/bench/"  # excluded from initial seed (Q27)
   - "mind_api/docs/development-history/"
@@ -151,9 +163,12 @@ exclude_always:
   - ".env.local"
   - ".claude/settings.local.json"
 
-  # Internal planning docs
-  - "PACKAGING-PLAN.md"
-  - "publication-cleanup-plan.md"
+  # (Internal planning docs removed 2026-05-20 — content encoded into
+  # the knowledge tree at world/knowledge/tree/system/publication-pipeline.md
+  # plus RB entries rb-1108/rb-1109/rb-1110. The files PACKAGING-PLAN.md and
+  # publication-cleanup-plan.md no longer exist at source. If a future plan
+  # document is needed, prefer encoding it directly into the tree rather
+  # than adding a new exclude_always entry here.)
 
   # Session/runtime artifacts
   - ".active-agent-*"

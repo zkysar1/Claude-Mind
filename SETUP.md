@@ -40,22 +40,47 @@ bash core/scripts/check-prerequisites.sh
 You'll be asked for two paths during agent setup. Pick them now so you have
 them ready:
 
-- **A "world" directory** — where shared knowledge lives. This can be:
-  - A folder on a shared drive or NAS (multiple machines can point to it)
-  - A OneDrive / SharePoint / Dropbox folder (synced across your machines)
-  - A local directory if you'll only use one machine
-
-  Example: `C:/Users/you/OneDrive/my-mind-world` or `/Users/you/Documents/my-mind-world`
-
+- **A "world" directory** — where shared knowledge lives.
 - **A "meta" directory** — where the agent's improvement strategies live.
-  Same options. Usually next to the world directory for convenience.
 
-  Example: `C:/Users/you/OneDrive/my-mind-meta`
+### The simple default (single machine, single repo)
+
+Use **`./world`** and **`./meta`** — these expand to `<project_root>/world`
+and `<project_root>/meta`, sitting alongside `core/`, `mind_api/`, and
+`agents/`. Everything lives in one place; nothing external to manage.
+
+When `/start` asks "where should the world directory be?", just reply
+`./world` (or "default", or "you pick" — it'll take the suggestion).
+
+### When to use external paths instead
+
+Pick an external path **only if** you want this world to be reachable from
+multiple repos or multiple machines:
+
+- A folder on a shared drive or NAS — multiple machines can point to it
+- A OneDrive / SharePoint / Dropbox / iCloud folder — synced across your machines
+- Any local directory outside the project root
+
+Examples:
+- `C:/Users/you/OneDrive/my-mind-world` (Windows, OneDrive — sharable)
+- `/Users/you/Documents/my-mind-world`  (macOS — local outside repo)
+
+The trade-off: external paths add a coordination layer (the agent has to
+have read/write access to that location across machines), but they enable
+multi-agent / multi-machine collaboration. If you're not sure, start with
+`./world` — you can migrate later.
 
 > **Use forward slashes on every platform**, including Windows. Bash sources
 > the path file at runtime, and backslashes get interpreted as escape sequences.
 > If you copy a path from Explorer's address bar (`C:\Users\...`), convert
 > the `\` to `/` before pasting — or just paste it; `/start` will normalize.
+
+> **`/start` will NOT pick a path for you.** Even in "auto mode", path
+> selection is a non-skippable user-confirmation gate (`BOOTSTRAP PATHS
+> GATE`, mirrors the bootstrap-identity gate). The agent suggests the
+> default and waits for your explicit reply — it never invents one
+> silently. If you want the default, say so; if you want a different
+> path, say so. The wait is intentional.
 
 Both directories will be created on first `/start` if they don't exist yet.
 

@@ -52,9 +52,16 @@ SESSION_HEADER_PREFIX = "#session:"
 TRACKED_PREFIXES = [
     str(CONFIG_DIR),
     str(PROJECT_ROOT / ".claude" / "skills"),
-    str(WORLD_DIR / "knowledge" / "tree"),
-    str(WORLD_DIR / "conventions"),
 ]
+# WORLD_DIR is None on UNINITIALIZED first-run (no local-paths.conf yet).
+# Guard so /start can run load-conventions / context-reads without crashing
+# before Phase B writes the conf. Mirrors the SESSION_DIR / AGENT_DIR pattern
+# above and the AGENT_DIR pattern in TRACKED_FILES below.
+if WORLD_DIR:
+    TRACKED_PREFIXES.extend([
+        str(WORLD_DIR / "knowledge" / "tree"),
+        str(WORLD_DIR / "conventions"),
+    ])
 
 # Individual files tracked outside any tracked prefix
 TRACKED_FILES = [

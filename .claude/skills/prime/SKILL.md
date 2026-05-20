@@ -45,13 +45,26 @@ give the agent full domain awareness.
 ## Phase 0.5: Agent Mode Detection
 
 ```
-Bash: session-state-get.sh
+# Capture the state check's output FIRST so the IF clause below
+# unambiguously refers to it (G3, 2026-05-20). The validate-paths.sh
+# call between this and the IF emits multi-line "L3 PATH VALIDATOR"
+# text — without naming the variable, a future editor could misread
+# the IF as checking validate-paths' output.
+Bash: state=$(bash core/scripts/session-state-get.sh); echo "state=$state"
+# The trailing echo (H1, 2026-05-20) makes the captured value visible to the
+# LLM in the Bash tool's stdout. Without it, the assignment writes to a bash
+# subshell variable that dies when bash exits — zero stdout — and the IF
+# clause below has no value to compare. Sibling skills use bare `var=$(cmd)`
+# as pseudocode convention; /prime's NO_AGENT branch is critical enough to
+# warrant explicit echo.
+
 # L3 PATH DEFENSE (g-115-35) — verify local-paths.conf points at paths that
 # exist and are writable BEFORE any tree/meta read or write. Fail-open:
 # prints WARN on mismatch but never blocks loop entry. Enforcement belongs
 # to L1 (write-time hook) and L2 (permission gate).
 Bash: validate-paths.sh
-IF output is "NO_AGENT":
+
+IF state == "NO_AGENT":
   → World-only priming mode. Skip all agent-specific steps.
   → Bash: world-cat.sh program.md  # The Program — shared purpose
   → Bash: world-cat.sh knowledge/tree/_tree.yaml  # collective knowledge overview
@@ -71,7 +84,9 @@ IF output is "NO_AGENT":
 ## Phase 1: Detect Context & Build Category List
 
 ```
-1. Bash: `session-state-get.sh` → determine IDLE vs RUNNING vs UNINITIALIZED
+1. Reuse the `state` variable captured in Phase 0.5 (G3, 2026-05-20 —
+   was a duplicate `session-state-get.sh` call; the value cannot change
+   between Phase 0.5 and here, so re-reading was wasted work):
    - UNINITIALIZED: output "Nothing to prime — run /start first." → STOP
    - IDLE or RUNNING: PROCEED
 

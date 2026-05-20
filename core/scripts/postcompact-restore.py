@@ -129,6 +129,7 @@ def _format_iteration_ckpt_block(iter_ckpt):
     aspiration_id = iter_ckpt.get("aspiration_id", "?")
     score = iter_ckpt.get("selector_score", "?")
     skill = iter_ckpt.get("skill", "")
+    cross_owner = iter_ckpt.get("cross_agent_owner", "") or ""
     out = [
         "═══ IN-FLIGHT GOAL (autocompact boundary) ═══",
         f"goal_id:       {goal_id}",
@@ -139,6 +140,8 @@ def _format_iteration_ckpt_block(iter_ckpt):
     ]
     if skill:
         out.append(f"skill:         {skill}")
+    if cross_owner:
+        out.append(f"cross_agent_owner: {cross_owner}")
     out.extend([
         "",
         f"CRITICAL: Your in-flight goal is {goal_id} at phase '{phase}'.",
@@ -146,6 +149,15 @@ def _format_iteration_ckpt_block(iter_ckpt):
         "pick a different one. Do NOT substitute a different goal based on",
         "narrative context from the compact summary. If this checkpoint",
         "looks wrong, /aspirations precheck + select will surface the mismatch.",
+    ])
+    if cross_owner:
+        out.append(
+            f"CROSS-AGENT: Goal pulled from sibling '{cross_owner}'. Phase 4 must "
+            f"prefix MIND_AGENT={cross_owner} on owner-state writes "
+            f"(aspirations-update-goal/release/complete-by, iteration-close, "
+            f"recurring-close). See aspirations-execute Phase 4 Setup."
+        )
+    out.extend([
         "═══════════════════════════════════════════════",
         "",
     ])

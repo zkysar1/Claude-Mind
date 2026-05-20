@@ -65,7 +65,7 @@ recovery fires automatically.
    `recovery_action: clear` in `core/config/session-manifest.yaml`. This is
    the SAME script that `/start --recover` Phase 0.7 calls — the file list
    and clearing semantics are SSOT in `session-manifest.yaml`.
-3. Writes `<agent>/session/recovery-notice` with the cause (which
+3. Writes `agents/<agent>/session/recovery-notice` with the cause (which
    conditions triggered) so the next user message surfaces a diagnostic.
 
 The script-gated nature means the LLM CANNOT call `session-state-set.sh`

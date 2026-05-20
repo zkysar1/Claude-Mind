@@ -28,11 +28,20 @@ CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 # goal-selector.py requires MIND_AGENT to load (paths derive AGENT_DIR).
-# Set it before import; tests don't actually depend on which agent is bound.
+# Capture-restore around the module-level mutation so collection-time env
+# pollution cannot leak to other tests (Layer 1 test-pollution defense —
+# rb-1096, guard-588, tree node test-pollution-defense). Tests don't
+# actually depend on which agent is bound.
+_SAVED_AGENT = os.environ.get("MIND_AGENT")
 os.environ.setdefault("MIND_AGENT", "bravo")
 
 gs = importlib.import_module("goal-selector")
 compute_role_affinity = gs.compute_role_affinity
+
+if _SAVED_AGENT is None:
+    os.environ.pop("MIND_AGENT", None)
+else:
+    os.environ["MIND_AGENT"] = _SAVED_AGENT
 
 # Canonical multiplier table mirrors meta/goal-selection-strategy.yaml
 # initial values (Day 1 of Magic Wand 4 rollout).

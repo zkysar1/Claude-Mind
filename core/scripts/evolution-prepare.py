@@ -160,11 +160,15 @@ def classify_path(abs_path, project_root, world_dir):
                 if _is_tracked_core_path(parts):
                     return ("script_edit", "/".join(parts))
                 return (None, None)
-            # Agent self.md: <agent>/self.md (top-level dir + self.md file)
-            if len(parts) == 2 and parts[1] == "self.md":
-                # Agent directory has a local-paths.conf
-                if (pr / parts[0] / "local-paths.conf").exists():
-                    return ("agent_self", parts[0])
+            # Agent self.md: agents/<agent>/self.md (Phase 2.5.D: under agents/ parent).
+            # Was previously: <agent>/self.md (len(parts)==2) — silently dead since 2.5.D.
+            if (
+                len(parts) == 3
+                and parts[0] == "agents"
+                and parts[2] == "self.md"
+            ):
+                if (pr / "agents" / parts[1] / "local-paths.conf").exists():
+                    return ("agent_self", parts[1])
     except (ValueError, OSError):
         pass
 
@@ -243,6 +247,24 @@ def resolve_agent(project_root, session_id, env_agent):
     # Defense: no path traversal via SID
     if any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) or ".." in session_id:
         return None
+    # Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+    # Without this, Write/Edit/MultiEdit PreToolUse hooks (which don't get
+    # MIND_AGENT env-injected by bash-agent-inject) fail to resolve agent
+    # → no sidecar → evolution pipeline silently dead for new sessions.
+    agents_parent = Path(project_root) / "agents"
+    if agents_parent.is_dir():
+        try:
+            for child in agents_parent.iterdir():
+                if not child.is_dir():
+                    continue
+                binding_p26 = child / "sessions" / session_id / "binding.yaml"
+                if binding_p26.is_file():
+                    name = child.name
+                    if re.match(r"^[a-z][a-z0-9-]*$", name):
+                        return name
+        except OSError:
+            pass
+    # Legacy fallback: pre-Phase-2.6 .active-agent-<SID>.
     binding = Path(project_root) / f".active-agent-{session_id}"
     if not binding.exists():
         return None
@@ -302,7 +324,9 @@ def main():
         approve_no_mutation()  # No agent binding → no sidecar location
 
     world_dir = None
-    conf = Path(project_root) / agent / "local-paths.conf"
+    # Phase 2.5.D: agent dirs under agents/ parent. Was previously
+    # Path(project_root) / agent / "local-paths.conf" — missed the migration.
+    conf = Path(project_root) / "agents" / agent / "local-paths.conf"
     if conf.exists():
         try:
             for line in conf.read_text(encoding="utf-8").splitlines():
@@ -396,7 +420,10 @@ def main():
         # snapshot path (single source of truth).
     # program: no extra key needed
 
-    sidecar_dir = Path(project_root) / agent / "session"
+    # Phase 2.5.D: agent dirs under agents/ parent. Was previously
+    # Path(project_root) / agent / "session" — created orphan cruft dirs
+    # at PROJECT_ROOT/<agent>/session/ because mkdir(parents=True) succeeds.
+    sidecar_dir = Path(project_root) / "agents" / agent / "session"
     sidecar_name = f"pending-evolution-{path_key(abs_path)}.json"
     sidecar_path = sidecar_dir / sidecar_name
 

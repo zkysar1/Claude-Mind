@@ -66,17 +66,35 @@ def main() -> int:
     if WORLD_DIR is None or PROJECT_ROOT is None:
         return 0
 
-    # Step 3: Resolve agent from session binding (.active-agent-<sid>)
+    # Step 3: Resolve agent from session binding.
+    # Tries Phase 2.6 (agents/<name>/sessions/<SID>/binding.yaml) first,
+    # then legacy (.active-agent-<SID>). Without Phase 2.6, presence
+    # logging silently degrades for non-Bash hook tool calls
+    # (Write/Edit/MultiEdit don't get MIND_AGENT env-injected).
     agent = ""
-    if session_id:
-        binding = Path(PROJECT_ROOT) / f".active-agent-{session_id}"
-        if binding.exists():
+    if session_id and not any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) and ".." not in session_id:
+        agents_parent = Path(PROJECT_ROOT) / "agents"
+        if agents_parent.is_dir():
             try:
-                agent = binding.read_text(encoding="utf-8").strip()
-            except Exception:
+                for child in agents_parent.iterdir():
+                    if not child.is_dir():
+                        continue
+                    binding_p26 = child / "sessions" / session_id / "binding.yaml"
+                    if binding_p26.is_file():
+                        agent = child.name
+                        break
+            except OSError:
                 pass
+        if not agent:
+            binding = Path(PROJECT_ROOT) / f".active-agent-{session_id}"
+            if binding.exists():
+                try:
+                    agent = binding.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
     if not agent:
-        # Fallback: MIND_AGENT env var
+        # Final fallback: MIND_AGENT env var (available for PreToolUse[Bash]
+        # but NOT for Write/Edit/MultiEdit hooks).
         agent = os.environ.get("MIND_AGENT", "").strip()
     if not agent:
         return 0

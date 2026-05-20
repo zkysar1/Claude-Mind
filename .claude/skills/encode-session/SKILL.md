@@ -28,6 +28,38 @@ and same protocol blocks as `/aspirations-spark` Phase 6.5, just adapted for
 conversation input rather than goal-record input. The two skills must evolve
 together — when one's encoding logic changes, the other should mirror it.
 
+## JSON Construction Policy (MANDATORY)
+
+Every encoding sub-lane below invokes an `*-add.sh` script that accepts JSON
+on stdin. Build payloads **inline** — do NOT materialize them to disk first:
+
+```
+printf '%s' '{"title":"...","type":"success",...}' \
+  | bash core/scripts/reasoning-bank-add.sh
+```
+
+This applies uniformly to `reasoning-bank-add.sh`, `guardrails-add.sh`,
+`aspirations-add-goal.sh`, `experience-add.sh`, and every other encoding
+entry point.
+
+**If a payload is too complex to inline** (rare — encoding records are
+almost always < 2 KB), the only sanctioned scratch home is
+`agents/<name>/sessions/<SID>/scratch/` (Phase 2.6 — see
+`.claude/rules/path-resolution.md` "L1 Cruft Prevention"). Two prohibitions:
+
+- **NEVER `PROJECT_ROOT/.scratch-encode-session/`** or any other
+  invented top-level dir at the repo root. The L1 hook only governs
+  Write/Edit, so a `mkdir` + heredoc via Bash bypasses it silently —
+  the prohibition lives at the SKILL.md layer to close that gap.
+- **Always delete scratch at end-of-skill** in the same turn that
+  applies the encodings. Orphan staging files are cruft even when the
+  encodings landed successfully.
+
+The 2026-05-20 incident that motivated this policy: alpha session
+materialized 8 JSON payloads under `PROJECT_ROOT/.scratch-encode-session/`,
+applied all 8 successfully, then exited without cleanup. All payloads
+were correct; the only failure was the scratch-location choice.
+
 ## Sub-commands
 
 ```

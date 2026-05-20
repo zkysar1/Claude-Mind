@@ -81,7 +81,28 @@ if [ -z "$HOOK_SID" ]; then
 fi
 
 HOOK_AGENT=""
-if [ -f "$PROJECT_ROOT/.active-agent-$HOOK_SID" ]; then
+
+# Phase 2.6 binding (preferred): agents/<name>/sessions/<SID>/binding.yaml.
+# Added 2026-05-20 — previously this script only checked the legacy
+# .active-agent-<SID> file at PROJECT_ROOT, which /start no longer writes
+# after Phase 2.6. Every autonomous session post-Phase-2.6 was therefore
+# unresolvable at stop-hook time → ALLOW gate=no-agent → loop dies on
+# first turn-end (observed 2026-05-20, alpha/bravo/charlie/delta/zeta
+# all stopping mid-iteration). The Phase 2.6 dir name IS the SID, so the
+# agent name is just the parent path segment — pure-bash glob, no file
+# read needed.
+for _BF in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/sessions/"$HOOK_SID"/binding.yaml; do
+    [ -f "$_BF" ] || continue
+    # Extract <name> from .../agents/<name>/sessions/<SID>/binding.yaml
+    _BD="${_BF%/sessions/*}"
+    HOOK_AGENT="${_BD##*/}"
+    break
+done
+
+# Legacy fallback: .active-agent-<SID> at PROJECT_ROOT (pre-Phase-2.6).
+# Still relevant during the migration window — sessions started before
+# Phase 2.6 cutover have this file, not the Phase 2.6 binding.yaml.
+if [ -z "$HOOK_AGENT" ] && [ -f "$PROJECT_ROOT/.active-agent-$HOOK_SID" ]; then
     HOOK_AGENT=$(cat "$PROJECT_ROOT/.active-agent-$HOOK_SID" 2>/dev/null | tr -d '\r\n')
 fi
 
@@ -94,24 +115,53 @@ fi
 # exit 0 with gate=no-agent — identical to the canonical resolver's
 # contract in _resolve_agent_from_sid.py and idle-tick.sh:40.
 
-# Fallback: reverse-lookup — the agent name is in the path
+# Reverse-lookup fallback + RESOLUTION_GAP defense in ONE pass.
+# Single scan of agents/*/session/running-session-id files: (a) try to
+# match THIS SID to identify the agent, (b) build _LIVE_SIDS list of
+# OTHER running agents for the defense-layer diagnostic if (a) fails.
+# Glob path uses $AGENTS_PARENT_DIR (exported by sourced _paths.sh) so
+# a future rename of the agents-parent dir updates this glob via the
+# single sync constant — same failure mode the 2026-05-20 incident
+# demonstrated for hardcoded paths.
 if [ -z "$HOOK_AGENT" ]; then
-    for _RSF in "$PROJECT_ROOT"/*/session/running-session-id; do
+    _LIVE_SIDS=""
+    for _RSF in "$PROJECT_ROOT/${AGENTS_PARENT_DIR}"/*/session/running-session-id; do
         [ -f "$_RSF" ] || continue
         _RSID=$(cat "$_RSF" 2>/dev/null | tr -d '\r\n')
+        [ -n "$_RSID" ] || continue
+        _RAGENT=$(basename "$(dirname "$(dirname "$_RSF")")")
         if [ "$_RSID" = "$HOOK_SID" ]; then
-            HOOK_AGENT=$(basename "$(dirname "$(dirname "$_RSF")")")
-            # Self-heal: recreate the binding so next time is O(1)
+            HOOK_AGENT="$_RAGENT"
+            # Self-heal: recreate the legacy binding so next time is O(1)
+            # (Phase 2.6 binding.yaml is the canonical write path; the
+            # legacy file is kept here only as a cheap second-tier cache.)
             echo "$HOOK_AGENT" > "$PROJECT_ROOT/.active-agent-$HOOK_SID"
-            break
+            # Don't break — finish building _LIVE_SIDS for parity with
+            # the defense diagnostic. Cost is bounded by agent count.
+            # (Defense path doesn't fire when HOOK_AGENT is set, but
+            # keeping the full scan symmetric means future readers don't
+            # wonder why _LIVE_SIDS is partial on match.)
         fi
+        _LIVE_SIDS="$_LIVE_SIDS $_RAGENT:$_RSID"
     done
-fi
 
-# No agent resolved — nothing to block for
-if [ -z "$HOOK_AGENT" ]; then
-    echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-agent sid=$HOOK_SID" >> "$LOG" 2>/dev/null || true
-    exit 0
+    # No agent resolved through any tier — nothing to BLOCK for.
+    # DEFENSE LAYER (added 2026-05-20 after Phase 2.5.D + 2.6 silent-loss
+    # incident): if _LIVE_SIDS is non-empty, OTHER agents are running but
+    # THIS SID couldn't be resolved — likely indicator the resolver tiers
+    # are broken for a new layout. Log loudly so the next investigator
+    # has the evidence within one hook fire instead of waiting for 100%
+    # of agents to silently stop.
+    if [ -z "$HOOK_AGENT" ]; then
+        if [ -n "$_LIVE_SIDS" ]; then
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-agent-RESOLUTION_GAP sid=$HOOK_SID live_sids=$_LIVE_SIDS" >> "$LOG" 2>/dev/null || true
+        else
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-agent sid=$HOOK_SID" >> "$LOG" 2>/dev/null || true
+        fi
+        unset _LIVE_SIDS _RSF _RSID _RAGENT
+        exit 0
+    fi
+    unset _LIVE_SIDS _RSF _RSID _RAGENT
 fi
 
 HOOK_AGENT_DIR="$(agent_dir "$HOOK_AGENT")"

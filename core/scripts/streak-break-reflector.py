@@ -69,6 +69,94 @@ DEFAULT_CATEGORY = "framework-maintenance"
 DEDUP_HOURS = 48
 
 
+def _load_session_gap_threshold() -> float:
+    """Load recurring.session_gap_threshold_hours from aspirations.yaml.
+
+    Used by `_auto_resolve_recovered_canaries()` to decide whether a
+    too-late recovery (outside the streak_mult window) is actually
+    session-inactivity (agent wasn't running) rather than real cadence
+    drift. The execution-diary is probed for activity gaps >= this
+    threshold during the canary-filing-to-recovery span; a gap big
+    enough to span the threshold flips the verdict from "leave open" to
+    "auto-resolve with session-gap note".
+
+    Fail-open: any read/parse error falls back to 2.0 hours (matches
+    default in aspirations.yaml). Bounded by
+    `modifiable.recurring.session_gap_threshold_hours: {min: 0.5,
+    max: 999.0, default: 2.0}`. Set very high to disable.
+    """
+    cfg_path = PROJECT_ROOT / "core" / "config" / "aspirations.yaml"
+    try:
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        v = (cfg.get("recurring") or {}).get("session_gap_threshold_hours")
+        if v is None:
+            return 2.0
+        return float(v)
+    except Exception:
+        return 2.0
+
+
+def _has_session_gap(start_dt: datetime, end_dt: datetime,
+                     agent_dir: Path, gap_threshold_h: float) -> bool:
+    """True iff execution-diary shows a gap >= gap_threshold_h in [start_dt, end_dt].
+
+    Reads agent_dir/session/execution-diary.jsonl and inspects the
+    timestamps that fall inside the window. Returns True when:
+      - no diary entries at all in the window (entire span was inactive), OR
+      - the gap between start_dt and the first in-window entry >= threshold, OR
+      - the gap between the last in-window entry and end_dt >= threshold, OR
+      - any consecutive pair of in-window entries is >= threshold apart.
+
+    Fail-open: missing diary, unreadable file, or zero parsable entries
+    all return False — the caller then keeps the existing "leave open"
+    semantics for the canary. This matches the broader fail-open posture
+    of the reflector (a broken probe must never silently auto-resolve
+    real drift).
+
+    Closes the bravo 2026-05-20 catch-up cluster: 6 streak-break canaries
+    from a 30h session gap stayed open under the streak_mult window
+    because the recovery was always > 2 * interval. With this helper, the
+    diary's 30h gap correctly classifies the misses as session-inactivity
+    and the canaries auto-resolve on the next routine close.
+    """
+    diary = agent_dir / "session" / "execution-diary.jsonl"
+    try:
+        if not diary.exists():
+            return False
+        text = diary.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    timestamps: list[datetime] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts = datetime.fromisoformat(str(rec.get("timestamp", "")))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if start_dt <= ts <= end_dt:
+            timestamps.append(ts)
+    span_hours = (end_dt - start_dt).total_seconds() / 3600.0
+    if not timestamps:
+        # No activity in the window at all. Only counts as a gap if the
+        # window itself is >= threshold (otherwise even a fresh canary
+        # filed seconds before recovery would trip this).
+        return span_hours >= gap_threshold_h
+    timestamps.sort()
+    if (timestamps[0] - start_dt).total_seconds() / 3600.0 >= gap_threshold_h:
+        return True
+    if (end_dt - timestamps[-1]).total_seconds() / 3600.0 >= gap_threshold_h:
+        return True
+    for i in range(1, len(timestamps)):
+        if (timestamps[i] - timestamps[i - 1]).total_seconds() / 3600.0 >= gap_threshold_h:
+            return True
+    return False
+
+
 def _load_streak_mult() -> float:
     """Load recurring.streak_mult from core/config/aspirations.yaml.
 
@@ -247,8 +335,21 @@ def _file_investigate(entry: dict, asp_id: str, dry_run: bool) -> tuple[bool, st
 
 def _auto_resolve_recovered_canaries(dry_run: bool) -> tuple[int, list[str]]:
     """Auto-close open `investigate:streak-break:*` canaries whose source
-    recurring goal has fired AFTER the canary was filed and within
-    streak_mult × interval_hours of that filing.
+    recurring goal has fired AFTER the canary was filed.
+
+    Two recovery paths resolve the canary:
+      1. **Cadence path** (original): recovery happened within
+         `streak_mult * interval_hours` of the canary filing — the streak
+         break was transient, real cadence resumed.
+      2. **Session-gap path** (added 2026-05-20): recovery happened LATER
+         than `streak_mult * interval_hours` (would normally be classified
+         as real drift), BUT the agent's `execution-diary.jsonl` shows a
+         gap >= `recurring.session_gap_threshold_hours` between canary
+         filing and recovery — the cadence miss was structural (agent
+         wasn't running), not a bug. The bravo 2026-05-20 catch-up cluster
+         (6 Investigates from one 30h session gap) is the canonical
+         incident this path closes. Set `session_gap_threshold_hours: 999`
+         in aspirations.yaml to disable this path.
 
     Returns (resolved_count, resolved_goal_ids). Fail-open on every parse
     error; a malformed record never blocks the sweep.
@@ -256,6 +357,7 @@ def _auto_resolve_recovered_canaries(dry_run: bool) -> tuple[int, list[str]]:
     Forward-looking design — see module docstring "Auto-resolve sweep".
     """
     streak_mult = _load_streak_mult()
+    session_gap_threshold_h = _load_session_gap_threshold()
     canary_re = re.compile(r"^investigate:streak-break:(g-\d+-\d+)$")
     candidates: list[tuple[Path, str]] = []
     if WORLD_DIR is not None:
@@ -346,11 +448,26 @@ def _auto_resolve_recovered_canaries(dry_run: bool) -> tuple[int, list[str]]:
                     continue
                 delta_h = (last_achieved - canary_filed).total_seconds() / 3600.0
                 if delta_h > streak_mult * interval_h:
-                    # Recovered too late — real drift, leave open.
-                    continue
-                note = (f"transient session gap - cadence recovered "
-                        f"{delta_h:.1f}h after canary filing "
-                        f"(within {streak_mult}x interval={interval_h}h)")
+                    # Recovered too late by cadence standard. Check the
+                    # session-gap escape hatch: if the agent's
+                    # execution-diary shows >= session_gap_threshold_h of
+                    # inactivity between canary filing and recovery, this
+                    # was session-inactivity (agent wasn't running), not
+                    # real drift. (Bravo 2026-05-20 catch-up cluster.)
+                    if AGENT_DIR is None or not _has_session_gap(
+                            canary_filed, last_achieved, AGENT_DIR,
+                            session_gap_threshold_h):
+                        continue  # real drift, leave open
+                    note = (f"session-inactivity gap ({delta_h:.1f}h) - agent "
+                            f"was not running continuously between canary "
+                            f"and recovery; cadence resumed on session "
+                            f"restart (threshold "
+                            f"{session_gap_threshold_h}h, interval "
+                            f"{interval_h}h)")
+                else:
+                    note = (f"transient session gap - cadence recovered "
+                            f"{delta_h:.1f}h after canary filing "
+                            f"(within {streak_mult}x interval={interval_h}h)")
                 gid = g["id"]
                 if dry_run:
                     print(f"[streak-break-reflector] [dry-run] would "
