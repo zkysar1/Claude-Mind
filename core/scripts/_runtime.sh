@@ -36,10 +36,19 @@ RT_PORT_FILE="${RT_PORT_FILE:-$RT_DIR/daemon.port}"
 RT_SPAWN_LOG="${RT_SPAWN_LOG:-$RT_DIR/spawn.log}"
 
 # Tunables. Override per-invocation by exporting before sourcing.
-# RT_CURL_TIMEOUT must cover cold-cache loads — the tree endpoint's first
-# request after a daemon (re)start pays the OneDrive cost of reading every
-# referenced .md file (~5s on this machine). Subsequent calls are <250ms.
-RT_CURL_TIMEOUT="${RT_CURL_TIMEOUT:-15}"     # seconds per request
+# RT_CURL_TIMEOUT must cover two distinct worst-case wait sources:
+#   1. Cold-cache loads — the tree endpoint's first request after a daemon
+#      (re)start pays the OneDrive cost of reading every referenced .md
+#      file (~5s on this machine). Subsequent calls are <250ms.
+#   2. _atomic_write retry storms — OneDrive holds an exclusive lock on
+#      world/*.jsonl while syncing, causing os.replace to fail with WinError 5.
+#      _fileops._atomic_write retries 10× with exponential backoff capped at
+#      5s/retry; the worst-case sum is ~22s before the in-place-rewrite
+#      fallback fires. Raised from 15→45 after the 2026-05-20 false-down
+#      incident where slow-due-to-write-contention was misread as
+#      "daemon unreachable." See rt_no_daemon_error below for the paired
+#      verify-before-report fix.
+RT_CURL_TIMEOUT="${RT_CURL_TIMEOUT:-45}"     # seconds per request
 RT_SPAWN_WAIT_MS="${RT_SPAWN_WAIT_MS:-5000}" # max wait for spawned daemon
 RT_SPAWN_POLL_MS="${RT_SPAWN_POLL_MS:-50}"   # poll interval while waiting
 
@@ -630,8 +639,37 @@ rt_call() {
 # DAEMON-ONLY (2026-05-14 cutover): print a loud error when the daemon is
 # unreachable and the auto-spawn attempt also failed. Replaces _fallback_exec.
 # See .claude/rules/no-python-cli-fallback.md.
+#
+# Verify-before-report (2026-05-20): rt_curl returns rc=3 on EITHER a true
+# connection failure OR a request that exceeded RT_CURL_TIMEOUT. The wrapper's
+# rt_try_autospawn then fails because the daemon's port is still bound (so a
+# new spawn cannot bind). Without verification, BOTH paths surface the same
+# "daemon is unreachable" message — even though in the timeout case the
+# daemon is healthy and the original request was just slow (OneDrive
+# write-lock contention is the canonical cause). This probe fixes the
+# diagnostic: a fast /v1/admin/health hit distinguishes "truly down" from
+# "slow but alive." Both paths still exit 1; only the message changes.
 rt_no_daemon_error() {
     local cmd="${1:-<wrapper>}"
+
+    # Fast health probe (1s max) before declaring unreachable. rt_is_up uses
+    # the same --max-time 1 budget as elsewhere in this file.
+    if rt_is_up; then
+        local port
+        port="$(rt_port)"
+        echo "ERROR: daemon is REACHABLE but the request did not complete within RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s." >&2
+        echo "  Wrapper: $cmd" >&2
+        echo "  Daemon health: OK (port ${port:-?})" >&2
+        echo "  Likely cause: write contention (OneDrive sync lock on world/*.jsonl) or large/cold request." >&2
+        echo "  The daemon's _atomic_write retries up to 10× with exponential backoff; worst case ~22s." >&2
+        echo "  Recovery options:" >&2
+        echo "    1. Retry — write contention is usually transient (<30s)." >&2
+        echo "    2. Raise RT_CURL_TIMEOUT (current: ${RT_CURL_TIMEOUT}s) for this call if recurrent." >&2
+        echo "    3. Inspect mind_api/state/spawn.log for _atomic_write retry storms." >&2
+        echo "    4. Inspect meta/file-contention-telemetry.jsonl for the contention history." >&2
+        exit 1
+    fi
+
     echo "ERROR: daemon is unreachable and could not be auto-spawned." >&2
     echo "  Wrapper: $cmd" >&2
     echo "  Probe: GET ${MIND_RUNTIME_URL:-http://127.0.0.1:?}/v1/admin/health  failed" >&2

@@ -84,6 +84,13 @@ def _load_session_gap_threshold() -> float:
     default in aspirations.yaml). Bounded by
     `modifiable.recurring.session_gap_threshold_hours: {min: 0.5,
     max: 999.0, default: 2.0}`. Set very high to disable.
+
+    Overlay caveat (rb-335 pattern-match, intentional): reads raw
+    aspirations.yaml; does NOT merge `meta/config-overrides.yaml`.
+    Matches the sibling `_load_streak_mult` behavior. Overlay-aware
+    reads for `recurring.*` knobs would need to touch both readers
+    plus mind_api/src/endpoints/aspirations_write.py
+    _load_streak_mult_config — a separate cross-cutting change.
     """
     cfg_path = PROJECT_ROOT / "core" / "config" / "aspirations.yaml"
     try:
@@ -109,11 +116,12 @@ def _has_session_gap(start_dt: datetime, end_dt: datetime,
       - the gap between the last in-window entry and end_dt >= threshold, OR
       - any consecutive pair of in-window entries is >= threshold apart.
 
-    Fail-open: missing diary, unreadable file, or zero parsable entries
-    all return False — the caller then keeps the existing "leave open"
-    semantics for the canary. This matches the broader fail-open posture
-    of the reflector (a broken probe must never silently auto-resolve
-    real drift).
+    Fail-open on infrastructure errors: a missing diary or unreadable
+    file returns False so the caller keeps the existing "leave open"
+    semantics for the canary. A broken probe must never silently
+    auto-resolve real drift. Note that zero PARSABLE entries inside a
+    long window still returns True via the "no entries" rule above —
+    that's an inactivity signal, not an infrastructure error.
 
     Closes the bravo 2026-05-20 catch-up cluster: 6 streak-break canaries
     from a 30h session gap stayed open under the streak_mult window

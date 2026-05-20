@@ -139,7 +139,7 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # 2026-05-19 (plan v1 step 0.13-0.14): both writers relocated from PROJECT_ROOT/
    # to core/logs/ (already-gitignored telemetry sink hosting watchdog logs).
    # Check confirms the writers point at the canonical sink, not the legacy root paths.
-   Bash (writer-sink): grep -q 'core" / "logs" / "bash-inject-sentinels"' core/scripts/bash-agent-inject.py && grep -q 'logs_dir / "bash-inject-misses.jsonl"' core/scripts/bash-agent-inject.py && echo "PASS: writers point at core/logs/" || echo "FAIL: writers still target PROJECT_ROOT — relocation regressed"
+   Bash (writer-sink): grep -q '"core" / "logs"' core/scripts/bash-agent-inject.py && grep -q 'logs_dir / "bash-inject-sentinels"' core/scripts/bash-agent-inject.py && grep -q 'logs_dir / "bash-inject-misses.jsonl"' core/scripts/bash-agent-inject.py && echo "PASS: writers point at core/logs/" || echo "FAIL: writers still target PROJECT_ROOT — relocation regressed"
    Bash (helper-invoked): grep -qE '_log_binding_miss_once\(sid' core/scripts/bash-agent-inject.py && echo "PASS: helper invoked from main()" || echo "FAIL: helper defined but not called"
 
    # Bash-inject miss-rate surfacing (g-115-897, paired Apply of g-115-795)
@@ -301,18 +301,18 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (precompact-poison-write): grep -q "autocompact-serialize-poison" core/scripts/precompact-serialize.sh && echo "PASS: precompact-serialize.sh writes poison marker on timeout" || echo "FAIL: precompact-serialize.sh missing poison marker (Tier 4a)"
    Bash (save-id-poison-gate): grep -q "autocompact-serialize-poison" core/scripts/session-save-id.sh && echo "PASS: session-save-id.sh checks poison marker in compact branch" || echo "FAIL: session-save-id.sh missing poison gate (Tier 4a)"
    Bash (race-window-closed-message): test "$(grep -c 'RACE_WINDOW_CLOSED' .claude/skills/start/SKILL.md)" -ge 3 && echo "PASS: /start prints RACE_WINDOW_CLOSED at all 3 binding sites (IDLE Step 0 + observer Step 0 + UNINITIALIZED A2)" || echo "FAIL: /start missing RACE_WINDOW_CLOSED at one of the 3 binding sites — user cannot tell when safe to start next agent"
-   # Triple-write-before-state-set ordering (rb-323 / guard-403) — observer-paired signals MUST be seeded BEFORE state-set RUNNING in /start. The 2026-05-12 fresh-eyes review found the triple-write was AFTER state-set, creating a partial-write window. Each site's state-set line MUST be preceded by the triple-write within ~10 lines so a future engineer cannot inadvertently re-flip the order.
+   # Triple-write-before-state-set ordering (rb-323 / guard-403) — observer-paired signals MUST be seeded BEFORE state-set RUNNING in /start. The 2026-05-12 fresh-eyes review found the triple-write was AFTER state-set, creating a partial-write window. Each site's state-set line MUST be preceded by the triple-write within ~50 lines so a future engineer cannot inadvertently re-flip the order. (Widened from 10 to 50 on 2026-05-20 after the F4 reorder legitimately inserted 23 lines of pure-Bash cleanups between the triple-write and state-set — see start/SKILL.md IDLE Step 3 for the rationale comment.)
    Bash (start-triple-write-before-state-set): py -3 -c "
 import re, pathlib
 lines = pathlib.Path('.claude/skills/start/SKILL.md').read_text(encoding='utf-8').splitlines()
 state_set = [i for i, L in enumerate(lines) if 'session-state-set.sh RUNNING' in L and 'Bash:' in L]
 fails = []
 for ln in state_set:
-    window = '\n'.join(lines[max(0, ln-10):ln])
+    window = '\n'.join(lines[max(0, ln-50):ln])
     if 'RUNNER_TOKEN' not in window:
         fails.append(ln+1)
 if fails:
-    print('FAIL: state-set RUNNING at line(s)', fails, 'not preceded by triple-write within 10 lines (rb-323/guard-403 ordering regressed — partial-write window re-introduced)')
+    print('FAIL: state-set RUNNING at line(s)', fails, 'not preceded by triple-write within 50 lines (rb-323/guard-403 ordering regressed — partial-write window re-introduced)')
 else:
     print('PASS: every /start state-set RUNNING is preceded by the runner-token triple-write (rb-323/guard-403 ordering preserved)')
 "

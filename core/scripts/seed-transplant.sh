@@ -265,13 +265,23 @@ if d['removed']:
 else:
     print('  no orphans found')"
 
-# Step 11: Handle git
+# Step 11: Handle git (init only — commit happens AFTER post-actions so
+# their outputs land in the same commit as the transplanted files)
 if [ $FRESH_GIT -eq 1 ]; then
     echo "[seed-transplant] Re-initializing git at destination..."
     rm -rf "$DEST/.git"
     git -C "$DEST" init -q
 fi
 
+# Step 12: Post-copy actions (MUST run before auto-commit — post-action A1
+# regenerates _tree.yaml at destination, and previously its output landed as
+# an uncommitted change after the commit had already fired. rb-1109-derived
+# fix 2026-05-20.)
+echo "[seed-transplant] Running post-copy actions..."
+py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" --source "$PROJECT_ROOT" || true
+
+# Step 12.5: Auto-commit (runs AFTER post-actions so regenerated files are
+# captured in the commit)
 if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     echo "[seed-transplant] Committing transplant at destination..."
     git -C "$DEST" add -A
@@ -281,10 +291,6 @@ if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     # the public GitHub home page.
     git -C "$DEST" commit -m "chore: sync framework ($TS)" -q || echo "  (nothing to commit)"
 fi
-
-# Step 12: Post-copy actions
-echo "[seed-transplant] Running post-copy actions..."
-py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" --source "$PROJECT_ROOT" || true
 
 # Step 13: Verification
 echo "[seed-transplant] Running verification..."

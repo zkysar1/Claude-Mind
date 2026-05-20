@@ -15,16 +15,26 @@ SANDBOX="$(mktemp -d)"
 trap "rm -rf '$SANDBOX'" EXIT
 
 # Build a minimal sandbox that looks like the project
-mkdir -p "$SANDBOX/core/scripts" "$SANDBOX/agent-x/session" "$SANDBOX/agent-y/session"
-echo "WORLD_PATH=$SANDBOX/world" > "$SANDBOX/agent-x/local-paths.conf"
-echo "META_PATH=$SANDBOX/meta"  >> "$SANDBOX/agent-x/local-paths.conf"
-echo "WORLD_PATH=$SANDBOX/world" > "$SANDBOX/agent-y/local-paths.conf"
-echo "META_PATH=$SANDBOX/meta"  >> "$SANDBOX/agent-y/local-paths.conf"
+mkdir -p "$SANDBOX/core/scripts" "$SANDBOX/agents/agent-x/session" "$SANDBOX/agents/agent-y/session"
+echo "WORLD_PATH=$SANDBOX/world" > "$SANDBOX/agents/agent-x/local-paths.conf"
+echo "META_PATH=$SANDBOX/meta"  >> "$SANDBOX/agents/agent-x/local-paths.conf"
+echo "WORLD_PATH=$SANDBOX/world" > "$SANDBOX/agents/agent-y/local-paths.conf"
+echo "META_PATH=$SANDBOX/meta"  >> "$SANDBOX/agents/agent-y/local-paths.conf"
 mkdir -p "$SANDBOX/world" "$SANDBOX/meta"
 cp "$PROJECT_ROOT_REAL/core/scripts/session-save-id.sh" "$SANDBOX/core/scripts/"
 cp "$PROJECT_ROOT_REAL/core/scripts/precompact-serialize.sh" "$SANDBOX/core/scripts/"
 cp "$PROJECT_ROOT_REAL/core/scripts/_paths.sh" "$SANDBOX/core/scripts/"
 cp "$PROJECT_ROOT_REAL/core/scripts/_paths.py" "$SANDBOX/core/scripts/"
+# session-save-id.sh sub-script deps (added 2026-05-20 after Phase 2.5.D
+# scenario-2 regression: sid-collision-check.sh is the 8th witness — when
+# missing, bash <missing> returns 127, the witness check fails, and the
+# breadcrumb is restored instead of consumed. Heartbeat-stale + cleanup-stale
+# are tolerated-missing today (`|| true` / `|| ""` callers), copied for
+# completeness so the sandbox exercises the real code paths.
+cp "$PROJECT_ROOT_REAL/core/scripts/sid-collision-check.sh" "$SANDBOX/core/scripts/"
+cp "$PROJECT_ROOT_REAL/core/scripts/heartbeat-stale.sh" "$SANDBOX/core/scripts/"
+cp "$PROJECT_ROOT_REAL/core/scripts/cleanup-stale-bindings.sh" "$SANDBOX/core/scripts/"
+cp "$PROJECT_ROOT_REAL/core/scripts/_resolve_agent_from_sid.py" "$SANDBOX/core/scripts/"
 
 PASS=0
 FAIL=0
@@ -42,7 +52,7 @@ assert_equals() {
 
 reset_sandbox() {
     rm -f "$SANDBOX"/.active-agent-*
-    rm -f "$SANDBOX"/agent-x/session/* "$SANDBOX"/agent-y/session/*
+    rm -f "$SANDBOX"/agents/agent-x/session/* "$SANDBOX"/agents/agent-y/session/*
 }
 
 run_hook() {
@@ -55,13 +65,13 @@ run_hook() {
 # ===== Scenario 1: New-window-hijack prevention =====
 echo "Scenario 1: new-window event (source!=compact) must NOT consume breadcrumbs"
 reset_sandbox
-echo "OLD_X" > "$SANDBOX/agent-x/session/compact-pending"
-echo "OLD_X" > "$SANDBOX/agent-x/session/running-session-id"
-echo "OLD_X" > "$SANDBOX/agent-x/session/latest-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/compact-pending"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/running-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/latest-session-id"
 echo "agent-x" > "$SANDBOX/.active-agent-OLD_X"
 run_hook "NEW_FRESH" "startup"
-assert_equals "compact-pending preserved" "$(cat "$SANDBOX/agent-x/session/compact-pending")" "OLD_X"
-assert_equals "agent-x running-session-id unchanged" "$(cat "$SANDBOX/agent-x/session/running-session-id")" "OLD_X"
+assert_equals "compact-pending preserved" "$(cat "$SANDBOX/agents/agent-x/session/compact-pending")" "OLD_X"
+assert_equals "agent-x running-session-id unchanged" "$(cat "$SANDBOX/agents/agent-x/session/running-session-id")" "OLD_X"
 [ -f "$SANDBOX/.active-agent-NEW_FRESH" ] && {
     echo "  FAIL: new-window should NOT have created .active-agent-NEW_FRESH"
     FAIL=$((FAIL + 1))
@@ -73,14 +83,14 @@ assert_equals "agent-x running-session-id unchanged" "$(cat "$SANDBOX/agent-x/se
 # ===== Scenario 2: Valid compact with four-witness =====
 echo "Scenario 2: compact event with all four witnesses agreeing"
 reset_sandbox
-echo "OLD_X" > "$SANDBOX/agent-x/session/compact-pending"
-echo "OLD_X" > "$SANDBOX/agent-x/session/running-session-id"
-echo "OLD_X" > "$SANDBOX/agent-x/session/latest-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/compact-pending"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/running-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/latest-session-id"
 echo "agent-x" > "$SANDBOX/.active-agent-OLD_X"
 run_hook "NEW_X" "compact"
-assert_equals "compact-pending consumed" "$([ -f "$SANDBOX/agent-x/session/compact-pending" ] && echo "exists" || echo "gone")" "gone"
-assert_equals "running-session-id updated to NEW_X" "$(cat "$SANDBOX/agent-x/session/running-session-id")" "NEW_X"
-assert_equals "latest-session-id updated to NEW_X" "$(cat "$SANDBOX/agent-x/session/latest-session-id")" "NEW_X"
+assert_equals "compact-pending consumed" "$([ -f "$SANDBOX/agents/agent-x/session/compact-pending" ] && echo "exists" || echo "gone")" "gone"
+assert_equals "running-session-id updated to NEW_X" "$(cat "$SANDBOX/agents/agent-x/session/running-session-id")" "NEW_X"
+assert_equals "latest-session-id updated to NEW_X" "$(cat "$SANDBOX/agents/agent-x/session/latest-session-id")" "NEW_X"
 assert_equals ".active-agent-NEW_X created" "$(cat "$SANDBOX/.active-agent-NEW_X" 2>/dev/null)" "agent-x"
 
 # ===== Scenario 3: Compact with witness mismatch — breadcrumb restored =====
@@ -92,13 +102,13 @@ assert_equals ".active-agent-NEW_X created" "$(cat "$SANDBOX/.active-agent-NEW_X
 # check. Mismatch running-session-id to exercise the first content-witness.
 echo "Scenario 3: compact event with witness mismatch must NOT consume"
 reset_sandbox
-echo "OLD_X" > "$SANDBOX/agent-x/session/compact-pending"
-echo "DIFFERENT" > "$SANDBOX/agent-x/session/running-session-id"   # mismatch
-echo "OLD_X" > "$SANDBOX/agent-x/session/latest-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/compact-pending"
+echo "DIFFERENT" > "$SANDBOX/agents/agent-x/session/running-session-id"   # mismatch
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/latest-session-id"
 echo "agent-x" > "$SANDBOX/.active-agent-OLD_X"
 run_hook "NEW_X" "compact"
-assert_equals "compact-pending preserved on mismatch" "$([ -f "$SANDBOX/agent-x/session/compact-pending" ] && cat "$SANDBOX/agent-x/session/compact-pending" || echo "gone")" "OLD_X"
-assert_equals "running-session-id unchanged on mismatch" "$(cat "$SANDBOX/agent-x/session/running-session-id")" "DIFFERENT"
+assert_equals "compact-pending preserved on mismatch" "$([ -f "$SANDBOX/agents/agent-x/session/compact-pending" ] && cat "$SANDBOX/agents/agent-x/session/compact-pending" || echo "gone")" "OLD_X"
+assert_equals "running-session-id unchanged on mismatch" "$(cat "$SANDBOX/agents/agent-x/session/running-session-id")" "DIFFERENT"
 
 # ===== Scenario 4: Concurrent compact resumes (BYPASSES PRECOMPACT GATE) =====
 # This scenario tests session-save-id.sh in isolation, with two simulated
@@ -111,19 +121,19 @@ assert_equals "running-session-id unchanged on mismatch" "$(cat "$SANDBOX/agent-
 # outcome. Test logs outcome informationally, does NOT fail.
 echo "Scenario 4 (informational): concurrent compact race (gate-bypassed)"
 reset_sandbox
-echo "OLD_X" > "$SANDBOX/agent-x/session/compact-pending"
-echo "OLD_X" > "$SANDBOX/agent-x/session/running-session-id"
-echo "OLD_X" > "$SANDBOX/agent-x/session/latest-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/compact-pending"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/running-session-id"
+echo "OLD_X" > "$SANDBOX/agents/agent-x/session/latest-session-id"
 echo "agent-x" > "$SANDBOX/.active-agent-OLD_X"
-echo "OLD_Y" > "$SANDBOX/agent-y/session/compact-pending"
-echo "OLD_Y" > "$SANDBOX/agent-y/session/running-session-id"
-echo "OLD_Y" > "$SANDBOX/agent-y/session/latest-session-id"
+echo "OLD_Y" > "$SANDBOX/agents/agent-y/session/compact-pending"
+echo "OLD_Y" > "$SANDBOX/agents/agent-y/session/running-session-id"
+echo "OLD_Y" > "$SANDBOX/agents/agent-y/session/latest-session-id"
 echo "agent-y" > "$SANDBOX/.active-agent-OLD_Y"
 run_hook "NEW_X" "compact" &
 run_hook "NEW_Y" "compact" &
 wait
-X_RSI=$(cat "$SANDBOX/agent-x/session/running-session-id" 2>/dev/null || echo "missing")
-Y_RSI=$(cat "$SANDBOX/agent-y/session/running-session-id" 2>/dev/null || echo "missing")
+X_RSI=$(cat "$SANDBOX/agents/agent-x/session/running-session-id" 2>/dev/null || echo "missing")
+Y_RSI=$(cat "$SANDBOX/agents/agent-y/session/running-session-id" 2>/dev/null || echo "missing")
 echo "  INFO: agent-x running-session-id=$X_RSI"
 echo "  INFO: agent-y running-session-id=$Y_RSI"
 if [ "$X_RSI" = "NEW_Y" ] || [ "$Y_RSI" = "NEW_X" ]; then
