@@ -18,10 +18,10 @@ import json
 import sys
 from datetime import datetime
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import META_DIR
 
@@ -64,7 +64,17 @@ def next_id(records):
 
 
 def cmd_add(args):
-    """Register a new dead end from JSON on stdin."""
+    """Register a new dead end from JSON on stdin.
+
+    Atomic via locked_modify_jsonl — the read-modify-write cycle (find
+    overlapping existing record → either merge or append) runs entirely
+    inside the lock, so two concurrent adds cannot:
+      - both allocate the same de-NNN id (next_id race)
+      - both fail to see each other's overlapping record (merge race
+        producing two records that should have been one)
+      - tear the file via the bare open("a") append previously used as
+        a fallback when no merge target was found
+    """
     if sys.stdin.isatty():
         print("Error: expected JSON on stdin", file=sys.stderr)
         sys.exit(1)
@@ -72,58 +82,67 @@ def cmd_add(args):
     raw = sys.stdin.read().strip()
     item = json.loads(raw)
 
-    records = read_all()
-
-    # Assign ID if not provided
-    if "id" not in item:
-        item["id"] = next_id(records)
-
     # Set defaults
     item.setdefault("registered", datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
     item.setdefault("times_matched", 0)
     item.setdefault("status", "active")
     item.setdefault("category", "meta_weight")
 
-    # Validate category
+    # Validate category (pre-lock — cheap, fail-fast)
     if item.get("category") not in VALID_CATEGORIES:
         print(f"ERROR: Invalid category '{item.get('category')}'. Valid: {VALID_CATEGORIES}", file=sys.stderr)
         sys.exit(1)
 
-    # Required fields
+    # Required fields (pre-lock)
     for field in ["strategy_file", "field", "failure_pattern"]:
         if field not in item:
             print(f"ERROR: Missing required field '{field}'", file=sys.stderr)
             sys.exit(1)
 
-    # Check for duplicate (same file + field + overlapping range)
-    for existing in records:
-        if (existing.get("strategy_file") == item.get("strategy_file") and
-                existing.get("field") == item.get("field") and
-                existing.get("status") in ("active", "reviewed")):
-            # Check range overlap
-            existing_range = existing.get("value_range")
-            new_range = item.get("value_range")
-            if existing_range and new_range:
-                if (new_range[0] <= existing_range[1] and new_range[1] >= existing_range[0]):
-                    # Merge: expand range and evidence
-                    existing["value_range"] = [
-                        min(existing_range[0], new_range[0]),
-                        max(existing_range[1], new_range[1]),
-                    ]
-                    existing["evidence"] = list(set(existing.get("evidence", []) + item.get("evidence", [])))
-                    existing["failure_pattern"] = item.get("failure_pattern", existing["failure_pattern"])
-                    write_all(records)
-                    print(json.dumps({"status": "merged", "id": existing["id"]}))
-                    return
+    from _fileops import locked_modify_jsonl
 
-    # Append
-    records.append(item)
-    # Append-only write
-    DE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(DE_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+    # Closure carry-out: status reported in stdout reflects what actually
+    # happened inside the lock (merged vs added, with the resolved id).
+    outcome = {"status": None, "id": None}
 
-    print(json.dumps({"status": "added", "id": item["id"]}))
+    def _modifier(records):
+        # Allocate id only if caller didn't supply one. Inside the lock
+        # so two concurrent adds get distinct ids.
+        if "id" not in item:
+            item["id"] = next_id(records)
+
+        # Check for overlapping existing record — same file + field +
+        # active/reviewed + overlapping value_range.
+        for existing in records:
+            if (existing.get("strategy_file") == item.get("strategy_file") and
+                    existing.get("field") == item.get("field") and
+                    existing.get("status") in ("active", "reviewed")):
+                existing_range = existing.get("value_range")
+                new_range = item.get("value_range")
+                if existing_range and new_range:
+                    if (new_range[0] <= existing_range[1] and
+                            new_range[1] >= existing_range[0]):
+                        existing["value_range"] = [
+                            min(existing_range[0], new_range[0]),
+                            max(existing_range[1], new_range[1]),
+                        ]
+                        existing["evidence"] = list(set(
+                            existing.get("evidence", []) +
+                            item.get("evidence", [])))
+                        existing["failure_pattern"] = item.get(
+                            "failure_pattern", existing["failure_pattern"])
+                        outcome["status"] = "merged"
+                        outcome["id"] = existing["id"]
+                        return records
+
+        # No merge target — append the new record
+        records.append(item)
+        outcome["status"] = "added"
+        outcome["id"] = item["id"]
+        return records
+
+    locked_modify_jsonl(DE_PATH, _modifier, initial=[])
+    print(json.dumps(outcome))
 
 
 def cmd_check(args):

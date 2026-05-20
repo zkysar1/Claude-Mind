@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""PostToolUse[Bash] hook — iteration-close loop-continuity reminder.
+
+Fires AFTER iteration-close.sh --phase productivity-check OR recurring-close.sh
+completes, injecting a system-reminder into the model's context that commands
+Skill(aspirations) args='loop' as the next tool call.
+
+Background (session 58 alpha-stopping investigation, 2026-04-24):
+The Stop hook does not fire reliably when Claude Code ends a turn with a text
+message (no tool calls pending). Alpha's runner SID dec15d77 had zero BLOCK
+entries in .stop-hook-log despite the loop repeatedly dying with text-terminal
+turns. Relying on Stop to enforce the Skill(aspirations) re-entry contract
+fails in practice. PostToolUse fires deterministically on every Bash tool call,
+so injecting a reminder here guarantees the model sees the iteration-close
+contract at the exact moment it's most likely to drift.
+
+SAFETY (matches bash-agent-inject.py): fail open on ANY error. sys.exit(0)
+with empty stdout = "no additional context injected" per Claude Code's
+PostToolUse hook contract. A broken hook must never kill the iteration.
+
+Output contract: the injected reminder goes into hookSpecificOutput.
+additionalContext per Claude Code's PostToolUse format (same channel used by
+path-resolution-hook.py for permissionDecision and bash-agent-inject.py for
+updatedInput).
+"""
+
+import os
+import sys
+import json
+import re
+
+#  / : force utf-8 on stdin/stdout/stderr (covers Windows
+# cp1252 fallback when callers bypass the _platform.sh PYTHONIOENCODING=utf-8
+# shim). Closes acceptance (4) of  — stdin-ingest sweep.
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
+
+
+REMINDER_TEXT = (
+    "<system-reminder>\n"
+    "An iteration just closed (iteration-close.sh --phase productivity-check OR "
+    "recurring-close.sh completed). Your VERY NEXT tool call MUST be "
+    "Skill(aspirations) with args='loop'. Do NOT emit a text summary, do NOT "
+    "end with a Bash echo, do NOT write any other tool call first. A terminal "
+    "text paragraph or Bash echo here ends the turn without re-entering the "
+    "loop and kills the autonomous session. See .claude/rules/return-protocol.md "
+    "for the two-case terminal-action rule (sub-skill = Bash; orchestrator at "
+    "iteration close = Skill(aspirations)).\n"
+    "</system-reminder>"
+)
+
+
+# Terminal-script match is two-layered:
+#
+#   Layer 1 — segment split on `[;&|]+`. PreToolUse.Bash (bash-agent-inject.py)
+#   rewrites every command to prepend `export PATH="..."; export MIND_AGENT=...;
+#   export MIND_SID=...; ` — so the actual invocation sits at segment-N, not
+#   at start-of-command. Without the split, an anchored regex over the whole
+#   string would never match in production.
+#
+#   Layer 2 — anchored per-segment regex. Each segment must start (after
+#   optional whitespace + zero-or-more env-var assignments + optional `bash`)
+#   with the target script. Anchoring rejects substrings embedded in `echo`
+#   arguments, `grep` patterns, `cat` targets, etc.
+#
+# CRITICAL — DO NOT "simplify" to a single un-anchored `re.search` over the
+# full command. That would re-introduce two incidents at once:
+#   (1) false positives on echo/grep/cat arguments that happen to contain the
+#       script name (observed 2026-04-24 during this hook's own test run);
+#   (2) un-anchored match of the runtime `export X=Y; ... bash script.sh` form
+#       would succeed for the wrong reason — it'd match "bash script.sh"
+#       deep inside the command rather than proving that segment IS the
+#       invocation.
+# Both were considered and rejected. Keep the segment-split + anchored match.
+_CMD_PREFIX = r"^\s*(?:[A-Z_][A-Z0-9_]*=\S+\s+)*(?:bash\s+)?(?:\S*/)?"
+
+ITER_CLOSE_RE = re.compile(
+    _CMD_PREFIX + r"iteration-close\.sh\s+(?:[^|&;]*?\s+)?--phase\s+productivity-check\b"
+)
+RECURRING_CLOSE_RE = re.compile(
+    _CMD_PREFIX + r"recurring-close\.sh(?:\s|$)"
+)
+_SEGMENT_SEP_RE = re.compile(r"[;&|]+")
+
+
+def _command_invokes_iteration_close(command: str) -> bool:
+    """True iff any command segment invokes iteration-close.sh productivity-check
+    or recurring-close.sh as a standalone command. Segments are split on shell
+    command separators (`;`, `&&`, `||`, `|`) — not a full shell parser, but
+    sufficient for the invocation patterns iteration-close scripts appear in."""
+    for segment in _SEGMENT_SEP_RE.split(command):
+        if ITER_CLOSE_RE.match(segment) or RECURRING_CLOSE_RE.match(segment):
+            return True
+    return False
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        sys.exit(0)
+
+    if data.get("tool_name") != "Bash":
+        sys.exit(0)
+
+    tool_input = data.get("tool_input") or {}
+    command = tool_input.get("command") or ""
+    if not command:
+        sys.exit(0)
+
+    if not _command_invokes_iteration_close(command):
+        sys.exit(0)
+
+    # Mode gate: the Skill(aspirations) imperative only applies to the runner
+    # session of an agent in RUNNING + autonomous. Three cuts, in order:
+    #   (a) session_id + PROJECT_ROOT present,
+    #   (b) .active-agent-<sid> binding exists and resolves to an agent name,
+    #   (c) agent-state=RUNNING, agent-mode=autonomous,
+    #   (d) running-session-id matches THIS session_id (runner, not observer).
+    # CRITICAL — (d) is NOT optional. agent-state/agent-mode reflect the
+    # RUNNER's values; an observer session (reader/assistant started while
+    # the agent is RUNNING per CLAUDE.md "observer session") would pass (c)
+    # but MUST NOT be told to call Skill(aspirations) — that violates the
+    # control-command boundary (user-interaction.md: "Claude MUST NOT invoke
+    # boot or start the aspirations loop without RUNNING state and autonomous
+    # mode"). Omitting (d) would make observer terminals get hectored with
+    # Skill(aspirations) reminders every time the user manually probes
+    # iteration-close.sh.
+    session_id = data.get("session_id", "") or ""
+    project_root = os.environ.get("PROJECT_ROOT", "")
+    if not session_id or not project_root:
+        sys.exit(0)
+
+    # Path-traversal defense on session_id before joining it into a filesystem
+    # path. Same defense posture as stop-hook.sh and path-resolution-hook.py.
+    if any(c in session_id for c in ("/", "\\", "\n", "\r", " ")) or ".." in session_id:
+        sys.exit(0)
+
+    binding_path = os.path.join(project_root, f".active-agent-{session_id}")
+    try:
+        with open(binding_path, "r", encoding="utf-8") as fh:
+            agent = fh.read().strip()
+    except Exception:
+        sys.exit(0)
+    if not agent:
+        sys.exit(0)
+
+    session_dir = os.path.join(project_root, agent, "session")
+    try:
+        with open(os.path.join(session_dir, "agent-state"), "r", encoding="utf-8") as fh:
+            state = fh.read().strip()
+        with open(os.path.join(session_dir, "agent-mode"), "r", encoding="utf-8") as fh:
+            mode = fh.read().strip()
+        with open(os.path.join(session_dir, "running-session-id"), "r", encoding="utf-8") as fh:
+            running_sid = fh.read().strip()
+    except Exception:
+        sys.exit(0)
+
+    if state != "RUNNING" or mode != "autonomous":
+        sys.exit(0)
+    if running_sid != session_id:
+        # Observer session — not the runner. Skill(aspirations) not applicable.
+        sys.exit(0)
+
+    # Inject the imperative as additionalContext. The model sees this in its
+    # next turn's context window alongside the tool output, so ignoring it
+    # requires actively overriding an explicit <system-reminder> — which is
+    # much rarer than forgetting an implicit contract.
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": REMINDER_TEXT,
+        }
+    }
+    print(json.dumps(payload))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # Catch-all fail-open: any unexpected error -> no injection.
+        pass
+    sys.exit(0)

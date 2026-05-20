@@ -10,6 +10,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+#  / : force utf-8 on stdin/stdout/stderr (covers Windows
+# cp1252 fallback when callers bypass the _platform.sh PYTHONIOENCODING=utf-8
+# shim). Closes acceptance (4) of  — stdin-ingest sweep.
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
+
 from _paths import AGENT_DIR
 
 def extract_insights(text: str) -> list[str]:
@@ -57,6 +63,21 @@ def main():
 
     insights = extract_insights(message)
     if not insights:
+        # Observability anchor ( / ): without this line, a
+        # zero-extraction run is indistinguishable from a broken pipeline
+        # for downstream observers. ✶ Insight blocks only emit under the
+        # Explanatory output style — sessions in default/concise styles
+        # produce zero captures by design, NOT by failure. The Stop hook
+        # invocation suppresses stderr (2>/dev/null), so this line is
+        # silent in normal operation; it surfaces only when the script is
+        # invoked diagnostically without the suppression.
+        print(
+            "[capture-insights] zero Insight blocks extracted — likely the "
+            "session output style is not 'Explanatory' (only that style "
+            "emits the ✶ Insight format). Empty extraction is correct "
+            "behavior for default/concise styles.",
+            file=sys.stderr,
+        )
         sys.exit(0)
 
     filepath = AGENT_DIR / "insights.jsonl"

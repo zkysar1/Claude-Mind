@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
+# Entry sentinel for hook-fire-audit () — FIRST executable line,
+# bash-builtin only, fail-open. mtime of core/logs/hook-fires/context-reads-gate
+# = last fire of this hook.
+{ _HF_DIR="${BASH_SOURCE[0]%/*}/../.." ; mkdir -p "$_HF_DIR/core/logs/hook-fires" 2>/dev/null && : > "$_HF_DIR/core/logs/hook-fires/context-reads-gate" 2>/dev/null ; unset _HF_DIR ; } 2>/dev/null || true
+
 # PreToolUse[Read] hook — gate duplicate file reads.
 # Reads JSON from stdin (tool_input.file_path), checks context-reads tracker.
 # Exit 0 = allow read, Exit 2 = block (already in context).

@@ -18,11 +18,22 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, assert_agent_dir
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("postcompact-restore")
 
 CHECKPOINT_PATH = AGENT_DIR / "session" / "compact-checkpoint.yaml"
 DIARY_PATH = AGENT_DIR / "session" / "execution-diary.jsonl"
 SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
+# iteration-checkpoint.json is the skill-level breadcrumb written by
+# aspirations-select Phase 2.95. Small (~80B JSON) and durable across
+# autocompact — if present, it names the goal the loop picked pre-compact.
+# Surfaced prominently so the model resumes the correct goal instead of
+# reconstructing a different one from the compact summary (bug traced
+# 2026-04-22 alpha session-56).
+ITERATION_CKPT_PATH = AGENT_DIR / "session" / "iteration-checkpoint.json"
 
 # Slots to skip in the "additional slots" section (already shown in dedicated sections)
 DEDICATED_SECTION_SLOTS = {
@@ -95,9 +106,73 @@ def _read_reasoning_snapshot():
         return None
 
 
+def _read_iteration_checkpoint():
+    """Read the in-flight goal anchor from aspirations-select Phase 2.95.
+
+    Returns dict or None. Robust to missing file and parse errors —
+    postcompact-restore must never crash on a broken checkpoint.
+    """
+    if not ITERATION_CKPT_PATH.exists():
+        return None
+    try:
+        return json.loads(ITERATION_CKPT_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"iteration-checkpoint read failed: {e}")
+        return None
+
+
+def _format_iteration_ckpt_block(iter_ckpt):
+    """Format the in-flight goal block for the restore output."""
+    goal_id = iter_ckpt.get("goal_id", "?")
+    phase = iter_ckpt.get("phase", "?")
+    selected_at = iter_ckpt.get("selected_at", "?")
+    aspiration_id = iter_ckpt.get("aspiration_id", "?")
+    score = iter_ckpt.get("selector_score", "?")
+    skill = iter_ckpt.get("skill", "")
+    out = [
+        "═══ IN-FLIGHT GOAL (autocompact boundary) ═══",
+        f"goal_id:       {goal_id}",
+        f"aspiration:    {aspiration_id}",
+        f"phase:         {phase}",
+        f"selected_at:   {selected_at}",
+        f"selector_score: {score}",
+    ]
+    if skill:
+        out.append(f"skill:         {skill}")
+    out.extend([
+        "",
+        f"CRITICAL: Your in-flight goal is {goal_id} at phase '{phase}'.",
+        "Resume execution on THIS goal. Do NOT re-run goal-selector.sh to",
+        "pick a different one. Do NOT substitute a different goal based on",
+        "narrative context from the compact summary. If this checkpoint",
+        "looks wrong, /aspirations precheck + select will surface the mismatch.",
+        "═══════════════════════════════════════════════",
+        "",
+    ])
+    return out
+
+
 def main():
+    # Read iteration-checkpoint FIRST — surface in-flight goal anchor even
+    # when compact-checkpoint.yaml is missing (PreCompact hook failed, or
+    # first-iteration session). Separate code path from the full restore.
+    iter_ckpt = _read_iteration_checkpoint()
+
     if not CHECKPOINT_PATH.exists():
-        log("no checkpoint file -- skip")
+        log("no compact-checkpoint.yaml -- degraded restore")
+        if iter_ckpt is not None:
+            # Emit a minimal restore with just the iteration anchor so the
+            # model still knows which goal to resume.
+            minimal = [
+                "=== CONTEXT RESTORED (post-compaction, degraded) ===",
+                "compact-checkpoint.yaml missing — only iteration anchor available.",
+                "",
+            ]
+            minimal.extend(_format_iteration_ckpt_block(iter_ckpt))
+            minimal.append("ACTION: Re-enter /aspirations loop. Phase -0.5c will skip")
+            minimal.append("(no checkpoint). Phase 0 precheck + Phase 2 select still run.")
+            minimal.append("===========================================")
+            print("\n".join(minimal))
         return
 
     checkpoint = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8")) or {}
@@ -117,6 +192,13 @@ def main():
     lines.append(f"Compaction #{compact_count} this session. "
                  f"Session: {checkpoint.get('session_id', 'unknown')}")
     lines.append("")
+
+    # --- In-flight goal anchor (from aspirations-select Phase 2.95) ---
+    # Highest priority — printed FIRST so the model sees the pre-compact
+    # goal selection before any narrative context that could drift it.
+    # iter_ckpt was already read at top of main() for degraded-path handling.
+    if iter_ckpt is not None:
+        lines.extend(_format_iteration_ckpt_block(iter_ckpt))
 
     # --- Active context (NO truncation — full summary) ---
     if active:

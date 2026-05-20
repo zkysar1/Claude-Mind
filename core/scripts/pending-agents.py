@@ -29,7 +29,11 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, assert_agent_dir
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("pending-agents")
 
 PENDING_PATH = AGENT_DIR / "session" / "pending-agents.yaml"
 

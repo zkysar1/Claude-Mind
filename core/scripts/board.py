@@ -13,15 +13,16 @@ Subcommands:
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import WORLD_DIR
 
@@ -46,28 +47,36 @@ VALID_MESSAGE_TYPES = [
     "status",              # General update (backward-compatible default)
 ]
 
-
 def require_board():
     """Ensure board directory exists."""
     BOARD_DIR.mkdir(parents=True, exist_ok=True)
-
 
 def channel_path(name):
     """Get the JSONL file path for a channel."""
     return BOARD_DIR / f"{name}.jsonl"
 
+def generate_message_id(channel, author, *, items=None):
+    """Generate a unique message ID.
 
-def generate_message_id(channel, author):
-    """Generate a unique message ID."""
+    When `items` is supplied (the channel records, read inside a lock by
+    cmd_post's allocator), the count is computed from that snapshot —
+    no separate file read, no race window. When called outside a lock
+    (legacy callers), the function still works but reads the file
+    unlocked, which is the original race documented in the
+    msg-20260428-045553-alpha-NNN finding.
+    """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    # Simple counter: count existing messages in channel to avoid collisions
-    ch_path = channel_path(channel)
-    count = 0
-    if ch_path.exists():
-        with open(ch_path, "r", encoding="utf-8") as f:
-            count = sum(1 for line in f if line.strip())
+    if items is None:
+        # Legacy fallback: count existing lines without locking. Caller is
+        # responsible for race-handling. cmd_post no longer takes this path.
+        ch_path = channel_path(channel)
+        count = 0
+        if ch_path.exists():
+            with open(ch_path, "r", encoding="utf-8") as f:
+                count = sum(1 for line in f if line.strip())
+    else:
+        count = len(items)
     return f"msg-{ts}-{author}-{count + 1:03d}"
-
 
 def parse_duration(duration_str):
     """Parse a duration string like '1h', '30m', '2d' into a timedelta."""
@@ -86,7 +95,6 @@ def parse_duration(duration_str):
         return timedelta(days=value)
     return None
 
-
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -101,84 +109,165 @@ def cmd_post(args):
         print("Error: No message text provided (pipe to stdin)", file=sys.stderr)
         sys.exit(1)
 
-    author = args.author or os.environ.get("AYOAI_AGENT", "system")
+    author = args.author or os.environ.get("MIND_AGENT", "system")
     channel = args.channel
 
     # Structured message type (optional, defaults to "status" for backward compat)
     msg_type = getattr(args, "type", None) or "status"
 
-    msg = {
-        "id": generate_message_id(channel, author),
-        "author": author,
-        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "channel": channel,
-        "type": msg_type,
-        "text": text,
-        "reply_to": args.reply_to,
-        "tags": [t.strip() for t in args.tags.split(",")] if args.tags else [],
-    }
-
     ch_path = channel_path(channel)
-    from _fileops import locked_append_jsonl
-    locked_append_jsonl(ch_path, msg)
+    from _fileops import locked_append_jsonl_with_allocator
+
+    # Build msg INSIDE the lock so the count component of msg-id reflects
+    # the channel's actual record count at write time. The previous
+    # generate_message_id-then-locked_append split was the
+    # msg-20260428-045553-alpha-NNN race — two posts in the same wall-clock
+    # second from one agent's parallel processes both saw count=N and
+    # both wrote msg-...-(N+1).
+    def _build(items):
+        return {
+            "id": generate_message_id(channel, author, items=items),
+            "author": author,
+            # session_id is the PreToolUse-injected SID (core/scripts/bash-agent-inject.py).
+            # Lets future readers distinguish observer posts from runner posts by comparing
+            # against <agent>/session/running-session-id without needing a new schema concept.
+            # Empty string when MIND_SID is absent (rare hook-timeout case) — purely additive.
+            "session_id": os.environ.get("MIND_SID", ""),
+            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "channel": channel,
+            "type": msg_type,
+            "text": text,
+            "reply_to": args.reply_to,
+            "tags": [t.strip() for t in args.tags.split(",")] if args.tags else [],
+        }
+
+    msg = locked_append_jsonl_with_allocator(ch_path, _build)
     print(msg["id"])
 
+    # : wake any sleeping peer agents when this is a coordination
+    # post — peers polling interruptible-sleep.sh will exit 2 (light-precheck
+    # branch) within 1s instead of running their full quiescent sleep.
+    # Coordination is the cross-agent signal channel (claims, releases,
+    # directives, abstentions). Other channels currently do not fan wake
+    # signals — findings/general/decisions deliberately stay quiet so a busy
+    # board doesn't thrash partner sleep cycles.
+    # Best-effort: import lazily and swallow any failure. A board post must
+    # not fail because a peer's filesystem is unavailable.
+    if channel == "coordination":
+        try:
+            from _wake_signals import touch_peer_signals
+            touch_peer_signals("board-activity")
+        except Exception:
+            pass
 
-def cmd_read(args):
-    """Read messages from a channel."""
+    # : source-tag attribution — guard-NNN / rb-NNN tags on a
+    # findings post bump the named entry's times_inferred_helpful (half-
+    # weight in utilization_score per reasoning-bank.py:382). The finding's
+    # existence IS positive signal: the gate fired, defect surfaced.
+    #
+    # CRITICAL — never change `times_inferred_helpful` to `times_cited`:
+    # times_cited carries zero weight in the active v1 utilization_score
+    # formula (reasoning-bank.py:194 + :382). The whole point is to FLOW
+    # value into the score; switching to times_cited silently re-creates
+    # the measurement gap (guard-343 read 0.04 despite producing 57% of
+    # critical findings, n=246, 2026-04-27..05-09).
+    if channel == "findings":
+        cited = {t for t in msg["tags"] if re.fullmatch(r"(?:guard|rb)-\d{3}", t)}
+        if cited:
+            rb_script = Path(__file__).parent / "reasoning-bank.py"
+            for cite in sorted(cited):
+                family = "rb" if cite.startswith("rb-") else "guard"
+                try:
+                    subprocess.run(
+                        [sys.executable, str(rb_script), family, "increment",
+                         cite, "utilization.times_inferred_helpful"],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass  # fail-open per-cite
+
+def reads_sidecar_path(channel):
+    """Get the sidecar path for a channel's read events."""
+    return BOARD_DIR / f"{channel}-reads.jsonl"
+
+def cmd_mark_read(args):
+    """Mark message IDs as read by the current agent.
+
+    Reads msg_ids from --ids (comma-separated) OR from stdin (one per line).
+    Appends one row per msg_id to <channel>-reads.jsonl.
+    Idempotent: re-marking the same msg_id by the same agent is allowed but
+    consumers can dedupe by (msg_id, reader_agent) when reporting.
+    """
     require_board()
 
-    ch_path = channel_path(args.channel)
-    if not ch_path.exists():
-        print(f"Channel '{args.channel}' is empty or does not exist.")
-        return
-
-    messages = []
-    with open(ch_path, "r", encoding="utf-8") as f:
-        for line in f:
-            stripped = line.strip()
-            if stripped:
-                messages.append(json.loads(stripped))
-
-    # Filter by --since
-    if args.since:
-        delta = parse_duration(args.since)
-        if delta:
-            cutoff = datetime.now() - delta
-            messages = [m for m in messages
-                        if datetime.strptime(m["timestamp"], "%Y-%m-%dT%H:%M:%S") >= cutoff]
-
-    # Filter by --author
-    if args.author:
-        messages = [m for m in messages if m["author"] == args.author]
-
-    # Filter by --type (structured message type)
-    msg_type_filter = getattr(args, "type", None)
-    if msg_type_filter:
-        messages = [m for m in messages if m.get("type") == msg_type_filter]
-
-    # Filter by --tag
-    if args.tag:
-        messages = [m for m in messages if args.tag in m.get("tags", [])]
-
-    # Limit by --last
-    if args.last:
-        messages = messages[-args.last:]
-
-    # Output
-    if args.json_output:
-        for msg in messages:
-            print(json.dumps(msg, ensure_ascii=False))
+    if args.ids:
+        msg_ids = [i.strip() for i in args.ids.split(",") if i.strip()]
     else:
-        for msg in messages:
-            tags = f" [{', '.join(msg.get('tags', []))}]" if msg.get("tags") else ""
-            reply = f" (reply to {msg['reply_to']})" if msg.get("reply_to") else ""
-            mtype = msg.get("type", "status")
-            type_label = f" ({mtype})" if mtype and mtype != "status" else ""
-            print(f"[{msg['timestamp']}] {msg['author']}{type_label}: {msg['text']}{tags}{reply}")
-            print(f"  id: {msg['id']}")
-            print()
+        msg_ids = [line.strip() for line in sys.stdin if line.strip()]
 
+    if not msg_ids:
+        print("Error: No message IDs provided (use --ids or pipe stdin)",
+              file=sys.stderr)
+        sys.exit(1)
+
+    reader = args.reader or os.environ.get("MIND_AGENT", "unknown")
+    reader_sid = os.environ.get("MIND_SID", "")
+    read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    sidecar = reads_sidecar_path(args.channel)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+
+    # Dedup against existing sidecar rows so re-marking the same msg_id by the
+    # same agent is a no-op (idempotent). Cross-agent re-marks still write.
+    seen = _load_read_msg_ids(args.channel, reader)
+
+    from _fileops import locked_append_jsonl
+    written = 0
+    for mid in msg_ids:
+        if mid in seen:
+            continue
+        # locked_append_jsonl takes ONE item per call; loop here. For prime's
+        # typical batch (a few coordination posts), this is sub-ms per row.
+        # If batch sizes ever grow large, swap to locked_write_jsonl(read-
+        # modify-write append) to acquire the lock once.
+        locked_append_jsonl(sidecar, {
+            "msg_id": mid,
+            "reader_agent": reader,
+            "reader_sid": reader_sid,
+            "read_at": read_at,
+        })
+        seen.add(mid)
+        written += 1
+    print(f"Marked {written} new message(s) read in {args.channel} by {reader} "
+          f"({len(msg_ids) - written} already read)", file=sys.stderr)
+
+def _load_read_msg_ids(channel, reader_agent):
+    """Return the set of msg_ids in <channel>-reads.jsonl already read by reader_agent.
+
+    Fail-open: returns empty set on any error so --unread-only never blocks read.
+    """
+    sidecar = reads_sidecar_path(channel)
+    if not sidecar.exists():
+        return set()
+    seen = set()
+    try:
+        with open(sidecar, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("reader_agent") == reader_agent:
+                    mid = row.get("msg_id")
+                    if mid:
+                        seen.add(mid)
+    except OSError:
+        return set()
+    return seen
 
 def cmd_channels(args):
     """List available channels with message counts."""
@@ -216,7 +305,6 @@ def cmd_channels(args):
                         pass
         print(f"  {name}: {count} messages{last_ts}")
 
-
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -228,39 +316,32 @@ def build_parser():
     # post
     post_p = sub.add_parser("post", help="Post a message (text from stdin)")
     post_p.add_argument("--channel", required=True, help="Channel name")
-    post_p.add_argument("--author", help="Author name (defaults to AYOAI_AGENT)")
+    post_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
     post_p.add_argument("--reply-to", help="Message ID to reply to")
     post_p.add_argument("--tags", help="Comma-separated tags")
     post_p.add_argument("--type", help="Message type (claim, complete, blocked, encoding, finding, status)",
                         default="status")
 
-    # read
-    read_p = sub.add_parser("read", help="Read messages from a channel")
-    read_p.add_argument("--channel", required=True, help="Channel name")
-    read_p.add_argument("--since", help="Duration filter (e.g., 1h, 30m, 2d)")
-    read_p.add_argument("--author", help="Filter by author")
-    read_p.add_argument("--tag", help="Filter by tag")
-    read_p.add_argument("--type", help="Filter by message type (claim, complete, blocked, encoding, finding, status)")
-    read_p.add_argument("--last", type=int, help="Show only last N messages")
-    read_p.add_argument("--json", dest="json_output", action="store_true",
-                        help="Output as JSONL")
+    # mark-read (standalone — pre-existing msg IDs)
+    mr_p = sub.add_parser("mark-read", help="Mark message IDs as read (g-304-03)")
+    mr_p.add_argument("--channel", required=True, help="Channel name")
+    mr_p.add_argument("--ids", help="Comma-separated msg IDs (or pipe one-per-line via stdin)")
+    mr_p.add_argument("--reader", help="Reader agent (defaults to MIND_AGENT)")
 
     # channels
     sub.add_parser("channels", help="List channels with message counts")
 
     return parser
 
-
 def main():
     parser = build_parser()
     args = parser.parse_args()
     dispatch = {
         "post": cmd_post,
-        "read": cmd_read,
+        "mark-read": cmd_mark_read,
         "channels": cmd_channels,
     }
     dispatch[args.command](args)
-
 
 if __name__ == "__main__":
     main()

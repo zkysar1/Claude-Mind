@@ -112,13 +112,14 @@ def cmd_restore(args):
     target = Path(args.file)
     from _fileops import acquire_lock, release_lock, save_history, append_changelog
 
-    # Lock the target file during restore to prevent concurrent writes
+    # Lock the target file during restore to prevent concurrent writes.
+    # stale_seconds=10: restore is a copy + atomic rename, sub-second hold.
     lock_path = target.with_suffix(".lock")
-    acquire_lock(lock_path)
+    acquire_lock(lock_path, stale_seconds=10)
     try:
         # Save current version to history before restoring (if it exists)
         if target.exists():
-            agent = os.environ.get("AYOAI_AGENT", "restore")
+            agent = os.environ.get("MIND_AGENT", "restore")
             base = resolve_base_dir(args.file)
             save_history(target, base, agent, summary=f"Before restore from {args.version}")
 
@@ -126,7 +127,7 @@ def cmd_restore(args):
 
         # Log the restore in changelog
         base = resolve_base_dir(args.file)
-        agent = os.environ.get("AYOAI_AGENT", "restore")
+        agent = os.environ.get("MIND_AGENT", "restore")
         append_changelog(base, agent, target, "restore",
                          summary=f"Restored from {args.version}")
     finally:

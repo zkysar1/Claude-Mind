@@ -1,0 +1,50 @@
+# Domain-term blocklist for core file lint (case-sensitive grep).
+# One term per line. Lines starting with # are ignored.
+# Add new domain terms as they appear in your project.
+
+# Cloud provider terms (both cases where needed)
+security group
+Security group
+security groups
+Security groups
+Lambda
+DynamoDB
+CloudWatch
+EFS
+boto3
+API Gateway
+
+# Project-specific terms
+NPC
+Roblox
+AyoBridge
+Studio Bridge
+MIND_API_KEY
+AYO_OPERATOR_KEY
+game session
+Game session
+
+# External-path directory naming variants (g-115-432, 2026-05-08).
+# Catches Ayoai-* in core docstrings/rules where they leak. Test-fixture
+# files (test-*.sh/.py) and files marked domain-leak-exempt are excluded
+# automatically by domain-leak-check.sh. orphan-root-sweep.sh uses these
+# strings as detection data and carries the exempt marker.
+Ayoai-World
+Ayoai-Meta
+Ayoai-Mind
+Ayoai-Alpha
+Ayoai-Bravo
+My-Meta
+
+# Domain-specific identifiers surfaced during 2026-05-18 packaging
+# audit (plan Phase 4.4). Each is a real AyoAI-deployment identifier
+# that should not appear in framework files. Add new terms here as
+# the audit catches them.
+jose
+IAUS
+richmondkey
+bitnet
+seedgettervert
+BTEvents
+Roblox-Integration
+Environment-Processor

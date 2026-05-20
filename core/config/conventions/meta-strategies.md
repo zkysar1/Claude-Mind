@@ -135,7 +135,7 @@ Import: `meta-transfer.sh import` merges into existing meta-strategies. Weights 
 | Boot Step 2 | meta.yaml + velocity | — |
 | Step 8.85 (State update) | backpressure.yaml | backpressure.yaml, dead-ends.jsonl, strategy-generations.yaml |
 | Step 0.7 (Evolve) | backpressure, dead-ends, credit-assignment, strategy-generations, weakness-report | — |
-| Step 5.55 (Reflect full) | pattern-sigs, guardrails, experiences, backpressure | <agent>/weakness-report.yaml |
+| Step 5.55 (Reflect full) | pattern-sigs, guardrails, experiences, backpressure | agents/<agent>/weakness-report.yaml |
 | Step 8.65 (Consolidate) | credit-assignment.yaml, strategy-generations.yaml | credit-assignment.yaml |
 
 ## Backpressure Gate (AutoContext-inspired)
@@ -214,7 +214,7 @@ Maps parameter configurations to performance. Each "generation" = a frozen set o
 
 Aggregated failure pattern detection from multiple signal sources.
 
-**State**: `<agent>/weakness-report.yaml` (domain-specific, wiped when agent is removed).
+**State**: `agents/<agent>/weakness-report.yaml` (domain-specific, wiped when agent is removed).
 
 **Schema per weakness**:
 - `id`: wk-NNN

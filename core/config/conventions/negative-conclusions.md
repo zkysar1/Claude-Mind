@@ -75,6 +75,73 @@ what actually happened. Then that verbose output counts as signal 1.
    doesn't work and plans to skip or defer, apply the multi-signal requirement
    before accepting the conclusion.
 
+5. **Phase 5 Q2 (aspirations-verify)**: Automated gate wire-up — a negation
+   claim in the result text or Q2 failure-mode answer is routed to the
+   appropriate gate script. See `aspirations-verify/SKILL.md` Q2 NEGATIVE CHECK.
+
+## Statistical / Audit Negations (rb-245)
+
+A class of negative conclusion distinct from operational and knowledge
+negations: claims about *data values across many records*. Examples:
+
+- "98% of records have times_triggered=0" <!-- DRIFT-EXEMPT: anti-pattern illustration -->
+- "0 goals have priority=HIGH"
+- "all experience entries are missing the verified_values field"
+- "N/M pipeline records lack resolution_criteria"
+
+These look authoritative but fail silently when the field name drifted. The
+2026-04-17 guardrail-utilization audit concluded "98% zero-utilization" by
+aggregating `times_triggered`; the real counter was `utilization.times_active`.  <!-- DRIFT-EXEMPT: anti-pattern illustration -->
+The conclusion had to be retracted the next iteration.
+
+### Protocol
+
+Before accepting a statistical/audit negation, BOTH must hold:
+
+1. **Schema probe**: A `core/scripts/jsonl-field-probe.py` run confirmed the
+   field exists in at least one sampled record. The probe is signal 2 — the
+   statistical claim itself is signal 1.
+2. **Gate pass**: `core/scripts/zero-count-gate.py` exits 0 with
+   `--file-probed`, `--field-probed`, and `--probe-result="found"`.
+
+A probe result of `missing` means the field does not exist in the sample —
+the statistical claim is almost certainly a schema-drift artifact and must
+not be accepted.
+
+### Enforcement
+
+- `aspirations-verify/SKILL.md` Q2 NEGATIVE CHECK invokes the gate for any
+  matching claim. A gate exit of 1 maps to Q2 FAIL and the goal goes back
+  to pending, same as the infrastructure and knowledge gates.
+- The gate is fail-open on internal errors: it prefers letting a legitimate
+  claim through to silently suppressing output. Integrity of the enforcement
+  surface comes from repeated use across verification cycles, not from the
+  gate being a hard wall.
+
+### Two gates, one principle (g-115-58)
+
+Two scripts enforce rb-245 at different points in the audit lifecycle —
+they are **complementary, not redundant**:
+
+| Gate | When it fires | Input | What it checks |
+|------|---------------|-------|----------------|
+| `audit-schema-gate.py` | BEFORE an audit runs | Caller passes file path + field names | Samples live records; blocks if any claimed field is absent or always-null across the sample |
+| `zero-count-gate.py` | AFTER a claim is made | Triggered by aspirations-verify Q2 on phrases like "98% have X=0" | Scans the claim text for statistical-negation patterns; requires a separate `jsonl-field-probe.py` run as signal 2 |
+
+**Call order for a new audit/analysis script**:
+1. Call `audit-schema-gate.py` with the fields you plan to aggregate over.
+   If the gate exits non-zero, the audit is misconfigured — STOP, do not
+   proceed to aggregate. This prevents producing the false-authoritative
+   claim in the first place.
+2. If schema-gate passes, run the aggregation.
+3. When the resulting claim reaches aspirations-verify Q2, zero-count-gate
+   catches any claim that bypassed step 1 or that used unscoped field
+   inference. This is the belt-and-suspenders layer.
+
+The pre-audit gate (step 1) is load-bearing for new code; the post-audit
+gate (step 3) is the safety net for code paths that don't yet call
+step 1.
+
 ## Integration with infra-health.sh
 
 `infra-health.sh check <component>` always counts as 1 real signal (it runs

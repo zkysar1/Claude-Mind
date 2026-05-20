@@ -1,6 +1,6 @@
 # Working Memory Convention
 
-Working memory (`<agent>/session/working-memory.yaml`) is the agent's session-scoped RAM.
+Working memory (`agents/<agent>/session/working-memory.yaml`) is the agent's session-scoped RAM.
 All access goes through dedicated `wm-*.sh` scripts. The LLM MUST NOT read or write
 the file directly — all access via scripts.
 
@@ -50,7 +50,7 @@ slot_meta:
 
 ## Script API
 
-All scripts in `core/scripts/`. File path is hardcoded to `<agent>/session/working-memory.yaml`.
+All scripts in `core/scripts/`. File path is hardcoded to `agents/<agent>/session/working-memory.yaml`.
 
 | Script | Purpose | Side Effects |
 |--------|---------|-------------|
@@ -61,7 +61,8 @@ All scripts in `core/scripts/`. File path is hardcoded to `<agent>/session/worki
 | `wm-ages.sh [--json]` | Report all slot ages | Pure read, no side effects |
 | `wm-prune.sh [--dry-run]` | Mid-session pruning per config | Prunes stale items, evicts stale scalars |
 | `wm-init.sh` | Create from template | Reads slot_types from `core/config/memory-pipeline.yaml` |
-| `wm-reset.sh` | Reset to template state | Same as init (session-end consolidation) |
+| `wm-reset.sh` | Reset slots + top-level keys to template; PRESERVE SESSION_IDENTITY_FIELDS (`{session_start}`) from existing WM | Runs mid-session from `aspirations-consolidate` Step 5 (including the autocompact path); preservation keeps session-identity values alive across the autocompact boundary so the same session resumes with a non-null `session_start`. Message names preserved fields when any survived. |
+| `wm-clear-identity.sh` | Explicitly null SESSION_IDENTITY_FIELDS | No-op if already clear (no write, no mtime bump). Authorized caller: `/stop` graceful-stop D4.5 — the ONE place the session genuinely ends. Do NOT call from consolidate. |
 
 ### Slot Addressing
 
@@ -106,6 +107,23 @@ the slot and its `slot_meta` entry on first write. These slots won't exist after
 
 Domain-specific slots (e.g. `infrastructure_recovery_directive`) are created this way at
 runtime by domain knowledge articles or forged skills.
+
+### Cadence-Tracking Slots
+
+Several skills persist cadence-tracking state as ad-hoc slots. These are read
+each iteration by their owning skill's cadence gate. Single-writer per slot
+(guard-155): only the owning skill is authorized to write, to avoid dual-write
+drift where one site resets the stamp while another skips the update.
+
+| Slot | Owner | Content | Used by |
+|------|-------|---------|---------|
+| `last_strategic_scan` | `aspirations-strategic-scan` | ISO timestamp of last scan | Orchestrator Phase 1.5 `hours_cadence` check |
+| `last_fresh_eyes_review` | `fresh-eyes-review` | `{timestamp, goals_count_at_last_fire}` | `fresh-eyes-cadence-check.sh` → precheck Phase 0.5e |
+| `portfolio_health_signal` | `aspirations-strategic-scan` (S3 phase) | Category concentration + uncovered-priority findings | Consumed by `/fresh-eyes-review` Phase 2.5 + evolution gap analysis |
+| `cooldown_active` | `productivity-stop-gate.sh` `_write_blocked_sleep_until` | Boolean — true while a productivity-cooldown sleep is pending; cleared on every `blocked_sleep_until=null` cleanup path in `core/config/blocked-sleep-recovery-digest.md` | `blocked-sleep-recovery-digest.md` Phase -0.5e light-precheck — suppresses the `proactive_escalation` "still blocked" notification when the wake came from productivity-paced rest rather than B7-backoff (g-251-08). |
+
+New cadence slots follow the same pattern: plain top-level key via `wm-set.sh`,
+no schema declaration required, skill owns the write path.
 
 ---
 
@@ -156,12 +174,15 @@ proactively — not deferred until state update — so they survive autocompact:
 
 - **Execution diary**: For decision points, failures, and approach changes, use
   `execution-diary.sh append` to write structured breadcrumbs to the append-only diary
-  (`<agent>/session/execution-diary.jsonl`). Unlike WM slots (which are overwritten), the
+  (`agents/<agent>/session/execution-diary.jsonl`). Unlike WM slots (which are overwritten), the
   diary is cumulative. See `core/config/conventions/compact-recovery.md`.
 
-- **Reasoning snapshot**: When context enters the tight zone (>=65%), proactively write a
-  synthesis of current reasoning state via `reasoning-snapshot.sh write`. This captures the
-  LLM's own synthesized understanding before autocompact fires at 80%.
+- **Reasoning snapshot**: When context enters the tight zone (as classified by
+  `core/scripts/context-budget-status.py` — distance-to-autocompact, not raw usage),
+  proactively write a synthesis of current reasoning state via
+  `reasoning-snapshot.sh write`. Before writing, `Bash: bash core/scripts/context-budget-banner.sh`
+  and quote its output so the trigger is evidence-based. This captures the
+  LLM's own synthesized understanding before autocompact fires.
 
 All three mechanisms survive compaction: WM slots via the full checkpoint (`all_slots`),
 the diary via the append-only JSONL file on disk, and the snapshot via its YAML file.
@@ -191,6 +212,16 @@ prior session are available during boot.
   _item_ts: "YYYY-MM-DDTHH:MM:SS"   # Auto-added by wm-append.sh
 ```
 
+**Schema gate** (wm-append.sh, rb-248 + g-115-59): entries are validated at write time.
+One of three forms is required — anything else is rejected:
+
+1. **Node-scoped**: `node_key` resolves to a real entry in `world/knowledge/tree/_tree.yaml`
+2. **Housekeeping**: `priority: housekeeping` + `reason` (for framework-wide debt not tied to a single node)
+3. **Explicit-null**: `node_key: null` + `reason` (for debt that cannot be located to a specific node yet)
+
+Placeholder strings like `"multiple"` or `"tree_maintenance"` as `node_key` are rejected —
+they produce false positives in debt-closure matchers that use substring containment.
+
 ### known_blockers items
 See `core/config/conventions/handoff-working-memory.md` for full schema.
 
@@ -215,3 +246,31 @@ See `core/config/conventions/handoff-working-memory.md` for full schema.
   replay_priority: "violations | high_surprise | routine_observations"
   _item_ts: "YYYY-MM-DDTHH:MM:SS"
 ```
+
+## Pseudocode Placeholder Convention
+
+Skill pseudocode uses `$<name>` (dollar-prefixed) as a placeholder for "value
+captured from a previous tool call, passed to the next one." This is NOT a
+bash variable in the skill-author's sense — it is a narrative device
+indicating data flow across Bash-tool invocations.
+
+Example:
+```
+Bash: next_val = `<compute-next>.sh`
+Bash: echo "$next_val" | wm-set.sh SLOT
+```
+
+The agent reading the pseudocode does the substitution at execution time:
+capture the stdout of the first call, then literally echo that value into
+the stdin of the second call. Do NOT `export` the name or assume cross-call
+bash-style variable scoping — each Bash tool invocation is a fresh shell.
+
+Canonical case:
+- `$next_val` — computed scalar flowing from a probe into `wm-set.sh`.
+
+Other placeholder names may appear as needed; the convention is the
+dollar-prefix + narrative-device semantics, not a fixed vocabulary.
+
+When the flow spans more than two calls, consider `wm-set.sh` to the
+working-memory slot instead — slots persist across calls, pseudocode
+placeholders do not.

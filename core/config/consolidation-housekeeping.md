@@ -50,16 +50,64 @@ IF conclusions non-empty:
 
 ## Step 2.8: Pending Questions Re-evaluation
 
+Bash-driven sweep replaces the old per-question LLM probe loop. The sweep
+runs in O(N) string/date ops on alpha's data (~milliseconds, not seconds),
+emitting a per-entry verdict the LLM acts on in one short pass.
+
 ```
-Read <agent>/session/pending-questions.yaml
-IF file exists AND has entries with status == "pending":
-    FOR EACH pending question:
-        node=$(bash core/scripts/tree-find-node.sh --text "{question}" --leaf-only --top 3)
-        IF knowledge answers it: status → "resolved", set resolution + resolved_at
-        ELIF state/infrastructure changed: status → "resolved" as "Stale"
-    Write updated <agent>/session/pending-questions.yaml
-    Report: "{resolved} self-resolved, {stale} stale, {remaining} still pending"
+Bash: pending-questions-sweep.sh sweep
+# Parse JSON output (subcommand, summary, flags, counts, entries[]).
+# Exit 0 = clean (no flags). Exit 1 = flags raised. Exit 2 = input error.
+IF exit_code == 0 OR flags is empty:
+    Report: "Pending questions: clean ({counts.total} entries, no action needed)"
+ELSE:
+    # Apply each verdict. The LLM is responsible for the YAML mutation —
+    # the script is read-only by design (see header docstring).
+    FOR entry in entries:
+        IF entry.verdict == "auto_resolve":
+            Edit agents/<agent>/session/pending-questions.yaml:
+                Set status=resolved, resolution="<entry.reason> (auto-resolved by sweep)",
+                resolved_at=<now>
+        ELIF entry.verdict == "cleanup_only":
+            # Already terminal-with-resolution, OR answered-with-answer.
+            # For "answered with answer": flip status to resolved AND copy
+            # the answer into resolution (single LLM-side YAML edit per
+            # batch is fine — typically 14 in one pass for alpha).
+            IF entry.status == "answered":
+                Edit: status=resolved, resolution="<answer field copied>", resolved_at=<now>
+            # ELSE: already resolved with resolution; nothing to mutate.
+            #       The "cleanup_only" verdict surfaces them so the report
+            #       counts include them but no YAML edit fires.
+        ELIF entry.verdict in {"likely_resolved", "likely_stale"}:
+            # Marginal cases — brief LLM judgment per entry. Read the entry
+            # body, re-check the heuristic's reason against current world
+            # state. Confirm or keep pending.
+            IF confirmed:
+                Edit: status=resolved, resolution="<entry.reason> (confirmed during consolidation)",
+                resolved_at=<now>
+            ELSE: keep status pending (will resurface in next sweep)
+        ELIF entry.verdict == "flag_for_review":
+            # >30d pending. Not auto-resolved. Surface in the report so the
+            # user sees the count of long-pending entries on next /prime.
+            (no edit)
+    IF any status flipped to resolved: Bash: session-signal-set.sh pq-resolved
+    Report: "Pending questions: auto={counts.auto_resolve}, cleanup={counts.cleanup_only},
+             confirmed={count of likely_* the LLM accepted}, kept={count kept pending},
+             review={counts.flag_for_review}, total={counts.total}"
 ```
+
+Sweep heuristics (priority order, from `core/scripts/pending-questions-sweep.py`):
+
+1. `cleanup_only` — already-terminal status with non-empty resolution
+2. `cleanup_only` — status=answered with non-empty answer (just needs status flip)
+3. `likely_resolved` — agent_answered + 7-day grace expired
+4. `likely_stale` — infra-state question (PID/port/VRAM/etc.) + 14-day age
+5. `likely_stale` — ritual entry (fresh-eyes-*) superseded by newer resolved sibling
+6. `auto_resolve` — pending + no-op default_action + 14-day age (only auto-resolve)
+7. `flag_for_review` — pending > 30 days (catch-all for unbounded growth)
+8. `no_action` — fresh / no signal yet
+
+The script is fail-open: malformed entries yield `no_action` with a reason rather than crashing.
 
 ## Step 2.9: Experience Distillation (runs on both paths)
 
@@ -70,7 +118,7 @@ Group experiences by tree_nodes_related field.
 
 FOR EACH tree node with 3+ related experiences since last distillation:
     FOR EACH experience in cluster:
-        Read <agent>/experience/{exp.content_file}
+        Read agents/<agent>/experience/{exp.content_file}
         Extract: verbatim_anchors, key findings, exact values, failure sequences
     Read target tree node .md file
     Compose multi-paragraph synthesis preserving:
@@ -119,9 +167,21 @@ This captures remaining WM state before destruction.
 ## Step 6: Tree Rebalancing (runs always, including stop_mode)
 
 ```
-Invoke /tree maintain (ALL ops: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
+IF stop_mode == true:
+    # Small fixed budget — drains structural debt incrementally without
+    # making /stop slow. Caps live in core/config/tree.yaml `stop_mode_caps`
+    # (default 5 decomposes, 2 distills, others ≤1). Lane D Magic Wand #4.
+    Invoke /tree maintain --stop-mode
+ELSE:
+    Invoke /tree maintain (ALL ops: DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
 Report structural changes to journal
 ```
+
+NOTE: Pre-2026-05-08 this step was a deferral path under stop_mode + tight context
+("deferred (stop_mode+tight)") which let candidates accumulate. The new behavior
+honors the meta-principle in `core/config/modes/autonomous.md` "Stop-mode does
+work" — /stop pays a small wall-clock cost (≤90s) to drain a few candidates per
+invocation, instead of a zero cost that lets debt grow forever.
 
 ## Steps 7-8: Skill Maintenance (skip in stop_mode)
 
@@ -174,7 +234,7 @@ IF stop_mode != true:
 ## Step 8.9: Release Held Claims
 
 ```
-Bash: AYOAI_AGENT={agent} aspirations-read.sh --active-compact 2>/dev/null
+Bash: MIND_AGENT={agent} aspirations-read.sh --active-compact 2>/dev/null
 FOR EACH world goal WHERE claimed_by == this agent:
     Bash: aspirations-release.sh <goal-id>
 echo "Session ending: released all held claims" | Bash: board-post.sh --channel coordination --type status
@@ -184,7 +244,7 @@ echo "Session ending: released all held claims" | Bash: board-post.sh --channel 
 
 ```
 Bash: goal-selector.sh → get top-ranked goal for next session
-Write <agent>/session/handoff.yaml:
+Write agents/<agent>/session/handoff.yaml:
   session_number: {session_count}
   timestamp: "{ISO 8601}"
   last_goal_completed: "{last goal id}"

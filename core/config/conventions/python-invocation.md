@@ -1,0 +1,259 @@
+# Python Invocation (Windows / Git Bash)
+
+## The Problem
+
+On Windows, typing `python3` in Git Bash resolves to a Microsoft Store alias
+(`/c/Users/<user>/AppData/Local/Microsoft/WindowsApps/python3`). That alias is
+a stub — executing it prints:
+
+```
+Python was not found; run without arguments to install from the Microsoft Store,
+or disable this shortcut from Settings > Apps > Advanced app settings >
+App execution aliases.
+```
+
+and exits with code 49. It is NOT an actual Python interpreter. The real
+interpreter is reached via the `py` launcher (`py -3 --version` → `Python 3.12.x`).
+
+## The Existing Defense (Two Layers)
+
+### Layer 1 — Shim directory
+
+`core/scripts/.python-shim/python3` and `core/scripts/.python-shim/python` are
+bash wrappers that dispatch to `py`, `python`, `python3`, or `/c/Windows/py`
+in order. First executable wins:
+
+```bash
+for candidate in py python python3 /c/Windows/py; do
+  if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+```
+
+Created on first run by `core/scripts/_paths.sh` (lines 22-53) when direct
+`python3 -c "pass"` fails. Any `.sh` script that sources `_paths.sh` at the
+top gets the shim prepended to PATH for its subshell — this is why every
+wrapper script (`reasoning-bank-read.sh`, `pipeline-read.sh`, etc.) works
+reliably regardless of Windows-level alias routing.
+
+### Layer 2 — PreToolUse[Bash] hook
+
+`core/scripts/bash-agent-inject.sh` runs before every LLM-issued Bash tool
+call. It sources `_paths.sh` + `_platform.sh` and prepends the shim directory
+to the command's PATH via `bash-agent-inject.py` (alongside the
+`MIND_AGENT` env var). Configured in `.claude/settings.json` with an 8s
+timeout.
+
+## Why Failures Can Happen (Residual Failure Mode)
+
+Historical root cause (fixed 2026-04-19 in `bash-agent-inject.py:55-62`):
+the hook computed the shim path via `pathlib.Path.as_posix()`, which on
+Windows produces `C:/<repo-root>/.../.python-shim`. That form is preserved
+intact as a single PATH entry (bash does NOT split at the `C:` colon —
+empirically verified), but MSYS bash's directory lookup only resolves
+POSIX drive form (`/c/...`). So the shim dir was "on PATH" but executables
+inside it were unreachable — `which python3` fell through to the next
+match, the MS Store stub. The fix converts `C:/...` → `/c/...` before
+emission. Post-fix, `which python3` resolves to the shim and `python3 -c`
+works from any LLM Bash tool call whose hook fires.
+
+Two residual failure modes:
+
+1. **Hook fails open** — on timeout (8s budget in `.claude/settings.json`),
+   parse error, or missing agent binding (`.active-agent-<SID>` absent),
+   the hook exits 0 with empty stdout (`approve, no mutation`). The LLM's
+   raw `python3 -c` then runs with no shim attempt, hits the MS Store stub,
+   returns exit 49. This is an intentional safety property (never block
+   user work on hook failure), not a bug to fix.
+
+2. **Heredoc ghosting** — multi-line heredoc tool_input (`py -3 <<PY ... PY`
+   or `python3 <<EOF ... EOF`) occasionally reaches the Windows runtime in
+   a form that the harness classifies as background execution. Symptom: the
+   Bash call appears to complete but produces an empty stdout file, forcing
+   a retry. Not reproducible on demand, but observed under Git Bash / MSYS2.
+   The hook is innocent (`bash-agent-inject.py:83-86` does a faithful
+   passthrough of `run_in_background`; it never injects the flag). Rule #5
+   below avoids the pattern entirely from LLM-issued Bash calls. Heredocs
+   inside `.sh` wrapper scripts remain safe — the harness sees a single-line
+   `bash script.sh` invocation; the heredoc lives in a subshell it never
+   parses.
+
+The rules below are designed around both residual modes: `py -3` is bedrock
+and works regardless of hook state, and inline `-c` (or a `.sh` wrapper) avoids
+the multi-line tool_input form that trips the ghosting.
+
+## The Rule
+
+When you need Python from a Bash tool call, follow this order of preference:
+
+### 1. Use a framework script (first choice, always)
+
+```bash
+bash core/scripts/reasoning-bank-read.sh --active
+bash core/scripts/pipeline-read.sh --stage active
+bash core/scripts/guardrails-read.sh --active
+```
+
+These source `_paths.sh`, which guarantees `python3` resolves inside their
+subshell even when the outer hook PATH injection is absent.
+
+### 2. For inline one-liners, use `py -3` explicitly
+
+```bash
+bash core/scripts/reasoning-bank-read.sh --active | py -3 -c "import json, sys; ..."
+bash core/scripts/pipeline-read.sh --stage active | py -3 -c "..."
+```
+
+`py -3` is the Windows Python launcher and is bedrock — it bypasses PATH
+resolution entirely. Works on every machine where `core/scripts/.python-shim/`
+got initialized (i.e., every machine the loop ever booted on).
+
+### 3. `python3` inline only inside a `.sh` wrapper you author
+
+If you write a new `.sh` wrapper, source `_paths.sh` at the top — then
+`python3` inside the script body is safe because the shim is on PATH:
+
+```bash
+#!/usr/bin/env bash
+source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+python3 "$CORE_ROOT/scripts/my-new-script.py" "$@"
+```
+
+### 4. NEVER — raw `python3 -c "..."` from a Bash tool call
+
+If you write `python3 -c "import json; ..."` as a direct Bash tool call,
+you are betting that the hook's PATH injection reached you. On this
+machine that bet has been losing often enough that the pattern is
+considered unsafe. Use `py -3 -c` instead — it's the same number of
+characters and it always works.
+
+### 5. NEVER — `py -3 <<PY` (or `python3 <<`) heredoc from a Bash tool call
+
+Multi-line heredocs in direct LLM-issued Bash tool calls have been
+observed to "ghost" into `run_in_background` mode on Windows, producing
+empty stdout files and forcing retries. See the "Heredoc ghosting"
+residual failure mode above. Root cause is harness-side and we cannot
+fix it — but we can stop emitting the pattern.
+
+**Allowed**: heredocs inside `.sh` wrapper scripts (e.g., `python3 -
+<<'PYEOF'` in `core/scripts/*.sh` that source `_paths.sh`). The harness
+sees a single-line `bash script.sh` tool_input; the heredoc lives in a
+subshell it never parses.
+
+**If a snippet feels too long for `-c`**, choose in this order:
+
+1. Short (≤1 logical statement) → `py -3 -c "..."` with escaped quotes,
+   pipe stdin in via `bash core/scripts/X.sh | py -3 -c "..."`.
+2. Multi-line JSON/YAML/Python payload → **prefer building the payload
+   inline with `py -3 -c "..."` and piping directly to the consumer
+   wrapper without on-disk staging**. Reference pattern (validated
+   2026-05-16 delta iter-9 filing g-115-840):
+   ```bash
+   MIND_AGENT=<name> bash -c 'PAYLOAD=$(py -3 -c "
+   import json
+   goal = { ... }   # construct programmatically — escape inner quotes
+   print(json.dumps(goal))
+   ")
+   echo "$PAYLOAD" | grep -q "<sentinel>" && echo "SENTINEL OK"   # guard-428 readback
+   echo "$PAYLOAD" | bash core/scripts/aspirations-add-goal.sh ...
+   '
+   ```
+   This avoids the Write tool entirely and works for payloads up to
+   the bash arg-length limit (~32KB on Windows shells, usually plenty
+   for one goal/finding payload). Apply guard-545 (avoid em-dashes /
+   non-ASCII inside heredocs) and guard-428 (readback content sentinels
+   before piping) to the in-memory payload the same way you would to a
+   staged file.
+
+   If the payload is genuinely too large for inline construction AND
+   needs to be on disk: be aware that `agents/<agent>/session/<file>` writes
+   are gated by `core/scripts/session-manifest-write-gate.py` in
+   autonomous mode — only basenames registered in
+   `core/config/session-manifest.yaml` files[] are allowed (the gate
+   filters by `target_parts[-1]` only, so the registered `scratch`
+   dir-type entry at L418 does NOT currently allow files under it via
+   the Write tool — `Apply: honor type:dir entries in the
+   session-manifest write-gate` is queued as `g-115-840`; until it
+   lands, `agents/<agent>/session/scratch/<file>` Write tool calls BLOCK).
+   Workable on-disk staging today: (a) register the specific basename
+   in `session-manifest.yaml` files[] then Write; (b) write to an
+   out-of-scope path (under `<agent>/` but NOT under `session/`, e.g.
+   `agents/<agent>/journal/...`, with awareness that those dirs have their
+   own conventions); (c) author a `.sh` wrapper that does the staging
+   inside its own subshell (heredoc inside `.sh` is allowed per rule
+   5). Always clean up after use.
+3. New capability that would repeat → author or extend a `.sh` wrapper
+   in `core/scripts/` that contains the heredoc. See the reference
+   pattern at `core/scripts/test-background-jobs-output-gate.sh:46`:
+   `cat > "$SANDBOX/driver.py" <<'PYDRIVER' ... PYDRIVER` then `python3
+   "$SANDBOX/driver.py"` — **all inside the .sh wrapper**, not as a
+   direct Bash tool call.
+
+Scope: this rule covers `py -3 <<` and `python3 <<` heredocs — the
+observed ghosting pattern. Bash heredocs for non-Python use
+(`cat > file <<EOF`, `sed <<EOF`, etc.) have not been observed ghosting
+and are not in scope. If future evidence shows they do, extend this
+rule.
+
+## Diagnostic Recipe
+
+If you see `Exit code 49` or `Python was not found; run without arguments to
+install from the Microsoft Store`:
+
+1. **Do not retry the same command.** The shim PATH entry was mangled by
+   the colon-split bug or the hook failed open; either way, retrying the
+   identical call hits the same stub.
+2. **Switch to `py -3 -c "..."`** if the command was `python3 -c "..."`.
+   Same argument structure, bedrock resolution.
+3. **Switch to a framework `.sh` wrapper** if one exists for what you're
+   doing (`reasoning-bank-read.sh`, `pipeline-read.sh`, etc.).
+
+## Scope
+
+Applies to the LLM's direct Bash tool calls AND to any SKILL.md pseudocode
+templates that teach the LLM to emit `python3`. Base skills SHOULD prefer
+the `.sh` wrapper or `py -3 -c` idiom. If a skill's SKILL.md uses raw
+`python3 -c` and the hook occasionally fails, the skill is priming the LLM
+for a recurring failure mode — update the skill to use `py -3 -c`.
+
+## Migration Note (2026-05-14)
+
+As of 2026-05-14, 35 wrappers in `core/scripts/` were migrated to
+daemon-only operation. Those wrappers no longer fall back to direct
+Python invocation (`python3 core/scripts/<name>.py <subcommand>`) — they
+route exclusively through the daemon. The Python invocation guidance in
+this file remains relevant for:
+
+- The 280 pure-CLI wrappers that still invoke Python via subprocess
+- Inline `py -3 -c` one-liners from LLM Bash tool calls
+- New `.sh` scripts that source `_paths.sh` and call `python3`
+- Gate scripts, ad-hoc analysis, and utility scripts
+
+Cross-ref: `.claude/rules/no-python-cli-fallback.md` for the daemon-only
+rule and recovery story.
+
+## Related
+
+- `.claude/rules/no-python-cli-fallback.md` — daemon-only rule for the 35
+  migrated wrappers (no CLI fallback)
+- `.claude/rules/domain-free-examples.md` — keep examples generic (no
+  cloud-provider names); this file uses domain-free `py -3 -c` examples
+  for the same reason
+- `core/scripts/_paths.sh` lines 22-53 — the shim creation + PATH prepend
+- `core/scripts/bash-agent-inject.sh` + `bash-agent-inject.py` — the hook
+  defense (fail-open)
+- `core/scripts/.python-shim/python3` + `python` — the wrappers themselves
+- `world/guardrails.jsonl` → `guard-335` — fires when the error is seen
+- `world/guardrails.jsonl` → `guard-368` — fires when the agent is about
+  to emit a multi-line heredoc in a direct Bash tool call
+- `world/reasoning-bank.jsonl` → `rb-370` — the diagnosis entry (MS Store
+  stub / hook fail-open)
+- `world/reasoning-bank.jsonl` → `rb-433` — the diagnosis entry
+  (heredoc ghosting into run_in_background)
+- `world/reasoning-bank.jsonl` → `rb-471` — audit-scope discipline when
+  migrating existing code to this convention (enumerate every legacy
+  invocation variant before claiming the sweep is complete; narrow greps
+  mask `py -c`, bare `py <file>`, and `py -` heredoc forms)
+- `core/scripts/test-background-jobs-output-gate.sh:46` — the reference
+  pattern for wrapping a long Python snippet inside a `.sh` script

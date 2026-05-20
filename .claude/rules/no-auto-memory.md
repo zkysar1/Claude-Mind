@@ -6,8 +6,12 @@ auto-memory directory (~/.claude/projects/*/memory/). All persistence uses:
 - User corrections / behavioral rules → guardrails (guardrails-add.sh)
 - Domain knowledge / facts → knowledge tree (/tree add or Edit node .md)
 - Lessons learned / failure analysis → reasoning bank (reasoning-bank-add.sh)
-- Session-scoped info → working memory (<agent>/session/working-memory.yaml)
+- Session-scoped info → working memory (agents/<agent>/session/working-memory.yaml)
 
 When the user says "remember": use the knowledge tree, not auto-memory.
 When you learn something new: use guardrails or reasoning bank, not auto-memory.
 The MEMORY.md content injected by the platform is legacy — ignore it.
+
+For the full decision tree covering all ten stores (including pipeline,
+pattern signatures, experience, journal, resource locators, and spark
+questions), see `core/config/conventions/learning-routing.md`.

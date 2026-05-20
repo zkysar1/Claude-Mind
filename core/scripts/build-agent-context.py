@@ -30,7 +30,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR
+from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, META_DIR, AGENT_NAME
 
 # Store paths
 TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
@@ -193,6 +193,27 @@ def build_context(categories, role, repo_path, max_tokens):
     sections.append("\u2500\u2500 PROGRAM \u2500\u2500")
     program_body = extract_md_body(program_path, max_lines=3)
     sections.append(program_body or "Not configured")
+    sections.append("")
+
+    # --- Resolved paths (always rendered; never truncated) ---
+    # Sub-agents that read/grep/enumerate data under world/, meta/, or an
+    # agent directory need the resolved on-disk paths. The virtual prefixes
+    # "world/" and "meta/" in skill docs map to user-configured external
+    # paths — without these resolved values, a sub-agent that searches only
+    # the local repo misses 100% of canonical world/ artifacts.
+    sections.append("\u2500\u2500 RESOLVED PATHS \u2500\u2500")
+    sections.append(f"PROJECT_ROOT: {PROJECT_ROOT}")
+    sections.append(f"WORLD_DIR:    {WORLD_DIR}")
+    sections.append(f"META_DIR:     {META_DIR}")
+    if AGENT_DIR is not None:
+        sections.append(f"AGENT_DIR:    {AGENT_DIR}  (agent: {AGENT_NAME})")
+    else:
+        sections.append("AGENT_DIR:    (no agent bound)")
+    sections.append(
+        "Use these paths directly when grepping JSONL stores "
+        "(reasoning-bank.jsonl, guardrails.jsonl, aspirations.jsonl, "
+        "pipeline.jsonl) or tree nodes. Do NOT search only the local repo."
+    )
     sections.append("")
 
     # --- Repo context (if --repo provided) ---

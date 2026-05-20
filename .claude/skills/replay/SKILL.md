@@ -1,6 +1,6 @@
 ---
 name: replay
-description: "Hippocampal replay — compressed, selective review of resolved hypotheses for reconsolidation and domain transfer"
+description: "Performs hippocampal replay on resolved hypotheses: compressed sharp-wave review for reconsolidation, reverse-order recency scan, selective encoding-queue replay, category-scoped replay, or domain-transfer bundling. Use whenever the aspirations loop hits the replay cadence, /aspirations-consolidate schedules a replay pass, the user says \"replay recent learning\" or \"cross-reference resolved hypotheses\", or the orchestrator needs to bootstrap cross-domain transfer. Mode selected via --sharp-wave / --reverse / --selective / --category / --domain-transfer."
 user-invocable: false
 triggers:
   - "/replay"
@@ -19,6 +19,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [pipeline, experience, tree-retrieval, reasoning-guardrails, pattern-signatures, handoff-working-memory]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-replay-f3b9d2"
+previous_revision_id: null
 ---
 
 # /replay — Hippocampal Replay Engine
@@ -72,7 +74,7 @@ Apply spaced repetition filter:
 Select top N candidates (N = max_replay_items from config, default 10)
 
    # Add experience-backed candidates
-   IF <agent>/experience.jsonl exists:
+   IF agents/<agent>/experience.jsonl exists:
        Bash: experience-read.sh --type goal_execution
        Bash: experience-read.sh --type hypothesis_formation
        Include experiences with high retrieval_count as additional replay candidates
@@ -186,13 +188,26 @@ FOR EACH shared_condition group where N >= 2 corrected hypotheses:
     IF NOT is_procedural_gap:
         CONTINUE  # Not a convention candidate
 
-    # Phase classification
-    IF shared_condition relates to setup/prerequisites before execution:
-        target = "pre-execution"
-    ELIF shared_condition relates to cleanup/verification after execution:
+    # Slot classification — four-way per core/config/conventions/domain-hooks.md
+    # Targeting Guidance. Decision order (check specific before general):
+    # outcome-observation → signal-refresh → post-execution → pre-execution → skip.
+    IF shared_condition relates to pulling a new outcome metric from real-world
+       systems AFTER state update (repo commits, CI pass rate, service health,
+       business KPI, process-vs-outcome divergence signal):
+        target = "outcome-observation"
+    ELIF shared_condition relates to refreshing an input channel BEFORE goal
+         scoring (user email/reply, board directive, pending-question silence,
+         external queue state):
+        target = "signal-refresh"
+    ELIF shared_condition relates to cleanup/verification/commit/test AFTER a
+         single goal's execution:
         target = "post-execution"
+    ELIF shared_condition relates to setup/prerequisites BEFORE a single goal's
+         execution:
+        target = "pre-execution"
     ELSE:
-        CONTINUE  # Ambiguous — skip
+        CONTINUE  # Unroutable — skip (may indicate a new slot is needed; file
+                  # an Idea goal if this recurs across mining passes)
 
     # Check for existing proposals to reinforce
     Bash: source core/scripts/_paths.sh
@@ -259,14 +274,32 @@ For each strategy referenced during replay:
                   newer evidence from {outcome_date}"
            echo '{"node_key":"<key>","reason":"<reason>","source":"replay-staleness"}' | wm-append.sh knowledge_debt
 
-   # Update experience retrieval stats for replayed experiences
+   # Update experience retrieval stats for replayed experiences.
+   #
+   # experience-update-field.sh rejects dotted-path syntax (g-115-529 / g-115-928
+   # fail-loud rejection per experience.py:549). Use whole-object JSON: read
+   # current retrieval_stats, mutate, write the whole object back in one call.
    For each experience record consulted during replay:
-       bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.retrieval_count {n+1}
-       bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.last_retrieved "{today}"
-       IF experience content contributed to strategy reinforcement or revision:
-           bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.times_useful {n+1}
-       ELSE:
-           bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.times_noise {n+1}
+       # Step 1: read current retrieval_stats subobject (may be null/absent for
+       # records added before retrieval_stats was a tracked field — default to {}).
+       current = $(bash core/scripts/experience-read.sh --id {exp-id} \
+                   | py -3 -c "import sys,json; r=json.load(sys.stdin); \
+                       print(json.dumps((r if not isinstance(r,list) else (r[0] if r else {})).get('retrieval_stats') or {}))")
+       # Step 2: mutate the relevant subkeys.
+       useful_flag = "true" if experience content contributed to strategy reinforcement or revision else "false"
+       updated = $(echo "$current" | py -3 -c "
+import json, sys
+s = json.load(sys.stdin) or {}
+s['retrieval_count'] = s.get('retrieval_count', 0) + 1
+s['last_retrieved']  = '{today}'
+if '$useful_flag' == 'true':
+    s['times_useful'] = s.get('times_useful', 0) + 1
+else:
+    s['times_noise']  = s.get('times_noise', 0) + 1
+print(json.dumps(s))")
+       # Step 3: write whole-object JSON back. experience.py auto-recomputes
+       # utility_ratio when retrieval_stats is updated.
+       bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats "$updated"
 ```
 
 ## Step 5: Domain Transfer Check (--domain-transfer mode)
@@ -276,7 +309,7 @@ Find patterns in the strongest domain that could bootstrap weaker domains.
 ```
 leaves_json=$(bash core/scripts/tree-read.sh --leaves)
 # Each entry has key, depth, capability_level — extract domain-level capability info
-Read <agent>/developmental-stage.yaml → exploration budget allocation
+Read agents/<agent>/developmental-stage.yaml → exploration budget allocation
 
 strongest = leaf with highest capability_level (strong domain, EXPLOIT or MASTER level)
 weakest = leaf with lowest capability_level (weak domain, EXPLORE or CALIBRATE level)
@@ -296,9 +329,9 @@ For each validated pattern/strategy in strongest domain:
       strong domain "exhaustion detection" → weak domain "mean reversion signals"
 
   If plausible transfer:
+    Bash: echo "SCAFFOLDING: {strong domain} -> {weak domain}: {hypothesis} (Log spark for aspirations: Test {pattern} transfer to {domain})"
     echo '<transfer-json>' | wm-set.sh cross_domain_transfer
-    Log spark for aspirations: "Test {pattern} transfer to {domain}" (aspirations gap analysis picks this up)
-    Log: "SCAFFOLDING: {strong domain} → {weak domain}: {hypothesis}"
+Bash: echo "replay phase documented"
 ```
 
 ## Step 6: Replay Report
@@ -340,3 +373,9 @@ Next replay due: {date based on 7-day interval}
 | Updates | Pattern signatures via `pattern-signatures-record-outcome.sh` | Outcome stats, new separation markers |
 | Updates | Knowledge tree node articles | Reconsolidation updates |
 | Updates | Working memory (via `wm-set.sh`) | Cross-domain transfer slot, pattern cache |
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `pattern-signatures-record-outcome.sh`, a tree-node write,
+or `wm-set.sh`. Never end with a text summary of the replay.

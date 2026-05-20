@@ -40,11 +40,102 @@ extract_initial_state() {
 # --- 1. Create directory structure ---
 mkdir -p \
     "$WORLD/conventions" \
+    "$WORLD/config" \
     "$WORLD/knowledge/tree" \
     "$WORLD/knowledge/patterns" \
     "$WORLD/knowledge/strategies"
 
 echo "  Created directory structure"
+
+# --- 1.1 Seed empty domain-overlay stub files (Phase 2.5 packaging) ---
+# Core scripts read these via core/scripts/_world_config.py with safe-empty
+# defaults. A fresh deployment can leave them empty; the host deployment
+# populates them with domain-specific routing/classification tables. See
+# core/scripts/_world_config.py docstring + the read sites:
+#   - gates/capability_route.py:   capability-routing.yaml
+#   - gates/scaffolded_exploration.py:  scaffolded-exploration.yaml
+#   - audit-applies-to.py:         applies-to-rules.yaml
+#
+# IDEMPOTENCY: each cat-into-config-file is guarded by [[ -f ]] so a
+# rerun (after deleting .initialized) does NOT clobber populated overlays.
+# Fresh-eyes review HIGH H3 (2026-05-18): the top-level .initialized
+# marker is necessary but not sufficient — if a user deletes .initialized
+# to "reseed" while keeping their populated overlays, the prior version
+# of this script would replace the 8.7KB capability-routing.yaml with an
+# empty stub. Per-file guards prevent that data loss.
+[[ -f "$WORLD/config/capability-routing.yaml" ]] || cat > "$WORLD/config/capability-routing.yaml" << 'EOF'
+# Domain-specific capability routing overlay — populated by the host
+# deployment. Read by core/scripts/gates/capability_route.py.
+# Empty = classifier returns "either" for every goal (safe default).
+# Schema:
+#   title_prefix_routes:
+#     - prefix: "investigate:"
+#       agent: "<agent-name>"
+#       confidence: 0.88
+#       rationale: "..."
+#   category_routes:
+#     - category: "<category-key>"
+#       agent: "<agent-name>"
+#       confidence: 0.55
+#       rationale: "..."
+#   description_heuristics:
+#     - phrase: "<substring>"
+#       agent: "<agent-name>"
+#       delta: 0.10
+#       rationale: "..."
+title_prefix_routes: []
+category_routes: []
+description_heuristics: []
+EOF
+
+[[ -f "$WORLD/config/scaffolded-exploration.yaml" ]] || cat > "$WORLD/config/scaffolded-exploration.yaml" << 'EOF'
+# Domain-specific scaffolded-exploration overlay — populated by the host
+# deployment. Read by core/scripts/gates/scaffolded_exploration.py.
+# Empty = gate never fires on category (no Apply: blocking on missing
+# discovered_by). Add your product's category prefixes here to enable
+# the Investigate-precursor enforcement on Apply: goals.
+product_category_prefixes: []
+EOF
+
+[[ -f "$WORLD/config/applies-to-rules.yaml" ]] || cat > "$WORLD/config/applies-to-rules.yaml" << 'EOF'
+# Domain-specific applies-to classification overlay — populated by the host
+# deployment. Read by core/scripts/audit-applies-to.py.
+# Empty = every reasoning-bank entry falls into "uncertain" (no auto-
+# classification as "domain"). Add your domain's category prefixes here
+# (e.g. "math", "lessons", "chemistry") to enable the auto-classifier.
+# METHODOLOGY_TERMS remain in core (framework-universal).
+domain_prefixes: []
+EOF
+
+[[ -f "$WORLD/config/work-class-mapping.yaml" ]] || cat > "$WORLD/config/work-class-mapping.yaml" << 'EOF'
+# Domain-specific work-class mapping overlay — populated by the host
+# deployment. Merged with core/config/work-class-mapping.yaml (per-key
+# override). Read by core/scripts/_work_class.py.
+# Empty = core framework-universal mapping alone (framework / hygiene /
+# research / unclassified). Add your domain's "product" categories here
+# (e.g. lesson-planning: product) to participate in portfolio balance.
+# Format: see core/config/work-class-mapping.yaml header.
+mapping: {}
+EOF
+
+[[ -f "$WORLD/config/stale-scanner.yaml" ]] || cat > "$WORLD/config/stale-scanner.yaml" << 'EOF'
+# Domain-specific stale-process-scanner thresholds (WORLD overlay).
+# Read by world/scripts/stale-jobs-scan.py (if your deployment uses one).
+# Each threshold is a lifetime limit in hours per process type. Processes
+# older than their type's threshold are kill candidates (unless protected).
+# Empty = scanner falls back to its built-in DEFAULT_THRESHOLDS.
+thresholds: {}
+EOF
+
+[[ -f "$WORLD/config/infra-health-categories.yaml" ]] || cat > "$WORLD/config/infra-health-categories.yaml" << 'EOF'
+# Domain-specific infra-health component categories (WORLD overlay).
+# Read by core/scripts/infra-health.py for known_blocker affected_categories
+# sync. Each entry maps a probe-component name to the goal categories that
+# should be suppressed when the component crosses failing_streak_threshold.
+# Empty = streak alerts still fire but never reach the goal-selector.
+component_categories: {}
+EOF
+echo "  Seeded world/config/ stub overlay files (empty defaults)"
 
 # --- 2. Domain verification checklist ---
 cat > "$WORLD/verification-checklist.md" << 'CHECKLIST_EOF'
@@ -58,6 +149,10 @@ echo "  Created verification-checklist.md"
 # --- 3. Seed collective data from config ---
 
 # --- Aspirations: World-level task queue (JSONL) ---
+# NOTE: This seeds the WORLD bootstrap aspiration ( "Explore and Learn").
+# The agent-level  ("Maintain Agent Health") is a DIFFERENT aspiration
+# sharing the canonical bootstrap ID by convention — seeded in init-agent.sh.
+# See core/config/conventions/aspirations.md → Dual-Scope Bootstrap IDs.
 if [ -f "$CONFIG/world-aspirations-initial.jsonl" ]; then
     cp "$CONFIG/world-aspirations-initial.jsonl" "$WORLD/aspirations.jsonl"
     python3 "$CORE_ROOT/scripts/aspirations.py" recompute-all-progress "$WORLD/aspirations.jsonl"
@@ -87,7 +182,7 @@ rm -f "$WORLD/pattern-signatures.yaml.tmp"
 touch "$WORLD/pipeline.jsonl"
 touch "$WORLD/pipeline-archive.jsonl"
 cat > "$WORLD/pipeline-meta.json" << 'EOF'
-{"last_updated":null,"stage_counts":{"discovered":0,"evaluating":0,"active":0,"resolved":0,"archived":0},"accuracy":{"total_resolved":0,"confirmed":0,"corrected":0,"accuracy_pct":0.0}}
+{"last_updated":null,"stage_counts":{"discovered":0,"active":0,"resolved":0,"archived":0},"accuracy":{"total_resolved":0,"confirmed":0,"corrected":0,"accuracy_pct":0.0}}
 EOF
 echo "  Seeded pipeline JSONL files"
 

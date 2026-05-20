@@ -3,10 +3,10 @@
 Experience records store full-fidelity interaction traces in JSONL with script-based access.
 
 ## File Layout
-- `<agent>/experience.jsonl` — Live experience records
-- `<agent>/experience-archive.jsonl` — Archived experiences (append-only)
-- `<agent>/experience-meta.json` — Metadata (totals, by_type, by_category)
-- `<agent>/experience/{id}.md` — Full content files (one per experience)
+- `agents/<agent>/experience.jsonl` — Live experience records
+- `agents/<agent>/experience-archive.jsonl` — Archived experiences (append-only)
+- `agents/<agent>/experience-meta.json` — Metadata (totals, by_type, by_category)
+- `agents/<agent>/experience/{id}.md` — Full content files (one per experience)
 
 ## Record Schema
 Required: `id`, `type`, `created`, `category`, `summary`, `content_path`
@@ -58,3 +58,13 @@ temporal_credit: 0.0                 # Accumulated backward credit from downstre
 **Note:** `source_reflection_id` is set on **reasoning bank and guardrail records** (not experience records) by Phase 6.5. Phase 4.26 reads it from those records to track which reflections produced helpful artifacts downstream.
 
 Temporal credit informs strategy extraction (`/reflect-on-self` Patterns mode, Step 3): experiences with high temporal_credit represent "enabling strategies" that set up later success.
+
+## Experience vs Journal
+
+Both stores describe "things that happened," but at different granularities.
+Experience = per-goal/hypothesis full-fidelity evidence. Journal =
+per-session narrative summary. They are additive, not redundant. The full
+comparison (unit, fidelity, structured refs, retrieval, archival, purpose)
+lives in `core/config/conventions/learning-routing.md`.
+
+Mnemonic: experience is evidence; journal is narrative.

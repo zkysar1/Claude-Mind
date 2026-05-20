@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# domain-leak-exempt: tokenizer comments cite "how does NPC selection work" as a
+# concrete query example to anchor the unsplit-token bug discussion. The term
+# is comment-prose illustrating a regression, not framework-domain coupling.
 """Shared matching module for knowledge tree node lookup.
 
 Extracted from retrieve.py so that both retrieve.py (full retrieval) and
@@ -17,8 +20,10 @@ Functions:
         - Extract YAML front matter from a .md file.
 """
 
+import math
 import re
 import sys
+from datetime import date, datetime
 from pathlib import Path
 
 # Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
@@ -51,6 +56,59 @@ CAPABILITY_BONUS = {
     "EXPLOIT": 0.3,
     "CALIBRATE": 0.1,
 }
+
+# Cosine-similarity bonus weight, applied on top of channel + depth +
+# confidence + capability bonuses. cosine ∈ [0, 1] → bonus ∈ [0, COSINE_BONUS_WEIGHT].
+# Tuned 2.0 so a fully-aligned query/node pair adds enough to outrank a
+# generic-token match (e.g. word_prefix 1.5 + d3 1.5 = 3.0 base) while
+# not overwhelming the depth/confidence signals on partial-cosine matches.
+# Weight is the SCORING-LAYER tunable; the IDF math itself in tree_idf.py
+# is parameter-free.
+COSINE_BONUS_WEIGHT = 2.0
+
+# Recency bonus parameters (P2 #10, 2026-05-10). One-sided positive bonus
+# based on `last_updated` — recently-edited nodes get a small score boost,
+# stable old knowledge gets ZERO bonus (no penalty). Asymmetric on purpose:
+# a stale-but-correct node should not be demoted just for being stable.
+# Decay: bonus = MAX_BONUS * exp(-age_days / TAU_DAYS).
+#   age=0   → 0.50 bonus (full)
+#   age=30  → 0.18 bonus
+#   age=90  → 0.025 bonus
+#   age=130 → 0.007 bonus (~zero, matches HISTORICAL_ANCHOR positioning)
+#   missing last_updated → 0 bonus (legacy nodes pre-backfill)
+# Source field is `last_updated` (content freshness), NOT `last_retrieved`
+# (interest signal — would create runaway feedback if amplified by scoring).
+RECENCY_MAX_BONUS = 0.5
+RECENCY_TAU_DAYS = 30
+
+# MMR (Maximal Marginal Relevance) parameters (P2 #11, 2026-05-10).
+# Re-ranks the top-K to favor diversity when multiple high-relevance results
+# come from the same subtree (e.g., 5 siblings under one parent crowding out
+# alternatives). Both terms are normalized to [0, 1] by max-relevance scaling
+# before combining:
+#   MMR(i) = λ * (score_i / max_score) - (1-λ) * max_j∈S path_sim(i, j)
+# λ=1 → pure relevance (no diversity); λ=0 → pure diversity.
+# Tuned 0.7: high-relevance items still dominate, but a top-relevance sibling
+# can lose its slot to a mid-relevance different-branch alternative when the
+# slot would otherwise be its 3rd or 4th sibling.
+MMR_LAMBDA = 0.7
+
+
+def _recency_bonus(node):
+    """Exponential-decay recency bonus from `last_updated`. Missing → 0.
+    Future-dated entries (clock skew) are clamped to today so the bonus
+    cannot exceed RECENCY_MAX_BONUS."""
+    lu = node.get("last_updated")
+    if not lu:
+        return 0.0
+    try:
+        d = datetime.strptime(str(lu)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return 0.0
+    age_days = (date.today() - d).days
+    if age_days < 0:
+        age_days = 0
+    return RECENCY_MAX_BONUS * math.exp(-age_days / RECENCY_TAU_DAYS)
 
 
 # ---------------------------------------------------------------------------
@@ -150,13 +208,22 @@ def _match_nodes(category, nodes, entity_index, concept_index):
                 matched_keys.add(en)
                 channels[en] = "entity_index"
 
-    # Strategy 3: Word-prefix — split on hyphens, prefix match (min 4 chars)
-    cat_words_4 = {w for w in cat_lower.split("-") if len(w) >= 4}
+    # Strategy 3: Word-prefix — tokenize on word boundaries (any non-alphanumeric
+    # separator: hyphen, space, underscore, slash, etc.), prefix match (min 4 chars).
+    # 2026-05-09 (P0 #2 from knowledge-system audit): pre-fix used `split("-")`
+    # which only split on hyphens. Space-separated multi-word queries
+    # ("memory consolidation", "framework architecture") and natural-language
+    # questions ("how does NPC selection work") became one giant unsplit token
+    # that never prefix-matched anything — those queries returned 0 tree nodes.
+    # Aligned with Strategy 4's tokenizer (`re.findall`) for consistency.
+    # Node KEYS are still hyphen-separated (the framework convention) so we
+    # split them with the same regex — pure hyphen-split was a happy accident.
+    cat_words_4 = {w for w in re.findall(r'[a-z0-9]+', cat_lower) if len(w) >= 4}
     if cat_words_4:
         for key, node in nodes.items():
             if key in matched_keys:
                 continue
-            key_words = {w for w in key.lower().split("-") if len(w) >= 4}
+            key_words = {w for w in re.findall(r'[a-z0-9]+', key.lower()) if len(w) >= 4}
             if any(cw.startswith(kw) or kw.startswith(cw)
                    for cw in cat_words_4 for kw in key_words):
                 matched.append((key, node))
@@ -226,6 +293,99 @@ def _include_parents(matched, matched_keys, channels, nodes):
     return matched, matched_keys, channels
 
 
+def _path_chain(nodes, key, max_hops=20):
+    """Walk parent pointers from key to root. Returns the list of keys in
+    root-first order. Cycle-safe via visited set; max_hops bounds runaway
+    in malformed trees."""
+    chain = []
+    visited = set()
+    current = key
+    hops = 0
+    while current and current not in visited and hops < max_hops:
+        visited.add(current)
+        chain.append(current)
+        current = nodes.get(current, {}).get("parent")
+        hops += 1
+    chain.reverse()
+    return chain
+
+
+def _path_similarity(chain_a, chain_b):
+    """Common-ancestor-prefix length / max chain length. Range [0, 1].
+
+    Two siblings (share all ancestors except themselves) at depth 5:
+        common=5, max_len=6, sim ≈ 0.83
+    Cousins (different L4 parents) at depth 6:
+        common=4, max_len=7, sim ≈ 0.57
+    Different L1 branches:
+        common=1 (root), max_len=N, sim ≈ 1/N (low)
+
+    Pre-tokenized chains expected so callers can cache `_path_chain` per
+    candidate (called O(K) times during MMR; without cache it's O(K^2)).
+    """
+    common = 0
+    for a, b in zip(chain_a, chain_b):
+        if a == b:
+            common += 1
+        else:
+            break
+    longest = max(len(chain_a), len(chain_b), 1)
+    return common / longest
+
+
+def _mmr_rerank(scored, all_nodes, limit, lambda_=None):
+    """Re-rank a sorted-by-relevance list using normalized MMR for diversity.
+
+    `scored` is a list of tuples whose first element is the node key and
+    third element is the (relevance) score — matches both the lightweight
+    `_score_and_limit` shape (key, node, score, channel) and retrieve.py's
+    `_score_weight_limit` shape (key, node, effective, channel, base, util_w).
+    Returns at most `limit` items in MMR-selected order.
+
+    Normalization: each candidate's relevance is divided by max_score so
+    both MMR terms live in [0, 1]. Without normalization the relevance
+    term (3-7 typical) would swamp the path-similarity term (always [0, 1])
+    and MMR would degenerate to pure relevance.
+
+    No-op when len(scored) <= limit — returns the input unchanged. The
+    cost path only fires when the cap actually binds.
+    """
+    if not scored:
+        return []
+    if len(scored) <= limit:
+        return list(scored)
+    if lambda_ is None:
+        lambda_ = MMR_LAMBDA
+
+    max_score = scored[0][2] if scored[0][2] > 0 else 1.0
+    chains = {item[0]: _path_chain(all_nodes, item[0]) for item in scored}
+
+    selected = [scored[0]]
+    remaining = list(scored[1:])
+
+    while len(selected) < limit and remaining:
+        best_idx = -1
+        best_mmr = -float("inf")
+        for i, cand in enumerate(remaining):
+            cand_key = cand[0]
+            cand_score = cand[2]
+            normalized_rel = cand_score / max_score
+            cand_chain = chains[cand_key]
+            max_sim = max(
+                _path_similarity(cand_chain, chains[sel[0]])
+                for sel in selected
+            )
+            mmr = lambda_ * normalized_rel - (1 - lambda_) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+        if best_idx < 0:
+            break
+        selected.append(remaining.pop(best_idx))
+
+    return selected
+
+
 def _compute_match_score(key, node, channel):
     """Score a matched node by match quality. Higher = more relevant."""
     score = CHANNEL_SCORES.get(channel, 0.5)
@@ -245,18 +405,45 @@ def _compute_match_score(key, node, channel):
     # Capability bonus
     score += CAPABILITY_BONUS.get(node.get("capability_level", ""), 0)
 
+    # Recency bonus (asymmetric — recently-updated content gets a boost,
+    # stable old content gets no penalty). See _recency_bonus.
+    score += _recency_bonus(node)
+
     return score
 
 
-def _score_and_limit(matched, channels, limit):
-    """Score all matched nodes, sort by match quality, apply limit."""
+def _score_and_limit(matched, channels, limit, query_text="", all_nodes=None):
+    """Score all matched nodes, sort by match quality, apply limit.
+
+    When `query_text` and `all_nodes` are both provided, augment each base
+    score with a TF-IDF cosine-similarity bonus computed against the full
+    `all_nodes` corpus (NOT just `matched` — IDF needs the whole corpus to
+    weight tokens correctly). Callers that only need channel-based scoring
+    (legacy lightweight lookups) pass neither and get identical pre-IDF
+    behavior. See COSINE_BONUS_WEIGHT for the tunable.
+    """
+    idf_index = None
+    q_vm = None
+    if query_text and all_nodes:
+        from tree_idf import build_index, query_vector
+        idf_index = build_index(all_nodes)
+        q_vm = query_vector(query_text, idf_index["idf"])
+
+    if idf_index is not None:
+        from tree_idf import cosine
+
     scored = []
     for key, node in matched:
         channel = channels.get(key, "parent")
         ms = _compute_match_score(key, node, channel)
+        if idf_index is not None:
+            d_vm = idf_index["vectors"].get(key, ({}, 0.0))
+            ms += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)
         scored.append((key, node, ms, channel))
 
     scored.sort(key=lambda x: -x[2])
+    if all_nodes and len(scored) > limit:
+        return _mmr_rerank(scored, all_nodes, limit)
     return scored[:limit]
 
 
@@ -291,8 +478,10 @@ def find_nodes(text, nodes, entity_index, top=3, leaf_only=False):
         text, nodes, entity_index, concept_index
     )
 
-    # Score and limit (no sibling/parent inclusion)
-    scored = _score_and_limit(matched, channels, top)
+    # Score and limit (no sibling/parent inclusion). Pass query+nodes so the
+    # cosine bonus is layered onto channel scores — see _score_and_limit.
+    scored = _score_and_limit(matched, channels, top,
+                              query_text=text, all_nodes=nodes)
 
     # Build lightweight result dicts
     results = []

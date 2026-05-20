@@ -1,6 +1,6 @@
 # Handoff Schema (Enhanced)
 
-The continuation handoff (`<agent>/session/handoff.yaml`) includes structured fields for
+The continuation handoff (`agents/<agent>/session/handoff.yaml`) includes structured fields for
 fast cross-session resume:
 
 ```yaml
@@ -25,7 +25,7 @@ decisions_locked:
     made_session: 14
     reason: "CALIBRATE level reached, focused exploration more productive"
     kind: "strategy"              # "strategy" | "world_claim" (required)
-  - decision: "Port 8686 blocked by security groups"
+  - decision: "Port 8686 blocked by firewall"
     made_session: 48
     reason: "Connection refused when curling port 8686"
     kind: "world_claim"           # Claims about infrastructure/external state
@@ -59,7 +59,7 @@ consolidation_meta:
   consecutive_lean_sessions: 2      # informational copy for boot status output
 ```
 
-Anti-suppression ceiling source of truth: `<agent>/session/consolidation-lean-streak` (plain integer).
+Anti-suppression ceiling source of truth: `agents/<agent>/session/consolidation-lean-streak` (plain integer).
 Written by consolidation Step 9, read by Step 0.1 triage. If >= 3, forces `full` tier.
 This file is NOT consumed by boot (unlike handoff.yaml itself).
 See `aspirations-consolidate/SKILL.md` Step 0.1.
@@ -69,7 +69,7 @@ See `aspirations-consolidate/SKILL.md` Step 0.1.
 # Reasoning Trajectory (Cross-Session Context)
 
 The handoff captures the reasoning *journey*, not just the end-state. Built from the
-execution diary (`<agent>/session/execution-diary.jsonl`) during consolidation Step 9.
+execution diary (`agents/<agent>/session/execution-diary.jsonl`) during consolidation Step 9.
 
 ```yaml
 reasoning_trajectory:
@@ -81,12 +81,12 @@ reasoning_trajectory:
       outcome: "3 tree nodes encoded"
   failed_approaches:
     - goal: "g-206-05"
-      approach: "Direct API invocation for task seeding"
-      failure: "Firewall blocks port — switched to API Gateway"
+      approach: "Direct service call for data seeding"
+      failure: "Firewall blocks port — switched to alternative endpoint"
   emerging_patterns:
-    - "Deploys require integration test to propagate to shared state"
+    - "Deploys require integration test to verify propagation"
   open_threads:
-    - "Task seeding deployed but not yet verified via integration test"
+    - "Data seeding deployed but not yet verified via integration test"
 ```
 
 Boot Step 0.5 reads `reasoning_trajectory` and includes key decisions and open threads

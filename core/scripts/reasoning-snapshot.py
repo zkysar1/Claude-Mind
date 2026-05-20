@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Reasoning snapshot — proactive context persistence for tight-zone checkpointing.
 
-When context enters tight zone (>=65%), the LLM proactively writes a synthesis of its
+When context enters tight zone (as classified by context-budget-status.py on
+distance-to-autocompact, not raw usage), the LLM proactively writes a synthesis of its
 current reasoning state to a well-known file. This is higher fidelity than WM slots
 because it's the LLM's own synthesized understanding, written while context is still fresh.
 
@@ -19,14 +20,18 @@ import os
 import sys
 from datetime import datetime
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 import yaml
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, assert_agent_dir
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "session"` TypeError class the next line would otherwise raise.
+assert_agent_dir("reasoning-snapshot")
 
 SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
 
@@ -58,16 +63,6 @@ def cmd_write(args):
 
     # Auto-add metadata
     data["snapshot_at"] = now_iso()
-
-    # Read context budget if available
-    budget_path = AGENT_DIR / "session" / "context-budget.json"
-    if budget_path.exists():
-        try:
-            budget = json.loads(budget_path.read_text(encoding="utf-8"))
-            data["context_used_pct"] = budget.get("used_pct")
-            data["context_zone"] = budget.get("zone")
-        except Exception:
-            pass
 
     # Atomic write
     SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)

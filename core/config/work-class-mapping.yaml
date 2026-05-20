@@ -1,0 +1,83 @@
+# Work-class taxonomy and category mapping (CORE — framework-universal).
+#
+# Consumed by _work_class.py → resolve(category) → work_class string.
+# Writers: aspirations.py cmd_add_goal (new goals), backfill-work-class.py
+# (one-shot historical fill). Reader: goal-selector.py criterion 7e and
+# self-drift-gate.py (both index on session_completions[].work_class).
+#
+# Four classes balance portfolio effort:
+#   product   — end-user-facing work (domain-specific; lives in WORLD overlay)
+#   framework — the cognitive engine itself (skills, scripts, conventions)
+#   hygiene   — ops plumbing (infra, pipelines, monitoring, data integrity)
+#   research  — investigation, landscape, analysis
+#
+# Unmapped / "uncategorized" / "UNSET" categories resolve to "unclassified"
+# and are excluded from both the denominator (class distribution) and the
+# bonus computation in goal-selector criterion 7e. Keep the default fail-open:
+# adding a new category without a mapping entry does NOT break scoring — it
+# just produces unclassified goals until the mapping is extended.
+#
+# DOMAIN-SPECIFIC ENTRIES live in `world/config/work-class-mapping.yaml`
+# (per packaging plan Phase 2.6). The reader merges them: this file is the
+# fallback, world overrides per-key. A fresh deployment with no world overlay
+# still gets full framework-universal coverage from this file alone.
+
+version: 1
+
+default: unclassified
+
+mapping:
+  # ---- framework (cognitive engine) ----
+  framework: framework
+  framework-maintenance: framework
+  framework-architecture: framework
+  framework-patterns: framework
+  framework-engineering: framework
+  framework-coordination: framework
+  framework-meta: framework
+  framework-design: framework
+  framework-instrumentation: framework
+  framework-tuning: framework
+  framework-reliability: framework
+  framework-audit: framework
+  framework-hardening: framework
+  framework-skill-authoring: framework
+  framework-self-improvement: framework
+  code: framework
+  code-patterns: framework
+  testing: framework
+  test: framework
+  documentation: framework
+  system-behavior: framework
+  agent-health: framework
+  tree-maintenance-patterns: framework
+  prose-filter-pattern: framework
+  agent-config-override-layer: framework
+  strategic-planning: framework
+  dri-protocol-and-mechanics: framework
+  digest-extraction: framework
+  aspirations: framework
+  coordination: framework
+  cross-agent-coordination: framework
+  session-identity-contract: framework
+  signal-taxonomy-and-schema: framework
+  failure-to-aspiration-pipeline: framework
+  audit-2026-04-scanners: framework
+
+  # ---- hygiene (ops plumbing — universal patterns) ----
+  infrastructure: hygiene
+  infrastructure-monitoring: hygiene
+  observability: hygiene
+  data-integrity: hygiene
+  data-quality: hygiene
+  framework-hygiene: hygiene
+  health-and-operations: hygiene
+
+  # ---- research (investigation/analysis — universal) ----
+  research: research
+  analysis: research
+  hypothesis-accuracy: research
+  meta-learning: research
+
+  # ---- explicit unclassified (keeps the intent visible) ----
+  uncategorized: unclassified

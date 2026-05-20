@@ -13,20 +13,20 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 
 ## A. Core Agent Lifecycle
 
-1. State machine: `<agent>/session/agent-state` contains "IDLE" (stopped correctly)
-2. Journal entries: `<agent>/journal/` has session logs with dated entries
+1. State machine: `agents/<agent>/session/agent-state` contains "IDLE" (stopped correctly)
+2. Journal entries: `agents/<agent>/journal/` has session logs with dated entries
 3. Aspirations progress: `world/aspirations.jsonl` — goals attempted, sparks fired
 4. Aspirations meta: `world/aspirations-meta.json` — session_count, readiness_gates
 5. Aspirations archive: `world/aspirations-archive.jsonl` — completed aspirations moved here
 6. Evolution log: `meta/evolution-log.jsonl` — evolution events logged
-7. Developmental stage: `<agent>/developmental-stage.yaml` — should be `exploring` (first run)
+7. Developmental stage: `agents/<agent>/developmental-stage.yaml` — should be `exploring` (first run)
 8. Working memory: `Bash: wm-read.sh --json` — should be reset (all slots null/empty) after consolidation. Has `slot_meta` section.
 9. Pipeline activity: `pipeline-read.sh --counts` — did it discover, evaluate, or activate any hypotheses?
 10. Knowledge tree index: `world/knowledge/tree/_tree.yaml` — nodes registered with `article_count`, `growth_state`, `confidence`, `capability_level`, interior/leaf distinction via `node_type`. All scoring/structural metadata lives exclusively in `_tree.yaml` (split-by-nature schema).
 11. No `world/knowledge/research-queue.yaml` exists (queue eliminated — aspirations handles topic selection)
 12. No `world/knowledge/_index.yaml` exists (index consolidated into `_tree.yaml`)
 13. Graceful stop signal: `session-signal-set.sh stop-requested` succeeds while RUNNING (no guard blocks it). `session-signal-clear.sh stop-requested` succeeds. Signal lifecycle: set → exists (exit 0) → clear → exists (exit 1).
-14. Graceful stop cleanup: after `/stop` + `/start` cycle, no `<agent>/session/stop-requested` or `<agent>/session/iteration-checkpoint.json` files remain (cleaned by /start).
+14. Graceful stop cleanup: after `/stop` + `/start` cycle, no `agents/<agent>/session/stop-requested` or `agents/<agent>/session/iteration-checkpoint.json` files remain (cleaned by /start).
 15. **Runtime**: After `/stop` during mid-iteration execution, journal should contain entry for the interrupted goal (written by Phase -1.4 obligation recovery, not lost).
 
 ---
@@ -109,7 +109,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 3. `core/config/hypothesis-conventions.md` / `core/config/knowledge-conventions.md` context_consulted section says "populated when retrieve.sh loads context"
 4. Knowledge tree: `world/knowledge/tree/_tree.yaml` — L2+ nodes created if research occurred, L3+ from DECOMPOSE if /tree maintain ran
 5. No orphan state: `pipeline-read.sh --counts` stage counts match `pipeline-recompute-meta.sh` recount
-6. No stale signals: `<agent>/session/loop-active` exists if the loop ran; `<agent>/session/stop-loop` exists if stopped
+6. No stale signals: `agents/<agent>/session/loop-active` exists if the loop ran; `agents/<agent>/session/stop-loop` exists if stopped
 
 ---
 
@@ -215,12 +215,15 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 2. `core/scripts/goal-selector.sh` is thin bash wrapper that routes subcommands (defaults to `select`)
 3. `goal-selector.sh` reads `world/aspirations.jsonl` via JSONL infrastructure
 4. `goal-selector.sh` returns JSON array of ranked goals with score breakdowns
-5. `goal-selector.sh` implements all 16 deterministic scoring criteria: priority, deadline_urgency, agent_executable, variety_bonus, streak_momentum, novelty_bonus, recurring_urgency, recurring_saturation, reward_history, completion_pressure, depth_bonus, evidence_backing, deferred_readiness, context_coherence, skill_affinity, directive_boost
-5b. `goal-selector.py` reads epsilon from `<agent>/developmental-stage.yaml` and noise_scale from `core/config/developmental-stage.yaml`
+5. `goal-selector.sh` implements all 17 deterministic scoring criteria: priority, deadline_urgency, agent_executable, variety_bonus, streak_momentum, novelty_bonus, recurring_urgency, recurring_saturation, reward_history, completion_pressure, tail_bonus, depth_bonus, evidence_backing, deferred_readiness, context_coherence, skill_affinity, directive_boost
+5b. `goal-selector.py` reads epsilon from `agents/<agent>/developmental-stage.yaml` and noise_scale from `core/config/developmental-stage.yaml`
 5c. `goal-selector.py` output includes `exploration_noise` in breakdown/raw, and `exploration_params` with epsilon/noise_scale/noise_weight
 5d. At epsilon=0.19 (mastering), max noise contribution < 0.6
 5e. At epsilon=0.85 (exploring), max noise contribution ~2.5
 5f. `goal-selector.py` output includes `recurring` boolean field per goal (true if goal.recurring is set)
+5g. `goal-selector.py` computes `tail_bonus` per-goal: zero when aspiration `completion_ratio < 0.70`, else `(completion_ratio - 0.70) / remaining * 3.0` (no defensive cap — natural asymptote is ~0.90)
+5h. `tail_bonus` appears in every goal's score breakdown with weight read from `meta/goal-selection-strategy.yaml` (default `tail_bonus: 0.8`); single source of truth — no Python-side fallback for this weight
+5i. `tail_bonus` reaches its peak on the final straggler of a near-complete aspiration (e.g. 14/15 done → raw 0.70); decreases as `remaining` count grows
 6. `aspirations/SKILL.md` Phase 2 calls `goal-selector.sh` instead of LLM-computing scores
 6b. `aspirations/SKILL.md` Phase 2 has creative boredom check: if all candidates are recurring, invokes `/create-aspiration from-self` before proceeding with top recurring goal
 7. **Runtime**: `goal-selector.sh` scores vary between invocations (exploration noise); deterministic criteria stable
@@ -232,7 +235,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 11. `decisions_locked` entries have `decision`, `made_session`, `reason` fields
 12. `decisions_locked` entries expire after 3 sessions (cleanup logic in consolidation)
 13. `core/config/conventions/handoff-working-memory.md` documents handoff schema additions
-14. **Runtime**: `<agent>/session/handoff.yaml` contains `first_action` after session-end consolidation
+14. **Runtime**: `agents/<agent>/session/handoff.yaml` contains `first_action` after session-end consolidation
 15. **Runtime**: First goal in new session matches `first_action.goal_id` (check journal)
 
 ### K3. Unified Verification Field
@@ -256,7 +259,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 29c. `core/config/execute-protocol-digest.md` contains complete retrieval Steps 1-5c (the safety-critical content)
 
 ### K5. Compatible Goal Batching (Context-Aware)
-30. `aspirations/SKILL.md` Phase 2 reads `<agent>/session/context-budget.json` for zone
+30. `aspirations/SKILL.md` Phase 2 reads `agents/<agent>/session/context-budget.json` for zone
 31. Fresh zone (<40%): batch up to 3 same-category goals (any aspiration), break on first category mismatch
 32. Normal zone (40-65%): batch up to 2 same-category + same-aspiration goals
 33. Tight zone (>65%): original strict criteria (same category + aspiration + skill + minimal effort)
@@ -264,14 +267,13 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 35. **Runtime**: After decompose produces sibling goals, journal shows single retrieval for batched goals
 
 ### K6. Context Budget Estimator
-36. `core/scripts/context-budget-status.py` reads status line JSON from stdin, writes `<agent>/session/context-budget.json`
+36. `core/scripts/context-budget-status.py` reads status line JSON from stdin, writes `agents/<agent>/session/context-budget.json`
 37. `core/scripts/context-budget-status.sh` is thin bash wrapper
 38. `.claude/settings.local.json` has `statusLine` object with `type: "command"` pointing to context-budget-status.sh
 39. Budget file has: `used_pct`, `remaining_pct`, `window_size`, `input_tokens`, `zone`, `updated_at`
-40. Zone thresholds: fresh (<40%), normal (40-65%), tight (>=65%)
+40. Zone thresholds: fresh (<40%), normal (40-85%), tight (>=85%)
 41. `core/scripts/goal-selector.py` WEIGHTS dict includes `context_coherence: 1.0`
-42. `core/scripts/goal-selector.py` reads budget file via `read_context_budget()`, defaults to zone "normal" if missing
-43. `core/scripts/goal-selector.py` output includes `context_coherence` in breakdown and raw for each goal
+42. `core/scripts/goal-selector.py` output includes `context_coherence` in breakdown and raw for each goal
 44. `core/scripts/wm.py` TOP_LEVEL_KEYS includes `last_goal_category`; cmd_init and cmd_reset include `last_goal_category: ""`
 45. `aspirations-state-update/SKILL.md` Step 3 writes `last_goal_category` via wm-set.sh
 46. `core/scripts/precompact-checkpoint.py` saves `last_goal_category` in checkpoint
@@ -311,13 +313,13 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 ## N. Self System
 
 ### N1. Self File & Rule
-1. `<agent>/self.md` exists with YAML front matter (created, last_updated, last_update_trigger, source)
-2. `<agent>/self.md` has non-empty body content (the agent identity description)
-3. `.claude/rules/self.md` exists — contains directive to consult <agent>/self.md
+1. `agents/<agent>/self.md` exists with YAML front matter (created, last_updated, last_update_trigger, source)
+2. `agents/<agent>/self.md` has non-empty body content (the agent identity description)
+3. `.claude/rules/self.md` exists — contains directive to consult agents/<agent>/self.md
 
 ### N2. Boot Integration
-5. Boot dashboard displays "SELF" section with contents of <agent>/self.md
-6. Boot continuation mode (Step 0.5) reads <agent>/self.md in abbreviated flow
+5. Boot dashboard displays "SELF" section with contents of agents/<agent>/self.md
+6. Boot continuation mode (Step 0.5) reads agents/<agent>/self.md in abbreviated flow
 8. **Runtime**: Journal boot entry mentions Self
 
 ### N3. /create-aspiration Skill
@@ -327,7 +329,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 12. **Runtime**: After first boot, aspirations were created via /create-aspiration (not bootstrap copy)
 
 ### N4. Self-Driven Aspiration Generation
-13. `/aspirations evolve` reads <agent>/self.md before generating aspirations
+13. `/aspirations evolve` reads agents/<agent>/self.md before generating aspirations
 14. Aspirations loop no-goals fallback invokes /create-aspiration (not inline gap analysis)
 15. Aspiration completion triggers /create-aspiration from-self
 16. Phase 0 has aspiration health check (active_count < 2 triggers creation)
@@ -347,7 +349,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 ### N7. Self Maintenance
 25. `/respond` directive table includes "Self update" type
 26. sq-012 spark action writes Self evolution proposals to pending-questions.yaml
-27. <agent>/self.md last_update_trigger tracks all update sources
+27. agents/<agent>/self.md last_update_trigger tracks all update sources
 28. Self survives IDLE/RUNNING transitions; wiped when agent directory is deleted
 
 ---
@@ -357,7 +359,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 ### O1. Experience Archive Infrastructure
 1. `core/scripts/experience.py` exists with `read`, `add`, `update-field`, `archive-sweep`, `meta-update` subcommands
 2. 5 shell wrappers exist: `experience-read.sh`, `experience-add.sh`, `experience-update-field.sh`, `experience-archive.sh`, `experience-meta-update.sh`
-3. `core/scripts/init-agent.sh` creates `<agent>/experience/` directory and empty JSONL/JSON files
+3. `core/scripts/init-agent.sh` creates `agents/<agent>/experience/` directory and empty JSONL/JSON files
 4. `core/config/knowledge-conventions.md` documents experience archive format (JSONL schema, content files, verbatim anchors, retrieval_stats)
 5. `core/config/memory-pipeline.yaml` has experience archival step, `archived_context` slot type, adaptive weight bounds
 6. `core/config/conventions/experience.md` has Experience Archive section with ID format, script API, file layout
@@ -376,12 +378,12 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 15. `aspirations/SKILL.md` Hypothesis Formation Spark Handler (step 2.5, within Phase 6 spark processing) archives hypothesis context via `experience-add.sh`
 16. `aspirations/SKILL.md` Hypothesis Formation Spark Handler sets `experience_ref` on pipeline record
 17. `reflect/SKILL.md` Step 1 dereferences `experience_ref` via `experience-read.sh --id`
-18. **Runtime**: After hypothesis formation, experience `.md` file exists in `<agent>/experience/`
+18. **Runtime**: After hypothesis formation, experience `.md` file exists in `agents/<agent>/experience/`
 19. **Runtime**: `pipeline-read.sh --id <id>` shows `experience_ref` field on new records
 
 ### O4. Goal Execution Traces
 20. `aspirations/SKILL.md` Phase 4.25 archives goal trace via `experience-add.sh`
-21. **Runtime**: After goal execution, `<agent>/experience/` has corresponding `.md` file
+21. **Runtime**: After goal execution, `agents/<agent>/experience/` has corresponding `.md` file
 
 ### O5. Research Archive with Verbatim Anchors
 22. `research-topic/SKILL.md` archives full results via `experience-add.sh` with verbatim anchors
@@ -416,7 +418,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 
 ### O9. Experience Staleness & Archival
 46. `core/config/memory-pipeline.yaml` has `experience_staleness` section with `archive_unused_after_days`, `archive_low_utility_after_days`, `protect_threshold`
-47. `experience-archive.sh` sweeps records matching staleness criteria to `<agent>/experience-archive.jsonl`
+47. `experience-archive.sh` sweeps records matching staleness criteria to `agents/<agent>/experience-archive.jsonl`
 48. `experience-archive.sh` preserves content `.md` files (only moves JSONL record, not content)
 49. `experience-read.sh --id <id>` searches archive after live (archived experiences still dereferenceable)
 50. `experience-read.sh --category` excludes archived records (only returns live)
@@ -461,8 +463,8 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 
 ### P5. Security
 16. No credential values (from `env-read.sh value`) appear in any file under `world/`, `<agent>/`, or `meta/`
-17. No credential values appear in `<agent>/journal/` entries
-18. No credential values appear in `<agent>/session/handoff.yaml`
+17. No credential values appear in `agents/<agent>/journal/` entries
+18. No credential values appear in `agents/<agent>/session/handoff.yaml`
 
 ---
 
@@ -519,7 +521,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 
 ### R4. Bootstrap Seeding
 18. `core/scripts/init-world.sh` copies `core/config/world-aspirations-initial.jsonl` to `world/aspirations.jsonl` then runs `recompute-all-progress`
-19. `core/scripts/init-agent.sh` copies `core/config/agent-aspirations-initial.jsonl` to `<agent>/aspirations.jsonl` (plus onboarding for subsequent agents)
+19. `core/scripts/init-agent.sh` copies `core/config/agent-aspirations-initial.jsonl` to `agents/<agent>/aspirations.jsonl` (plus onboarding for subsequent agents)
 20. Boot doesn't duplicate-create aspirations that already exist from init scripts
 
 ### R5. Schema & Conventions
@@ -595,11 +597,11 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 4. Phase 4.5 references `external_changes` from Phase 4.2 (not assumed)
 
 ### S2. Domain-Agnostic Cognitive Core
-5. Base skill files contain no domain-specific terms from `<agent>/self.md` — verify by grepping key domain nouns from Self against `.claude/skills/*/SKILL.md`
+5. Base skill files contain no domain-specific terms from `agents/<agent>/self.md` — verify by grepping key domain nouns from Self against `.claude/skills/*/SKILL.md`
 6. `.claude/rules/*.md` files contain no domain-specific terms — verify by grepping key domain nouns
 7. Convention files (`core/config/conventions/*.md`) use generic examples, not domain-specific ones
 8. `core/config/verification-checklist-domain-specific.md` is a template (domain checks live in `world/verification-checklist.md`)
-9. `core/scripts/infra-health.py` has no hardcoded component names or probe functions — components come from `<agent>/infra-health.yaml`, probes from `world/scripts/probe-{name}.sh`
+9. `core/scripts/infra-health.py` has no hardcoded component names or probe functions — components come from `agents/<agent>/infra-health.yaml`, probes from `world/scripts/probe-{name}.sh`
 10. `core/scripts/init-agent.sh` creates `infra-health.yaml` with `components: {}` (empty, not domain-specific)
 11. `core/scripts/guardrail-check.py` `INFRASTRUCTURE_KEYWORDS` contains only generic terms (no domain product names)
 12. `core/scripts/guardrail-check.py` `extract_action_hint()` uses no auto-prefix magic — paths in guardrail text are used directly
@@ -677,19 +679,19 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 34. `echo '{"goals_completed":["g-test"],"key_events":["test"]}' | journal-merge.sh <N>` union-merges goals_completed/tags, always-appends key_events
 35. `journal-add.sh` auto-increments session number and auto-sets date if not provided
 36. `journal-update.sh <N>` rejects stdin JSON with mismatched session number (data integrity guard)
-37. No `<agent>/journal/_index.yaml` exists (old YAML format deleted)
+37. No `agents/<agent>/journal/_index.yaml` exists (old YAML format deleted)
 
 ### V5. Experiential Index (experience.py integration)
 38. `core/scripts/experience.py` has `recompute-index` subcommand
 39. `experience-recompute-index.sh` wrapper exists
 40. `experience-recompute-index.sh` reads both live and archive pipeline JSONL, aggregates by category
-41. Output: writes `<agent>/experiential-index.yaml` (human-readable YAML) + prints JSON to stdout
-42. `<agent>/experiential-index.yaml` lives at top-level <agent>/ (not world/knowledge/patterns/)
+41. Output: writes `agents/<agent>/experiential-index.yaml` (human-readable YAML) + prints JSON to stdout
+42. `agents/<agent>/experiential-index.yaml` lives at top-level <agent>/ (not world/knowledge/patterns/)
 
 ### V6. Init Bootstrap
-43. `core/scripts/init-world.sh` creates empty JSONL files: `world/reasoning-bank.jsonl`, `world/guardrails.jsonl`; `core/scripts/init-agent.sh` creates `<agent>/journal.jsonl`
+43. `core/scripts/init-world.sh` creates empty JSONL files: `world/reasoning-bank.jsonl`, `world/guardrails.jsonl`; `core/scripts/init-agent.sh` creates `agents/<agent>/journal.jsonl`
 44. `core/scripts/init-meta.sh` converts spark-questions to `meta/spark-questions.jsonl`; `core/scripts/init-world.sh` converts pattern-signatures to `world/pattern-signatures.jsonl` from config YAML initial_state via `migrate-yaml` subcommands
-45. `core/scripts/init-agent.sh` creates `<agent>/experiential-index.yaml` at top-level (not patterns/ subdirectory)
+45. `core/scripts/init-agent.sh` creates `agents/<agent>/experiential-index.yaml` at top-level (not patterns/ subdirectory)
 46. `core/scripts/init-world.sh` does NOT create `world/knowledge/reasoning-bank/` directory (old format)
 
 ### V7. Runtime
@@ -697,7 +699,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 48. **Runtime**: `world/guardrails.jsonl` has records after `/reflect` OR Phase 6.5 immediate learning
 49. **Runtime**: `world/pattern-signatures.jsonl` has records with updated accuracy after `/reflect` or `/replay`
 50. **Runtime**: `meta/spark-questions.jsonl` shows incrementing `times_asked` counters after goal completions
-51. **Runtime**: `<agent>/journal.jsonl` has one record per session with accumulated goals/events/tags
+51. **Runtime**: `agents/<agent>/journal.jsonl` has one record per session with accumulated goals/events/tags
 52. **Runtime**: No direct JSONL file reads/edits by the LLM — all access through scripts
 53. All 8 JSONL scripts use `ensure_ascii=True` in `write_jsonl`, `append_jsonl`, and `write_json` functions (prevents Windows shell mojibake from creating unreadable surrogates): `grep -c "ensure_ascii=True" core/scripts/aspirations.py core/scripts/pipeline.py core/scripts/experience.py core/scripts/reasoning-bank.py core/scripts/journal.py core/scripts/pattern-signatures.py core/scripts/spark-questions.py core/scripts/retrieve.py` — each file returns >= 2
 
@@ -707,7 +709,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 
 ### W1. Infrastructure
 1. `.claude/skills/prime/SKILL.md` exists with `user-invocable: false` (internal skill)
-2. `_tree.yaml` registers prime with `type: system`, `parent: null`, `user_invocable: false`
+2. `_tree.yaml` registers prime with `type: system`, `parent: null`, `user-invocable: false`
 3. `_triggers.yaml` has boot trigger entry that calls prime
 4. Boot SKILL.md has Step 2.7 (full boot: `invoke /prime`) and Step 8.5 (continuation: `invoke /prime --category {goal_category}`)
 5. Boot chaining section lists `/prime`
@@ -732,7 +734,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 4. Phase 6.5 creates guardrails via `guardrails-add.sh` (not direct JSONL edit)
 5. Phase 6.5 comment distinguishes execution-time learning from `/reflect`'s hypothesis-resolution learning
 6. Phase 6.5 has forge awareness block: detects recurring manual procedures that should be skills
-7. Phase 6.5 forge awareness registers/increments gaps in `<agent>/skill-gaps.yaml`, checks forge criteria, creates forge goals via `aspirations-update.sh`
+7. Phase 6.5 forge awareness registers/increments gaps in `agents/<agent>/skill-gaps.yaml`, checks forge criteria, creates forge goals via `aspirations-update.sh`
 8. Phase 6.5 forge awareness has `gap.status == "forged"` guard (prevents re-forging already-forged skills)
 
 ### X2. Batch-Micro Actionable Discoveries
@@ -817,7 +819,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 
 ### Y5. Runtime
 20. **Runtime**: After a gap reaches `forge_threshold` encounters, `aspirations-read.sh --active` shows a forge goal with `skill: /forge-skill`
-21. **Runtime**: Already-forged gaps (`status: forged` in `<agent>/skill-gaps.yaml`) do NOT generate new forge goals
+21. **Runtime**: Already-forged gaps (`status: forged` in `agents/<agent>/skill-gaps.yaml`) do NOT generate new forge goals
 22. **Runtime**: `evolution-log-append.sh` entries include `forge-ready` events with source entry point identified
 23. **Runtime**: User says "make a skill for X" → goal created with `skill: "/forge-skill"` (not `skill: null`)
 
@@ -879,7 +881,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 3. `aspirations/SKILL.md` Phase 2.5 contains "Token cost and wall-clock time are NOT reasons to defer or skip"
 4. `CLAUDE.md` Autonomous Loop Rules contains "NEVER STOP for context concerns"
 5. `CLAUDE.md` Autonomous Loop Rules contains "NEVER defer or skip goals because of token cost"
-6. `<agent>/session/stop-loop` does NOT exist (stale stop signals must be cleaned up)
+6. `agents/<agent>/session/stop-loop` does NOT exist (stale stop signals must be cleaned up)
 6b. `boot/SKILL.md` Step 0.5 clears stop-loop in BOTH paths (handoff AND non-handoff) via `session-signal-clear.sh stop-loop`
 7. `grep -c "stop_condition_met" .claude/skills/aspirations/SKILL.md` returns 0
 8. `CLAUDE.md` Autonomous Loop Rules prohibits ALL forms of asking — tool, plain text, options, and waiting
@@ -891,12 +893,15 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 14. `.claude/rules/stop-hook-compliance.md` exists and prohibits manual stop-loop
 15. `stop-hook.sh` Tier 1-3 message contains "Do NOT set stop-loop"
 16. `.claude/settings.json` has `"Stop"` key in `hooks` object referencing `stop-hook.sh` (global, not skill-scoped — skill-scoped hooks don't fire between loop iterations)
+17. `stop-hook.sh` contains reverse-lookup fallback: scans `*/session/running-session-id` for exact SID match when `.active-agent-$SID` is missing — `grep -q 'running-session-id' core/scripts/stop-hook.sh`
+18. `stop-hook.sh` cleanup loop checks `running-session-id` existence before deleting `.active-agent-*` files — never deletes bindings for running agents
+19. `session-save-id.sh` does NOT contain fallback agent resolution outside the breadcrumb mechanism (guard-117: SessionStart fires for all sessions, not just compactions — adding fallbacks here corrupts running-session-id on new-window sessions)
 
 ## AE. No-Fallback Philosophy
 
 1. `guardrails-read.sh --id guard-001` rule contains "no graceful degradation"
 2. `guardrails-read.sh --id guard-001` trigger_condition covers knowledge authoring (not just code)
-3. `<agent>/self.md` contains no-fallback philosophy content _(domain-specific Self content checks moved to `core/config/verification-checklist-domain-specific.md`)_
+3. `agents/<agent>/self.md` contains no-fallback philosophy content _(domain-specific Self content checks moved to `core/config/verification-checklist-domain-specific.md`)_
 4. `grep -ri "graceful degradation" world/knowledge/` returns 0 matches that endorse fallbacks (only matches in negation context like "not graceful degradation" are acceptable)
 5. `guardrails-read.sh --id guard-013` exists with category "execution-discipline" and rule containing "Execute, don't just report"
 
@@ -1166,7 +1171,7 @@ Verifies the agent always probes infrastructure before declaring it unavailable.
 1. `.claude/rules/verify-before-assuming.md` exists with verification imperative
 2. `core/scripts/infra-health.sh` exists as thin bash wrapper
 3. `core/scripts/infra-health.py` exists with `check`, `check-all`, `status`, `stale` subcommands
-4. `<agent>/infra-health.yaml` created by `init-agent.sh` with all components initialized to null
+4. `agents/<agent>/infra-health.yaml` created by `init-agent.sh` with all components initialized to null
 
 ### AL2. Integration Points
 
@@ -1206,7 +1211,7 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 7. Neither `/agent-completion-report` nor `/backlog-report` is in the "MUST NOT invoke" enumerated list (enforcement rule 1)
 7b. `/backlog-report` is NOT in the Internal Skills table (it's hybrid, not agent-only)
 7c. `.claude/skills/backlog-report/SKILL.md` has `user-invocable: true` in frontmatter
-7d. `_tree.yaml` has `backlog-report` with `user_invocable: true` and `model_invocable: true`
+7d. `_tree.yaml` has `backlog-report` with `user-invocable: true` and `model_invocable: true`
 
 ### AN2. Timer Ownership
 
@@ -1237,18 +1242,20 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 
 ### AN8. Report Persistence
 
-23. `/agent-completion-report` Phase 4 writes timestamped file to `<agent>/reports/`
-24. `/agent-completion-report` Phase 4 writes `<agent>/COMPLETION-REPORT.md` (latest, overwritten)
+23. `/agent-completion-report` Phase 4 writes timestamped file to `agents/<agent>/reports/`
+24. `/agent-completion-report` Phase 4 writes `agents/<agent>/COMPLETION-REPORT.md` (latest, overwritten)
 25. Timestamped filename uses hyphens (not colons) for Windows compatibility: `completion-report-{YYYY-MM-DDTHH-MM-SS}.md`
+25a. `/agent-completion-report` Phase 4 contains NO deletion commands (no `rm`, `xargs rm`, `unlink`, `find ... -delete`) — `agents/<agent>/reports/` is append-only history
+25b. `/agent-completion-report` Phase 4 ends at Step 4 (write latest pointer); no Step 5 pruning/rotation/retention cap exists
 
 ### AN6. Backlog Report Behavior
 
-26. `/backlog-report` SKILL.md writes to `<agent>/BACKLOG.md` (not repo root)
+26. `/backlog-report` SKILL.md writes to `agents/<agent>/BACKLOG.md` (not repo root)
 27. Phase 1 uses only framework scripts + pending-questions.yaml read (no direct JSONL reads)
 28. Phase 2 step 4: null `lastAchievedAt` treated as infinitely overdue (never-completed recurring goals)
 29. Phase 2 step 5: null/missing `resolves_no_earlier_than` treated as testable (no time gate)
-30. Phase 5 terminal summary includes absolute path to `<agent>/BACKLOG.md`
-31. `/backlog-report` mutates NO JSONL, NO state files — only writes `<agent>/BACKLOG.md`
+30. Phase 5 terminal summary includes absolute path to `agents/<agent>/BACKLOG.md`
+31. `/backlog-report` mutates NO JSONL, NO state files — only writes `agents/<agent>/BACKLOG.md`
 32. `/backlog-report` has NO timer mechanism (unlike `/agent-completion-report` which updates g-001-04)
 
 ### AN7. Runtime
@@ -1257,7 +1264,7 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 34. **Runtime**: `/agent-completion-report` shows "Blocked" section with root bottlenecks when dependency-blocked goals exist
 35. **Runtime**: After 4h of RUNNING, g-001-04 selected → `/agent-completion-report` fires (or forged delivery wrapper if exists)
 36. **Runtime**: If delivery wrapper fails, g-001-04 is NOT marked completed (retried next cycle)
-37. **Runtime**: User runs `/backlog-report` → `<agent>/BACKLOG.md` written, terminal summary displayed with full file path
+37. **Runtime**: User runs `/backlog-report` → `agents/<agent>/BACKLOG.md` written, terminal summary displayed with full file path
 38. **Runtime**: `/backlog-report` shows "Hypotheses Ready to Test" section only for hypotheses past their `resolves_no_earlier_than` date
 
 ---
@@ -1428,7 +1435,7 @@ Verifies that cognitive core conventions are demand-loaded via `core/config/conv
 Verifies that encoding state is preserved across autocompact cycles and processed in fresh context.
 
 ### AR1. Script Infrastructure
-1. `core/scripts/precompact-checkpoint.py` exists — reads working memory, writes `<agent>/session/compact-checkpoint.yaml`
+1. `core/scripts/precompact-checkpoint.py` exists — reads working memory, writes `agents/<agent>/session/compact-checkpoint.yaml`
 2. `core/scripts/precompact-checkpoint.sh` exists — thin bash wrapper, delegates to .py
 3. `core/scripts/postcompact-restore.py` exists — reads checkpoint, prints restoration message to stdout
 4. `core/scripts/postcompact-restore.sh` exists — thin bash wrapper, delegates to .py
@@ -1452,7 +1459,7 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 
 ### AR3. Aspirations Loop Integration
 14. `aspirations/SKILL.md` has Phase -0.5c between Phase -0.5 and Phase -1.5
-15. Phase -0.5c checks for `<agent>/session/compact-checkpoint.yaml` existence
+15. Phase -0.5c checks for `agents/<agent>/session/compact-checkpoint.yaml` existence
 16. Phase -0.5c restores encoding queue from checkpoint if working memory queue was lost
 17. Phase -0.5c processes encoding queue with `budget = min(5, len(queue))` — smaller than full consolidation
 18. Phase -0.5c uses `last_update_trigger: "compact_encoding"` on tree node updates
@@ -1468,7 +1475,7 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 25. `core/config/conventions/session-state.md` has "Compact Checkpoint" section
 
 ### AR5. Runtime
-26. **Runtime**: After autocompact fires, `<agent>/session/compact-checkpoint.yaml` exists with correct `compact_count`
+26. **Runtime**: After autocompact fires, `agents/<agent>/session/compact-checkpoint.yaml` exists with correct `compact_count`
 27. **Runtime**: After compaction, context restoration message appears in agent's context (from SessionStart hook stdout)
 28. **Runtime**: After loop re-entry, Phase -0.5c processes encoding items and deletes checkpoint
 29. **Runtime**: After multiple compactions in one session, `compact_count` increments and `prior_encoding_items` accumulates
@@ -1513,7 +1520,7 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 ### AR9. Execution Diary
 61. `core/scripts/execution-diary.py` exists with subcommands: append, read, summary, trim
 62. `core/scripts/execution-diary.sh` exists — thin bash wrapper, delegates to .py
-63. Diary file path: `<agent>/session/execution-diary.jsonl` (append-only JSONL)
+63. Diary file path: `agents/<agent>/session/execution-diary.jsonl` (append-only JSONL)
 64. `append` subcommand: requires `content` field, auto-adds `timestamp` if missing, validates `entry_type`
 65. Valid entry types: decision, failure, finding, approach_change, observation, state_update
 66. `read` subcommand: supports `--limit`, `--since`, `--goal`, `--json` filters
@@ -1525,7 +1532,7 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 ### AR10. Reasoning Snapshot
 71. `core/scripts/reasoning-snapshot.py` exists with subcommands: write, read, clear
 72. `core/scripts/reasoning-snapshot.sh` exists — thin bash wrapper, delegates to .py
-73. Snapshot file path: `<agent>/session/reasoning-snapshot.yaml`
+73. Snapshot file path: `agents/<agent>/session/reasoning-snapshot.yaml`
 74. `write` subcommand: accepts JSON or YAML from stdin, auto-adds `snapshot_at` timestamp
 75. `write` subcommand: enriches with `context_used_pct` and `context_zone` from `context-budget.json` if available
 76. `write` uses atomic write (tmp + `os.replace`)
@@ -1541,7 +1548,7 @@ Verifies that background agents dispatched via `Agent(run_in_background=true)` a
 persistently and the stop hook allows graceful idle-waiting instead of forced loop re-entry.
 
 ### ARa1. Script Infrastructure
-1. `core/scripts/pending-agents.py` exists — manages `<agent>/session/pending-agents.yaml`
+1. `core/scripts/pending-agents.py` exists — manages `agents/<agent>/session/pending-agents.yaml`
 2. `core/scripts/pending-agents.sh` exists — thin bash wrapper, delegates to .py
 3. `pending-agents.py` supports subcommands: register, deregister, deregister-team, list, has-pending, prune-stale, clear
 4. `pending-agents.py` `has-pending` and `list` run `prune_stale` internally before returning — stale entries self-heal
@@ -1559,7 +1566,7 @@ persistently and the stop hook allows graceful idle-waiting instead of forced lo
 
 ### ARa3. Aspirations Loop Integration
 14. `aspirations/SKILL.md` has Phase -0.5a between Phase -0.5 and Phase -0.5c
-15. Phase -0.5a checks for `<agent>/session/pending-agents.yaml` existence
+15. Phase -0.5a checks for `agents/<agent>/session/pending-agents.yaml` existence
 16. Phase -0.5a calls `pending-agents.sh list --json` to enumerate pending agents
 17. Phase -0.5a deregisters agents whose results are available in context
 18. Phase -0.5a calls `has-pending` at end to prune stale and clean up
@@ -1575,7 +1582,7 @@ persistently and the stop hook allows graceful idle-waiting instead of forced lo
 26. `core/config/conventions/session-state.md` has "Pending Background Agents" section
 
 ### ARa5. Runtime
-27. **Runtime**: `pending-agents.sh register --id X --team Y --goal Z` creates `<agent>/session/pending-agents.yaml`
+27. **Runtime**: `pending-agents.sh register --id X --team Y --goal Z` creates `agents/<agent>/session/pending-agents.yaml`
 28. **Runtime**: `pending-agents.sh has-pending` returns exit 0 when non-stale agents exist, exit 1 when empty/all-stale
 29. **Runtime**: `pending-agents.sh deregister --id X` removes entry and deletes file when list empty
 30. **Runtime**: `pending-agents.sh deregister-team --team Y` removes all team entries
@@ -1632,9 +1639,9 @@ Recurring goals that find nothing to do (empty inbox, all healthy) skip expensiv
 
 ### AS5a. Encoding Drift Safeguard (aspirations/SKILL.md + aspirations-state-update/SKILL.md)
 28b. `session_signals.goals_since_last_tree_update` counter initialized to 0 at session start
-28c. Counter increments after every state update where `step_8_wrote_insight` is false (all outcome types, including routine)
-28d. Counter resets to 0 when `step_8_wrote_insight` is true OR when mid-session drain encodes an item
-28e. After 4 goals without tree update: orchestrator sets `force_tree_encoding = "true"` in WM and resets counter
+28c. Counter increments by 1 every state-update via `iteration-close.sh` → `tree-encoding-drift-gate.sh` (bash single-writer; g-248-75)
+28d. Counter resets to 0 by the gate when threshold crosses, OR by mid-session encoding-queue drain (Phase 11) when an item is encoded
+28e. When counter >= `tree_encoding_drift_threshold` (config; default 3): bash gate sets `force_tree_encoding = "true"` in WM and resets counter (was LLM-residue Phase 8.0.6 — now bash; g-248-75)
 28f. `aspirations-state-update` Step 8 reads `force_tree_encoding` from WM BEFORE the "new insight" gate
 28g. When `force_tree_encoding` is true: `force_encoding = true`, flag cleared from WM, "new insight" gate bypassed
 28h. Curator quality gate still runs on forced encodings — garbage is rejected even when force is active
@@ -1746,7 +1753,7 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 17h. **Runtime**: After autocompact (tracker cleared), skill re-invokes normally
 
 ### AT3. Tracker Lifecycle
-18. Tracker file: `<agent>/session/context-reads.txt` — plain text, first line is `#session:<id>` header, remaining lines are paths
+18. Tracker file: `agents/<agent>/session/context-reads.txt` — plain text, first line is `#session:<id>` header, remaining lines are paths
 19. `precompact-checkpoint.py` deletes tracker file before compaction (post-compact context may not retain file content)
 20. `context-reads.py clear` deletes tracker file (idempotent)
 21. `context-reads.py invalidate` only removes `world/knowledge/tree/**` paths (convention files are immutable)
@@ -1792,7 +1799,7 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 40i. `stop/SKILL.md` Step 4 calls `consolidation-precheck.sh` before routing
 40j. `consolidation-housekeeping.md` handoff schema includes `consolidation_meta.consecutive_lean_sessions`
 40k. `consolidation-housekeeping.md` Step 6 (tree rebalancing) runs always — NOT gated by stop_mode
-40l. **Runtime**: `AYOAI_AGENT=<agent> consolidation-precheck.sh` returns valid JSON with `verdict` field
+40l. **Runtime**: `MIND_AGENT=<agent> consolidation-precheck.sh` returns valid JSON with `verdict` field
 40m. **Runtime**: When all WM queues empty and no lean ceiling, verdict is `"FAST"`
 
 ### AT6. Known Limitation
@@ -1805,7 +1812,7 @@ Verifies that the hook-based context deduplication system prevents redundant fil
 44. **Runtime**: After editing a tree node, that node is removed from tracker (re-read allowed)
 45. **Runtime**: `load-conventions.sh aspirations pipeline` returns only unloaded convention paths
 46. **Runtime**: After autocompact, tracker is cleared and all files can be re-read
-47. **Runtime**: `<agent>/session/working-memory.yaml` reads are never tracked (out of scope)
+47. **Runtime**: `agents/<agent>/session/working-memory.yaml` reads are never tracked (out of scope)
 48. **Runtime**: `load-tree-summary.sh` first call outputs path; second call outputs nothing (cached)
 49. **Runtime**: After `tree-update.sh --set` modifies `_tree.yaml`, `load-tree-summary.sh` regenerates and outputs path
 
@@ -1956,7 +1963,7 @@ Verifies the Self-anchored alignment check replaces binary boredom, `--plan` fla
 1. `core/scripts/work-alignment.py` exists with `check` subcommand
 2. `core/scripts/work-alignment.sh` exists as bash wrapper (same pattern as `goal-selector.sh`)
 3. `bash core/scripts/work-alignment.sh check` outputs JSON with 7 fields: `self_priorities`, `covered_priorities`, `uncovered_priorities`, `hours_since_novel_goal`, `recurring_ratio`, `active_aspiration_count`, `goal_category_distribution`, plus `config_thresholds`
-4. `self_priorities` are extracted from `<agent>/self.md` numbered items and `##` headers
+4. `self_priorities` are extracted from `agents/<agent>/self.md` numbered items and `##` headers
 5. `covered_priorities` uses term matching (50% of 3+ char terms) against active aspiration titles, descriptions, and goal titles
 6. `hours_since_novel_goal` uses `firstAchievedAt` for recurring goals with any achievedCount (not just achievedCount==1)
 7. `recurring_ratio` is null when `--ranked-goals` is not provided, otherwise a 0.0–1.0 float
@@ -2013,7 +2020,7 @@ Verifies the Self-anchored alignment check replaces binary boredom, `--plan` fla
 3. User makes testable prediction (e.g. "I think X causes Y") → pipeline hypothesis created at stage `discovered`
 4. Simple Q&A (e.g. "what's the status?") → no artifacts created, notability assessment returns immediately
 5. Duplicate insight → existing rb entry strengthened (`times_helpful` incremented), no new entry
-6. Duplicate feedback → existing guardrail strengthened (`times_triggered` incremented), no new entry
+6. Duplicate feedback → existing guardrail strengthened (`utilization.times_active` incremented), no new entry
 7. Experience record created for notable interactions with type `user_interaction`
 8. Journal entry appended for interactions where learning occurred
 9. Works in IDLE state (no RUNNING requirement)
@@ -2036,7 +2043,7 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 ### PF2. _paths.sh Safety Under set -u
 
-5. `_paths.sh` line 26 uses `${AYOAI_AGENT:-}` — safe under `set -u` when AYOAI_AGENT is unset
+5. `_paths.sh` line 26 uses `${MIND_AGENT:-}` — safe under `set -u` when MIND_AGENT is unset
 6. All hook scripts source `_paths.sh` with `set -euo pipefail` — if `_paths.sh` crashes, ALL hooks die silently (stop hook, read dedup, compaction checkpoint)
 7. `_paths.sh` sets `AGENT_DIR=""` (not unset) when no agent bound — all downstream `[ -n "$AGENT_DIR" ]` checks work
 
@@ -2044,7 +2051,7 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 8. **Runtime**: `bash core/scripts/aspirations-update-goal.sh <id> skill /some-skill` stores `/some-skill` (not `C:/Program Files/Git/some-skill`)
 9. **Runtime**: Hook scripts (`context-reads-gate.sh`, `context-reads-invalidate.sh`) run without path errors
-10. **Runtime**: `AYOAI_AGENT="" bash core/scripts/stop-hook.sh < /dev/null` exits 0 (not crash) — stop hook survives no-agent state
+10. **Runtime**: `MIND_AGENT="" bash core/scripts/stop-hook.sh < /dev/null` exits 0 (not crash) — stop hook survives no-agent state
 
 ---
 
@@ -2058,10 +2065,10 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 5. `forged-skills.yaml` entries with `gap_ref` cross-reference to matching `skill-gaps.yaml` entries with `forged_into`
 
 ### FS2. World-Level Single Source of Truth
-6. `world/forged-skills.yaml` is the ONLY forged skills registry — no `<agent>/forged-skills.yaml` exists (except tombstone)
+6. `world/forged-skills.yaml` is the ONLY forged skills registry — no `agents/<agent>/forged-skills.yaml` exists (except tombstone)
 7. Every entry in `world/forged-skills.yaml` has a `forged_by` field (provenance tracking)
-8. `world/skill-relations.yaml` is the ONLY skill relations store — no `<agent>/skill-relations.yaml` exists
-9. Companion scripts live in `world/scripts/` — no `<agent>/scripts/` directories exist
+8. `world/skill-relations.yaml` is the ONLY skill relations store — no `agents/<agent>/skill-relations.yaml` exists
+9. Companion scripts live in `world/scripts/` — no `agents/<agent>/scripts/` directories exist
 10. `init-world.sh` creates `forged-skills.yaml`, `skill-relations.yaml`, and `scripts/` directory
 11. `init-agent.sh` does NOT create `forged-skills.yaml` or `skill-relations.yaml`
 12. `skill-relations.py` imports `WORLD_DIR` (not `AGENT_DIR`) for relations path
@@ -2085,8 +2092,8 @@ Verifies the cross-platform bash wrapper pattern that prevents Git Bash on Windo
 
 ### SC2. Runtime (after a /start → /stop cycle)
 
-10. `<agent>/session/handoff.yaml` exists after /stop (Step 9 ran)
-11. `<agent>/session/working-memory.yaml` is reset to template state (Steps 4-5 ran)
+10. `agents/<agent>/session/handoff.yaml` exists after /stop (Step 9 ran)
+11. `agents/<agent>/session/working-memory.yaml` is reset to template state (Steps 4-5 ran)
 12. Journal entry has "## Consolidation" section (Step 3 ran)
 13. No "Interrupted Session — Sensory Buffer Snapshot" in journal (old mini-consolidation gone)
 15. Next `/start` detects handoff.yaml and enters continuation mode
@@ -2216,6 +2223,9 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 19. **Runtime**: After `aspirations-update-goal.sh`, next `load-aspirations-compact.sh` regenerates cache (staleness detected)
 20. **Runtime**: After autocompact, compact cache file is re-read (tracker cleared by PreCompact hook)
 21. **Runtime**: Phase 2.9 `--id` call provides goal with `description` and `verification` fields for execution
+21a. **Runtime**: `aspirations-compact.json` stays under Read-tool 256KB cap. bravo g-115-194 found pretty-print `indent=2` inflated the file from 234KB → 335KB via whitespace alone — 30% of the file was structural spaces. Fix g-115-196 (2026-04-24): `core/scripts/aspirations.py` uses `indent=None, separators=(",", ":")`. Guard against regression to indent=2 or looser separators.
+   Bash: for agent in alpha bravo; do f="$HOME/../.../$agent/session/aspirations-compact.json"; [ -f "$f" ] && python3 -c "import os,sys; s=os.path.getsize(sys.argv[1]); assert s < 262144, f'{sys.argv[1]}: {s} bytes > 256KB cap'; print(f'OK: {sys.argv[1]} {s} bytes')" "$f" || echo "$f: missing (cache may not yet be populated — re-run load-aspirations-compact.sh)"; done
+   Bash: grep -n 'json.dumps(compact' core/scripts/aspirations.py — verify indent=None separators=(",", ":") present; indent=2 is a regression
 
 ### BE5. Targeted Goal Query (aspirations-query.sh)
 
@@ -2238,10 +2248,10 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 
 ### WM1. Script Infrastructure
 
-1. `core/scripts/wm.py` exists with 8 subcommands: read, set, append, clear, ages, prune, init, reset
-2. 8 shell wrappers exist: `wm-read.sh`, `wm-set.sh`, `wm-append.sh`, `wm-clear.sh`, `wm-ages.sh`, `wm-prune.sh`, `wm-init.sh`, `wm-reset.sh`
-3. `wm-init.sh` creates `<agent>/session/working-memory.yaml` with 15 slots + `slot_meta` section
-4. `wm-reset.sh` produces identical template to `wm-init.sh` (with distinct message)
+1. `core/scripts/wm.py` exists with 9 subcommands: read, set, append, clear, ages, prune, init, reset, clear-identity
+2. 9 shell wrappers exist: `wm-read.sh`, `wm-set.sh`, `wm-append.sh`, `wm-clear.sh`, `wm-ages.sh`, `wm-prune.sh`, `wm-init.sh`, `wm-reset.sh`, `wm-clear-identity.sh`
+3. `wm-init.sh` creates `agents/<agent>/session/working-memory.yaml` with 15 slots + `slot_meta` section
+4. `wm-reset.sh` produces template matching `wm-init.sh` but preserves SESSION_IDENTITY_FIELDS (currently `{session_start}`) from the existing WM — distinct message, plus a `preserved:` suffix when any identity field survived the reset. Cleared explicitly only by `wm-clear-identity.sh` at /stop D4.5.
 5. `core/config/memory-pipeline.yaml` `slot_types` list has 15 entries including `active_constraints`, `sensory_buffer`, and `known_blockers`
 6. `core/config/memory-pipeline.yaml` has `working_memory_pruning` section with `stale_threshold_minutes`, `evict_threshold_minutes`, `array_limits`, `item_stale_minutes`, `protected_slots`
 
@@ -2261,9 +2271,9 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 
 ### WM4. Skill Migration (No Direct File Access)
 
-15. Grep `.claude/skills/` for `Read <agent>/session/working-memory` returns 0 matches
-16. Grep `.claude/skills/` for `Write <agent>/session/working-memory` returns 0 matches
-17. Grep `.claude/skills/` for `Edit <agent>/session/working-memory` returns 0 matches
+15. Grep `.claude/skills/` for `Read agents/<agent>/session/working-memory` returns 0 matches
+16. Grep `.claude/skills/` for `Write agents/<agent>/session/working-memory` returns 0 matches
+17. Grep `.claude/skills/` for `Edit agents/<agent>/session/working-memory` returns 0 matches
 18. Only legitimate `working-memory.yaml` reference: `boot/SKILL.md` cleanup whitelist (filename string, not access)
 
 ### WM5. Convention & Documentation
@@ -2468,7 +2478,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 ### Known Design Limitations (verify these are NOT bugs)
 48. `reflection_effectiveness_by_type` only tracks spark reflections (Phase 6.5 tags artifacts). Hypothesis and execution reflection sub-skills do not yet tag their artifacts with `source_reflection_id` — this is a known limitation, not a bug. Step 0.3 guards against this with `total >= 3`.
 49. Episode chaining only fires on `"failed"` outcomes. Infrastructure failures (`INFRASTRUCTURE_UNAVAILABLE`, `RESOURCE_BLOCKED`) are explicitly excluded — Phase 4.0's blocker protocol handles those.
-50. `max_episodes_per_goal: 3` in config is only the fallback when `context_zone` is undefined. The runtime max is determined by `context_zone_override` values (tight:0, normal:1, fresh:2).
+50. Episode chaining's runtime max is `context_zone_override[zone]` read live from `context-budget.json` each iteration. `max_episodes_per_goal: 3` in the same config section is currently unread at runtime (retained only as an evolution-modifiable bound at `modifiable.max_episodes_per_goal`).
 
 ---
 
@@ -2628,14 +2638,14 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 2. `ls -d meta/ 2>/dev/null` at project root returns nothing (directory must not exist)
 3. `.gitignore` contains `/world/` and `/meta/` entries (safety net)
 
-### BM2. Auto-Detect When AYOAI_AGENT Unset
-4. `AYOAI_AGENT= python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` (from core/scripts/) prints the external OneDrive path, NOT PROJECT_ROOT/world
-5. `AYOAI_AGENT= bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
+### BM2. Auto-Detect When MIND_AGENT Unset
+4. `MIND_AGENT= python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` (from core/scripts/) prints the external OneDrive path, NOT PROJECT_ROOT/world
+5. `MIND_AGENT= bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
 6. Neither command produces stderr warnings (hooks call these hundreds of times per session)
 
-### BM3. Normal Resolution With AYOAI_AGENT Set
-7. `AYOAI_AGENT=alpha python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` prints the external path
-8. `AYOAI_AGENT=alpha bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
+### BM3. Normal Resolution With MIND_AGENT Set
+7. `MIND_AGENT=alpha python3 -c "from _paths import WORLD_DIR; print(WORLD_DIR)"` prints the external path
+8. `MIND_AGENT=alpha bash -c "source core/scripts/_paths.sh && echo $WORLD_DIR"` prints the external path
 
 ### BM4. Script and Pseudocode Hygiene
 9. `grep -rn 'mkdir.*world/' .claude/skills/` returns zero matches using bare `world/` (all use `$WORLD_DIR`)
@@ -2667,3 +2677,337 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 12. **Runtime**: After B7 fires, `wm-read.sh proactive_escalation_log` should contain `{"blocker_id":"_all_blocked","sent_at":"..."}` entry
 13. **Runtime**: After a blocker persists > 2 hours, `wm-read.sh proactive_escalation_log` should contain an entry matching that blocker's ID
 14. **Runtime**: Circuit breaker notification email subject contains the failing goal's title
+
+---
+
+## BO. Dependency Timeout (blocked_by Fail-Open)
+
+### BO1. Config
+1. `core/config/aspirations.yaml` has `dependency_timeout_hours: 48` in `multi_agent:` section
+2. `core/config/aspirations.yaml` has `multi_agent.dependency_timeout_hours: {min: 12, max: 168, default: 48}` in `modifiable:`
+3. `core/config/aspirations.yaml` `_common_fields:` has `blocked_since: null` immediately after `blocked_by: []`
+
+### BO2. Schema
+4. `core/config/conventions/goal-schemas.md` documents `blocked_since` with fail-open semantics (missing = expires immediately)
+5. `core/config/conventions/goal-schemas.md` `blocked_since` entry mentions `cmd_add`, `cmd_add_goal`, and `cmd_update_goal` as auto-setters
+
+### BO3. Auto-Management (aspirations.py)
+6. `core/scripts/aspirations.py` `COMPACT_GOAL_KEEP` set includes `"blocked_since"`
+7. `core/scripts/aspirations.py` `cmd_update_goal()` — after `goal[field] = value`, if `field == "blocked_by"` and value is truthy, sets `blocked_since` if not already set
+8. `core/scripts/aspirations.py` `cmd_update_goal()` — if `field == "blocked_by"` and value is falsy, clears `blocked_since` to `None`
+9. `core/scripts/aspirations.py` `cmd_add_goal()` — before lock, if goal has `blocked_by` and no `blocked_since`, auto-sets it
+10. `core/scripts/aspirations.py` `cmd_add()` — before validation, iterates goals and auto-sets `blocked_since` for any with non-empty `blocked_by`
+10a. `core/scripts/aspirations.py` `cmd_update()` — before validation, iterates goals and auto-sets `blocked_since` for any with non-empty `blocked_by` (same pattern as `cmd_add`)
+11. `core/scripts/aspirations.py` `_clear_stale_blockers()` — when `blocked_by` becomes empty (all deps resolved), clears `blocked_since` to `None`
+
+### BO4. Timeout Enforcement (goal-selector.py)
+12. `core/scripts/goal-selector.py` `collect_candidates()` signature includes `dependency_timeout_hours=None`
+13. `core/scripts/goal-selector.py` `collect_candidates()` blocked_by check uses `hours_since(goal.get("blocked_since"))` — if `dep_age is not None and dep_age <= dependency_timeout_hours`: skip (blocked); else: fall through (fail-open)
+14. `core/scripts/goal-selector.py` `collect_blocked()` signature includes `dependency_timeout_hours=None`
+15. `core/scripts/goal-selector.py` `collect_blocked()` dependency check — if `dep_age is None or dep_age > dependency_timeout_hours`: pass (not blocked); else: report as dependency-blocked. Logic is the complement of collect_candidates (symmetry requirement)
+16. `core/scripts/goal-selector.py` `cmd_select()` loads `dependency_timeout_hours` from config and passes to both `collect_candidates()` calls and the `collect_blocked()` call
+17. `core/scripts/goal-selector.py` `cmd_blocked()` loads `dependency_timeout_hours` from config and passes to `collect_blocked()`
+
+### BO5. Proactive Escalation
+18. `.claude/skills/aspirations-precheck/SKILL.md` has Phase 0.5b.2 "Dependency Timeout Escalation" section
+19. Phase 0.5b.2 uses 75% of `dependency_timeout_hours` as escalation threshold (default 36h)
+20. Phase 0.5b.2 differentiates: user-needed root cause → notify user; agent-resolvable → boost priority to HIGH
+
+### BO6. Runtime
+21. **Runtime**: A goal with `blocked_by: ["g-XXX-YY"]` and `blocked_since` set 49 hours ago should appear in `goal-selector.sh select` output (expired, fail-open)
+22. **Runtime**: A goal with `blocked_by: ["g-XXX-YY"]` and `blocked_since` set 10 hours ago should NOT appear in `goal-selector.sh select` output (still blocked)
+23. **Runtime**: A goal with `blocked_by: ["g-XXX-YY"]` and NO `blocked_since` field should appear in `goal-selector.sh select` output (missing timestamp = immediate fail-open)
+24. **Runtime**: After `aspirations-update-goal.sh <goal-id> blocked_by '["g-001-01"]'`, the goal should have a non-null `blocked_since` timestamp
+25. **Runtime**: After `aspirations-update-goal.sh <goal-id> blocked_by '[]'`, the goal's `blocked_since` should be `null`
+
+---
+
+## BP. Session-47 Backoff Health-Check Fixes
+
+Covers the mechanics added in the fuzzy-crafting-noodle plan (2026-04-17) to
+prevent the "backoff silently disables framework health checks" failure mode.
+
+### BP1. Capability-Gate STOPWORDS
+1. `core/scripts/capability-gate.py` `_STOPWORDS` contains the high-collision
+   state-change set: `new, old, create, update, delete, add, remove, change,
+   modify, reset, rotate, refresh, restart, replace, keep, same, different,
+   current, previous, next, prior, latest, initial, final` (plus verb tense
+   variants: created, updated, deleted, added, removed, changed, modified,
+   rotated, refreshed, restarted, replaced, kept).
+2. Inline comment above the state-change block references the session-47
+   false positive (keyword `new` matching add-npc-task).
+3. **Regression test**: `capability-gate.sh --failure-reason "SSH host key
+   mismatch new ED25519 fingerprint" --intended-participants user` returns
+   matches that EXCLUDE add-npc-task and INCLUDE access-efs-data (triggers
+   contain `known_hosts`, `ssh`, or `host-key-rotation`).
+
+### BP2. Blocker-Recheck HUMAN_ONLY Types
+4. `core/scripts/blocker-recheck.py` defines
+   `HUMAN_ONLY_BLOCKER_TYPES = {"security-trust", "credentials-required",
+   "physical-hardware", "user_action"}`.
+5. The blocker loop short-circuits with `continue` BEFORE the participants
+   check when `b.get("type")` is in that set. No capability-gate keyword
+   match can auto-clear a blocker of these types.
+6. **Regression test**: a synthetic blocker with `type: security-trust` and
+   a failure_reason that strongly matches any skill returns `rechecked: 0`
+   when fed to `blocker-recheck.sh --apply`.
+
+### BP3. Idle-Tick Light-Precheck Cap
+7. `core/scripts/idle-tick.sh` defines `LIGHT_PRECHECK_CAP=600` (10 minutes).
+8. When `REMAINING > LIGHT_PRECHECK_CAP`: directive emits
+   `SLEEP_DURATION=600` and `CHECKPOINT_SLEEP=1`.
+9. When `REMAINING <= LIGHT_PRECHECK_CAP`: directive emits
+   `SLEEP_DURATION=REMAINING` and `CHECKPOINT_SLEEP=0`.
+10. Directive text includes both fields in a format the aspirations loop
+    Phase -0.5e can parse.
+
+### BP4. Interruptible-Sleep Wake-on-Signal
+11. `core/scripts/interruptible-sleep.sh` checks `stop-loop` and
+    `stop-requested` (exit 0) AND `blocker-cleared`, `pq-resolved` (exit 2)
+    on every iteration.
+12. When `blocker-cleared` or `pq-resolved` is detected, the signal file is
+    CONSUMED (`rm -f`) before exit. Exit code 2.
+13. File header documents exit codes: 0 = natural/stop, 1 = bad args,
+    2 = wake-on-signal.
+14. Header includes WRITER STATUS block naming the two wire-up locations
+    (known_blockers resolution transition; pq status → resolved path).
+15. **Known gap**: until writers are added (see goal under asp-240), the
+    exit-2 path is dead code. A passing BP4 run does NOT imply wake-on-signal
+    works end-to-end.
+
+### BP5. Aspirations Phase -0.5e Checkpoint-Aware Branch
+16. `.claude/skills/aspirations/SKILL.md` Phase -0.5e IF branch parses
+    `CHECKPOINT_SLEEP` from the directive and writes it to WM slot
+    `last_checkpoint_sleep`.
+17. ELSE branch reads `last_checkpoint_sleep` and branches on
+    `checkpoint_flag == "1" AND remaining_seconds > 60` → light-precheck
+    pass; else → residual inline-sleep or expired.
+18. Light-precheck body invokes ONLY scripts that exist in core/scripts/:
+    `session-signal-exists.sh stop-requested` and
+    `blocker-recheck.sh --max-age-hours {N} --apply`. No call to
+    `aspirations-precheck.sh` (does not exist).
+19. CRITICAL comment in the light-precheck body warns against reintroducing
+    the `aspirations-precheck.sh` phantom calls.
+20. When light-precheck clears all blockers, both `blocked_sleep_until` and
+    `last_checkpoint_sleep` WM slots are nulled before falling through.
+21. When blockers persist, C2 proactive heartbeat notification fires subject
+    to `proactive_escalation_log` cooldown, then re-enters backoff with
+    `min(remaining_seconds, 600)`.
+22. Residual inline-sleep branch handles exit code 2 from
+    `interruptible-sleep.sh` by nulling both WM slots (wake-on-signal path).
+
+### BP6. Maintain Primitive
+23. `.claude/skills/aspirations-execute/SKILL.md` has a "Maintain Goals" section
+    under Cognitive Primitives.
+24. Maintain template sets `status: completed`, `started` and `completed_date`
+    to current ISO timestamp, `category: framework-maintenance`,
+    `skill: null`, `participants: ["agent"]`.
+25. Template description pattern: "Inline framework correction during
+    {triggering_context}: {what was wrong}\n\nFix applied: {what}\n\nLesson
+    encoded: {guard-ID / rb-ID / rule-path}".
+26. CLAUDE.md Cognitive Primitives section lists Maintain alongside Unblock,
+    Investigate, Idea (drift-check point).
+
+### BP7. Populated Triggers on Access-\* Skills
+27. `grep -l '^triggers:\s*\[\]' .claude/skills/*/SKILL.md` returns zero
+    matches. Every skill has a populated `triggers:` list.
+28. `access-efs-data` triggers include at least: `efs-ssh`, `known_hosts`,
+    `ssh`, `host-key-rotation` (the keywords that discriminated the session-47
+    misdiagnosis).
+29. `access-email` triggers include at least: `email`, `send-info-alert`,
+    `send-error-alert` (failure reasons routing to email infra).
+
+### BP8. Probe-Canonicality Rule + Cross-References
+30. `.claude/rules/probe-with-canonical-code-path.md` exists and lists
+    efs-ssh.sh / aws-exec.sh / operator-api.sh anti-pattern examples.
+31. `world/conventions/capability-routing.md` remote-storage SSH row references
+    `guard-147 / rb-246` (NOT rb-226 — that's an unrelated defensive-layers
+    entry).
+32. `world/guardrails.jsonl` guard-147 `action_hint` cross-links rb-225 and
+    rb-246 (NOT rb-226).
+33. `world/reasoning-bank.jsonl` contains rb-246 with title starting
+    "Non-canonical probes produce false-positive blockers".
+
+### BP9. Runtime
+34. **Runtime**: Fresh `interruptible-sleep.sh 10 &` followed by
+    `touch agents/<agent>/session/blocker-cleared` exits with code 2 within 2s
+    and removes the signal file.
+35. **Runtime**: `idle-tick.sh` with `blocked_sleep_until` set 25 minutes
+    out emits a directive containing `SLEEP_DURATION=600` and
+    `CHECKPOINT_SLEEP=1`.
+36. **Runtime**: `capability-gate.sh --failure-reason "the new user needs
+    created access to the service" --intended-participants user` returns
+    `match_count: 0` for the state-change words (`new`, `created`) —
+    remaining tokens alone should not match agent skills.
+37. **Runtime**: `blocker-recheck.sh --apply` against a WM state with one
+    security-trust blocker returns `rechecked: 0` and leaves the blocker
+    untouched.
+
+## BQ. Zero-Count Gate + Debt-Closure Classifier Override (rb-245 + session-48)
+
+Extensions of the capability-gate pattern (rb-229) to statistical/audit
+negations, and the first semantic override on the routine/deep classifier.
+
+### BQ1. New Scripts Exist
+1. `core/scripts/zero-count-gate.py` exists, has `#!/usr/bin/env python3`, and defines `_TRIGGER_PATTERNS` with at least 9 regex patterns
+2. `core/scripts/jsonl-field-probe.py` exists, has `#!/usr/bin/env python3`, and exits 0 always (diagnostic contract, not a gate)
+3. `core/scripts/backfill-closes-knowledge-debt.py` exists with a `--require-tree-node` filter that skips debts not resolving to real tree nodes
+4. `core/scripts/audit-schema-gate.py` is recognized as a complementary (pre-audit) sibling — both gates cite rb-245; zero-count-gate triggers on claim-text phrases while audit-schema-gate triggers on explicit field-name arguments
+
+### BQ2. Zero-Count Gate Contract
+5. `py core/scripts/zero-count-gate.py --claim-text "98% of records have times_triggered=0"` exits `1` with `would_block=true` (no probe)
+6. Same claim with `--file-probed <path> --field-probed <name> --probe-result found` exits `0` with `would_block=false`
+7. Same claim with `--probe-result missing` exits `1` (schema drift detected)
+8. Non-negation text (`"The deploy succeeded"`) exits `0` (no-op, `trigger_matched=null`)
+9. Any claim with `--override "<justification>"` exits `0` and writes `[zero-count-gate] override applied: ...` to stderr
+10. Internal errors fail-open (exit 0) with `gate_error` populated in the JSON output
+
+### BQ3. Field-Probe Helper Contract
+11. `py core/scripts/jsonl-field-probe.py --file <jsonl-path> --field <dot.path>` always exits 0 (diagnostic tool)
+12. `--field` supports dotted paths (e.g., `utilization.times_active`); array indexing is NOT supported
+13. Output JSON contains `field_present` (bool), `sample_value`, `records_sampled`, `record_index`, `probe_error` fields
+14. Missing file reports `probe_error: "file not found: ..."` with `field_present: false` and exit 0
+15. `_get_dotted` semantic: explicit null terminal returns `field_present: false` (same as absent segment) — aligned with `audit-schema-gate.py`
+
+### BQ4. Q2 Gate Wire-Up (aspirations-verify)
+16. `.claude/skills/aspirations-verify/SKILL.md` Q2 NEGATIVE CHECK block lists THREE gate classes: knowledge/capability (exhaustive-search-gate), infrastructure/operational (verify-before-assuming-gate), statistical/audit (zero-count-gate)
+17. Q2 block invokes gates via `py core/scripts/...py`, NOT `bash core/scripts/...py` (bash would silently fail — gates are Python scripts)
+18. Q2 block instructs: "ALL triggered gates must pass (exit 0). Overlap is intentional defense-in-depth, not a bug."
+19. Q2 block maps a gate exit of 1 to Q2 FAIL → `all_passed = false`, status → pending, `verification_gap` appended to `sensory_buffer`
+
+### BQ5. Classifier Semantic Override (aspirations-execute Phase 4-post)
+20. `.claude/skills/aspirations-execute/SKILL.md` Phase 4-post has a block labeled `SEMANTIC OVERRIDE: knowledge-debt closure (rb-245 / anti-pattern 2)` after the `outcome_class = "routine"` assignment
+21. The override checks `goal.closes_knowledge_debt` is non-empty AND (debt cleared OR tree node `last_updated == today`) — if so, forces `outcome_class = "deep"` with log line `▸ DEBT-CLOSURE OVERRIDE`
+22. Safety comment added: `SAFETY: Goals that actually close knowledge-debt ALWAYS become "deep" (override above)`
+23. Phase 4-post retains all prior SAFETY lines (non-recurring, failed, findings-present, bias-toward-deep)
+
+### BQ6. Goal Schema + Auto-Detect Fallback
+24. `core/config/conventions/goal-schemas.md` has a `# Knowledge-Debt Closure Field` section documenting `closes_knowledge_debt: ["<node-key>", ...]`
+25. Schema docs say "A goal with this field set is NEVER routine-classified"
+26. `.claude/skills/aspirations-state-update/SKILL.md` Step 8 deep-path has a `Knowledge-debt auto-detect fallback` block after `step_8_tree_encoded = true`
+27. Auto-detect calls `wm-read.sh knowledge_debt --json`, matches the just-written `node.key` against any debt entry, and back-populates `goal.closes_knowledge_debt` via `aspirations-update-goal.sh` when matched
+28. `.claude/skills/decompose/SKILL.md` Step 5 sub-goal assembly reads `wm-read.sh knowledge_debt` and pre-populates the field when sub-goal title/description/category references a debt `node_key`
+
+### BQ7. Rule + Convention Updates
+29. `.claude/rules/verify-before-assuming.md` has a Rule 5 "Statistical / audit negations require schema verification (rb-245)" referencing `zero-count-gate.py` and `jsonl-field-probe.py`
+30. Anti-patterns list includes "98% of records have X=0 without probing whether X is the correct field name (rb-245 — the original audit retracted after probing showed the counter was at a different nested path)"
+31. `core/config/conventions/negative-conclusions.md` has a new section `## Statistical / Audit Negations (rb-245)` with a Protocol subsection specifying probe-first then gate-pass
+32. `core/config/conventions/negative-conclusions.md` "Enforcement Points" list has entry 5 for Phase 5 Q2 gate wire-up
+
+### BQ8. Dashboard Surface (agent-completion-report)
+33. `.claude/skills/agent-completion-report/SKILL.md` Phase 2 has step 3c (`Knowledge-debt closures in the report window`) collecting `closes_knowledge_debt` from completed goals
+34. Phase 2 step 11e computes `knowledge_debt_oldest_age_days` and `knowledge_debt_entries` (top 5 by sessions_deferred/age)
+35. Phase 3 has a `## Knowledge Debt` section between `## Knowledge` and `## Message Board`, listing outstanding debts + closure events, omitted when both counts are zero
+
+### BQ9. Reasoning Bank + Guardrail Entries
+36. Reasoning bank has `rb-247` (Windows bash subprocess → prefer direct python3), `rb-248` (grep core/scripts for sibling gates before forging), `rb-249` (regex `%\b` trap) — all dated 2026-04-18
+37. Guardrails has `guard-152` "Before creating a new enforcement gate (any `core/scripts/*-gate.py` or `audit-*.py`), run an `ls`..."
+
+### BQ10. Integration Smoke (rb-245 replay)
+38. **Runtime**: Probing `times_triggered` (legacy field) against the live `guardrails.jsonl` returns `field_present: false`
+39. **Runtime**: Probing `utilization.times_active` against the same file returns `field_present: true`
+40. **Runtime**: Gate invoked with the legacy probe result + original retraction claim ("98% of guardrails have `times_triggered=0`") exits 1 and cites schema drift in `reason`
+41. **Runtime**: Gate invoked with the correct probe result exits 0
+
+### BQ11. Backfill Correctness
+42. **Runtime**: `backfill-closes-knowledge-debt.py --agent bravo --also-agent alpha --include-archived --require-tree-node` exits 0 with `proposed_count: 0` when all current debt `node_keys` are placeholders (current state of bravo's handoff)
+43. **Runtime**: Same script without `--require-tree-node` produces false-positive matches against goals whose descriptions contain common words like "multiple" — expected; the flag is the correct default for this data
+
+### BQ12. Gate Invocation Correctness (added session-48, 2026-04-18 review)
+44. **Runtime**: `py core/scripts/exhaustive-search-gate.py --claim-text "test" --tiers-used tree --queries-count 1` produces valid JSON on stdout and exits 0 (no-trigger no-op path). The analogous `bash core/scripts/exhaustive-search-gate.py ...` form fails with exit 2, empty stdout, ≥500 bytes stderr — regression canary for the `bash <file>.py` silent-failure bug (guard-156)
+45. **Runtime**: `py core/scripts/jsonl-field-probe.py` and `py core/scripts/audit-schema-gate.py` AGREE on explicit-null terminals. For a record `{"utilization":{"times_active":null}}`: probe reports `field_present: false`; gate reports `would_block: true`. The opposite result from either script indicates a semantic regression between the two tools
+46. **Static**: `grep -rn "times_triggered" .claude/skills/{reflect,respond,aspirations-spark}/SKILL.md core/config/conventions/reasoning-guardrails.md` returns zero matches — guardrail-context drift is fully cleared. (Pattern-signature-context matches in `aspirations-evolve/SKILL.md:590-591`, `reflect/SKILL.md:220`, `reflect-maintain/SKILL.md:68,71` are KNOWN DRIFT pending g-115-50 resolution; do NOT include those files in this grep.)
+47. **Static**: `reasoning-bank.py` `UTILIZATION_COUNTERS` has a comment-block above it citing rb-245 and warning against reintroducing a top-level `times_triggered`. `audit-schema-gate.py._get_dotted` has a `DO NOT CHANGE` comment on the `cur is None → False` semantic. Both are load-bearing; removing either comment recreates conditions for the rb-245 class of bug
+48. **Static**: `core/config/meta.yaml` `backpressure.audit_only_fields` block exists and lists at minimum `reflection-strategy.yaml: [roi_history, reflection_quality_log]` and `step-attribution.yaml: [step_attribution]`. Without this skiplist, meta-backpressure rolls back append-only audit logs as if they were tunable parameters (rb-504, the wk-001 systematic_bias). Verified by g-115-204.
+49. **Runtime**: `py core/scripts/meta-backpressure.py` with a monitor on `reflection-strategy.yaml::roi_history` and 5+ below-baseline checks emits `audit_only_skipped` for that monitor and zero `rollback_actions` against that field. The legacy rollback path remains live for tunable fields (e.g., a non-listed field like `class_balance.targets` still rolls back at the same threshold). Verified by g-115-204 end-to-end test.
+
+## BR. Session-49 Assistant-Mode Code-Review Regressions (rb-266 / rb-267 / guard-165)
+
+Catches regressions of the three anti-patterns fixed in session-49 assistant-mode review (2026-04-18). Source fixes: `productivity-stop-gate.sh` dead notify-user block, `iteration-close.sh` hardcoded-recurring-in-WM-append, `iteration-close.sh` shell-into-Python interpolation.
+
+### BR1. Productivity Gate — Notification Channels (rb-266)
+
+1. **Static**: `grep -n "notify-user\.sh\|notify_user" core/scripts/productivity-stop-gate.sh` returns at most ONE match — the single explanatory comment explaining why NOT to re-add the path. Zero code references.
+2. **Static**: `grep -nE "^\s*notify_user\s*:" core/config/aspirations.yaml` returns zero matches. The `productivity_gate:` block has `min_iterations` and `stop_threshold` only, plus an explanatory comment stating why no `notify_user` key exists.
+3. **Static**: No `core/scripts/notify-user.sh` file exists (`test -f core/scripts/notify-user.sh` exits 1). `/notify-user` lives at `.claude/skills/notify-user/SKILL.md` and is LLM-invoked only. Any script attempting to call a nonexistent `notify-user.sh` is a rb-266 regression.
+
+### BR2. iteration-close Recurring Lookup (rb-267)
+
+4. **Static**: `grep -n 'local recurring="false"' core/scripts/iteration-close.sh` matches ONLY the final `[[ -z "$recurring" ]] && recurring="false"` safety default. No hardcoded-default `local recurring="false"` with a "tracks it separately"-style comment.
+5. **Static**: `grep -n "aspirations-read.sh" core/scripts/iteration-close.sh` shows the lookup in `do_state_update` returns a tab-separated `asp_id\trecurring` line, parsed by `${lookup%%$'\t'*}` + `${lookup##*$'\t'}`. If only asp_id is emitted, the fix has regressed.
+6. **Runtime**: After ≥5 autonomous iterations where at least one recurring goal completes, `bash core/scripts/wm-read.sh goals_completed_this_session | grep -c '"recurring": true'` returns ≥1. Verified by g-115-69.
+
+### BR3. No Shell-into-Python Source Interpolation (guard-165)
+
+7. **Static**: `grep -nE "r'\\\$[A-Z_]+'" core/scripts/iteration-close.sh core/scripts/productivity-stop-gate.sh` returns zero matches. Raw-string shell-var interpolation is the specific variant that misled readers into thinking it was injection-safe.
+8. **Static**: `grep -nE 'py -c "[^"]*\$\{?[A-Z_]+\}?[^"]*"' core/scripts/iteration-close.sh` returns zero matches. The canonical shape is `VAR=val py -c '...'` with env-var reads inside single-quoted Python.
+9. **Static**: `iteration-close.sh` `_checkpoint_refresh` uses `CP=... PHASE_NAME=... UPDATED=... py -c '...'` form; `do_state_update` lookup uses `READ_SH=... SRC=... GID=... py -c '...'` form; `do_verify` diary append uses `GID=... SUM=... py -c '...'` form. Presence of all three is the structural signal the env-var pattern is actually followed.
+
+### BR4. g-115-66 rb-260/rb-261 Binding (this session's goal edit)
+
+10. **Static**: `g-115-66` in `agents/alpha/aspirations.jsonl` has `verification.outcomes` of length 3 with explicit `rb-260` and `rb-261` string references. `verification.checks` has exactly two `command_check` entries: one exit-code check for `world/tree-maintenance-log.jsonl` presence, one count check for a pending drain-rate follow-up goal.
+11. **Static**: `g-115-66.verification.checks[0].condition` is `"exit 0"`, NOT `"output is present"`. The earlier form used `[ -s F ] && echo present || echo missing` and collapsed setup-failure into "missing" — replaced during session-49 review.
+12. **Runtime**: `bash -c 'source core/scripts/_paths.sh && test -s "$WORLD_DIR/tree-maintenance-log.jsonl"'` is the exact command in `checks[0].command`. It will fail (exit 1) until g-115-66 is executed — that is the correct pre-execution state.
+
+### BR5. Felt-Sense Check-In Wiring (session 2026-04-22 install)
+
+The felt-sense-checkin skill is a three-part contract: cadence-check script + precheck hook + config block. Any part missing silently breaks the cadenced ritual.
+
+13. **Static**: `test -x core/scripts/felt-sense-cadence-check.sh && test -f core/scripts/felt-sense-cadence-check.py` — both files present. The `.sh` wrapper `exec python3`s the `.py`, so both must exist.
+14. **Static**: `grep -q "^## Phase 0.5f" .claude/skills/aspirations-precheck/SKILL.md` — the precheck hook is present. Without this line the cadence gate is never invoked from the loop.
+15. **Static**: `grep -q "^felt_sense:" core/config/aspirations.yaml && grep -q "^  goal_cadence:" core/config/aspirations.yaml` — config block is present with its primary knob. A missing `felt_sense:` block makes the Python script read `{}` and silently fall back to defaults; worse, a missing `goal_cadence` would make the skill fire every iteration.
+16. **Runtime**: `bash core/scripts/felt-sense-cadence-check.sh --print-current` prints a non-negative integer and exits 0. This proves the script is runnable on this machine AND the completed-goal counter works. If this fails, the skill is dead.
+17. **Static**: `grep -q "DO NOT REMOVE" core/scripts/felt-sense-cadence-check.py` — the fail-open outer guard's protective comment survives. rb-463 documents why the bare-except is load-bearing: any crash in the cadence gate without fail-open would block the entire aspirations loop.
+18. **Static**: `.claude/skills/felt-sense-checkin/SKILL.md` contains a `## Return Protocol` section and a Cadence Gate phase that branches on the presence of `--cadence` in args (explicit `IF args contains "--cadence"` + `ELSE` pseudocode, not an always-run gate). This catches the specific prose-pseudocode drift that guard-387 was written to prevent; the check guards against it being re-introduced in this skill specifically.
+
+## BR6. Signal-Strengthening Ships A+B+C+D (rb-475 / rb-476 / rb-477 / guard-420 / guard-421 / guard-422)
+
+The four 2026-04-23 ships wire existing orphaned infrastructure into consumers: boredom counters (A), insights.jsonl (B), user-push classifier (C), insight curation (D). Each has a specific anti-regression check.
+
+### BR6A. Boredom Signal Surfaced on Prime + Precheck
+
+19. **Static**: `grep -q "wm-read.sh loop_state" .claude/skills/prime/SKILL.md` AND `grep -q "routine_streak_global" .claude/skills/prime/SKILL.md` — Phase 2 step 9 reads the counter. Without both greps, /prime has no boredom surface.
+20. **Static**: `grep -q "Phase 0-pre.0b" .claude/skills/aspirations-precheck/SKILL.md` AND `grep -q "⚠ BOREDOM" .claude/skills/aspirations-precheck/SKILL.md` — the pre-selection observability phase is wired with the near-threshold warning (>=6).
+
+### BR6B. Insights Surfaced on Prime, Drained by Felt-Sense
+
+21. **Static**: `grep -q "insights-read.sh --count" .claude/skills/prime/SKILL.md` — /prime reads the debt signal.
+22. **Static**: `grep -q "sort entries by \`timestamp\` desc" .claude/skills/prime/SKILL.md` AND `grep -q "sort entries by timestamp desc" .claude/skills/felt-sense-checkin/SKILL.md` — both consumers have the imperative sort (guard-421). Without it, surfaced entries would be in file/append order (oldest first).
+23. **Static**: `grep -q "insights-read.sh --mark-processed" .claude/skills/felt-sense-checkin/SKILL.md` — Phase 1b drains the queue. If missing, the /prime surface never clears and curation-debt grows unbounded.
+24. **Static**: `grep -q "Phase 1b: Insight Curation" .claude/skills/felt-sense-checkin/SKILL.md` — the curation phase header is present (regression canary for someone "simplifying" the skill back to 7 lanes).
+
+### BR6C. Step 8.77 User-Push Classifier With created_at Guard
+
+25. **Static**: `grep -q "Step 8.77: User-Notable Event Push Classifier" .claude/skills/aspirations-state-update/SKILL.md` — the classifier step exists.
+26. **Static**: `grep -qE 'goal\.created_at is not None' .claude/skills/aspirations-state-update/SKILL.md` — the None-guard is present on Trigger 2 (guard-420, rb-475). Without it, 80% of Unblock goal completions would crash Phase 8 with TypeError on `(now - None).days`.
+27. **Static**: `grep -q "SINGLE SOURCE OF TRUTH for send history: wm.notification_log" .claude/skills/aspirations-state-update/SKILL.md` — the rate-cap uses the existing /notify-user log, no parallel counter (rb-477).
+28. **Static**: `awk '/^# ── Step 8\.77:/,/^# ── Step 8\.78:/' .claude/skills/aspirations-state-update/SKILL.md | grep -c "Append to agents/<agent>/journal"` returns 0 (guard-422 — no orphaned narrative writes inside the Step 8.77 rate-cap path; iteration Output: line is the single surface for rate-cap suppression). The block header `# ── Step 8.XX:` form is unique to section headers and avoids matching cross-references in front-matter description. The two legitimate "Append to agents/<agent>/journal" hits elsewhere in Steps 7 and 7r are paired with journal-index writes and out of scope.
+29. **Static**: `grep -q "Notify the user about" .claude/skills/aspirations-state-update/SKILL.md` — Step 8.77 dispatches via canonical prose form (forged-skill-resolution.md), not `Skill(notify-user)` direct.
+
+## BR7. Cadence-Tick Sibling-Ritual Seed-Stagger (g-270-02 / rb-566)
+
+The fresh-eyes cadence-tick rituals (review @ 25, felt-sense @ 75, program @ 100) share `fresh-eyes-cadence-check.py`. On a mature world (`current_goal_count >= max(cadences)`) where all three WM slots are null (fresh-init scenarios), they would all first-fire on the same iteration — three user-facing pings in one turn (asp-270 session 59 incident). The fix adds a per-ritual `first_fire_offset` config field plus a seed-stagger branch that writes a synthesized `last_count` and returns noop, allowing each ritual to first-fire at staggered offsets (+5/+15/+30 goals from seed). Verified by g-270-02. Source: rb-566.
+
+30. **Static**: `grep -c "first_fire_offset:" core/config/aspirations.yaml` returns exactly 3 — one per cadence block (`fresh_eyes_review`, `felt_sense`, `fresh_eyes_program`). Without all three, only some rituals stagger and the simultaneous-fire collision returns.
+31. **Static**: `grep -q "seeded_for_stagger" core/scripts/fresh-eyes-cadence-check.py` AND `grep -q "first_fire_offset" core/scripts/fresh-eyes-cadence-check.py` — the seed-stagger branch markers are present. Without these, the legacy g-001-190 cap fires immediately on null slots and the stagger does nothing.
+32. **Static**: `grep -q "First-fire normalization (g-001-190)" core/scripts/fresh-eyes-cadence-check.py` — the legacy first-fire cap (`diff = min(diff, goal_cadence)` from g-001-190) is preserved as a fallback. The seed-stagger branch must precede this cap, not replace it, so backward-compat is guaranteed when `first_fire_offset` is missing or 0 in a cadence config block.
+
+## BR8. Sentinel-Lifecycle Gate Symmetry (Phase 0-pre / 0-pre2 / 0-pre3)
+
+The aspirations-precheck has three precheck sentinel gates that follow the same wm-read → if non-null → action → wm-set null pattern. Each gate requires (1) a bash writer, (2) a WM slot name, (3) a precheck consumer. Asymmetry — bash writer without consumer — produces silent backlog accumulation (g-115-280 → g-115-281 incident: `fresh_eyes_dispatch_pending` was being written by `iteration-close.sh do_state_update` for 6+ days with no consumer, producing a 33-file / 605-LOC review backlog before the gap was caught). Source: g-115-281 (Phase 0-pre3 fix), rb-428 (sentinel-lifecycle pattern).
+
+33. **Static**: `grep -cE "^## Phase 0-pre[0-9]?:" .claude/skills/aspirations-precheck/SKILL.md` returns exactly 3 — one section per sentinel gate (force_tree_maintain, force_experience_archival, fresh_eyes_dispatch_pending). Adding a new sentinel gate without a Phase 0-preN consumer recreates the g-115-280 incident.
+34. **Static**: For each sentinel slot, both writer (in the named bash) and consumer (in precheck SKILL.md) must reference the slot name. The writer-side syntax varies (`bash "$SCRIPT_DIR/wm-set.sh" <slot>` in iteration-close.sh, `subprocess.run([..., "set", "<slot>"])` in experience-staleness-check.sh) — slot-name presence in the file is the universal check:
+    - `grep -q "force_tree_maintain" core/scripts/iteration-close.sh` AND `grep -q "force_tree_maintain" .claude/skills/aspirations-precheck/SKILL.md`
+    - `grep -q "force_experience_archival" core/scripts/experience-staleness-check.sh` AND `grep -q "force_experience_archival" .claude/skills/aspirations-precheck/SKILL.md`
+    - `grep -q "fresh_eyes_dispatch_pending" core/scripts/iteration-close.sh` AND `grep -q "fresh_eyes_dispatch_pending" .claude/skills/aspirations-precheck/SKILL.md`
+35. **Static**: `grep -cE "echo 'null' \| Bash: wm-set.sh (force_tree_maintain|force_experience_archival|fresh_eyes_dispatch_pending)" .claude/skills/aspirations-precheck/SKILL.md` returns at least 3 — each consumer clears its own sentinel after firing (one-shot pattern). Without the clear, the gate re-fires every iteration and the LLM gets stuck in a dispatch loop.
+
+## BR9. Tree-Encoding-Drift Gate Tree-Encoded Signal Wiring (g-115-282)
+
+The tree-encoding-drift-gate increments `goals_since_last_tree_update` every state-update. Without a "tree was actually encoded this iteration" signal, the counter over-fires on iterations whose deep encoding work landed in non-tree stores (rules / board / RB / guardrails / docs). The `--tree-updated` flag (already at `iteration-close.sh:105` and passed to `state-update-audit.sh:509`) is the concrete signal; g-115-282 wires it through to the drift gate so the counter short-circuits to 0 (without setting the sentinel) when the iteration genuinely did tree work. Source: g-115-282 (filed in felt-sense iter-141 Lane 4, executed iter-141 same iteration).
+
+36. **Static**: `grep -q "GATE_ARGS" core/scripts/iteration-close.sh` AND `grep -q '\[\[ "$TREE_UPDATED" == "true" \]\] && GATE_ARGS+=(--tree-updated)' core/scripts/iteration-close.sh` — the conditional pass-through array exists at the gate call site. Without this wiring the flag never reaches the gate and over-fire returns.
+37. **Static**: `grep -q '"--tree-updated" in sys.argv' core/scripts/tree-encoding-drift-gate.py` — the gate parses the flag in main(). Without parsing, the flag is silently dropped even if iteration-close passes it.
+38. **Static**: `grep -q "short_circuited" core/scripts/tree-encoding-drift-gate.py` AND `grep -q "g-115-282" core/scripts/tree-encoding-drift-gate.py` — the short-circuit branch and traceability tag are present. The branch resets counter to 0 WITHOUT setting `slots["force_tree_encoding"]`; without that asymmetry the flag would behave identically to the threshold-cross path (which DOES set the sentinel).
+

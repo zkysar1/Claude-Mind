@@ -3,7 +3,7 @@
 ## Immutable Constraints (all states)
 
 - Claude MUST NOT invoke /start, /stop, /open-questions
-- Claude MUST NOT modify `<agent>/session/agent-state`, `<agent>/session/agent-mode`, or `<agent>/session/persona-active` — see Script-Level Restrictions below
+- Claude MUST NOT modify `agents/<agent>/session/agent-state`, `agents/<agent>/session/agent-mode`, or `agents/<agent>/session/persona-active` — see Script-Level Restrictions below
 - User directive processing works in assistant and autonomous modes (not reader mode)
 
 ## Script-Level Restrictions
@@ -11,7 +11,7 @@
 The following scripts perform user-only state changes. Claude MUST NOT call them
 directly via Bash — they may only be executed as part of user-invoked skills:
 
-- `session-state-set.sh` — only /start and /stop may change agent state
+- `session-state-set.sh` — only /start and /stop may change agent state. The authorized /start sub-paths are: (1) the IDLE→RUNNING transition in the IDLE branch, (2) the RUNNING→IDLE rewrite in the explicit `/start --recover` crashed-runner cleanup (see start/SKILL.md Step 0.7), and (3) the RUNNING→IDLE rewrite in the auto-recovery branch under "RUNNING + requested mode is autonomous" when the 6-condition zombie gate passes (state=RUNNING + heartbeat=stale + no recent stop-hook BLOCK in last 5 min + execution-diary.jsonl mtime older than 15 min + no stop-requested + `background-jobs.sh has-pending` exits 1 — identical conditions and probe scripts as recovery-gate.sh). /stop's authorized callers are listed in stop-hook-compliance.md. The script-gated SessionStart hook caller `core/scripts/recovery-gate.sh` is also authorized (RUNNING→IDLE only, under the 6-condition AND-gate documented in stop-hook-compliance.md).
 - `session-mode-set.sh` — only /start and /stop may change agent mode
 - `init-mind.sh`, `init-world.sh`, `init-agent.sh`, `init-meta.sh` — only /start and /boot may initialize
 

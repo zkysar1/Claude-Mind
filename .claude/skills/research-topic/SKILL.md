@@ -1,6 +1,6 @@
 ---
 name: research-topic
-description: "Web research engine — acquires knowledge from external sources and writes findings to memory tree nodes"
+description: "Web research engine that acquires knowledge on a named topic from external sources (WebSearch + WebFetch across multiple queries and depths) and writes the findings as structured knowledge-tree nodes with citations. Use whenever the user says \"research X\", \"learn about Y\", \"build a knowledge base on Z\", or the aspirations loop identifies an external knowledge gap that cannot be filled from existing tree content. Accepts --depth quick/standard/deep and optional --target-node."
 user-invocable: false
 triggers:
   - "/research-topic"
@@ -25,6 +25,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [tree-retrieval, experience]
 minimum_mode: assistant
+revision_id: "skill-bootstrap-research-topic-b23bb2"
+previous_revision_id: null
 ---
 
 # /research-topic — Web Research Engine
@@ -140,6 +142,17 @@ After writing content, check growth triggers:
 
 ### If creating new node (SPROUT):
 ```
+0. Pre-create duplicate gate (Phase 2 curation). The add-child in step 1 will
+   exit with code 3 if a sibling under <parent-key> already covers substantially
+   the same summary (Jaccard >= 0.6). When that happens:
+   - Read the rejected JSON from stderr; it contains sibling_key of the match.
+   - UPDATE that sibling in place instead of retrying with a new key: read its
+     .md, merge in the new findings, bump article_count, set last_updated.
+   - Do NOT pick a different child key just to satisfy the gate — that
+     reintroduces the breadth-without-depth debt the gate exists to prevent.
+   The gate is bypassable via --no-dedup, but only for trusted batch ops — not
+   here.
+
 1. Register in _tree.yaml (sets parent, depth, capability_level, confidence):
    bash core/scripts/tree-update.sh --add-child <parent-key> < JSON
    JSON: {"key": "<topic-slug>", "file": "world/knowledge/tree/<parent>/<topic-slug>.md",
@@ -163,14 +176,16 @@ After writing content, check growth triggers:
    <findings>
    ## Sources
    <source list>
-4. Set last_updated in _tree.yaml:
-   bash core/scripts/tree-update.sh --set <node-key> last_updated <today>
+4. Tree-wide last_updated mirror happens automatically — the T21 PostToolUse
+   hook (`tree-front-matter-sync.py`) bumps both the .md front matter and
+   _tree.yaml `nodes[<node-key>].last_updated` on every Edit/Write of a
+   tree node file.
 ```
 
 ### Archive Research Results as Experience
 ```
 experience_id = "exp-research-{topic-slug}-{date}"
-Write <agent>/experience/{experience_id}.md with:
+Write agents/<agent>/experience/{experience_id}.md with:
     - Complete web fetch results and source evaluations
     - Key findings with full context (not just compressed insights)
     - Source URLs, reliability assessments, contradictions found
@@ -189,7 +204,7 @@ Experience JSON:
           content: "exact quote or data point from source"
         - key: "key-finding-2"
           content: "exact quote or data point from source"
-    content_path: "<agent>/experience/{experience_id}.md"
+    content_path: "agents/<agent>/experience/{experience_id}.md"
 
 # Add experience_refs to tree node front matter
 Read target tree node .md file
@@ -225,3 +240,9 @@ Caller handles: tree propagation, journal entry, spark check, tree maintenance t
 | Outputs | Tree node | New or updated `.md` file + `_tree.yaml` updates |
 | Calls | `/tree maintain` | Invokes when growth triggers fire (decompose_threshold or split_threshold exceeded) |
 | Does NOT do | Journal, spark, propagation | Caller (aspirations) handles all downstream |
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is the tree-node write (`.md` file) or `_tree.yaml` update.
+Never end with a text summary of research findings — the tree article IS the output.

@@ -1,2 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts MUST be LF — defense-in-depth against autocrlf=true (g-115-869).
+# Without these explicit rules, `* text=auto` is heuristic-only and git's
+# enforcement is not guaranteed; charlie's 2026-05-16 rc=127 incident (CRLF
+# bash refusing to exec) reproduced because `_runtime.sh` was attr=text=auto,
+# not attr=text eol=lf. Sibling fix: g-115-868 routes insight-trigger-sweep
+# through _rt.py to bypass bash entirely.
+*.sh text eol=lf
+*.bash text eol=lf

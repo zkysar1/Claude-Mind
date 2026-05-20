@@ -5,21 +5,45 @@ Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorith
 The LLM no longer computes scores — this script handles the arithmetic.
 The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
 
-Scoring criteria (16 deterministic + 1 stochastic weighted factors):
+Scoring criteria (21 deterministic + 1 stochastic weighted factors):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
   + variety_bonus × 0.5 + streak_momentum × 0.5 + novelty_bonus × 0.6
-  + recurring_urgency × 0.8 + recurring_saturation × 0.8
+  + recurring_urgency × 0.8 + recurring_saturation × 0.8 + per_goal_saturation × 0.8
+  + user_signal_boost × 1.2 + class_balance_bonus × 0.8
   + reward_history × 0.5 + completion_pressure × 0.8 + depth_bonus × 0.6
+  + tail_bonus × 0.8
   + evidence_backing × 0.7 + deferred_readiness × 0.6
   + context_coherence × 1.0 + skill_affinity × 0.4 + directive_boost × 1.5
+  + co_invest_alignment × 0.5
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
-  context_coherence: +2.0 if same category as last goal (fresh/normal zone),
-    +1.0 if same category (tight zone), 0 otherwise.
-    Reads context budget from <agent>/session/context-budget.json (written by status line).
+  co_invest_alignment: +1.0 raw bonus when this candidate's co_parent_id
+    matches a partner's live team-state in_flight.co_parent_id — pair-
+    iteration bias. Schema + protocol in core/config/conventions/coordination.md
+    Co-Investigation Protocol section. g-115-563.
 
-  recurring_urgency: 1.5 base when due + overdue_ratio, capped at 5.0
-  recurring_saturation: -(ratio * 4.0) penalty when recurring goals dominate recent selections
+  context_coherence: +2.0 if same category as last goal, 0 otherwise.
+    Context-pressure agnostic — same-category reuse saves tokens regardless of zone.
+
+  recurring_urgency: base + log2(1 + overdue_ratio) * log_scale (logarithmic, no cap)
+  recurring_saturation: -(ratio * max_penalty) penalty when recurring goals dominate recent selections (CLASS level)
+  per_goal_saturation: flat penalty when the SAME goal_id fires repeatedly in the recent window (GOAL level).
+    Config: aspirations.yaml → per_goal_saturation. Tranche B (rb-390).
+  user_signal_boost: reads <agent>/session/user-signal-snapshot.yaml (refreshed
+    by the signal-refresh hook) and boosts goals listed in the
+    pending_questions.silent_48h_goal_ids snapshot field — i.e., goals whose
+    user-facing question has gone unanswered for 48h+. Path A (per-goal
+    user_signal_kind/user_thread_id) retired 2026-04-24 (g-252-03) after
+    fields stayed 0/798 for 6+ days; only the snapshot-level Path B contributes.
+    Fail-open: missing snapshot OR empty silent_48h list → zero contribution.
+    Config: aspirations.yaml → user_signal_boost. Tranche C (rb-390).
+  class_balance_bonus: pulls under-represented work_class values up when the
+    last-N session completions distribution drifts from configured targets.
+    Goals with no work_class default to "unclassified" and are excluded from
+    the balance computation.
+    Fail-open: empty distribution or missing targets → zero contribution.
+    Config: aspirations.yaml → class_balance (nested: targets, window_size,
+    max_boost, max_penalty). Tranche C (rb-390).
   deferred_readiness: +1.5 when a deferred goal's time has arrived
   exploration_noise: random(0,1) scaled by developmental epsilon.
     At exploring stage (~0.85 epsilon): noise can reorder rankings.
@@ -28,10 +52,13 @@ Scoring criteria (16 deterministic + 1 stochastic weighted factors):
 
 import argparse
 import json
+import math
+import os
 import random
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+import hashlib
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -41,8 +68,115 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml  # Required — tree.py already depends on PyYAML
 
-from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT
+from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT, agents_root as _agents_root
+from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm, WM_PATH as WORKING_MEMORY_PATH  # noqa: E402
+# Single source of truth for terminal goal statuses — see aspirations.py.
+# Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
+# status is added to TERMINAL_GOAL_STATUSES.
+from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
+SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
+ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
+
+# Populated by main() before scoring loop fires; consumed by score_goal's
+# cross_aspiration_support criterion (LifingPolls item 2). Empty fallback
+# means the criterion contributes 0 — never errors when supports[] is unset.
+_ASP_COMPLETION_RATIOS: dict = {}
+_STRUCTURED_DEFER_PREFIXES_LOWER = tuple(p.lower() for p in STRUCTURED_DEFER_PREFIXES)
+
+
+def _synth_blocker_ref_from_structured_defer(goal):
+    """For quiescence-gate compatibility (): when a goal is structurally
+    deferred but lacks an explicit blocker_ref, synthesize one so
+    quiescence-gate.py C2 (blocker_ref_required) treats the structural marker as
+    structured-enough. Two paths:
+      (a) defer_reason has STRUCTURED_DEFER_PREFIXES (precondition_unmet:,
+          blocked_on_dependency:, Circuit breaker:). The structured-prefix
+          bypass at write-time means cmd_update_goal accepts these defers
+          without --blocker-ref; without this synth, quiescence sees
+          blocker_ref=None and rejects forever.
+      (b) deferred_until is an ISO timestamp in the future. Time-gated defers
+          (e.g. "Deferred until 2026-05-15: ..." for telemetry soak windows)
+          have a structural expiry but no explicit blocker_ref. Treat the
+          time gate as the structural marker; expires_at=deferred_until.
+    Returns existing blocker_ref dict if present, else a synthesized one with
+    type=resource (catch-all for structural waits — see BLOCKER_REF_TYPES in
+    aspirations.py), else None. The synth uses md5(stable-key)[:12] for
+    external_id so quiescence C4 hysteresis hash stays stable across iters."""
+    existing = goal.get("blocker_ref")
+    if isinstance(existing, dict):
+        return existing
+    defer = goal.get("defer_reason") or ""
+    deferred_until = goal.get("deferred_until")
+
+    # Path (a): structured-prefix defer_reason
+    if defer and defer.lower().startswith(_STRUCTURED_DEFER_PREFIXES_LOWER):
+        set_at = goal.get("defer_reason_set_at")
+        try:
+            created = datetime.fromisoformat(str(set_at)) if set_at else datetime.now()
+        except (ValueError, TypeError):
+            created = datetime.now()
+        expires = created + timedelta(hours=120)
+        h = hashlib.md5(defer.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return {
+            "type": "resource",
+            "external_id": f"structured-defer:{h}",
+            "state_hash": None,
+            "created_at": created.isoformat(timespec="seconds"),
+            "expires_at": expires.isoformat(timespec="seconds"),
+            "synthesized": True,
+        }
+
+    # Path (b): deferred_until time gate
+    if deferred_until:
+        try:
+            expires_dt = datetime.fromisoformat(str(deferred_until))
+            if expires_dt > datetime.now():
+                set_at = goal.get("defer_reason_set_at")
+                try:
+                    created = datetime.fromisoformat(str(set_at)) if set_at else datetime.now()
+                except (ValueError, TypeError):
+                    created = datetime.now()
+                key = f"{deferred_until}:{defer[:80]}"
+                h = hashlib.md5(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+                return {
+                    "type": "resource",
+                    "external_id": f"time-gate:{h}",
+                    "state_hash": None,
+                    "created_at": created.isoformat(timespec="seconds"),
+                    "expires_at": expires_dt.isoformat(timespec="seconds"),
+                    "synthesized": True,
+                }
+        except (ValueError, TypeError):
+            pass
+
+    # Path (c): hypothesis time gate via resolves_no_earlier_than (date string).
+    # Hypothesis-tracked goals carry an ISO date; treat it as the structural expiry.
+    rne = goal.get("resolves_no_earlier_than")
+    if rne:
+        try:
+            # rne is a date (YYYY-MM-DD), not full timestamp — promote to midnight
+            expires_dt = datetime.fromisoformat(f"{rne}T00:00:00")
+            if expires_dt > datetime.now():
+                created_str = goal.get("created_at") or goal.get("started")
+                try:
+                    created = datetime.fromisoformat(str(created_str)) if created_str else datetime.now()
+                except (ValueError, TypeError):
+                    created = datetime.now()
+                key = f"rne:{rne}:{goal.get('id','')}"
+                h = hashlib.md5(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+                return {
+                    "type": "resource",
+                    "external_id": f"hypothesis-gate:{h}",
+                    "state_hash": None,
+                    "created_at": created.isoformat(timespec="seconds"),
+                    "expires_at": expires_dt.isoformat(timespec="seconds"),
+                    "synthesized": True,
+                }
+        except (ValueError, TypeError):
+            pass
+
+    return None
 
 # Collective domain stores (world/)
 WORLD_ASP_PATH = WORLD_DIR / "aspirations.jsonl"
@@ -61,13 +195,50 @@ SKILL_QUALITY_PATH = META_DIR / "skill-quality.yaml"
 # Per-agent state
 DEV_STAGE_PATH = AGENT_DIR / "developmental-stage.yaml" if AGENT_DIR else None
 DEV_STAGE_CONFIG_PATH = CONFIG_DIR / "developmental-stage.yaml"
-BUDGET_PATH = AGENT_DIR / "session" / "context-budget.json" if AGENT_DIR else None
 
 # Single source of truth for goal scoring weights: meta/goal-selection-strategy.yaml
 # Seeded by init-meta.sh, editable by the agent during evolution Step 0.7.
 # NOTE: exploration_noise is NOT here — its weight is dynamic (epsilon × noise_scale),
 # computed at runtime in score_goal(). Do not add it to this dict.
 META_GOAL_SELECTION = META_DIR / "goal-selection-strategy.yaml"
+
+# : cap on applications_log entries to prevent unbounded growth.
+# Proof-of-concept lane for meta-strategy "when was this applied" telemetry.
+_APPLICATIONS_LOG_CAP = 200
+
+
+def _record_strategy_application(strategy_path, summary):
+    """Append a {ts, agent, sid, summary} entry to a meta-strategy's applications_log.
+
+    g-304-09: Surfaces "when this meta-strategy was applied" — a flat strategy
+    YAML alone tells you the parameters but not whether anything ever consumed
+    them. Log is FIFO-capped at _APPLICATIONS_LOG_CAP to prevent unbounded
+    growth. Fail-open: any error logs to stderr but does NOT crash the caller.
+    """
+    agent = os.environ.get("MIND_AGENT", "unknown")
+    sid = os.environ.get("MIND_SID", "unknown")
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "agent": agent,
+        "sid": (sid[:8] if isinstance(sid, str) and sid else "unknown"),
+        "summary": summary,
+    }
+    def _mut(data):
+        if not isinstance(data, dict):
+            data = {}
+        log = data.get("applications_log")
+        if not isinstance(log, list):
+            log = []
+        log.append(entry)
+        if len(log) > _APPLICATIONS_LOG_CAP:
+            log = log[-_APPLICATIONS_LOG_CAP:]
+        data["applications_log"] = log
+        return data
+    try:
+        locked_modify_yaml(strategy_path, _mut)
+    except Exception as e:
+        print(f"[goal-selector] applications_log append failed: {e}",
+              file=sys.stderr)
 
 
 def load_weights():
@@ -79,10 +250,322 @@ def load_weights():
 
 
 WEIGHTS = load_weights()
-# Fallback defaults for agents seeded before consolidate-before-expand
-WEIGHTS.setdefault("completion_pressure", 0.8)
-WEIGHTS.setdefault("depth_bonus", 0.6)
-WEIGHTS.setdefault("directive_boost", 1.5)
+# handoff_bonus: raw value IS the bonus (not scaled). Configured in
+# meta/goal-selection-strategy.yaml like every other weight — no setdefault
+# fallback (, rb-215 single-source-of-truth).
+
+# Override-key prefix for aspirations.yaml — see world/conventions/capability-routing.md
+# "Currently wired readers" list. Keep in sync with _OVERRIDE_FILE_PREFIX in tree.py.
+_OVERRIDE_FILE_PREFIX = "aspirations."
+
+
+def load_recurring_config():
+    """Load recurring goal scoring params from core/config/aspirations.yaml.
+
+    Routes through _config_overlay.merged_config so meta/config-overrides.yaml
+    entries keyed `aspirations.recurring.*` take effect. Wires 7 params:
+    urgency_base, urgency_log_scale, saturation_window, saturation_max_penalty,
+    debt_threshold, debt_bonus, streak_mult (g-115-123, rb-335 — streak_mult
+    renamed from streak_reset_multiplier 2026-05-18 / g-115-929 to consolidate
+    with the literal variable name used at the two readers in
+    aspirations_write.py cmd_complete_by and streak-break-reflector.py).
+    """
+    defaults = {
+        "urgency_base": 1.5, "urgency_log_scale": 1.5,
+        "saturation_window": 4, "saturation_max_penalty": 4.0,
+        "debt_threshold": 0.80, "debt_bonus": 3.0,
+        "streak_mult": 2.0,
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        rc = asp_config.get("recurring", {})
+        if isinstance(rc, dict):
+            for k, default in defaults.items():
+                v = rc.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+RECURRING_CONFIG = load_recurring_config()
+
+
+def load_per_goal_saturation_config():
+    """Load per-goal rapid-repeat suppression config from aspirations.yaml.
+
+    Tranche B 2026-04-20 (rb-390): suppresses the SAME goal_id firing
+    multiple times within the recent session-completions window.
+    Distinct from RECURRING_CONFIG['saturation_*'] which is class-level.
+    """
+    defaults = {
+        "window_size": 8,
+        "consecutive_threshold": 1,
+        "suppress_penalty": -5.0,
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        pgs = asp_config.get("per_goal_saturation", {})
+        if isinstance(pgs, dict):
+            for k, default in defaults.items():
+                v = pgs.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+PER_GOAL_SATURATION_CONFIG = load_per_goal_saturation_config()
+
+
+def load_user_signal_boost_config():
+    """Load user-signal boost params from core/config/aspirations.yaml.
+
+    Tranche C 2026-04-20 (rb-390): reweights goals based on fresh user-signal
+    evidence collected by the signal-refresh hook
+    (<agent>/session/user-signal-snapshot.yaml).
+
+    Natural gate: snapshot existence. No separate `enabled` flag — if the
+    snapshot is missing or empty, every boost path evaluates to zero.
+    """
+    defaults = {
+        "reply_boost": 2.5,           # user_signal_kind == "reply" on this thread
+        "directive_boost": 3.0,       # user_signal_kind == "directive"
+        "silence_48h_boost": 1.5,     # pending-question silent ≥48h — surface the ask
+        "override_penalty": -2.0,     # user override superseded this thread
+        "thread_active_boost": 1.0,   # user_thread_id appears in any recent-activity list
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        # Block name matches the scorer criterion (user_signal_boost) —
+        # keep these two in sync. DO NOT rename without matching score_goal().
+        usb = asp_config.get("user_signal_boost", {})
+        if isinstance(usb, dict):
+            for k, default in defaults.items():
+                v = usb.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+USER_SIGNAL_BOOST_CONFIG = load_user_signal_boost_config()
+
+
+def load_user_signal_snapshot():
+    """Read <agent>/session/user-signal-snapshot.yaml if present.
+
+    Fail-open: missing file, parse error, or wrong shape → empty dict.
+    Called once per goal-selector invocation (one-shot script; the file is
+    refreshed per iteration by the signal-refresh hook in aspirations-precheck).
+    """
+    try:
+        snap_path = AGENT_DIR / "session" / "user-signal-snapshot.yaml"
+        if not snap_path.exists():
+            return {}
+        with open(snap_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+USER_SIGNAL_SNAPSHOT = load_user_signal_snapshot()
+
+
+def load_class_balance_config():
+    """Load work-class balance params from core/config/aspirations.yaml.
+
+    Tranche C 2026-04-20 (rb-390): pulls under-represented work_class values
+    up when the last-N session completions distribution drifts from the
+    configured targets. Addresses the work-mix skew failure mode (framework
+    maintenance accumulating gravity unopposed).
+
+    Natural gate: `targets` non-empty. No separate `enabled` flag — an empty
+    targets map means the criterion contributes zero.
+    """
+    defaults = {
+        "window_size": 20,
+        "max_boost": 2.0,             # cap for under-represented class
+        "max_penalty": -2.0,          # cap for over-represented class
+        "targets": {},                # {work_class: fraction}; empty → disabled
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        cb = asp_config.get("class_balance", {})
+        if isinstance(cb, dict):
+            for k, default in defaults.items():
+                v = cb.get(k)
+                if v is not None:
+                    if isinstance(default, dict):
+                        defaults[k] = v if isinstance(v, dict) else {}
+                    else:
+                        defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+CLASS_BALANCE_CONFIG = load_class_balance_config()
+
+
+def load_agent_role_multipliers():
+    """Load per-agent work_class multipliers from meta/goal-selection-strategy.yaml.
+
+    Magic Wand 4 (bravo session-61, 2026-05-07): encodes agent role into goal
+    scoring without per-iteration LLM metacognition. Format:
+    {agent_name: {work_class: multiplier_float}}. Empty dict on missing key,
+    parse error, or wrong shape — fail-open (criterion contributes zero,
+    identical to today's scoring).
+
+    Multiplier interpretation: positive = score boost, zero = no effect.
+    Values are NOT clamped to [0, 3] like the weights table — they are
+    per-class scaling factors meant to live in the [0.0, 2.0] range
+    (e.g., 0.3 dampens by 70%, 1.5 boosts by 50%).
+    """
+    try:
+        with open(META_GOAL_SELECTION, encoding="utf-8") as f:
+            meta = yaml.safe_load(f) or {}
+        v = meta.get("agent_role_multipliers", {})
+        if not isinstance(v, dict):
+            return {}
+        return v
+    except Exception:
+        return {}
+
+
+AGENT_ROLE_MULTIPLIERS = load_agent_role_multipliers()
+
+
+def compute_role_affinity(agent_name, goal_class, multipliers):
+    """Return the role_affinity raw value for (agent, goal_class).
+
+    Pure function — no module state. Extracted to top level so tests can
+    exercise the decision rule without setting up a full score_goal call.
+
+    Returns 0.0 (zero contribution) when:
+    - agent_name is empty/None
+    - goal_class is None or "unclassified"
+    - agent has no entry in multipliers
+    - agent's entry is not a dict (corrupt config)
+    - goal_class has no entry under that agent
+    - the looked-up value cannot be coerced to float
+    """
+    # "unclassified" is excluded by design — same precedent as criterion
+    # 7e (class_balance_bonus, line ~1473): goals with no work_class tag
+    # don't participate in class-based scoring at all. Removing this
+    # exclusion would attribute role_affinity to backfill-pending goals.
+    if not agent_name or not goal_class or goal_class == "unclassified":
+        return 0.0
+    if not isinstance(multipliers, dict):
+        return 0.0
+    agent_mults = multipliers.get(agent_name, {})
+    if not isinstance(agent_mults, dict):
+        return 0.0
+    try:
+        return float(agent_mults.get(goal_class, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def load_handoff_config():
+    """Load cross-agent handoff scoring params from core/config/aspirations.yaml.
+
+    handoff_bonus: scoring bonus when goal.handoff_to == current MIND_AGENT.
+    handoff_sender_penalty: penalty applied to goals.handoff_to == OTHER agent
+      (prevents the sender from taking back their own routed work).
+    handoff_aging:
+      warn_hours: receiver-side escalating-bonus onset
+      escalate_hours: aspirations-precheck board-post + notify age
+      sender_decay_hours: sender-side silence-gated decay window
+      partner_active_threshold_min: below this (minutes of silence),
+        penalty stays full regardless of handoff age
+    """
+    defaults = {
+        "handoff_bonus": 0.30,
+        "handoff_sender_penalty": -2.5,
+        "warn_hours": 48,
+        "escalate_hours": 72,
+        "sender_decay_hours": 4,
+        "partner_active_threshold_min": 30,
+    }
+    try:
+        with open(CONFIG_DIR / "aspirations.yaml", encoding="utf-8") as f:
+            asp_config = yaml.safe_load(f)
+        scoring = asp_config.get("scoring", {}) or {}
+        if "handoff_bonus" in scoring:
+            defaults["handoff_bonus"] = float(scoring["handoff_bonus"])
+        if "handoff_sender_penalty" in scoring:
+            defaults["handoff_sender_penalty"] = float(scoring["handoff_sender_penalty"])
+        aging = asp_config.get("handoff_aging", {}) or {}
+        for k in ("warn_hours", "escalate_hours", "sender_decay_hours"):
+            if k in aging:
+                defaults[k] = int(aging[k])
+        if "partner_active_threshold_min" in aging:
+            defaults["partner_active_threshold_min"] = int(aging["partner_active_threshold_min"])
+    except Exception:
+        pass
+    return defaults
+
+
+HANDOFF_CONFIG = load_handoff_config()
+
+
+# Sentinel for the team-state read cache. None = not yet read this run.
+# Any dict (including {}) means the read has already happened — a repeat
+# call returns the cached value. Declared BEFORE the function that uses it
+# so the module's read order matches its runtime order.
+_TEAM_STATE_CACHE = None
+
+
+def _load_team_state_cached():
+    """Read world/team-state.yaml once and cache for the selector run.
+
+    The sender-side handoff penalty decay is gated by partner liveness
+    (agent_status.<partner>.last_active). We read the file exactly once per
+    selector invocation — not once per scored goal — to avoid per-goal I/O.
+    Missing file → {} (legitimate pre-coordination state). Corrupt yaml
+    raises — the selector should fail visibly on a malformed team-state,
+    not silently score every handoff with the penalty disengaged.
+    """
+    global _TEAM_STATE_CACHE
+    if _TEAM_STATE_CACHE is not None:
+        return _TEAM_STATE_CACHE
+    path = WORLD_DIR / "team-state.yaml"
+    if not path.exists():
+        _TEAM_STATE_CACHE = {}
+        return _TEAM_STATE_CACHE
+    with open(path, "r", encoding="utf-8") as f:
+        _TEAM_STATE_CACHE = yaml.safe_load(f) or {}
+    return _TEAM_STATE_CACHE
+
 
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
@@ -153,6 +636,115 @@ def read_yaml_file(path):
 
 
 # ---------------------------------------------------------------------------
+# Cross-session class completions ( /  drift fix)
+# ---------------------------------------------------------------------------
+
+def load_recent_class_completions(window_size=20):
+    """Cross-session sampling window for goal-selector criteria.
+
+    Replaces in-session-only `wm.goals_completed_this_session` (which resets
+    every /stop and was structurally blind to cross-session drift) with a
+    rolling window drawn from <agent>/journal.jsonl recent completions, cross-
+    referenced against world+agent aspirations.jsonl for `work_class` lookup.
+
+    Returns a list shaped like `goals_completed_this_session` entries:
+        [{goal_id, aspiration_id, recurring, work_class}, ...]
+    in chronological order (oldest first), so consumers can keep using
+    `recent[-window:]` slicing semantics unchanged.
+
+    Falls back to the in-session list when:
+    - No AGENT_DIR (fresh install)
+    - journal.jsonl missing
+    - journal yielded zero entries with mappable work_class (fresh agent)
+
+    See alpha/reports/framework-vs-product-drift-2026-05-09.md for motivation
+    (g-115-508 finding: 53% framework dominance over 60 sessions vs 25%
+    target was invisible to class_balance_bonus because the window reset
+    every session).
+    """
+    if not AGENT_DIR:
+        return []
+
+    journal_path = AGENT_DIR / "journal.jsonl"
+
+    def _in_session_fallback():
+        try:
+            wm = read_wm()
+            sc = wm.get("goals_completed_this_session", [])
+            return sc if isinstance(sc, list) else []
+        except Exception:
+            return []
+
+    if not journal_path.exists():
+        return _in_session_fallback()
+
+    # Build goal_id → {aspiration_id, recurring, work_class} index from
+    # world + agent aspirations. Empty work_class is preserved so callers
+    # can distinguish "no entry" from "no work_class tag" (the existing
+    # class_balance check filters missing work_class out of the denominator).
+    index = {}
+    try:
+        for src_path in (WORLD_ASP_PATH, AGENT_ASP_PATH):
+            if not src_path:
+                continue
+            for asp in read_jsonl(src_path):
+                asp_id = asp.get("id")
+                for g in asp.get("goals", []):
+                    gid = g.get("id")
+                    if not gid:
+                        continue
+                    index[gid] = {
+                        "goal_id": gid,
+                        "aspiration_id": asp_id,
+                        "recurring": bool(g.get("recurring", False)),
+                        "work_class": g.get("work_class") or "",
+                    }
+    except Exception:
+        return _in_session_fallback()
+
+    # Tail-read journal: collect goals_completed entries from latest entries
+    # backwards until we have window_size with non-empty work_class.
+    try:
+        with open(journal_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return _in_session_fallback()
+
+    completions = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        gids = entry.get("goals_completed") or []
+        if not isinstance(gids, list):
+            continue
+        # Process in reverse (last-completed-first within this entry)
+        for gid in reversed(gids):
+            if not isinstance(gid, str):
+                continue
+            info = index.get(gid)
+            if not info or not info.get("work_class"):
+                # Skip goals without a current work_class lookup —
+                # archived/orphaned IDs would dilute the denominator
+                continue
+            completions.append(info)
+            if len(completions) >= window_size:
+                break
+        if len(completions) >= window_size:
+            break
+
+    if not completions:
+        return _in_session_fallback()
+
+    # Reverse to chronological (oldest first) so [-N:] slicing semantics match
+    return list(reversed(completions))
+
+
+# ---------------------------------------------------------------------------
 # Exploration params
 # ---------------------------------------------------------------------------
 
@@ -178,21 +770,6 @@ def load_exploration_params():
         noise_scale = config_exploration.get("noise_scale", 3.0)
 
     return (float(epsilon), float(noise_scale))
-
-
-def read_context_budget():
-    """Read context budget from status line output file.
-
-    Returns dict with zone and used_pct. Defaults to normal if unavailable.
-    The budget file is written by scripts/context-budget-status.py (status line).
-    """
-    if not BUDGET_PATH.exists():
-        return {"zone": "normal", "used_pct": 50}
-    try:
-        data = json.loads(BUDGET_PATH.read_text(encoding="utf-8"))
-        return data
-    except (json.JSONDecodeError, OSError):
-        return {"zone": "normal", "used_pct": 50}
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +841,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                        global_done_ids=None, claim_timeout_hours=None,
                        reallocation_hours=None,
                        abstention_timeout_hours=None,
-                       defer_reason_timeout_hours=None):
+                       defer_reason_timeout_hours=None,
+                       dependency_timeout_hours=None):
     """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT).
 
     Args:
@@ -313,8 +891,10 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             done_ids = {g["id"] for g in asp.get("goals", [])
                         if g.get("status") in ("completed", "decomposed")}
 
-        # Note: verification.preconditions are natural-language conditions
-        # evaluated by the LLM in Phase 2 of SKILL.md, not here.
+        # verification.preconditions come in two forms:
+        #   - strings → LLM-evaluated in aspirations-select Phase 2.2
+        #   - dicts with "type" → structured predicates, filtered below via
+        #     predicate.evaluate_all (fail-fast; selector_skip=True is honored)
         for goal in asp.get("goals", []):
             if goal.get("status") != "pending":
                 continue
@@ -336,20 +916,34 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # Expiry makes stale claims (older than claim_timeout_hours) fall through
             # so other agents can pick up abandoned work. The actual re-claim is still
             # atomic via aspirations-claim.sh — this only controls VISIBILITY.
+            # For recurring goals, claim timeout is capped at 2x interval_hours so that
+            # short-interval goals (e.g. 1h email check) don't stay claimed for 4h.
             if source == "world":
                 claimed = goal.get("claimed_by")
                 if claimed and claimed != AGENT_NAME:
                     if claim_timeout_hours is not None:
+                        effective_timeout = claim_timeout_hours
+                        if goal.get("recurring"):
+                            interval = get_interval_hours(goal)
+                            effective_timeout = min(claim_timeout_hours, 2 * interval)
                         claim_age = hours_since(goal.get("claimed_at"))
-                        if claim_age is not None and claim_age <= claim_timeout_hours:
+                        if claim_age is not None and claim_age <= effective_timeout:
                             continue  # Valid claim — skip
                         # else: claim expired or no claimed_at — fall through to include
                     else:
                         continue  # No expiry configured — legacy behavior
 
-            # blocked_by check
-            if any(b not in done_ids for b in _ensure_list(goal.get("blocked_by"))):
-                continue
+            # blocked_by check (dependency timeout: expired blocks fall through)
+            unmet_deps = [b for b in _ensure_list(goal.get("blocked_by"))
+                          if b not in done_ids]
+            if unmet_deps:
+                if dependency_timeout_hours is not None:
+                    dep_age = hours_since(goal.get("blocked_since"))
+                    if dep_age is not None and dep_age <= dependency_timeout_hours:
+                        continue  # Valid dependency block — skip
+                    # else: expired or no blocked_since — fall through (fail-open)
+                else:
+                    continue  # No expiry configured — legacy behavior
 
             # Infrastructure blocker check (skill-based, primary)
             goal_skill = goal.get("skill", "")
@@ -379,16 +973,24 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
 
             # Defer reason: textual deferral blocks the goal.
             # Expiry: defer_reason without deferred_until expires after defer_reason_timeout_hours.
-            # Goals WITH deferred_until are governed by the time gate below, not this expiry.
+            # Goals WITH deferred_until are governed by the time gate below, not this expiry —
+            # the structured field is authoritative when present, and falls through here
+            # to the time gate which checks the date and clears past-dated entries naturally.
             # If no defer_reason_set_at timestamp (legacy), deferral expires immediately (fail-open).
+            # (: prior `else: continue` unconditionally blocked goals with both fields,
+            # leaving 5 goals with deferred_until in the past permanently blocked because they
+            # never reached the time gate at L678-685.)
             if goal.get("defer_reason"):
-                if not goal.get("deferred_until") and defer_reason_timeout_hours is not None:
-                    defer_age = hours_since(goal.get("defer_reason_set_at"))
-                    if defer_age is not None and defer_age <= defer_reason_timeout_hours:
-                        continue  # Valid deferral — skip
-                    # else: expired or no timestamp — fall through (fail-open)
-                else:
-                    continue  # Has deferred_until (time-gated below) or no expiry configured
+                if not goal.get("deferred_until"):
+                    # No structural gate — apply expiry logic
+                    if defer_reason_timeout_hours is not None:
+                        defer_age = hours_since(goal.get("defer_reason_set_at"))
+                        if defer_age is not None and defer_age <= defer_reason_timeout_hours:
+                            continue  # Valid deferral — skip
+                        # else: expired or no timestamp — fall through (fail-open)
+                    else:
+                        continue  # No expiry configured — defer indefinitely
+                # else: has deferred_until — let the time gate below handle it
 
             # Deferred time gate
             deferred = goal.get("deferred_until")
@@ -399,6 +1001,43 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                         continue  # Not yet time
                 except (ValueError, TypeError):
                     pass  # Corrupt value — fail open
+
+            # Structured preconditions (cheap filter; strings stay on the LLM path).
+            # SYMMETRY: must be the logical complement of the struct_pc check in
+            # collect_blocked. If you change one, change the other.
+            # No try/except on the import — predicate is a required sibling module;
+            # a broken import is a real bug we want to surface, not silence.
+            # NOTE: `goal.get("verification") or {}` (not `goal.get("verification", {})`)
+            # because some goals carry an explicit `verification: null` from filings
+            # that didn't structure verification — dict.get returns the stored None
+            # in that case, not the default. AttributeError on the chained `.get`
+            # was the crash observed during selector runs.
+            struct_pcs = [p for p in (goal.get("verification") or {}).get("preconditions") or []
+                          if isinstance(p, dict) and "type" in p]
+            # Magic Wand #4 (alpha session-60, 2026-05-07): fire_when sugar.
+            # Recurring goals can carry a single structured fire_when gate
+            # that's evaluated alongside preconditions. Same predicate
+            # registry — any predicate type works (command_succeeds for
+            # infrastructure probes, file_check for data-pending gates,
+            # metric_threshold for traffic-driven recurring fires, etc).
+            # When fire_when fails, recurring-precondition-sweep.py advances
+            # lastAchievedAt so overdue_ratio doesn't run away while the
+            # upstream signal is absent.
+            fw = goal.get("fire_when")
+            if isinstance(fw, dict) and "type" in fw:
+                struct_pcs.append(fw)
+            if struct_pcs:
+                from predicate import evaluate_all as _eval_preconditions
+                # NOTE: do NOT name this `results` — outer `results = []` (L644)
+                # is the candidate accumulator and L820 appends to it. Function
+                # scope means a `results = ...` assignment here would clobber
+                # the accumulator and L822 would return the wrong object type.
+                # Filed as fresh-eyes-code F-001 (alpha-fec, msg-715), fixed
+                # in  — the regression came in with commit 0f42275.
+                pc_results = _eval_preconditions(struct_pcs, mode="fail_fast",
+                                                 include_skippable=False)
+                if any(not r.passed for r in pc_results):
+                    continue
 
             # Agent eligibility check (filters user-only AND other-agent goals)
             participants = _ensure_list(goal.get("participants"), ["agent"])
@@ -419,8 +1058,104 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 else:
                     continue  # Not eligible and not reallocatable
 
+            # Intended-agent routing filter (): drop goals routed to a
+            # different agent. Routing is a HINT, not a hard refusal — the
+            # `intended_agent` field can be null/unset (no preference),
+            # "either" (no preference), this agent's own name (route to me),
+            # or another agent's name (route away from me). Only the last
+            # case drops; the first three pass through. Mirror of the
+            # partner-claim filter pattern in aspirations-select.
+            #
+            # Pairs with the creation-side wire-up in aspirations.py
+            # cmd_add_goal () that stamps intended_agent via
+            # capability-route-gate.py. The gate suggests "either" on
+            # uncertainty, so any genuinely cross-lane goal stays visible
+            # to both agents — only goals confidently routed to a specific
+            # peer get filtered out here.
+            intended_agent = goal.get("intended_agent")
+            if (intended_agent
+                    and intended_agent != AGENT_NAME
+                    and intended_agent != "either"):
+                continue
+
             results.append({"goal": goal, "aspiration": asp, "source": source})
 
+    return results
+
+
+def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
+                                   known_blockers=None,
+                                   global_done_ids=None,
+                                   claim_timeout_hours=None,
+                                   reallocation_hours=None,
+                                   abstention_timeout_hours=None,
+                                   defer_reason_timeout_hours=None,
+                                   dependency_timeout_hours=None):
+    """Pull pending goals from sibling agent queues where intended_agent == agent_name.
+
+    Closes the cross-agent stranding gap (g-115-946): the capability-route gate
+    stamps intended_agent on newly-filed goals; when that lands in the FILER's
+    private queue, the routed-to TARGET never sees the goal because the
+    selector previously read only world + own-agent queues. This helper adds
+    a third read pass over sibling agent dirs at selection time. Symmetric
+    with the cross-agent awareness already present in directive_boost and
+    handoff_bonus scoring criteria — preserves "each goal lives in one queue"
+    invariant (no migration / copy / push).
+
+    Returns list of candidate dicts shaped exactly like collect_candidates,
+    with source="cross-agent:<owner_dir_name>" so downstream completion
+    attribution can write back to the owning sibling's queue.
+
+    Strict-match contract: ONLY goals where goal["intended_agent"] == agent_name
+    are returned. Goals with intended_agent unset, "either", or another agent's
+    name are NOT included (they're either visible via the agent's own queue
+    or correctly routed elsewhere).
+
+    Fail-open per sibling: an unreadable aspirations.jsonl, missing dir, or
+    permission error on a single sibling skips THAT sibling without aborting
+    the sweep. iterdir errors at the project_root level return empty list.
+    """
+    if project_root is None or agent_dir is None or not agent_name:
+        return []
+    results = []
+    # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/. Walk that
+    # parent — fall back to no-op if the parent is missing (fresh repo).
+    agents_parent = project_root / "agents"
+    if not agents_parent.is_dir():
+        return []
+    try:
+        siblings = list(agents_parent.iterdir())
+    except Exception:
+        return []  # fail-open at parent
+    for sib_dir in siblings:
+        if not sib_dir.is_dir() or sib_dir == agent_dir:
+            continue
+        sib_q = sib_dir / "aspirations.jsonl"
+        if not sib_q.exists():
+            continue  # non-agent dir (no aspirations.jsonl)
+        try:
+            sib_aspirations = read_jsonl(sib_q)
+        except Exception:
+            continue  # fail-open per sibling
+        # Reuse the full eligibility filter from collect_candidates (status,
+        # claims, defers, blocked_by, structured preconditions, participants,
+        # intended_agent routing). The intended_agent filter at the end of
+        # collect_candidates already drops goals routed to OTHER agents; we
+        # post-filter to require exact match (drop "either" and None too,
+        # those are not stranded — they're visible via world/own queue or
+        # explicitly meant to stay in the filer's hands).
+        sib_candidates = collect_candidates(
+            sib_aspirations, known_blockers=known_blockers,
+            source=f"cross-agent:{sib_dir.name}",
+            global_done_ids=global_done_ids,
+            claim_timeout_hours=claim_timeout_hours,
+            reallocation_hours=reallocation_hours,
+            abstention_timeout_hours=abstention_timeout_hours,
+            defer_reason_timeout_hours=defer_reason_timeout_hours,
+            dependency_timeout_hours=dependency_timeout_hours)
+        for c in sib_candidates:
+            if c.get("goal", {}).get("intended_agent") == agent_name:
+                results.append(c)
     return results
 
 
@@ -429,7 +1164,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
 # ---------------------------------------------------------------------------
 
 def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
-                    defer_reason_timeout_hours=None):
+                    defer_reason_timeout_hours=None,
+                    dependency_timeout_hours=None):
     """Return blocked goals with reasons (inverse of collect_candidates).
 
     Checks blocking conditions in priority order (first match = primary reason):
@@ -475,7 +1211,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             goal_id = goal.get("id", "")
 
             # Skip terminal and in-progress statuses
-            if status in ("completed", "skipped", "expired", "decomposed", "in-progress"):
+            if status in SKIP_STATUSES:
                 continue
 
             # Skip ineligible goals (user-only or other-agent)
@@ -489,6 +1225,16 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 "skill": goal.get("skill"),
                 "priority": goal.get("priority", asp.get("priority", "MEDIUM")),
                 "chain_position": None,
+                # blocker_ref (Change 1: typed blocker reference). Present
+                # uniformly so the quiescence gate (Change 2) has one read
+                # path regardless of block_reason. For deferred blocks this
+                # comes from goal.blocker_ref; for infrastructure blocks the
+                # known_blockers augmentation below overwrites it with the
+                # infra blocker's own blocker_ref. Absence (None) is the
+                # signal that disqualifies quiescence.
+                # : synth blocker_ref from structured-prefix defer
+                # so quiescence accepts what the write-side already accepts.
+                "blocker_ref": _synth_blocker_ref_from_structured_defer(goal),
             }
 
             # Checks 1-5: first match wins. Order matters — higher-level blocks
@@ -513,6 +1259,11 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 entry["block_detail"] = "{skill} blocked: {reason}".format(
                     skill=goal_skill, reason=b.get("reason", "unknown"))
                 entry["blocker_id"] = b.get("blocker_id", "")
+                # Prefer the known_blockers blocker_ref over the goal's own
+                # — infrastructure blocks are owned by the blocker record,
+                # not the individual goal. create-blocker.py writes this.
+                if b.get("blocker_ref"):
+                    entry["blocker_ref"] = b["blocker_ref"]
                 blocked.append(entry)
                 continue
 
@@ -525,17 +1276,32 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     entry["block_detail"] = "{cat} category blocked: {reason}".format(
                         cat=goal_cat, reason=b.get("reason", "unknown"))
                     entry["blocker_id"] = b.get("blocker_id", "")
+                    if b.get("blocker_ref"):
+                        entry["blocker_ref"] = b["blocker_ref"]
                     blocked.append(entry)
                     continue
 
-            # 3. Dependency (blocked_by with unmet prerequisites)
+            # 3. Dependency (blocked_by with unmet prerequisites, timeout-aware).
+            # SYMMETRY: must be the logical complement of the blocked_by check in
+            # collect_candidates. If you change one, change the other.
             unmet = [bid for bid in _ensure_list(goal.get("blocked_by")) if bid not in done_ids]
             if unmet:
-                entry["block_reason"] = "dependency"
-                entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
-                entry["unmet_deps"] = unmet
-                blocked.append(entry)
-                continue
+                if dependency_timeout_hours is not None:
+                    dep_age = hours_since(goal.get("blocked_since"))
+                    if dep_age is None or dep_age > dependency_timeout_hours:
+                        pass  # Expired — not blocked (fail-open)
+                    else:
+                        entry["block_reason"] = "dependency"
+                        entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
+                        entry["unmet_deps"] = unmet
+                        blocked.append(entry)
+                        continue
+                else:
+                    entry["block_reason"] = "dependency"
+                    entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
+                    entry["unmet_deps"] = unmet
+                    blocked.append(entry)
+                    continue
 
             # 4. Deferred time gate
             deferred = goal.get("deferred_until")
@@ -554,23 +1320,31 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     pass
 
             # 4b. Defer reason (textual — blocks unless expired)
+            # Symmetric to collect_eligible's defer_reason check (L664-680).
+            # Goals WITH deferred_until are governed by the time gate at L864-877
+            # above; this block only handles goals WITHOUT a structural gate.
+            # (: prior `else: append blocked + continue` marked goals
+            # with both fields as "deferred" even when deferred_until had passed.)
             if goal.get("defer_reason"):
-                if not goal.get("deferred_until") and defer_reason_timeout_hours is not None:
-                    defer_age = hours_since(goal.get("defer_reason_set_at"))
-                    if defer_age is None or defer_age > defer_reason_timeout_hours:
-                        pass  # Expired — fall through to candidate pool
+                if not goal.get("deferred_until"):
+                    # No structural gate — apply expiry logic
+                    if defer_reason_timeout_hours is not None:
+                        defer_age = hours_since(goal.get("defer_reason_set_at"))
+                        if defer_age is None or defer_age > defer_reason_timeout_hours:
+                            pass  # Expired — fall through to candidate pool
+                        else:
+                            entry["block_reason"] = "deferred"
+                            entry["block_detail"] = "Deferred: {reason}".format(
+                                reason=goal.get("defer_reason", ""))
+                            blocked.append(entry)
+                            continue
                     else:
                         entry["block_reason"] = "deferred"
                         entry["block_detail"] = "Deferred: {reason}".format(
                             reason=goal.get("defer_reason", ""))
                         blocked.append(entry)
                         continue
-                else:
-                    entry["block_reason"] = "deferred"
-                    entry["block_detail"] = "Deferred: {reason}".format(
-                        reason=goal.get("defer_reason", ""))
-                    blocked.append(entry)
-                    continue
+                # else: has deferred_until — handled by time gate at L864-877
 
             # 5. Hypothesis time gate
             rne = goal.get("resolves_no_earlier_than")
@@ -583,6 +1357,29 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                         continue
                 except (ValueError, TypeError):
                     pass
+
+            # 6. Structured preconditions unmet (SYMMETRY with collect_candidates).
+            # NOTE: `goal.get("verification") or {}` defends against goals with
+            # explicit `verification: null` — same fix as in collect_candidates.
+            struct_pcs = [p for p in (goal.get("verification") or {}).get("preconditions") or []
+                          if isinstance(p, dict) and "type" in p]
+            # Magic Wand #4 (alpha session-60): fire_when sugar in collect_blocked
+            # too — must mirror collect_candidates for the SYMMETRY invariant.
+            fw = goal.get("fire_when")
+            if isinstance(fw, dict) and "type" in fw:
+                struct_pcs.append(fw)
+            if struct_pcs:
+                from predicate import evaluate_all as _eval_preconditions
+                results = _eval_preconditions(struct_pcs, mode="fail_fast",
+                                              include_skippable=False)
+                failed = [r for r in results if not r.passed]
+                if failed:
+                    failed_ids = [r.predicate_id or r.type for r in failed]
+                    entry["block_reason"] = "precondition_unmet"
+                    entry["block_detail"] = "Preconditions unmet: " + ", ".join(failed_ids)
+                    entry["precondition_unmet"] = failed_ids
+                    blocked.append(entry)
+                    continue
 
             # Recurring cooldown is NOT a block — goal is just "not yet due"
 
@@ -830,8 +1627,7 @@ def directive_boost_score(goal_id, category):
 # Scoring
 # ---------------------------------------------------------------------------
 
-def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scale=3.0,
-               budget=None):
+def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scale=3.0):
     """Score a single goal using the 15-criteria weighted formula."""
     goal, asp, source = cand["goal"], cand["aspiration"], cand.get("source", "world")
     raw = {}
@@ -865,34 +1661,125 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 6. novelty_bonus (+1.0 if never done before)
     raw["novelty_bonus"] = 1.0 if goal.get("achievedCount", 0) == 0 else 0
 
-    # 7. recurring_urgency (1.5 base when due + overdue ratio, capped at 5.0)
+    # 7. recurring_urgency (log-scaled: base + log2(1 + overdue_ratio) * scale)
+    # Logarithmic scaling preserves differentiation among overdue goals — a 72x-overdue
+    # goal scores higher than a 4x-overdue one, unlike the old linear cap at 5.0.
     rec = 0
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
         la = hours_since(goal.get("lastAchievedAt"))
         if la is None or (la >= interval and interval > 0):
-            # 1.5 base = "this goal is due now" signal
-            # + linear overdue growth
-            # Cap at 5.0 prevents indefinite starvation of domain work
             overdue_ratio = 0.0
             if la is not None and interval > 0:
-                overdue_ratio = (la - interval) / interval
-            rec = min(1.5 + overdue_ratio, 5.0)
+                overdue_ratio = max((la - interval) / interval, 0.0)
+            rec = RECURRING_CONFIG["urgency_base"] + math.log2(1 + overdue_ratio) * RECURRING_CONFIG["urgency_log_scale"]
     raw["recurring_urgency"] = rec
 
     # 7b. recurring_saturation (penalty when recurring goals dominate recent selections)
     # Uses goals_completed_this_session from working memory. Each entry has an optional
     # "recurring" flag (defaults to False for backward compat with older entries).
-    # Penalty scales from 0 (no saturation) to -4.0 (all recent completions were recurring).
     # Truly overdue recurring goals overcome this via high recurring_urgency.
     rec_sat = 0.0
     if goal.get("recurring") and session_completions:
-        window = 4
+        window = int(RECURRING_CONFIG["saturation_window"])
         recent = session_completions[-window:]
         recurring_count = sum(1 for s in recent if s.get("recurring", False))
         ratio = recurring_count / len(recent)
-        rec_sat = -(ratio * 4.0)
+        rec_sat = -(ratio * RECURRING_CONFIG["saturation_max_penalty"])
     raw["recurring_saturation"] = rec_sat
+
+    # 7c. per_goal_saturation (penalty when the SAME goal_id fires rapidly)
+    # Tranche B 2026-04-20 (rb-390). Addresses the " fired 4× in 2 min"
+    # failure mode the recurring.saturation_* block above cannot see — that one
+    # measures the CLASS ratio (any recurring goal in window), not the specific
+    # goal_id. This criterion suppresses rapid re-selection of the exact same
+    # goal by counting matches in the recent completions window and applying
+    # a flat penalty once the threshold is reached. Count-based rather than
+    # wall-clock because session_completions entries carry no timestamp; in
+    # practice 4 back-to-back fires == 4 consecutive window entries regardless
+    # of elapsed seconds, which is exactly the signal we want.
+    pgs = 0.0
+    if session_completions:
+        window = int(PER_GOAL_SATURATION_CONFIG["window_size"])
+        threshold = int(PER_GOAL_SATURATION_CONFIG["consecutive_threshold"])
+        recent = session_completions[-window:]
+        same_id = sum(1 for s in recent if s.get("goal_id") == goal.get("id"))
+        if same_id >= threshold:
+            pgs = float(PER_GOAL_SATURATION_CONFIG["suppress_penalty"])
+    raw["per_goal_saturation"] = pgs
+
+    # 7d. user_signal_boost (Path B: snapshot-level silent_48h detection only)
+    # Path A (per-goal user_signal_kind/user_thread_id) retired 2026-04-24
+    # after : fields stayed 0/798 for 6+ days — writer never landed.
+    # Re-audit on 2026-05-07 will confirm Path B still contributes. To revert:
+    # restore signal_kind/thread_id reads AND ship a scanner that populates
+    # them in the same change — reader-without-writer is the failure mode
+    # this retire removed. See bravo/reports/-user-signal-boost-decision.md.
+    usb_total = 0.0
+    if USER_SIGNAL_SNAPSHOT:
+        sources = USER_SIGNAL_SNAPSHOT.get("sources", {}) or {}
+        goal_id = goal.get("id")
+        pq = sources.get("pending_questions", {}) or {}
+        silent_ids = pq.get("silent_48h_goal_ids", []) or []
+        if goal_id and isinstance(silent_ids, list) and goal_id in silent_ids:
+            usb_total += float(USER_SIGNAL_BOOST_CONFIG["silence_48h_boost"])
+    raw["user_signal_boost"] = usb_total
+
+    # 7e. class_balance_bonus (pull under-represented work_class up)
+    # Tranche C 2026-04-20 (rb-390). Computes the last-N distribution of
+    # work_class among session completions; if this goal's class is below
+    # its configured target fraction, boost proportionally (capped by
+    # max_boost); if above, penalize (capped by max_penalty). Goals with
+    # no work_class tag default to "unclassified" and are excluded from
+    # both the distribution and the bonus computation.
+    # Fail-open: empty distribution, no targets, missing work_class,
+    # or disabled config → 0.0.
+    cbb = 0.0
+    targets = CLASS_BALANCE_CONFIG["targets"] or {}
+    goal_class = goal.get("work_class")
+    if (
+        targets
+        and goal_class
+        and goal_class != "unclassified"
+        and goal_class in targets
+        and session_completions
+    ):
+        window = int(CLASS_BALANCE_CONFIG["window_size"])
+        recent = session_completions[-window:]
+        # work_class in session_completions entries is optional; missing →
+        # excluded from the denominator so classes that aren't being tracked
+        # don't dilute the fractions.
+        classed = [s.get("work_class") for s in recent if s.get("work_class")]
+        if classed:
+            count = sum(1 for c in classed if c == goal_class)
+            observed_fraction = count / len(classed)
+            target_fraction = float(targets.get(goal_class, 0.0))
+            # deficit > 0 = under-represented; < 0 = over-represented
+            deficit = target_fraction - observed_fraction
+            max_boost = float(CLASS_BALANCE_CONFIG["max_boost"])
+            max_penalty = float(CLASS_BALANCE_CONFIG["max_penalty"])
+            # Linear proportional to deficit, clamped to [max_penalty, max_boost].
+            # Deficit range is [-1, +1]; scale = cap at boundary.
+            if deficit >= 0:
+                cbb = min(max_boost, deficit * max_boost * 2)  # ×2 so deficit=0.5 saturates
+            else:
+                cbb = max(max_penalty, deficit * abs(max_penalty) * 2)
+    raw["class_balance_bonus"] = cbb
+
+    # 7f. role_affinity (per-agent work_class preference)
+    # Magic Wand 4 (bravo session-61, 2026-05-07): encodes the agent's role
+    # into scoring so PM-shaped goals naturally rank higher for PM agents
+    # (bravo) and code-shaped goals naturally rank higher for code agents
+    # (alpha). Replaces reliance on per-iteration LLM metacognition to
+    # enforce role. Stacks additively with handoff_bonus — a bravo-created
+    # goal with handoff_to=alpha gets BOTH bonuses on alpha's selector,
+    # reinforcing routing intent. Backward compat: missing AGENT_NAME,
+    # missing multipliers config, or missing/unclassified work_class all
+    # resolve to multiplier 0.0 → zero contribution → identical to today.
+    # Decision rule lives in compute_role_affinity (top-level, testable).
+    raw["role_affinity"] = compute_role_affinity(
+        AGENT_NAME, goal_class, AGENT_ROLE_MULTIPLIERS
+    )
 
     # 8. reward_history (+1.0 if previous goals in this aspiration had high success)
     completed = sum(1 for g in asp.get("goals", []) if g.get("status") == "completed")
@@ -902,14 +1789,45 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # Quadratic: negligible for early aspirations, dominant for near-complete ones
     #   1/15 = 0.01, 7/15 = 0.54, 10/15 = 1.11, 14/15 = 2.18
     active_goals = [g for g in asp.get("goals", [])
-                    if g.get("status") not in ("skipped", "expired", "decomposed")]
+                    if g.get("status") not in ABANDONED_STATUSES]
     total_goals = len(active_goals)
     done_goals = sum(1 for g in active_goals if g.get("status") == "completed")
     completion_ratio = done_goals / total_goals if total_goals > 0 else 0
     raw["completion_pressure"] = (completion_ratio ** 2) * 2.5
 
-    # 8c. depth_bonus (reward continuing in same aspiration — counterbalances variety_bonus)
+    # 8c. tail_bonus (surface frontier goals as an aspiration nears completion)
+    # Zero below 50% completion. As the tail shrinks, each remaining goal gets
+    # a larger share of the pull — final straggler in 14/15 scores ~1.30 raw
+    # under the 0.50 threshold. Natural ceiling is ~1.50 (asymptote at
+    # remaining=1, ratio→1); do not add a cap, it would mask deliberate future
+    # tuning of the 3.0 factor. Threshold lowered from 0.70 to 0.50 to extend
+    # consolidation pressure into the mid-tail range (50-70% aspirations).
+    if completion_ratio >= 0.50 and total_goals > done_goals:
+        remaining = total_goals - done_goals  # guaranteed >= 1 by the guard above
+        raw["tail_bonus"] = (completion_ratio - 0.50) / remaining * 3.0
+    else:
+        raw["tail_bonus"] = 0.0
+
+    # 8d. depth_bonus (reward continuing in same aspiration — counterbalances variety_bonus)
     raw["depth_bonus"] = 1.0 if asp.get("id") == touched else 0
+
+    # 8e. cross_aspiration_support (LifingPolls plan item 2 — 2026-05-08).
+    # When a goal declares supports: [asp-id, ...], it advances the named
+    # aspirations in addition to its own parent. Boost = sum of supported
+    # aspirations' completion_pressure × per_support_weight, capped at +2.0.
+    # Soft attribution only — completion still ticks one parent.
+    supports = goal.get("supports") or []
+    if isinstance(supports, list) and supports:
+        per_weight = 0.3
+        cap = 2.0
+        bonus = 0.0
+        for sup_id in supports:
+            sup_ratio = _ASP_COMPLETION_RATIOS.get(sup_id, 0.0)
+            # Mirror completion_pressure shape: quadratic × 2.5 weight.
+            bonus += (sup_ratio ** 2) * 2.5 * per_weight
+        raw["cross_aspiration_support"] = round(min(bonus, cap), 3)
+    else:
+        raw["cross_aspiration_support"] = 0.0
 
     # 9. evidence_backing (resolved hypothesis support score)
     raw["evidence_backing"] = evidence_score(asp, resolved)
@@ -926,14 +1844,12 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
             pass
     raw["deferred_readiness"] = dr
 
-    # 11. context_coherence (same-category bonus modulated by context budget zone)
-    budget = budget or {}
+    # 11. context_coherence — same-category bonus. Context-pressure agnostic:
+    # reusing already-primed category knowledge is always cheaper, regardless
+    # of zone. Do not re-introduce zone modulation without profiling evidence.
     last_cat = wm.get("last_goal_category", "")
     category = _resolve_category(goal, asp)
-    if category and last_cat and category == last_cat:
-        raw["context_coherence"] = 2.0 if budget.get("zone") != "tight" else 1.0
-    else:
-        raw["context_coherence"] = 0
+    raw["context_coherence"] = 2.0 if category and last_cat and category == last_cat else 0
 
     # 12. skill_affinity (quality-weighted skill preference)
     # Reads meta/skill-quality.yaml for aggregate quality of the goal's linked skill.
@@ -951,6 +1867,102 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 13b. directive_boost (cross-agent priority influence from board directives)
     raw["directive_boost"] = directive_boost_score(
         goal.get("id", ""), category)
+
+    # 13c. handoff_bonus (cross-agent handoff routing).
+    # A planning/reviewer agent files implementer-targeted goals via
+    # handoff_to="<target-agent>". The target's selector applies a positive
+    # bonus; the sender's selector applies a penalty so those goals don't
+    # loop back. Aging boost fires after warn_hours so stale handoffs
+    # surface naturally.
+    # NOTE: handoff_to is a ROUTING hint, not a visibility gate. Participants
+    # still controls who CAN see the goal (see goal-schemas.md). raw value IS
+    # the bonus (WEIGHTS["handoff_bonus"] = 1.0 — no scaling).
+    raw["handoff_bonus"] = 0.0
+    ht = goal.get("handoff_to")
+    if ht:
+        if ht == AGENT_NAME:
+            raw["handoff_bonus"] = HANDOFF_CONFIG["handoff_bonus"]
+            ch = goal.get("handoff_created_at")
+            age = hours_since(ch) if ch else None
+            if age is not None and age > HANDOFF_CONFIG["warn_hours"]:
+                # Escalating bonus: +0.10 per 48h of age, capped at 2x (0.20 total addition)
+                raw["handoff_bonus"] += min(age / 48, 2.0) * 0.10
+        else:
+            # Other agent's handoff — partner-liveness-gated penalty.
+            # Heavy (handoff_sender_penalty, default -2.5) when the routed
+            # partner is demonstrably alive. Decays linearly to 0 over
+            # sender_decay_hours (default 4h) of measured PARTNER SILENCE —
+            # NOT of elapsed wall-clock handoff age.
+            #
+            # Why the decay clock is silence, not handoff-age: a 3-day-old
+            # handoff where bravo is still actively running means bravo is
+            # working on it. The old pure-age decay let alpha take back
+            # bravo's fresh work after 72h just because time passed. This
+            # rebase makes the penalty derivable from observable state —
+            # rb-324 (brittle tuned weight → derivable state, 2026-04-19).
+            #
+            # History: see rb-284 +  for why fresh penalty had to
+            # be ≤-2.5 in the first place (lower values let priority +
+            # recurring_urgency still rank other-agent handoffs #1).
+            base = HANDOFF_CONFIG["handoff_sender_penalty"]
+            decay_h = HANDOFF_CONFIG["sender_decay_hours"]
+            active_floor_min = HANDOFF_CONFIG["partner_active_threshold_min"]
+
+            team = _load_team_state_cached()
+            partner_status = (team.get("agent_status") or {}).get(ht) or {}
+            silence_h = hours_since(partner_status.get("last_active"))
+            handoff_age_h = hours_since(goal.get("handoff_created_at"))
+
+            # FAIL-OPEN on missing inputs: the sender penalty is a behavioral
+            # control that requires BOTH partner silence AND handoff age to
+            # compute. If either input is missing/corrupt, we can't derive
+            # the decision from observable state — so the control does not
+            # engage (penalty = 0). No fake-protection, no protective guess.
+            # The active-partner branch below is NOT a fallback — it is the
+            # feature working correctly when both inputs are valid.
+            if silence_h is None or silence_h < 0 or handoff_age_h is None or handoff_age_h < 0:
+                # INVARIANT — DO NOT REPLACE WITH `base`.
+                # Fail-open is the spec: without both inputs we cannot
+                # derive the penalty from observed state, so the control
+                # disengages. Restoring the full penalty here would bring
+                # back the brittle tuned-weight behavior rb-324 retired.
+                raw["handoff_bonus"] = 0.0
+            elif silence_h * 60 < active_floor_min:
+                # Partner wrote to team-state within the active floor — alive.
+                # Full base penalty protects them from take-back.
+                raw["handoff_bonus"] = base
+            else:
+                # INVARIANT — DO NOT REMOVE THE min() CLAMP.
+                # Decay cannot exceed handoff age. Without this clamp, a
+                # long-silent partner sending a fresh handoff would let the
+                # sender immediately take it back (silence_h >> age_h).
+                # The clamp encodes "decay only counts silence that overlaps
+                # with the handoff's own lifetime."
+                effective_h = min(silence_h, handoff_age_h)
+
+                if decay_h <= 0 or effective_h >= decay_h:
+                    raw["handoff_bonus"] = 0.0
+                else:
+                    raw["handoff_bonus"] = base * (1.0 - effective_h / decay_h)
+
+    # 13d. co_invest_alignment (): pair-iteration bias.
+    # Bonus when this candidate's co_parent_id matches a partner's live
+    # team-state in_flight.co_parent_id — biases the selector toward "pair
+    # on the same parent right now." Schema: see core/config/conventions/
+    # coordination.md → Co-Investigation Protocol. Reads use the cached
+    # team-state; missing/empty fields produce 0.0 (no bonus).
+    raw["co_invest_alignment"] = 0.0
+    candidate_cpi = goal.get("co_parent_id")
+    if candidate_cpi:
+        team = _load_team_state_cached()
+        agent_status = team.get("agent_status", {}) or {}
+        for other_name, other_state in agent_status.items():
+            if other_name == AGENT_NAME:
+                continue
+            in_flight = (other_state or {}).get("in_flight") or {}
+            if in_flight.get("co_parent_id") == candidate_cpi:
+                raw["co_invest_alignment"] = 1.0
+                break
 
     # 14. exploration_noise (random value scaled by developmental epsilon)
     raw["exploration_noise"] = random.random()
@@ -1007,7 +2019,12 @@ def cmd_select(args):
 
     # Load working memory for variety/streak context
     wm = read_wm()
-    sc = wm.get("goals_completed_this_session", [])
+    # Cross-session sampling window ( /  drift fix).
+    # Replaces in-session-only `wm.goals_completed_this_session` (which reset
+    # every /stop) with a rolling window from journal + aspirations.
+    # See alpha/reports/framework-vs-product-drift-2026-05-09.md.
+    cb_window = int(CLASS_BALANCE_CONFIG.get("window_size", 20)) if CLASS_BALANCE_CONFIG else 20
+    sc = load_recent_class_completions(window_size=cb_window)
     if not isinstance(sc, list):
         sc = []
 
@@ -1032,6 +2049,7 @@ def cmd_select(args):
     reallocation_hours = None
     abstention_timeout_hours = None
     defer_reason_timeout_hours = None
+    dependency_timeout_hours = None
     try:
         asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
         ma = asp_config.get("multi_agent", {})
@@ -1048,6 +2066,9 @@ def cmd_select(args):
             drth = ma.get("defer_reason_timeout_hours")
             if drth is not None:
                 defer_reason_timeout_hours = float(drth)
+            dth = ma.get("dependency_timeout_hours")
+            if dth is not None:
+                dependency_timeout_hours = float(dth)
     except Exception:
         pass
 
@@ -1057,18 +2078,37 @@ def cmd_select(args):
         global_done_ids=global_done_ids, claim_timeout_hours=claim_timeout_hours,
         reallocation_hours=reallocation_hours,
         abstention_timeout_hours=abstention_timeout_hours,
-        defer_reason_timeout_hours=defer_reason_timeout_hours)
+        defer_reason_timeout_hours=defer_reason_timeout_hours,
+        dependency_timeout_hours=dependency_timeout_hours)
     candidates += collect_candidates(
         agent_aspirations, known_blockers=known_blockers, source="agent",
         global_done_ids=global_done_ids, reallocation_hours=reallocation_hours,
         abstention_timeout_hours=abstention_timeout_hours,
-        defer_reason_timeout_hours=defer_reason_timeout_hours)
+        defer_reason_timeout_hours=defer_reason_timeout_hours,
+        dependency_timeout_hours=dependency_timeout_hours)
+    #  — cross-agent stranding fix. Pull goals from sibling agent
+    # queues where intended_agent matches AGENT_NAME. Catches goals filed by
+    # another agent (capability-route gate stamps intended_agent on add) that
+    # landed in the FILER's private queue and were invisible to the TARGET.
+    # Strict-match contract: only intended_agent == AGENT_NAME pulls; "either"
+    # and unset stay in their owner's queue. Fail-open per sibling.
+    if AGENT_DIR is not None:
+        candidates += collect_cross_agent_candidates(
+            AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
+            known_blockers=known_blockers,
+            global_done_ids=global_done_ids,
+            claim_timeout_hours=claim_timeout_hours,
+            reallocation_hours=reallocation_hours,
+            abstention_timeout_hours=abstention_timeout_hours,
+            defer_reason_timeout_hours=defer_reason_timeout_hours,
+            dependency_timeout_hours=dependency_timeout_hours)
     if not candidates:
         # Distinguish "no goals exist" from "goals exist but all blocked"
         # (all_aspirations already computed above for global_done_ids)
         blocked = collect_blocked(all_aspirations, known_blockers=known_blockers,
                                   global_done_ids=global_done_ids,
-                                  defer_reason_timeout_hours=defer_reason_timeout_hours)
+                                  defer_reason_timeout_hours=defer_reason_timeout_hours,
+                                  dependency_timeout_hours=dependency_timeout_hours)
         if blocked:
             summary = {}
             for b in blocked:
@@ -1091,12 +2131,49 @@ def cmd_select(args):
         return
 
     epsilon, noise_scale = load_exploration_params()
-    budget = read_context_budget()
-    scored = [score_goal(c, wm, resolved, sc, epsilon=epsilon, noise_scale=noise_scale,
-                         budget=budget)
+    # Precompute completion ratios for cross_aspiration_support criterion.
+    # Origin: LifingPolls plan item 2 (2026-05-08). Builds a dict of
+    # {asp_id: completion_ratio} so score_goal can read it without
+    # re-walking aspirations per candidate.
+    global _ASP_COMPLETION_RATIOS
+    _ASP_COMPLETION_RATIOS = {}
+    for asp in all_aspirations:
+        active_g = [g for g in asp.get("goals", [])
+                    if g.get("status") not in ABANDONED_STATUSES]
+        total = len(active_g)
+        done = sum(1 for g in active_g if g.get("status") == "completed")
+        _ASP_COMPLETION_RATIOS[asp.get("id", "")] = (
+            done / total if total > 0 else 0.0)
+    scored = [score_goal(c, wm, resolved, sc, epsilon=epsilon, noise_scale=noise_scale)
               for c in candidates]
+
+    # Recurring debt recovery: when most candidates are recurring (agent recovering from
+    # a gap), boost non-recurring goals so real work gets oxygen during catch-up.
+    recurring_count = sum(1 for s in scored if s.get("recurring"))
+    debt_threshold = RECURRING_CONFIG["debt_threshold"]
+    if len(scored) >= 5 and recurring_count / len(scored) > debt_threshold:
+        bonus = RECURRING_CONFIG["debt_bonus"]
+        for s in scored:
+            if not s.get("recurring"):
+                s["score"] += bonus
+                s["breakdown"]["recurring_debt_bonus"] = bonus
+                s["raw"]["recurring_debt_bonus"] = bonus
+
     # Sort: highest score first, then lower aspiration number, then lower goal number
     scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))
+
+    # : log meta-strategy application. Proof-of-concept that the
+    # goal-selection-strategy.yaml WAS consulted during this iteration —
+    # surfaces "which meta-strategies actually fire" telemetry that's
+    # invisible from the strategy file alone. Other meta-strategy consumers
+    # (reflection-strategy, encoding-strategy, etc.) can follow the same
+    # pattern: import _record_strategy_application + call near decision point.
+    _record_strategy_application(META_GOAL_SELECTION, {
+        "skill": "goal-selector.cmd_select",
+        "candidates_scored": len(scored),
+        "top_score": round(float(scored[0]["score"]), 2) if scored else None,
+        "top_goal_id": scored[0]["goal_id"] if scored else None,
+    })
 
     print(json.dumps(scored, indent=2, ensure_ascii=False))
 
@@ -1110,6 +2187,7 @@ def cmd_blocked(args):
 
     # Load expiry config (same source as cmd_select)
     defer_reason_timeout_hours = None
+    dependency_timeout_hours = None
     try:
         asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
         ma = asp_config.get("multi_agent", {})
@@ -1117,6 +2195,9 @@ def cmd_blocked(args):
             drth = ma.get("defer_reason_timeout_hours")
             if drth is not None:
                 defer_reason_timeout_hours = float(drth)
+            dth = ma.get("dependency_timeout_hours")
+            if dth is not None:
+                dependency_timeout_hours = float(dth)
     except Exception:
         pass
 
@@ -1147,7 +2228,8 @@ def cmd_blocked(args):
 
     blocked = collect_blocked(aspirations, known_blockers=known_blockers,
                               global_done_ids=global_done_ids,
-                              defer_reason_timeout_hours=defer_reason_timeout_hours)
+                              defer_reason_timeout_hours=defer_reason_timeout_hours,
+                              dependency_timeout_hours=dependency_timeout_hours)
 
     # Count total non-terminal goals across active aspirations
     total_active = 0

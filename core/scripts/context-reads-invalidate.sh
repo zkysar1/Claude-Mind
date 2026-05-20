@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # PostToolUse[Write,Edit] hook — invalidate modified files from context-reads tracker.
 # Reads JSON from stdin (tool_input.file_path), removes from tracker if present.
 # Only invalidates mutable tracked paths (world/knowledge/tree/**).

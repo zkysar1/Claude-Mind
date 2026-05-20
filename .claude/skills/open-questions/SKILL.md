@@ -1,11 +1,13 @@
 ---
 name: open-questions
-description: "Show open questions, user-assigned goals, and blocked goals — user dashboard"
+description: "Shows the user dashboard: pending questions the agent has logged for the user, goals with participants including user, and blocked goals grouped by blocker reason. Use whenever the user says \"what do you need from me\", \"what's blocked\", \"what questions do you have\", \"what am I on the hook for\", or invokes /open-questions directly. USER-ONLY — Claude must never invoke this autonomously. Primes context first so follow-up is knowledge-informed."
 user-invocable: true
 triggers:
   - "/open-questions"
 conventions: [aspirations]
 minimum_mode: reader
+revision_id: "skill-bootstrap-open-questions-f2715d"
+previous_revision_id: null
 ---
 
 # /open-questions — User Dashboard
@@ -30,7 +32,7 @@ Valid from ANY state (RUNNING, IDLE, UNINITIALIZED).
 ## Phase 2: Scan Pending Questions
 
 ```
-1. Read <agent>/session/pending-questions.yaml
+1. Read agents/<agent>/session/pending-questions.yaml
    IF file missing: pending_questions = []
    ELSE: filter questions where status == "pending"
    Store as pending_questions list

@@ -12,11 +12,10 @@ import re
 import sys
 from pathlib import Path
 
-# Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+# : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
+# when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import META_DIR, CONFIG_DIR
 
@@ -24,8 +23,12 @@ LIVE_PATH = META_DIR / "spark-questions.jsonl"
 
 VALID_TYPES = {"question", "candidate"}
 VALID_STATUSES = {"active", "retired"}
-QUESTION_ID_RE = re.compile(r"^sq-\d{3}$")
-CANDIDATE_ID_RE = re.compile(r"^sq-c\d{2}$")
+# Allow any digit count — auto-id allocator produces zero-padded ids inside
+# the file lock (sq-001..sq-999, then sq-1000+; sq-c01..sq-c99, then sq-c100+).
+# Strict-padded regex would silently fail on overflow. Same fix applied to
+# rb/guard/sig regexes when those allocators moved inside the lock.
+QUESTION_ID_RE = re.compile(r"^sq-\d+$")
+CANDIDATE_ID_RE = re.compile(r"^sq-c\d+$")
 
 QUESTION_REQUIRED_FIELDS = {"id", "text", "category", "type"}
 QUESTION_DEFAULTS = {
@@ -39,7 +42,6 @@ CANDIDATE_REQUIRED_FIELDS = {"id", "text", "category", "type"}
 CANDIDATE_DEFAULTS = {
     "proposed_session": 0,
 }
-
 
 # ---------------------------------------------------------------------------
 # Helpers: file I/O (same as pipeline.py)
@@ -58,18 +60,15 @@ def read_jsonl(path):
                 items.append(json.loads(stripped))
     return items
 
-
 def write_jsonl(path, items):
     """Atomically write JSONL with locking and history."""
     from _fileops import locked_write_jsonl
     locked_write_jsonl(path, items)
 
-
 def append_jsonl(path, item):
     """Append one JSON line with locking and history."""
     from _fileops import locked_append_jsonl
     locked_append_jsonl(path, item)
-
 
 def parse_value(value_str):
     """Parse a string value into the appropriate Python type."""
@@ -99,32 +98,38 @@ def parse_value(value_str):
         pass
     return value_str
 
-
 # ---------------------------------------------------------------------------
 # Helpers: validation
 # ---------------------------------------------------------------------------
 
-def validate_record(rec):
-    """Validate a spark question record dict. Raises ValueError on invalid."""
+def validate_record(rec, *, skip_id_check=False):
+    """Validate a spark question record dict. Raises ValueError on invalid.
+
+    skip_id_check=True is used by the auto-id path in cmd_add — see
+    reasoning-bank.validate_rb_record for the same rationale.
+    """
     rec_type = rec.get("type")
     if rec_type not in VALID_TYPES:
         raise ValueError(f"Invalid type: {rec_type} (expected 'question' or 'candidate')")
 
     if rec_type == "question":
-        missing = QUESTION_REQUIRED_FIELDS - set(rec.keys())
+        required = QUESTION_REQUIRED_FIELDS - ({"id"} if skip_id_check else set())
+        missing = required - set(rec.keys())
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
-        if not QUESTION_ID_RE.match(rec["id"]):
-            raise ValueError(f"Invalid question ID format: {rec['id']} (expected sq-NNN)")
+        if not skip_id_check:
+            if not QUESTION_ID_RE.match(rec["id"]):
+                raise ValueError(f"Invalid question ID format: {rec['id']} (expected sq-NNN)")
         if rec.get("status") and rec["status"] not in VALID_STATUSES:
             raise ValueError(f"Invalid status: {rec['status']}")
     else:
-        missing = CANDIDATE_REQUIRED_FIELDS - set(rec.keys())
+        required = CANDIDATE_REQUIRED_FIELDS - ({"id"} if skip_id_check else set())
+        missing = required - set(rec.keys())
         if missing:
             raise ValueError(f"Missing required fields: {missing}")
-        if not CANDIDATE_ID_RE.match(rec["id"]):
-            raise ValueError(f"Invalid candidate ID format: {rec['id']} (expected sq-cNN)")
-
+        if not skip_id_check:
+            if not CANDIDATE_ID_RE.match(rec["id"]):
+                raise ValueError(f"Invalid candidate ID format: {rec['id']} (expected sq-cNN)")
 
 def normalize_record(rec):
     """Apply defaults for missing fields. Mutates and returns rec."""
@@ -143,7 +148,6 @@ def normalize_record(rec):
                 rec[field] = default
     return rec
 
-
 # ---------------------------------------------------------------------------
 # Helpers: search
 # ---------------------------------------------------------------------------
@@ -155,123 +159,26 @@ def find_record_by_id(items, rec_id):
             return (i, rec)
     return None
 
-
 def check_no_duplicate_id(items, rec_id):
     """Raise ValueError if rec_id already exists in items."""
     for item in items:
         if item.get("id") == rec_id:
             raise ValueError(f"Duplicate record ID: {rec_id}")
 
-
 # ---------------------------------------------------------------------------
 # Subcommands: read
 # ---------------------------------------------------------------------------
 
-def cmd_read(args):
-    if args.active:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("type") == "question" and r.get("status") == "active"]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
-    elif args.candidates:
-        items = read_jsonl(LIVE_PATH)
-        filtered = [r for r in items if r.get("type") == "candidate"]
-        print(json.dumps(filtered, indent=2, ensure_ascii=False))
-
-    elif args.all:
-        items = read_jsonl(LIVE_PATH)
-        print(json.dumps(items, indent=2, ensure_ascii=False))
-
-    elif args.id:
-        items = read_jsonl(LIVE_PATH)
-        result = find_record_by_id(items, args.id)
-        if result is None:
-            print(f"Record {args.id} not found", file=sys.stderr)
-            sys.exit(1)
-        print(json.dumps(result[1], indent=2, ensure_ascii=False))
-
-    elif args.summary:
-        items = read_jsonl(LIVE_PATH)
-        for rec in items:
-            text = rec.get("text", "")
-            truncated = text[:60] + "..." if len(text) > 60 else text
-            rec_id = rec.get("id", "?")
-            if rec.get("type") == "question":
-                yr = rec.get("yield_rate", 0.0)
-                ta = rec.get("times_asked", 0)
-                print(f"{rec_id}: {truncated} [yield={yr:.2f}, asked={ta}]")
-            else:
-                print(f"{rec_id}: {truncated} [CANDIDATE]")
-
-    else:
-        print("Specify one of: --active, --candidates, --all, --id, --summary",
-              file=sys.stderr)
-        sys.exit(1)
-
-
-# ---------------------------------------------------------------------------
-# Subcommands: write
-# ---------------------------------------------------------------------------
-
-def cmd_add(args):
-    if sys.stdin.isatty():
-        print("Error: expected JSON on stdin (not a terminal)", file=sys.stderr)
-        sys.exit(1)
-    raw = sys.stdin.read().strip()
-    if not raw:
-        print("No input provided on stdin", file=sys.stderr)
-        sys.exit(1)
-    try:
-        rec = json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"Invalid JSON: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    rec = normalize_record(rec)
-
-    try:
-        validate_record(rec)
-    except ValueError as e:
-        print(f"Validation error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    items = read_jsonl(LIVE_PATH)
-    try:
-        check_no_duplicate_id(items, rec["id"])
-    except ValueError as e:
-        print(f"Duplicate error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    append_jsonl(LIVE_PATH, rec)
-
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
-
-def cmd_update_field(args):
-    rec_id = args.rec_id
-    field = args.field
-    value = parse_value(args.value)
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-    rec[field] = value
-
-    # Recompute yield_rate if a counter field changed on a question
-    if rec.get("type") == "question" and field in ("times_asked", "sparks_generated"):
-        rec["yield_rate"] = round(
-            rec.get("sparks_generated", 0) / max(rec.get("times_asked", 0), 1), 4
-        )
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+# --- cmd_add, cmd_update_field, cmd_retire GUTTED --------------------------
+# Migrated to daemon store endpoint (H2 Wave 3, 2026-05-15). These
+# subcommands now route through POST /v1/store/{append,set-field}
+# via thin .sh wrappers (spark-questions-{add,update-field,retire}.sh).
+# Validators and helpers above are kept as they are referenced by
+# store_registry.py (lifted verbatim there, mirrored here for the
+# surviving bespoke cmd_increment and cmd_promote).
+# See: mind_api/src/store_registry.py, mind_api/src/endpoints/store.py
+# -----------------------------------------------------------------------
 
 def cmd_increment(args):
     rec_id = args.rec_id
@@ -282,53 +189,37 @@ def cmd_increment(args):
               file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
+    from _fileops import locked_modify_jsonl
 
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
+    written = {"rec": None}
+
+    def _modifier(items):
+        result = find_record_by_id(items, rec_id)
+        if result is None:
+            raise ValueError(f"Record {rec_id} not found")
+        idx, rec = result
+        if rec.get("type") != "question":
+            raise ValueError(
+                f"Record {rec_id} is not a question (type={rec.get('type')})")
+        rec[field] = rec.get(field, 0) + 1
+        # Recompute yield_rate
+        rec["yield_rate"] = round(
+            rec.get("sparks_generated", 0) / max(rec.get("times_asked", 0), 1), 4
+        )
+        items[idx] = rec
+        written["rec"] = rec
+        return items
+
+    try:
+        locked_modify_jsonl(LIVE_PATH, _modifier)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
         sys.exit(1)
-
-    idx, rec = result
-
-    if rec.get("type") != "question":
-        print(f"Record {rec_id} is not a question (type={rec.get('type')})", file=sys.stderr)
-        sys.exit(1)
-
-    rec[field] = rec.get(field, 0) + 1
-
-    # Recompute yield_rate
-    rec["yield_rate"] = round(
-        rec.get("sparks_generated", 0) / max(rec.get("times_asked", 0), 1), 4
-    )
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
+    print(json.dumps(written["rec"], indent=2, ensure_ascii=False))
 
 
-def cmd_retire(args):
-    rec_id = args.rec_id
-
-    items = read_jsonl(LIVE_PATH)
-    result = find_record_by_id(items, rec_id)
-
-    if result is None:
-        print(f"Record {rec_id} not found", file=sys.stderr)
-        sys.exit(1)
-
-    idx, rec = result
-
-    if rec.get("type") != "question":
-        print(f"Record {rec_id} is not a question (type={rec.get('type')})", file=sys.stderr)
-        sys.exit(1)
-
-    rec["status"] = "retired"
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+# cmd_retire GUTTED — migrated to daemon store endpoint (H2 Wave 3).
+# See spark-questions-retire.sh.
 
 def cmd_promote(args):
     candidate_id = args.candidate_id
@@ -338,48 +229,49 @@ def cmd_promote(args):
         print(f"Invalid new ID format: {new_id} (expected sq-NNN)", file=sys.stderr)
         sys.exit(1)
 
-    items = read_jsonl(LIVE_PATH)
+    from _fileops import locked_modify_jsonl
 
-    # Find candidate
-    result = find_record_by_id(items, candidate_id)
-    if result is None:
-        print(f"Candidate {candidate_id} not found", file=sys.stderr)
-        sys.exit(1)
+    written = {"rec": None}
 
-    idx, rec = result
-
-    if rec.get("type") != "candidate":
-        print(f"Record {candidate_id} is not a candidate (type={rec.get('type')})",
-              file=sys.stderr)
-        sys.exit(1)
-
-    # Check new ID doesn't already exist
-    try:
+    def _modifier(items):
+        # Find candidate
+        result = find_record_by_id(items, candidate_id)
+        if result is None:
+            raise ValueError(f"Candidate {candidate_id} not found")
+        idx, rec = result
+        if rec.get("type") != "candidate":
+            raise ValueError(
+                f"Record {candidate_id} is not a candidate (type={rec.get('type')})")
+        # Check new ID doesn't already exist (inside lock — was racy outside)
         check_no_duplicate_id(items, new_id)
+        # Promote: change type, set new ID, apply question defaults
+        rec["id"] = new_id
+        rec["type"] = "question"
+        rec["status"] = "active"
+        rec["times_asked"] = 0
+        rec["sparks_generated"] = 0
+        rec["yield_rate"] = 0.0
+        # Remove candidate-only fields
+        rec.pop("proposed_session", None)
+        items[idx] = rec
+        written["rec"] = rec
+        return items
+
+    try:
+        locked_modify_jsonl(LIVE_PATH, _modifier)
     except ValueError as e:
-        print(f"Duplicate error: {e}", file=sys.stderr)
+        msg = str(e)
+        if "Duplicate record ID" in msg:
+            print(f"Duplicate error: {msg}", file=sys.stderr)
+        else:
+            print(msg, file=sys.stderr)
         sys.exit(1)
-
-    # Promote: change type, set new ID, apply question defaults
-    rec["id"] = new_id
-    rec["type"] = "question"
-    rec["status"] = "active"
-    rec["times_asked"] = 0
-    rec["sparks_generated"] = 0
-    rec["yield_rate"] = 0.0
-
-    # Remove candidate-only fields
-    rec.pop("proposed_session", None)
-
-    items[idx] = rec
-    write_jsonl(LIVE_PATH, items)
 
     # Sync framework config so new agents get the promoted question as active.
     # This keeps core/config/spark-questions.yaml and runtime in agreement.
-    _sync_framework_promotion(candidate_id, new_id, rec)
+    _sync_framework_promotion(candidate_id, new_id, written["rec"])
 
-    print(json.dumps(rec, indent=2, ensure_ascii=False))
-
+    print(json.dumps(written["rec"], indent=2, ensure_ascii=False))
 
 def _sync_framework_promotion(candidate_id, new_id, rec):
     """Warn when framework YAML needs updating after a runtime promotion.
@@ -400,7 +292,6 @@ def _sync_framework_promotion(candidate_id, new_id, rec):
               f"seed_questions as {new_id} and update initial_state.", file=sys.stderr)
     except Exception as e:
         print(f"Warning: could not check framework YAML: {e}", file=sys.stderr)
-
 
 # ---------------------------------------------------------------------------
 # Subcommands: migrate-yaml (for init-mind.sh bootstrap)
@@ -461,7 +352,6 @@ def cmd_migrate_yaml(args):
     c_count = sum(1 for r in records if r["type"] == "candidate")
     print(f"  Seeded spark-questions.jsonl: {q_count} questions + {c_count} candidates")
 
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -470,34 +360,16 @@ def main():
     parser = argparse.ArgumentParser(description="Spark questions engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # read
-    p_read = subparsers.add_parser("read", help="Read spark question records")
-    read_group = p_read.add_mutually_exclusive_group(required=True)
-    read_group.add_argument("--active", action="store_true", help="Active questions only")
-    read_group.add_argument("--candidates", action="store_true", help="Candidates only")
-    read_group.add_argument("--all", action="store_true", help="All records")
-    read_group.add_argument("--id", type=str, help="Find record by ID")
-    read_group.add_argument("--summary", action="store_true", help="One-liner summary per record")
+    # add, update-field, retire: GUTTED — migrated to daemon store endpoint
+    # (H2 Wave 3). Wrappers now call POST /v1/store/*.
 
-    # add
-    subparsers.add_parser("add", help="Add record from stdin JSON")
-
-    # update-field
-    p_uf = subparsers.add_parser("update-field", help="Update a single record field")
-    p_uf.add_argument("rec_id", type=str, help="Record ID")
-    p_uf.add_argument("field", type=str, help="Field to update")
-    p_uf.add_argument("value", type=str, help="New value")
-
-    # increment
+    # increment (bespoke — flat counters + type check + recompute; the generic
+    # store/increment handler supports nested-prefix counters only)
     p_inc = subparsers.add_parser("increment", help="Atomically increment a counter and recompute yield_rate")
     p_inc.add_argument("rec_id", type=str, help="Record ID")
     p_inc.add_argument("field", type=str, help="Field to increment (times_asked or sparks_generated)")
 
-    # retire
-    p_ret = subparsers.add_parser("retire", help="Retire a question (set status=retired)")
-    p_ret.add_argument("rec_id", type=str, help="Question ID to retire")
-
-    # promote
+    # promote (bespoke — candidate->active reformat + id change)
     p_promo = subparsers.add_parser("promote", help="Promote a candidate to active question")
     p_promo.add_argument("candidate_id", type=str, help="Candidate ID to promote")
     p_promo.add_argument("new_id", type=str, help="New question ID (sq-NNN format)")
@@ -510,11 +382,7 @@ def main():
     args = parser.parse_args()
 
     dispatch = {
-        "read": cmd_read,
-        "add": cmd_add,
-        "update-field": cmd_update_field,
         "increment": cmd_increment,
-        "retire": cmd_retire,
         "promote": cmd_promote,
         "migrate-yaml": cmd_migrate_yaml,
     }
@@ -524,7 +392,6 @@ def main():
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

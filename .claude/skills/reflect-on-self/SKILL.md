@@ -1,6 +1,6 @@
 ---
 name: reflect-on-self
-description: "Self-model reflection — pattern synthesis, strategy extraction, Level 2 self-model, confidence calibration"
+description: "Runs deep self-model reflection: synthesizes patterns across recent outcomes, extracts strategies into the archive, updates the Level 2 self-model, and calibrates confidence scores. Use whenever the loop hits the self-reflection cadence, sq-012 fires (\"does this outcome change my core purpose?\"), cumulative learning warrants rewriting self.md, or /reflect dispatches with --extract-patterns / --calibration-check. Produces self-model updates, not outcome-level insights."
 user-invocable: false
 parent-skill: reflect
 triggers:
@@ -9,6 +9,8 @@ triggers:
   - "/reflect --calibration-check"
 conventions: [pipeline, tree-retrieval, reasoning-guardrails, pattern-signatures]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-reflect-on-self-3b9f63"
+previous_revision_id: null
 ---
 
 # /reflect-on-self — Self-Model Reflection
@@ -100,7 +102,9 @@ Write strategies to extracted-strategies.md (resolve path via world-cat.sh first
          # Append to "## Decision Rules" section (create if missing):
          #   - IF {strategy.condition} THEN {strategy.action} — source: pattern-extraction, confidence: {strategy.confidence}, sample: {strategy.sample_size}
          Edit strategy_node.file with new decision rule
-         bash core/scripts/tree-update.sh --set <strategy_node.key> last_updated $(date +%Y-%m-%d)
+         # T21 PostToolUse hook (`tree-front-matter-sync.py`) auto-bumps
+         # last_updated on every tree-node Edit — no explicit
+         # `tree-update.sh --set last_updated` call needed (guard-531).
          Log: "▸ Strategy compiled to tree: {strategy_node.key}"
      # ── End tree compilation ──────────────────────────────────────
 ```
@@ -146,7 +150,8 @@ IF len(enabling_experiences) >= 2:
         # Append to "## Decision Rules" section (create if missing):
         #   - IF {enabling_strategy.condition} THEN {enabling_strategy.action} — source: pattern-extraction (enabling), confidence: {enabling_strategy.confidence}, sample: {enabling_strategy.sample_size}
         Edit strategy_node.file with new decision rule
-        bash core/scripts/tree-update.sh --set <strategy_node.key> last_updated $(date +%Y-%m-%d)
+        # T21 PostToolUse hook auto-bumps last_updated — no explicit
+        # `tree-update.sh --set last_updated` call needed (guard-531).
         Log: "▸ Enabling strategy compiled to tree: {strategy_node.key}"
     # ── End tree compilation ──────────────────────────────────────
 
@@ -220,7 +225,8 @@ IF len(mature_aspirations) >= 3:
                 # Append to "## Decision Rules" section (create if missing):
                 #   - IF {enabling_trajectory_strategy.condition} THEN {enabling_trajectory_strategy.action} — source: pattern-extraction (trajectory), confidence: {enabling_trajectory_strategy.confidence}
                 Edit strategy_node.file with new decision rule
-                bash core/scripts/tree-update.sh --set <strategy_node.key> last_updated $(date +%Y-%m-%d)
+                # T21 PostToolUse hook auto-bumps last_updated — no explicit
+                # `tree-update.sh --set last_updated` call needed (guard-531).
                 Log: "▸ Trajectory strategy compiled to tree: {strategy_node.key}"
             # ── End tree compilation ──────────────────────────────────────
 ```
@@ -238,7 +244,7 @@ We should [strategic recommendation].
 ```
 
 Bash: meta-set.sh meta-knowledge/_index.yaml  # update self-model
-Update aspirations meta via Bash: `aspirations-meta-update.sh <field> <value>`.
+Update aspirations meta via Bash: `aspirations-meta-update.sh --source agent <field> <value>`.
 
 ## Step 5: Meta-Strategy Synthesis *(metacognitive self-modification)*
 
@@ -262,11 +268,55 @@ For each proposed change:
   IF permitted:
       Bash: meta-set.sh {file} {field} {new_value} --reason "{pattern evidence}"
 
+## Step 5.3: Meta-Heuristic Usage Report
+
+Surface which meta/*-strategy.yaml heuristics are actually being applied via
+strategy-apply.sh (wired into execute-protocol-digest.md Step 4b). Without this
+step, times_applied counters accumulate silently with no surfacing in /reflect
+output — the consumer exists but the signal never reaches the reviewer.
+
+Heuristics with times_applied==0 past a staleness window are retirement candidates,
+analogous to reflect-maintain Step 1a for extracted-strategies.md.
+
+```
+# Read both strategy files (in migrations scope — see strategy-apply.py STRATEGY_FILES)
+Bash: meta-read.sh goal-selection-strategy.yaml --field selection_heuristics --json
+Bash: meta-read.sh aspiration-generation-strategy.yaml --field generation_heuristics --json
+
+# Aggregate and classify
+total_heuristics = len(selection_heuristics) + len(generation_heuristics)
+applied = [h for h in all if h.get("times_applied", 0) > 0]
+unused = [h for h in all if h.get("times_applied", 0) == 0]
+stale_unused = [h for h in unused if (today - parse(h.added)).days > 30]
+
+Output:
+  "▸ Meta-heuristic usage: {len(applied)}/{total_heuristics} applied at least once"
+  "  Top-used: {top-3 by times_applied}"
+  IF stale_unused:
+      "  Retirement candidates ({len(stale_unused)}): {ids} (zero applications, >30 days old)"
+      FOR EACH h in stale_unused:
+          Log: "META-HEURISTIC UNUSED: {h.id} added {h.added} — review for retirement"
+
+# Strategic reclassification: if a heuristic has high times_applied AND correlates with
+# outcome quality (from Step 2/3 patterns), promote it to convention or reasoning bank.
+FOR EACH h in applied:
+    IF h.times_applied >= 5 AND correlates_with_positive_outcome:
+        Log: "META-HEURISTIC MATURE: {h.id} applied {h.times_applied}x — consider promoting to guardrail or reasoning bank"
+```
+
 ## Step 6: Update Knowledge Base
 
 - Write new patterns to `world/knowledge/patterns/` with proper YAML front matter
 - Update `world/knowledge/patterns/_index.yaml`
 - Update meta-memory in `meta/meta-knowledge/_index.yaml`
+
+PLACEMENT CHECK (rules vs. conventions): If the extracted pattern or strategy
+would be encoded into a `.claude/rules/*.md` or `core/config/conventions/*.md`
+file (because the pattern is universal-behavioral or framework-structural),
+verify the content stays domain-agnostic per `.claude/rules/domain-free-examples.md`.
+Domain-specific patterns (named services, endpoints, branded workflows) belong
+in `world/conventions/*.md` instead. See `core/config/conventions/learning-routing.md`
+§ "Rules vs Conventions" for the decision tree.
 
 ## Tree Update Protocol
 
@@ -311,12 +361,13 @@ For future hypotheses, recommend using self-consistency:
 3. High agreement (4/5 or 5/5) = high confidence
 4. Moderate agreement (3/5) = moderate confidence
 5. Low agreement (2/5 or less) = low confidence or skip
+Bash: echo "reflect-on-self phase documented"
 ```
 
 ## Step 4: Update Calibration Data
 
 Write calibration report to journal and update:
-- Aspirations meta confidence_calibration_bias via Bash: `aspirations-meta-update.sh confidence_calibration_bias <value>` (read via `aspirations-read.sh --meta`)
+- Aspirations meta confidence_calibration_bias via Bash: `aspirations-meta-update.sh --source agent confidence_calibration_bias <value>` (read via `aspirations-read.sh --source agent --meta`)
 - `meta/meta-knowledge/_index.yaml` category-level calibration data
 
 ---
@@ -339,4 +390,10 @@ Write calibration report to journal and update:
 | Updates | `world/knowledge/strategies/` | Patterns | Strategy files |
 | Updates | `meta/meta-knowledge/` | Both | Self-model, calibration |
 | Updates | Tree node Decision Rules | Patterns | Strategy compilation |
-| Updates | `<agent>/journal/` | Calibration | Calibration report |
+| Updates | `agents/<agent>/journal/` | Calibration | Calibration report |
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `aspirations-meta-update.sh` or a tree-node write. Never end
+with a text summary of pattern synthesis or calibration.

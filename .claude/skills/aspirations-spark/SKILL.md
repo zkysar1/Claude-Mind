@@ -1,6 +1,6 @@
 ---
 name: aspirations-spark
-description: "Spark Check — adaptive spark questions, all sq-XXX handlers, aspiration-level spark, and Phase 6.5 immediate learning"
+description: "Runs the Spark Check (Phase 6) and Immediate Learning (Phase 6.5) of the aspirations loop: adaptive spark questions, all sq-XXX handlers (including sq-012 self-purpose update), aspiration-level spark, and immediate capture of reasoning-bank entries, guardrails, and forge awareness. Use whenever a goal completes — this is the recursive self-improvement mechanism that captures learning in-flight instead of deferring to /reflect. Internal sub-skill of /aspirations."
 user-invocable: false
 parent-skill: aspirations
 triggers:
@@ -8,13 +8,53 @@ triggers:
   - "run_aspiration_spark()"
 conventions: [aspirations, spark-questions, reasoning-guardrails, experience]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-aspirations-spark-e160b8"
+previous_revision_id: null
 ---
 
 # Spark Check (Micro-Evolution) and Immediate Learning
 
 Invoked after every goal completion as Phase 6 (spark check) and Phase 6.5 (immediate learning) of the aspirations loop. The spark check is the recursive self-improvement mechanism. Phase 6.5 captures reasoning bank entries, guardrails, and forge awareness immediately during execution rather than waiting for /reflect.
 
+## Abbreviation Policy
+
+Mandatory writes for this obligation: see `core/config/obligation-schema.yaml`
+→ `obligations.spark`. Spark has no mandatory writes — it's discretionary
+by design — but abbreviation is explicitly permitted when
+`outcome_class == routine`. When skipping, log one line in the journal:
+`OBLIGATION ABBREVIATED: spark — {condition}`. The learning-gate audit
+(Phase 9.5d) verifies the claimed condition was true at iteration time.
+
 ---
+
+## Handoff Goal Protocol (Item 3)
+
+When Phase 6.5 or any sq-XXX handler creates a goal that another agent should
+pick up (e.g., a planner agent filing "Apply: ..." work for an implementer
+agent), set the handoff fields so Item 3's scoring routes the goal correctly:
+
+```json
+{
+  "title": "Apply: {what the target agent must do}",
+  "participants": ["agent"],
+  "handoff_to": "<target-agent-name>",
+  "handoff_from": "{current MIND_AGENT}",
+  "handoff_created_at": "{ISO timestamp now}",
+  ...
+}
+```
+
+The target agent must be reachable via `participants` — `[agent]` (shown
+above, visible to all agents), `[agent, user]`, or explicit `[<name>]` all
+qualify. `handoff_to` is the *routing preference*; `participants` is the
+*visibility gate*. Handoff fields are additive — goals without them keep
+baseline scoring. See `core/config/conventions/goal-schemas.md`
+§ Cross-Agent Handoff Fields.
+
+Without these fields, the goal lands in the shared world queue with baseline
+priority and may rot. With them, the target agent's boot surfaces it
+(`▸ N pending handoff(s) for you`) and the selector's handoff_bonus scoring
+(default +0.30) prioritizes it above unrelated work.
 
 ## Inputs
 
@@ -33,6 +73,15 @@ SKIP: goal outcome was routine/expected with no new insight.
 Exception: the Operational Gotcha Auto-Detection block always runs (it uses
 structural keyword signals, not agent judgment about novelty).
 
+PLACEMENT CHECK (before creating ANY guardrail or rb entry below): if the
+prescriptive rule's `applies_to` is `domain` — i.e., it names a brand, a
+product, a specific external service, or domain-specific infrastructure —
+the rule belongs in a `world/conventions/*.md` file or as a `domain`-scoped
+guardrail entry, NOT in a core `.claude/rules/*.md` file. Core rules and
+core conventions must remain domain-agnostic per
+`.claude/rules/domain-free-examples.md`. Pick `applies_to` honestly: if in
+doubt between framework and domain, pick domain.
+
 ```
     IF goal outcome revealed a reusable reasoning pattern (heuristic, procedure,
        diagnostic, or causal insight) that would help with FUTURE similar goals:
@@ -48,15 +97,17 @@ structural keyword signals, not agent judgment about novelty).
             Proceed to create new entry (supersedes old)
 
         Create reasoning bank entry via reasoning-bank-add.sh:
-          id: next rb-NNN (check existing IDs via reasoning-bank-read.sh --summary)
+          # `id` and `created` auto-set by the script inside the file lock.
+          # Omit both — capture the assigned id from stdout's full-record JSON.
           title: concise name for the insight
           type: success | failure   # success if from a working approach; failure if from debugging/fixing
           category: goal's category
           content: the insight — what to do and why
+          applies_to: <any|framework|domain|specific>  # REQUIRED. any=cross-cutting methodology; framework=this framework's skills/scripts/gates; domain=this agent's deployment domain (the specific services, products, workflows the agent is deployed into); specific=single-incident
           when_to_use: when this insight applies
           source_goal: goal.id
           source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
-        Log in journal: "Immediate learning: created {rb-id} from {goal.id}"
+        Log in journal: "Immediate learning: created {rb-id from stdout} from {goal.id}"
 
     IF goal outcome revealed a safety hazard, a mistake to avoid, or a
        precondition that MUST be checked in future similar work:
@@ -64,7 +115,7 @@ structural keyword signals, not agent judgment about novelty).
         # Duplicate/contradiction check before creating guardrail
         existing_guards = Bash: guardrails-read.sh --category {goal.category}
         IF proposed guardrail semantically overlaps with an existing guardrail:
-            Strengthen existing: Bash: guardrails-increment.sh {guard.id} times_triggered
+            Strengthen existing: Bash: guardrails-increment.sh {guard.id} utilization.times_active
             Log: "Phase 6.5: Strengthened existing {guard.id} instead of creating duplicate"
             SKIP creation
         IF proposed guardrail contradicts an existing guardrail:
@@ -72,13 +123,14 @@ structural keyword signals, not agent judgment about novelty).
             Proceed to create new guardrail (supersedes old)
 
         Create guardrail via guardrails-add.sh:
-          id: next guard-NNN (check existing IDs via guardrails-read.sh --summary)
+          # `id` and `created` auto-set by the script — omit both; capture
+          # assigned id from stdout's full-record JSON.
           rule: what to check or avoid
           category: goal's category
           trigger_condition: when this guardrail applies
           source: goal.id
           source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
-        Log in journal: "Immediate guardrail: created {guard-id} from {goal.id}"
+        Log in journal: "Immediate guardrail: created {guard-id from stdout} from {goal.id}"
 
     # ── Operational Gotcha Auto-Detection (MANDATORY) ──────────────────
     # Structural trigger: if execution involved debugging/fixing an error,
@@ -97,11 +149,11 @@ structural keyword signals, not agent judgment about novelty).
         IF lesson matches prescriptive pattern (always|never|must|do not):
             existing_guards = Bash: guardrails-read.sh --category {goal.category}
             IF semantic overlap with existing:
-                Bash: guardrails-increment.sh {guard.id} times_triggered
+                Bash: guardrails-increment.sh {guard.id} utilization.times_active
                 Log: "OPS GOTCHA: Strengthened existing {guard.id}"
             ELIF no semantic overlap:
                 Create guardrail via guardrails-add.sh:
-                  id: next guard-NNN
+                  # `id` and `created` auto-set — omit both; capture from stdout.
                   rule: the prescriptive lesson
                   category: goal's category
                   trigger_condition: when this gotcha applies
@@ -112,11 +164,12 @@ structural keyword signals, not agent judgment about novelty).
             existing_rb = Bash: reasoning-bank-read.sh --category {goal.category}
             IF no semantic overlap with existing:
                 Create reasoning bank entry via reasoning-bank-add.sh:
-                  id: next rb-NNN
+                  # `id` and `created` auto-set — omit both; capture from stdout.
                   title: "Gotcha: {concise description}"
                   type: failure
                   category: goal's category
                   content: what happened, why, and how it was fixed
+                  applies_to: <any|framework|domain|specific>  # REQUIRED. ops gotchas about external services / domain infra → domain; framework-internal gotchas → framework; cross-cutting → any
                   when_to_use: {conditions: ["{error pattern or symptom}"], category: "{goal.category}"}
                   source_goal: goal.id
                   tags: ["ops-gotcha"]
@@ -142,7 +195,7 @@ structural keyword signals, not agent judgment about novelty).
         IF gap.status == "forged": skip forge criteria check
 
         Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-        Read <agent>/developmental-stage.yaml → current stage
+        Read agents/<agent>/developmental-stage.yaml → current stage
         IF gap.times_encountered >= forge_threshold
            AND gap.estimated_value >= "medium"
            AND developmental stage >= EXPLOIT (developing+):
@@ -164,6 +217,69 @@ structural keyword signals, not agent judgment about novelty).
 
 Run after EVERY goal completion. This is the recursive self-improvement mechanism.
 
+### Program-Alignment Response (boost_generative_sparks consumer)
+
+The `aspirations-select` Program-alignment probe (see `aspirations-select/SKILL.md`
+§ Program-alignment probe, lines 156-185) reads `world/program.md` every
+`check_interval_goals` iterations, asks the LLM whether the top-ranked goal
+materially serves The Program, and increments `program_misalignment_streak`
+in working memory on misalignment. When the streak reaches 3, the probe sets
+`boost_generative_sparks = true`. This phase is the consumer for that flag —
+without it, the probe's terminal action is a dead signal and the framework-vs-
+domain self-correction mechanism never fires.
+
+```
+# CRITICAL: --json mode is load-bearing. The writer in aspirations-select
+# stores a JSON bool (`echo 'true' | wm-set.sh ...`). Non-JSON wm-read.sh
+# would serialize that as Python's `True` (capital T) while --json emits
+# lowercase `true`. Comparing to the string "true" ONLY works in JSON mode.
+# wm-read.sh prints `null` + exit 0 on missing slot — no fallback needed;
+# `"null" != "true"` is the intended pass-through when the probe hasn't fired.
+Bash: boost = wm-read.sh boost_generative_sparks --json
+IF boost.strip() == "true":
+    Log: "▸ Program-alignment misalignment streak triggered — forcing aspiration_generation spark with product-domain bias"
+
+    # Clear the flag FIRST (atomic, idempotent). Even if subsequent steps
+    # error, the flag must not re-fire on the next iteration — otherwise a
+    # single misalignment escalation loops forever.
+    # CRITICAL: clear with `echo 'false'` (JSON bool) to match the writer's
+    # type. `echo '"false"'` would store a JSON string, breaking the bool
+    # round-trip that the --json read above depends on.
+    Bash: echo 'false' | wm-set.sh boost_generative_sparks
+
+    # Fire sq-007 (aspiration_generation) unconditionally — bypasses the
+    # routine-spark filter's escalation gate. The bias toward product-domain is
+    # communicated through the in-turn LLM question prompt below; the
+    # Extended layer (E1 in the aspiration-management plan) will formalize
+    # the bias via aspiration-generation-strategy.yaml domain_class_targets.
+
+    Ask sq-007: "The Program-alignment probe detected a misalignment streak
+      of 3 — my recent goals have drifted from The Program's primary
+      product focus (read world/program.md for the current domain) toward
+      framework-meta work. What new PRODUCT-DOMAIN aspiration would
+      materially serve The Program right now? Consider domain-specific
+      quality improvements, end-user-facing pipeline work, integration
+      work, or competitive-landscape response — whatever The Program
+      identifies as its primary value surface. Do NOT propose framework-
+      meta, agent-health, or cognitive-core aspirations — those are what
+      triggered the streak."
+    Bash: spark-questions-increment.sh sq-007 times_asked
+    IF sq-007 produces a concrete aspiration candidate:
+        Bash: spark-questions-increment.sh sq-007 sparks_generated
+        Invoke /create-aspiration from-self --plan with the candidate
+        description and explicit product-domain framing. The LLM passes the
+        product-domain preference through the candidate text; Phase B of
+        create-aspiration evaluates it normally.
+
+    # Log the causal chain so future reflection can attribute outcomes to
+    # the alignment intervention. Posted as a finding so correlations
+    # between probe firing and spark-generated aspirations are discoverable
+    # cross-agent. (journal-add.sh takes stdin JSON with a journal_file key
+    # — it is not a free-form telemetry sink; board-post fits this one-line
+    # event better.)
+    Bash: echo "Misalignment streak consumed: sq-007 fired with product-domain bias; outcome={candidate_created|no_candidate}" | board-post.sh --channel findings --type finding --tags "program-alignment,spark,sq-007"
+```
+
 ### Goal-Level Spark
 
 ### Routine Spark Mode
@@ -176,13 +292,15 @@ so cost is bounded. Principle: we are here to learn — never skip.
 ```
 IF outcome_class == "routine_spark":
     Bash: spark-questions-read.sh --active
-    creative_routine_questions = [q for q in result if q.category in (
+    all_active_questions = result  # save — result will be overwritten by later reads
+    creative_routine_questions = [q for q in all_active_questions if q.category in (
         "hypothesis_generation",       # sq-009 — testable predictions
         "forward_prediction",          # sq-011 — what would break/change
         "experiential_hypothesis",     # sq-c09 — player perspective
-        "first_principles",            # sq-c07 — inherited assumptions
+        "first_principles",            # sq-016 — inherited assumptions
         "transfer",                    # sq-003 — cross-domain transfer
-        "surprise"                     # sq-004 — did the outcome surprise us
+        "surprise",                    # sq-004 — did the outcome surprise us
+        "self_evolution"               # sq-012 — does this outcome change my core purpose?
     )]
     Log: "▸ Routine spark: evaluating {len(creative_routine_questions)} creative+hypothesis questions"
     For each question in creative_routine_questions:
@@ -191,9 +309,34 @@ IF outcome_class == "routine_spark":
         If spark generated:
             Bash: spark-questions-increment.sh <question.id> sparks_generated
             Execute the spark action (hypothesis creation via sq-009 handler,
-            or first-principles via sq-c07 handler, or transfer insight log)
+            or first-principles via sq-016 handler, or transfer insight log)
     If any spark fires → log via:
       echo '{"event":"routine_spark","details":"Goal {id} routine-sparked: {description}","date":"<today>"}' | bash core/scripts/evolution-log-append.sh
+
+    # ── Phase R2: Signal-escalated work discovery ──
+    # If any creative spark fired, the recurring goal's output was interesting enough
+    # to warrant checking whether it suggests new aspirations or actionable work.
+    # Also check for strategic scan signals in working memory — these enrich the
+    # spark evaluation even for seemingly routine outcomes.
+    Bash: wm-read.sh strategic_scan_signals --json
+    has_scan_signals = (result is not null and result != "null" and len(result) > 0)
+
+    IF any_spark_fired OR has_scan_signals:
+        # Escalate to generative sparks that were skipped by the routine filter
+        generative_questions = [q for q in all_active_questions if q.category in (
+            "aspiration_generation",   # sq-007 — "Does this outcome justify a NEW ASPIRATION?"
+            "work_discovery"           # sq-013 — "Did this reveal actionable work?"
+        )]
+        Log: "▸ Routine spark ESCALATION: evaluating {len(generative_questions)} generative questions"
+        For each question in generative_questions:
+            Ask the question about the just-completed goal
+            (include scan signal context from working memory if available)
+            Bash: spark-questions-increment.sh <question.id> times_asked
+            If spark generated:
+                Bash: spark-questions-increment.sh <question.id> sparks_generated
+                Execute the spark action (sq-007 handler creates aspiration,
+                sq-013 handler creates goals or aspiration)
+
     RETURN  # Skip full spark evaluation and Phase 6.5
 ```
 
@@ -294,9 +437,13 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
    captured by a goal outcome — don't duplicate it as a session hypothesis. Prefer forming
    predictions about what WILL change or what WOULD happen IF something changes.
 
+2.4. Move to active: `bash core/scripts/pipeline-move.sh <hypothesis_id> active`
+     (Without this, the record stays in `discovered` forever — /review-hypotheses reads active-only.
+     Mirrors /decompose Step 3.)
+
 2.5. Archive hypothesis formation context:
         experience_id = "exp-{hypothesis_id}"
-        Write <agent>/experience/{experience_id}.md with:
+        Write agents/<agent>/experience/{experience_id}.md with:
             - Full context manifest content (what was actually read, not just paths)
             - Evidence consulted and reasoning chain
             - Why this confidence level was chosen
@@ -311,7 +458,7 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
             hypothesis_id: "{hypothesis_id}"
             tree_nodes_related: [nodes from context manifest]
             verbatim_anchors: [key evidence excerpts that informed the prediction]
-            content_path: "<agent>/experience/{experience_id}.md"
+            content_path: "agents/<agent>/experience/{experience_id}.md"
         Set experience_ref on pipeline record:
             bash core/scripts/pipeline-update-field.sh {hypothesis_id} experience_ref "{experience_id}"
 3. Move pipeline file from `discovered/` to `active/` (it's immediately actionable)
@@ -322,22 +469,59 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
 **sq-012**: "Does this outcome change how I think about my core purpose? Should my Self evolve?"
 
 When sq-012 fires after goal completion:
-1. Read `<agent>/self.md` — current Self content
+1. Read `agents/<agent>/self.md` — current Self content
 2. Assess: does the goal outcome suggest a refinement, expansion, or course correction?
 2.5. CONTRACT CHECK (before acting on Self):
    Bash: `curriculum-contract-check.sh --action allow_self_edits`
    IF exit code 1 (not permitted):
        Log: "sq-012: Self edit blocked by curriculum stage {stage_name from JSON output}"
        Skip to step 4 — increment sparks_generated but DO NOT edit Self or write pending question
-3. IF YES — choose ONE path (never both):
-   a. IF highly confident AND the change is a minor refinement (not a rewrite):
-      Edit `<agent>/self.md` — update body, set last_update_trigger: self_evolution
-      Log: "SELF EVOLUTION: {summary of change}"
-   b. ELSE (uncertain or significant change):
-      Write proposed update to `<agent>/session/pending-questions.yaml`:
-        question: "Based on [outcome], I think my Self should evolve from [current summary] to [proposed]. Should I update?"
-        default_action: "Keep current Self unchanged"
-        status: pending
+3. IF YES — classify signal strength and change size (enforced by guard-380):
+   # Both `last_updated` and `last_update_trigger` MUST be set in the SAME
+   # Edit so the front-matter audit trail stays accurate. Setting only the
+   # trigger leaves last_updated stale and the change becomes invisible to
+   # any reader checking "when was Self last touched." Mirror sites that
+   # MUST stay in sync with this pattern: respond/SKILL.md (user-correction),
+   # felt-sense-checkin/SKILL.md (Material lane), encode-session/SKILL.md
+   # (Lane 7). After Phase 7b collapse, this site no longer has a manual
+   # forged-notification invocation — evolution-complete.py (Phase 5) handles
+   # decisions-board posting AND user email for material self edits automatically.
+   a. STRONG signal + COSMETIC change (wording, typo, formatting only):
+      Edit `agents/<agent>/self.md` — update body AND front matter:
+        last_updated: <today (YYYY-MM-DD)>
+        last_update_trigger: self_evolution
+      # The Phase 2 hooks (evolution-prepare -> evolution-record) captured the
+      # Edit as a self-evolution.jsonl stub with status=awaiting_completion.
+      # Finalize via the canonical primitive (cosmetic edits auto-skip email):
+      Bash: bash core/scripts/evolution-complete.sh \
+          --revision-id <stub-rev-from-self-evolution.jsonl> \
+          --reasoning "<>=80-char rationale citing sq-012 cosmetic signal>" \
+          --signal-source sq-012 \
+          --signal-evidence '[{"type":"spark_question","id":"sq-012","outcome":"cosmetic"}]'
+      Log: "SELF EVOLUTION (cosmetic, audited via self-evolution stream): {summary}"
+   b. STRONG signal + MATERIAL change (new/removed drive, principle, role,
+      agent-provisionable action, or multi-paragraph rewrite — when in doubt,
+      treat as material):
+      Edit `agents/<agent>/self.md` — update body AND front matter:
+        last_updated: <today (YYYY-MM-DD)>
+        last_update_trigger: self_evolution
+      # The Phase 2 hooks (evolution-prepare -> evolution-record) captured the
+      # Edit as a self-evolution.jsonl stub with status=awaiting_completion.
+      # Finalize via the canonical primitive (Phase 5 auto-posts decisions board
+      # AND auto-emails user for material self edits — no manual forged-skill
+      # invocation needed here):
+      Bash: bash core/scripts/evolution-complete.sh \
+          --revision-id <stub-rev-from-self-evolution.jsonl> \
+          --reasoning "<>=80-char rationale citing sq-012 signal + goal outcome>" \
+          --signal-source sq-012 \
+          --signal-evidence '[{"type":"spark_question","id":"sq-012","outcome":"confirmed"}]'
+      Log: "SELF EVOLUTION (material, audited via self-evolution stream): {summary}"
+   c. WEAK / uncertain signal: DO NOT edit self.md on sq-012 alone.
+      Record the tentative signal for /reflect-on-self or /fresh-eyes-review
+      to cross-reference against other signals before acting.
+      Log: "sq-012: weak signal — deferred to cross-signal review"
+   (No pending-question pre-approval path — guard-380 replaced it with
+   post-notification on 2026-04-22. Pre-approval is no longer written here.)
 4. Increment `sparks_generated` on the spark question
 
 #### Data Acquisition Spark Handler
@@ -354,9 +538,9 @@ When sq-c05 fires after goal completion:
 
 #### Memory Curation Spark Handlers
 
-**sq-c03**: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
+**sq-014**: "Did completing this goal make any of our existing STRATEGIES, GUARDRAILS, or PATTERN SIGNATURES obsolete or irrelevant?"
 
-When sq-c03 fires after goal completion:
+When sq-014 fires after goal completion:
 1. Identify the completed goal's category/domain
 2. Scan that category for strategies, guardrails, and pattern signatures
 3. For each item: "Does this goal's outcome make this artifact obsolete or irrelevant?"
@@ -397,6 +581,17 @@ When sq-013 fires after goal completion:
    - `verification`: `outcomes` + `checks` + `preconditions`
    - `discovered_by`: the completed goal ID that triggered this spark
    - `discovery_type`: the classification from step 1
+   # `origin_signal` is gate-required — origin-signal-gate.py rejects
+   # agent-sourced goals without one. The mapping below codifies the
+   # discovery_type → origin_signal correspondence so future passes pick
+   # the right value without re-deriving it; the table is the single
+   # source of truth for sq-013-filed goals.
+   - `origin_signal`: derive from `discovery_type` (use the prefix form with
+     a short slug — typically `g-NNN-NN-<short-tag>` or the discovered work's
+     identifier):
+       `requirement` | `dependency` | `fix`  → `"maintain:<tag>"` or `"unblock:<tag>"`
+       `follow-up`   | `capability_gap`      → `"investigate:<tag>"` or `"idea:<tag>"`
+       `opportunity`                         → `"idea:<tag>"`
 5.5. **Quality gate for project+ aspirations** (scope-aware goal addition):
    IF target aspiration's scope is "project" or "initiative"
    AND discovery_type NOT in ("fix", "dependency"):  # cognitive primitives exempt
@@ -413,9 +608,9 @@ When sq-013 fires after goal completion:
 
 #### Integration Path Coverage Spark Handler
 
-**sq-015**: "Does the test coverage verify the INTEGRATION PATH (trigger -> handler -> side effect), or only the extracted function in isolation?"
+**sq-019**: "Does the test coverage verify the INTEGRATION PATH (trigger -> handler -> side effect), or only the extracted function in isolation?"
 
-When sq-015 fires after goal completion:
+When sq-019 fires after goal completion:
 1. Did this goal produce or modify code (Edit/Write to source files)? If no → SKIP (not applicable)
 2. Trace the integration path from the change point:
    - What triggers the changed code? (API call, event bus message, scheduler, user action)
@@ -430,25 +625,12 @@ When sq-015 fires after goal completion:
 4. ELIF integration path test exists but is incomplete:
    Create idea goal: `"Idea: extend integration test for {module} to cover {gap}"`
 5. ELSE: integration path is covered — no spark generated, SKIP to step 7
-6. Log spark event: `echo '{"event":"spark","details":"sq-015: Goal <completed-id> integration path check for <module>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
+6. Log spark event: `echo '{"event":"spark","details":"sq-019: Goal <completed-id> integration path check for <module>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
 7. Increment `sparks_generated` on the spark question ONLY if step 3 or 4 created a goal
-
-#### Idea Generation Spark Handler
-
-**sq-014** (candidate for promotion): "Is there a better way to do what I just did? What adjacent problem could benefit from what I just learned?"
-
-When sq-014 fires after goal completion:
-1. Reflect on the execution approach: was it optimal? Could it be improved?
-2. Consider adjacent problems: does this technique/insight apply elsewhere?
-3. If YES: create an idea goal (via Cognitive Primitives) in the most relevant aspiration
-   - Title: `"Idea: {creative insight (50 chars)}"`
-   - Priority: MEDIUM, skill: null
-   - Description: what the idea is, expected benefit, which goal inspired it
-4. Increment `sparks_generated` on the spark question
 
 #### Aspiration Generation Spark Handler
 
-**sq-007**: "Is there a new ASPIRATION suggested by this outcome?"
+**sq-007**: "Does this outcome justify a NEW ASPIRATION (multi-goal initiative) — not just a single follow-up Idea/Investigate goal?"
 
 When sq-007 fires after goal completion:
 1. Assess: does the goal's outcome suggest an entirely new direction that doesn't fit within any existing aspiration?
@@ -456,11 +638,11 @@ When sq-007 fires after goal completion:
 3. Log spark event: `echo '{"event":"spark","details":"sq-007: Goal <completed-id> suggested new aspiration direction: <brief description>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
 4. Increment `sparks_generated` on the spark question
 
-#### sq-c06: Meta-Improvement Spark
+#### sq-015: Meta-Improvement Spark
 
-**Handler for sq-c06** — "Did this outcome suggest a better improvement PROCEDURE?"
+**Handler for sq-015** — "Did this outcome suggest a better improvement PROCEDURE?"
 
-When sq-c06 fires after goal completion:
+When sq-015 fires after goal completion:
 1. Bash: meta-cat.sh improvement-instructions.md
 2. Compare: did the approach used in this goal deviate from the documented procedure?
    - Deviated AND succeeded: procedure may be outdated → note for evolve phase
@@ -473,13 +655,57 @@ When sq-c06 fires after goal completion:
       "insight":"<what the meta-insight is>","procedure_match":"<deviated|followed>",
       "outcome":"<succeeded|failed>"}
    - Log: "META SPARK: {insight} from {goal.id}"
-4. Bash: spark-questions-increment.sh sq-c06 sparks_generated
+4. Bash: spark-questions-increment.sh sq-015 sparks_generated
 
-#### sq-c07: First-Principles Spark
+#### sq-018: Verify-Learning Maintenance Spark
 
-**Handler for sq-c07** — "Did this goal's approach rest on inherited assumptions rather than verified ground truth?"
+**Handler for sq-018** — "Did this work suggest a NEW test/check/assertion to add to /verify-learning?"
 
-When sq-c07 fires after goal completion:
+This catches regressions in framework-relevant code (core/, .claude/skills/,
+.claude/rules/, world/conventions/, .claude/settings.json) by proposing an
+explicit assertion in /verify-learning Step 3 BEFORE the next regression hits.
+
+When sq-018 fires after goal completion:
+1. SCOPE FILTER — was this goal framework-touching?
+   Bash: git diff --name-only HEAD@{1} HEAD 2>/dev/null | grep -E '^(core/(scripts|config)|\.claude/(skills|rules)|world/conventions|\.claude/settings\.json)' | head -20
+   IF empty: SKIP — do NOT increment sparks_generated. Pure non-framework
+   goals (domain-specific code, application logic, product features) have
+   no /verify-learning surface.
+
+2. For each changed framework file, identify a check that catches the same regression:
+   - New script invariant   → grep-based assertion ("file X must contain Y")
+   - New file expected      → existence check (test -f / test -d)
+   - New behavior           → command_check + expected stdout/stderr
+   - New convention rule    → assertion that the documented rule holds in code
+   - New hook / integration → run-once verification that wiring is live
+
+3. PROPOSE the check via a Maintain-style goal under asp-115 (framework hygiene).
+   Do NOT auto-edit `.claude/skills/verify-learning/SKILL.md` — it's a high-trust
+   file; the user reviews check additions before they land.
+
+   # origin_signal MUST come from the canonical list enforced by
+   # core/scripts/origin-signal-gate.py. Bare "sq-018" is rejected — use the
+   # "maintain:" prefix form with a short tag.
+   # aspirations-add-goal.sh reads JSON from STDIN (BODY="$(cat)" at line 103);
+   # positional JSON args are silently discarded.
+   echo '{"title":"Maintain: add verify-learning check for <file>",
+      "description":"What changed during <goal.id>, why a check is needed, suggested check form",
+      "status":"pending","priority":"MEDIUM","category":"framework-hygiene",
+      "participants":["agent"],
+      "discovered_by":"<goal.id>",
+      "discovery_type":"capability_gap",
+      "origin_signal":"maintain:sq-018-verify-learning"}' \
+     | bash core/scripts/aspirations-add-goal.sh --source world asp-115
+
+4. Log: `echo '{"event":"spark","details":"sq-018: Goal <goal-id> proposed verify-learning check for <file>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`
+
+5. Bash: spark-questions-increment.sh sq-018 sparks_generated
+
+#### sq-016: First-Principles Spark
+
+**Handler for sq-016** — "Did this goal's approach rest on inherited assumptions rather than verified ground truth?"
+
+When sq-016 fires after goal completion:
 1. Identify the goal's execution approach and framing
 2. Surface 2-3 assumptions embedded in the approach:
    - What was taken for granted?
@@ -494,11 +720,12 @@ When sq-c07 fires after goal completion:
       Bash: reasoning-bank-read.sh --category {goal.category}
    b. IF no existing entry covers this assumption:
       Create reasoning bank entry via reasoning-bank-add.sh:
-        id: next rb-NNN
+        # `id` and `created` auto-set — omit both; capture from stdout.
         title: "Assumption: {concise description of the inherited assumption}"
         type: failure
         category: goal's category
         content: "Goal {goal.id} used this assumption without verification: {assumption}. The approach {did/did not} succeed, but the assumption remains unverified. Ground truth check: {what would need to be true for this to be verified}."
+        applies_to: any  # surfaced assumptions are methodological — they apply across domains
         when_to_use: "{conditions where this assumption is relevant}"
         source_goal: goal.id
         tags: ["first-principles", "inherited-assumption"]
@@ -506,10 +733,10 @@ When sq-c07 fires after goal completion:
    c. IF assumption is UNTESTED AND goal succeeded:
       # Most dangerous case — success reinforces unchecked assumptions
       Create a micro-hypothesis in working memory:
-      echo '{"claim":"Goal {goal.id} succeeded despite untested assumption: {assumption}. This assumption may fail when {condition}.","confidence":0.40,"source_goal":"{goal.id}","source_step":"sq-c07","horizon":"session"}' | Bash: wm-append.sh micro_hypotheses
+      echo '{"claim":"Goal {goal.id} succeeded despite untested assumption: {assumption}. This assumption may fail when {condition}.","confidence":0.40,"source_goal":"{goal.id}","source_step":"sq-016","horizon":"session"}' | Bash: wm-append.sh micro_hypotheses
       Log: "FIRST PRINCIPLES -> HYPOTHESIS: untested assumption '{assumption}' may fail under {condition}"
    # Only count as spark if at least one assumption was surfaced (step 4b or 4c fired)
-   Bash: spark-questions-increment.sh sq-c07 sparks_generated
+   Bash: spark-questions-increment.sh sq-016 sparks_generated
 
 #### Failure Stepping-Stone Spark Handler (OMNI-EPIC-inspired)
 
@@ -536,7 +763,7 @@ When sq-c08 fires after a FAILED goal:
 
 3. Add via aspirations-add-goal.sh to the same aspiration:
    ```
-   echo '{"title":"Stepping stone: {simpler variant title}","description":"Easier variant of {failed.id}: {failed.title}. {what makes this simpler}. Original failure mode: {failure_analysis}.","priority":"{same as failed}","category":"{failed.category}","participants":["agent"]}' | Bash: aspirations-add-goal.sh --source {source} {asp.id}
+   echo '{"title":"Stepping stone: {simpler variant title}","description":"Easier variant of {failed.id}: {failed.title}. {what makes this simpler}. Original failure mode: {failure_analysis}.","priority":"{same as failed}","category":"{failed.category}","participants":["agent"],"origin_signal":"unblock:{failed.id}"}' | Bash: aspirations-add-goal.sh --source {source} {asp.id}
    ```
 
 4. Log: `echo '{"date":"<today>","event":"stepping_stone_created","details":"Easier variant of {failed.id} → {new.title}","trigger_reason":"sq-c08 failure stepping-stone"}' | bash core/scripts/evolution-log-append.sh`
@@ -562,7 +789,7 @@ Ask these 3 questions:
    → IF yes:
        Bash: curriculum-contract-check.sh --action allow_meta_edits
        IF permitted: Read via meta-read.sh and update via meta-set.sh: aspiration-generation-strategy.yaml with learned heuristic.
-     Append to meta-log.jsonl via meta-log-append.sh: {"date":"<today>","event":"aspiration_meta_learning","aspiration":"<asp-id>","insight":"<insight>"}
+     Bash: echo '{"date":"<today>","event":"aspiration_meta_learning","aspiration":"<asp-id>","insight":"<insight>"}' | meta-log-append.sh
 
 Replacement aspiration generation is handled by Phase 7 archival in aspirations/SKILL.md
 (with --plan for full planning treatment). Do NOT duplicate generation here.

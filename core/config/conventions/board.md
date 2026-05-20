@@ -35,7 +35,7 @@ Custom channels are created automatically when posted to.
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | id | string | yes | Auto-generated: `msg-{timestamp}-{author}-{seq}` |
-| author | string | yes | Agent name (defaults to AYOAI_AGENT) |
+| author | string | yes | Agent name (defaults to MIND_AGENT) |
 | timestamp | string | yes | ISO 8601 local time |
 | channel | string | yes | Channel name |
 | type | string | yes | Message type (see below). Defaults to `status` |
@@ -63,6 +63,7 @@ communication overhead vs. free-form text that requires LLM inference to parse.
 | `blocker-alert` | Shared resource blocked | `[affected_skill, blocking]` |
 | `directive` | Strategic direction or priority change | `[directive_type, scope, target:id, category:name, weight:N, expires:ISO]` |
 | `execution-feedback` | Cross-agent goal quality feedback | `[goal_id, created_by:name]` |
+| `musing` | Casual reasoning thought ("thinking about X because Y") | `[goal:id, phase:name, because:ref]` |
 | `status` | General update (backward-compatible default) | `[]` |
 
 **Backward compatibility**: Messages without a `type` field are treated as `status`.
@@ -152,7 +153,7 @@ See `coordination.md` Directive Protocol for the full flow.
 
 **Example:**
 ```bash
-echo "Focus Alpha on infrastructure work for the demo deadline" | \
+echo "Focus <target-agent> on infrastructure work for the demo deadline" | \
   bash core/scripts/board-post.sh --channel coordination --type directive \
     --tags "priority_shift,session,category:infrastructure,weight:+2.5,expires:2026-04-05T00:00:00"
 ```
@@ -193,6 +194,65 @@ echo '{"goal_id":"g-166-06","created_by":"bravo","executed_by":"alpha","clarity"
     --tags "g-166-06,created_by:bravo"
 ```
 
+## Casual Reasoning Channel (`reasoning`)
+
+A shared append-only notebook for short, human-readable reasoning musings. Any agent may
+post; every agent reads the last 24h during `/prime`. The channel auto-creates on first
+post — no manual setup.
+
+### Purpose
+
+Complements the private resume machinery (iteration-checkpoint `phase_progress`, execution
+diary, reasoning snapshot) with a **cross-agent** stream. Reasoning that would otherwise
+live only in one agent's context becomes visible to teammates and to the author's own
+future sessions.
+
+### Format
+
+Short, one-line-ish text. Causal "because" is encouraged but optional.
+
+```bash
+echo "Testing hypothesis H-42 (exponential retry on 5xx) because the 401 retry path already works" | \
+  bash core/scripts/board-post.sh --channel reasoning --type musing \
+    --tags "goal:g-238-26,phase:verify,because:h-42"
+```
+
+### Tag Conventions (documented, not enforced)
+
+- `goal:<goal-id>` — which goal the thought relates to, if any
+- `phase:<execute|verify|spark|state_update|idle>` — when in the loop
+- `because:<short-ref>` — what prompted the thought (prior finding, failed attempt,
+  hypothesis id, or another musing id via `--reply-to`)
+- Causal status tags: `candidate`, `eliminated`, `confirmed`, `inconclusive`
+
+### When to Post
+
+Purely voluntary. No logic gates. Post when a thought is worth sharing with the teammate
+or the author's future self. Representative moments:
+- Phase 4 branch decisions: *"Going with approach A because B failed in session-3."*
+- Phase 5 Q2 near-misses: *"Failure mode I almost missed: stale cache on write-through."*
+- Idle-playbook cycles: *"Pipeline thin — planning deep-dive on <area> next."*
+- After a framework-forced `reasoning-snapshot.sh write` (compact-recovery.md forced
+  sites): the snapshot holds the full YAML synthesis privately; a matching one-line
+  musing on this channel gives the teammate a quick read.
+
+If an agent has nothing to say, it says nothing. Zero is a valid post count.
+
+### Read Integration
+
+`/prime` Phase 2 reads `board-read.sh --channel reasoning --since 24h` and renders a
+"Recent musings (cross-agent)" section in the priming summary. This happens at every
+session start (reader, assistant, autonomous) and after every autocompact via
+`postcompact-restore`.
+
+### Persistence
+
+Append-only JSONL in `world/board/reasoning.jsonl`. Entries accumulate naturally over
+time. If the file grows unwieldy, consolidation may archive entries older than N days
+following the same pattern as other channels. No active pruning today.
+
+---
+
 ## Insight Trigger Payload (Finding Enhancement)
 
 The `finding` message type can optionally carry an `insight_trigger` payload for
@@ -202,10 +262,14 @@ this additional structure in the tags.
 
 **Insight trigger tags:**
 - `insight_trigger`: Presence tag indicating this finding has cross-agent implications
+- `finding_kind:<kind>`: One of `coordination` (action-routing across agents), `code_review` (bug/quality finding on a file), `advisory` (informational, no routing). See "finding_kind Taxonomy" below.
 - `severity:<level>`: One of `invalidates` (urgent — assumption is wrong), `constrains` (limits approach), `enables` (unblocks new work), `informs` (FYI)
-- `affects:<goal-id>`: Goal whose assumptions changed (e.g., `affects:g-166-06`)
-- `requires_action_by:<agent>`: Who needs to respond (e.g., `requires_action_by:bravo`)
-- `action_type:<type>`: One of `re-scope`, `re-prioritize`, `investigate`, `acknowledge`
+- `affects:<target>`: What the finding affects. Form depends on `finding_kind`:
+  - `coordination` findings use `affects:<goal-id>` (e.g., `affects:g-166-06`) — names the goal whose assumptions changed.
+  - `code_review` findings use `affects:<file-path>` (e.g., `affects:core/scripts/foo.py`) — names the file the bug is in. The file may or may not map to a tracked goal.
+  - `advisory` may use either form depending on what the advisory references.
+- `requires_action_by:<agent>`: Who needs to respond (e.g., `requires_action_by:bravo`). Required on `coordination` findings; optional on others.
+- `action_type:<type>`: One of `re-scope`, `re-prioritize`, `investigate`, `acknowledge`. Required on `coordination` findings; omitted on others.
 
 **Severity determines response urgency:**
 - `invalidates`: Receiving agent auto-creates investigation goal during Phase 2.07
@@ -213,12 +277,69 @@ this additional structure in the tags.
 - `enables`: Receiving agent boosts affected goals
 - `informs`: Awareness only — logged, no automatic action
 
-**Example:**
+### finding_kind Taxonomy
+
+The `finding_kind` tag disambiguates the use case so `insight-trigger-gate.py`
+routes only the right subset to action. Origin: g-248-70 — pre-tag, code-review
+findings (using `affects:<file>`) bypassed the gate's `affects:<goal-id>` filter,
+silently dropping ~70% of board findings from action routing.
+
+| Kind | Purpose | `affects:` form | Routing |
+|---|---|---|---|
+| `coordination` | Cross-agent action routing — partner must do X next | `affects:<goal-id>` | Routed by `insight-trigger-gate.py`; receiver auto-acts in Phase 2.07 per severity |
+| `code_review` | Bug/quality finding from /fresh-eyes-code or audit on a file | `affects:<file-path>` | NOT routed by the gate; logged for follow-up; may seed an Audit goal manually |
+| `advisory` | Informational — pattern observation, calibration note, deprecated guidance | `affects:<goal-id>` or `affects:<file-path>` | NOT routed; visible via board-read for human/agent review |
+
+`insight-trigger-gate.py _collect_triggers` filters `finding_kind:coordination`
+exclusively. Findings without `finding_kind` are treated as `coordination` for
+backwards compatibility (legacy posts before this taxonomy was introduced).
+
+**Examples by kind:**
 ```bash
+# coordination — partner must investigate during their next iteration
 echo "The config.yaml file is empty — all goals assuming configuration data exists are invalid" | \
   bash core/scripts/board-post.sh --channel findings --type finding \
-    --tags "insight_trigger,severity:invalidates,affects:g-166-06,requires_action_by:bravo,action_type:re-scope,infrastructure"
+    --tags "insight_trigger,finding_kind:coordination,severity:invalidates,affects:g-166-06,requires_action_by:bravo,action_type:re-scope,infrastructure"
+
+# code_review — fresh-eyes pass surfaced a TOCTOU race in a write helper
+echo "guard-419 path: validation runs AFTER append-to-file, so failed validation still mutates jsonl" | \
+  bash core/scripts/board-post.sh --channel findings --type finding \
+    --tags "insight_trigger,finding_kind:code_review,severity:constrains,affects:core/scripts/reasoning-bank.py,fresh-eyes-code"
+
+# advisory — calibration note, no action expected
+echo "Productivity-gate threshold may need re-tuning — last 5 sessions all scored 0.55-0.65" | \
+  bash core/scripts/board-post.sh --channel findings --type finding \
+    --tags "insight_trigger,finding_kind:advisory,severity:informs,affects:core/config/aspirations.yaml"
 ```
+
+### Forward-Routing: insight_trigger → goal queue
+
+Two routing mechanisms close the "board post tagged with action items but no
+goal-queue consumer" gap. Both are read-only on the board (the post itself is
+the durable artifact); both write Apply/Investigate goals into the queue.
+
+| Mechanism | Origin signal | Trigger condition |
+|---|---|---|
+| `core/scripts/insight-trigger-gate.py` | `board_post:<msg_id>` | severity:invalidates findings; partial wiring — currently invoked from `/fresh-eyes-code` only |
+| `core/scripts/insight-trigger-sweep.py` (recurring g-115-754, 1h) | `insight_trigger:<msg_id>` | any severity; aged past 1h grace; scans the last 24h |
+
+Dedup is asymmetric today: the sweep scans world + per-agent aspirations.jsonl
+for BOTH origin_signal formats before filing, so a post already filed by the
+gate as `board_post:<id>` blocks a duplicate `insight_trigger:<id>`. The gate
+relies on aspirations.py's standard duplication-gate (exact-string match on
+origin_signal), so it does NOT recognize the sweep's `insight_trigger:<id>`
+format. In the order-of-firing the sweep is the safer "second responder" —
+if the gate fires first (severity:invalidates path), the sweep correctly
+dedups; if the sweep fires first, the gate could file a duplicate under
+`board_post:<id>` once it gets fully wired into precheck. The 1h grace
+window also lets an author who files their own goal-via-script pre-empt
+the sweep without producing a duplicate.
+
+Canonical incident: msg-20260514-143816-bravo-1073 (bravo audit) posted at
+14:38 with `requires_action_by:alpha + action_type:extend-filter +
+severity:constrains`. Existing gate skipped (not invalidates + not invoked
+from precheck). 2h later no goal existed in any queue. The sweep closes the
+gap for severities the gate doesn't route, with the same dedup guarantees.
 
 ## Locking
 

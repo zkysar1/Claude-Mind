@@ -13,7 +13,7 @@ config:
   merge_threshold: 1
   min_articles_per_child: 2
   decompose_threshold: 80               # line count triggering DECOMPOSE of monolith files
-  max_decompose_per_invocation: 30     # max DECOMPOSE ops per /tree maintain run
+  max_decompose_per_invocation: 50     # max DECOMPOSE ops per /tree maintain run (raised 30→50 at config ceiling 2026-04-18 to match framework-expansion growth rate, g-115-79)
   max_redistribute_per_invocation: 5   # max REDISTRIBUTE ops per /tree maintain run
   compression_ratio_formula: "10 * 1.5^(depth - 2)"  # target compression at each depth
   growth_approval:
@@ -25,10 +25,98 @@ pruning:
   distill_min_retrievals: 5               # minimum retrievals before DISTILL eligible
   distill_line_threshold: 50              # line count threshold for large-but-mediocre nodes
   distill_line_utility_threshold: 0.5     # utility threshold for line-count-based DISTILL
-  max_distill_per_invocation: 5           # max DISTILL ops per /tree maintain run
+  max_distill_per_invocation: 10          # max DISTILL ops per /tree maintain run (raised 5→10 at config ceiling 2026-04-18 for backlog drain, g-115-79)
   retire_sessions_unused: 5              # sessions with 0 retrievals before RETIRE eligible
   retire_noise_threshold: 0.1            # utility below this with 10+ retrievals = actively harmful
   retire_noise_min_retrievals: 10
+
+# Three-tier maintenance budget — read this section top to bottom for the full
+# picture. The standard caps in `config:` above are the daily ceiling.
+# `maintenance.backlog_mode_trigger` (above) raises the caps × 1.5 (ceil)
+# when debt accumulates. `stop_mode_caps` (below) is the OPPOSITE: a small
+# fixed budget for /stop so structural debt drains incrementally without
+# making every stop slow. Tier relationship: standard 50 / backlog 75 / stop 5.
+#
+# Why this tier exists ( family — Magic Wand #4): pre-2026-05-08,
+# stop_mode skipped /tree maintain entirely under tight context. Decompose
+# candidates accumulated for weeks. The fix isn't "skip more to save time" —
+# it's "do a small budget per stop so the queue drains over many stops."
+# Sibling principle: pending-questions sweep (Lane B), structural-progress
+# axis (Lane D #1). All three follow the meta-rule:
+# `core/config/modes/autonomous.md` → "Stop-mode does work."
+stop_mode_caps:
+  max_decompose_per_invocation: 5       # ~20% of typical 24-candidate standing queue → drains in 5 stops
+  max_redistribute_per_invocation: 1    # rare op (typically 0-2 candidates); 1 is sufficient
+  max_distill_per_invocation: 2         # one or two utility-low or oversized leaves per stop
+  max_split_per_invocation: 1           # straggler handler
+  max_sprout_per_invocation: 0          # do NOT create new structural debt during /stop
+  max_merge_per_invocation: 1           # straggler handler
+  max_prune_per_invocation: 1           # straggler handler
+  max_retire_per_invocation: 1          # straggler handler
+  # Wall-clock budget: 5 decomposes × ~5-10s LLM each + 2 distills + a few
+  # single-ops ≈ 45-90s of /tree maintain inside /stop. /stop overall stays
+  # under 3 min on the FAST consolidation path.
+
+# Pre-create duplicate gate (Phase 2 of cognitive-core curation plan).
+# Every write path (/tree add, state-update Step 8 encoding, reflect-tree-update,
+# research-topic sprout, /tree maintain SPROUT) calls tree-dedup-check.py before
+# creating a new child. Stops "breadth without depth" accumulation.
+dedup:
+  sibling_overlap_threshold: 0.6          # Jaccard over distinctive tokens; overlap >= this = reject
+  min_tokens_for_overlap: 3               # skip check when either summary tokenizes to fewer than N
+  enforce_from_depth: 2                   # don't block L1 growth (keeps top-level flexibility)
+
+# Utility-weighted retrieval ranking (Phase 1.5 of cognitive-core curation plan).
+# Reweights base match score by each node's utility_ratio: effective = base * clamp(0.5 + utility_ratio, min, max).
+# Proven-helpful nodes outrank zero-utility ones; bad nodes stop being selected →
+# retrieval_count stops climbing → existing RETIRE rule (retrieval_count == 0 for N sessions) fires naturally.
+retrieval:
+  utility_weight_min: 0.5                       # floor on reweight (zero-utility cap)
+  utility_weight_max: 1.5                       # ceiling (proven-helpful cap)
+  utility_weight_neutral_below_retrievals: 5    # nodes below this retrieval_count get weight 1.0
+
+# Scheduled tree debt check (Phase 4 of cognitive-core curation plan).
+# Runs every N goals in the aspirations loop; invokes /tree maintain when
+# distill/retire candidate count exceeds the threshold. Lowers reliance on
+# session-end consolidation being the only curation trigger.
+tree_debt_check:
+  interval_goals: 3          # run every N completed goals per session
+  debt_threshold: 40         # distill_candidates above this triggers cleanup; ×3 (=120) is the decompose critical threshold in iteration-close.sh. Raised 20→40 (g-001-187, rb-290): at depth 5-7, many 80-113 line leaves are coherent concepts that cannot be meaningfully split. After iter 78 two consecutive backlog drains saw 0/5 decomposes actionable — the signal was noise. 40 keeps genuine monolithic nodes (e.g. 180+ lines flat at shallow depth) detectable while silencing coherent-concept false positives.
+  force_maintain_cooldown_hours: 1.0   # min hours between force_tree_maintain re-emits (g-115-82, rb-280 — prevents signal starving goal progress when backlog drains slower than one-iter cadence)
+
+# Backlog-mode trigger for /tree maintain. When EITHER threshold is met, the
+# maintenance pass should escalate from standard caps to elevated caps
+# (--backlog mode). Single source of truth — consumed by  (recurring
+# tree maintenance sweep). Update HERE rather than editing goal-description prose.
+maintenance:
+  backlog_mode_trigger:
+    min_decompose_candidates: 5    # decompose-candidates count >= this → use --backlog
+    min_days_since_clear: 7        # days since last_backlog_clear_at >= this → use --backlog
+
+# Capability-aware child limits (Phase 3 of cognitive-core curation plan).
+# Parents at early capability levels should cap children low so depth is
+# forced before breadth; mature EXPLOIT/MASTER parents get the full K_soft.
+# Originally shipped in `warn` so 2-3 sessions of real data could inform the
+# caps. Flipped to `block` in  after shadow data confirmed the caps
+# (EXPLORE:2, CALIBRATE:4, EXPLOIT/MASTER:8) match real growth patterns.
+# 2026-05-09 user-directed retune: caps bumped to the configured ceiling
+# (EXPLOIT/MASTER 8→16, CALIBRATE 4→8) and mode reverted to `warn` to remove
+# write-time override ceremony while preserving the structural-fix signal.
+# Real distribution at retune time: 6 of 975 nodes over the 8-cap (0.6%);
+# under the new caps, only domain-intelligence (CALIBRATE, 15) is over-cap and
+# IS a genuine junk drawer worth flagging via warn. EXPLORE stays at 2 —
+# early-stage parents should still genuinely deepen first.
+# Mode values: warn | block | off. Warn mode: log [child-limit] WARN to
+# stderr and allow the write (no debt entry, no exit). Block mode:
+# tree-update.sh --add-child exits 6 on cap violations unless
+# --accept-overflow '<justification>' is passed, which writes a tree-debt
+# entry to world/tree-debt.jsonl.
+child_limits:
+  mode: warn
+  EXPLORE: 2                 # force depth inside parent first
+  CALIBRATE: 8
+  EXPLOIT: 16
+  MASTER: 16
 
 domain_health:
   weights:
@@ -63,6 +151,29 @@ modifiable:
   distill_min_retrievals: {min: 3, max: 10, default: 5}
   max_distill_per_invocation: {min: 1, max: 10, default: 5}
   retire_sessions_unused: {min: 3, max: 10, default: 5}
+  dedup_sibling_overlap_threshold: {min: 0.3, max: 0.9, default: 0.6}
+  dedup_min_tokens_for_overlap: {min: 2, max: 8, default: 3}
+  dedup_enforce_from_depth: {min: 1, max: 5, default: 2}
+  # Phase 1.5 — utility-weighted retrieval ranking.
+  # min floor: 0.1 (near-zero weight crushes all match-score signal for bad nodes;
+  # leave some daylight so evolve can explore). max ceiling: 2.5 (beyond ~1.5 the
+  # utility weight starts drowning the base relevance signal).
+  retrieval_utility_weight_min: {min: 0.1, max: 0.9, default: 0.5}
+  retrieval_utility_weight_max: {min: 1.0, max: 2.5, default: 1.5}
+  retrieval_utility_weight_neutral_below_retrievals: {min: 2, max: 20, default: 5}
+  # Phase 4 — scheduled tree debt check.
+  tree_debt_check_interval_goals: {min: 1, max: 10, default: 3}
+  tree_debt_check_debt_threshold: {min: 5, max: 100, default: 20}
+  # Backlog-mode trigger — see `maintenance.backlog_mode_trigger` above.
+  maintenance_backlog_min_decompose_candidates: {min: 1, max: 50, default: 5}
+  maintenance_backlog_min_days_since_clear: {min: 1, max: 30, default: 7}
+  # Phase 3 — capability-aware child limits. mode excluded (enum, not numeric).
+  # 2026-05-09 retune: defaults raised to ceiling for EXPLOIT/MASTER/CALIBRATE
+  # (see child_limits block above for rationale). Defaults must match active values.
+  child_limits_explore: {min: 1, max: 4, default: 2}
+  child_limits_calibrate: {min: 2, max: 8, default: 8}
+  child_limits_exploit: {min: 4, max: 16, default: 16}
+  child_limits_master: {min: 4, max: 16, default: 16}
 
 # Entity cross-link index configuration (HindSight-inspired)
 entity_index:
@@ -72,7 +183,11 @@ entity_index:
     - reflect          # Step 7.5b: extract from ABC chains
   entity_types: [person, organization, concept, metric, event]
 
-# L1 domains — the four fundamental branches every agent starts with
+# L1 domains — the fundamental branches every agent starts with.
+# Phase 2 of tree-taxonomy review (S8): l1_domains is MODIFIABLE via the
+# user-approval gate. See `structural_modifiable.l1_domains` below for the
+# allowed-changes scope and `core/config/conventions/l1-taxonomy-changes.md`
+# for the apply protocol.
 l1_domains:
   - key: execution
     file: world/knowledge/tree/execution.md
@@ -86,6 +201,30 @@ l1_domains:
   - key: system
     file: world/knowledge/tree/system.md
     summary: "HOW we work — meta-knowledge about the agent's own operation"
+
+# --- STRUCTURAL MODIFIABLE (S8 — user-approval-gated taxonomy changes) ---
+# Separate from `modifiable:` because these changes are NOT numeric param
+# tuning — they alter categorical structure. Evolution engine can PROPOSE
+# changes via pending-question; user approves before any apply script runs.
+# See `core/config/conventions/l1-taxonomy-changes.md` for the protocol.
+#
+# Locked scope (2026-05-14): RENAME and ADD only. RETIRE and RESHAPE need a
+# separate dedicated workflow because they require atomic reparenting of
+# the L1's entire subtree — out of scope for this iteration.
+structural_modifiable:
+  l1_domains:
+    scope: [rename, add]
+    requires_user_approval: true
+    apply_scripts:
+      rename: core/scripts/l1-domain-rename.sh
+      add: core/scripts/l1-domain-add.sh
+    proposal_template_pending_id_prefix: l1-taxonomy-
+    rationale: |
+      The four L1s have not been re-evaluated since framework birth. S1
+      surfaces distribution skew (intelligence 69x performance at first
+      measurement). When skew or new-L1 emergence signals warrant it, the
+      evolution engine should propose changes via pending-question, NOT
+      auto-apply. User approval is the gate.
 
 # --- NODE TEMPLATES ---
 # Reference templates for tree node creation. Used by /tree, /research-topic,

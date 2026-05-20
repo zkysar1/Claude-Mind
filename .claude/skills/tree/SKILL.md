@@ -1,9 +1,9 @@
 ---
 name: tree
-description: "Knowledge tree operations — read, find, add, edit, set, decompose, distill, maintain, stats, validate"
+description: "Knowledge-tree operations entry point dispatching to sub-commands: read (node content), find (search), add (new node), edit (existing node), set (field update), decompose (split large node), distill (summarize), maintain (rebalance), stats (counts & health), validate (schema check). Use whenever the agent needs to read, modify, reorganize, or audit the world knowledge tree — the user says \"add a node about X\", \"update the Y node\", \"reorganize this category\", or reflection/encoding produces a tree write. Canonical entry point; never edit _tree.yaml or node .md files directly."
 type: system
 user-invocable: false
-triggers: []
+triggers: [knowledge-tree, tree-maintain, tree-decompose, tree-distill, tree-node, tree-read, tree-add, tree-edit, tree-validate]
 reads:
   - world/knowledge/tree/_tree.yaml
   - core/config/memory-pipeline.yaml
@@ -23,6 +23,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [tree-retrieval]
 minimum_mode: reader
+revision_id: "skill-bootstrap-tree-cd036b"
+previous_revision_id: null
 ---
 
 # /tree — Knowledge Tree Operations
@@ -34,7 +36,7 @@ with granular read/write operations that any skill can call.
 Supports recursive knowledge tree at arbitrary depth up to D_max=20.
 
 ## Mode Gate for Write Operations
-For sub-commands: add, edit, set, decompose, distill, maintain
+For sub-commands: add, edit, set, decompose, distill, maintain, reparent
 Bash: `session-mode-get.sh`
 - If mode is `reader`: output "Tree write operations require assistant mode. Run `/start --mode assistant` to enable." STOP.
 - If mode is `assistant` or `autonomous`: PROCEED.
@@ -51,6 +53,7 @@ Read-only sub-commands (read, find, stats, validate) work in all modes.
 /tree decompose <key>               — Break a large node into children
 /tree distill <key>                 — Extract actionable kernel, archive narrative
 /tree maintain                      — Full batch maintenance (DECOMPOSE, REDISTRIBUTE, DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE)
+/tree reparent <node> <new-parent>   — Move node (and subtree) to a new parent
 /tree stats                         — Tree health overview
 /tree validate                      — Consistency check
 ```
@@ -113,10 +116,15 @@ parent_node=$(bash core/scripts/tree-read.sh --node <parent>)
 # Strip .md from parent file, use as directory, append {key}.md
 child_path = parent_node.file with .md stripped + "/" + key + ".md"
 
-# 2. Create the .md file with YAML front matter
+# 2. Create the .md file with YAML front matter.
+#    Creator owns the initial mechanical fields (last_updated, trigger.session,
+#    trigger.source, trigger.type). Layer A's hook keeps them fresh on
+#    subsequent edits but does NOT initialize them — the file isn't yet
+#    registered in _tree.yaml when the Write fires, so Layer A early-exits.
 Write {child_path}:
 ---
 topic: <key in title case>
+last_updated: '<today>'
 last_update_trigger:
   type: tree_growth
   source: "/tree add"
@@ -126,16 +134,33 @@ last_update_trigger:
 
 {summary}
 
-# 3. Register child + propagate (atomic single write)
+# 3. Register child + propagate (atomic single write).
+#    --encoding-source attributes this write to the /tree add path in the
+#    L1 pick log (S9). Auto-logging fires regardless; this enriches the
+#    entry. Pass --encoding-reason "<short why>" when the call site has
+#    semantic context worth capturing (a one-line "why this L1").
 echo '{"operations": [
   {"op": "add-child", "key": "<parent>", "child": {"key": "<key>", "summary": "<summary>"}},
   {"op": "propagate", "key": "<parent>"}
-]}' | bash core/scripts/tree-update.sh --batch
+]}' | bash core/scripts/tree-update.sh --batch --encoding-source tree-add
 ```
 
 ## Sub-Command: /tree edit <key>
 
-Read a node for editing, then sync `_tree.yaml` metadata after changes.
+Read a node for editing, then perform the SEMANTIC re-evaluation that
+Layer A cannot do mechanically.
+
+Three-layer consistency model:
+- **Layer A** (`tree-sync-check.sh` PostToolUse hook → `tree-front-matter-sync.py`)
+  auto-fixes mechanical fields on EVERY tree-node Edit/Write, regardless of
+  whether `/tree edit` was the entry point: front-matter `last_updated`,
+  `last_update_trigger.session`, `last_update_trigger.source` (filled from
+  in-flight goal if missing), and `_tree.yaml.<key>.last_updated`.
+- **Layer B** (this Step 4) handles semantic fields that need LLM judgment:
+  `_tree.yaml.summary`, front-matter `topic`, `last_update_trigger.type`.
+- **Layer C** (`guard-503`) reminds direct-Edit callers (those who skip
+  `/tree edit`) to run the semantic walk anyway when the body change was
+  material.
 
 ```
 # 1. Get node metadata
@@ -145,9 +170,46 @@ node=$(bash core/scripts/tree-read.sh --node <key>)
 Read {node.file}
 
 # 3. (Caller makes edits via Edit tool)
+#    Layer A's PostToolUse hook fires automatically here, mutating
+#    last_updated + trigger.session + trigger.source. Do NOT manually
+#    re-stamp those fields — the hook owns them.
 
-# 4. After editing, update _tree.yaml metadata
-bash core/scripts/tree-update.sh --set <key> last_updated "$(date +%Y-%m-%d)"
+# 4. Layer B: SEMANTIC re-evaluation. Walk these three questions before
+#    declaring the edit complete. Each is LLM-judgment that no script can
+#    replace. Skip any question whose answer is genuinely "no change" —
+#    but answer all three.
+
+#    Q1 — TOPIC DRIFT
+#      Re-read the body's H1 and the first paragraph.
+#      Does front-matter `topic` still describe the same thing?
+#      If body's scope shifted (e.g., was about "X retry logic", now covers
+#      "X retry + Y fallback"), Edit the .md file's front-matter topic line
+#      to match. Layer A will not touch topic.
+
+#    Q2 — SUMMARY DRIFT
+#      Read the current _tree.yaml summary:
+#        bash core/scripts/tree-read.sh --node <key>
+#      The `summary` field is what `retrieve.sh` shows in previews and
+#      what the agent matches against during retrieval. If body added,
+#      removed, or replaced a major topic, the summary likely no longer
+#      describes the gist. Decision rule: would a future reader retrieving
+#      by this summary be misled about what they'll find? If yes, refresh:
+#        bash core/scripts/tree-update.sh --set <key> summary "<new one-line>"
+#      Keep summaries dense and specific — they drive retrieval ranking.
+
+#    Q3 — EDIT CATEGORIZATION
+#      Set front-matter `last_update_trigger.type`. Layer A leaves this
+#      blank because it cannot infer WHAT KIND of edit you made.
+#      Common values:
+#        - knowledge_reconciliation — corrected facts based on new evidence
+#        - direct_correction       — typo, polish, formatting
+#        - decompose               — split sections out into children
+#        - distill                 — extracted kernel, archived narrative
+#        - tree_growth             — added new content to a growing area
+#        - audit_followup          — encoded an audit finding
+#      This field drives session_artifacts_count.py — getting it right
+#      matters for the productivity gate (maintenance vs real encoding).
+#      Edit the .md file's front-matter to add/update the type line.
 
 # 5. Check growth triggers
 Read core/config/tree.yaml for decompose_threshold
@@ -271,19 +333,25 @@ If `growth_state` field is missing from the node, check `decompose_threshold` di
    c. Compute child directory from parent's file path: strip `.md` extension, use as
       directory name
    d. Create child leaf files in the new subdirectory, one per cluster:
-      - Each child gets minimal YAML front matter: `topic`, `last_update_trigger`
-        (node_type, depth, parent, capability_level set automatically by `add-child` batch op)
+      - Each child gets minimal YAML front matter: `topic`, `last_updated: '<today>'`,
+        `last_update_trigger` (with `type: decompose`, `source: "/tree maintain"`,
+        `session: {current_session}`). node_type, depth, parent, capability_level
+        are set automatically by the `add-child` batch op (which also sets
+        `_tree.yaml.<key>.last_updated` per cmd_add_child).
       - Move the relevant `##` sections into each child file
-   e-f. Atomically convert parent + register all children + propagate (ONE batch call):
+   e-f. Atomically convert parent + register all children + propagate (ONE batch call).
+        --encoding-source attributes the new children to /tree maintain DECOMPOSE
+        in the L1 pick log (S9). The auto-logger uses this to distinguish
+        structural-debt-driven children from agent-judgment SPROUTs.
       echo '{"operations": [
         {"op": "set", "key": "<parent-key>", "field": "node_type", "value": "interior"},
         {"op": "set", "key": "<parent-key>", "field": "article_count", "value": 0},
         {"op": "add-child", "key": "<parent-key>", "child": {"key": "<child-1>", "summary": "..."}},
         ...repeat for each child...
         {"op": "propagate", "key": "<parent-key>"}
-      ]}' | bash core/scripts/tree-update.sh --batch
+      ]}' | bash core/scripts/tree-update.sh --batch --encoding-source tree-maintain-decompose
    g. Append to `tree_growth_log`: `{op: DECOMPOSE, node, children, date, reason}`
-   Cap: process up to `config.max_decompose_per_invocation` candidates (default 7, largest first).
+   Cap: process up to `config.max_decompose_per_invocation` candidates (default 50, largest first — single source of truth is core/config/tree.yaml, raised 30→50 in 2026-04-18 per g-115-79).
 
 #### 1.5. REDISTRIBUTE — Move interior node body content into children
 
@@ -344,7 +412,7 @@ of utility tracking have accumulated signal.
 2. Find best parent at any depth
 3. Depth guard: abort if `parent.depth + 1 > D_max` (20)
 4. Compute child file path from parent's `file` field
-5. Create node, register via `tree-update.sh --add-child`
+5. Create node, register via `tree-update.sh --add-child --encoding-source tree-maintain-sprout` (the --encoding-source flag attributes the new node to the SPROUT path in `meta/l1-pick-log.jsonl` — S9; pass --encoding-reason "<why this L1>" to enrich the entry)
 6. Log to tree_growth_log. K_max is soft limit.
 
 #### 4. MERGE — Absorb sparse nodes into siblings
@@ -405,6 +473,63 @@ validation=$(bash core/scripts/tree-read.sh --validate)
 ```
 If validation fails: log errors, attempt auto-repair for common issues.
 
+#### 9. Record Maintenance
+
+Always invoked — records that `/tree maintain` ran to completion. Writes
+`maintenance.last_maintain_at` so callers (aspirations precheck, reports,
+consolidation audits) have a verifiable cadence signal. Cleared state
+(`last_backlog_clear_at`) is auto-computed by tree.py from post-run debt
+vs `tree_debt_check.debt_threshold` — the caller does not pass it.
+
+**Instrumentation (required)**: As you perform actions in steps 1–5.5,
+maintain an in-memory counter dict tracking what you actioned and what you
+reasoned-past. Shape:
+
+```
+{
+  "mode": "standard" | "backlog",
+  "started_at": "<ISO timestamp captured at step 1 start>",
+  "decompose":    {"actioned": N, "skipped_by_reason": {"coherent_concept": N, ...}, "children_created": N},
+  "distill":      {"actioned": N, "skipped_by_reason": {"still_useful": N, ...}, "bytes_removed": N},
+  "redistribute": {"actioned": N, "skipped_by_reason": {...}},
+  "split":        {"actioned": N, "skipped_by_reason": {...}},
+  "sprout":       {"actioned": N},
+  "merge":        {"actioned": N, "skipped_by_reason": {...}},
+  "prune":        {"actioned": N},
+  "retire":       {"actioned": N, "skipped_by_reason": {...}}
+}
+```
+
+`skipped_by_reason` keys are free-form strings chosen by the LLM
+(e.g. `coherent_concept`, `still_useful`, `risk_of_fragmenting`). Use
+concise, reusable reasons so aggregates stay readable. Python-side pre-filter
+skip counts are computed automatically by tree.py (`has_children`, `no_file`,
+`depth_at_dmax`, `file_not_found`, `read_error`, `below_line_threshold`,
+`insufficient_retrievals`, `utility_above_threshold`) — do NOT include those
+in your LLM-reported dict.
+
+Pipe the counter dict as stdin JSON with `--with-run-record`. Wrapping the
+JSON in a HEREDOC keeps special characters safe in bash:
+
+```
+bash core/scripts/tree-update.sh --record-maintenance --with-run-record <<'EOF'
+{"mode":"standard","started_at":"...","decompose":{...},"distill":{...},...}
+EOF
+```
+
+The script appends a full run record to `world/tree-maintenance-log.jsonl`
+(merging pre-filter skip counts + llm-reported counts + post-run debt) AND
+writes the `maintenance` cadence block as today.
+
+Running without `--with-run-record` is still supported (legacy callers) and
+skips the JSONL append. New maintain invocations should always include it.
+
+`_tree.yaml.maintenance.last_maintain_at` is the SINGLE source of truth for
+tree-maintenance cadence. Callers (Phase 8.8) read it via `tree-read.sh
+--maintenance`. Do NOT add a working-memory mirror — the dual-source pattern
+introduces divergence risk across crash boundaries with no compensating benefit.
+The JSONL log is instrumentation, not an alternate cadence source.
+
 ### Completion Criteria (maintain only)
 
 1. All DECOMPOSE candidates processed (or cap reached with remainder logged)
@@ -412,6 +537,7 @@ If validation fails: log errors, attempt auto-repair for common issues.
 3. All SPLIT, SPROUT, MERGE, PRUNE operations evaluated AND executed where triggered
 4. Validation passes
 5. Tree node count changed if DECOMPOSE or SPLIT candidates existed
+6. `maintenance.last_maintain_at` updated via `tree-update.sh --record-maintenance`
 
 **Failure states** (do NOT mark goal completed):
 - Candidates identified but not acted on
@@ -420,29 +546,162 @@ If validation fails: log errors, attempt auto-repair for common issues.
 
 ### /tree maintain --backlog
 
-One-time backlog cleanup mode for trees with accumulated structural debt.
-Same operations as `/tree maintain` but with elevated caps:
+Backlog cleanup mode for trees with accumulated structural debt.
+Same operations as `/tree maintain` but with elevated caps. Standard caps live
+in `core/config/tree.yaml` (single source of truth). Backlog mode multiplies
+each standard cap by 1.5 (ceil), bounded by the corresponding `modifiable.max`
+ceiling in `tree.yaml`:
 
-- DECOMPOSE cap: 15 (vs standard 10)
-- REDISTRIBUTE cap: 10 (vs standard 5)
+- DECOMPOSE: `min(ceil(max_decompose_per_invocation * 1.5),
+  modifiable.max_decompose_per_invocation.max)`
+- REDISTRIBUTE: `min(ceil(max_redistribute_per_invocation * 1.5),
+  modifiable.max_redistribute_per_invocation.max)`
+- DISTILL: `min(ceil(max_distill_per_invocation * 1.5),
+  modifiable.max_distill_per_invocation.max)`
+
+Other differences from standard mode:
 - Processes ALL candidates regardless of `growth_state` field value
   (standard mode requires `growth_state: ready_to_decompose` or checks threshold;
   backlog mode checks threshold directly for every leaf node)
 - Processes candidates largest-first (by .md line count)
 
-**When to use**: After deploying threshold changes, or when `tree-read.sh --decompose-candidates`
-shows a large backlog (10+ candidates). Not needed for routine maintenance.
+**When to use**: Auto-invoked by aspirations loop Phase 8.7 and by
+consolidation Step 6 when
+`(decompose_candidates + distill_candidates) > tree_debt_check.debt_threshold * 3`.
+Can also be run manually after deploying threshold changes.
 
 **Steps**:
 1. `Bash: tree-read.sh --decompose-candidates` (uses current decompose_threshold)
 2. `Bash: tree-read.sh --redistribute-candidates`
-3. Process DECOMPOSE candidates (up to 15, largest first) — same steps as standard DECOMPOSE
-4. Process REDISTRIBUTE candidates (up to 10, largest first) — same steps as standard REDISTRIBUTE
-5. Run standard DISTILL, SPLIT, SPROUT, MERGE, PRUNE, RETIRE with normal caps
-6. Log: "BACKLOG CLEANUP: {decomposed} decompositions, {redistributed} redistributions, {total_new_nodes} new nodes created"
-7. `Bash: tree-read.sh --validate` — verify structural integrity after bulk changes
+3. Compute elevated caps from `core/config/tree.yaml` standard × 1.5 (ceil),
+   bounded by the `modifiable.max` ceiling for each parameter.
+4. Process DECOMPOSE candidates (up to elevated cap, largest first) —
+   same steps as standard DECOMPOSE.
+5. Process REDISTRIBUTE candidates (up to elevated cap, largest first) —
+   same steps as standard REDISTRIBUTE.
+6. Process DISTILL candidates (up to elevated cap, largest first).
+7. Run SPLIT, SPROUT, MERGE, PRUNE, RETIRE with normal caps.
+8. Log: "BACKLOG CLEANUP: {decomposed} decompositions, {redistributed} redistributions, {distilled} distillations, {total_new_nodes} new nodes created"
+9. `Bash: tree-read.sh --validate` — verify structural integrity after bulk changes.
+10. Record maintenance with `--backlog-mode --with-run-record`. Pipe the
+    instrumentation counter dict (same schema as standard step 9, with
+    `"mode":"backlog"`) on stdin. tree.py auto-computes whether backlog drained
+    below `tree_debt_check.debt_threshold` and sets `last_backlog_clear_at`
+    accordingly, AND appends a run record to `world/tree-maintenance-log.jsonl`.
+    ```
+    bash core/scripts/tree-update.sh --record-maintenance --backlog-mode --with-run-record <<'EOF'
+    {"mode":"backlog","started_at":"...","decompose":{...},"distill":{...},...}
+    EOF
+    ```
+    (Same single-source-of-truth rule as standard step 9 — no WM mirror.
+    The JSONL log is instrumentation for drain-rate diagnostics.)
 
 After backlog cleanup, subsequent `/tree maintain` calls use standard caps.
+
+### /tree maintain --stop-mode
+
+Stop-mode maintenance for session-end consolidation. Same operations as standard
+`/tree maintain` but with a small fixed budget from `core/config/tree.yaml`
+`stop_mode_caps` section. Designed to drain ~20% of standing structural debt per
+/stop invocation while keeping /stop under 3 minutes wall-clock.
+
+The three-tier cap relationship: standard 50 / backlog 75 / stop 5. Read
+`stop_mode_caps` in `tree.yaml` for the full ratio across all op types.
+
+Caps (from `stop_mode_caps` in `core/config/tree.yaml`):
+- DECOMPOSE: `stop_mode_caps.max_decompose_per_invocation` (default 5)
+- REDISTRIBUTE: `stop_mode_caps.max_redistribute_per_invocation` (default 1)
+- DISTILL: `stop_mode_caps.max_distill_per_invocation` (default 2)
+- SPLIT: `stop_mode_caps.max_split_per_invocation` (default 1)
+- SPROUT: `stop_mode_caps.max_sprout_per_invocation` (default 0 — do NOT create new debt during /stop)
+- MERGE: `stop_mode_caps.max_merge_per_invocation` (default 1)
+- PRUNE: `stop_mode_caps.max_prune_per_invocation` (default 1)
+- RETIRE: `stop_mode_caps.max_retire_per_invocation` (default 1)
+
+Other behavior identical to standard mode (processes candidates largest-first).
+
+**When to use**: Invoked from `core/config/consolidation-housekeeping.md` Step 6
+when stop_mode is active. NOT auto-elevated to backlog mode (the whole point is
+small budget, not big drain). NEVER invoked from a normal iteration close — that
+path uses standard or backlog caps based on the debt threshold.
+
+**Why this exists** (Magic Wand #4 — see `core/config/modes/autonomous.md`
+"Stop-mode does work"): pre-2026-05-08, stop_mode skipped /tree maintain
+entirely under tight context, leaving decompose candidates to accumulate for
+weeks. The fix isn't "skip more to save time" — it's "do a small budget per
+stop so the queue drains over many stops." Sibling principle: pending-questions
+sweep (Lane B), structural-progress productivity axis (Lane D #1).
+
+**Steps**:
+1. `Bash: tree-read.sh --decompose-candidates`
+2. `Bash: tree-read.sh --redistribute-candidates`
+3. Read `stop_mode_caps` from `core/config/tree.yaml`.
+4. Process DECOMPOSE candidates (up to stop cap, largest first).
+5. Process REDISTRIBUTE candidates (up to stop cap, largest first).
+6. Process DISTILL candidates (up to stop cap, largest first).
+7. Run SPLIT, MERGE, PRUNE, RETIRE with stop caps. SKIP SPROUT (cap=0 means
+   no new node creation during /stop — bias toward draining, not adding).
+8. Record maintenance with `--stop-mode --with-run-record`. Pipe the
+   instrumentation counter dict (same schema as standard, with `"mode":"stop"`)
+   on stdin. Sets `maintenance.last_stop_mode_at` for cadence visibility.
+   ```
+   bash core/scripts/tree-update.sh --record-maintenance --stop-mode --with-run-record <<'EOF'
+   {"mode":"stop","started_at":"...","decompose":{...},"distill":{...},...}
+   EOF
+   ```
+   The JSONL log entry at `world/tree-maintenance-log.jsonl` records `mode: "stop"`
+   and the per-op `actioned` counts. The Lane D #1 productivity-gate structural
+   axis reads these entries to credit /stop-time drain as legitimate work.
+
+## Sub-Command: /tree reparent <node> <new-parent>
+
+Move a node (and its entire subtree) to a new parent. Updates all YAML metadata
+atomically. Reports physical file moves for the agent to execute.
+
+```
+result=$(bash core/scripts/tree-update.sh --reparent <node> <new-parent>)
+# Returns JSON:
+# {
+#   "reparented": "<node>",
+#   "old_parent": "<old-parent-key>",
+#   "new_parent": "<new-parent-key>",
+#   "new_depth": N,
+#   "file_moves": [{"key": "<node>", "old": "world/...", "new": "world/..."}, ...],
+#   "old_chain_propagation": {...},
+#   "new_chain_propagation": {...}
+# }
+
+# The command handles atomically:
+# - Remove node from old parent's children, add to new parent's children
+# - Update node's parent field
+# - Recursively recompute file paths and depths for entire subtree
+# - Update node_type (old parent → leaf if childless, new parent → interior if was leaf)
+# - Propagate confidence up both old and new parent chains
+
+# Guards (rejects with exit 1):
+# - Cannot reparent root
+# - Cannot reparent a node to itself
+# - Cannot reparent to a descendant (circular)
+# - Cannot reparent to current parent (no-op)
+# - Cannot reparent if subtree would exceed D_max
+
+# AFTER the command succeeds, execute physical file moves.
+# file_moves[0] is always the reparented node itself.
+# For interior nodes: moving the directory implicitly moves all descendants,
+# so only the top-level node needs explicit handling.
+top = result.file_moves[0]
+old_abs = resolve_file_path(top.old)
+new_abs = resolve_file_path(top.new)
+mkdir -p $(dirname new_abs)
+mv old_abs new_abs
+# If node is interior, move the directory (carries all children)
+old_dir = old_abs without .md
+new_dir = new_abs without .md
+IF old_dir exists as directory:
+    mv old_dir new_dir
+# Verify: remaining file_moves entries should now resolve to existing files
+# (moved implicitly by the directory move)
+```
 
 ## Sub-Command: /tree stats
 
@@ -471,9 +730,9 @@ validation=$(bash core/scripts/tree-read.sh --validate)
 # Returns: {valid: true/false, errors: [...], warnings: [...]}
 
 IF validation.valid:
-  Output: "Tree validation PASSED"
+  Bash: echo "Tree validation PASSED"
 ELSE:
-  Output: "Tree validation FAILED: {errors}"
+  Bash: echo "Tree validation FAILED: {errors}"
   Attempt auto-repair for: mismatched child_count, broken parent refs
 ```
 
@@ -513,3 +772,10 @@ ELSE:
 - **Reads**: `world/knowledge/tree/_tree.yaml`, node `.md` files, `core/config/memory-pipeline.yaml`, `core/config/tree.yaml`
 - **Writes**: `world/knowledge/tree/_tree.yaml`, node `.md` files, `world/knowledge/archived/`
 - **Does NOT call**: any other skills (pure tree operations)
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is the last tree-script call (`tree-find-node.sh`, `tree-add.sh`,
+`tree-set.sh`, etc.) or the Edit/Write of a node `.md` file. Never end with a text
+summary — the tree mutation IS the output.

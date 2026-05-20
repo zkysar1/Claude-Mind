@@ -1,0 +1,238 @@
+# Schema Registry — canonical field names for each JSONL store.
+#
+# Purpose: single source of truth for schema-drift-sweep.py.
+#   - live_fields:  dotted paths confirmed present in live records (probe validates)
+#   - stale_fields: legacy names that appear in pseudocode but are absent in live data
+#                   map: stale_name -> live_equivalent (or "REMOVED" when no replacement)
+#
+# When a script changes a schema, update this file AND update SKILL.md pseudocode
+# in the same change. The sweep will catch anyone who forgets.
+#
+# allowlist: known-legitimate mentions of stale field names that must NOT be flagged.
+#   Format: "path/to/file:line:field"  or  "path/to/file:*:field" (all lines).
+#   Each allowlisted hit is still reported under "allowlisted_hits" for auditability.
+#
+# Live probes run against each store's jsonl_path at every sweep. If the registry
+# claims a live_field that's absent in the latest record, exit 2 (registry-drifted).
+# Source of last probe: bravo session 48 (2026-04-18), from the same investigation
+# that produced rb-245 and rb-259.
+
+stores:
+
+  pattern-signatures:
+    jsonl_path: world/pattern-signatures.jsonl
+    live_fields:
+      - id
+      - name
+      - status
+      - outcome_stats.total
+      - outcome_stats.confirmed
+      - outcome_stats.accuracy
+      - utilization.retrieval_count
+      - utilization.last_retrieved
+      - validation_status
+    # NOTE: `utilization.retrieval_count` and `utilization.last_retrieved`
+    # are populated LAZILY on first retrieval — newly-created signatures
+    # legitimately lack them until matched by the recall path (e.g. sig-007
+    # was just created with utilization=null at time of ). The
+    # last-N-records probe (, default look_back=10 in
+    # schema-drift-sweep.py probe_live_fields) considers a field present
+    # if ANY recent record carries it non-null, so these correctly stay
+    # in live_fields without false REGISTRY-DRIFTED firings.
+    stale_fields:
+      # Only list field names unambiguous enough that grep won't produce noise
+      # from cross-domain uses. Names like `utility_ratio`, `times_useful`, and
+      # `question` are too common (tree-node concept, reasoning-bank utilization,
+      # English word) — those need context-aware detection (future work).
+      hit_rate: outcome_stats.accuracy
+      times_triggered: outcome_stats.total
+      false_positive_rate: derived_from_outcome_stats_accuracy
+      false_positives: derived_from_outcome_stats
+
+  reasoning-bank:
+    jsonl_path: world/reasoning-bank.jsonl
+    live_fields:
+      - id
+      - title
+      - type
+      - category
+      - status
+      - utilization.retrieval_count
+      - utilization.times_helpful
+      - utilization.times_noise
+      - utilization.times_active
+      - utilization.times_skipped
+      - utilization.times_inferred_helpful
+      - utilization.utilization_score
+    stale_fields: {}
+
+  guardrails:
+    jsonl_path: world/guardrails.jsonl
+    live_fields:
+      - id
+      - rule
+      - category
+      - status
+      - when_to_use.conditions
+      - when_to_use.category
+      - utilization.retrieval_count
+      - utilization.times_helpful
+      - utilization.times_noise
+      - utilization.times_active
+      - utilization.times_skipped
+      - utilization.utilization_score
+    stale_fields: {}
+
+  pipeline:
+    jsonl_path: world/pipeline.jsonl
+    live_fields:
+      - id
+      - title
+      - position
+      - claim
+      - horizon
+      - confidence
+      - stage
+      - formed_date
+      - reflected
+    # NOTE: `hypothesis` was renamed to `claim` ( iter-34, 2026-04-25).
+    # NOT added to stale_fields because the word is too ambiguous — it appears
+    # 284+ times in skill prose as the conceptual term for the entire pipeline
+    # category (not field references). Per the registry preamble (lines 35-38):
+    # "Names like `utility_ratio`, `times_useful`, and `question` are too common
+    # — those need context-aware detection (future work)." `hypothesis` falls
+    # in the same bucket. If a skill genuinely references the OLD field name in
+    # code, expect it to break loudly at runtime — that's the better signal
+    # than a false-positive flood.
+    #
+    # `claim` is REQUIRED for non-discovered stages (pipeline.py L253-262
+    # validate_formation_quality) but optional for stage=discovered drafts.
+    # The last-N-records probe (, default look_back=10 in
+    # schema-drift-sweep.py probe_live_fields) considers a field present
+    # if ANY recent record carries it non-null — handling the stage-conditional
+    # case without false REGISTRY-DRIFTED firings.
+    #
+    # `source_goal` was removed from live_fields (, 2026-05-10) because
+    # it is purely optional caller-supplied metadata (never validated). Empirically
+    # only 38/133 historical records carry it, and the last 10 records all
+    # legitimately lack it — far below the look_back=10 ANY-record threshold. The
+    # field is still ALLOWED in records (callers can set it); it's just not
+    # required for drift-clean status. Consumers that depend on it
+    # (chronic-friction-aggregator.py L132, pending-questions-sweep.py L227,
+    # aspiration-trajectory.py L57+) tolerate its absence with `.get("source_goal", "")`
+    # patterns.
+    stale_fields: {}
+
+  aspirations:
+    jsonl_path: world/aspirations.jsonl
+    live_fields:
+      - id
+      - title
+      - status
+      - priority
+      - scope
+      - goals
+      - progress.completed_goals
+      - progress.total_goals
+      - progress.recurring_goals
+      - sessions_active
+      - archived
+    stale_fields: {}
+
+  spark-questions:
+    # Lives on the meta/ mount (per-agent config). Not probed by this sweep
+    # unless meta path is configured and accessible.
+    jsonl_path: meta/spark-questions.jsonl
+    live_fields:
+      - id
+      - text
+      - category
+      - type
+      - status
+      - times_asked
+      - sparks_generated
+      - yield_rate
+    stale_fields: {}
+      # `question` would be listed here as the legacy name (live is `text`), but
+      # "question" is too common an English word for grep-based detection.
+      # Context-aware detection (future work) — e.g., only flag `q["question"]`
+      # or `q.question` — would catch these cleanly.
+
+  experience:
+    # Per-agent. The sweep probes whichever agent is bound via MIND_AGENT.
+    jsonl_path: "<agent>/experience.jsonl"
+    live_fields:
+      - id
+      - type
+      - created
+      - category
+      - summary
+      - content_path
+    stale_fields: {}
+
+  journal:
+    # Per-agent index file. Per-day .md entries are not JSONL.
+    jsonl_path: "<agent>/journal.jsonl"
+    live_fields:
+      - session
+      - date
+      - journal_file
+    stale_fields: {}
+
+allowlist:
+  # Known-legitimate mentions of stale field names. These hits appear in the
+  # "allowlisted_hits" report section for audit, but do NOT count as drift.
+
+  # `hit_rate` as a local variable name in reflect-on-outcome — computed from
+  # outcome_stats.confirmed / outcome_stats.total. The variable is named for
+  # readability; the source fields are correct.
+  - ".claude/skills/reflect-on-outcome/SKILL.md:*:hit_rate"
+
+  # `utility_ratio` is a live tree-node concept (computed by tree.py
+  # _recompute_utility_ratio). Separate from the pattern-signatures utility_ratio
+  # that was removed. These tree-node references are legitimate.
+  - ".claude/skills/aspirations-consolidate/SKILL.md:*:utility_ratio"
+  - ".claude/skills/aspirations-execute/SKILL.md:*:utility_ratio"
+  - ".claude/skills/tree/SKILL.md:*:utility_ratio"
+  - ".claude/skills/verify-learning/SKILL.md:*:utility_ratio"
+
+  # Registry itself contains stale field names in the stale_fields map — not drift.
+  - "core/config/schema-registry.yaml:*:*"
+
+  # This convention file documents the stale→live mapping — legitimate reference.
+  - "core/config/conventions/pattern-signatures.md:*:*"
+
+  # Pre-existing experience records document historical drift findings verbatim.
+  # Their prose contains stale field names by design (as evidence of the drift).
+  - "*/experience/exp-g-115-50.md:*:*"
+  - "*/experience/exp-*.md:*:*"
+
+  # verification-checklist.md contains example strings demonstrating what the
+  # zero-count-gate does when an agent makes a stale-field claim. These are
+  # test-documentation examples, not pseudocode — legitimate mentions.
+  - "core/config/verification-checklist.md:*:*"
+  - "core/config/verification-checklist-domain-specific.md:*:*"
+
+  # audit-before-concluding.md is the convention file for the rb-245 pattern —
+  # it exists specifically to document `times_triggered` as a cautionary example.
+  # Every mention is a legitimate illustration, not pseudocode drift.
+  - "core/config/conventions/audit-before-concluding.md:*:*"
+
+  # reasoning-bank has cross-reference comments mentioning stale names (rb-245
+  # discusses the original times_triggered mistake).
+  - "core/config/conventions/reasoning-guardrails.md:*:*"
+
+  # Rename-documentation allowlist (; migrated to inline markers in ):
+  # These sites previously had line-precise registry entries
+  # (".claude/skills/.../SKILL.md:NNN:field").  replaced the line
+  # coordinates with inline `DRIFT-EXEMPT: <reason>` markers on the source
+  # lines themselves — the marker survives line shifts because the sweep
+  # reads the line content, not the registry coordinate. Sites covered:
+  #   .claude/skills/aspirations-evolve/SKILL.md (was-X/Y rename narrative)
+  #   .claude/skills/reflect/SKILL.md (rename-documentation)
+  #   .claude/skills/verify-learning/SKILL.md (test-input for audit gate)
+  #   core/config/conventions/negative-conclusions.md (anti-pattern illustration)
+  # If a future maintainer needs to add a new rename-documentation site,
+  # tag the source line with `DRIFT-EXEMPT: <reason>` rather than adding a
+  # line-precise entry here. Schema-drift-sweep recognizes the marker as
+  # equivalent to an allowlist entry (see _MARKER_TOKEN in schema-drift-sweep.py).

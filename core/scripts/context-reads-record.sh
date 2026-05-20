@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
 # PostToolUse[Read] hook — record file reads into context-reads tracker.
 # Reads JSON from stdin (tool_input.file_path), records if in scope.
 # Partial reads (offset/limit/pages) are NOT recorded — only full reads are tracked.

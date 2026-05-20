@@ -2,6 +2,10 @@
 # Hippocampal encoding: sensory buffer -> working memory -> consolidation -> long-term
 # Immutable pipeline config. Agent state for category_overrides/weight_log in world/memory-pipeline.yaml
 # Boot reads initial_state to seed state file on first run.
+#
+# This file routes observations through the sensory->encoding-gate->tree pathway.
+# The cross-store routing question ("RB vs guardrail vs pipeline vs experience?")
+# lives in the prose companion: core/config/conventions/learning-routing.md
 
 # --- FRAMEWORK ---
 
@@ -16,7 +20,6 @@ sensory_buffer:
 
 working_memory:
   max_slots: 16
-  chunking_enabled: true
   slot_types:
     - active_constraints
     - active_context
@@ -43,6 +46,20 @@ encoding_gate:
   encode_threshold: 0.40
   skip_threshold: 0.15
   review_range: [0.15, 0.40]
+  # Category-class multiplier — applied to encoding_score AFTER precision bonus,
+  # BEFORE threshold comparison. Class lookup: goal.category → _tree.yaml node
+  # → node.domain_class. Unknown category → 1.00 (neutral).
+  #
+  # SPLIT: core holds framework-scoped entries and neutral defaults only.
+  # Domain-specific entries live in world/memory-pipeline.yaml under the same key.
+  # Readers must MERGE: effective_map = {**core, **world} (world wins on conflict).
+  # Rationale: core is domain-free per .claude/rules/domain-free-examples.md;
+  # non-1.0 multipliers for domain classes are data, not framework.
+  category_class_multiplier:
+    framework-meta: 0.60   # framework learning must clear encode_threshold/0.60 ≈ 0.67
+    mixed:          1.00
+    other:          1.00
+    "":             1.00   # missing/unknown tag
 
 consolidation:
   replay_trigger: "session_end"
@@ -85,7 +102,6 @@ long_term:
     L4: "world/pipeline.jsonl, <agent>/journal/, config/"
 
 forgetting:
-  active_pruning_enabled: true
   prune_trigger: "evolution_check"
   staleness_thresholds:
     fresh: 7
@@ -105,13 +121,23 @@ forgetting:
       analysis: 0.7
       refuted: 0.3
   reconsolidation:
-    enabled: true
     window: "1 session"
     description: >
       When an article is retrieved for use in a hypothesis, it enters a
       reconsolidation window. During that session, new evidence can UPDATE
       the article (not just append) — beliefs become temporarily labile.
       After session end (consolidation pass): reset reconsolidation_window: false.
+
+# C.3: utilization-feedback unknown-counter accumulator + auto-flag.
+# When --infer leaves a supplementary item in the unknown bucket OR --all-unknown
+# fires for a backstop, utilization-feedback.py increments
+# utilization.times_inferred_unknown for that item. After unknown_threshold
+# consecutive unknowns, it sets the top-level `auto_flagged_for_review=true`
+# field, forcing inclusion in B.1's candidate list regardless of evidence.
+# Distinguishes "we tried hard and couldn't classify" from "never retrieved"
+# (retrieval_count=0) — both look identical in evidence terms otherwise.
+curation:
+  unknown_threshold: 5  # consecutive --infer-unknowns before auto-flag
 
 working_memory_pruning:
   stale_threshold_minutes: 30       # Flag for refresh in Phase 11
@@ -130,6 +156,10 @@ working_memory_pruning:
   protected_slots:                  # Only pruned by specific rules (resolution, etc.)
     - known_blockers
     - knowledge_debt
+    # loop_state — single-writer-bash, slot_meta is stale by design (writers
+    # bypass update_modified; ). Without protection, wm-prune evicts
+    # mid-session and Phase -0.5 reinitializes counters/streaks every iteration.
+    - loop_state
 
 micro_hypothesis_consolidation:
   description: >
@@ -274,11 +304,32 @@ experience_staleness:
     min_retrieval_count: 5
     min_utility_ratio: 0.5
 
+# Reasoning bank prioritization — universal (cross-domain) vs. domain partition.
+# retrieve.py uses `_rb_helpers.is_universal_rb` to split active reasoning-bank
+# entries into two result keys:
+#   meta_lessons  — top-N universal lessons (framework-* category OR
+#                   applies_to in {any, framework}), capped, sorted by
+#                   utilization_score desc then created desc.
+#   reasoning_bank — all other active entries (domain-specific).
+# Retrieval counters increment on BOTH partitions (utilization not lost).
+# Entries opt out of universal surfacing via applies_to: specific.
+reasoning_bank_routing:
+  universal_triggers:
+    applies_to_values: [any, framework]
+    category_prefix: "framework-"       # framework-maintenance, framework-patterns, etc.
+  universal_cap: 5                       # top-N surfaced as meta_lessons
+  sort_keys: [utilization_score_desc, created_desc]
+  opt_out_value: specific                # applies_to: specific excludes an entry
+  notes: >
+    Existing framework-* category entries auto-qualify without requiring an
+    explicit applies_to field — no migration needed for rb-226, rb-245, rb-246,
+    rb-258, rb-260, rb-261, etc. Entries with a framework category that are
+    genuinely domain-scoped can set applies_to: specific to opt out.
+
 # Curator quality gate — evaluates QUALITY of knowledge encoding (AutoContext-inspired).
 # Runs between encoding decision and tree write. Complements encoding_gate which decides
 # IF to encode; this decides if the content is GOOD ENOUGH to encode.
 curator_gate:
-  enabled: true
   score_formula: "(coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)"
   pass_threshold: 0.45
   dimensions:
@@ -288,7 +339,6 @@ curator_gate:
   on_fail: "demote_to_overflow"    # don't encode now; consolidation gets second chance
 
 encoding_weight_adaptation:
-  enabled: true
   adjustment_per_session: 0.05
   min_weights:
     novelty: 0.10

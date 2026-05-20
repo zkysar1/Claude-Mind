@@ -24,7 +24,8 @@ from pathlib import Path
 
 # --- Path setup ---
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import WORLD_DIR, AGENT_DIR, CONFIG_DIR
+from _paths import WORLD_DIR, AGENT_DIR, CONFIG_DIR, PROJECT_ROOT
+from _long_path import open_long_path
 
 def load_jsonl(path):
     """Load a JSONL file, returning list of dicts."""
@@ -48,6 +49,131 @@ def load_yaml(path):
     if not p.exists():
         return None
     return yaml.safe_load(p.read_text(encoding="utf-8"))
+
+
+def build_tree_attribution_map(tree_dir):
+    """Scan tree .md files, extract goal-id attribution from front matter.
+
+    Returns {goal_id: count_of_nodes_attributed}. A node attributes when either
+    (a) front matter has a clean source_goal: 'g-NNN-NN' field, or (b) the free-
+    text last_update_trigger.source starts with a goal-id (extract the prefix).
+
+    Both schemas exist in world/knowledge/tree/. Files without a goal-attributable
+    source (semantic descriptors like 'DECOMPOSE category', 'tree_growth') are
+    skipped — those are tree-internal events, not goal-driven encoding.
+
+    rb-601 fix — replaces the broken count_learning_artifacts() category-key
+    proxy that read _tree.yaml node.last_retrieved instead of per-file
+    last_updated provenance.
+    """
+    import re
+    import yaml
+
+    GOAL_ID_PFX = re.compile(r'^(g-\d+-\d+)\b')
+    attribution = {}
+
+    tree_root = Path(tree_dir)
+    if not tree_root.is_dir():
+        return attribution
+
+    for md_path in tree_root.rglob("*.md"):
+        try:
+            # rb-450 / : tree nodes under deeply-nested categories can
+            # exceed Windows MAX_PATH (260 chars). Path.read_text() doesn't
+            # expose the long-path retry; route through open_long_path so
+            # attribution counts don't silently drop those files. POSIX no-op.
+            with open_long_path(md_path) as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not text.startswith("---"):
+            continue
+        end_idx = text.find("\n---", 4)
+        if end_idx < 0:
+            continue
+        try:
+            fm = yaml.safe_load(text[4:end_idx]) or {}
+        except yaml.YAMLError:
+            continue
+        if not isinstance(fm, dict):
+            continue
+
+        # Prefer clean source_goal field if present
+        sg = fm.get("source_goal")
+        if isinstance(sg, str):
+            m = GOAL_ID_PFX.match(sg.strip())
+            if m:
+                gid = m.group(1)
+                attribution[gid] = attribution.get(gid, 0) + 1
+                continue
+
+        # Fall back: extract leading goal-id from free-text source
+        trigger = fm.get("last_update_trigger") or {}
+        if not isinstance(trigger, dict):
+            continue
+        source = trigger.get("source", "")
+        if not isinstance(source, str):
+            continue
+        m = GOAL_ID_PFX.match(source.strip())
+        if m:
+            gid = m.group(1)
+            attribution[gid] = attribution.get(gid, 0) + 1
+
+    return attribution
+
+
+def build_script_convention_attribution_map():
+    """Scan code artifacts (scripts + conventions) for goal-id mentions
+    in header/docstring regions. Returns {goal_id: count} where each file
+    that mentions a goal-id in its first 4000 chars contributes +1.
+
+    Closes the gap where development goals whose primary deliverable is
+    code or convention text receive zero learning-artifact credit from
+    count_learning_artifacts (which only counts rb/guard/pattern/tree
+    encodings). Without this, aspirations like asp-282 — which produced
+    capability-route-gate.py, agent-lanes.md, and the intended_agent
+    schema — show velocity=0 and trip precheck-eval cycles detector's
+    zero_learning_velocity false-positive (g-115-595 / rb-803 / g-115-596).
+
+    Scan targets (each fail-open on missing dir):
+      - core/scripts/*.py, *.sh         framework scripts
+      - core/config/conventions/*.md    framework conventions
+      - {WORLD_DIR}/scripts/*.sh, *.py  domain scripts
+      - {WORLD_DIR}/conventions/*.md    domain conventions
+
+    Attribution rule: each distinct g-NNN-NN matched in the file's first
+    4000 chars yields +1 for that goal-id. Files mentioning multiple
+    goal-ids attribute +1 to each (a single file authored under g-282-01
+    that also cross-references g-282-02 credits both). Multiple files per
+    goal-id accumulate. The 4000-char window targets header/docstring
+    regions where authorship signals concentrate and ignores random mid-
+    body cross-references that are not authorship.
+    """
+    import re
+    pat = re.compile(r"\bg-\d+-\d+\b")
+    attribution = {}
+
+    scan_targets = [
+        (PROJECT_ROOT / "core" / "scripts", ("*.py", "*.sh")),
+        (CONFIG_DIR / "conventions", ("*.md",)),
+        (WORLD_DIR / "scripts", ("*.sh", "*.py")),
+        (WORLD_DIR / "conventions", ("*.md",)),
+    ]
+
+    for root, patterns in scan_targets:
+        if not isinstance(root, Path) or not root.is_dir():
+            continue
+        for glob_pat in patterns:
+            for path in root.glob(glob_pat):
+                try:
+                    text = path.read_text(encoding="utf-8")[:4000]
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for gid in set(pat.findall(text)):
+                    attribution[gid] = attribution.get(gid, 0) + 1
+
+    return attribution
+
 
 def load_config():
     """Load plateau detection config from core/config/aspirations.yaml.
@@ -91,17 +217,18 @@ def get_completed_goals(asp):
     completed.sort(key=sort_key)
     return completed
 
-def count_learning_artifacts(goal, reasoning_bank, guardrails, pattern_sigs, tree_data):
+def count_learning_artifacts(goal, reasoning_bank, guardrails, pattern_sigs,
+                             tree_data, tree_attribution=None,
+                             script_convention_attribution=None):
     """Count learning artifacts produced by or attributable to a goal."""
     gid = goal.get("id", "")
-    cat = goal.get("category", "")
-    started = goal.get("started")
 
     artifacts = {
         "reasoning_bank_entries": 0,
         "guardrails_created": 0,
         "pattern_signatures": 0,
         "tree_nodes_updated": 0,
+        "scripts_conventions_authored": 0,
     }
 
     # Count reasoning bank entries sourced from this goal
@@ -122,14 +249,23 @@ def count_learning_artifacts(goal, reasoning_bank, guardrails, pattern_sigs, tre
         if ps.get("source_goal") == gid:
             artifacts["pattern_signatures"] += 1
 
-    # Approximate tree node updates by category match
-    # (exact attribution would require changelog, but category is a good proxy)
-    if tree_data and cat:
-        node = tree_data.get("nodes", {}).get(cat, {})
-        if node:
-            last_retrieved = node.get("last_retrieved", "")
-            if started and last_retrieved and last_retrieved >= started[:10]:
-                artifacts["tree_nodes_updated"] += 1
+    # Tree-node attribution by goal_id from per-file front matter (rb-601 fix).
+    # Prior implementation used goal.category as a tree-node-key proxy AND read
+    # _tree.yaml node.last_retrieved (the field that fires on retrieval, not
+    # update) — both incorrect, returning 0 for every goal. tree_attribution
+    # is built once in load_shared_data() via build_tree_attribution_map().
+    if tree_attribution and gid:
+        artifacts["tree_nodes_updated"] = tree_attribution.get(gid, 0)
+
+    # Script + convention attribution ( / rb-803).
+    # Counts files in core/scripts, world/scripts, core/config/conventions,
+    # and world/conventions whose header region mentions this goal-id.
+    # Lifts the zero_learning_velocity false-positive on aspirations whose
+    # primary deliverable is code or convention text rather than
+    # rb/guard/tree entries —  was the canonical incident.
+    if script_convention_attribution and gid:
+        artifacts["scripts_conventions_authored"] = \
+            script_convention_attribution.get(gid, 0)
 
     return artifacts
 
@@ -147,7 +283,8 @@ def compute_learning_velocity(goal_artifacts, window):
     for ga in recent:
         a = ga["artifacts"]
         total += (a["reasoning_bank_entries"] + a["guardrails_created"]
-                  + a["pattern_signatures"] + a["tree_nodes_updated"])
+                  + a["pattern_signatures"] + a["tree_nodes_updated"]
+                  + a.get("scripts_conventions_authored", 0))
     return total / len(recent)
 
 def detect_inflection_points(goal_artifacts):
@@ -223,6 +360,8 @@ def load_shared_data():
         "guardrails": load_jsonl(WORLD_DIR / "guardrails.jsonl"),
         "pattern_sigs": load_jsonl(WORLD_DIR / "pattern-signatures.jsonl"),
         "tree_data": load_yaml(WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"),
+        "tree_attribution": build_tree_attribution_map(WORLD_DIR / "knowledge" / "tree"),
+        "script_convention_attribution": build_script_convention_attribution_map(),
         "asp_sources": asp_sources,
     }
 
@@ -248,12 +387,16 @@ def build_trajectory(asp_id, shared=None):
     guardrails = shared["guardrails"]
     pattern_sigs = shared["pattern_sigs"]
     tree_data = shared["tree_data"]
+    tree_attribution = shared.get("tree_attribution", {})
+    script_convention_attribution = shared.get("script_convention_attribution", {})
 
     # Build per-goal artifact counts
     goal_artifacts = []
     for g in completed:
         artifacts = count_learning_artifacts(g, reasoning_bank, guardrails,
-                                            pattern_sigs, tree_data)
+                                            pattern_sigs, tree_data,
+                                            tree_attribution,
+                                            script_convention_attribution)
         goal_artifacts.append({
             "goal_id": g.get("id", "unknown"),
             "title": g.get("title", ""),

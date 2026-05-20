@@ -45,10 +45,10 @@ if ! echo "$AGENT_NAME_ARG" | grep -qE '^[a-z][a-z0-9-]*$'; then
     exit 1
 fi
 
-AGENT="$PROJECT_ROOT/$AGENT_NAME_ARG"
+AGENT="$(agent_dir "$AGENT_NAME_ARG")"
 
 # Export so session scripts can resolve paths via _paths.sh
-export AYOAI_AGENT="$AGENT_NAME_ARG"
+export MIND_AGENT="$AGENT_NAME_ARG"
 
 # --- Idempotent gate ---
 if [ -f "$AGENT/.initialized" ]; then
@@ -94,6 +94,10 @@ else
     AGENT_MODE="first"
 fi
 
+# NOTE: This seeds the AGENT bootstrap aspiration ( "Maintain Agent Health").
+# The world-level  ("Explore and Learn") is a DIFFERENT aspiration sharing
+# the canonical bootstrap ID by convention — seeded in init-world.sh.
+# See core/config/conventions/aspirations.md → Dual-Scope Bootstrap IDs.
 if [ -f "$CONFIG/agent-aspirations-initial.jsonl" ]; then
     cp "$CONFIG/agent-aspirations-initial.jsonl" "$AGENT/aspirations.jsonl"
     echo "  Seeded agent aspirations (maintenance goals)"
@@ -154,11 +158,21 @@ EOF
 echo "  Created domain-specific tool files"
 
 # --- 7. Session state ---
+
+# Initialize working memory (idempotent — guard preserves init-agent.sh contract).
+# Without this call, /start UNINITIALIZED flow leaves wm slots null until first
+# /aspirations Phase -1 runs wm-init.sh. Inline init keeps WM available the
+# moment any session script (e.g., wm-read.sh) is called by /start itself.
+if [ ! -f "$AGENT/session/working-memory.yaml" ]; then
+    bash "$CORE_ROOT/scripts/wm-init.sh"
+    echo "  Initialized working memory"
+fi
+
 cat > "$AGENT/session/pending-questions.yaml" << 'EOF'
 questions: []
 EOF
 
-# Set persona active via session script (uses AYOAI_AGENT env var)
+# Set persona active via session script (uses MIND_AGENT env var)
 bash "$CORE_ROOT/scripts/session-persona-set.sh" true
 
 echo "  Created session files"

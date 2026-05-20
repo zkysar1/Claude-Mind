@@ -1,6 +1,6 @@
 ---
 name: boot
-description: "Session entry point — status report with hypothesis readiness, pipeline, accuracy, meta-memory, and handoff to aspirations loop"
+description: "Entry point for autonomous mode — runs the status report (hypothesis readiness, pipeline state, accuracy stats, meta-memory counts), invokes /prime for full context load, then hands off to the /aspirations loop. Use only when /start activates autonomous mode or when recovering the loop after autocompact. NEVER invoke from assistant or reader mode; those modes use /prime alone without handing off to the loop."
 user-invocable: false
 triggers:
   - "/boot"
@@ -15,6 +15,8 @@ execution_history:
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
 conventions: [aspirations, pipeline, session-state, handoff-working-memory, secrets, reasoning-guardrails, tree-retrieval, pattern-signatures, journal, curriculum, coordination]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-boot-c07cfd"
+previous_revision_id: null
 ---
 
 # /boot — Session Entry Point & Status Report
@@ -42,11 +44,11 @@ This gate means boot can ONLY run when /start has set agent-state to RUNNING.
 Check for crash marker left by StopFailure hook (context exhaustion in previous session):
 
 ```
-IF file exists <agent>/session/crash-marker:
+IF file exists agents/<agent>/session/crash-marker:
   Read content (format: "<timestamp> context_exhaustion sid=<session-id>")
   Log: "⚠ Previous session ended abnormally — context exhaustion detected"
   Log the crash-marker content for diagnostics
-  Delete <agent>/session/crash-marker
+  Delete agents/<agent>/session/crash-marker
 ```
 
 ## Phase -2: State Initialization (First Boot)
@@ -56,7 +58,7 @@ and meta/ (meta-strategies) from core/config/ `initial_state:` sections.
 Idempotent — each exits immediately if its .initialized marker already exists.
 
 ```
-Run: bash core/scripts/init-mind.sh $AYOAI_AGENT
+Run: bash core/scripts/init-mind.sh $MIND_AGENT
 IF exit code != 0: ABORT with error message
 IF output contains "First boot": log "First boot detected — agent is a blank slate"
 ```
@@ -64,35 +66,26 @@ IF output contains "First boot": log "First boot detected — agent is a blank s
 Note: init-mind.sh includes migration detection. If world/aspirations.yaml exists
 without world/aspirations.jsonl, it auto-runs aspirations-migrate.sh.
 
-## Phase -1.5: Session Temp Cleanup
+## Phase -1.5: Session Temp Cleanup (advisory)
 
-Remove non-framework files from `<agent>/session/` left by previous goal execution
-(domain data exports, analysis artifacts, ad-hoc scripts). Prevents unbounded growth.
+Surface orphan files in `agents/<agent>/session/` so the agent can register them in the
+manifest or file a Maintain goal. This phase does NOT delete — the single source
+of truth for "what belongs in session/" is `core/config/session-manifest.yaml`,
+and `/start --recover` handles actual cleanup via `session-manifest-clear.sh`.
 
 ```
-WHITELISTED = [
-  "agent-state", "agent-mode", "persona-active", "loop-active", "stop-loop",
-  "working-memory.yaml", "handoff.yaml",
-  "pending-questions.yaml", "overflow-queue.yaml",
-  "last-report-timestamp",
-  "compact-checkpoint.yaml",
-  "pending-agents.yaml",
-  "running-session-id",
-  "crash-marker"
-]
-
-For each file in <agent>/session/:
-  IF filename NOT in WHITELISTED:
-    Delete file
-    Log: "CLEANUP: removed session temp file {filename}"
+Bash: session-desync-check.sh
+# Advisory only — does NOT delete. On [info] orphan warnings, invoke
+# /create-aspiration from-followup with the filename + writer + proposed
+# recovery_action, or file a Maintain goal if the file is non-framework.
 ```
 
 ## Phase -1: Persona State Migration
 
 Ensure persona configuration exists in state files (handles upgrades from pre-persona installations):
 
-1. Read `<agent>/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
-2. Read `<agent>/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
+1. Read `agents/<agent>/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
+2. Read `agents/<agent>/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
 3. Bash: `session-persona-set.sh true` — starting the loop always means full agent mode
 
 ## Phase -0.5: Environment Check
@@ -163,12 +156,12 @@ Before generating the report:
 
 ## Step 0.5: Continuation Detection (Auto-Session)
 
-Check for `<agent>/session/handoff.yaml` to detect auto-continuation from a previous session:
+Check for `agents/<agent>/session/handoff.yaml` to detect auto-continuation from a previous session:
 
 ```
-IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
+IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from consolidation):
     1. Read handoff.yaml for previous session state
-    1b. Read <agent>/self.md (Self must be in working context even during fast auto-resume)
+    1b. Read agents/<agent>/self.md (Self must be in working context even during fast auto-resume)
     1b2. Bash: world-cat.sh program.md  # The Program must be in working context even during fast auto-resume
     1c. User Goals Resume:
         IF handoff.user_goals_pending exists and count > 0:
@@ -245,7 +238,7 @@ IF <agent>/session/handoff.yaml EXISTS (auto-continuation / inline restart from 
     10. Jump directly to Step 10 → handoff to /aspirations loop
         Pass first_action and decisions_locked to the loop
 
-IF <agent>/session/handoff.yaml NOT EXISTS (user-initiated):
+IF agents/<agent>/session/handoff.yaml NOT EXISTS (user-initiated):
     1. Bash: `session-signal-clear.sh loop-active` (cleanup from crashed session)
     1d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
     2. Proceed with full boot (Steps 1.5 through 12)
@@ -293,17 +286,43 @@ ELSE:
     Bash: team-state-init.sh
 ```
 
+### Pending handoffs for this agent (Item 3)
+
+After team state, scan `world/aspirations.jsonl` for goals routed to this agent
+via `handoff_to: <AGENT_NAME>` that are still pending or in-progress. Surface
+the count + oldest age so the agent picks them up before baseline scoring
+kicks in.
+
+```
+Bash: bash core/scripts/status.sh --field handoffs_inbound | python3 -c "
+import sys, json
+h = json.loads(sys.stdin.read() or '{}')
+if not h.get('count'): sys.exit(0)
+oldest = h.get('oldest_age_hours') or 0
+ids = ', '.join(h.get('ids') or [])
+more = f' (+{h[\"count\"]-5} more)' if h['count'] > 5 else ''
+print(f'▸ {h[\"count\"]} pending handoff(s) for you: {ids}{more} (oldest: {oldest:.0f}h)')
+for p in h.get('top') or []:
+    print(f'    {p[\"id\"]}: {p[\"title\"]}')
+"
+```
+
+Single scan of `aspirations.jsonl` lives in `core/scripts/status.py`
+`collect_handoffs_inbound()`. Do NOT re-implement the scan here — if the
+summary shape needs changing, change `collect_handoffs_inbound()` so
+`status.sh` and boot stay consistent.
+
 ## Step 2: Gather All State
 
 Read all state files (including freshly updated data from Step 1.5):
 ```
-<agent>/self.md                                 → agent Self (core purpose)
+agents/<agent>/self.md                                 → agent Self (core purpose)
 world/program.md                                → The Program (world shared purpose)
 core/config/profile.yaml                          → system config, evaluation framework (framework)
-<agent>/profile.yaml                           → strategy parameters, evaluation state (mutable state)
+agents/<agent>/profile.yaml                           → strategy parameters, evaluation state (mutable state)
 Bash: aspirations-read.sh --active           → aspirations and goals
 Bash: aspirations-read.sh --meta             → readiness gates, session_count, last_updated
-<agent>/prep-tasks.yaml                        → pending tasks
+agents/<agent>/prep-tasks.yaml                        → pending tasks
 world/sources.yaml                           → information source tracking
 Bash: pipeline-read.sh --counts              → pipeline stage counts
 Bash: pipeline-read.sh --accuracy            → accuracy stats
@@ -312,7 +331,7 @@ Bash: pipeline-read.sh --stage active        → active hypotheses
 Bash: pipeline-read.sh --stage discovered    → unscored hypotheses waiting
 meta/meta-knowledge/_index.yaml             → meta-memory (strengths, weaknesses)
 world/knowledge/patterns/violations.md       → recent violations (if exists)
-<agent>/experiential-index.yaml               → experiential memory cross-references
+agents/<agent>/experiential-index.yaml               → experiential memory cross-references
 Bash: journal-read.sh --meta                → session-level totals for episodic retrieval
 Bash: journal-read.sh --latest              → context from last session
 Bash: world-cat.sh knowledge/tree/_tree.yaml → identify all depth-1 nodes
@@ -321,14 +340,20 @@ Bash: curriculum-status.sh                  → curriculum stage, unlocks, gates
 Bash: meta-read.sh meta.yaml                    → meta-strategy state (imp@k, evaluations)
 Bash: meta-read.sh improvement-velocity.yaml    → last 5 entries for trend
 Bash: meta-experiment.sh list --active          → active A/B experiments
+Bash: bash core/scripts/learning-ratio.sh       → one-line framework-vs-domain learning ratio
 ```
+
+Display the learning ratio line verbatim in the dashboard — a single line showing the
+current mix of framework-meta, product-domain, and other learning across
+the operational stores, with the plan's targets inline (framework ≤ 25%, domain ≥ 30%).
+If the script fails or is missing, skip silently.
 
 Display Self and The Program prominently in the dashboard:
 ```
 ═══ SELF ══════════════════════════════════════
-[contents of <agent>/self.md body — everything after the YAML front matter]
+[contents of agents/<agent>/self.md body — everything after the YAML front matter]
 ```
-If <agent>/self.md is empty or missing, display: "SELF: Not configured — run /start to set up."
+If agents/<agent>/self.md is empty or missing, display: "SELF: Not configured — run /start to set up."
 
 ```
 ═══ THE PROGRAM ════════════════════════════════
@@ -448,7 +473,7 @@ Bash: world-cat.sh sources.yaml
 
 1. STALE KNOWLEDGE CHECK:
    For each node article at any depth with last_updated > 14 days:
-     If article was cited in a corrected hypothesis (check <agent>/experiential-index.yaml):
+     If article was cited in a corrected hypothesis (check agents/<agent>/experiential-index.yaml):
        FLAG: "STALE + CORRECTED: {article} — last updated {date}, cited in {corrected_hypothesis}"
    For each pattern signature with outcome_stats:
      If confirmed_rate < 50% in last 10 uses:
@@ -470,7 +495,7 @@ Bash: world-cat.sh sources.yaml
      If reliability < 50% AND times_used > 5:
        FLAG: "UNRELIABLE SOURCE: {source} — {reliability}% over {times_used} uses"
 
-4. CONTEXT GAP TRENDS (from <agent>/experiential-index.yaml):
+4. CONTEXT GAP TRENDS (from agents/<agent>/experiential-index.yaml):
    Read by_context_quality section
    If context_gap_identified count > 0:
      Report: "{N} hypotheses had context gaps — common gaps: {list}"
@@ -501,7 +526,7 @@ Bash: `journal-read.sh --recent 5` to get last 5 session entries. Look for:
 1. **Repeated topics**: Same category touched 3+ sessions without accuracy improvement → stale strategy alert
 2. **Repeated patterns**: Same pattern signature triggered 3+ sessions → well-exercised, check if `validation_status` should update
 3. **Coverage gaps**: Categories NOT touched in last 5 sessions → potential blind spot alert
-4. **Encoding overflow persistence**: Read `<agent>/session/overflow-queue.yaml`. Items with `deferred_count >= 3` → promote to consolidation priority or discard
+4. **Encoding overflow persistence**: Read `agents/<agent>/session/overflow-queue.yaml`. Items with `deferred_count >= 3` → promote to consolidation priority or discard
 
 Report findings in the boot dashboard under "Cross-Session Insights" section.
 
@@ -547,8 +572,8 @@ Recent capability changes: {list any level transitions since last boot}
 Next capability unlock: {which topic is closest to next threshold}
 ```
 
-Read <agent>/developmental-stage.yaml for stage context:
-Read <agent>/profile.yaml for focus:
+Read agents/<agent>/developmental-stage.yaml for stage context:
+Read agents/<agent>/profile.yaml for focus:
 Report: "Stage: {current_stage} | Highest capability: {highest_capability} | Exploration budget: {epsilon}%"
 If focus is set: append "| Focus: \"{focus text}\""
 
@@ -656,7 +681,7 @@ If no L1 nodes have sufficient data, output: "Domain health: insufficient data a
 - Research queue items pending > 14 days: {list}
 - Accuracy dropping (last 5 below last 10): {flag}
 - Confidence calibration significantly off: {flag}
-- Status report: last generated {from <agent>/session/last-report-timestamp or "never"}
+- Status report: last generated {from agents/<agent>/session/last-report-timestamp or "never"}
 
 ### Triggered Reviews
 {List any auto-review triggers from resolve_result.triggered_reviews (from Step 1.5)}
@@ -705,7 +730,7 @@ Append boot report to journal .md file (NOT _index.yaml — that is owned by /as
 ```markdown
 ## Boot — HH:MM
 
-Pipeline: {N} discovered, {N} evaluating, {N} active, {N} resolved
+Pipeline: {N} discovered, {N} active, {N} resolved
 Accuracy: {X}% overall ({N} hypotheses)
 Readiness: {N}/6 gates ({stage})
 Focus: {today's recommended focus area}
@@ -714,7 +739,7 @@ Stage: {developmental stage} (exploration budget {N}%)
 Curriculum: {stage_name} ({gates_passed}/{gates_total} gates)
 ```
 
-Note: /aspirations State Update Step 7 is the authoritative owner of <agent>/journal.jsonl.
+Note: /aspirations State Update Step 7 is the authoritative owner of agents/<agent>/journal.jsonl.
 Boot creates the session's journal .md entry; the aspirations loop creates/updates the journal.jsonl session record on first goal completion via `journal-add.sh` and `journal-merge.sh`.
 
 ## Step 12: Evolution Check
@@ -735,4 +760,10 @@ Read evolution history: Bash: meta-cat.sh evolution-log.jsonl
 - **Called by**: `/start` (user command), `/aspirations` session-end consolidation (inline restart)
 - **Calls**: `/prime` (context priming — Step 2.7 full, Step 8.5 continuation), `/review-hypotheses --resolve` (catch-up on resolutions, NO learning), `/aspirations` completion checks (Phase 0), `/aspirations loop` (handoff to perpetual heartbeat)
 - **Does NOT call**: `/reflect` (learning happens downstream via `/aspirations` goals calling `/review-hypotheses --learn`)
-- **Auto-session**: When `<agent>/session/handoff.yaml` exists, runs in continuation mode (abbreviated report, fast handoff). See `/aspirations` Auto-Session Continuation Protocol for details.
+- **Auto-session**: When `agents/<agent>/session/handoff.yaml` exists, runs in continuation mode (abbreviated report, fast handoff). See `/aspirations` Auto-Session Continuation Protocol for details.
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+Boot's terminal action is `Skill('aspirations')` (handoff to the perpetual heartbeat).
+Never end boot with a text summary after the handoff.

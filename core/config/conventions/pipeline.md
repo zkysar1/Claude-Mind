@@ -3,7 +3,7 @@
 Hypothesis pipeline records use JSONL (one JSON object per line) with script-based access:
 
 ## File Layout
-- `world/pipeline.jsonl` — Live records (discovered, evaluating, active, resolved)
+- `world/pipeline.jsonl` — Live records (discovered, active, resolved)
 - `world/pipeline-archive.jsonl` — Archived records (append-only)
 - `world/pipeline-meta.json` — Metadata (stage_counts, accuracy cache, micro_hypothesis_stats)
 

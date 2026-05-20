@@ -1,0 +1,98 @@
+"""X-Mind-Tenant header plumbing (R4, PR-pre-4).
+
+Verifies that ctx.tenant is populated from the request header and defaults
+to "default" when the header is absent.
+"""
+from __future__ import annotations
+
+import json
+import socket
+import threading
+import time
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+from mind_api.src import lifecycle
+from mind_api.src.server import Response, RequestContext, _Handler
+
+
+def _start_daemon_with_tenant_echo(project_root: Path):
+    """Start a minimal daemon that echoes ctx.tenant on GET /v1/test/tenant."""
+
+    def echo_tenant(ctx: RequestContext) -> Response:
+        return Response.json({"tenant": ctx.tenant})
+
+    from mind_api.src.server import Server
+    server = Server(project_root=project_root, port=0)
+    routes = server.routes
+    routes[("GET", "/v1/test/tenant")] = echo_tenant
+
+    handler_cls = type(
+        "_TenantTestHandler", (_Handler,), {
+            "routes": routes,
+            "resolver": server.resolver,
+            "access_log_path": lifecycle.access_log(project_root),
+            "pid": 0,
+            "port": 0,
+        },
+    )
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    port = httpd.server_address[1]
+    handler_cls.port = port
+    handler_cls.pid = 99999
+
+    lifecycle.write_pid_and_port_atomic(project_root, 99999, port)
+
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                break
+        except OSError:
+            time.sleep(0.02)
+
+    return httpd, port
+
+
+def _get(port: int, path: str, *, headers: dict | None = None) -> tuple[int, dict]:
+    url = f"http://127.0.0.1:{port}{path}"
+    req = urllib.request.Request(url)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+
+def test_tenant_from_header(project_root):
+    """When X-Mind-Tenant is sent, ctx.tenant carries that value."""
+    httpd, port = _start_daemon_with_tenant_echo(project_root)
+    try:
+        status, body = _get(port, "/v1/test/tenant", headers={
+            "X-Mind-Agent": "alpha",
+            "X-Mind-Tenant": "acme-corp",
+        })
+        assert status == 200
+        assert body["tenant"] == "acme-corp"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        lifecycle.clear_runtime_files(project_root)
+
+
+def test_tenant_defaults_to_default(project_root):
+    """When X-Mind-Tenant is absent, ctx.tenant is 'default'."""
+    httpd, port = _start_daemon_with_tenant_echo(project_root)
+    try:
+        status, body = _get(port, "/v1/test/tenant", headers={
+            "X-Mind-Agent": "alpha",
+        })
+        assert status == 200
+        assert body["tenant"] == "default"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        lifecycle.clear_runtime_files(project_root)

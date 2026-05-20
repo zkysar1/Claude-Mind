@@ -1,6 +1,84 @@
 #!/usr/bin/env bash
+# DAEMON-ONLY as of 2026-05-14. No Python CLI fallback. See:
+#   .claude/rules/no-python-cli-fallback.md
+#   world/knowledge/tree/system/daemon-only-architecture.md
+# pipeline-add — daemon-aware wrapper (PR 8).
+#
+# Hot path:
+#   1. Skinny PROJECT_ROOT resolve (no _paths.sh)
+#   2. Read stdin body (JSON pipeline record)
+#   3. POST /v1/pipeline/add
+#   4. On 200, print the record to stdout
+#
 set -euo pipefail
-source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
-cd "$PROJECT_ROOT"
-source "$CORE_ROOT/scripts/_platform.sh"
-exec python3 "$CORE_ROOT/scripts/pipeline.py" add "$@"
+
+# --- Skinny PROJECT_ROOT resolve ------------------------------------------
+_RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
+CORE_ROOT="$PROJECT_ROOT/core"
+
+# --- Parse args -----------------------------------------------------------
+SCHEMA=0
+declare -a PASSTHROUGH=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --schema)
+            SCHEMA=1
+            PASSTHROUGH+=("$1"); shift;;
+        *)
+            PASSTHROUGH+=("$1"); shift;;
+    esac
+done
+
+# --- Pre-daemon validation ------------------------------------------------
+if [ "$SCHEMA" = "1" ]; then
+    echo "Error: --schema is no longer available. See mind_api/src/endpoints/ for API docs." >&2
+    exit 1
+fi
+
+# Read stdin (the JSON pipeline record) BEFORE invoking the daemon.
+BODY="$(cat)"
+
+# --- Daemon path ----------------------------------------------------------
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_runtime.sh"
+
+rc=0
+RESPONSE="$(rt_call POST /v1/pipeline/add \
+    --body-string "$BODY" \
+    )" || rc=$?
+
+case $rc in
+    0)
+        # shellcheck disable=SC2086
+        printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+import json, sys
+resp = json.load(sys.stdin)
+rec = resp.get('record') or resp
+print(json.dumps(rec, indent=2, ensure_ascii=False))
+"
+        exit 0;;
+    2)
+        exit 1;;
+    3)
+        # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
+        if rt_try_autospawn; then
+            rc=0
+            RESPONSE="$(rt_call POST /v1/pipeline/add \
+                --body-string "$BODY")" || rc=$?
+            if [ "$rc" = "0" ]; then
+                # shellcheck disable=SC2086
+                printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+import json, sys
+resp = json.load(sys.stdin)
+rec = resp.get('record') or resp
+print(json.dumps(rec, indent=2, ensure_ascii=False))
+"
+                exit 0
+            fi
+        fi
+        rt_no_daemon_error "pipeline-add.sh";;
+    *)
+        exit $rc;;
+esac

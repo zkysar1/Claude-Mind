@@ -23,7 +23,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT, PROJECT_ROOT
+from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT, PROJECT_ROOT, assert_agent_dir
+
+# : fail loud at import time if MIND_AGENT unset; replaces the
+# opaque `None / "curriculum.yaml"` TypeError class the next line would otherwise raise.
+assert_agent_dir("curriculum")
 
 CURRICULUM_PATH = AGENT_DIR / "curriculum.yaml"
 PROMOTIONS_PATH = AGENT_DIR / "curriculum-promotions.jsonl"

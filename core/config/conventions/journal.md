@@ -1,20 +1,42 @@
 # Journal Index JSONL Format
 
 The journal session index uses JSONL (one JSON object per line) with script-based access.
-Journal content `.md` files remain in `<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` as before.
+Journal content `.md` files remain in `agents/<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` as before.
 The JSONL index tracks which sessions wrote to which journal files.
 
 ## File Layout
-- `<agent>/journal.jsonl` — Session index (one record per session)
-- `<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` — Content files (unchanged)
+- `agents/<agent>/journal.jsonl` — Session index (one record per session). **Script-written** via
+  `journal-add.sh` / `journal-update.sh` / `journal-merge.sh`.
+- `agents/<agent>/journal/{year}/{month}/{YYYY-MM-DD}.md` — Narrative detail file (content).
+  **Hand-written** by the agent. NOT created, appended to, or modified by
+  `journal-add.sh`. The `journal_file` field inside the JSONL record is a POINTER to
+  this detail file, not an instruction to write there.
+
+## The Two-File Pairing (CRITICAL)
+
+Every journal session has TWO artifacts that MUST stay in sync:
+
+1. **Index entry** in `agents/<agent>/journal.jsonl` — written by `journal-add.sh` from stdin JSON.
+2. **Narrative detail** in `agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md` — written by hand
+   (Write for new files, Edit for appending additional session blocks during a day).
+
+The scripts enforce path validity and schema of the index entry only. They do NOT
+touch the `.md` file. Callers who rely on `journal-add.sh` alone and assume the
+narrative was also written are filing a false-negative conclusion — the index says
+"session happened on this file" but the file itself may have no content for that
+session. Always pair the script call with an Edit/Write to the referenced `.md`.
+
+See session 96 (source of this convention) for the incident where this pairing
+was implicit and produced a false missing-detail-file audit.
 
 ## Record Schema
-Required: `session`, `date`, `journal_file`
+Required on stdin: `journal_file` (path must match `agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md`)
+Auto-defaulted if absent: `session` (next integer), `date` (today ISO)
 Defaults: `goals_completed` (0), `goals_attempted` (0)
 Optional: `key_events`, `hypotheses_resolved`, `aspirations_created`
 
 ## Script-Based Access (Exclusive Data Layer)
-The LLM NEVER reads or edits `<agent>/journal.jsonl` directly. All operations go through scripts:
+The LLM NEVER reads or edits `agents/<agent>/journal.jsonl` directly. All operations go through scripts:
 
 | Script | Purpose | Stdin |
 |--------|---------|-------|
@@ -26,4 +48,13 @@ The LLM NEVER reads or edits `<agent>/journal.jsonl` directly. All operations go
 | `journal-update.sh <session>` | Update existing session record | JSON |
 | `journal-merge.sh <session>` | Merge fields into existing record | JSON |
 
-All backed by `core/scripts/journal.py` (Python 3, stdlib only).
+All backed by the `core/scripts/journal-*.sh` wrappers above (Python 3, stdlib only). Direct read/write of `agents/<agent>/journal.jsonl` is prohibited — use the wrappers exclusively.
+
+## Journal vs Experience
+
+Journal = per-session narrative summary. Experience = per-goal or
+per-hypothesis full-fidelity evidence. Both stores describe "things that
+happened" at different granularities and serve different readers. The
+full comparison lives in `core/config/conventions/learning-routing.md`.
+
+Mnemonic: experience is evidence; journal is narrative.

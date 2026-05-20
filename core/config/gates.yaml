@@ -1,0 +1,399 @@
+# Gate Registry
+#
+# Single source of truth for the gate population. Phase 2 of the gate
+# audit/retirement plan. Read by:
+#   - aspirations-evolve retirement evaluator
+#   - gate-stats.sh dashboard
+#   - per-gate tuning reviewer
+#   - audit scripts that enumerate all gates
+#
+# Pairing: meta/gate-firings.jsonl (telemetry log) keys off `id` here.
+#
+# Field semantics:
+#   id                   stable identifier; matches gate_id in firing log.
+#   script               implementation path, relative to repo root. For
+#                        embedded gates (logic inside a larger script),
+#                        the path of the host script.
+#   embedded             true if the gate is logic embedded in a larger
+#                        script rather than its own standalone gate.
+#   instrumented         true if the gate emits a record to meta/gate-firings.jsonl
+#                        via _gate_log.log() on every decision. Required input
+#                        for the auto-retirement evaluator — uninstrumented gates
+#                        produce no firing signal and so are invisible to it.
+#   sites                where the gate is invoked from (file + phase).
+#   dominant_risk        FN | FP | both — which error mode hurts more.
+#   asymmetry_magnitude  extreme | high | medium | low — how lopsided.
+#   keyword_bias         generous | strict | balanced — tuning policy.
+#                        FN-dominant → generous (better to over-fire, cheap
+#                        to override). FP-dominant → strict (bias toward
+#                        letting work through). both-low → balanced.
+#   override_flag        name of the bypass flag, or null if none yet.
+#   fp_cost              low | medium | high — severity on false positive.
+#   fn_cost              low | medium | high — severity on false negative.
+#   fp_description       one-line description of the FP failure mode.
+#   fn_description       one-line description of the FN failure mode.
+#   rb_evidence          list of rb-NNN entries documenting incidents.
+#   tuning_notes         current state of the tuning effort.
+#   retirement_eligible  true | false. Structural gates (Unix flags, file
+#                        existence) are excluded from the auto-retirement
+#                        evaluator regardless of fire count.
+#
+# Source: agents' Session-56 audit (2026-04-22), 14 gates with explicit
+# asymmetry analysis. Other gates in core/scripts/ are listed under
+# pending_audit pending the same analysis.
+
+schema_version: 1
+last_updated: "2026-04-22"
+
+gates:
+
+  # ─── Asymmetry: FN-dominant (extreme) ─────────────────────────────────
+  # These two have ~zero FP cost. Bias keywords aggressively wide.
+
+  - id: positive-state-gate
+    script: core/scripts/positive-state-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-verify/SKILL.md", phase: "Q1 evidence check" }
+      - { file: ".claude/skills/agent-completion-report/SKILL.md", phase: "advisory" }
+      - { file: ".claude/skills/aspirations-state-update/SKILL.md", phase: "Step 8.75" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: generous
+    override_flag: "--override"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Legit evidenced claim blocked; agent forced to re-read (~50ms)."
+    fn_description: "Hallucinated state claim passes; downstream reasoning builds on a wrong file."
+    rb_evidence: []
+    tuning_notes: "Phase 3 candidate. Widen trigger pattern set; tolerate FP."
+    retirement_eligible: true
+
+  - id: verify-before-assuming-gate
+    script: core/scripts/verify-before-assuming-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/config/conventions/infrastructure.md", phase: "infra-failure classification" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: generous
+    override_flag: "--override"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Knowledge gap classified as infra; one extra infra-health.sh call (~5s)."
+    fn_description: "Real infra issue misclassified; agent skips probe, files wrong blocker."
+    rb_evidence: []
+    tuning_notes: "Phase 3 candidate. Widen infra-failure trigger set."
+    retirement_eligible: true
+
+  # ─── Asymmetry: FN-dominant (high) ────────────────────────────────────
+
+  - id: capability-gate
+    script: core/scripts/capability-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-execute/SKILL.md", phase: "Step 2.6 CREATE_BLOCKER" }
+      - { file: "core/scripts/aspirations.py", phase: "cmd_update_goal (defer_reason)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: generous
+    override_flag: "--override-agent-match"
+    fp_cost: medium
+    fn_cost: high
+    fp_description: "User-only goal reclassified as agent-capable; agent thrashes, recoverable."
+    fn_description: "Agent-capable work routed to user; freezes for days/weeks (g-115-156 class)."
+    rb_evidence: []
+    tuning_notes: "Already wide via three-source scan (forged-skills, SKILL.md triggers, capability-routing.md)."
+    retirement_eligible: true
+
+  - id: blocker-create-gate
+    script: core/scripts/blocker-create-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-execute/SKILL.md", phase: "Step 2.55 CREATE_BLOCKER" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: generous
+    override_flag: "--override-blocker-gate"
+    fp_cost: medium
+    fn_cost: high
+    fp_description: "Legit blocker needs extra probe step; small friction."
+    fn_description: "Blocker filed on false premise; 5-day TTL freeze + corrupted reasoning bank."
+    rb_evidence: ["rb-245"]
+    tuning_notes: "Statistical-negation pattern. Schema-probe-first protocol enforced."
+    retirement_eligible: true
+
+  - id: goal-duplication-gate
+    script: core/scripts/goal-duplication-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations.py", phase: "cmd_add (batch goal write, --override-all fan-out)" }
+      - { file: "core/scripts/aspirations.py", phase: "cmd_add_goal (single goal write)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: generous
+    override_flag: "--override-duplication"
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Legit non-overlap blocked on shared keyword; agent rewords or overrides (~30s)."
+    fn_description: "Duplicate goal filed; partner conflict / self-thrash on overlapping work (g-115-141 class)."
+    rb_evidence: ["rb-466"]
+    tuning_notes: "4-check mosaic (recent_completions, git_log, insight_triggers, target_state). target_state has class-name inference fallback (g-248-56). IDF-weighted keywords (cd93fe4)."
+    retirement_eligible: true
+
+  - id: stale-read-gate
+    script: core/scripts/stale-read-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations.py", phase: "cmd_add_goal (parent_goal stale-context check)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: "--override-stale-read"
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Agent forced to re-read parent (cmd_read --id <asp> or cmd_query) before filing child; ~1 extra read."
+    fn_description: "Child filed on stale parent context; constraints/decomposition shape derived from outdated requirements (g-115-410 class)."
+    rb_evidence: []
+    tuning_notes: "g-115-410 sub-task 3. Skips when parent_goal absent OR parent has no last_modified (legacy). Compares parent.last_modified vs <agent>/session/goal-reads.jsonl most-recent read_at. Audit ledger: world/stale-read-overrides.jsonl."
+    retirement_eligible: true
+
+  # ─── Asymmetry: FP-dominant (the inversions) ─────────────────────────
+
+  - id: notify-user-approval-gate
+    script: .claude/skills/notify-user/SKILL.md
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/notify-user/SKILL.md", phase: "Step 1.5" }
+    dominant_risk: FP
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: high
+    fn_cost: medium
+    fp_description: "Real user-critical notification (blocker, security) blocked; user never learns."
+    fn_description: "Approval-request slips through; user replies 'just do it'; 30-min late."
+    rb_evidence: []
+    tuning_notes: "INVERSION. Tighten patterns: 'approve' alone is not enough; need 'approve' AND deploy/commit/push together."
+    retirement_eligible: false
+
+  - id: cargo-cult-detector
+    script: core/scripts/cargo-cult-detector.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-spark/SKILL.md", phase: "cargo-cult Idea suppression" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: medium
+    fn_cost: low
+    fp_description: "True cargo-cult false-protected; never tuned; iterations consumed by noise."
+    fn_description: "Artifact goal flagged as cargo-cult; one wasted Idea iteration (~15min, self-correcting)."
+    rb_evidence: ["rb-447"]
+    tuning_notes: "INVERSION. Tighten artifact-evidence check; allow Idea filings more freely."
+    retirement_eligible: true
+
+  - id: read-intent-verbs
+    script: core/scripts/_target_state.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/_target_state.py", phase: "READ_INTENT_VERBS classification" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Read-only goal flagged as write; stricter dup check blocks legit new read."
+    fn_description: "Write-intent goal classified as read-only; dup-gate skipped; possible duplicate writes."
+    rb_evidence: []
+    tuning_notes: "INVERSION. Trim verb list; default-to-write-intent is the safer side."
+    retirement_eligible: true
+
+  # ─── Asymmetry: FN > FP (medium-high) ────────────────────────────────
+
+  - id: prose-verification-drift
+    script: core/scripts/aspirations.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations.py", phase: "goal write validation" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: generous
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Legit structured goal flagged; author adds structure (~1 min)."
+    fn_description: "Prose-only goal slips through; verify phase has no structured criteria; goal completes on hallucinated success."
+    rb_evidence: []
+    tuning_notes: "Generous toward structure requirement."
+    retirement_eligible: true
+
+  - id: agent-action-keywords
+    script: core/scripts/precheck-eval.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/precheck-eval.py", phase: "AGENT_ACTION_KEYWORDS reclassification" }
+    dominant_risk: both
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: medium
+    fn_cost: medium
+    fp_description: "Agent picks up a goal needing human (approval, credentials); thrashes."
+    fn_description: "Agent-capable goal stuck in user-only bucket; freeze-class (sister of capability-gate)."
+    rb_evidence: []
+    tuning_notes: "Watch both sides. Sibling of capability-gate; tuning should mirror."
+    retirement_eligible: true
+
+  - id: exhaustive-search-gate
+    script: core/scripts/exhaustive-search-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/rules/verify-before-assuming.md", phase: "negation conclusion" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: generous
+    override_flag: "--override"
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Legit negation forced to exhaustive-search; 2 extra retrievals."
+    fn_description: "Premature negation passes; agent gives up on real capability."
+    rb_evidence: []
+    tuning_notes: "Generous on negation triggers."
+    retirement_eligible: true
+
+  - id: origin-signal-gate
+    script: core/scripts/origin-signal-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations.py", phase: "cmd_add (batch validation, --override-all fan-out)" }
+      - { file: "core/scripts/aspirations.py", phase: "cmd_add_goal (single goal validation)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: "--override-signal"
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Legit goal needs concrete signal added; agent supplies origin_signal or overrides (~10s)."
+    fn_description: "Make-work goal slips through; one wasted iteration on category-label goal (B2.5 saturation class)."
+    rb_evidence: ["rb-466"]
+    tuning_notes: "Closed allowlist (ALLOWED_PREFIXES tuple). Tuning is via prefix-set expansion as new agent classes emerge — not keyword fuzziness."
+    retirement_eligible: true
+
+  # ─── Asymmetry: both-low ─────────────────────────────────────────────
+
+  - id: reflect-convention-routing
+    script: core/scripts/reflect-bookkeeping.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/reflect-bookkeeping.py", phase: "lesson routing (convention vs guardrail)" }
+    dominant_risk: both
+    asymmetry_magnitude: low
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: low
+    fp_description: "Local guardrail promoted to convention; pollutes doc; easy revert."
+    fn_description: "Universal lesson stays as guardrail; filed narrowly but findable."
+    rb_evidence: []
+    tuning_notes: "Low priority for tuning."
+    retirement_eligible: true
+
+  - id: category-suggest
+    script: core/scripts/category-suggest.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/decompose/SKILL.md", phase: "category suggestion" }
+      - { file: ".claude/skills/aspirations-execute/SKILL.md", phase: "tree node placement" }
+    dominant_risk: both
+    asymmetry_magnitude: low
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: low
+    fp_description: "Wrong category; node misfiled but movable."
+    fn_description: "Goal in 'uncategorized'; retrieval slightly degraded."
+    rb_evidence: []
+    tuning_notes: "Low priority for tuning."
+    retirement_eligible: true
+
+  - id: strategy-apply
+    script: core/scripts/strategy-apply.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-execute/SKILL.md", phase: "meta-strategy match" }
+    dominant_risk: both
+    asymmetry_magnitude: low
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: low
+    fp_description: "Strategy misapplied; mild behavior drift."
+    fn_description: "Strategy missed; slightly slower learning this iteration."
+    rb_evidence: []
+    tuning_notes: "Low priority for tuning."
+    retirement_eligible: true
+
+  # ─── Excluded from semantic audit (structural) ───────────────────────
+
+  - id: conclusion-record-silent-flag
+    script: core/scripts/conclusion-record.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/conclusion-record.py", phase: "evidence weighting" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Legit -sf command zero-weighted; agent re-runs without flag."
+    fn_description: "Silent failure counted as evidence; blocker filed on empty signal (rb-147 class)."
+    rb_evidence: ["rb-147"]
+    tuning_notes: "EXCLUDED from semantic audit. Flag set is structural (Unix flags) and stable."
+    retirement_eligible: false
+
+# ─── Gates discovered in core/scripts/ but not in the Session-56 audit.
+# These need their own asymmetry analysis before tuning. Listed here so the
+# audit dashboard knows they exist and can prompt for the missing data.
+# NOTE: origin-signal and goal-duplication gates were promoted from this list
+# into the main `gates:` block on 2026-04-25 (, rb-466). Search for
+# `id: origin-signal-gate` and `id: goal-duplication-gate` above for their
+# instrumented asymmetry rows.
+pending_audit:
+  - audit-schema-gate.py
+  - encode-stable-facts-gate.py
+  - findings-gate.py
+  - insight-trigger-gate.py
+  - quiescence-gate.py
+  - scripts-referenced-gate.py
+  - self-drift-gate.py
+  - signal-lifecycle-gate.py
+  - skill-structure-gate.py
+  - zero-count-gate.py
+  - post-state-update-gate.sh
+  - productivity-stop-gate.sh       # script-gated stop signal; not LLM-discretionary
+  - recovery-gate.sh                # script-gated recovery; not LLM-discretionary
+  - utilization-gate.sh
+  - context-reads-gate.sh
+  - context-reads-skill-gate.sh
+  - test-background-jobs-output-gate.sh

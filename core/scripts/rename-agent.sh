@@ -20,8 +20,8 @@ if [ -z "$OLD_NAME" ] || [ -z "$NEW_NAME" ]; then
     exit 1
 fi
 
-OLD_DIR="$PROJECT_ROOT/$OLD_NAME"
-NEW_DIR="$PROJECT_ROOT/$NEW_NAME"
+OLD_DIR="$(agent_dir "$OLD_NAME")"
+NEW_DIR="$(agent_dir "$NEW_NAME")"
 
 # Validate old directory exists
 if [ ! -d "$OLD_DIR" ]; then
@@ -132,4 +132,4 @@ fi
 
 echo ""
 echo "Agent renamed successfully: $OLD_NAME → $NEW_NAME"
-echo "Remember to update AYOAI_AGENT environment variable in active sessions."
+echo "Remember to update MIND_AGENT environment variable in active sessions."

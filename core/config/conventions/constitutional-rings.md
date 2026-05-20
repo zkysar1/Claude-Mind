@@ -5,20 +5,46 @@ existing permission structure to a formal constitutional hierarchy. Inspired by
 arXiv 2603.28990 (Dochkina): "The closer to 'why,' the more human control;
 the closer to 'how,' the more system autonomy."
 
-## Ring 1 — Immutable Core Mission (human-only modification)
+## Ring 0 — The Constitutional Anchor (tamper-proof; no autonomous path)
+
+The single surface the agent CANNOT modify by ANY autonomous path — not
+post-notification, not propose-via-pending-questions, not at all. Enforced
+structurally (not honor-system) by a self-referential permission deny.
+
+| File | Why anchored |
+|------|--------------|
+| `.claude/settings.local.json` | Holds the deny rules that make every other tier's permission model real. A self-referential `deny: Edit/Write/MultiEdit(**/.claude/settings.local.json)` *inside this file* makes it immutable to every session — deny beats allow across all tiers, hot-reloaded (linchpin-verified 2026-05-16). Mirrored in `~/.claude/settings.json` as an out-of-repo backstop. |
+| `core/scripts/settings-structural-validator.{py,sh}` | The fail-closed PreToolUse hook that protects `settings.json`'s deny[]/hooks. rb-931: a meta-safeguard whose substrate is in scope for self-edit is no safeguard. Anchored so the agent cannot neuter it. |
+
+**Modification authority**: NONE autonomously. Changes require a deliberate
+user-authorized maintenance path. This friction is the entire point — the
+anchor is what lets Rings 1–3 be *more* permissive safely, because the floor
+cannot be removed from inside the loop. Origin: g-115-732 loosened the
+deny-list so the loop self-evolves the framework, creating a bootstrap
+paradox (rb-931); the anchor resolves it.
+
+## Ring 1 — Core Mission (user owns intent; agent edits post-notification)
 
 These define WHY the system exists. Only the user may modify them.
 
 | File | Purpose |
 |------|---------|
 | `world/program.md` | The Program — shared purpose statement |
-| `<agent>/self.md` | Agent identity, core capabilities, operating principles |
+| `agents/<agent>/self.md` | Agent identity, core capabilities, operating principles |
 | `core/config/conventions/` | Framework conventions (the rules of the game) |
 | `core/config/modes/` | Mode behavioral rules |
 | `.claude/rules/` | Agent behavioral rules |
 
-**Modification authority**: User only (via direct edit or `/respond` directive).
-Agent may propose changes via pending-questions queue but MUST NOT write directly.
+**Modification authority**: The user OWNS the *intent* of Ring 1 (the "why").
+The agent MAY edit these files directly — the deny-list was loosened
+(2026-05-14, g-115-732) so the loop self-evolves the framework; git-tracking
++ loop-commit are the safety net. Material changes are **post-notification,
+revert-if-wrong** (per `guard-380`, the self.md evolution model), NOT
+pre-approval via pending-questions — that earlier gate is superseded. The
+hard floor the agent genuinely cannot cross is **Ring 0**, not Ring 1.
+(This line previously read "User only … MUST NOT write directly"; that was
+stale relative to g-115-732 + guard-380 and was the same behavioral-layer
+split-brain that caused the g-115-792 user-gated-goal spam.)
 
 ## Ring 2 — Standards and Metrics (human + system modification)
 
@@ -51,7 +77,7 @@ strategy archive.
 | `meta/reflection-strategy.yaml` | Reflection mode preferences |
 | `meta/evolution-strategy.yaml` | Evolution parameters |
 | `meta/encoding-strategy.yaml` | Knowledge encoding preferences |
-| `<agent>/developmental-stage.yaml` | Agent's mutable state (epsilon, competence) |
+| `agents/<agent>/developmental-stage.yaml` | Agent's mutable state (epsilon, competence) |
 | Board communication patterns | Channel usage, posting frequency |
 | Batching thresholds, context budgets | Operational parameters |
 

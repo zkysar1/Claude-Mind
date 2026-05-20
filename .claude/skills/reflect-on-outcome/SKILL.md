@@ -1,6 +1,6 @@
 ---
 name: reflect-on-outcome
-description: "Outcome reflection — hypothesis ABC chains, execution pattern signatures, batch micro-hypothesis processing"
+description: "Reflects on a just-resolved hypothesis or goal outcome: builds the Antecedent-Behavior-Consequence (ABC) chain, captures execution pattern signatures, and processes batched micro-hypotheses. Use whenever a hypothesis resolves in the pipeline and reflection depth is \"outcome\" (not full self-model reflection), or /reflect dispatches with --on-hypothesis / --on-execution / --batch-micro. Produces reasoning-bank entries and new pattern signatures."
 user-invocable: false
 parent-skill: reflect
 triggers:
@@ -10,6 +10,8 @@ triggers:
   - "/reflect --batch-micro"
 conventions: [pipeline, experience, tree-retrieval, reasoning-guardrails, pattern-signatures, spark-questions, aspirations, handoff-working-memory]
 minimum_mode: autonomous
+revision_id: "skill-bootstrap-reflect-on-outcome-8d5cd4"
+previous_revision_id: null
 ---
 
 # /reflect-on-outcome — Outcome-Based Reflection
@@ -141,9 +143,14 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      ```bash
      echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
      ```
-     JSON fields: id (rb-NNN), title, description, content (reasoning summary), type ("success"),
+     `id` and `created` are auto-set by the script inside the file lock —
+     omit both from the JSON; capture the assigned id from stdout's full
+     record JSON. Fields to supply: title, description, content
+     (reasoning summary), type ("success"), applies_to (REQUIRED: pick
+     `any`, `framework`, `domain`, or `specific` based on content scope),
      source_hypothesis, outcome, category, tags, status ("active"),
-     when_to_use (conditions, category, confidence_range), utilization (initialized to zeros)
+     when_to_use (conditions, category, confidence_range). Utilization
+     is initialized to zeros automatically.
   4. Include `when_to_use` field — structured trigger conditions:
      ```yaml
      when_to_use:
@@ -172,19 +179,57 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      ```bash
      echo '<JSON>' | bash core/scripts/guardrails-add.sh
      ```
-     JSON fields: id (guard-NNN), title, description, category, status ("active"),
-     when_to_use (conditions, category), utilization (initialized to zeros)
-     Include `when_to_use` field on the guardrail:
+     `id` and `created` are auto-set by the script inside the file lock —
+     omit both from the JSON; capture the assigned id from stdout. Required
+     JSON fields the LLM must still supply: rule, category, trigger_condition,
+     source. Optional: title, tags, action_hint, severity, when_to_use,
+     trigger_pattern, context_triggers, phases, source_reflection_id.
+     `status`, `utilization`, `trigger_pattern`, and `when_to_use` are
+     auto-defaulted if omitted. The allowlist rejects unknown fields loudly
+     — do NOT send `description` (not in schema; use `rule` + optional `title`).
+     Include `when_to_use` when the failure condition is reusable:
      ```yaml
      when_to_use:
        conditions: ["trigger condition from failure analysis"]
        category: "{hypothesis.category}"
      ```
-     Utilization tracking is initialized automatically by the script
   4. Create a reasoning bank entry (type: failure) with failure_lesson and preventive_guardrail fields via script:
      ```bash
      echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
      ```
+     `id` and `created` are auto-set — omit both; capture from stdout.
+     Include `applies_to` (REQUIRED): `any` (cross-cutting methodology),
+     `framework` (this framework's skills/scripts/gates), `domain`
+     (this agent's deployment domain — its specific services, products,
+     and integration points), or `specific` (single-incident).
+
+### Scripted Reflect-Bookkeeping
+
+Steps 2.5b, 2.7, 7.5b (entity normalization), 7.6c (dual classification),
+7.7 (context gap), and 7.7f (utilization deltas) route through
+`reflect-bookkeeping.sh` subcommands — pure arithmetic, no LLM judgment
+needed. The LLM still owns Steps 2.6 (contrastive extraction), 7.5
+(pattern-signature outcome record), 7.6 (belief registry updates), 7.6b
+(contradiction narrative).
+
+Subcommand map:
+
+- Step 2.5b: `reflect-bookkeeping.sh convention-routing --lesson "..." --recurrence-count N`
+  - **N is LLM-computed, not a default.** Before invoking, run `guardrails-read.sh --active`
+    and judge semantic similarity (meaning overlap, not substring) between the lesson
+    and each active guardrail. N = count of semantically similar guardrails. Passing
+    `N=0` blindly silently under-fires auto-promotion.
+- Step 2.7:  `reflect-bookkeeping.sh encoding-score --novelty X --outcome-impact Y --surprise Z --goal-relevance W --repetition-count N --precision-items P --domain-class CLS`
+- Step 7.5b: `reflect-bookkeeping.sh entity-normalize` (entities via stdin)
+- Step 7.6c: `reflect-bookkeeping.sh dual-classification --outcome OUT --confidence C`
+- Step 7.7:  `reflect-bookkeeping.sh context-gap --hypothesis-category CAT --consulted-nodes '[...]' --consulted-signatures '[...]' --outcome OUT`
+- Step 7.7f: `reflect-bookkeeping.sh utilization-delta` (deliberation JSON via stdin)
+- Batch mode: `reflect-bookkeeping.sh batch-micro`
+
+Each subcommand emits JSON with a `summary` field; act on the summary and
+any flags. The per-Step sections below describe WHEN each Step fires and
+the caller-side context. The script is the mandatory path for the
+arithmetic/lookup inside each Step.
 
 ## Step 2.5b: Convention Routing Check
 
@@ -204,17 +249,48 @@ is_universal = lesson applies to ALL or MOST goals (not conditional on specific 
 is_procedural = lesson describes a STEP TO PERFORM (not a check to consult)
   Signal words: "run", "execute", "pull", "commit", "push", "test", "scan", "review", "verify"
 
-# 2. PHASE MAPPING — Pre or post execution?
-maps_to_pre = lesson relates to setup/prerequisites before goal execution
-  Signal words: "before executing", "before starting", "prerequisite", "check first", "pull latest"
-maps_to_post = lesson relates to cleanup/verification after goal execution
-  Signal words: "after executing", "after finishing", "commit", "push", "clean up", "record", "verify result"
+# 2. SLOT MAPPING — Which hook slot does this lesson target?
+# Four-way classifier per core/config/conventions/domain-hooks.md → Targeting Guidance.
+# Decision order (check most specific first): outcome-observation → signal-refresh →
+# post-execution → pre-execution → skip.
 
-IF NOT (is_universal AND is_procedural AND (maps_to_pre OR maps_to_post)):
+maps_to_outcome_observation = lesson describes a new outcome metric to pull from the
+  real world AFTER state update (repo commits, CI pass rate, service health, business KPI)
+  Signal words: "outcome metric", "measure impact", "pull commits", "CI pass rate",
+  "service health after", "business KPI", "process vs outcome", "real-world effect"
+
+maps_to_signal_refresh = lesson describes a new input channel to scan or refresh
+  BEFORE goal scoring (user signal, board directive, external queue state)
+  Signal words: "refresh before scoring", "scan inbox", "check board", "poll for",
+  "user signal", "directive count", "before selection", "fresh evidence before scoring"
+
+maps_to_post = lesson relates to cleanup/verification after a single goal's execution
+  Signal words: "after executing", "after finishing", "commit", "push", "clean up",
+  "record", "verify result"
+
+maps_to_pre = lesson relates to setup/prerequisites before a single goal's execution
+  Signal words: "before executing", "before starting", "prerequisite", "check first",
+  "pull latest"
+
+IF NOT (is_universal AND is_procedural AND
+        (maps_to_outcome_observation OR maps_to_signal_refresh
+         OR maps_to_post OR maps_to_pre)):
     Log: "CONVENTION ROUTING: lesson stays as guardrail (not universal/procedural enough)"
     SKIP to Step 2.6
 
-target_convention = "pre-execution" if maps_to_pre else "post-execution"
+# Priority-ordered classifier — match specific slots before general ones.
+IF maps_to_outcome_observation:
+    target_convention = "outcome-observation"
+ELIF maps_to_signal_refresh:
+    target_convention = "signal-refresh"
+ELIF maps_to_post:
+    target_convention = "post-execution"
+ELIF maps_to_pre:
+    target_convention = "pre-execution"
+ELSE:
+    # Should not reach here given the guard above, but defensive.
+    Log: "CONVENTION ROUTING: unclassifiable — keeping as guardrail"
+    SKIP to Step 2.6
 
 # 3. RECURRENCE CHECK — Do similar guardrails already exist?
 Bash: guardrails-read.sh --active
@@ -257,7 +333,7 @@ ELSE:
     # Propose: single occurrence, needs reinforcement before applying
     echo '{"date":"<today>","type":"add","target":"{target_convention}","proposed_step":<proposed_step JSON>,"source":"reflect-on-outcome","source_hypothesis":"{hypothesis.id}","source_guardrails":[],"reinforcement_count":1,"confidence":0.6,"status":"pending"}' >> $WORLD_DIR/conventions/convention-changes.jsonl
     # Create pending question for user awareness
-    Write to <agent>/session/pending-questions.yaml:
+    Write to agents/<agent>/session/pending-questions.yaml:
         question: "Convention learning: Propose adding step to {target_convention}.md — '{proposed_step.title}'. Source: hypothesis {hypothesis.id} correction. Will auto-apply after reinforcement."
         default_action: "Will add after 2+ reinforcing signals from reflect/replay/evolve"
         status: pending
@@ -290,10 +366,13 @@ If both a CONFIRMED and CORRECTED exist in this category AND they haven't been p
 
   Create reasoning bank entry (type: contrastive) via script:
     echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
-    JSON fields: id (rb-NNN), title, description, content (contrastive analysis),
-            type ("contrastive"), confirmed_source, corrected_source, category, tags,
-            when_to_use (derived from confirmed conditions),
-            utilization (initialized to zeros), status ("active")
+    `id` and `created` are auto-set by the script — omit both; capture the
+    assigned id from stdout. Fields to supply: title, description, content
+    (contrastive analysis), type ("contrastive"), applies_to (REQUIRED:
+    `any` | `framework` | `domain` | `specific` based on the lesson's
+    scope), confirmed_source, corrected_source, category, tags,
+    when_to_use (derived from confirmed conditions), status ("active").
+    Utilization is auto-initialized.
 
   Log: "CONTRASTIVE EXTRACTION: {category} — CONFIRMED {confirmed_id} vs CORRECTED {corrected_id}"
 
@@ -306,7 +385,7 @@ If pair already extracted (check reasoning-bank-read.sh --active for existing co
 ```
 # Archive reflection insight as experience
 experience_id = "exp-reflect-{hypothesis_id}"
-Write <agent>/experience/{experience_id}.md with:
+Write agents/<agent>/experience/{experience_id}.md with:
     - ABC chain analysis
     - Extracted strategy or guardrail
     - Contrastive analysis (if applicable)
@@ -321,7 +400,7 @@ Experience JSON:
     hypothesis_id: "{hypothesis_id}"
     tree_nodes_related: [nodes updated during reflection]
     verbatim_anchors: [key quotes from ABC chain, exact strategy text]
-    content_path: "<agent>/experience/{experience_id}.md"
+    content_path: "agents/<agent>/experience/{experience_id}.md"
 ```
 
 ## Step 2.7: Memory Encoding Score (Hippocampal Gate)
@@ -343,6 +422,26 @@ Calculate component scores:
 
 encoding_score = (novelty * 0.30) + (outcome_impact * 0.25) + (surprise * 0.20) +
                  (goal_relevance * 0.15) + (repetition * 0.10)
+
+# Domain-class multiplier — applied BEFORE the threshold check.
+# Framework-scoped entries (e.g. framework-meta × 0.60, filtering routine framework
+# encoding) live in core/config/memory-pipeline.yaml. Domain-specific entries
+# (the ones the domain-leak-check would otherwise flag) live in
+# world/memory-pipeline.yaml under the same key. READERS MERGE: world wins on conflict.
+# Lookup: goal.category → _tree.yaml node → domain_class. Unknown → 1.00 (neutral).
+# Framework-meta goals with non-tree categories (e.g. "framework-maintenance") fall
+# into the neutral bucket today; extending the lookup is a follow-up item.
+domain_class = lookup_tree_node(goal.category).domain_class if lookup_succeeds else ""
+# INVARIANT: core MUST define encoding_gate.category_class_multiplier — it's a
+# framework-required key. No `or {}` fallback here: a missing key is a framework
+# corruption and should surface, not be masked as neutral 1.00 for every goal.
+core_map     = core_memory_pipeline.encoding_gate.category_class_multiplier
+# World MAY define the same key as a domain-override; absence is a valid state
+# (fresh install, no overrides defined yet), so the `or {}` chain is legitimate.
+world_map    = (world_memory_pipeline.get("encoding_gate") or {}).get("category_class_multiplier") or {}
+effective    = {**core_map, **world_map}   # world wins on conflict
+multiplier   = effective.get(domain_class, 1.00)
+encoding_score = encoding_score * multiplier
 
 If encoding_score >= 0.40 (encode_threshold):
     # PRECISION EXTRACTION: Before compressing, extract exact values from ABC chain
@@ -544,7 +643,7 @@ For each source in source_validation.sources:
 
 ## Step 6: Append to Journal
 
-Write reflection to `<agent>/journal/YYYY/MM/YYYY-MM-DD.md`:
+Write reflection to `agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md`:
 
 ```markdown
 ## Reflection: {record-slug}
@@ -637,11 +736,14 @@ Bash: pattern-signatures-read.sh --active   (load all active pattern signatures)
      AND the same condition has occurred 2+ times (check violations.md for repeats):
        Create new signature entry via script:
          echo '<JSON>' | bash core/scripts/pattern-signatures-add.sh
-         JSON fields: id (sig-{next number}), name ({descriptive kebab-case name}),
-         conditions ({from hypothesis_context}), outcome_stats ({total: 1, confirmed: 0 or 1}),
-         retrieval_cues ({from antecedents}), separation_markers ({what makes this different}),
-         status ("active"), created_session ({current session_count from aspirations-read.sh --meta})
-       Log: "NEW PATTERN SIGNATURE: {name} — discovered from {hypothesis-id}"
+         `id` and `created` are auto-set by the script — omit both; capture
+         the assigned id from stdout's full record JSON. Fields to supply:
+         name ({descriptive kebab-case name}), description, conditions
+         ({from hypothesis_context}), expected_outcome, outcome_stats
+         ({total: 1, confirmed: 0 or 1}), retrieval_cues ({from antecedents}),
+         separation_markers ({what makes this different}), status ("active"),
+         created_session ({current session_count from aspirations-read.sh --meta}).
+       Log: "NEW PATTERN SIGNATURE: {name from stdout id} — discovered from {hypothesis-id}"
 
 3. CONFUSION CHECK: Was a pattern wrongly matched during evaluation?
    If the hypothesis's evaluation record shows a pattern_match
@@ -816,7 +918,7 @@ Runs after Step 7.7d so the context quality rating is always finalized before ag
 
 ```
 # Part 1: Experiential Index
-Read <agent>/experiential-index.yaml (if exists, else skip)
+Read agents/<agent>/experiential-index.yaml (if exists, else skip)
 Update by_context_quality section:
   - Increment total for this category
   - Increment the usefulness bucket (helpful/neutral/misleading/irrelevant)
@@ -844,12 +946,24 @@ For each reasoning bank entry (rb-NNN) or guardrail (guard-NNN) that was loaded:
   If utilization_score < 0.20 AND retrieval_count >= 5:
     Log: "LOW UTILIZATION: {entry_id} — score {utilization_score} after {retrieval_count} retrievals — candidate for retirement"
 
-# Update experience retrieval stats (if experiences were consulted during this reflection)
+# Update experience retrieval stats (if experiences were consulted during
+# this reflection). experience-update-field.sh rejects dotted-path syntax
+# (g-115-529 / g-115-928 fail-loud rejection per experience.py:549). Read
+# current retrieval_stats, mutate, write whole-object JSON back.
 For each experience record consulted during this reflection cycle:
-    IF the experience was helpful (informed the ABC chain or strategy extraction):
-        bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.times_useful {n+1}
-    ELSE:
-        bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats.times_noise {n+1}
+    current = $(bash core/scripts/experience-read.sh --id {exp-id} \
+                | py -3 -c "import sys,json; r=json.load(sys.stdin); \
+                    print(json.dumps((r if not isinstance(r,list) else (r[0] if r else {})).get('retrieval_stats') or {}))")
+    useful_flag = "true" if the experience was helpful (informed the ABC chain or strategy extraction) else "false"
+    updated = $(echo "$current" | py -3 -c "
+import json, sys
+s = json.load(sys.stdin) or {}
+if '$useful_flag' == 'true':
+    s['times_useful'] = s.get('times_useful', 0) + 1
+else:
+    s['times_noise']  = s.get('times_noise', 0) + 1
+print(json.dumps(s))")
+    bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats "$updated"
 ```
 
 ## Step 8: Spark Check
@@ -883,7 +997,7 @@ If YES:
   IF gap.status == "forged": skip forge criteria check
 
   Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-  Read <agent>/developmental-stage.yaml → current stage
+  Read agents/<agent>/developmental-stage.yaml → current stage
   IF gap.times_encountered >= forge_threshold
      AND gap.estimated_value >= "medium"
      AND developmental stage >= EXPLOIT (developing+):
@@ -919,7 +1033,7 @@ If YES:
 
 **Q7: Update Experiential Memory Index**:
 ```
-Read <agent>/experiential-index.yaml (if exists, else skip)
+Read agents/<agent>/experiential-index.yaml (if exists, else skip)
 Update indexes with this hypothesis's data:
   - by_violation_cause: if corrected, add to relevant cause bucket
   - by_category: update accuracy, confirmed/corrected, update exemplar_confirmed/corrected if notable
@@ -1046,8 +1160,64 @@ IF goal completed AND goal.verification.checks is empty:
         signals.append("verification_gap")
 
 IF len(signals) == 0:
-    Output: "▸ Exec reflection: No notable execution signals — skipped"
+    Bash: echo "▸ Exec reflection: No notable execution signals — skipped"
     RETURN
+```
+
+## Step 0.75: Depth Calibration
+
+Compare the pre-execution depth estimate (Phase 3.95 of aspirations-execute)
+against the actual outcome_class and execution duration. Mismatches > 1 tier
+are logged to `meta/depth-calibration.jsonl` so bias drift can be surfaced
+in later reflect-on-self passes.
+
+This step runs for EVERY notable outcome (it's cheap — no retrieval, just
+a comparison and a file append). Over time the JSONL produces a
+per-category calibration signal: "recurring goals in category X tend to
+be deeper than estimated — default to standard" becomes an advisory in
+`meta/goal-selection-strategy.yaml`.
+
+```
+estimated = goal.estimated_depth             # routine | standard | deep | null
+actual_class = outcome_class                 # routine_spark | standard | deep
+actual_seconds = elapsed (from execution-diary.jsonl or Phase 4 timing)
+
+# Map outcome_class to tier for comparison: routine_spark → routine;
+# everything else uses actual_class literally.
+actual_tier = "routine" if actual_class == "routine_spark" else actual_class
+
+IF estimated is null:
+    # Legacy goal without Phase 3.95 metadata — skip calibration, log once.
+    Bash: echo "▸ Depth calibration: no estimate on {goal.id} — skipped"
+ELSE:
+    tiers = ["routine", "standard", "deep"]
+    estimated_idx = tiers.index(estimated)
+    actual_idx = tiers.index(actual_tier)
+    tier_diff = actual_idx - estimated_idx     # negative = over-estimate, positive = under-estimate
+
+    IF abs(tier_diff) >= 1:
+        error_direction = "under_estimated_depth" if tier_diff > 0 else "over_estimated_depth"
+        Bash: source core/scripts/_paths.sh && \
+              echo '{"goal_id":"<goal.id>","category":"<goal.category>","estimated":"<estimated>","actual":"<actual_tier>","estimated_seconds":<goal.estimated_seconds>,"actual_seconds":<actual_seconds>,"error_direction":"<error_direction>","date":"<today-ISO>"}' \
+              >> "$META_DIR/depth-calibration.jsonl"
+        Bash: echo "▸ Depth calibration: {error_direction} for {goal.id} ({estimated} → {actual_tier})"
+
+        # Every 10 mismatches, summarize bias direction and write an advisory.
+        # File exists — the >> append above just wrote to it. No fallback needed.
+        Bash: calibration_count=$(wc -l < "$META_DIR/depth-calibration.jsonl")
+        IF calibration_count > 0 AND calibration_count % 10 == 0:
+            # Read the last 30 entries, compute per-category bias (under/over),
+            # and append an advisory note to goal-selection-strategy.yaml.
+            Analyze: tail 30 entries, group by category, compute dominant
+            error_direction per category (>=60% same direction).
+            For each biased category:
+                Append one advisory line to meta/goal-selection-strategy.yaml
+                under `depth_bias_advisories:` — preserve existing entries,
+                update timestamp on duplicate category.
+            Log: "▸ Depth calibration: advisory refreshed at N={calibration_count}"
+    ELSE:
+        # Estimate was within tolerance (±0 tiers). No log entry.
+        Bash: echo "▸ Depth calibration: {goal.id} on target ({estimated}=={actual_tier})"
 ```
 
 ## Step 1: Pattern Signature Check
@@ -1084,10 +1254,11 @@ IF NOT matched AND "recurring_pattern" in signals:
     # (check working memory recent_outcomes + journal for similar execution patterns)
     Bash: wm-read.sh active_context --json  # recent outcomes are part of active_context
     IF similar_execution_count >= 2:
-        sig_id = next sig-NNN (check existing via pattern-signatures-read.sh --summary)
         echo '<JSON>' | bash core/scripts/pattern-signatures-add.sh
+        # `id` and `created` are auto-set by the script — omit both;
+        # capture the assigned id from stdout's full record JSON.
         # JSON: {
-        #   id: sig_id, name: descriptive name,
+        #   name: descriptive name,
         #   description: the recurring pattern,
         #   conditions: [conditions from execution context],
         #   expected_outcome: what typically happens,
@@ -1095,7 +1266,7 @@ IF NOT matched AND "recurring_pattern" in signals:
         #   source: "execution-reflection",
         #   source_goals: [goal.id, prior similar goal IDs]
         # }
-        Log: "NEW EXEC PATTERN: {name} — discovered from {goal.id}"
+        Log: "NEW EXEC PATTERN: {name} (sig from stdout) — discovered from {goal.id}"
 ```
 
 ## Step 2: Contradiction Detection
@@ -1115,9 +1286,9 @@ IF "surprise" in signals OR "mistake" in signals:
             IF contradiction is simple (can be corrected in 1-2 sentences):
                 # Fix inline — Edit the contradicted insight
                 Edit node.file: replace or annotate the contradicted insight
-                # last_update_trigger lives in .md front matter, last_updated in _tree.yaml
+                # T21 PostToolUse hook auto-syncs last_updated to _tree.yaml
+                # on every Edit; last_update_trigger lives in .md FM.
                 Edit node.file front matter: last_update_trigger: "execution-contradiction"
-                bash core/scripts/tree-update.sh --set <node.key> last_updated "$(date +%Y-%m-%dT%H:%M:%S)"
                 Log: "EXEC CONTRADICTION FIXED: {node.key} — insight updated after {goal.id}"
             ELSE:
                 # Too complex for inline fix — flag for Step 3 investigation goal
@@ -1146,9 +1317,8 @@ IF "surprise" in signals OR "mistake" in signals:
                 Append to node "## Verified Values" section (create if missing):
                   - **{label}**: `{value}` {unit} — {context}
             Edit node.file: append 1-2 sentence qualitative refinement to Key Insights
-            # last_update_trigger lives in .md front matter, last_updated in _tree.yaml
+            # T21 PostToolUse hook auto-syncs last_updated to _tree.yaml.
             Edit node.file front matter: last_update_trigger: "execution-refinement"
-            bash core/scripts/tree-update.sh --set <node.key> last_updated "$(date +%Y-%m-%dT%H:%M:%S)"
             Log: "EXEC REFINEMENT: {node.key} — insight refined after {goal.id}"
 ```
 
@@ -1236,7 +1406,12 @@ IF len(goals_to_create) > 0:
                 checks: []
             },
             discovered_by: goal.id,
-            discovery_type: new_goal.type
+            discovery_type: new_goal.type,
+            # origin_signal: execution-reflection maps type → prefix.
+            #   investigate → "investigate:{goal.id}"
+            #   unblock     → "unblock:{goal.id}"
+            #   idea        → "idea:{goal.id}"
+            origin_signal: "{new_goal.type}:{goal.id}"
         }
         target_asp = parent_asp  # Route to same aspiration as source goal
         echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh <target_asp>
@@ -1252,7 +1427,7 @@ If any learning occurred in Steps 1-3, archive as an experience record.
 ```
 IF matched OR new signature created OR contradiction handled OR goals_created_count > 0:
     experience_id = "exp-exec-{goal.id}"
-    Write <agent>/experience/{experience_id}.md with:
+    Write agents/<agent>/experience/{experience_id}.md with:
         ---
         type: execution_reflection
         goal_id: {goal.id}
@@ -1284,7 +1459,7 @@ IF matched OR new signature created OR contradiction handled OR goals_created_co
     #   summary: "Exec reflection on {goal.title}: {signals} → {outcomes}",
     #   goal_id: goal.id,
     #   tree_nodes_related: [node.key if any],
-    #   content_path: "<agent>/experience/{experience_id}.md"
+    #   content_path: "agents/<agent>/experience/{experience_id}.md"
     # }
 ```
 
@@ -1293,7 +1468,7 @@ IF matched OR new signature created OR contradiction handled OR goals_created_co
 Append execution reflection summary to the session journal.
 
 ```
-Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
+Append to agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md:
 
     ## {timestamp} — Execution Reflection: {goal.title}
     Signals: {signals joined by ", "}
@@ -1395,15 +1570,15 @@ Update micro_hypothesis_stats:
 Bash: pipeline-meta-update.sh micro_hypothesis_stats '<JSON>'
 
 # Count toward developmental stage resolved_hypotheses total
-Read <agent>/developmental-stage.yaml
+Read agents/<agent>/developmental-stage.yaml
 Update: resolved_hypotheses += (confirmed + corrected)  # only resolved micros count
-Write <agent>/developmental-stage.yaml
+Write agents/<agent>/developmental-stage.yaml
 ```
 
 ## Step 5: Journal Entry
 
 ```
-Append to <agent>/journal/YYYY/MM/YYYY-MM-DD.md:
+Append to agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md:
 
 ## Micro-Hypothesis Batch — Session {N}
 Total: {total} | Confirmed: {confirmed}/{confirmed+corrected} ({accuracy_pct}%)
@@ -1467,6 +1642,7 @@ batch_micro_result:
     - "Overconfident about {category}: {N} high-confidence misses"
     - "Underconfident about {category}: {N} low-confidence hits"
   actionable_discoveries: [...]  # from Step 6, empty list if none
+Bash: echo "reflect-on-outcome phase documented"
 ```
 
 ---
@@ -1487,4 +1663,10 @@ batch_micro_result:
 | Calls | `aspirations-add-goal.sh` | Execution | Investigation/unblock/idea goals |
 | Calls | `pipeline-meta-update.sh` | Batch Micro | Aggregate stats |
 | Updates | Tree nodes, beliefs, transitions | Hypothesis | Knowledge encoding |
-| Updates | `<agent>/journal/` | All | Reflection entries |
+| Updates | `agents/<agent>/journal/` | All | Reflection entries |
+
+## Return Protocol
+
+See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
+The terminal action is `reasoning-bank-add.sh`, `guardrails-add.sh`,
+`aspirations-add-goal.sh`, or `pipeline-meta-update.sh`. Never end with a text summary.
