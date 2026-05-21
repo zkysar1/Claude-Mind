@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-gate.sh",
             "timeout": 20
           }
         ]
@@ -73,12 +73,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-skill-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-skill-gate.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/utilization-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/utilization-gate.sh",
             "timeout": 20
           }
         ]
@@ -88,7 +88,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/bash-agent-inject.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-agent-inject.sh",
             "timeout": 30
           }
         ]
@@ -98,7 +98,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/schedule-wakeup-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/schedule-wakeup-gate.sh",
             "timeout": 10
           }
         ]
@@ -108,37 +108,37 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/path-resolution-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/session-manifest-write-gate-hook.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/rule-vs-convention-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/marker-placement-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/marker-placement-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/post-recovery-edit-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/post-recovery-edit-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-prepare.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-prepare.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/settings-structural-validator.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
             "timeout": 10
           }
         ]
@@ -148,37 +148,37 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/path-resolution-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/session-manifest-write-gate-hook.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/rule-vs-convention-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/marker-placement-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/marker-placement-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/post-recovery-edit-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/post-recovery-edit-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-prepare.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-prepare.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/settings-structural-validator.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
             "timeout": 10
           }
         ]
@@ -188,37 +188,37 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/path-resolution-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/session-manifest-write-gate-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/session-manifest-write-gate-hook.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/rule-vs-convention-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/rule-vs-convention-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/marker-placement-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/marker-placement-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/post-recovery-edit-gate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/post-recovery-edit-gate.sh",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-prepare.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-prepare.sh",
             "timeout": 15
           },
           {
             "type": "command",
-            "command": "bash core/scripts/settings-structural-validator.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
             "timeout": 10
           }
         ]
@@ -230,7 +230,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-record.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-record.sh",
             "timeout": 5
           }
         ]
@@ -240,27 +240,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-invalidate.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/tree-sync-check.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-sync-check.sh",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/skill-stdin-json-lint.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/lock-symmetry-lint.sh --quiet --force",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-record.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
           }
         ]
@@ -270,27 +270,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-invalidate.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/tree-sync-check.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-sync-check.sh",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/skill-stdin-json-lint.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/lock-symmetry-lint.sh --quiet --force",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-record.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
           }
         ]
@@ -300,27 +300,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/context-reads-invalidate.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-invalidate.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/tree-sync-check.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-sync-check.sh",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "bash core/scripts/skill-stdin-json-lint.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/skill-stdin-json-lint.sh",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash core/scripts/lock-symmetry-lint.sh --quiet --force",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/lock-symmetry-lint.sh --quiet --force",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash core/scripts/evolution-record.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
           }
         ]
@@ -330,7 +330,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/iteration-close-reminder.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/iteration-close-reminder.sh",
             "timeout": 5
           }
         ]
@@ -340,7 +340,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/presence-tick.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/presence-tick.sh",
             "timeout": 5
           }
         ]
@@ -352,12 +352,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/precompact-serialize.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/precompact-serialize.sh",
             "timeout": 90
           },
           {
             "type": "command",
-            "command": "bash core/scripts/precompact-checkpoint.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/precompact-checkpoint.sh",
             "timeout": 10
           }
         ]
@@ -368,7 +368,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/sessionstart-orchestrator.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/sessionstart-orchestrator.sh",
             "timeout": 95
           }
         ]
@@ -380,7 +380,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/user-prompt-skill-record.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/user-prompt-skill-record.sh",
             "timeout": 15
           }
         ]
@@ -391,7 +391,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/stop-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/stop-hook.sh",
             "timeout": 60
           }
         ]
@@ -402,7 +402,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash core/scripts/stop-failure-hook.sh",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/stop-failure-hook.sh",
             "timeout": 5
           }
         ]

@@ -35,8 +35,36 @@ On resume (agent already exists):
 - `--mode <value>`: mode flag. Valid values: `reader`, `assistant`, `autonomous`. If omitted, default to `autonomous`.
 - `--recover`: recovery flag. Set `recover = true` if any argument is the literal string `--recover`. This flag triggers the crashed-runner cleanup in Step 0.7 below. Only meaningful when agent state is RUNNING; fails loud otherwise.
 - `--force`: force flag. Set `force = true` if any argument is the literal string `--force`. Bypasses the heartbeat-staleness precondition on `--recover` (emergency override for the "heartbeat fresh but runner is stuck" case). No effect outside recovery.
+- `--override-output-style <justification>`: override flag for the Step 0.6 + C7.7 autonomous+Explanatory gate. When present with a non-empty justification string, Step 0.6 lets the autonomous mode proceed, and C7.7 passes the same value to `output-style-gate.sh --override` for audit logging. The justification is echoed to `world/output-style-overrides.jsonl`.
 
 The flag parser must run flag extraction BEFORE positional extraction so `/start --recover` (no agent name) binds to the current session's agent rather than being misinterpreted as `/start <agent-name=--recover>`.
+
+**Step 0.6: Output-style preflight (autonomous mode only)** — When the parsed mode is `autonomous` (the default), read `.claude/settings.local.json` for the active `outputStyle` and warn the user IMMEDIATELY if it's set to `Explanatory`. The C7.7 Layer-B gate fires the same check later, but only AFTER all the long Phase A/B/C work (path prompts, permissions, init-mind, conventions, The Program, identity). Failing at C7.7 wastes ~30+ min of user investment. This preflight surfaces the collision before any state mutation.
+
+Bash: `py -3 -c "import json,pathlib;p=pathlib.Path('.claude/settings.local.json');s=(json.loads(p.read_text(encoding='utf-8')).get('outputStyle') or '').strip().lower() if p.exists() else '';print(s)" 2>/dev/null`
+
+IF the output is `explanatory`: print the following warning and STOP (do not proceed to Step 0.7 or Step 1):
+
+```
+⚠ OUTPUT-STYLE PREFLIGHT WARNING
+
+You requested autonomous mode but the active output style is Explanatory.
+This combination is a documented loop killer (rb-629, guard-454,
+.claude/rules/return-protocol.md): Explanatory mandates trailing
+"✶ Insight" blocks that land AFTER the terminal Skill(aspirations)
+call as text, ending the turn and killing the loop.
+
+The Layer-B gate at C7.7 would refuse this combination anyway, but
+that's after ~30 min of path/identity/Program setup. Bailing early.
+
+Switch with /output-style default (or any non-Explanatory style),
+then re-issue /start <agent>. Or re-issue with
+--override-output-style "<justification>" to audit-log and proceed.
+```
+
+IF the user re-issues with `--override-output-style "<justification>"`, accept and proceed to Step 0.7 (the override is re-validated and audit-logged by the C7.7 gate). Other output styles (default, concise, etc.) pass this preflight.
+
+Fail-open: if the file or `outputStyle` key is absent, or `py -3` is unavailable, proceed silently — the C7.7 gate is the safety net.
 
 **Step 0.7: Recovery Branch (only if `recover = true`)** — Runs BEFORE Step 1's state check so recovery can rewrite the state before Step 1 reads it.
 
@@ -1473,7 +1501,13 @@ C7. Write `agents/<agent>/self.md` with parsed Self (where `<agent>` is the acti
 C7.7. Layer-B output-style gate (g-115-316 / guard-454 / rb-629).
     Refuses autonomous mode + Explanatory output style — documented loop killer.
     Runs BEFORE C8 so a refusal leaves agent-state untouched.
+    Step 0.6 already fires the same check pre-Phase-A so most users hit the
+    early bail; this is the defense-in-depth layer in case Step 0.6 fail-opened
+    (missing settings file, no py launcher).
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/output-style-gate.sh --mode autonomous`
+      (Append ` --override "<justification>"` when the Step 0.5 parser captured
+      `--override-output-style <justification>`. Pass the justification string
+      verbatim — it lands in `world/output-style-overrides.jsonl`.)
       Exit codes: 0=proceed, 2=REFUSE (STOP /start, ask user to run
       `/output-style default` first, then re-issue `/start <agent-name>`),
       3=override accepted (proceed; audit logged to
@@ -1481,7 +1515,7 @@ C7.7. Layer-B output-style gate (g-115-316 / guard-454 / rb-629).
       Layer A (Return Protocol) and Layer C (stop-hook trailing-text-detector)
       remain in effect.
 
-C8. Set MODE ONLY — agent-state stays IDLE until the C9.9 runner claim.
+C8. Set MODE + explicit IDLE state — agent-state RUNNING flip is deferred to C9.9.
     (Fix 2, 2026-05-15: the RUNNING flip is deliberately deferred until
     everything interactive/long — identity confirmation C5, prime C8.5,
     aspiration creation C9, verification C9.3 — is DONE. A turn-end anywhere
@@ -1494,6 +1528,15 @@ C8. Set MODE ONLY — agent-state stays IDLE until the C9.9 runner claim.
       suspenders rationale. Setting mode=autonomous now makes the C8.5 prime
       run as an autonomous counter-bump retrieve, the intended bootstrap-prime
       behavior.)
+    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
+      (Fresh-install fix, 2026-05-20: on UNINITIALIZED→autonomous, agent-state
+      never existed before — the "state stays IDLE" comment above is only
+      literally true if IDLE was already set. Without this explicit write,
+      C8.5 /prime sees state=UNINITIALIZED and Phase 0.5 either short-circuits
+      or branches wrong. The reader and assistant flows (Phase C lines ~1152,
+      ~1235) already do this; the autonomous flow's omission was a state-
+      machine gap. **HALT ON NON-ZERO EXIT** — if the script exits non-zero,
+      STOP. Investigate stderr and retry.)
 
 C8.5. Invoke `/prime` — load domain context before aspiration creation.
     When connecting to an existing world, this ensures goal decomposition

@@ -352,6 +352,19 @@ EOF
 mkdir -p "$WORLD/scripts"
 echo "  Created skill relations + scripts directory"
 
+# Seed Layer-B/C defense scripts from framework templates so fresh worlds get
+# the canonical loop-death prevention out-of-the-box (rb-629/guard-454). Domain
+# may edit these in world/scripts/ later. Idempotent: only seed when missing.
+if [ ! -f "$WORLD/scripts/output-style-mode-guard.sh" ]; then
+    cp "$CONFIG/templates/output-style-mode-guard.sh" "$WORLD/scripts/output-style-mode-guard.sh"
+    chmod +x "$WORLD/scripts/output-style-mode-guard.sh" 2>/dev/null || true
+    echo "  Seeded output-style-mode-guard.sh (Layer-B)"
+fi
+if [ ! -f "$WORLD/scripts/trailing-text-detector.py" ]; then
+    cp "$CONFIG/templates/trailing-text-detector.py" "$WORLD/scripts/trailing-text-detector.py"
+    echo "  Seeded trailing-text-detector.py (Layer-C)"
+fi
+
 # --- 9.7. Team state ---
 bash "$CORE_ROOT/scripts/team-state-init.sh"
 echo "  Initialized team-state.yaml"
