@@ -4,8 +4,11 @@ Hard checks BEFORE filing a new goal. Catches the g-115-141 class: a new
 goal whose scope overlaps with peer work that is (a) in team-state
 recent_completions, (b) the subject of a partner's in_flight claim, (c)
 visible in 48h git commits, (d) the subject of an active insight_trigger,
-or (e) already implemented in the target file. See the CLI wrapper
-docstring for the full failure-mode catalog and rb-NNN crosslinks.
+(e) already implemented in the target file, or (f) already pending /
+in-progress in the world or any agent queue (g-115-783; closes the
+missing-CORPUS gap surfaced by the 4-way l1-skew dup cluster
+g-115-743/776/778/779). See the CLI wrapper docstring for the full
+failure-mode catalog and rb-NNN crosslinks.
 
 Public API:
     evaluate(goal, *, override_duplication, agent_name, world_dir,
@@ -452,7 +455,10 @@ def _check_git_log(goal, file_paths, project_root):
         }
     try:
         out = subprocess.run(
-            ["git", "log", "--since=48h",
+            # git approxidate rejects the bare unit-letter form "48h" (returns
+            # 0 commits, silently disabling this check); use "N.units.ago".
+            # 6 — this check was dead since inception (0/15155 firings).
+            ["git", "log", "--since=48.hours.ago",
              "--name-only", "--pretty=format:COMMIT %H %s"],
             capture_output=True, text=True, timeout=10,
             encoding="utf-8", errors="replace",
@@ -486,7 +492,13 @@ def _check_git_log(goal, file_paths, project_root):
         # sorted() — set iteration is per-process; first-match
         # `goal_file_pattern` must be deterministic.
         for fp in sorted(file_paths):
-            if fp == line or fp in line or line in fp:
+            # Specificity floor (6): a bare basename (no "/") is too
+            # generic to confirm same-file against the large 48h commit corpus
+            # (dominated by frequently-churned state files), so it would
+            # over-fire once the date filter above was un-broken. Require an
+            # exact match for bare names; only qualified paths may
+            # substring-match either direction.
+            if fp == line or ("/" in fp and (fp in line or line in fp)):
                 raw_matches.append({
                     "commit": current,
                     "file": line,
@@ -815,6 +827,238 @@ def _check_target_state(goal: dict, agent_name: str, project_root: Path):
     }
 
 
+# --- Check 6: pending_queue --------------------------------------------------
+
+def _iter_pending_goals_from_jsonl(jsonl_path: Path, proposed_id: str):
+    """Yield (asp_id, goal) for goals with status in (pending, in-progress)
+    from one aspirations.jsonl file. Skips the proposed goal if it shares
+    an id with an existing record (idempotent re-file). Fail-open on read
+    errors — missing/unreadable files yield nothing."""
+    if not jsonl_path.exists():
+        return
+    try:
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    asp = json.loads(line)
+                except Exception:
+                    continue
+                asp_id = asp.get("id") or ""
+                for g in asp.get("goals", []) or []:
+                    if not isinstance(g, dict):
+                        continue
+                    if g.get("status") not in ("pending", "in-progress"):
+                        continue
+                    if proposed_id and g.get("id") == proposed_id:
+                        continue
+                    yield (asp_id, g)
+    except Exception:
+        return
+
+
+def _check_pending_queue(goal, file_paths, keywords, source_name,
+                        world_dir, project_root):
+    """Scan world + per-agent aspirations.jsonl for pending/in-progress
+    goals overlapping the proposed goal. Closes the missing-CORPUS gap
+    flagged by g-115-783: the other five checks NEVER read the pending
+    queue, so a new proposal whose semantic twin was already pending
+    (canonical incident: 4-way l1-skew dup cluster
+    g-115-743/776/778/779 over 22h, consolidated manually) slipped
+    through cleanly.
+
+    Match strategies (any one blocks):
+      1. origin_signal exact match — STRONG; symptom-keyed identity
+         (the goal description: "keyed on symptom/origin-signal not
+         title prose"). Only fires when both proposed and existing
+         origin_signal are non-empty.
+      2. Structural overlap with co-signal — mirrors
+         _check_recent_completions: weighted >= 1.5, unique_hits >= 2,
+         structural co-signal (file-path hit OR keyword with -_0-9).
+
+    Sources scanned:
+      - world_dir/aspirations.jsonl (world queue)
+      - project_root/agents/*/aspirations.jsonl (per-agent queues — ALL
+        agents; pending dups are equally bad in any queue).
+
+    Skip-paths:
+      - world_dir and project_root both None → skip (no sources)
+      - Empty proposed signals AND empty origin_signal → skip
+      - Read errors → skip the affected file silently
+    """
+    if world_dir is None and project_root is None:
+        return {
+            "name": "pending_queue",
+            "passed": True,
+            "reason": "skipped (no world_dir or project_root)",
+            "matches": [],
+        }
+
+    proposed_origin = (goal.get("origin_signal") or "").strip()
+    proposed_id = goal.get("id") or ""
+
+    # Collect source paths. Sorted iteration for deterministic ordering.
+    source_paths = []
+    if world_dir is not None:
+        source_paths.append(("world", world_dir / "aspirations.jsonl"))
+    if project_root is not None:
+        agents_root = project_root / "agents"
+        if agents_root.is_dir():
+            for agent_dir in sorted(agents_root.iterdir()):
+                if not agent_dir.is_dir():
+                    continue
+                source_paths.append((f"agent:{agent_dir.name}",
+                                     agent_dir / "aspirations.jsonl"))
+
+    # Collect candidate pending goals across all sources.
+    # Shape per entry: {source, asp_id, goal_id, title, description,
+    # origin_signal, text} where text = (title + description).lower().
+    candidates = []
+    for source_label, jp in source_paths:
+        for asp_id, g in _iter_pending_goals_from_jsonl(jp, proposed_id):
+            title = g.get("title") or ""
+            description = g.get("description") or ""
+            candidates.append({
+                "source": source_label,
+                "asp_id": asp_id,
+                "goal_id": g.get("id") or "",
+                "title": title,
+                "description": description,
+                "origin_signal": (g.get("origin_signal") or "").strip(),
+                "text": (title + " " + description).lower(),
+            })
+
+    if not candidates:
+        return {
+            "name": "pending_queue",
+            "passed": True,
+            "reason": "no pending/in-progress goals across world+agent queues",
+            "matches": [],
+        }
+
+    # Strategy 1: origin_signal exact match.
+    # Symptom-keyed origin_signals are the strongest non-id duplicate
+    # signal — e.g. "idea:dup-gate-pending-corpus-gap" or
+    # "alert-email:s3-key/foo". Exact match blocks immediately.
+    origin_matches = []
+    if proposed_origin:
+        for c in candidates:
+            if c["origin_signal"] and c["origin_signal"] == proposed_origin:
+                origin_matches.append({
+                    "source": c["source"],
+                    "asp_id": c["asp_id"],
+                    "goal_id": c["goal_id"],
+                    "title": c["title"][:120],
+                    "origin_signal": c["origin_signal"],
+                    "match_strategy": "origin_signal",
+                })
+
+    # Strategy 2: structural overlap mirroring _check_recent_completions.
+    # IDF computed over the candidate text corpus so common queue vocab
+    # doesn't inflate matches (matches the rare-identifier discipline in
+    # the recent_completions check).
+    all_terms = set(file_paths) | set(keywords)
+    # _compute_idf takes entries with `key_finding` field. Wrap candidate
+    # text in that shape so the helper applies symmetrically.
+    pseudo_entries = [{"key_finding": c["text"]} for c in candidates]
+    idf = _compute_idf(pseudo_entries, all_terms) if all_terms else {}
+
+    WEIGHT_THRESHOLD = 1.5
+    MIN_UNIQUE_HITS = 2
+
+    structural_matches = []
+    advisories = []
+    for c in candidates:
+        text = c["text"]
+        # sorted() — file_paths/keywords are sets; stable order needed for
+        # determinism across processes (Python hash randomization).
+        hit_paths = sorted(fp for fp in file_paths if fp.lower() in text)
+        hit_kws = sorted(kw for kw in keywords if kw in text)
+        unique_hits = len(hit_paths) + len(hit_kws)
+        weighted = sum(idf.get(fp, 1.0) for fp in hit_paths) + \
+                   sum(idf.get(kw, 1.0) for kw in hit_kws)
+        strong = unique_hits >= MIN_UNIQUE_HITS and weighted >= WEIGHT_THRESHOLD
+        # Structural co-signal required — stricter than the recent_completions
+        # variant. Pending+in-progress corpus is ~5-10x larger than
+        # recent_completions (377 vs ~50), so generic compound vocabulary
+        # ("cross-agent", "fresh-eyes", "post-execution" — hyphen-only)
+        # produces too many false-positive structural matches. Require a
+        # file-path hit OR a keyword with [_0-9] (true identifier — goal
+        # IDs like , rb-IDs, script names with digit suffixes).
+        # Hyphen-alone does NOT qualify. This aligns with the goal's
+        # "keyed on symptom/origin-signal not title prose" intent — the
+        # PRIMARY duplicate signal is origin_signal exact match
+        # (Strategy 1 above); structural overlap is the safety net for
+        # cases where the duplicate was filed with a distinct
+        # origin_signal but shares structural fingerprints.
+        has_specific = bool(hit_paths) or any(
+            re.search(r"[_0-9]", k) for k in hit_kws)
+        if strong and has_specific:
+            structural_matches.append({
+                "source": c["source"],
+                "asp_id": c["asp_id"],
+                "goal_id": c["goal_id"],
+                "title": c["title"][:120],
+                "origin_signal": c["origin_signal"],
+                "file_path_hits": hit_paths,
+                "keyword_hits": hit_kws[:5],
+                "weighted_score": round(weighted, 2),
+                "unique_hits": unique_hits,
+                "match_strategy": "structural_overlap",
+            })
+        elif strong:
+            advisories.append({
+                "source": c["source"],
+                "goal_id": c["goal_id"],
+                "unique_hits": unique_hits,
+                "weighted_score": round(weighted, 2),
+                "keyword_hits": hit_kws[:5],
+                "strong_keyword_only": True,
+            })
+        elif unique_hits >= 1:
+            advisories.append({
+                "source": c["source"],
+                "goal_id": c["goal_id"],
+                "unique_hits": unique_hits,
+                "weighted_score": round(weighted, 2),
+            })
+
+    matches = origin_matches + structural_matches
+    advisories.sort(key=lambda a: (not a.get("strong_keyword_only"),
+                                    -a.get("weighted_score", 0.0)))
+    strong_only = sum(1 for a in advisories if a.get("strong_keyword_only"))
+
+    if matches:
+        strategy_summary = ", ".join(sorted(set(m["match_strategy"]
+                                               for m in matches)))
+        return {
+            "name": "pending_queue",
+            "passed": False,
+            "reason": ("overlap with " + str(len(matches)) +
+                       " pending/in-progress goal(s) across world+agent queues"
+                       " [strategies=" + strategy_summary +
+                       ", source=" + source_name +
+                       ", scanned=" + str(len(candidates)) + "]"),
+            "matches": matches,
+            "advisories": advisories[:5],
+        }
+    return {
+        "name": "pending_queue",
+        "passed": True,
+        "reason": ("no blocking overlap (scanned=" + str(len(candidates)) +
+                   " pending/in-progress, source=" + source_name +
+                   ", " + str(len(advisories)) +
+                   " sub-threshold advisories"
+                   + (", " + str(strong_only) +
+                      " strong keyword-only demoted (no file-path/identifier co-signal)"
+                      if strong_only else "") + ")"),
+        "matches": [],
+        "advisories": advisories[:5],
+    }
+
+
 # --- Override audit ----------------------------------------------------------
 
 def _log_override(world_dir: Optional[Path], agent_name: str, goal: dict,
@@ -882,6 +1126,8 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
         _check_insight_triggers(goal, file_paths, self_agent, world_dir,
                                 expected_paths),
         _check_target_state(goal, self_agent, project_root),
+        _check_pending_queue(goal, file_paths, keywords, source_name,
+                             world_dir, project_root),
     ]
     failing = [c for c in checks if not c.get("passed")]
     would_block = bool(failing) and not override_duplication

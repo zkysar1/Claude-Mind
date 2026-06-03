@@ -40,6 +40,13 @@ Active probes:
   - BackgroundJobProbe — dead-PID / max-duration in background-jobs.yaml.
   - StopHookBlockProbe — stop-hook BLOCK thrash without heartbeat
     advancement (cross-binding stomp, rb-739).
+  - DaemonHealthProbe — proactive daemon-death detection + race-safe respawn
+    on the tick cadence (g-240-97); guard-597 confirmation re-probe before
+    declaring death so a slow-but-alive daemon is never spuriously respawned.
+  - FreshnessProbe — pointer-doc freshness: deterministic content-hash
+    auto-bump of stale-but-unchanged pointers; deduped Investigate goal on
+    canonical drift. Replaces the clock-based recurring re-verify goal
+    (logic in pointer_freshness.py).
 
 LOG FORMATS
 -----------
@@ -63,7 +70,8 @@ State file (<agent>/session/watchdog-prev-state.json):
     "running-sid":      { "exists": bool, "mtime": float, "sid": str },
     "heartbeat":        { "last_state": "fresh|stale|missing|unknown" },
     "background-job":   { "reported": [[job_id, event_type], ...] },
-    "stop-hook-block":  { "last_pos": int, "consecutive_blocks": int, ... }
+    "stop-hook-block":  { "last_pos": int, "consecutive_blocks": int, ... },
+    "daemon-health":    { "prev_reachable": bool|null, "consecutive_unreachable": int }
   }
 First tick (file missing or corrupt) → each probe captures current state
 as baseline; no events emitted. Subsequent ticks compare and emit.
@@ -94,8 +102,11 @@ DESIGN NOTES
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -856,6 +867,211 @@ class StopHookBlockProbe(Probe):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DaemonHealthProbe — proactive daemon-death detection + respawn ()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rt_port_file(root: Path) -> Path:
+    """Resolve the daemon port file exactly as _runtime.sh does
+    (RT_PORT_FILE, else RT_DIR/daemon.port, else
+    PROJECT_ROOT/mind_api/state/daemon.port). Mirrors _runtime.sh lines 33-35
+    and honors the same env overrides so a relocated state dir stays in sync."""
+    pf = os.environ.get("RT_PORT_FILE")
+    if pf:
+        return Path(pf)
+    rt_dir = os.environ.get("RT_DIR")
+    base = Path(rt_dir) if rt_dir else (root / "mind_api" / "state")
+    return base / "daemon.port"
+
+
+def daemon_health_probe(root: Path, timeout: float = 1.0) -> bool:
+    """Pure-Python faithful replica of _runtime.sh rt_is_up: read the port
+    file, GET http://127.0.0.1:<port>/v1/admin/health, return True iff HTTP
+    2xx within `timeout` seconds (mirrors curl --max-time 1).
+
+    WHY pure Python and not `bash -c 'source _runtime.sh && rt_is_up'`: on
+    Windows, subprocess "bash" resolves to WSL bash (rb-225/rb-247), which
+    cannot read the Windows RT_PORT_FILE and would false-negative — a
+    spurious respawn against a live daemon (the exact guard-597 failure).
+    This is the FREQUENT path (every watchdog tick), so it must be
+    lottery-free and stays in-process. The coupling to _runtime.sh is only
+    three things — port-file path (env-mirrored above), endpoint, and
+    timeout — pinned by this comment. Monkeypatched in tests to simulate
+    up/down without a real daemon."""
+    try:
+        port = _rt_port_file(root).read_text(encoding="utf-8").strip()
+    except OSError:
+        # No port file == daemon not running (matches rt_base_url empty -> rt_is_up rc1).
+        return False
+    if not port:
+        return False
+    url = f"http://127.0.0.1:{port}/v1/admin/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            status = getattr(resp, "status", None) or resp.getcode()
+            return 200 <= int(status) < 300
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def daemon_respawn(root: Path) -> dict:
+    """Delegate respawn to _runtime.sh rt_ensure_running. NOT reimplemented:
+    rt_ensure_running owns the wrapper-side spawn mutex (rt_acquire_spawn_lock),
+    the already-up early-return, the detached rt_spawn, and rt_wait_for_ready.
+    Reimplementing any of that in Python would duplicate the race-safety
+    surface (implementation-discipline rule 3) and lose the mutex that prevents
+    multi-daemon launches.
+
+    Bash resolution: RT_BASH env (if a Git Bash invoker exports it) else "bash".
+    The WSL-bash lottery (rb-225/rb-247) is contained here by (a) this being
+    the RARE path — reached only on guard-597-confirmed death — and (b) the
+    caller re-probing health (daemon_health_probe) afterward for the
+    authoritative outcome, so a wrong-bash subprocess can never produce a
+    false 'respawned' claim. Returns a result dict; never raises.
+    Monkeypatched in tests so no real daemon is spawned."""
+    bash = os.environ.get("RT_BASH") or "bash"
+    try:
+        r = subprocess.run(
+            [bash, "-c", "source core/scripts/_runtime.sh && rt_ensure_running"],
+            cwd=str(root), capture_output=True, text=True, timeout=60,
+        )
+        return {"attempted": True, "subprocess_rc": r.returncode,
+                "detail": ((r.stderr or "") + (r.stdout or "")).strip()[-300:]}
+    except subprocess.TimeoutExpired:
+        return {"attempted": True, "subprocess_rc": None,
+                "detail": "rt_ensure_running timed out (>60s)"}
+    except OSError as e:
+        return {"attempted": True, "subprocess_rc": None,
+                "detail": f"{type(e).__name__}: {e}"}
+
+
+class DaemonHealthProbe(Probe):
+    """Pings the daemon health endpoint on the watchdog tick cadence and
+    triggers a race-safe respawn when it is confirmed dead — so death is
+    caught proactively instead of by the unlucky next wrapper call (g-240-97).
+
+    Unlike the transition-based probes above (running-sid, background-job),
+    daemon-down is an ABSOLUTE state, not a transition: a dead daemon is worth
+    respawning regardless of whether this is the first observation. So this
+    probe does NOT capture an initialize() baseline — a dead daemon on the
+    very first tick is reported and respawned.
+
+    guard-597 compliance: a SINGLE rt_is_up timeout does NOT establish death.
+    OneDrive write-lock contention can stall a live daemon past the 1s probe
+    (retry storms up to ~22s observed). On the first 'down' reading the probe
+    runs CONFIRM_PROBES additional health probes; only when ALL of them also
+    fail is the daemon treated as genuinely dead. A daemon that answers on any
+    re-probe is logged once as daemon_slow (info) and NOT respawned —
+    respawning a live-but-slow daemon is the precise false-positive guard-597
+    exists to prevent.
+
+    Respawn is delegated to rt_ensure_running (see daemon_respawn) and its
+    success is VERIFIED by a fresh pure-Python health probe, so the emitted
+    event reports the real post-respawn state, not a subprocess exit code.
+
+    Observe-only: when RT_NO_AUTOSPAWN=1 the probe still detects + emits but
+    does not respawn (mirrors rt_ensure_running's own opt-out; lets the
+    daemon-down test suite exercise detection without spawning a daemon).
+
+    Cross-tick state: prev_reachable (last settled reachability — None until
+    the first reading) and consecutive_unreachable (count of confirmed-dead
+    ticks; reset on recovery)."""
+
+    name = "daemon-health"
+    CONFIRM_PROBES = 2     # extra health probes after the first 'down' before declaring death
+    CONFIRM_GAP_S = 0.5    # brief pause between confirmation probes
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.prev_reachable: Optional[bool] = None
+        self.consecutive_unreachable: int = 0
+
+    def check(self) -> list[Event]:
+        root = self.ctx.project_root_path
+        no_autospawn = os.environ.get("RT_NO_AUTOSPAWN") == "1"
+
+        if daemon_health_probe(root):
+            events: list[Event] = []
+            if self.prev_reachable is False:
+                events.append(Event(
+                    probe=self.name, event="daemon_recovered", severity="info",
+                    payload={"cleared_consecutive_unreachable": self.consecutive_unreachable},
+                    summary=f"{self.name}: daemon_recovered (was unreachable x{self.consecutive_unreachable})",
+                ))
+            self.prev_reachable = True
+            self.consecutive_unreachable = 0
+            return events
+
+        # First 'down' reading — guard-597 confirmation re-probe.
+        confirmed_down = True
+        for _ in range(self.CONFIRM_PROBES):
+            time.sleep(self.CONFIRM_GAP_S)
+            if daemon_health_probe(root):
+                confirmed_down = False
+                break
+
+        if not confirmed_down:
+            events = []
+            if self.prev_reachable is False:
+                # Was confirmed dead, now answering on re-probe — recovery.
+                events.append(Event(
+                    probe=self.name, event="daemon_recovered", severity="info",
+                    payload={"cleared_consecutive_unreachable": self.consecutive_unreachable,
+                             "note": "answered on guard-597 confirmation re-probe"},
+                    summary=f"{self.name}: daemon_recovered (answered on re-probe)",
+                ))
+            else:
+                # Previously alive (or first tick) — a transient slow blip.
+                events.append(Event(
+                    probe=self.name, event="daemon_slow", severity="info",
+                    payload={"note": "rt_is_up timed out once then answered on re-probe — "
+                                     "slow-but-alive, no respawn (guard-597)"},
+                    summary=f"{self.name}: daemon_slow (timeout then alive on re-probe — no respawn)",
+                ))
+            self.prev_reachable = True
+            self.consecutive_unreachable = 0
+            return events
+
+        # Confirmed dead across the initial probe + CONFIRM_PROBES re-probes.
+        self.consecutive_unreachable += 1
+        if no_autospawn:
+            respawn = {"attempted": False, "reason": "RT_NO_AUTOSPAWN=1 — observe-only",
+                       "verified_up": False}
+        else:
+            respawn = daemon_respawn(root)
+            # Authoritative post-probe: the subprocess rc alone is not trusted
+            # (a wrong-bash subprocess could exit 0 without spawning).
+            respawn["verified_up"] = daemon_health_probe(root)
+
+        event = Event(
+            probe=self.name, event="daemon_unreachable", severity="critical",
+            payload={
+                "confirmation_probes": self.CONFIRM_PROBES,
+                "consecutive_unreachable": self.consecutive_unreachable,
+                "respawn": respawn,
+            },
+            include_processes=True,
+            summary=(f"{self.name}: daemon_unreachable "
+                     f"(confirmed x{1 + self.CONFIRM_PROBES}) "
+                     f"respawn_verified_up={respawn.get('verified_up', False)}"),
+        )
+        # Settle reachability from the VERIFIED post-probe. If respawn brought
+        # it up, the next tick sees up and won't re-emit; if still down,
+        # prev_reachable stays False so the next tick re-confirms and
+        # re-attempts (death persists → keep trying).
+        self.prev_reachable = bool(respawn.get("verified_up", False))
+        return [event]
+
+    def to_dict(self) -> dict:
+        return {"prev_reachable": self.prev_reachable,
+                "consecutive_unreachable": self.consecutive_unreachable}
+
+    def from_dict(self, state: dict) -> None:
+        if state:
+            self.prev_reachable = state.get("prev_reachable", None)
+            self.consecutive_unreachable = int(state.get("consecutive_unreachable", 0) or 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Event log writer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -890,6 +1106,116 @@ def emit_event(ctx: WatchdogContext, log_path: Path, event: Event) -> None:
 # Watchdog modes
 # ─────────────────────────────────────────────────────────────────────────────
 
+class FreshnessProbe(Probe):
+    """Pointer-doc freshness: auto-bumps stale-but-unchanged pointer docs and
+    files a deduped Investigate goal when a tracked canonical has drifted.
+
+    Heavy logic lives in pointer_freshness.py (lazy-imported inside check() so a
+    syntax error there can never crash the watchdog tick). Transition semantics:
+    a drift / canonical_missing / error event is emitted only when a pointer's
+    status or canonical hash changes from the prior tick, so a persistent drift
+    logs once per episode rather than every tick. Goal filing is deduped
+    independently inside scan() via an open-goal scan, so the Investigate goal is
+    filed at most once regardless of event emission.
+
+    Unlike the liveness probes, first-tick ACTION (auto-bump / drift-escalation)
+    is the intended work, not a false alarm -- so initialize() starts from an
+    empty baseline instead of capturing current-as-prev.
+    """
+    name = "freshness"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.prev: dict = {}  # {pointer_path: {"status": str, "hash": str|None}}
+
+    def initialize(self) -> None:
+        self.prev = {}
+
+    def _world_dir(self):
+        try:
+            from _paths import WORLD_DIR  # type: ignore
+            return WORLD_DIR
+        except Exception:
+            return None
+
+    def check(self) -> list[Event]:
+        world_dir = self._world_dir()
+        if not world_dir:
+            return []
+        try:
+            from pointer_freshness import scan as freshness_scan  # type: ignore
+        except Exception as e:
+            sys.stderr.write(
+                f"agent-watchdog: freshness probe import failed: "
+                f"{type(e).__name__}: {e}\n"
+            )
+            return []
+        out = freshness_scan(
+            world_dir,
+            agent_dir=self.ctx.agent_dir,
+            project_root=self.ctx.project_root_path,
+            dry_run=False,
+        )
+        events: list[Event] = []
+        new_prev: dict = {}
+        for r in out["results"]:
+            path = r["path"]
+            status = r["status"]
+            cur_hash = r.get("current_hash")
+            new_prev[path] = {"status": status, "hash": cur_hash}
+            prior = self.prev.get(path, {})
+            changed = (prior.get("status") != status) or (prior.get("hash") != cur_hash)
+            if status == "bumped":
+                events.append(Event(
+                    probe=self.name, event="auto_bumped", severity="info",
+                    payload={"pointer": path, "age_days": r["age_days"],
+                             "max_age_days": r["max_age_days"]},
+                    summary=(f"freshness: auto-bumped {r['slug']} "
+                             f"(was {r['age_days']}d stale, canonical unchanged)"),
+                ))
+            elif status == "drift" and changed:
+                if r["goal_filed"]:
+                    tail = f" (filed {r['goal_id']})"
+                elif r["dedup_skipped"]:
+                    tail = " (goal already open)"
+                else:
+                    tail = " (goal-file FAILED)"
+                events.append(Event(
+                    probe=self.name, event="drift", severity="info",
+                    payload={"pointer": path, "canonical": r["canonical"],
+                             "recorded_hash": r["recorded_hash"],
+                             "current_hash": cur_hash, "goal_filed": r["goal_filed"],
+                             "goal_id": r["goal_id"], "dedup_skipped": r["dedup_skipped"],
+                             "error": r["error"]},
+                    summary=f"freshness: DRIFT {r['slug']} -- canonical changed{tail}",
+                ))
+            elif status == "canonical_missing" and changed:
+                events.append(Event(
+                    probe=self.name, event="canonical_missing", severity="info",
+                    payload={"pointer": path, "canonical": r["canonical"]},
+                    summary=f"freshness: canonical missing for {r['slug']} ({r['canonical']})",
+                ))
+            elif status == "error" and changed:
+                events.append(Event(
+                    probe=self.name, event="probe_error", severity="info",
+                    payload={"pointer": path, "error": r["error"]},
+                    summary=f"freshness: error on {r['slug']}: {r['error']}",
+                ))
+        self.prev = new_prev
+        return events
+
+    def to_dict(self) -> dict:
+        return {"prev": self.prev}
+
+    def from_dict(self, state: dict) -> None:
+        # `or {}` coalesces BOTH missing-key and explicit-null ({"prev": null}
+        # from a torn write) to {} -- without it self.prev=None permanently
+        # breaks check() (self.prev.get raises AttributeError every tick).
+        self.prev = (state.get("prev") or {}) if isinstance(state, dict) else {}
+
+
+
+
 def build_probes(ctx: WatchdogContext) -> list[Probe]:
     """Single registration point. Add new probes here."""
     return [
@@ -897,6 +1223,8 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         HeartbeatProbe(ctx),
         BackgroundJobProbe(ctx),
         StopHookBlockProbe(ctx),
+        DaemonHealthProbe(ctx),
+        FreshnessProbe(ctx),
     ]
 
 

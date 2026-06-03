@@ -74,7 +74,7 @@ def main():
         "total": 0,
     }
 
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         result["error"] = "no agent bound"
         print(json.dumps(result))
         return

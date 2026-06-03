@@ -269,6 +269,59 @@ IF inbound_signals is non-empty:
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> status in-progress
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> started <today>
 
+# ── Unblock-intake probe (g-115-1017, rb-1111) ──────────────────────
+# Fast intake-time probe: if this is an Unblock goal whose cited bug was
+# fixed by an independent commit between filing and pickup, surface that
+# signal BEFORE the heavy retrieval + execution pipeline. Canonical
+# incident: g-115-985 (filed against loop-state-save.py:82, commit
+# a49e4805 fix landed 12h before pickup; verify-and-close was the right
+# path, not redundant deep-fix). Probe is ADVISORY — never blocks
+# execution. Title-gated (skips non-Unblock goals), age-gated (skips
+# fresh Unblocks), config-gated (unblock_intake_probe.enabled in
+# core/config/aspirations.yaml).
+Bash: ${ENV_PREFIX} bash core/scripts/unblock-intake-probe.sh --goal-id <goal.id> --source {source}
+Parse JSON output from stdout:
+  status = <probable-fix-landed | bug-still-present | inconclusive | skipped>
+  recommendation = <verify-and-close | execute-normally>
+  IF status == "probable-fix-landed":
+      Output: "▸ UNBLOCK INTAKE PROBE: probable-fix-landed ({recommendation}; signals: {signals[:2]})"
+      # The cited bug appears resolved already. Execution proceeds, but
+      # verify-and-close is the expected path — DO NOT apply a redundant
+      # fix. If verify confirms the resolution, mark complete with
+      # outcome_note "verified-and-closed (intake-probe: probable-fix-landed)".
+  ELIF status == "bug-still-present":
+      Output: "▸ UNBLOCK INTAKE PROBE: bug-still-present ({signals[:2]})"
+      # Proceed normally with deep-fix execution.
+  ELIF status == "inconclusive":
+      Output: "▸ UNBLOCK INTAKE PROBE: inconclusive ({skip_reason or 'no signal'}); proceed normally"
+  # status == "skipped" → silent (gate-skipped; not signal-bearing)
+# ── End Unblock-intake probe ────────────────────────────────────────
+
+# ── Encode-Stable-Facts Gate (G17) ─────────────────────────────────
+# Before resource-access steps (SSH, AWS CLI, describe-*, list-*, find),
+# enforce the three-probe threshold from .claude/rules/encode-stable-facts.md.
+# When the goal's primary_action or description references a discoverable
+# external resource (shared filesystem path, service endpoint, account
+# ID, remote storage location), check whether a locator already exists BEFORE
+# issuing discovery probes. The gate is called inline each time the
+# agent is about to issue the Nth discovery command for a single resource.
+#
+# Contract: --resource-id <canonical id> --probe-count <int> [--override "<text>"]
+# Exit 0 = pass (below threshold, locator found, or override). Exit 1 = block.
+# When blocked: STOP probing, encode the discovered value as a locator in
+# world/conventions/ before continuing. See core/config/conventions/resource-locators.md.
+#
+# Invocation (before each discovery probe for a given resource):
+#   Bash: bash core/scripts/encode-stable-facts-gate.sh \
+#            --resource-id "<resource identifier>" \
+#            --probe-count <N>
+#   IF exit 1: encode the value discovered so far as a locator, then
+#              read the locator instead of probing further.
+#
+# Fail-open: gate errors (missing world dir, script crash) exit 0 —
+# never blocks execution. The gate is advisory-loud, not hard-block.
+# ── End Encode-Stable-Facts Gate ───────────────────────────────────
+
 # ── Intelligent Retrieval Protocol ──────────────────────────────────
 # Full pseudocode lives in the execute-protocol digest. Load on-demand:
 Bash: load-execute-protocol.sh → IF path returned: Read it

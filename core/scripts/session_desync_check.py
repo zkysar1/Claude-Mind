@@ -38,6 +38,16 @@ except Exception as e:
     print(f"ERROR: failed to import _paths: {e}", file=sys.stderr)
     sys.exit(0)  # advisory — never block
 
+# SSOT for the own-cloud sync data-extension set (Phase 2 fail-safe heuristic).
+# Used by the orphan knowledge-loss classifier below to predict whether the
+# sweep will mirror an UNREGISTERED session file to S3 (data extension) or keep
+# it machine-local (signal-shaped). Guarded: if the import fails, the classifier
+# falls back to treating every orphan as the higher-risk signal-shaped case.
+try:
+    from owncloud_sync import _SESSION_DATA_EXTS  # type: ignore
+except Exception:
+    _SESSION_DATA_EXTS = None
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Invariant handlers. Each takes (files_by_name: dict, agent_state: str)
@@ -91,6 +101,40 @@ _HANDLERS = {
     "loop_active_when_idle": _inv_loop_active_when_idle,
     "running_without_heartbeat": _inv_running_without_heartbeat,
 }
+
+
+def _classify_orphan(name, size):
+    """Knowledge-loss classifier for an UNREGISTERED session/ file (an orphan).
+
+    Frames the warning around what the own-cloud sweep will do with the file and
+    whether knowledge in it survives a machine-move — the user-stated concern
+    that "temporary files turn into living documents" whose knowledge is lost.
+
+    Returns (severity, data_class, description):
+      - data extension (in _SESSION_DATA_EXTS): the Phase-2 fail-safe heuristic
+        MIRRORS it to S3, but it is NOT in the continuity pull-set, so it will not
+        auto-resume on another machine -> severity 'info', register as
+        continuity (resume) or ephemeral (don't).
+      - signal-shaped (extensionless / unknown ext): the sweep keeps it
+        MACHINE-LOCAL -> any knowledge in it is LOST on a move -> severity
+        'warning'. (Also the fallback when _SESSION_DATA_EXTS could not import.)
+    """
+    suffix = Path(name).suffix.lower()
+    sz = f"{size}B" if isinstance(size, int) else "unknown size"
+    if _SESSION_DATA_EXTS is not None and suffix in _SESSION_DATA_EXTS:
+        return ("info", "data",
+                f"Orphan DATA file '{name}' ({sz}) is unregistered in "
+                f"session-manifest.yaml. The own-cloud sweep mirrors it to S3 "
+                f"(known data extension), but it is NOT in the continuity "
+                f"pull-set, so it will NOT auto-resume on a machine-move. "
+                f"Register it: sync_tier=continuity if it must resume on another "
+                f"machine, else sync_tier=ephemeral.")
+    return ("warning", "signal",
+            f"Orphan file '{name}' ({sz}) is unregistered AND signal-shaped "
+            f"(no known data extension), so the own-cloud sweep keeps it "
+            f"MACHINE-LOCAL — any knowledge in it is LOST on a machine-move. "
+            f"If it holds learning, register sync_tier=continuity; if it is a "
+            f"liveness/marker signal, register sync_tier=machine_local to confirm.")
 
 
 def _read_agent_state(files):
@@ -165,13 +209,28 @@ def main(argv=None):
                 "message": f"handler raised: {type(e).__name__}: {e}",
             })
 
-    # Orphan files (present in session/ but not in manifest).
+    # Orphan files (present in session/ but not in manifest) — knowledge-loss
+    # sweep: classify each by what the own-cloud sweep does with it and whether
+    # its content survives a machine-move (the user's "living document" concern).
+    session_dir = (Path(AGENT_DIR) / "session") if AGENT_DIR is not None else None
     for orphan in snapshot.get("orphans", []):
+        # Orphans are by definition NOT in snapshot["files"] (session_snapshot.py
+        # excludes manifest-registered names from the orphan scan), so there is no
+        # snapshot size to reuse — stat the file directly.
+        size = None
+        if session_dir is not None:
+            try:
+                size = (session_dir / orphan).stat().st_size
+            except OSError:
+                size = None
+        sev, data_class, desc = _classify_orphan(orphan, size)
         warnings.append({
             "id": "orphan_file",
-            "severity": "info",
+            "severity": sev,
             "file": orphan,
-            "description": f"File '{orphan}' is in session/ but not listed in manifest — add to session-manifest.yaml if intentional.",
+            "size": size,
+            "data_class": data_class,
+            "description": desc,
         })
 
     # Log to <agent>/session/desync-warnings.jsonl (append-only, advisory).

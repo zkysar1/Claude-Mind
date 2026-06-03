@@ -78,6 +78,51 @@ def _make_world_and_agent(tmp: Path, agent_name: str = "alpha"):
     return world, agent_dir
 
 
+def _make_world_and_agent_with_agent_asp(tmp: Path, agent_name: str = "alpha"):
+    """Seed minimal world + agent dir with the recurring goal in the AGENT queue.
+
+    Mirror of _make_world_and_agent but the test aspiration lives in
+    agent_dir/aspirations.jsonl, not world. Used by the agent-queue path
+    tests for g-115-980 (source-aware filing).
+    """
+    world = tmp / "world"
+    world.mkdir()
+    (world / "aspirations.jsonl").write_text("", encoding="utf-8")
+    (world / "aspirations-archive.jsonl").write_text("", encoding="utf-8")
+
+    agent_dir = tmp / agent_name
+    agent_dir.mkdir()
+    (agent_dir / "session").mkdir()
+    asp_agent = {
+        "id": "asp-200",
+        "title": "Test agent asp",
+        "motivation": "Test",
+        "scope": "project",
+        "priority": "MEDIUM",
+        "status": "active",
+        "created": "2026-05-08T12:00:00",
+        "goals": [{
+            "id": "g-200-01",
+            "title": "Recurring agent-queue goal",
+            "description": "Test",
+            "status": "pending",
+            "priority": "MEDIUM",
+            "recurring": True,
+            "interval_hours": 4,
+            "blocked_by": [],
+            "verification": {"outcomes": ["x"], "checks": [],
+                             "preconditions": []},
+            "origin_signal": "user_directive",
+            "achievedCount": 1,
+            "participants": ["agent"],
+        }],
+    }
+    (agent_dir / "aspirations.jsonl").write_text(
+        json.dumps(asp_agent, ensure_ascii=False) + "\n", encoding="utf-8")
+    (agent_dir / "aspirations-archive.jsonl").write_text("", encoding="utf-8")
+    return world, agent_dir
+
+
 def _write_signals(agent_dir: Path, signals: list[dict]):
     log_path = agent_dir / "session" / "streak-breaks.jsonl"
     with open(log_path, "w", encoding="utf-8") as f:
@@ -240,6 +285,155 @@ def test_already_processed_signal_skipped():
         for asp in asps:
             for g in asp.get("goals", []):
                 assert "streak-break" not in g.get("title", "").lower()
+
+
+# ---- Agent-queue path tests () -----------------------------------
+#
+#  fixed source-misrouting in _file_investigate: _rt.aspirations_add_goal
+# defaults to source="world", so signals for agent-queue goals (e.g., 
+# on asp-001 in the agent queue) silently failed with aspiration_not_found
+# in world. The fix returns (asp_id, source) from _aspiration_for_goal and
+# threads source through _file_investigate -> _rt.aspirations_add_goal.
+
+
+def _seed_agent_asp_at_daemon_path(daemon_agent_dir: Path):
+    """Write the asp-200 agent aspiration into the daemon's agent_dir.
+
+    The daemon resolves agent_dir from its project_root (pr/agents/<agent>),
+    NOT from MIND_AGENT_DIR. For agent-queue tests both the subprocess
+    reflector and the daemon must read/write the same agent aspirations
+    file, so seed at the daemon's path AND pass that same path as the
+    subprocess's MIND_AGENT_DIR via _run_reflector(agent_dir=...).
+    """
+    daemon_agent_dir.mkdir(parents=True, exist_ok=True)
+    (daemon_agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    asp_agent = {
+        "id": "asp-200",
+        "title": "Test agent asp",
+        "motivation": "Test",
+        "scope": "project",
+        "priority": "MEDIUM",
+        "status": "active",
+        "created": "2026-05-08T12:00:00",
+        "goals": [{
+            "id": "g-200-01",
+            "title": "Recurring agent-queue goal",
+            "description": "Test",
+            "status": "pending",
+            "priority": "MEDIUM",
+            "recurring": True,
+            "interval_hours": 4,
+            "blocked_by": [],
+            "verification": {"outcomes": ["x"], "checks": [],
+                             "preconditions": []},
+            "origin_signal": "user_directive",
+            "achievedCount": 1,
+            "participants": ["agent"],
+        }],
+    }
+    (daemon_agent_dir / "aspirations.jsonl").write_text(
+        json.dumps(asp_agent, ensure_ascii=False) + "\n", encoding="utf-8")
+    (daemon_agent_dir / "aspirations-archive.jsonl").write_text(
+        "", encoding="utf-8")
+
+
+def test_signal_with_explicit_source_routes_to_agent_queue():
+    """Signal entry carrying source='agent' files Investigate in agent queue."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        # Build only the world; the agent_dir lives inside the daemon's PR
+        world = Path(tmpd) / "world"
+        world.mkdir()
+        (world / "aspirations.jsonl").write_text("", encoding="utf-8")
+        (world / "aspirations-archive.jsonl").write_text("", encoding="utf-8")
+
+        with DaemonFixture(world) as df:
+            daemon_agent_dir = df.project_root / "agents" / df.agent
+            _seed_agent_asp_at_daemon_path(daemon_agent_dir)
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-200-01",
+                "aspiration_id": "asp-200",
+                "source": "agent",
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "lateness_ratio": 3.13,
+                "processed": False,
+            }
+            _write_signals(daemon_agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, daemon_agent_dir)
+            assert rc == 0, err
+
+            # Investigate landed in the AGENT queue
+            agent_path = daemon_agent_dir / "aspirations.jsonl"
+            agent_asps = [json.loads(line) for line in
+                          agent_path.read_text(encoding="utf-8").splitlines()
+                          if line.strip()]
+            asp_200 = next(a for a in agent_asps if a["id"] == "asp-200")
+            streak_goals = [g for g in asp_200["goals"]
+                            if "streak-break" in g.get("title", "").lower()]
+            assert len(streak_goals) == 1, (
+                f"Expected 1 streak-break Investigate in agent queue, "
+                f"got {len(streak_goals)}. stdout={out!r} stderr={err!r}")
+            assert "g-200-01" in streak_goals[0]["title"]
+
+            # World queue stays empty (no misrouting)
+            world_text = (world / "aspirations.jsonl").read_text(encoding="utf-8")
+            assert "streak-break" not in world_text.lower(), (
+                f"World queue should not contain streak-break goals; "
+                f"reflector misrouted to world. World content: {world_text!r}")
+
+            signals = _read_signals(daemon_agent_dir)
+            assert signals[0]["processed"] is True
+            assert "filed_at" in signals[0]
+            assert "filing_error" not in signals[0], (
+                f"Filing should have succeeded; got error: "
+                f"{signals[0].get('filing_error')}")
+
+
+def test_legacy_signal_falls_back_to_lookup_for_agent_queue():
+    """Legacy signal lacking source field — _aspiration_for_goal lookup
+    finds the goal in the agent queue and threads source through."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = Path(tmpd) / "world"
+        world.mkdir()
+        (world / "aspirations.jsonl").write_text("", encoding="utf-8")
+        (world / "aspirations-archive.jsonl").write_text("", encoding="utf-8")
+
+        with DaemonFixture(world) as df:
+            daemon_agent_dir = df.project_root / "agents" / df.agent
+            _seed_agent_asp_at_daemon_path(daemon_agent_dir)
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-200-01",
+                # No aspiration_id, no source — forces _aspiration_for_goal
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "processed": False,
+            }
+            _write_signals(daemon_agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, daemon_agent_dir)
+            assert rc == 0, err
+
+            agent_path = daemon_agent_dir / "aspirations.jsonl"
+            agent_asps = [json.loads(line) for line in
+                          agent_path.read_text(encoding="utf-8").splitlines()
+                          if line.strip()]
+            asp_200 = next(a for a in agent_asps if a["id"] == "asp-200")
+            streak_goals = [g for g in asp_200["goals"]
+                            if "streak-break" in g.get("title", "").lower()]
+            assert len(streak_goals) == 1, (
+                f"Legacy signal lookup should route to agent queue; "
+                f"found {len(streak_goals)} streak-break goals. "
+                f"stdout={out!r} stderr={err!r}")
+
+            world_text = (world / "aspirations.jsonl").read_text(encoding="utf-8")
+            assert "streak-break" not in world_text.lower()
+
+            signals = _read_signals(daemon_agent_dir)
+            assert signals[0]["processed"] is True
+            assert "filing_error" not in signals[0]
 
 
 # ---- Auto-resolve sweep tests () ---------------------------------

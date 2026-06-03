@@ -333,13 +333,13 @@ def _gather_citation_haystack():
         # Also include this agent's experience + report markdown content.
         # experience.jsonl is metadata only; rule citations live in the
         # per-trace markdown content_path (<agent>/experience/<id>.md) and
-        # in <agent>/reports/*.md. Without these sources, rules cited only
+        # in <agent>/reports/*.md and <agent>/temp/*.md. Without these sources, rules cited only
         # in trace bodies show false-zero citation_count (,
         # evidence from  follow-up: 9-file probe confirmed
         # code-review-protocol.md / implementation-discipline.md /
         # learning-philosophy.md / pre-completion-review.md citations all
         # land in agent experience+reports markdown).
-        for sub in ("experience", "reports"):
+        for sub in ("experience", "reports", "temp"):
             sub_dir = AGENT_DIR / sub
             if sub_dir.exists():
                 sources.extend(sorted(sub_dir.glob("*.md")))
@@ -352,7 +352,7 @@ def _gather_citation_haystack():
             if agent_dir == AGENT_DIR:
                 continue
             sources.append(agent_dir / "journal.jsonl")
-            for sub in ("experience", "reports"):
+            for sub in ("experience", "reports", "temp"):
                 sub_dir = agent_dir / sub
                 if sub_dir.exists():
                     sources.extend(sorted(sub_dir.glob("*.md")))

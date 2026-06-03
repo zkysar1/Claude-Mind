@@ -27,6 +27,8 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "core" / "scripts
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from .agent_paths import assert_not_cruft  # noqa: E402
+
 
 def snapshot(path: Path, base_dir: Path, agent_name: str,
              summary: str = "") -> Optional[Path]:
@@ -49,6 +51,7 @@ def snapshot(path: Path, base_dir: Path, agent_name: str,
 
     rel = path.relative_to(base_dir)
     history_dir = base_dir / ".history" / str(rel)
+    assert_not_cruft(history_dir, "mkdir (history snapshot)")
     history_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")

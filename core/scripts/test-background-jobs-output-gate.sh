@@ -60,6 +60,7 @@ artifacts_json = sys.argv[3]
 fake_paths = types.ModuleType("_paths")
 fake_paths.AGENT_DIR = Path(sandbox)
 fake_paths.PROJECT_ROOT = Path(sandbox)
+fake_paths.assert_agent_dir = lambda module_name="<unknown>": None
 sys.modules["_paths"] = fake_paths
 
 spec = importlib.util.spec_from_file_location(

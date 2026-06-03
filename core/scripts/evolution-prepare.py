@@ -371,18 +371,19 @@ def main():
             from _fileops import save_history, resolve_base_dir
             base = resolve_base_dir(abs_path)
             if base:
-                rel_to_base = Path(abs_path).resolve().relative_to(Path(base).resolve())
-                snap_dir = Path(base) / ".history" / str(rel_to_base)
                 save_history(abs_path, base, agent, summary=f"pre-edit snapshot (file_kind={file_kind})")
-                # Find newest snapshot in that dir matching this agent
-                if snap_dir.exists():
-                    candidates = sorted(
-                        snap_dir.glob(f"*_{agent}{Path(abs_path).suffix}"),
-                        key=lambda p: p.stat().st_mtime,
-                        reverse=True,
-                    )
-                    if candidates:
-                        history_snapshot = str(candidates[0])
+                # CAS-store migration (fix-ballooning-history, 2026-05-22):
+                # save_history now writes the CAS-delta store, NOT the legacy
+                # .history/<rel>/<ts>.gz tree. Recover the snapshot_id from the
+                # store (list_snapshots is newest-first) instead of globbing the
+                # now-unwritten legacy tree. The old glob silently null'd
+                # history_snapshot on EVERY tracked edit post-cutover, degrading
+                # section_changed to __no_snapshot__ (rollback stayed safe via
+                # the CAS store + git; only the recorded id + section label broke).
+                import _history_store
+                snaps = _history_store.list_snapshots(abs_path, base)
+                if snaps:
+                    history_snapshot = snaps[0]["snapshot_id"]
         except Exception:
             # Snapshot failure is non-fatal — Post will record without snapshot reference
             history_snapshot = None

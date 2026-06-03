@@ -143,6 +143,32 @@ ELSE:
     Output: "▸ Boredom: routine_streak_global={global} (auto-deep at 8) | per-goal: {per_goal_s} | session: {ratio_s}"
 ```
 
+## Phase 0-pre.0c: Stash Carryover Probe (g-115-1133)
+
+Cheap per-iteration observability surface in the same cluster as Phase 0-pre.0
+(partner snapshot) and 0-pre.0b (boredom). Surfaces non-empty `git stash`
+entries, which are invisible to `git status` and therefore an undetectable
+cross-session/cross-agent working-tree carryover risk. Origin incident
+(g-115-1127): an externally-created stash (92543f81 at 12:15) silently shelved
+~10 min of alpha-LLM working-tree work before manual recovery via
+`git checkout 92543f81 -- <files>`. Defense-in-depth observability, NOT a gate
+— it never blocks, defers, or mutates state; it only warns.
+
+No state mutation. Fail-open: any git error (no repo, detached state) is
+swallowed — never blocks the loop. Quiet on the common empty case.
+
+```
+# Single local git read (sub-second; reads .git/refs/stash).
+Bash: git stash list 2>/dev/null
+IF output is non-empty:
+    count  = number of stash entries (lines)
+    first5 = first 5 entries
+    Output: "▸ ⚠ STASH CARRYOVER: {count} non-empty git stash(es) — invisible to `git status`, possible cross-session/cross-agent working-tree carryover. First {min(5,count)}:"
+    FOR EACH entry in first5: Output: "    {entry}"
+    Output: "    Recover via `git stash show -p stash@{N}` then `git stash pop`, or `git stash drop` once confirmed obsolete (g-115-1127)."
+# ELSE: clean — emit nothing (quiet on the common empty case).
+```
+
 ## Phase 0-pre: Tree-Debt Critical Gate (g-115-81, source-dispatch g-115-721)
 
 Runs BEFORE Phase 0 completion checks. Consumes the `force_tree_maintain` WM
@@ -477,6 +503,15 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #   user-goals:reclassifiable_user_goals → for each entry in
 #                                        results.user-goals.candidates[]: invoke
 #                                        aspirations-update-goal.sh participants '["agent"]'
+#   temp-pressure:temp_drain_needed    → file results.temp-pressure.suggested_goal
+#                                        via aspirations-add-goal.sh (title/priority
+#                                        HIGH/participants ["agent"]/description from
+#                                        the payload) into asp-001, then the loop
+#                                        executes /drain-temp. Dedup is already done
+#                                        by the check (it suppresses this flag when an
+#                                        open drain goal exists — emits temp_drain_pending
+#                                        instead). temp_pressure_warn / temp_drain_pending
+#                                        are visibility-only — surface in output, no goal.
 ```
 
 ## Phase 0.5a: Pre-Selection Guardrail Check

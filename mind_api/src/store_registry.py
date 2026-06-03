@@ -106,14 +106,61 @@ def _journal_coerce_id(s: Any) -> int:
     return int(s.split("-", 1)[1]) if s.startswith("session-") else int(s)
 
 
+def _journal_file_re(agent_name: str):
+    """Canonical journal_file regex: <agent>/journal/YYYY/MM/YYYY-MM-DD.md.
+
+    Single source of truth shared by _journal_prepare (derive) and
+    _journal_validate (check) so the two can never drift."""
+    return re.compile(
+        rf"^{re.escape(agent_name)}/journal/\d{{4}}/\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}\.md$"
+    )
+
+
+def _journal_prepare(ctx, rec) -> None:
+    """Derive the canonical journal_file from date + agent (SSOT) — B7.
+
+    journal_file is fully determined by the record's `date` and the bound
+    agent, and has NO consumer beyond this store's own validation +
+    persistence. Yet callers historically hand-built it and got it wrong:
+    charlie passed the INDEX path `agents/charlie/journal.jsonl` (the
+    `agents/` prefix + `.jsonl` extension) instead of the dated ENTRY path,
+    producing 4 `validation_failed` rejections (B7). Requiring the caller to
+    supply a value that must match a regex derived from data the record
+    ALREADY carries is the single-source-of-truth violation at the root of
+    the bug class; derive it here instead.
+
+    A caller value that already matches the canonical shape is preserved
+    (backward-compatible). Anything else (absent / index path / wrong agent
+    prefix / wrong extension) is replaced with the value derived from `date`
+    (or today, when `date` is absent or unparseable — _journal_validate
+    still independently rejects a malformed `date`, so that error is never
+    masked). prepare runs before defaults_dynamic, so an omitted date is None
+    here; the today() fallback keeps journal_file canonical and the
+    subsequently-applied date default stays consistent with it."""
+    agent_name = ctx.paths.agent.name
+    jf = rec.get("journal_file")
+    if isinstance(jf, str) and _journal_file_re(agent_name).match(jf):
+        return  # canonical caller value — respect SSOT, change nothing
+    raw_date = rec.get("date")
+    try:
+        d = datetime.strptime(str(raw_date), "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        d = date.today()
+    rec["journal_file"] = (
+        f"{agent_name}/journal/{d.year:04d}/{d.month:02d}/{d.isoformat()}.md"
+    )
+
+
 def _journal_validate(ctx, rec, *, skip_id: bool = False) -> None:
     """Verbatim port of journal.py validate_record. The journal_file regex
     is agent-name-scoped; the name is resolved from ctx (never a module
-    constant) per .claude/rules/path-resolution.md."""
+    constant) per .claude/rules/path-resolution.md.
+
+    journal_file is normally derived upstream by _journal_prepare (B7); this
+    regex check stays as the structural backstop for the rare path that
+    bypasses prepare (e.g. a direct validate call in a future caller)."""
     agent_name = ctx.paths.agent.name
-    jf_re = re.compile(
-        rf"^{re.escape(agent_name)}/journal/\d{{4}}/\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}\.md$"
-    )
+    jf_re = _journal_file_re(agent_name)
     required = {"session", "date", "journal_file"} - ({"session"} if skip_id else set())
     missing = required - set(rec.keys())
     if missing:
@@ -306,15 +353,18 @@ def validate_rb_record(ctx, rec, *, skip_id: bool = False) -> None:
     if not skip_id:
         if not RB_ID_RE.match(rec["id"]):
             raise ValueError(f"Invalid record ID format: {rec['id']} (expected rb-NNN)")
-    if rec["type"] not in RB_VALID_TYPES:
-        raise ValueError(f"Invalid type: {rec['type']} (expected: {RB_VALID_TYPES})")
-    if rec["status"] not in RB_VALID_STATUSES:
-        raise ValueError(f"Invalid status: {rec['status']} (expected: {RB_VALID_STATUSES})")
+    # isinstance guard precedes membership: `["x"] not in <set>` raises
+    # TypeError: unhashable type: 'list' (B10 — a list-valued field 500'd the
+    # request and dropped the rb lesson). Short-circuit to a clean ValueError.
+    if not isinstance(rec["type"], str) or rec["type"] not in RB_VALID_TYPES:
+        raise ValueError(f"Invalid type: {rec['type']!r} (expected one of {RB_VALID_TYPES})")
+    if not isinstance(rec["status"], str) or rec["status"] not in RB_VALID_STATUSES:
+        raise ValueError(f"Invalid status: {rec['status']!r} (expected: {RB_VALID_STATUSES})")
     util = rec.get("utilization")
     if util is not None:
         _validate_utilization(util)
     applies = rec.get("applies_to")
-    if applies not in RB_VALID_APPLIES_TO:
+    if not isinstance(applies, str) or applies not in RB_VALID_APPLIES_TO:
         raise ValueError(
             f"Invalid applies_to: {applies!r} (expected one of {RB_VALID_APPLIES_TO})")
     exp_ref = rec.get("experience_ref")
@@ -341,8 +391,8 @@ def validate_guard_record(ctx, rec, *, skip_id: bool = False) -> None:
     if not skip_id:
         if not GUARD_ID_RE.match(rec["id"]):
             raise ValueError(f"Invalid record ID format: {rec['id']} (expected guard-NNN)")
-    if rec["status"] not in GUARD_VALID_STATUSES:
-        raise ValueError(f"Invalid status: {rec['status']} (expected: {GUARD_VALID_STATUSES})")
+    if not isinstance(rec["status"], str) or rec["status"] not in GUARD_VALID_STATUSES:
+        raise ValueError(f"Invalid status: {rec['status']!r} (expected: {GUARD_VALID_STATUSES})")
     util = rec.get("utilization")
     if util is not None:
         _validate_utilization(util)
@@ -580,6 +630,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         },
         defaults_dynamic={"date": lambda: date.today().isoformat()},
         allocate=_journal_next_session,
+        prepare=_journal_prepare,  # B7: derive canonical journal_file (SSOT)
         validate=_journal_validate,
         merge_lists={
             "goals_completed": "union",

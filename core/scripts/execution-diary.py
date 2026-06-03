@@ -291,6 +291,37 @@ def cmd_trim(args):
     print(f"trimmed {removed} entries older than {hours}h, {len(kept)} remaining")
 
 
+# POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
+def _maintain_execute_in_flight(kind, phase):
+    """Write/clear the execute-in-flight sentinel based on phase transitions.
+
+    The sentinel marks "agent is mid-Phase-4-execute" for recovery-gate.sh
+    Path A and Path C suppressors. Deep code work can run >60 min without a
+    phase boundary or diary write (canonical incident: 2026-05-22 delta
+    g-115-1017 Phase 4 = 1h 31m), staling all liveness signals. Without the
+    sentinel, recovery-gate false-positive-fires on actively-working agents.
+
+    Lifecycle:
+      - phase_start phase-4-execute  → write sentinel
+      - phase_end   phase-4-execute  → delete sentinel
+      - phase_start of any other phase → delete sentinel (defensive)
+
+    Fail-open: any error swallowed. Diary writes must NEVER fail because
+    sentinel maintenance had an opinion.
+    """
+    try:
+        sentinel = AGENT_DIR / "session" / "execute-in-flight"
+        if kind == "phase_start" and phase == "phase-4-execute":
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text(now_iso(), encoding="utf-8")
+        elif kind == "phase_end" and phase == "phase-4-execute":
+            sentinel.unlink(missing_ok=True)
+        elif kind == "phase_start":
+            sentinel.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _emit_phase_marker(kind, phase, iteration, goal_id, note):
     """Shared implementation for phase-start / phase-end markers."""
     if _is_observer_session():
@@ -312,6 +343,7 @@ def _emit_phase_marker(kind, phase, iteration, goal_id, note):
     with open(DIARY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     _advance_heartbeat()
+    _maintain_execute_in_flight(kind, phase)
     print(f"ok: {kind} {phase} @ {entry['timestamp']}")
 
 

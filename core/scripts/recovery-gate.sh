@@ -332,24 +332,34 @@ _check_state_corruption() {
     _perform_recovery "$agent" "$cause"
 }
 
+# POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
 # === PATH C: Hung-autocompact detection (source-independent) ===
-# Triggers when compact-pending exists with mtime > 60 min AND heartbeat is
-# stale AND state=RUNNING AND no stop-requested. Covers the case where the
-# autocompact API call hangs indefinitely — the PreCompact hook wrote
-# compact-pending, but SessionStart(compact) never fires to consume it because
-# the autocompact never completes. Path A's source gate skips source=compact,
-# and even if a fresh source=startup hits, the heartbeat-only check doesn't
-# observe compact-pending. Without Path C the agent is stuck in RUNNING with
-# a stale heartbeat indefinitely until the user notices.
+# Triggers when compact-in-flight exists with mtime > 60 min AND heartbeat is
+# stale AND state=RUNNING AND no stop-requested AND diary stale AND no
+# execute-in-flight sentinel. Covers the case where the autocompact API call
+# hangs indefinitely — precompact-serialize.sh wrote compact-in-flight, but
+# SessionStart(compact) never fires to consume it because the autocompact
+# never completes.
+#
+# 2026-05-22 sentinel rename: previously checked compact-pending mtime, but
+# compact-pending is written by stop-hook on EVERY iteration BLOCK as the
+# SID-binding breadcrumb. Its mtime tracked "time since last BLOCK" not
+# "time since autocompact start" — a deep Phase 4 work session running
+# >60 min without a phase boundary aged out the threshold and false-
+# positive-fired. Canonical incident: 2026-05-22T17:02:31 delta recovered
+# during 1h 31m Phase 4 of 7 (no autocompact actually running).
+# Fix: compact-in-flight is written ONLY by PreCompact, so its mtime
+# accurately reflects autocompact start. See precompact-serialize.sh and
+# session-save-id.sh for the new sentinel's lifecycle.
 #
 # Source-independent: must fire on source=compact (the hung compact's own
 # delayed SessionStart, if it ever arrives) AND source=startup (a fresh
 # session opened while the original is hung). Mirrors Path B's design.
 #
 # 60-min threshold: normal autocompact round-trips in <2 min; 60 min is
-# unambiguously hung. Reusing the existing 30-min heartbeat-stale threshold
-# (default in core/config/aspirations.yaml runner_heartbeat) would not be
-# enough — heartbeat stales BEFORE compact-pending becomes diagnostic.
+# unambiguously hung. With the compact-in-flight rename above, the threshold
+# now precisely matches autocompact roundtrip duration — no need to inflate
+# to cushion the prior conflation.
 #
 # Origin: bravo's 2026-05-05 incident — compact-pending stamped at 17:07:44,
 # autocompact hung 4h, no postcompact-restore ever ran, loop_state went empty,
@@ -358,8 +368,11 @@ _check_hung_autocompact() {
     local agent="$1"
     local _adir
     _adir="$(agent_dir "$agent")"
-    local cp="$_adir/session/compact-pending"
-    [[ -f "$cp" ]] || return 0
+    # 2026-05-22: switched from compact-pending (stop-hook breadcrumb, refreshed
+    # on every BLOCK) to compact-in-flight (PreCompact-only sentinel). See
+    # function-level comment block above for the rename rationale.
+    local cif="$_adir/session/compact-in-flight"
+    [[ -f "$cif" ]] || return 0
 
     # CRITICAL — DO NOT lower the 60-min threshold below the upper bound of a
     # NORMAL autocompact roundtrip. Normal compacts complete in <2 min; 30 min
@@ -368,15 +381,15 @@ _check_hung_autocompact() {
     # match heartbeat-stale (30 min) would cause Path C to false-positive on
     # an autocompact that's slow but recovering. Origin: rb-697 (bravo
     # 2026-05-05, autocompact hung 4h before user nudge).
-    [[ -n "$(find "$cp" -maxdepth 0 -mmin +60 2>/dev/null)" ]] || return 0
+    [[ -n "$(find "$cif" -maxdepth 0 -mmin +60 2>/dev/null)" ]] || return 0
 
     # CRITICAL — state==RUNNING is the recovery-vs-cleanup boundary. Path C is
     # for recovering a stuck-in-RUNNING agent, NOT for cleaning up stale
-    # compact-pending files on already-IDLE agents. session-save-id.sh handles
-    # the cleanup case at SessionStart. If a future dev expands this to
-    # IDLE-state agents, the recovery action (_perform_recovery → state-set
-    # IDLE) becomes a no-op write and the audit log fills with spurious
-    # entries. Cleanup ≠ recovery.
+    # compact-in-flight files on already-IDLE agents. session-save-id.sh
+    # handles the cleanup case at SessionStart. If a future dev expands this
+    # to IDLE-state agents, the recovery action (_perform_recovery →
+    # state-set IDLE) becomes a no-op write and the audit log fills with
+    # spurious entries. Cleanup ≠ recovery.
     local state
     state="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/session-state-get.sh" 2>/dev/null || echo "")"
     [[ "$state" == "RUNNING" ]] || return 0
@@ -386,6 +399,34 @@ _check_hung_autocompact() {
     hb="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/heartbeat-stale.sh" 2>/dev/null || echo "fresh")"
     [[ "$hb" == "stale" ]] || return 0
 
+    # Execute-in-flight suppressor (7 followup, 2026-05-22). When
+    # the agent is mid-Phase-4-execute, deep code work can run >60 min
+    # without a phase boundary or diary write — every liveness signal goes
+    # stale even though work IS progressing. execute-in-flight is written by
+    # execution-diary.py on phase_start phase-4-execute, deleted on phase_end
+    # phase-4-execute (or any subsequent phase_start). Sentinel within 4h
+    # (240min) — agent is genuinely working in Phase 4, suppress recovery.
+    # Beyond 4h — Phase 4 itself is hung, let recovery fire.
+    local eif="$_adir/session/execute-in-flight"
+    if [[ -f "$eif" ]]; then
+        if [[ -z "$(find "$eif" -maxdepth 0 -mmin +240 2>/dev/null)" ]]; then
+            return 0
+        fi
+    fi
+
+    # Diary freshness suppressor (defense-in-depth, 2026-05-22). Mirrors
+    # Path A's Condition 2.7 — if execution-diary was written in the last
+    # 15 min, the agent is actively producing narrative work, suppress
+    # recovery. Catches cases where execute-in-flight is absent (non-Phase-4
+    # long work) but the agent is still alive and writing observations or
+    # findings.
+    local diary="$_adir/session/execution-diary.jsonl"
+    if [[ -f "$diary" ]]; then
+        if [[ -z "$(find "$diary" -maxdepth 0 -mmin +15 2>/dev/null)" ]]; then
+            return 0
+        fi
+    fi
+
     # stop-requested gate: graceful /stop owns the wind-down.
     # Exit-code semantics mirror Cond 2.5/Cond 4 (rb-762): rc=1 is the ONLY
     # "continue" code. rc=0 (signal exists) AND rc=2+ (script error) both
@@ -394,7 +435,7 @@ _check_hung_autocompact() {
     local sr_rc=$?
     [[ $sr_rc -eq 1 ]] || return 0   # 0=signal-set, 2+=error → both suppress recovery
 
-    local cause="hung autocompact: compact-pending mtime >60min, heartbeat=$hb, state=RUNNING, no stop-requested"
+    local cause="hung autocompact: compact-in-flight mtime >60min, heartbeat=$hb, state=RUNNING, no stop-requested, no execute-in-flight, diary stale"
     _perform_recovery "$agent" "$cause"
 }
 
@@ -431,6 +472,21 @@ run_gate_for_agent() {
     local _adir
     _adir="$(agent_dir "$agent")"
     [[ -d "$_adir/session" ]] || return 0  # not initialized
+
+    # POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
+    # Execute-in-flight suppressor (7 followup, 2026-05-22). Same
+    # contract as Path C's suppressor: when the agent is mid-Phase-4-execute,
+    # deep code work can stale every liveness signal even though work IS
+    # progressing. Sentinel within 4h (240min) — agent is genuinely working
+    # in Phase 4, suppress recovery. Beyond 4h — Phase 4 itself is hung, let
+    # runner-dead-check.sh's 6-condition gate decide. See execution-diary.py
+    # _emit_phase_marker for the write/clear sites.
+    local eif="$_adir/session/execute-in-flight"
+    if [[ -f "$eif" ]]; then
+        if [[ -z "$(find "$eif" -maxdepth 0 -mmin +240 2>/dev/null)" ]]; then
+            return 0
+        fi
+    fi
 
     # Delegate to the canonical helper. Exit-code semantics (rb-762 propagated):
     #   0   = all 6 conditions met (dead) — proceed with recovery

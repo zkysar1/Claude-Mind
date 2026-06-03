@@ -36,6 +36,7 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from _paths import WORLD_DIR, AGENT_DIR, CONFIG_DIR  # noqa: E402
+from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 
 ABANDONED_STATUSES = {"skipped", "expired", "decomposed", "superseded"}
 TERMINAL_STATUSES = ABANDONED_STATUSES | {"completed"}
@@ -85,12 +86,13 @@ def _read_class_balance_targets() -> dict:
 
 
 def _completion_ratio(asp: dict) -> tuple[float, int, int]:
-    """Return (ratio, completed, total) for non-recurring goals."""
-    goals = [g for g in asp.get("goals", [])
-             if not g.get("recurring")
-             and g.get("status") not in ABANDONED_STATUSES]
-    total = len(goals)
-    done = sum(1 for g in goals if g.get("status") == "completed")
+    """Return (ratio, completed, total) for non-recurring, non-abandoned goals.
+
+    Census-augmented (B9-deep): archived completed goals fold back in so
+    eviction leaves the pulse ratio byte-identical.
+    """
+    total, done = effective_counts(
+        asp, exclude_statuses=ABANDONED_STATUSES, include_recurring=False)
     return (done / total if total > 0 else 0.0, done, total)
 
 

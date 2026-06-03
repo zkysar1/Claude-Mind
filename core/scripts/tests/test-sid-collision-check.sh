@@ -9,11 +9,16 @@
 # fast-path with a runner-vs-observer collision check.
 #
 # Sandbox: a fresh temp dir mirroring PROJECT_ROOT/core/scripts/ with the
-# real sid-collision-check.sh copied in, plus stubs for _paths.sh and
-# heartbeat-stale.sh that drive AGENT_DIR / heartbeat decisions from
-# easily-controlled disk state inside the sandbox. This avoids touching
-# the real PROJECT_ROOT and keeps the test independent of the real
-# aspirations.yaml.
+# real sid-collision-check.sh copied in, plus stubs for _paths.sh,
+# heartbeat-stale.sh, and _resolve_agent_from_sid.py that drive AGENT_DIR /
+# heartbeat / binding-resolution decisions from easily-controlled disk state
+# inside the sandbox. This avoids touching the real PROJECT_ROOT and keeps the
+# test independent of the real aspirations.yaml.
+#
+# Agent dirs live at $SANDBOX/agents/<name> to match the real _paths.sh
+# AGENTS_PARENT_DIR="agents" layout (post-Phase-2.5.D). The gate reads
+# agent-state / running-session-id / heartbeat via agent_dir(), so the disk
+# layout MUST match agent_dir's output or every state read returns empty.
 #
 # Run: bash core/scripts/tests/test-sid-collision-check.sh
 # Exit 0 = all pass, exit 1 = any case fails.
@@ -58,7 +63,13 @@ agent_dir() {
         printf '%s/%s' "$PROJECT_ROOT" "$1"
     fi
 }
-AGENT_NAME="${MIND_AGENT:-}"
+# Deployment-prefix-agnostic: the production gate passes the agent to
+# heartbeat-stale.sh via the LOCAL env prefix — MIND_AGENT upstream,
+# MIND_AGENT in MIND_* deployments. Read whichever is set so this test is
+# portable across deployments (the gate diverged by prefix only). In a native
+# session exactly one prefix is ambient and the gate's per-call value wins;
+# the precedence here only matters under cross-deployment test runs.
+AGENT_NAME="${MIND_AGENT:-${MIND_AGENT:-}}"
 if [ -n "$AGENT_NAME" ]; then
     AGENT_DIR="$(agent_dir "$AGENT_NAME")"
 else
@@ -84,6 +95,26 @@ fi
 HB_EOF
 chmod +x "$SANDBOX/core/scripts/heartbeat-stale.sh"
 
+# Stub _resolve_agent_from_sid.py: the gate (Phase 2.6 refactor) resolves the
+# SID->agent binding through this script (sid-collision-check.sh line ~80), NOT
+# by reading .active-agent-<SID> directly. Without this stub the resolver call
+# fails, EXISTING is empty, and EVERY collision case short-circuits at
+# `[ -n "$EXISTING" ] || exit 0` before any collision logic runs — the silent
+# stub-drift that made cases 7 & 9 vacuously "pass" (exit 0 where 2 was
+# expected). The stub mirrors the real resolver's legacy fallback: read
+# PROJECT_ROOT/.active-agent-<SID> (what mk_bind writes).
+cat > "$SANDBOX/core/scripts/_resolve_agent_from_sid.py" <<'RESOLVE_EOF'
+#!/usr/bin/env python3
+import os, sys
+sid = sys.argv[1] if len(sys.argv) > 1 else ""
+root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    with open(os.path.join(root, ".active-agent-" + sid), encoding="utf-8") as fh:
+        sys.stdout.write(fh.read().strip())
+except Exception:
+    pass
+RESOLVE_EOF
+
 GATE="$SANDBOX/core/scripts/sid-collision-check.sh"
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -91,7 +122,7 @@ FAIL_COUNT=0
 # reset_state — wipe the sandbox between cases. core/ is kept; agent dirs
 # and binding files are recreated per case.
 reset_state() {
-    rm -rf "$SANDBOX/zeta" "$SANDBOX/alpha" "$SANDBOX/bravo"
+    rm -rf "$SANDBOX/agents"
     find "$SANDBOX" -maxdepth 1 -name '.active-agent-*' -delete 2>/dev/null || true
 }
 
@@ -141,13 +172,13 @@ mk_agent() {
     local state="$2"
     local rsid="$3"      # pass "" to skip running-session-id
     local heartbeat="$4" # "fresh" creates file, "stale" omits it
-    mkdir -p "$SANDBOX/$name/session"
-    echo "$state" > "$SANDBOX/$name/session/agent-state"
+    mkdir -p "$SANDBOX/agents/$name/session"
+    echo "$state" > "$SANDBOX/agents/$name/session/agent-state"
     if [ -n "$rsid" ]; then
-        echo "$rsid" > "$SANDBOX/$name/session/running-session-id"
+        echo "$rsid" > "$SANDBOX/agents/$name/session/running-session-id"
     fi
     if [ "$heartbeat" = "fresh" ]; then
-        touch "$SANDBOX/$name/session/runner-heartbeat"
+        touch "$SANDBOX/agents/$name/session/runner-heartbeat"
     fi
 }
 
@@ -156,6 +187,19 @@ mk_bind() {
     local agent="$2"
     echo "$agent" > "$SANDBOX/.active-agent-$sid"
 }
+
+# ─── Case 0 (CANARY): the harness can drive the gate to a collision verdict ──
+# Minimal end-to-end smoke that ISOLATES "sandbox/harness broken" from "gate
+# broken". If this fails, a sandbox dependency drifted (a missing stub, a
+# layout mismatch) — fix the harness, not sid-collision-check.sh. Guards the
+# exact silent stub-drift that let cases 7 & 9 degrade to vacuous passes: when
+# the gate gained the _resolve_agent_from_sid.py dependency, every collision
+# case quietly became a no-op exit-0. A loud canary turns that regression class
+# into an obvious, specific failure.
+reset_state
+mk_agent alpha RUNNING alphaRsid fresh
+mk_bind canarySID alpha
+run_case "0-CANARY-harness-can-detect-collision" 2 "ERROR:SID_COLLISION" zeta canarySID
 
 # ─── Case 1: binding file missing — safe ───────────────────────────────────
 reset_state

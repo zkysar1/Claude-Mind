@@ -59,7 +59,7 @@ def _now_iso():
 
 
 def main():
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         sys.exit(0)
 
     # --tree-updated flag (, iter-141): when caller signals tree

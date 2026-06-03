@@ -65,3 +65,13 @@ bash "$REPO/core/scripts/domain-leak-check.sh" >&2 || true
 # cruft incident shape). Refuses commits introducing the regression
 # in staged .md files. See .claude/rules/path-resolution.md.
 bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"
+
+# Gate 8: Secret-content scanner (2026-05-21). Refuses commits whose
+# staged content contains GitHub PAT / OAuth-token / AWS-access-key
+# shapes. Origin: the rotate-lambda-common-pat.sh incident where an
+# auto-bundled file carried a 33-char identifier-truncation of a
+# fine-grained PAT into a commit because L1 path-resolution-hook
+# (Write/Edit/MultiEdit only) and iteration-commit.sh's filename
+# filter both missed it. See script header for full pattern set +
+# bypass mechanisms.
+bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"

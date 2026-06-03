@@ -28,7 +28,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-ENDPOINTS_DIR = REPO_ROOT / "core" / "runtime" / "endpoints"
+ENDPOINTS_DIR = REPO_ROOT / "mind_api" / "src" / "endpoints"
 
 
 def _is_file_locks_locked(call: ast.Call) -> bool:

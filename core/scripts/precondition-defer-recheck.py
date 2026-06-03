@@ -107,49 +107,15 @@ def _py(args, input_text=None):
 def _tolerant_decode(source, raw):
     """-tolerant decode for daemon aspirations_read body.
 
-    Mirrors consolidation-health.py::_tolerant_decode (lines 112-172,
-    landed via g-115-796) and parent-supersession-sweep.py::_tolerant_decode
-    (sibling A4) adapted for precondition-defer-recheck's expected aggregate
-    shapes: dict with "aspirations" key OR bare list.
+    Thin wrapper around `_rt.tolerant_decode_aggregate` (extracted via g-115-949).
+    The shared primitive enforces the full contract: empty -> None, raw_decode
+    recovery, guard-383 fatal on JSONDecodeError or non-dict-and-non-list.
+    This function exists only to prepend the script-name prefix to the stderr
+    diagnostic so existing log consumers don't need updates.
 
-    Contract per g-115-797-A3 / guard-383 / rb-774:
-      - Empty / whitespace-only body: return None (caller maps None → [];
-        valid empty queue, NOT a source error).
-      - Valid JSON (list OR dict with "aspirations" key): return as-is.
-      - Valid prefix + trailing garbage (g-115-766 shape): raw_decode
-        returns the prefix; recovery is NOT a source error.
-      - JSONDecodeError: ONE stderr diagnostic + sys.exit(1).
-      - Non-dict-and-non-list aggregate (e.g. string, number): stderr +
-        sys.exit(1).
-
-    Pre-fix behavior at line 114 was a bare json.loads + silent
-    `except json.JSONDecodeError: return []` — collapsing corruption to
-    "no goals to recheck" and freezing precondition_unmet defers
-    indefinitely. The fail-open boundary is the caller's shell wrapper
-    `|| echo WARN`, never inside this aggregator (rb-347).
+    See _rt.tolerant_decode_aggregate for the full guard-383 contract.
     """
-    stripped = (raw or "").lstrip()
-    if not stripped:
-        return None  # genuinely empty queue — valid state, not source error
-    try:
-        obj, _consumed = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError as exc:
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"precondition-defer-recheck: {source} JSONDecodeError ({exc}); "
-            f"body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: source error is fatal
-    if not isinstance(obj, (dict, list)):
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"precondition-defer-recheck: {source} non-dict-and-non-list aggregate "
-            f"(type={type(obj).__name__}); body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: corrupt aggregate shape
-    return obj
+    return _rt.tolerant_decode_aggregate(f"precondition-defer-recheck: {source}", raw)
 
 
 def _read_goals(source):

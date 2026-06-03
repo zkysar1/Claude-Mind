@@ -15,6 +15,7 @@ import io
 import json
 import sys
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -162,6 +163,185 @@ class ProbeRespondingBridgePidsTest(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             result = sjs.probe_responding_bridge_pids([proc])
         self.assertEqual(result, set())
+
+
+class MultiEnvBridgePidsTest(unittest.TestCase):
+    """7: multi_env_bridge_pids protects roblox-bridge processes on the
+    canonical multi-env ports (28080-28083) UNCONDITIONALLY -- regardless of
+    probe-response / plugin_connected state. Closes the g-115-106 / g-115-625 gap
+    where a bridge whose plugin was disconnected (probe_responding returns empty)
+    fell through to a Tier-B --auto-kill candidate and the working source bridge
+    was killed (twice)."""
+
+    def test_all_multi_env_ports_protected_unconditionally(self):
+        procs = [_make_bridge_proc(p + 1000, p) for p in (28080, 28081, 28082, 28083)]
+        # No probe mocking -- protection is unconditional (port-based), not probe-based.
+        result = sjs.multi_env_bridge_pids(procs)
+        self.assertEqual(result, {29080, 29081, 29082, 29083})
+
+    def test_hung_bridge_still_protected_when_probe_fails(self):
+        """The canonical incident: a 28083 bridge with no live plugin (probe
+        fails) is NOT protected by probe_responding_bridge_pids, but IS protected
+        by multi_env_bridge_pids -- the unconditional layer that prevents the kill."""
+        proc = _make_bridge_proc(2083, 28083)
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(set()),  # no port responds
+        ):
+            probe_result = sjs.probe_responding_bridge_pids([proc])
+        self.assertEqual(probe_result, set(),
+                         "probe-based protection should NOT cover a non-responding bridge")
+        self.assertEqual(sjs.multi_env_bridge_pids([proc]), {2083},
+                         "multi_env protection must cover it regardless of probe state")
+
+    def test_non_protected_port_not_protected(self):
+        proc = _make_bridge_proc(2999, 29999)
+        self.assertEqual(sjs.multi_env_bridge_pids([proc]), set())
+
+    def test_bridge_without_port_defaults_to_28080_protected(self):
+        proc = {
+            "ProcessId": 5556,
+            "ParentProcessId": 1,
+            "Name": "python.exe",
+            "CommandLine": "C:\\Python\\python.exe C:/Users/Foo/roblox-bridge.py",
+            "CreationDate": None,
+        }
+        self.assertEqual(sjs.multi_env_bridge_pids([proc]), {5556})
+
+    def test_non_bridge_on_protected_port_not_protected(self):
+        proc = {
+            "ProcessId": 9998,
+            "ParentProcessId": 1,
+            "Name": "python.exe",
+            "CommandLine": "C:\\Python\\python.exe C:/Users/Foo/some-other-script.py --port 28083",
+            "CreationDate": None,
+        }
+        self.assertEqual(sjs.multi_env_bridge_pids([proc]), set())
+
+    def test_port_28083_candidate_reported_but_not_killed(self):
+        """Goal verification (7): an aged 28083 bridge that WOULD be a
+        Tier-B kill candidate is excluded from candidates because build_do_not_kill
+        now contains it -- so --auto-kill never reaps it. Negative control: an
+        identically-aged bridge on a non-protected port (29999) IS a candidate,
+        proving the test would catch a regression that removed the protection."""
+        old = datetime.now() - timedelta(hours=25)  # past the 24h roblox-bridge threshold
+        protected = _make_bridge_proc(2083, 28083)
+        protected["CreationDate"] = old
+        unprotected = _make_bridge_proc(2999, 29999)
+        unprotected["CreationDate"] = old
+        procs = [protected, unprotected]
+        with mock.patch(
+            "urllib.request.urlopen",
+            side_effect=_mock_urlopen_factory(set()),  # deterministic: no probe protection
+        ):
+            dnk = sjs.build_do_not_kill(procs, [])
+            candidates = sjs.identify_candidates(procs, None, [], dnk, sjs.DEFAULT_THRESHOLDS)
+        self.assertIn(2083, dnk, "28083 bridge must be in do_not_kill (multi-env protect)")
+        self.assertNotIn(2999, dnk, "29999 (non-multi-env) bridge must NOT be protected by port rule")
+        cand_pids = {c["pid"] for c in candidates}
+        self.assertNotIn(2083, cand_pids,
+                         "protected 28083 bridge must NOT be a kill candidate (reported but not killed)")
+        self.assertIn(2999, cand_pids,
+                      "unprotected 29999 bridge SHOULD be a candidate (regression-catch control)")
+
+
+def _make_hook_python_proc(pid, ppid, age_hours, cmdline=None, name="python.exe"):
+    """A python.exe whose cmdline references core/scripts (inline `py -c`,
+    PreToolUse hook, or .python-shim). Default cmdline is a forward-slash
+    inline-py-c; pass cmdline to exercise the backslash / shim shapes."""
+    return {
+        "ProcessId": pid,
+        "ParentProcessId": ppid,
+        "Name": name,
+        "CommandLine": cmdline or (
+            "C:\\Python312\\python.exe -c \"import sys; "
+            "sys.path.insert(0, 'core/scripts'); from _paths import PROJECT_ROOT\""
+        ),
+        "CreationDate": datetime.now() - timedelta(hours=age_hours),
+    }
+
+
+class HookPythonOrphanTest(unittest.TestCase):
+    """g-?? (2026-05-28 chat-mode): hook-python Tier-B signature closes the
+    windows-process-orphan-blind-spot. A python.exe referencing core/scripts
+    whose parent (claude/bash) is dead is a stuck orphan; one with a live
+    parent is an active hook (protected). Threshold 0.5h. The parent-liveness
+    check reads the process-table snapshot (console-independent), NOT
+    os.kill(pid,0) — see _parent_is_live and the lifecycle.is_pid_alive fix."""
+
+    def test_classify_hook_python_forward_slash(self):
+        proc = _make_hook_python_proc(7001, 6001, 1.0)
+        self.assertEqual(sjs.classify_orphan(proc["CommandLine"], proc["Name"]),
+                         "hook-python")
+
+    def test_classify_hook_python_backslash_and_shim(self):
+        shim = ("C:\\Python312\\python.exe "
+                "C:\\repo\\core\\scripts\\.python-shim\\python3 retrieve.sh")
+        self.assertEqual(sjs.classify_orphan(shim, "python.exe"), "hook-python")
+
+    def test_bash_wrapper_mentioning_core_scripts_not_classified(self):
+        """`bash core/scripts/foo.sh` has Name=bash.exe — the name filter must
+        exclude it so we only ever reap true python.exe processes."""
+        cmd = "C:\\Program Files\\Git\\bin\\bash.exe core/scripts/retrieve.sh --category x"
+        self.assertIsNone(sjs.classify_orphan(cmd, "bash.exe"))
+
+    def test_daemon_not_classified_as_hook_python(self):
+        """The daemon is `python -m mind_api.src` — no core/scripts in cmdline,
+        so it must NOT match (would be catastrophic to reap)."""
+        cmd = "C:\\Python312\\python.exe -m mind_api.src --port 51763"
+        self.assertIsNone(sjs.classify_orphan(cmd, "python.exe"))
+
+    def test_parent_is_live_dead_recycled_alive(self):
+        child = _make_hook_python_proc(7001, 6001, 1.0)
+        # (a) parent absent from table -> dead
+        self.assertFalse(sjs._parent_is_live(child, {7001: child}))
+        # (b) parent present, born BEFORE child -> live
+        live_parent = {"ProcessId": 6001, "ParentProcessId": 1, "Name": "bash.exe",
+                       "CommandLine": "bash.exe",
+                       "CreationDate": datetime.now() - timedelta(hours=2.0)}
+        self.assertTrue(sjs._parent_is_live(child, {7001: child, 6001: live_parent}))
+        # (c) parent present but born AFTER child -> recycled PID -> dead
+        recycled = {"ProcessId": 6001, "ParentProcessId": 1, "Name": "notepad.exe",
+                    "CommandLine": "notepad.exe",
+                    "CreationDate": datetime.now() - timedelta(hours=0.25)}
+        self.assertFalse(sjs._parent_is_live(child, {7001: child, 6001: recycled}))
+
+    def test_dead_parent_aged_orphan_is_candidate(self):
+        """Aged hook-python whose parent is gone -> reap candidate."""
+        child = _make_hook_python_proc(7001, 6001, 1.0)  # parent 6001 absent
+        cands = sjs.identify_candidates([child], None, [], set(), sjs.DEFAULT_THRESHOLDS)
+        pids = {c["pid"] for c in cands}
+        self.assertIn(7001, pids)
+        self.assertEqual(next(c for c in cands if c["pid"] == 7001)["type"], "hook-python")
+
+    def test_live_parent_protected(self):
+        """Aged hook-python with a LIVE parent must NOT be a candidate. This is
+        the regression-catch: deleting the parent-gate makes 7001 a candidate."""
+        child = _make_hook_python_proc(7001, 6001, 1.0)
+        parent = {"ProcessId": 6001, "ParentProcessId": 1, "Name": "bash.exe",
+                  "CommandLine": "C:\\Program Files\\Git\\bin\\bash.exe",
+                  "CreationDate": datetime.now() - timedelta(hours=2.0)}
+        cands = sjs.identify_candidates([child, parent], None, [], set(),
+                                        sjs.DEFAULT_THRESHOLDS)
+        self.assertNotIn(7001, {c["pid"] for c in cands})
+
+    def test_recycled_parent_aged_orphan_is_candidate(self):
+        """Parent PID present but born after child (recycled) -> true parent
+        dead -> candidate."""
+        child = _make_hook_python_proc(7001, 6001, 1.0)
+        recycled = {"ProcessId": 6001, "ParentProcessId": 1, "Name": "notepad.exe",
+                    "CommandLine": "notepad.exe",
+                    "CreationDate": datetime.now() - timedelta(hours=0.25)}
+        cands = sjs.identify_candidates([child, recycled], None, [], set(),
+                                        sjs.DEFAULT_THRESHOLDS)
+        self.assertIn(7001, {c["pid"] for c in cands})
+
+    def test_young_hook_python_below_threshold_not_candidate(self):
+        """Dead parent but only 12 min old (< 0.5h threshold) -> not yet a
+        candidate. Isolates the threshold from the parent gate and cooldown."""
+        child = _make_hook_python_proc(7001, 6001, 0.2)  # 12 min, parent absent
+        cands = sjs.identify_candidates([child], None, [], set(), sjs.DEFAULT_THRESHOLDS)
+        self.assertNotIn(7001, {c["pid"] for c in cands})
 
 
 if __name__ == "__main__":

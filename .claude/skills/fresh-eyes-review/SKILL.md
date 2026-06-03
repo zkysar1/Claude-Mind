@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-review
-description: "Periodic local self-audit (cadence: every 25 goals). Assembles a portfolio-direction briefing (Self snapshot, aspiration portfolio, evolution signals, partner activity), writes it to agents/<agent>/reports/, and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Use whenever the user wants to force a portfolio review on demand (/fresh-eyes-review), or the precheck cadence triggers automatically (--cadence). Distinct from sq-012 (post-goal, narrow) and /priority-review (user-pull, ranking-only)."
+description: "Periodic local self-audit (cadence: every 25 goals). Assembles a portfolio-direction briefing (Self snapshot, aspiration portfolio, evolution signals, partner activity), writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Use whenever the user wants to force a portfolio review on demand (/fresh-eyes-review), or the precheck cadence triggers automatically (--cadence). Distinct from sq-012 (post-goal, narrow) and /priority-review (user-pull, ranking-only)."
 user-invocable: true
 triggers:
   - "/fresh-eyes-review"
@@ -25,8 +25,9 @@ previous_revision_id: null
 
 Every 25 completed goals (or on user demand), step back and produce a
 portfolio-direction briefing. The ritual runs autonomously, writes the
-briefing to `agents/<agent>/reports/`, and posts a one-line summary to the
-coordination board. No email push, no user-approval gate.
+briefing to `agents/<agent>/temp/` (a staging file drained to the knowledge
+tree), and posts a one-line summary to the coordination board. No email push,
+no user-approval gate.
 
 The user reviews changes via git log and tracked signals at their own pace.
 This follows the same pattern as Self evolution (guard-380, 2026-04-22):
@@ -82,6 +83,23 @@ Extract for each active aspiration:
 Read agents/<agent>/session/pending-questions.yaml
   → capture entries where id starts with 'sq-012' OR tags include 'self_evolution'
     AND created within last 30 days (any status)
+  → call these pq_signals
+
+# 2.3b Self-evolution signals on the findings board (g-115-1214)
+# pending-questions.yaml is not the only self-evolution surface. A self-drift
+# or self_evolution finding posted to world/board/findings — by a partner
+# agent, or by this agent's own strategic-scan / fresh-eyes-followup — is
+# ALSO a self-evolution signal that Phase 2.3 above never read. Incident
+# (2026-05-24): a no_change verdict landed with self_evolution_signals_count=0
+# while alpha self-drift finding msg-20260523-091626-alpha-1586 sat unread on
+# the findings board (later actioned by hand as g-115-1213). See rb-1279.
+Bash: board-read.sh --channel findings --since 30d --json
+  → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
+    AND directed at this agent (tags include MIND_AGENT, OR text/author names
+    this agent, OR the finding carries no agent tag = applies to all)
+  → call these board_signals
+  → surface board_signals to Phase 3 "Recent self-evolution signals" bullets
+    so the briefing names the unread finding(s), not just pending-questions
 
 # 2.4 Evolution engine output — dev stage, gap analysis, novelty pressure
 Bash: tail -n 5 <META_DIR>/evolution-log.jsonl
@@ -160,15 +178,17 @@ All observations must follow `.claude/rules/communication-clarity.md` rule 6:
 state what the evidence shows, do not hedge. If evidence is ambiguous, say
 "the evidence shows X but does not show Y."
 
-## Phase 4: Archive Copy
+## Phase 4: Stage Briefing to temp/
 
-Write the briefing body to `agents/<agent>/reports/fresh-eyes-{YYYY-MM-DDTHH-MM-SS}.md`
-for historical reference. Timestamp includes HH-MM-SS so multiple same-day
-invocations (cadence fire + user-forced review) do not collide.
+Write the briefing body to `agents/<agent>/temp/fresh-eyes-{YYYY-MM-DDTHH-MM-SS}.md`
+as a staging artifact — its durable findings are encoded to the knowledge tree
+by Phase 5.6, and the file itself is drained by `/drain-temp` (see
+`core/config/conventions/temp-store.md`). Timestamp includes HH-MM-SS so multiple
+same-day invocations (cadence fire + user-forced review) do not collide.
 
 ```
-Bash: mkdir -p agents/<agent>/reports
-Write the briefing body (from Phase 3) to agents/<agent>/reports/fresh-eyes-{today-isotime}.md
+Bash: mkdir -p agents/<agent>/temp
+Write the briefing body (from Phase 3) to agents/<agent>/temp/fresh-eyes-{today-isotime}.md
   (where {today-isotime} = `date +%Y-%m-%dT%H-%M-%S` — colons replaced with
    hyphens for Windows filesystem compatibility)
 ```
@@ -186,7 +206,7 @@ noted) and pass to the helper:
 SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
   "completion_health":              {0..1 — average completion ratio across active aspirations},
-  "self_evolution_signals_count":   {int — recent sq-012/ABC-chain/pattern-signature self-evolution indicators in last 30d},
+  "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214). A self_evolution/self-drift finding on the board counts even when pending-questions.yaml is empty — this is the count that was silently 0 on 2026-05-24},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
   "explicit_user_directive":        {true|false — outstanding /respond about purpose or portfolio},
   "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Self edit}
@@ -219,6 +239,50 @@ ALWAYS log the decision to `agents/<agent>/journal` (one-line tagged
 `fresh-eyes-decision`) and append a single board post to the `reasoning`
 channel summarizing decision + rationale. The audit trail is the
 guardrail's evidence path.
+
+## Phase 5.6: Encode Non-Routed Observations
+
+Phase 5.5 routes at most ONE finding to a durable home (a Self edit via
+`act_now`, or an Idea goal via `act_later`). Every OTHER observation in the
+Phase 3 briefing — category-distribution evidence, completion-health
+patterns, partner-activity signals, self-evolution-signal aggregations,
+candidate-rebalance rationale — otherwise lands ONLY in the transient `temp/`
+staging file, which is invisible to `/prime` and `retrieve.sh` and is drained
+away over time. This step encodes the observations that have no other durable
+home, so the briefing's knowledge survives after the staging file is drained.
+Modeled on
+`/felt-sense-checkin` Phase 1.
+
+**No-double-encode**: skip the single observation Phase 5.5 already routed
+(the `act_now` Self-edit target, or the `act_later` goal's
+`recommended_action`). The journal/board decision entries carry the decision
+label, not the observations — they are not duplicates.
+
+For each REMAINING briefing observation, classify per
+`core/config/conventions/learning-routing.md` and route to ONE store. When in
+doubt, drop — the asymmetry favors dropping (over-encoding inflates retrieval
+cost forever; under-encoding loses one signal once):
+
+- **tree** — a compressed durable fact (category-distribution ratio,
+  completion-health pattern, cross-agent work dynamic). **Novelty gate
+  (mandatory — fresh-eyes fires every 25 goals; un-gated `/tree add` floods
+  the tree):** before adding, check whether a node already covers this
+  observation (`tree-read.sh --node {candidate-key}`, or a `retrieve.sh`
+  lookup). If one exists and this is only a refreshed measurement, `/tree
+  edit` it (update body + `last_updated` + `last_update_trigger:
+  fresh-eyes-review`) instead of adding a duplicate. Use `/tree add {parent}
+  {key} {summary}` ONLY for a genuinely novel finding.
+- **reasoning_bank** — a recurring diagnostic / ABC pattern.
+  `reasoning-bank-add.sh` with summary + ABC chain + `applies_to`
+  (`framework` for multi-agent / portfolio patterns, else `any`).
+- **guardrails** — a prescriptive rule with a trigger condition.
+  `guardrails-add.sh` with rule + trigger_condition.
+- **drop** — already captured, too thin, or a one-cycle anomaly.
+
+The encoding writes are self-evidencing (the new/edited tree, reasoning-bank,
+and guardrail records); no separate log line is required. Do NOT add a
+terminal action here — Phase 8's board-post remains the skill's final tool
+call.
 
 ## Phase 8: Record the Tick
 
@@ -266,13 +330,18 @@ the skill does NOT end with text output.
   Phase 0.5e (`/fresh-eyes-review --cadence`)
 - **Calls**: `fresh-eyes-cadence-check.sh`, `load-aspirations-compact.sh`,
   `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`,
-  `self-assess-and-decide.sh`, `journal-add.sh`, `board-post.sh`
+  `self-assess-and-decide.sh`, `journal-add.sh`, `board-post.sh`,
+  `/tree add`, `/tree edit`, `tree-read.sh`, `reasoning-bank-add.sh`,
+  `guardrails-add.sh` (Phase 5.6 encoding)
 - **Reads**: `agents/<agent>/self.md`, `agents/<agent>/session/pending-questions.yaml`,
   `<meta>/evolution-log.jsonl`, world aspirations compact,
   `agents/<agent>/session/working-memory.yaml`
-- **Modifies**: `agents/<agent>/reports/fresh-eyes-*.md` (new),
+- **Modifies**: `agents/<agent>/temp/fresh-eyes-*.md` (new staging file),
   `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_review slot),
-  `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort)
+  `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort),
+  `world/knowledge/tree/` (Phase 5.6 new/edited nodes),
+  `world/reasoning-bank.jsonl` (Phase 5.6 appends),
+  `world/guardrails.jsonl` (Phase 5.6 appends)
 - **Does NOT modify**: `agents/<agent>/self.md` (unless Phase 5.5 returns act_now),
   aspiration priorities, pending-questions. No email is sent.
 

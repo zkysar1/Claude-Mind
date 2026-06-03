@@ -53,6 +53,14 @@ class YamlCache:
         Returns None if the file is missing. Skips the cache for small
         files. See module docstring for the no-mutation contract.
         """
+        # s5 (lodestar own-cloud): materialize from the active backend BEFORE
+        # the stat (mirrors jsonl_cache.get). ensure_local() pulls a changed S3
+        # object into the local cache and bumps its mtime so the reload below
+        # fires; identity/no-op on LocalBackend. Function-local import for
+        # module-load-order safety. Precedes the small-file branch, so it covers
+        # the direct _load() path too.
+        from storage_backend import get_backend
+        get_backend().ensure_local(path)
         try:
             st = path.stat()
         except FileNotFoundError:

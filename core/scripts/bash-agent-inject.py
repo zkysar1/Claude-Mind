@@ -24,7 +24,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Hooks run with cwd set by Claude Code, not this file's dir, so the resolver
 # module is not importable by relative name without a sys.path hint.
 sys.path.insert(0, str(SCRIPT_DIR))
-from _resolve_agent_from_sid import resolve as resolve_agent
+# resolve_binding_with_diagnostics returns (binding, failure_reason) so the
+# miss log can name the SPECIFIC failure mode instead of a single opaque
+# "no_active_agent_binding" (7). The legacy resolve() wrapper is no
+# longer imported here — the diagnostics variant supersedes it for the hook.
+from _session_binding import resolve_binding_with_diagnostics
 
 # Shared helpers (): approve_no_mutation, stdin_json_or_approve.
 # emit_deny added 2026-05-19 for the F4 cruft gate below — bash-agent-inject
@@ -33,50 +37,121 @@ from _resolve_agent_from_sid import resolve as resolve_agent
 from hook_helpers import approve_no_mutation, stdin_json_or_approve, emit_deny  # noqa: E402
 
 
-def _log_binding_miss_once(sid: str, project_root: Path) -> None:
+def _sanitize_reason(reason: str) -> str:
+    """Reduce a reason string to a filesystem-safe sentinel-key fragment.
+
+    Reasons are short kebab-case tokens from resolve_binding_with_diagnostics
+    (e.g. "binding-yaml-missing", "session-id-mismatch"). Defensive scrub:
+    keep [a-z0-9-], collapse anything else to '-', cap length. Guarantees the
+    `<sid>__<reason>` sentinel path never escapes the sentinels dir even if a
+    future reason carries unexpected characters.
+    """
+    safe = re.sub(r"[^a-z0-9-]", "-", (reason or "unknown").lower())
+    return safe[:48] or "unknown"
+
+
+def _binding_resolved_dir(project_root: Path) -> Path:
+    return project_root / "core" / "logs" / "bash-inject-resolved"
+
+
+def _mark_binding_resolved(sid: str, project_root: Path, agent: str = "") -> None:
+    """Record that this SID resolved to an agent at least once this session.
+
+    A zero-byte memo at `core/logs/bash-inject-resolved/<sid>`. Its presence
+    lets a SUBSEQUENT miss distinguish "binding was never there"
+    (first Bash before /start — expected, low-signal) from
+    "binding-yaml-mid-session-disappeared" (the canonical g-115-1146 bug:
+    injection worked, then silently stopped). Fail-open: any error swallowed.
+    """
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return
+        d = _binding_resolved_dir(project_root)
+        d.mkdir(parents=True, exist_ok=True)
+        # Store the resolved agent NAME (was a zero-byte touch) so a later
+        # transient resolve failure can fail SAFE -- reuse this SID's bound agent
+        # instead of fail-open to the first agent (6 cross-agent hazard).
+        (d / sid).write_text(agent or "", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _binding_was_resolved(sid: str, project_root: Path) -> bool:
+    """True if a resolution memo exists for this SID. Fail-open False."""
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return False
+        return (_binding_resolved_dir(project_root) / sid).exists()
+    except Exception:
+        return False
+
+
+def _last_resolved_agent(sid: str, project_root: Path) -> str:
+    """The agent this SID last resolved to (from the memo), or '' if none.
+
+    Lets a transient binding-resolve failure fail SAFE: a SID is bound to one
+    agent for its session lifetime, so reusing the last-known name routes the
+    call to the CORRECT agent rather than fail-open to the first agent. The
+    name is strictly validated before any caller injects it into a shell
+    export clause (defense vs a tampered memo). Fail-open '' on any error.
+    """
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return ""
+        p = _binding_resolved_dir(project_root) / sid
+        if not p.exists():
+            return ""
+        name = p.read_text(encoding="utf-8").strip()
+        return name if re.fullmatch(r"[A-Za-z0-9._-]+", name or "") else ""
+    except Exception:
+        return ""
+
+
+def _log_binding_miss_once(sid: str, project_root: Path, reason: str = "binding-yaml-missing") -> None:
     """Defense-in-depth diagnostic when binding resolution returns no agent.
 
-    Fires only when bash-agent-inject attempted to resolve `.active-agent-<SID>`
-    AND the caller did NOT write an explicit `MIND_AGENT=` override. Per-SID
-    one-shot via a zero-byte sentinel — long NO_AGENT sessions log exactly once,
-    not once per Bash call.
+    Fires only when bash-agent-inject attempted to resolve the SID binding
+    AND the caller did NOT write an explicit `MIND_AGENT=` override. Per-(SID,
+    reason) one-shot via a zero-byte sentinel — a NO_AGENT session logs each
+    DISTINCT failure mode once, not once per Bash call, and not collapsed
+    across modes.
+
+    Per-(SID, reason) rather than per-SID (g-115-1187): the prior per-SID
+    sentinel suppressed EVERY miss after the first for a SID. The canonical
+    g-115-1146 incident — injection working then silently stopping mid-session
+    — produced ZERO additional log lines because the session-start miss had
+    already set the SID's only sentinel. Keying the sentinel on (sid, reason)
+    means a "binding-yaml-mid-session-disappeared" miss logs even when an
+    earlier "binding-yaml-missing" miss for the same SID already fired.
 
     Discoverability path (the whole reason this exists):
       1. User notices that MIND_AGENT injection isn't happening for some session.
       2. User greps `core/logs/bash-inject-misses.jsonl`.
-      3. Each line names a SID that hit this hook with no binding resolved.
+      3. Each line names a SID + the SPECIFIC failure reason that hit this hook.
       4. The `hint` field tells them the two fixes: `/start <agent-name>` to
          create the binding, or prefix the Bash command with `MIND_AGENT=<name>`
          for one-off cross-agent probes.
 
-    Why per-SID one-shot rather than every-call:
-      A NO_AGENT session running 50+ Bash commands would otherwise produce 50+
-      identical log lines for the same SID. The sentinel collapses that to one.
-      The sentinel files are zero bytes; their accumulation cost is negligible.
-
     Sink location (2026-05-19 relocation, plan v1 step 0.13-0.14):
-      Previously sentinel + log lived at PROJECT_ROOT/ (`.bash-inject-no-binding-<sid>`
-      + `.bash-inject-misses.jsonl`) — that produced 28-file repo-root clutter and
-      a perpetually-growing root-level log. Both now route to `core/logs/`, the
-      canonical telemetry sink (already gitignored, already hosts watchdog logs).
-      Sentinels under `core/logs/bash-inject-sentinels/<sid>`; log at
-      `core/logs/bash-inject-misses.jsonl`. Cleanup sweep applies to the new path.
+      Sentinels under `core/logs/bash-inject-sentinels/<sid>__<reason>`; log at
+      `core/logs/bash-inject-misses.jsonl`. Both gitignored.
 
     Fail-open invariant (PreToolUse hook contract):
       ANY exception here is swallowed. The hook MUST never block the Bash call
       because of a diagnostic write. The whole function is wrapped in try/except.
 
     SID-shape protection: rejects path-traversal characters before constructing
-    the sentinel path. Mirrors `_resolve_agent_from_sid.resolve()`'s validation,
-    so a malicious SID can't write outside the project root.
+    the sentinel path. `reason` is additionally scrubbed via _sanitize_reason,
+    so neither component can escape the sentinels dir.
     """
     try:
         if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
             return
+        safe_reason = _sanitize_reason(reason)
         logs_dir = project_root / "core" / "logs"
         sentinels_dir = logs_dir / "bash-inject-sentinels"
         sentinels_dir.mkdir(parents=True, exist_ok=True)
-        sentinel = sentinels_dir / sid
+        sentinel = sentinels_dir / f"{sid}__{safe_reason}"
         if sentinel.exists():
             return
         # Touch first so a concurrent hook instance sees the sentinel and
@@ -103,7 +178,7 @@ def _log_binding_miss_once(sid: str, project_root: Path) -> None:
         record = json.dumps({
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "sid": sid,
-            "reason": "no_active_agent_binding",
+            "reason": reason,
             "hint": "Run /start <agent-name>, or prefix the Bash command with MIND_AGENT=<name>.",
         })
         with open(log_path, "a", encoding="utf-8") as f:
@@ -291,15 +366,44 @@ def main():
     #                    binding exists yet (first Bash call of /start Step 0).
     agent_clause = ""
     if not re.search(r"(^|[\s;&|(])MIND_AGENT=", command):
-        agent = resolve_agent(sid, SCRIPT_DIR.parent.parent)
-        if agent:
-            agent_clause = f"export MIND_AGENT={agent}; "
+        project_root = SCRIPT_DIR.parent.parent
+        binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
+        # Transient I/O (OneDrive latency / AV scan / handle contention) can make
+        # resolve spuriously return None for a SID whose binding is fine. Retry --
+        # re-reading the actual binding yields the CORRECT current agent (no
+        # staleness), unlike the memo fallback below. 6 hazard.
+        if binding is None or not getattr(binding, "agent", ""):
+            for _retry in range(2):
+                binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
+                if binding is not None and binding.agent:
+                    break
+        if binding is not None and binding.agent:
+            agent_clause = f"export MIND_AGENT={binding.agent}; "
+            # Record that this SID resolved at least once. A later miss can then
+            # be classified as mid-session-disappeared rather than expected
+            # first-call-before-/start. See _mark_binding_resolved (7).
+            _mark_binding_resolved(sid, project_root, binding.agent)
         else:
             # Defense-in-depth: surface SIDs that ran without a binding so the
             # silent-no-injection failure class becomes greppable instead of
             # invisible. The hook still fails open — no exception path here can
             # block the Bash call. See _log_binding_miss_once for the rationale.
-            _log_binding_miss_once(sid, SCRIPT_DIR.parent.parent)
+            #
+            # Mid-session-disappeared upgrade (7): a "binding-yaml-missing"
+            # miss AFTER a prior successful resolve for this SID is the canonical
+            # 6 bug (injection worked, then stopped) — promote the reason
+            # so it greps distinctly from the expected first-Bash-before-/start miss.
+            last = _last_resolved_agent(sid, project_root)
+            if last:
+                # Fail SAFE: transient resolve failure for a SID that resolved
+                # earlier this session -- reuse its (immutable) bound agent rather
+                # than fall through to the first agent. 6 hazard.
+                agent_clause = f"export MIND_AGENT={last}; "
+                _log_binding_miss_once(sid, project_root, "binding-resolve-transient-failsafe")
+            else:
+                if fail_reason == "binding-yaml-missing" and _binding_was_resolved(sid, project_root):
+                    fail_reason = "binding-yaml-mid-session-disappeared"
+                _log_binding_miss_once(sid, project_root, fail_reason)
 
     expected_prefix = f'export PATH="{shim_path}:$PATH"; {agent_clause}export MIND_SID={sid};'
     if command.startswith(expected_prefix):
@@ -323,9 +427,13 @@ def main():
     }))
 
 
-try:
-    main()
-except Exception:
-    pass
-
-sys.exit(0)
+# Guard module-level execution so the helpers above are importable for tests
+# (7). The hook is invoked as `python3 bash-agent-inject.py` by
+# bash-agent-inject.sh, so __name__ == "__main__" and behavior is unchanged;
+# importing the module (test harness) no longer runs main() + sys.exit(0).
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

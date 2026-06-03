@@ -75,6 +75,7 @@ from wm import read_wm, WM_PATH as WORKING_MEMORY_PATH  # noqa: E402
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
 from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
+from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
@@ -269,12 +270,20 @@ def load_recurring_config():
     renamed from streak_reset_multiplier 2026-05-18 / g-115-929 to consolidate
     with the literal variable name used at the two readers in
     aspirations_write.py cmd_complete_by and streak-break-reflector.py).
+    Plus urgency_max (g-115-1090) and the FW-1 substantive_demotion_* family
+    (2026-05-25, 7-agent feedback distillation).
     """
     defaults = {
         "urgency_base": 1.5, "urgency_log_scale": 1.5,
+        "urgency_max": 4.0,
         "saturation_window": 4, "saturation_max_penalty": 4.0,
         "debt_threshold": 0.80, "debt_bonus": 3.0,
         "streak_mult": 2.0,
+        # FW-1 (2026-05-25): substantive-availability demotion (see aspirations.yaml).
+        "substantive_demotion_enabled": True,
+        "substantive_demotion_margin": 0.5,
+        "substantive_demotion_floor": 5.0,
+        "substantive_demotion_overdue_exempt_ratio": 5.0,
     }
     try:
         import importlib.util
@@ -635,6 +644,50 @@ def read_yaml_file(path):
         return yaml.safe_load(f) or {}
 
 
+def _log_transient_allblocked_recovery(first_world, retry_world, retry_count):
+    """Record a transient all_blocked recovery for root-cause evidence (5).
+
+    Emitted by cmd_select when the FIRST collection pass returns zero candidates
+    but a fresh re-read + re-collect finds work. The WORLD aspirations file lives
+    on a synced network drive (OneDrive); the leading hypothesis is a transient
+    stale/partial snapshot presented during sync. Recording first-vs-retry
+    aspiration/goal counts lets a later analysis distinguish "file content changed
+    between the two reads" (world_content_changed_between_reads=True -> stale-read
+    confirmed) from "identical content, different collection result" (=False ->
+    a deeper non-determinism worth a separate investigation). Fail-open at every
+    layer: telemetry must never break selection.
+    """
+    try:
+        def _counts(asps):
+            ng = sum(len(a.get("goals", []) or [])
+                     for a in (asps or []) if a.get("status") == "active")
+            return len(asps or []), ng
+        fa, fg = _counts(first_world)
+        ra, rg = _counts(retry_world)
+        content_changed = (fa != ra) or (fg != rg)
+        sys.stderr.write(
+            "[goal-selector] WARN transient all_blocked recovered: first pass 0 "
+            "candidates, retry found %d. world_content_changed_between_reads=%s "
+            "(first %d asps/%d goals, retry %d asps/%d goals). See g-115-1295.\n"
+            % (retry_count, content_changed, fa, fg, ra, rg))
+        try:
+            rec = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "event": "transient_all_blocked_recovered",
+                "retry_candidates": retry_count,
+                "first_world_aspirations": fa, "retry_world_aspirations": ra,
+                "first_world_goals": fg, "retry_world_goals": rg,
+                "world_content_changed_between_reads": content_changed,
+            }
+            path = Path(WORLD_DIR) / "goal-selector-anomalies.jsonl"
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Cross-session class completions ( /  drift fix)
 # ---------------------------------------------------------------------------
@@ -662,7 +715,7 @@ def load_recent_class_completions(window_size=20):
     target was invisible to class_balance_bonus because the window reset
     every session).
     """
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         return []
 
     journal_path = AGENT_DIR / "journal.jsonl"
@@ -1661,18 +1714,24 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 6. novelty_bonus (+1.0 if never done before)
     raw["novelty_bonus"] = 1.0 if goal.get("achievedCount", 0) == 0 else 0
 
-    # 7. recurring_urgency (log-scaled: base + log2(1 + overdue_ratio) * scale)
+    # 7. recurring_urgency (log-scaled: base + log2(1 + overdue_ratio) * scale, capped at urgency_max)
     # Logarithmic scaling preserves differentiation among overdue goals — a 72x-overdue
     # goal scores higher than a 4x-overdue one, unlike the old linear cap at 5.0.
+    # urgency_max (0, zeta-1477 fix) caps raw at a ceiling so heavily-overdue
+    # recurring goals can no longer systematically out-score capped role_affinity
+    # (1.5x ceiling × weight 1.0 = 1.5 max contribution) — bounds asymmetry while
+    # preserving relative ordering up to the cap point (~3x overdue at default 4.0).
     rec = 0
+    overdue_ratio = 0.0  # hoisted (FW-1): exposed in the result dict so the
+                         # post-scoring substantive-demotion exemption can read it.
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
         la = hours_since(goal.get("lastAchievedAt"))
         if la is None or (la >= interval and interval > 0):
-            overdue_ratio = 0.0
             if la is not None and interval > 0:
                 overdue_ratio = max((la - interval) / interval, 0.0)
             rec = RECURRING_CONFIG["urgency_base"] + math.log2(1 + overdue_ratio) * RECURRING_CONFIG["urgency_log_scale"]
+            rec = min(rec, RECURRING_CONFIG["urgency_max"])
     raw["recurring_urgency"] = rec
 
     # 7b. recurring_saturation (penalty when recurring goals dominate recent selections)
@@ -1782,16 +1841,19 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     )
 
     # 8. reward_history (+1.0 if previous goals in this aspiration had high success)
-    completed = sum(1 for g in asp.get("goals", []) if g.get("status") == "completed")
+    # Census-augmented (B9-deep): evicted completed goals still count toward the
+    # reward signal, so an aspiration whose done goals were archived is not
+    # mistaken for one that never succeeded.
+    _, completed = effective_counts(asp, exclude_statuses=ABANDONED_STATUSES)
     raw["reward_history"] = 1.0 if completed > 0 else 0
 
     # 8b. completion_pressure (nonlinear boost for near-complete aspirations)
     # Quadratic: negligible for early aspirations, dominant for near-complete ones
     #   1/15 = 0.01, 7/15 = 0.54, 10/15 = 1.11, 14/15 = 2.18
-    active_goals = [g for g in asp.get("goals", [])
-                    if g.get("status") not in ABANDONED_STATUSES]
-    total_goals = len(active_goals)
-    done_goals = sum(1 for g in active_goals if g.get("status") == "completed")
+    # "active" = status not in ABANDONED_STATUSES (recurring kept). effective_counts
+    # folds archived completed back in so eviction leaves the ratio byte-identical.
+    total_goals, done_goals = effective_counts(
+        asp, exclude_statuses=ABANDONED_STATUSES)
     completion_ratio = done_goals / total_goals if total_goals > 0 else 0
     raw["completion_pressure"] = (completion_ratio ** 2) * 2.5
 
@@ -1980,6 +2042,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "skill": goal.get("skill"),
         "category": category,
         "recurring": bool(goal.get("recurring")),
+        "recurring_overdue_ratio": round(overdue_ratio, 3),
         "score": round(total, 2),
         "breakdown": {
             **{k: round(raw[k] * WEIGHTS[k], 2) for k in WEIGHTS},
@@ -1992,6 +2055,60 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
             "noise_weight": round(noise_weight, 2),
         },
     }
+
+
+def apply_substantive_demotion(scored, config):
+    """FW-1 (2026-05-25, 7-agent feedback): bound recurring scores below substantive work.
+
+    Six of seven agents reported recurring sweeps perpetually out-ranking rare
+    substantive work (e.g. g-001-01: 175 runs, 98.8% routine, score 13.87, still
+    #1). The existing knobs (urgency_max cap, recurring_saturation,
+    per_goal_saturation, recurring_debt_bonus) each address a piece, but a healthy
+    MIX of candidates still lets one recurring goal top the list because it also
+    wins on priority / agent_executable / role_affinity.
+
+    This caps any recurring goal's effective score to `substantive_demotion_margin`
+    BELOW the best-scoring non-recurring, agent-executable candidate, UNLESS that
+    recurring goal is overdue beyond `substantive_demotion_overdue_exempt_ratio`
+    (genuinely-stale monitoring must still surface — monitoring must not rot).
+
+    Pure w.r.t. `config`; mutates and returns `scored` in place. Records the
+    adjustment in each demoted goal's breakdown + raw for telemetry. No-ops when
+    disabled, when fewer than 2 candidates exist, when no agent-executable
+    substantive candidate exists, or when the best substantive score is below
+    `substantive_demotion_floor` (don't suppress maintenance for low-value
+    stragglers). MUST run AFTER the recurring_debt_bonus block so the substantive
+    floor already reflects catch-up boosts.
+    """
+    if not config.get("substantive_demotion_enabled"):
+        return scored
+    if len(scored) < 2:
+        return scored
+    margin = float(config["substantive_demotion_margin"])
+    floor = float(config["substantive_demotion_floor"])
+    exempt_ratio = float(config["substantive_demotion_overdue_exempt_ratio"])
+    # "Substantive" = non-recurring AND executable by THIS agent (agent_executable
+    # raw is 2 when eligible, 0 otherwise). Only protect work the agent can pick up.
+    substantive = [
+        s for s in scored
+        if not s.get("recurring")
+        and (s.get("raw") or {}).get("agent_executable", 0) > 0
+    ]
+    if not substantive:
+        return scored
+    top_sub = max(s["score"] for s in substantive)
+    if top_sub < floor:
+        return scored
+    cap = round(top_sub - margin, 2)
+    for s in scored:
+        if (s.get("recurring")
+                and s["score"] > cap
+                and float(s.get("recurring_overdue_ratio", 0.0)) < exempt_ratio):
+            s.setdefault("breakdown", {})["substantive_demotion"] = round(cap - s["score"], 2)
+            s.setdefault("raw", {})["substantive_demotion_pre_score"] = s["score"]
+            s["raw"]["substantive_demotion_applied"] = True
+            s["score"] = cap
+    return scored
 
 
 # ---------------------------------------------------------------------------
@@ -2103,32 +2220,87 @@ def cmd_select(args):
             defer_reason_timeout_hours=defer_reason_timeout_hours,
             dependency_timeout_hours=dependency_timeout_hours)
     if not candidates:
-        # Distinguish "no goals exist" from "goals exist but all blocked"
-        # (all_aspirations already computed above for global_done_ids)
-        blocked = collect_blocked(all_aspirations, known_blockers=known_blockers,
-                                  global_done_ids=global_done_ids,
-                                  defer_reason_timeout_hours=defer_reason_timeout_hours,
-                                  dependency_timeout_hours=dependency_timeout_hours)
-        if blocked:
-            summary = {}
-            for b in blocked:
-                reason = b["block_reason"]
-                summary[reason] = summary.get(reason, 0) + 1
-            print(json.dumps({
-                "candidates": [],
-                "all_blocked": True,
-                "blocked_count": len(blocked),
-                "by_reason": summary,
-                "blocked_goals": [
-                    {"goal_id": b["goal_id"], "title": b["title"],
-                     "reason": b["block_reason"],
-                     "detail": b.get("block_detail", "")}
-                    for b in blocked[:10]
-                ]
-            }, indent=2))
+        # VERIFY-BEFORE-ASSUMING (5): all_blocked is a NEGATIVE,
+        # work-gating conclusion ("no executable goals exist"). The WORLD
+        # aspirations file is on a synced network drive (OneDrive); a transient
+        # stale/partial snapshot during sync can produce a valid-but-empty FIRST
+        # collection while real candidates exist (observed alpha session-77: 124
+        # candidates present, selector intermittently emitted all_blocked; load +
+        # collect proven deterministic 8/8 + 12/12 on the settled file). Per
+        # .claude/rules/verify-before-assuming.md a negative work-gating
+        # conclusion requires 2+ independent signals -- re-read fresh and
+        # re-collect ONCE before declaring all-blocked. If the retry finds
+        # candidates the first pass was a transient anomaly: proceed with the
+        # retry results (recomputing all_aspirations + global_done_ids from the
+        # fresh read) and log the discrepancy for root-cause evidence. The three
+        # collect_* calls below intentionally MIRROR the initial collection above
+        # -- keep them in sync; test_goal_selector_allblocked_reread guards this.
+        world_retry = read_jsonl(WORLD_ASP_PATH)
+        agent_retry = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
+        all_aspirations_retry = world_retry + agent_retry
+        global_done_ids_retry = set()
+        for asp in all_aspirations_retry:
+            if asp.get("status") != "active":
+                continue
+            for g in asp.get("goals", []):
+                if g.get("status") in ("completed", "decomposed"):
+                    global_done_ids_retry.add(g["id"])
+        retry_candidates = collect_candidates(
+            world_retry, known_blockers=known_blockers, source="world",
+            global_done_ids=global_done_ids_retry, claim_timeout_hours=claim_timeout_hours,
+            reallocation_hours=reallocation_hours,
+            abstention_timeout_hours=abstention_timeout_hours,
+            defer_reason_timeout_hours=defer_reason_timeout_hours,
+            dependency_timeout_hours=dependency_timeout_hours)
+        retry_candidates += collect_candidates(
+            agent_retry, known_blockers=known_blockers, source="agent",
+            global_done_ids=global_done_ids_retry, reallocation_hours=reallocation_hours,
+            abstention_timeout_hours=abstention_timeout_hours,
+            defer_reason_timeout_hours=defer_reason_timeout_hours,
+            dependency_timeout_hours=dependency_timeout_hours)
+        if AGENT_DIR is not None:
+            retry_candidates += collect_cross_agent_candidates(
+                AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
+                known_blockers=known_blockers,
+                global_done_ids=global_done_ids_retry,
+                claim_timeout_hours=claim_timeout_hours,
+                reallocation_hours=reallocation_hours,
+                abstention_timeout_hours=abstention_timeout_hours,
+                defer_reason_timeout_hours=defer_reason_timeout_hours,
+                dependency_timeout_hours=dependency_timeout_hours)
+        if retry_candidates:
+            _log_transient_allblocked_recovery(
+                world_aspirations, world_retry, len(retry_candidates))
+            candidates = retry_candidates
+            all_aspirations = all_aspirations_retry
+            global_done_ids = global_done_ids_retry
         else:
-            print("[]")
-        return
+            # Two independent signals agree: genuinely all-blocked.
+            # (Report blocked goals from the fresh retry read for consistency.)
+            blocked = collect_blocked(all_aspirations_retry, known_blockers=known_blockers,
+                                      global_done_ids=global_done_ids_retry,
+                                      defer_reason_timeout_hours=defer_reason_timeout_hours,
+                                      dependency_timeout_hours=dependency_timeout_hours)
+            if blocked:
+                summary = {}
+                for b in blocked:
+                    reason = b["block_reason"]
+                    summary[reason] = summary.get(reason, 0) + 1
+                print(json.dumps({
+                    "candidates": [],
+                    "all_blocked": True,
+                    "blocked_count": len(blocked),
+                    "by_reason": summary,
+                    "blocked_goals": [
+                        {"goal_id": b["goal_id"], "title": b["title"],
+                         "reason": b["block_reason"],
+                         "detail": b.get("block_detail", "")}
+                        for b in blocked[:10]
+                    ]
+                }, indent=2))
+            else:
+                print("[]")
+            return
 
     epsilon, noise_scale = load_exploration_params()
     # Precompute completion ratios for cross_aspiration_support criterion.
@@ -2138,10 +2310,8 @@ def cmd_select(args):
     global _ASP_COMPLETION_RATIOS
     _ASP_COMPLETION_RATIOS = {}
     for asp in all_aspirations:
-        active_g = [g for g in asp.get("goals", [])
-                    if g.get("status") not in ABANDONED_STATUSES]
-        total = len(active_g)
-        done = sum(1 for g in active_g if g.get("status") == "completed")
+        # Census-augmented (B9-deep): same "active" semantics as completion_pressure.
+        total, done = effective_counts(asp, exclude_statuses=ABANDONED_STATUSES)
         _ASP_COMPLETION_RATIOS[asp.get("id", "")] = (
             done / total if total > 0 else 0.0)
     scored = [score_goal(c, wm, resolved, sc, epsilon=epsilon, noise_scale=noise_scale)
@@ -2158,6 +2328,12 @@ def cmd_select(args):
                 s["score"] += bonus
                 s["breakdown"]["recurring_debt_bonus"] = bonus
                 s["raw"]["recurring_debt_bonus"] = bonus
+
+    # FW-1 (2026-05-25): bound recurring goals below the best substantive
+    # candidate when real work is available. Runs AFTER recurring_debt_bonus so
+    # the substantive floor already reflects catch-up boosts; BEFORE the sort so
+    # the demoted scores drive the ranking. See apply_substantive_demotion.
+    apply_substantive_demotion(scored, RECURRING_CONFIG)
 
     # Sort: highest score first, then lower aspiration number, then lower goal number
     scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))

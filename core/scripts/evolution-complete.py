@@ -41,6 +41,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 
 _STREAMS = (
@@ -308,7 +309,7 @@ def _email_user(entry, event):
         env["MIND_AGENT"] = agent
     try:
         result = subprocess.run(
-            ["bash", email_script],
+            bash_cmd(email_script),
             input=_json.dumps(payload), capture_output=True, text=True,
             env=env, timeout=30,
         )
@@ -563,7 +564,14 @@ def main():
     if change_class == "material" and not args.dry_run and not program_ack_initiated:
         new_entry["board_post_id"] = _post_board_decision(new_entry)
         if entry.get("file_kind") == "agent_self":
-            new_entry["user_notify_ref"] = _email_user(new_entry, event="material-self")
+            ref = _email_user(new_entry, event="material-self")
+            new_entry["user_notify_ref"] = ref
+            # `user_notified` had been a dead field — initialized False and
+            # never set True anywhere — so it read false on every material-self
+            # edit even when user_notify_ref showed the email fired. Derive it
+            # from the send result (single source of truth): True only on a real
+            # send ("email:..."), not on dry-run ("dry-run:...") or failure (None).
+            new_entry["user_notified"] = bool(ref) and ref.startswith("email:")
 
     if args.dry_run:
         print(f"DRY RUN — would finalize {args.revision_id} in {stream_path}")

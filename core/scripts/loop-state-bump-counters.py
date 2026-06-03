@@ -112,7 +112,7 @@ def main():
     )
     args = parser.parse_args()
 
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         sys.exit(0)
 
     wm_path = Path(AGENT_DIR) / "session" / "working-memory.yaml"

@@ -36,7 +36,7 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 
-REMINDER_TEXT = (
+REMINDER_TEXT_GENERIC = (
     "<system-reminder>\n"
     "An iteration just closed (iteration-close.sh --phase productivity-check OR "
     "recurring-close.sh completed). Your VERY NEXT tool call MUST be "
@@ -48,6 +48,52 @@ REMINDER_TEXT = (
     "iteration close = Skill(aspirations)).\n"
     "</system-reminder>"
 )
+
+# 8 (zeta investigation 1): on DEEP recurring closes,
+# Phase 6 (aspirations-spark) must fire BEFORE Phase 8 state-update. The
+# generic reminder above directs Skill(aspirations) only, silently overriding
+# recurring-close.sh's outcome-aware stdout imperative (system-reminder wins
+# over plain stdout in LLM priority). This second reminder restores the
+# spark-first sequence when the OUTCOME=deep marker is present in
+# tool_response.stdout. See agents/zeta/reports/
+# 1-posttool-hook-overrides-recurring-imperative-analysis.md.
+REMINDER_TEXT_DEEP_RECURRING = (
+    "<system-reminder>\n"
+    "A deep recurring close just completed (recurring-close.sh OUTCOME=deep). "
+    "Your VERY NEXT tool call MUST be Skill(aspirations-spark) — Phase 6 spark "
+    "fires on deep closes and is NOT wrapped by recurring-close.sh. AFTER "
+    "Phase 6 completes, call Skill(aspirations) with args='loop' to re-enter "
+    "the loop. Do NOT emit text or a Bash echo before Skill(aspirations-spark). "
+    "See .claude/skills/aspirations/SKILL.md \"Recurring-goal shortcut\" section "
+    "and .claude/rules/return-protocol.md.\n"
+    "</system-reminder>"
+)
+
+# Marker emitted by recurring-close.sh:692-694 when OUTCOME=deep. The literal
+# uses an em-dash (U+2014) between "OUTCOME=deep" and "NEXT ACTION REQUIRED"
+# — NOT a double-hyphen. The pattern below matches by anchoring on the two
+# stable phrases and accepting any separator between them, so future drift
+# in the dash style (em-dash → double-hyphen → en-dash, etc.) does not
+# silently degrade the deep-recurring branch back to generic. /verify-
+# learning sq-018 still pins the literal on the producer side so a
+# producer-side typo is caught at verification time.
+_DEEP_RECURRING_RE = re.compile(
+    r"\[recurring-close\]\s+OUTCOME=deep\s*[—\-]+\s*NEXT ACTION REQUIRED"
+)
+
+
+def _is_deep_recurring_close(tool_response) -> bool:
+    """True iff tool_response.stdout contains the recurring-close.sh OUTCOME=deep marker.
+
+    Fail-open: any unexpected shape (None, non-dict, missing stdout, non-str
+    stdout) yields False. The generic reminder fires instead — never crashes.
+    """
+    if not isinstance(tool_response, dict):
+        return False
+    stdout = tool_response.get("stdout")
+    if not isinstance(stdout, str):
+        return False
+    return _DEEP_RECURRING_RE.search(stdout) is not None
 
 
 # Terminal-script match is two-layered:
@@ -188,6 +234,16 @@ def main():
         # Observer session — not the runner. Skill(aspirations) not applicable.
         sys.exit(0)
 
+    # Pick reminder text by inspecting tool_response.stdout for the deep
+    # recurring marker. Generic reminder is the default — applies to
+    # iteration-close.sh productivity-check AND to OUTCOME=routine recurring
+    # closes AND to any unexpected tool_response shape (fail-open).
+    tool_response = data.get("tool_response")
+    if _is_deep_recurring_close(tool_response):
+        reminder_text = REMINDER_TEXT_DEEP_RECURRING
+    else:
+        reminder_text = REMINDER_TEXT_GENERIC
+
     # Inject the imperative as additionalContext. The model sees this in its
     # next turn's context window alongside the tool output, so ignoring it
     # requires actively overriding an explicit <system-reminder> — which is
@@ -195,7 +251,7 @@ def main():
     payload = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": REMINDER_TEXT,
+            "additionalContext": reminder_text,
         }
     }
     print(json.dumps(payload))

@@ -12,8 +12,10 @@ Hard check BEFORE filing a new goal. Catches the g-115-141 class: a new
 goal whose scope overlaps with peer work that either (a) is visible in
 the team-state recent_completions ring buffer, (b) is the subject of a
 partner's in_flight claim, (c) has already landed in git commits within
-48h, (d) is the subject of an active insight_trigger finding, or (e) is
-already implemented in the target file.
+48h, (d) is the subject of an active insight_trigger finding, (e) is
+already implemented in the target file, or (f) is already pending /
+in-progress in the world or any agent aspiration queue (g-115-783;
+matches via origin_signal exact OR structural file/identifier overlap).
 
 N-agent correct: the gate identifies ITSELF via MIND_AGENT and scans all
 non-self completions, all recent commits (any author), and all non-self

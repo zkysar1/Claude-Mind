@@ -121,6 +121,42 @@ IF state != "RUNNING":
     Bash: `echo "Loop will NOT start — agent-state=<state>. Auto-recovery likely fired while session was paused. [Include recovery-notice cause if read above.] Run /start <agent-name> --mode autonomous from a fresh terminal to resume."`
     RETURN  # No further tool calls — loop death here is intentional.
 
+# Phase -1.45: Runner-Identity Gate (multi-runner ejection, 2026-05-23)
+# ════════════════════════════════════════════════════════════════════════════
+# The state check ABOVE reads session-state-get.sh → the SHARED agent-level
+# agent-state file. EVERY session of this agent reads the same "RUNNING" the
+# real runner wrote, so that check answers "is this AGENT running?", NOT "am I
+# THE runner?". The loop self-re-enters every iteration via Skill(aspirations).
+# When two+ terminals run the same agent (e.g. a second /start auto-recovered
+# during a stale-heartbeat window and took over running-session-id while THIS
+# session kept looping), the non-runner terminals pass the state check forever
+# and iterate indefinitely — confusing the real runner with concurrent writes
+# to shared world/agent state. stop-hook.sh Gate 0 ALLOWS a non-runner to stop,
+# but nothing ever TELLS it to. This gate is the active eject point.
+#
+# runner-identity-check.sh compares this session's $MIND_SID (injected into
+# every Bash call by bash-agent-inject.py) against running-session-id.
+#   exit 0 = I am the runner, OR ambiguous (fail-open) → CONTINUE
+#   exit 1 = definite non-runner mismatch              → EJECT
+# SELF-HEALING: running-session-id holds exactly one SID, so at most one session
+# passes; when a new session claims runner, the old one ejects on its NEXT
+# iteration. FAIL-OPEN by design — exit 1 ONLY on a definite mismatch (both SIDs
+# known and different); any ambiguity (either SID empty) continues, so a
+# transient-empty running-session-id never kills the legitimate runner.
+# This is the FIRST and ONLY runner-identity checkpoint needed: because the loop
+# re-enters through this phase every iteration, one gate here is checked every
+# cycle. DO NOT scatter additional per-session checks mid-loop — the re-entry
+# chokepoint already covers all iterations.
+# ════════════════════════════════════════════════════════════════════════════
+Bash: `bash core/scripts/runner-identity-check.sh`
+IF exit code == 1:
+    # This session is NOT the runner. The script printed an actionable
+    # diagnostic (which SID owns the loop, what to run instead) to stderr.
+    # That Bash call IS the terminal tool call (return-protocol satisfied):
+    # do NOT emit Skill(aspirations). Loop ejection here is intentional and
+    # self-healing — the live runner is unaffected and keeps iterating.
+    RETURN  # No further tool calls — non-runner exits the loop.
+
 # Phase -1.4: Graceful Stop Handler (delegated)
 # CRITICAL INVARIANT — do NOT re-add budget/context self-stop triggers here.
 # The loop NEVER self-stops. Only /stop (user command) may set stop-requested;
@@ -208,8 +244,72 @@ IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:
     Bash: `compact-restore-slots.sh`
     # Step 2: Process encoding queue (precision-first — queue items contain precision_manifests)
     Process encoding queue (budget: min(5, queue_length)).
-    # Step 3: One-shot consumption
-    Delete checkpoint.
+    # Step 3: One-shot consumption — handled by the script (g-115-962).
+    # compact-restore-slots.py deletes the checkpoint at all clean success
+    # paths (stale-skip, empty-checkpoint, restored-clean) and PRESERVES it
+    # on the wm-uninitialized error exit for next-iteration retry. The
+    # previous LLM-owned delete step silently dropped on the stale-skip
+    # path; the script-side deletion closes that gap.
+
+# Phase -0.5c.1: Stranded-Claim Sweep (g-115-1044)
+# Autocompact between aspirations-claim.sh success and Phase 4 start can
+# leave an in-progress claim with no execution-diary entry — the next
+# iteration's selector sees the goal as "owned" and skips it, the goal
+# sits frozen until /felt-sense-checkin (75-goal cadence) catches it.
+# Runs unconditionally — safe when no goals are claimed (exits 0 with
+# {scanned: 0}). With --apply: releases the claim, flips status to
+# pending, clears matching team-state.in_flight. The 5-min stale threshold
+# guards against race conditions where Phase 4 was just starting.
+# Direct py -3 invocation (not bash wrapper) — see rb-225/rb-247 for the
+# Windows bash subprocess hang.
+Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
+
+# Phase -0.5c.2: Pending Phase-6 Spark Sentinel (g-115-1174)
+# Consumes the `pending_phase_6_spark` WM slot written by recurring-close.sh
+# at end-of-script — AFTER the four iteration-close phases, just before the
+# terminal imperative (NOT during Block C/D, which runs earlier). Corollary:
+# a NULL read here while the bg recurring-close is still mid-phase is EXPECTED,
+# not a bug — the sentinel lands only once the bg reaches end-of-script.
+# When recurring-close.sh's wall-clock
+# exceeds the Bash 2-minute timeout the call backgrounds, the harness fires
+# the stop hook before bg completes, and the LLM re-enters /aspirations loop
+# never seeing the stdout outcome-aware imperative — Phase 6 spark was
+# silently bypassed on deep recurring closes (observed 2/2: g-115-760
+# bfzr7dvyk + g-115-754 bo42a8rld). This consumer decouples Phase 6
+# dispatch from bg-completion: the sentinel persists on disk, visible to
+# next-iteration entry regardless of when recurring-close.sh's stdout
+# arrives.
+#
+# Sentinel-lifecycle pattern (rb-428): wm-read → if non-null → action →
+# clear via `echo null | wm-set.sh`. One-shot. Lifecycle below.
+Bash: wm-read.sh pending_phase_6_spark --json
+IF signal is not null:
+    expires_at = signal.get("expires_at")
+    now_iso    = current ISO timestamp
+    IF expires_at AND now_iso > expires_at:
+        # Sentinel aged past its 60-min TTL — log + clear silently. Possible
+        # cause: ran during a long pause or pre-existing stale entry. Do NOT
+        # fire Phase 6 spark on stale signals — they may not reflect current
+        # work.
+        Output: "▸ PENDING-PHASE-6-SPARK: expired (set {expires_at}, age > 60min) — clearing without action"
+        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+    ELIF signal.outcome == "deep":
+        # Fire Phase 6 spark for the named recurring goal. The sentinel
+        # carries goal_id + source + summary so the spark handler has the
+        # context that the in-bg stdout would have provided.
+        Output: "▸ PENDING-PHASE-6-SPARK: outcome=deep for {signal.goal_id} — firing Skill(aspirations-spark) before precheck"
+        invoke /aspirations-spark with: goal_id={signal.goal_id},
+                                        source={signal.source},
+                                        outcome_class=deep,
+                                        summary={signal.summary}
+        # Clear AFTER spark dispatch (one-shot).
+        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+    ELSE:
+        # outcome=routine — Phase 6 is skipped by the standard skip-rule.
+        # Clear silently; the sentinel just records the close attempt.
+        Output: "▸ PENDING-PHASE-6-SPARK: outcome=routine for {signal.goal_id} — Phase 6 skipped per skip-rule, clearing sentinel"
+        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+    # Continue to Phase -0.5e.
 
 # Phase -0.5e: Blocked-Sleep Recovery — cheap-path sentinel + gated digest load.
 # DO NOT inline the digest here. Loading it every iteration (vs. only when a
@@ -291,6 +391,21 @@ Without this shortcut, recurring goals re-select forever at high score
 because `lastAchievedAt` never advances through the plain
 `iteration-close.sh status completed` path. Step 3 (working memory
 maintenance) still runs separately around the wrapper.
+
+**Phase 6 spark is NOT wrapped by recurring-close.sh** (g-115-977 / g-115-965).
+The shortcut collapses Phase 5/8/12 but Phase 6 (aspirations-spark) sits
+between Phase 5 (verify) and Phase 8 (state-update) in the larger iteration
+body and must be invoked separately for deep outcomes. recurring-close.sh
+emits an OUTCOME-AWARE terminal imperative on stdout: when its final
+classification (post Block A/C flip) is `deep`, the imperative directs
+`Skill(aspirations-spark)` FIRST then `Skill(aspirations)` LOOP_CONTINUE;
+when `routine`, only the LOOP_CONTINUE imperative fires. Follow the script's
+terminal imperative verbatim — DO NOT skip Phase 6 on deep recurring closes,
+and DO NOT fire it on routine closes. The previous (pre-g-115-977) imperative
+unconditionally said "Skill(aspirations) only", which silently bypassed Phase 6
+on forced-flip deep outcomes — the docs-vs-impl drift class flagged by the
+universal reasoning-bank entry "Docs-vs-impl drift in framework shortcut
+wrappers".
 
 The sub-skills `aspirations-verify`, `aspirations-state-update`, and
 `aspirations-learning-gate` remain on disk for `/boot`, consolidation, and

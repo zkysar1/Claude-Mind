@@ -605,8 +605,10 @@ else:
         # convert SCRIPT_DIR to Windows path for python3 on Windows.
         # g-115-664: pass --goal-id so the helper can refuse a double-bump on
         # state-update retry (bravo session 66 saw rc=127 → retry → double-bump).
-        python3 "$(cygpath -w "$SCRIPT_DIR/loop-state-bump-counters.py")" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
-            || echo "[iteration-close] WARN: loop-state-bump-counters failed for $GOAL_ID (fail-open; productivity-gate may stay stale this iteration)" >&2
+        # >>> RELOCATED (zeta s80 freeze-fix): the loop_state bump is now an
+        # UNCONDITIONAL call AFTER this block's `fi` - it must advance on every
+        # state-update close, not only when the aspiration lookup above succeeds.
+        # See the `[[ -n "$GOAL_ID" ]]` bump just past the block close.
 
         # g-001-217: sessions_active counter increment (Phase 8.1 implementation).
         # The aspirations-loop-digest.md:154 pseudocode "asp.sessions_active += 1"
@@ -639,6 +641,25 @@ except: print(0)' 2>/dev/null || echo 0)"
         # silently swallow the mismatch — recurring_saturation & streak_momentum
         # go stale.
         echo "[iteration-close] WARN: lookup for goal $GOAL_ID in $SOURCE aspirations returned asp_id='$asp_id' recurring='$recurring' — goals_completed_this_session + aspiration_touched_last skipped" >&2
+    fi
+
+    # LOOP-STATE FREEZE FIX (zeta s80, 2026-06-01): the cross-session loop_state
+    # counter bump (g-283-06) runs here UNCONDITIONALLY, decoupled from the
+    # aspiration-lookup gate above. It was previously nested inside
+    # `[[ -n "$asp_id" && -n "$recurring" ]]`, so whenever that lookup returned
+    # hit=None (goal not in COMPACT or source JSONL), the entire block - including
+    # this bump - silently skipped and loop_state.goals_completed froze. Observed
+    # signature: slot_meta.loop_state stuck at update_count=1 for 3+ days while
+    # goals kept closing; productivity-stop-gate read a frozen counter; session
+    # counters reset on every compaction because the checkpoint captured the null.
+    # The bump only needs $OUTCOME + $GOAL_ID (--goal is required for state-update)
+    # and --goal-id gives idempotency (g-115-664), so an unconditional placement
+    # cannot double-bump on retry. The wm-append (goals_completed_this_session)
+    # and sessions_active writers genuinely need asp_id and correctly stay inside
+    # the lookup-gated block above.
+    if [[ -n "$GOAL_ID" ]]; then
+        python3 "$(cygpath -w "$SCRIPT_DIR/loop-state-bump-counters.py")" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
+            || echo "[iteration-close] WARN: loop-state-bump-counters failed for $GOAL_ID (fail-open; productivity-gate may stay stale this iteration)" >&2
     fi
     echo "\"$SOURCE\"" | bash "$SCRIPT_DIR/wm-set.sh" current_goal_source || echo "[iteration-close] WARN: wm-set current_goal_source failed" >&2
 
@@ -753,6 +774,36 @@ print(title or "")
         # when iteration-commit no-ops. fail-open via the `|| true` above.
         echo "[iteration-close] iteration-commit: $_commit_output"
 
+        # g-115-1178: extract commit_sha from iteration-commit's JSON output so
+        # the post-state-update gate (Step 8.78 below) scopes its fresh-eyes
+        # file-detection to exactly the files THIS commit landed, instead of
+        # re-deriving from a working tree that may carry partner WIP at neutral
+        # paths (the stranded-partner false-positive class, g-115-1154). The
+        # function-scoped local is read by the gate call further down.
+        # _commit_output is 2>&1-merged (INFO/warning lines + a trailing JSON
+        # line); per guard-559 parse ONLY a line that is itself valid JSON —
+        # never json.load the whole blob (the INFO lines raise JSONDecodeError
+        # 'Extra data'). Take the last line that parses with a non-empty
+        # commit_sha. Empty on no-op/parse-failure → gate falls back to
+        # working-tree scope.
+        local _commit_sha
+        _commit_sha="$(printf '%s\n' "$_commit_output" | python3 -c '
+import json, sys
+sha = ""
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        d = json.loads(line)
+    except Exception:
+        continue
+    s = (d.get("commit_sha") or "").strip()
+    if s:
+        sha = s
+print(sha)
+' 2>/dev/null || true)"
+
         # g-115-746: extend the commit ceremony beyond PROJECT_ROOT to sibling
         # product repos under AGENT_WRITE_PATH (resolved from <agent>/local-
         # paths.conf). The pre-existing --repo "$PROJECT_ROOT" call covers the
@@ -806,7 +857,10 @@ print(title or "")
         # because `|| echo '{"fired":false}'` still fires on non-zero
         # exit. (g-240-79, fresh-eyes finding from g-001-04 iter-14.)
         mkdir -p "$CORE_ROOT/logs"
-        gate_json=$(bash "$SCRIPT_DIR/post-state-update-gate.sh" deep 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{"fired":false}')
+        # COMMIT_SHA (g-115-1178): scope the gate to the files iteration-commit
+        # just committed. Empty when iteration-commit no-op'd or parse failed →
+        # gate falls back to working-tree scope (backward-compatible).
+        gate_json=$(COMMIT_SHA="${_commit_sha:-}" bash "$SCRIPT_DIR/post-state-update-gate.sh" deep 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{"fired":false}')
         local fired
         fired=$(echo "$gate_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('fired') else 'false')" 2>/dev/null || echo false)
         if [[ "$fired" == "true" ]]; then
@@ -1007,6 +1061,79 @@ print(title or "")
         bash "$WORLD_DIR/scripts/outcome-metrics-collect.sh" 2>/dev/null \
             || echo "[iteration-close] WARN: outcome-metrics-collect.sh failed (non-fatal; outcome-metrics.yaml not advanced this iteration)" >&2
     fi
+
+    # ----------------------------------------------------------------------
+    # g-115-1043 outcome 3: post-state-update aspirations.jsonl parse-canary.
+    # Defense-in-depth backstop for the _fileops.py outcome 1+2 layers — runs
+    # AFTER every state-update on both world and agent queues. Independent of
+    # outcome_class (corruption is corruption). On parse failure: restores
+    # from .history, files an Investigate goal, alerts via stderr.
+    #
+    # Fail-open at every layer — a canary bug must never block state-update.
+    # Catches corruption that slipped past the _atomic_write_with_fallback
+    # validation (e.g., external corruption, manual edits, hooks).
+    local _canary_targets=()
+    [[ -f "$WORLD_DIR/aspirations.jsonl" ]] && _canary_targets+=("$WORLD_DIR/aspirations.jsonl")
+    [[ -f "$AGENT_DIR/aspirations.jsonl" ]] && _canary_targets+=("$AGENT_DIR/aspirations.jsonl")
+    for _canary_target in "${_canary_targets[@]}"; do
+        CANARY_TARGET="$_canary_target" CORE_SCRIPTS="$CORE_ROOT/scripts" \
+            python3 -c '
+import os, sys, json
+target = os.environ["CANARY_TARGET"]
+sys.path.insert(0, os.environ["CORE_SCRIPTS"])
+try:
+    from _fileops import _parse_jsonl_skip_corrupt, _find_latest_history_snapshot
+    import shutil
+    items, _errs, total = _parse_jsonl_skip_corrupt(target)
+    if total > 0 and len(items) == 0:
+        snap = _find_latest_history_snapshot(target)
+        if snap:
+            shutil.copy(target, target + ".canary-corrupt")
+            shutil.copy(str(snap), target)
+            print(f"[iteration-close] CANARY RESTORED: {target} ({total} lines, 0 parseable) -> restored from {snap.name}; corrupt saved as .canary-corrupt", file=sys.stderr)
+            sys.exit(2)
+        else:
+            print(f"[iteration-close] CANARY CRITICAL: {target} corrupt AND no .history snapshot", file=sys.stderr)
+            sys.exit(2)
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"[iteration-close] canary-parse error for {target}: {e!r} (non-fatal)", file=sys.stderr)
+' 2>>"$CORE_ROOT/logs/iteration-close-stderr.log"
+        local _canary_rc=$?
+        if [[ $_canary_rc -eq 2 ]]; then
+            # Canary fired — file an Investigate goal so the corruption is on the queue.
+            # aspirations-add-goal.sh takes the goal body via STDIN as JSON, NOT
+            # as CLI flags (--title/--priority/etc. are explicitly rejected).
+            # Fail-open: if goal filing itself fails, log and continue (never block state-update).
+            local _canary_basename="$(basename "$_canary_target")"
+            local _canary_payload
+            _canary_payload="$(CANARY_BASENAME="$_canary_basename" CANARY_TARGET="$_canary_target" CANARY_NOW="$NOW_ISO" CANARY_GOAL_ID="$GOAL_ID" \
+                python3 -c '
+import json, os
+print(json.dumps({
+    "title": f"Investigate: aspirations.jsonl canary fired on {os.environ[\"CANARY_BASENAME\"]} ({os.environ[\"CANARY_NOW\"]})",
+    "priority": "HIGH",
+    "participants": ["agent"],
+    "category": "framework-architecture",
+    "origin_signal": f"canary-fired:{os.environ[\"CANARY_BASENAME\"]}:{os.environ[\"CANARY_NOW\"]}",
+    "description": (
+        f"iteration-close.sh state-update canary detected corruption in "
+        f"{os.environ[\"CANARY_TARGET\"]} after state-update for goal "
+        f"{os.environ[\"CANARY_GOAL_ID\"]}. File was restored from latest "
+        f".history snapshot in place; corrupted version preserved as "
+        f".canary-corrupt sidecar. Investigate root cause — _fileops.py "
+        f"outcomes 1+2 should have caught this earlier; canary firing "
+        f"means corruption slipped through some path that bypasses the "
+        f"writer-layer validation."
+    ),
+}))
+')"
+            printf '%s' "$_canary_payload" | bash "$SCRIPT_DIR/aspirations-add-goal.sh" --source world --aspiration asp-115 \
+                >/dev/null 2>&1 \
+                || echo "[iteration-close] WARN: canary-Investigate goal-file failed for $_canary_target (non-fatal)" >&2
+        fi
+    done
 }
 
 # --------------------------- phase: learning-gate ---------------------------
@@ -1372,7 +1499,7 @@ do_productivity_check() {
         fi
         {
             echo "--- $(date +%Y-%m-%dT%H:%M:%S) iter sweep ---"
-            bash "$SCRIPT_DIR/orphan-root-sweep.sh"
+            bash "$SCRIPT_DIR/orphan-root-sweep.sh" --auto-clean
         } >>"$orphan_log" 2>&1
     } || true
 

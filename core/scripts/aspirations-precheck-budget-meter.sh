@@ -92,13 +92,19 @@ read_config() {
     # Store stub returns non-zero on bare python3, the `|| echo` fallback
     # would mask the failure and silently use hardcoded defaults regardless
     # of aspirations.yaml. Found by bravo fresh-eyes-code review msg-20260510-045254.
-    GID="$AGENT_DIR" py -3 - <<'PYEOF' 2>/dev/null || echo "15 60000 {}"
+    GID="$AGENT_DIR" PROOT="$PROJECT_ROOT" py -3 - <<'PYEOF' 2>/dev/null || echo "15 60000 {}"
 import os, sys, yaml, json
 from pathlib import Path
+# Resolve PROJECT_ROOT from the _paths.sh-forwarded PROOT (single source of
+# truth — this script sources _paths.sh at the top, which sets PROJECT_ROOT).
+# Fall back to agent_dir.parent.parent for the AGENTS_PARENT_DIR=agents layout
+# (AGENT_DIR = PROJECT_ROOT/agents/<agent>). Pre-Phase-2.5.D this was a single
+# agent_dir.parent (AGENT_DIR=PROJECT_ROOT/<agent>); the relocation moved the
+# project root two levels up, silently 404'ing the config and pinning cap_ms to
+# the 9000ms fallback regardless of the configured 90000ms (9).
+proot = os.environ.get("PROOT", "")
 agent_dir = Path(os.environ.get("GID", ""))
-# Find core config relative to agent_dir → project root → core
-# AGENT_DIR is PROJECT_ROOT/<agent>, so PROJECT_ROOT = parent
-proj = agent_dir.parent
+proj = Path(proot) if proot else agent_dir.parent.parent
 cfg_path = proj / "core" / "config" / "aspirations.yaml"
 try:
     with open(cfg_path) as f:

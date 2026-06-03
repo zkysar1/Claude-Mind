@@ -183,8 +183,22 @@ def test_forced_flip_empty_signals_suppresses(sandbox, agent_dir):
 
 @with_sandbox
 def test_forced_flip_encoding_queue_nonempty_runs_canary(sandbox, agent_dir):
-    """Canary runs: forced flip but encoding_queue non-empty (substantive work)."""
+    """Canary runs: forced flip + encoding_queue non-empty + recent tree .md edit.
+
+    After g-115-1120 landed the second-layer g-115-1089 substantive-artifact
+    probe, the test must seed at least one of the 4 artifact types (tree-md,
+    new goal, non-status board post, pipeline-meta) in the 90s window so the
+    probe finds substantive=True and falls through to the canary. The g-115-634
+    branch by itself no longer guarantees canary execution — g-115-1089 is the
+    second gate.
+    """
     _write_wm(agent_dir, encoding_queue=[{"kind": "tree"}], sensory_buffer=[])
+    # Seed a recent tree .md so the 9 substantive-artifact probe
+    # returns substantive=True and falls through to the canary's sentinel write.
+    world_dir = sandbox / "world-test"
+    tree_dir = world_dir / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    (tree_dir / "some-node.md").write_text("# some node\n", encoding="utf-8")
     r = _run_canary(agent_dir, original_outcome="routine", outcome="deep")
     assert r.returncode == 0, f"non-zero exit: {r.stderr}"
     assert "suppressing canary" not in r.stderr, \
@@ -195,8 +209,20 @@ def test_forced_flip_encoding_queue_nonempty_runs_canary(sandbox, agent_dir):
 
 @with_sandbox
 def test_forced_flip_sensory_buffer_nonempty_runs_canary(sandbox, agent_dir):
-    """Canary runs: forced flip but sensory_buffer non-empty (perception backlog)."""
+    """Canary runs: forced flip + sensory_buffer non-empty + recent tree .md edit.
+
+    Mirrors test_forced_flip_encoding_queue_nonempty_runs_canary for the
+    g-115-1089 second-layer gate. After the g-115-634 branch falls through
+    (sensory_buffer non-empty so the empty-WM check doesn't fire), g-115-1089's
+    artifact probe runs — the seeded tree-md provides substantive=True.
+    """
     _write_wm(agent_dir, encoding_queue=[], sensory_buffer=[{"event": "x"}])
+    # Seed a recent tree .md so the 9 substantive-artifact probe
+    # returns substantive=True and falls through to the canary's sentinel write.
+    world_dir = sandbox / "world-test"
+    tree_dir = world_dir / "knowledge" / "tree"
+    tree_dir.mkdir(parents=True, exist_ok=True)
+    (tree_dir / "some-node.md").write_text("# some node\n", encoding="utf-8")
     r = _run_canary(agent_dir, original_outcome="routine", outcome="deep")
     assert r.returncode == 0, f"non-zero exit: {r.stderr}"
     assert "suppressing canary" not in r.stderr, \

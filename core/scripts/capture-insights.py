@@ -50,7 +50,7 @@ def next_id(filepath: Path) -> str:
 
 
 def main():
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         sys.exit(0)
 
     try:

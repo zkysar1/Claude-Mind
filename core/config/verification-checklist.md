@@ -1240,13 +1240,13 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 21. Empty/missing board directory handled gracefully (no error)
 22. Max 10 messages per channel, with "... and N earlier" overflow note
 
-### AN8. Report Persistence
+### AN8. Report Persistence (reports/ archive abolished — file-model normalization)
 
-23. `/agent-completion-report` Phase 4 writes timestamped file to `agents/<agent>/reports/`
-24. `/agent-completion-report` Phase 4 writes `agents/<agent>/COMPLETION-REPORT.md` (latest, overwritten)
-25. Timestamped filename uses hyphens (not colons) for Windows compatibility: `completion-report-{YYYY-MM-DDTHH-MM-SS}.md`
-25a. `/agent-completion-report` Phase 4 contains NO deletion commands (no `rm`, `xargs rm`, `unlink`, `find ... -delete`) — `agents/<agent>/reports/` is append-only history
-25b. `/agent-completion-report` Phase 4 ends at Step 4 (write latest pointer); no Step 5 pruning/rotation/retention cap exists
+23. `/agent-completion-report` Phase 4 writes `agents/<agent>/COMPLETION-REPORT.md` (the single latest-pointer report, overwritten each cycle; git history is the permanent archive)
+24. `/agent-completion-report` Phase 4 does NOT write a timestamped archive under `agents/<agent>/reports/` — that directory was abolished by the file-model normalization (see `core/config/conventions/temp-store.md`)
+25. `/agent-completion-report` Phase 4 saves the delta baseline to `agents/<agent>/session/last-outcome-snapshot.yaml` (machine-local; NOT under `reports/`)
+25a. `/agent-completion-report` Phase 4 contains NO deletion commands (no `rm`, `xargs rm`, `unlink`, `find ... -delete`)
+25b. `/agent-completion-report` Phase 4 does NOT recreate a `reports/` directory (no `mkdir -p agents/<agent>/reports`) — the L1 allowlist gate denies writes there
 
 ### AN6. Backlog Report Behavior
 

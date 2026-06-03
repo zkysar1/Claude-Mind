@@ -165,7 +165,16 @@ def _read_local_paths():
         )
         # fall through to the first-available glob below
 
-    # MIND_AGENT unset OR named a nonexistent agent — use first available conf
+    # MIND_AGENT unset OR named a nonexistent agent — use first available conf.
+    # NOTE (8): do NOT warn on the empty-MIND_AGENT fall-through here,
+    # unlike _paths.sh. This module is imported at load time by pytest, the
+    # daemon, and direct `py -3` script runs where unset MIND_AGENT is normal —
+    # an unconditional warning floods all of them (and broke
+    # test_unset_agent_no_warning + collateral metric-gate tests when first
+    # tried).  deliberately kept the unset Python path silent; the
+    # named-but-nonexistent case above already warns. The hook-miss wrong-agent
+    # read is surfaced on the shell side (_paths.sh), which the PreToolUse hooks
+    # source with `2>/dev/null` so the warning fires only for LLM Bash tool calls.
     for conf in sorted(agents_root().glob("*/local-paths.conf")):
         return _parse_conf(conf)
     return {}

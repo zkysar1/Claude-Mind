@@ -76,54 +76,30 @@ def _py(args: list, input_text=None) -> tuple:
 def _tolerant_decode(slot, raw):
     """-tolerant decode for the wm_read('known_blockers') body.
 
-    Mirrors `consolidation-health.py::_tolerant_decode` (lines 112-172,
-    landed via g-115-796) and `precondition-defer-recheck.py::_tolerant_decode`
-    (A3 sibling, g-115-941, commit bd71431c) adapted for single-source wm
-    slot reads. The pattern lineage and tree node are documented at
-    `world/knowledge/tree/system/daemon-only-architecture/post-cutover-silent-loss-classes.md`
-    (corruption-intolerant-parse row).
+    Thin wrapper around `_rt.tolerant_decode_aggregate` (extracted via
+    g-115-949; 5th-site migration g-115-1057). Sister sites:
+    consolidation-health.py, defer-recheck.py, parent-supersession-sweep.py,
+    precondition-defer-recheck.py — all delegate to the same shared helper.
 
-    Contract per g-115-797-A2 / guard-383 / rb-987:
-      - Empty / whitespace-only body OR literal "null": return None (caller
-        maps None → []; valid empty slot state, NOT a source error).
-      - Valid JSON list: return list (canonical known_blockers shape).
-      - Valid JSON dict: return dict — caller's `isinstance(data, list)
-        else []` guards downstream consumption. wm slot schema is list-only,
-        but the decode tolerates aggregate-shape variance from the daemon.
-      - Valid prefix + trailing garbage (g-115-766 shape): raw_decode
-        returns the prefix; recovery is NOT a source error.
-      - JSONDecodeError: ONE stderr diagnostic + sys.exit(1).
-      - Non-dict-and-non-list aggregate (e.g. string, number): stderr +
-        sys.exit(1).
+    One pre-delegation early-return preserves wm-slot-specific semantics:
+    `wm_read` returns the literal string `"null"` when the slot was set to
+    JSON null. That is the canonical empty-slot serialization (NOT a source
+    error or a corrupt aggregate), and must map to None so the caller's
+    `if data is None: return []` collapses it to an empty blocker list.
+    `_rt.tolerant_decode_aggregate` parses "null" as Python None and
+    correctly classifies it as a non-dict-and-non-list aggregate (fatal);
+    the early-return below short-circuits that path for THIS slot only,
+    keeping the daemon-aggregator's strict contract intact for all other
+    bodies.
 
-    Pre-fix behavior at line 87 was a bare json.loads + silent
-    `except json.JSONDecodeError: return []` — collapsing corruption to
-    "no blockers to recheck" and freezing every aged blocker indefinitely.
-    The fail-open boundary is the caller's shell wrapper (rb-347), never
+    See _rt.tolerant_decode_aggregate for the full guard-383 contract
+    (raw_decode recovery, JSONDecodeError fatal, non-aggregate fatal). The
+    fail-open boundary is the caller's shell wrapper (rb-347), never
     inside this aggregator.
     """
-    stripped = (raw or "").lstrip()
-    if not stripped or stripped == "null":
-        return None  # genuinely empty slot — valid state, not source error
-    try:
-        obj, _consumed = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError as exc:
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"blocker-recheck: {slot} JSONDecodeError ({exc}); "
-            f"body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: source error is fatal
-    if not isinstance(obj, (dict, list)):
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"blocker-recheck: {slot} non-dict-and-non-list aggregate "
-            f"(type={type(obj).__name__}); body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: corrupt aggregate shape
-    return obj
+    if (raw or "").lstrip() == "null":
+        return None  # canonical wm-slot empty-state literal
+    return _rt.tolerant_decode_aggregate(f"blocker-recheck: {slot}", raw)
 
 
 def _wm_read_blockers() -> list:

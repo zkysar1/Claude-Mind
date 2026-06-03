@@ -61,6 +61,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 
 def _now_iso() -> str:
@@ -261,7 +262,7 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
                 % email_script)
             return False, "no_email_script"
         proc = subprocess.run(
-            ["bash", str(email_script)],
+            bash_cmd(email_script),
             input=json.dumps(payload),
             capture_output=True,
             text=True,
@@ -317,8 +318,8 @@ def _append_log(blocker_id: str, severity: str, sent_at: str, log_path: Path = N
         # the bash backslash-escape stripping that silently no-ops these
         # invocations on Windows. Same pattern as dependent-unblock.py.
         proc = subprocess.run(
-            ["bash", (SCRIPT_DIR / "wm-append.sh").as_posix(),
-             "proactive_escalation_log"],
+            bash_cmd(SCRIPT_DIR / "wm-append.sh",
+                     "proactive_escalation_log"),
             input=json.dumps(entry),
             capture_output=True,
             text=True,

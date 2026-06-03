@@ -130,23 +130,38 @@ def test_append_rejects_duplicate_session(running_daemon):
     assert "Duplicate" in body
 
 
-def test_append_rejects_missing_journal_file(running_daemon):
+def test_append_derives_missing_journal_file(running_daemon):
+    """B7 (contract change): journal_file is fully derivable from date + agent
+    (single source of truth) and has no downstream consumer, so an ABSENT
+    journal_file is now DERIVED by _journal_prepare rather than rejected
+    (previously 400 validation_failed). Eliminates the reject-on-missing path
+    that drove caller friction. The agent-header gate (g-115-957) is unaffected
+    — it runs before prepare and still refuses a missing header."""
     _, port = running_daemon
-    bad = _rec()
-    del bad["journal_file"]
-    status, body = _post_err(port, "/v1/store/append", {"store": "journal"},
-                             json.dumps(bad).encode("utf-8"))
-    assert status == 400
-    assert "validation_failed" in body
+    rec = _rec()
+    del rec["journal_file"]
+    status, body = _post(port, "/v1/store/append", {"store": "journal"},
+                         json.dumps(rec).encode("utf-8"))
+    assert status == 200
+    # _rec default date 2026-05-15, agent alpha -> canonical dated entry path
+    assert json.loads(body)["record"]["journal_file"] == \
+        "alpha/journal/2026/05/2026-05-15.md"
 
 
-def test_append_rejects_bad_journal_file_pattern(running_daemon):
+def test_append_corrects_bad_journal_file_pattern(running_daemon):
+    """B7 (contract change): a non-canonical journal_file — here the wrong-dir
+    shape, of which the index path `agents/<a>/journal.jsonl` that caused the
+    4x charlie validation_failed is the canonical instance — is CORRECTED to
+    the dated entry path derived from date + agent, rather than rejected. A
+    canonical caller value is preserved unchanged (unit-suite coverage:
+    test_journal_file_derive.test_canonical_caller_value_is_preserved)."""
     _, port = running_daemon
-    status, body = _post_err(
+    status, body = _post(
         port, "/v1/store/append", {"store": "journal"},
         json.dumps(_rec(journal_file="alpha/notes/x.md")).encode("utf-8"))
-    assert status == 400
-    assert "validation_failed" in body
+    assert status == 200
+    assert json.loads(body)["record"]["journal_file"] == \
+        "alpha/journal/2026/05/2026-05-15.md"
 
 
 def test_append_unknown_store(running_daemon):
@@ -163,6 +178,37 @@ def test_append_missing_store_param(running_daemon):
                              json.dumps(_rec()).encode("utf-8"))
     assert status == 400
     assert "missing_param" in body
+
+
+def test_append_rejects_missing_agent_header(running_daemon):
+    """ regression: rt_curl omits X-Mind-Agent when MIND_AGENT is
+    empty; the daemon must refuse rather than silently fall back to the
+    alphabetically-first agent. Session-77 incident shape (2026-05-18 bravo
+    consolidation): without this gate the validator returned the misleading
+    'Invalid journal_file: bravo/... (expected alpha/journal/...)' error
+    because the resolver fell through to alpha. The gate now refuses at the
+    endpoint with a clear missing_agent_header error.
+
+    Body shape mimics bravo's session-77 attempt — the journal_file names
+    bravo, the MIND_AGENT header is absent, the expected new behavior is a
+    400 missing_agent_header (NOT validation_failed with an alpha reference).
+    """
+    _, port = running_daemon
+    bravo_rec = _rec(
+        session=77,
+        date="2026-05-18",
+        journal_file="bravo/journal/2026/05/2026-05-18.md",
+    )
+    status, body = _post_err(
+        port, "/v1/store/append", {"store": "journal"},
+        json.dumps(bravo_rec).encode("utf-8"),
+        agent=None,
+    )
+    assert status == 400
+    assert "missing_agent_header" in body
+    # Defensive: the OLD bug path leaked the alphabetically-first agent
+    # name into the error message. Must not regress.
+    assert "expected alpha/journal" not in body
 
 
 def test_append_history_and_changelog(running_daemon):

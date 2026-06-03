@@ -263,7 +263,7 @@ that has shown up across goals or invocations):
   IF encoding_snapshot[{topic}].pattern_signatures has entries (Lane 1.0):
     Use the utility-ranked snapshot list; skip the category dump
   ELSE:
-    Bash: pattern-signatures-read.sh --category <category>
+    Bash: pattern-signatures-read.sh --active | py -3 -c "import json,sys; [print(json.dumps(s)) for s in json.load(sys.stdin) if s.get('category')=='<category>']"
   IF no matching signature: PROPOSE adding (do not auto-create — pattern
     signatures are high-value, low-volume; surfaces best with user input).
   Print: PATTERN CANDIDATE: <description>

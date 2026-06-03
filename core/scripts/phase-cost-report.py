@@ -193,7 +193,7 @@ def main():
     parser.add_argument("--rolling", type=int, default=None,
                         help="Restrict to last N iterations (heuristic: phase-0 starts = iteration boundaries)")
     parser.add_argument("--write-report", action="store_true",
-                        help="Also write report to {agent}/reports/phase-costs/<timestamp>.json")
+                        help="Also write report to {agent}/session/phase-costs/<timestamp>.json")
     parser.add_argument("--output", choices=["json", "human"], default="json",
                         help="Output format (default: json)")
     parser.add_argument("--max-pair-seconds", type=float, default=600.0,
@@ -242,7 +242,7 @@ def main():
     }
 
     if args.write_report and AGENT_DIR:
-        out_dir = AGENT_DIR / "reports" / "phase-costs"
+        out_dir = AGENT_DIR / "session" / "phase-costs"
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = _now().strftime("%Y%m%dT%H%M%S")
         out_path = out_dir / f"{stamp}.json"

@@ -80,6 +80,11 @@ except ImportError:
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR
 from _rb_helpers import is_universal_rb, sort_universal_rbs
 from trigger_firings import record_firing  # g-304-07 telemetry — fail-open inside
+# s4 (lodestar own-cloud): route store-file reads through the active backend so
+# own-cloud materializes the current S3 object into the local cache before the
+# raw read. On the default LocalBackend, ensure_local() is identity and refresh()
+# is a no-op (zero added I/O) — the local read path is byte-for-byte unchanged.
+from storage_backend import get_backend
 
 # Universal meta-lessons cap in retrieve output — prevents framework-category
 # entries from flooding domain retrieval. Tuned: 5 is enough to surface the
@@ -141,6 +146,11 @@ def _infer_in_flight_goal_id():
     if not agent or WORLD_DIR is None:
         return None
     ts_path = WORLD_DIR / "team-state.yaml"
+    # s4: materialize via the backend so own-cloud reads the current S3 object,
+    # not a stale local cache. team-state WRITES already route through the
+    # backend (_fileops.locked_modify_yaml), so this read must match. Identity
+    # on LocalBackend; best-effort — a genuinely missing file still returns None.
+    ts_path = Path(get_backend().ensure_local(ts_path))
     if not ts_path.exists():
         return None
     try:
@@ -161,7 +171,10 @@ def _infer_in_flight_goal_id():
 
 def read_jsonl(path):
     """Read JSONL file, return list of dicts. Returns [] if missing/empty."""
-    p = Path(path)
+    # s4: materialize from the active backend (own-cloud: pull the current S3
+    # object into the local cache; LocalBackend: identity, no I/O) before the
+    # raw read, so own-cloud never reads a missing/stale local cache.
+    p = Path(get_backend().ensure_local(path))
     if not p.exists():
         return []
     items = []
@@ -174,7 +187,12 @@ def read_jsonl(path):
 
 def read_yaml(path):
     """Read YAML file, return dict. Returns {} if missing/empty."""
-    p = Path(path)
+    # s4: materialize via the backend before the raw read (see read_jsonl).
+    # Identity on LocalBackend. NB: the daemon retrieve endpoint patches
+    # `_r.read_yaml` to a yaml_cache-backed version, so on the daemon path this
+    # body runs only as the fallback; own-cloud freshness for the cached daemon
+    # path is wired when yaml_cache becomes backend-aware (s5).
+    p = Path(get_backend().ensure_local(path))
     if not p.exists():
         return {}
     with open(p, "r", encoding="utf-8") as f:
@@ -208,12 +226,22 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
                           append_changelog, resolve_base_dir, _agent_name,
                           _validate_no_surrogates, _atomic_write_with_fallback)
     p = Path(path)
+    # s4: materialize from the backend before the pre-lock existence check so
+    # own-cloud does not skip the bump for a file that exists in S3 but is not
+    # yet in the local cache. Self-contained (does not rely on a caller having
+    # read_jsonl'd first). Identity on LocalBackend.
+    get_backend().ensure_local(p)
     if not p.exists():
         return []
     base_dir = resolve_base_dir(p)
     lock_path = p.with_suffix(".lock")
     acquire_lock(lock_path)
     try:
+        # s4: force-fresh the local cache from the backend AFTER acquiring the
+        # lock and BEFORE the read — own-cloud lost-update prevention (fix #2)
+        # and records the If-Match fence etag for the atomic_write below.
+        # No-op on LocalBackend. Mirrors _fileops.locked_modify_jsonl.
+        get_backend().refresh(p)
         # Read inside the lock — captures the post-writer state, not whatever
         # was on disk before another agent's locked append landed.
         records = []

@@ -552,9 +552,12 @@ Written by `/agent-completion-report` Phase 5 after generating a report. Read by
 to determine the report window. If missing, report falls back to `handoff.yaml`
 session start time or shows lifetime totals.
 
-Report files: `/agent-completion-report` Phase 4 writes the full report markdown to
-`agents/<agent>/reports/completion-report-{timestamp}.md` (timestamped archive) and
-`agents/<agent>/COMPLETION-REPORT.md` (latest, overwritten each run).
+Report file: `/agent-completion-report` Phase 4 writes the full report markdown to
+`agents/<agent>/COMPLETION-REPORT.md` (the single latest-pointer report, overwritten
+each run). Its git history is the permanent archive — there is no timestamped
+`reports/` archive (that directory was abolished by the file-model normalization;
+see `core/config/conventions/temp-store.md`). The delta baseline is saved to
+`agents/<agent>/session/last-outcome-snapshot.yaml`.
 
 ---
 

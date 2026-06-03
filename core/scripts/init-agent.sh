@@ -71,7 +71,13 @@ extract_initial_state() {
 mkdir -p \
     "$AGENT/journal" \
     "$AGENT/session" \
-    "$AGENT/experience"
+    "$AGENT/experience" \
+    "$AGENT/temp" \
+    "$AGENT/temp/drained"
+
+# temp/ is the canonical staging store (core/config/conventions/temp-store.md).
+# Unlike session/, temp/ is git-tracked, so seed .gitkeep to track the empty dirs.
+touch "$AGENT/temp/.gitkeep" "$AGENT/temp/drained/.gitkeep"
 
 echo "  Created directory structure"
 

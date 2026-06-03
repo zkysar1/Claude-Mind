@@ -172,7 +172,7 @@ def main():
     # Default echo: caller's claimed outcome. Updated to post-flip on success.
     final_outcome = outcome
 
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         print(final_outcome)
         sys.exit(0)
 

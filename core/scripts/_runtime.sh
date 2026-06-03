@@ -33,22 +33,28 @@ fi
 RT_DIR="${RT_DIR:-$PROJECT_ROOT/mind_api/state}"
 RT_PID_FILE="${RT_PID_FILE:-$RT_DIR/daemon.pid}"
 RT_PORT_FILE="${RT_PORT_FILE:-$RT_DIR/daemon.port}"
+RT_PARENT_PID_FILE="${RT_PARENT_PID_FILE:-$RT_DIR/daemon.parent.pid}"
 RT_SPAWN_LOG="${RT_SPAWN_LOG:-$RT_DIR/spawn.log}"
 
 # Tunables. Override per-invocation by exporting before sourcing.
-# RT_CURL_TIMEOUT must cover two distinct worst-case wait sources:
-#   1. Cold-cache loads — the tree endpoint's first request after a daemon
-#      (re)start pays the OneDrive cost of reading every referenced .md
-#      file (~5s on this machine). Subsequent calls are <250ms.
-#   2. _atomic_write retry storms — OneDrive holds an exclusive lock on
-#      world/*.jsonl while syncing, causing os.replace to fail with WinError 5.
-#      _fileops._atomic_write retries 10× with exponential backoff capped at
-#      5s/retry; the worst-case sum is ~22s before the in-place-rewrite
-#      fallback fires. Raised from 15→45 after the 2026-05-20 false-down
-#      incident where slow-due-to-write-contention was misread as
-#      "daemon unreachable." See rt_no_daemon_error below for the paired
-#      verify-before-report fix.
-RT_CURL_TIMEOUT="${RT_CURL_TIMEOUT:-45}"     # seconds per request
+# RT_CURL_TIMEOUT must cover the worst-case request wait. History:
+#   - 15→45s (2026-05-20): false-down incident where a write slowed by OneDrive
+#     _atomic_write retry-storms (WinError 5 on os.replace, ~22s worst case) was
+#     misread as "daemon unreachable." See rt_no_daemon_error below.
+#   - 45→90s (2026-05-31, G4): the cache moved OFF OneDrive, so the OneDrive
+#     retry-storm source is gone, but two post-G4 sources remain:
+#       (1) cold-cache S3 refresh after a daemon (re)start — first access to a
+#           large world file (3.7MB aspirations.jsonl) pays a full S3 GET+PUT
+#           (~7s observed);
+#       (2) 6-agent lock-queue — concurrent writes to a SHARED world file
+#           serialize on a per-file lock, so a write's HTTP duration =
+#           lock-wait + write, which can stack toward 45s under heavy
+#           concurrency. A stacked wait tripping rc=3 would spuriously respawn
+#           the busy-but-alive daemon and ORPHAN it (the orphan-accumulation
+#           failure mode). 90s gives ~2x margin over the projected worst case.
+#     rt_is_up keeps its separate 1s probe, so true-down detection stays fast.
+#     See mind_api/docs/lodestar-rollout-status.md (G4 / daemon-stability).
+RT_CURL_TIMEOUT="${RT_CURL_TIMEOUT:-90}"     # seconds per request
 RT_SPAWN_WAIT_MS="${RT_SPAWN_WAIT_MS:-5000}" # max wait for spawned daemon
 RT_SPAWN_POLL_MS="${RT_SPAWN_POLL_MS:-50}"   # poll interval while waiting
 
@@ -207,7 +213,35 @@ rt_check_staleness() {
         # silently — `if bash <wrong-path>; then` evaluates false (rc 127)
         # and the staleness arming is suppressed with no diagnostic. Same
         # pure-bash dirname idiom this file's top-of-source guard uses.
-        if bash "${BASH_SOURCE[0]%/*}/mind-api-code-changed.sh" "$running_sha" >/dev/null 2>&1; then
+        # B1: verdict cache. The (running_sha, on_disk) pair deterministically
+        # decides restart-vs-not, yet in the stale window EVERY wrapper call
+        # (each a fresh shell) re-ran the git diff below -> git contention +
+        # the restart-churn the 6-agent soak surfaced. Cache the verdict keyed
+        # on the exact pair: a new commit (on_disk moves) or a daemon restart
+        # (running_sha moves) invalidates by key mismatch. Conservative — an
+        # absent/malformed cache, or any key mismatch, recomputes; a hit is a
+        # deterministic function of the key, so it can never mask a genuine
+        # stale-code state (the never-serve-stale invariant holds).
+        local _sv_cache="" _sv_key="$running_sha $on_disk" _sv=""
+        [ -n "${RT_DIR:-}" ] && _sv_cache="$RT_DIR/staleness-verdict"
+        if [ -n "$_sv_cache" ] && [ -r "$_sv_cache" ]; then
+            case "$(cat "$_sv_cache" 2>/dev/null)" in
+                "$_sv_key changed") _sv=changed ;;
+                "$_sv_key current") _sv=current ;;
+            esac
+        fi
+        if [ -z "$_sv" ]; then
+            if bash "${BASH_SOURCE[0]%/*}/mind-api-code-changed.sh" "$running_sha" >/dev/null 2>&1; then
+                _sv=changed
+            else
+                _sv=current
+            fi
+            if [ -n "$_sv_cache" ]; then
+                printf '%s %s\n' "$_sv_key" "$_sv" > "$_sv_cache.tmp.$$" 2>/dev/null \
+                    && mv -f "$_sv_cache.tmp.$$" "$_sv_cache" 2>/dev/null || true
+            fi
+        fi
+        if [ "$_sv" = "changed" ]; then
             echo "[runtime] WARNING: daemon is running stale code (sha ${running_sha:0:8}, on-disk ${on_disk:0:8}). Auto-restart will fire on the next rt_ensure_running call (one-shot)." >&2
             export RT_STALENESS_WARNED=1
             #  Change 1: escalate from warn-only to actionable. The
@@ -216,6 +250,27 @@ rt_check_staleness() {
             export RT_STALENESS_RESTART_PENDING=1
         fi
     fi
+}
+
+# rt_daemon_is_fresh — true (0) iff a daemon is up AND its reported
+# git_head_sha equals on-disk HEAD. Read-only. Used by rt_ensure_running's
+# stale-restart path (B2 double-checked locking) to skip a redundant restart
+# when another wrapper already refreshed the daemon while we waited for the
+# spawn lock. Conservative: a daemon that predates git_head_sha (no field), or
+# any read failure, returns 1 (not-provably-fresh) so the caller still restarts.
+rt_daemon_is_fresh() {
+    local base on_disk response running_sha
+    base="$(rt_base_url)"; [ -n "$base" ] || return 1
+    on_disk="$(rt_on_disk_sha)" || return 1
+    [ -n "$on_disk" ] || return 1
+    response=$(curl -s -f --max-time 1 "$base/v1/admin/health" 2>/dev/null) || return 1
+    case "$response" in *'"git_head_sha"'*) ;; *) return 1;; esac
+    running_sha="${response#*\"git_head_sha\":}"
+    running_sha="${running_sha%%,*}"
+    running_sha="${running_sha%%\}*}"
+    running_sha="${running_sha//\"/}"
+    running_sha="${running_sha// /}"
+    [ -n "$running_sha" ] && [ "$running_sha" = "$on_disk" ]
 }
 
 # rt_on_disk_sha — read git HEAD without shelling to `git`. Mirrors the
@@ -315,6 +370,13 @@ rt_spawn() {
     # spawn (rt_ensure_running, the  staleness restart) stacked a
     # new process on top of the old one (observed 170 started / 6 stopped).
     rt_daemon_kill
+
+    # DELIBERATELY no implicit `rt_sweep_orphan_daemons "" ""` call. An
+    # empty-args sweep kills every mind_api.src process system-wide, which
+    # collides with OTHER repos running their own daemons (same cmdline,
+    # same regex). rt_daemon_kill's kill-by-KNOWN-PIDs is the authoritative
+    # reap and is repo-safe by construction. User-invoked
+    # `daemon-orphan-sweep.sh --clean` is available for explicit cleanup.
     echo "[$stamp] rt_spawn — attempting daemon start" >> "$RT_SPAWN_LOG"
 
     (
@@ -387,53 +449,188 @@ rt_release_spawn_lock() {
     rm -f "$RT_DIR/daemon.wrapper.lock" 2>/dev/null || true
 }
 
-# rt_daemon_kill — terminate the running daemon process TREE by PID
-# ( Change 1; graceful-first + tree-reap ).
+# rt_log_spawn — append a single line to spawn.log with a timestamp.
+# Mirrors mind-api-start.sh _log so both kill paths produce comparable
+# entries. Best-effort; never fails the caller.
+rt_log_spawn() {
+    local stamp
+    stamp="$(date +%Y-%m-%dT%H:%M:%S 2>/dev/null || echo unknown)"
+    echo "[$stamp] rt_runtime: $*" >> "$RT_SPAWN_LOG" 2>/dev/null || true
+}
+
+# rt_force_kill_tree CHILD_PID PARENT_PID — Windows tree reap by KNOWN PIDs.
+# See mind-api-start.sh _force_kill_tree for the full rationale (
+# v3 bulletproof fix). This is the sister implementation for the wrapper
+# path so rt_daemon_kill behaves identically to mind-api-start.sh.
+rt_force_kill_tree() {
+    local child_pid="$1"
+    local parent_pid="${2:-}"
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            if [ -n "$child_pid" ] && kill -0 "$child_pid" >/dev/null 2>&1; then
+                kill -KILL "$child_pid" 2>/dev/null || true
+                rt_log_spawn "force-killed POSIX child PID $child_pid"
+            fi
+            return 0
+            ;;
+    esac
+    local pp="${parent_pid:-0}"
+    [ -z "$pp" ] && pp=0
+    local cp="${child_pid:-0}"
+    [ -z "$cp" ] && cp=0
+    local ps_script="
+        \$results = @()
+        function Kill-Guarded(\$pid_to_kill, \$label) {
+            if (-not \$pid_to_kill -or \$pid_to_kill -le 0) {
+                \$script:results += \"\$label=skip(no-pid)\"
+                return
+            }
+            \$p = Get-CimInstance Win32_Process -Filter \"ProcessId=\$pid_to_kill\" -ErrorAction SilentlyContinue
+            if (-not \$p) {
+                \$script:results += \"\$label=skip(already-gone PID=\$pid_to_kill)\"
+                return
+            }
+            if (\$p.CommandLine -notmatch 'mind_api') {
+                \$script:results += \"\$label=skip(cmdline-mismatch PID=\$pid_to_kill name=\$(\$p.Name))\"
+                return
+            }
+            try {
+                Stop-Process -Id \$pid_to_kill -Force -ErrorAction Stop
+                \$script:results += \"\$label=killed(PID=\$pid_to_kill name=\$(\$p.Name))\"
+            } catch {
+                \$script:results += \"\$label=fail(PID=\$pid_to_kill err=\$(\$_.Exception.Message))\"
+            }
+        }
+        Kill-Guarded $pp 'parent'
+        Kill-Guarded $cp 'child'
+        \$results -join '; '
+    "
+    local result
+    result="$(powershell.exe -NoProfile -Command "$ps_script" 2>&1)" || true
+    rt_log_spawn "force-kill-tree child=$cp parent=$pp -> ${result:-<no-output>}"
+}
+
+# rt_sweep_orphan_daemons KEEP_CHILD KEEP_PARENT — Windows orphan sweeper.
+# See mind-api-start.sh _sweep_orphan_daemons for the full rationale. Used
+# by rt_spawn as belt-and-suspenders before launching a new daemon.
+rt_sweep_orphan_daemons() {
+    local keep_child="${1:-}"
+    local keep_parent="${2:-}"
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            local pids
+            pids="$(pgrep -f 'python.* -m mind_api\.src' 2>/dev/null | tr '\n' ' ')"
+            local killed=0
+            for p in $pids; do
+                [ "$p" = "$keep_child" ] && continue
+                [ "$p" = "$keep_parent" ] && continue
+                kill -KILL "$p" 2>/dev/null && killed=$((killed + 1)) || true
+            done
+            [ "$killed" -gt 0 ] && rt_log_spawn "orphan-sweep POSIX killed $killed mind_api.src processes"
+            return 0
+            ;;
+    esac
+    local keep_c="${keep_child:-0}"
+    [ -z "$keep_c" ] && keep_c=0
+    local keep_p="${keep_parent:-0}"
+    [ -z "$keep_p" ] && keep_p=0
+    local ps_script="
+        \$keep_child = $keep_c
+        \$keep_parent = $keep_p
+        \$procs = Get-CimInstance Win32_Process -Filter \"Name='py.exe' OR Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -match 'mind_api\.src' }
+        \$killed = @()
+        \$kept = @()
+        foreach (\$p in \$procs) {
+            if (\$p.ProcessId -eq \$keep_child -or \$p.ProcessId -eq \$keep_parent) {
+                \$kept += \"\$(\$p.Name)/\$(\$p.ProcessId)\"
+                continue
+            }
+            try {
+                Stop-Process -Id \$p.ProcessId -Force -ErrorAction Stop
+                \$killed += \"\$(\$p.Name)/\$(\$p.ProcessId)\"
+            } catch {
+                \$killed += \"fail-\$(\$p.Name)/\$(\$p.ProcessId)\"
+            }
+        }
+        if (\$killed.Count -gt 0) {
+            Write-Output \"killed=\$(\$killed.Count) [\$(\$killed -join ',')] kept=[\$(\$kept -join ',')]\"
+        } else {
+            Write-Output \"clean (alive=[\$(\$kept -join ',')])\"
+        }
+    "
+    local result
+    result="$(powershell.exe -NoProfile -Command "$ps_script" 2>&1)" || true
+    if [ -n "$result" ]; then
+        case "$result" in
+            "clean"*)
+                if [ "$keep_c" != "0" ] || [ "$keep_p" != "0" ]; then
+                    rt_log_spawn "orphan-sweep: $result"
+                fi
+                ;;
+            *)
+                rt_log_spawn "orphan-sweep: $result"
+                ;;
+        esac
+    fi
+}
+
+# rt_daemon_kill — terminate the running daemon process TREE by KNOWN PIDs
+# ( v3 bulletproof fix; supersedes  Change 1 + ).
 #
-# daemon.pid holds the python.exe CHILD pid (os.getpid() inside
-# mind_api.src). On Windows that child was launched by a `py -3 -m
-# mind_api.src` py.exe PARENT. Windows has no POSIX process-group
-# cascade: killing only the child orphans the py.exe parent, and that
-# orphaning is the code root cause of the  114-process
-# pileup. The force-reap below kills the WHOLE tree (parent + child),
-# PID-reuse-guarded by a `mind_api.src` CommandLine match on BOTH so a
-# recycled PID for an unrelated process is never force-killed.
+# daemon.pid holds the python.exe CHILD PID. daemon.parent.pid holds the
+# py.exe launcher PARENT PID ( v3 — written by the daemon itself
+# at startup, see mind_api/src/server.py and mind_api/src/lifecycle.py).
+# Killing both by known values closes the silent-failure window in the
+# previous tree-kill: the old code used Get-CimInstance Win32_Process
+# -Filter "ProcessId=$child" .ParentProcessId, which returns null whenever
+# the child has already exited from SIGTERM — orphaning the py.exe parent
+# in ~17% of recycles (35 orphan pairs over 204 spawns in 37 hours per
+# the 2026-05-22 snapshot).
 #
-# Graceful SIGTERM is attempted first. On POSIX it reaches the child,
-# whose signal handler (__main__.py:135) runs the clean shutdown and
-# logs the "stopped" lifecycle event — closing the started>>stopped
-# asymmetry there. On Git Bash MSYS, `kill -TERM` does not reliably
-# reach a detached native-Windows python.exe and never reaches the
-# py.exe parent, so the Windows force-reap is authoritative and the
-# daemon does NOT log "stopped" on Windows external kill
-# (TerminateProcess bypasses the Python signal handler — a documented
-# platform limitation, not a regression). Fail-open at every step; a
-# missing or unkillable PID must not abort the caller.
+# Graceful SIGTERM is still attempted first. Wait window uses health-probe
+# (curl) when port is known, falling back to kill -0. The unconditional
+# force-kill-tree that follows is the authoritative reap on Windows; the
+# daemon does NOT log "stopped" when external force-kill bypasses the
+# Python signal handler (TerminateProcess platform limitation, not a
+# regression). Fail-open at every step.
 rt_daemon_kill() {
     [ -f "$RT_PID_FILE" ] || return 0
-    local pid
+    local pid parent_pid port
     pid="$(cat "$RT_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
     [ -n "$pid" ] || return 0
+    parent_pid="$(cat "$RT_PARENT_PID_FILE" 2>/dev/null | tr -d '[:space:]' || echo "")"
+    port="$(cat "$RT_PORT_FILE" 2>/dev/null | tr -d '[:space:]' || echo "")"
+
     # Graceful first — POSIX child logs "stopped" and exits cleanly.
+    # Windows MSYS kill -TERM is best-effort (signal delivery unreliable
+    # for detached native processes); the force-kill below is the safety.
     kill -TERM "$pid" >/dev/null 2>&1 || true
+
+    # Wall-clock-bounded wait: short-timeout curl probes capped at ~1.5s.
+    # --max-time 0.3 (not 1) keeps a frozen daemon from blowing past the
+    # budget. 5 iters × (0.3s probe + 0.1s sleep) = ~2s absolute worst
+    # case (typically <1s — probe fails fast on connection refused).
+    # Mirrors mind-api-start.sh _kill_escalate.
     local waited=0
-    while [ "$waited" -lt 30 ]; do          # ~3s graceful window
-        kill -0 "$pid" >/dev/null 2>&1 || break
+    local max_iters=5
+    while [ "$waited" -lt "$max_iters" ]; do
+        if [ -n "$port" ]; then
+            if ! curl -s -f --max-time 0.3 "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1; then
+                break
+            fi
+        else
+            kill -0 "$pid" >/dev/null 2>&1 || break
+        fi
         sleep 0.1
         waited=$((waited + 1))
     done
-    # Force-reap the process TREE: the python.exe child (= $pid) plus
-    # its py.exe launcher parent, each PID-reuse-guarded by a
-    # mind_api.src CommandLine match. Unconditional — it force-reaps a
-    # survivor and is a silent no-op when SIGTERM already exited it.
-    # POSIX uses kill -KILL on the child (no py.exe parent layer there).
-    case "$(uname -s 2>/dev/null || echo unknown)" in
-        MINGW*|MSYS*|CYGWIN*)
-            powershell.exe -NoProfile -Command "\$c=Get-CimInstance Win32_Process -Filter \"ProcessId=$pid\" -ErrorAction SilentlyContinue; if (\$c -and \$c.CommandLine -match 'mind_api\.src') { \$pp=\$c.ParentProcessId; \$p=Get-CimInstance Win32_Process -Filter \"ProcessId=\$pp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.CommandLine -match 'mind_api\.src') { Stop-Process -Id \$pp -Force -ErrorAction SilentlyContinue }; Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
-            ;;
-        *) kill -KILL "$pid" >/dev/null 2>&1 || true;;
-    esac
-    rm -f "$RT_PID_FILE" 2>/dev/null || true
+
+    # Unconditional force-reap by KNOWN PIDs.
+    rt_force_kill_tree "$pid" "$parent_pid"
+
+    rm -f "$RT_PID_FILE" "$RT_PARENT_PID_FILE" 2>/dev/null || true
 }
 
 # rt_ensure_running — start the daemon if down. Returns 0 if (re)ready, 1 otherwise.
@@ -456,6 +653,16 @@ rt_ensure_running() {
         # Wrapper-side spawn mutex: another wrapper may already be doing the
         # stale-code restart; let them finish and reuse the fresh daemon.
         if rt_acquire_spawn_lock; then
+            # B2: double-checked freshness. While we waited for the spawn lock
+            # another wrapper may have already done this stale-restart. If the
+            # daemon is now FRESH (running sha == on-disk HEAD), skip the
+            # redundant restart that would kill a healthy daemon and open an
+            # orphan window — the churn amplifier when N wrappers each detect
+            # the same staleness. Mirrors the down-path rt_is_up re-check.
+            if rt_daemon_is_fresh; then
+                rt_release_spawn_lock
+                return 0
+            fi
             rt_spawn
             local rc=1
             if rt_wait_for_ready; then rc=0; fi
@@ -537,6 +744,11 @@ rt_curl() {
     local headers=( -H "X-Runtime-Client: shell" )
     [ -n "$agent" ] && headers+=( -H "X-Mind-Agent: $agent" )
     headers+=( -H "X-Mind-Tenant: ${MIND_TENANT:-default}" )
+    # Forward the calling session's SID (always-injected by bash-agent-inject,
+    # guard-341/rb-386) so endpoints that record session attribution
+    # (board_write reads x-ayoai-sid) are byte-compat with the CLI, which reads
+    # MIND_SID from the env. Endpoints that ignore it are unaffected.
+    [ -n "${MIND_SID:-}" ] && headers+=( -H "X-Mind-Sid: $MIND_SID" )
     if [ ${#extra_headers[@]} -gt 0 ]; then
         headers+=( "${extra_headers[@]}" )
     fi
@@ -614,9 +826,30 @@ rt_call() {
     rt_curl "$@" || rc=$?
     if [ "$rc" -ne 3 ]; then
         # Daemon answered. If it's running stale code, rt_check_staleness
-        # warns AND arms the auto-restart sentinel ( Change 1) so a
-        # subsequent rt_ensure_running recycles the process.
+        # warns AND arms the auto-restart sentinel ( Change 1).
         rt_check_staleness
+        # : the SUCCESS path must also CONSUME the sentinel. Before
+        # this fix it armed RT_STALENESS_RESTART_PENDING and returned without
+        # calling rt_ensure_running (the sole consumer) — and `export` scopes
+        # the sentinel to THIS shell, so it died when the wrapper subprocess
+        # exited and the next wrapper (a fresh process) never saw it. A
+        # stale-but-RESPONSIVE daemon answers 200 (rc 0) or shape-corrupted
+        # (rc 2), never rc 3, so it took this branch forever: armed a sentinel
+        # no one consumed, served stale/corrupted JSON, never auto-healed
+        # (the  JSONDecodeError class). Recycle in-shell NOW and retry
+        # once so the caller receives fresh data. The guard mirrors
+        # rt_ensure_running's own conditions so the hot path (fresh daemon →
+        # PENDING unset) pays nothing, the one-shot (RESTARTED=1) is honored,
+        # and RT_NO_AUTOSPAWN (health/test paths) observes true state without a
+        # recycle attempt or a pointless retry against the un-recycled daemon.
+        if [ "${RT_STALENESS_RESTART_PENDING:-0}" = "1" ] && \
+           [ "${RT_STALENESS_RESTARTED:-0}" != "1" ] && \
+           [ "${RT_NO_AUTOSPAWN:-0}" != "1" ]; then
+            if rt_ensure_running; then
+                rc=0
+                rt_curl "$@" || rc=$?
+            fi
+        fi
         return "$rc"
     fi
     # rc==3: connection refused, no port, OR a routing-layer 404 escalated by

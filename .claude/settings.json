@@ -90,6 +90,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-agent-inject.sh",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-path-resolution-hook.sh",
+            "timeout": 15
           }
         ]
       },
@@ -180,6 +185,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/pre-edit-context-gate.sh",
+            "timeout": 10
           }
         ]
       },
@@ -219,6 +229,11 @@
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/settings-structural-validator.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/pre-edit-context-gate.sh",
             "timeout": 10
           }
         ]

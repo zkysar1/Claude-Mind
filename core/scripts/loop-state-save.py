@@ -32,7 +32,12 @@ reconfigure_stdio()
 # a stderr WARN and non-zero exit.
 SCHEMA = {
     # Required at init time:
-    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-\d+-\d+[a-z]?$"},
+    # B13: match the canonical GOAL_ID_RE (aspirations.py:197 / aspirations_write.py:139)
+    # — the hyphenated decomposition-child form g-NNN-NN-a (/decompose,
+    # decompose/SKILL.md:147) was rejected by the old `[a-z]?` (appended, no
+    # hyphen), so checkpoint init aborted on the WARN (~line 136) for any
+    # decomposed child goal.
+    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-\d{3}-\d{2,4}(-[a-z])?$"},
     "aspiration_id":    {"required": True,  "type": str, "pattern": r"^asp-\d+$"},
     "source":           {"required": True,  "type": str, "enum": ("world", "agent")},
     "phase":            {"required": True,  "type": str},  # selected, executed, verified, ...

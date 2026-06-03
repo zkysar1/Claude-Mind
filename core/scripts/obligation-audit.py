@@ -43,6 +43,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from _paths import AGENT_DIR  # type: ignore
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -149,8 +150,8 @@ def _append_jsonl(path: Path, record: dict) -> None:
 def _existing_investigate_goal() -> bool:
     try:
         r = subprocess.run(
-            ["bash", (SCRIPT_DIR / "aspirations-query.sh").as_posix(),
-             "--goal-status", "pending", "--goal-status", "in-progress"],
+            bash_cmd(SCRIPT_DIR / "aspirations-query.sh",
+                     "--goal-status", "pending", "--goal-status", "in-progress"),
             capture_output=True, text=True, timeout=15,
         )
         if r.returncode != 0 or not r.stdout.strip():
@@ -171,7 +172,7 @@ def _file_investigate_goal(session_false_claims: int, audit_log_path: Path) -> N
     # Find a target aspiration (first active framework-maintenance, else first active).
     try:
         r = subprocess.run(
-            ["bash", (SCRIPT_DIR / "world-cat.sh").as_posix(), "aspirations-compact.json"],
+            bash_cmd(SCRIPT_DIR / "world-cat.sh", "aspirations-compact.json"),
             capture_output=True, text=True, timeout=15,
         )
         target_id = None
@@ -208,8 +209,8 @@ def _file_investigate_goal(session_false_claims: int, audit_log_path: Path) -> N
             "origin_signal": f"investigate:obligation-audit-{session_false_claims}-false-claims",
         }
         subprocess.run(
-            ["bash", (SCRIPT_DIR / "aspirations-add-goal.sh").as_posix(),
-             "--source", target_source, target_id],
+            bash_cmd(SCRIPT_DIR / "aspirations-add-goal.sh",
+                     "--source", target_source, target_id),
             input=json.dumps(goal), text=True, capture_output=True, timeout=15,
         )
         print(f"[obligation-audit] filed investigate goal in {target_id} "
@@ -288,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             new_false_this_iter += 1
             try:
                 subprocess.run(
-                    ["bash", (SCRIPT_DIR / "wm-append.sh").as_posix(), "sensory_buffer"],
+                    bash_cmd(SCRIPT_DIR / "wm-append.sh", "sensory_buffer"),
                     input="false_abbreviation", text=True,
                     capture_output=True, timeout=10,
                 )

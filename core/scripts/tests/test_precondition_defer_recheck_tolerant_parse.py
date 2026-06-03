@@ -208,6 +208,11 @@ def test_read_goals_flattens_aspirations_into_goals_list():
                 ']}'
             )
 
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
+
     orig_rt = M._rt
     M._rt = _StubRt
     try:
@@ -251,6 +256,11 @@ def test_read_goals_rterror_is_fatal_with_loud_diagnostic():
         def aspirations_read(source, active):
             raise _StubRt.RtError("daemon unavailable")
 
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
+
     orig_rt = M._rt
     M._rt = _StubRt
     buf = io.StringIO()
@@ -287,6 +297,11 @@ def test_read_goals_on_corruption_exits_not_silent():
         @staticmethod
         def aspirations_read(source, active):
             return "<<< not valid json at all >>>"
+
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
 
     orig_rt = M._rt
     M._rt = _StubRt

@@ -23,18 +23,18 @@ two A1-specific adaptations:
      downstream cleanup to extract a shared `_tolerant_decode` primitive
      to `core/scripts/_rt.py` for all four sites.
 
-A1 RtError handling — intentional pre-correction silent-return (g-115-948):
-`_read_goals` is called once for "world" and once for "agent" then merged
-in main() at line 707. Per guard-383, the N>=2-source aggregator pattern
-mandates per-source error be FATAL on RtError, not silent `return []`.
-Sibling A2/A3/A4 follow the corrected pattern; A1 retains the
-pre-correction silent-return because g-115-797-A1's stated 5-item contract
-(see g-115-939 description) is strictly the BODY-decode contract — it
-does NOT include the RtError fatal upgrade. The RtError drift is tracked
-under g-115-948 ("Investigate: RtError handling drift in g-115-797
-audit-catalog Applies vs guard-383"). This test pins the inlined-decode
-contract g-115-939 actually applies; the RtError-fatal regression test
-will land with g-115-948.
+A1 RtError handling — corrected to guard-383 fatal-aggregator (g-115-948
+resolved via g-115-981): `_read_goals` is called once for "world" and once
+for "agent" then merged in main() (`_read_goals("world") + _read_goals(
+"agent")`). Per guard-383, the N>=2-source aggregator pattern mandates
+per-source error be FATAL on RtError, not silent `return []` — a silent
+[] from one source would poison the merged set with a complete-looking
+lie (cleared defers based on a half-view). A1 now joins siblings A2
+(blocker-recheck), A3 (precondition-defer-recheck), and A4 (parent-
+supersession-sweep) in exiting fatally on RtError; the defer-recheck.sh
+wrapper swallows non-zero exit so a transient daemon outage leaves the
+defers untouched for the next sweep — no regression on daemon-up. Test
+case 10 (`test_rterror_is_fatal_guard_383`) pins the corrected behavior.
 
 Behavior contract (g-115-939 goal description, verbatim):
   1. lstrip body before decoding
@@ -48,9 +48,10 @@ Plus the A1-inlined post-decode goals-extraction:
   - list aggregate: walk `data` (already a list of asps) then each asp's `goals`
   - Each yielded goal gets `_source` + `_aspiration_id` stamps
 
-A1 silent-return regression pin (intentional, cite g-115-948):
-  - _rt.RtError raised -> _read_goals returns [] (NOT fatal). Test asserts
-    the silent-return behavior so g-115-948 has a clean baseline to flip.
+A1 RtError-fatal regression pin (post-g-115-981):
+  - _rt.RtError raised -> _read_goals exits 1 with stderr diagnostic.
+    Mirrors A2/A3/A4 exemplars; matches the canonical guard-383 pattern
+    in parent-supersession-sweep.py.
 
 Run: py -3 -m pytest core/scripts/tests/test_defer_recheck_tolerant_parse.py -v
      OR: py -3 core/scripts/tests/test_defer_recheck_tolerant_parse.py
@@ -84,7 +85,13 @@ M = load_module()
 # ── Helpers for stubbing _rt.aspirations_read ─────────────────────────────
 
 class _StubRtBase:
-    """Base stub for _rt — subclasses override aspirations_read."""
+    """Base stub for _rt — subclasses override aspirations_read.
+
+    Pure-parse helpers (tolerant_decode_list, tolerant_decode_aggregate)
+    delegate to the real _rt module since they don't touch the daemon —
+    only aspirations_read needs to be stubbed for daemon isolation.
+    Wired here after g-115-949 extracted the decoders to _rt.py.
+    """
 
     class RtError(Exception):
         def __init__(self, body=""):
@@ -94,6 +101,18 @@ class _StubRtBase:
     @staticmethod
     def aspirations_read(source, active):  # pragma: no cover — overridden
         raise NotImplementedError
+
+    @staticmethod
+    def tolerant_decode_list(source, raw):
+        # Delegate to real _rt — pure parse, no daemon contact ().
+        import importlib
+        return importlib.import_module("_rt").tolerant_decode_list(source, raw)
+
+    @staticmethod
+    def tolerant_decode_aggregate(source, raw):
+        # Delegate to real _rt — pure parse, no daemon contact ().
+        import importlib
+        return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
 
 
 def _call_read_goals(stub_cls, source="world"):
@@ -277,7 +296,7 @@ def test_non_aggregate_string_is_fatal():
     err = _call_read_goals_expect_exit(_Stub, source="world")
     lines = [ln for ln in err.splitlines() if ln.strip()]
     assert len(lines) == 1, f"expected exactly 1 diagnostic line, got {lines!r}"
-    assert "non-dict/non-list aggregate" in lines[0] and "type=str" in lines[0], (
+    assert "non-dict-and-non-list aggregate" in lines[0] and "type=str" in lines[0], (
         f"diagnostic must name the wrong-aggregate shape, got {lines[0]!r}"
     )
 
@@ -293,21 +312,19 @@ def test_integer_aggregate_is_fatal():
     assert "type=int" in err, f"diagnostic must name int type, got {err!r}"
 
 
-# ── Case 10: RtError -> [] (PRE-CORRECTION silent-return; pinned for ) ─
-def test_rterror_returns_empty_pre_correction():
-    """A1 INTENTIONALLY retains the pre-correction silent-return on RtError
-    (per g-115-939's stated 5-item contract, which covers body-decode only,
-    not the guard-383 RtError fatal upgrade).
+# ── Case 10: RtError -> SystemExit(1) (POST-CORRECTION fatal-aggregator) ──
+def test_rterror_is_fatal_guard_383():
+    """A1 RtError handling now matches the guard-383 fatal-aggregator
+    contract (g-115-948 resolved via g-115-981). _read_goals is one of
+    two source reads merged in main() (`_read_goals("world") +
+    _read_goals("agent")`); a silent [] from either source would poison
+    the merged set with a complete-looking lie.
 
-    Sibling A2 (blocker-recheck), A3 (precondition-defer-recheck), and
-    A4 (parent-supersession-sweep) all follow the corrected exemplar
-    (consolidation-health.py commit 28a3b7a) and exit fatally on RtError.
-    A1 is tracked separately under g-115-948 ("Investigate: RtError
-    handling drift in g-115-797 audit-catalog Applies vs guard-383").
-
-    This test pins A1's current behavior so g-115-948's eventual flip has
-    a clean regression baseline. When g-115-948 lands, this case flips
-    to `_call_read_goals_expect_exit` matching A2/A3/A4 symmetry.
+    Mirrors siblings A2 (blocker-recheck), A3 (precondition-defer-
+    recheck), and A4 (parent-supersession-sweep) which all follow the
+    canonical pattern from parent-supersession-sweep.py. The defer-
+    recheck.sh wrapper swallows non-zero exit so a transient daemon
+    outage just leaves defers untouched for the next sweep.
     """
     class _Stub(_StubRtBase):
         @staticmethod
@@ -318,22 +335,13 @@ def test_rterror_returns_empty_pre_correction():
     # RtError) — NOT _StubRtBase, whose base aspirations_read raises
     # NotImplementedError. The `except _rt.RtError` clause inside
     # _read_goals catches via _Stub.RtError == _StubRtBase.RtError.
-    orig_rt = M._rt
-    M._rt = _Stub
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(buf):
-            result = M._read_goals("world")
-    finally:
-        M._rt = orig_rt
-    assert result == [], (
-        f"A1 pre-correction: RtError must return [] (NOT exit). g-115-948 "
-        f"will flip this to fatal. Got {result!r}"
+    err = _call_read_goals_expect_exit(_Stub, source="world")
+    assert "[defer-recheck] world read failed" in err, (
+        f"diagnostic must carry the symmetric '[defer-recheck] {{source}} "
+        f"read failed' prefix, got {err!r}"
     )
-    # One diagnostic is still emitted (the pre-existing print before the
-    # silent return).
-    assert "[defer-recheck] world read failed" in buf.getvalue(), (
-        f"pre-correction diagnostic must still emit, got {buf.getvalue()!r}"
+    assert "daemon unreachable" in err, (
+        f"diagnostic must include the RtError body, got {err!r}"
     )
 
 
@@ -349,7 +357,7 @@ def run_all():
         test_diagnostic_truncates_and_escapes_long_body,
         test_non_aggregate_string_is_fatal,
         test_integer_aggregate_is_fatal,
-        test_rterror_returns_empty_pre_correction,
+        test_rterror_is_fatal_guard_383,
     ]
     failed = 0
     for t in tests:

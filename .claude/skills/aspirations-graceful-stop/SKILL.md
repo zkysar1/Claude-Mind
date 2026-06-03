@@ -277,6 +277,19 @@ Bash: rm -f agents/<agent>/session/running-session-id agents/<agent>/session/asp
 # 0 silently. Goal/tree counts are 0 here because graceful-stop doesn't have a
 # rolling counter; future enhancement is to seed them from team-state intel.
 Bash: MIND_AGENT=<agent> SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && bash core/scripts/session-summary-write.sh --sid "$SID" --agent "<agent>" --reason graceful-stop >/dev/null || true
+# D6.7 (session-continuity redesign, 2026-06-02): Flush this machine's governed
+# writes to S3 NOW so a machine-move right after this clean stop cannot strand
+# the session's last continuity writes locally. By this point ALL continuity
+# files are written: handoff (D4 consolidate), working-memory (D4.5/D5),
+# execution-diary, session-summary (D6.5); machine-local files were deleted in
+# D6. The flush is the deterministic race-closer over the daemon's 120s periodic
+# sweep — under the own-cloud backend it pushes continuity/ephemeral session
+# files (+ world/meta) immediately; under the local backend it is a clean no-op.
+# Best-effort: the daemon's periodic sweep is STILL running after this agent
+# goes IDLE and will retry any file the flush missed, so a flush error warns
+# but never blocks the stop. (Runs as its own Bash line — its rc cannot break
+# D7's chain.)
+Bash: MIND_AGENT=<agent> bash core/scripts/owncloud-flush.sh || echo "[owncloud-flush] WARN: flush returned non-zero — periodic sweep (interval 120s) will retry; avoid an immediate machine-move until the next sweep tick"
 # D7: Apply post-stop mode AND emit the final user-facing message in ONE Bash
 # call. The Bash stdout IS the stop-complete message — there is no separate text
 # Output block after this. That makes the Bash invocation the unambiguous last

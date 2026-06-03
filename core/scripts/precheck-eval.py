@@ -48,6 +48,7 @@ from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT  # type: ignore
 from _fileops import log_script_decision  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
 from _prefix_registry import PRIMITIVE_PREFIXES  # type: ignore
+from _goal_census import effective_counts  # type: ignore  (B9-deep census-augmented counts)
 
 try:
     import yaml  # type: ignore
@@ -164,11 +165,14 @@ def cmd_zombies(args, config, compact):
         non_recurring = [g for g in goals if not g.get("recurring")]
         if not non_recurring:
             continue
-        completed = [g for g in non_recurring if g.get("status") == "completed"]
         unfinished = [g for g in non_recurring if g.get("status") not in TERMINAL_STATUSES]
         if not non_recurring or not unfinished:
             continue
-        completion_ratio = len(completed) / len(non_recurring)
+        # Census-augmented (B9-deep): archived completed/abandoned goals still
+        # count toward the zombie completion ratio, so eviction can't make a
+        # near-done aspiration drop below the zombie threshold and escape review.
+        nonrec_total, nonrec_completed = effective_counts(asp, include_recurring=False)
+        completion_ratio = nonrec_completed / nonrec_total if nonrec_total else 0.0
         if completion_ratio < zombie_ratio:
             continue
         # All unfinished must be blocked AND past the stale threshold
@@ -389,20 +393,23 @@ def cmd_consolidation(args, config, compact):
     ratios = []
     stalled_detail = []
     near_complete = 0
+    # "tracked" here EXCLUDES skipped/expired/decomposed but counts superseded —
+    # a denominator distinct from the scorer's ABANDONED set, so it needs the
+    # per-status census to fold evicted goals back in (B9-deep).
+    _TRACKED_EXCL = frozenset({"skipped", "expired", "decomposed"})
     for asp in active:
-        goals = asp.get("goals", [])
-        tracked = [g for g in goals if g.get("status") not in ("skipped", "expired", "decomposed")]
-        completed = [g for g in tracked if g.get("status") == "completed"]
-        if not tracked:
+        tracked_n, completed_n = effective_counts(
+            asp, exclude_statuses=_TRACKED_EXCL, include_recurring=True)
+        if not tracked_n:
             continue
-        ratio = len(completed) / len(tracked)
+        ratio = completed_n / tracked_n
         ratios.append(ratio)
         sessions_active = asp.get("sessions_active", 0)
         if ratio < 0.15 and sessions_active > 2:
             stalled_detail.append({
                 "asp_id": asp.get("id"),
                 "title": asp.get("title"),
-                "completion": f"{len(completed)}/{len(tracked)}",
+                "completion": f"{completed_n}/{tracked_n}",
                 "sessions_active": sessions_active,
             })
         if ratio > 0.75:
@@ -438,11 +445,12 @@ def cmd_consolidation(args, config, compact):
 # ─────────────────────────────────────────────────────────────────────────
 
 def _has_recent_reports(asp_id, recent_goals, age_days):
-    """Whether any agents/<agent>/reports/*.md was filed within `age_days`
-    for this aspiration or any of its `recent_goals`. Filename substring
-    match against aspiration id OR goal id. Walks every agent's
-    reports/ dir under PROJECT_ROOT/agents/ (N-agent safe — not hardcoded
-    to alpha/bravo; Phase 2.5.D layout).
+    """Whether any agents/<agent>/temp/*.md or reports/*.md was filed within
+    `age_days` for this aspiration or any of its `recent_goals`. Filename
+    substring match against aspiration id OR goal id. Walks every agent's
+    temp/ and reports/ dirs under PROJECT_ROOT/agents/ (N-agent safe — not
+    hardcoded to alpha/bravo; Phase 2.5.D layout). Briefings moved reports/
+    -> temp/ in the file-model normalization; reports/ is the frozen archive.
 
     Origin: g-115-188. The cycle detector's zero_learning_velocity branch
     flagged actively-shipping aspirations that produced reports/commits but
@@ -466,21 +474,25 @@ def _has_recent_reports(asp_id, recent_goals, age_days):
     for entry in agents_parent.iterdir():
         if not entry.is_dir():
             continue
-        reports_dir = entry / "reports"
-        if not reports_dir.is_dir():
-            continue
-        for rpt in reports_dir.glob("*.md"):
-            try:
-                mtime = datetime.fromtimestamp(rpt.stat().st_mtime)
-            except OSError:
+        # Briefings/reports activity: scan temp/ (new home — file-model
+        # normalization moved briefings reports/ -> temp/) AND reports/
+        # (frozen archive, until the Phase-6 legacy drain empties it).
+        for sub in ("temp", "reports"):
+            scan_dir = entry / sub
+            if not scan_dir.is_dir():
                 continue
-            if mtime < cutoff:
-                continue
-            name_lc = rpt.name.lower()
-            if asp_lc and asp_lc in name_lc:
-                return True
-            if any(gid and gid in name_lc for gid in recent_ids):
-                return True
+            for rpt in scan_dir.glob("*.md"):
+                try:
+                    mtime = datetime.fromtimestamp(rpt.stat().st_mtime)
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    continue
+                name_lc = rpt.name.lower()
+                if asp_lc and asp_lc in name_lc:
+                    return True
+                if any(gid and gid in name_lc for gid in recent_ids):
+                    return True
     return False
 
 
@@ -506,24 +518,31 @@ def cmd_cycles(args, config, compact):
         # designed. Genuine repeated failures of non-primitive work still
         # surface (Apply/Maintain/Investigate skips fall through unchanged).
         #
-        #  (session 64, extending  rationale to synthetic
-        # wire-test goals from /05 infrastructure): goals tagged
-        # 'synthetic' are skip-by-design test stubs that exist only to verify
-        # gate firing patterns. Their skipped status is structural, not
-        # behavioral, so they should not count toward repeated_failure
-        # detection any more than the auto-Unblock false-positives above.
-        # Confirmed via simulation: when /600/602 were the
-        # last-3-resolved, the pre-fix filter let all 3 through and the
-        # detector fired repeated_failure; with the synthetic exclusion the
-        # FP disappears.
+        # 1 (2026-05-27) REMOVED the  synthetic-tag branch
+        # (`or "synthetic" in g.get("tags")`). It was DEAD in production: the
+        # live compact projection (_COMPACT_GOAL_KEEP in
+        # mind_api/src/endpoints/aspirations.py — the daemon duplicate of the
+        # now-orphaned CLI COMPACT_GOAL_KEEP) strips `tags`, so cmd_cycles
+        # always saw g.get("tags") == None here and the branch never matched on
+        # real compact data. The  "confirmed via simulation" used
+        # hand-injected tags that bypassed the projection (false-confidence,
+        # testSymmetry/ class). No production harm resulted from the
+        # dead branch, because repeated_failure is ADVISORY and skip-by-design
+        # FPs self-resolve via lookback-window churn (: "pushed migrated
+        # trio out of lookback window; cycles clean"; rb-1320: "treat the cycle
+        # flag as advisory noise"). Resurrecting the exclusion would require
+        # carrying `tags` through the hot-path compact for every goal
+        # (regenerated each iteration, consumed by 5+ systems) to protect a
+        # near-extinct class (3 historical skipped wire-tests /600/602,
+        # 0 active). Subtraction beats that permanent tax. The Unblock: branch
+        # below STAYS — `title` survives the projection, so it is genuinely live.
+        # Migration skip-by-design FPs () are a separate live concern;
+        # if they recur, address with a dedicated mechanism, not tag-resurrection.
         resolved = [
             g for g in resolved
             if not (
                 g.get("status") == "skipped"
-                and (
-                    (g.get("title") or "").strip().startswith("Unblock:")
-                    or "synthetic" in (g.get("tags") or [])
-                )
+                and (g.get("title") or "").strip().startswith("Unblock:")
             )
         ]
         if len(resolved) < lookback:
@@ -681,6 +700,99 @@ def cmd_user_goals(args, config, compact):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Phase 0.5.x — temp/ accumulation pressure (file-model normalization Phase 5)
+# ─────────────────────────────────────────────────────────────────────────
+
+def cmd_temp_pressure(args, config, compact):
+    """Count undrained working docs in the bound agent's temp/ store and flag
+    accumulation pressure, so temp/ never becomes the new slush directory.
+
+    temp/ is the single staging SSOT for working docs that drain to the
+    knowledge tree (core/config/conventions/temp-store.md). Files accumulate
+    there until /drain-temp encodes each and moves it to temp/drained/. This
+    check counts the UNDRAINED files — files directly under temp/ (NOT the
+    drained/ subdir) — and emits:
+      - temp_pressure_warn  at >= warn_threshold   (visible nudge, no goal)
+      - temp_drain_needed   at >= drain_threshold  (orchestrator files the
+                                                    HIGH /drain-temp goal in
+                                                    `suggested_goal`)
+      - temp_drain_pending  at >= drain_threshold when an open drain goal
+                            already exists (deduped — no second goal filed)
+    Advisory like the sibling checks: this function never files the goal; the
+    aspirations-precheck SKILL acts on `temp_drain_needed` + `suggested_goal`.
+    """
+    tp = config.get("temp_pressure") or {}
+    warn_threshold = tp.get("warn_threshold")
+    drain_threshold = tp.get("drain_goal_threshold")
+    if warn_threshold is None or drain_threshold is None:
+        raise KeyError(
+            "aspirations.yaml missing temp_pressure."
+            "{warn_threshold,drain_goal_threshold}")
+
+    # Undrained working docs = files directly under temp/, excluding drained/.
+    count = 0
+    temp_dir = (AGENT_DIR / "temp") if AGENT_DIR is not None else None
+    if temp_dir is not None and temp_dir.is_dir():
+        for f in temp_dir.iterdir():
+            if f.is_file() and f.suffix in (".md", ".json"):
+                count += 1
+
+    # Dedup: if a drain-temp goal is already open, do NOT re-suggest filing —
+    # else every iteration above threshold would spawn a duplicate HIGH goal.
+    existing = None
+    for asp in _active_aspirations(compact):
+        for g in asp.get("goals", []):
+            if g.get("status") in ("pending", "in-progress"):
+                t = (g.get("title") or "").lower()
+                if "drain" in t and "temp" in t:
+                    existing = g.get("id")
+                    break
+        if existing:
+            break
+
+    flags = []
+    suggested_goal = None
+    if count >= drain_threshold and existing is None:
+        flags.append("temp_drain_needed")
+        suggested_goal = {
+            "title": (f"Maintain: drain {count} accumulated temp/ working docs "
+                      f"to the knowledge tree"),
+            "priority": "HIGH",
+            "participants": ["agent"],
+            "description": (
+                f"agents/<agent>/temp/ holds {count} undrained working docs "
+                f"(>= drain threshold {drain_threshold}). Invoke /drain-temp to "
+                f"encode each into the knowledge tree / reasoning bank / "
+                f"experience and move it to temp/drained/. temp/ is a staging "
+                f"SSOT, not an archive — undrained accumulation is the "
+                f"slush-directory failure mode the file-model normalization "
+                f"exists to prevent."
+            ),
+        }
+    elif count >= drain_threshold and existing is not None:
+        flags.append("temp_drain_pending")
+    elif count >= warn_threshold:
+        flags.append("temp_pressure_warn")
+
+    summary = (
+        f"temp-pressure: {count} undrained doc(s) "
+        f"(warn>={warn_threshold}, drain>={drain_threshold}"
+        + (f"; open drain goal {existing}" if existing else "") + ")"
+        if count else "temp-pressure: clean"
+    )
+    return {
+        "subcommand": "temp-pressure",
+        "summary": summary,
+        "flags": flags,
+        "count": count,
+        "existing_drain_goal": existing,
+        "thresholds": {"warn_threshold": warn_threshold,
+                       "drain_goal_threshold": drain_threshold},
+        "suggested_goal": suggested_goal,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # run-all — aggregate all subcommands into one report
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -692,6 +804,7 @@ SUBCMDS = [
     ("consolidation", cmd_consolidation),
     ("cycles", cmd_cycles),
     ("user-goals", cmd_user_goals),
+    ("temp-pressure", cmd_temp_pressure),
 ]
 
 
@@ -737,6 +850,7 @@ DISPATCH = {
     "consolidation": cmd_consolidation,
     "cycles": cmd_cycles,
     "user-goals": cmd_user_goals,
+    "temp-pressure": cmd_temp_pressure,
 }
 
 

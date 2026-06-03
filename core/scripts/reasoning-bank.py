@@ -427,18 +427,22 @@ def validate_rb_record(rec, *, skip_id_check=False):
     # Assumes normalize_record has already run — status is guaranteed present.
     # If this invariant is violated, KeyError fails loud rather than silently
     # assuming "active" and masking the caller's bug.
-    if rec["type"] not in RB_VALID_TYPES:
-        raise ValueError(f"Invalid type: {rec['type']} (expected: {RB_VALID_TYPES})")
+    # isinstance guard precedes membership: `["x"] not in <set>` raises
+    # TypeError: unhashable type: 'list', escaping the caller's ValueError
+    # handler as a 500 that drops the write (B10). Short-circuit to ValueError.
+    # Kept verbatim-in-sync with mind_api/src/store_registry.py validate_rb_record.
+    if not isinstance(rec["type"], str) or rec["type"] not in RB_VALID_TYPES:
+        raise ValueError(f"Invalid type: {rec['type']!r} (expected one of {RB_VALID_TYPES})")
 
-    if rec["status"] not in RB_VALID_STATUSES:
-        raise ValueError(f"Invalid status: {rec['status']} (expected: {RB_VALID_STATUSES})")
+    if not isinstance(rec["status"], str) or rec["status"] not in RB_VALID_STATUSES:
+        raise ValueError(f"Invalid status: {rec['status']!r} (expected: {RB_VALID_STATUSES})")
 
     util = rec.get("utilization")
     if util is not None:
         validate_utilization(util)
 
     applies = rec.get("applies_to")
-    if applies not in RB_VALID_APPLIES_TO:
+    if not isinstance(applies, str) or applies not in RB_VALID_APPLIES_TO:
         raise ValueError(
             f"Invalid applies_to: {applies!r} (expected one of {RB_VALID_APPLIES_TO})"
         )

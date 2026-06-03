@@ -60,6 +60,27 @@ def _set_default_agent():
 
 _set_default_agent()
 
+# Hermetic storage backend (lodestar-s7 test isolation): tests must NEVER touch
+# real S3. After the own-cloud cutover, .env.local carries
+# MIND_STORAGE_BACKEND=own-cloud, so ANY daemon spawned from this repo —
+# including test-spawned subprocess daemons that run mind_api.src.__main__ and
+# its _load_env_local — would otherwise inherit own-cloud and either hit real S3
+# or 500 in the hermetic test env. Pin local for the whole pytest session
+# (subprocesses inherit os.environ). Own-cloud behavior is covered by the
+# moto-mocked test_owncloud_backend.py, which constructs the backend directly
+# rather than via this env selector, so the pin does not reduce its coverage.
+os.environ["MIND_STORAGE_BACKEND"] = "local"
+
+# Standalone-runner test files (run via `py -3 <file>`, NOT pytest): they use a
+# `@test` decorator — `def test(fn)` — to register cases into a module-level
+# TESTS list. Pytest mis-collects the bare `def test` as a test needing an `fn`
+# fixture and reports a collection ERROR. Exclude them from collection so the
+# suite is green; the standalone runners are still invoked directly. (6)
+collect_ignore = [
+    "test_history_cli_stage2.py",
+    "test_history_prune_legacy_stage3.py",
+]
+
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE
 # _paths is first imported caches AGENT_DIR=None for the whole session.
@@ -83,6 +104,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _UNSET = object()
 _BOOTSTRAP_MIND_AGENT = os.environ.get("MIND_AGENT", _UNSET)
 _BOOTSTRAP_MIND_WORLD = os.environ.get("MIND_WORLD", _UNSET)
+_BOOTSTRAP_MIND_BACKEND = os.environ.get("MIND_STORAGE_BACKEND", _UNSET)
 
 
 @pytest.fixture(autouse=True)
@@ -109,4 +131,10 @@ def _restore_env_per_test():
         os.environ.pop("MIND_WORLD", None)
     else:
         os.environ["MIND_WORLD"] = _BOOTSTRAP_MIND_WORLD
+    # Keep the storage backend pinned local across tests that may mutate it
+    # (lodestar-s7 test isolation — see the module-level set above).
+    if _BOOTSTRAP_MIND_BACKEND is _UNSET:
+        os.environ.pop("MIND_STORAGE_BACKEND", None)
+    else:
+        os.environ["MIND_STORAGE_BACKEND"] = _BOOTSTRAP_MIND_BACKEND
     yield

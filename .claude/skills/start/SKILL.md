@@ -223,6 +223,52 @@ The `MIND_AGENT=<agent-name>` env prefix ensures we read `agents/<agent-name>/se
 not another agent's state. If no `<agent-name>` was provided (bare `/start` or `/start --mode`),
 omit the prefix — use the current session binding.
 
+**Step 1.5: UNINITIALIZED Drift-Warning Probe** — Defensive check for the
+inlined-helper drift class. When Step 1 returns `UNINITIALIZED`, the agent
+dir might genuinely not exist OR `session-state-get.sh` might have a stale
+inlined `_APD` (AGENTS_PARENT_DIR) constant relative to `core/scripts/_paths.sh`
+(rb-1092 — five sites inline that constant for latency, see CLAUDE.md
+"Agent-dir Resolution"). The latter case would re-initialize a fully working
+agent, clobbering aspirations, journal, handoff, and session history. This
+probe distinguishes the two before the Phase A re-init begins.
+
+```bash
+IF state == "UNINITIALIZED":
+    Bash: test -f "agents/<agent-name>/session/agent-state" && cat "agents/<agent-name>/session/agent-state"
+    IF the file exists AND contents trim to "IDLE" or "RUNNING":
+        Print the diagnostic below and STOP. Do NOT proceed to the
+        UNINITIALIZED branch — that would re-initialize a fully working
+        agent and lose all per-agent state.
+
+        ⚠ /start drift-warning: state-get returned UNINITIALIZED but
+        agents/<agent-name>/session/agent-state on disk is <X>.
+
+        Suspected inlined-helper drift on AGENTS_PARENT_DIR (_APD).
+        Five files inline that constant for latency (see CLAUDE.md
+        "Agent-dir Resolution"):
+          core/scripts/session-state-get.sh
+          core/scripts/session-mode-get.sh
+          core/scripts/session-signal-exists.sh
+          core/scripts/cleanup-stale-bindings.sh   (also inlines _SDN)
+          core/scripts/_wake_signals.py            (uses _AGENTS_PARENT_DIR)
+
+        Investigate:
+          git diff --stat -- core/scripts/session-state-get.sh core/scripts/_paths.sh
+          git show HEAD:core/scripts/session-state-get.sh | grep _APD
+
+        Reconcile working tree to HEAD before retrying /start.
+
+        DONE.
+    ELSE (file missing, empty, or other content):
+        Fall through to the UNINITIALIZED branch — genuine first-run or
+        wiped state.
+```
+
+This is the Layer-A tactical defense (loud diagnostic at /start entry).
+The companion Layer-B is `/verify-learning`'s inlined-_APD audit, which
+grep-checks the 5 sites against `_paths.sh` on a routine cadence so drift
+is caught even when no /start re-entry surfaces it.
+
 ## Behavior by Current State
 
 ### RUNNING (agent-state contains "RUNNING")
@@ -425,6 +471,15 @@ agent-state, agent-mode, persona-active, or running-session-id.
    - `session-mode-set.sh` (would overwrite autonomous mode)
    - `session-state-set.sh` (state stays RUNNING for the runner)
    - `session-persona-set.sh` (would interfere with runner)
+   - `owncloud-pull.sh` (the IDLE branch's Step 2.6 continuity pull is
+     INTENTIONALLY omitted here): an observer coexists with a live autonomous
+     runner that is actively writing continuity files (handoff.yaml,
+     working-memory.yaml, ...). A pull would download S3 over those files and
+     race the runner's in-flight writes — the same reason observers skip every
+     other state write. The observer reads whatever local state exists. If an
+     observer on a freshly-moved machine sees stale data, the correct path is
+     `/stop` (which routes through IDLE and runs Step 2.6) — or, for a crashed
+     runner, the zombie auto-recovery flips to IDLE and Step 2.6 fires there.
 
 3. **Mode-specific setup:**
 
@@ -474,6 +529,18 @@ agent-state, agent-mode, persona-active, or running-session-id.
 
 2. Set mode: Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-mode-set.sh <target-mode>`
 
+   **HALT ON NON-ZERO EXIT (g-115-1032, 2026-05-21)** — if `session-mode-set.sh`
+   exits non-zero, STOP. Do NOT proceed to step 2.5 / mode-specific branches.
+   Mode signal write failed; disk default (absence of `agent-mode`) is reader
+   per CLAUDE.md "Mode System". Without this halt, an assistant-mode `/start`
+   that silently failed the mode-set would land the agent in reader mode (the
+   disk default), and the mode-specific branch below would emit a misleading
+   "Assistant mode active" output while the agent's persona/loop/write
+   capabilities silently mismatch the user's stated intent. Display:
+   > Cannot transition agent `<agent-name>` to mode `<target-mode>`
+   > (session-mode-set.sh exited non-zero). Investigate stderr above and
+   > retry `/start <agent-name> --mode <target-mode>`.
+
    The explicit `MIND_AGENT=` prefix is belt-and-suspenders: it bypasses the
    PreToolUse[Bash] hook's auto-inject path, so even if the hook is still
    cold-starting Python and times out, the script still receives the env var.
@@ -492,6 +559,32 @@ agent-state, agent-mode, persona-active, or running-session-id.
    do this clear in the autonomous sub-path below — it's already done HERE.
    Do NOT add this clear to the RUNNING observer branch above — observers MUST
    NOT touch signal files (that's the observer contract).
+
+2.6. Pull continuity files from S3 (own-cloud machine-move resume — runs for ALL modes):
+   Bash: `MIND_AGENT=<agent-name> bash core/scripts/owncloud-pull.sh --agent "<agent-name>" || echo "[owncloud-pull] WARN: continuity pull returned non-zero — resuming from local state (may be stale on a just-moved machine; the periodic sweep reconciles next tick)"`
+
+   The read-side complement of /stop's D6.7 flush (session-continuity redesign,
+   2026-06-02). Under the own-cloud backend this materializes the agent's
+   continuity-tier session files (handoff.yaml, working-memory.yaml,
+   execution-diary.jsonl, reasoning-snapshot.yaml, pending-questions.yaml, ...)
+   from S3 to local NOW — BEFORE Step 3's `/prime` (reader/assistant) or `/boot`
+   (autonomous) does its raw Read of those files. Without it, an agent moved to a
+   new machine would resume from a STALE or absent local copy and lose everything
+   the previous machine learned. The endpoint (owncloud_sync.pull_continuity) is
+   freshness-aware: it NEVER clobbers a local file carrying unpushed local writes
+   (the same-machine crash-restart case) — the manifest baseline gates every
+   overwrite. Under the local backend it is a clean no-op.
+
+   Placement rationale: runs for ALL modes after the binding (Step 0) and
+   mode-set (Step 2) but while state is still IDLE — so it is OUTSIDE the
+   autonomous "nothing stoppable between RUNNING and /boot" critical section
+   (it precedes the RUNNING flip at the autonomous sub-path below), and it runs
+   BEFORE the autonomous `wm-set session_start` so this session's stamp lands on
+   the freshly-pulled working-memory rather than being clobbered by the pull.
+   Non-blocking (`|| echo WARN`): a pull error must never block /start — local
+   state is the fallback and the daemon's periodic sweep reconciles. The daemon
+   need not be up yet (the wrapper auto-spawns it); Step 3's `mind-api-start.sh`
+   is then a no-op.
 
 3. Based on target mode:
 
@@ -1177,6 +1270,19 @@ C3. If user provided an identity (not "skip"), write `agents/<agent>/self.md`:
 
 C4. Set mode and state:
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-mode-set.sh reader`
+
+     **HALT ON NON-ZERO EXIT (g-115-1032, 2026-05-21)** — if
+     `session-mode-set.sh` exits non-zero, STOP. Do NOT proceed to the
+     session-state-set.sh write below. Mode-set failure means the on-disk
+     mode signal was NOT written; agent will fall back to the reader disk
+     default per CLAUDE.md "Mode System" — that happens to match the
+     intended `reader` here, but the asymmetric assistant/autonomous C8/C9.9
+     siblings would silently land in reader. Halt for the contract
+     uniformity; the session-state-set.sh below would also be misleading
+     if mode-set silently failed. Display:
+     > Cannot initialize agent `<agent-name>` in reader mode
+     > (session-mode-set.sh exited non-zero). Investigate stderr above and
+     > retry `/start <agent-name> --mode reader`.
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
 
      **HALT ON NON-ZERO EXIT (G2, 2026-05-20)** — if `session-state-set.sh`
@@ -1260,6 +1366,19 @@ and Self is never derived from The Program (C1.9 rules 2-3).
 
 C8. Set mode and state:
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-mode-set.sh assistant`
+
+      **HALT ON NON-ZERO EXIT (g-115-1032, 2026-05-21)** — if
+      `session-mode-set.sh` exits non-zero, STOP. Do NOT proceed to the
+      session-state-set.sh write below. Mode-set failure means the on-disk
+      mode signal was NOT written; agent will fall back to the reader disk
+      default per CLAUDE.md "Mode System" — so the user who asked for
+      assistant mode would silently land in reader (no writes, no
+      directives), while the C10 success message would falsely confirm
+      assistant mode. This is the canonical silent capability mismatch the
+      goal calls out. Display:
+      > Cannot initialize agent `<agent-name>` in assistant mode
+      > (session-mode-set.sh exited non-zero). Investigate stderr above and
+      > retry `/start <agent-name> --mode assistant`.
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
 
       **HALT ON NON-ZERO EXIT (G2, 2026-05-20)** — if `session-state-set.sh`
@@ -1528,6 +1647,21 @@ C8. Set MODE + explicit IDLE state — agent-state RUNNING flip is deferred to C
       suspenders rationale. Setting mode=autonomous now makes the C8.5 prime
       run as an autonomous counter-bump retrieve, the intended bootstrap-prime
       behavior.)
+
+      **HALT ON NON-ZERO EXIT (g-115-1032, 2026-05-21)** — if
+      `session-mode-set.sh` exits non-zero, STOP. Do NOT proceed to the
+      session-state-set.sh write below or to C8.5 /prime / C9 aspiration
+      creation / C9.9 RUNNING flip. Mode-set failure means the on-disk
+      mode signal was NOT written; agent will fall back to the reader disk
+      default per CLAUDE.md "Mode System" — and a subsequent autonomous
+      loop entry (C9.9) against a reader-default agent would mis-route
+      /prime's retrieve, fire `/create-aspiration` against an
+      uninitialized-mode agent, and the autonomous bootstrap would lie
+      about being autonomous while reader-mode capabilities applied.
+      Display:
+      > Cannot transition agent `<agent-name>` to mode `autonomous` at C9
+      > (session-mode-set.sh exited non-zero). Investigate stderr above and
+      > retry `/start <agent-name>` (autonomous is the default mode).
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
       (Fresh-install fix, 2026-05-20: on UNINITIALIZED→autonomous, agent-state
       never existed before — the "state stays IDLE" comment above is only

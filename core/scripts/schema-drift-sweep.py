@@ -42,6 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _paths  # noqa: E402
 from _long_path import open_long_path  # noqa: E402  —  / rb-450
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 try:
     import yaml
@@ -371,7 +372,7 @@ def create_fix_goals(all_results: list, aspiration_id: str = "asp-115") -> int:
         }
         try:
             proc = subprocess.run(
-                ["bash", rel_script, "--source", "world", aspiration_id],
+                bash_cmd(rel_script, "--source", "world", aspiration_id),
                 input=json.dumps(goal),
                 text=True, capture_output=True, timeout=30,
                 cwd=str(_paths.PROJECT_ROOT),

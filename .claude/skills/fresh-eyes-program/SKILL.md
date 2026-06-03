@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-program
-description: "Periodic local self-audit of world/program.md (cadence: every 100 goals). Assembles a briefing (The Program body, both agents' Self summaries, cross-agent aspiration portfolio, recent completions, drift signals), writes it to agents/<agent>/reports/, and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Sibling to /fresh-eyes-review (per-agent Self, 25 goals). Closes the 'program.md has no systematic evolution path' gap."
+description: "Periodic local self-audit of world/program.md (cadence: every 100 goals). Assembles a briefing (The Program body, both agents' Self summaries, cross-agent aspiration portfolio, recent completions, drift signals), writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Sibling to /fresh-eyes-review (per-agent Self, 25 goals). Closes the 'program.md has no systematic evolution path' gap."
 user-invocable: true
 triggers:
   - "/fresh-eyes-program"
@@ -30,7 +30,7 @@ shared-purpose briefing examining two questions:
 1. **Is The Program still the right shared purpose for this world?**
 2. **Do both agents' Selfs still serve The Program, or are they drifting?**
 
-The ritual runs autonomously, writes the briefing to `agents/<agent>/reports/`,
+The ritual runs autonomously, writes the briefing to `agents/<agent>/temp/`,
 and posts a one-line summary to the coordination board. No email push, no
 user-approval gate. The user reviews changes via git log and tracked signals
 at their own pace.
@@ -121,6 +121,30 @@ Read agents/<agent>/session/pending-questions.yaml
     program cadence is 4x longer)
 ALSO read <partner_agent>/session/pending-questions.yaml if accessible
 
+# 2.6b Drift signals on the findings board (g-115-1258 — sibling of g-115-1214)
+# pending-questions.yaml (2.6) is not the only drift surface. A program- or
+# self-drift finding posted to world/board/findings — by either agent's
+# strategic-scan, fresh-eyes-followup, or cross-agent review — is ALSO a drift
+# signal 2.6 never reads. Same omission rb-1279 caught for fresh-eyes-review
+# (self_evolution_signals_count=0 while a self-drift finding sat unread);
+# fresh-eyes-review closed it in Phase 2.3b — this is the program-scope sibling.
+Bash: board-read.sh --channel findings --since 60d --json
+  → filter to findings WHERE tags intersect
+    {'program_drift', 'program-drift', 'self_evolution', 'self-drift'}
+  → call these board_signals
+  → SCOPE (diverges deliberately from guard-493 AND fresh-eyes-review 2.3b):
+    do NOT add --author $MIND_AGENT and do NOT restrict to "directed at this
+    agent". guard-493 mandates per-agent scoping ONLY for board-reads feeding a
+    PER-AGENT gate (commit-block, blocker filter) where a partner finding would
+    false-block THIS agent. Phase 5.5 here is a PROGRAM-level gate
+    (self-assess-and-decide --review-type fresh-eyes-program weighs
+    partner_alignment_score) — cross-agent drift findings are SIGNAL, not noise.
+    Capture findings naming EITHER agent OR the shared purpose. A future
+    "add --author" edit would blind the program review to partner drift.
+  → window matches 2.6 (60d; program cadence is 4x the per-agent cadence)
+  → surface board_signals to Phase 3 "Observations from recent team work"
+    (program-side) and "Alignment observations" (self-drift side)
+
 # 2.7 Goal-count context — how much work backs this review
 Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program --verbose
   → capture current goals-completed count, last-fire count, diff
@@ -193,16 +217,18 @@ All observations must follow `.claude/rules/communication-clarity.md` rule 6:
 state what the evidence shows, do not hedge. If evidence is ambiguous, say
 "the evidence shows X but does not show Y."
 
-## Phase 4: Archive Copy
+## Phase 4: Stage Briefing to temp/
 
 Write the briefing body to
-`agents/<agent>/reports/fresh-eyes-program-{YYYY-MM-DDTHH-MM-SS}.md` for historical
-reference. Timestamp includes HH-MM-SS so multiple same-day invocations
-(cadence fire + user-forced review) do not collide.
+`agents/<agent>/temp/fresh-eyes-program-{YYYY-MM-DDTHH-MM-SS}.md` as a staging
+artifact — its durable findings are encoded to the knowledge tree by Phase 5.6,
+and the file itself is drained by `/drain-temp` (see
+`core/config/conventions/temp-store.md`). Timestamp includes HH-MM-SS so multiple
+same-day invocations (cadence fire + user-forced review) do not collide.
 
 ```
-Bash: mkdir -p agents/<agent>/reports
-Write the briefing body (from Phase 3) to agents/<agent>/reports/fresh-eyes-program-{today-isotime}.md
+Bash: mkdir -p agents/<agent>/temp
+Write the briefing body (from Phase 3) to agents/<agent>/temp/fresh-eyes-program-{today-isotime}.md
   (where {today-isotime} = `date +%Y-%m-%dT%H-%M-%S` — colons replaced with
    hyphens for Windows filesystem compatibility)
 ```
@@ -232,7 +258,7 @@ and recent goal portfolios:
 SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree cross-agent portfolio has drifted from Program emphasis since last review},
   "completion_health":              {0..1 — average completion ratio across active aspirations (both agents)},
-  "self_evolution_signals_count":   {int — Program-related drift indicators across both agents (sq-012 hits citing purpose, etc.)},
+  "self_evolution_signals_count":   {int — Program-related drift indicators across both agents = sq-012/self_evolution pending-questions hits citing purpose (2.6) + len(board_signals) from the findings board (2.6b). A program/self-drift finding on the board counts even when pending-questions is empty (rb-1279 — the count silently 0 on 2026-05-24)},
   "self_last_updated_days":         {int — days since world/program.md last_updated},
   "partner_alignment_score":        {0..1 — cross-agent agreement on Program emphasis; LOW = misalignment},
   "explicit_user_directive":        {true|false — outstanding /respond about The Program or shared purpose},
@@ -266,6 +292,47 @@ Branch on decision:
 ALWAYS log the decision to `agents/<agent>/journal` (one-line tagged
 `fresh-eyes-program-decision`) and post to the `reasoning` board summarizing
 decision + rationale. The audit trail is the guardrail's evidence path.
+
+## Phase 5.6: Encode Non-Routed Observations
+
+Phase 5.5 routes at most ONE finding to a durable home (a Program edit via
+`act_now`, or an Idea goal via `act_later`). Every OTHER observation in the
+Phase 3 briefing — program-vs-portfolio alignment ratios, team-model coverage
+evidence, cross-agent drift patterns, Self-vs-Program divergence signals —
+otherwise lands ONLY in the transient `temp/` staging file, which is invisible
+to `/prime` and `retrieve.sh` and is drained away over time. This step encodes
+the observations that have no other durable home, so the briefing's knowledge
+survives after the staging file is drained. Modeled on `/felt-sense-checkin` Phase 1.
+
+**No-double-encode**: skip the single observation Phase 5.5 already routed
+(the `act_now` Program-edit target, or the `act_later` goal's
+`recommended_action`). The journal/board decision entries carry the decision
+label, not the observations — they are not duplicates. Per-agent Self
+refinements stay out of scope here (they route through sq-012 / guard-380,
+per Phase 3) — do NOT encode Self-change proposals.
+
+For each REMAINING briefing observation, classify per
+`core/config/conventions/learning-routing.md` and route to ONE store. When in
+doubt, drop — the asymmetry favors dropping:
+
+- **tree** — a compressed durable fact (program-alignment ratio, team-model
+  coverage metric, cross-agent work dynamic). **Novelty gate (mandatory):**
+  before adding, check whether a node already covers this observation
+  (`tree-read.sh --node {candidate-key}`, or a `retrieve.sh` lookup). If one
+  exists and this is only a refreshed measurement, `/tree edit` it (update
+  body + `last_updated` + `last_update_trigger: fresh-eyes-program`) instead
+  of adding a duplicate. Use `/tree add {parent} {key} {summary}` ONLY for a
+  genuinely novel finding.
+- **reasoning_bank** — a recurring drift / alignment diagnostic.
+  `reasoning-bank-add.sh` with summary + ABC chain + `applies_to`
+  (`framework` for multi-agent / program-alignment patterns, else `any`).
+- **guardrails** — a prescriptive rule with a trigger condition.
+  `guardrails-add.sh` with rule + trigger_condition.
+- **drop** — already captured, too thin, or a one-cycle anomaly.
+
+The encoding writes are self-evidencing; no separate log line is required. Do
+NOT add a terminal action here — Phase 8's board-post remains the skill's
+final tool call.
 
 ## Phase 8: Record the Tick
 
@@ -311,15 +378,21 @@ the skill does NOT end with text output.
   Phase 0.5e.5 (`/fresh-eyes-program --cadence`)
 - **Calls**: `fresh-eyes-cadence-check.sh --config-block fresh_eyes_program`,
   `load-aspirations-compact.sh`,
-  `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`, `world-cat.sh`,
+  `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`, `board-read.sh`, `world-cat.sh`,
   `self-assess-and-decide.sh`, `fresh-eyes-record-tick.sh
-  last_fresh_eyes_program_review`, `board-post.sh`, `journal-add.sh`
+  last_fresh_eyes_program_review`, `board-post.sh`, `journal-add.sh`,
+  `/tree add`, `/tree edit`, `tree-read.sh`, `reasoning-bank-add.sh`,
+  `guardrails-add.sh` (Phase 5.6 encoding)
 - **Reads**: `world/program.md`, `agents/<agent>/self.md`, `<partner>/self.md`
   (for each partner agent in team-state), `agents/<agent>/session/pending-questions.yaml`,
+  `world/board/findings` (drift signals, Phase 2.6b),
   world aspirations compact, `agents/<agent>/session/working-memory.yaml`
-- **Modifies**: `agents/<agent>/reports/fresh-eyes-program-*.md` (new),
+- **Modifies**: `agents/<agent>/temp/fresh-eyes-program-*.md` (new staging file),
   `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_program_review slot),
-  `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort)
+  `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort),
+  `world/knowledge/tree/` (Phase 5.6 new/edited nodes),
+  `world/reasoning-bank.jsonl` (Phase 5.6 appends),
+  `world/guardrails.jsonl` (Phase 5.6 appends)
 - **Does NOT modify**: `world/program.md` (unless Phase 5.5 returns act_now),
   `agents/<agent>/self.md`, `<partner>/self.md`, aspiration priorities,
   pending-questions. No email is sent.

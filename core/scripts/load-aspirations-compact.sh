@@ -9,8 +9,29 @@ WORLD_JSONL="$WORLD_DIR/aspirations.jsonl"
 
 # Cache lives in agent session dir (per-agent)
 if [ -z "$AGENT_DIR" ]; then
-    echo "[load-aspirations-compact] no agent bound, skipping" >&2
-    exit 0
+    # Fallback (, zeta-1094): hook may have injected MIND_SID but
+    # failed to resolve MIND_AGENT (transient resolver miss). Without this
+    # fallback the script exits 0 + empty stdout AND the caller
+    # ('IF path returned: Read it' pattern) blindly proceeds with no compact.
+    # Use python3 directly on _resolve_agent_from_sid.py rather than the
+    # session-binding-read.sh wrapper: _platform.sh sets MSYS_NO_PATHCONV=1
+    # which breaks nested bash invocations of Windows-form paths from a
+    # subshell, but Python's argv parsing is unaffected.
+    if [ -n "${MIND_SID:-}" ]; then
+        AGENT_NAME="$(python3 "$CORE_ROOT/scripts/_resolve_agent_from_sid.py" "$MIND_SID" 2>/dev/null || true)"
+        if [ -n "$AGENT_NAME" ]; then
+            AGENT_DIR="$(agent_dir "$AGENT_NAME")"
+            # Export so child invocations (aspirations-read.sh daemon roundtrips
+            # via X-Mind-Agent header) see the resolved agent. Without this,
+            # the fallback resolves AGENT_DIR locally but the daemon call
+            # rejects with {"error":"agent_unset"} and the regen path fails.
+            export MIND_AGENT="$AGENT_NAME"
+        fi
+    fi
+    if [ -z "$AGENT_DIR" ]; then
+        echo "[load-aspirations-compact] no agent bound (MIND_AGENT empty, MIND_SID=${MIND_SID:-unset} also unresolved), skipping" >&2
+        exit 0
+    fi
 fi
 COMPACT="$AGENT_DIR/session/aspirations-compact.json"
 COMPACT_SUMMARY="$AGENT_DIR/session/aspirations-compact-summary.json"

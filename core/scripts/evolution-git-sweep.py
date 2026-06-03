@@ -580,7 +580,7 @@ def main():
         args.dry_run = True
         print("[default: dry-run]  Use --apply to write entries.")
 
-    if not WORLD_DIR:
+    if WORLD_DIR is None:
         print("ERROR: WORLD_DIR not resolvable. Run with MIND_AGENT set + valid local-paths.conf.", file=sys.stderr)
         return 2
 

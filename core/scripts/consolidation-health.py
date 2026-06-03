@@ -112,64 +112,15 @@ def _completion_ratio(asp: dict) -> float:
 def _tolerant_decode(source: str, raw: str) -> list:
     """-tolerant decode for the daemon's aspirations_read body.
 
-    Background: g-115-766 documented an intermittent failure mode where the
-    daemon's aggregate JSON response can arrive as VALID JSON prefix +
-    trailing garbage (stale-code window during reload). The previous
-    `json.loads(raw or "[]")` path treated such bodies as wholly invalid
-    and silently collapsed `active_count` to 0 — which the three downstream
-    consumers (aspirations-evolve gap gate, aspirations-select near-complete
-    bias, create-aspiration consolidation-gate) read as "portfolio is
-    empty," firing wrong-direction decisions.
+    Thin wrapper around `_rt.tolerant_decode_list` (extracted to _rt.py via
+    g-115-949). The shared primitive enforces the full contract: empty -> [],
+    raw_decode recovery, guard-383 fatal on JSONDecodeError or non-list
+    aggregate. This function exists only to prepend the script-name prefix
+    to the stderr diagnostic so existing log consumers don't need updates.
 
-    guard-383 (N>=2-source aggregator): `compute_snapshot` merges
-    `_load_active("world") + _load_active("agent")` into the single
-    `consolidation_health` WM slot the three gates treat as COMPLETE. A
-    per-source error that returns [] would write a complete-looking LIE
-    (e.g. agent-only count presented as the whole portfolio). guard-383
-    therefore mandates: a source ERROR is FATAL (sys.exit(1)) — the single
-    fail-open boundary is the caller's shell wrapper `|| echo WARN`
-    (documented in the module docstring, rb-347), never inside the
-    aggregator. A genuinely-empty source is NOT an error.
-
-    Contract (g-115-775 trace + guard-383 / rb-774 pre-apply consultation):
-      - Empty body: return []. A genuinely empty queue is a valid state,
-        NOT a source error; guard-383 does not apply. Distinct path so a
-        real corruption never masquerades as an empty portfolio.
-      - JSON-prefix (+ optional trailing garbage): parse via
-        json.JSONDecoder().raw_decode (stops at the first valid JSON
-        value) and return it. A recoverable body is NOT a source error —
-        this is the g-115-766 recovery branch, guard-383-neutral.
-      - Unrecoverable body (raw_decode raises): source error → emit ONE
-        stderr diagnostic (body prefix truncated to 120, newlines escaped)
-        then sys.exit(1). Do NOT return [] (guard-383 action_hint #1).
-      - Non-list aggregate (valid JSON but not a list — e.g. a daemon
-        error-envelope `{...}` recovered from a g-115-766 object-prefix):
-        ALSO a source error → stderr diagnostic + sys.exit(1). Returning
-        [] here was the residual silent-loss fresh-eyes flagged
-        (msg-20260516-070416-alpha-1156); guard-383 makes it fatal, which
-        resolves that finding correctly (loud > silent-[]).
+    See _rt.tolerant_decode_list for the full guard-383 / g-115-766 contract.
     """
-    stripped = (raw or "").lstrip()
-    if not stripped:
-        return []  # genuinely empty queue — valid state, not a source error
-    try:
-        obj, _consumed = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError as exc:
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"consolidation-health: {source} JSONDecodeError ({exc}); body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: source error is fatal; fail-open is the wrapper
-    if not isinstance(obj, list):
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"consolidation-health: {source} non-list aggregate (type={type(obj).__name__}); "
-            f"body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: a non-list source body is corrupt, not empty
-    return obj
+    return _rt.tolerant_decode_list(f"consolidation-health: {source}", raw)
 
 
 def _load_active(source: str) -> list:

@@ -29,6 +29,17 @@ CREATE_BLOCKER(failure_skill, failure_reason, goal, aspiration_id, diagnostic_co
        Update diagnostic_context with new info
        (unblocking goal already exists — no new goal)
      ELSE:
+       2.1. RETRIEVAL CHECK (G20 — retrieve-before-deciding.md decision boundary):
+            Filing a blocker is a consequential decision. Retrieve prior knowledge
+            before committing to it.
+            Bash: bash core/scripts/retrieve.sh \
+                    --category "<failure_reason one-line summary>" --depth shallow
+            Scan returned reasoning_bank, guardrails, and tree_nodes for:
+              (a) a known workaround for this failure mode, or
+              (b) a prior blocker with the same root cause that was resolved.
+            IF a viable workaround surfaces: attempt it inline instead of filing.
+            Only proceed to Step 2.5 if no workaround resolves the failure.
+
        2.5. CAPABILITY SCAN (mandatory — see .claude/rules/capability-before-user.md):
             a. Check .claude/skills/ for skill matching failure_skill
             b. Check world/forged-skills.yaml for matching triggers

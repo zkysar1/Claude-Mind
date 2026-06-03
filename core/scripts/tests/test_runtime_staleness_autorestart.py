@@ -26,7 +26,7 @@ Git-Bash explicitly (default `bash` is WSL on this machine), run with
 PROJECT_ROOT pre-exported so _runtime.sh's idempotency guard skips the
 _paths.sh agent-binding dependency (pure-function test).
 
-8 cases:
+12 cases:
   1. change2-routing-404-escalates       — "no route for " body, 404 -> rc 3
   2. change2-plain-404-unchanged         — other 404 body            -> rc 2
   3. change2-2xx-unchanged               — 200 body                  -> rc 0
@@ -37,6 +37,19 @@ _paths.sh agent-binding dependency (pure-function test).
   7. change1-sentinel-armed-on-mismatch  — rt_check_staleness sets PENDING
                                             AND WARNED (outcome 5 preserved)
   8. change1-no-sentinel-when-sha-equal  — SHA equal -> no PENDING, no WARNED
+  9. change1d-rc3-check-before-ensure    — rc==3 path: check_staleness runs
+                                            BEFORE ensure_running (sq-018 glue)
+ 10. g115787-success-consumes-sentinel   — rc!=3 + PENDING -> rt_ensure_running
+                                            consumes + retry once, rc 0 (the fix)
+ 11. g115787-fresh-success-skips-ensure  — rc!=3 + no sentinel -> NO ensure
+                                            (hot path stays cheap)
+ 12. g115787-no-autospawn-suppresses     — rc!=3 + PENDING + RT_NO_AUTOSPAWN=1
+                                            -> NO recycle (health/test paths)
+
+g-115-787 (cases 9-11): rt_call's SUCCESS path (rc != 3) previously armed the
+staleness sentinel but never consumed it — only the rc==3 path called
+rt_ensure_running. A stale-but-responsive daemon thus never auto-healed. The
+fix makes the success path symmetric (consume in-shell + retry once).
 """
 from __future__ import annotations
 
@@ -162,6 +175,12 @@ def test_change2_2xx_unchanged():
 # the rt_spawn invocation entirely, so the stubbed kill never fires.
 _RESTART_RECORDERS = (
     'rt_is_up() { return 0; }\n'              # daemon IS up (stale, not down)
+    # B2 (2026-06-01): the stale-restart path now double-checks rt_daemon_is_fresh
+    # after acquiring the spawn lock (skip a redundant restart when another
+    # wrapper already refreshed the daemon). Stub it "not fresh" here so the
+    # restart-fires cases exercise a GENUINELY-stale daemon — and so the check
+    # never falls through to the real primitives / a live daemon (hermetic).
+    'rt_daemon_is_fresh() { return 1; }\n'
     'rt_daemon_kill() { echo "KILL_CALLED"; }\n'
     'rt_spawn() { rt_daemon_kill; echo "SPAWN_CALLED"; }\n'
     'rt_wait_for_ready() { return 0; }\n'
@@ -216,6 +235,33 @@ def test_change1_no_autospawn_suppresses_restart():
     assert "KILL_CALLED" not in r.stdout, (
         f"RT_NO_AUTOSPAWN must suppress restart:\n{r.stdout}\n{r.stderr}"
     )
+
+
+def test_b2_double_check_skips_redundant_restart_when_fresh():
+    """B2 (Lodestar): PENDING set, but by the time we hold the spawn lock the
+    daemon is already FRESH (another wrapper restarted it while we waited).
+    rt_ensure_running's double-check (rt_daemon_is_fresh) must SKIP the
+    redundant restart — no kill, no spawn, rc 0 — while still consuming the
+    one-shot sentinel (RESTARTED=1, PENDING cleared). Prevents the churn
+    amplifier where N wrappers each detect the same staleness and serially
+    kill+respawn a healthy daemon (each restart an orphan window)."""
+    r = _run(
+        _RESTART_RECORDERS
+        + 'rt_daemon_is_fresh() { return 0; }\n'   # already fresh -> skip restart
+        + "export RT_STALENESS_RESTART_PENDING=1\n"
+        + "unset RT_STALENESS_RESTARTED 2>/dev/null || true\n"
+        + "rc=0; rt_ensure_running || rc=$?\n"
+        + 'echo "RC=$rc"\n'
+        + 'echo "RESTARTED=${RT_STALENESS_RESTARTED:-unset}"\n'
+        + 'echo "PENDING=${RT_STALENESS_RESTART_PENDING:-unset}"\n'
+    )
+    assert "KILL_CALLED" not in r.stdout, (
+        f"B2 violated — redundant restart fired despite a fresh daemon:\n{r.stdout}\n{r.stderr}"
+    )
+    assert "SPAWN_CALLED" not in r.stdout, f"B2 — spawn fired despite fresh:\n{r.stdout}"
+    assert "RC=0" in r.stdout, f"expected rc=0 (fresh, skipped):\n{r.stdout}"
+    assert "RESTARTED=1" in r.stdout, f"one-shot sentinel not consumed:\n{r.stdout}"
+    assert "PENDING=unset" in r.stdout, f"PENDING not cleared:\n{r.stdout}"
 
 
 # ──────────────── Change 1 (rt_check_staleness arms sentinel) ─────────────
@@ -298,6 +344,84 @@ def test_change1d_rc3_calls_check_staleness_before_ensure_running():
     )
     # rt_ensure_running stub returned 1 -> rt_call falls through to return 3.
     assert "RC=3" in out, f"expected terminal rc=3:\n{out}"
+
+
+# ────────────  (rt_call SUCCESS path consumes the sentinel) ───────
+# Sibling to Change 1d (rc==3 path) above. The SUCCESS path (rc != 3) armed
+# RT_STALENESS_RESTART_PENDING via rt_check_staleness but returned WITHOUT
+# calling rt_ensure_running (the sole consumer). Because `export` scopes the
+# sentinel to the current shell, it died when the wrapper subprocess exited
+# and the next wrapper (a fresh process) never saw it — a stale-but-RESPONSIVE
+# daemon (rc 0/2, never rc 3) never auto-healed (the  JSONDecodeError
+# class). The fix makes the success path symmetric with rc==3: consume the
+# sentinel in-shell + retry once, gated on rt_ensure_running's own conditions
+# (PENDING set, not yet RESTARTED, autospawn allowed).
+
+def test_g115787_success_path_consumes_sentinel_and_retries():
+    """rt_call SUCCESS path: when rt_check_staleness arms the sentinel on a
+    stale-but-RESPONSIVE daemon, rt_call MUST consume it via rt_ensure_running
+    and retry once (g-115-787). Previously armed-but-never-consumed."""
+    r = _run(
+        _curl_stub('{"ok":true}', "200")                       # rt_curl -> rc 0
+        + 'rt_base_url() { echo "http://127.0.0.1:9999"; }\n'
+        # Simulate stale-but-responsive: the staleness check arms the sentinel.
+        + 'rt_check_staleness() { export RT_STALENESS_RESTART_PENDING=1; echo "ORDER:CHECK_STALENESS"; }\n'
+        + 'rt_ensure_running() { echo "ORDER:ENSURE_RUNNING"; unset RT_STALENESS_RESTART_PENDING; return 0; }\n'
+        + "unset RT_STALENESS_RESTARTED 2>/dev/null || true\n"
+        + "rc=0; rt_call GET /v1/x 2>/dev/null || rc=$?\n"
+        + 'echo "RC=$rc"\n'
+    )
+    out = r.stdout
+    i_check = out.find("ORDER:CHECK_STALENESS")
+    i_ensure = out.find("ORDER:ENSURE_RUNNING")
+    assert i_check != -1, f"rt_check_staleness not called on success path:\n{out}\n{r.stderr}"
+    assert i_ensure != -1, (
+        "g-115-787 regression: success path armed the sentinel but did NOT "
+        f"consume it via rt_ensure_running:\n{out}\n{r.stderr}"
+    )
+    assert i_check < i_ensure, f"check must precede ensure:\n{out}"
+    assert "RC=0" in out, f"expected rc=0 after fresh retry:\n{out}"
+
+
+def test_g115787_fresh_success_path_skips_ensure_running():
+    """rt_call SUCCESS path with a FRESH daemon (sentinel not armed) must NOT
+    call rt_ensure_running — the hot path stays cheap (no recycle attempt)."""
+    r = _run(
+        _curl_stub('{"ok":true}', "200")
+        + 'rt_base_url() { echo "http://127.0.0.1:9999"; }\n'
+        + 'rt_check_staleness() { :; }\n'                 # fresh daemon: arms nothing
+        + 'rt_ensure_running() { echo "ORDER:ENSURE_RUNNING"; return 0; }\n'
+        + "unset RT_STALENESS_RESTART_PENDING RT_STALENESS_RESTARTED 2>/dev/null || true\n"
+        + "rc=0; rt_call GET /v1/x 2>/dev/null || rc=$?\n"
+        + 'echo "RC=$rc"\n'
+    )
+    out = r.stdout
+    assert "ORDER:ENSURE_RUNNING" not in out, (
+        "hot-path regression — rt_ensure_running called on a FRESH success "
+        f"path (no sentinel):\n{out}\n{r.stderr}"
+    )
+    assert "RC=0" in out, f"expected rc=0:\n{out}"
+
+
+def test_g115787_no_autospawn_suppresses_success_recycle():
+    """RT_NO_AUTOSPAWN=1 on the success path: sentinel armed but recycle
+    suppressed (health-probe / test paths observe true state) — mirrors
+    test_change1_no_autospawn_suppresses_restart for the success branch."""
+    r = _run(
+        _curl_stub('{"ok":true}', "200")
+        + 'rt_base_url() { echo "http://127.0.0.1:9999"; }\n'
+        + 'rt_check_staleness() { export RT_STALENESS_RESTART_PENDING=1; }\n'
+        + 'rt_ensure_running() { echo "ORDER:ENSURE_RUNNING"; return 0; }\n'
+        + "unset RT_STALENESS_RESTARTED 2>/dev/null || true\n"
+        + "export RT_NO_AUTOSPAWN=1\n"
+        + "rc=0; rt_call GET /v1/x 2>/dev/null || rc=$?\n"
+        + 'echo "RC=$rc"\n'
+    )
+    out = r.stdout
+    assert "ORDER:ENSURE_RUNNING" not in out, (
+        f"RT_NO_AUTOSPAWN must suppress success-path recycle:\n{out}\n{r.stderr}"
+    )
+    assert "RC=0" in out, f"expected rc=0:\n{out}"
 
 
 if __name__ == "__main__":

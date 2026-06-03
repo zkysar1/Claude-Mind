@@ -149,6 +149,25 @@ def test_invalid_value_fails():
 # prevention layer this file enforces.
 
 
+def test_list_valued_fields_raise_valueerror_not_typeerror():
+    """B10 (Lodestar): a list where a scalar is expected (type/status/applies_to)
+    must raise ValueError, never TypeError (unhashable type: 'list'). The TypeError
+    used to escape store.append's `except ValueError` and 500 -> dropped rb lesson.
+    Pins the CLI twin in sync with mind_api/src/store_registry.py (B10 daemon fix)."""
+    for field, bad in (("type", ["success"]), ("status", ["active"]),
+                       ("applies_to", ["framework"])):
+        rec = _seed_minimal_rb(applies_to="framework")
+        rec[field] = bad
+        try:
+            rb_mod.validate_rb_record(rec)
+            assert False, f"expected ValueError on {field}={bad!r}"
+        except TypeError as e:  # noqa: F841
+            assert False, f"{field}={bad!r} raised TypeError (B10 regression): {e}"
+        except ValueError as e:
+            assert "unhashable" not in str(e).lower(), \
+                f"{field}: must be a clean ValueError, not unhashable TypeError: {e}"
+
+
 def _run_all():
     tests = [v for k, v in globals().items()
              if k.startswith("test_") and callable(v)]

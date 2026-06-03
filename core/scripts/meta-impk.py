@@ -32,7 +32,28 @@ def read_yaml(path):
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        raw = f.read()
+    # OneDrive sync-corruption guard (1): a transiently un-synced replica of a
+    # shared meta hot-file reads as NUL bytes -- full zero-fill, or (on a partial block
+    # sync) a real-YAML prefix + NUL suffix. The mechanism is a sync-write race on a
+    # frequently rewritten file, NOT Files-On-Demand dehydration: all meta files are
+    # pinned ("always keep on this device"), census-verified 0 dehydration-prone of 40,237
+    # (1) -- so do not chase a dehydration fix, it is already maxed out. Both
+    # forms make yaml.safe_load raise
+    # a cryptic "#x0000 ReaderError". Translate to an actionable message so the next reader
+    # does not burn an investigation. Behavior is UNCHANGED -- the read still raises, so the
+    # write path (cmd_snapshot) aborts and the file is NOT overwritten (no clobber); only the
+    # message is clearer and names the recovery path. Recovery is assured by the .history
+    # snapshots written on every prior successful write.
+    if chr(0) in raw:
+        raise ValueError(
+            f"{path.name}: {raw.count(chr(0))} NUL byte(s) detected -- transient OneDrive "
+            f"sync corruption of a shared meta hot-file. NOT overwriting (read aborts, no "
+            f"clobber). Usually transient: re-read after OneDrive re-syncs, or restore a "
+            f"known-good version via `py -3 core/scripts/history.py restore '{path}' <version>` "
+            f"(list versions with `history.py list '{path}'`). (g-115-1271)"
+        )
+    data = yaml.safe_load(raw)
     return data if data is not None else {}
 
 

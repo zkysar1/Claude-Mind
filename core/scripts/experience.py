@@ -323,6 +323,52 @@ def _stamp_now():
     """
     return datetime.now().isoformat(timespec="seconds")
 
+def _read_optional_stdin(timeout_s=None):
+    """Read OPTIONAL stdin without blocking forever on a non-EOF pipe.
+
+    `isatty()` distinguishes a terminal from a non-terminal, but a non-terminal
+    stdin can be an inherited pipe that never reaches EOF -- the common case
+    when this CLI is invoked WITHOUT an explicit `echo '...' |` pipe or a
+    `</dev/null` redirect. A bare `sys.stdin.read()` then blocks indefinitely.
+    That is g-115-1232: experience-archive-goal.sh hung >90s on the g-115-900
+    deep close and was killed, while experience-add.sh (always piped, EOF
+    always arrives) worked. Read in a daemon thread with a deadline so a
+    non-EOF stdin degrades to "no input" instead of hanging; when stdin IS
+    piped, EOF arrives in << timeout_s and the read completes normally.
+
+    Returns "" on a tty or on timeout (no input available). Cross-platform by
+    construction: select()/signal.alarm do not work on Windows pipes; a thread
+    does. Timeout is tunable via EXPERIENCE_STDIN_TIMEOUT_S (default 10s) --
+    far below the >90s hang, far above any real `echo`-piped delivery.
+    """
+    if sys.stdin.isatty():
+        return ""
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("EXPERIENCE_STDIN_TIMEOUT_S", "10"))
+    import threading
+    box = {"data": "", "done": False}
+
+    def _reader():
+        try:
+            box["data"] = sys.stdin.read()
+        except Exception:
+            pass
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if not box["done"]:
+        sys.stderr.write(
+            f"WARN: stdin did not reach EOF within {timeout_s:.0f}s -- proceeding "
+            f"without optional stdin JSON. Caller likely invoked the wrapper "
+            f"without an `echo '...' |` pipe or `</dev/null` (g-115-1232).\n"
+        )
+        return ""
+    return box["data"]
+
+
 def cmd_add(args):
     if getattr(args, "schema", False):
         print(EXPERIENCE_ADD_SCHEMA_TEXT)
@@ -396,18 +442,22 @@ def cmd_archive_goal(args):
         sys.exit(1)
 
     # Optional stdin JSON for verbatim_anchors / tree_nodes_related / retrieval_audit / etc.
+    # Use _read_optional_stdin (NOT a bare sys.stdin.read()): isatty() does not
+    # guarantee EOF on a non-terminal stdin, so a bare read blocks >90s on an
+    # inherited non-EOF pipe when the wrapper is invoked without a stdin pipe
+    # (2 root cause; experience-add.sh avoids this only because it is
+    # always piped).
     extra = {}
-    if not sys.stdin.isatty():
-        raw = sys.stdin.read().strip()
-        if raw:
-            try:
-                extra = json.loads(raw)
-            except json.JSONDecodeError as e:
-                print(f"Invalid stdin JSON: {e}", file=sys.stderr)
-                sys.exit(1)
-            if not isinstance(extra, dict):
-                print("Stdin JSON must be an object", file=sys.stderr)
-                sys.exit(1)
+    raw = _read_optional_stdin().strip()
+    if raw:
+        try:
+            extra = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"Invalid stdin JSON: {e}", file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(extra, dict):
+            print("Stdin JSON must be an object", file=sys.stderr)
+            sys.exit(1)
 
     goal_id = args.goal
     skill_slug = args.skill_slug

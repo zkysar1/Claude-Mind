@@ -47,6 +47,12 @@ or has to be undone. In particular:
 9. **Discovering a stable fact** — if the value is a resource locator
    (path, endpoint, account ID), check `world/conventions/` for an
    existing locator before discovering. See `encode-stable-facts.md`.
+10. **Editing or modifying an existing file** — before any Edit or
+   MultiEdit on a file, you must have Read that file in this session.
+   Editing from stale context (prior session memory, summary, or
+   model prior) lands changes on wrong lines, overwrites concurrent
+   modifications, or targets content that no longer exists. See
+   `.claude/rules/read-before-edit.md`.
 
 If you find yourself making one of these decisions without having
 retrieved in the same turn, STOP and retrieve first.
@@ -126,6 +132,13 @@ Today, this rule is enforced via:
   happened during goal execution; forces retroactive retrieval when
   Phase 4 skipped it entirely
 - `exhaustive-search-before-negation.md` — gates "doesn't exist" claims
+- Advisory PreToolUse[Edit] gate `core/scripts/pre-edit-context-gate.sh` —
+  checks `context-reads.txt` for a prior Read of the target file and prints a
+  stderr advisory if absent. NEVER blocks (always exits 0). Fires only for the
+  manifest's trackable subset (`core/config`, `.claude/skills`,
+  `world/knowledge/tree`, `world/conventions`); silent for out-of-scope files
+  like `core/scripts`/`.claude/rules`/agent files, where Rules 1-3 are the only
+  safeguard (see `.claude/rules/read-before-edit.md` Rule 4, retrieval-triggers.md G14)
 
 The catalog in `core/config/conventions/retrieval-triggers.md` lists
 the additional decision points where retrieval should fire but

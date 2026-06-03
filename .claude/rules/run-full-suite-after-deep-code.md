@@ -36,6 +36,42 @@ The rule does NOT apply to pure documentation goals (changelog, journal,
 tree node edits without script behavior changes) or routine closures
 (simple presence checks).
 
+## Live-Daemon Exception (own-cloud, 2026-05-31)
+
+When a **live own-cloud daemon is serving autonomous agents on this repo**
+(`mind_api/state/daemon.port` present + healthy), do NOT run the full
+`pytest core/scripts/tests` suite to satisfy this rule. The daemon-lifecycle
+integration tests (e.g. `test_daemon_orphan_prevention.py`, which spawns
+subprocess daemons against the real `mind_api/state/`) hijack the live
+`daemon.port`, route the running agents onto a transient `LocalBackend`, and
+leave local-only write residue (split-brain). This caused two daemon storms on
+2026-05-31 (the second was an agent running this suite to verify its own deep-code change).
+
+Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
+1. Run the daemon-SAFE full suite:
+   `python -m pytest core/scripts/tests -q -m "not daemon_integration"`.
+   The `daemon_integration` marker (registered in `pytest.ini`) tags the only
+   tests that spawn REAL subprocess daemons and/or count system-wide
+   `mind_api.src` processes — currently just `test_daemon_orphan_prevention.py`.
+   Excluding them, the rest of the suite is hermetic (the in-process
+   `_daemon_fixture.py` / `running_daemon` fixtures bind a thread-local daemon
+   in a tmp project root) and is safe to run with a live daemon present.
+2. Defer ONLY the `daemon_integration` subset to a quiescent window (agents
+   stopped) or a separate clone / CI:
+   `python -m pytest core/scripts/tests -q -m daemon_integration`.
+   Narrate "daemon_integration subset deferred to quiescent window" — NOT "full
+   suite deferred" (the rest ran).
+
+`MIND_RUNTIME_DIR` (honored by `lifecycle.runtime_dir`, `mind-api-start.sh`'s
+`RT_DIR`, and `owncloud_sync.py`) lets a future test spawn an isolated daemon
+whose `daemon.pid/port` live in a tmp dir, so a spawn-and-check-own-files test
+need not hijack the live daemon's `mind_api/state`. It does NOT make the
+system-wide-process-counting orphan test safe (that counts by command line, not
+runtime dir) — hence that one keeps the marker.
+
+This is a scoped exception, not a repeal — the full unrestricted suite still
+runs whenever no live daemon is present. Enforced by `guard-672`.
+
 ## Required Full-Suite Commands (per code area)
 
 ### Mind framework

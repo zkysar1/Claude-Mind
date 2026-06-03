@@ -265,6 +265,20 @@ if [ "$SOURCE" = "compact" ]; then
     # releasing on startup/resume would let new windows clear locks held by
     # mid-compact autonomous sessions and defeat the gate.
     rm -rf "$PROJECT_ROOT/.autocompact-serialize-lock" 2>/dev/null || true
+
+    # POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
+    # --- Clear compact-in-flight sentinels for any agent whose compact just
+    # finished. Written by precompact-serialize.sh; mtime <10min means "compact
+    # just resumed via this SessionStart event" — the autocompact roundtrip
+    # is complete and the sentinel has served its purpose. Older files are
+    # genuine hangs and stay for recovery-gate Path C to act on. Cross-agent
+    # iteration mirrors the stale-cleanup pattern at line 86. Fail-open.
+    for _CIF in "$PROJECT_ROOT/$AGENTS_PARENT_DIR"/*/session/compact-in-flight; do
+        [ -f "$_CIF" ] || continue
+        [ -n "$(find "$_CIF" -maxdepth 0 -mmin -10 2>/dev/null)" ] || continue
+        rm -f "$_CIF" 2>/dev/null || true
+    done
+    unset _CIF
 fi
 
 # --- 2. Resolve agent binding for the new SID ---

@@ -184,3 +184,90 @@ def store_set_field(store, rec_id, field, value):
     query = "store=%s&id=%s&field=%s&value=%s" % (
         _q(store), _q(rec_id), _q(field), _q(value))
     return json.loads(rt_call("POST", "/v1/store/set-field", query=query))
+
+
+# --- Tolerant decode helpers () -----------------------------------
+# Shared decode primitives for daemon aspirations_read bodies that need the
+#  raw_decode recovery + guard-383 fatal contract. Extracted from
+# 4 near-identical sites (consolidation-health.py, defer-recheck.py inline,
+# parent-supersession-sweep.py, precondition-defer-recheck.py).
+#
+# Contract per guard-383 (N>=2-source aggregators):
+#   - Empty / whitespace-only body: return empty marker (list or None per shape).
+#     A genuinely-empty queue is NOT a source error.
+#   - Valid JSON: return decoded object.
+#   - Valid prefix + trailing garbage ( shape): raw_decode recovers
+#     the prefix; recovery is NOT a source error.
+#   - JSONDecodeError: emit ONE stderr diagnostic, sys.exit(1).
+#   - Wrong-type aggregate: emit stderr diagnostic, sys.exit(1).
+#
+# The single fail-open boundary is the caller's shell wrapper (`|| echo WARN`),
+# never inside the aggregator (rb-347). `source` is treated as an opaque tag
+# in stderr — callers pass e.g. "consolidation-health: world" to preserve the
+# existing diagnostic identity.
+
+def _raw_decode_or_fatal(source, stripped):
+    """Shared body of tolerant_decode_*: raw_decode + JSONDecodeError fatal.
+    Returns the decoded object; never returns on JSONDecodeError."""
+    import sys
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError as exc:
+        body_prefix = stripped[:120].replace("\n", "\\n")
+        print(
+            "%s JSONDecodeError (%s); body prefix: %r" % (source, exc, body_prefix),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return obj
+
+
+def tolerant_decode_list(source, raw):
+    """Tolerant decode of daemon aspirations_read body that MUST be a list.
+
+    Returns [] on genuinely-empty body; the decoded list on success.
+    sys.exit(1) on JSONDecodeError or non-list aggregate (guard-383).
+
+    Used by sites that expect a list-only queue shape (consolidation-health.py).
+    """
+    import sys
+    stripped = (raw or "").lstrip()
+    if not stripped:
+        return []  # genuinely empty — valid state, not a source error
+    obj = _raw_decode_or_fatal(source, stripped)
+    if not isinstance(obj, list):
+        body_prefix = stripped[:120].replace("\n", "\\n")
+        print(
+            "%s non-list aggregate (type=%s); body prefix: %r"
+            % (source, type(obj).__name__, body_prefix),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return obj
+
+
+def tolerant_decode_aggregate(source, raw):
+    """Tolerant decode of daemon aspirations_read body that accepts dict-or-list.
+
+    Returns None on genuinely-empty body (caller maps None -> []); dict or list
+    on success. sys.exit(1) on JSONDecodeError or non-dict-and-non-list
+    aggregate (guard-383).
+
+    Used by sites that accept either a dict (with "aspirations" key) or a bare
+    list (parent-supersession-sweep.py, precondition-defer-recheck.py,
+    defer-recheck.py).
+    """
+    import sys
+    stripped = (raw or "").lstrip()
+    if not stripped:
+        return None  # genuinely empty — valid state, not a source error
+    obj = _raw_decode_or_fatal(source, stripped)
+    if not isinstance(obj, (dict, list)):
+        body_prefix = stripped[:120].replace("\n", "\\n")
+        print(
+            "%s non-dict-and-non-list aggregate (type=%s); body prefix: %r"
+            % (source, type(obj).__name__, body_prefix),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return obj

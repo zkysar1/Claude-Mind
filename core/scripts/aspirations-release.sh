@@ -17,6 +17,13 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# Normalize --goal/--goal-id flag aliases → positional goal id (rewrites $@).
+# SSOT for the dual-accept goal-id contract; verify-learning enforces that this
+# wrapper sources the normalizer (12-wrapper coverage grep). Restored 2026-05-29
+# — dropped by a prior daemon cutover, which silently broke dual-accept and the
+# verify-learning normalizer-coverage check.
+GOAL_NORMALIZE_TARGET=positional source "$CORE_ROOT/scripts/_goal-arg-normalize.sh"
+
 # --- Parse args -----------------------------------------------------------
 GOAL_ID=""
 declare -a PASSTHROUGH=()
