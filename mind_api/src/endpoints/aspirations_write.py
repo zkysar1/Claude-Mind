@@ -66,7 +66,13 @@ from .. import file_locks, history, changelog
 # policy (single source of truth for OneDrive contention); the gates
 # package gives us the pure evaluate() functions extracted in PR 7a.
 from _fileops import _atomic_write_with_fallback  # noqa: E402
+from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
+from ..agent_paths import assert_not_cruft  # noqa: E402
 import _gate_log  # noqa: E402
+# B9-deep: single-source census math (NOT a 3rd mirror) — folds evicted goals
+# back into progress so goal eviction is metric-neutral. _goal_census is a pure
+# leaf, resolvable via the same core/scripts sys.path entry file_locks adds.
+from _goal_census import effective_counts as _effective_counts, census_completed as _census_completed  # noqa: E402
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
 from gates.uncommitted_work import evaluate as _uncommitted_work_eval  # noqa: E402
@@ -153,6 +159,10 @@ _UNBLOCK_ACTIVE_STATUSES = ("pending", "in-progress")
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     """Plain JSONL read. Used for read-modify-write where the cache's no-
     mutation contract would force a deepcopy anyway."""
+    # s5c (own-cloud): force-fresh via the backend before reading. In-lock RMW
+    # callers get lost-update prevention + the If-Match fence etag; plain probe
+    # reads get the latest remote state. No-op on LocalBackend.
+    get_backend().refresh(path)
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items
@@ -174,6 +184,7 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
     exhausting retries, falls back to in-place rewrite. Telemetry sidecars
     in _fileops degrade gracefully when WORLD_DIR/META_DIR are unset.
     """
+    assert_not_cruft(path.parent, "mkdir (_atomic_write_jsonl)")
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(handle):
@@ -240,9 +251,11 @@ def _recompute_progress(asp: Dict[str, Any]) -> None:
     completed. They are tracked separately under `recurring_goals`.
     """
     goals = asp.get("goals", [])
-    non_recurring = [g for g in goals if not g.get("recurring")]
     recurring_count = sum(1 for g in goals if g.get("recurring"))
-    total = len(non_recurring)
+    # Census-augmented (B9-deep): "non_recurring" total/completed via the shared
+    # helper, which folds archived_census back in so goal eviction leaves
+    # progress (and fan_out_ratio) byte-identical.
+    total, completed_goals = _effective_counts(asp, include_recurring=False)
     # fan_out_ratio: growth from the creation-time seed. None when
     # initial_goal_count is absent (predates the metric — no inferred
     # backfill) or 0 (ratio from an empty seed is undefined).
@@ -250,8 +263,7 @@ def _recompute_progress(asp: Dict[str, Any]) -> None:
     fan_out_ratio = (round(total / igc, 2)
                      if isinstance(igc, int) and igc > 0 else None)
     asp["progress"] = {
-        "completed_goals": sum(1 for g in non_recurring
-                               if g.get("status") == "completed"),
+        "completed_goals": completed_goals,
         "total_goals": total,
         "recurring_goals": recurring_count,
         "fan_out_ratio": fan_out_ratio,
@@ -665,6 +677,38 @@ def _agent_name(ctx) -> str:
     return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
 
 
+def _require_explicit_agent(ctx, source: str) -> Optional["Response"]:  # type: ignore[name-defined]
+    """Refuse agent-scoped goal writes when X-Mind-Agent is missing/empty.
+
+    Mirrors store.py:_require_agent_header (g-115-957). When source == "agent",
+    the live queue path is ctx.paths.agent, resolved centrally in server.py
+    from the X-Mind-Agent header. An empty header makes AgentPathResolver
+    fall back to _first_available_agent() (alphabetically-first agent with a
+    local-paths.conf — typically "alpha"), so a write meant for the caller's
+    OWN agent queue silently targets alpha's queue, while _agent_name() falls
+    back to "system" for attribution — the exact mismatch bravo hit on
+    2026-05-25 (nearly set alpha's completed g-001-240 -> pending). World-source
+    writes target the shared world queue and are agent-agnostic, so they are
+    NOT gated here. Read endpoints with no agent context never call this.
+    FW-2 (7-agent feedback distillation). See store.py precedent + g-115-957.
+    """
+    from ..server import Response
+    if source != "agent":
+        return None
+    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    if not agent:
+        return Response.error(
+            400, "missing_agent_header",
+            "X-Mind-Agent header required for agent-scoped goal writes "
+            "(source=agent). Caller environment likely has MIND_AGENT "
+            "empty/unset — the wrapper omits the header, and the daemon must "
+            "not silently fall back to the alphabetically-first agent (would "
+            "target the wrong agent's queue; FW-2 / g-115-957). Set "
+            "MIND_AGENT explicitly before invoking the wrapper.",
+        )
+    return None
+
+
 def _parse_body_json(body: bytes) -> Any:
     if not body:
         raise ValueError("empty body")
@@ -1002,6 +1046,112 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
     return None, normalized_ref, None
 
 
+def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
+    """Phase D.5 (5): post-decompose Self.md routing audit.
+
+    After Phase D stamps intended_agent and the main goal persists, this
+    helper runs the audit (`core/scripts/post-decompose-routing-audit.py`).
+    When a significant mismatch is detected, it files a single Investigate
+    goal into asp-115 (world source) with idempotent dedup against existing
+    routing-mismatch:<id> origin_signals.
+
+    Returns the filed Investigate goal id, or None when:
+      - audit module can't be imported (fail-open),
+      - audit decision is no_file,
+      - dedup found an existing pending/in-progress Investigate,
+      - the file write failed.
+
+    Side-effect-free on errors. Never raises. Bypasses _run_add_goal_pipeline
+    intentionally — the Investigate is system-generated, well-formed, and
+    routing it back through goal-duplication-gate would falsely block on
+    "Investigate:" verb overlap.
+
+    Recursion guard: the audit module bails on origin_signal starting with
+    "routing-mismatch:", so the Investigate filed here won't re-trigger.
+    """
+    try:
+        import importlib.util
+        from pathlib import Path as _Path
+        core_scripts = _Path(ctx.paths.project_root) / "core" / "scripts"
+        audit_path = core_scripts / "post-decompose-routing-audit.py"
+        spec = importlib.util.spec_from_file_location(
+            "post_decompose_routing_audit_loaded", str(audit_path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        audit_fn = mod.audit
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+    try:
+        result = audit_fn(goal, project_root=_Path(ctx.paths.project_root))
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+    if result.get("decision") != "file":
+        return None
+    invest_spec = result.get("investigate_spec")
+    if not invest_spec or not isinstance(invest_spec, dict):
+        return None
+
+    asp_id = "asp-115"
+    world_live, world_base = _resolve_paths(ctx, "world")
+    agent = _agent_name(ctx)
+    origin_signal_val = invest_spec.get("origin_signal", "")
+
+    try:
+        with file_locks.locked(world_live):
+            items = _read_jsonl(world_live)
+            found = _find_aspiration(items, asp_id)
+            if found is None:
+                return None
+            _, asp = found
+
+            # Idempotent dedup: skip if a pending/in-progress Investigate
+            # with the same origin_signal already exists in asp-115.
+            for existing in asp.get("goals", []) or []:
+                if (existing.get("origin_signal") == origin_signal_val
+                        and existing.get("status") in (
+                            "pending", "in-progress")):
+                    return None
+
+            invest_goal: Dict[str, Any] = {
+                "id": _allocate_goal_id(asp),
+                "title": invest_spec.get("title", ""),
+                "description": invest_spec.get("description", ""),
+                "priority": invest_spec.get("priority", "MEDIUM"),
+                "status": "pending",
+                "participants": invest_spec.get("participants", ["agent"]),
+                "origin_signal": origin_signal_val,
+                "category": invest_spec.get(
+                    "category", "framework-decomposition"),
+                "discovered_by": invest_spec.get(
+                    "discovered_by", "post-decompose-routing-audit"),
+                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "intended_agent": "bravo",
+                "work_class": "framework",
+            }
+            try:
+                _validate_goal(invest_goal)
+            except ValueError:
+                return None
+
+            asp.setdefault("goals", []).append(invest_goal)
+            history.snapshot(
+                world_live, world_base, agent,
+                summary=f"add-goal {invest_goal['id']} (routing-audit)")
+            _atomic_write_jsonl(world_live, items)
+            changelog.append(
+                world_base, agent, world_live, "edit",
+                summary=f"add-goal {invest_goal['id']} (routing-audit)",
+                lines_changed=len(items))
+            _jsonl_cache().invalidate(world_live)
+        return invest_goal["id"]
+    except (OSError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -1018,6 +1168,12 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     source = (ctx.query.get("source") or "world").lower()
     if source not in ("world", "agent"):
         return Response.error(400, "invalid_source", "source must be world or agent")
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
 
     try:
         goal = _parse_body_json(ctx.body)
@@ -1104,6 +1260,12 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                      "source": source},
             world_dir=ctx.paths.world)
 
+    # Phase D.5 (5): Routing-audit after main goal persists.
+    # Outside the original lock — the audit reads each agent's Self.md and
+    # files a separate Investigate goal in asp-115 if a significant mismatch
+    # is detected. Fail-open: returns None on any error.
+    routing_audit_investigate_id = _file_routing_audit_investigate(ctx, goal)
+
     response_body: Dict[str, Any] = {
         "ok": True,
         "goal_id": goal["id"],
@@ -1115,6 +1277,8 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
         # auto-derive) so the caller sees what actually landed on disk.
         "goal": goal,
     }
+    if routing_audit_investigate_id:
+        response_body["routing_audit_investigate_id"] = routing_audit_investigate_id
     # Surface advisory warnings on 200 — wrappers (when migrated) can
     # re-emit them to stderr to match the legacy CLI experience.
     if warnings:
@@ -1153,6 +1317,12 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     source = (ctx.query.get("source") or "world").lower()
     if source not in ("world", "agent"):
         return Response.error(400, "invalid_source", "source must be world or agent")
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
 
     try:
         value = _parse_body_json(ctx.body)
@@ -1815,6 +1985,7 @@ def _validate_intent_satisfaction(
 
 def _append_jsonl(path: Path, item: Dict[str, Any]) -> None:
     """Append a single record to a JSONL file (for archive writes)."""
+    assert_not_cruft(path.parent, "mkdir (_append_jsonl)")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
@@ -1852,6 +2023,12 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
     source = (ctx.query.get("source") or "world").strip()
     if source not in ("world", "agent"):
         return Response.error(400, "invalid_source", f"source must be 'world' or 'agent', got '{source}'")
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
 
     force = (ctx.query.get("force") or "").strip().lower() in ("true", "1", "yes")
     intent_satisfied = (ctx.query.get("intent_satisfied") or "").strip().lower() in ("true", "1", "yes")
@@ -2014,6 +2191,12 @@ def complete_intent(ctx) -> "Response":  # type: ignore[name-defined]
     if source not in ("world", "agent"):
         return Response.error(400, "invalid_source", f"source must be 'world' or 'agent', got '{source}'")
 
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+
     agent = _agent_name(ctx)
     live_path, base_dir = _resolve_paths(ctx, source)
     archive_path = base_dir / "aspirations-archive.jsonl"
@@ -2156,6 +2339,7 @@ def _emit_streak_break_signal_daemon(ctx, goal_id: str,
     """
     import sys
     session_dir = ctx.paths.agent / "session"
+    assert_not_cruft(session_dir, "mkdir (streak-break session dir)")
     session_dir.mkdir(parents=True, exist_ok=True)
     log_path = session_dir / "streak-breaks.jsonl"
     record = {
@@ -2201,6 +2385,12 @@ def complete_by(ctx):
                               f"agent_name {agent!r} must match "
                               f"[a-z][a-z0-9_-]* (looks like a flag or empty)")
     key_finding = params.get("key_finding", "").strip() or None
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
 
     live_path, base_dir = _resolve_paths(ctx, source)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -2322,6 +2512,11 @@ def retire(ctx) -> "Response":  # type: ignore[name-defined]
 
     source = (ctx.query.get("source") or "world").strip()
     force = (ctx.query.get("force") or "").lower() == "true"
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
     live_path, base_dir = _resolve_paths(ctx, source)
     archive_path = base_dir / "aspirations-archive.jsonl"
     agent = _agent_name(ctx)
@@ -2392,6 +2587,11 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
                               "query parameter 'id' required")
 
     source = (ctx.query.get("source") or "world").strip()
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
     had_claim = False
@@ -2575,6 +2775,12 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_source",
                               "source must be world or agent")
 
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+
     agent = _agent_name(ctx)
     live_path, base_dir = _resolve_paths(ctx, source)
     archive_path = base_dir / "aspirations-archive.jsonl"
@@ -2717,6 +2923,12 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
 
     agent = _agent_name(ctx)
 
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+
     # Resolve meta-json path from the same base_dir as aspirations.jsonl.
     _, base_dir = _resolve_paths(ctx, source)
     meta_path = base_dir / "aspirations-meta.json"
@@ -2753,6 +2965,12 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         with file_locks.locked(meta_path):
+            # #38 own-cloud: force-fresh BEFORE the raw read so the read sees a
+            # peer's committed meta and the backend records the If-Match fence
+            # etag — without it the _atomic_write below issues an UNCONDITIONAL
+            # PUT (fence=None) that silently clobbers a concurrent peer's meta
+            # update on a stale-lock-break race. No-op on LocalBackend.
+            get_backend().refresh(meta_path)
             # Read existing or create default.
             if meta_path.exists():
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -2765,6 +2983,7 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
 
             # Atomic write via _fileops helper (same retry policy as
             # locked_write_json but we already hold the lock).
+            assert_not_cruft(meta_path.parent, "mkdir (meta_update)")
             meta_path.parent.mkdir(parents=True, exist_ok=True)
 
             def _write(handle):
@@ -2812,6 +3031,11 @@ def clear_stale_claims(ctx) -> "Response":  # type: ignore[name-defined]
 
     dry_run = (ctx.query.get("dry_run") or "").strip().lower() == "true"
     agent = _agent_name(ctx)
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
     live_path, base_dir = _resolve_paths(ctx, source)
     cleared: List[str] = []
 
@@ -2937,6 +3161,12 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(400, "invalid_body", f"body must be JSON aspiration object: {e}")
     if not isinstance(asp, dict):
         return Response.error(400, "invalid_body", "body must be a JSON object")
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
 
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
@@ -3118,6 +3348,11 @@ def recover_recurring(ctx) -> "Response":  # type: ignore[name-defined]
                               "source must be world or agent")
 
     agent = _agent_name(ctx)
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
     live_path, base_dir = _resolve_paths(ctx, source)
 
     # --- Pipeline reads (Case 3): outside lock, read-only, fail-open ---
@@ -3291,6 +3526,12 @@ def update_aspiration(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.error(400, "invalid_archived",
                                   f"'archived' must be a boolean, got {type(value).__name__}")
 
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
 
@@ -3324,6 +3565,113 @@ def update_aspiration(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"ok": True, "aspiration": asp})
 
 
+# ---------------------------------------------------------------------------
+# Bulk maintenance + evolution log (Batch 4)
+# ---------------------------------------------------------------------------
+
+# Mirror of aspirations.py::DATE_RE (line 198), used by evolution-append's
+# validate_evolution_event replica.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def recompute_all_progress(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/aspirations/recompute-all-progress?source=world|agent
+
+    Mirrors aspirations.py cmd_recompute_all_progress: recompute progress for
+    EVERY aspiration in the source's aspirations.jsonl, then full-rewrite the
+    file. recompute_progress excludes recurring goals from completion counts;
+    _recompute_progress (line 236) is the verbatim mirror used here. The
+    full rewrite is byte-identical to write_jsonl -> locked_write_jsonl
+    (`json.dumps(item, ensure_ascii=True) + "\\n"`).
+    """
+    from ..server import Response
+
+    source = (ctx.query.get("source") or "world").lower()
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source", "source must be world or agent")
+
+    # FW-2: agent-scoped writes MUST carry an explicit X-Mind-Agent header —
+    # never silently fall back to the alphabetically-first agent's queue.
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+
+    live_path, base_dir = _resolve_paths(ctx, source)
+    agent = _agent_name(ctx)
+
+    if not live_path.exists():
+        return Response.error(404, "file_not_found",
+                              f"{source} aspirations.jsonl not found at {live_path}")
+
+    try:
+        with file_locks.locked(live_path):
+            items = _read_jsonl(live_path)
+            for asp in items:
+                _recompute_progress(asp)
+            history.snapshot(live_path, base_dir, agent,
+                             summary="recompute-all-progress")
+            _atomic_write_jsonl(live_path, items)
+            changelog.append(base_dir, agent, live_path, "edit",
+                             summary="recompute-all-progress",
+                             lines_changed=len(items))
+            _jsonl_cache().invalidate(live_path)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+
+    return Response.json({"ok": True, "source": source,
+                          "aspirations_recomputed": len(items)})
+
+
+def evolution_append(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/aspirations/evolution-append   body: JSON evolution event.
+
+    Mirrors aspirations.py cmd_evolution_append: validate {date,event,details},
+    then single-line append to META_DIR/evolution-log.jsonl. The append is
+    byte-identical to _fileops.locked_append_jsonl (validate -> history snapshot
+    -> append-only `json.dumps(evt, ensure_ascii=True) + "\\n"` -> changelog;
+    _fileops.py:1372-1383). base_dir = ctx.paths.meta (evolution-log.jsonl
+    lives under META_DIR).
+    """
+    from ..server import Response
+    from _fileops import _validate_no_surrogates
+
+    try:
+        evt = _parse_body_json(ctx.body)
+    except (ValueError, json.JSONDecodeError) as e:
+        return Response.error(400, "invalid_body", f"body must be JSON event: {e}")
+    if not isinstance(evt, dict):
+        return Response.error(400, "invalid_body", "body must be a JSON object")
+
+    # validate_evolution_event (aspirations.py:525) — required fields + date.
+    missing = {"date", "event", "details"} - set(evt.keys())
+    if missing:
+        return Response.error(400, "validation_failed",
+                              f"Missing required evolution event fields: {missing}")
+    if not _DATE_RE.match(str(evt["date"])):
+        return Response.error(400, "validation_failed",
+                              f"Invalid date format: {evt['date']} (expected YYYY-MM-DD)")
+
+    log_path = ctx.paths.meta / "evolution-log.jsonl"
+    base_dir = ctx.paths.meta
+    agent = _agent_name(ctx)
+
+    try:
+        _validate_no_surrogates(evt, log_path)
+        assert_not_cruft(log_path.parent, "mkdir (evolution-append)")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with file_locks.locked(log_path):
+            history.snapshot(log_path, base_dir, agent, summary="evolution-append")
+            with log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(evt, ensure_ascii=True) + "\n")
+            changelog.append(base_dir, agent, log_path, "edit",
+                             summary="evolution-append", lines_changed=1)
+            _jsonl_cache().invalidate(log_path)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+
+    return Response.json({"ok": True, "event": evt})
+
+
 def register(routes) -> None:
     routes[("POST", "/v1/aspirations/add-goal")] = add_goal
     routes[("POST", "/v1/aspirations/update-goal")] = update_goal
@@ -3339,3 +3687,5 @@ def register(routes) -> None:
     routes[("POST", "/v1/aspirations/add")] = add
     routes[("POST", "/v1/aspirations/recover-recurring")] = recover_recurring
     routes[("POST", "/v1/aspirations/update")] = update_aspiration
+    routes[("POST", "/v1/aspirations/recompute-all-progress")] = recompute_all_progress
+    routes[("POST", "/v1/aspirations/evolution-append")] = evolution_append

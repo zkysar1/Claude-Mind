@@ -63,6 +63,7 @@ mapping:
   signal-taxonomy-and-schema: framework
   failure-to-aspiration-pipeline: framework
   audit-2026-04-scanners: framework
+  self-program-evolution-historical-audit: framework  # g-115-1241: was unmapped -> unclassified -> role_affinity 0.0 -> 82.8h streak-break (g-115-760)
 
   # ---- hygiene (ops plumbing — universal patterns) ----
   infrastructure: hygiene

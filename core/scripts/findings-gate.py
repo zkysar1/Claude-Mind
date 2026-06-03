@@ -36,6 +36,7 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import PROJECT_ROOT, AGENT_DIR, WORLD_DIR  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402  # gate-firing telemetry ()
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 RESOLUTION_SUPPRESSION_CHARS = 50  # window after a match to check for resolution language
 
@@ -195,7 +196,7 @@ def load_dedup_titles(aspiration_id):
     if loader.exists():
         try:
             subprocess.run(
-                ["bash", loader.as_posix()],
+                bash_cmd(loader),
                 env={**os.environ, "MIND_AGENT": os.environ.get("MIND_AGENT", "")},
                 capture_output=True,
                 timeout=10,
@@ -271,7 +272,7 @@ def dispatch_goal(goal_json, aspiration_id, source):
     if not script.exists():
         print(f"ERROR: aspirations-add-goal.sh not found at {script}", file=sys.stderr)
         return False
-    cmd = ["bash", script.as_posix(), "--source", source, aspiration_id]
+    cmd = bash_cmd(script, "--source", source, aspiration_id)
     try:
         result = subprocess.run(
             cmd,

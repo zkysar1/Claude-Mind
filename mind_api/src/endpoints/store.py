@@ -28,6 +28,8 @@ from ..jsonl_cache import cache as _jsonl_cache
 from .. import file_locks, history, changelog
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
+from storage_backend import get_backend  # noqa: E402  # s5b: own-cloud read freshness
+from ..agent_paths import assert_not_cruft  # noqa: E402
 
 from ..store_registry import STORE_REGISTRY, apply_defaults
 
@@ -67,6 +69,15 @@ def _parse_value(value_str: str):
 # ---------------------------------------------------------------------------
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    # s5b (own-cloud): EVERY caller holds file_locks.locked(path) for a
+    # read-modify-write (verified: all 5 call sites are inside `with
+    # file_locks.locked(path):`). Force-fresh the local cache from the backend
+    # before reading — bypasses the cache TTL so the RMW never starts from a
+    # stale cached value (lost-update prevention) AND records the If-Match fence
+    # etag for the _atomic_write_jsonl that follows. No-op on LocalBackend (zero
+    # added I/O); also materializes a remote-only file so the exists() check and
+    # read below see it. Mirrors _fileops.locked_modify_jsonl.
+    get_backend().refresh(path)
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items
@@ -80,6 +91,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
+    assert_not_cruft(path.parent, "mkdir (store._atomic_write_jsonl)")
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(handle):
@@ -92,6 +104,40 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 
 def _agent_name(ctx) -> str:
     return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+
+
+def _require_agent_header(ctx) -> Optional["Response"]:  # type: ignore[name-defined]
+    """Reject store writes when X-Mind-Agent header is missing/empty.
+
+    Without this gate, an empty header lets agent_paths.AgentPathResolver
+    fall back to `_first_available_agent()` (alphabetically first agent
+    with a local-paths.conf — typically "alpha"). The downstream validator
+    then surfaces the misleading "Invalid journal_file: bravo/... (expected
+    alpha/journal/...)" error even though the caller's environment had
+    MIND_AGENT=bravo. The bravo session-77 incident (2026-05-18) was
+    exactly this shape: MIND_AGENT was empty at journal-add invocation,
+    rt_curl omitted the header, daemon resolved to alpha, validator
+    rejected the bravo-shaped body with the wrong-agent error.
+
+    Per-agent store writes require explicit agent identity. Read endpoints
+    that legitimately have no agent context (admin, health) bypass this
+    gate by not calling it.
+
+    See g-115-957.
+    """
+    from ..server import Response
+    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    if not agent:
+        return Response.error(
+            400, "missing_agent_header",
+            "X-Mind-Agent header required for store writes. Caller "
+            "environment likely has MIND_AGENT empty/unset — the wrapper "
+            "omits the header when MIND_AGENT is empty, and the daemon "
+            "must not silently fall back to the alphabetically first agent "
+            "(g-115-957). Set MIND_AGENT explicitly before invoking the "
+            "wrapper, or pass --agent to rt_curl.",
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +207,9 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
+    err = _require_agent_header(ctx)
+    if err:
+        return err
     spec, err = _spec_or_error(ctx)
     if err:
         return err
@@ -192,12 +241,19 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
     if spec.validate is not None:
         try:
             spec.validate(ctx, rec, skip_id=not has_key)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:
+            # TypeError too: a list/dict where a scalar field is expected makes
+            # a validator's `x not in <set>` raise "unhashable type" — that must
+            # be a clean 400, never a 500 that silently drops the write (B10).
             return Response.error(400, "validation_failed", str(e))
 
     path = spec.path(ctx)
     try:
-        with file_locks.locked(path):
+        # #38: the whole in-lock read-modify-write is the retry unit. On an
+        # own-cloud If-Match stale-lock-break ConflictError, locked_rmw re-runs
+        # _cycle, which re-reads fresh (via _read_jsonl's backend.refresh),
+        # re-runs the dup-check against the peer's landed write, and re-appends.
+        def _cycle():
             items = _read_jsonl(path)
             if not has_key:
                 if spec.allocate is None:
@@ -215,16 +271,16 @@ def append(ctx) -> "Response":  # type: ignore[name-defined]
             if spec.validate is not None:
                 try:
                     spec.validate(ctx, rec, skip_id=False)
-                except ValueError as e:
+                except (ValueError, TypeError) as e:  # B10: TypeError -> 400, not 500
                     return Response.error(400, "validation_failed", str(e))
             items.append(rec)
             _commit(ctx, spec, path, items,
                     f"store-append {ctx.query.get('store')} "
                     f"{rec.get(spec.id_field)}")
+            return Response.json({"ok": True, "record": rec})
+        return file_locks.locked_rmw(path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.json({"ok": True, "record": rec})
 
 
 def replace(ctx) -> "Response":  # type: ignore[name-defined]
@@ -236,6 +292,9 @@ def replace(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
+    err = _require_agent_header(ctx)
+    if err:
+        return err
     spec, err = _spec_or_error(ctx)
     if err:
         return err
@@ -266,12 +325,12 @@ def replace(ctx) -> "Response":  # type: ignore[name-defined]
     if spec.validate is not None:
         try:
             spec.validate(ctx, rec, skip_id=False)
-        except ValueError as e:
+        except (ValueError, TypeError) as e:  # B10: TypeError -> 400, not 500
             return Response.error(400, "validation_failed", str(e))
 
     path = spec.path(ctx)
     try:
-        with file_locks.locked(path):
+        def _cycle():  # #38: retry unit — see append for the rationale.
             items = _read_jsonl(path)
             found = _find(items, spec, key)
             if found is None:
@@ -286,10 +345,10 @@ def replace(ctx) -> "Response":  # type: ignore[name-defined]
             items[found[0]] = rec
             _commit(ctx, spec, path, items,
                     f"store-replace {ctx.query.get('store')} {key}")
+            return Response.json({"ok": True, "record": rec})
+        return file_locks.locked_rmw(path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.json({"ok": True, "record": rec})
 
 
 def merge(ctx) -> "Response":  # type: ignore[name-defined]
@@ -303,6 +362,9 @@ def merge(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
+    err = _require_agent_header(ctx)
+    if err:
+        return err
     spec, err = _spec_or_error(ctx)
     if err:
         return err
@@ -320,9 +382,8 @@ def merge(ctx) -> "Response":  # type: ignore[name-defined]
         return err
 
     path = spec.path(ctx)
-    written: Dict[str, Any] = {}
     try:
-        with file_locks.locked(path):
+        def _cycle():  # #38: retry unit — see append for the rationale.
             items = _read_jsonl(path)
             found = _find(items, spec, key)
             if found is None:
@@ -353,13 +414,12 @@ def merge(ctx) -> "Response":  # type: ignore[name-defined]
                     rec[k] = v
 
             items[idx] = rec
-            written = rec
             _commit(ctx, spec, path, items,
                     f"store-merge {ctx.query.get('store')} {key}")
+            return Response.json({"ok": True, "record": rec})
+        return file_locks.locked_rmw(path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.json({"ok": True, "record": written})
 
 
 def set_field(ctx) -> "Response":  # type: ignore[name-defined]
@@ -371,6 +431,9 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
+    err = _require_agent_header(ctx)
+    if err:
+        return err
     spec, err = _spec_or_error(ctx)
     if err:
         return err
@@ -411,7 +474,7 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
 
     path = spec.path(ctx)
     try:
-        with file_locks.locked(path):
+        def _cycle():  # #38: retry unit — see append for the rationale.
             items = _read_jsonl(path)
             found = _find(items, spec, key)
             if found is None:
@@ -423,17 +486,17 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
             if spec.validate is not None:
                 try:
                     spec.validate(ctx, rec)
-                except ValueError as e:
+                except (ValueError, TypeError) as e:  # B10: TypeError -> 400, not 500
                     return Response.error(400, "validation_failed", str(e))
             if field_name in spec.recompute_on_fields and spec.recompute:
                 spec.recompute(rec)
             items[idx] = rec
             _commit(ctx, spec, path, items,
                     f"store-set-field {ctx.query.get('store')} {key} {field_name}")
+            return Response.json({"ok": True, "record": rec})
+        return file_locks.locked_rmw(path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.json({"ok": True, "record": rec})
 
 
 def increment(ctx) -> "Response":  # type: ignore[name-defined]
@@ -444,6 +507,9 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
+    err = _require_agent_header(ctx)
+    if err:
+        return err
     spec, err = _spec_or_error(ctx)
     if err:
         return err
@@ -479,7 +545,11 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
 
     path = spec.path(ctx)
     try:
-        with file_locks.locked(path):
+        # #38: increment is the classic lost-update — a counter += 1 read against
+        # a stale value silently drops a peer's concurrent increment. On a
+        # ConflictError, _cycle re-reads the peer's landed value and increments
+        # on TOP of it, so the count is preserved across the stale-lock-break race.
+        def _cycle():
             items = _read_jsonl(path)
             found = _find(items, spec, key)
             if found is None:
@@ -493,10 +563,10 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
             items[idx] = rec
             _commit(ctx, spec, path, items,
                     f"store-increment {ctx.query.get('store')} {key} {field_name}")
+            return Response.json({"ok": True, "record": rec})
+        return file_locks.locked_rmw(path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.json({"ok": True, "record": rec})
 
 
 # ---------------------------------------------------------------------------

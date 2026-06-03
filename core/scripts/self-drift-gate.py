@@ -63,6 +63,7 @@ import yaml  # Required — tree.py already depends on PyYAML
 
 from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _resolve_agent_dir  # noqa: E402
+from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
 
 
 def _read_local_paths_conf(agent_name):
@@ -392,8 +393,8 @@ def _post_board(agent_name, drifted, dry_run):
     script = CORE_ROOT / "scripts" / "board-post.sh"
     try:
         subprocess.run(
-            ["bash", script.as_posix(), "--channel", "coordination",
-             "--type", "status", "--tags", "self-drift-gate"],
+            bash_cmd(script, "--channel", "coordination",
+                     "--type", "status", "--tags", "self-drift-gate"),
             input=msg,
             capture_output=True,
             text=True,

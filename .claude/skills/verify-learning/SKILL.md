@@ -117,6 +117,46 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `core/scripts/_paths.sh` resolves `AGENT_NAME="${AYOAI_AGENT:-}"` (one line, no fallbacks)
    Bash: AYOAI_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent"
 
+   # Inlined-_APD drift detection (rb-1092, g-115-983)
+   # AGENTS_PARENT_DIR is inlined at 5 sites for latency/import-cycle reasons
+   # (see CLAUDE.md "Agent-dir Resolution" table). Drift between any inlined
+   # copy and core/scripts/_paths.sh AGENTS_PARENT_DIR silently re-routes the
+   # affected helper to the wrong root: session-state-get.sh would return
+   # UNINITIALIZED for an existing agent (canonical rb-1092 incident), which
+   # would route /start to the UNINITIALIZED branch and clobber a working
+   # agent's state. The /start Step 1.5 drift-warning probe (skill: start)
+   # catches this at entry; this check catches it on the verify-learning
+   # cadence so drift is surfaced even when no /start re-entry happens.
+   Bash (inlined-_APD-drift): canonical=$(grep -E '^AGENTS_PARENT_DIR=' core/scripts/_paths.sh | head -1 | sed -E 's/^AGENTS_PARENT_DIR=//;s/^"//;s/"$//') && fail=0 && for f in core/scripts/session-state-get.sh core/scripts/session-mode-get.sh core/scripts/session-signal-exists.sh core/scripts/cleanup-stale-bindings.sh; do v=$(grep -E '^_APD=' "$f" | head -1 | sed -E 's/^_APD=//;s/^"//;s/"$//'); if [ "$v" != "$canonical" ]; then echo "FAIL: $f _APD=$v != _paths.sh AGENTS_PARENT_DIR=$canonical"; fail=1; fi; done && py=$(grep -E '^_AGENTS_PARENT_DIR' core/scripts/_wake_signals.py | head -1 | sed -E 's/^_AGENTS_PARENT_DIR[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/') && if [ "$py" != "$canonical" ]; then echo "FAIL: core/scripts/_wake_signals.py _AGENTS_PARENT_DIR=$py != _paths.sh AGENTS_PARENT_DIR=$canonical"; fail=1; fi && [ "$fail" = 0 ] && echo "PASS: all 5 inlined _APD/_AGENTS_PARENT_DIR sites match _paths.sh canonical \"$canonical\"" || true
+
+   # _world_config Mode G overlay loader (rb-1100, guard-590, Phase 2.5.D)
+   # When _world_config.py used the pre-relocation root/agent/local-paths.conf
+   # path (Mode G), it silently fell through to PROJECT_ROOT/world (nonexistent
+   # in canonical layout) and returned None. load_world_config swallowed the
+   # None as a dict(default) fallback, causing 25 routing-table-empty failures
+   # for ~3 weeks until pytest collection collision surfaced the regression.
+   # These two checks catch the same drift class at verify-learning cadence:
+   # (1) _resolve_world_dir() returns non-None Path for a bound agent
+   # (2) capability-routing overlay loads non-empty title_prefix_routes
+   # rb-1100 calls this "silent safe-default degradation = sync-invariant audit missed a site".
+   Check: `core/scripts/_world_config.py` `_resolve_world_dir()` returns non-None Path for a bound agent (Mode G regression — Phase 2.5.D missed sync site)
+   Bash (world-config-resolves): AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import _resolve_world_dir; p = _resolve_world_dir(); assert p is not None, 'FAIL: _resolve_world_dir() returned None (Mode G regression — silently falls through to PROJECT_ROOT/world)'; print(f'PASS: _world_config._resolve_world_dir() returned {p}')"
+   Check: `core/scripts/_world_config.py` `load_world_config('capability-routing')` returns non-empty title_prefix_routes (overlay file load works end-to-end)
+   Bash (capability-routing-non-empty): AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import load_world_config; cfg = load_world_config('capability-routing'); routes = cfg.get('title_prefix_routes', {}) if cfg else {}; assert len(routes) > 0, 'FAIL: title_prefix_routes is empty — overlay loader silently degraded (rb-1100)'; print(f'PASS: capability-routing overlay loaded {len(routes)} title_prefix_routes')"
+
+   # Hardcoded AGENTS_PARENT_DIR literal audit (g-115-1009, source: exp-encode-
+   # session-2026-05-20-world-config-mode-g). Static-pattern companion to the
+   # Mode G dynamic checks above. Inlined-_APD-drift guards the 5 documented
+   # sync sites; the Mode G checks above probe runtime behavior of one loader;
+   # THIS check guards completeness across the WHOLE Python tree — any Python
+   # file silently doing `PROJECT_ROOT / "agents"` instead of routing through
+   # agents_root() is a latent Phase-2.5.D regression that neither sibling
+   # catches. Canonical example was context-budget-status.py:80, fixed in
+   # g-115-1009 Part 1. Extracts canonical value from _paths.py dynamically
+   # (not hardcoded "agents") so future AGENTS_PARENT_DIR relocations don't
+   # re-introduce a false-pass when the literal-name changes.
+   Bash (hardcoded-APD-literal): canonical=$(grep -E '^AGENTS_PARENT_DIR\s*=' core/scripts/_paths.py | head -1 | sed -E 's/.*=\s*"([^"]*)".*/\1/') && hits=$(grep -rEn "\bPROJECT_ROOT\s*/\s*\"${canonical}\"" core/scripts/*.py mind_api/src/*.py 2>/dev/null | grep -v '_paths.py' || true) && if [ -n "$hits" ]; then echo "FAIL: hardcoded PROJECT_ROOT / \"${canonical}\" outside _paths.py — use agents_root() helper"; echo "$hits"; else echo "PASS: no hardcoded PROJECT_ROOT / \"${canonical}\" outside _paths.py canonical declaration"; fi
+
    # Bash-agent-inject hook evidence checks (Section 4T continued)
    # The PreToolUse[Bash] hook auto-injects AYOAI_AGENT from .active-agent-<SID> so
    # the LLM no longer needs to prefix every Bash call manually.
@@ -234,7 +274,79 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # (compiled-but-never-committed pre-cutover) and from the goal-selector
    # import-smoke check (g-115-768 sibling). Asserts the deliverable exists,
    # is git-tracked, and its >=5 attribution tests still pass.
-   Bash (cross-agent-attribution-deliverable): test -f core/scripts/_cross_agent_attribution_filter.py && git ls-files --error-unmatch core/scripts/_cross_agent_attribution_filter.py >/dev/null 2>&1 && N=$(py -3 -m pytest -q core/scripts/tests/test_post_state_update_attribution.py 2>/dev/null | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1) && [ -n "$N" ] && [ "$N" -ge 5 ] && echo "PASS: _cross_agent_attribution_filter.py exists + git-tracked + $N attribution tests passing (>=5)" || echo "FAIL: cross-agent attribution deliverable regression - _cross_agent_attribution_filter.py missing/untracked OR test_post_state_update_attribution.py <5 passing (g-115-714 lost-deliverable class; restore file + git add + ensure >=5 tests)"
+   # Pytest idiom (g-115-1182): `-o addopts= ... 2>&1`, NOT `-q ... 2>/dev/null`.
+   # This repo's pytest.ini sets addopts=-q; a second explicit -q double-quiets
+   # pytest and suppresses the "N passed" summary line, so the grep returns empty
+   # → false FAIL. `-o addopts=` overrides the .ini default (restores summary);
+   # 2>&1 captures it regardless of stream. (Was the broken `-q | grep passed`
+   # idiom until g-115-1182 fixed it here + in sibling Section ATF below.)
+   Bash (cross-agent-attribution-deliverable): test -f core/scripts/_cross_agent_attribution_filter.py && git ls-files --error-unmatch core/scripts/_cross_agent_attribution_filter.py >/dev/null 2>&1 && N=$(py -3 -m pytest core/scripts/tests/test_post_state_update_attribution.py -o addopts= 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1) && [ -n "$N" ] && [ "$N" -ge 5 ] && echo "PASS: _cross_agent_attribution_filter.py exists + git-tracked + $N attribution tests passing (>=5)" || echo "FAIL: cross-agent attribution deliverable regression - _cross_agent_attribution_filter.py missing/untracked OR test_post_state_update_attribution.py <5 passing (g-115-714 lost-deliverable class; restore file + git add + ensure >=5 tests)"
+
+   # Attribution-Filter in_flight-null Robustness (Section ATF — g-115-1182, 2026-05-26)
+   # g-115-1154 confirmed team-state-clear-in-flight runs in iteration-close.sh
+   # do_verify Step 3 (g-284-06) BEFORE post-state-update-gate fires the filter in
+   # do_state_update Step 8.78 — so self.in_flight=null (self_claimed_at=0) is the
+   # NORMAL filter-time state, not an edge case. Under that state Source 3
+   # (pre-claim-mtime) is disabled by its `self_claimed_at>0` guard; only Sources 1
+   # (concurrent-partner) and 2 (partner uncommitted-log) survive as fallbacks. This
+   # guards that the in_flight-null contract stays pinned: a regression test asserts
+   # Sources 1+2 STILL drop partner files and documents the Source 3 fail-open gap
+   # (tracked by g-115-1154 / g-115-1178 / g-115-1180). NOT a Source 4 fallback —
+   # the sq-018 spark proposed one but it contradicts the filter's fail-open
+   # philosophy and is not the chosen fix layer. Sibling to Section CAA.
+   # NOTE on the pytest idiom: this repo's pytest.ini sets `addopts = -q`, so a
+   # second explicit `-q` double-quiets pytest and SUPPRESSES the "N passed"
+   # summary line entirely (output becomes just the progress dots). Grepping
+   # `-q ... 2>/dev/null` for "N passed" therefore returns empty → false FAIL.
+   # Use `-o addopts=` to override the .ini default (restores the summary) and
+   # `2>&1` so the summary is captured regardless of stream. (g-115-1182 fixed
+   # the same broken `-q | grep passed` idiom in sibling Section CAA above in
+   # the same pass.)
+   Bash (attribution-filter-in-flight-null): test -f core/scripts/tests/test_attribution_filter_no_self_inflight.py && git ls-files --error-unmatch core/scripts/tests/test_attribution_filter_no_self_inflight.py >/dev/null 2>&1 && N=$(py -3 -m pytest core/scripts/tests/test_attribution_filter_no_self_inflight.py -o addopts= 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1) && [ -n "$N" ] && [ "$N" -ge 4 ] && echo "PASS: test_attribution_filter_no_self_inflight.py exists + git-tracked + $N cases passing (>=4) — Sources 1+2 still drop partner files when self.in_flight=null; Source 3 gap documented" || echo "FAIL: attribution-filter in_flight-null regression — test missing/untracked OR <4 cases passing (g-115-1182; restore test + git add, or if a Source-4/gate-scope fix changed the contract update the test + this check)"
+
+   # No-Broken-Pytest-Idiom Guard (Section PYI — g-115-1182, 2026-05-26)
+   # guard-656: any verify-learning Bash check that greps pytest output for the
+   # "N passed" summary MUST pass `-o addopts=` (this repo's pytest.ini sets
+   # `addopts = -q`; an inherited/second `-q` double-quiets pytest and
+   # SUPPRESSES the summary line — output becomes bare progress dots — so the
+   # grep returns empty -> silent FALSE-FAIL). g-115-1182's sq-018 spark added
+   # this self-referential guard after finding the idiom silently FALSE-FAILing
+   # in THREE checks (Section CAA, Section ATF, and the PMG `tests-pass` check
+   # below — all fixed in the same pass). Detector scopes to `Bash (` check
+   # lines (the `#` comments above are not matched); a check that runs pytest +
+   # greps `passed` but lacks `addopts=` is the broken signature. This PYI line
+   # contains `addopts=` and is therefore self-excluded.
+   Bash (no-broken-pytest-idiom): BROKEN=$(grep -E '^[[:space:]]*Bash \(' .claude/skills/verify-learning/SKILL.md | grep -F 'pytest' | grep -F 'passed' | grep -v -F 'addopts='); [ -z "$BROKEN" ] && echo "PASS: every verify-learning pytest-summary-grep check uses -o addopts= (no silent FALSE-FAIL idiom)" || echo "FAIL: a Bash check greps pytest for 'passed' without -o addopts= — addopts=-q suppresses the summary, silent FALSE-FAIL (guard-656, g-115-1182). Offending: $BROKEN"
+
+   # Committed-Files-Only Gate Scoping (Section CFO — g-115-1178, 2026-05-26)
+   # post-state-update-gate.sh now scopes its fresh-eyes file-detection to the
+   # files a commit actually landed when iteration-close.sh extracts the
+   # commit_sha from iteration-commit.sh's JSON and exports COMMIT_SHA (Option B
+   # from the g-115-1154 stranded-partner-false-positive investigation). When
+   # COMMIT_SHA is valid the gate uses git diff --name-only SHA~1..SHA AND skips
+   # untracked detection (committed scope); when unset/empty/invalid it falls
+   # back to the prior working-tree behavior. These checks guard all three
+   # surfaces: gate consumption, iteration-close extraction+pass, and the
+   # regression test (3 cases: committed-scope, unset-fallback, invalid-fallback).
+   # Pytest idiom (guard-656): `-o addopts= ... 2>&1`, never `-q ... 2>/dev/null`
+   # (this repo's pytest.ini sets addopts=-q; a second -q suppresses the summary
+   # line -> false FAIL). The regression check below carries `addopts=` and is
+   # therefore self-excluded from Section PYI's detector.
+   Bash (cfo-gate-consumes-commit-sha): grep -qF 'COMMIT_SHA_VALID' core/scripts/post-state-update-gate.sh && grep -qF '"${COMMIT_SHA}~1" "${COMMIT_SHA}"' core/scripts/post-state-update-gate.sh && echo "PASS: post-state-update-gate.sh scopes to the COMMIT_SHA committed range (g-115-1178)" || echo "FAIL: post-state-update-gate.sh lost the COMMIT_SHA committed-scope branch — stranded-partner false-positive scoping regressed (g-115-1178); restore the COMMIT_SHA_VALID branch + the SHA~1..SHA range diff"
+   Bash (cfo-iteration-close-extracts-commit-sha): grep -qF '_commit_sha="$(printf' core/scripts/iteration-close.sh && grep -qF 'COMMIT_SHA="${_commit_sha:-}"' core/scripts/iteration-close.sh && echo "PASS: iteration-close.sh extracts commit_sha from iteration-commit JSON and passes COMMIT_SHA to the gate (g-115-1178)" || echo "FAIL: iteration-close.sh no longer extracts commit_sha / passes COMMIT_SHA to post-state-update-gate.sh — committed-scope wiring regressed (g-115-1178)"
+   Bash (cfo-regression-test): test -f core/scripts/tests/test_post_state_update_gate_committed_files_only.py && git ls-files --error-unmatch core/scripts/tests/test_post_state_update_gate_committed_files_only.py >/dev/null 2>&1 && N=$(py -3 -m pytest core/scripts/tests/test_post_state_update_gate_committed_files_only.py -o addopts= 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1) && [ -n "$N" ] && [ "$N" -ge 3 ] && echo "PASS: committed-files-only regression test exists + git-tracked + $N cases passing (>=3)" || echo "FAIL: committed-files-only regression test missing/untracked OR <3 passing (g-115-1178; restore test + git add, or if the scoping contract changed update the test + this check)"
+
+   # Fresh-Eyes Findings-Board Self-Evolution Read (Section FEF — g-115-1214, 2026-05-26)
+   # fresh-eyes-review Phase 2 input assembly historically read only
+   # pending-questions.yaml for self-evolution signals (Phase 2.3), never the
+   # findings board. Incident (2026-05-24): a no_change verdict landed with
+   # self_evolution_signals_count=0 while alpha self-drift finding
+   # msg-20260523-091626-alpha-1586 sat unread on world/board/findings (later
+   # actioned by hand as g-115-1213). The fix added Phase 2.3b (board-read
+   # --channel findings, filtered to self_evolution/self-drift directed at this
+   # agent) and folded board_signals into self_evolution_signals_count. See
+   # rb-1279. This check guards that the findings-board read does not regress.
+   Bash (fresh-eyes-reads-findings-board): grep -qE 'board-read\.sh --channel findings' .claude/skills/fresh-eyes-review/SKILL.md && grep -qF 'board_signals' .claude/skills/fresh-eyes-review/SKILL.md && echo "PASS: fresh-eyes-review Phase 2 reads the findings board for self_evolution/self-drift signals (g-115-1214)" || echo "FAIL: fresh-eyes-review Phase 2 no longer reads world/board/findings for self-evolution signals — the 2026-05-24 self_evolution_signals_count=0 blind spot regressed (g-115-1214, rb-1279); restore Phase 2.3b board-read + board_signals fold into self_evolution_signals_count"
 
    # SID-Collision Hardening (Section SID-COLLISION — 2026-05-12)
    # Four-tier defense against Claude Code session_id reuse across windows
@@ -268,6 +380,14 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (start-idle-wires-collision-check): grep -q "sid-collision-check.sh" .claude/skills/start/SKILL.md && echo "PASS: /start references sid-collision-check.sh" || echo "FAIL: /start does NOT call sid-collision-check.sh (Tier 1a regressed)"
    Bash (start-halt-on-collision): grep -q "HALT ON SID_COLLISION" .claude/skills/start/SKILL.md && echo "PASS: /start has HALT ON SID_COLLISION instruction" || echo "FAIL: /start missing HALT ON SID_COLLISION (Tier 1a)"
    Bash (save-id-eighth-witness): grep -q "sid-collision-check.sh" core/scripts/session-save-id.sh && echo "PASS: session-save-id.sh compact branch calls sid-collision-check.sh (8th witness)" || echo "FAIL: session-save-id.sh missing 8th-witness collision check (Tier 1a)"
+   # Tier 1a (test-defense, g-115-1224) — the sid-collision GATE is itself guarded by
+   # core/scripts/tests/test-sid-collision-check.sh, which carries two stub-drift
+   # defenses: (1) the _resolve_agent_from_sid.py sandbox-stub heredoc (delimiter
+   # RESOLVE_EOF) and (2) the 0-CANARY-harness-can-detect-collision case at the suite
+   # head. If either is removed by a refactor, collision cases 7+9 short-circuit at the
+   # resolver-missing exit and the suite silently reverts to vacuous-pass — the gate's
+   # regression net vanishes with no failing test. Assert both survive (dfc27caa).
+   Bash (sid-collision-test-stub-defenses): grep -q "RESOLVE_EOF" core/scripts/tests/test-sid-collision-check.sh && grep -q "0-CANARY-harness-can-detect-collision" core/scripts/tests/test-sid-collision-check.sh && echo "PASS: test-sid-collision-check.sh retains both stub-drift defenses (resolver-stub heredoc + 0-CANARY canary)" || echo "FAIL: test-sid-collision-check.sh missing resolver-stub heredoc OR 0-CANARY canary — suite may silently revert to vacuous-pass mode (cases 7+9 short-circuit at resolver-missing exit; g-115-1224)"
    # Tier 1b — stale-binding cleanup predicate (3-signal: mtime>24h + SID-mismatch +
    # heartbeat-stale). Extracted to shared core/scripts/cleanup-stale-bindings.sh on
    # 2026-05-12 (g-303-25 B2). Both stop-hook.sh and session-save-id.sh invoke the
@@ -378,6 +498,34 @@ else:
    Check: `core/scripts/origin-signal-gate.py` defines a top-level `ALLOWED_PREFIXES` set (authoritative whitelist)
    Check: `.claude/skills/create-aspiration/SKILL.md` Step 1.2 origin_signal computation comments the ALLOWED_PREFIXES location — grep Step 1.2 for `origin-signal-gate.py` must match
    Bash (from-followup-smoke): grep -q 'from-followup' .claude/skills/create-aspiration/SKILL.md && grep -q 'user_directive\|idea:' .claude/skills/create-aspiration/SKILL.md && echo "PASS: from-followup mode present with valid origin_signal prefixes" || echo "FAIL: from-followup mode missing or uses unregistered prefix"
+
+   # Prefix-table sync (g-115-1102, rb-1170): ALLOWED_PREFIXES in
+   # core/scripts/gates/origin_signal.py and the prefix-mapping inside
+   # core/scripts/_goal_source.py infer() must agree on every colon-suffix
+   # prefix. Drift between the two tables produces goal_source=null entries
+   # that pass the origin_signal gate at create time but fall through infer()
+   # at write time. g-115-1100 audit found 7/11 new asp-115 goals had
+   # goal_source=null because alert-email:, routing-mismatch:, and
+   # insight_trigger: were absent from both tables. The check below extracts
+   # ALLOWED_PREFIXES via AST and verifies every colon-suffix entry appears
+   # as a literal substring in _goal_source.py — catches additions to the
+   # whitelist that forget to extend infer().
+   Bash (origin-signal-goalsource-sync): missing=$(py -3 -c 'import ast,pathlib;a=pathlib.Path("core/scripts/gates/origin_signal.py").read_text(encoding="utf-8");b=pathlib.Path("core/scripts/_goal_source.py").read_text(encoding="utf-8");pre=set();[pre.add(e.value) for n in ast.walk(ast.parse(a)) if isinstance(n,ast.Assign) and any(getattr(t,"id","")=="ALLOWED_PREFIXES" for t in n.targets) and isinstance(n.value,ast.Tuple) for e in n.value.elts if isinstance(e,ast.Constant) and isinstance(e.value,str)];print(" ".join(x for x in sorted(pre) if x.endswith(":") and x not in b))'); [ -z "$missing" ] && echo "PASS: origin_signal/goal_source prefix-table sync" || echo "FAIL: prefix-table drift -- '$missing' in ALLOWED_PREFIXES but absent from _goal_source.py infer()"
+
+   # Recurring urgency cap + 6-agent role_multiplier table (g-115-1109, rb-1170 paired-table drift class).
+   # Three regression-class checks for the zeta-1477 fix (urgency_max cap on log-scaled
+   # recurring_urgency) and the 6-agent goal-selection-strategy table. Without these
+   # checks, accidental removal of the cap during refactor or loss of an agent entry
+   # would silently revert the fix — same regression class g-115-1106 closed for
+   # min_session_goals gate. Source assertions (verified at goal close 2026-05-22):
+   #   goal-selector.py:275 "urgency_max": 4.0 in RECURRING_CONFIG defaults dict
+   #   goal-selector.py:1681 rec = min(rec, RECURRING_CONFIG["urgency_max"]) in criterion 7
+   #   aspirations.yaml:673 urgency_max: 4.0 under recurring block
+   #   aspirations.yaml:1171 recurring.urgency_max: {...} in modifiable bounds
+   #   meta/goal-selection-strategy.yaml:29 agent_role_multipliers: block with 6 agents (alpha/bravo/zeta/charlie/delta/echo) at lines 30/36/42/48/54/60
+   Bash (recurring-urgency-max-cap): defaults=$(grep -c '"urgency_max": ' core/scripts/goal-selector.py); applied=$(grep -c 'min(rec, RECURRING_CONFIG\["urgency_max"\])' core/scripts/goal-selector.py); [ "$defaults" -ge 1 ] && [ "$applied" -ge 1 ] && echo "PASS: goal-selector.py urgency_max cap (defaults=$defaults, applied=$applied)" || echo "FAIL: goal-selector.py urgency_max cap missing (defaults=$defaults, applied=$applied — zeta-1477 fix reverted?)"
+   Bash (recurring-urgency-max-config): recur=$(grep -c '^  urgency_max: ' core/config/aspirations.yaml); bounds=$(grep -c '^  recurring\.urgency_max:' core/config/aspirations.yaml); [ "$recur" -ge 1 ] && [ "$bounds" -ge 1 ] && echo "PASS: aspirations.yaml urgency_max (recurring=$recur, bounds=$bounds)" || echo "FAIL: aspirations.yaml urgency_max missing (recurring=$recur, bounds=$bounds — config drift, zeta-1477 cap not configurable)"
+   Bash (agent-role-multipliers-6): source core/scripts/_paths.sh; f="$META_DIR/goal-selection-strategy.yaml"; has_block=$(grep -c '^agent_role_multipliers:' "$f" 2>/dev/null || echo 0); missing=""; for a in alpha bravo zeta charlie delta echo; do grep -q "^  $a:" "$f" 2>/dev/null || missing="$missing $a"; done; [ "$has_block" -ge 1 ] && [ -z "$missing" ] && echo "PASS: agent_role_multipliers 6-agent table complete" || echo "FAIL: agent_role_multipliers issues (block=$has_block, missing=$missing — role-bonus drift, an agent's strategic boost lost)"
 
    # Windows platform-friction fixes (Section WPF — 2026-04-19)
    # Four root-cause fixes for Windows MSYS bash + Python ergonomics. If any of
@@ -698,6 +846,15 @@ else:
    Bash: grep -c 'if \[ -z "\$AYOAI_SID" \]; then echo "ERROR:EMPTY_AYOAI_SID"' .claude/skills/start/SKILL.md → verify ≥3 (observer Step 0, IDLE Step 3, UNINITIALIZED C8; IDLE Step 0 + A2 share the same pattern so total ≥5 acceptable)
    # Anti-regression: no silent-gate pattern allowed on SID writes
    Bash: grep -c '\[ -n "\$AYOAI_SID" \] &&' .claude/skills/start/SKILL.md → verify 0
+   # Visible-halt guard for session-mode-set.sh (g-115-1032, 2026-05-21): mode-set
+   # failures at any of the 4 /start sites (IDLE Step 2, UNINITIALIZED Phase C
+   # reader C4, assistant C8, autonomous C9) must HALT, not silently fall through.
+   # Without HALT, a failed assistant/autonomous mode-set lets the agent land in
+   # the reader disk-default while the success message lies about the actual mode
+   # (silent capability mismatch). Mirrors the session-state-set.sh HALT contract
+   # added 2026-05-20 (tag G2).
+   Check: `start/SKILL.md` session-mode-set.sh sites carry g-115-1032 HALT blocks (4 sites)
+   Bash: grep -c 'HALT ON NON-ZERO EXIT (g-115-1032' .claude/skills/start/SKILL.md → verify ≥4
    Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch DOES bind session (`.active-agent-<SID>`)
    Check: `session-state.md` has "Observer Sessions" section with rules and concurrency safety
    Check: `stop-hook.sh` Gate 0 allows non-runner SIDs (HOOK_SID != RUNNER_SID → exit 0)
@@ -814,6 +971,29 @@ else:
    Check: budget-meter sweep_tier classifies unblock-parent-status-sweep as deferrable. Bash: `grep -E 'pending-questions-sweep\|.*\|unblock-parent-status-sweep\|.*\)' core/scripts/aspirations-precheck-budget-meter.sh >/dev/null && echo PASS || { echo "FAIL: unblock-parent-status-sweep not in deferrable case of sweep_tier()"; exit 1; }`
    Check: test_unblock_parent_status_sweep.py defines exactly 12 tests. Bash: `count=$(grep -cE '^def test_' core/scripts/tests/test_unblock_parent_status_sweep.py 2>/dev/null); test "$count" = "12" && echo "PASS: 12 tests" || { echo "FAIL: expected 12 tests, got $count"; exit 1; }`
 
+   # Section UIP: Unblock-intake-probe wiring (g-115-1017, rb-1111, 2026-05-22)
+   # Fast intake-time probe for Unblock goals at claim time. Parses
+   # failure_reason for named artifacts (commit hashes / file:line refs /
+   # function names) and emits a probable-fix-landed | bug-still-present |
+   # inconclusive verdict. Canonical incident: g-115-985 (filed against
+   # loop-state-save.py:82, commit a49e4805 fix landed before pickup).
+   # Three wiring points MUST stay intact:
+   #   (1) aspirations-execute SKILL.md Phase 4 invokes the .sh wrapper
+   #       between aspirations-update-goal.sh status in-progress and the
+   #       Intelligent Retrieval Protocol load.
+   #   (2) core/scripts/unblock-intake-probe.py + .sh both exist and are
+   #       executable.
+   #   (3) test_unblock_intake_probe.py defines >=9 test cases covering
+   #       title gate, age gate, commit-ancestor, file-line-out-of-range,
+   #       file-missing, no-artifacts, goal-not-found, force-bypass,
+   #       and always-exit-zero.
+   #   (4) core/config/aspirations.yaml carries the unblock_intake_probe
+   #       block with enabled + min_age_hours keys.
+   Check: aspirations-execute Phase 4 invokes the probe. Bash: `grep -q 'unblock-intake-probe.sh' .claude/skills/aspirations-execute/SKILL.md && echo PASS || { echo "FAIL: aspirations-execute SKILL.md missing unblock-intake-probe.sh wiring — g-115-1017 regressed"; exit 1; }`
+   Check: probe wrapper + python script both exist. Bash: `test -f core/scripts/unblock-intake-probe.py && test -f core/scripts/unblock-intake-probe.sh && echo PASS || { echo "FAIL: unblock-intake-probe script(s) missing — g-115-1017 regressed"; exit 1; }`
+   Check: test_unblock_intake_probe.py defines at least 9 test cases. Bash: `count=$(grep -cE '^def test_' core/scripts/tests/test_unblock_intake_probe.py 2>/dev/null); test "$count" -ge "9" && echo "PASS: $count tests" || { echo "FAIL: expected >=9 tests, got $count"; exit 1; }`
+   Check: aspirations.yaml has unblock_intake_probe block with enabled + min_age_hours. Bash: `py -3 -c "import yaml,pathlib; d=yaml.safe_load(pathlib.Path('core/config/aspirations.yaml').read_text(encoding='utf-8')); blk=d.get('unblock_intake_probe') or {}; ok='enabled' in blk and 'min_age_hours' in blk; print('PASS' if ok else f'FAIL: unblock_intake_probe block missing or incomplete: {blk}')" | grep -q PASS && echo PASS || { echo "FAIL: aspirations.yaml unblock_intake_probe block missing or incomplete"; exit 1; }`
+
    # Section DER: Daemon Endpoint Registry pre-commit gate (g-115-802, g-115-807, 2026-05-16)
    # Layer B sibling to check-no-python-cli-fallback.sh. Verifies
    # mind_api/src/endpoints/__init__.py load_all imports resolve to existing
@@ -829,7 +1009,77 @@ else:
    # Behavioral audit: run the gate against the current working tree. Catches
    # drift introduced since last commit (mid-refactor stage where __init__.py
    # references modules that don't exist yet, OR exist but were renamed).
-   Bash: case "$(uname -s 2>/dev/null || echo unknown)" in MINGW*|MSYS*|CYGWIN*) PY="py -3" ;; *) PY="python3" ;; esac; $PY core/scripts/check-mind-api-endpoint-registry.py --audit && echo "PASS: all load_all imports resolve" || { echo "FAIL: endpoint-registry audit found missing modules — daemon would ImportError on next start"; exit 1; }
+   Bash: case "$(uname -s 2>/dev/null || echo unknown)" in MINGW*|MSYS*|CYGWIN*) PY="py -3" ;; *) PY="python3" ;; esac; $PY core/scripts/check-mind-api-endpoint-registry.py --audit && echo "PASS: all load_all imports resolve" || { echo "FAIL: endpoint-registry audit found missing modules - daemon would ImportError on next start"; exit 1; }
+
+   # Section DPA: Daemon Per-Agent Header Gate (g-115-957, g-115-1153, 2026-05-22)
+   # The store endpoint (mind_api/src/endpoints/store.py) routes ALL agent-private
+   # store writes (reasoning-bank, guardrails, pattern-signatures, journal, etc.)
+   # and MUST call _require_agent_header(ctx) early in its POST handler so a
+   # missing/invalid AYOAI-Agent header rejects the write with a 400 before any
+   # store-side mutation. g-115-957 added the gate; this check pins it.
+   #
+   # Scope is intentionally narrow: ONLY store.py. The original Apply description
+   # listed store/aspirations_write/pipeline_write/wm/experience as candidates,
+   # but pre-flight investigation (2026-05-22 iter 20) confirmed:
+   #   - pipeline_write.py does not exist
+   #   - wm.py is a read-only GET endpoint (no write to gate)
+   #   - experience.py is a read-only GET endpoint (no write to gate)
+   #   - aspirations_write.py uses its own multi-gate pipeline (capability-route-gate,
+   #     goal-duplication-gate, stale-read-gate, etc.) keyed off intended_agent
+   #     field validation, not header gating
+   # Broadening the check to those files would FAIL immediately with no
+   # corresponding regression to catch. If the gate is later extended to other
+   # write endpoints, append them to the grep list below.
+   Check: `mind_api/src/endpoints/store.py` calls `_require_agent_header` in its POST handler. Bash (store-py-agent-header-gate): grep -q '_require_agent_header' mind_api/src/endpoints/store.py && echo "PASS: store.py invokes _require_agent_header" || { echo "FAIL: store.py missing _require_agent_header gate - g-115-957 regressed; per-agent store writes can land without AYOAI-Agent header validation"; exit 1; }
+
+   # Section DOP: Daemon Orphan Prevention (g-115-764 v3, g-115-1112, 2026-05-22)
+   # The 2026-05-22 snapshot found 36 orphan daemon pairs (72 processes)
+   # accumulated over 204 spawns in 37 hours (~17% kill-failure rate). Root
+   # cause: the powershell tree-kill in mind-api-start.sh + _runtime.sh looked
+   # up the py.exe launcher PID via Get-CimInstance Win32_Process -Filter
+   # "ProcessId=<child>" .ParentProcessId. When SIGTERM gracefully killed the
+   # python.exe child BEFORE the powershell tree-kill ran, Get-CimInstance
+   # returned null and the inner if-block (which contained BOTH the parent
+   # AND the child kill) was skipped — orphaning the py.exe parent.
+   #
+   # v3 fix:
+   #   1. Daemon writes its py.exe parent PID to daemon.parent.pid at startup
+   #      (mind_api/src/lifecycle.py + mind_api/src/server.py).
+   #   2. Kill paths read the parent PID from disk and force-kill BOTH PIDs
+   #      by KNOWN values, no lookup chain (mind-api-start.sh _force_kill_tree
+   #      + _runtime.sh rt_force_kill_tree). This is the authoritative reap.
+   #   3. Pre-spawn orphan sweep helpers EXIST (_sweep_orphan_daemons /
+   #      rt_sweep_orphan_daemons) but are NOT called implicitly with empty
+   #      keep-args anymore — that would kill EVERY mind_api.src process
+   #      system-wide and collide with other repos running the same daemon
+   #      (same cmdline, Win32_Process exposes no cwd/env discriminator).
+   #      kill-by-KNOWN-PIDs in step 2 is repo-safe by construction.
+   #   4. Standalone user-invocable diagnostic: daemon-orphan-sweep.sh
+   #      reports state, --clean reaps orphans, --strict exits 1 on detection.
+   #      Note: --clean is cross-repo dangerous; user invokes it knowingly.
+   #   5. PowerShell results are LOGGED to spawn.log (no more
+   #      >/dev/null 2>&1 silently swallowing failures).
+   #
+   # The checks below guard the four files that participate in the fix.
+   # A future edit that removes parent-PID writing OR replaces the new kill
+   # path with the old Get-CimInstance lookup would regress the class.
+   Check: `mind_api/src/lifecycle.py` exports `parent_pid_file()` and `read_parent_pid()`. Bash: `grep -q 'def parent_pid_file' mind_api/src/lifecycle.py && grep -q 'def read_parent_pid' mind_api/src/lifecycle.py && echo "PASS: lifecycle.py exports parent_pid_file + read_parent_pid" || { echo "FAIL: lifecycle.py missing parent_pid_file or read_parent_pid — daemon orphan fix (g-115-764 v3) regressed"; exit 1; }`
+   Check: `mind_api/src/lifecycle.py::write_pid_and_port_atomic` accepts `parent_pid` kwarg. Bash: `grep -A 3 '^def write_pid_and_port_atomic' mind_api/src/lifecycle.py | grep -q 'parent_pid' && echo "PASS: write_pid_and_port_atomic accepts parent_pid" || { echo "FAIL: write_pid_and_port_atomic missing parent_pid parameter — daemon will not write daemon.parent.pid (g-115-764 v3 regression)"; exit 1; }`
+   Check: `mind_api/src/server.py` passes `os.getppid()` to `write_pid_and_port_atomic`. Bash: `grep -A2 'write_pid_and_port_atomic' mind_api/src/server.py | grep -q 'parent_pid' && echo "PASS: server.py passes parent_pid at startup" || { echo "FAIL: server.py not passing parent_pid — daemon.parent.pid will not be populated"; exit 1; }`
+   Check: `core/scripts/mind-api-start.sh` defines `_force_kill_tree` AND `_sweep_orphan_daemons`. Bash: `grep -q '^_force_kill_tree()' core/scripts/mind-api-start.sh && grep -q '^_sweep_orphan_daemons()' core/scripts/mind-api-start.sh && echo "PASS: mind-api-start.sh has bulletproof kill helpers" || { echo "FAIL: mind-api-start.sh missing _force_kill_tree or _sweep_orphan_daemons (g-115-764 v3 regression)"; exit 1; }`
+   Check: `core/scripts/_runtime.sh` defines `rt_force_kill_tree` AND `rt_sweep_orphan_daemons`. Bash: `grep -q '^rt_force_kill_tree()' core/scripts/_runtime.sh && grep -q '^rt_sweep_orphan_daemons()' core/scripts/_runtime.sh && echo "PASS: _runtime.sh has bulletproof kill helpers" || { echo "FAIL: _runtime.sh missing rt_force_kill_tree or rt_sweep_orphan_daemons (g-115-764 v3 regression)"; exit 1; }`
+   Check: `core/scripts/mind-api-start.sh::_force_kill_tree` does NOT use the old `.ParentProcessId` lookup pattern (g-115-764 v3 regression check). Bash: `awk '/^_force_kill_tree\(\)/,/^}/' core/scripts/mind-api-start.sh | grep -q 'ParentProcessId' && { echo "FAIL: _force_kill_tree still uses Get-CimInstance .ParentProcessId lookup — the silent-no-op bug (g-115-764) regressed"; exit 1; } || echo "PASS: _force_kill_tree uses known-PID kill (no ParentProcessId lookup)"`
+   Check: `core/scripts/_runtime.sh::rt_force_kill_tree` does NOT use the old `.ParentProcessId` lookup pattern. Bash: `awk '/^rt_force_kill_tree\(\)/,/^}/' core/scripts/_runtime.sh | grep -q 'ParentProcessId' && { echo "FAIL: rt_force_kill_tree still uses Get-CimInstance .ParentProcessId lookup — the silent-no-op bug (g-115-764) regressed"; exit 1; } || echo "PASS: rt_force_kill_tree uses known-PID kill (no ParentProcessId lookup)"`
+   Check: `core/scripts/daemon-orphan-sweep.sh` exists and is executable. Bash: `test -x core/scripts/daemon-orphan-sweep.sh && echo "PASS: daemon-orphan-sweep.sh present + executable" || { echo "FAIL: daemon-orphan-sweep.sh missing or not executable (g-115-764 v3 user-facing diagnostic)"; exit 1; }`
+   Check: `core/scripts/tests/test_daemon_orphan_prevention.py` exists. Bash: `test -f core/scripts/tests/test_daemon_orphan_prevention.py && echo "PASS: regression test present" || { echo "FAIL: test_daemon_orphan_prevention.py missing — no regression coverage for g-115-764 v3"; exit 1; }`
+   # Behavioral check: run the sweep in report-only mode. Exits 0 always;
+   # we capture and inspect output for orphans. Skipped on POSIX (orphan
+   # class is Windows-specific). On multi-repo machines (sibling repos
+   # running concurrent mind_api daemons), the sweep CORRECTLY reports
+   # other repos' daemons as "orphans of THIS repo's published state" —
+   # which is informational, not a failure. The check passes if THIS
+   # repo's own daemon (daemon.pid + daemon.parent.pid) is KEPT.
+   Bash (daemon-no-orphans): case "$(uname -s 2>/dev/null || echo unknown)" in MINGW*|MSYS*|CYGWIN*) out=$(bash core/scripts/daemon-orphan-sweep.sh 2>&1); our_pid=$(cat mind_api/state/daemon.pid 2>/dev/null | tr -d '[:space:]'); our_parent=$(cat mind_api/state/daemon.parent.pid 2>/dev/null | tr -d '[:space:]'); if [ -z "$our_pid" ]; then echo "INFO: daemon not running — skipping orphan check"; elif echo "$out" | grep -qE "KEEP PID=$our_pid" && ( [ -z "$our_parent" ] || echo "$out" | grep -qE "KEEP PID=$our_parent" ); then echo "PASS: this-repo daemon kept by sweep (child=$our_pid parent=${our_parent:-<none>})"; else echo "FAIL: sweep did not flag our daemon as KEEP — kill path regression"; echo "$out"; fi ;; *) echo "SKIP: daemon orphan check is Windows-specific" ;; esac
 
    # Section GAE: .gitattributes EOL Enforcement for Shell Scripts (g-115-869, g-115-871, 2026-05-17)
    # `core.autocrlf=true` is the standard Windows Git install default and will
@@ -1487,6 +1737,69 @@ print('SHAPE-LEAK:', bad if bad else 'PASS (zero orphan timing fields on recurri
    Bash: test -f core/scripts/tests/test_recurring_close_canary_suppress.py && echo OK || echo MISSING
    Bash: py -3 core/scripts/tests/test_recurring_close_canary_suppress.py 2>&1 | tail -1 → expect "5/5 tests passed"
 
+   # iteration-close-reminder outcome-aware reminder pin (g-115-1138 / sq-018).
+   # Origin: zeta investigation g-115-1121 confirmed the hook's generic
+   # Skill(aspirations) imperative silently overrode recurring-close.sh's
+   # stdout directing Skill(aspirations-spark) first on OUTCOME=deep closes
+   # (system-reminder wins over plain stdout). Phase 6 spark was skipped on
+   # every deep recurring close. Fix landed in g-115-1138: split reminder
+   # text into REMINDER_TEXT_GENERIC + REMINDER_TEXT_DEEP_RECURRING and
+   # branch on a stdout marker. These checks pin both reminder constants AND
+   # the producer/consumer marker contract so neither side can drift
+   # independently and re-introduce the silent spark skip.
+   Check: `core/scripts/iteration-close-reminder.py` defines `REMINDER_TEXT_GENERIC` constant
+   Bash: grep -c 'REMINDER_TEXT_GENERIC = (' core/scripts/iteration-close-reminder.py → verify ≥1
+   Check: `core/scripts/iteration-close-reminder.py` defines `REMINDER_TEXT_DEEP_RECURRING` constant
+   Bash: grep -c 'REMINDER_TEXT_DEEP_RECURRING = (' core/scripts/iteration-close-reminder.py → verify ≥1
+   Check: `REMINDER_TEXT_DEEP_RECURRING` body directs Skill(aspirations-spark) before Skill(aspirations)
+   Bash: grep -c 'Skill(aspirations-spark)' core/scripts/iteration-close-reminder.py → verify ≥2
+   Check: detector helper `_is_deep_recurring_close` exists in iteration-close-reminder.py
+   Bash: grep -c 'def _is_deep_recurring_close' core/scripts/iteration-close-reminder.py → verify ≥1
+   # Producer-side marker pin: recurring-close.sh MUST emit the OUTCOME=deep
+   # phrase followed by NEXT ACTION REQUIRED on the same line. The hook's
+   # detector regex (_DEEP_RECURRING_RE) tolerates em-dash, double-hyphen,
+   # and en-dash separators, so the grep below uses a regex that anchors on
+   # the stable phrases and matches any separator. Bypassing the dash
+   # character avoids Windows grep encoding quirks while still catching
+   # producer drift if either stable phrase changes.
+   Check: `core/scripts/recurring-close.sh` emits OUTCOME=deep NEXT ACTION REQUIRED marker
+   Bash: grep -cE 'OUTCOME=deep[^A-Za-z]+NEXT ACTION REQUIRED' core/scripts/recurring-close.sh → verify ≥1
+   # Consumer-side regex pin: iteration-close-reminder.py must keep its
+   # detector regex tolerant of dash-style drift. If a future edit hardcodes
+   # a specific dash literal, this check fails — forcing the author to
+   # consider symmetry with the producer.
+   Check: `core/scripts/iteration-close-reminder.py` _DEEP_RECURRING_RE matches OUTCOME=deep+NEXT ACTION REQUIRED with any separator
+   Bash: grep -cE 'OUTCOME=deep.+NEXT ACTION REQUIRED' core/scripts/iteration-close-reminder.py → verify ≥1
+   Check: regression test `test_iteration_close_reminder.py` exists and all cases pass
+   Bash: test -f core/scripts/tests/test_iteration_close_reminder.py && echo OK || echo MISSING
+   Bash: py -3 -m pytest core/scripts/tests/test_iteration_close_reminder.py -q 2>&1 | tail -1 → expect "passed"
+
+   # Cargo-cult placeholder suppression pin (g-115-1089 / g-115-1120, sq-018).
+   # Second-layer suppression of Phase 4.25 force_experience_archival sentinel
+   # for forced-flip routine→deep closes that produce no substantive artifact.
+   # First layer is g-115-634 (empty encoding_queue + sensory_buffer); this
+   # extends to cover sessions with non-empty buffers from unrelated earlier
+   # work. Probes 4 artifact types (tree-md, new goal, non-status board post,
+   # pipeline-meta mtime) in a tight time window. ALL FOUR negative → suppress.
+   # Fail-open at every layer: probe errors → sentinel fires as normal.
+   # Origin: zeta investigation g-115-1089 → Apply g-115-1120 (alpha).
+   Check: `core/config/aspirations.yaml` recurring: block defines cargo_cult_suppress_no_artifact
+   Bash: grep -c 'cargo_cult_suppress_no_artifact:' core/config/aspirations.yaml → verify ≥1
+   Check: `core/config/aspirations.yaml` recurring: block defines cargo_cult_artifact_window_seconds
+   Bash: grep -c 'cargo_cult_artifact_window_seconds:' core/config/aspirations.yaml → verify ≥1
+   Check: `core/scripts/recurring-close.sh` Phase 4.25 enforcement block contains g-115-1089 marker
+   Bash: grep -c 'g-115-1089' core/scripts/recurring-close.sh → verify ≥1
+   Check: `core/scripts/recurring-close.sh` reads cargo_cult_artifact_window_seconds knob
+   Bash: grep -c 'cargo_cult_artifact_window_seconds' core/scripts/recurring-close.sh → verify ≥1
+   # Fail-open contract: probe exceptions MUST log diagnostic + continue
+   # (never block sentinel write). The "artifact probe error" string inside
+   # the except block proves the fail-open path is wired.
+   Check: `core/scripts/recurring-close.sh` artifact probe handles exceptions (fail-open)
+   Bash: grep -c 'artifact probe error' core/scripts/recurring-close.sh → verify ≥1
+   Check: regression test `test_recurring_close_cargo_cult_suppression.py` exists and 3/3 pass
+   Bash: test -f core/scripts/tests/test_recurring_close_cargo_cult_suppression.py && echo OK || echo MISSING
+   Bash: py -3 -m pytest core/scripts/tests/test_recurring_close_cargo_cult_suppression.py -q 2>&1 | tail -1 → expect "3 passed"
+
    # Exploration noise evidence checks
    Bash: goal-selector.sh → parse first result
        Check: output includes exploration_params with epsilon, noise_scale, noise_weight
@@ -1654,13 +1967,13 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `agent-completion-report/SKILL.md` Phase 3 has "Message Board" section between "Knowledge" and "Active Work"
    Check: `agent-completion-report/SKILL.md` conventions list includes `board`
 
-   # Report persistence (Section AN8)
+   # Report persistence (Section AN8) — reports/ archive abolished by file-model normalization
    Check: `agent-completion-report/SKILL.md` tools_used includes `Write`
-   Check: `agent-completion-report/SKILL.md` Phase 4 writes to `agents/<agent>/reports/` and `agents/<agent>/COMPLETION-REPORT.md`
-   Check: `agent-completion-report/SKILL.md` Chaining Modifies lists `agents/<agent>/reports/*.md` and `agents/<agent>/COMPLETION-REPORT.md`
+   Check: `agent-completion-report/SKILL.md` Phase 4 writes `agents/<agent>/COMPLETION-REPORT.md` (the single latest-pointer report; git history is the archive)
+   Check: `agent-completion-report/SKILL.md` Phase 4 does NOT write a timestamped archive under `agents/<agent>/reports/` and does NOT `mkdir` a `reports/` directory (regression guard — reports/ is abolished)
+   Check: `agent-completion-report/SKILL.md` Chaining Modifies lists `agents/<agent>/COMPLETION-REPORT.md` and `agents/<agent>/session/last-outcome-snapshot.yaml`, and does NOT list `agents/<agent>/reports/`
    IF `/agent-completion-report` was run during the test:
        Check: `agents/<agent>/COMPLETION-REPORT.md` exists and is non-empty
-       Check: `agents/<agent>/reports/` directory exists with at least one `completion-report-*.md` file
 
    # Stop consolidation evidence checks (Section SC)
    Check: `stop/SKILL.md` RUNNING section sets `stop-requested` signal (consolidation delegated to Phase -1.4)
@@ -2132,6 +2445,27 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -qE 'has_specific\s*=\s*bool\(hit_paths\)\s*or\s*any\(' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (structural-co-signal predicate present)
    Bash: AYOAI_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py 2>&1 | grep -q "PASS (3/3 cases)" && echo PASS || echo FAIL → verify PASS (3-case regression — G1 plain-words demote / G2 file-path block / G3 structured-identifier block)
 
+   # pending_queue check regression (g-115-783, added 2026-05-22)
+   # The pending_queue check (6th corpus) scans world + per-agent
+   # aspirations.jsonl for pending/in-progress goals overlapping the
+   # proposed goal. Closes the missing-CORPUS gap surfaced by the 4-way
+   # l1-skew duplicate cluster (g-115-743/776/778/779; bravo s75
+   # 2026-05-15) — the other 5 corpora NEVER read the pending queue.
+   # Two match strategies: (1) origin_signal exact match — symptom-keyed
+   # identity; (2) structural overlap mirroring recent_completions but
+   # STRICTER co-signal (file-path hit OR keyword with [_0-9], NOT
+   # hyphen-alone) because the ~377-pending corpus is ~5-10x larger than
+   # recent_completions and generic compound vocabulary ("cross-agent",
+   # "fresh-eyes") produces too many false positives.
+   # Regression risk: someone removes the check, weakens the stricter
+   # co-signal back to hyphen-permissive, or skips status filter.
+   Check: `core/scripts/gates/goal_duplication.py` defines `_check_pending_queue`
+   Bash: grep -q 'def _check_pending_queue' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (function defined)
+   Bash: grep -q '_check_pending_queue(goal, file_paths, keywords, source_name' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (wired into checks list in evaluate())
+   Check: stricter co-signal predicate — `re.search(r"[_0-9]", k)` (no hyphen) inside `_check_pending_queue`
+   Bash: AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from gates import goal_duplication as gd; import inspect; src=inspect.getsource(gd._check_pending_queue); sys.exit(0 if 're.search(r\"[_0-9]\", k)' in src and 'cross-agent' in src else 1)" && echo PASS || echo FAIL → verify PASS (stricter pending-queue co-signal predicate present, NOT hyphen-permissive)
+   Bash: AYOAI_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_pending_queue.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — P1 origin_signal / P2 file-path / P3 demote / P4 unrelated / P5 status-filter / P6 empty)
+
    # READ-intent exemption regression (rb-404, added 2026-04-21)
    # The target_state check inverts semantics for Investigate/Audit/Review/
    # Observe/Research/Analyze titles — identifiers in target files are the
@@ -2256,6 +2590,16 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `mind_api/src/endpoints/aspirations_write.py` defines `_load_streak_mult_config` and `cmd_complete_by` reads `streak_mult` from it (no `streak_mult = 2.0` literal). Bash: `grep -q "^def _load_streak_mult_config" mind_api/src/endpoints/aspirations_write.py && ! grep -qE "^[[:space:]]+streak_mult = 2\.0$" mind_api/src/endpoints/aspirations_write.py` — both halves must succeed.
    Check: `core/scripts/streak-break-reflector.py` defines `_load_streak_mult` and uses it in `_auto_resolve_recovered_canaries` (no `STREAK_MULT = 2.0` module constant). Bash: `grep -q "^def _load_streak_mult" core/scripts/streak-break-reflector.py && ! grep -qE "^STREAK_MULT = 2\.0$" core/scripts/streak-break-reflector.py` — both halves must succeed.
    Bash (streak-mult-config-shared-knob): py -c "import sys, yaml; cfg=yaml.safe_load(open('core/config/aspirations.yaml')); v=cfg.get('recurring',{}).get('streak_mult'); sys.exit(0 if v==2.0 else 1)" && echo "PASS: recurring.streak_mult config knob present and equals 2.0" || echo "FAIL: streak_mult missing or wrong value"
+   # session_gap_threshold_hours config-knob (g-115-1031, 2026-05-20)
+   # Governs auto-resolve threshold for streak-break canaries when an
+   # execution-diary gap >= the threshold separates two close events.
+   # Sole consumer: streak-break-reflector.py _load_session_gap_threshold
+   # + _has_session_gap. Pre-1031 the gap was hard-coded; lifting to
+   # recurring.session_gap_threshold_hours makes the cadence tunable
+   # without code edits and parallels the streak_mult pattern above.
+   Check: `core/scripts/streak-break-reflector.py` defines `_load_session_gap_threshold` and `_has_session_gap` (no hard-coded `SESSION_GAP_THRESHOLD = 2.0` module constant). Bash: `grep -q "^def _load_session_gap_threshold" core/scripts/streak-break-reflector.py && grep -q "^def _has_session_gap" core/scripts/streak-break-reflector.py && ! grep -qE "^SESSION_GAP_THRESHOLD = 2\.0$" core/scripts/streak-break-reflector.py` — all three halves must succeed.
+   Bash (session-gap-threshold-config-knob): py -c "import sys, yaml; cfg=yaml.safe_load(open('core/config/aspirations.yaml')); v=cfg.get('recurring',{}).get('session_gap_threshold_hours'); sys.exit(0 if v==2.0 else 1)" && echo "PASS: recurring.session_gap_threshold_hours config knob present and equals 2.0" || echo "FAIL: session_gap_threshold_hours missing or wrong value"
+   Bash (session-gap-threshold-bounds): py -c "import sys, yaml; cfg=yaml.safe_load(open('core/config/aspirations.yaml')); b=cfg.get('modifiable',{}).get('recurring.session_gap_threshold_hours') or {}; sys.exit(0 if b.get('min')==0.5 and b.get('max')==999.0 and b.get('default')==2.0 else 1)" && echo "PASS: modifiable.recurring.session_gap_threshold_hours bounds entry present (min=0.5 max=999.0 default=2.0)" || echo "FAIL: bounds entry missing or wrong"
    Check: `aspirations-select/SKILL.md` self-alignment has `recurring_heavy` threshold (not just `all_recurring`)
    Check: `goal-selection-algorithm.md` documents `log2` formula and `recurring_debt_bonus` (not linear cap)
 
@@ -2461,7 +2805,13 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `execute-protocol-digest.md` Phase 4.2 `test -f` uses `$WORLD_DIR/conventions/` (not hardcoded `world/conventions/`)
    Check: `start/SKILL.md` has Phase C0.5 "Configure domain conventions" between C0 and C1
    Check: `start/SKILL.md` Phase C0.5 only runs when `world/conventions/` has no `.md` files (existing world skips)
-   Bash: bash core/scripts/guardrails-read.sh --id guard-006 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='active'; assert all(ord(c)<128 for c in d['rule']); print('OK')" → verify guard-006 exists, is active, has no non-ASCII
+   # guard-006 was retired without explicit metadata. The rule it codified (no
+   # uncommitted code across session boundaries) is now enforced structurally by
+   # iteration-commit.sh in Phase 8 state-update + post-execution.md Step 2's
+   # build-gate ceremony. Accept either status so the check stays useful as an
+   # existence + ASCII probe without false-failing on the deliberate retirement.
+   # Drift detected and reconciled by g-115-998 (2026-05-22).
+   Bash: bash core/scripts/guardrails-read.sh --id guard-006 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status'] in ('active','retired'); assert all(ord(c)<128 for c in d['rule']); print('OK')" → verify guard-006 exists, has no non-ASCII (status either active or retired — rule structurally enforced post-retirement)
    # Fresh eyes code review step (DC continued)
    Bash: source core/scripts/_paths.sh && grep -c "Step 1.75" "$WORLD_DIR/conventions/post-execution.md" → verify returns >= 1 (fresh eyes step exists)
    Check: `$WORLD_DIR/conventions/post-execution.md` Step 1.75 is between Step 1.5 (testing) and Step 2 (commit)
@@ -3105,6 +3455,26 @@ sys.exit(1)
    # with the fallback flow.
    Bash: awk '/^## Step 4:/{f=1; next} /^## Step [0-9]/{f=0} f' .claude/skills/notify-user/SKILL.md | grep -cE 'journal-add|^### Logging' → expect 0 (Step 4 has neither a Logging subsection nor any journal-add reference)
 
+   # notify-build-payload helper integration (Section FSR-NBP — sq-018, 2026-05-20)
+   # Locks in the strategic fix from the encode-session 2026-05-20: the LLM
+   # used to hand-construct notification payloads inline (variable Subject/Body
+   # quality, silent-empty-email regressions). The new core/scripts/notify-build-payload.py
+   # centralizes payload construction with a silent-empty-email guard (min Body
+   # length, exit 2 if too short). /notify-user and /agent-completion-report
+   # were rewritten to invoke the helper instead of hand-constructing.
+   # Regression risk: someone restores the LLM-hand-construct path — these 5
+   # checks catch it.
+   Check: `core/scripts/notify-build-payload.py` exists (the centralized payload helper)
+   Bash (C1): test -f core/scripts/notify-build-payload.py && echo "PASS: notify-build-payload.py exists" || echo "FAIL: helper deleted — LLM-hand-construct regression risk"
+   Check: `.claude/skills/notify-user/SKILL.md` references `notify-build-payload.py` (Step 2/3 uses the helper, not inline construction)
+   Bash (C2): grep -q notify-build-payload.py .claude/skills/notify-user/SKILL.md && echo "PASS: /notify-user invokes helper" || echo "FAIL: /notify-user no longer references helper — regression to hand-construct"
+   Check: `.claude/skills/agent-completion-report/SKILL.md` Phase 5.5 uses the COMPLETION-REPORT.md pointer file (Phase 5.5 rewrite)
+   Bash (C3): grep -q COMPLETION-REPORT.md .claude/skills/agent-completion-report/SKILL.md && echo "PASS: Phase 5.5 uses pointer file" || echo "FAIL: agent-completion-report no longer uses pointer pattern"
+   Check: Silent-empty-email guard rejects short Body (exit 2 on message < min chars; prevents the 2026-05-20 incident of Title-only completion emails)
+   Bash (C4): py -3 core/scripts/notify-build-payload.py --agent zeta --category info --subject x --message too_short > /dev/null 2>&1; if [ $? -eq 2 ]; then echo "PASS: silent-empty-email guard rejects short Body (exit 2)"; else echo "FAIL: guard regressed — short Body accepted (incident: 2026-05-20 Title-only emails)"; fi
+   Check: notify-build-payload test suite passes (19 tests covering envelope shape, guard behavior, agent-attribution)
+   Bash (C5): py -3 -m pytest core/scripts/tests/test_notify_build_payload.py -q > /dev/null 2>&1 && echo "PASS: notify-build-payload test suite (19 tests) green" || echo "FAIL: notify-build-payload tests regressed"
+
    # Skill description quality checks (Section FSR-D)
    # Regression coverage for the 2026-04-19 ultrathink review (guard-306, rb-321):
    # (1) No XML-tag-shaped placeholders in description fields — Claude injects the
@@ -3557,7 +3927,7 @@ sys.exit(1)
    Bash (consumer-side): grep -q 'force_metric_encoding_pending' .claude/skills/aspirations-precheck/SKILL.md && echo "PASS: Phase 0-pre4 consumer reads sentinel" || echo "FAIL: precheck Phase 0-pre4 consumer missing — gate writes signal nobody reads"
    Bash (consumer-clears): grep -A 50 'Phase 0-pre4' .claude/skills/aspirations-precheck/SKILL.md | grep -q "wm-set.sh force_metric_encoding_pending" && echo "PASS: Phase 0-pre4 clears sentinel after dispatch" || echo "FAIL: Phase 0-pre4 reads but never clears — sentinel sticks across iterations"
    Bash (tests-present): test -f core/tests/gates/test_post_state_update_metric_gate.py && echo "PASS: regression test file present" || echo "FAIL: core/tests/gates/test_post_state_update_metric_gate.py missing — no behavioral pinning on gate (orphaned .pyc bytecode suggests over-deletion casualty; file Investigate to restore)"
-   Bash (tests-pass): test -f core/tests/gates/test_post_state_update_metric_gate.py && py -3 -m pytest core/tests/gates/test_post_state_update_metric_gate.py -q 2>&1 | tail -1 | grep -qE "passed|no tests ran" && echo "PASS: PMG regression suite green" || echo "FAIL: regression suite red or test file missing"
+   Bash (tests-pass): test -f core/tests/gates/test_post_state_update_metric_gate.py && py -3 -m pytest core/tests/gates/test_post_state_update_metric_gate.py -o addopts= 2>&1 | tail -1 | grep -qE "passed|no tests ran" && echo "PASS: PMG regression suite green" || echo "FAIL: regression suite red or test file missing"
 
    Check: `.claude/skills/aspirations-consolidate/SKILL.md` queries both candidate types side-by-side (preserves compound-backlog visibility — distill-only would hide composite debt)
    Check: `.claude/skills/aspirations/SKILL.md` Phase 8.8 reads maintenance cadence via `tree-read.sh --maintenance` (NOT via `wm-read.sh` — the WM mirror was removed under Option A)
@@ -3944,6 +4314,13 @@ sys.exit(1)
    Check: `core/config/aspirations-chaining-map.md` contains rows for every sub-skill the orchestrator's summary names. Bash: `for s in aspirations-strategic-scan aspirations-all-blocked aspirations-graceful-stop; do grep -q "$s" core/config/aspirations-chaining-map.md || { echo "MISSING: $s"; exit 1; }; done && echo "PASS"` — must print PASS.
    Check: `core/config/blocked-sleep-recovery-digest.md` front matter distinguishes Branch A from Branch B entry preconditions. Bash: `grep -c "Branch A entry\|Branch B entry" core/config/blocked-sleep-recovery-digest.md | awk '{exit ($1 >= 2) ? 0 : 1}'` — must exit 0.
    Check: `core/scripts/load-blocked-sleep-recovery.sh` uses `context-reads.py check-file` for dedup (not blind cat or Read). Bash: `grep -q "context-reads.py check-file" core/scripts/load-blocked-sleep-recovery.sh` — must match.
+   # G14 regression guard (g-115-1293, rb-1410/rb-1411): the advisory pre-edit gate must delegate
+   # the scope/session decision to context-reads.py check-file (NOT a direct manifest grep — a
+   # direct grep restores the false-positive-on-ALL-files behavior G14 fixed) AND invoke it via
+   # python3 (NOT py -3 — this .sh hook sources _paths.sh, where python3 is the sanctioned form
+   # per rb-1411). The negative arm is scoped to `py -3 .*context-reads.py` so the line-40
+   # explanatory comment that literally contains "py -3" does not trip a false FAIL.
+   Bash (pre-edit-gate-delegates-check-file): grep -qE 'python3 .*context-reads\.py" check-file' core/scripts/pre-edit-context-gate.sh && ! grep -qE 'py -3 .*context-reads\.py' core/scripts/pre-edit-context-gate.sh && echo "PASS: pre-edit-context-gate.sh delegates scope/session decision to context-reads.py check-file via python3 (G14 fix g-115-1291/rb-1410; python3-not-py-3 rb-1411)" || echo "FAIL: pre-edit-context-gate.sh no longer delegates to context-reads.py check-file via python3 — G14 scope-awareness regressed to direct-manifest-grep (false-positive on all files) or reverted to py -3 (rb-1410/rb-1411)"
    Check: knowledge tree node `system/digest-extraction` registered. Bash: `bash core/scripts/tree-read.sh --node digest-extraction | grep -q '"file":.*digest-extraction.md'` — must match.
 
    # Session File Manifest + desync + positive-state-gate (Section SFM, rb-352/rb-353/guard-324)
@@ -4878,6 +5255,117 @@ else:
    Check: 4 inlined _APD constants in session-* hot-path scripts mirror _paths.sh's AGENTS_PARENT_DIR.
    Bash: `canon=$(grep -E '^AGENTS_PARENT_DIR=' core/scripts/_paths.sh | head -1 | sed 's/AGENTS_PARENT_DIR=//; s/^"//; s/"$//'); fail=0; for f in session-state-get.sh session-mode-get.sh session-signal-exists.sh cleanup-stale-bindings.sh; do v=$(grep -E '^_APD=' core/scripts/$f | head -1 | sed 's/_APD=//; s/^"//; s/"$//'); if [ "$v" != "$canon" ]; then echo "FAIL: $f _APD=\"$v\" drifted from canonical AGENTS_PARENT_DIR=\"$canon\" (see CLAUDE.md Agent-dir Resolution, rb-1092, guard-587, commit 520e9375)"; fail=1; fi; done; [ $fail -eq 0 ] && echo "PASS: all 4 inlined _APD constants mirror canonical AGENTS_PARENT_DIR=\"$canon\""`
 
+   # Section APD12: Full 12-site AGENTS_PARENT_DIR / SESSIONS_DIRNAME / SESSION_DIRNAME sync (g-115-1062, 2026-05-21)
+   # Section APD above covers only the 4 inlined _APD shell sites. CLAUDE.md
+   # "Agent-dir Resolution" tables list 12 total sync sites — 7 framework
+   # (_paths.{py,sh}, mind_api/src/agent_paths.py, _agents.py,
+   # path-resolution-hook.py, _world_config.py, _session_binding.py) plus
+   # the 5 inlined hot-path copies. _paths.sh is canonical; the other 11
+   # must mirror it across AGENTS_PARENT_DIR, SESSIONS_DIRNAME, and
+   # SESSION_DIRNAME (per-site subset varies — see the script's SITES
+   # table). Drift between any site and canon silently re-routes agent-dir
+   # resolution. The 2026-05-20 incident (_world_config.py kept a
+   # pre-Phase-2.5.D shape for ~3 weeks; ~25 routing-table-empty pytest
+   # failures surfaced it) motivated this check. Section APD remains as
+   # the targeted shell-only probe; APD12 is the full-coverage sister.
+   Check: all 12 AGENTS_PARENT_DIR/SESSIONS_DIRNAME/SESSION_DIRNAME sync sites match canonical _paths.sh values.
+   Bash: `py -3 core/scripts/check-agents-parent-dir-sync.py`
+
+   # Section UER: uncommitted-edits.jsonl log freshness — neutral-path filter + Windows path normalization (g-115-1129, g-115-1125, rb-1127, 2026-05-22)
+   # g-115-1125 (commit 3c4a61c4) fixed two silent bugs in uncommitted-edits-
+   # record.sh:
+   #   1. Neutral-path filter under AGENTS_PARENT_DIR=agents — entries like
+   #      "agents/<name>/..." should be filtered out (agent-private, not
+   #      neutral), not appended as neutral-path edits.
+   #   2. Windows absolute-path normalization — entries should land as repo-
+   #      relative paths ("core/scripts/foo.py"), not absolute Windows form
+   #      ("C:/ZakNoCloud/GitHub/Ayoai-Mind/core/scripts/foo.py").
+   # A regression in either is silent — the log keeps appending, but
+   # iteration-commit's cross-agent attribution filter misclassifies entries
+   # and the wrong agent's signature lands on the resulting commit. That
+   # exact incident (rb-1127, commit 3c4a61c4) clobbered alpha's authorship
+   # of the very fix that closed the bug. This check is the fail-loud
+   # regression detector for the fix that closed the incident.
+   # Tolerance: pre-fix entries (edit_ts < BASELINE) are kept as historical
+   # noise. Only post-fix entries are checked. BASELINE is tunable via
+   # UNCOMMITTED_EDITS_BASELINE env var.
+   Check: agent session/uncommitted-edits.jsonl logs have no post-fix entries with `agents/` prefix (neutral-path filter regression)
+   Check: agent session/uncommitted-edits.jsonl logs have no post-fix entries with absolute path form `[A-Za-z]:/...` or `/<letter>/...` (Windows path normalization regression)
+   Bash: `py -3 core/scripts/check-uncommitted-edits-log-freshness.py`
+
+   # Section MCV: verify-learning meta-check — its own rb/guard citations match live records (g-115-1140, rb-1191, 2026-05-22)
+   # g-115-998 surfaced silent drift between verify-learning Bash assertions
+   # and the actual reasoning-bank/guardrails records they cite:
+   #   1. Section SFH asserted rb-435.applies_to=any while the live record
+   #      held framework (semantic drift after the check was written).
+   #   2. Section DC asserted guard-006.status=active while the record was
+   #      deliberately retired (rule moved to structural enforcement —
+   #      iteration-commit.sh Phase 8 + post-execution.md Step 2 build-gate).
+   # Both went undetected because /verify-learning only runs the assertions —
+   # it never cross-checked that the asserted fields still match live state.
+   # This section flips that gap: a meta-check that parses verify-learning's
+   # own Bash check lines, extracts (record_id, field, expected_value) tuples
+   # from common assertion forms (grep -q '"field": "value"', d['field']==X,
+   # d['field'] in (A,B)), reads the live record, and reports mismatches.
+   # Parser is intentionally conservative — content-substring greps and
+   # custom python checks are skipped (they need ad-hoc handling that the
+   # author writing them already owns); the value of this gate is catching
+   # the simple field=value drift class that g-115-998 surfaced.
+   Check: every Bash check line in verify-learning SKILL.md citing an rb-NNN / guard-NNN id with a parseable field=value assertion matches the live record's current field value.
+   Bash: `py -3 core/scripts/check-verify-learning-citation-drift.py`
+
+   # Section MOTIF: MOTIF pairwise-preference pass default-off invariant (g-307-32 / g-115-1086, 2026-05-21)
+   # The MOTIF pairwise pass in Processor's strategy_extractor.py is feature-flagged
+   # default-off in processor-config.yaml -> strategy_extractor.motif_pairwise.enabled.
+   # Acceptance #1 of the original spec requires byte-identical pre-flag behavior; a
+   # future edit that flips enabled to true would silently change pre-flag-baseline
+   # behavior AND spike production LLM cost (every extraction pass enumerates C(N,2)
+   # pairs against the LLM). This check fires when the Processor repo is reachable
+   # via AGENT_WRITE_PATH and SKIPs cleanly otherwise (not every agent has product
+   # checkout). Pattern: existing default-off invariants like user_signal_boost /
+   # class_balance (lines 2626 / 2631).
+   Check: `processor-config.yaml` strategy_extractor.motif_pairwise.enabled is false (or motif_pairwise block absent — both satisfy the default-off invariant)
+   Bash (motif-pairwise-default-off): awp=$(grep -E '^AGENT_WRITE_PATH=' "agents/$AYOAI_AGENT/local-paths.conf" 2>/dev/null | head -1 | sed -E 's/^AGENT_WRITE_PATH=//;s/^"//;s/"$//') && cfg="$awp/Ayoai-Environment-Processor/processor-config.yaml" && if [ ! -f "$cfg" ]; then echo "SKIP: processor-config.yaml not reachable for agent $AYOAI_AGENT (path=$cfg) — MOTIF check is product-domain"; else py -3 -c "import yaml,sys; c=yaml.safe_load(open(r'$cfg')) or {}; m=c.get('strategy_extractor',{}).get('motif_pairwise',{}); en=m.get('enabled'); sys.exit(0 if en is False or en is None else 1)" && echo "PASS: motif_pairwise.enabled is default-off (false or absent)" || echo "FAIL: motif_pairwise.enabled is true in $cfg — pre-flag baseline behavior is no longer the default (g-307-32 acceptance #1 violation, regression risk: LLM cost spike + behavior drift)"; fi
+
+   # Section SMJ: stderr-merge-into-json.loads regression class (guard-659, g-115-1265, 2026-05-26)
+   # A shell command captured with `2>&1` whose output is fed to python
+   # json.loads / json.load silently zeroes out on ANY stderr line (the parse
+   # fails, the except branch returns empty, the caller reads false-empty).
+   # Two historical instances: g-249-16 detected the pattern; g-249-18 fixed
+   # instance 2 at infra-streak-notify.sh:58 (stderr was zeroing alert_count ->
+   # false "no alerts", a guard-465 silent-monitoring instance).
+   # check-stderr-json-merge.py scans core/scripts/*.sh, correlates each
+   # 2>&1-captured var with its json.loads consumer window, and EXEMPTS the
+   # three valid mitigations: (a) remove 2>&1 (var never enters the flag set),
+   # (b) raw_decode + residual-split (g-115-769, aspirations-update-goal.sh),
+   # (c) per-line JSON extraction with a startswith prefix filter (guard-559,
+   # iteration-close.sh). Exit 1 + flagged[] on any unhardened site. Behavior
+   # pinned by core/scripts/tests/test_check_stderr_json_merge.py.
+   Check: no core/scripts/*.sh feeds a `2>&1`-captured value to json.loads/json.load without one of the three hardenings (guard-659 regression class)
+   Bash (stderr-json-merge): py -3 core/scripts/check-stderr-json-merge.py >/dev/null 2>&1 && echo "PASS: no unhardened 2>&1-into-json.loads sites in core/scripts/*.sh (guard-659)" || echo "FAIL: unhardened 2>&1-capture fed to json.loads in core/scripts (guard-659 regression) — run 'py -3 core/scripts/check-stderr-json-merge.py' for the flagged site; fix via remove-2>&1 / raw_decode (g-115-769) / per-line extraction (guard-559)"
+
+   # Section TBF: time-bomb fixture scanner wiring (guard-566, g-115-1260, 2026-05-27)
+   # A "time-bomb fixture" hardcodes an absolute ISO timestamp that production
+   # code then compares against a now()-relative staleness window (streak/TTL
+   # reset, overdue branch, *_since age). It passes on authoring day, then
+   # silently flips to the overdue/reset path as wall-clock advances -- a
+   # deterministic failure hours-to-days later with NO code change. Canonical
+   # incident g-115-1141 (test_insight_trigger_gate_reprobe.py hardcoded
+   # 2026-05-21, aged out of a 24h scan window, 4 failures). guard-566 mandates
+   # the now-relative idiom; timebomb-fixture-scan.py is the Layer-C detective.
+   # The g-115-1260 audit established the pattern is NOT a fail-loud full-scan
+   # gate: --all reports ~165 LEGITIMATE literals (inert `created` metadata,
+   # fixed-vs-fixed round-trips, explicit now= params, far-future output
+   # assertions) -- a 165:0 false-positive-to-bomb ratio. So enforcement is
+   # diff-scoped: --diff --exit-on-hits flags only a NEW unmarked recent literal
+   # in an uncommitted test file, tripping on the bomb at authoring time without
+   # the legacy-literal noise. Exemptions encode guard-566's own exception
+   # clause: same-line now-idiom, far-past (>recency-days), or a
+   # `# timebomb-safe: <reason>` marker. This check confirms the scanner runs
+   # clean against the working tree; a future uncommitted bomb FAILs it here.
+   Check: `core/scripts/timebomb-fixture-scan.py` exists and reports 0 unmarked recent hardcoded-timestamp fixtures in the diff-scoped working tree (guard-566 enforcement, diff mode)
+   Bash (timebomb-fixture-scan): test -f core/scripts/timebomb-fixture-scan.py && py -3 core/scripts/timebomb-fixture-scan.py --diff --exit-on-hits >/dev/null 2>&1 && echo "PASS: timebomb-fixture-scan present, 0 unmarked new hardcoded-timestamp fixtures in working tree (guard-566)" || echo "FAIL: timebomb-fixture-scan missing OR a new uncommitted test fixture hardcodes a recent ISO timestamp without the now-relative idiom or a '# timebomb-safe:' marker — run 'py -3 core/scripts/timebomb-fixture-scan.py --diff' for the site; fix per guard-566 (mirror test_insight_trigger_sweep_reprobe.py::_trigger_timestamp)"
+
 ## Step 4: Summary Report
 
    # Priority review skill integrity checks (Section PR)
@@ -5794,6 +6282,35 @@ print('PASS: state-update flag-name contract intact — 3/3 prefixed pairs prese
    Check: /fresh-eyes-program pending-id uses timestamp (not just date)
    Bash: grep -qE 'id: program-review-\{YYYY-MM-DDTHH-MM-SS\}' .claude/skills/fresh-eyes-program/SKILL.md && echo 'PASS: /fresh-eyes-program pending-id includes HH-MM-SS' || { echo 'FAIL: /fresh-eyes-program pending-id reverted to date-only — same-day collision risk returns.'; false; }
 
+   # S55.6: Sibling-ritual min_session_goals gate (g-115-1054, g-115-1106)
+   # World-counter ticks PER-AGENT rituals every time ANY agent completes a goal.
+   # A ritual can therefore "fire" against an agent that has done zero session
+   # work — pure ritual-without-cause. The min_session_goals sub-gate compares
+   # loop_state.goals_completed_this_session for the firing agent against a
+   # per-ritual floor read from the matching aspirations.yaml block. If the
+   # cadence-check or felt-sense-check scripts lose this gate (refactor regression),
+   # cross-agent fire-without-work returns. Three checks pin the contract: both
+   # scripts must reference min_session_goals AND the config block must declare it.
+   Check: fresh-eyes-cadence-check.py references min_session_goals (gate code present)
+   Bash: grep -c 'min_session_goals' core/scripts/fresh-eyes-cadence-check.py | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=2, f'FAIL: only {n} min_session_goals references in fresh-eyes-cadence-check.py — gate removed or stub-only (g-115-1054 regression)'; print(f'PASS: fresh-eyes-cadence-check.py has {n} min_session_goals references')"
+   Check: felt-sense-cadence-check.py references min_session_goals (gate code present)
+   Bash: grep -c 'min_session_goals' core/scripts/felt-sense-cadence-check.py | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=2, f'FAIL: only {n} min_session_goals references in felt-sense-cadence-check.py — gate removed or stub-only (g-115-1054 regression)'; print(f'PASS: felt-sense-cadence-check.py has {n} min_session_goals references')"
+   Check: aspirations.yaml ritual blocks declare min_session_goals (at least 3 — fresh_eyes_review, fresh_eyes_program/tree, felt_sense)
+   Bash: grep -c '^\s*min_session_goals:' core/config/aspirations.yaml | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=3, f'FAIL: only {n} min_session_goals declarations in aspirations.yaml — fresh_eyes_review, fresh_eyes_program (or _tree), and felt_sense each need their own (g-115-1054)'; print(f'PASS: aspirations.yaml declares min_session_goals in {n} ritual blocks')"
+
+   # S55.7: post-decompose-routing-audit wiring gate (g-115-1085, g-115-1112)
+   # g-115-1085 added core/scripts/post-decompose-routing-audit.py and wired it
+   # into mind_api/src/endpoints/aspirations_write.py via the
+   # _file_routing_audit_investigate(ctx, goal) helper called after the main
+   # goal lands in add_goal(). This closes the LIFECYCLE-gap from sub-fix 3 —
+   # if someone removes or unwires the audit, the closure silently breaks.
+   # Two checks pin both halves: script presence + API signature, and
+   # daemon wire-in (helper definition + call site).
+   Check: post-decompose-routing-audit.py exists with audit API
+   Bash: test -f core/scripts/post-decompose-routing-audit.py && grep -q 'def audit' core/scripts/post-decompose-routing-audit.py && echo 'PASS: post-decompose-routing-audit.py present with def audit' || { echo 'FAIL: post-decompose-routing-audit.py missing or def audit signature absent — LIFECYCLE-gap closure from g-115-1085 sub-fix 3 broken'; false; }
+   Check: daemon aspirations_write.py wires _file_routing_audit_investigate helper
+   Bash: grep -q '_file_routing_audit_investigate' mind_api/src/endpoints/aspirations_write.py && grep -q '_file_routing_audit_investigate(ctx, goal)' mind_api/src/endpoints/aspirations_write.py && echo 'PASS: aspirations_write.py defines and calls _file_routing_audit_investigate(ctx, goal)' || { echo 'FAIL: aspirations_write.py missing the helper definition or its call site — post-decompose routing audit not firing after add_goal (g-115-1085 regression)'; false; }
+
    # Output-Sanity Gate (Section OSG — 2026-04-20, rb-372, guard-333)
    # Framework-level defense against exit-0 + 0-byte-output silent successes in
    # background-jobs.py::check_job. Generalizes rb-061/rb-085/guard-156 family.
@@ -6029,6 +6546,141 @@ print(f"PASS: {len(files)} aspiration stores scanned, 0 dotted-literal keys")'
    # (when outcome=deep) productive_goals by +1.
    Check: `core/scripts/tests/test_loop_state_counter_advance.py` exists and exits 0 (g-283-06)
    Bash (loop-state-counter-advance-test-runs): test -f core/scripts/tests/test_loop_state_counter_advance.py && py -3 core/scripts/tests/test_loop_state_counter_advance.py >/dev/null 2>&1 && echo "PASS: test_loop_state_counter_advance.py exits 0" || { echo "FAIL: test_loop_state_counter_advance.py missing or non-zero exit — loop_state counter writer may have regressed"; exit 1; }
+
+   # === Section S60: PreToolUse hook deny-protocol uniformity (g-115-1012) =========
+   # Three structural checks that catch the INERT-gate class of regression
+   # surfaced during /encode-session 2026-05-20. A PreToolUse deny gate can
+   # ship in a likely-INERT shape (Python sys.exit(2) + Bash wrapper that
+   # propagates the exit code via `exec python3 ...`) and still pass test
+   # invocation because the scripts exit cleanly — but Claude Code interprets
+   # any non-zero wrapper exit as a hook ERROR (fail-open silently), NOT as a
+   # deny. The authoritative spec lives in hook_helpers.py (`emit_deny()`:
+   # JSON on stdout + exit 0) and is documented in marker-placement-gate.py
+   # header ("Any exit code != 0 is treated by Claude Code as a hook ERROR
+   # (fail-open) — NOT as a deny").
+   #
+   # S60.1: Every PreToolUse Python gate imports `hook_helpers` AND has no
+   # `sys.exit(1)`/`sys.exit(2)` in the deny path. EXEMPT lists carry inline
+   # justification: legacy gates pending retire, recording-only hooks that
+   # have no deny path.
+   # S60.2: Every PreToolUse Bash wrapper exits 0 unconditionally — last
+   # non-comment `exit` line is `exit 0`, no `exit $RC`/`exit $?` pattern,
+   # no terminal `exec python3 ...` (exec replaces the process so wrapper
+   # inherits Python's exit code).
+   # S60.3: ALLOWLIST sync — marker-placement-gate.py ALLOWLIST set and
+   # domain-leak-check.sh ALLOWLIST array MUST hold identical entries.
+   # Drift means one gate accepts what the other rejects.
+
+   # S60.1: Python deny-protocol uniformity
+   Check: PreToolUse Python gates discovered via `.claude/settings.json` import `hook_helpers` and avoid `sys.exit(1)`/`sys.exit(2)` outside comments.
+   Bash: py -3 -c "
+import json, re, sys
+from pathlib import Path
+LEGACY_EXEMPT = {'context-reads.py'}
+RECORDING_HOOKS = {'evolution-prepare.py', 'bash-agent-inject.py'}
+settings = json.load(open('.claude/settings.json'))
+checked, violations = {}, []
+for entry in settings.get('hooks', {}).get('PreToolUse', []):
+    for h in entry.get('hooks', []):
+        cmd = h.get('command', '')
+        m = re.search(r'core/scripts/([a-zA-Z0-9_\-]+)\.sh', cmd)
+        if not m: continue
+        wrapper = Path(f'core/scripts/{m.group(1)}.sh')
+        if not wrapper.exists(): continue
+        wsrc = wrapper.read_text(encoding='utf-8')
+        py_refs = set()
+        sib = Path(f'core/scripts/{m.group(1)}.py')
+        if sib.exists(): py_refs.add(sib)
+        for pm in re.finditer(r'python3?\s.*?(?:core/scripts/|/scripts/)([a-zA-Z0-9_\-]+\.py)', wsrc):
+            ref = Path(f'core/scripts/{pm.group(1)}')
+            if ref.exists(): py_refs.add(ref)
+        for p in py_refs:
+            n = p.name
+            if n in checked: continue
+            if n in LEGACY_EXEMPT: checked[n]='EXEMPT'; continue
+            if n in RECORDING_HOOKS: checked[n]='RECORDING'; continue
+            src = p.read_text(encoding='utf-8')
+            has_h = 'from hook_helpers' in src or 'import hook_helpers' in src
+            bad = [ln for ln,l in enumerate(src.splitlines(),1) if not l.lstrip().startswith('#') and re.search(r'sys\.exit\(\s*[12]\s*\)', l)]
+            ok = has_h and not bad
+            checked[n] = 'OK' if ok else 'BAD'
+            if not has_h: violations.append(f'{n}: missing hook_helpers import')
+            if bad: violations.append(f'{n}: sys.exit(1)/sys.exit(2) at line(s) {bad}')
+if violations:
+    print('FAIL: PreToolUse Python deny-protocol violations (g-115-1012):')
+    for v in violations: print(f'  - {v}')
+    sys.exit(1)
+ok_count = sum(1 for s in checked.values() if s == 'OK')
+exempt_count = sum(1 for s in checked.values() if s in ('EXEMPT','RECORDING'))
+print(f'PASS: PreToolUse Python deny-protocol clean ({ok_count} OK / {exempt_count} exempt across {len(checked)} unique gates)')
+"
+
+   # S60.2: Bash wrappers exit 0 unconditionally
+   Check: PreToolUse Bash wrappers do NOT end with `exec python3 ...`, do NOT carry `exit \$RC` patterns, and their last non-comment `exit` line is `exit 0`.
+   Bash: py -3 -c "
+import json, re, sys
+from pathlib import Path
+EXEMPT = {'context-reads-gate.sh': 'legacy exec-propagate pattern; retire via g-115-1012 follow-up'}
+settings = json.load(open('.claude/settings.json'))
+wrappers = set()
+for entry in settings.get('hooks', {}).get('PreToolUse', []):
+    for h in entry.get('hooks', []):
+        cmd = h.get('command', '')
+        m = re.search(r'core/scripts/([a-zA-Z0-9_\-]+)\.sh', cmd)
+        if m:
+            p = Path(f'core/scripts/{m.group(1)}.sh')
+            if p.exists(): wrappers.add(p)
+violations = []
+for w in sorted(wrappers):
+    if w.name in EXEMPT: continue
+    lines = w.read_text(encoding='utf-8').splitlines()
+    exit_lines, exec_lines = [], []
+    for ln, line in enumerate(lines, 1):
+        if line.lstrip().startswith('#'): continue
+        nc = re.sub(r'\s*#.*\$', '', line)
+        em = re.match(r'^\s*exit\s+(.+?)\s*\$', nc)
+        if em: exit_lines.append((ln, em.group(1).strip()))
+        em2 = re.match(r'^\s*exec\s+(python3?\s)', nc)
+        if em2: exec_lines.append(ln)
+    if exec_lines and (not exit_lines or exit_lines[-1][0] < exec_lines[-1]):
+        violations.append(f'{w.name}: terminal exec python3 at line {exec_lines[-1]} — wrapper inherits Python exit code, not exit 0')
+        continue
+    if not exit_lines:
+        violations.append(f'{w.name}: no exit line — last-command exit code is non-deterministic')
+        continue
+    last_ln, last_val = exit_lines[-1]
+    if last_val != '0':
+        violations.append(f'{w.name}: line {last_ln} final exit is exit {last_val} (not exit 0)')
+    for ln, v in exit_lines:
+        if v.startswith('\$'):
+            violations.append(f'{w.name}: line {ln} propagates variable exit code exit {v} — fails unconditional-exit-0 contract')
+if violations:
+    print('FAIL: PreToolUse Bash wrapper exit-protocol violations (g-115-1012):')
+    for v in violations: print(f'  - {v}')
+    sys.exit(1)
+print(f'PASS: PreToolUse Bash wrappers exit 0 unconditionally ({len(wrappers)-len(EXEMPT)} checked, {len(EXEMPT)} exempt)')
+"
+
+   # S60.3: ALLOWLIST sync between marker-placement-gate.py and domain-leak-check.sh
+   Check: Both ALLOWLISTs hold the same set of paths. Drift admits leaks in one direction or false positives in the other (the Phase 5 marker-placement doctrine names them as a single source-of-truth pair).
+   Bash: py -3 -c "
+import re, sys
+from pathlib import Path
+py_src = Path('core/scripts/marker-placement-gate.py').read_text(encoding='utf-8')
+sh_src = Path('core/scripts/domain-leak-check.sh').read_text(encoding='utf-8')
+py_m = re.search(r'ALLOWLIST = \{([^}]+)\}', py_src)
+sh_m = re.search(r'ALLOWLIST=\(([^)]+)\)', sh_src)
+if not py_m: print('FAIL: marker-placement-gate.py ALLOWLIST = {...} block not found'); sys.exit(1)
+if not sh_m: print('FAIL: domain-leak-check.sh ALLOWLIST=(...) block not found'); sys.exit(1)
+py_paths = set(re.findall(r'\"([^\"]+)\"', py_m.group(1)))
+sh_paths = set(re.findall(r'\"([^\"]+)\"', sh_m.group(1)))
+if py_paths != sh_paths:
+    print(f'FAIL: marker-placement ALLOWLIST drift between .py and .sh (g-115-1012):')
+    print(f'  In .py only: {sorted(py_paths - sh_paths)}')
+    print(f'  In .sh only: {sorted(sh_paths - py_paths)}')
+    sys.exit(1)
+print(f'PASS: marker-placement ALLOWLIST in sync ({len(py_paths)} entries)')
+"
 
 Provide a summary table:
 - Total PASS / FAIL / N/A per section

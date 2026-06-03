@@ -137,28 +137,38 @@ def test_update_dry_run_skips_subprocess(dependent_unblock_module):
 
 
 def test_inbox_alert_uses_posix_path():
-    """inbox-alert-age-check.py wm-append.sh invocation also uses
-    .as_posix(). Audited as part of g-115-786 rb-428 sibling sweep.
+    """inbox-alert-age-check.py invokes wm-append.sh through bash_cmd(),
+    which prepends the resolved BASH and emits the script path via
+    Path.as_posix() (guard-580 + guard-581). Audited as part of g-115-786
+    rb-428 sibling sweep; migrated to the shared bash_cmd() helper in
+    g-115-900 — the inline .as_posix() guarantee moved into
+    core/scripts/_runtime_bash.py:bash_cmd, pinned by
+    test_runtime_bash_resolution.py::test_bash_cmd_posix_normalizes_path.
 
-    Static source check — confirms the fix landed at the call site. A
-    full functional test would require seeding wm.py state and is out
-    of scope for this regression suite (the dependent-unblock test
-    above proves the pattern works; this asserts the sibling adopted it).
+    Static source check — confirms the safe pattern landed at the call
+    site. A full functional test would require seeding wm.py state and is
+    out of scope for this regression suite (the dependent-unblock test
+    above proves the path-shape contract; this asserts the sibling adopted
+    the helper).
     """
     src = (SCRIPTS_DIR / "inbox-alert-age-check.py").read_text(
         encoding="utf-8")
-    # Strong signal: the .as_posix() form is present at the wm-append.sh
-    # call site.
-    assert '"wm-append.sh").as_posix()' in src, (
-        "inbox-alert-age-check.py wm-append.sh invocation missing "
-        ".as_posix() — Windows path-separator stripping would silently "
-        "no-op proactive_escalation_log writes")
-    # Negative assertion: no remaining bare str(SCRIPT_DIR / *.sh) at
-    # this call site. (Other str(...) usage may be legitimate where the
-    # path is not handed to bash; we narrow to the bash-invocation line.)
+    # Strong signal: the wm-append.sh invocation goes through bash_cmd(),
+    # which is Windows-safe by construction (resolved BASH + .as_posix()).
+    assert 'bash_cmd(SCRIPT_DIR / "wm-append.sh"' in src, (
+        "inbox-alert-age-check.py wm-append.sh invocation no longer uses "
+        "bash_cmd() — Windows path-separator stripping (or the System32 "
+        "WSL stub) would silently no-op proactive_escalation_log writes")
+    # Negative assertions: the legacy vulnerable forms must NOT reappear at
+    # this call site — neither bare str(...) (backslash stripping) nor the
+    # literal "bash" prefix (System32 WSL stub, rc=127).
     assert 'str(SCRIPT_DIR / "wm-append.sh")' not in src, (
         "inbox-alert-age-check.py still uses str(SCRIPT_DIR / "
         '"wm-append.sh") — vulnerable to bash backslash stripping')
+    assert '["bash", (SCRIPT_DIR / "wm-append.sh")' not in src, (
+        'inbox-alert-age-check.py still uses the literal "bash" prefix at '
+        "the wm-append.sh call site — bypasses resolve_bash(), risking the "
+        "System32 WSL stub (g-115-900)")
 
 
 def test_blocker_recheck_uses_posix_path():

@@ -11,6 +11,7 @@ Bounds validation reads core/config/meta.yaml strategy_schemas.
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -61,7 +62,27 @@ def read_yaml(path):
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        raw = f.read()
+    # OneDrive sync-corruption guard (1): a transiently un-synced replica of a
+    # shared meta hot-file reads as NUL bytes -- full zero-fill, or (on a partial block
+    # sync) a real-YAML prefix + NUL suffix. The mechanism is a sync-write race on a
+    # frequently rewritten file, NOT Files-On-Demand dehydration: all meta files are
+    # pinned ("always keep on this device"), census-verified 0 dehydration-prone of 40,237
+    # (1) -- so do not chase a dehydration fix, it is already maxed out. Both
+    # forms make yaml.safe_load raise
+    # a cryptic "#x0000 ReaderError". Translate to an actionable message so the next reader
+    # does not burn an investigation. Behavior is UNCHANGED -- the read still raises, so any
+    # read-modify-write path (cmd_set) aborts and the file is NOT overwritten (no clobber);
+    # only the message is clearer and names the recovery path.
+    if chr(0) in raw:
+        raise ValueError(
+            f"{path.name}: {raw.count(chr(0))} NUL byte(s) detected -- transient OneDrive "
+            f"sync corruption of a shared meta hot-file. NOT overwriting (read aborts, no "
+            f"clobber). Usually transient: re-read after OneDrive re-syncs, or restore a "
+            f"known-good version via `py -3 core/scripts/history.py restore '{path}' <version>` "
+            f"(list versions with `history.py list '{path}'`). (g-115-1271)"
+        )
+    data = yaml.safe_load(raw)
     return data if data is not None else {}
 
 
@@ -77,13 +98,31 @@ def navigate(data, dotpath):
     Returns (parent, key) where parent[key] is the target value.
     Numeric path segments index into lists.
     Creates intermediate dicts as needed for set operations.
+
+    Bracket-index notation (``gaps[6]``) is normalized to dotted form
+    (``gaps.6``) so list indices route through the numeric-segment path
+    below. Without this, ``gaps[6]`` was treated as a literal dict key,
+    silently creating an orphan sibling key instead of indexing the list —
+    the orphan-key corruption class that rotted skill-gaps.yaml (g-115-1263).
+    Invalid / out-of-range list indices fail loud (clean error + exit 1)
+    instead of raising a raw traceback.
     """
+    dotpath = re.sub(r"\[(\d+)\]", r".\1", dotpath).lstrip(".")
     parts = dotpath.split(".")
     current = data
     for i, part in enumerate(parts[:-1]):
         if isinstance(current, list):
-            idx = int(part)
-            current = current[idx]
+            try:
+                current = current[int(part)]
+            except ValueError:
+                print(f"ERROR: list index '{part}' is not an integer at "
+                      f"'{'.'.join(parts[:i+1])}'", file=sys.stderr)
+                sys.exit(1)
+            except IndexError:
+                print(f"ERROR: list index {part} out of range at "
+                      f"'{'.'.join(parts[:i+1])}' (list len {len(current)})",
+                      file=sys.stderr)
+                sys.exit(1)
         elif isinstance(current, dict):
             if part not in current:
                 current[part] = {}
@@ -94,12 +133,27 @@ def navigate(data, dotpath):
 
     final_key = parts[-1]
     if isinstance(current, list):
-        final_key = int(final_key)
+        try:
+            final_key = int(final_key)
+        except ValueError:
+            print(f"ERROR: list index '{final_key}' is not an integer "
+                  f"(target list at '{'.'.join(parts[:-1]) or '<root>'}')",
+                  file=sys.stderr)
+            sys.exit(1)
     return current, final_key
 
 
 def parse_value(raw):
-    """Auto-detect type from string: int, float, bool, null, or string."""
+    """Auto-detect type from string: int, float, bool, null, JSON list/dict, or string.
+
+    A value whose stripped form starts with ``[`` or ``{`` is parsed as JSON so
+    that list/dict values round-trip instead of being stored as a literal
+    string. This closes the gaps-as-string corruption class (g-115-1263): a
+    caller passing a JSON array to ``meta-set.sh`` previously stored the whole
+    array as one string. Invalid JSON falls through to the string return, and
+    the ``--string`` flag still forces a literal string when a value that
+    looks like JSON must be kept verbatim.
+    """
     if raw == "null":
         return None
     if raw == "true":
@@ -114,6 +168,12 @@ def parse_value(raw):
         return float(raw)
     except ValueError:
         pass
+    stripped = raw.strip()
+    if stripped[:1] in ("[", "{"):
+        try:
+            return json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            pass
     return raw
 
 
@@ -351,7 +411,14 @@ def cmd_set(args):
         old_value = parent[key]
     except (KeyError, IndexError):
         old_value = None
-    parent[key] = value
+    # List-index append: when the target is a list and the index equals the
+    # current length, append rather than raising IndexError. Lets
+    # `meta-set.sh <file> 'gaps[N]' '<json>'` extend a list (the real
+    # list-overlay behavior the orphan-key bug faked), 3.
+    if isinstance(parent, list) and isinstance(key, int) and key == len(parent):
+        parent.append(value)
+    else:
+        parent[key] = value
     write_yaml(path, data)
 
     # Auto-log the change (now returns mc-NNN ID)

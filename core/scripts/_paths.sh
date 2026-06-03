@@ -146,9 +146,21 @@ agent_state_dir() {
 if [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
     source "$(agent_dir "$AGENT_NAME")/local-paths.conf"
 else
-    # MIND_AGENT unset — use first available conf (hooks don't have the env var)
+    # MIND_AGENT unset — use first available conf (hooks don't have the env var).
+    # Fall-through STAYS (prevents PROJECT_ROOT/world,meta cruft, ); the
+    # warning makes the silent wrong-agent read visible (6 root cause B).
+    # The two PreToolUse hooks that source this file (bash-agent-inject.sh,
+    # path-resolution-hook.sh) use `2>/dev/null`, which suppresses stderr emitted
+    # during sourcing — so the warning fires only for LLM Bash tool calls where
+    # the inject hook actually missed (MIND_AGENT genuinely empty at use time).
     for _CONF in "$(agents_root)"/*/local-paths.conf; do
-        [ -f "$_CONF" ] && source "$_CONF" && break
+        if [ -f "$_CONF" ]; then
+            source "$_CONF"
+            if [ -z "$AGENT_NAME" ]; then
+                echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
+            fi
+            break
+        fi
     done
     unset _CONF
 fi

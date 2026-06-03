@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-tree
-description: "Periodic local self-audit of the knowledge tree's top-level taxonomy (cadence: every 200 goals). Assembles a briefing covering L1 distribution skew (S1), L1 pick-rate trends (S9), candidate L2 promotions, candidate L1 retirements, and SPROUT/REPARENT history, writes it to agents/<agent>/reports/, and posts a one-line summary to the coordination board. No email push, no user-approval gate. The user can invoke l1-domain-add.sh / l1-domain-rename.sh manually if taxonomy changes are desired. Closes the 'tree has no taxonomy-level review' gap."
+description: "Periodic local self-audit of the knowledge tree's top-level taxonomy (cadence: every 200 goals). Assembles a briefing covering L1 distribution skew (S1), L1 pick-rate trends (S9), candidate L2 promotions, candidate L1 retirements, and SPROUT/REPARENT history, writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate. The user can invoke l1-domain-add.sh / l1-domain-rename.sh manually if taxonomy changes are desired. Closes the 'tree has no taxonomy-level review' gap."
 user-invocable: true
 triggers:
   - "/fresh-eyes-tree"
@@ -29,7 +29,7 @@ taxonomy assessment:
 
 **Are the L1s still the right top-level cuts for the knowledge tree?**
 
-The ritual runs autonomously, writes the briefing to `agents/<agent>/reports/`,
+The ritual runs autonomously, writes the briefing to `agents/<agent>/temp/`,
 and posts a one-line summary to the coordination board. No email push, no
 user-approval gate. The user reviews via git log and tracked signals.
 
@@ -244,11 +244,11 @@ they invoke the S8 apply scripts directly:
 - `bash core/scripts/l1-domain-add.sh --approved-by <user-supplied-id>`
 ```
 
-## Phase 4: Archive Copy
+## Phase 4: Stage Briefing to temp/
 
 ```
-Bash: mkdir -p agents/<agent>/reports
-Write the briefing body to agents/<agent>/reports/fresh-eyes-tree-{today-isotime}.md
+Bash: mkdir -p agents/<agent>/temp
+Write the briefing body to agents/<agent>/temp/fresh-eyes-tree-{today-isotime}.md
   (where {today-isotime} = `date +%Y-%m-%dT%H-%M-%S` — colons replaced with
    hyphens for Windows filesystem compatibility)
 ```
@@ -261,6 +261,49 @@ the user decides a taxonomy change is warranted after reviewing the archived
 briefing, they invoke the apply scripts directly. The periodic ritual does
 not gate on them.
 
+## Phase 5.5: Encode Durable Findings
+
+The Phase 3 briefing's taxonomy-health observations otherwise land ONLY in
+the transient `temp/` staging file, which is invisible to `/prime` and
+`retrieve.sh` and is drained away over time. This step encodes the substantive
+findings into the durable stores so they survive after the staging file is
+drained. Modeled on `/felt-sense-checkin` Phase 1.
+
+**No-double-encode**: this skill has NO `act_now` (Self/Program edit) or
+`act_later` (goal) routing — every finding here is net-new durable storage,
+so there is nothing to exclude. (If a future revision adds a self-assess /
+triage step, this step must then skip any finding already routed to Self or a
+filed goal.)
+
+Encode the substantive findings (S1 distribution skew, S9 pick-rate trends,
+S4/S6/S7 emergence candidates, structural-op observations, and the overall
+taxonomy assessment) per `core/config/conventions/learning-routing.md`. When
+in doubt, drop:
+
+- **tree** — a compressed durable fact about tree structure (skew ratio,
+  pick-rate distribution, emergence candidate, taxonomy assessment). Target
+  the tree-taxonomy-health area under the `system` L1. **Novelty gate
+  (mandatory — preserves a time series instead of flooding):** before adding,
+  check whether a node already covers this (`tree-read.sh --node
+  {candidate-key}`). If one exists and this is a refreshed measurement,
+  `/tree edit` it (update body + `last_updated` + `last_update_trigger:
+  fresh-eyes-tree`) rather than adding a duplicate. Use `/tree add {parent}
+  {key} {summary}` ONLY for a genuinely novel finding (e.g. a new emergence
+  candidate).
+- **reasoning_bank** — a recurring cross-review pattern (e.g. "skew is
+  self-reinforcing across 3+ reviews"). `reasoning-bank-add.sh` with summary
+  + ABC chain + `applies_to: framework`.
+- **guardrails** — a prescriptive rule with a trigger condition (e.g. "when a
+  single L1 exceeds N% structural mass for 2+ reviews, surface a decompose
+  candidate"). `guardrails-add.sh` with rule + trigger_condition.
+- **drop** — already captured, too thin, or a one-cycle anomaly.
+
+Taxonomy CHANGES remain user-driven via the S8 apply scripts (Phase 5) — this
+step encodes OBSERVATIONS only, never mutates `core/config/tree.yaml
+l1_domains`. The encoding writes are self-evidencing; no separate log line is
+required. Do NOT add a terminal action here — Phase 6's board-post remains
+the skill's final tool call.
+
 ## Phase 6: Record the Tick
 
 ```
@@ -268,7 +311,7 @@ not gate on them.
 Bash: bash core/scripts/fresh-eyes-record-tick.sh last_fresh_eyes_tree_review
 
 # Step 2: Board post (best-effort)
-Bash: echo "Fresh-eyes TREE review completed; briefing archived at agents/<agent>/reports/fresh-eyes-tree-{today-isotime}.md." | bash core/scripts/board-post.sh --channel general --type status --tags fresh-eyes-tree || true
+Bash: echo "Fresh-eyes TREE review completed; briefing staged at agents/<agent>/temp/fresh-eyes-tree-{today-isotime}.md." | bash core/scripts/board-post.sh --channel general --type status --tags fresh-eyes-tree || true
 ```
 
 The board-post is the terminal action — per Return Protocol requirements,
@@ -281,16 +324,22 @@ the skill does NOT end with text output.
 - **Calls**: `fresh-eyes-cadence-check.sh --config-block fresh_eyes_tree`,
   `l1-skew-check.sh --markdown`,
   `tree-read.sh --stats --by-l1`, `fresh-eyes-record-tick.sh
-  last_fresh_eyes_tree_review`, `board-post.sh`
+  last_fresh_eyes_tree_review`, `board-post.sh`,
+  `/tree add`, `/tree edit`, `tree-read.sh --node`, `reasoning-bank-add.sh`,
+  `guardrails-add.sh` (Phase 5.5 encoding)
 - **Reads**: `meta/l1-pick-log.jsonl`, `world/knowledge/tree/_tree.yaml`
   (tree_growth_log), `core/config/tree.yaml` (l1_domains)
-- **Modifies**: `agents/<agent>/reports/fresh-eyes-tree-*.md` (new),
+- **Modifies**: `agents/<agent>/temp/fresh-eyes-tree-*.md` (new staging file),
   `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_tree_review),
-  board `general` channel (best-effort)
-- **Does NOT modify**: `core/config/tree.yaml l1_domains`,
-  `world/knowledge/tree/_tree.yaml` nodes, pending-questions, or any tree
-  content. No email is sent. Taxonomy changes are user-driven via
-  `l1-domain-rename.sh` / `l1-domain-add.sh` invoked manually.
+  board `general` channel (best-effort),
+  `world/knowledge/tree/` (Phase 5.5 observation nodes under existing L1s),
+  `world/reasoning-bank.jsonl` (Phase 5.5 appends),
+  `world/guardrails.jsonl` (Phase 5.5 appends)
+- **Does NOT modify**: `core/config/tree.yaml l1_domains` — the L1 cut
+  itself. Taxonomy changes (rename/add an L1) remain user-driven via
+  `l1-domain-rename.sh` / `l1-domain-add.sh` invoked manually. No email is
+  sent. (Phase 5.5 DOES add observation nodes under existing L1s and may
+  append reasoning-bank / guardrail entries — see Modifies.)
 
 ## Relationship to Existing Mechanisms
 
@@ -313,6 +362,6 @@ user reviews via git log and tracked signals.
 ## Return Protocol
 
 See `.claude/rules/return-protocol.md` — last action must be a tool call,
-not text. The terminal action is the Phase 8 Step 2 board-post Bash call.
+not text. The terminal action is the Phase 6 Step 2 board-post Bash call.
 Never end this skill with a text summary of the briefing — the briefing
 is in the archive.

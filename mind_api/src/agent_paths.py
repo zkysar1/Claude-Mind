@@ -23,7 +23,11 @@ from typing import Dict, NamedTuple, Optional
 _SCRIPTS_DIR = str(Path(__file__).resolve().parents[2] / "core" / "scripts")
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
-from _path_helpers import absolutize  # noqa: E402
+from _path_helpers import (  # noqa: E402
+    absolutize,
+    assert_not_cruft,
+    CruftPathRefused,
+)
 
 
 # --- Agent-dir resolution (Phase 2.5.C/D) ---

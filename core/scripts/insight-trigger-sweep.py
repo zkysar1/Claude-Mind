@@ -68,6 +68,14 @@ SEVERITY_PRIORITY = {
 REQ_ACTION_RE = re.compile(r"^requires_action_by:(.+)$")
 ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
 SEVERITY_RE = re.compile(r"^severity:(.+)$")
+AFFECTS_RE = re.compile(r"^affects:(g-\d+-\d+)$")
+
+# 6: terminal statuses that mean "no Apply needed — target already
+# resolved". Mirrors unblock-parent-status-sweep.py:112 (rb-908 lineage).
+# Audit-time -> apply-time staleness gap (rb-1150): zeta's 06:37 audit
+# spawned a supersession-Apply at 18:11; the target had already closed at
+# 15:32. Re-probe at filing time catches that drift.
+TERMINAL_GOAL_STATES = {"completed", "skipped", "superseded", "archived"}
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +125,7 @@ def load_triggers():
         target = None
         action = None
         severity = "informs"
+        affects_goal = None
         for t in tags:
             m = REQ_ACTION_RE.match(t)
             if m:
@@ -129,6 +138,10 @@ def load_triggers():
             m = SEVERITY_RE.match(t)
             if m:
                 severity = m.group(1).strip()
+                continue
+            m = AFFECTS_RE.match(t)
+            if m:
+                affects_goal = m.group(1).strip()
         if not target or not action:
             continue
         out.append({
@@ -137,12 +150,93 @@ def load_triggers():
             "target": target,
             "action": action,
             "severity": severity,
+            "affects_goal": affects_goal,
             "text": msg.get("text", ""),
             "tags": tags,
             "timestamp": msg.get("timestamp"),
             "age_h": round((now - ts).total_seconds() / 3600, 1),
         })
     return out
+
+
+# ---------------------------------------------------------------------------
+# Apply-time goal-status re-probe (6, rb-1150)
+# ---------------------------------------------------------------------------
+
+
+def probe_goal_status(goal_id):
+    """Return current status of goal_id by scanning world + per-agent
+    aspirations.jsonl. Returns the status string when found, None when the
+    goal does not exist anywhere.
+
+    Closes the audit-time -> apply-time staleness gap (rb-1150). The
+    insight_trigger may have been authored hours earlier; the target goal
+    can have transitioned to a terminal state in that window. Re-probing
+    at filing time avoids spawning duplicate Apply work.
+
+    Reads JSONL directly rather than _rt.aspirations_read so the function
+    is testable against a sandbox WORLD_DIR via monkeypatch — _rt would
+    require a running daemon. The dedup helper `load_converted_ids` above
+    uses the same direct-read pattern.
+    """
+    paths = [WORLD_ASPS]
+    for d in sorted(_agents_root().iterdir()):
+        if d.is_dir() and (d / "local-paths.conf").is_file():
+            paths.append(d / "aspirations.jsonl")
+    for path in paths:
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                asp = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for g in asp.get("goals", []) or []:
+                if g.get("id") == goal_id:
+                    return g.get("status")
+    return None
+
+
+def _emit_audit_stale_note(trigger, target_status):
+    """Post a coordination-board status note for a skipped Apply.
+
+    One short post per audit-stale finding. The text matches the
+    acceptance criteria shape (`Audit-stale: <finding-id> targeted
+    <goal-id> already <status>`) so future grepping picks them up.
+
+    Fail-open: board-post.sh errors are logged to stderr but do not
+    abort the sweep — the metric record (returned to summary) is the
+    durable audit trail.
+    """
+    import subprocess
+    text = (
+        f"Audit-stale: insight_trigger {trigger['msg_id']} from "
+        f"{trigger['author']} targeted {trigger['affects_goal']} "
+        f"(action={trigger['action']}) -- already {target_status}; "
+        "Apply spawn skipped (rb-1150 audit-time vs apply-time gap)."
+    )
+    tags = (
+        f"audit-stale,insight-trigger:{trigger['msg_id']},"
+        f"target:{trigger['affects_goal']},target_status:{target_status}"
+    )
+    try:
+        # board.py is invoked directly via sys.executable instead of `bash
+        # board-post.sh` to avoid the Windows bash-subprocess hazard
+        # (rb-225/rb-247): bash from Python on Windows resolves to the WSL
+        # stub when PATH is wrong, hanging silently. sys.executable +
+        # board.py reaches the same code path (the bash wrapper exec's
+        # `python3 board.py post`) without the bash layer.
+        proc = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "core" / "scripts" / "board.py"),
+             "post", "--channel", "coordination", "--type", "status", "--tags", tags],
+            input=text, capture_output=True, text=True, timeout=10,
+        )
+        return {"posted": proc.returncode == 0, "msg_id": proc.stdout.strip() if proc.returncode == 0 else None}
+    except Exception as e:
+        print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed: {e}", file=sys.stderr)
+        return {"posted": False, "msg_id": None, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +380,41 @@ def main():
 
     filed = []
     overflow = []
+    audit_stale = []  # 6: skipped because target already terminal
+    affects_missing = []  # 6: filed-with-warning when target not found
     for t in pending:
         if len(filed) >= MAX_GOALS_PER_RUN:
             overflow.append(t)
             continue
+        # 6 / rb-1150: re-probe affects:<goal-id> target status
+        # before filing the Apply. Authors of insight_triggers tag with
+        # `affects:<goal-id>` when the action points at a specific goal;
+        # absent that tag we file unchanged (no probe target available).
+        if t.get("affects_goal"):
+            target_status = probe_goal_status(t["affects_goal"])
+            if target_status in TERMINAL_GOAL_STATES:
+                note_result = {"posted": False, "msg_id": None}
+                if not dry_run:
+                    note_result = _emit_audit_stale_note(t, target_status)
+                audit_stale.append({
+                    "msg_id": t["msg_id"],
+                    "author": t["author"],
+                    "affects_goal": t["affects_goal"],
+                    "target_status": target_status,
+                    "action": t["action"],
+                    "note_result": note_result,
+                })
+                continue
+            elif target_status is None:
+                # Target not found — file as-is with a warning (per
+                # acceptance criteria: "target missing -> file as-is with
+                # warning"). The warning lands in the affects_missing list
+                # and is surfaced in the summary.
+                affects_missing.append({
+                    "msg_id": t["msg_id"],
+                    "affects_goal": t["affects_goal"],
+                    "warning": "affects target not found in any queue at filing time",
+                })
         result = file_goal(t, dry_run=dry_run)
         filed.append({"trigger": t, "result": result})
 
@@ -304,6 +429,8 @@ def main():
         "grace_hours": GRACE_HOURS,
         "scanned": len(triggers),
         "skipped_already_converted": len(skipped),
+        "audit_stale": len(audit_stale),
+        "affects_missing": len(affects_missing),
         "filed": filed_count,
         "attempted": len(filed),
         "overflow": len(overflow),
@@ -314,11 +441,14 @@ def main():
                 "target": t["target"],
                 "action": t["action"],
                 "severity": t["severity"],
+                "affects_goal": t.get("affects_goal"),
                 "age_h": t["age_h"],
             }
             for t in pending
         ],
         "filed_details": filed,
+        "audit_stale_details": audit_stale,
+        "affects_missing_details": affects_missing,
         "overflow_details": [{"msg_id": t["msg_id"], "target": t["target"]} for t in overflow],
     }
 
@@ -328,6 +458,7 @@ def main():
         # Human-readable
         print(f"[insight-trigger-sweep] mode={summary['mode']} scanned={summary['scanned']} "
               f"skipped={summary['skipped_already_converted']} filed={summary['filed']} "
+              f"audit_stale={summary['audit_stale']} affects_missing={summary['affects_missing']} "
               f"overflow={summary['overflow']}")
         for f in filed:
             t = f["trigger"]
@@ -336,6 +467,10 @@ def main():
             print(f"  {status}: {t['msg_id']} {t['author']}->{t['target']} action={t['action']} severity={t['severity']}")
             if not dry_run and r.get("rc") != 0:
                 print(f"    stderr: {r.get('stderr')[:200]}")
+        for a in audit_stale:
+            print(f"  AUDIT-STALE: {a['msg_id']} targeted {a['affects_goal']} (action={a['action']}) -- already {a['target_status']}")
+        for am in affects_missing:
+            print(f"  WARN: {am['msg_id']} affects_goal={am['affects_goal']} not found in any queue; filed as-is")
         if overflow:
             print(f"  WARN: {len(overflow)} additional triggers exceeded MAX_GOALS_PER_RUN={MAX_GOALS_PER_RUN}")
 

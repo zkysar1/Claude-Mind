@@ -20,23 +20,109 @@ History directories mirror the path structure of the base directory (world/ or m
 ## Snapshot Filename Format
 
 ```
-{timestamp}_{agent}{extension}
+{timestamp}_{agent}{extension}.gz
 ```
 
 - **timestamp**: `YYYY-MM-DDTHH-MM-SS` (hyphens, not colons — filesystem safe)
 - **agent**: Name of the agent making the change
 - **extension**: Same as the original file
+- **.gz**: gzip compression (default since fix-ballooning-history-2026-05-22).
+  Compression ratio for text/JSONL/YAML/MD is typically 5–10×.
 
-Optional `.meta` sidecar: `{snapshot}.meta` contains a one-line summary.
+Optional `.meta` sidecar: `{snapshot}.meta` (i.e. `<file>.<ext>.gz.meta`) contains
+a one-line summary. The sidecar is **not** compressed — it stays grep-able.
+
+**Backward compatibility**: legacy uncompressed snapshots (`{timestamp}_{agent}{extension}`
+without the `.gz` suffix) remain readable indefinitely. `history-list.sh`,
+`history-restore.sh`, `history-diff.sh`, and `history-prune.sh` all handle both
+forms. `history-restore.sh <file> <version>` accepts the version name with or
+without `.gz` — the resolver tries both.
+
+## Snapshot Blacklist
+
+Some files have no real restore value and produce pathological history growth
+when snapshotted on every write. The blacklist in `core/scripts/_fileops.py`
+(`_SNAPSHOT_BLACKLIST`) names those files; matching writes **skip** the
+`.history/` snapshot but still append to `changelog.jsonl` (the audit trail
+is preserved).
+
+Current entries:
+
+| Base | Pattern | Why |
+|------|---------|-----|
+| world | `presence/` | Per-agent liveness heartbeats. Rewritten >>1 Hz across all running agents. Zero historical interest — current state is the only state that matters. |
+| meta | `gate-firings.jsonl` | Append-only gate-decision audit log. The file IS the history; full-file snapshots multiply storage by O(N²). |
+
+To add an entry:
+
+1. Confirm the file truly has no restore value (the changelog and the live
+   file together must be sufficient for every conceivable audit).
+2. Add the pattern to `_SNAPSHOT_BLACKLIST` in `core/scripts/_fileops.py`.
+   Use a key from `_classify_base()` (`world` / `meta` / `agent` / `claude`).
+   Trailing `/` matches all paths under that directory.
+3. Delete the corresponding `.history/<pattern>/` subtree (it is dead
+   storage from this point forward — free it).
+4. Add a row to the table above with the "why".
+5. Pair the SSOT-pair: a test in
+   `core/scripts/tests/test_fileops_snapshot_blacklist_and_gzip.py` that
+   asserts the new pattern is honored.
+
+## Per-File Snapshot Cap (Items 3 + 4)
+
+Even with the blacklist and gzip, files written hundreds of times per day
+(aspirations.jsonl, reasoning-bank.jsonl, the board) accumulate snapshots
+faster than the weekly date-tiered prune can keep up. The per-file cap
+bounds that growth continuously inside the write path.
+
+Policy: `DEFAULT_SNAPSHOT_CAP = 500` for any file not in
+`_PER_FILE_SNAPSHOT_CAP`. Known high-churn files have lower per-file caps:
+
+| Base | File | Cap |
+|------|------|-----|
+| world | `aspirations.jsonl`        | 100 |
+| world | `reasoning-bank.jsonl`     | 100 |
+| world | `guardrails.jsonl`         | 100 |
+| world | `pipeline.jsonl`           | 100 |
+| world | `team-state.yaml`          | 100 |
+| world | `aspirations-meta.json`    |  50 |
+| meta  | `changelog.jsonl`          | 100 |
+| meta  | `improvement-velocity.yaml`|  50 |
+| meta  | `goal-selection-strategy.yaml`| 50 |
+
+Enforcement: `save_history()` calls `_prune_to_cap()` immediately after
+writing a new snapshot, dropping the oldest non-`.meta` files by parsed
+timestamp until count ≤ cap. Paired `.meta` sidecars are dropped with
+their snapshots. Unparseable filenames (legacy artifacts, manual backups)
+are left alone. OneDrive lock/permission errors are swallowed — the
+weekly recurring prune sweeps what auto-prune couldn't drop in-call.
+
+Latency bound: a single `_prune_to_cap` call drops at most
+`MAX_SNAPSHOTS_DROPPED_PER_CALL` (default 50) snapshots, so the next write
+to a file currently at thousands-over-cap doesn't hang for 30-60s inside
+the locked write. Excess surplus drains across multiple successive writes;
+high-churn files converge to cap in <1 day at their normal write rate.
+
+Lookup precedence:
+1. Per-base named override
+2. `DEFAULT_SNAPSHOT_CAP`
+
+To add or change an override: edit `_PER_FILE_SNAPSHOT_CAP` in
+`core/scripts/_fileops.py`. Pair the change with a regression test in
+`core/scripts/tests/test_fileops_snapshot_blacklist_and_gzip.py`.
+
+The cap is the steady-state bound. Existing surplus snapshots are trimmed
+naturally over the next N writes (where N = current_count - cap).
 
 ## How It Works
 
 All write scripts delegate to `_fileops.py` locked write functions. These automatically:
 1. Acquire a file lock
-2. Copy the current file to `.history/` (via `save_history`)
-3. Perform the atomic write
-4. Append to `changelog.jsonl`
-5. Release the lock
+2. Check the snapshot blacklist; skip steps 3 + 7 for matching files
+3. gzip-compress the current file into `.history/` (via `save_history`)
+4. Perform the atomic write
+5. Append to `changelog.jsonl`
+6. Release the lock
+7. Auto-prune the per-file snapshot dir to the cap (oldest dropped first)
 
 No manual history calls needed — it happens transparently on every write.
 

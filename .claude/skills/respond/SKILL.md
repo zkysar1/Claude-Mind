@@ -283,9 +283,43 @@ IF any entry has `type: fresh-eyes-review` AND `status: pending`:
 - Mention relevant ones in context
 - Occasionally: "There are {N} items waiting for your input — ask me about them anytime."
 
+## Step 4c: Partner Context Refresh (G16)
+
+Fires ONLY when the user's message references a partner agent, coordination,
+board activity, or team state — OR when the assistant turn count since last
+refresh exceeds a threshold (~10 turns). Simple Q&A turns skip this entirely.
+
+```
+1. Determine if refresh is needed (judgment — no script call):
+   a. Does the user's message mention a partner agent by name, or reference
+      coordination, board posts, team activity, partner status, or
+      cross-agent work?
+      → YES: fire refresh.
+   b. ELSE: Read assistant_turn_count from working memory:
+      Bash: bash core/scripts/wm-read.sh assistant_turn_count 2>/dev/null
+      IF value is numeric AND value >= 10 since last partner refresh:
+        → fire refresh.
+      ELSE: SKIP entire Step 4c.
+
+2. Team state probe:
+   Bash: bash core/scripts/team-state-read.sh --field agent_status --json
+
+3. Recent coordination board:
+   Bash: bash core/scripts/board-read.sh --channel coordination --since 2h
+
+4. Incorporate returned context into the response:
+   - If partner status or board posts are relevant to the user's question,
+     weave into the answer naturally.
+   - If not directly relevant, hold in working context for Step 5 directive
+     routing (partner-aware decisions).
+
+Fail-open: if either probe errors, log and proceed. Partner context is
+supplementary — never block the user-facing response on a refresh failure.
+```
+
 ### Mode Gate (Directive & Learning Steps)
 Bash: `session-mode-get.sh`
-- If mode is `reader`: SKIP Steps 5, 6, 6.5, 7, 7.5 entirely (read-only mode, no directive processing or learning). RETURN after Step 4b.
+- If mode is `reader`: SKIP Steps 5, 6, 6.5, 7, 7.5 entirely (read-only mode, no directive processing or learning). RETURN after Step 4c (Step 4c's partner-context probes are read-only, so reader mode runs them).
 - If mode is `assistant` or `autonomous`: PROCEED with Steps 5-7.5.
 - **RUNNING state only**: After ALL steps complete (including 7.5), execute Step 3a.7 (loop re-entry). This is the LAST thing that happens — always.
 
@@ -361,13 +395,13 @@ For `/create-aspiration from-user`, the skill itself sets the aspiration's
 
 | Directive Type | Example | Action |
 |---------------|---------|--------|
-| Self update | "Change your purpose to..." / "You're actually a..." | Edit `agents/<agent>/self.md` body. In the same Edit, update front matter: `last_updated: <today (YYYY-MM-DD)>` AND `last_update_trigger: user-correction` (both fields mandatory — mirror sites: aspirations-spark sq-012, felt-sense-checkin Material lane, encode-session Lane 7, all collapsed per world/conventions/self-program-evolution.md to call the same evolution-complete primitive). The Phase 2 PostToolUse hook captured the Edit as a stub in `world/self-evolution.jsonl`. Finalize via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user directive verbatim and citing it as the trigger>" --signal-source user-directive --signal-evidence '[{"type":"user_correction","id":"<turn-id-or-respond-step>","outcome":"applied"}]'`. The primitive auto-posts to decisions board AND triggers a confirmation email (cross-agent visibility surface). Confirm change to user in your response. |
+| Self update | "Change your purpose to..." / "You're actually a..." | Read `agents/<agent>/self.md` — current Self content (G14a: pre-read before edit). Edit `agents/<agent>/self.md` body. In the same Edit, update front matter: `last_updated: <today (YYYY-MM-DD)>` AND `last_update_trigger: user-correction` (both fields mandatory — mirror sites: aspirations-spark sq-012, felt-sense-checkin Material lane, encode-session Lane 7, all collapsed per world/conventions/self-program-evolution.md to call the same evolution-complete primitive). The Phase 2 PostToolUse hook captured the Edit as a stub in `world/self-evolution.jsonl`. Finalize via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user directive verbatim and citing it as the trigger>" --signal-source user-directive --signal-evidence '[{"type":"user_correction","id":"<turn-id-or-respond-step>","outcome":"applied"}]'`. The primitive auto-posts to decisions board AND triggers a confirmation email (cross-agent visibility surface). Confirm change to user in your response. |
 | New aspiration | "Learn about cooking" | Invoke `/create-aspiration from-user` with the user's description |
 | Remove/pause aspiration | "Stop learning about politics" | Mark aspiration as `paused` via `aspirations-update.sh`, mark its goals as `skipped` |
 | Priority review | "Focus more on X than Y" / "show me priorities" / "reorder aspirations" / "asp-125 is most important" / response to priority-review pq | Invoke `/priority-review` with user's input. If a `type: priority-review` pending question exists with `status: pending`, pass its context to the skill. For simple single-aspiration priority changes (e.g., "make asp-125 HIGH"), update directly via `aspirations-update.sh` without invoking the full skill. |
 | Fresh-eyes reply | "Self is still right" / "Self should be X" / "We're working on wrong problems — focus Y" / any reply referencing the two meta-questions from an open `type: fresh-eyes-review` pq | Split the user's reply into Self-portion and portfolio-portion. **Self-portion**: if the user says Self is still right, no self.md change — just record the confirmation. If they give a correction ("Self should be X" / "Update purpose to Y"), treat it as a Self update directive (row above) — edit `agents/<agent>/self.md` with `last_update_trigger: fresh-eyes-review`, then finalize the Phase 2 stub via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user's fresh-eyes correction verbatim>" --signal-source fresh-eyes-review --signal-evidence '[{"type":"fresh_eyes_reply","id":"<pq-id>","outcome":"correction-applied"}]'`, confirm. **Portfolio-portion**: if the user gives any priority guidance ("focus on X", "deprioritize Y", "Z is most important"), route to the Priority review row above (invoke `/priority-review` with the fresh-eyes pq context). Then mark the fresh-eyes-* pq `status: answered`, append a `resolution:` field with the full reply text, and `Bash: session-signal-set.sh pq-resolved`. The fresh-eyes cadence gate (`fresh-eyes-cadence-check.sh`) reads `skip_if_pending`, so flipping this pq to answered immediately unblocks the next 25-goal cycle. If the reply is ambiguous (only vague praise or critique), surface a follow-up clarifier in this same response before marking answered. |
 | Persona change | "Be more casual" | Update persona settings in `agents/<agent>/profile.yaml` |
-| Remember fact/preference | "Remember I prefer Python" | PLACEMENT CHECK: route domain-specific stable values (endpoints, paths, service names, account IDs, brand names) to `world/conventions/*.md` per `.claude/rules/encode-stable-facts.md`. Route universal behavioral preferences to working memory or a guardrail. Only create or edit a `.claude/rules/*.md` file for universal behavioral rules that apply regardless of domain — never for a domain-specific operational fact. Then write to the chosen target (`/tree add`, `wm-set.sh domain_data`, or Edit on the appropriate convention file). NEVER use platform auto-memory. |
+| Remember fact/preference | "Remember I prefer Python" | PLACEMENT CHECK: route domain-specific stable values (endpoints, paths, service names, account IDs, brand names) to `world/conventions/*.md` per `.claude/rules/encode-stable-facts.md`. Route universal behavioral preferences to working memory or a guardrail. Only create or edit a `.claude/rules/*.md` file for universal behavioral rules that apply regardless of domain — never for a domain-specific operational fact. Then Read the target convention file first (G14b: pre-read before edit) and write to the chosen target (`/tree add`, `wm-set.sh domain_data`, or Edit on the appropriate convention file). NEVER use platform auto-memory. |
 | Recurring task | "Check news every week" | Add as recurring goal to an appropriate aspiration |
 | Skill creation request | "Make a skill for X" / "Create a skill" / "Forge a skill for Y" | Route through forge pipeline. Read `meta/skill-gaps.yaml`. If a gap matches the user's description, create goal: title `"Forge skill: {gap.procedure_name}"`, `skill: "/forge-skill"`, `args: "skill {gap-id}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh`. If no matching gap exists, register a new gap in `meta/skill-gaps.yaml` (id: `gap-{next}`, status: `registered`, times_encountered: 1, procedure_name from user description, estimated_value: `medium`), then create the forge goal targeting it. If user was generic ("make a skill" with no specifics), create goal with `skill: "/forge-skill"`, `args: "list"`. Forge-skill gates (curriculum, threshold, stage) apply at execution time — do NOT pre-check here. Confirm: "I'll queue a skill forge for {description}." In UNINITIALIZED state, acknowledge verbally only. |
 | Idea/suggestion | "What if we...?" / "I had an idea..." | Create idea goal: title `"Idea: {user's suggestion}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh` |
@@ -383,6 +417,43 @@ For `/create-aspiration from-user`, the skill itself sets the aspiration's
 5. In RUNNING state: directive takes effect on next aspirations loop iteration
 6. In IDLE state: state is updated, takes effect when user runs `/start`
 7. In UNINITIALIZED state: do NOT write files (world/ and agent dir don't exist yet). Acknowledge conversationally: "Got it — once you run `/start`, I'll set that up." Process the directive immediately after `/start` creates world/ and agent dir.
+
+## Step 5.5: Mid-Directive Drift Check (G15)
+
+Assistant-mode analogue of autonomous Phase 4.05 (aspirations-execute). When
+a directive turn has produced substantial output, the Step 4 retrieval snapshot
+may be stale — re-retrieve and reconcile before continuing to Step 6.
+
+SKIP entirely if this turn was simple Q&A (no directive routed in Step 5).
+
+```
+1. Count this turn's write volume:
+   edit_count = number of Edit/Write/MultiEdit tool calls THIS turn
+   bash_output_chars = total chars of Bash stdout THIS turn
+
+   IF edit_count <= 3 AND bash_output_chars <= 3000:
+     SKIP entire Step 5.5 — turn is lightweight, drift unlikely.
+
+2. Re-retrieve at shallow depth, read-only:
+   Bash: bash core/scripts/retrieve.sh --category "{current directive subject}" --depth shallow --read-only
+
+3. Reconcile against Step 4's retrieval snapshot:
+   - New reasoning_bank entries added since this turn started? (check `created` field)
+   - New guardrails added that constrain the directive just executed?
+   - Tree nodes touched since Step 4 ran? (check `last_updated`)
+
+   IF any drift detected:
+     Surface in response: "Note: new context arrived mid-turn — {one-line summary}."
+     If drift contradicts what Step 5 just wrote, flag for the user rather than
+     silently proceeding.
+
+   ELSE:
+     # No drift — proceed with Step 4's snapshot for downstream steps.
+     pass
+
+Fail-open: if retrieve.sh errors, log and proceed. The drift check must not
+block the user-facing response or downstream learning steps.
+```
 
 ## Step 6: Knowledge Freshness Check
 

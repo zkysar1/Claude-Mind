@@ -54,6 +54,28 @@ AGENTS_PARENT_DIR = "agents"
 SESSIONS_DIRNAME = "sessions"
 SESSION_DIRNAME = "session"
 
+# --- Agent-dir write-surface allowlist (file-model normalization, 2026-06) ---
+# The bound agent dir is a CLOSED write surface: only these top-level dirs
+# (writes anywhere beneath them) and these registered top-level files are
+# permitted. Everything else — reports/, an invented directory, or a stray
+# top-level file — is denied with a redirect to temp/. This is an ALLOWLIST,
+# NOT a reports/ blacklist: reports/ is denied because it is not on the list,
+# the same mechanism that denies any future invented directory. Keep in sync
+# with core/config/conventions/temp-store.md ("Permitted top-level directories"
+# + the registered-file list) and init-agent.sh.
+_AGENT_DIR_ALLOWLIST_DIRS = frozenset({
+    "session", "sessions", "journal", "experience", ".history", "temp",
+})
+_AGENT_DIR_ALLOWLIST_FILES = frozenset({
+    "self.md", "profile.yaml", "developmental-stage.yaml", "curriculum.yaml",
+    "curriculum-promotions.jsonl", "aspirations.jsonl", "aspirations-archive.jsonl",
+    "aspirations-meta.json", "experience.jsonl", "experience-archive.jsonl",
+    "experience-meta.json", "experiential-index.yaml", "infra-health.yaml",
+    "prep-tasks.yaml", "journal.jsonl", "changelog.jsonl", "local-paths.conf",
+    ".initialized", "insights.jsonl", "weakness-report.yaml", "BACKLOG.md",
+    "COMPLETION-REPORT.md",
+})
+
 
 def _resolve_agent_dir(project_root, agent):
     """Compute agent dir path. Mirrors agent_dir() in _paths.py."""
@@ -131,6 +153,34 @@ def is_new_toplevel(target, root):
         return False
     toplevel_path = root + "/" + first_segment
     return not os.path.exists(toplevel_path)
+
+
+def is_allowlisted_agent_toplevel(target, agent_root):
+    """True if `target` is at or below an ALLOWLISTED top-level entry of the
+    bound agent dir — an allowlisted directory (writes anywhere beneath it) or
+    a registered top-level file. Everything else returns False and is denied by
+    the caller.
+
+    Mirrors is_new_toplevel's first-segment extraction but checks allowlist
+    MEMBERSHIP instead of disk existence — so it denies `reports/` even though
+    `reports/` exists on disk (the file-model normalization froze reports/ and
+    routes working docs to temp/). See core/config/conventions/temp-store.md
+    and `.claude/rules/path-resolution.md`.
+    """
+    if not is_under(target, agent_root) or target == agent_root:
+        return False
+    rel = target[len(agent_root) + 1:]
+    if not rel:
+        return False
+    parts = rel.split("/", 1)
+    first_segment = parts[0]
+    if not first_segment:
+        return False
+    if len(parts) == 1:
+        # A file (or entry) directly at the agent root — must be registered.
+        return first_segment in _AGENT_DIR_ALLOWLIST_FILES
+    # A path under a first-segment subdirectory — that dir must be allowlisted.
+    return first_segment in _AGENT_DIR_ALLOWLIST_DIRS
 
 
 def read_paths_conf(conf_path):
@@ -410,38 +460,48 @@ def main():
                             )
                             emit_deny(session_invented_reason)
 
-            # Cruft prevention parity for the bound agent dir. Only fires
-            # when the matched root is PROJECT_ROOT AND the target lies
-            # inside <PROJECT_ROOT>/<agent>/. Other PROJECT_ROOT areas
-            # (core/, .claude/, the project root itself) are untouched —
-            # those are governed by their own conventions and protected
-            # by L2 permission rules.
+            # Agent-dir write-surface allowlist (file-model normalization).
+            # Fires when the matched root is PROJECT_ROOT AND the target lies
+            # inside <PROJECT_ROOT>/<agent>/ AND the target is NOT on the
+            # allowlist (permitted dirs + registered files). Denies reports/,
+            # invented dirs, and stray top-level files alike. Other PROJECT_ROOT
+            # areas (core/, .claude/, the project root itself) are untouched —
+            # governed by their own conventions and L2 permission rules. The
+            # sessions/<SID>/ block above runs first and exits, so a bound
+            # session's scratch is unaffected by this check.
             if (
                 label == "PROJECT_ROOT"
                 and agent_dir_norm
                 and is_under(target, agent_dir_norm)
-                and is_new_toplevel(target, agent_dir_norm)
+                and not is_allowlisted_agent_toplevel(target, agent_dir_norm)
             ):
                 agent_cruft_reason = (
                     f"Path-resolution hook (L1) blocked {tool_name} to:\n"
                     f"  {file_path}\n"
-                    f"This would create a new top-level entry under the bound "
-                    f"agent dir ({agent_dir_norm}).\n"
-                    f"Agent dir top-levels are governed for the same reason as "
-                    f"WORLD_PATH and META_PATH — silent invention of new "
-                    f"top-level subdirectories (e.g. `{agent}/handoffs/`, "
-                    f"`{agent}/scratch/`, `{agent}/notes/`) blends visually "
-                    f"into the canonical layout and accumulates as cruft "
-                    f"(see .claude/rules/path-resolution.md "
-                    f"\"L1 Cruft Prevention\" section).\n"
-                    f"Options:\n"
-                    f"  (a) Place under an EXISTING top-level dir within the "
-                    f"agent dir if the artifact fits there.\n"
-                    f"  (b) For ephemeral artifacts, write under "
-                    f"{agent}/session/ — already established for transients.\n"
-                    f"  (c) Ask the user where the new entry should live, OR "
-                    f"have them create the directory first; this write "
-                    f"succeeds on retry once the entry exists on disk."
+                    f"This target is not on the bound agent dir's write-surface "
+                    f"allowlist ({agent_dir_norm}).\n"
+                    f"The agent dir is a CLOSED write surface (file-model "
+                    f"normalization). Permitted top-level directories: session, "
+                    f"sessions, journal, experience, .history, temp — plus the "
+                    f"registered top-level agent files (self.md, the *.jsonl / "
+                    f"*.yaml / *.json state files, COMPLETION-REPORT.md, "
+                    f"BACKLOG.md, etc.). Any OTHER directory (e.g. "
+                    f"`{agent}/reports/`, `{agent}/handoffs/`, `{agent}/notes/`) "
+                    f"or stray top-level file is denied. This is an ALLOWLIST, "
+                    f"not a reports/ blacklist — reports/ is denied because it is "
+                    f"not on the list, the same rule that denies any invented "
+                    f"directory (see core/config/conventions/temp-store.md).\n"
+                    f"Where this output belongs:\n"
+                    f"  - Reports / analyses / briefings / audits / snapshots "
+                    f"(working docs that drain to the knowledge tree) -> "
+                    f"{agent}/temp/\n"
+                    f"  - Per-session IO buffers / probe dumps -> "
+                    f"{agent}/session/scratch/\n"
+                    f"  - Reusable knowledge -> the knowledge tree "
+                    f"(world/knowledge/tree/) via /tree add\n"
+                    f"  - A genuinely new registered location -> ask the user to "
+                    f"create it (or add an init-*.sh step); shell mkdir bypasses "
+                    f"this Write/Edit gate by design."
                 )
                 emit_deny(agent_cruft_reason)
             approve_no_mutation()

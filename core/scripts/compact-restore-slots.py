@@ -98,18 +98,114 @@ def now_iso():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _delete_checkpoint_safely(path, reason: str) -> bool:
+    """One-shot consumption: delete checkpoint at clean success return points.
+
+    g-115-962 fix. Previously the LLM-side Phase -0.5c pseudocode owned the
+    delete step ("Step 3: One-shot consumption — Delete checkpoint"), but it
+    silently dropped on the stale-skip path — the LLM remembered the delete
+    after a successful restore but not after a "restore SKIPPED" early
+    return, so the stale file lingered into the next iteration. Single-
+    writer principle: the script that owns the checkpoint lifecycle deletes
+    it; the LLM no longer carries that responsibility.
+
+    Reasons covered: 'stale-skip', 'empty-checkpoint', 'restored-clean'.
+    NOT called from: the 'no checkpoint' early return (nothing to delete)
+    OR the wm-uninitialized error exit (preserve for next-iteration retry).
+
+    Returns True on successful (or no-op) deletion, False on OSError —
+    callers may ignore the return value (the script never blocks on
+    delete-failure: the next iteration's freshness gate will re-handle).
+
+    Takes `path` as arg so the helper is testable without monkey-patching
+    module-level CHECKPOINT_PATH (mirrors the testable shape of
+    `_is_checkpoint_stale` above).
+    """
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError as e:
+        print(f"WARN: failed to delete checkpoint ({reason}): {e}", file=sys.stderr)
+        return False
+
+
+def _recover_lost_loop_state():
+    """Null-guarded loop_state recovery across compaction (2).
+
+    loop_state is in SKIP_SLOTS (the general merge never restores it) AND the
+    freshness gate below skips the whole restore when wm.yaml mtime > checkpoint
+    mtime. Neither path recovers a loop_state that was NULLED/LOST in the
+    compaction window. A null on-disk loop_state is data-loss, never "fresher
+    truth" than a valid checkpoint snapshot — and loop-state-bump-counters.py
+    would then self-init from goals_completed=0 (g-115-622), silently resetting
+    the session count (session_count double-increments, productivity-gate goes
+    stale).
+
+    Recovers loop_state from the checkpoint ONLY when the on-disk value is
+    null/missing/non-dict, so it can NEVER clobber a valid on-disk loop_state —
+    the g-115-593 latest-wins intent that put loop_state in SKIP_SLOTS is fully
+    preserved. No-op in the common case (valid on-disk loop_state → no write, so
+    the freshness gate's mtime comparison is unaffected). Fail-open: any error →
+    no-op (recovery is best-effort, never blocks the general restore).
+    """
+    try:
+        ck = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8")) or {}
+        ck_ls = (ck.get("all_slots") or {}).get("loop_state")
+        if not isinstance(ck_ls, dict):
+            return  # checkpoint carries no valid loop_state to recover from
+        wm = read_wm()
+        if not wm:
+            return  # uninitialized wm — main()'s read_wm guard handles this
+        slots = wm.setdefault("slots", {})
+        disk_ls = slots.get("loop_state")
+        if isinstance(disk_ls, dict):
+            return  # on-disk loop_state is valid — DO NOT clobber ()
+        # on-disk loop_state is null/lost — recover from the checkpoint snapshot
+        slots["loop_state"] = ck_ls
+        meta = wm.setdefault("slot_meta", {})
+        prev = meta.get("loop_state") if isinstance(meta.get("loop_state"), dict) else {}
+        meta["loop_state"] = {
+            "updated_at": now_iso(),
+            "accessed_at": now_iso(),
+            "update_count": prev.get("update_count", 0) + 1,
+        }
+        write_wm(wm)
+        gc = ck_ls.get("goals_completed", "?")
+        pg = ck_ls.get("productive_goals", "?")
+        print(
+            f"loop_state RECOVERED from checkpoint (was null on disk; "
+            f"goals_completed={gc}, productive_goals={pg}) [g-115-1302]"
+        )
+    except Exception as e:
+        print(f"WARN: loop_state recovery skipped ({e})", file=sys.stderr)
+
+
 def main():
     if not CHECKPOINT_PATH.exists():
         print("no checkpoint")
         return
 
+    # Capture the freshness decision BEFORE the recovery write below. A
+    # recovery write bumps wm.yaml's mtime, which would otherwise make this
+    # gate wrongly skip a legitimate general restore — the gate's premise is
+    # "an iteration completed after PreCompact", which a recovery write does
+    # NOT satisfy. 2.
+    _wm_fresher_than_checkpoint = _is_checkpoint_stale(CHECKPOINT_PATH, WM_PATH)
+
+    # 2: recover loop_state if it was nulled/lost in the compaction
+    # window. MUST run before the general merge — loop_state is in SKIP_SLOTS
+    # (never restored) and the freshness gate below skips the whole restore,
+    # so neither would recover it. Null-guarded: no-op (no write) when on-disk
+    # loop_state is a valid dict, so existing behavior is unchanged then.
+    _recover_lost_loop_state()
+
     # Freshness gate (): when wm.yaml mtime exceeds checkpoint mtime,
     # the in-process iteration completed after PreCompact, so wm.yaml carries
     # newer state. Running the merge logic here would silently regress
-    # counters and slot values. SKIP the restore + return success — the
-    # caller (Phase -0.5c) still proceeds to process encoding_queue and
-    # delete the stale checkpoint (one-shot consumption).
-    if _is_checkpoint_stale(CHECKPOINT_PATH, WM_PATH):
+    # counters and slot values. SKIP the restore + delete the stale
+    # checkpoint (: was LLM-owned Phase -0.5c Step 3; moved here so
+    # the stale-skip path can no longer leak).
+    if _wm_fresher_than_checkpoint:
         ck_mtime = CHECKPOINT_PATH.stat().st_mtime
         wm_mtime = WM_PATH.stat().st_mtime
         delta = wm_mtime - ck_mtime
@@ -117,6 +213,7 @@ def main():
             f"checkpoint stale (wm.yaml is {delta:.0f}s fresher than checkpoint) — "
             f"restore SKIPPED to prevent loop_state regression (g-115-684)"
         )
+        _delete_checkpoint_safely(CHECKPOINT_PATH, "stale-skip")
         return
 
     checkpoint = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8")) or {}
@@ -125,10 +222,12 @@ def main():
 
     if not all_slots:
         print("no slots in checkpoint")
+        _delete_checkpoint_safely(CHECKPOINT_PATH, "empty-checkpoint")
         return
 
     wm = read_wm()
     if not wm:
+        # Preserve checkpoint for next-iteration retry — wm-init may recover.
         print("ERROR: Working memory not initialized", file=sys.stderr)
         sys.exit(1)
 
@@ -235,6 +334,8 @@ def main():
     if parts:
         summary += f" ({'; '.join(parts)})"
     print(summary)
+
+    _delete_checkpoint_safely(CHECKPOINT_PATH, "restored-clean")
 
 
 if __name__ == "__main__":

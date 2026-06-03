@@ -124,6 +124,19 @@ Bash: echo "{influence_line}" | bash core/scripts/wm-set.sh retrieval_influence_
 #   bash core/scripts/wm-set.sh retrieval_influence_last <<'EOF'
 #   {influence_line}
 #   EOF
+
+# Step 5d: Tier-2 Codebase Probe (G19 — conditional)
+# When goal metadata names a concrete target, probe it BEFORE execution
+# so the agent enters Phase 4 with first-hand knowledge of the artifact.
+# Closes the gap detected post-hoc by aspirations-learning-gate Phase 9.5b
+# escalation-quality check (lines ~161-167 of that SKILL.md).
+IF goal.primary_action OR goal.description names a concrete file path or script:
+    Read that file (or the relevant section if large)
+ELIF goal.primary_action OR goal.description references a subsystem without naming a file:
+    Grep for the subsystem's key identifiers (function names, class names, config keys)
+    Read the top hit if unambiguous
+# Skip silently when goal metadata contains no concrete target reference.
+# This is a retrieval enrichment step, not a gate — never blocks execution.
 ```
 
 Execute primary goal: `result = invoke goal.skill with goal.args`

@@ -80,3 +80,40 @@ def looks_like_cruft(p: Path) -> bool:
     if len(s) >= 3 and s[1] == ":" and s[2] == "/":
         s = s[2:]
     return ":" in s or "\uF03A" in s
+
+
+class CruftPathRefused(Exception):
+    """Raised by assert_not_cruft when a path looks like cruft mirror.
+
+    The exception name is structured: callers and tests can catch
+    CruftPathRefused specifically without swallowing unrelated OSError /
+    FileNotFoundError. The raise-not-skip choice is deliberate \u2014 silent
+    skip leaves the system in a partial-write state where the file IS
+    on disk (cruft mirror) but the daemon thinks the write failed. Loud
+    fail surfaces the bypass at the call site so it gets fixed instead
+    of accumulating as a noisy log entry no one reads.
+    """
+
+
+def assert_not_cruft(path: Path, operation: str = "write") -> None:
+    """Tripwire: refuse to proceed if `path` looks like cruft mirror.
+
+    Use at write boundaries (mkdir, open(w), write_text) in daemon code
+    where the path argument is a function parameter and its provenance
+    cannot be audited locally. If the path traces back to ctx.paths.*
+    (which goes through absolutize()), this is a no-op. If a caller
+    constructed the path via raw join of a non-absolutized value, this
+    fires.
+
+    Canonical sites: every mkdir(parents=True) in mind_api/src/
+    (g-315-77 audit, 2026-05-21). Adding to a new daemon write helper
+    is the standard hardening pattern \u2014 see  the audit at
+    core/scripts/tests/test_daemon_mkdir_cruft_tripwires.py for the
+    canonical site list + test coverage.
+    """
+    if looks_like_cruft(path):
+        raise CruftPathRefused(
+            f"Refusing {operation}: path looks like cruft mirror \u2014 "
+            f"{path!r}. Caller bypassed absolutize() somewhere upstream. "
+            f"See .claude/rules/path-resolution.md \"L1 Cruft Prevention\"."
+        )

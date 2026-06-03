@@ -48,6 +48,24 @@ fi
 # Normalize backslashes (Windows Edit-tool payloads).
 file_path="${file_path//\\//}"
 
+# Normalize Windows drive-letter paths (C:/foo) to MSYS POSIX form (/c/foo)
+# so the PROJECT_ROOT case match below works. Claude Code hooks deliver
+# Windows-form paths; bash's `pwd` inside Git Bash returns POSIX-form. Before
+# this normalization the case match silently failed on Windows: rel_path
+# stayed absolute, the case-`/*` exit at line 62 did NOT match (C: doesn't
+# start with /), top_seg resolved to literal `C:` which matches no agent
+# name, and EVERY path slipped past the filter into the log with absolute
+# path (alpha's log had 175 entries — including 36 agent-prefixed — all
+# absolute, all wrong). The agent-dir filter underneath this block depends
+# on rel_path being the project-relative form ("agents/alpha/foo"), not the
+# absolute drive path.
+case "$file_path" in
+    [A-Za-z]:/*)
+        _drive=$(printf '%s' "${file_path%%:*}" | tr '[:upper:]' '[:lower:]')
+        file_path="/${_drive}${file_path#*:}"
+        ;;
+esac
+
 # Convert absolute paths to repo-relative when they land under PROJECT_ROOT.
 # Paths outside PROJECT_ROOT (e.g., temp files, sibling repos) stay absolute
 # and will fail the neutral-path test below.
@@ -67,17 +85,31 @@ esac
 # starts with world/ or meta/ virtual prefixes.
 top_seg="${rel_path%%/*}"
 
-# Known agent dirs: any sibling of PROJECT_ROOT with self.md sentinel.
+# Known agent dirs: depends on AGENTS_PARENT_DIR layout.
+# Modern (AGENTS_PARENT_DIR=agents): any path under "agents/" is agent-private
+# (every dir there has a self.md by construction — /start refuses agent names
+# that collide with non-agent siblings under agents/).
+# Legacy (AGENTS_PARENT_DIR=""): walk PROJECT_ROOT/*/ for self.md sentinels.
+# Before this branch existed, the legacy loop was the only path, and under
+# AGENTS_PARENT_DIR=agents it silently never matched — agent-private edits
+# under agents/<name>/ landed in the neutral-path log as false-positives
+# (alpha's log accumulated 36 such entries before the fix).
 is_agent_dir=0
-for d in "$PROJECT_ROOT"/*/; do
-    [ -d "$d" ] || continue
-    [ -f "$d/self.md" ] || continue
-    a=$(basename "$d")
-    if [ "$a" = "$top_seg" ]; then
+if [ -n "$AGENTS_PARENT_DIR" ]; then
+    if [ "$top_seg" = "$AGENTS_PARENT_DIR" ]; then
         is_agent_dir=1
-        break
     fi
-done
+else
+    for d in "$PROJECT_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        [ -f "$d/self.md" ] || continue
+        a=$(basename "$d")
+        if [ "$a" = "$top_seg" ]; then
+            is_agent_dir=1
+            break
+        fi
+    done
+fi
 
 # Virtual prefixes (world/, meta/) are external owned-domain.
 case "$rel_path" in

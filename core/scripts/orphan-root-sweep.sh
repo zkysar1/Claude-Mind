@@ -32,6 +32,20 @@
 set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_paths.sh"
 
+# ─── Args ────────────────────────────────────────────────────────────────
+# --auto-clean: when Mode D findings are present AND daemon /v1/admin/health
+# reports git_head_sha matching the on-disk HEAD, remove the cruft dirs.
+# Per rb-939 + guard-554: cleanup is safe ONLY after daemon has been
+# restarted with the latest path-resolver fix. If sha mismatch (daemon
+# stale) — skip and instruct restart. Mode-D-only by design; other modes
+# (A/B/E/F) need different triage and stay advisory.
+AUTO_CLEAN=false
+for arg in "$@"; do
+    case "$arg" in
+        --auto-clean) AUTO_CLEAN=true ;;
+    esac
+done
+
 world_basename="$(basename "$WORLD_DIR")"
 meta_basename="$(basename "$META_DIR")"
 world_parent="$(dirname "$WORLD_DIR")"
@@ -41,6 +55,7 @@ project_root_basename="$(basename "$PROJECT_ROOT")"
 
 findings=0
 findings_text=""
+declare -a mode_d_paths=()
 
 emit() {
     findings_text+="$1"$'\n'
@@ -195,6 +210,7 @@ for name in sorted(os.listdir(proj_root)):
             # sequence even when terminals render it invisibly.
             name_hex="$(printf '%s' "$bad_name" | od -An -tx1 | tr -d ' \n')"
             emit "  MODE-D ORPHAN: $bad_name ($kind, mtime: $mtime, name-bytes: $name_hex)"
+            mode_d_paths+=("$entry")
         done <<< "$cruft_stream"
     fi
 else
@@ -257,6 +273,57 @@ else
     echo "  (cruft mtime + git log fix-commit time + daemon start time) AND guard-554 (curl /v1/admin/health,"
     echo "  confirm git_head_sha matches \`git rev-parse HEAD\`, kill+respawn via \`Stop-Process -Id \$(cat mind_api/state/daemon.pid) -Force\`"
     echo "  on Windows or \`kill \$(cat mind_api/state/daemon.pid)\` on POSIX) BEFORE removing the cruft directory."
+fi
+
+# ─── Auto-clean (Mode D only, opt-in, daemon-health-gated) ──────────────
+# Implements guard-554 / rb-939 cleanup protocol:
+#   1. Daemon /v1/admin/health must be reachable
+#   2. Returned git_head_sha must match `git rev-parse HEAD`
+#   3. Only then is it safe to delete (cruft is stale residue, not active)
+# If either condition fails, refuse the delete and explain.
+if [ "$AUTO_CLEAN" = "true" ] && [ "${#mode_d_paths[@]}" -gt 0 ]; then
+    echo ""
+    echo "=== auto-clean (Mode D) ==="
+    daemon_sha=""
+    daemon_url="${AYOAI_DAEMON_URL:-http://localhost:8765}/v1/admin/health"
+    if command -v curl >/dev/null 2>&1; then
+        # Quiet curl; if reachable, extract git_head_sha via py -3 (jq absent on Windows git-bash).
+        daemon_response="$(curl -sf --max-time 3 "$daemon_url" 2>/dev/null || echo "")"
+        if [ -n "$daemon_response" ]; then
+            daemon_sha="$(printf '%s' "$daemon_response" | py -3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d.get("git_head_sha") or "")
+except Exception:
+    print("")' 2>/dev/null || echo "")"
+        fi
+    fi
+    repo_sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || echo "")"
+    cleanup_log="$PROJECT_ROOT/core/logs/orphan-root-sweep-cleanups.log"
+
+    if [ -z "$daemon_sha" ]; then
+        echo "  SKIP: daemon health unreachable at $daemon_url"
+        echo "        — start the daemon or set AYOAI_DAEMON_URL, then re-run."
+    elif [ -z "$repo_sha" ]; then
+        echo "  SKIP: git rev-parse HEAD failed (not in a git work tree?)"
+    elif [ "$daemon_sha" != "$repo_sha" ]; then
+        echo "  SKIP: daemon git_head_sha=$daemon_sha != repo HEAD=$repo_sha"
+        echo "        Daemon is running stale code. Restart it first (per guard-554),"
+        echo "        then re-run with --auto-clean. Removing cruft now would just let"
+        echo "        the stale daemon re-create it."
+    else
+        echo "  OK: daemon git_head_sha matches HEAD ($repo_sha) — daemon has the fix."
+        echo "  Removing ${#mode_d_paths[@]} Mode-D cruft path(s):"
+        for cruft in "${mode_d_paths[@]}"; do
+            if rm -rf "$cruft" 2>/dev/null; then
+                echo "    REMOVED: $cruft"
+                printf '%s orphan-root-sweep auto-clean: removed %s\n' \
+                    "$(date +%Y-%m-%dT%H:%M:%S)" "$cruft" >> "$cleanup_log"
+            else
+                echo "    REMOVE FAILED: $cruft (manual cleanup needed)"
+            fi
+        done
+    fi
 fi
 
 # Always exit 0 — advisory only.

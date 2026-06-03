@@ -27,6 +27,36 @@ from .agent_paths import AgentPathResolver, AgentPaths
 from .endpoints import load_all
 
 
+# --- Request body normalization --------------------------------------------
+
+def _normalize_request_body(raw: bytes) -> bytes:
+    """Normalize a POST body to valid UTF-8 bytes at the single door.
+
+    Some clients (Windows shells using the cp1252 codepage) encode the body
+    in CP1252 rather than UTF-8 — an em-dash arrives as the lone byte 0x97
+    instead of the UTF-8 sequence 0xE2 0x80 0x94. Every endpoint then does a
+    strict ``body.decode("utf-8")``; that raises UnicodeDecodeError and
+    surfaces as a 500, silently dropping the agent's write (board posts,
+    reasoning-bank lessons, working-memory, experience — learning/coordination
+    DATA LOSS). Normalizing once HERE means all ~20 endpoint decode sites see
+    clean UTF-8 with zero per-endpoint changes (single source of truth).
+
+    We re-decode invalid bytes as cp1252 (which maps 0x97 -> U+2014 em-dash)
+    then re-encode UTF-8, RECOVERING the intended character rather than
+    blanking it to U+FFFD. cp1252 has 5 undefined byte positions; errors=
+    "replace" covers only those rare cases. Symmetric with the response-side
+    surrogatepass in Response.text/json. (Lodestar B5; reinforced by rb-739:
+    the cp1252<->utf-8 transform is the canonical mojibake recovery.)
+    """
+    if not raw:
+        return raw
+    try:
+        raw.decode("utf-8")
+        return raw  # already valid UTF-8 — the overwhelmingly common case
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace").encode("utf-8")
+
+
 # --- Response shape --------------------------------------------------------
 
 class Response:
@@ -141,6 +171,10 @@ class _Handler(BaseHTTPRequestHandler):
 
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length > 0 else b""
+            # B5: recover a cp1252-encoded body (Windows em-dash 0x97 etc.) to
+            # valid UTF-8 once, so every endpoint's strict body.decode("utf-8")
+            # sees clean bytes instead of 500-ing and dropping the write.
+            body = _normalize_request_body(body)
 
             agent_header = self.headers.get("X-Mind-Agent", "")
             paths = self.resolver.resolve(agent_header)
@@ -176,10 +210,37 @@ class _Handler(BaseHTTPRequestHandler):
 
             self._write_response(resp)
         except Exception as e:  # pragma: no cover — defensive
-            # : no repr(e) — repr of a UnicodeError embeds the whole
-            # failed payload and re-triggers the surrogate cascade (empty body).
-            detail = type(e).__name__ + ": " + str(e)[:200]
-            resp = Response.error(500, "internal_error", detail)
+            # own-cloud RMW conflict (#38): an If-Match stale-lock-break
+            # ConflictError — the remote object moved between a handler's
+            # in-lock fresh read and its PUT (the DDB lock was force-broken by
+            # a crashed/reclaimed holder on another machine) — is a TRANSIENT
+            # optimistic-concurrency conflict, not an internal fault. Map it to
+            # a 409 the caller can safely retry, distinct from a 500. The
+            # high-value shared-store handlers retry in-process
+            # (file_locks.locked_rmw) so most conflicts never reach here; this
+            # is the universal floor for every other handler. isinstance against
+            # the backend's conflict_error is () on LocalBackend (matches
+            # nothing — zero behavior change off own-cloud) and ConflictError on
+            # OwnCloudBackend. Lazy import keeps server.py importable on a
+            # LocalBackend-only host without the cloud-backend dependencies.
+            _is_conflict = False
+            try:
+                from storage_backend import get_backend
+                _is_conflict = isinstance(e, get_backend().conflict_error)
+            except Exception:
+                _is_conflict = False
+            if _is_conflict:
+                resp = Response.error(
+                    409, "write_conflict",
+                    "optimistic-concurrency conflict: remote changed between "
+                    "the in-lock read and the write; the write did NOT land — "
+                    "safe to retry")
+            else:
+                # : no repr(e) — repr of a UnicodeError embeds the
+                # whole failed payload and re-triggers the surrogate cascade
+                # (empty body).
+                detail = type(e).__name__ + ": " + str(e)[:200]
+                resp = Response.error(500, "internal_error", detail)
             try:
                 self._write_response(resp)
             except Exception:
@@ -252,6 +313,24 @@ class _Handler(BaseHTTPRequestHandler):
 
 # --- Server -----------------------------------------------------------------
 
+
+class _BackloggedHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a listen backlog sized for a shared daemon.
+
+    request_queue_size (the socket listen backlog passed to socket.listen())
+    defaults to 5 in the stdlib. When many agents share one daemon, a burst
+    of >5 simultaneous wrapper connects overflows the backlog and the kernel
+    refuses the excess connects. A refused connect surfaces to the wrapper as
+    connection-refused (rc=3), which spuriously respawns a busy-but-alive
+    daemon and orphans it — the orphan-accumulation source observed under a
+    multi-agent fleet (~1 orphan every ~90s under a 6-agent fleet). 128 covers
+    the fleet's burst with wide margin; the OS clamps the value to the
+    platform backlog ceiling, so a too-large value is harmless.
+    """
+
+    request_queue_size = 128
+
+
 class Server:
     """The daemon. Holds state, starts the HTTP listener, manages PID/port files."""
 
@@ -286,7 +365,7 @@ class Server:
 
         # AF_INET ipv4 only — Decision 6 binds to 127.0.0.1.
         try:
-            self._http = ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+            self._http = _BackloggedHTTPServer(("127.0.0.1", port), handler_cls)
         except OSError as e:
             self._log_lifecycle("bind_failed", port=port, error=repr(e))
             raise
@@ -296,8 +375,21 @@ class Server:
         handler_cls.pid = os.getpid()
         handler_cls.port = self.actual_port
 
-        lifecycle.write_pid_and_port_atomic(self.project_root, os.getpid(), self.actual_port)
-        self._log_lifecycle("started", port=self.actual_port, pid=os.getpid())
+        #  v3 fix: capture the launcher (py.exe on Windows, shell on
+        # POSIX) parent PID at spawn time. The kill path reads this file so
+        # it can force-kill the parent WITHOUT a Win32 .ParentProcessId
+        # lookup that silently no-ops once the child has gracefully exited
+        # from SIGTERM. Behavior when getppid() returns the test harness or
+        # debugger PID (not a launcher) is safe: the kill path does a
+        # CommandLine sanity check before Stop-Process, so a non-py.exe parent
+        # never gets killed by accident.
+        parent_pid = os.getppid()
+        lifecycle.write_pid_and_port_atomic(
+            self.project_root, os.getpid(), self.actual_port,
+            parent_pid=parent_pid,
+        )
+        self._log_lifecycle("started", port=self.actual_port, pid=os.getpid(),
+                            parent_pid=parent_pid)
 
         try:
             self._http.serve_forever()

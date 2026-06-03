@@ -190,9 +190,34 @@ bridge that calls the helper via `py -3 -c "from <module> import ..."`:
 | `core/scripts/session-state-get.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — every loop iteration |
 | `core/scripts/_wake_signals.py` | `AGENTS_PARENT_DIR` (`_AGENTS_PARENT_DIR`) | imported via `py -3 -c "from _wake_signals import ..."` from shell — must stay self-contained |
 
+**Plus 2 literal-string hardcoders** bake the literal `agents/` path segment
+directly into a glob or prefix-check WITHOUT naming the constant — so the
+constant-definition audit grep below does NOT see them. They work for
+`AGENTS_PARENT_DIR=agents` but would break on any rename:
+
+| File | Hardcoded sites | Why not constant-routed |
+|------|-----------------|-------------------------|
+| `core/scripts/iteration-commit.sh` | `"$REPO"/agents/*/` agent-dir walk (~L221) + `[[ "$path" == agents/* ]]` namespace-filter prefix checks (~L591/657/706) | Namespace filter; never sources `_paths.sh`. Contrast `stop-hook.sh:128`, which DOES route its `*/session/` glob through `${AGENTS_PARENT_DIR}` — the gold-standard pattern these two should adopt. |
+| `core/scripts/seed-transplant.sh` | `"$DEST"/agents/*/session/agent-state` walk (~L99) | Walks a FOREIGN repo root (`$DEST`), not `PROJECT_ROOT` |
+
 When changing `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME`, or `SESSION_DIRNAME`,
-update ALL 12 sites. Audit with:
+update ALL 12 constant-named sites AND the 2 literal-string hardcoders above.
+Audit with ALL THREE greps (the first finds constant-named sites; the second
+finds literal-`agents/` glob hardcoders — it also surfaces comments/tests/bench
+refs, so eyeball-filter to executable glob/prefix lines; the third finds
+`.parent`-based PROJECT_ROOT re-derivations from an agent-dir variable, which
+the constant-name and `agents/*` greps both miss):
 `grep -rn '^[[:space:]]*\(_APD=\|_SDN=\|_\?AGENTS_PARENT_DIR\|_\?SESSIONS_DIRNAME\|_\?SESSION_DIRNAME\)' core/scripts/ mind_api/`
+`grep -rn 'agents/\*' core/scripts/ mind_api/`
+`grep -rnE '(agent_dir|AGENT_DIR)\.parent' core/scripts/ mind_api/`
+Third-grep triage: a single `.parent` of `PROJECT_ROOT/agents/<agent>` yields
+the *agents-parent* dir (correct for sibling enumeration — goal-selector.py
+`collect_cross_agent_candidates`), but treating that `.parent` result AS
+PROJECT_ROOT, or joining it with `core`/`config`, is the g-115-1279 bug class
+(budget-meter `read_config` 404'd the config and pinned `cap_ms` to the 9000ms
+fallback vs the configured 90000ms). The fix forwards `$PROJECT_ROOT` from
+`_paths.sh` (SSOT); a `.parent.parent` fallback matches the current `agents/`
+layout.
 
 Helper API (available after sourcing `_paths.sh` or importing from `_paths`):
 - `agents_root()` — parent directory containing all agent dirs
@@ -278,6 +303,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `python-invocation.md` | Windows Python access: shim mechanism, hook PATH injection, `py -3` fallback rule for direct `-c` calls (rb-370, guard-335) |
 | `gate-overrides.md` | `--override-all` bulk-bypass pattern, per-gate flag precedence, audit ledger schema, decision rule for which form to use |
 | `audit-baselines.md` | `meta/audit-baselines.yaml` schema, verdicts (seeded/stable/ratcheted/regressed), when to add a baseline, /verify-learning integration |
+| `temp-store.md` | Canonical agent temp store (`agents/<agent>/temp/`), temp-vs-scratch lifecycle, the agent-dir write-surface allowlist, `reports/` freeze + migration |
 
 Additional on-demand specs (not convention files):
 - `core/config/hypothesis-conventions.md` — Hypothesis record schemas, horizons, context manifests

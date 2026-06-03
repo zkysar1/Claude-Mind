@@ -24,8 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -37,6 +39,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import _paths  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+from _goal_census import census_completed  # noqa: E402  (B9-deep evicted-goal counts)
 
 CONFIG_PATH = _paths.CONFIG_DIR / "aspirations.yaml"
 # Default config block for backward compat when invoked with no flags. Sibling
@@ -91,6 +94,10 @@ def count_completed_goals() -> int:
                     for g in asp.get("goals", []):
                         if g.get("status") == "completed":
                             total += 1
+                    # B9-deep: evicted completed goals live only in the per-status
+                    # census now (removed from the goals list) — fold them back so
+                    # the cadence count is eviction-invariant.
+                    total += census_completed(asp)
         except OSError:
             continue
     return total
@@ -112,6 +119,71 @@ def wm_slot_value(slot_name: str):
         return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+# Report-timestamp filename pattern shared by all three fresh-eyes rituals:
+# `<prefix>-YYYY-MM-DDThh-mm-ss.md` (the skill writes the time component with
+# hyphens for Windows-filesystem safety). We read the timestamp from the
+# FILENAME rather than the file mtime: the filename is written once and never
+# mutated, so it is immune to the background-writer / git-checkout mtime-refresh
+# failure mode rb-190 warns about ("any monitoring system that uses file mtime
+# as a liveness signal is vulnerable to background writers — check content, not
+# timestamp"). The trailing-timestamp shape is identical across review / program
+# / tree reports, so one regex covers all three.
+_REPORT_TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})\.md$")
+
+
+def _parse_iso_epoch(iso) -> float | None:
+    """Parse an ISO 'YYYY-MM-DDThh:mm:ss' string to a local-time epoch float.
+    Returns None for a missing/empty/sentinel/unparseable value (e.g. the
+    seed-stagger '0000-00-00T00:00:00' marker) so callers treat 'no real prior
+    stamp' as 'do not reconcile — fire normally'."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso)).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def _report_filename_epoch(filename: str) -> float | None:
+    """Extract the embedded timestamp from a fresh-eyes report filename and
+    return it as a local-time epoch float, or None when the name does not carry
+    the expected trailing `...THH-MM-SS.md` shape."""
+    m = _REPORT_TS_RE.search(filename)
+    if not m:
+        return None
+    date_part, hh, mm, ss = m.groups()
+    return _parse_iso_epoch(f"{date_part}T{hh}:{mm}:{ss}")
+
+
+def newest_reconcilable_report(reports_dir: Path, report_glob: str, slot_epoch: float):
+    """8 auto-reconcile detector. Return (Path, iso_ts) for the newest
+    report under `reports_dir` matching `report_glob` whose FILENAME timestamp is
+    strictly newer than `slot_epoch` (the last cadence stamp). Return None when no
+    such report exists — i.e. the most recent review is already accounted for by
+    the slot, so the cadence should fire normally.
+
+    The 'newer-than-stamp report exists' condition means a fresh-eyes ritual wrote
+    its Phase-4 archive but its Phase-8 stamp was lost (autocompact between the two
+    steps). Reconciling re-stamps instead of wastefully re-running the whole ritual
+    whose briefing already exists on disk."""
+    newest_epoch = slot_epoch  # only files strictly newer than the stamp qualify
+    newest = None
+    try:
+        for p in reports_dir.glob(report_glob):
+            fe_epoch = _report_filename_epoch(p.name)
+            if fe_epoch is None:
+                continue  # unrecognized name shape — skip (do not reconcile on it)
+            if fe_epoch > newest_epoch:
+                newest_epoch = fe_epoch
+                newest = p
+    except OSError:
+        return None
+    if newest is None:
+        return None
+    iso_ts = datetime.fromtimestamp(newest_epoch).strftime("%Y-%m-%dT%H:%M:%S")
+    return newest, iso_ts
 
 
 def main() -> int:
@@ -243,6 +315,76 @@ def main() -> int:
             f"current={current} last={last_count} diff={diff} cadence={goal_cadence}"
         )
     if diff >= goal_cadence:
+        # 4 min_session_goals gate: world-goal completions tick every
+        # agent's cadence counter, but per-agent rituals (Self briefing, felt-
+        # sense lanes 1-6) need session-scoped data to do real work. When the
+        # firing-agent has <min_session_goals completed THIS session, return
+        # noop instead of fire — the ritual's lanes would no-op anyway, but
+        # the unfired tick still increments the slot so cadence stays sane.
+        # Fail-open: missing loop_state slot or read error → no-gate behavior.
+        min_session_goals = int(fe.get("min_session_goals", 0) or 0)
+        if min_session_goals > 0:
+            loop_state = wm_slot_value("loop_state") or {}
+            session_done = int(loop_state.get("goals_completed_this_session", 0) or 0)
+            if session_done < min_session_goals:
+                if not args.verbose:
+                    print(
+                        f"fresh-eyes-cadence-check: noop (block={args.config_block}, "
+                        f"diff={diff}>=cadence={goal_cadence} but min_session_goals gate: "
+                        f"session_done={session_done} < min_session_goals={min_session_goals})"
+                    )
+                return 1
+        # 8 auto-reconcile: the fresh-eyes rituals write their archive
+        # report (Phase 4) BEFORE stamping the cadence slot (Phase 8). Autocompact
+        # between those two steps leaves a report on disk with the slot un-stamped,
+        # so on the next iteration the cadence "fires" again even though the review
+        # already ran. Before firing, look for a report whose embedded filename
+        # timestamp is newer than the slot stamp; if one exists, the ritual already
+        # ran (just lost its stamp) — re-stamp the slot and noop instead of
+        # re-running it. Config-gated by `report_glob`: rituals without that field
+        # (felt_sense, l1_skew — which write no fresh-eyes-*.md report) skip this.
+        # The slot write mirrors the seed-stagger path above (wm.py set); on write
+        # failure we fall through to fire (re-running the review is safe and
+        # self-heals via Phase 8 record-tick — better than silently suppressing).
+        report_glob = fe.get("report_glob")
+        slot_epoch = _parse_iso_epoch(last.get("timestamp")) if report_glob else None
+        if report_glob and slot_epoch is not None:
+            agent = os.environ.get("MIND_AGENT", "")
+            # Briefings now live under temp/ (file-model normalization moved
+            # fresh-eyes briefings reports/ -> temp/; reports/ is abolished).
+            briefing_dir = _paths.agent_dir(agent) / "temp" if agent else None
+            if briefing_dir is not None and briefing_dir.is_dir():
+                hit = newest_reconcilable_report(briefing_dir, report_glob, slot_epoch)
+                if hit is not None:
+                    report_path, report_ts_iso = hit
+                    reconcile_payload = json.dumps({
+                        "timestamp": report_ts_iso,
+                        "goals_count_at_last_fire": current,
+                        "auto_reconciled": True,
+                        "reconciled_from_report": report_path.name,
+                    })
+                    try:
+                        subprocess.run(
+                            [sys.executable, str(HERE / "wm.py"), "set", slot_name],
+                            input=reconcile_payload,
+                            capture_output=True,
+                            text=True,
+                            check=True,
+                        )
+                        print(
+                            f"fresh-eyes-cadence-check: auto-reconciled "
+                            f"(block={args.config_block}, report {report_path.name} "
+                            f"newer than slot stamp — review already ran, re-stamped "
+                            f"{slot_name}, noop instead of re-fire) [g-115-1308]"
+                        )
+                        return 1  # noop — slot re-stamped; ritual already ran
+                    except (subprocess.CalledProcessError, OSError) as exc:
+                        print(
+                            f"fresh-eyes-cadence-check: auto-reconcile write to "
+                            f"{slot_name} failed ({exc!r}) — firing normally",
+                            file=sys.stderr,
+                        )
+                        # fall through to fire
         if not args.verbose:
             print(
                 f"fresh-eyes-cadence-check: fire (block={args.config_block}, "

@@ -32,6 +32,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 import _paths  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+from _goal_census import census_completed  # noqa: E402  (B9-deep evicted-goal counts)
 
 CONFIG_PATH = _paths.CONFIG_DIR / "aspirations.yaml"
 SLOT_NAME = "last_felt_sense_checkin"
@@ -77,16 +78,23 @@ def count_completed_goals() -> int:
                     for g in asp.get("goals", []):
                         if g.get("status") == "completed":
                             total += 1
+                    # B9-deep: evicted completed goals live only in the per-status
+                    # census now (removed from the goals list) — fold them back so
+                    # the cadence count is eviction-invariant.
+                    total += census_completed(asp)
         except OSError:
             continue
     return total
 
 
-def wm_slot_value():
-    """Read last_felt_sense_checkin via daemon. --json semantics preserved
-    (wm_read as_json=True returns the same JSON text the deleted wm.py CLI printed)."""
+def wm_slot_value(slot_name: str = SLOT_NAME):
+    """Read `slot_name` via daemon. --json semantics preserved
+    (wm_read as_json=True returns the same JSON text the deleted wm.py CLI printed).
+    Default slot_name keeps backward-compat with bare wm_slot_value() callers;
+    g-115-1054 added the slot_name parameter so the min_session_goals gate can
+    also read `loop_state` from this script without a second helper."""
     try:
-        raw = _rt.wm_read(slot=SLOT_NAME, as_json=True)
+        raw = _rt.wm_read(slot=slot_name, as_json=True)
     except _rt.RtError:
         return None
     raw = (raw or "").strip()
@@ -192,6 +200,25 @@ def main() -> int:
             f"diff={diff} cadence={goal_cadence}"
         )
     if diff >= goal_cadence:
+        # 4 min_session_goals gate: world-goal completions tick every
+        # agent's cadence counter, but felt-sense lanes 1-6 require firing-
+        # agent's session-scoped data (sensory-buffer, recent goals, in-flight
+        # signals). When the firing-agent has <min_session_goals completed
+        # THIS session, lanes 1-6 produce no-op output anyway; gate the fire
+        # so the ritual doesn't burn context on hollow lanes.
+        # Fail-open: missing loop_state slot or read error → no-gate behavior.
+        min_session_goals = int(fs.get("min_session_goals", 0) or 0)
+        if min_session_goals > 0:
+            loop_state = wm_slot_value("loop_state") or {}
+            session_done = int(loop_state.get("goals_completed_this_session", 0) or 0)
+            if session_done < min_session_goals:
+                if not args.verbose:
+                    print(
+                        f"felt-sense-cadence-check: noop "
+                        f"(diff={diff}>=cadence={goal_cadence} but min_session_goals gate: "
+                        f"session_done={session_done} < min_session_goals={min_session_goals})"
+                    )
+                return 1
         if not args.verbose:
             print(
                 f"felt-sense-cadence-check: fire "

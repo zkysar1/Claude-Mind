@@ -23,9 +23,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
 
-RT_DIR="$PROJECT_ROOT/mind_api/state"
+# B16: MIND_RUNTIME_DIR override isolates the daemon's runtime files so a
+# daemon-integration test can spawn a daemon without hijacking the live one's
+# PROJECT_ROOT/mind_api/state. Unset (production default) -> the canonical path,
+# byte-identical to prior behavior. Mirrors lifecycle.runtime_dir / owncloud_sync.
+RT_DIR="${MIND_RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
 PID_FILE="$RT_DIR/daemon.pid"
 PORT_FILE="$RT_DIR/daemon.port"
+PARENT_PID_FILE="$RT_DIR/daemon.parent.pid"
 SPAWN_LOG="$RT_DIR/spawn.log"
 
 # --restart forces a recycle even when the daemon is healthy-and-responsive.
@@ -74,8 +79,20 @@ _read_port() {
     [ -n "$port" ] && echo "$port"
 }
 
+#  v3: read the py.exe launcher PID written by the daemon at
+# startup. Returns empty string when the file is absent (older daemon
+# predating the v3 fix, daemon spawned without a launcher, foreground
+# debugger run) — _force_kill_tree treats empty as "skip parent kill, child
+# kill alone is best-effort."
+_read_parent_pid() {
+    [ -f "$PARENT_PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$PARENT_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
+    [ -n "$pid" ] && echo "$pid"
+}
+
 _clean_runtime_files() {
-    rm -f "$PID_FILE" "$PORT_FILE" 2>/dev/null || true
+    rm -f "$PID_FILE" "$PORT_FILE" "$PARENT_PID_FILE" 2>/dev/null || true
 }
 
 # _acquire_spawn_lock / _release_spawn_lock — wrapper-side spawn mutex.
@@ -117,29 +134,219 @@ _release_spawn_lock() {
     rm -f "$RT_DIR/daemon.wrapper.lock" 2>/dev/null || true
 }
 
-# _kill_escalate PID — SIGTERM → 5s wait → SIGKILL if still alive.
+# _kill_escalate PID [PORT] — SIGTERM → short graceful wait → caller follows
+# up with _force_kill_tree for guaranteed reap.
+#
+# 2 v3: the wait loop now uses HEALTH PROBE (curl) when PORT is
+# available, falling back to _is_pid_alive only when no port is known. The
+# original kill -0 loop false-negatives on MSYS Git Bash against detached
+# native-Windows processes (the same fault that motivated 0's
+# idempotency-check fix; the wait loop was the second site that never got
+# the same treatment), exiting at the first 100ms iteration and logging a
+# misleading "PID X exited after SIGTERM" while the daemon was still serving.
+#
+# The graceful window is intentionally short (1.5s vs the old 5s). The
+# daemon's signal handler runs in microseconds; if it hasn't gracefully
+# exited inside 1.5s it isn't going to, and the unconditional Windows
+# tree-kill that follows (in the caller) is the authoritative reap. Long
+# SIGTERM windows just delay the spawn and prolong the wrapper-side lock.
 _kill_escalate() {
     local pid="$1"
-    _log "sending SIGTERM to PID $pid"
+    local port="${2:-}"
+    _log "sending SIGTERM to PID $pid (graceful window: ~1.5s wall, port=${port:-none})"
     kill -TERM "$pid" 2>/dev/null || true
 
-    # Wait up to 5 seconds for graceful exit.
+    # Wall-clock-bounded wait: short-timeout curl probes capped at ~1.5s
+    # total. The probe uses --max-time 0.3 (not 2) so a frozen daemon
+    # holding the port doesn't blow past the documented budget. 5 iters
+    # × (0.3s probe + 0.1s sleep) = 2s absolute worst case (typically <1s
+    # when the daemon exits cleanly because the probe fails fast on
+    # connection refused).
     local waited=0
-    while [ "$waited" -lt 50 ]; do
-        if ! _is_pid_alive "$pid"; then
-            _log "PID $pid exited after SIGTERM"
-            return 0
+    local max_iters=5
+    while [ "$waited" -lt "$max_iters" ]; do
+        if [ -n "$port" ]; then
+            # Inline curl (NOT _health_probe — that uses --max-time 2 which
+            # is appropriate for liveness checks but too slow for a tight
+            # kill loop). A connection-refused returns near-instantly; only
+            # a hung-but-bound daemon hits the 0.3s ceiling.
+            if ! curl -s -f --max-time 0.3 "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1; then
+                _log "PID $pid no longer responding on port $port (graceful exit detected in iter $((waited + 1)))"
+                return 0
+            fi
+        else
+            if ! _is_pid_alive "$pid"; then
+                _log "PID $pid no longer alive (kill -0; graceful exit detected in iter $((waited + 1)))"
+                return 0
+            fi
         fi
         sleep 0.1
         waited=$((waited + 1))
     done
+    _log "PID $pid still responding after ~1.5s — caller will force-kill the tree"
+}
 
-    # Still alive — escalate to SIGKILL.
-    _log "PID $pid still alive after 5s, sending SIGKILL"
-    kill -KILL "$pid" 2>/dev/null || true
-    sleep 0.2
-    if _is_pid_alive "$pid"; then
-        _log "WARNING: PID $pid survived SIGKILL"
+# _force_kill_tree CHILD_PID [PARENT_PID] — guaranteed reap of the daemon
+# process tree on Windows.
+#
+#  v3 BULLETPROOF FIX. The previous tree-kill on Windows looked up
+# the parent via Get-CimInstance Win32_Process -Filter "ProcessId=$child"
+# .ParentProcessId. When the child had already exited from SIGTERM (which
+# happens in ~17% of recycle cycles), Get-CimInstance returned null, the
+# inner if-block was skipped, and the py.exe parent was orphaned. Empirical
+# evidence: 35 orphan daemon pairs accumulated over 204 spawns in 37 hours
+# (the snapshot the user surfaced 2026-05-22).
+#
+# v3 fix: kill BOTH PIDs by KNOWN values (read from daemon.parent.pid +
+# daemon.pid). No lookup chain. PARENT_PID is optional (empty when no
+# parent.pid file exists — older daemon, foreground debugger, etc.); in
+# that case only the child is killed.
+#
+# Each Stop-Process is gated by a Get-CimInstance CommandLine sanity check
+# against 'mind_api' (relaxed from 'mind_api\.src' so we still match the
+# launcher's `py -3 -m mind_api.src` line under any future renaming). This
+# guards against PID reuse: if the PID now names a different process, the
+# CommandLine won't match and Stop-Process is skipped.
+#
+# Output is captured + logged (NOT silenced with >/dev/null). The previous
+# code's blanket `>/dev/null 2>&1 || true` made every kill failure invisible,
+# which is why this regression survived multiple "fix" attempts.
+_force_kill_tree() {
+    local child_pid="$1"
+    local parent_pid="${2:-}"
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            # POSIX: just SIGKILL the child (no py.exe launcher layer).
+            if [ -n "$child_pid" ] && _is_pid_alive "$child_pid"; then
+                kill -KILL "$child_pid" 2>/dev/null || true
+                _log "force-killed POSIX child PID $child_pid"
+            fi
+            return 0
+            ;;
+    esac
+
+    # Normalize empty PIDs to 0 sentinel so PowerShell sees a number.
+    # Kill-Guarded checks <=0 and skips.
+    local pp="${parent_pid:-0}"
+    [ -z "$pp" ] && pp=0
+    local cp="${child_pid:-0}"
+    [ -z "$cp" ] && cp=0
+
+    # PowerShell script: kill each known PID with CommandLine sanity check,
+    # return one structured line for spawn.log.
+    local ps_script="
+        \$results = @()
+        function Kill-Guarded(\$pid_to_kill, \$label) {
+            if (-not \$pid_to_kill -or \$pid_to_kill -le 0) {
+                \$script:results += \"\$label=skip(no-pid)\"
+                return
+            }
+            \$p = Get-CimInstance Win32_Process -Filter \"ProcessId=\$pid_to_kill\" -ErrorAction SilentlyContinue
+            if (-not \$p) {
+                \$script:results += \"\$label=skip(already-gone PID=\$pid_to_kill)\"
+                return
+            }
+            if (\$p.CommandLine -notmatch 'mind_api') {
+                \$script:results += \"\$label=skip(cmdline-mismatch PID=\$pid_to_kill name=\$(\$p.Name))\"
+                return
+            }
+            try {
+                Stop-Process -Id \$pid_to_kill -Force -ErrorAction Stop
+                \$script:results += \"\$label=killed(PID=\$pid_to_kill name=\$(\$p.Name))\"
+            } catch {
+                \$script:results += \"\$label=fail(PID=\$pid_to_kill err=\$(\$_.Exception.Message))\"
+            }
+        }
+        Kill-Guarded $pp 'parent'
+        Kill-Guarded $cp 'child'
+        \$results -join '; '
+    "
+    local result
+    result="$(powershell.exe -NoProfile -Command "$ps_script" 2>&1)" || true
+    _log "force-kill-tree child=$cp parent=$pp -> ${result:-<no-output>}"
+}
+
+# _sweep_orphan_daemons CURRENT_CHILD_PID CURRENT_PARENT_PID — belt-and-suspenders
+# scan for any mind_api.src processes whose PID is NOT in the current
+# {child, parent} pair, and kill them. Catches orphans from past spawns
+# whose kill silently failed (the residual failure mode this whole patch
+# addresses). Safe to run as a no-op when no orphans exist.
+#
+# CURRENT_CHILD_PID + CURRENT_PARENT_PID identify the daemon we want to
+# KEEP alive (the one whose PIDs are in daemon.pid + daemon.parent.pid).
+# Pass empty strings to "kill them all" — used when we are about to spawn
+# a fresh daemon and there should be no surviving mind_api.src processes.
+_sweep_orphan_daemons() {
+    local keep_child="${1:-}"
+    local keep_parent="${2:-}"
+    case "$(uname -s 2>/dev/null || echo unknown)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            # POSIX implementation: pgrep for python processes whose cmdline
+            # contains 'mind_api.src'. POSIX never had the orphan problem
+            # (clean process group semantics) so this is preventive only.
+            local pids
+            pids="$(pgrep -f 'python.* -m mind_api\.src' 2>/dev/null | tr '\n' ' ')"
+            local killed=0
+            for p in $pids; do
+                [ "$p" = "$keep_child" ] && continue
+                [ "$p" = "$keep_parent" ] && continue
+                kill -KILL "$p" 2>/dev/null && killed=$((killed + 1)) || true
+            done
+            [ "$killed" -gt 0 ] && _log "orphan-sweep POSIX killed $killed mind_api.src processes (kept child=${keep_child:-none} parent=${keep_parent:-none})"
+            return 0
+            ;;
+    esac
+
+    local keep_c="${keep_child:-0}"
+    [ -z "$keep_c" ] && keep_c=0
+    local keep_p="${keep_parent:-0}"
+    [ -z "$keep_p" ] && keep_p=0
+
+    local ps_script="
+        \$keep_child = $keep_c
+        \$keep_parent = $keep_p
+        \$procs = Get-CimInstance Win32_Process -Filter \"Name='py.exe' OR Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -match 'mind_api\.src' }
+        \$killed = @()
+        \$kept = @()
+        foreach (\$p in \$procs) {
+            if (\$p.ProcessId -eq \$keep_child -or \$p.ProcessId -eq \$keep_parent) {
+                \$kept += \"\$(\$p.Name)/\$(\$p.ProcessId)\"
+                continue
+            }
+            try {
+                Stop-Process -Id \$p.ProcessId -Force -ErrorAction Stop
+                \$killed += \"\$(\$p.Name)/\$(\$p.ProcessId)\"
+            } catch {
+                \$killed += \"fail-\$(\$p.Name)/\$(\$p.ProcessId)\"
+            }
+        }
+        if (\$killed.Count -gt 0) {
+            Write-Output \"killed=\$(\$killed.Count) [\$(\$killed -join ',')] kept=[\$(\$kept -join ',')]\"
+        } else {
+            Write-Output \"clean (no orphans; alive=[\$(\$kept -join ',')])\"
+        }
+    "
+    local result
+    result="$(powershell.exe -NoProfile -Command "$ps_script" 2>&1)" || true
+    # Always log; the "clean" line confirms the sweeper ran and saw a healthy
+    # process state, which is itself valuable telemetry. Skip log when the
+    # sweep saw nothing AND we have no current daemon yet (avoids noise on
+    # the very first spawn after a clean repo checkout).
+    if [ -n "$result" ]; then
+        case "$result" in
+            "clean"*)
+                # Only log clean state when we have a current daemon — proves the
+                # sweep matched our published PIDs. Otherwise skip.
+                if [ "$keep_c" != "0" ] || [ "$keep_p" != "0" ]; then
+                    _log "orphan-sweep: $result"
+                fi
+                ;;
+            *)
+                _log "orphan-sweep: $result"
+                ;;
+        esac
     fi
 }
 
@@ -173,12 +380,20 @@ mkdir -p "$RT_DIR"
 # Fast-path: skip the spawn mutex when the daemon is already alive and
 # responsive AND no --restart was requested. Keeps the common path
 # (SessionStart hook with a live daemon) lock-free.
+#
+# 0 fix: health-probe ALONE is the authoritative liveness signal
+# here. POSIX `kill -0` false-negatives on MSYS Git Bash against detached
+# native-Windows processes spawned via `py -3 -m mind_api.src` — every
+# invocation was falling through to the slow path and recycling a healthy
+# daemon (post-commit hook + SessionStart orchestrator hit this hundreds
+# of times). If the daemon is responding to /health on the published port
+# AND the PID/port files are current, it IS alive, regardless of kill -0.
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
-   _is_pid_alive "$existing_pid" && _health_probe "$existing_port" && \
+   _health_probe "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
-    _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port)"
+    _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port, health-probe authoritative)"
     exit 0
 fi
 
@@ -195,8 +410,8 @@ if ! _acquire_spawn_lock; then
         new_pid="$(_read_pid || echo "")"
         new_port="$(_read_port || echo "")"
         if [ -n "$new_pid" ] && [ -n "$new_port" ] && \
-           _is_pid_alive "$new_pid" && _health_probe "$new_port"; then
-            _log "daemon ready via concurrent spawn (PID=$new_pid port=$new_port)"
+           _health_probe "$new_port"; then
+            _log "daemon ready via concurrent spawn (PID=$new_pid port=$new_port, health-probe authoritative)"
             exit 0
         fi
         sleep 0.1
@@ -208,74 +423,92 @@ fi
 trap '_release_spawn_lock' EXIT
 
 # Re-probe inside the lock — daemon may have come up while we waited.
+# 0 fix: health-probe alone (kill -0 false-negatives on Windows).
+# 2 v3: also read parent_pid (py.exe launcher PID) for the kill
+# path — see _force_kill_tree.
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
+existing_parent_pid="$(_read_parent_pid || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
-   _is_pid_alive "$existing_pid" && _health_probe "$existing_port" && \
+   _health_probe "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
-    _log "daemon came up during lock wait (PID=$existing_pid, port=$existing_port)"
+    _log "daemon came up during lock wait (PID=$existing_pid, port=$existing_port, health-probe authoritative)"
     exit 0
 fi
 
 # 1. Check if daemon is already up and healthy.
+# 0 fix: health-probe FIRST. POSIX `kill -0` false-negatives on
+# MSYS Git Bash against detached native-Windows processes — concluding
+# "stale PID, cleaning up" against a HEALTHY daemon was the root cause of
+# the 112-restarts-in-24h pileup. Health-probe on the published port is
+# the authoritative liveness signal; kill -0 only matters when we need
+# to escalate a SIGTERM (the kill itself works fine — only `kill -0`
+# false-negatives).
+need_recycle=0
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
-    if _is_pid_alive "$existing_pid"; then
-        if _health_probe "$existing_port"; then
-            if [ "$FORCE_RESTART" != "1" ]; then
-                # Daemon is alive and responsive — nothing to do.
-                _log "daemon already running (PID=$existing_pid, port=$existing_port)"
-                exit 0
-            fi
-            # --restart: healthy but a daemon-code commit landed, so the
-            # in-memory code is stale. Recycle. (Falls through to the
-            # process-tree reap + spawn below — same path as the
-            # unresponsive case.)
-            _log "daemon healthy (PID=$existing_pid) but --restart requested; recycling for fresh code"
-            _kill_escalate "$existing_pid"
-            _clean_runtime_files
-        else
-            # PID alive but health probe failed — unresponsive daemon.
-            _log "daemon PID $existing_pid alive but not responding on port $existing_port"
-            _kill_escalate "$existing_pid"
-            _clean_runtime_files
+    if _health_probe "$existing_port"; then
+        # Daemon is alive and responsive — verified by health probe,
+        # regardless of what kill -0 says about the PID.
+        if [ "$FORCE_RESTART" != "1" ]; then
+            _log "daemon already running (PID=$existing_pid, port=$existing_port, health-probe authoritative)"
+            exit 0
         fi
+        # --restart: healthy but a daemon-code commit landed, so the
+        # in-memory code is stale. Recycle.
+        _log "daemon healthy (PID=$existing_pid parent=${existing_parent_pid:-?}) but --restart requested; recycling for fresh code"
+        need_recycle=1
+    elif _is_pid_alive "$existing_pid"; then
+        # Health probe failed but kill -0 says the PID is alive —
+        # genuinely unresponsive daemon (not a Windows false-negative).
+        _log "daemon PID $existing_pid alive but not responding on port $existing_port"
+        need_recycle=1
     else
-        # PID file present but process is dead — stale PID.
-        _log "stale PID file (PID=$existing_pid is dead), cleaning up"
-        _clean_runtime_files
+        # Health probe failed AND kill -0 says dead — actually stale.
+        # (Windows false-negative would have been caught by the health
+        # probe above; if /health doesn't respond AND kill -0 says dead,
+        # the PID file is genuinely stale.)
+        _log "stale PID file (PID=$existing_pid is dead and unresponsive), cleaning up"
+        # Stale: no process to kill, just clean files (below).
     fi
 elif [ -n "$existing_pid" ]; then
     # PID file but no port file — partial state.
     if _is_pid_alive "$existing_pid"; then
         _log "PID $existing_pid alive but no port file — killing orphan"
-        _kill_escalate "$existing_pid"
+        need_recycle=1
     fi
-    _clean_runtime_files
 fi
 
-# : clean-stop guard mirroring _runtime.sh rt_daemon_kill's
-# process-TREE reap. The _is_pid_alive recovery gates above use POSIX
-# `kill -0`, which false-negatives on a detached native-Windows
-# `py -m mind_api.src` under MSYS — a live orphan slips past as "dead",
-# _kill_escalate is never called, and we would spawn a replacement on
-# top of it (observed leak: 170 started / 6 stopped, 17 orphans).
-# existing_pid is the python.exe CHILD; killing only it orphans the
-# py.exe launcher PARENT (Windows has no POSIX process-group cascade) —
-# the root cause of the  114-process pileup. Reap the WHOLE
-# tree (parent + child), PID-reuse-guarded by a `mind_api.src`
-# CommandLine match on BOTH so a recycled PID is never force-killed.
-# By the time we reach here the captured `existing_pid` is never a
-# live healthy daemon: either the health check `exit 0`'d (no --restart,
-# healthy) and we never got here, OR it was already _kill_escalate'd
-# above (unresponsive, OR --restart recycling a healthy one). So
-# force-stopping the captured predecessor tree cannot kill a serving daemon.
-if [ -n "$existing_pid" ]; then
-    case "$(uname -s 2>/dev/null || echo unknown)" in
-        MINGW*|MSYS*|CYGWIN*)
-            powershell.exe -NoProfile -Command "\$c=Get-CimInstance Win32_Process -Filter \"ProcessId=$existing_pid\" -ErrorAction SilentlyContinue; if (\$c -and \$c.CommandLine -match 'mind_api\.src') { \$pp=\$c.ParentProcessId; \$p=Get-CimInstance Win32_Process -Filter \"ProcessId=\$pp\" -ErrorAction SilentlyContinue; if (\$p -and \$p.CommandLine -match 'mind_api\.src') { Stop-Process -Id \$pp -Force -ErrorAction SilentlyContinue }; Stop-Process -Id $existing_pid -Force -ErrorAction SilentlyContinue }" >/dev/null 2>&1 || true
-            ;;
-    esac
+#  v3 BULLETPROOF KILL:
+#   1. _kill_escalate sends SIGTERM with a SHORT graceful window. The wait
+#      now uses health-probe (curl) when port is known — the 0 fix
+#      applied to the second site (kill wait) that the original fix missed.
+#   2. _force_kill_tree force-kills BOTH the child python.exe AND the py.exe
+#      parent (read from daemon.parent.pid). No Win32 Get-CimInstance
+#      .ParentProcessId lookup — that lookup silently no-op'd in ~17% of
+#      recycles when the child had already exited, orphaning the py.exe
+#      parent. Empirical evidence: 35 orphan daemon pairs accumulated over
+#      204 spawns in 37 hours (snapshot the user surfaced 2026-05-22).
+#   3. Each Stop-Process is CommandLine-guarded against 'mind_api' to defend
+#      against Windows PID reuse.
+#   4. Results are logged to spawn.log — no more silent >/dev/null 2>&1.
+if [ "$need_recycle" = "1" ]; then
+    _kill_escalate "$existing_pid" "$existing_port"
+    _force_kill_tree "$existing_pid" "$existing_parent_pid"
 fi
+
+# Clean state files regardless of whether we killed. A stale PID file
+# without a live process is the simplest case — no kill, just rm.
+_clean_runtime_files
+
+# DELIBERATELY no implicit `_sweep_orphan_daemons "" ""` call here. An
+# empty-args sweep kills every mind_api.src process system-wide, which
+# collides with OTHER repos running their own mind_api daemons (same
+# cmdline, same regex — Win32_Process exposes no cwd/env discriminator).
+# The `_force_kill_tree` above (kill by KNOWN PIDs from daemon.parent.pid
+# + daemon.pid) is the authoritative reap and is repo-safe by construction.
+# Empirical 2026-05-22: 15 back-to-back --restart cycles produced 0 orphans
+# with no implicit sweep. User-invoked `daemon-orphan-sweep.sh --clean`
+# remains available for explicit cleanup if a regression slips through.
 
 # 2. Spawn the daemon.
 py_cmd="$(_python_launcher)"

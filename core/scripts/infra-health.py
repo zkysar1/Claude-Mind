@@ -66,6 +66,7 @@ def _blank_component():
         "last_failure": None,
         "last_failure_reason": None,
         "consecutive_failures": 0,
+        "streak_started_at": None,
         "session_last_checked": None,
     }
 
@@ -254,10 +255,17 @@ def record_result(data, component, result):
         entry["last_failure"] = None
         entry["last_failure_reason"] = None
         entry["consecutive_failures"] = 0
+        entry["streak_started_at"] = None  # down-episode ended (g-249-16)
     elif result["status"] in ("failed", "provisionable"):
+        prev_consecutive = entry.get("consecutive_failures") or 0
         entry["last_failure"] = now
         entry["last_failure_reason"] = result.get("error", "unknown")
-        entry["consecutive_failures"] = (entry.get("consecutive_failures") or 0) + 1
+        entry["consecutive_failures"] = prev_consecutive + 1
+        # g-249-16: stamp the down-episode start on the 0->1 transition and
+        # preserve it while the streak climbs, so per-episode alert dedup can
+        # key on a stable identifier instead of the per-probe last_failure.
+        if prev_consecutive == 0:
+            entry["streak_started_at"] = now
     # "no_credentials" / "no_probe" / "no_target" — don't update success/failure,
     # just mark checked. "no_target" means the probe ran successfully but had
     # nothing to probe (e.g., bitnet-prod has no game-server EC2 running right
@@ -633,6 +641,8 @@ def cmd_failing_streak(args):
             "consecutive_failures": consecutive,
             "last_failure": last_failure,
             "last_failure_reason": entry.get("last_failure_reason"),
+            "streak_started_at": entry.get("streak_started_at"),
+            "human_gated": bool(entry.get("human_gated")),
         })
 
     output = {

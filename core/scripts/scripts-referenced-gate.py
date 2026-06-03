@@ -31,6 +31,13 @@ from _paths import CORE_ROOT, PROJECT_ROOT
 
 SCRIPTS_DIR = CORE_ROOT / "scripts"
 
+# git hooks live here (invoked via `core.hooksPath=core/githooks`). The hook
+# files (pre-commit, post-commit) are EXTENSIONLESS, so the REF_EXTS suffix
+# filter in _collect_reference_text would skip them — a script referenced ONLY
+# by a hook would false-flag as orphan (). Scanned as a reference
+# surface with NO extension filter.
+GITHOOKS_DIR = CORE_ROOT / "githooks"
+
 # Hook-bound scripts: any core/scripts/*.sh or *.py named in a `command:`
 # field of .claude/settings.json hooks. These are invoked by the Claude
 # Code harness, not by grep-able bash calls in the repo, so they would
@@ -278,6 +285,21 @@ def _collect_reference_text() -> list:
             out.append((f, f.read_text(encoding="utf-8", errors="replace")))
         except OSError:
             continue
+    # core/githooks/* — extensionless git hook scripts (pre-commit, post-commit)
+    # invoked via core.hooksPath. Scanned with NO extension filter so a script
+    # referenced only by a hook is not false-flagged orphan (). The dir
+    # is shallow (a handful of files) so the rglob is cheap.
+    if GITHOOKS_DIR.is_dir():
+        for p in sorted(GITHOOKS_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            pp = p.as_posix()
+            if "/.history/" in pp or "\\.history\\" in str(p):
+                continue
+            try:
+                out.append((p, p.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                continue
     return out
 
 

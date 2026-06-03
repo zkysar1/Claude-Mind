@@ -55,6 +55,48 @@ def _file_mtime(repo_root, path):
         return 0
 
 
+def _normalize_rel_path(p, project_root):
+    """Canonicalize a recorded/candidate path to PROJECT_ROOT-relative POSIX
+    form so Source 2 set-membership compares equal regardless of whether the
+    path was stored absolute or relative.
+
+    g-115-1180: uncommitted-edits.jsonl can hold BOTH relative paths (current
+    uncommitted-edits-record.sh output, after its drive-letter normalization
+    landed) AND absolute Windows paths (legacy entries written before that
+    writer fix — observed C:/<WORKSPACE>/.../core/foo.py). The Source 2 lookup
+    `path in partner_uncommitted` is an exact string match; a relative
+    candidate (git diff output) silently misses an absolute log key for the
+    same file, so partner WIP is not dropped and gets mis-attributed.
+
+    SINGLE SOURCE OF TRUTH (rb-1405): iteration-commit.sh's partner-uncommitted
+    extraction imports THIS function, so both consumers of uncommitted-edits.jsonl
+    normalize identically and cannot drift.
+
+    Forward-slashes all separators, then strips a leading PROJECT_ROOT prefix.
+    Handles the Windows drive form (C:/root/...) and the MSYS/Git-Bash form
+    (/c/root/...) since either can appear depending on the writing shell.
+    Fail-open: returns the forward-slashed input unchanged on any mismatch (an
+    unrecognized absolute path simply won't match relative candidates — same
+    behavior as before, never raises into the filter)."""
+    if not isinstance(p, str) or not p:
+        return p
+    s = p.replace("\\", "/")
+    root = str(project_root or "").replace("\\", "/").rstrip("/")
+    if not root:
+        return s
+    prefixes = [root]
+    # Windows drive form <-> MSYS form: C:/foo and /c/foo both reachable
+    # depending on whether the path was recorded by Python (C:/) or Git-Bash (/c/).
+    if len(root) >= 2 and root[1] == ":":
+        prefixes.append("/" + root[0].lower() + root[2:])
+    elif len(root) >= 3 and root[0] == "/" and root[2] == "/":
+        prefixes.append(root[1].upper() + ":" + root[2:])
+    for pre in prefixes:
+        if pre and s.startswith(pre + "/"):
+            return s[len(pre) + 1:]
+    return s
+
+
 def _read_team_state(world_dir):
     try:
         import yaml
@@ -155,11 +197,14 @@ def filter_paths(paths, self_agent, project_root, world_dir):
 
     # Source 2: partner uncommitted-edits logs (explicit authorship record).
     # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/<name>/.
+    # Keys are normalized to PROJECT_ROOT-relative POSIX form (0) so a
+    # legacy absolute log entry and a relative git-diff candidate for the same
+    # file compare equal. The owner value is the partner name (unchanged).
     partner_uncommitted = {}
     agents_parent = Path(project_root) / "agents"
     for p in partners:
         for path in _read_uncommitted_log(agents_parent / p):
-            partner_uncommitted.setdefault(path, p)
+            partner_uncommitted.setdefault(_normalize_rel_path(path, project_root), p)
 
     kept = []
     dropped = []
@@ -168,12 +213,18 @@ def filter_paths(paths, self_agent, project_root, world_dir):
             continue
 
         # Source 2 wins first: an explicit partner authorship record.
-        if path in partner_uncommitted:
+        # Normalize the candidate to the same PROJECT_ROOT-relative POSIX form
+        # the keys were built with (0) so an absolute-vs-relative
+        # format mismatch does not cause a silent set-membership miss. The
+        # original (unnormalized) path is preserved in the decision record so
+        # downstream consumers see the path exactly as it was passed in.
+        norm_path = _normalize_rel_path(path, project_root)
+        if norm_path in partner_uncommitted:
             dropped.append(
                 {
                     "path": path,
                     "reason": "partner-uncommitted-log",
-                    "owner": partner_uncommitted[path],
+                    "owner": partner_uncommitted[norm_path],
                 }
             )
             continue

@@ -65,6 +65,17 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _agent_dir  # noqa: E402
+from _paths import enumerate_agent_confs as _enumerate_agent_confs  # noqa: E402
+
+
+# 7 / rb-1150: terminal statuses that mean "no Investigate needed
+# - target already resolved". Mirrors insight-trigger-sweep.py (6)
+# and unblock-parent-status-sweep.py:112 (rb-908 lineage). Audit-time vs
+# apply-time staleness gap: a finding posted to the board at T0 with
+# `affects:<g-id>` can sit in the queue until /fresh-eyes-code fires this
+# gate at T+N hours; by then the target may have closed. Probing at filing
+# time avoids spawning duplicate Investigate work.
+TERMINAL_GOAL_STATES = {"completed", "skipped", "superseded", "archived"}
 
 
 def _read_local_paths_conf(agent_name):
@@ -337,6 +348,94 @@ def _log_action(record):
         return False
 
 
+def probe_goal_status(goal_id):
+    """Return current status of goal_id by scanning world + per-agent
+    aspirations.jsonl. Returns the status string when found, None when
+    the goal does not exist anywhere.
+
+    g-115-1077 / rb-1150: closes the audit-time -> apply-time staleness
+    gap on the event-driven gate path. Mirrors
+    insight-trigger-sweep.probe_goal_status (g-115-1076) but routes
+    through _world_dir() + _enumerate_agent_confs() since this script
+    already uses that resolution path for findings reads.
+
+    Reads JSONL directly rather than _rt.aspirations_read so the function
+    is testable against a sandbox WORLD_PATH via monkeypatch — _rt would
+    require a running daemon. Same direct-read pattern as
+    _already_filed_in_aspirations above.
+    """
+    if not goal_id:
+        return None
+    paths = []
+    world = _world_dir()
+    if world is not None:
+        paths.append(world / "aspirations.jsonl")
+    for conf in _enumerate_agent_confs():
+        paths.append(conf.parent / "aspirations.jsonl")
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    for g in rec.get("goals") or []:
+                        if g.get("id") == goal_id:
+                            return g.get("status")
+        except Exception:
+            continue
+    return None
+
+
+def _emit_audit_stale_note(finding, affected_goal, target_status, severity):
+    """Post a coordination-board status note for a skipped Investigate.
+
+    Mirrors insight-trigger-sweep._emit_audit_stale_note (g-115-1076) but
+    references the gate path's vocabulary (Investigate spawn vs Apply
+    spawn) and the gate's per-affected loop semantics. One short post per
+    audit-stale finding, matching the acceptance criteria shape so future
+    grepping picks them up.
+
+    Fail-open: board.py errors are logged to stderr but do not abort the
+    gate — the metric record (returned to summary) is the durable audit
+    trail.
+    """
+    text = (
+        "Audit-stale: insight_trigger {fid} from {author} targeted "
+        "{aff} (severity={sev}) -- already {st}; Investigate spawn "
+        "skipped (rb-1150 audit-time vs apply-time gap)."
+    ).format(
+        fid=finding.get("id"),
+        author=finding.get("author"),
+        aff=affected_goal,
+        sev=severity,
+        st=target_status,
+    )
+    tags = (
+        "audit-stale,insight-trigger:{fid},target:{aff},target_status:{st}"
+    ).format(fid=finding.get("id"), aff=affected_goal, st=target_status)
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(CORE_ROOT / "scripts" / "board.py"),
+             "post", "--channel", "coordination", "--type", "status",
+             "--tags", tags],
+            input=text, capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
+        )
+        return {"posted": proc.returncode == 0,
+                "msg_id": proc.stdout.strip() if proc.returncode == 0 else None}
+    except Exception as e:
+        print("[insight-trigger-gate] WARN: audit-stale board-post failed: "
+              + str(e), file=sys.stderr)
+        return {"posted": False, "msg_id": None, "error": str(e)}
+
+
 def _act_on_trigger(trigger, dry_run):
     """Create one Investigate goal per affected-goal-id in .
 
@@ -361,6 +460,31 @@ def _act_on_trigger(trigger, dry_run):
     actions = []
     verb = "invalidates" if severity == "invalidates" else "constrains"
     for affected in affects:
+        # 7 / rb-1150: re-probe target status at filing time.
+        # Terminal -> skip + audit-stale note (avoid duplicate Investigate
+        # for a goal that already resolved). Missing -> file with warning
+        # (target may have been archived after the finding was authored).
+        # Pending/in-progress/blocked -> file as-is (normal path).
+        target_status = probe_goal_status(affected)
+        if target_status in TERMINAL_GOAL_STATES:
+            note_result = {"posted": False, "msg_id": None}
+            if not dry_run:
+                note_result = _emit_audit_stale_note(
+                    finding, affected, target_status, severity)
+            actions.append({
+                "kind": "audit-stale-skip",
+                "target": affected,
+                "target_status": target_status,
+                "note_result": note_result,
+            })
+            continue
+        affects_missing_warning = None
+        if target_status is None:
+            # Target not found in any queue - file with warning per
+            # acceptance criteria. The warning is surfaced in the action
+            # record so main()'s summary aggregation can flag it.
+            affects_missing_warning = (
+                "affects target not found in any queue at filing time")
         title = "Investigate: insight_trigger {verb} {aff}".format(
             verb=verb, aff=affected)
         text = (finding.get("text") or "")[:500]
@@ -371,7 +495,8 @@ def _act_on_trigger(trigger, dry_run):
                                  sev=severity, aff=affected, text=text)
         if dry_run:
             actions.append({"kind": "dry-run-create-goal",
-                            "target": affected, "title": title})
+                            "target": affected, "title": title,
+                            "affects_missing_warning": affects_missing_warning})
             continue
         goal_payload = {
             "title": title,
@@ -398,6 +523,7 @@ def _act_on_trigger(trigger, dry_run):
             "asp_id": "asp-001",
             "ok": ok,
             "script_stderr": err_text if not ok else None,
+            "affects_missing_warning": affects_missing_warning,
         })
     return actions
 
@@ -465,12 +591,40 @@ def main(argv=None):
             "actions": acts,
         })
 
+    # 7 / rb-1150: aggregate audit_stale and affects_missing
+    # counters from per-trigger action records so callers can detect the
+    # staleness-gap closures without re-walking the actions tree.
+    audit_stale_count = 0
+    affects_missing_count = 0
+    audit_stale_details = []
+    affects_missing_details = []
+    for entry in all_actions:
+        for act in entry.get("actions") or []:
+            if act.get("kind") == "audit-stale-skip":
+                audit_stale_count += 1
+                audit_stale_details.append({
+                    "finding_id": entry.get("finding_id"),
+                    "target": act.get("target"),
+                    "target_status": act.get("target_status"),
+                })
+            elif act.get("affects_missing_warning"):
+                affects_missing_count += 1
+                affects_missing_details.append({
+                    "finding_id": entry.get("finding_id"),
+                    "target": act.get("target"),
+                    "warning": act.get("affects_missing_warning"),
+                })
+
     result = {
         "scanned_since_hours": args.since_hours,
         "total_findings_seen": len(findings),
         "triggers_matched": len(triggers) + deferred,
         "triggers_acted_on": len(triggers),
         "deferred_over_limit": deferred,
+        "audit_stale": audit_stale_count,
+        "affects_missing": affects_missing_count,
+        "audit_stale_details": audit_stale_details,
+        "affects_missing_details": affects_missing_details,
         "dry_run": args.dry_run,
         "actions": all_actions,
     }

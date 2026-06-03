@@ -69,37 +69,86 @@ if [ "$OUTCOME_CLASS" != "deep" ]; then
 fi
 
 # ── Gather changed files ─────────────────────────────────────────────────────
-# git diff --name-only HEAD captures working-tree + staged changes vs HEAD.
-# If state-update runs BEFORE commit (typical: aspirations-execute's domain
-# post-execution step runs commit/push at end-of-goal, but state-update fires
-# between them), this captures the goal's edits exactly. If state-update runs
-# AFTER commit, HEAD diff returns empty and we fall back to HEAD~1..HEAD.
-CHANGED_VS_HEAD=$(git diff --name-only HEAD 2>/dev/null | sed '/^$/d' || true)
-
-# Untracked files — new scripts don't appear in `git diff --name-only HEAD`
-# until they're at least staged. guard-343 explicitly includes "introduced
-# a new companion script" as a trigger, so we must scan untracked too.
-UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null | sed '/^$/d' || true)
-
-CHANGED=$(printf '%s\n%s\n' "$CHANGED_VS_HEAD" "$UNTRACKED" | sed '/^$/d' | sort -u)
-
-# LOAD-BEARING — DO NOT COLLAPSE THESE TWO PATHS INTO ONE.
-# HEAD vs HEAD~1..HEAD serve DIFFERENT invocation timings:
-#   - BASE_FOR_LOC="HEAD" path: state-update runs BEFORE goal's commit — working
-#     tree + staged diff against HEAD captures the goal's uncommitted edits.
-#   - BASE_FOR_LOC="HEAD~1..HEAD" path: state-update runs AFTER goal's commit
-#     (post-execution.md Step 2 commits at end of goal) — HEAD diff returns
-#     empty, fall back to previous-commit-to-HEAD range.
-# Removing either path silently breaks the opposite scenario. The CHANGED-empty
-# check is the discriminator; do not replace with a timestamp heuristic.
-BASE_FOR_LOC="HEAD"
-if [ -z "$CHANGED" ]; then
-  CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | sed '/^$/d' | sort -u || true)
-  BASE_FOR_LOC="HEAD~1..HEAD"
+# Two scope modes:
+#   (1) COMMITTED SCOPE (8) — when iteration-close.sh extracts the
+#       commit_sha from iteration-commit.sh's JSON output and exports COMMIT_SHA,
+#       scope detection to exactly the files THAT COMMIT landed
+#       (git diff --name-only ${SHA}~1..${SHA}) and SKIP untracked detection.
+#       iteration-commit already ran its 3-source cross-agent attribution filter
+#       BEFORE committing, so the committed set is this-agent-only; scoping here
+#       inherits that decision instead of re-deriving it from a working tree that
+#       may carry partner WIP at neutral paths (core/scripts/, core/config/,
+#       mind_api/src/). Closes the stranded-partner false-positive class
+#       (4 investigation, Option B). The gate's OWN attribution filter
+#       (below) is ALSO skipped in this mode — it exists to scrub working-tree
+#       noise that committed scope eliminates by construction, and re-running it
+#       on fresh-mtime committed files would reintroduce the Source-1 over-drop
+#       the same investigation flagged.
+#   (2) WORKING-TREE SCOPE (fallback) — COMMIT_SHA unset/empty/invalid (routine
+#       closes, iteration-commit no-ops, non-deep callers, or any caller that
+#       bypassed commit). Preserves the prior HEAD / HEAD~1..HEAD behavior
+#       verbatim.
+# COMMIT_SHA_VALID is read again by the attribution-filter and new-script blocks
+# below so the guard-343 "new companion script" trigger survives committed scope
+# (a script added in the commit shows as status=A in the range diff, not as
+# untracked).
+COMMIT_SHA="${COMMIT_SHA:-}"
+COMMIT_SHA_VALID=no
+COMMITTED_NEW_SCRIPTS=""
+if [ -n "$COMMIT_SHA" ] \
+   && git rev-parse --verify --quiet "${COMMIT_SHA}^{commit}" >/dev/null 2>&1 \
+   && git rev-parse --verify --quiet "${COMMIT_SHA}~1" >/dev/null 2>&1; then
+  # Valid = resolves to a commit AND has a parent (so ${SHA}~1..${SHA} is a real
+  # range). A root commit (no parent) fails the ~1 probe and falls through to
+  # working-tree scope rather than crashing the range diff.
+  COMMIT_SHA_VALID=yes
 fi
 
-if [ -z "$CHANGED" ]; then
-  FIRED=false REASON="no changed files detected (clean working tree + empty HEAD~1 diff)" emit_json
+if [ "$COMMIT_SHA_VALID" = "yes" ]; then
+  CHANGED=$(git diff --name-only "${COMMIT_SHA}~1" "${COMMIT_SHA}" 2>/dev/null | sed '/^$/d' | sort -u || true)
+  UNTRACKED=""  # committed scope — untracked detection skipped (8)
+  BASE_FOR_LOC="${COMMIT_SHA}~1..${COMMIT_SHA}"
+  # Preserve guard-343's new-script trigger under committed scope: a newly added
+  # core/scripts/*.{sh,py} appears as status=A in the range diff (once committed
+  # it is tracked, so `git ls-files --others` no longer sees it).
+  COMMITTED_NEW_SCRIPTS=$(git diff --name-status "${COMMIT_SHA}~1" "${COMMIT_SHA}" 2>/dev/null \
+    | awk '$1 ~ /^A/ {print $2}' | sed '/^$/d' | sort -u || true)
+  if [ -z "$CHANGED" ]; then
+    FIRED=false REASON="no changed files in commit ${COMMIT_SHA} (committed scope, g-115-1178)" emit_json
+  fi
+else
+  # git diff --name-only HEAD captures working-tree + staged changes vs HEAD.
+  # If state-update runs BEFORE commit (typical: aspirations-execute's domain
+  # post-execution step runs commit/push at end-of-goal, but state-update fires
+  # between them), this captures the goal's edits exactly. If state-update runs
+  # AFTER commit, HEAD diff returns empty and we fall back to HEAD~1..HEAD.
+  CHANGED_VS_HEAD=$(git diff --name-only HEAD 2>/dev/null | sed '/^$/d' || true)
+
+  # Untracked files — new scripts don't appear in `git diff --name-only HEAD`
+  # until they're at least staged. guard-343 explicitly includes "introduced
+  # a new companion script" as a trigger, so we must scan untracked too.
+  UNTRACKED=$(git ls-files --others --exclude-standard 2>/dev/null | sed '/^$/d' || true)
+
+  CHANGED=$(printf '%s\n%s\n' "$CHANGED_VS_HEAD" "$UNTRACKED" | sed '/^$/d' | sort -u)
+
+  # LOAD-BEARING — DO NOT COLLAPSE THESE TWO PATHS INTO ONE.
+  # HEAD vs HEAD~1..HEAD serve DIFFERENT invocation timings:
+  #   - BASE_FOR_LOC="HEAD" path: state-update runs BEFORE goal's commit — working
+  #     tree + staged diff against HEAD captures the goal's uncommitted edits.
+  #   - BASE_FOR_LOC="HEAD~1..HEAD" path: state-update runs AFTER goal's commit
+  #     (post-execution.md Step 2 commits at end of goal) — HEAD diff returns
+  #     empty, fall back to previous-commit-to-HEAD range.
+  # Removing either path silently breaks the opposite scenario. The CHANGED-empty
+  # check is the discriminator; do not replace with a timestamp heuristic.
+  BASE_FOR_LOC="HEAD"
+  if [ -z "$CHANGED" ]; then
+    CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | sed '/^$/d' | sort -u || true)
+    BASE_FOR_LOC="HEAD~1..HEAD"
+  fi
+
+  if [ -z "$CHANGED" ]; then
+    FIRED=false REASON="no changed files detected (clean working tree + empty HEAD~1 diff)" emit_json
+  fi
 fi
 
 # ── Filter to core/ and compute thresholds ───────────────────────────────────
@@ -121,7 +170,11 @@ CORE_FILES=$(printf '%s\n' "$CHANGED" | grep '^core/' | grep -v '^core/logs/' ||
 # any error retains the original list (biases over-firing). Also filter
 # UNTRACKED so partner-untracked scripts don't trigger NEW_SCRIPT.
 ATTRIB_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_cross_agent_attribution_filter.py"
-if [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB_HELPER" ]; then
+# Skipped under committed scope (COMMIT_SHA_VALID=yes): the committed set is
+# already this-agent-only (iteration-commit filtered it pre-commit), and
+# re-filtering fresh-mtime committed files would reintroduce the Source-1
+# over-drop the 4 investigation flagged (8).
+if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB_HELPER" ]; then
   if [ -n "$CORE_FILES" ]; then
     ATTRIB_TMP=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-core-$$.txt")
     if printf '%s\n' "$CORE_FILES" | py -3 "$ATTRIB_HELPER" > "$ATTRIB_TMP" 2>/dev/null; then
@@ -158,12 +211,19 @@ if [ -n "$CORE_SCRIPTS" ]; then
   done <<< "$CORE_SCRIPTS"
 fi
 
-# New-script detection — any untracked core/scripts/*.sh or *.py. Take
-# first match for the reason string (full list is in CORE_FILES already).
-# UNTRACKED is post-attribution-filter at this point.
+# New-script detection — any new core/scripts/*.sh or *.py. Take first match
+# for the reason string (full list is in CORE_FILES already). Source depends on
+# scope: working-tree → UNTRACKED (post-attribution-filter); committed scope →
+# COMMITTED_NEW_SCRIPTS (status=A files in the commit range), so guard-343's
+# new-script trigger survives committed scope (8).
 NEW_SCRIPT=""
-if [ -n "$UNTRACKED" ]; then
-  NEW_SCRIPT=$(printf '%s\n' "$UNTRACKED" | grep -E '^core/scripts/.*\.(sh|py)$' | head -1 || true)
+if [ "$COMMIT_SHA_VALID" = "yes" ]; then
+  NEW_SCRIPT_SOURCE="$COMMITTED_NEW_SCRIPTS"
+else
+  NEW_SCRIPT_SOURCE="$UNTRACKED"
+fi
+if [ -n "$NEW_SCRIPT_SOURCE" ]; then
+  NEW_SCRIPT=$(printf '%s\n' "$NEW_SCRIPT_SOURCE" | grep -E '^core/scripts/.*\.(sh|py)$' | head -1 || true)
 fi
 
 # ── Threshold decision ───────────────────────────────────────────────────────

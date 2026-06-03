@@ -1,0 +1,1736 @@
+"""POST /v1/tree/write — daemon writer for the private knowledge tree.
+
+This is the headline gap the Mycelium refactor closes: before this endpoint,
+the daemon could READ the tree (GET /v1/tree/find-node, /v1/tree/read) but
+every WRITE still went through the CLI (core/scripts/tree.py via
+tree-update.sh). This endpoint daemonises the mechanical write ops.
+
+BYTE-COMPATIBILITY with the CLI write path is a hard requirement: the
+on-disk _tree.yaml produced here must be byte-identical to what the CLI
+produces, so a tree alternately written by the CLI and the daemon does not
+churn the whole 270 KB file in git / .history on every write. Compatibility
+holds because:
+
+  1. Field computation mirrors core/scripts/tree.py exactly. The stable,
+     pure helpers (apply_defaults, parse_value, _recompute_utility_ratio,
+     _UTILITY_RATIO_FIELDS) are copied VERBATIM below with line refs, rather
+     than imported — importing tree.py runs its module-top
+     `TREE_PATH = str(WORLD_DIR / ...)`, which raises when WORLD_DIR is None
+     (the daemon resolves paths per-request via agent_paths, not _paths
+     globals; WORLD_DIR is unset in non-bound / test contexts). The
+     byte-compat test (test_runtime_tree_write.py) runs the REAL CLI against
+     a temp world and diffs the bytes, catching any drift in these copies.
+     normalize_virtual_path / compute_child_path are reimplemented against
+     ctx.paths.world (tenant-correct — the CLI versions read the module-global
+     WORLD_DIR, wrong for a daemon serving a non-bound agent).
+
+  2. The YAML dump uses the EXACT params _fileops.locked_modify_yaml uses —
+     Dumper=yaml.CSafeDumper, default_flow_style=False, allow_unicode=True,
+     sort_keys=False (default width). NOT write_tree's params
+     (default_flow_style=None, width=200): cmd_add_child / cmd_set /
+     cmd_increment / cmd_remove_child — what agents actually run — all write
+     through locked_modify_yaml, so THAT is the byte-compat target.
+
+  3. The lock is path.with_suffix('.lock') (== <tree-dir>/_tree.lock), the
+     SAME lock file _fileops.acquire_lock uses, so a daemon write and a
+     concurrent CLI / fallback-path write serialise correctly.
+
+  4. history.snapshot + changelog.append mirror _fileops.save_history +
+     append_changelog (byte-identical snapshot filename + format).
+
+SCOPE:
+  op = add-child | set | increment | remove-child | propagate
+       | reconcile-capabilities | reparent | batch | record-maintenance
+  Optional `body` on add-child writes the node .md file (daemon-only
+  convenience; the CLI add-child does NOT write .md — the /tree skill writes
+  it separately via the Write tool. Omit `body` for byte-compat with the CLI.)
+
+  add-child curation gates (2026-05-29): add-child now runs the dedup gate
+  (tree-dedup-check.py) and the capability-aware child-limit gate
+  (tree.py _enforce_child_limit) BEFORE writing — full CLI parity, so cutting
+  the tree-add-child wrapper to daemon-only no longer silently drops those two
+  safety enforcements. Both are pure gating (no _tree.yaml byte impact); a
+  reject returns 409 instead of the CLI's sys.exit. Optional body fields:
+  `no_dedup` (bypasses BOTH gates, matching the CLI's --no-dedup binding) and
+  `accept_overflow` (a justification string that writes a tree-debt entry and
+  allows an over-cap add, matching --accept-overflow).
+
+  Batch-3 propagation core (2026-05-29): set field=confidence now propagates
+  confidence up the parent chain + self-graduates the source node, and the
+  standalone `propagate` / `reconcile-capabilities` ops are exposed. The engine
+  (_propagate_in_memory + _graduate_node_level) is copied VERBATIM from
+  core/scripts/tree.py; competence thresholds load from core/config/tree.yaml
+  via _load_competence_config (mirrors the CLI's empty-dict-on-missing-key
+  semantics exactly — see cross-check FINDING 1). All three write via the same
+  _write_tree_locked (locked_modify_yaml params), so byte-compat holds by
+  construction; verified by test_runtime_tree_write.py real-CLI diffs.
+
+  Batch-3 reparent (2026-05-29): the `reparent` op mirrors cmd_reparent
+  (tree.py:2392-2560) — move a node between parents, recompute the whole
+  subtree's file paths + depths, dual-chain confidence propagation (new-parent
+  chain via the node first, THEN the old-parent chain — order is byte-compat
+  significant because shared ancestors are re-read on the second pass). All 9
+  CLI sys.exit() validations become 4xx responses. Depth check reads D_max via
+  _config_d_max(ctx) → _merged_config(ctx), which overlays meta/config-overrides
+  `tree.*` entries on core/config/tree.yaml exactly as the CLI does (drift would
+  silently change the depth gate vs the CLI). Physical .md file moves are NOT
+  performed — reported in `file_moves` for the caller to execute, same as the
+  CLI. The L1-pick-log telemetry (cmd_reparent S9) is DEFERRED: it appends to a
+  separate file and does not affect _tree.yaml bytes.
+
+  record-maintenance (2026-05-29): the `record-maintenance` op mirrors
+  cmd_record_maintenance (tree.py:1355-1556) — stamps the top-level
+  `maintenance` cadence block (last_maintain_at + optional last_backlog_mode_at
+  / last_stop_mode_at) and auto-sets last_backlog_clear_at when post-run debt
+  (distill + decompose candidate counts) has dropped to/below
+  tree_debt_check.debt_threshold. The candidate-scan helpers
+  (_get_distill/decompose/redistribute_candidates, _qualifies_for_decomposition,
+  _get_all_leaves) are ctx-aware ports — config + node .md reads route through
+  ctx.paths, never the CLI module-global WORLD_DIR/CONFIG_DIR. With
+  with_run_record + a run_record_input object (the daemon analogue of the CLI's
+  stdin JSON blob), a full run record is appended to
+  world/tree-maintenance-log.jsonl via _fileops.locked_append_jsonl (the same
+  byte-compatible path the CLI uses).
+
+DELIBERATELY NOT YET IMPLEMENTED (tracked in mycelium-api-impl.md risk register):
+  - reparent's L1-pick-log append (_log_l1_pick_for_key, fail-open telemetry to
+    a separate file — does not affect _tree.yaml byte-compat).
+  - L1-pick-log append (fail-open telemetry) and the post-remove dangling-ref
+    sweep (CLI-side cleanup).
+  - _validate_no_surrogates pre-write check.
+  - Multi-tenant commons topology (this writes ctx.paths.world only).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from .. import file_locks, history, changelog
+from ..agent_paths import assert_not_cruft
+
+from _fileops import _atomic_write_with_fallback  # noqa: E402
+
+
+VALID_OPS = {"add-child", "set", "increment", "remove-child",
+             "propagate", "reconcile-capabilities", "reparent", "batch",
+             "record-maintenance"}
+
+# Fields copied verbatim from the add-child payload onto the new node, in the
+# SAME order as core/scripts/tree.py cmd_add_child._do_add (insertion order
+# matters for sort_keys=False byte-compat).
+_CHILD_COPY_FIELDS = (
+    "summary", "domain_confidence", "capability_level", "confidence",
+    "article_count", "growth_state", "node_type",
+)
+
+# Mirror of core/scripts/tree.py:104-109. DO NOT edit independently — the
+# byte-compat test diffs daemon output against the CLI, which uses this exact
+# set to decide when to recompute utility_ratio on increment.
+_UTILITY_RATIO_FIELDS = (
+    "times_helpful",
+    "times_inferred_helpful",
+    "retrieval_count",
+    "times_noise",
+)
+
+
+# ---------------------------------------------------------------------------
+# Pure helpers — copied VERBATIM from core/scripts/tree.py (line refs noted).
+# Drift is caught by test_runtime_tree_write.py's real-CLI byte-compat diff.
+# ---------------------------------------------------------------------------
+
+def _recompute_utility_ratio(node: Dict[str, Any]) -> None:
+    """Mirror of tree.py:112-126."""
+    rc = node.get("retrieval_count", 0)
+    th = node.get("times_helpful", 0)
+    tih = node.get("times_inferred_helpful", 0)
+    node["utility_ratio"] = round((th + 0.5 * tih) / max(rc, 1), 4)
+    ta = node.get("times_active", 0)
+    tc = node.get("times_cited", 0)
+    node["utility_ratio_v2"] = round(
+        (th + 0.5 * tih + 0.25 * ta + 1.0 * tc) / max(rc + 1, 1), 4
+    )
+
+
+def _apply_defaults(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Mirror of tree.py:347-379. Returns a new dict (does not mutate)."""
+    out = dict(node)
+    if "article_count" not in out:
+        out["article_count"] = 0
+    if "growth_state" not in out:
+        out["growth_state"] = "stable"
+    children = out.get("children", [])
+    if "node_type" not in out:
+        out["node_type"] = "interior" if children else "leaf"
+    if "capability_level" not in out:
+        out["capability_level"] = "EXPLORE"
+    if "retrieval_count" not in out:
+        out["retrieval_count"] = 0
+    if "times_helpful" not in out:
+        out["times_helpful"] = 0
+    if "times_noise" not in out:
+        out["times_noise"] = 0
+    if "utility_ratio" not in out:
+        out["utility_ratio"] = 0.0
+    return out
+
+
+def _parse_value(value_str: str) -> Any:
+    """Mirror of tree.py:1178-1213 (case-insensitive bools/null)."""
+    lowered = value_str.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null" or lowered == "none":
+        return None
+    if value_str == "[]":
+        return []
+    if value_str.startswith("{") or value_str.startswith("["):
+        try:
+            return json.loads(value_str)
+        except json.JSONDecodeError:
+            pass
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    return value_str
+
+
+# ---------------------------------------------------------------------------
+# Path helpers (reimplemented tenant-correct against ctx.paths.world; mirror
+# core/scripts/tree.py normalize_virtual_path / compute_child_path for the
+# virtual-input case — guarded by test_runtime_tree_write.py byte-compat test)
+# ---------------------------------------------------------------------------
+
+def _normalize_virtual_path(raw_path: str, world_path: Path) -> str:
+    """Mirror tree.normalize_virtual_path, but strip THIS request's world_path
+    (not the CLI module-global WORLD_DIR). The META_DIR branch is omitted —
+    tree node files never live under meta."""
+    if not raw_path:
+        return raw_path
+    path = raw_path.replace("\\", "/")
+    while "//" in path:
+        path = path.replace("//", "/")
+    path = path.rstrip("/")
+    world_str = str(world_path).replace("\\", "/").rstrip("/")
+    if path.startswith(world_str + "/"):
+        path = "world/" + path[len(world_str) + 1:]
+    elif path.lower().startswith(world_str.lower() + "/"):
+        path = "world/" + path[len(world_str) + 1:]
+    if path.startswith("knowledge/"):
+        path = "world/" + path
+    if path.endswith(".md") and not (
+        path.startswith("world/") or path.startswith("meta/")
+    ):
+        path = "world/knowledge/tree/" + path
+    return path
+
+
+def _compute_child_path(parent_file: str, slug: str, world_path: Path) -> str:
+    """Mirror tree.compute_child_path: strip .md from parent, append slug.md."""
+    parent_dir = parent_file[:-3] if parent_file.endswith(".md") else parent_file
+    return _normalize_virtual_path(parent_dir + "/" + slug + ".md", world_path)
+
+
+def _resolve_node_md(virtual_file: str, world_path: Path) -> Path:
+    """Resolve a virtual `world/...` node-file path to a concrete path under
+    THIS request's world. Used only when add-child carries a `body`."""
+    vf = virtual_file.replace("\\", "/")
+    if vf.startswith("world/"):
+        return world_path / vf[len("world/"):]
+    return world_path / vf
+
+
+# ---------------------------------------------------------------------------
+# Confidence propagation engine — copied VERBATIM from core/scripts/tree.py
+# (line refs noted). Drift is caught by test_runtime_tree_write.py's real-CLI
+# byte-compat diff. These power set(field=confidence), propagate, and
+# reconcile-capabilities.
+# ---------------------------------------------------------------------------
+
+def _load_competence_config(ctx) -> Dict[str, Any]:
+    """Mirror of tree.py:2163-2170, reading THIS request's project root.
+
+    BYTE-COMPAT TRAP (cross-check FINDING 1): when core/config/tree.yaml EXISTS
+    but `domain_health` or `competence_mapping` is absent, `.get(..., {})`
+    returns an EMPTY dict — NOT the hardcoded defaults. The hardcoded default
+    fires ONLY when the file is missing. Replicate exactly; a "helpful"
+    fallback on the missing-key path would produce different capability_level
+    strings on disk than the CLI. (In practice core/config/tree.yaml carries
+    the mapping, so the empty-dict path never fires today.)
+    """
+    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as f:
+            config = yaml.safe_load(f)
+        return config.get("domain_health", {}).get("competence_mapping", {})
+    return {"EXPLORE": 0.25, "CALIBRATE": 0.50, "EXPLOIT": 0.75, "MASTER": 1.00}
+
+
+# Only `tree.*`-prefixed override keys apply to tree.yaml — every other config
+# is filtered by its own reader. Mirror of tree.py:42.
+_OVERRIDE_FILE_PREFIX = "tree."
+
+
+def _merged_config(ctx) -> Dict[str, Any]:
+    """Mirror of tree.py:45-84, reading THIS request's project root + meta.
+
+    Read core/config/tree.yaml and overlay any `tree.*`-prefixed entries from
+    meta/config-overrides.yaml. Same dict-entry-with-`value` schema and the
+    same typo-guard (`parts[-1] in target`) as the CLI — drift would change
+    D_max and silently desync the reparent depth gate from the CLI. The
+    `or {}` guards on an empty overrides file can never change byte-output for
+    valid input; they only stop a daemon thread crashing on a degenerate file.
+    """
+    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+    with config_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    overrides_path = ctx.paths.meta / "config-overrides.yaml"
+    if not overrides_path.exists():
+        return cfg
+    with overrides_path.open("r", encoding="utf-8") as f:
+        override_doc = yaml.safe_load(f)
+    overrides = (override_doc or {}).get("overrides", {})
+    for dotted_key, entry in overrides.items():
+        if not dotted_key.startswith(_OVERRIDE_FILE_PREFIX):
+            continue
+        in_file_path = dotted_key[len(_OVERRIDE_FILE_PREFIX):]
+        val = entry["value"] if isinstance(entry, dict) else entry
+        parts = in_file_path.split(".")
+        target = cfg
+        for p in parts[:-1]:
+            if not isinstance(target, dict) or p not in target:
+                target = None
+                break
+            target = target[p]
+        if target is not None and isinstance(target, dict) and parts[-1] in target:
+            target[parts[-1]] = val
+    return cfg
+
+
+def _config_d_max(ctx) -> int:
+    """Mirror of tree.py:96-98. D_max from tree.yaml + meta overlay."""
+    return _merged_config(ctx)["config"]["D_max"]
+
+
+def _graduate_node_level(node: Dict[str, Any], competence: Dict[str, Any]):
+    """Verbatim mirror of tree.py:2173-2196. Recompute a node's
+    capability_level from its own confidence vs the competence thresholds.
+    Mutates `node` in place when the level changes; returns (old, new) or
+    (None, None)."""
+    conf = node.get("confidence")
+    if conf is None or not isinstance(conf, (int, float)):
+        return None, None
+    levels_sorted = sorted(competence.items(), key=lambda x: x[1])
+    if not levels_sorted:
+        return None, None
+    old_level = node.get("capability_level", "") or ""
+    new_level = "EXPLORE"
+    for level_name, threshold in levels_sorted:
+        if conf >= threshold:
+            new_level = level_name
+    if old_level != new_level:
+        node["capability_level"] = new_level
+        return old_level, new_level
+    return None, None
+
+
+def _propagate_in_memory(nodes: Dict[str, Any], key: str,
+                         competence: Dict[str, Any]):
+    """Verbatim mirror of tree.py:2199-2299. Propagate confidence up the
+    parent chain (and self-graduate the source). Mutates `nodes` in place;
+    returns (ancestors_updated, capability_changes)."""
+    levels_sorted = sorted(competence.items(), key=lambda x: x[1])
+
+    if key not in nodes:
+        return [], []
+
+    ancestors_updated: List[Dict[str, Any]] = []
+    capability_changes: List[Dict[str, Any]] = []
+
+    # Self-graduation of the source (the ancestor loop skips index 0).
+    src_old, src_new = _graduate_node_level(nodes[key], competence)
+    if src_old is not None:
+        capability_changes.append({
+            "key": key,
+            "old_level": src_old,
+            "new_level": src_new,
+        })
+
+    result_chain: List[str] = []
+    visited = set()
+    current = key
+    while current is not None:
+        if current in visited or current not in nodes:
+            break
+        visited.add(current)
+        result_chain.append(current)
+        current = nodes[current].get("parent")
+
+    if len(result_chain) < 2:
+        return ancestors_updated, capability_changes
+
+    for anc_key in result_chain[1:]:  # skip self (index 0) — handled above
+        anc_node = nodes.get(anc_key)
+        if not anc_node:
+            break
+
+        children_keys = anc_node.get("children", [])
+        if not children_keys:
+            continue
+
+        child_confidences = []
+        for ck in children_keys:
+            if ck in nodes:
+                c = nodes[ck].get("confidence")
+                if c is not None and isinstance(c, (int, float)):
+                    child_confidences.append(c)
+
+        if not child_confidences:
+            continue
+
+        new_confidence = round(sum(child_confidences) / len(child_confidences), 4)
+        old_confidence = anc_node.get("confidence")
+        if old_confidence is not None:
+            old_confidence = round(float(old_confidence), 4)
+
+        old_level = anc_node.get("capability_level", "EXPLORE")
+        new_level = "EXPLORE"
+        for level_name, threshold in levels_sorted:
+            if new_confidence >= threshold:
+                new_level = level_name
+
+        capability_changed = old_level != new_level
+
+        anc_node["confidence"] = new_confidence
+        anc_node["domain_confidence"] = new_confidence
+        if capability_changed:
+            anc_node["capability_level"] = new_level
+        nodes[anc_key] = anc_node
+
+        ancestors_updated.append({
+            "key": anc_key,
+            "old_confidence": old_confidence,
+            "new_confidence": new_confidence,
+            "capability_changed": capability_changed,
+        })
+
+        if capability_changed:
+            capability_changes.append({
+                "key": anc_key,
+                "old_level": old_level,
+                "new_level": new_level,
+            })
+
+        if old_confidence is not None and old_confidence == new_confidence:
+            break
+
+    return ancestors_updated, capability_changes
+
+
+# ---------------------------------------------------------------------------
+# add-child curation gates — dedup (tree-dedup-check.py) + child-limit
+# (tree.py:147-272), reimplemented tenant-correct against ctx.paths. Both are
+# PURE GATING — they decide WHETHER add-child proceeds, never the bytes written
+# when it does — so they never affect _tree.yaml byte-compat. The CLI's
+# sys.exit() rejections become 409 responses (a daemon thread must not exit).
+# The dedup module is read-only and self-contained when handed a `tree` dict,
+# so rather than importlib-load core/scripts/tree-dedup-check.py (whose
+# module-top `TREE_PATH = WORLD_DIR / ...` raises when WORLD_DIR is None and
+# reads the wrong tenant otherwise), the small pure logic is copied verbatim.
+# ---------------------------------------------------------------------------
+
+# Verbatim from tree-dedup-check.py:47-58.
+_DEDUP_DEFAULT_CONFIG = {
+    "sibling_overlap_threshold": 0.6,
+    "min_tokens_for_overlap": 3,
+    "enforce_from_depth": 2,
+}
+_DEDUP_STOPWORDS = frozenset([
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+    "has", "have", "in", "is", "it", "its", "of", "on", "or", "that",
+    "the", "this", "to", "was", "were", "will", "with", "but", "not",
+    "been", "being", "via", "over", "into", "than", "then",
+])
+
+# Verbatim from tree.py:158 — the hardcoded child-limit fallback when
+# core/config/tree.yaml has no `child_limits:` section.
+_CHILD_LIMITS_DEFAULT = {"mode": "block", "EXPLORE": 2, "CALIBRATE": 4,
+                         "EXPLOIT": 8, "MASTER": 8}
+
+
+def _tokenize(text: str) -> set:
+    """Verbatim mirror of tree-dedup-check.py:82-87."""
+    if not text:
+        return set()
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if len(t) >= 3 and t not in _DEDUP_STOPWORDS}
+
+
+def _jaccard(a: set, b: set) -> float:
+    """Verbatim mirror of tree-dedup-check.py:90-95."""
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def _load_dedup_config(ctx) -> Dict[str, Any]:
+    """Mirror of tree-dedup-check.py:61-69, reading THIS request's project
+    root. NOT cached (per-tenant ctx; the file is tiny)."""
+    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        merged = dict(_DEDUP_DEFAULT_CONFIG)
+        merged.update(cfg.get("dedup", {}) or {})
+        return merged
+    except (OSError, yaml.YAMLError):
+        return dict(_DEDUP_DEFAULT_CONFIG)
+
+
+def _check_dedup(parent_key: str, proposed_key: str, proposed_summary: str,
+                 tree: Dict[str, Any], ctx) -> Dict[str, Any]:
+    """Verbatim mirror of tree-dedup-check.py:98-198 check_dedup, operating on
+    the in-memory `tree` (never re-reads _tree.yaml) and the tenant config.
+    Returns a dict with at minimum `action` ('accept' | 'reject' | 'error')."""
+    nodes = tree.get("nodes", {})
+    parent = nodes.get(parent_key)
+    if parent is None:
+        return {"action": "error", "reason": "parent_not_found", "exit_code": 4}
+
+    cfg = _load_dedup_config(ctx)
+    parent_depth = parent.get("depth", 0)
+    proposed_depth = parent_depth + 1
+
+    if proposed_depth < cfg["enforce_from_depth"]:
+        return {"action": "accept", "reason": "below_enforce_depth",
+                "exit_code": 0, "proposed_depth": proposed_depth}
+
+    proposed_key_lower = proposed_key.lower()
+    children = parent.get("children", []) or []
+
+    for sibling_key in children:
+        if sibling_key.lower() == proposed_key_lower:
+            return {"action": "reject", "reason": "exact_key_match",
+                    "exit_code": 2, "sibling_key": sibling_key,
+                    "suggestion": "update_existing"}
+
+    proposed_tokens = _tokenize(proposed_summary)
+    if len(proposed_tokens) < cfg["min_tokens_for_overlap"]:
+        return {"action": "accept", "reason": "summary_too_short",
+                "exit_code": 0}
+
+    best_match = None
+    best_overlap = 0.0
+    threshold = cfg["sibling_overlap_threshold"]
+    for sibling_key in children:
+        sibling = nodes.get(sibling_key)
+        if not sibling:
+            continue
+        sibling_tokens = _tokenize(sibling.get("summary") or "")
+        if len(sibling_tokens) < cfg["min_tokens_for_overlap"]:
+            continue
+        overlap = _jaccard(proposed_tokens, sibling_tokens)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_match = sibling_key
+
+    if best_match is not None and best_overlap >= threshold:
+        return {"action": "reject", "reason": "summary_overlap", "exit_code": 3,
+                "sibling_key": best_match, "overlap": round(best_overlap, 4),
+                "threshold": threshold, "suggestion": "update_existing"}
+
+    return {"action": "accept", "reason": "no_conflict", "exit_code": 0,
+            "best_sibling_overlap": round(best_overlap, 4) if best_match else 0.0,
+            "best_sibling_key": best_match}
+
+
+def _load_child_limits(ctx) -> Dict[str, Any]:
+    """Mirror of tree.py:147-166 (sans the process-wide cache — wrong for a
+    multi-tenant daemon; the file is tiny so a per-call read is fine)."""
+    cfg = dict(_CHILD_LIMITS_DEFAULT)
+    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            file_cfg = yaml.safe_load(f) or {}
+        cfg.update(file_cfg.get("child_limits", {}) or {})
+    except (OSError, yaml.YAMLError):
+        pass
+    return cfg
+
+
+def _write_tree_debt_entry(ctx, entry: Dict[str, Any]) -> None:
+    """Append a tree-debt record to world/tree-debt.jsonl. Fail-soft, mirroring
+    tree.py:169-185 — a broken debt log must never block an accept-overflow
+    acknowledgement. Locked (the daemon is multi-threaded); tree-debt.jsonl is
+    append-only telemetry, NOT byte-compat-tested, so the lock is a pure
+    correctness win over the CLI's unlocked append."""
+    try:
+        debt_path = ctx.paths.world / "tree-debt.jsonl"
+        with file_locks.locked(debt_path):
+            with debt_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception:  # noqa: BLE001 — fail-soft by contract
+        pass
+
+
+def _check_child_limit(parent_key: str, parent_node: Dict[str, Any], ctx,
+                       no_limit: bool,
+                       accept_overflow: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Mirror of tree.py:188-247 _enforce_child_limit, RETURNING the reject dict
+    instead of sys.exit(6). Returns None when the add may proceed (under limit,
+    mode off, or accept_overflow acknowledged); returns the reject payload when
+    mode=block and the cap is hit without an override."""
+    if no_limit:
+        return None
+    cfg = _load_child_limits(ctx)
+    mode = str(cfg.get("mode", "block")).lower()
+    if mode == "off":
+        return None
+    level = (parent_node.get("capability_level") or "CALIBRATE").upper()
+    limit = cfg.get(level)
+    if not isinstance(limit, int) or limit <= 0:
+        return None
+    current = parent_node.get("child_count")
+    if not isinstance(current, int):
+        current = len(parent_node.get("children", []) or [])
+    if current < limit:
+        return None
+    msg = {
+        "context": "add-child", "parent": parent_key,
+        "capability_level": level, "limit": limit, "current": current,
+        "recommendation": "MERGE or DISTILL an existing child first, "
+                          "or update-in-place",
+    }
+    if accept_overflow:
+        _write_tree_debt_entry(ctx, {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "parent": parent_key, "capability_level": level, "limit": limit,
+            "current": current, "context": "add-child",
+            "justification": str(accept_overflow),
+            "source_agent": _agent_name(ctx),
+        })
+        return None
+    if mode == "block":
+        return {"child_limit_reject": msg}
+    # warn mode (legacy): allow.
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Request plumbing
+# ---------------------------------------------------------------------------
+
+def _tree_path(ctx) -> Path:
+    return ctx.paths.world / "knowledge" / "tree" / "_tree.yaml"
+
+
+def _agent_name(ctx) -> str:
+    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+
+
+def _parse_body_json(body: bytes) -> Any:
+    if not body:
+        raise ValueError("empty body")
+    return json.loads(body.decode("utf-8"))
+
+
+def _read_tree_locked(path: Path) -> Dict[str, Any]:
+    """Read _tree.yaml fresh (NOT via yaml_cache — the cache returns a shared
+    copy under a no-mutation contract). CSafeLoader matches the CLI read path
+    and is required for speed on the 270 KB tree; CSafeDumper output is
+    byte-identical regardless of which loader produced the in-memory dict."""
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.load(f, Loader=yaml.CSafeLoader)
+
+
+def _write_tree_locked(path: Path, data: Dict[str, Any], base_dir: Path,
+                       agent: str, summary: str) -> None:
+    """Snapshot → atomic write → changelog, byte-compatible with
+    _fileops.locked_modify_yaml. Caller MUST hold file_locks.locked(path)."""
+    history.snapshot(path, base_dir, agent, summary=summary)
+
+    def _write(handle):
+        yaml.dump(data, handle, Dumper=yaml.CSafeDumper,
+                  default_flow_style=False, allow_unicode=True,
+                  sort_keys=False)
+
+    assert_not_cruft(path.parent, "mkdir (tree_write._write_tree_locked)")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_with_fallback(path, _write,
+                                fallback_counter_key="daemon_tree_write")
+    changelog.append(base_dir, agent, path, "edit",
+                     summary=summary, lines_changed=len(data.get("nodes", {})))
+
+
+# ---------------------------------------------------------------------------
+# Mutation helpers (mirror core/scripts/tree.py cmd_* _do_* closures exactly)
+# ---------------------------------------------------------------------------
+
+def _apply_add_child(tree: Dict[str, Any], parent_key: str,
+                     child_data: Dict[str, Any], world_path: Path) -> Dict[str, Any]:
+    nodes = tree["nodes"]
+    parent = nodes[parent_key]
+    parent_depth = parent.get("depth", 0)
+
+    child_key = child_data["key"]
+    child_node: Dict[str, Any] = {}
+    if "file" not in child_data:
+        child_node["file"] = _compute_child_path(parent.get("file", ""),
+                                                  child_key, world_path)
+    else:
+        child_node["file"] = _normalize_virtual_path(child_data["file"], world_path)
+    child_node["depth"] = parent_depth + 1
+    child_node["parent"] = parent_key
+    child_node["children"] = child_data.get("children", [])
+    child_node["child_count"] = len(child_node["children"])
+    for field in _CHILD_COPY_FIELDS:
+        if field in child_data:
+            child_node[field] = child_data[field]
+    if "capability_level" not in child_node:
+        parent_cl = parent.get("capability_level")
+        if parent_cl:
+            child_node["capability_level"] = parent_cl
+    child_node = _apply_defaults(child_node)
+    child_node["last_updated"] = date.today().isoformat()
+
+    nodes[child_key] = child_node
+    if child_key not in parent.get("children", []):
+        if "children" not in parent:
+            parent["children"] = []
+        parent["children"].append(child_key)
+        parent["child_count"] = len(parent["children"])
+    nodes[parent_key] = parent
+
+    tree["nodes"] = nodes
+    tree["last_updated"] = date.today().isoformat()
+    return child_node
+
+
+def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
+               world_path: Path) -> Dict[str, Any]:
+    """Non-confidence field set. Confidence is rejected upstream (handler)."""
+    nodes = tree["nodes"]
+    node = nodes[key]
+    v = _parse_value(value) if isinstance(value, str) else value
+    if field == "file" and isinstance(v, str):
+        v = _normalize_virtual_path(v, world_path)
+    node[field] = v
+    if field != "last_updated":
+        node["last_updated"] = date.today().isoformat()
+    nodes[key] = node
+    tree["nodes"] = nodes
+    tree["last_updated"] = date.today().isoformat()
+    return node
+
+
+def _apply_increment(tree: Dict[str, Any], key: str, field: str) -> Dict[str, Any]:
+    nodes = tree["nodes"]
+    node = nodes[key]
+    current = node.get(field, 0)
+    if not isinstance(current, (int, float)):
+        current = 0
+    node[field] = current + 1
+    if field in _UTILITY_RATIO_FIELDS:
+        _recompute_utility_ratio(node)
+    nodes[key] = node
+    tree["last_updated"] = date.today().isoformat()
+    return node
+
+
+def _apply_remove_child(tree: Dict[str, Any], parent_key: str,
+                        child_key: str) -> List[str]:
+    """Returns the immediate-children list of child_key if removal would
+    orphan a subtree (caller refuses); empty list means removal proceeded."""
+    nodes = tree["nodes"]
+    parent = nodes[parent_key]
+    descendants = list(nodes.get(child_key, {}).get("children") or [])
+    if descendants:
+        return descendants
+    children = parent.get("children", [])
+    if child_key in children:
+        children.remove(child_key)
+    parent["children"] = children
+    parent["child_count"] = len(children)
+    nodes[parent_key] = parent
+    if child_key in nodes:
+        del nodes[child_key]
+    tree["nodes"] = nodes
+    tree["last_updated"] = date.today().isoformat()
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Maintenance candidate-scan helpers — ctx-aware ports of core/scripts/tree.py
+# (line refs noted). Copied rather than imported for the SAME reason as the
+# pure helpers above: importing tree.py runs its module-top
+# `TREE_PATH = str(WORLD_DIR / ...)`, which raises when WORLD_DIR is None (the
+# daemon / pytest non-bound context). These power op="record-maintenance".
+# Path resolution + config reads are threaded through ctx.paths, NOT the CLI's
+# module-global WORLD_DIR / CONFIG_DIR / META_DIR. The distill + decompose
+# counts gate maintenance.last_backlog_clear_at on disk (byte-compat) and feed
+# the run-record JSONL; byte-compat is verified by test_runtime_tree_write.py.
+# ---------------------------------------------------------------------------
+
+def _config_threshold(ctx) -> int:
+    """Mirror of tree.py:87-93 / _paths.py:87-93. decompose_threshold from
+    core/config/tree.yaml + meta/config-overrides.yaml overlay (no fallback —
+    a drifted default would silently change decomposition behavior)."""
+    return _merged_config(ctx)["config"]["decompose_threshold"]
+
+
+def _resolve_candidate_path(ctx, virtual_path: str) -> str:
+    """ctx-aware mirror of _paths.resolve_file_path (core/scripts/_paths.py:328)
+    INCLUDING the Windows `\\\\?\\` long-path wrap (_longpath_safe, _paths.py:315)
+    that gates os.path.exists / line-count on deep tree-node paths. Returns the
+    str form the CLI's `str(resolve_file_path(...))` produces. The `world/`
+    branch is the only one tree nodes hit; the bare branch resolves to
+    PROJECT_ROOT (NOT world) to mirror resolve_file_path exactly — unlike
+    _resolve_node_md, which is add-child-specific and world-anchored."""
+    if virtual_path.startswith("world/"):
+        p = ctx.paths.world / virtual_path[len("world/"):]
+    elif virtual_path.startswith("meta/"):
+        p = ctx.paths.meta / virtual_path[len("meta/"):]
+    else:
+        p = ctx.paths.project_root / virtual_path
+    s = str(p)
+    if os.name == "nt" and len(s) >= 260 and not s.startswith("\\\\?\\"):
+        return "\\\\?\\" + s
+    return s
+
+
+def _get_all_leaves(tree: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Mirror of tree.py:474-484. Leaf nodes (empty children), defaults applied.
+    Only file/depth/key/growth_state are read downstream, so _apply_defaults
+    field-ORDER is irrelevant here (this output is never dumped to _tree.yaml)."""
+    nodes = tree.get("nodes", {})
+    leaves = []
+    for key, node in nodes.items():
+        if not node.get("children", []):
+            out = _apply_defaults(node)
+            out["key"] = key
+            leaves.append(out)
+    return leaves
+
+
+_CANONICAL_END_SECTIONS = {"verified values", "decision rules"}
+
+
+def _qualifies_for_decomposition(abs_path: str):
+    """Verbatim mirror of tree.py:692-747 (semantic-structure decompose gate).
+    Returns (qualifies, skip_reason | None). skip_reason ∈
+    {insufficient_sections, short_sections_avg}."""
+    try:
+        with open(abs_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return True, None
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            body = text[end + 4:]
+    lines = body.splitlines()
+    section_starts = [
+        (i, ln.lstrip("# ").strip())
+        for i, ln in enumerate(lines)
+        if ln.startswith("## ") and not ln.startswith("### ")
+    ]
+    non_end_sections = [
+        (i, title) for (i, title) in section_starts
+        if title.lower() not in _CANONICAL_END_SECTIONS
+    ]
+    if len(non_end_sections) < 4:
+        return False, "insufficient_sections"
+    all_starts = [i for (i, _) in section_starts]
+    spans = []
+    for i, _ in non_end_sections:
+        next_starts = [s for s in all_starts if s > i]
+        end_idx = next_starts[0] if next_starts else len(lines)
+        spans.append(end_idx - i)
+    avg_span = sum(spans) / len(spans) if spans else 0
+    if avg_span <= 10:
+        return False, "short_sections_avg"
+    return True, None
+
+
+def _get_distill_candidates(ctx, tree, include_skipped=False):
+    """ctx-aware mirror of tree.py:561-633. Reads pruning thresholds from the
+    RAW core/config/tree.yaml (no meta overlay — matches the CLI) and node .md
+    line counts via _resolve_candidate_path. Sort + skip-reason enum identical."""
+    config_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+    pruning = {}
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        pruning = cfg.get("pruning", {})
+    threshold = pruning.get("distill_utility_threshold", 0.3)
+    min_ret = pruning.get("distill_min_retrievals", 5)
+    line_threshold = pruning.get("distill_line_threshold", 50)
+    line_util_threshold = pruning.get("distill_line_utility_threshold", 0.5)
+
+    nodes = tree.get("nodes", {})
+    candidates = []
+    skipped = []
+    for key, node in nodes.items():
+        if node.get("children"):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "has_children"})
+            continue
+        rc = node.get("retrieval_count", 0)
+        ur = node.get("utility_ratio", 0.0)
+        th = node.get("times_helpful", 0)
+        tn = node.get("times_noise", 0)
+        has_feedback = (th + tn) >= 1
+        crit1 = rc >= min_ret and has_feedback and ur < threshold
+        file_path = node.get("file", "")
+        abs_path = _resolve_candidate_path(ctx, file_path) if file_path else ""
+        line_count = 0
+        if abs_path and os.path.exists(abs_path):
+            with open(abs_path, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+        crit2 = (line_count > line_threshold and ur < line_util_threshold
+                 and rc >= min_ret and has_feedback)
+        if crit1 or crit2:
+            candidates.append({
+                "key": key,
+                "utility_ratio": ur,
+                "retrieval_count": rc,
+                "times_helpful": th,
+                "times_noise": tn,
+                "line_count": line_count,
+                "file": file_path,
+                "trigger": "low_utility" if crit1 else "large_mediocre",
+            })
+        elif include_skipped:
+            if rc < min_ret:
+                skipped.append({"node_key": key, "skip_reason": "insufficient_retrievals"})
+            elif not has_feedback:
+                skipped.append({"node_key": key, "skip_reason": "no_feedback"})
+            else:
+                skipped.append({"node_key": key, "skip_reason": "utility_above_threshold"})
+    candidates.sort(key=lambda x: x["utility_ratio"])
+    if include_skipped:
+        return {"candidates": candidates, "skipped": skipped}
+    return candidates
+
+
+def _get_decompose_candidates(ctx, tree, threshold=50, include_skipped=False):
+    """ctx-aware mirror of tree.py:750-804. Leaf .md files over `threshold`
+    lines, depth < D_max, passing the semantic-structure gate."""
+    d_max = _config_d_max(ctx)
+    leaves = _get_all_leaves(tree)
+    candidates = []
+    skipped = []
+    for leaf in leaves:
+        file_path = leaf.get("file", "")
+        depth = leaf.get("depth", 0)
+        key = leaf["key"]
+        if not file_path:
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "no_file"})
+            continue
+        if depth >= d_max:
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
+            continue
+        abs_path = _resolve_candidate_path(ctx, file_path)
+        if not os.path.exists(abs_path):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+        except (OSError, UnicodeDecodeError):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "read_error"})
+            continue
+        if line_count > threshold:
+            qualifies, skip_reason = _qualifies_for_decomposition(abs_path)
+            if qualifies:
+                candidates.append({
+                    "key": key,
+                    "file": file_path,
+                    "line_count": line_count,
+                    "depth": depth,
+                    "growth_state": leaf.get("growth_state", "stable"),
+                })
+            elif include_skipped:
+                skipped.append({"node_key": key, "skip_reason": skip_reason})
+        elif include_skipped:
+            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
+    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+    if include_skipped:
+        return {"candidates": candidates, "skipped": skipped}
+    return candidates
+
+
+def _get_redistribute_candidates(ctx, tree, threshold=50, include_skipped=False):
+    """ctx-aware mirror of tree.py:807-865. Interior nodes whose .md body
+    exceeds `threshold` lines and depth < D_max."""
+    d_max = _config_d_max(ctx)
+    nodes = tree.get("nodes", {})
+    candidates = []
+    skipped = []
+    for key, node in nodes.items():
+        children = node.get("children", [])
+        if not children:
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "no_children"})
+            continue
+        file_path = node.get("file", "")
+        depth = node.get("depth", 0)
+        if not file_path:
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "no_file"})
+            continue
+        if depth >= d_max:
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
+            continue
+        abs_path = _resolve_candidate_path(ctx, file_path)
+        if not os.path.exists(abs_path):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
+            continue
+        try:
+            with open(abs_path, "r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+        except (OSError, UnicodeDecodeError):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "read_error"})
+            continue
+        if line_count > threshold:
+            candidates.append({
+                "key": key,
+                "file": file_path,
+                "line_count": line_count,
+                "depth": depth,
+                "child_count": len(children),
+                "children": children,
+                "growth_state": node.get("growth_state", "stable"),
+            })
+        elif include_skipped:
+            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
+    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+    if include_skipped:
+        return {"candidates": candidates, "skipped": skipped}
+    return candidates
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
+
+def write(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/tree/write
+
+    Body JSON (op-tagged):
+      add-child:    {"op":"add-child","parent":"<key>","child":{"key":...,...},
+                     "body":"<optional .md markdown>",
+                     "no_dedup":<bool, bypasses dedup+child-limit>,
+                     "accept_overflow":"<justification, allows over-cap add>"}
+      set:          {"op":"set","key":"<key>","field":"<f>","value":<v>}
+      increment:    {"op":"increment","key":"<key>","field":"<f>"}
+      remove-child: {"op":"remove-child","parent":"<key>","child_key":"<key>"}
+      propagate:    {"op":"propagate","key":"<key>"}
+      reconcile-capabilities: {"op":"reconcile-capabilities"}
+      reparent:     {"op":"reparent","key":"<key>","new_parent":"<key>"}
+      batch:        {"op":"batch","operations":[<set|increment|add-child|
+                     remove-child|propagate op objects>]}  (atomic; propagate
+                     ops apply last)
+      record-maintenance: {"op":"record-maintenance",
+                     "backlog_mode":<bool>,"stop_mode":<bool>,
+                     "with_run_record":<bool>,
+                     "run_record_input":{mode,started_at,decompose,distill,...}}
+                     (run_record_input required only when with_run_record; it is
+                     the daemon analogue of the CLI's stdin JSON blob)
+    """
+    from ..server import Response
+
+    try:
+        req = _parse_body_json(ctx.body)
+    except (ValueError, json.JSONDecodeError) as e:
+        return Response.error(400, "invalid_body", f"body must be JSON: {e}")
+    if not isinstance(req, dict):
+        return Response.error(400, "invalid_body", "body must be a JSON object")
+
+    op = (req.get("op") or "").strip()
+    if op not in VALID_OPS:
+        return Response.error(400, "invalid_op",
+                              f"op must be one of {sorted(VALID_OPS)}; got {op!r}")
+
+    path = _tree_path(ctx)
+    base_dir = ctx.paths.world
+    agent = _agent_name(ctx)
+    world_path = ctx.paths.world
+
+    if not path.exists():
+        return Response.error(404, "tree_not_found",
+                              f"_tree.yaml not found at {path}")
+
+    try:
+        with file_locks.locked(path):
+            tree = _read_tree_locked(path)
+            if not isinstance(tree, dict) or "nodes" not in tree:
+                return Response.error(500, "invalid_tree",
+                                      "_tree.yaml missing 'nodes' key")
+            nodes = tree["nodes"]
+
+            # ---- add-child --------------------------------------------------
+            if op == "add-child":
+                parent_key = (req.get("parent") or "").strip()
+                child = req.get("child")
+                if not parent_key:
+                    return Response.error(400, "missing_param",
+                                          "'parent' required for add-child")
+                if not isinstance(child, dict) or not child.get("key"):
+                    return Response.error(400, "missing_param",
+                                          "'child' object with a 'key' required")
+                child_key = child["key"]
+                if parent_key not in nodes:
+                    return Response.error(404, "parent_not_found",
+                                          f"parent node not found: {parent_key}")
+                if child_key in nodes:
+                    return Response.error(409, "duplicate_key",
+                                          f"node key already exists: {child_key}")
+
+                # Curation gates (mirror cmd_add_child:1667-1681): dedup first,
+                # then child-limit. The CLI binds BOTH bypasses to --no-dedup
+                # (tree.py:1679 passes no_limit=no_dedup), so a single
+                # `no_dedup` field skips both here too. Dedup is fail-open
+                # (a crash must never block the write — _enforce_dedup contract).
+                if not req.get("no_dedup"):
+                    try:
+                        ded = _check_dedup(parent_key, child_key,
+                                           child.get("summary", ""), tree, ctx)
+                    except Exception:  # noqa: BLE001 — fail-open like the CLI
+                        ded = {"action": "error"}
+                    if ded.get("action") == "reject":
+                        return Response.error(409, "dedup_reject",
+                                              f"sibling already covers this: "
+                                              f"{ded}")
+                cl = _check_child_limit(parent_key, nodes[parent_key], ctx,
+                                        no_limit=bool(req.get("no_dedup")),
+                                        accept_overflow=req.get("accept_overflow"))
+                if cl is not None:
+                    return Response.error(409, "child_limit_reject", f"{cl}")
+
+                child_node = _apply_add_child(tree, parent_key, child, world_path)
+
+                # Optional .md body (daemon-only; CLI add-child writes no .md).
+                md_written = False
+                body_text = req.get("body")
+                if isinstance(body_text, str) and body_text:
+                    md_path = _resolve_node_md(child_node["file"], world_path)
+                    assert_not_cruft(md_path.parent, "mkdir (tree_write node .md)")
+                    md_path.parent.mkdir(parents=True, exist_ok=True)
+                    md_path.write_text(body_text, encoding="utf-8")
+                    changelog.append(base_dir, agent, md_path, "create",
+                                     summary=f"tree-add-child .md {child_key}",
+                                     lines_changed=body_text.count("\n") + 1)
+                    md_written = True
+
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-add-child {child_key} -> {parent_key}")
+                out = _apply_defaults(child_node)
+                out["key"] = child_key
+                return Response.json({"ok": True, "op": op, "key": child_key,
+                                      "node": out, "md_written": md_written})
+
+            # ---- set --------------------------------------------------------
+            if op == "set":
+                key = (req.get("key") or "").strip()
+                field = (req.get("field") or "").strip()
+                if not key or not field:
+                    return Response.error(400, "missing_param",
+                                          "'key' and 'field' required for set")
+                if "value" not in req:
+                    return Response.error(400, "missing_param",
+                                          "'value' required for set")
+                if key not in nodes:
+                    return Response.error(404, "node_not_found",
+                                          f"node not found: {key}")
+                node = _apply_set(tree, key, field, req["value"], world_path)
+                # field=confidence triggers parent-chain propagation +
+                # self-graduation (mirrors cmd_set:1599-1604). The node is
+                # re-fetched after propagation because self-graduation may
+                # have changed the source node's capability_level.
+                ancestors_updated: List[Dict[str, Any]] = []
+                capability_changes: List[Dict[str, Any]] = []
+                if field == "confidence":
+                    competence = _load_competence_config(ctx)
+                    ancestors_updated, capability_changes = _propagate_in_memory(
+                        tree["nodes"], key, competence)
+                    node = tree["nodes"][key]
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-set {key}.{field}")
+                out = _apply_defaults(node)
+                out["key"] = key
+                if field == "confidence":
+                    out["ancestors_updated"] = ancestors_updated
+                    out["capability_changes"] = capability_changes
+                return Response.json({"ok": True, "op": op, "key": key, "node": out})
+
+            # ---- increment --------------------------------------------------
+            if op == "increment":
+                key = (req.get("key") or "").strip()
+                field = (req.get("field") or "").strip()
+                if not key or not field:
+                    return Response.error(400, "missing_param",
+                                          "'key' and 'field' required for increment")
+                if key not in nodes:
+                    return Response.error(404, "node_not_found",
+                                          f"node not found: {key}")
+                node = _apply_increment(tree, key, field)
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-increment {key}.{field}")
+                out = _apply_defaults(node)
+                out["key"] = key
+                return Response.json({"ok": True, "op": op, "key": key, "node": out})
+
+            # ---- remove-child -----------------------------------------------
+            if op == "remove-child":
+                parent_key = (req.get("parent") or "").strip()
+                child_key = (req.get("child_key") or "").strip()
+                if not parent_key or not child_key:
+                    return Response.error(400, "missing_param",
+                                          "'parent' and 'child_key' required")
+                if parent_key not in nodes:
+                    return Response.error(404, "parent_not_found",
+                                          f"parent node not found: {parent_key}")
+                if child_key not in nodes[parent_key].get("children", []):
+                    return Response.error(404, "child_not_found",
+                                          f"child '{child_key}' not in parent "
+                                          f"'{parent_key}' children list")
+                descendants = _apply_remove_child(tree, parent_key, child_key)
+                if descendants:
+                    return Response.error(
+                        409, "would_orphan_subtree",
+                        f"'{child_key}' has {len(descendants)} descendant(s) "
+                        f"({', '.join(descendants)}); remove them first")
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-remove-child {child_key} from {parent_key}")
+                return Response.json({"ok": True, "op": op,
+                                      "removed": child_key, "parent": parent_key})
+
+            # ---- propagate --------------------------------------------------
+            # Mirrors cmd_propagate (tree.py:2302-2337). No key-existence 404:
+            # _propagate_in_memory returns ([],[]) for a missing key and the
+            # tree is still written (last_updated bumped) — identical to the
+            # CLI, which the cutover must match exactly.
+            if op == "propagate":
+                key = (req.get("key") or "").strip()
+                if not key:
+                    return Response.error(400, "missing_param",
+                                          "'key' required for propagate")
+                competence = _load_competence_config(ctx)
+                p_ancestors, p_caps = _propagate_in_memory(
+                    tree["nodes"], key, competence)
+                tree["last_updated"] = date.today().isoformat()
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-propagate {key}")
+                return Response.json({"ok": True, "op": op, "source_node": key,
+                                      "ancestors_updated": p_ancestors,
+                                      "capability_changes": p_caps})
+
+            # ---- reconcile-capabilities -------------------------------------
+            # Mirrors cmd_reconcile_capabilities (tree.py:2340-2389): recompute
+            # every node's capability_level from its confidence vs the
+            # competence thresholds. Always writes (last_updated bumped).
+            if op == "reconcile-capabilities":
+                competence = _load_competence_config(ctx)
+                changes: List[Dict[str, Any]] = []
+                for nkey, nnode in tree["nodes"].items():
+                    old_level, new_level = _graduate_node_level(nnode, competence)
+                    if old_level is not None:
+                        changes.append({
+                            "key": nkey,
+                            "old_level": old_level,
+                            "new_level": new_level,
+                            "confidence": nnode.get("confidence"),
+                        })
+                tree["last_updated"] = date.today().isoformat()
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary="tree-reconcile-capabilities")
+                return Response.json({"ok": True, "op": op,
+                                      "reconciled": len(changes),
+                                      "total_nodes": len(tree["nodes"]),
+                                      "changes": changes})
+
+            # ---- reparent ---------------------------------------------------
+            # Mirrors cmd_reparent (tree.py:2392-2560). Every CLI sys.exit(1)
+            # validation becomes a 4xx response. Dual-chain propagation runs in
+            # the EXACT CLI order — new-parent chain (via node_key, whose parent
+            # was just repointed) first, THEN the old-parent chain — because the
+            # two chains can share ancestors and the second pass reads
+            # confidences the first pass wrote; order is part of byte-compat.
+            # Physical .md moves are NOT performed: reported in `file_moves` for
+            # the caller. The L1-pick-log telemetry (cmd_reparent S9) is
+            # DEFERRED — separate file, no _tree.yaml byte impact.
+            if op == "reparent":
+                node_key = (req.get("key") or req.get("node") or "").strip()
+                new_parent_key = (req.get("new_parent") or "").strip()
+                if not node_key or not new_parent_key:
+                    return Response.error(
+                        400, "missing_param",
+                        "'key' and 'new_parent' required for reparent")
+                if node_key not in nodes:
+                    return Response.error(404, "node_not_found",
+                                          f"node not found: {node_key}")
+                if new_parent_key not in nodes:
+                    return Response.error(404, "new_parent_not_found",
+                                          f"new parent not found: {new_parent_key}")
+                if node_key == "root":
+                    return Response.error(400, "invalid_reparent",
+                                          "cannot reparent root node")
+                if node_key == new_parent_key:
+                    return Response.error(400, "invalid_reparent",
+                                          "cannot reparent a node to itself")
+
+                node = nodes[node_key]
+                old_parent_key = node.get("parent")
+                if old_parent_key is None:
+                    return Response.error(
+                        400, "invalid_reparent",
+                        f"node '{node_key}' has no parent (is it root?)")
+                if old_parent_key not in nodes:
+                    return Response.error(
+                        500, "invalid_tree",
+                        f"old parent '{old_parent_key}' not found in tree")
+                if new_parent_key == old_parent_key:
+                    return Response.error(
+                        409, "already_child",
+                        f"node '{node_key}' is already a child of "
+                        f"'{new_parent_key}'")
+
+                # Circular check: new parent must not be a descendant of node.
+                descendants = set()
+                stack = [node_key]
+                while stack:
+                    cur = stack.pop()
+                    for ch in nodes.get(cur, {}).get("children", []):
+                        if ch not in descendants:
+                            descendants.add(ch)
+                            stack.append(ch)
+                if new_parent_key in descendants:
+                    return Response.error(
+                        409, "circular_reparent",
+                        f"'{new_parent_key}' is a descendant of '{node_key}'")
+
+                # Depth check (D_max via tree.yaml + meta overlay).
+                d_max = _config_d_max(ctx)
+                new_parent_depth = nodes[new_parent_key].get("depth", 0)
+
+                def _max_subtree_depth(k):
+                    children = nodes.get(k, {}).get("children", [])
+                    if not children:
+                        return 0
+                    return 1 + max(_max_subtree_depth(c) for c in children)
+
+                subtree_height = _max_subtree_depth(node_key)
+                new_max_depth = new_parent_depth + 1 + subtree_height
+                if new_max_depth > d_max:
+                    return Response.error(
+                        409, "depth_exceeded",
+                        f"reparent would exceed D_max={d_max}: deepest "
+                        f"descendant would be at depth {new_max_depth}")
+
+                # --- Execute (mirrors tree.py:2481-2531 exactly) ---
+                old_parent = nodes[old_parent_key]
+                old_children = old_parent.get("children", [])
+                if node_key in old_children:
+                    old_children.remove(node_key)
+                old_parent["children"] = old_children
+                old_parent["child_count"] = len(old_children)
+                if not old_children:
+                    old_parent["node_type"] = "leaf"
+
+                new_parent = nodes[new_parent_key]
+                if "children" not in new_parent:
+                    new_parent["children"] = []
+                new_parent["children"].append(node_key)
+                new_parent["child_count"] = len(new_parent["children"])
+                if new_parent.get("node_type") == "leaf":
+                    new_parent["node_type"] = "interior"
+
+                node["parent"] = new_parent_key
+
+                file_moves: List[Dict[str, Any]] = []
+
+                def _recompute_subtree(k, parent_file, parent_depth):
+                    n = nodes[k]
+                    old_file = n.get("file", "")
+                    new_depth = parent_depth + 1
+                    new_file = _compute_child_path(parent_file, k, world_path)
+                    if old_file != new_file:
+                        file_moves.append(
+                            {"key": k, "old": old_file, "new": new_file})
+                    n["file"] = new_file
+                    n["depth"] = new_depth
+                    for ck in n.get("children", []):
+                        _recompute_subtree(ck, new_file, new_depth)
+
+                _recompute_subtree(node_key, new_parent.get("file", ""),
+                                   new_parent_depth)
+
+                competence = _load_competence_config(ctx)
+                new_ancestors, new_cap = _propagate_in_memory(
+                    nodes, node_key, competence)
+                old_ancestors, old_cap = _propagate_in_memory(
+                    nodes, old_parent_key, competence)
+
+                tree["nodes"] = nodes
+                tree["last_updated"] = date.today().isoformat()
+                _write_tree_locked(
+                    path, tree, base_dir, agent,
+                    summary=f"tree-reparent {node_key} -> {new_parent_key}")
+                return Response.json({
+                    "ok": True, "op": op,
+                    "reparented": node_key,
+                    "old_parent": old_parent_key,
+                    "new_parent": new_parent_key,
+                    "new_depth": nodes[node_key].get("depth"),
+                    "file_moves": file_moves,
+                    "old_chain_propagation": {
+                        "ancestors_updated": old_ancestors,
+                        "capability_changes": old_cap,
+                    },
+                    "new_chain_propagation": {
+                        "ancestors_updated": new_ancestors,
+                        "capability_changes": new_cap,
+                    },
+                })
+
+            # ---- batch ------------------------------------------------------
+            # Mirrors cmd_batch (tree.py:1902-2160). Applies a sequence of ops
+            # atomically under the single lock already held: validate ALL ops
+            # first (any failure returns 4xx and writes NOTHING), then phase-1
+            # mutations IN ORDER (reusing the same _apply_* helpers + gates as
+            # the single-op branches — byte-identical per-op logic, verified:
+            # batch increment, like _apply_increment, does NOT stamp node
+            # last_updated), then phase-2 propagate ops LAST so they see the
+            # phase-1 mutations. As in the CLI, a forward-referenced new key is
+            # only usable if its add-child op precedes the op that uses it
+            # (pending_child_keys suppresses only the validation error, not the
+            # execution-order requirement) — a mis-ordered ref surfaces as a
+            # clean 400 here rather than the CLI's bare KeyError traceback.
+            if op == "batch":
+                operations = req.get("operations")
+                if not isinstance(operations, list) or not operations:
+                    return Response.error(400, "missing_param",
+                                          "'operations' must be a non-empty list")
+                _VALID_BATCH = ("set", "increment", "add-child",
+                                "remove-child", "propagate")
+                pending_child_keys = set()
+                for o in operations:
+                    if o.get("op") == "add-child":
+                        c = o.get("child") or {}
+                        if c.get("key"):
+                            pending_child_keys.add(c["key"])
+
+                # ---- Validation (all ops, before any mutation) ----
+                mutation_ops: List[Dict[str, Any]] = []
+                propagate_ops: List[Dict[str, Any]] = []
+                for i, o in enumerate(operations):
+                    op_type = o.get("op")
+                    key = o.get("key")
+                    if not op_type or not key:
+                        return Response.error(
+                            400, "invalid_operation",
+                            f"operation {i} missing 'op' or 'key'")
+                    if op_type not in _VALID_BATCH:
+                        return Response.error(
+                            400, "invalid_operation",
+                            f"operation {i} invalid op {op_type!r}; must be one "
+                            f"of {list(_VALID_BATCH)}")
+                    if (op_type != "add-child" and key not in nodes
+                            and key not in pending_child_keys):
+                        return Response.error(
+                            404, "node_not_found",
+                            f"operation {i} references non-existent node {key!r}")
+                    if op_type in ("set", "increment") and not o.get("field"):
+                        return Response.error(
+                            400, "missing_param",
+                            f"operation {i} ({op_type}) missing 'field'")
+                    if op_type == "add-child":
+                        c = o.get("child") or {}
+                        if not c.get("key"):
+                            return Response.error(
+                                400, "missing_param",
+                                f"operation {i} (add-child) missing child.key")
+                        if key not in nodes:
+                            return Response.error(
+                                404, "parent_not_found",
+                                f"operation {i} (add-child) parent {key!r} "
+                                f"not found")
+                    if op_type == "remove-child" and not o.get("child_key"):
+                        return Response.error(
+                            400, "missing_param",
+                            f"operation {i} (remove-child) missing 'child_key'")
+                    (propagate_ops if op_type == "propagate"
+                     else mutation_ops).append(o)
+
+                updated_keys = set()
+                propagate_results: List[Dict[str, Any]] = []
+                try:
+                    # ---- Phase 1: mutations in order ----
+                    for o in mutation_ops:
+                        op_type = o["op"]
+                        key = o["key"]
+                        if op_type == "set":
+                            _apply_set(tree, key, o["field"], o.get("value"),
+                                       world_path)
+                            updated_keys.add(key)
+                        elif op_type == "increment":
+                            _apply_increment(tree, key, o["field"])
+                            updated_keys.add(key)
+                        elif op_type == "add-child":
+                            child = o["child"]
+                            child_key = child["key"]
+                            if child_key in nodes:
+                                return Response.error(
+                                    409, "duplicate_key",
+                                    f"node key already exists: {child_key}")
+                            if not o.get("no_dedup"):
+                                try:
+                                    ded = _check_dedup(
+                                        key, child_key,
+                                        child.get("summary", ""), tree, ctx)
+                                except Exception:  # noqa: BLE001 — fail-open
+                                    ded = {"action": "error"}
+                                if ded.get("action") == "reject":
+                                    return Response.error(
+                                        409, "dedup_reject",
+                                        f"sibling already covers this: {ded}")
+                            cl = _check_child_limit(
+                                key, nodes[key], ctx,
+                                no_limit=bool(o.get("no_dedup")),
+                                accept_overflow=o.get("accept_overflow"))
+                            if cl is not None:
+                                return Response.error(
+                                    409, "child_limit_reject", f"{cl}")
+                            _apply_add_child(tree, key, child, world_path)
+                            updated_keys.add(child_key)
+                            updated_keys.add(key)
+                        elif op_type == "remove-child":
+                            child_key = o["child_key"]
+                            descendants = _apply_remove_child(
+                                tree, key, child_key)
+                            if descendants:
+                                return Response.error(
+                                    409, "would_orphan_subtree",
+                                    f"'{child_key}' has {len(descendants)} "
+                                    f"descendant(s) "
+                                    f"({', '.join(descendants)}); "
+                                    f"remove them first")
+                            updated_keys.add(key)
+
+                    # ---- Phase 2: propagate ops LAST ----
+                    if propagate_ops:
+                        competence = _load_competence_config(ctx)
+                        for o in propagate_ops:
+                            p_key = o["key"]
+                            anc, caps = _propagate_in_memory(
+                                tree["nodes"], p_key, competence)
+                            propagate_results.append({
+                                "source_node": p_key,
+                                "ancestors_updated": anc,
+                                "capability_changes": caps,
+                            })
+                            for a in anc:
+                                updated_keys.add(a["key"])
+                except KeyError as e:
+                    return Response.error(
+                        400, "batch_execution_error",
+                        f"operation referenced a missing node mid-batch "
+                        f"(ensure add-child precedes ops that use the new "
+                        f"key): {e}")
+
+                tree["last_updated"] = date.today().isoformat()
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary=f"tree-batch ({len(operations)} ops)")
+                updated_nodes: List[Dict[str, Any]] = []
+                for k in updated_keys:
+                    if k in tree["nodes"]:
+                        nd = _apply_defaults(tree["nodes"][k])
+                        nd["key"] = k
+                        updated_nodes.append(nd)
+                return Response.json({"ok": True, "op": op,
+                                      "updated_nodes": updated_nodes,
+                                      "propagate": propagate_results})
+
+            # ---- record-maintenance -----------------------------------------
+            # Mirrors cmd_record_maintenance (tree.py:1355-1556). Records a
+            # /tree maintain completion in the top-level `maintenance` block and
+            # (with with_run_record) appends a run record to
+            # world/tree-maintenance-log.jsonl. Byte-compat significant:
+            #   • maintenance-block key INSERTION ORDER (last_maintain_at, then
+            #     optionally last_backlog_mode_at, last_stop_mode_at, and
+            #     last_backlog_clear_at) — sort_keys=False dumps in this order.
+            #   • the post-run debt math (distill+decompose counts vs
+            #     tree_debt_check.debt_threshold) decides whether
+            #     last_backlog_clear_at lands on disk.
+            #   • `maintenance` is assigned LAST (after entity_index) when the
+            #     key is new, matching the CLI's `tree["maintenance"] = ...`.
+            # Candidate counts are computed ctx-aware (config + node .md reads
+            # through ctx.paths). The `tree`/`nodes` read under the held lock
+            # above are reused — same single-snapshot guarantee as the CLI's
+            # locked_modify_yaml(_do_record).
+            if op == "record-maintenance":
+                now = datetime.now().isoformat(timespec="seconds")
+                # No fallback — tree.yaml is framework-owned and MUST carry
+                # tree_debt_check.debt_threshold (single-source-of-truth; mirror
+                # cmd_record_maintenance:1395-1397). A missing config/key is a
+                # misconfiguration surfaced as 500, not silently defaulted.
+                cfg_path = ctx.paths.project_root / "core" / "config" / "tree.yaml"
+                try:
+                    with cfg_path.open("r", encoding="utf-8") as f:
+                        rm_cfg = yaml.safe_load(f)
+                    debt_threshold = rm_cfg["tree_debt_check"]["debt_threshold"]
+                except (OSError, KeyError, TypeError) as e:
+                    return Response.error(
+                        500, "config_error",
+                        f"core/config/tree.yaml missing "
+                        f"tree_debt_check.debt_threshold: {e}")
+
+                with_run_record = bool(req.get("with_run_record"))
+                backlog_mode = bool(req.get("backlog_mode"))
+                stop_mode = bool(req.get("stop_mode"))
+
+                maintenance = tree.get("maintenance") or {}
+                maintenance["last_maintain_at"] = now
+                if backlog_mode:
+                    maintenance["last_backlog_mode_at"] = now
+                if stop_mode:
+                    maintenance["last_stop_mode_at"] = now
+
+                decompose_detail = distill_detail = redistribute_detail = None
+                if with_run_record:
+                    distill_detail = _get_distill_candidates(
+                        ctx, tree, include_skipped=True)
+                    decompose_detail = _get_decompose_candidates(
+                        ctx, tree, _config_threshold(ctx), include_skipped=True)
+                    redistribute_detail = _get_redistribute_candidates(
+                        ctx, tree, _config_threshold(ctx), include_skipped=True)
+                    distill_count = len(distill_detail["candidates"])
+                    decompose_count = len(decompose_detail["candidates"])
+                else:
+                    distill_count = len(_get_distill_candidates(ctx, tree))
+                    decompose_count = len(
+                        _get_decompose_candidates(ctx, tree, _config_threshold(ctx)))
+
+                post_debt = distill_count + decompose_count
+                if post_debt <= debt_threshold:
+                    maintenance["last_backlog_clear_at"] = now
+
+                tree["maintenance"] = maintenance
+                tree["last_updated"] = date.today().isoformat()
+                _write_tree_locked(path, tree, base_dir, agent,
+                                   summary="tree-record-maintenance")
+
+                result = {
+                    "maintenance": maintenance,
+                    "post_run_debt": {
+                        "distill": distill_count,
+                        "decompose": decompose_count,
+                        "total": post_debt,
+                        "threshold": debt_threshold,
+                        "cleared": post_debt <= debt_threshold,
+                    },
+                }
+
+                if with_run_record:
+                    run_input = req.get("run_record_input")
+                    if not isinstance(run_input, dict):
+                        return Response.error(
+                            400, "missing_param",
+                            "with_run_record requires a 'run_record_input' object "
+                            "(mode/started_at/decompose/distill/...) — the daemon "
+                            "analogue of the CLI's stdin JSON blob")
+
+                    def _agg_skip_reasons(skipped_items):
+                        agg: Dict[str, int] = {}
+                        for item in skipped_items:
+                            reason = item.get("skip_reason", "unknown")
+                            agg[reason] = agg.get(reason, 0) + 1
+                        return agg
+
+                    pre_filter = {
+                        "decompose": {
+                            "candidates_in": len(decompose_detail["candidates"]),
+                            "skipped_by_reason": _agg_skip_reasons(decompose_detail["skipped"]),
+                        },
+                        "distill": {
+                            "candidates_in": len(distill_detail["candidates"]),
+                            "skipped_by_reason": _agg_skip_reasons(distill_detail["skipped"]),
+                        },
+                        "redistribute": {
+                            "candidates_in": len(redistribute_detail["candidates"]),
+                            "skipped_by_reason": _agg_skip_reasons(redistribute_detail["skipped"]),
+                        },
+                    }
+
+                    started_at = run_input.get("started_at") or now
+                    # Run-record agent mirrors the CLI's
+                    # `os.environ.get("MIND_AGENT","") or "unknown"` (NOT
+                    # _agent_name's "system" default) so run_id matches the CLI
+                    # byte-for-byte when an agent header is present, and uses the
+                    # same "unknown" sentinel when it is absent.
+                    rr_agent = (ctx.headers.get("x-ayoai-agent") or "").strip() or "unknown"
+                    run_id = ("maint-" + started_at.replace(":", "").replace("-", "")
+                              + "-" + rr_agent)
+
+                    record = {
+                        "run_id": run_id,
+                        "agent": rr_agent,
+                        "mode": run_input.get("mode", "standard"),
+                        "started_at": started_at,
+                        "ended_at": now,
+                        "candidates_pre_filter": pre_filter,
+                        "llm_reported": {
+                            k: v for k, v in run_input.items()
+                            if k not in ("mode", "started_at")
+                        },
+                        "post_run_debt": result["post_run_debt"],
+                    }
+                    # Function-local import mirrors the CLI idiom
+                    # (cmd_record_maintenance:1472). ensure_ascii=True + the
+                    # snapshot/changelog ceremony are identical, so the appended
+                    # JSONL record is byte-compatible with the CLI path.
+                    from _fileops import locked_append_jsonl
+                    log_path = ctx.paths.world / "tree-maintenance-log.jsonl"
+                    locked_append_jsonl(log_path, record)
+                    result["run_record"] = {
+                        "run_id": run_id,
+                        "log_path": str(log_path),
+                        "appended": True,
+                    }
+
+                return Response.json({"ok": True, "op": op, "result": result})
+
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+
+    # Unreachable (all ops return inside the lock), but keep the type checker
+    # and any future op-without-return honest.
+    return Response.error(500, "no_op_result", "operation produced no result")
+
+
+def register(routes) -> None:
+    routes[("POST", "/v1/tree/write")] = write

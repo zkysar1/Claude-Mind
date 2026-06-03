@@ -68,14 +68,19 @@ def compute_body_hash(file_path):
     return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
 
 
-def get_body_text(file_path):
-    """Return the body (post-front-matter) text of a file, normalized."""
-    raw = Path(file_path).read_text(encoding="utf-8") if Path(file_path).exists() else ""
+def _body_text_from_raw(raw):
+    """Strip leading YAML front matter from a raw string; return the body."""
     if raw.startswith("---\n"):
         end_idx = raw.find("\n---\n", 4)
         if end_idx >= 0:
             return raw[end_idx + 5:]
     return raw
+
+
+def get_body_text(file_path):
+    """Return the body (post-front-matter) text of a file, normalized."""
+    raw = Path(file_path).read_text(encoding="utf-8") if Path(file_path).exists() else ""
+    return _body_text_from_raw(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +330,42 @@ def main():
     # is empty and diff_stats would produce misleading "whole file added"
     # counts. Emit null/empty diff metadata in that case — change_class
     # and hashes still convey the real signal.
-    snapshot_path = sidecar.get("history_snapshot")
-    has_snapshot = bool(snapshot_path) and Path(snapshot_path).exists()
+    snapshot_ref = sidecar.get("history_snapshot")
     is_bootstrap = before_hash is None  # file didn't exist before — empty before_text is correct
 
-    before_text = get_body_text(snapshot_path) if has_snapshot else ""
+    # history_snapshot is a CAS snapshot_id (manifest name) for files tracked
+    # by the CAS-delta store post-2026-05-22 migration; legacy sidecars stored
+    # a filesystem path. Handle both: an existing path reads directly,
+    # otherwise treat the value as a snapshot_id and reconstruct the pre-edit
+    # body from the store via restore().
+    before_text = ""
+    has_snapshot = False
+    if snapshot_ref:
+        if Path(snapshot_ref).exists():
+            before_text = get_body_text(snapshot_ref)
+            has_snapshot = True
+        else:
+            try:
+                import _history_store
+                from _fileops import resolve_base_dir
+                base = resolve_base_dir(abs_path)
+                if base:
+                    before_bytes = _history_store.restore(abs_path, snapshot_ref, base)
+                    # restore() returns raw bytes; .decode() does NOT apply the
+                    # universal-newline translation that the path-based
+                    # get_body_text() branch gets for free via read_text(). On
+                    # CRLF working trees (git autocrlf) that leaves \r\n in
+                    # before_text while after_text (via read_text) is \n, so
+                    # diff_stats would report every line changed and the front
+                    # matter (---\r\n) would not strip. Normalize to LF here to
+                    # match the path-based branch exactly.
+                    before_raw = before_bytes.decode("utf-8", errors="replace")
+                    before_raw = before_raw.replace("\r\n", "\n").replace("\r", "\n")
+                    before_text = _body_text_from_raw(before_raw)
+                    has_snapshot = True
+            except Exception:
+                has_snapshot = False
+                before_text = ""
     after_text = get_body_text(abs_path) if Path(abs_path).exists() else ""
 
     if has_snapshot or is_bootstrap:

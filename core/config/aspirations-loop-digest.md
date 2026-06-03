@@ -182,6 +182,15 @@ of the iteration — bash gates have run since.
               Skill(aspirations-spark) — deep: full; routine: creative+hypothesis (bounded).
               Bash: execution-diary.sh phase-end phase-6-spark --goal {goal.id}
               Checkpoint: phase_completed=spark.
+              # RECURRING SHORTCUT NOTE (g-115-977): recurring-close.sh wraps
+              # Phase 5/8/12 but NOT Phase 6. For recurring goals closed via
+              # the shortcut, follow recurring-close.sh's outcome-aware terminal
+              # imperative — when stdout reports OUTCOME=deep, fire
+              # Skill(aspirations-spark) BEFORE Skill(aspirations) LOOP_CONTINUE.
+              # When OUTCOME=routine, spark is skipped per the standard rule.
+              # The post-flip outcome on recurring-close.sh stdout is authoritative
+              # (Block A/C may have flipped routine→deep — the imperative reflects
+              # the FINAL classification).
   Phase 7-7.6 Completion review — aspiration_fully_complete → /aspirations-complete-review;
               recurring-only leftovers → /aspirations-complete-review functionally_complete=true.
   Phase 8.    Bash: iteration-close.sh --phase state-update …

@@ -69,6 +69,15 @@ Priority selection (most learning signal first):
 Apply spaced repetition filter:
   For each candidate, check replay_metadata.last_replayed
   Skip if replayed within last 7 days
+  Skip if replay_metadata.encoded_via_chronic == true
+    # Chronic-CORRECTED items already encoded as a calibration guardrail by
+    # Step 3.6 — re-replaying them yields zero new learning (g-115-1104).
+  IF replay_metadata.replay_count >= 5:
+    # Hard cap (encoded or not): stop infinite cycling. Move to archived,
+    # never delete (CLAUDE.md pipeline rule), then drop from candidates.
+    Bash: pipeline-move.sh {candidate.id} archived
+    Log: "REPLAY CAP: archived {candidate.id} (replay_count >= 5)"
+    Skip
   Prefer hypotheses never replayed (replay_count == 0)
 
 Select top N candidates (N = max_replay_items from config, default 10)
@@ -234,6 +243,68 @@ FOR EACH shared_condition group where N >= 2 corrected hypotheses:
 
 # Pass any convention proposals to Step 4 for reconsolidation context
 ```
+
+## Step 3.6: Chronic-Corrected Strategy Nucleation
+
+Chronic-CORRECTED hypotheses whose claims are about specific systems (zones,
+livetests, BTs, memory leaks) reference no named STRATEGY, so Step 4's
+reconsolidation loop is a no-op for them — they return to the candidate pool
+intact and re-replay forever. The 2026-05-22 survey found 8 of 11 chronic items
+(replay_count >= 3) in this state. Step 4 only UPDATES existing strategies; it
+never CREATES one from a chronic pattern. This step closes that gap: it encodes
+the wrong-prediction shape as a calibration GUARDRAIL, then marks the hypothesis
+so it stops cycling. (Refs: g-115-1093, g-115-1104,
+agents/echo/reports/chronic-re-replay-encoding-gap-2026-05-22.md.)
+
+SCHEMA NOTE (verified 2026-05-27, g-115-1104): there is NO stored
+`reconsolidation_updates` field on pipeline records — the investigation's
+"reconsolidation_updates is empty" was a conceptual description, not a field.
+The idempotency guard is `replay_metadata.encoded_via_chronic` instead: once a
+chronic-corrected hypothesis is encoded here, the flag stops re-processing here
+AND makes Step 1's spaced-repetition filter skip it. Dotted field names are
+rejected by the pipeline update-field endpoint (pipeline_write.py
+`dotted_field_rejected`), so the flag is written via the whole-object pattern
+(read replay_metadata, merge, write the whole object back) — the same pattern
+Step 4 uses for experience `retrieval_stats`.
+
+```
+FOR EACH replayed hypothesis WHERE replay_metadata.replay_count >= 3
+                              AND outcome == "CORRECTED"
+                              AND replay_metadata.encoded_via_chronic is not true:
+
+    # The chronic-CORRECTED hypothesis has no strategy to reinforce/revise.
+    # Encode the wrong-prediction shape as a calibration guardrail instead.
+    Bash: guardrails-read.sh --category {hypothesis.category}
+
+    IF an existing guardrail already captures "predictions of shape X in this
+       category are systematically wrong / apply skepticism" (semantic overlap):
+        Bash: guardrails-increment.sh {guard.id} utilization.times_active
+        Log: "CHRONIC-CORRECTED ENCODING: strengthened {guard.id} from {hypothesis.id} (replay_count {rc})"
+    ELSE:
+        # Nucleate a new guardrail. The rule names the prediction shape (from
+        # hypothesis.title/question/rationale) and the corrected reality (from
+        # the replay OUTCOME lesson). Stdin JSON; id/created auto-set.
+        echo '<json>' | Bash: guardrails-add.sh
+          rule: "Predictions claiming {claim-pattern from hypothesis} in
+                 {hypothesis.category} have been CORRECTED {replay_count}x across
+                 replays. Apply skepticism — refuse confidence > 0.5 for this
+                 prediction shape until a confirming run reverses the pattern."
+          category: {hypothesis.category}
+          trigger_condition: "{category-specific signal preceding the wrong prediction}"
+          source: "replay:{hypothesis.id}"
+          tags: ["chronic-re-replay", "calibration"]
+        Log: "CHRONIC-CORRECTED ENCODING: nucleated new guardrail from {hypothesis.id} (replay_count {rc})"
+
+    # Mark encoded so this step + Step 1 stop re-selecting it. WHOLE-OBJECT
+    # write — dotted field names are rejected by pipeline-update-field; merge
+    # encoded_via_chronic into the existing replay_metadata object.
+    updated_rm = {**hypothesis.replay_metadata, "encoded_via_chronic": true}
+    Bash: pipeline-update-field.sh {hypothesis.id} replay_metadata '<updated_rm JSON>'
+    Log: "CHRONIC-CORRECTED ENCODING: marked {hypothesis.id} encoded_via_chronic=true"
+```
+
+The replay_count >= 5 archive cap lives in Step 1's spaced-repetition filter —
+the safety net that hard-stops cycling even if this encoding step is skipped.
 
 ## Step 4: Reconsolidation Window
 

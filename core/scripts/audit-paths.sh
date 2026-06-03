@@ -38,7 +38,12 @@ declare -A canonical_roots
 canonical_roots["$PROJECT_ROOT"]=1
 
 shopt -s nullglob
-for conf in */local-paths.conf; do
+# Glob via agents_root() (PROJECT_ROOT/$AGENTS_PARENT_DIR) so the two-level
+# agents/<name>/local-paths.conf layout is matched. A bare */local-paths.conf is
+# one level relative to PROJECT_ROOT and matched ZERO confs under
+# AGENTS_PARENT_DIR=agents, silently collapsing canonical_roots to {PROJECT_ROOT}
+# and skipping every agent WORLD/META root in the permission audit (4).
+for conf in "$(agents_root)"/*/local-paths.conf; do
   while IFS='=' read -r key value; do
     value="${value%%$'\r'}"   # strip trailing CR on Windows
     case "$key" in
@@ -131,7 +136,7 @@ fi
 
 echo "=== audit-paths.sh ==="
 echo "Current agents with local-paths.conf:"
-for conf in */local-paths.conf; do echo "  $conf"; done
+for conf in "$(agents_root)"/*/local-paths.conf; do echo "  $conf"; done
 echo ""
 echo "Canonical write roots (derived from configs + PROJECT_ROOT):"
 for root in "${!canonical_roots[@]}"; do echo "  $root"; done

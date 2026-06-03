@@ -66,6 +66,7 @@ if [ -f "$POISON_FILE" ]; then
     fi
 fi
 
+# POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
 # Atomic claim with bounded backoff (max 60s)
 WAITED=0
 while [ "$WAITED" -lt 60 ]; do
@@ -73,6 +74,20 @@ while [ "$WAITED" -lt 60 ]; do
         echo "$(date +%s)" > "$LOCK_DIR/timestamp"
         echo "$MY_AGENT"   > "$LOCK_DIR/holder"
         echo "$SID"        > "$LOCK_DIR/sid"
+        # compact-in-flight: per-agent sentinel marking autocompact start.
+        # Distinct from compact-pending (written by stop-hook on EVERY iteration
+        # BLOCK as the SID-binding breadcrumb): this file is written ONLY here
+        # in PreCompact, so its mtime accurately reflects autocompact start time.
+        # recovery-gate.sh _check_hung_autocompact reads this file instead of
+        # compact-pending so the 60-min hung-compact threshold actually means
+        # "compact has been running >60 min" rather than the pre-fix
+        # "no iteration BLOCK in >60 min" — which false-positive-fired during
+        # deep Phase 4 work that ran >60 min without a phase boundary
+        # (canonical incident: 2026-05-22 delta 7 Phase 4 = 1h 31m,
+        # compact-pending mtime crossed 60-min threshold at 17:02:31 with no
+        # autocompact actually running).
+        mkdir -p "$(agent_dir "$MY_AGENT")/session" 2>/dev/null || true
+        printf '%s\n' "$SID" > "$(agent_dir "$MY_AGENT")/session/compact-in-flight" 2>/dev/null || true
         exit 0
     fi
     sleep 5

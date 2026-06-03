@@ -141,21 +141,45 @@ def _parse_yaml_min(text: str) -> dict:
 def _try_phase26_binding(sid: str, project_root: Path) -> Optional[SessionBinding]:
     """Look for agents/*/sessions/<SID>/binding.yaml. Returns None if absent.
 
-    Validates that:
-      - the binding file's agent matches the parent agent-dir name
-      - the binding file's session_id matches the dir name
-      - the agent name passes shape + reserved-name checks
+    Thin wrapper around `_try_phase26_binding_with_reason` that drops the
+    diagnostic reason — kept for backward-compat callers of the original
+    signature. New callers wanting the failure mode should call
+    `_try_phase26_binding_with_reason` directly.
+    """
+    binding, _reason = _try_phase26_binding_with_reason(sid, project_root)
+    return binding
+
+
+def _try_phase26_binding_with_reason(
+    sid: str, project_root: Path
+) -> tuple[Optional[SessionBinding], str]:
+    """Phase 2.6 resolution that also returns a failure reason on miss.
+
+    Returns (binding, "") on success, (None, reason) on failure. Reason is
+    the MOST SPECIFIC failure encountered across the agent-dir scan (later
+    matches override earlier ones, so a file-with-mismatched-agent-name
+    reports `agent-name-mismatch` not `binding-yaml-missing`).
+
+    Reasons:
+      agents-root-missing        - agents/ dir absent
+      binding-yaml-missing       - no binding.yaml for this SID under any agent
+      binding-yaml-read-error    - file exists but read failed (OSError)
+      binding-yaml-parse-failed  - file exists but YAML parse failed
+      session-id-mismatch        - binding.yaml session_id != dir name
+      agent-name-mismatch        - binding.yaml agent != parent dir name
+      local-paths-conf-missing   - validated binding but agent dir has no local-paths.conf
     """
     ar = _agents_root(project_root)
     if not ar.is_dir():
-        return None
+        return None, "agents-root-missing"
 
     # Build candidate path directly per agent for efficiency.
     try:
         children = list(ar.iterdir())
     except OSError:
-        return None
+        return None, "agents-root-missing"
 
+    reason = "binding-yaml-missing"
     for child in children:
         if not child.is_dir():
             continue
@@ -169,17 +193,22 @@ def _try_phase26_binding(sid: str, project_root: Path) -> Optional[SessionBindin
         try:
             text = candidate.read_text(encoding="utf-8")
         except OSError:
+            reason = "binding-yaml-read-error"
             continue
         data = _parse_yaml_min(text)
         if not data:
+            reason = "binding-yaml-parse-failed"
             continue
 
         # Cross-check: file values must agree with on-disk layout.
         if str(data.get("session_id", "")).strip() != sid:
+            reason = "session-id-mismatch"
             continue
         if str(data.get("agent", "")).strip() != agent_name:
+            reason = "agent-name-mismatch"
             continue
         if not (child / "local-paths.conf").is_file():
+            reason = "local-paths-conf-missing"
             continue
 
         mode = _coerce_str_field(data.get("mode"))
@@ -193,9 +222,9 @@ def _try_phase26_binding(sid: str, project_root: Path) -> Optional[SessionBindin
             started_at=started_at,
             started_by=started_by,
             source="binding.yaml",
-        )
+        ), ""
 
-    return None
+    return None, reason
 
 
 def _try_legacy_active_agent(sid: str, project_root: Path) -> Optional[SessionBinding]:
@@ -236,19 +265,44 @@ def resolve_binding(sid: str, project_root: Path) -> Optional[SessionBinding]:
     `.active-agent-<SID>` file at PROJECT_ROOT. Returns None on any
     validation failure or missing-binding case.
     """
+    binding, _reason = resolve_binding_with_diagnostics(sid, project_root)
+    return binding
+
+
+def resolve_binding_with_diagnostics(
+    sid: str, project_root: Path
+) -> tuple[Optional[SessionBinding], str]:
+    """Resolve a SID and also return a failure reason on miss.
+
+    Returns (binding, "") on success, (None, reason) on failure. The reason
+    string is the most-specific failure mode encountered; callers consume it
+    for diagnostic logging (e.g. bash-agent-inject's miss log). Used by the
+    bash-agent-inject hook (g-115-1187) so silent mid-session binding drops
+    become greppable by failure mode rather than collapsing into a single
+    `no_active_agent_binding` line per SID.
+
+    Reason value set: see `_try_phase26_binding_with_reason` docstring plus
+    "invalid-sid" (SID failed shape check). Legacy-active-agent path is a
+    fallback only — when Phase 2.6 produces a specific failure reason that
+    reason is preserved (legacy is treated as an additional attempt, not a
+    reason source).
+    """
     if not _valid_sid_shape(sid):
-        return None
+        return None, "invalid-sid"
     project_root = Path(project_root)
     try:
-        new = _try_phase26_binding(sid, project_root)
+        new, reason = _try_phase26_binding_with_reason(sid, project_root)
     except Exception:
-        new = None
+        new, reason = None, "phase26-exception"
     if new is not None:
-        return new
+        return new, ""
     try:
-        return _try_legacy_active_agent(sid, project_root)
+        legacy = _try_legacy_active_agent(sid, project_root)
     except Exception:
-        return None
+        legacy = None
+    if legacy is not None:
+        return legacy, ""
+    return None, reason
 
 
 def resolve_agent_name(sid: str, project_root: Path) -> str:

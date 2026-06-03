@@ -10,6 +10,7 @@ needed. The httpd lifecycle is started/stopped explicitly per test.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import socket
 import sys
@@ -22,6 +23,14 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
+
+# Hermetic storage backend (lodestar-s7 test isolation): tests must NEVER touch
+# real S3. After the own-cloud cutover, .env.local carries
+# MIND_STORAGE_BACKEND=own-cloud; the in-process daemon fixtures here resolve
+# get_backend() from os.environ, and any wrapper subprocess they spawn inherits
+# this env. Pin local for the whole pytest session so test daemons stay on the
+# LocalBackend rather than reaching for real S3 (or 500-ing on from_env).
+os.environ["MIND_STORAGE_BACKEND"] = "local"
 
 
 @pytest.fixture
@@ -63,6 +72,27 @@ def project_root(tmp_path: Path) -> Path:
     (agent / "aspirations.jsonl").write_text(
         '{"id":"asp-100","title":"AgentLocal","status":"active","priority":"LOW",'
         '"archived":false,"goals":[],"progress":{"completed_goals":0,"total_goals":0}}\n',
+        encoding="utf-8",
+    )
+
+    # Minimal core/config/tree.yaml. The real daemon's project_root ALWAYS
+    # carries this (it's part of the framework); the tree-write reparent op's
+    # D_max gate reads it via _merged_config (which, mirroring the CLI's
+    # no-silent-fallback contract rb-215/rb-275, opens it unconditionally —
+    # unlike _load_competence_config, which tolerates a missing file). Seed it
+    # with the canonical D_max + competence_mapping so the temp repo matches
+    # production shape.
+    core_config = pr / "core" / "config"
+    core_config.mkdir(parents=True)
+    (core_config / "tree.yaml").write_text(
+        "config:\n"
+        "  D_max: 20\n"
+        "domain_health:\n"
+        "  competence_mapping:\n"
+        "    EXPLORE: 0.25\n"
+        "    CALIBRATE: 0.50\n"
+        "    EXPLOIT: 0.75\n"
+        "    MASTER: 1.00\n",
         encoding="utf-8",
     )
 

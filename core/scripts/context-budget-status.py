@@ -48,7 +48,7 @@ _timer = threading.Timer(10, lambda: os._exit(0))
 _timer.daemon = True
 _timer.start()
 
-from _paths import AGENT_DIR, PROJECT_ROOT, agent_dir as _agent_dir
+from _paths import AGENT_DIR, PROJECT_ROOT, agent_dir as _agent_dir, agents_root
 
 # Status-line subprocesses don't inherit MIND_AGENT, so _paths.AGENT_DIR is
 # typically None here. Resolution via session_id (from the status payload) maps
@@ -77,7 +77,10 @@ def _resolve_budget_path_from_session(session_id):
     # Without this, status-line subprocesses (which don't inherit MIND_AGENT)
     # cannot resolve the agent → context-budget.json is never written →
     # zone-aware batching in goal-selector silently degrades.
-    agents_parent = PROJECT_ROOT / "agents"
+    # 9: use agents_root() instead of hardcoded "agents" literal so
+    # Phase 2.6+ AGENTS_PARENT_DIR relocations don't silently regress this
+    # status-line resolver (pre-Phase-2.5.D shape would re-emerge otherwise).
+    agents_parent = agents_root()
     if agents_parent.is_dir():
         try:
             for child in agents_parent.iterdir():

@@ -167,6 +167,7 @@ def _score_gate(gate, counts, min_fires):
     instrumented = gate.get("instrumented", False)
     retirement_eligible = gate.get("retirement_eligible", False)
     keyword_bias = gate.get("keyword_bias", "balanced")
+    dominant_risk = gate.get("dominant_risk")
 
     total = sum(counts.values())
     noop = counts.get("noop", 0)
@@ -187,7 +188,7 @@ def _score_gate(gate, counts, min_fires):
         "keyword_bias": keyword_bias,
         "retirement_eligible": retirement_eligible,
         "asymmetry_magnitude": gate.get("asymmetry_magnitude"),
-        "dominant_risk": gate.get("dominant_risk"),
+        "dominant_risk": dominant_risk,
     }
 
     if not instrumented:
@@ -225,6 +226,24 @@ def _score_gate(gate, counts, min_fires):
     # The MIN_TOTAL_FIRINGS guard above prevents a single smoke-test noop
     # on an under-exercised gate from triggering false retirement.
     if meaningful == 0 and retirement_eligible:
+        # FN-dominant guard (rb 2026-05-28, canonical gate prose-verification-drift):
+        # an all-noop gate with dominant_risk=FN is typically a WORKING preventive
+        # guard whose rare, costly guarded condition simply didn't occur in-window
+        # -- retiring it removes the guard exactly when it's quiet. Route to
+        # investigate, not retire: decide whether it's correctly scoped for a rare
+        # event (keep) or mis-wired (widen/fix). Without this, the retire rule
+        # preempts the widen path (unreachable when meaningful==0) and deletes a
+        # guard that never had a chance to fire.
+        if dominant_risk == "FN":
+            return {"recommendation": "investigate",
+                    "reason": f"Gate fired {total} times over window, all noops, "
+                              f"but dominant_risk=FN. An all-noop FN-dominant gate "
+                              f"is typically a working preventive guard whose rare "
+                              f"guarded condition didn't occur in-window, NOT a dead "
+                              f"gate. Investigate whether it is correctly scoped for "
+                              f"a rare event (keep) or mis-wired (widen/fix) before "
+                              f"retiring.",
+                    "evidence": evidence}
         return {"recommendation": "retire",
                 "reason": f"Gate fired {total} times over window, all noops "
                           f"(no trigger ever matched). Has never produced a "
@@ -325,6 +344,8 @@ def _self_test():
 
     Historical failure modes guarded:
       - retire false-positive on under-exercised gates (total < MIN_TOTAL_FIRINGS)
+      - retire false-positive on FN-dominant all-noop preventive guards
+        (dominant_risk=FN must route to investigate, not retire)
       - widen rule eaten by a meaningful-firings volume guard
       - MIN_RATE_SAMPLES collapsed into MIN_TOTAL_FIRINGS (tighten fires on
         total-volume instead of rate-sample-volume)
@@ -342,6 +363,16 @@ def _self_test():
           "keyword_bias": "balanced"},
          Counter({"noop": 15}),
          "retire"),
+        # FN-dominant retire false-positive guard (rb 2026-05-28): identical
+        # counts to retire-pure-noise; only dominant_risk=FN flips the outcome
+        # to investigate. An all-noop FN-dominant gate is a working preventive
+        # guard (canonical: prose-verification-drift), not a dead gate. Without
+        # the dominant_risk guard in _score_gate, the retire rule would delete it.
+        ("fn-dominant-all-noop-investigate-not-retire",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "balanced", "dominant_risk": "FN"},
+         Counter({"noop": 15}),
+         "investigate"),
         ("retire-suppressed-by-low-volume",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "balanced"},

@@ -55,7 +55,13 @@ touch "$SENT_FILE"
 # anywhere cygpath is unavailable, fall back to the original path.
 SENT_FILE_NATIVE=$(cygpath -w "$SENT_FILE" 2>/dev/null || printf '%s' "$SENT_FILE")
 
-CURRENT_ALERTS=$(python3 "$CORE_ROOT/scripts/infra-health.py" streak-alert 2>&1 || true)
+#  (guard-659): capture stdout ONLY -- no `2>&1`. The prior merge fed
+# infra-health.py's stderr into the json.loads below; any stderr line (e.g. a
+# WM-not-init WARN) failed the parse -> except -> ALERT_JSON='[]' -> ALERT_COUNT=0
+# -> false "no alerts" (a guard-465 silent-monitoring instance). stderr now flows
+# to this wrapper's stderr (visible to the caller), not into the JSON. streak-alert
+# emits its JSON on stdout; stderr is empty in the normal case (verified ).
+CURRENT_ALERTS=$(python3 "$CORE_ROOT/scripts/infra-health.py" streak-alert || true)
 ALERT_JSON=$(echo "$CURRENT_ALERTS" | python3 -c "
 import sys, json
 raw = sys.stdin.read().strip()
@@ -94,7 +100,18 @@ except FileNotFoundError:
 
 new = []
 for a in alerts:
-    key = f\"{a.get('component')}:{a.get('last_failure')}\"
+    # : human-gated components (e.g. a GUI a human must open) are
+    # EXPECTED to be down for long stretches; keying dedup on the per-probe
+    # last_failure made every streak increment a fresh alert (roblox-studio
+    # 3-4-5-7, bridge 5-6-7-8 within one episode). For those components, key
+    # on the down-episode start (stable while the streak climbs) so only the
+    # FIRST alert per episode fires. Falls back to the last_failure key when
+    # no episode stamp exists (legacy mid-episode entries) or for
+    # non-human-gated components (unchanged per-increment behavior).
+    if a.get('human_gated') and a.get('streak_started_at'):
+        key = f\"{a.get('component')}:episode:{a.get('streak_started_at')}\"
+    else:
+        key = f\"{a.get('component')}:{a.get('last_failure')}\"
     if key in seen:
         continue
     a['_key'] = key

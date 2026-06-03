@@ -36,10 +36,177 @@ _SPAWN_LOCK_STALE_SECONDS = 30
 # any operator-perceptible orphan-pileup window.
 _SUPERSEDE_CHECK_SECONDS = 10
 
+# B15: cadence (seconds) of the own-cloud governed-dir mirror sweep. The sweep is
+# incremental (an mtime manifest skips unchanged files), so a tick is an os.walk +
+# local stat per governed file plus an S3 HEAD/PUT only for files that changed
+# since the last tick. 120s keeps cross-machine staleness of raw-write / LLM-tool
+# writes bounded without per-tick S3 cost on a quiescent tree. Override via
+# MIND_OWNCLOUD_SYNC_INTERVAL; disable entirely via MIND_OWNCLOUD_SYNC_DISABLE=1.
+_OWNCLOUD_SYNC_DEFAULT_INTERVAL = 120
+
 
 def _project_root() -> Path:
     """Resolve PROJECT_ROOT — the directory containing `mind_api/`."""
     return Path(__file__).resolve().parent.parent.parent
+
+
+def _load_env_local(project_root: Path) -> None:
+    """Populate ``os.environ`` from ``.env.local`` for the keys the daemon needs
+    to select + configure the storage backend (the ``own-cloud`` cutover, s7).
+
+    The daemon does NOT otherwise read ``.env.local`` (it inherits its env from
+    the spawning shell — ``WORLD_PATH``/``META_PATH`` arrive that way via
+    ``_paths.sh``). Without this, a ``MIND_STORAGE_BACKEND=own-cloud`` flip in
+    ``.env.local`` would never reach ``get_backend()`` and the daemon would stay
+    on the ``local`` default — a silent split-brain.
+
+    Security: loads ONLY ``MIND_*`` (the scoped own-cloud creds + backend config)
+    plus ``AWS_DEFAULT_REGION`` (a non-secret region string). It deliberately
+    NEVER loads the root ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` (which
+    on this deployment are reserved for unrelated lambda access, NOT the daemon —
+    the ``OwnCloudBackend.from_env`` fail-closed guard exists for exactly this).
+    The ``MIND_`` prefix filter excludes them by construction. ``setdefault`` so an
+    explicit launch-env value always wins; an already-set var is never clobbered.
+    """
+    env_local = project_root / ".env.local"
+    try:
+        text = env_local.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        key, val = s.split("=", 1)
+        key = key.strip()
+        if not (key.startswith("MIND_") or key == "AWS_DEFAULT_REGION"):
+            continue
+        # First whitespace token is the value (drops a trailing inline comment).
+        tok = val.strip().split()[0] if val.strip() else ""
+        # A token that IS a comment means the line had a blank value followed by a
+        # `# ...` note — e.g. `.env.example` copied to `.env.local` without editing
+        # (`MIND_MACHINE_ID=  # UNIQUE per-machine id`). Treat as EMPTY so the
+        # required-var / G5 fail-closed checks trip VISIBLY, rather than loading a
+        # bogus value like "#" that silently passes them (communication-clarity
+        # rule 5: fail visibly over a silent inconsistent value). No legitimate
+        # MIND_* value begins with '#'.
+        if tok.startswith("#"):
+            tok = ""
+        os.environ.setdefault(key, tok)
+
+
+def _ensure_owncloud_roots(project_root: Path) -> None:
+    """When the own-cloud backend is selected, ensure the governed roots
+    (``WORLD_PATH``/``META_PATH``) are present in ``os.environ`` so
+    ``OwnCloudBackend.from_env`` — called lazily by the first storage request —
+    can build its root map.
+
+    The roots live in each agent's ``local-paths.conf`` (NOT ``.env.local``) and
+    are normally exported by ``_paths.sh`` in the spawning shell. But the daemon
+    is frequently (re)spawned by paths that do NOT export them — notably
+    ``mind-api-start.sh --restart`` driven by the watchdog / orphan-sweep. On
+    those paths the roots never reach the daemon's env and every storage op 500s
+    with ``OwnCloudBackend.from_env: ... cannot map a governed path to a root``.
+    Resolving the roots here makes the daemon spawn-path-agnostic — the same
+    rationale as ``_load_env_local`` for the backend selector.
+
+    Local mode is untouched (zero added I/O): this runs ONLY when
+    ``MIND_STORAGE_BACKEND == own-cloud``. Uses ``setdefault`` so an explicit
+    shell-exported root always wins, and reuses the daemon's own
+    ``AgentPathResolver`` (``resolve(None)`` → the first agent's conf, i.e. the
+    shared-world fallback) rather than re-implementing conf parsing. Fail-open:
+    if no agent conf can be resolved, log to stderr and return — ``get_backend()``
+    raises its own specific per-request error rather than crash-loop the daemon
+    at startup.
+    """
+    if os.environ.get("MIND_STORAGE_BACKEND", "").strip().lower() != "own-cloud":
+        return
+    have_world = os.environ.get("MIND_WORLD") or os.environ.get("WORLD_PATH")
+    have_meta = os.environ.get("MIND_META") or os.environ.get("META_PATH")
+    if have_world and have_meta:
+        return
+    try:
+        from .agent_paths import AgentPathResolver
+        paths = AgentPathResolver(project_root).resolve(None)
+    except Exception as e:  # noqa: BLE001 — fail-open; lazy get_backend reports specifics
+        print(f"[runtime] _ensure_owncloud_roots: could not resolve world/meta "
+              f"roots for the own-cloud backend ({e}); storage ops will report "
+              f"the specific error per-request", file=sys.stderr)
+        return
+    os.environ.setdefault("WORLD_PATH", str(paths.world))
+    os.environ.setdefault("META_PATH", str(paths.meta))
+    os.environ.setdefault("MIND_AGENTS_ROOT", str(paths.agent.parent))
+
+
+def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event"):
+    """B15: under the own-cloud backend, run a periodic incremental mirror sweep
+    so governed-dir files persisted by RAW write paths (and LLM Write/Edit-tool
+    writes) that bypass the storage backend still reach S3 — i.e. actually sync
+    across machines. Each machine's daemon mirrors ITS machine's writes; the
+    daemon already has the scoped creds + governed roots in os.environ (see
+    _load_env_local / _ensure_owncloud_roots), so get_backend() works here.
+
+    No-op under the local backend (the local files ARE the store — nothing to
+    mirror). Fully defensive: an import failure disables the sweep without
+    touching the daemon; every tick is wrapped so a transient S3/credential error
+    logs and retries next interval, never killing the thread or the process. The
+    thread is daemon=True (dies with the process) and waits on `shutdown` so a
+    graceful stop ends it promptly. Disable via MIND_OWNCLOUD_SYNC_DISABLE=1;
+    tune cadence via MIND_OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
+
+    Returns the started Thread, or None when the sweep is not applicable."""
+    if os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower() != "own-cloud":
+        return None
+    if os.environ.get("MIND_OWNCLOUD_SYNC_DISABLE", "").strip().lower() in (
+            "1", "true", "yes"):
+        print("[runtime] own-cloud mirror sweep disabled "
+              "(MIND_OWNCLOUD_SYNC_DISABLE)", file=sys.stderr)
+        return None
+    try:
+        interval = int(os.environ.get("MIND_OWNCLOUD_SYNC_INTERVAL",
+                                      str(_OWNCLOUD_SYNC_DEFAULT_INTERVAL)))
+    except ValueError:
+        interval = _OWNCLOUD_SYNC_DEFAULT_INTERVAL
+    interval = max(30, interval)
+
+    scripts_dir = str(project_root / "core" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+
+    def _loop():
+        # Settle delay: don't fire during daemon startup churn.
+        if shutdown.wait(timeout=min(interval, 30)):
+            return
+        try:
+            import owncloud_sync
+            from storage_backend import get_backend
+        except Exception as e:  # noqa: BLE001 — import broke: disable, don't churn
+            print(f"[owncloud-sync] import failed; mirror sweep disabled: {e}",
+                  file=sys.stderr)
+            return
+        while not shutdown.is_set():
+            t0 = time.monotonic()
+            try:
+                stats = owncloud_sync.sweep(
+                    get_backend(), only_root=None, dry_run=False,
+                    use_manifest=True, full=False)
+                if stats.get("pushed") or stats.get("errors") or stats.get("conflicts"):
+                    print(f"[owncloud-sync] pushed {stats.get('pushed', 0)}, "
+                          f"conflicts {stats.get('conflicts', 0)}, "
+                          f"errors {stats.get('errors', 0)} "
+                          f"(scanned {stats.get('scanned', 0)})", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 — a bad tick never kills the thread
+                print(f"[owncloud-sync] sweep error (retry next tick): {e}",
+                      file=sys.stderr)
+            elapsed = time.monotonic() - t0
+            if shutdown.wait(timeout=max(1.0, interval - elapsed)):
+                break
+
+    t = threading.Thread(target=_loop, name="owncloud-sync", daemon=True)
+    t.start()
+    print(f"[runtime] own-cloud mirror sweep thread started (interval {interval}s)",
+          file=sys.stderr)
+    return t
 
 
 @contextlib.contextmanager
@@ -104,6 +271,20 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     project_root = _project_root()
+
+    # Load .env.local MIND_* config (storage-backend selector + scoped own-cloud
+    # creds) into os.environ before any endpoint calls get_backend(). The daemon
+    # does not otherwise read .env.local; without this a MIND_STORAGE_BACKEND
+    # cutover would never take effect in the daemon. See _load_env_local.
+    _load_env_local(project_root)
+
+    # When own-cloud is selected, ensure the governed roots (WORLD_PATH/META_PATH)
+    # are in os.environ so OwnCloudBackend.from_env can build its root map. They
+    # live in local-paths.conf (not .env.local) and do NOT reliably reach the
+    # daemon via the spawning shell on every spawn path (notably the watchdog's
+    # mind-api-start.sh --restart). Gated on own-cloud, so local mode is
+    # untouched. See _ensure_owncloud_roots.
+    _ensure_owncloud_roots(project_root)
 
     # Acquire spawn lock BEFORE the alive-check so concurrent rt_spawn calls
     # serialize. The second caller sees the live daemon written by the first
@@ -171,6 +352,12 @@ def main(argv=None) -> int:
     except RuntimeError as e:
         print(f"[runtime] {e}", file=sys.stderr)
         return 2
+
+    # B15: start the own-cloud governed-dir mirror sweep (no-op under local).
+    # Daemon-owned so it runs regardless of whether any agent loop is active and
+    # uses the creds/roots already in os.environ — each machine's daemon mirrors
+    # its own writes to S3.
+    _start_owncloud_sync_thread(project_root, shutdown)
 
     # Spawn lock released. Serving happens outside the lock so concurrent
     # alive-check spawns see the new PID/port immediately.

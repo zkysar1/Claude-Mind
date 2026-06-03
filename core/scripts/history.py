@@ -7,6 +7,7 @@ before they are overwritten. Each snapshot filename is:
 """
 
 import argparse
+import gzip
 import os
 import shutil
 import sys
@@ -20,7 +21,12 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from _paths import WORLD_DIR, META_DIR
-from _fileops import resolve_base_dir as _resolve_base_dir
+from _fileops import (
+    resolve_base_dir as _resolve_base_dir,
+    _find_history_snapshots,
+    _is_new_store_snapshot,
+    _parse_snapshot_datetime,
+)
 
 
 def resolve_base_dir(file_path):
@@ -32,30 +38,109 @@ def resolve_base_dir(file_path):
     return base
 
 
-def get_history_dir(file_path):
-    """Get the .history/ directory for a given file."""
-    file_path = Path(file_path).resolve()
-    base = resolve_base_dir(file_path)
-    rel = file_path.relative_to(base)
-    return base / ".history" / str(rel)
-
-
 def parse_snapshot_name(name):
-    """Parse timestamp and agent from snapshot filename like '2026-03-26T14-30-00_alpha.md'."""
+    """Parse timestamp and agent from snapshot filename.
+
+    Handles four forms:
+      - '<ts>_<agent>.<ext>'                legacy uncompressed snapshot
+      - '<ts>_<agent>.<ext>.gz'             legacy gzip-compressed (Stage 0/1)
+      - '<ts>_<agent>.yaml'                 new CAS-delta manifest (Stage 2+;
+                                            ts uses microsecond precision)
+      - '<ts>_<agent>.<ext>[.gz].meta'      sidecar (callers should filter
+                                            .meta first)
+
+    The trailing '.gz' is stripped before parsing so the agent token is
+    extracted from the underlying extension, not '.gz'. Timestamp parsing
+    delegates to `_fileops._parse_snapshot_datetime`, which tries both the
+    legacy `%Y-%m-%dT%H-%M-%S` format and the new `%Y-%m-%dT%H-%M-%S.%f`
+    format — single source of truth, no drift.
+    """
+    if name.endswith(".gz"):
+        name = name[:-3]
     stem = Path(name).stem
-    # Handle double extensions (.jsonl.meta)
     if "_" in stem:
         parts = stem.rsplit("_", 1)
-        timestamp_str = parts[0]
         agent = parts[1] if len(parts) > 1 else "unknown"
     else:
-        timestamp_str = stem
         agent = "unknown"
-    try:
-        ts = datetime.strptime(timestamp_str, "%Y-%m-%dT%H-%M-%S")
-    except ValueError:
-        ts = None
+    ts = _parse_snapshot_datetime(Path(name))
     return ts, agent
+
+
+def _find_snapshot_by_name(file_path, version_name):
+    """Locate a snapshot by its filename across both stores.
+
+    Returns a Path or None. Callers receive a Path that
+    `_restore_snapshot_to_target` can dispatch on without further work
+    (legacy gz vs. new-store .yaml manifest).
+
+    The version_name must match exactly as printed by cmd_list. For legacy
+    snapshots we also accept the bare name without '.gz' and the .gz name
+    when the on-disk file is uncompressed — preserves the convenience
+    behavior of the pre-Stage-2 _resolve_version_path helper.
+    """
+    snapshots = _find_history_snapshots(Path(file_path))
+    by_name = {p.name: p for p in snapshots}
+    if version_name in by_name:
+        return by_name[version_name]
+    if version_name.endswith(".gz"):
+        bare = version_name[:-3]
+        if bare in by_name:
+            return by_name[bare]
+    else:
+        with_gz = version_name + ".gz"
+        if with_gz in by_name:
+            return by_name[with_gz]
+    return None
+
+
+def _read_snapshot_text(version_path, target):
+    """Read snapshot content as text. Dispatches on store type.
+
+    Legacy gz:   gzip.open + read.
+    Legacy raw:  text read verbatim.
+    New manifest: reconstruct via _history_store.restore (walks the delta
+                  chain back to the nearest full anchor), then decode as
+                  utf-8 text.
+
+    `target` is the file the snapshot describes (the live file path the
+    user passed to cmd_diff). For new-store snapshots we resolve its
+    base_dir via the canonical `resolve_base_dir` instead of reconstructing
+    from `version_path.parts` — that avoids a fragility class where any
+    directory in the path coincidentally named `.history` or `snapshots`
+    would make `parts.index(...)` point at the wrong segment.
+
+    Used by cmd_diff. cmd_restore goes through _copy_snapshot_to_target →
+    _restore_snapshot_to_target, which is the canonical write-side path
+    and dispatches independently.
+    """
+    version_path = Path(version_path)
+    if _is_new_store_snapshot(version_path):
+        import _history_store
+        base_dir = resolve_base_dir(target)
+        content = _history_store.restore(
+            Path(target), version_path.name, base_dir,
+        )
+        return content.decode("utf-8")
+    if version_path.suffix == ".gz":
+        with gzip.open(version_path, "rt", encoding="utf-8") as f:
+            return f.read()
+    return version_path.read_text(encoding="utf-8")
+
+
+def _copy_snapshot_to_target(version_path, target):
+    """Restore snapshot bytes to target, decompressing gzip transparently.
+
+    Delegates to _fileops._restore_snapshot_to_target (single source of truth
+    for snapshot restore across the codebase), then stamps target's mtime to
+    the snapshot's filesystem mtime so downstream tooling sees a consistent
+    "when was this content placed here" signal that approximates the prior
+    shutil.copy2 behavior.
+    """
+    from _fileops import _restore_snapshot_to_target
+    _restore_snapshot_to_target(version_path, target)
+    st = version_path.stat()
+    os.utime(target, (st.st_atime, st.st_mtime))
 
 
 # ---------------------------------------------------------------------------
@@ -63,16 +148,21 @@ def parse_snapshot_name(name):
 # ---------------------------------------------------------------------------
 
 def cmd_list(args):
-    """List all versions of a file."""
-    history_dir = get_history_dir(args.file)
-    if not history_dir.exists():
-        print(f"No history for {args.file}")
-        return
+    """List all versions of a file across both legacy and new stores.
 
-    snapshots = sorted(history_dir.iterdir(), reverse=True)
-    # Filter out .meta sidecar files
-    snapshots = [s for s in snapshots if not s.name.endswith(".meta")]
+    Snapshots from the legacy `.history/<file>/<ts>...gz` tree and the new
+    `.history/snapshots/<file>/<ts>_<agent>.yaml` CAS-delta store are
+    merged and shown newest-first by parsed datetime. Each line carries a
+    `[old]` / `[new]` tag so the user can tell at a glance which store
+    holds it — useful while the legacy tree still exists pre-Stage-3.
 
+    Sizes shown:
+      legacy:  on-disk gzip'd snapshot size
+      new:     manifest `size_bytes` field (uncompressed payload size) —
+               the manifest itself is ~250 bytes; the user cares about
+               the snapshot's logical size, not the manifest's.
+    """
+    snapshots = _find_history_snapshots(Path(args.file))
     if not snapshots:
         print(f"No history for {args.file}")
         return
@@ -81,32 +171,48 @@ def cmd_list(args):
     print()
     for snap in snapshots:
         ts, agent = parse_snapshot_name(snap.name)
-        size = snap.stat().st_size
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "unknown"
 
-        # Check for summary sidecar
-        meta_file = snap.with_suffix(snap.suffix + ".meta")
-        summary = ""
-        if meta_file.exists():
-            summary = f" — {meta_file.read_text(encoding='utf-8').strip()}"
+        if _is_new_store_snapshot(snap):
+            tag = "new"
+            from _history_store import _read_manifest
+            try:
+                m = _read_manifest(snap)
+                size = m.get("size_bytes") or 0
+                summary_text = (m.get("summary") or "").strip()
+                encoding = m.get("encoding") or "?"
+            except OSError:
+                size = 0
+                summary_text = ""
+                encoding = "?"
+            extras = f" ({encoding})"
+            summary = f" — {summary_text}" if summary_text else ""
+        else:
+            tag = "old"
+            size = snap.stat().st_size
+            meta_file = snap.with_suffix(snap.suffix + ".meta")
+            summary = ""
+            if meta_file.exists():
+                summary = f" — {meta_file.read_text(encoding='utf-8').strip()}"
+            extras = ""
 
-        print(f"  {snap.name}  [{ts_str}] by {agent}  ({size:,} bytes){summary}")
+        print(f"  [{tag}] {snap.name}  [{ts_str}] by {agent}  "
+              f"({size:,} bytes){extras}{summary}")
 
 
 def cmd_restore(args):
-    """Restore a specific version of a file."""
-    history_dir = get_history_dir(args.file)
-    if not history_dir.exists():
-        print(f"Error: No history for {args.file}", file=sys.stderr)
-        sys.exit(1)
-
-    version_path = history_dir / args.version
-    if not version_path.exists():
-        print(f"Error: Version '{args.version}' not found", file=sys.stderr)
-        print(f"Available versions:", file=sys.stderr)
-        for snap in sorted(history_dir.iterdir()):
-            if not snap.name.endswith(".meta"):
-                print(f"  {snap.name}", file=sys.stderr)
+    """Restore a specific version of a file from either store."""
+    version_path = _find_snapshot_by_name(args.file, args.version)
+    if version_path is None:
+        all_snaps = _find_history_snapshots(Path(args.file))
+        if not all_snaps:
+            print(f"Error: No history for {args.file}", file=sys.stderr)
+        else:
+            print(f"Error: Version '{args.version}' not found", file=sys.stderr)
+            print(f"Available versions:", file=sys.stderr)
+            for snap in all_snaps:
+                tag = "new" if _is_new_store_snapshot(snap) else "old"
+                print(f"  [{tag}] {snap.name}", file=sys.stderr)
         sys.exit(1)
 
     target = Path(args.file)
@@ -123,7 +229,7 @@ def cmd_restore(args):
             base = resolve_base_dir(args.file)
             save_history(target, base, agent, summary=f"Before restore from {args.version}")
 
-        shutil.copy2(str(version_path), str(target))
+        _copy_snapshot_to_target(version_path, target)
 
         # Log the restore in changelog
         base = resolve_base_dir(args.file)
@@ -137,17 +243,16 @@ def cmd_restore(args):
 
 
 def cmd_diff(args):
-    """Show diff between current file and a historical version."""
+    """Show diff between current file and a historical version from either store."""
     import difflib
 
-    history_dir = get_history_dir(args.file)
-    if not history_dir.exists():
-        print(f"Error: No history for {args.file}", file=sys.stderr)
-        sys.exit(1)
-
-    version_path = history_dir / args.version
-    if not version_path.exists():
-        print(f"Error: Version '{args.version}' not found", file=sys.stderr)
+    version_path = _find_snapshot_by_name(args.file, args.version)
+    if version_path is None:
+        all_snaps = _find_history_snapshots(Path(args.file))
+        if not all_snaps:
+            print(f"Error: No history for {args.file}", file=sys.stderr)
+        else:
+            print(f"Error: Version '{args.version}' not found", file=sys.stderr)
         sys.exit(1)
 
     target = Path(args.file)
@@ -155,12 +260,12 @@ def cmd_diff(args):
         print(f"Error: Current file {args.file} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    old_lines = version_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    old_lines = _read_snapshot_text(version_path, target).splitlines(keepends=True)
     new_lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
 
     diff = difflib.unified_diff(
         old_lines, new_lines,
-        fromfile=f"{args.version} (historical)",
+        fromfile=f"{version_path.name} (historical)",
         tofile=f"{target.name} (current)",
     )
     output = "".join(diff)
@@ -171,12 +276,18 @@ def cmd_diff(args):
 
 
 def cmd_prune(args):
-    """Prune old history snapshots.
+    """Prune old history snapshots in the LEGACY gzip tree.
 
     Retention policy:
       - Keep all versions from the last 7 days
       - Keep one daily snapshot for days 8-30
       - Keep one weekly snapshot for days 31+
+
+    Scope: legacy `.history/<rel>/<ts>...gz` tree ONLY. The new CAS-delta
+    store (`.history/snapshots/<rel>/<ts>_<agent>.yaml`) has its own GC
+    via `_history_store.vacuum` — touching it here would orphan
+    blob/patch storage that vacuum later sweeps. The `snapshots/` subtree
+    is explicitly skipped during rglob descent.
     """
     base_dirs = []
     if WORLD_DIR and (WORLD_DIR / ".history").exists():
@@ -191,11 +302,26 @@ def cmd_prune(args):
     now = datetime.now()
     total_removed = 0
     total_kept = 0
+    total_skipped_locked = 0
+
+    # New-store storage roots that share .history/ with the legacy tree.
+    # Skipping these closes the mis-classification class where blob/patch
+    # files (sha256-named .gz) and manifest files (.yaml) would otherwise
+    # be candidates for the legacy retention pruner.
+    NEW_STORE_TOP_DIRS = ("snapshots", "blobs", "patches")
 
     for history_root in base_dirs:
-        # Walk all snapshot directories
+        # Walk all snapshot directories. Skip new-store storage —
+        # deleting its files would orphan blob/patch storage or manifests.
+        # The new store's GC is `_history_store.vacuum`.
         for snap_dir in sorted(history_root.rglob("*")):
             if not snap_dir.is_dir():
+                continue
+            try:
+                rel_to_root = snap_dir.relative_to(history_root)
+            except ValueError:
+                continue
+            if rel_to_root.parts and rel_to_root.parts[0] in NEW_STORE_TOP_DIRS:
                 continue
             # Only process leaf directories (containing snapshot files)
             snapshots = [f for f in snap_dir.iterdir() if f.is_file() and not f.name.endswith(".meta")]
@@ -230,26 +356,187 @@ def cmd_prune(args):
 
             def _prune_group(groups):
                 """Keep only the latest entry per group, remove the rest."""
-                nonlocal total_kept, total_removed
+                nonlocal total_kept, total_removed, total_skipped_locked
                 for _, group_entries in groups.items():
                     group_entries.sort(key=lambda x: x[0])
-                    # Keep the latest, remove the rest
+                    # Keep the latest, remove the rest.
+                    # OSError tolerance: matches _prune_to_cap defense
+                    # (_fileops.py). FileNotFoundError = a concurrent
+                    # _prune_to_cap (called from save_history) already
+                    # removed this snapshot — effectively pruned, count it.
+                    # PermissionError / WindowsError (OneDrive sync holding
+                    # the handle, file lock) = skip this one specifically
+                    # so the rest of the prune run continues; surface the
+                    # skipped count in the final report instead of crashing
+                    # the whole sweep mid-way. (bravo fresh-eyes,
+                    # msg-20260522-130146-bravo-1522.)
                     for ts, snap in group_entries[:-1]:
                         if args.dry_run:
                             print(f"  [dry-run] Would remove: {snap}")
+                            total_removed += 1
                         else:
-                            snap.unlink()
+                            unlinked = False
+                            try:
+                                snap.unlink()
+                                unlinked = True
+                            except FileNotFoundError:
+                                unlinked = True  # effectively pruned
+                            except OSError:
+                                total_skipped_locked += 1
                             meta = snap.with_suffix(snap.suffix + ".meta")
-                            if meta.exists():
-                                meta.unlink()
-                        total_removed += 1
+                            try:
+                                if meta.exists():
+                                    meta.unlink()
+                            except OSError:
+                                pass  # sidecar; never fatal
+                            if unlinked:
+                                total_removed += 1
                     total_kept += 1
 
             _prune_group(daily)
             _prune_group(weekly)
 
     action = "Would remove" if args.dry_run else "Removed"
-    print(f"{action} {total_removed} snapshots, kept {total_kept}")
+    tail = f", skipped {total_skipped_locked} locked" if total_skipped_locked else ""
+    print(f"{action} {total_removed} snapshots, kept {total_kept}{tail}")
+
+
+def cmd_prune_legacy(args):
+    """Stage 3: delete per-file legacy gz subtrees once Stage 2's new store
+    has taken over that file's snapshot history.
+
+    A legacy subtree at `<base>/.history/<rel>/` is eligible for deletion
+    when BOTH gates pass:
+
+      1. AGE GATE — every snapshot in the subtree has mtime older than
+         --min-age-days (default 30). A single recent legacy snapshot
+         (e.g., from a temporary KEEP_LEGACY_WRITES=1 rollback session)
+         disqualifies the subtree.
+
+      2. COVERAGE GATE — the corresponding new-store dir at
+         `<base>/.history/snapshots/<rel>/` exists AND contains at least
+         one manifest. Deleting a legacy subtree for a file with zero
+         new-store coverage would leave the file with NO history at all.
+
+    Conservative defaults — dry-run is the default; --apply is required
+    to actually delete. The OneDrive sync window is best-effort: this
+    sweep is one-shot per invocation, not continuous, and a snapshot
+    written between the eligibility check and the rmtree call would be
+    silently lost. Run during quiet periods.
+    """
+    min_age_days = args.min_age_days
+    age_cutoff = datetime.now().timestamp() - min_age_days * 86400
+    apply = args.apply
+
+    base_dirs = []
+    if WORLD_DIR and (WORLD_DIR / ".history").exists():
+        base_dirs.append(WORLD_DIR / ".history")
+    if META_DIR and (META_DIR / ".history").exists():
+        base_dirs.append(META_DIR / ".history")
+    if not base_dirs:
+        print("No .history/ directories found.")
+        return
+
+    deleted_dirs = 0
+    skipped_recent = 0
+    skipped_no_coverage = 0
+    bytes_freed = 0
+
+    # New-store storage roots that share .history/ with the legacy tree
+    # but are NOT legacy snapshot directories. Skipping these closes a
+    # mis-classification class where blob/patch storage looked like
+    # candidate legacy subtrees.
+    NEW_STORE_TOP_DIRS = ("snapshots", "blobs", "patches")
+
+    for history_root in base_dirs:
+        snapshots_root = history_root / "snapshots"
+        for leg_dir in sorted(history_root.rglob("*")):
+            if not leg_dir.is_dir():
+                continue
+            # Skip anything inside .history/{snapshots,blobs,patches}/ —
+            # those are new-store storage, managed by _history_store.vacuum.
+            try:
+                rel_to_root = leg_dir.relative_to(history_root)
+            except ValueError:
+                continue
+            if rel_to_root.parts and rel_to_root.parts[0] in NEW_STORE_TOP_DIRS:
+                continue
+
+            # Filter .meta sidecars AND .tmp orphans. A .tmp file left
+            # behind by an interrupted save_history is NOT a snapshot —
+            # counting it would block subtree deletion forever because its
+            # mtime stays "recent" until manually cleaned up. Mirrors the
+            # filter in _fileops._find_history_snapshots.
+            snaps = [f for f in leg_dir.iterdir()
+                     if f.is_file()
+                     and not f.name.endswith(".meta")
+                     and not f.name.endswith(".tmp")]
+            if not snaps:
+                # Empty dir (or only .tmp/.meta remnants) — clean up the
+                # husk. Doesn't need the coverage gate; nothing to lose.
+                if apply:
+                    try:
+                        leg_dir.rmdir()
+                    except OSError:
+                        pass
+                continue
+
+            # Age gate
+            recent_snap = None
+            for s in snaps:
+                try:
+                    if s.stat().st_mtime > age_cutoff:
+                        recent_snap = s
+                        break
+                except OSError:
+                    recent_snap = s  # stat failure → conservatively skip
+                    break
+            if recent_snap is not None:
+                skipped_recent += 1
+                continue
+
+            # Coverage gate: relative path from history_root → look in snapshots_root
+            try:
+                rel = leg_dir.relative_to(history_root)
+            except ValueError:
+                continue
+            new_dir = snapshots_root / rel
+            if not new_dir.exists():
+                skipped_no_coverage += 1
+                continue
+            new_manifests = [f for f in new_dir.iterdir()
+                             if f.is_file() and f.name.endswith(".yaml")]
+            if not new_manifests:
+                skipped_no_coverage += 1
+                continue
+
+            # Eligible. Compute bytes freed (informational), then delete.
+            dir_bytes = 0
+            for s in snaps:
+                try:
+                    dir_bytes += s.stat().st_size
+                except OSError:
+                    pass
+                meta = s.with_suffix(s.suffix + ".meta")
+                if meta.exists():
+                    try:
+                        dir_bytes += meta.stat().st_size
+                    except OSError:
+                        pass
+            bytes_freed += dir_bytes
+
+            if apply:
+                shutil.rmtree(leg_dir, ignore_errors=True)
+            else:
+                print(f"  [dry-run] Would delete: {leg_dir}  "
+                      f"({len(snaps)} snapshot{'s' if len(snaps) != 1 else ''}, "
+                      f"{dir_bytes:,} bytes)")
+            deleted_dirs += 1
+
+    verb = "Deleted" if apply else "Would delete"
+    print(f"{verb} {deleted_dirs} legacy subtree{'s' if deleted_dirs != 1 else ''} "
+          f"({bytes_freed:,} bytes). "
+          f"Skipped {skipped_recent} recent, {skipped_no_coverage} no-coverage.")
 
 
 # ---------------------------------------------------------------------------
@@ -275,8 +562,18 @@ def build_parser():
     diff_p.add_argument("version", help="Version filename (from list output)")
 
     # prune
-    prune_p = sub.add_parser("prune", help="Prune old snapshots")
+    prune_p = sub.add_parser("prune", help="Prune old snapshots (legacy gz tree)")
     prune_p.add_argument("--dry-run", action="store_true", help="Show what would be removed")
+
+    # prune-legacy (Stage 3)
+    pl = sub.add_parser(
+        "prune-legacy",
+        help="Delete entire legacy gz subtrees for files with new-store coverage",
+    )
+    pl.add_argument("--min-age-days", type=int, default=30,
+                    help="Skip subtrees with any snapshot newer than this (default 30)")
+    pl.add_argument("--apply", action="store_true",
+                    help="Actually delete (default: dry-run)")
 
     return parser
 
@@ -290,6 +587,7 @@ def main():
         "restore": cmd_restore,
         "diff": cmd_diff,
         "prune": cmd_prune,
+        "prune-legacy": cmd_prune_legacy,
     }
     dispatch[args.command](args)
 

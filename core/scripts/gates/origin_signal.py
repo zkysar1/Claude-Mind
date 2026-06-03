@@ -37,11 +37,15 @@ Daemon safety:
     - _gate_log() uses META_DIR cached at import-time in _paths.py — the
       daemon imports _paths once at startup so META_DIR is stable.
       _gate_log is best-effort and never raises (see _gate_log.py:18).
-    - _gate_log decision strings: the legacy gate emits "auto_derive"
-      which is NOT in _VALID_DECISIONS — that value gets coerced to
-      "fail_open" with _invalid_decision_received="auto_derive" in the
-      telemetry record. This is pre-existing legacy behavior, preserved
-      verbatim for equivalence. Fixing it is out of scope for PR 7a.
+    - _gate_log decision strings: the auto-derive branch emits decision
+      "pass" with extra.decision_path="auto_derive" -- a non-blocking PASS
+      that required Layer-D title-prefix derivation, and a valid
+      _VALID_DECISIONS value (guard-502). Earlier this branch emitted the
+      non-canonical "auto_derive", which _gate_log coerced to "fail_open"
+      with _invalid_decision_received="auto_derive"; that inflated the
+      gate's fail_open count (gate-retirement-eval flagged origin-signal
+      "investigate" on ~1023 phantom fail-opens). Fixed 2026-05-28; see the
+      reasoning-bank entry on auto-derive mislabel.
 """
 from __future__ import annotations
 
@@ -230,6 +234,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
             })
 
         # Decision derivation for telemetry.
+        decision_path = None  # branch label (guard-502); only auto-derive labeled today
         if world_user_context:
             decision = "noop"
             trigger = None
@@ -247,7 +252,13 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
                 None,
             )
         elif auto_derived_count > 0:
-            decision = "auto_derive"  # coerced to fail_open by _gate_log
+            # Auto-derived: trigger matched, a valid signal was derived
+            # (Layer-D), goal allowed -> a non-blocking PASS. decision_path
+            # marks the branch so auto-derives stay countable (guard-502).
+            # Was non-canonical "auto_derive" coerced to fail_open; fixed
+            # 2026-05-28 (rb on auto-derive mislabel).
+            decision = "pass"
+            decision_path = "auto_derive"
             trigger = next(
                 (r["origin_signal"] for r in results
                  if r.get("auto_derived")),
@@ -269,6 +280,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
                 "override_used": override_used,
                 "auto_derived_count": auto_derived_count,
                 "world_user_context": world_user_context,
+                "decision_path": decision_path,
             },
         )
         return {"any_blocked": any_blocked, "results": results}
@@ -306,10 +318,12 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
     derived = try_auto_derive(payload)
     if derived and not override_signal:
         _gate_log(
-            "origin-signal-gate", "auto_derive",  # coerced -> fail_open
+            # Auto-derived = non-blocking PASS; decision_path marks the branch
+            # (guard-502). Was non-canonical "auto_derive" coerced to fail_open.
+            "origin-signal-gate", "pass",
             trigger_matched=derived,
             payload=(payload.get("title") or "")[:500],
-            extra=dict(single_extra, derived_from=signal),
+            extra=dict(single_extra, derived_from=signal, decision_path="auto_derive"),
         )
         return {
             "would_block": False,

@@ -52,6 +52,7 @@ try:
         stdin_json_or_approve,
     )
     from _resolve_agent_from_sid import resolve as resolve_agent
+    from _paths import agent_dir as resolve_agent_dir
 except Exception:
     sys.exit(0)
 
@@ -137,7 +138,7 @@ def _audit_override(agent: str, rel_path: str, reason: str, tool_name: str) -> N
     """Append to world/post-recovery-edits.jsonl. Fail-open on any error."""
     try:
         # Find this agent's world dir from local-paths.conf
-        agent_dir = PROJECT_ROOT / "agents" / agent
+        agent_dir = resolve_agent_dir(agent)
         world = _world_dir(agent_dir)
         if world is None:
             return
@@ -182,7 +183,7 @@ def main():
         if not agent:
             approve_no_mutation()
 
-        agent_dir = PROJECT_ROOT / "agents" / agent
+        agent_dir = resolve_agent_dir(agent)
         if not agent_dir.is_dir():
             approve_no_mutation()
 

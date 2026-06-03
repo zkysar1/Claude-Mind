@@ -29,6 +29,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from ..jsonl_cache import cache
+from ..agent_paths import assert_not_cruft
 
 
 def _channel_path(ctx, channel: str):
@@ -80,6 +81,7 @@ def _mark_read_append(ctx, channel: str, agent: str, messages: list, seen: set):
     """
     sidecar = _reads_sidecar_path(ctx, channel)
     try:
+        assert_not_cruft(sidecar.parent, "mkdir (board reads sidecar)")
         sidecar.parent.mkdir(parents=True, exist_ok=True)
         read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         with open(sidecar, "a", encoding="utf-8") as f:

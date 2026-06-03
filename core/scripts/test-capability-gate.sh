@@ -32,17 +32,24 @@ GATE="$SCRIPT_DIR/capability-gate.py"
 # silently running under the fail-open path and producing misleading PASS/
 # FAIL output.
 if [[ -z "${MIND_AGENT:-}" ]]; then
-    PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    # Resolve PROJECT_ROOT + AGENTS_PARENT_DIR from the canonical helper rather
+    # than hardcoding the agent-parent layout (2). The prior bare
+    # "$PROJECT_ROOT"/*/ walk looked for local-paths.conf as a DIRECT child of
+    # PROJECT_ROOT, but under AGENTS_PARENT_DIR=agents the confs live one level
+    # deeper at agents/<name>/local-paths.conf — so the walk matched none,
+    # AUTO_BOUND stayed empty, and the gate SKIPped (exit 0) instead of binding,
+    # silently defeating the auto-bind this block exists for. Sourcing _paths.sh
+    # is safe with MIND_AGENT unset (it falls through to the first agent, never
+    # hard-fails) and mirrors session-save-id.sh's $PROJECT_ROOT/$AGENTS_PARENT_DIR glob.
+    # shellcheck disable=SC1091
+    source "$SCRIPT_DIR/_paths.sh"
     AUTO_BOUND=""
-    for agent_dir in "$PROJECT_ROOT"/*/; do
-        agent_name="$(basename "$agent_dir")"
-        case "$agent_name" in core|.claude|.git|node_modules|world|meta) continue ;; esac
-        [[ -f "$agent_dir/local-paths.conf" ]] || continue
-        # shellcheck disable=SC1091
-        AUTO_BOUND="$agent_name"; break
+    for conf in "$PROJECT_ROOT/$AGENTS_PARENT_DIR"/*/local-paths.conf; do
+        [[ -f "$conf" ]] || continue
+        AUTO_BOUND="$(basename "$(dirname "$conf")")"; break
     done
     if [[ -z "$AUTO_BOUND" ]]; then
-        echo "SKIP: no agent with local-paths.conf found in $PROJECT_ROOT — capability-routing.md unreachable without an agent binding. Bind an agent via /start <name> first." >&2
+        echo "SKIP: no agent with local-paths.conf found under $PROJECT_ROOT/$AGENTS_PARENT_DIR — capability-routing.md unreachable without an agent binding. Bind an agent via /start <name> first." >&2
         exit 0
     fi
     export MIND_AGENT="$AUTO_BOUND"

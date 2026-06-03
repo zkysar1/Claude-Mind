@@ -244,6 +244,7 @@ IF outcome_class == "routine":
    - Find target node:
      node=$(bash core/scripts/tree-find-node.sh --text "{goal.category}" --leaf-only --top 1)
      # Returns: {key, score, file, depth, summary, node_type}
+   - Read node.file
    - Navigate to node.file (use `Edit` to update — never `Write` on existing node files)
    # MR-Search episode chain encoding (Priority 1):
    # When episode_history is present, encode the PROGRESSION of understanding,

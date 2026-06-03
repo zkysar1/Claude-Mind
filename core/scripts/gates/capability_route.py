@@ -191,10 +191,27 @@ def _classify(title: str, category: str, description: str) -> dict:
             elif best_agent == agent:
                 best_conf = min(0.95, best_conf + delta)
             elif best_agent in active and agent != best_agent:
-                rationale_parts.append(
-                    f"  (kept {best_agent} despite {agent}-bias; "
-                    f"stronger Tier 1/2 signal wins)"
-                )
+                # Tier 3 high-delta override (4): a high-conviction
+                # description heuristic (delta >= 0.30) overrides a *low-confidence*
+                # Tier 1/2 signal (best_conf < 0.85). At/above 0.85 the stronger
+                # Tier 1/2 signal still wins (kept path) — without the confidence
+                # ceiling a single strong title prefix could be flipped by any
+                # adjacent phrase. Fixes: every 'Apply:' goal routed to the
+                # title-prefix agent (conf 0.80) regardless of solver_v0 /
+                # arc-agi-3 / owner-echo description content.
+                if delta >= 0.30 and best_conf < 0.85 and agent in active:
+                    prev_agent = best_agent
+                    best_agent = agent
+                    best_conf = max(0.50 + delta, best_conf)
+                    rationale_parts.append(
+                        f"  (OVERRIDE {prev_agent}->{agent}: Tier 3 delta {delta} "
+                        f">= 0.30 and Tier 1/2 conf < 0.85)"
+                    )
+                else:
+                    rationale_parts.append(
+                        f"  (kept {best_agent} despite {agent}-bias; "
+                        f"stronger Tier 1/2 signal wins)"
+                    )
 
     if not rationale_parts:
         rationale_parts.append(

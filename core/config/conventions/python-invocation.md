@@ -196,6 +196,58 @@ observed ghosting pattern. Bash heredocs for non-Python use
 and are not in scope. If future evidence shows they do, extend this
 rule.
 
+## The MIND_AGENT Pipe-LHS-Scope Gotcha (Operator Error)
+
+A `VAR=val cmd` prefix scopes `VAR` to **only** `cmd`. On a pipe, that
+prefix binds to the left-hand side; the right-hand side runs in its own
+subshell and inherits nothing from the prefix. So:
+
+```bash
+# WRONG -- MIND_AGENT is set for `echo`, NOT for the RHS `bash`
+MIND_AGENT=zeta echo "$PAYLOAD" | bash core/scripts/journal-add.sh
+```
+
+Here the right-hand `bash core/scripts/journal-add.sh` runs with
+`MIND_AGENT` unset. Worse, the `bash-agent-inject` hook (Layer 2 above)
+sees the explicit `MIND_AGENT=` token on the **left** of the pipe and
+treats it as caller-supplied override semantics, so it correctly skips
+injecting the binding on the right-hand call. The wrapper then receives no
+agent header and the daemon rejects the request. This is **operator error,
+not a hook bug** — the hook is doing exactly what an explicit override is
+supposed to do; the operator just put the override on the wrong side of the
+pipe.
+
+Three correct forms (pick whichever fits the call site):
+
+```bash
+# Right (A) -- export once; every command in the pipeline inherits it
+export MIND_AGENT=zeta
+echo "$PAYLOAD" | bash core/scripts/journal-add.sh
+
+# Right (B) -- prefix the RHS command (the one that actually needs it)
+echo "$PAYLOAD" | MIND_AGENT=zeta bash core/scripts/journal-add.sh
+
+# Right (C) -- wrap the whole pipeline in one env-prefixed subshell
+MIND_AGENT=zeta bash -c 'echo "$PAYLOAD" | bash core/scripts/journal-add.sh'
+```
+
+A heredoc fed to a single command also inherits the surrounding env, so
+heredoc-style payloads do not hit this trap (the heredoc and its consumer
+are one command, not a pipe). The trap is specific to `VAR=val LHS | RHS`
+where `RHS` is the command that needs the variable.
+
+In normal operation you do **not** need any explicit `MIND_AGENT=` prefix
+at all — the `bash-agent-inject` hook injects the bound agent automatically
+on every LLM Bash call (Layer 2 above). Add an explicit prefix only when you
+deliberately want to act as a different agent (a cross-agent probe), and
+when you do, put it on the command that needs it — never on the left of a
+pipe expecting the right side to inherit it.
+
+Observed 2026-05-23 in a zeta session (g-115-1146 investigation): an
+`MIND_AGENT=zeta echo {json} | bash journal-add.sh` call failed with a
+missing-agent-header rejection that was first mis-filed as a hook bug, then
+correctly re-classified as operator error. Documented per g-115-1189.
+
 ## Diagnostic Recipe
 
 If you see `Exit code 49` or `Python was not found; run without arguments to
@@ -247,6 +299,10 @@ rule and recovery story.
 - `world/guardrails.jsonl` → `guard-335` — fires when the error is seen
 - `world/guardrails.jsonl` → `guard-368` — fires when the agent is about
   to emit a multi-line heredoc in a direct Bash tool call
+- `world/guardrails.jsonl` → `guard-307` — sibling MIND_AGENT prefix
+  discipline (explicit prefix before session-binding writes); the
+  pipe-LHS-scope gotcha section above is the same variable, different
+  mechanism (env scoping across a pipe vs. resolution-order before binding)
 - `world/reasoning-bank.jsonl` → `rb-370` — the diagnosis entry (MS Store
   stub / hook fail-open)
 - `world/reasoning-bank.jsonl` → `rb-433` — the diagnosis entry

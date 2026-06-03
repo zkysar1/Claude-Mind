@@ -2,19 +2,30 @@
 # mind-api-code-changed.sh — SINGLE-SOURCE predicate: did the daemon's code
 # surface change between <BASE> and HEAD?
 #
-# The runtime daemon (`python -m mind_api.src`) loads exactly two kinds of
-# file into its long-lived process:
+# The runtime daemon (`python -m mind_api.src`) loads these files into its
+# long-lived process:
 #   1. everything under mind_api/src/**     (the daemon package itself)
-#   2. core/scripts/_*.py                 (the underscore-prefixed shared
-#                                          modules it imports — the `_`
-#                                          prefix IS the boundary; non-
-#                                          underscore *.py are standalone
-#                                          CLIs and *.sh are wrappers,
-#                                          NEITHER is loaded into the daemon)
+#   2. core/scripts/_*.py                 (underscore-prefixed shared modules
+#                                          it imports)
+#   3. specific NON-underscore core/scripts modules imported via the sys.path
+#                                          insert (file_locks.py et al. prepend
+#                                          core/scripts onto sys.path):
+#                                            core/scripts/gates/**  (gate evaluators)
+#                                            core/scripts/storage_backend.py
+#                                            core/scripts/experience.py
+#                                            core/scripts/tree.py
+#                                            core/scripts/tree_match.py
+#                                          The `_` prefix is NOT the boundary —
+#                                          these non-underscore modules are
+#                                          loaded too. Audited 2026-05-31 against
+#                                          the E402/sys.path-resolved import set
+#                                          in mind_api/src. If the daemon's
+#                                          import surface changes, update BOTH
+#                                          this list AND the pathspec below.
 #
 # A commit that touches only docs, world/, meta/, an agent dir, a *.sh
-# wrapper, or a non-underscore CLI cannot change daemon behaviour — the
-# running process is still current. Recycling it then is pure churn.
+# wrapper, or a standalone (NON-imported) CLI cannot change daemon behaviour —
+# the running process is still current. Recycling it then is pure churn.
 #
 # Two callers share THIS one predicate (do NOT inline the pathspec into
 # either — the boundary lives here and only here):
@@ -69,8 +80,43 @@ GIT=(git -C "$PROJECT_ROOT")
 # SHELL from glob-expanding `_*.py` so git receives the literal pathspec and
 # does its own match. Do NOT inline this list into the post-commit hook or
 # into _runtime.sh — both must call this script so the boundary stays in one
-# place. Changing the daemon's import surface? Change ONLY this line.
-changed="$("${GIT[@]}" diff --name-only "$BASE" HEAD -- mind_api/src 'core/scripts/_*.py' 2>/dev/null)" || exit 0
+# place. Changing the daemon's import surface? Change this pathspec AND the
+# import-surface list in the header comment above (keep the two in sync).
+# B1: retry transient git-lock contention before failing toward restart.
+# A concurrent agent commit (or the operator's) briefly holds .git/index.lock
+# or a ref lock; the bare `|| exit 0` below used to treat that transient error
+# as "cannot prove unchanged -> restart", producing the soak's spurious
+# "pure fail-open" daemon recycles. We retry ONLY transient lock errors; any
+# other error, or a transient one that persists past the retries, still exits
+# 0 (fail toward restart — never serve stale code). Hot path: first try
+# succeeds, zero added latency. stderr is folded into the capture to classify
+# the error: on rc=0 the capture is the file list (stderr empty); on rc!=0 it
+# is the error text (git diff fails before listing any file).
+changed=""
+_diff_rc=1
+for _attempt in 1 2 3; do
+    _out="$("${GIT[@]}" diff --name-only "$BASE" HEAD -- \
+        mind_api/src \
+        'core/scripts/_*.py' \
+        core/scripts/gates \
+        core/scripts/storage_backend.py \
+        core/scripts/experience.py \
+        core/scripts/tree.py \
+        core/scripts/tree_match.py \
+        2>&1)"
+    _diff_rc=$?
+    if [ "$_diff_rc" -eq 0 ]; then
+        changed="$_out"
+        break
+    fi
+    case "$_out" in
+        *index.lock*|*"cannot lock"*|*"Unable to create"*|*"nother git process"*)
+            sleep 0.2 ;;          # transient lock — retry
+        *)
+            break ;;              # non-transient error — fail toward restart now
+    esac
+done
+[ "$_diff_rc" -eq 0 ] || exit 0   # error (incl. exhausted transient retries) -> fail toward restart
 
 if [ -n "$changed" ]; then
     exit 0   # daemon code surface changed → restart warranted

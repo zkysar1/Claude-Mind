@@ -173,7 +173,7 @@ def _write_tree_debt_entry(entry):
     g-115-30 for the introduction of this store; reflect-maintain will consume
     it once its tree-debt loader lands (see spawned follow-up goal)."""
     try:
-        if not WORLD_DIR:
+        if WORLD_DIR is None:
             print("[tree-debt] WORLD_DIR unset — skipping debt entry write",
                   file=sys.stderr)
             return

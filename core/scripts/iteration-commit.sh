@@ -68,7 +68,7 @@ Behavior:
   - Namespace filter (g-280-12): drops paths under OTHER agents'
     directories so an agent's iteration-commit never absorbs partner
     files in agent-local namespaces. Discovers agent dirs by scanning
-    $REPO/*/self.md. Disabled when $MIND_AGENT is unset OR no agent
+    $REPO/agents/*/self.md. Disabled when $MIND_AGENT is unset OR no agent
     dirs are discovered (test repos, fresh installs). Override the
     filter explicitly with --no-namespace-filter when committing
     legitimate cross-agent edits (rare).
@@ -341,8 +341,20 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
         if [[ -z "${partner_uncommitted_owner[$recorded_path]:-}" ]]; then
           partner_uncommitted_owner["$recorded_path"]="$partner"
         fi
-      done < <(LOG_PATH="$partner_log" py -3 - 2>/dev/null <<'PYEOF' || true
+      done < <(LOG_PATH="$partner_log" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
 import json, os, sys
+# Normalize recorded paths to PROJECT_ROOT-relative POSIX form so legacy
+# absolute uncommitted-edits.jsonl entries (C:/...) match the relative
+# git-status candidates checked below (0). SINGLE SOURCE OF TRUTH
+# (rb-1405): import the SAME normalizer the Python attribution filter uses so
+# the two uncommitted-edits.jsonl consumers cannot drift on path format.
+sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
+try:
+    from _cross_agent_attribution_filter import _normalize_rel_path
+except Exception:
+    def _normalize_rel_path(p, root):  # fail-open: identity if import fails
+        return p
+proot = os.environ.get("XAGENT_ROOT", "")
 p = os.environ.get("LOG_PATH", "")
 try:
     with open(p, "r", encoding="utf-8") as f:
@@ -356,7 +368,7 @@ try:
                 continue
             fp = entry.get("file", "")
             if fp:
-                print(fp)
+                print(_normalize_rel_path(fp, proot))
 except OSError:
     pass
 PYEOF
@@ -470,6 +482,20 @@ commit_msg="$summary"$'\n\n'"$(printf '%s\n' "${body_lines[@]}")"
 # Sensitive patterns (CLAUDE.md: never commit .env, credentials, etc.).
 sensitive_regex='^(\.env|.*\.key$|.*\.pem$|credentials.*|secrets.*)'
 
+# Content-pattern filter (g-315-?? — 2026-05-21 rotate-script incident).
+# Filename-only filtering missed agents/alpha/scripts/rotate-lambda-common-pat.sh,
+# which carried a 33-char identifier-truncation of a fine-grained PAT inside
+# a script whose name matched none of the sensitive_regex tokens. This regex
+# scans file content for token shapes (≥20 chars after the type-prefix —
+# enough to be a unique identifier even when truncated). Matched files are
+# added to skipped_files with a stderr warning. Defense-in-depth complement
+# to Gate 8 (core/scripts/check-no-hardcoded-secrets.sh): iteration-commit
+# pre-stage filter keeps files out of auto-commits, Gate 8 catches anything
+# that slips into user-initiated `git commit`. Patterns must stay in sync
+# with check-no-hardcoded-secrets.sh.
+content_secret_regex='(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|ghu_[A-Za-z0-9]{20,}|ghs_[A-Za-z0-9]{20,}|ghr_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})'
+declare -a content_skipped_files=()
+
 # Parse porcelain output: positions 0-1 are status codes, then space, then path.
 # Renames "R  old -> new" need special handling — we want the destination.
 # Orphan-deletion split (): " D" entries (deleted in worktree) whose
@@ -506,6 +532,28 @@ while IFS= read -r line; do
   if [[ "$base" =~ $sensitive_regex ]]; then
     skipped_files+=("$path")
     continue
+  fi
+
+  # Content-secret filter (see content_secret_regex header above).
+  # Only scans existing files (additions, modifications) — deleted files
+  # have no content to scan and would error on grep. Self-allowlist:
+  # the scanner script itself, gitignore, and test fixtures (parallels
+  # check-no-hardcoded-secrets.sh allowed_path()).
+  if [[ -f "$path" ]]; then
+    case "$path" in
+      core/scripts/check-no-hardcoded-secrets.sh) : ;;
+      core/scripts/iteration-commit.sh)           : ;;
+      core/scripts/tests/fixtures/*)              : ;;
+      .gitignore)                                 : ;;
+      *)
+        if grep -qE "$content_secret_regex" "$path" 2>/dev/null; then
+          echo "[$SCRIPT_NAME] WARN: $path contains token-shaped content — skipping (file stays in working tree)" >&2
+          content_skipped_files+=("$path")
+          skipped_files+=("$path")
+          continue
+        fi
+        ;;
+    esac
   fi
 
   # Defensive filter: never commit our own lock dir contents ().
@@ -841,6 +889,50 @@ if [[ ${#cross_agent_partner_uncommitted_log[@]} -gt 0 ]]; then
   echo "[$SCRIPT_NAME] HINT: pass --include-untracked to override the filter (rare; only when committer legitimately authored these files during the partner's between-claim window)" >&2
 fi
 
+# --- Stash-overlap filter (4) ---------------------------------------
+# Defends against the rb-1127 / 3c4a61c4 stash-clobber incident: when agent A
+# stashes work (or an external `git stash push` runs) and a partner's
+# iteration-commit later sweeps up the recovered files, the partner's signature
+# wrongly attributes A's authorship. Probe `git stash list`; if any stashed
+# path overlaps the committer's staged set, drop those files from this commit
+# and emit a warning naming the stash SHA so the original author can recover
+# under their own signature via `git checkout <sha> -- <files>`.
+declare -a stash_filtered_files=()
+declare -a stash_overlap_log=()
+if [[ ${#staged_files[@]} -gt 0 ]]; then
+  while IFS=$'\t' read -r stash_sha stash_ref; do
+    [[ -z "$stash_sha" ]] && continue
+    declare -A _stash_paths=()
+    while IFS= read -r stash_path; do
+      [[ -z "$stash_path" ]] && continue
+      _stash_paths["$stash_path"]=1
+    done < <(git -C "$REPO" stash show --name-only "$stash_sha" 2>/dev/null || true)
+    for i in "${!staged_files[@]}"; do
+      sf="${staged_files[$i]}"
+      if [[ -n "${_stash_paths[$sf]:-}" ]]; then
+        stash_filtered_files+=("$sf")
+        stash_overlap_log+=("${stash_sha:0:8}|${stash_ref}|${sf}")
+        unset 'staged_files[i]'
+      fi
+    done
+    unset _stash_paths
+  done < <(git -C "$REPO" stash list --format="%H%x09%gd" 2>/dev/null || true)
+  staged_files=("${staged_files[@]}")
+fi
+
+if [[ ${#stash_filtered_files[@]} -gt 0 ]]; then
+  echo "[$SCRIPT_NAME] WARN: stash-overlap filter dropped ${#stash_filtered_files[@]} file(s) matching git stash entries (committer=$MIND_AGENT) — likely partner work captured by an external stash (rb-1127 / 3c4a61c4 pattern)" >&2
+  for entry in "${stash_overlap_log[@]}"; do
+    IFS='|' read -r so_sha so_ref so_path <<< "$entry"
+    echo "  filtered (stash-overlap): $so_path (stash=$so_sha $so_ref — original author recovers via: git checkout $so_sha -- $so_path)" >&2
+  done
+  echo "[$SCRIPT_NAME] HINT: if these files ARE legitimately yours, recover under your signature with 'git checkout <stash-sha> -- <path>' then re-run iteration-commit. Stash entries are inspected via 'git stash list / git stash show <ref>'." >&2
+  if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 ]]; then
+    echo "[$SCRIPT_NAME] INFO: all candidate files filtered by stash-overlap — nothing to commit" >&2
+    exit 0
+  fi
+fi
+
 # --- Dry-run output ----------------------------------------------------------
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "[$SCRIPT_NAME] DRY-RUN — would commit in $REPO:"
@@ -970,5 +1062,13 @@ for f in "${staged_files[@]}"; do
   files_json="$files_json\"$esc\""
 done
 
-printf '{"commit_sha":"%s","files_committed":[%s],"repo":"%s","goal_id":"%s","outcome":"%s","type":"%s"}\n' \
-  "$commit_sha" "$files_json" "$REPO" "$GOAL_ID" "$OUTCOME" "$TYPE"
+stash_filtered_json=""
+for f in "${stash_filtered_files[@]}"; do
+  if [[ -n "$stash_filtered_json" ]]; then stash_filtered_json="$stash_filtered_json,"; fi
+  esc="${f//\\/\\\\}"
+  esc="${esc//\"/\\\"}"
+  stash_filtered_json="$stash_filtered_json\"$esc\""
+done
+
+printf '{"commit_sha":"%s","files_committed":[%s],"stash_filtered_files":[%s],"repo":"%s","goal_id":"%s","outcome":"%s","type":"%s"}\n' \
+  "$commit_sha" "$files_json" "$stash_filtered_json" "$REPO" "$GOAL_ID" "$OUTCOME" "$TYPE"

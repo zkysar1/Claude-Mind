@@ -30,6 +30,7 @@ except ImportError:
     sys.exit(1)
 
 from _paths import META_DIR, CONFIG_DIR, WORLD_DIR, PROJECT_ROOT
+from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
 
 
 def read_yaml(path):
@@ -144,6 +145,14 @@ def cmd_check(args):
 
     for monitor in monitors:
         if monitor["status"] != "monitoring":
+            continue
+        # Evolution monitors (skill/self/program/rule) share active_monitors but
+        # carry a disjoint schema (monitor_kind/revision_id/metric_samples, NOT
+        # goals_since_change/imp_k_samples/strategy_file). They are checked by
+        # cmd_evolution_check, NOT here. Without this skip, cmd_check raises
+        # KeyError on the first evolution monitor (7). Symmetric to the
+        # "if kind not in EVOLUTION_KINDS: continue" filter in cmd_evolution_check.
+        if monitor.get("monitor_kind") in EVOLUTION_KINDS:
             continue
 
         monitor["goals_since_change"] += 1
@@ -644,7 +653,7 @@ def _email_rollback(rollback_entry):
         env["MIND_AGENT"] = agent
     try:
         result = subprocess.run(
-            ["bash", email_script],
+            bash_cmd(email_script),
             input=_json.dumps(payload), capture_output=True, text=True,
             env=env, timeout=30,
         )

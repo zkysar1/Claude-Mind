@@ -6,6 +6,9 @@ Query parameters (at least one required — same rule as the CLI):
     goal_field_name=<field>              paired with goal_field_value
     goal_field_value=<value>             AND semantics with name (both or neither)
     title_contains=<substring>           case-insensitive
+    full=true|1|yes                      return the full canonical goal record
+                                          (raw goal dict + {asp_id, source}) instead
+                                          of the 5-field projection (g-115-1304)
 
 Response: application/json — `json.dumps(results, indent=2, ensure_ascii=True)`,
 byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
@@ -78,6 +81,10 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
     raw_field_name = q.get("goal_field_name")
     raw_field_value = q.get("goal_field_value")
     raw_title = q.get("title_contains")
+    raw_full = q.get("full")
+    # full=true|1|yes → return raw goal records + {asp_id, source} metadata instead
+    # of the 5-field projection. Goal-by-id full-record read in one call (4).
+    full_mode = raw_full is not None and str(raw_full).strip().lower() in ("true", "1", "yes")
 
     # --goal-field is a 2-tuple at the CLI; rebuild from paired query params.
     # Reject "name but no value" / "value but no name" with the same shape of
@@ -121,13 +128,22 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
             asp_id = asp.get("id", "")
             for goal in asp.get("goals", []):
                 if _goal_matches(goal, status_filter, field_filter, raw_title):
-                    results.append({
-                        "goal_id": goal.get("id", ""),
-                        "asp_id": asp_id,
-                        "source": source_name,
-                        "title": goal.get("title", ""),
-                        "status": goal.get("status", ""),
-                    })
+                    if full_mode:
+                        # Full-record read (4): raw goal dict + {asp_id,
+                        # source} metadata. Returns the canonical record
+                        # (description, verification, priority, intended_agent) so a
+                        # goal-by-id lookup needs one call, not an aspiration-scoped
+                        # read + .goals[] traverse. asp_id/source are appended last so
+                        # they override any same-named goal keys (metadata authoritative).
+                        results.append({**goal, "asp_id": asp_id, "source": source_name})
+                    else:
+                        results.append({
+                            "goal_id": goal.get("id", ""),
+                            "asp_id": asp_id,
+                            "source": source_name,
+                            "title": goal.get("title", ""),
+                            "status": goal.get("status", ""),
+                        })
 
     # cmd_query uses ensure_ascii=True — match byte-for-byte.
     return Response.text(

@@ -20,6 +20,7 @@ reconfigure_stdio()
 
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT, CONFIG_DIR
 from _gate_log import log as _gate_log
+from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
 
 # Default paths point to world/ (collective task queue).
 # Overridden to agent/ at runtime when --source agent is passed.
@@ -635,9 +636,11 @@ def recompute_progress(asp):
     the total or be counted as completed. They are tracked separately.
     """
     goals = asp.get("goals", [])
-    non_recurring = [g for g in goals if not g.get("recurring")]
     recurring_count = sum(1 for g in goals if g.get("recurring"))
-    total = len(non_recurring)
+    # Census-augmented (B9-deep): "non_recurring" = all non-recurring goals
+    # (abandoned included). effective_counts folds every archived status back in,
+    # so eviction leaves total/completed/fan_out_ratio byte-identical.
+    total, completed_goals = _effective_counts(asp, include_recurring=False)
     # fan_out_ratio: growth from the creation-time seed. None when
     # initial_goal_count is absent (predates the metric — no inferred
     # backfill) or 0 (ratio from an empty seed is undefined).
@@ -645,7 +648,7 @@ def recompute_progress(asp):
     fan_out_ratio = (round(total / igc, 2)
                      if isinstance(igc, int) and igc > 0 else None)
     asp["progress"] = {
-        "completed_goals": sum(1 for g in non_recurring if g.get("status") == "completed"),
+        "completed_goals": completed_goals,
         "total_goals": total,
         "recurring_goals": recurring_count,
         "fan_out_ratio": fan_out_ratio,
@@ -2043,7 +2046,7 @@ def main():
     # Override paths for agent source
     global LIVE_PATH, ARCHIVE_PATH, META_PATH
     if args.source == "agent":
-        if not AGENT_DIR:
+        if AGENT_DIR is None:
             print("Error: MIND_AGENT not set — cannot use --source agent", file=sys.stderr)
             sys.exit(1)
         LIVE_PATH = AGENT_DIR / "aspirations.jsonl"

@@ -218,19 +218,27 @@ def _write_signals(log_path: Path, entries: list[dict]) -> None:
     os.replace(tmp, log_path)
 
 
-def _aspiration_for_goal(goal_id: str) -> str | None:
-    """Find the aspiration ID containing a goal — works for both queues.
+def _aspiration_for_goal(goal_id: str) -> tuple[str, str] | None:
+    """Find the aspiration ID and queue source containing a goal.
 
     Reads world/aspirations.jsonl and <agent>/aspirations.jsonl. Returns
-    the first match or None. Used when the signal record lacks
-    aspiration_id (legacy entries).
+    a (asp_id, source) tuple where source is "world" or "agent", or None
+    if the goal is not found in either queue. Used when the signal record
+    lacks aspiration_id and source (legacy entries).
+
+    Returning source is required so the caller can route the daemon
+    write to the correct queue. _rt.aspirations_add_goal defaults to
+    source="world"; without an explicit source, agent-queue aspirations
+    look up as aspiration_not_found in world (g-115-961, g-115-980).
+    Uses the same (path, source) candidate pattern as
+    _auto_resolve_recovered_canaries below.
     """
-    candidates = []
+    candidates: list[tuple[Path, str]] = []
     if WORLD_DIR is not None:
-        candidates.append(WORLD_DIR / "aspirations.jsonl")
+        candidates.append((WORLD_DIR / "aspirations.jsonl", "world"))
     if AGENT_DIR is not None:
-        candidates.append(AGENT_DIR / "aspirations.jsonl")
-    for path in candidates:
+        candidates.append((AGENT_DIR / "aspirations.jsonl", "agent"))
+    for path, source in candidates:
         if not path.exists():
             continue
         with open(path, "r", encoding="utf-8") as f:
@@ -244,7 +252,7 @@ def _aspiration_for_goal(goal_id: str) -> str | None:
                     continue
                 for g in asp.get("goals", []):
                     if g.get("id") == goal_id:
-                        return asp.get("id")
+                        return asp.get("id"), source
     return None
 
 
@@ -292,8 +300,14 @@ def _recent_investigate_exists(goal_id: str, since_hours: int = DEDUP_HOURS) -> 
     return False
 
 
-def _file_investigate(entry: dict, asp_id: str, dry_run: bool) -> tuple[bool, str]:
-    """File an Investigate goal on the parent aspiration."""
+def _file_investigate(entry: dict, asp_id: str, source: str,
+                      dry_run: bool) -> tuple[bool, str]:
+    """File an Investigate goal on the parent aspiration.
+
+    source must be "world" or "agent" — required because
+    _rt.aspirations_add_goal defaults to source="world", which silently
+    misroutes agent-queue aspirations as aspiration_not_found (g-115-980).
+    """
     goal_id = entry.get("goal_id") or "unknown"
     expected = entry.get("expected_interval_hours", 0)
     actual = entry.get("actual_elapsed_hours", 0)
@@ -335,7 +349,7 @@ def _file_investigate(entry: dict, asp_id: str, dry_run: bool) -> tuple[bool, st
         return True, "dry-run"
 
     try:
-        record = _rt.aspirations_add_goal(asp_id, payload)
+        record = _rt.aspirations_add_goal(asp_id, payload, source=source)
         return True, record.get("id") or "filed"
     except _rt.RtError as e:
         return False, (e.body or str(e)).strip()[:200]
@@ -540,7 +554,22 @@ def main() -> int:
             skipped_count += 1
             continue
 
-        asp_id = entry.get("aspiration_id") or _aspiration_for_goal(goal_id)
+        # Resolve aspiration_id AND source. Signal entry may carry both
+        # directly (preferred — no lookup cost); fall back to scanning
+        # both queues when either is missing. source is required to
+        # route the daemon write — _rt.aspirations_add_goal defaults to
+        # "world" and silently misroutes agent-queue aspirations otherwise
+        # (, ).
+        asp_id = entry.get("aspiration_id")
+        source = entry.get("source")
+        if not (asp_id and source):
+            found = _aspiration_for_goal(goal_id)
+            if found is not None:
+                found_asp, found_source = found
+                if not asp_id:
+                    asp_id = found_asp
+                if not source:
+                    source = found_source
         if not asp_id:
             print(f"[streak-break-reflector] WARN: aspiration not found for "
                   f"{goal_id}, skipping", file=sys.stderr)
@@ -548,7 +577,7 @@ def main() -> int:
             entry["filing_error"] = "aspiration_not_found"
             continue
 
-        ok, msg = _file_investigate(entry, asp_id, args.dry_run)
+        ok, msg = _file_investigate(entry, asp_id, source, args.dry_run)
         if ok:
             entry["processed"] = True
             entry["filed_at"] = datetime.now().isoformat(timespec="seconds")

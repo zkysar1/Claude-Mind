@@ -230,7 +230,7 @@ run_phase() {
 VERIFY_EXTRA=()
 [[ -n "$OVERRIDE_UNCOMMITTED" ]] && VERIFY_EXTRA+=(--override-uncommitted "$OVERRIDE_UNCOMMITTED")
 
-run_phase verify           --phase verify           "${COMMON[@]}" --status completed "${VERIFY_EXTRA[@]}"
+run_phase verify           --phase verify           "${COMMON[@]}" --status completed --outcome "$OUTCOME" "${VERIFY_EXTRA[@]}"
 run_phase state-update     --phase state-update     "${COMMON[@]}" --outcome "$OUTCOME"
 
 # ─── force_tree_encoding bypass-consumer (, follow-up rb-911 / ) ───
@@ -591,6 +591,144 @@ if original_outcome == "routine" and outcome == "deep":
         )
         sys.exit(0)
 
+    # 9: substantive-artifact probe (second-layer suppression).
+    # When the empty-WM check () did not fire (some buffer was
+    # non-empty from earlier work this session), the canary still fires
+    # unnecessarily if the just-closed iteration produced no new artifact.
+    # Probe four artifact types in a tight time window (default 90s back):
+    # tree node .md write, new goal filed, non-status board post,
+    # pipeline-meta mtime change. ALL FOUR negative → suppress.
+    # Config knobs (core/config/aspirations.yaml recurring:):
+    #   cargo_cult_suppress_no_artifact (default true) — gate this layer
+    #   cargo_cult_artifact_window_seconds (default 90) — probe window
+    # Fail-open: any probe error → sentinel fires as normal (the 12h
+    # global staleness backstop catches anything the probe misses).
+    try:
+        import yaml as _yaml_g_115_1089
+        sys.path.insert(0, sd)
+        import _paths as _paths_g_115_1089
+        _cfg_path = _paths_g_115_1089.CONFIG_DIR / "aspirations.yaml"
+        _recurring_cfg = {}
+        try:
+            with open(_cfg_path, encoding="utf-8") as _cf:
+                _recurring_cfg = (_yaml_g_115_1089.safe_load(_cf) or {}).get("recurring", {}) or {}
+        except Exception:
+            pass
+        _cfg_enabled = bool(_recurring_cfg.get("cargo_cult_suppress_no_artifact", True))
+        _window_seconds = int(_recurring_cfg.get("cargo_cult_artifact_window_seconds", 90))
+        if _cfg_enabled:
+            _now_ts = datetime.now()
+            _cutoff = _now_ts - timedelta(seconds=_window_seconds)
+            _world_dir_probe = _paths_g_115_1089.WORLD_DIR
+            _agent_name = os.environ.get("MIND_AGENT", "")
+            _agent_dir_probe = _paths_g_115_1089.AGENT_DIR
+            _substantive = False
+            _reason = "no substantive artifact"
+            # 1. Tree node .md file edited in window
+            _tree_dir = _world_dir_probe / "knowledge" / "tree"
+            if _tree_dir.exists():
+                for _p in _tree_dir.rglob("*.md"):
+                    try:
+                        if datetime.fromtimestamp(_p.stat().st_mtime) > _cutoff:
+                            _substantive = True
+                            _reason = f"tree-md:{_p.name}"
+                            break
+                    except Exception:
+                        continue
+            # 2. New goal in world + agent aspirations
+            if not _substantive:
+                for _asp_path in (_world_dir_probe / "aspirations.jsonl",
+                                  _agent_dir_probe / "aspirations.jsonl"):
+                    if not _asp_path.exists():
+                        continue
+                    try:
+                        for _line in _asp_path.read_text(encoding="utf-8").splitlines()[-200:]:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            try:
+                                _rec = json.loads(_line)
+                            except json.JSONDecodeError:
+                                continue
+                            for _g in (_rec.get("goals") or []):
+                                _ts = _g.get("created_at") or _rec.get("updated_at")
+                                if not _ts:
+                                    continue
+                                try:
+                                    if datetime.fromisoformat(_ts) > _cutoff:
+                                        _substantive = True
+                                        _reason = f"goal:{_g.get('id')}"
+                                        break
+                                except ValueError:
+                                    continue
+                            if _substantive:
+                                break
+                    except Exception:
+                        continue
+                    if _substantive:
+                        break
+            # 3. Non-status board post by this agent
+            if not _substantive:
+                _board_dir = _world_dir_probe / "board"
+                if _board_dir.exists():
+                    for _jl in _board_dir.glob("*.jsonl"):
+                        try:
+                            for _line in _jl.read_text(encoding="utf-8").splitlines()[-50:]:
+                                _line = _line.strip()
+                                if not _line:
+                                    continue
+                                try:
+                                    _m = json.loads(_line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if _m.get("author") != _agent_name:
+                                    continue
+                                if _m.get("type") == "status":
+                                    continue
+                                _ts = _m.get("timestamp", "")
+                                try:
+                                    if datetime.fromisoformat(_ts) > _cutoff:
+                                        _substantive = True
+                                        _reason = f"board:{_m.get('id')}"
+                                        break
+                                except ValueError:
+                                    continue
+                            if _substantive:
+                                break
+                        except Exception:
+                            continue
+            # 4. Pipeline state change (cheap proxy: pipeline.jsonl OR pipeline-meta.json mtime).
+            #    rb-1203 / 5: pipeline-add.sh writes pipeline.jsonl directly without
+            #    touching pipeline-meta.json mtime (only pipeline-recompute-meta.sh refreshes
+            #    meta), so checking meta alone missed in-window hypothesis filings and the
+            #    canary suppressed genuinely-productive forced-flips. Probe pipeline.jsonl first.
+            if not _substantive:
+                for _pf, _rsn in (
+                    (_world_dir_probe / "pipeline.jsonl", "pipeline-jsonl-updated"),
+                    (_world_dir_probe / "pipeline-meta.json", "pipeline-meta-updated"),
+                ):
+                    try:
+                        if _pf.exists() and datetime.fromtimestamp(_pf.stat().st_mtime) > _cutoff:
+                            _substantive = True
+                            _reason = _rsn
+                            break
+                    except Exception:
+                        pass
+            if not _substantive:
+                print(
+                    f"[recurring-close] g-115-1089: forced-flip "
+                    f"{original_outcome}->{outcome} with {_reason} — "
+                    f"suppressing canary for {gid}",
+                    file=sys.stderr,
+                )
+                sys.exit(0)
+    except Exception as _e:
+        # Fail-open: artifact probe error must NOT block sentinel writing.
+        print(
+            f"[recurring-close] g-115-1089: artifact probe error — {_e}",
+            file=sys.stderr,
+        )
+
 # Project root via _paths
 sys.path.insert(0, sd)
 try:
@@ -680,9 +818,58 @@ fi
 # imperative), but the cargo-cult-detector Python block above runs AFTER that and
 # becomes the TRUE terminal output seen by the LLM. Re-emit the imperative here so
 # the last lines in this tool call's stdout are the contract, not detector status.
+#
+# Outcome-aware terminal imperative (, Option C from  investigation).
+# recurring-close.sh wraps Phase 5/8/12 (verify/state-update/learning-gate +
+# productivity-check) but does NOT wrap Phase 6 (aspirations-spark). The loop
+# orchestrator's skip rule says spark fires whenever outcome_class == deep.
+# Without an outcome-aware imperative here, deep-outcome recurring closures
+# silently bypass Phase 6 — the same docs-vs-impl drift class universal RB
+# "Docs-vs-impl drift in framework shortcut wrappers" was filed against.
+# Sentinel-WM-slot transport for Phase 6 spark imperative (4).
+# When recurring-close.sh's wall-clock exceeds the Bash 2-minute timeout the
+# call backgrounds, the harness fires the stop hook before bg completes, and
+# the LLM re-enters /aspirations loop never seeing the stdout imperative
+# below. Phase 6 spark was silently bypassed on deep recurring closes
+# (observed 2/2:  bfzr7dvyk +  bo42a8rld).
+#
+# Write the OUTCOME (post Block A/C flip), goal_id, source, summary, and a
+# 60-min expires_at into wm.pending_phase_6_spark. The aspirations
+# orchestrator's Phase -0.5c.X consumes this slot on next-iteration entry
+# BEFORE precheck — if outcome=deep and not expired, it fires
+# Skill(aspirations-spark); if outcome=routine or expired, clears silently.
+# Stdout imperative below is preserved as backward-compatible signal for
+# non-bg cases. The sentinel is the authoritative transport.
+# Fail-open: errors echo to stderr and do not change MAX_RC.
+EXPIRES_AT="$(py -3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
+if [[ -n "$EXPIRES_AT" ]]; then
+    SENTINEL_PAYLOAD="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$EXPIRES_AT" py -3 -c "
+import json, os
+print(json.dumps({
+    'goal_id':    os.environ['GID'],
+    'outcome':    os.environ['OUT'],
+    'source':     os.environ['SRC'],
+    'summary':    os.environ.get('SUM',''),
+    'expires_at': os.environ['EXP'],
+}))
+" 2>/dev/null || true)"
+    if [[ -n "$SENTINEL_PAYLOAD" ]]; then
+        echo "$SENTINEL_PAYLOAD" | bash "$SCRIPT_DIR/wm-set.sh" pending_phase_6_spark >/dev/null 2>&1 \
+            || echo "[recurring-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — stdout imperative remains as fallback)" >&2
+    else
+        echo "[recurring-close] WARN: could not build pending_phase_6_spark payload (non-fatal)" >&2
+    fi
+else
+    echo "[recurring-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
+fi
+
 echo ""
 echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
-echo "[recurring-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+if [[ "$OUTCOME" == "deep" ]]; then
+    echo "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
+else
+    echo "[recurring-close] OUTCOME=routine — NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 
 exit $MAX_RC

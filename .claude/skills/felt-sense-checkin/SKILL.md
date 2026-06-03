@@ -324,6 +324,7 @@ Classify your answer:
 
 - **Material** (new primary drive, role change, added/removed operating
   principle or agent-provisionable action, multi-paragraph rewrite):
+  Read `agents/<agent>/self.md` — current Self content
   Edit `agents/<agent>/self.md` — update body AND front matter in the same Edit:
     last_updated: <today (YYYY-MM-DD)>
     last_update_trigger: felt-sense-material
@@ -368,12 +369,12 @@ path was silently dropping ticks. g-001-189 reproduces and documents.
 
 ```
 Bash: bash core/scripts/fresh-eyes-record-tick.sh last_felt_sense_checkin
-Write: agents/<agent>/reports/felt-sense-<YYYY-MM-DD>.md  # full 7-lane summary
+Write: agents/<agent>/temp/felt-sense-<YYYY-MM-DD>.md  # full 7-lane summary (staging — drained to tree)
 Bash: journal-add.sh stdin JSON {journal_file: agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md, key_events: [...], tags: [...]}
   # NOTE: journal-add.sh actual API is stdin-JSON only — no --kind / --summary
   # flags. The .md narrative file is written separately (see journal.md
-  # convention). This skill writes both: the 7-lane report at
-  # bravo/reports/felt-sense-*.md AND the index entry via journal-add.sh.
+  # convention). This skill writes both: the 7-lane summary at
+  # agents/<agent>/temp/felt-sense-*.md AND the index entry via journal-add.sh.
 ```
 
 ## Relationship to Existing Mechanisms
@@ -412,7 +413,7 @@ check as one atomic pass.
   `agents/<agent>/insights.jsonl` (bulk `--mark-processed` in Phase 1b —
   flips `processed: true` for all unprocessed entries so the `/prime`
   Phase 4 surface resets),
-  `agents/<agent>/reports/felt-sense-*.md` (new),
+  `agents/<agent>/temp/felt-sense-*.md` (new staging file),
   `agents/<agent>/journal.jsonl` (append),
   `agents/<agent>/session/working-memory.yaml` (last_felt_sense_checkin slot),
   `meta/*.yaml` (tuning edits), `core/config/verification-checklist.md`

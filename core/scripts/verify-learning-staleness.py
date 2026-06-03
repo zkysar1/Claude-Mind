@@ -138,6 +138,16 @@ _FORWARD_PY_RE = re.compile(
     r"\S*?([a-z][a-z0-9_-]*\.py)\b"
 )
 
+# L4: detect `exec "$..."/<basename>.sh "$@"` shell-wrapper-to-shell
+# delegations. Without this, wrappers like agent-aspirations-read.sh
+# (which `exec`s aspirations-read.sh) produce false-positive stale
+# findings — the flag lives in the underlying sibling, not the wrapper.
+#  (2026-05-22).
+_FORWARD_SH_RE = re.compile(
+    r"^\s*exec\s+.*?/?([a-z][a-z0-9_-]*\.sh)\b",
+    re.MULTILINE,
+)
+
 
 def load_skill_md(path: Path) -> list[tuple[int, str]]:
     """Return [(lineno, raw_line)] from the verify-learning SKILL.md."""
@@ -412,6 +422,10 @@ def _script_accepts_flag(script_path: Path, flag: str) -> bool:
             return True
         if path.suffix == ".sh":
             for m in _FORWARD_PY_RE.finditer(text):
+                forwarded = _resolve_script(m.group(1))
+                if forwarded and forwarded not in visited:
+                    queue.append(forwarded)
+            for m in _FORWARD_SH_RE.finditer(text):
                 forwarded = _resolve_script(m.group(1))
                 if forwarded and forwarded not in visited:
                     queue.append(forwarded)

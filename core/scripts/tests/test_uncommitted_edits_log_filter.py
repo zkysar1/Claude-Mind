@@ -309,6 +309,149 @@ def test_record_appends_neutral_path():
         assert result.returncode == 0, f"record script crashed on empty stdin: {result.stderr}"
 
 
+def _setup_full_record_env(tmp: Path) -> Path:
+    """Build a temp repo that uncommitted-edits-record.sh can actually run
+    against: copies the real script + _paths.sh into the temp tree, seeds
+    agents/<name>/ + local-paths.conf, returns the repo path.
+
+    Used by the g-115-1125 tests below to exercise the neutral-path filter
+    under AGENTS_PARENT_DIR=agents (the layout the live framework uses).
+    The original test_record_appends_neutral_path opted out of full setup
+    and only smoke-tested empty stdin; the filter regression that motivated
+    this fix sat undetected behind that decision."""
+    repo = _setup_repo(tmp, agents=("alpha", "zeta"))
+    core_scripts = repo / "core" / "scripts"
+    # Copy the real scripts + helpers. _paths.sh anchors via BASH_SOURCE so
+    # placing it in repo/core/scripts/ makes PROJECT_ROOT resolve to `repo`.
+    for fname in ("uncommitted-edits-record.sh", "_paths.sh"):
+        src = CORE_SCRIPTS / fname
+        dst = core_scripts / fname
+        dst.write_bytes(src.read_bytes())
+        dst.chmod(0o755)
+    # Stub team-state-read.sh so the goal_id lookup returns null without
+    # needing a full team-state.yaml file.
+    team_state_shim = core_scripts / "team-state-read.sh"
+    team_state_shim.write_text(
+        "#!/usr/bin/env bash\n"
+        "# null-everywhere shim for record-script tests\n"
+        "echo null\n"
+        "exit 0\n"
+    )
+    team_state_shim.chmod(0o755)
+    # Seed alpha's local-paths.conf — _paths.sh sources this when MIND_AGENT
+    # is set. Empty values are fine; the script doesn't read them.
+    (repo / "agents" / "alpha" / "local-paths.conf").write_text(
+        "WORLD_PATH=\nMETA_PATH=\n"
+    )
+    # Pre-seed the .python-shim/ dir so _paths.sh skips the python3 detection
+    # block — on Windows the bare `python3 -c "pass"` probe hits the Microsoft
+    # Store stub which can hang the test for tens of seconds. Mirrors what
+    # the real _paths.sh would have built lazily on first invocation.
+    shim_dir = core_scripts / ".python-shim"
+    shim_dir.mkdir()
+    for name in ("python3", "python"):
+        s = shim_dir / name
+        s.write_text("#!/usr/bin/env bash\nexec py -3 \"$@\"\n")
+        s.chmod(0o755)
+    return repo
+
+
+def _hook_payload(absolute_path: Path) -> str:
+    """Build a PostToolUse[Write] hook payload pointing at the given path.
+    Paths are JSON-string-escaped to handle Windows backslashes."""
+    p = str(absolute_path).replace("\\", "/")
+    return '{"tool_input":{"file_path":"' + p + '"}}'
+
+
+def test_record_filters_agent_prefixed_path_under_agents_parent():
+    """5 regression: under AGENTS_PARENT_DIR=agents, an edit to
+    agents/<name>/foo MUST NOT land in uncommitted-edits.jsonl. Before the
+    fix the loop at L72 walked `$PROJECT_ROOT/*/` looking for self.md
+    sentinels — but with AGENTS_PARENT_DIR=agents, no top-level sibling has
+    self.md (self.md sits at agents/<name>/self.md), so is_agent_dir stayed
+    0 and every agent-private path landed in the neutral-path log
+    (alpha accumulated 36 such false-positives before the fix).
+    """
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_full_record_env(tmp)
+        target = repo / "agents" / "alpha" / "journal.jsonl"
+        target.write_text('{"goal_id":"g-test"}\n')
+
+        result = subprocess.run(
+            [GIT_BASH, _to_bash_path(repo / "core" / "scripts" / "uncommitted-edits-record.sh")],
+            input=_hook_payload(target),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "MIND_AGENT": "alpha"},
+        )
+        assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
+        log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
+        assert not log.exists() or log.read_text().strip() == "", (
+            f"agent-prefixed path was wrongly logged. log_contents={log.read_text() if log.exists() else '(absent)'!r}"
+        )
+
+
+def test_record_appends_neutral_path_under_agents_parent():
+    """5 regression — positive case: under AGENTS_PARENT_DIR=agents,
+    an edit to core/scripts/foo MUST land in uncommitted-edits.jsonl. Pairs
+    with the negative test above so the fix is verified both ways
+    (rejects agent paths, accepts neutral paths)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_full_record_env(tmp)
+        target = repo / "core" / "scripts" / "some-new-tool.py"
+        target.write_text("# new tool\n")
+
+        result = subprocess.run(
+            [GIT_BASH, _to_bash_path(repo / "core" / "scripts" / "uncommitted-edits-record.sh")],
+            input=_hook_payload(target),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "MIND_AGENT": "alpha"},
+        )
+        assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
+        log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
+        assert log.exists(), "neutral-path edit was not logged at all"
+        contents = log.read_text()
+        assert "some-new-tool.py" in contents, (
+            f"neutral-path edit was not logged. log_contents={contents!r}"
+        )
+
+
+def test_record_filters_world_and_meta_virtual_prefixes():
+    """Sanity: world/ and meta/ virtual-prefix paths must not be logged
+    (changelog-tracked elsewhere). This branch existed before the fix and
+    should still work — locking it in via test prevents future refactors
+    from removing the case branch."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_full_record_env(tmp)
+        for sub in ("world", "meta"):
+            target = repo / sub / "something.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("# x\n")
+            result = subprocess.run(
+                [GIT_BASH, _to_bash_path(repo / "core" / "scripts" / "uncommitted-edits-record.sh")],
+                input=_hook_payload(target),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env={**os.environ, "MIND_AGENT": "alpha"},
+            )
+            assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
+        log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
+        assert not log.exists() or "world/" not in log.read_text(), \
+            f"world/ path was wrongly logged. log={log.read_text() if log.exists() else '(absent)'!r}"
+        assert not log.exists() or "meta/" not in log.read_text(), \
+            f"meta/ path was wrongly logged. log={log.read_text() if log.exists() else '(absent)'!r}"
+
+
 # ---------------------------------------------------------------------------
 # Clear-on-success tests
 # ---------------------------------------------------------------------------

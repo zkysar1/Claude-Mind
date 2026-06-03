@@ -180,6 +180,13 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         archived.sort(key=lambda a: a.get("completed_at") or "", reverse=True)
         stones = []
         for asp in archived[:limit]:
+            # B9-deep: an archived aspiration may have been goal-evicted while
+            # live, so its `goals` list under-counts. Fold archived_census back
+            # in for an accurate stepping-stone tally (read inline — see
+            # core/scripts/_goal_census.py; display-only, no import coupling).
+            _bs = ((asp.get("archived_census") or {}).get("by_status") or {})
+            _evicted_total = sum(v for v in _bs.values() if isinstance(v, int))
+            _evicted_completed = _bs.get("completed", 0) if isinstance(_bs.get("completed"), int) else 0
             stones.append({
                 "id": asp["id"],
                 "title": asp["title"],
@@ -187,8 +194,9 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                 "scope": asp.get("scope", "unknown"),
                 "tags": asp.get("tags", []),
                 "goals_completed": len([g for g in asp.get("goals", [])
-                                        if g.get("status") == "completed"]),
-                "goals_total": len(asp.get("goals", [])),
+                                        if g.get("status") == "completed"])
+                                   + _evicted_completed,
+                "goals_total": len(asp.get("goals", [])) + _evicted_total,
                 "goal_summaries": [
                     {"title": g["title"], "status": g.get("status", "unknown"),
                      "category": g.get("category")}

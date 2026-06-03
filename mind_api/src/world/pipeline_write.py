@@ -25,6 +25,8 @@ from ..jsonl_cache import cache as _jsonl_cache
 from .. import file_locks, history, changelog
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
+from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
+from ..agent_paths import assert_not_cruft  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +57,10 @@ DEFAULT_FIELDS = {
 # ---------------------------------------------------------------------------
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    # s5c (own-cloud): force-fresh via the backend before reading. In-lock RMW
+    # callers get lost-update prevention + the If-Match fence etag; plain probe
+    # reads get the latest remote state. No-op on LocalBackend.
+    get_backend().refresh(path)
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items
@@ -68,6 +74,7 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 
 def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
+    assert_not_cruft(path.parent, "mkdir (pipeline_write._atomic_write_jsonl)")
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def _write(handle):
@@ -88,6 +95,7 @@ def _append_to_archive(path: Path, item: Dict[str, Any]) -> None:
     accept the narrower guarantee because the daemon serializes on
     live_path).
     """
+    assert_not_cruft(path.parent, "mkdir (pipeline_write._append_to_archive)")
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")
@@ -739,6 +747,7 @@ def _update_meta(live_path: Path, archive_path: Path, meta_path: Path) -> None:
             except (json.JSONDecodeError, OSError):
                 pass
 
+        assert_not_cruft(meta_path.parent, "mkdir (pipeline_write meta refresh)")
         meta_path.parent.mkdir(parents=True, exist_ok=True)
 
         def _write(handle):
@@ -891,6 +900,13 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         with file_locks.locked(meta_path):
+            # #38 own-cloud: force-fresh the local cache BEFORE the raw read so
+            # (a) the read sees a peer's committed meta and (b) the backend
+            # records the If-Match fence etag. Without it the _atomic_write
+            # below issues an UNCONDITIONAL PUT (fence=None) that silently
+            # clobbers a concurrent peer's meta update on a stale-lock-break
+            # race. No-op on LocalBackend; also materializes a remote-only meta.
+            get_backend().refresh(meta_path)
             # Read existing or create default.
             if meta_path.exists():
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -902,6 +918,7 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
 
             # Atomic write via _fileops helper (same retry policy as
             # locked_write_json but we already hold the lock).
+            assert_not_cruft(meta_path.parent, "mkdir (pipeline_write meta_update)")
             meta_path.parent.mkdir(parents=True, exist_ok=True)
 
             def _write(handle):
@@ -924,6 +941,68 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"ok": True, "data": data})
 
 
+def recompute_meta(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/pipeline/recompute-meta
+
+    Mirrors pipeline.py cmd_recompute_meta: full recount of pipeline-meta.json
+    from live + archive records, preserving micro_hypothesis_stats from the
+    existing meta. Unlike the post-sweep _update_meta() refresh, this mirrors
+    the CLI's write_json -> locked_write_json path, so it ALSO writes a history
+    snapshot + changelog entry (cmd_recompute_meta is an explicit maintenance
+    recount, not an incidental refresh). The serialization
+    (`json.dump(meta, h, indent=2, ensure_ascii=True)` + trailing "\\n") is
+    byte-identical to _fileops.locked_write_json (_fileops.py:1651-1653).
+    """
+    from ..server import Response
+
+    live_path, archive_path, base_dir = _resolve_paths(ctx)
+    meta_path = base_dir / "pipeline-meta.json"
+    agent = _agent_name(ctx)
+
+    try:
+        with file_locks.locked(live_path):
+            live_items = _read_jsonl(live_path)
+            archive_items = _read_jsonl(archive_path)
+        meta = _compute_meta(live_items, archive_items)
+
+        with file_locks.locked(meta_path):
+            # Preserve micro_hypothesis_stats from existing meta. Read inside
+            # the lock so a concurrent meta_update can't lose its stats between
+            # our read-old and our atomic-write-new (same as _update_meta).
+            # #38 own-cloud: refresh BEFORE the raw read so the read sees a
+            # peer's committed meta and the backend records the If-Match fence
+            # etag — without it the _atomic_write issues an unconditional PUT
+            # that silently clobbers a concurrent meta_update. No-op locally.
+            get_backend().refresh(meta_path)
+            if meta_path.exists():
+                try:
+                    old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if "micro_hypothesis_stats" in old_meta:
+                        meta["micro_hypothesis_stats"] = old_meta["micro_hypothesis_stats"]
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            assert_not_cruft(meta_path.parent, "mkdir (pipeline_write recompute-meta)")
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+
+            def _write(handle):
+                json.dump(meta, handle, indent=2, ensure_ascii=True)
+                handle.write("\n")
+
+            _atomic_write_with_fallback(
+                meta_path, _write,
+                fallback_counter_key="daemon_pipeline_recompute_meta")
+
+            history.snapshot(meta_path, base_dir, agent,
+                             summary="pipeline-recompute-meta")
+            changelog.append(base_dir, agent, meta_path, "edit",
+                             summary="pipeline-recompute-meta", lines_changed=1)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+
+    return Response.json({"ok": True, "meta": meta})
+
+
 # ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
@@ -935,3 +1014,4 @@ def register(routes) -> None:
     routes[("POST", "/v1/pipeline/update-field")] = update_field
     routes[("POST", "/v1/pipeline/archive-sweep")] = archive_sweep
     routes[("POST", "/v1/pipeline/meta-update")] = meta_update
+    routes[("POST", "/v1/pipeline/recompute-meta")] = recompute_meta

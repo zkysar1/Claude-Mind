@@ -66,6 +66,31 @@ Bash: retrieve.sh --category {topic-category} --depth shallow
      - Research focus = broad (building initial understanding)
 ```
 
+## Step 1.5: Encode-Stable-Facts Gate (G17)
+
+Before external probing, check whether the topic names a resource whose locator
+is already encoded in `world/conventions/`. This prevents redundant web discovery
+for stable facts (paths, endpoints, account IDs) that prior sessions already found.
+
+```
+Bash: bash core/scripts/encode-stable-facts-gate.sh \
+  --resource-id "{topic}" \
+  --probe-count 0 \
+  --threshold 3
+
+# Exit 0 → proceed to Step 2 (resource not yet at threshold, or locator already exists).
+# Exit 1 → the topic names a resource that has been probed ≥3 times without encoding.
+#   Read the JSON output: if locator_found is true, read locator_file and use the
+#   encoded value instead of re-discovering via web search. If locator_found is false,
+#   proceed to Step 2 but encode any stable locator values discovered into
+#   world/conventions/ before returning (per .claude/rules/encode-stable-facts.md).
+#
+# Note: probe-count starts at 0 here (first invocation for this topic this session).
+# Callers that invoke research-topic multiple times for the same resource should
+# increment probe-count across calls. The --threshold 3 default applies; research-topic
+# may use a higher threshold via --threshold if broad exploration is documented.
+```
+
 ## Step 2: Research
 
 Depth adapts to the goal's needs. The caller sets depth based on effort assessment.

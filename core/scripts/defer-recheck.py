@@ -622,38 +622,33 @@ def _read_goals(source):
 
     Uses the daemon via _rt (aspirations.py read CLI was deleted in the
     2026-05-14 cutover; _rt is the canonical Python -> daemon client).
-    Decode path is g-115-766-tolerant: lstrip + raw_decode + loud-stderr +
-    sys.exit(1) per the contract documented in
-    `consolidation-health.py::_tolerant_decode`. Applied via g-115-797-A1
-    (bravo audit catalog row 6) — replaces the prior silent-collapse
-    `except json.JSONDecodeError: return []` that would hide corruption
-    behind a "no goals to recheck" no-op and freeze defers for ~5 days.
+    Decode path is g-115-766-tolerant via `_rt.tolerant_decode_aggregate`
+    (extracted from this site + 3 siblings via g-115-949). Replaces the
+    prior silent-collapse `except json.JSONDecodeError: return []` that
+    would hide corruption behind a "no goals to recheck" no-op.
+
+    RtError is FATAL (sys.exit(1)) per guard-383: the caller at line 702
+    merges this function's world+agent reads into a single aggregate
+    (`_read_goals("world") + _read_goals("agent")`), and a silent [] from
+    one source would poison the merged set with a complete-looking lie —
+    cleared defers based on a half-view. Mirrors the canonical pattern in
+    parent-supersession-sweep.py:158-164 / blocker-recheck.py / the rest
+    of the g-115-797 catalogue. The defer-recheck.sh wrapper swallows
+    non-zero exit so a transient daemon outage just leaves the defers
+    untouched for the next sweep — no regression on daemon-up.
     """
     try:
         out = _rt.aspirations_read(source=source, active=True)
     except _rt.RtError as e:
-        print(f"[defer-recheck] {source} read failed: {e.body or e}", file=sys.stderr)
+        # guard-383: source error is FATAL for the N>=2-source aggregator
+        # pattern (line 702 merges "world" + "agent"). A silent [] would
+        # poison the merged aggregate with a complete-looking lie.
+        print(f"[defer-recheck] {source} read failed: {e.body or e}",
+              file=sys.stderr)
+        sys.exit(1)
+    data = _rt.tolerant_decode_aggregate(f"[defer-recheck] {source}", out)
+    if data is None:
         return []
-    stripped = (out or "").lstrip()
-    if not stripped:
-        return []  # genuinely empty queue — valid state, not a source error
-    try:
-        data, _consumed = json.JSONDecoder().raw_decode(stripped)
-    except json.JSONDecodeError as exc:
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"[defer-recheck] {source} JSONDecodeError ({exc}); body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: source error is fatal; fail-open is the wrapper
-    if not isinstance(data, (dict, list)):
-        body_prefix = stripped[:120].replace("\n", "\\n")
-        print(
-            f"[defer-recheck] {source} non-dict/non-list aggregate (type={type(data).__name__}); "
-            f"body prefix: {body_prefix!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)  # guard-383: a non-aggregate source body is corrupt, not empty
     goals = []
     for asp in (data.get("aspirations") if isinstance(data, dict) else data) or []:
         for g in asp.get("goals", []) or []:

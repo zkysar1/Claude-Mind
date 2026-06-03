@@ -17,6 +17,7 @@ GOAL_STATUS=""
 GOAL_FIELD_NAME=""
 GOAL_FIELD_VALUE=""
 TITLE_CONTAINS=""
+FULL=0
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
 # --goal-field takes TWO values, so it gets a three-tier shift guard (same
@@ -36,6 +37,11 @@ while [[ $# -gt 0 ]]; do
             GOAL_FIELD_VALUE="${3-}"
             PASSTHROUGH+=("$1" "${2-}" "${3-}")
             shift $(( $# >= 3 ? 3 : ($# >= 2 ? 2 : 1) ));;
+        --full)
+            # Boolean flag (no value): full-record read mode (4).
+            # Translated to the full=true query param after the filter check below,
+            # so --full alone (no filter) still hits the "filter required" error.
+            FULL=1; shift;;
         *)
             PASSTHROUGH+=("$1"); shift;;
     esac
@@ -61,6 +67,9 @@ if [ -z "$QUERY" ]; then
     echo "Error: at least one filter is required (--goal-status, --goal-field, or --title-contains)." >&2
     exit 1
 else
+    # --full appends full=true ONLY when a filter is present (QUERY non-empty),
+    # so --full alone falls through to the filter-required error above (4).
+    if [ "$FULL" = "1" ]; then QUERY+="&full=true"; fi
     rc=0
     rt_call GET /v1/aspirations/query --query "$QUERY" || rc=$?
 fi

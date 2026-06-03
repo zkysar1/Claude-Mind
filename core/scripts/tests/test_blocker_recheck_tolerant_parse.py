@@ -220,6 +220,11 @@ def test_read_blockers_empty_slot_returns_empty_list():
         def wm_read(slot, as_json):
             return "null"  # canonical empty-slot serialization
 
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
+
     orig_rt = M._rt
     M._rt = _StubRt
     try:
@@ -243,6 +248,11 @@ def test_read_blockers_dict_slot_filtered_to_empty_list():
         @staticmethod
         def wm_read(slot, as_json):
             return '{"version": 2}'  # dict slot value
+
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
 
     orig_rt = M._rt
     M._rt = _StubRt
@@ -312,6 +322,11 @@ def test_read_blockers_on_corruption_exits_not_silent():
         @staticmethod
         def wm_read(slot, as_json):
             return "<<< not valid json at all >>>"
+
+        @staticmethod
+        def tolerant_decode_aggregate(source, raw):
+            import importlib
+            return importlib.import_module("_rt").tolerant_decode_aggregate(source, raw)
 
     orig_rt = M._rt
     M._rt = _StubRt

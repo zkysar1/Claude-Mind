@@ -337,6 +337,13 @@ def _load_capability_routing(world_dir) -> list:
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]+(?:[-_.][A-Za-z0-9]+)*")
 _PORT_RE = re.compile(r"\b\d{4,5}\b")
+# g-001-254: ISO dates/timestamps in failure_reasons (origin_signal carries
+# "2026-05-31T..." etc.) would otherwise have their 4-digit year matched by
+# _PORT_RE below as a spurious "port" keyword, producing false capability
+# matches and false-positive HIGH Unblock goals. Strip them first. A real port
+# (4-5 bare digits) never matches this dd-dd-dd-shaped pattern, so legit
+# port-keyword extraction is unaffected.
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2})?\b")
 
 # Stopwords — generic tokens too general to discriminate. DO NOT add
 # discriminative infra terms here; that silently breaks detection.
@@ -371,6 +378,11 @@ _STOPWORDS = {
     "access", "fresh", "live", "cannot", "still", "present", "presence",
     "pending", "awaiting", "required", "requires", "needs", "active",
     "control", "deployment", "evaluation", "accumulated", "meaningful",
+    # g-001-255: generic analysis verbs are non-discriminative; without these,
+    # "evaluate" leaks into keyword matching (it is in _IMPERATIVE_VERBS for
+    # title-gen, NOT here) and false-matched analyze-npc-behavior. The noun
+    # "evaluation" was already a stopword; the verb forms were not.
+    "evaluate", "evaluated", "evaluating",
     "before", "after", "only", "first", "last", "then", "stale",
     "must",
 }
@@ -498,6 +510,8 @@ def _extract_keywords(text: str, noise_phrases: list = None) -> set:
         return set()
     if noise_phrases:
         text = _strip_noise_phrases(text, noise_phrases)
+    # g-001-254: drop ISO dates/timestamps before port extraction (see _ISO_DATE_RE).
+    text = _ISO_DATE_RE.sub(" ", text)
     keywords = set()
     for m in _PORT_RE.finditer(text):
         keywords.add(m.group(0))

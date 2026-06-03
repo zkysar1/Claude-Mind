@@ -20,6 +20,22 @@ When using Read, Write, or Edit tools on files under `meta/` or `world/`:
 When using Bash scripts (meta-set.sh, retrieve.sh, etc.), paths resolve automatically
 via `_paths.sh` — no manual resolution needed.
 
+**Bash hooks do NOT rewrite `world/`/`meta/` prefixes (g-115-1056, verified 2026-05-27).**
+The "resolve automatically" above holds ONLY because the invoked script sources
+`_paths.sh` INTERNALLY (which exports `$WORLD_PATH`/`$META_PATH`). The two
+PreToolUse[Bash] hooks do NOT touch path arguments: `bash-agent-inject.py` only
+PREPENDS env exports (`export PATH=...; MIND_AGENT=...; export MIND_SID=...`) to
+the command (`bash-agent-inject.py:367`), and `bash-path-resolution-hook.sh` only
+DENIES new-top-level-entry cruft (it never rewrites a path). So a bare positional
+invocation like `bash world/scripts/<name>.sh ...` is NOT prefix-resolved — `world/`
+stays a literal relative path from cwd (PROJECT_ROOT), where no `world/` directory
+exists (the local repo holds only `core/`, `.claude/`, and `agents/`; `world/` lives
+at an external `$WORLD_PATH`), so the command fails to find the script. Use
+`source core/scripts/_paths.sh` then `bash "$WORLD_PATH/scripts/<name>.sh" ...`, or
+invoke the script's daemon wrapper. Contrast Read/Write/Edit/MultiEdit (rule above),
+whose `file_path` virtual prefixes ARE resolved by the PreToolUse[Write|Edit] path
+hook — that resolution does NOT extend to Bash tool arguments.
+
 ### Standard for daemon endpoints and long-running Python processes
 
 Every `mind_api/src/` endpoint MUST resolve paths through the per-request

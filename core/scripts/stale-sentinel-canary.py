@@ -56,6 +56,7 @@ try:
     import yaml
     from _paths import AGENT_DIR, CORE_ROOT, PROJECT_ROOT
     from _fileops import acquire_lock, release_lock
+    from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
 except Exception:
     sys.exit(0)
 
@@ -163,7 +164,7 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
     script_path = (Path(PROJECT_ROOT) / "core" / "scripts" / "aspirations-add-goal.sh").as_posix()
     try:
         result = subprocess.run(
-            ["bash", script_path, "--source", "world", ASP_ID],
+            bash_cmd(script_path, "--source", "world", ASP_ID),
             input=json.dumps(payload),
             capture_output=True, text=True, timeout=30,
         )
@@ -191,7 +192,7 @@ def run(threshold: int, dry_run: bool) -> dict:
         "investigate_goals_filed": [],
     }
 
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         report["skipped"] = "no_agent_bound"
         return report
 

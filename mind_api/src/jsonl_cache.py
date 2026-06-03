@@ -62,6 +62,17 @@ class JsonlCache:
         history snapshot recovery (that lives in _fileops.py and is invoked
         on the fallback path).
         """
+        # s5 (lodestar own-cloud): materialize from the active backend BEFORE
+        # the stat, so the mtime-keyed cache invariant holds under own-cloud.
+        # ensure_local() does a TTL-throttled HeadObject and downloads a changed
+        # S3 object into the local cache, bumping its mtime so the reload logic
+        # below fires (correcting the doc's H3 "no change needed" — nothing else
+        # pulls the object in before this stat). Identity/no-op on the default
+        # LocalBackend (zero added I/O); function-local import so module-load
+        # order can't break it. Covers BOTH the small-file direct read and the
+        # cached read since it precedes the size branch.
+        from storage_backend import get_backend
+        get_backend().ensure_local(path)
         try:
             st = path.stat()
         except FileNotFoundError:

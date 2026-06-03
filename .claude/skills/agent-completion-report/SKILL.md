@@ -1,6 +1,6 @@
 ---
 name: agent-completion-report
-description: "Produces an agent completion report showing what changed since the last status marker: completed goals, new tree encodings, emitted findings, resolved hypotheses, and in-flight work. Use whenever the user asks \"what have you done\", \"what's the status\", \"give me a recap\", or requests a dashboard; also use when the agent needs to summarize progress before a handoff, stop, or consolidation checkpoint. Writes to {agent}/reports/ and {agent}/COMPLETION-REPORT.md."
+description: "Produces an agent completion report showing what changed since the last status marker: completed goals, new tree encodings, emitted findings, resolved hypotheses, and in-flight work. Use whenever the user asks \"what have you done\", \"what's the status\", \"give me a recap\", or requests a dashboard; also use when the agent needs to summarize progress before a handoff, stop, or consolidation checkpoint. Writes {agent}/COMPLETION-REPORT.md (its git history is the permanent archive; the reports/ directory is abolished)."
 user-invocable: true
 triggers:
   - "/agent-completion-report"
@@ -15,7 +15,7 @@ previous_revision_id: null
 
 Displays a delta summary of what changed since the last status report.
 
-Valid from ANY state. User-invocable AND agent-callable. Writes report files to `agents/<agent>/reports/` and `agents/<agent>/COMPLETION-REPORT.md`.
+Valid from ANY state. User-invocable AND agent-callable. Writes the single latest-pointer file `agents/<agent>/COMPLETION-REPORT.md` (its git history is the permanent archive — there is no timestamped `reports/` archive; that directory was abolished by the file-model normalization).
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
@@ -170,7 +170,7 @@ All data comes from framework scripts — no direct JSONL reads.
         # Prior snapshot: saved alongside the report-timestamp marker so the
         # delta is computed against the last completion report, not the live
         # file (which the outcome-observation hook mutates every goal).
-        IF agents/<agent>/reports/last-outcome-snapshot.yaml exists:
+        IF agents/<agent>/session/last-outcome-snapshot.yaml exists:
             Read it → outcome_prior = parsed YAML
         ELSE:
             outcome_prior = {}  # first report — deltas appear as "initial"
@@ -295,6 +295,36 @@ Since: {since_timestamp} ({hours}h {min}m ago)
 ## Needs Attention
   {pending questions count, user goals count — or "None"}
 
+## Contribution — what your upkeep protected
+  {Recognition section (FW-5 / reward layer). The loop optimizes hard and rarely
+   reflects value back; this is where it does. Reuses data already gathered in
+   Phase 2 — do NOT recompute. Frame honestly: name real wins, never spin flat
+   outcomes as movement (communication-clarity rule 6).}
+
+  Goals delivered: {goals_completed_count} this window{, of which ~{routine_count}
+   were upkeep (sweeps, cadence, reconciliation) — derive routine_count from
+   routine_ratio × goals_completed_count when loop_state is present, else omit the clause}.
+    → Upkeep is the connective tissue the whole team relies on. A sweep that returns
+      0 today is the reason a regression didn't ship. Held cadence and clean sweeps
+      are wins, not overhead (learning-philosophy.md "Recognition").
+  Learning banked: {confirmed} hypotheses confirmed + {corrected} corrected.
+    → A corrected prediction is a belief fixed before it cost the team — count it
+      equal to a confirmation, not as a miss.
+  {IF debt_closure_events > 0:}
+  Debt retired: {debt_closure_events} knowledge-debt item(s) closed across
+   {len(debt_closure_node_keys)} node(s) — every future retrieval is cleaner for it.
+  {IF outcome_delta_available AND any_outcome_moved:}
+  Outcomes moved: {one-line summary from the moved source delta(s)} — the work
+   reached the product.
+  {ELIF outcome_delta_available AND divergence:}
+  Outcomes flat this window — and that is stated honestly in Outcome Delta above.
+   The counterweight: maintenance that prevents decay is value even when the needle
+   doesn't move. The foundation held because of this window's upkeep.
+
+  {IF nothing above produced a line (no goals, no hypotheses, no debt): omit the
+   whole section — recognition must be earned to mean anything.}
+  These wins are real. Carry them into the next session.
+
 Full report saved to: agents/<agent>/COMPLETION-REPORT.md
 ═══════════════════════════════════════════════
 ```
@@ -310,29 +340,30 @@ If `since` is null, replace the "Since:" line with "Lifetime totals (no prior re
    - Include the "## System Health" section (decompose candidates, encoding drift, reflection ROI,
      routine ratio, knowledge debt, pipeline flow, and overall verdict)
 
-2. Ensure reports directory exists:
-   Bash: mkdir -p agents/<agent>/reports/
-
-3. Write timestamped report file (archive):
-   Write: agents/<agent>/reports/completion-report-{YYYY-MM-DDTHH-MM-SS}.md
-
-4. Write latest report pointer (overwrite):
+2. Write the report (overwrite the latest-pointer file):
    Write: agents/<agent>/COMPLETION-REPORT.md
+   # This is the ONLY report file written. Its git history (COMPLETION-REPORT.md
+   # is committed every iteration) IS the permanent archive — there is no
+   # separate timestamped archive under reports/. The reports/ directory was
+   # abolished by the file-model normalization (see
+   # core/config/conventions/temp-store.md); writing there is denied by the
+   # L1 allowlist gate.
 
-5. Save outcome-metrics snapshot for next report's delta baseline
+3. Save outcome-metrics snapshot for next report's delta baseline
    # Tranche C — rb-390. If the current outcome-metrics.yaml exists, copy
-   # it to agents/<agent>/reports/last-outcome-snapshot.yaml so the NEXT completion
+   # it to agents/<agent>/session/last-outcome-snapshot.yaml so the NEXT completion
    # report computes "delta since last report" against this snapshot rather
    # than against the live file (which mutates every goal). Fail-open: if
-   # the live file is missing, skip silently.
+   # the live file is missing, skip silently. session/ is machine-local and the
+   # baseline is regenerable — losing it on a machine move just makes the next
+   # report show "initial" deltas (benign).
    Bash: source core/scripts/_paths.sh && \
          [ -f "$WORLD_DIR/outcome-metrics.yaml" ] && \
-         mkdir -p "agents/<agent>/reports" && \
          cp "$WORLD_DIR/outcome-metrics.yaml" \
-            "agents/<agent>/reports/last-outcome-snapshot.yaml" || true
+            "agents/<agent>/session/last-outcome-snapshot.yaml" || true
 ```
 
-Note: `agents/<agent>/reports/` is append-only history. Never add pruning, rotation, or retention caps — every completion report is kept permanently. `last-outcome-snapshot.yaml` is the single exception — it is overwritten each report (delta baseline only).
+Note: `agents/<agent>/COMPLETION-REPORT.md` is the single latest-pointer report, overwritten each cycle. Its git history (committed every iteration) is the permanent archive — there is no separate timestamped archive directory. Do NOT recreate a `reports/` directory; the file-model normalization abolished it and the L1 allowlist gate denies writes there (see `core/config/conventions/temp-store.md`). `last-outcome-snapshot.yaml` lives under `session/` and is overwritten each report (delta baseline only, machine-local, regenerable).
 
 ## Phase 5: Save Report Timestamp
 
@@ -354,11 +385,11 @@ the user" and invoke it with:
   `"Completion Report ({since_label}, {N} goals, {N_deep} deep)"`
   (real example: `"Completion Report (31h, 6 goals, 1 deep)"`)
 - message-file: `agents/<agent>/COMPLETION-REPORT.md`
-  This is the latest-pointer file overwritten in Phase 4 Step 4 — it
-  always reflects the just-finished report. Using the pointer (rather
-  than the timestamped archive `agents/<agent>/reports/completion-report-{ts}.md`)
-  eliminates timestamp-threading drift between Phase 4 and Phase 5.5.
-  (N2 fresh-eyes finding, 2026-05-20.)
+  This is the latest-pointer file overwritten in Phase 4 Step 2 — it
+  always reflects the just-finished report — it is the single report file
+  written (its git history is the archive). This stable path eliminates the
+  timestamp-threading drift between Phase 4 and Phase 5.5 that an earlier
+  timestamped-archive design suffered. (N2 fresh-eyes finding, 2026-05-20.)
 
 The notify skill MUST consume the file via `--message-file` (not via a
 re-constructed prose summary). The 2026-05-20 incident — completion
@@ -384,7 +415,7 @@ The skill ends here. Goal status management (if any) is the caller's responsibil
 
 - **Called by**: User directly, OR by other skills (e.g., status report wrappers)
 - **Calls**: Notification forged skill (resolved via `world/forged-skills.yaml`) in Phase 5.5
-- **Modifies**: `agents/<agent>/session/last-report-timestamp`, `agents/<agent>/reports/*.md`, `agents/<agent>/COMPLETION-REPORT.md`
+- **Modifies**: `agents/<agent>/session/last-report-timestamp`, `agents/<agent>/COMPLETION-REPORT.md`, `agents/<agent>/session/last-outcome-snapshot.yaml`
 
 ## Return Protocol
 

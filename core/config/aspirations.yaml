@@ -260,6 +260,17 @@ accuracy_min_sample: 5                  # require at least 5 resolved hypotheses
 # Lower → more frequent forced encoding; higher → tolerates longer deep-without-encoding streaks.
 tree_encoding_drift_threshold: 3
 
+# temp/ accumulation pressure (file-model normalization Phase 5).
+# precheck-eval.py cmd_temp_pressure counts UNDRAINED working docs directly under
+# the bound agent's temp/ (excluding the drained/ audit subdir) and flags
+# accumulation so temp/ never becomes the new slush directory. warn = visible
+# nudge; drain = orchestrator files a HIGH /drain-temp goal (deduped against any
+# open drain goal). temp/ is a staging SSOT that drains to the knowledge tree —
+# see core/config/conventions/temp-store.md.
+temp_pressure:
+  warn_threshold: 10          # >= this many undrained docs -> visible warn (no goal)
+  drain_goal_threshold: 20    # >= this many -> file a HIGH /drain-temp goal
+
 # --- STALE-SENTINEL CANARY () ---
 # Defense-in-depth for Cat C sentinels (bash writer + SKILL-only consumer).
 # If the consumer SKILL is skipped mid-iteration (graceful-stop interruption,
@@ -462,6 +473,19 @@ proactive_escalation:
     medium: 12                  #   Aged > medium with no prior HIGH fire → fire MEDIUM-severity notification.
                                 #   Cooldown via wm.proactive_escalation_log keyed on f"inbox_alert_{goal.id}". Closes  finding (2).
 
+# --- UNBLOCK INTAKE PROBE (7, rb-1111) ---
+# Fast intake-time probe for Unblock goals at claim time. Parses the goal's
+# failure_reason for named artifacts (commit hashes, file:line refs, function
+# names) and emits a probable-fix-landed | bug-still-present | inconclusive
+# verdict. Saves redundant fix cycles when the cited bug was resolved by an
+# independent commit between filing and pickup. Canonical incident: 
+# (filed 2026-05-19 vs commit a49e4805 fix landed before pickup).
+# Wired into aspirations-execute Phase 4 just-after-claim.
+
+unblock_intake_probe:
+  enabled: true                 # Set false to disable the probe entirely
+  min_age_hours: 6.0            # Skip Unblocks newer than this — no realistic fix-after-filing race window
+
 # --- PORTFOLIO HEALTH REVIEW ---
 # Periodic portfolio-level assessment during evolution. Catches drift that
 # per-aspiration mechanisms miss: priority inflation, completed aspirations
@@ -515,6 +539,20 @@ strategic_scan:
 fresh_eyes_review:
   goal_cadence: 25              # Every N completed goals — goal-count cadence only
   wm_slot: last_fresh_eyes_review
+  report_glob: "fresh-eyes-[0-9]*.md"  # g-115-1308 auto-reconcile: glob for THIS
+                                # ritual's archive reports under <agent>/reports/.
+                                # The [0-9] excludes the program/tree siblings
+                                # (fresh-eyes-program-*, fresh-eyes-tree-*) whose
+                                # names have a letter after the dash. When a
+                                # report newer than the slot stamp exists, the
+                                # cadence-check re-stamps instead of re-firing
+                                # (stamp lost to autocompact between Phase 4
+                                # archive and Phase 8 record-tick).
+  min_session_goals: 1          # g-115-1054: minimum goals_completed_this_session
+                                # required before fire. World-goal completions tick
+                                # every agent's cadence; per-agent Self briefing
+                                # needs ≥1 session-scoped goal to have material to
+                                # review. 0 disables the gate (legacy behavior).
   first_fire_offset: 5          # Stagger first-fire 5 goals out from now when
                                 # this slot is null on a mature world ().
                                 # Lowest cadence → smallest offset → fires first
@@ -539,6 +577,10 @@ fresh_eyes_review:
 fresh_eyes_program:
   goal_cadence: 100             # Every N completed goals — lower than review's 25
   wm_slot: last_fresh_eyes_program_review
+  report_glob: "fresh-eyes-program-*.md"  # g-115-1308 auto-reconcile (see review block)
+  min_session_goals: 0          # g-115-1054: Program review is cross-agent/shared,
+                                # not session-scoped — 0 = no session-goal gate
+                                # (default). Any agent crossing cadence can fire.
   first_fire_offset: 30         # Stagger first-fire 30 goals out (g-270-02).
                                 # Highest cadence → largest offset → fires LAST
                                 # of the three sibling rituals after a fresh
@@ -555,6 +597,10 @@ fresh_eyes_program:
 fresh_eyes_tree:
   goal_cadence: 200             # Every N completed goals
   wm_slot: last_fresh_eyes_tree_review
+  report_glob: "fresh-eyes-tree-*.md"  # g-115-1308 auto-reconcile (see review block)
+  min_session_goals: 0          # g-115-1054: Tree taxonomy review is structural,
+                                # not session-scoped — 0 = no session-goal gate
+                                # (default). Any agent crossing cadence can fire.
   first_fire_offset: 50         # Stagger first-fire 50 goals out — well clear
                                 # of review (+5), felt-sense (+15), program (+30).
 
@@ -579,6 +625,12 @@ fresh_eyes_tree:
 felt_sense:
   goal_cadence: 75              # Every N completed goals — anchored by user 2026-04-22
   wm_slot: last_felt_sense_checkin
+  min_session_goals: 3          # g-115-1054: lanes 1-6 require firing-agent's
+                                # session-scoped data (sensory buffer, recent
+                                # closes, in-flight signals). ≥3 ensures the
+                                # 7-lane sweep has substantive material — hollow
+                                # rituals with 0-1 session goals produce no-op
+                                # output. 0 disables the gate.
   first_fire_offset: 15         # Stagger first-fire 15 goals out (g-270-02).
                                 # Middle cadence → middle offset → fires SECOND
                                 # of the three sibling rituals after a fresh
@@ -653,6 +705,12 @@ open_ended_progress:
 recurring:
   urgency_base: 1.5              # Base score when a recurring goal becomes due
   urgency_log_scale: 1.5         # Multiplier for log2(1 + overdue_ratio)
+  urgency_max: 4.0               # Cap on log-scaled urgency raw (g-115-1090, zeta-1477).
+                                  # Without cap, heavily-overdue recurring goals
+                                  # (overdue_ratio > 3 → raw > 4.5) systematically
+                                  # out-score capped role_affinity (1.5 ceiling × 1.0
+                                  # weight). 4.0 default bounds asymmetry while
+                                  # preserving relative ordering up to ~3x overdue.
   saturation_window: 4            # Recent completions window for saturation check
   saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring
   debt_threshold: 0.80            # Candidate ratio triggering debt recovery bonus
@@ -694,6 +752,18 @@ recurring:
                                     # _load_session_gap_threshold() is the sole reader.
   cargo_cult_threshold: 3         # consecutive routine outcomes before auto-filing Idea
                                   # (see rb-335: YAML duplicate-key collision fix 2026-04-20)
+  # --- CARGO-CULT PLACEHOLDER SUPPRESSION (9) ---
+  # Second-layer suppression of Phase 4.25 force_experience_archival sentinel
+  # for forced-flip routine→deep closes that produce no substantive artifact.
+  # First layer is  (empty encoding_queue + sensory_buffer); this
+  # extends to cover sessions with non-empty buffers from unrelated earlier
+  # work. The probe checks four artifact types in a tight time window:
+  # tree node .md write, new goal filed, non-status board post, pipeline-
+  # meta mtime change. ALL FOUR negative → suppress.
+  # Fail-open at every layer: probe errors → sentinel fires as normal.
+  # Read by core/scripts/recurring-close.sh Phase 4.25 enforcement block.
+  cargo_cult_suppress_no_artifact: true   # gate this entire layer on/off
+  cargo_cult_artifact_window_seconds: 90  # how far back the probe scans
   routine_streak_flip_threshold: 5  # In-session per-goal routine streak ceiling. When a
                                     # recurring goal closes routine N times in a row WITHIN
                                     # one session and N >= this threshold, signal-mutation
@@ -718,6 +788,22 @@ recurring:
                                     # 2026-05-12 per bravo session-66 feedback: "by 7
                                     # routines I'm already in pattern-mode." Read by
                                     # core/scripts/recurring-loop-state-mutate.py.
+
+  # --- SUBSTANTIVE-AVAILABILITY DEMOTION (FW-1, 2026-05-25, 7-agent feedback) ---
+  # Six of seven agents reported recurring sweeps perpetually out-ranking rare
+  # substantive work (e.g. : 175 runs, 98.8% routine, score 13.87, still
+  # #1). urgency_max / saturation / debt_bonus each address a piece, but a HEALTHY
+  # MIX of candidates still lets one recurring goal top the list because it also
+  # wins on priority / agent_executable / role_affinity. This caps any recurring
+  # goal's effective score to `substantive_demotion_margin` BELOW the best
+  # non-recurring, agent-executable candidate — UNLESS that recurring goal is
+  # overdue beyond `substantive_demotion_overdue_exempt_ratio` (monitoring must
+  # not rot). Applied post-scoring in goal-selector.apply_substantive_demotion,
+  # AFTER the debt bonus so the substantive floor already reflects catch-up boosts.
+  substantive_demotion_enabled: true        # master gate for the whole mechanism
+  substantive_demotion_margin: 0.5          # demoted recurring lands this far below top substantive
+  substantive_demotion_floor: 5.0           # only fires when a non-recurring agent-exec goal scores >= this
+  substantive_demotion_overdue_exempt_ratio: 5.0  # recurring goals overdue beyond N× interval are exempt
 
   # --- AUTO-CONTRACT (LifingPolls plan item 4 — 2026-05-08) ---
   # Inverse of cargo-cult auto-extend. When a recurring goal consistently
@@ -1145,6 +1231,7 @@ modifiable:
   # Recurring goal scoring bounds
   recurring.urgency_base: {min: 0.5, max: 3.0, default: 1.5}
   recurring.urgency_log_scale: {min: 0.5, max: 3.0, default: 1.5}
+  recurring.urgency_max: {min: 2.0, max: 8.0, default: 4.0}
   recurring.saturation_window: {min: 2, max: 10, default: 4}
   recurring.saturation_max_penalty: {min: 2.0, max: 8.0, default: 4.0}
   recurring.debt_threshold: {min: 0.60, max: 0.95, default: 0.80}

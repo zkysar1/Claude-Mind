@@ -33,9 +33,13 @@ Run: py -3 -m pytest core/scripts/tests/test_post_state_update_metric_gate_categ
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
@@ -60,6 +64,62 @@ PRODUCTION_SHAPE_NOTE = (
 )
 
 
+# ---- Hermetic isolation of the gate's ambient-state reads (1) ----
+# The gate reads TWO pieces of LIVE agent state that make its fired/not-fired
+# decision non-deterministic between a full-suite run and an alone run:
+#   - Test-case-5 (gate:192): $AGENT_DIR/session/iteration-checkpoint.json +
+#     tree-edit-since.py against the live knowledge tree. If a checkpoint exists
+#     with a selected_at OLDER than the most recent tree edit (routine during a
+#     full-suite run where another agent is concurrently editing the tree), the
+#     gate suppresses -> fired=false.
+#   - Test-case-6 (gate:207): WM force_metric_encoding_pending. If a prior
+#     signal's candidate fingerprint matches PRODUCTION_SHAPE_NOTE's
+#     {2x, 250 vs 44, 0 -> 69}, the dedup suppresses -> fired=false.
+# The bug 1 diagnosed ("passes alone, fails in full suite") is this
+# non-hermeticity: _run_gate inherited the live bootstrap agent's session state
+# via the default subprocess env. The conftest _restore_env_per_test fixture
+# restores MIND_AGENT/MIND_WORLD but NOT the filesystem state (checkpoint, WM)
+# the gate reads. Route the gate at an isolated agent with an EMPTY session/
+# (no checkpoint -> Test 5 skips at the file-existence guard; no
+# working-memory.yaml -> Test 6 dedup skips) so the firing decision rests solely
+# on outcome_class + category + distinct_count -- which is what this file tests.
+# Mirrors the temp-agent pattern in test_stale_sentinel_canary.py.
+PROJECT_ROOT = CORE_SCRIPTS.parent.parent
+_ISO_AGENT_NAME = "_test_metric_gate_agent"
+_ISO_AGENT_DIR = PROJECT_ROOT / "agents" / _ISO_AGENT_NAME
+_GATE_ENV = None  # populated per-test by the autouse fixture below
+
+
+@pytest.fixture(autouse=True)
+def _isolated_gate_agent(tmp_path_factory):
+    """Point the gate subprocess at an isolated agent dir with a clean session.
+
+    Creates PROJECT_ROOT/agents/_test_metric_gate_agent with an empty session/
+    and a local-paths.conf whose WORLD_PATH/META_PATH point at a throwaway tmp
+    dir. _run_gate runs the gate with MIND_AGENT set to this isolated agent so
+    the gate's Test-case-5 (checkpoint) and Test-case-6 (WM dedup) reads find
+    nothing and the gate's decision is deterministic. Teardown removes the dir.
+    """
+    global _GATE_ENV
+    world = tmp_path_factory.mktemp("metric-gate-world")
+    (_ISO_AGENT_DIR / "session").mkdir(parents=True, exist_ok=True)
+    (_ISO_AGENT_DIR / "local-paths.conf").write_text(
+        f"WORLD_PATH={world.as_posix()}\n"
+        f"META_PATH={(world / 'meta').as_posix()}\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["MIND_AGENT"] = _ISO_AGENT_NAME
+    env.pop("MIND_WORLD", None)      # force conf-based world resolution
+    env.pop("MIND_AGENT_DIR", None)  # no AGENT_DIR override leaks in
+    _GATE_ENV = env
+    try:
+        yield
+    finally:
+        shutil.rmtree(_ISO_AGENT_DIR, ignore_errors=True)
+        _GATE_ENV = None
+
+
 def _run_gate(outcome_class: str, goal_id: str, category: str,
               slug: str = "test-slug", outcome_note: str = ""):
     """Invoke the gate via bash and return (rc, parsed_json_or_none, stderr).
@@ -73,6 +133,7 @@ def _run_gate(outcome_class: str, goal_id: str, category: str,
     proc = subprocess.run(
         [BASH, str(GATE), outcome_class, goal_id, category, slug],
         input=outcome_note, capture_output=True, text=True, timeout=15,
+        env=_GATE_ENV,
     )
     parsed = None
     if proc.stdout.strip():

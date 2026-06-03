@@ -36,7 +36,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
 # Imported once. acquire_lock/release_lock take explicit paths — they do NOT
 # reference _paths globals (WORLD_DIR/META_DIR), so importing _fileops here
 # is daemon-safe despite _fileops' top-level `from _paths import WORLD_DIR`.
-from _fileops import acquire_lock, release_lock  # noqa: E402
+# _rmw_with_conflict_retry is the own-cloud optimistic-concurrency retry wrapper
+# (#38) — it calls get_backend().conflict_error internally, so it stays a
+# transparent single pass on LocalBackend.
+from _fileops import (  # noqa: E402
+    acquire_lock,
+    release_lock,
+    _rmw_with_conflict_retry,
+)
 
 
 class FileLockManager:
@@ -108,3 +115,28 @@ def locked(path: Path, *, timeout: int = 10, stale_seconds: int = 30):
             release_lock(lock_path)
     finally:
         thread_lock.release()
+
+
+def locked_rmw(path: Path, cycle_fn, *, timeout: int = 10,
+               stale_seconds: int = 30):
+    """Hold the per-path lock and run a full refresh→read→modify→write cycle,
+    retrying on the backend's optimistic-concurrency ConflictError (the
+    own-cloud If-Match stale-lock-break race: the DDB lock that normally
+    serialises cross-machine writes was force-broken by a crashed/reclaimed
+    holder, so a second machine's PUT 412s against the etag this cycle read).
+
+    `cycle_fn` is the handler's ENTIRE in-lock body — read, validate, mutate,
+    write, changelog — and returns whatever the handler returns (typically a
+    Response). It MUST re-read fresh on every call so each retry re-applies the
+    modification on top of the peer's landed write; the daemon JSONL read
+    helpers (store._read_jsonl, aspirations_write._read_jsonl) already begin
+    with get_backend().refresh(path), satisfying this. A 412 means the PUT was
+    rejected and NOTHING landed (see owncloud_backend._put), so re-running the
+    cycle cannot double-apply.
+
+    On LocalBackend `conflict_error` is the empty tuple, so the retry wrapper is
+    a transparent single pass — byte-for-byte equivalent to a bare
+    `with locked(path): return cycle_fn()` with zero added I/O. Drop-in
+    replacement for that idiom on the daemon write path (#38)."""
+    with locked(path, timeout=timeout, stale_seconds=stale_seconds):
+        return _rmw_with_conflict_retry(path, cycle_fn)

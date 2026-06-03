@@ -199,7 +199,7 @@ def collect_pipeline_counts() -> dict:
 
 def collect_context_zone() -> dict:
     """Read <agent>/session/context-budget.json. Set by PreCompact-ish hook."""
-    if not AGENT_DIR:
+    if AGENT_DIR is None:
         return {}
     path = Path(AGENT_DIR) / "session" / "context-budget.json"
     if not path.exists():
