@@ -44,13 +44,9 @@ def with_sandbox(test_fn):
         sandbox = Path(tempfile.mkdtemp(prefix="snap_bl_gz_world_"))
         meta_sandbox = Path(tempfile.mkdtemp(prefix="snap_bl_gz_meta_"))
         tracked = ("MIND_WORLD", "MIND_META",
-                   "MIND_WORLD", "MIND_META",
                    "FILEOPS_HISTORY_KEEP_LEGACY_WRITES")
         prior = {k: os.environ.get(k) for k in tracked}
         try:
-            os.environ["MIND_WORLD"] = str(sandbox)
-            os.environ["MIND_META"] = str(meta_sandbox)
-            # Dual-set MIND_*/MIND_* for cross-repo portability.
             os.environ["MIND_WORLD"] = str(sandbox)
             os.environ["MIND_META"] = str(meta_sandbox)
             os.environ["FILEOPS_HISTORY_KEEP_LEGACY_WRITES"] = "1"
@@ -468,9 +464,7 @@ def _setup_history_dir():
     """
     sandbox = Path(tempfile.mkdtemp(prefix="hist_resolve_world_"))
     os.environ["MIND_WORLD"] = str(sandbox)
-    os.environ["MIND_WORLD"] = str(sandbox)
     meta = str(Path(tempfile.mkdtemp(prefix="hist_resolve_meta_")))
-    os.environ.setdefault("MIND_META", meta)
     os.environ.setdefault("MIND_META", meta)
     for mod in list(sys.modules):
         if mod in ("_fileops", "_paths", "history"):
@@ -488,9 +482,8 @@ def _setup_history_dir():
 def _teardown_history_dir(sandbox):
     shutil.rmtree(sandbox, ignore_errors=True)
     os.environ.pop("MIND_WORLD", None)
-    os.environ.pop("MIND_WORLD", None)
-    # MIND_META / MIND_META intentionally left — the wrapper above sets
-    # them lazily and subsequent tests via with_sandbox overwrite them.
+    # MIND_META intentionally left — the wrapper above sets it lazily and
+    # subsequent tests via with_sandbox overwrite it.
 
 
 def resolve_version_path_accepts_literal_gz_filename():

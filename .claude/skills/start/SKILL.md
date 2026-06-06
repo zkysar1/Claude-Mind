@@ -32,7 +32,7 @@ On resume (agent already exists):
 
 **Step 0.5: Parse Mode + Recovery Flags** — Extract the following from positional arguments:
 
-- `--mode <value>`: mode flag. Valid values: `reader`, `assistant`, `autonomous`. If omitted, default to `autonomous`.
+- `--mode <value>`: mode flag. Valid values: `reader`, `assistant`, `autonomous`. If omitted, default to `autonomous`. This default applies uniformly — including the Phase A-0 transplant-resume path, where a bare `/start <agent>` on a freshly-cloned agent resumes it autonomously, exactly like a bare `/start` on any IDLE agent. Pass `--mode reader` (or `assistant`) explicitly for the cautious first-boot-on-a-new-machine case.
 - `--recover`: recovery flag. Set `recover = true` if any argument is the literal string `--recover`. This flag triggers the crashed-runner cleanup in Step 0.7 below. Only meaningful when agent state is RUNNING; fails loud otherwise.
 - `--force`: force flag. Set `force = true` if any argument is the literal string `--force`. Bypasses the heartbeat-staleness precondition on `--recover` (emergency override for the "heartbeat fresh but runner is stuck" case). No effect outside recovery.
 - `--override-output-style <justification>`: override flag for the Step 0.6 + C7.7 autonomous+Explanatory gate. When present with a non-empty justification string, Step 0.6 lets the autonomous mode proceed, and C7.7 passes the same value to `output-style-gate.sh --override` for audit logging. The justification is echoed to `world/output-style-overrides.jsonl`.
@@ -404,6 +404,19 @@ a recoverable normal-RUNNING state instead of a half-recovered zombie.
    Manifest-clear was SKIPPED to avoid half-recovered zombie. Investigate
    agents/<agent-name>/session/agent-state directly before retrying." DONE.
 
+  **Session-telemetry crash close (WP5, 2026-06-03).** This branch auto-recovers
+  a crashed prior runner — the SAME event recovery-gate.sh handles via its
+  SessionStart hook (WP4), but here it is LLM-orchestrated at /start time. The
+  crashed runner's SID is still in `running-session-id` (manifest-clear below
+  has not run yet), so finalize its durable telemetry record now with
+  status=crashed, ended_reason=recovery-gate. MUST run BEFORE manifest-clear
+  (which deletes running-session-id). write_crash forces goals_completed=-1
+  (the crashed runner's outcome is unknown). Fire-and-forget (|| true) — a
+  telemetry failure must NEVER abort recovery. guard-165: SID/agent via ENV,
+  python source single-quoted. `py -3` (Bash-tool context — NOT a sourced .sh,
+  so the Microsoft-Store-stub rule applies). Only when a crashed SID is present.
+  Bash: `RECSID=$(cat "agents/<agent-name>/session/running-session-id" 2>/dev/null | tr -d '\r\n'); [ -n "$RECSID" ] && TSID="$RECSID" TAGENT="<agent-name>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_crash; write_crash(sid=os.environ["TSID"], agent=os.environ["TAGENT"])' >/dev/null 2>&1 || true`
+
   Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-manifest-clear.sh`
   Runs AFTER state-set IDLE succeeded; cleanup window now shows
   state=IDLE + sid present (mirrors aspirations-graceful-stop D1→D6).
@@ -464,6 +477,17 @@ agent-state, agent-mode, persona-active, or running-session-id.
 
    The PreToolUse[Bash] hook will auto-inject `MIND_AGENT=<agent-name>` on subsequent Bash calls. Write `MIND_AGENT=<other> <cmd>` explicitly if you need a cross-agent probe.
 
+0.5. **Open session telemetry** (session-telemetry WP1, 2026-06-03): write the
+   initial `status=active` record so this observer session is visible in the
+   live-sessions view BEFORE it closes (the close is WP2 in /stop's IDLE branch).
+   World is already configured here (the agent is RUNNING), so WORLD_DIR resolves
+   and the record lands at world/telemetry/session-records/<agent-name>/$MIND_SID.json.
+   write_open is idempotent (returns without clobbering if the record exists) and
+   never raises. `<target-mode>` is the observer mode (reader/assistant). guard-165:
+   SID/agent/mode via ENV, python source single-quoted. `py -3` (Bash-tool context).
+   Fire-and-forget (|| true) — telemetry must never block the bind.
+   Bash: `TSID="$MIND_SID" TAGENT="<agent-name>" TMODE="<target-mode>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_open; write_open(sid=os.environ["TSID"], agent=os.environ["TAGENT"], mode=os.environ["TMODE"], started_by="claude-code")' >/dev/null 2>&1 || true`
+
 1. **Ensure daemon is running** (fail-open):
    - Bash: `bash core/scripts/mind-api-start.sh || echo "[start] daemon-start failed (non-fatal)" >&2`
 
@@ -522,6 +546,20 @@ agent-state, agent-mode, persona-active, or running-session-id.
    > **Fix**: close this terminal AND relaunch Claude Code with `claude --fork-session` (which forces a new session_id). Or `/stop` the other agent first.
 
    The PreToolUse[Bash] hook will auto-inject `MIND_AGENT=<agent-name>` on subsequent Bash calls from the binding file. Write `MIND_AGENT=<other> <cmd>` explicitly if you need a deliberate cross-agent probe (the hook detects and preserves explicit overrides).
+
+0.5. **Open session telemetry** (session-telemetry WP1, 2026-06-03): write the
+   initial `status=active` record for THIS session so it is visible in the
+   live-sessions view before it closes. The matching close is WP3 (graceful-stop
+   D6.6) for the autonomous runner path, or WP2 (/stop IDLE branch) for a
+   reader/assistant start — both finalize the same world/telemetry/session-records/<agent-name>/$MIND_SID.json
+   record. World is already configured here (resumed/existing agent), so WORLD_DIR
+   resolves. `<target-mode>` is the determined target mode (the same value the
+   binding-write above used — `reader`, `assistant`, or `autonomous`). For the
+   autonomous path the runner claim (Step 3) writes latest-session-id == $MIND_SID,
+   so the close targets this same record. write_open is idempotent and never
+   raises. guard-165: SID/agent/mode via ENV, python source single-quoted.
+   `py -3` (Bash-tool context). Fire-and-forget (|| true).
+   Bash: `TSID="$MIND_SID" TAGENT="<agent-name>" TMODE="<target-mode>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_open; write_open(sid=os.environ["TSID"], agent=os.environ["TAGENT"], mode=os.environ["TMODE"], started_by="claude-code")' >/dev/null 2>&1 || true`
 
 1. Determine target mode:
    - If `--mode` flag provided: use that mode
@@ -714,6 +752,74 @@ agent-state, agent-mode, persona-active, or running-session-id.
    - Invoke `/boot`
 
 ### UNINITIALIZED (agent-state doesn't exist or <agent>/ doesn't exist)
+
+**Phase A-0: Transplant-Resume Detection (cloned agent landing on a new machine)**
+
+UNINITIALIZED has TWO causes that need OPPOSITE handling:
+- **Genuine first run** — brand-new agent, nothing on disk → full init (Phase A/B/C).
+- **Transplant/clone** — the agent dir arrived via `git clone` with its tracked
+  content intact (`.initialized`, `self.md`, `aspirations.jsonl`,
+  `curriculum.yaml`, journal/, experience/), but `session/agent-state` is absent
+  because `session/` and `local-paths.conf` are gitignored (machine-local, never
+  travel). Running full init here would re-elicit identity and **overwrite the
+  cloned `self.md`/`curriculum.yaml`** → resume as an EXISTING agent instead.
+
+`session-state-get.sh` only inspects `agent-state`, so it can't tell these apart.
+The tracked `.initialized` marker can: it clones with the agent, so its presence
+on an otherwise-UNINITIALIZED agent means "already initialized, just not started
+on THIS machine."
+
+Bash: `bash core/scripts/agent-resume-scaffold.sh "<agent-name>"; echo "rc=$?"`
+
+The scaffold (idempotent, verified) writes a default `local-paths.conf` (local
+own-cloud cache under `<cache-root>/<env-id>/`, override via `RUNTIME_CACHE_ROOT`)
+and creates `session/`. It NEVER writes `agent-state`/`agent-mode` (those stay
+/start's job — guard-340) and NEVER touches tracked content. Branch on rc:
+
+- **rc=2** (no agent dir OR no `.initialized` — genuine first run): proceed to
+  **Phase A** below. The rest of this UNINITIALIZED branch is unchanged.
+
+- **rc=1** (scaffold error): STOP, display stderr, do not proceed (guard-372 — fail loud).
+
+- **rc=0** (transplanted agent — scaffolded): do NOT run Phase A/B/C init.
+  Resume it as an EXISTING agent. **Resume mode = the parsed `--mode` value
+  (default `autonomous`)** — a transplant-resume is treated exactly like a bare
+  `/start` on any IDLE agent: bare `/start <agent>` runs the loop; `--mode
+  reader`/`assistant` is honored for the cautious first-boot-on-a-new-machine
+  case. (The earlier reader-first default for bare transplant-resume was removed
+  2026-06-04: it forced a two-step `/start` dance — first call landed reader,
+  a second was needed to actually run — which the user found annoying. The
+  dual-runner risk it guarded against is covered by the ownership warning below
+  plus the own-cloud write lock.)
+
+  IF the resume mode is `autonomous`, FIRST print this ownership warning, then
+  proceed:
+  "⚠ One machine per agent: starting `<agent-name>`'s autonomous loop here. If
+  `<agent-name>` is still RUNNING on its origin machine, `/stop` it there NOW —
+  two runners of the SAME agent on one own-cloud world claim and release each
+  other's goals (the DDB lock prevents file corruption, not this semantic
+  collision). Also confirm `.env.local` is configured for own-cloud (the one
+  manual step — secrets never travel in git)."
+
+  Steps:
+  1. Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
+     (UNINITIALIZED→IDLE — the same init endpoint reader/assistant first-boot
+     already uses; authorized /start path, see `.claude/rules/user-interaction.md`.
+     **HALT ON NON-ZERO EXIT**: STOP, display stderr.)
+  2. Execute the **IDLE branch** (Step 0 onward, above) with `<target-mode>` set
+     to the resume mode. It binds the session, pulls world/meta from S3
+     (own-cloud), primes, and — for `autonomous` — claims the runner and hands
+     off to `/boot`. NO identity prompts, NO clobber of tracked content, any mode.
+  3. After the IDLE branch's mode output, append this notice (substitute
+     `<world_path>` from the rc=0 JSON and `<chosen-mode>`):
+     "✓ Resumed transplanted agent `<agent-name>` in `<chosen-mode>` mode — cloned
+     identity + memory intact; scaffolded only the machine-local session + paths
+     (world cache: `<world_path>`). world/meta rehydrate from S3 on first daemon
+     read.{IF chosen-mode is reader or assistant, append: " (Once the pull looks
+     right and `<agent-name>` is `/stop`-ped on its origin machine, `/start
+     <agent-name> --mode autonomous` runs the loop here.)"} If `.env.local`
+     isn't set up for own-cloud yet — the one manual step, secrets never travel
+     in git — do that first."
 
 **Phase A: Agent Name and Session Binding**
 

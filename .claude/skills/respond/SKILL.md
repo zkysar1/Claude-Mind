@@ -259,7 +259,7 @@ IF any entry has `type: fresh-eyes-review` AND `status: pending`:
   "I have a periodic fresh-eyes check waiting for you (id {pq.id}):
     1. Is the current Self still right?
     2. Are we working on the right problems?
-   Full briefing at `agents/<agent>/reports/{pq.id}.md`. Reply in this chat or via email;
+   Full briefing at `agents/<agent>/temp/{pq.id}.md`. Reply in this chat or via email;
    a 'Self is still right' / 'shift focus to X' answer is enough — I'll route it."
   (The fresh-eyes cadence gate fires every 25 completed goals. While this pq
    is pending, the next cycle is blocked — resolving it unblocks the cadence.

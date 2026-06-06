@@ -210,6 +210,14 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: execute-in-flight
+    purpose: Phase-4-execute liveness sentinel (timestamp; written on phase_start phase-4-execute, deleted on phase_end phase-4-execute or any other phase_start). recovery-gate.sh reads it to suppress false-positive auto-recovery during long Phase-4 work that stales other liveness signals. Per-machine — a goal mid-execution on one machine is NOT in flight on another, so it must stay machine_local (registered 2026-06-04 after a machine-move desync warning flagged it as an unregistered signal-shaped orphan).
+    writer: execution-diary.py (_maintain_execute_in_flight)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   # ── Persistent agent data (preserve across recoveries) ──────────────
   - file: handoff.yaml
     purpose: cross-session state (consolidation → next boot); consumed at boot

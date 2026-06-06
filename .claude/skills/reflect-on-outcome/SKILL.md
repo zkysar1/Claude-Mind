@@ -1288,7 +1288,7 @@ IF "surprise" in signals OR "mistake" in signals:
                 Edit node.file: replace or annotate the contradicted insight
                 # T21 PostToolUse hook auto-syncs last_updated to _tree.yaml
                 # on every Edit; last_update_trigger lives in .md FM.
-                Edit node.file front matter: last_update_trigger: "execution-contradiction"
+                Edit node.file front matter: last_update_trigger: {type: "execution-contradiction"}
                 Log: "EXEC CONTRADICTION FIXED: {node.key} — insight updated after {goal.id}"
             ELSE:
                 # Too complex for inline fix — flag for Step 3 investigation goal
@@ -1318,7 +1318,7 @@ IF "surprise" in signals OR "mistake" in signals:
                   - **{label}**: `{value}` {unit} — {context}
             Edit node.file: append 1-2 sentence qualitative refinement to Key Insights
             # T21 PostToolUse hook auto-syncs last_updated to _tree.yaml.
-            Edit node.file front matter: last_update_trigger: "execution-refinement"
+            Edit node.file front matter: last_update_trigger: {type: "execution-refinement"}
             Log: "EXEC REFINEMENT: {node.key} — insight refined after {goal.id}"
 ```
 

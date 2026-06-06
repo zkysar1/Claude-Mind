@@ -104,9 +104,9 @@ path knew to clean them.
    transient signal files.
 3. **Never archive from scratch**: anything that should outlive the
    session belongs in the proper store — `agents/<agent>/experience/` for
-   experience archives, `agents/<agent>/reports/` for completion reports,
-   `world/knowledge/tree/` for knowledge, `world/conventions/` for
-   reusable schemas, and so on. Scratch is for the IO buffer between
+   experience archives, `agents/<agent>/temp/` for working docs that drain
+   to the tree, `world/knowledge/tree/` for knowledge, `world/conventions/`
+   for reusable schemas, and so on. Scratch is for the IO buffer between
    "the thing produced output" and "I extracted what mattered."
 4. **No ceremony**: scratch is created by `/start` and by recovery; the
    agent does NOT need to `mkdir` defensively.

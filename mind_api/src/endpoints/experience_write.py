@@ -536,6 +536,7 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
                               f"computed experience id fails validation: {experience_id}")
 
     content_dir = ctx.paths.agent / "experience"
+    assert_not_cruft(content_dir, "mkdir (experience content_dir)")
     content_dir.mkdir(parents=True, exist_ok=True)
     canonical = content_dir / f"{experience_id}.md"
     try:

@@ -3,7 +3,7 @@
 Phase 3 of the session-continuity redesign (2026-06-02). The endpoint forces an
 immediate own-cloud mirror sweep so a machine-move right after a clean /stop
 cannot strand the session's last continuity writes locally. Tested end-to-end
-against the in-process daemon (conftest pins MIND_STORAGE_BACKEND=local for the
+against the in-process daemon (conftest pins STORAGE_BACKEND=local for the
 session; the own-cloud-path tests flip it via monkeypatch and inject fake
 owncloud_sync / storage_backend modules so NO real S3 call is ever made).
 
@@ -64,7 +64,7 @@ def test_owncloud_flush_own_cloud_invokes_sweep_with_periodic_args(running_daemo
 
     monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
     monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
 
     status, body = _post(port, "/v1/admin/owncloud-flush", agent="alpha")
     assert status == 200
@@ -97,7 +97,7 @@ def test_owncloud_flush_sweep_error_returns_500(running_daemon, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
     monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
 
     try:
         _post(port, "/v1/admin/owncloud-flush", agent="alpha")
@@ -151,7 +151,7 @@ def test_owncloud_pull_own_cloud_invokes_pull_continuity(running_daemon, monkeyp
 
     monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
     monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
 
     status, body = _post(port, "/v1/admin/owncloud-pull?agent=alpha", agent="alpha")
     assert status == 200
@@ -177,7 +177,7 @@ def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
     monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
 
     try:
         _post(port, "/v1/admin/owncloud-pull?agent=alpha", agent="alpha")
@@ -208,7 +208,7 @@ def test_owncloud_pull_fail_closed_manifest_returns_200_ok_false(running_daemon,
 
     monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
     monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
 
     status, body = _post(port, "/v1/admin/owncloud-pull?agent=alpha", agent="alpha")
     assert status == 200          # fail-closed is NOT a server error

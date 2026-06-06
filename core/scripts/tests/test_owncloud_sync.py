@@ -6,7 +6,7 @@ conflict), and _sweep (dir pruning, dry-run plan, real push, manifest skip on
 re-run). The fenced-PUT mechanics of the real backend are covered by moto in
 test_owncloud_backend.py (test_mirror_put_*).
 
-H4 (machine-2 gate) coverage: MIND_OWNED_AGENTS agent-dir scoping (H4a) and the
+H4 (machine-2 gate) coverage: MACHINE_OWNED_AGENTS agent-dir scoping (H4a) and the
 content-baseline stale-cache / conflict classifier (H4b) that stops a second
 machine from pushing a stale cache over a peer's newer S3 bytes — including the
 --full clobber path the If-Match fence alone does not cover."""
@@ -28,12 +28,12 @@ from storage_backend import FileStat  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _clean_multimachine_env(monkeypatch):
-    """H4 reads MIND_OWNED_AGENTS / MIND_MULTI_MACHINE from the environment.
+    """H4 reads MACHINE_OWNED_AGENTS / MACHINE_MULTI from the environment.
     Default every test to the single-machine (unset) state so a runner shell
     that has them set cannot perturb results; tests exercising multi-machine
     behavior set them explicitly inside the test body."""
-    monkeypatch.delenv("MIND_OWNED_AGENTS", raising=False)
-    monkeypatch.delenv("MIND_MULTI_MACHINE", raising=False)
+    monkeypatch.delenv("MACHINE_OWNED_AGENTS", raising=False)
+    monkeypatch.delenv("MACHINE_MULTI", raising=False)
 
 
 def _md5(b: bytes) -> str:
@@ -193,29 +193,28 @@ def test_session_singular_walked_plural_pruned():
     assert "sessions" in _mod._EXCLUDE_DIRS
 
 
-def test_reports_excluded_temp_included():
-    # file-model normalization: reports/ is a FROZEN git archive -> walk-pruned
-    # (git is its transport, not S3). temp/ is LIVE working docs -> sync-by-default
-    # (NOT excluded; pull_temp resumes it cross-machine). The asymmetry is the point.
-    assert "reports" in _mod._EXCLUDE_DIRS
+def test_reports_abolished_temp_included():
+    # reports/ was abolished (user-directed, 2026-06-02): removed from the repo AND
+    # from _EXCLUDE_DIRS. It is no longer a frozen archive — git history is its
+    # archive, and the Phase-4 allowlist gate (path-resolution-hook.py) still DENIES
+    # new reports/ writes so it cannot be recreated (see test_agent_dir_allowlist).
+    # temp/ remains LIVE working docs -> sync-by-default (NOT excluded; pull_temp
+    # resumes it cross-machine).
+    assert "reports" not in _mod._EXCLUDE_DIRS
     assert "temp" not in _mod._EXCLUDE_DIRS
 
 
-def test_sweep_prunes_reports_keeps_temp(tmp_path, monkeypatch):
-    # End-to-end: a reports/ file is walk-pruned (never pushed); a temp/ working
-    # doc syncs. Proves the frozen-archive vs live-staging distinction in the walk.
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+def test_sweep_keeps_temp(tmp_path, monkeypatch):
+    # End-to-end: a temp/ working doc syncs to S3 (live staging). reports/ was
+    # abolished 2026-06-02 and no longer exists to prune.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     agents = tmp_path / "agents"
-    rpt = agents / "alpha" / "reports" / "old-closure-2026-05-01.md"
     tmp = agents / "alpha" / "temp" / "design-2026-06-02.md"
-    rpt.parent.mkdir(parents=True)
     tmp.parent.mkdir(parents=True)
-    rpt.write_bytes(b"frozen archive")
     tmp.write_bytes(b"live working doc")
     be = FakeBackend([(agents, "agents")])
     _mod.sweep(be, only_root="agents", dry_run=False, use_manifest=False, full=True)
     puts = set(be.puts)
-    assert str(rpt) not in puts, "reports/ (frozen archive) must NOT sync to S3"
     assert str(tmp) in puts, "temp/ (live working docs) MUST sync to S3"
 
 
@@ -226,6 +225,41 @@ def test_non_session_agent_file_unaffected():
     assert _mod._is_machine_local("self.md", "agents", full_path=fp, root_path=_SROOT) is False
     fp2 = _SROOT.joinpath("alpha", "aspirations.jsonl")
     assert _mod._is_machine_local("aspirations.jsonl", "agents", full_path=fp2, root_path=_SROOT) is False
+
+
+# --- health-ledger sync policy (health-ledger.md, 2026-06-03) ---------------
+# The per-agent health ledger lives at agents/<agent>/health/<YYYY-MM-DD>.jsonl.
+# It is DURABLE cross-machine signal state (the regression-detection record must
+# be queryable from any machine), so it MUST sync to S3 — the OPPOSITE of
+# .history (local CoW snapshots whose S3 copy is the bucket's own versioning, so
+# .history is walk-pruned). The day-file basenames are dynamic dates, not in any
+# exclude set; the *-log.jsonl rule is world-scoped; and the session-file policy
+# fires only for rel_parts[1] == "session", whereas here it is "health".
+def test_health_ledger_day_file_syncs():
+    fp = _SROOT.joinpath("zeta", "health", "2026-06-03.jsonl")
+    assert _mod._is_machine_local(
+        "2026-06-03.jsonl", "agents", full_path=fp, root_path=_SROOT) is False
+    # basename-only form (no path context) must also classify as syncable —
+    # the date-stamped name matches no _EXCLUDE_NAMES / _EXCLUDE_GLOBS entry.
+    assert _mod._is_machine_local("2026-06-03.jsonl", "agents") is False
+
+
+def test_health_dir_not_walk_pruned_history_is():
+    # health/ must be descended into (its contents sync); .history stays pruned.
+    assert "health" not in _mod._EXCLUDE_DIRS
+    assert ".history" in _mod._EXCLUDE_DIRS
+
+
+def test_sweep_pushes_health_ledger(tmp_path, monkeypatch):
+    # End-to-end through the real walk: a health day-file is pushed to S3.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    agents = tmp_path / "agents"
+    ledger = agents / "alpha" / "health" / "2026-06-03.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_bytes(b'{"agent":"alpha","composite":0.9466}\n')
+    be = FakeBackend([(agents, "agents")])
+    _mod.sweep(be, only_root="agents", dry_run=False, use_manifest=False, full=True)
+    assert str(ledger) in set(be.puts), "health ledger MUST sync to S3 (durable signal state)"
 
 
 # --- _etag_matches ---------------------------------------------------------
@@ -333,7 +367,7 @@ def _syncable(tmp_path):
 
 
 def test_sweep_pushes_only_syncable(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     stats = _mod.sweep(be, only_root=None, dry_run=False,
@@ -343,7 +377,7 @@ def test_sweep_pushes_only_syncable(tmp_path, monkeypatch):
 
 
 def test_sweep_dry_run_plans_no_write(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     stats = _mod.sweep(be, only_root=None, dry_run=True,
@@ -353,7 +387,7 @@ def test_sweep_dry_run_plans_no_write(tmp_path, monkeypatch):
 
 
 def test_sweep_manifest_skips_unchanged_on_rerun(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=True)
@@ -369,7 +403,7 @@ def test_sweep_manifest_repushes_changed_file(tmp_path, monkeypatch):
     # The complement to the skip test: a file whose CONTENT (and mtime) changed
     # since the last sync must bypass the manifest and re-push; unchanged peers
     # stay skipped. This is the path the daemon thread relies on every tick.
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=True)
@@ -385,7 +419,7 @@ def test_sweep_manifest_repushes_changed_file(tmp_path, monkeypatch):
 
 
 def test_sweep_only_root_filter(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     _mod.sweep(be, only_root="agents", dry_run=False,
@@ -398,7 +432,7 @@ def test_sweep_syncs_session_continuity_excludes_local_and_scratch(tmp_path, mon
     # IS pushed; a session/ machine_local file (agent-state) is NOT; session/
     # scratch/ contents are walk-pruned. Exercises the Phase-2 sweep changes
     # (session no longer in _EXCLUDE_DIRS, manifest-driven filter, scratch prune).
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     agents = tmp_path / "agents"
     sess = agents / "alpha" / "session"
     (sess / "scratch").mkdir(parents=True)
@@ -421,22 +455,22 @@ def test_owned_agents_unset_is_none():
 
 
 def test_owned_agents_parses_csv(monkeypatch):
-    monkeypatch.setenv("MIND_OWNED_AGENTS", " alpha , bravo ,")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", " alpha , bravo ,")
     assert _mod._owned_agents() == {"alpha", "bravo"}
 
 
 def test_owned_agents_blank_is_none(monkeypatch):
-    monkeypatch.setenv("MIND_OWNED_AGENTS", "   ")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "   ")
     assert _mod._owned_agents() is None
 
 
 def test_multi_machine_from_owned_agents(monkeypatch):
-    monkeypatch.setenv("MIND_OWNED_AGENTS", "alpha")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha")
     assert _mod._multi_machine() is True
 
 
 def test_multi_machine_explicit_flag(monkeypatch):
-    monkeypatch.setenv("MIND_MULTI_MACHINE", "1")
+    monkeypatch.setenv("MACHINE_MULTI", "1")
     assert _mod._multi_machine() is True
 
 
@@ -463,7 +497,7 @@ def test_save_manifest_atomic_roundtrip_no_temp_residue(tmp_path, monkeypatch):
     round-trips through _load_manifest, the overwrite (replace) path round-trips
     too, and the finally-block leaves NO .tmp residue behind."""
     rt = tmp_path / "rt"
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(rt))
+    monkeypatch.setenv("RUNTIME_DIR", str(rt))
     m = {"world/a.md": {"mtime": 123, "md5": "abc"},
          "agents/alpha/session/handoff.yaml": {"mtime": 456, "md5": "def"}}
     _mod._save_manifest(m)
@@ -574,7 +608,7 @@ def test_pull_one_dry_run_no_write(tmp_path):
 def test_pull_continuity_end_to_end(tmp_path, monkeypatch):
     """Drives the 16 continuity names: pulls an absent file + an untouched-cache
     file whose S3 moved, protects a local-ahead file, and counts S3-absent ones."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)  # read real manifest fresh
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
     agents_root = tmp_path / "agents"
@@ -605,7 +639,7 @@ def test_pull_continuity_end_to_end(tmp_path, monkeypatch):
 
 
 def test_pull_continuity_failsafe_untrustworthy_manifest(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", True)
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)  # untrustworthy -> pull nothing
     be = FakeBackend([(tmp_path / "agents", "agents")])
@@ -780,8 +814,8 @@ def test_sweep_full_does_not_clobber_peer_write(tmp_path, monkeypatch):
     """THE machine-2 hazard: a file this machine only CACHED (local == last sync)
     that a PEER then moved on S3 must NOT be pushed back stale by a --full sweep.
     The baseline md5 catches it; the If-Match fence alone would not."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
-    monkeypatch.setenv("MIND_MULTI_MACHINE", "1")
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("MACHINE_MULTI", "1")
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=True)
@@ -799,8 +833,8 @@ def test_sweep_full_does_not_clobber_peer_write(tmp_path, monkeypatch):
 def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
     """Complement: on machine-2, a file WE edited (local != baseline, S3 ==
     baseline) still pushes on --full — proves the stale-skip is not over-broad."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
-    monkeypatch.setenv("MIND_MULTI_MACHINE", "1")
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("MACHINE_MULTI", "1")
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=True)
@@ -815,8 +849,8 @@ def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
 
 # --- sweep agent-dir ownership scoping (H4a) -------------------------------
 def test_sweep_prunes_unowned_agent_dirs(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
-    monkeypatch.setenv("MIND_OWNED_AGENTS", "alpha")
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha")
     roots = _build_tree(tmp_path)
     bravo = tmp_path / "agents" / "bravo" / "self.md"   # a peer agent we don't own
     bravo.parent.mkdir(parents=True, exist_ok=True)
@@ -830,8 +864,8 @@ def test_sweep_prunes_unowned_agent_dirs(tmp_path, monkeypatch):
 
 
 def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
-    roots = _build_tree(tmp_path)                 # MIND_OWNED_AGENTS unset (fixture)
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    roots = _build_tree(tmp_path)                 # MACHINE_OWNED_AGENTS unset (fixture)
     bravo = tmp_path / "agents" / "bravo" / "self.md"
     bravo.parent.mkdir(parents=True, exist_ok=True)
     bravo.write_bytes(b"bravo identity")
@@ -845,7 +879,7 @@ def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
 
 # --- sync_file ownership (H4a, single-file PostToolUse path) ----------------
 def test_sync_file_skips_unowned_agent(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_OWNED_AGENTS", "alpha")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha")
     agents = tmp_path / "agents"
     bravo = agents / "bravo" / "self.md"
     bravo.parent.mkdir(parents=True, exist_ok=True)
@@ -856,7 +890,7 @@ def test_sync_file_skips_unowned_agent(tmp_path, monkeypatch):
 
 
 def test_sync_file_pushes_owned_agent(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIND_OWNED_AGENTS", "alpha")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha")
     agents = tmp_path / "agents"
     alpha = agents / "alpha" / "self.md"
     alpha.parent.mkdir(parents=True, exist_ok=True)
@@ -911,7 +945,7 @@ def test_e2e_flush_then_pull_round_trips_continuity(tmp_path, monkeypatch):
         is genuinely present in S3, not merely one that was never pushed.
     This is the user's exact failure scenario — stop alpha on m1, start alpha on
     m2 — proven closed across all three steps."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)  # real manifest fresh
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
     agents_root = tmp_path / "agents"
@@ -958,7 +992,7 @@ def test_e2e_ephemeral_synced_but_not_pulled(tmp_path, monkeypatch):
     it — by design, ephemeral telemetry is per-machine and harmless to leave
     behind. This guards against an over-broad pull that would resurrect
     machine-1's transient telemetry onto machine-2."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
     agents_root = tmp_path / "agents"
@@ -1077,7 +1111,7 @@ def test_pull_continuity_also_pulls_temp(tmp_path, monkeypatch):
     """Integration: the /start pull (pull_continuity) now also resumes temp/.
     A continuity session file AND a temp working doc both cross the machine-move
     in one call, both appear in pulled_files, and the temp sub-stats are exposed."""
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)  # real manifest fresh
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
     agents_root = tmp_path / "agents"

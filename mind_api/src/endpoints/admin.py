@@ -58,7 +58,7 @@ def owncloud_flush(ctx) -> "Response":  # type: ignore[name-defined]
     (the periodic sweep is still running in this daemon and will retry).
     """
     from ..server import Response
-    backend = os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower()
+    backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend != "own-cloud":
         return Response.json({
             "backend": backend, "flushed": False,
@@ -120,7 +120,7 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
     if not agent:
         return Response.json(
             {"ok": False, "error": "agent query param required"}, status=400)
-    backend = os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower()
+    backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend != "own-cloud":
         return Response.json({
             "backend": backend, "ok": False,

@@ -96,7 +96,13 @@ def test_all_unknown_increments_inferred_unknown_and_autoflags_at_threshold():
                 "MIND_WORLD": str(world),
                 "MIND_AGENT_DIR": str(agent),
             }
-            env.pop("MIND_AGENT", None)
+            # Daemon store WRITES require the X-Mind-Agent header (else 400
+            # missing_agent_header — mycelium store-write hardening). _rt derives
+            # that header from MIND_AGENT, so keep it set to the fixture's agent.
+            # Session reads stay isolated to the tmp agent dir via MIND_AGENT_DIR
+            # precedence (_paths.py:222). Popping MIND_AGENT here silently dropped
+            # every increment (the daemon 400'd, feedback fail-softs, iu stuck at 0).
+            env["MIND_AGENT"] = "alpha"
 
             # Threshold defaults to 5; run --all-unknown 5 times to cross.
             for i in range(5):
