@@ -1,0 +1,13 @@
+[
+  {
+    "version": "0.1.0",
+    "previous_version": null,
+    "date": "2026-06-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "claude-mind baseline (pre-rails marker)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  }
+]
