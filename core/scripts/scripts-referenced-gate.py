@@ -200,6 +200,29 @@ ALWAYS_EXEMPT = {
     "presence-read.sh",                # : pending user-side hook activation
     "presence-tick.sh",                # : pending user-side hook activation
     "presence-tick.py",                # : body of presence-tick.sh
+    # 2026-06-03 orphan-triage (7-orphan sweep). Each below is a legitimate
+    # tool with NO in-repo caller; channel named per the verify-learning
+    # S49.3 review-blocker rule. (The other 3 of the 7 were resolved NOT by
+    # exemption: session-manifest-gate.sh wired into pre-commit, goal-script-
+    # orphan-gate.sh wired into verify-learning, and meta-transfer.py deleted
+    # as daemon-superseded dead code.)
+    "skill-gaps-validate.sh",          # operator/CI: validate meta/skill-gaps.yaml
+                                       # schema (3). Tested by
+                                       # test_skill_gaps_hardening.py; run on
+                                       # demand -- not in a production call path
+                                       # (meta-set does not yet invoke it).
+    "stranded-claim-sweep.sh",         # operator: manual stranded-claim release
+                                       # (dry-run default). The .py IS the loop-
+                                       # wired path (aspirations/SKILL.md:265
+                                       # calls stranded-claim-sweep.py --apply);
+                                       # this .sh wrapper is the human entry.
+    "hook-fire-audit.sh",              # operator: manual hook-health diagnostic --
+                                       # reports entry-sentinel last-fire times
+                                       # (). Run ad-hoc; not in any
+                                       # recurring goal or hook.
+    "skill-attribution.py",            # operator: per-skill invocation-telemetry
+                                       # aggregator (read-only MVP, skill-
+                                       # telemetry master plan). Run on demand.
 }
 
 
@@ -304,13 +327,25 @@ def _collect_reference_text() -> list:
 
 
 def _find_references(basename: str, script_path: Path, corpus: list) -> list:
-    """Return [(ref_path, lineno)] for every non-self reference to basename."""
-    # Word-boundary match to avoid `foo.sh` matching `foo.sh.bak`. We allow
-    # any surrounding text because scripts are invoked in varied contexts:
-    #   bash core/scripts/foo.sh
-    #   source _foo.sh
-    #   from _module import X
-    #   `foo.sh` (documentation backtick — still counts as referenced)
+    """Return a non-empty list iff `basename` is referenced anywhere in the
+    corpus (outside its own file), else an empty list.
+
+    Short-circuits on the FIRST reference found. The sole caller
+    (`_build_report`) only tests the result for truthiness ("is this script
+    referenced at all?"), never the full reference list — so a returned list
+    holds at most one (path, lineno). Collecting EVERY reference meant
+    rescanning the whole corpus for all ~600 scripts even after a match,
+    which made the gate time out (5 min wall, ~1.5s CPU — almost pure I/O)
+    on the real repo. (g-249 perf fix, 2026-06-03.)
+
+    Matching is unchanged: a word-boundary regex on the basename (and, for
+    `.py`, the bare module name) so `foo.sh` does not match `foo.sh.bak`,
+    while varied invocation forms still count (`bash core/scripts/foo.sh`,
+    `source _foo.sh`, `from _module import X`, a `foo.sh` doc backtick).
+    A cheap C-level substring pre-filter skips the per-line regex on files
+    that do not contain the token at all — the word-boundary regex cannot
+    match where the literal token is absent, so the orphan set is byte-for-
+    byte identical to the pre-optimization behavior."""
     if basename.endswith(".py"):
         # Python modules may also be referenced by bare module name.
         module = basename[:-3]
@@ -318,20 +353,27 @@ def _find_references(basename: str, script_path: Path, corpus: list) -> list:
             rf"(?:(?<![\w.-]){re.escape(basename)}(?![\w.-]))"
             rf"|(?:(?<![\w.-]){re.escape(module)}(?![\w.-]))"
         )
+        needles = (basename, module)
     else:
         pattern = re.compile(
             rf"(?<![\w.-]){re.escape(basename)}(?![\w.-])"
         )
-    refs = []
+        needles = (basename,)
     script_str = str(script_path)
     for path, text in corpus:
         if str(path) == script_str:
             continue  # self-reference
+        # Substring pre-filter: the regex requires `basename` (or the bare
+        # module) as a literal substring, so a file lacking every needle
+        # cannot match — skip the line split + regex entirely. `in` on a str
+        # is a C-level scan, vastly cheaper than per-line regex across 1600+
+        # corpus files × 600+ scripts.
+        if not any(n in text for n in needles):
+            continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             if pattern.search(line):
-                refs.append((str(path), lineno))
-                break  # one ref per file is enough to mark as referenced
-    return refs
+                return [(str(path), lineno)]  # short-circuit: one ref suffices
+    return []
 
 
 def _classify_orphan(basename: str) -> str:

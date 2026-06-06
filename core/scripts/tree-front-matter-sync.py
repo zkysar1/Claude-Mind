@@ -318,23 +318,40 @@ def main():
     new_fm_text = fm_text or ""
     new_fm_text = _set_root_scalar(new_fm_text, "last_updated", f"'{today}'")
 
+    # Layer A's PRIMARY job is keeping last_updated in sync (.md front matter
+    # above via _set_root_scalar, and _tree.yaml below via
+    # _bump_tree_yaml_last_updated). Auto-filling trigger.session /
+    # trigger.source is SECONDARY and only works when the trigger is in BLOCK
+    # form (`last_update_trigger:` on its own line with `  type: ...` children).
+    # _set_nested_scalar returns None for an INLINE-form dict
+    # (`last_update_trigger: {type: ...}`) — the form most skill instructions
+    # actually emit. The original code exited(0) on that None, which ABORTED
+    # the primary last_updated sync and silently left _tree.yaml stale for
+    # every inline-trigger node. (The deleted "should not reach here" comment
+    # proved the path was believed unreachable: an inline dict passes the
+    # is-dict refusal check at line ~302 but still hits this nested-write None.)
+    # Fix (2026-06-04, _tree.yaml drift incident, node
+    # windows-maxpath-pathresolution lagged 5 months): a None result skips
+    # ONLY the nested write and FALLS THROUGH to the last_updated bump. Block
+    # form still gets session/source auto-filled; inline form keeps whatever
+    # session/source it was authored with (skills emit those inline already)
+    # and still stays date-synced. The string-form refusal at line ~302 is
+    # deliberate (legacy → Layer-B /tree-edit migration) and is preserved.
+    inline_trigger_seen = False
     if sid:
         result = _set_nested_scalar(new_fm_text, "last_update_trigger", "session", sid)
         if result is None:
-            # Should not reach here — we already refused above on non-dict trigger
-            print(
-                f"FRONT-MATTER-SYNC: {args.virtual_path} — REFUSED: trigger has inline form.",
-                file=sys.stderr,
-            )
-            sys.exit(0)
-        new_fm_text = result
+            inline_trigger_seen = True  # inline form — skip nested, keep date sync
+        else:
+            new_fm_text = result
 
     existing_source = (existing_trigger or {}).get("source") if isinstance(existing_trigger, dict) else None
     if inflight_goal and not existing_source:
         result = _set_nested_scalar(new_fm_text, "last_update_trigger", "source", inflight_goal)
         if result is None:
-            sys.exit(0)
-        new_fm_text = result
+            inline_trigger_seen = True
+        else:
+            new_fm_text = result
 
     # Reconstruct file content (still in LF land)
     if fm_text is None:
@@ -361,12 +378,14 @@ def main():
     # Advisory: surface what changed and whether trigger.type is unset
     trigger_type = (existing_trigger or {}).get("type") if isinstance(existing_trigger, dict) else None
     parts = [f"last_updated→{today}"]
-    if sid:
+    if sid and not inline_trigger_seen:
         parts.append(f"session→{sid[:12]}…")
     if existing_source:
         parts.append("source preserved")
-    elif inflight_goal:
+    elif inflight_goal and not inline_trigger_seen:
         parts.append(f"source→{inflight_goal}")
+    if inline_trigger_seen:
+        parts.append("trigger inline — session/source not auto-filled (run /tree edit to fill, Layer B)")
     if key and bumped_yaml:
         parts.append(f"_tree.yaml[{key}]✓")
     summary = ", ".join(parts)

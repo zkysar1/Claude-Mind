@@ -9,3 +9,11 @@
 # through _rt.py to bypass bash entirely.
 *.sh text eol=lf
 *.bash text eol=lf
+
+# Git hooks are shell scripts too, but EXTENSIONLESS — the *.sh/*.bash rules
+# above don't match their names, so pin them to LF explicitly. autocrlf=true
+# would otherwise check them out as CRLF on a fresh clone and break execution
+# (same g-115-869 rc=127 class). Covers pre-commit/post-commit/pre-push and any
+# future hook — critical because a fresh-clone machine (machine-2, CI) is exactly
+# where the pre-push M2 tag gate must still run.
+core/githooks/* text eol=lf

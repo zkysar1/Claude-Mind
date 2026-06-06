@@ -23,11 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
 
-# B16: MIND_RUNTIME_DIR override isolates the daemon's runtime files so a
+# B16: RUNTIME_DIR override isolates the daemon's runtime files so a
 # daemon-integration test can spawn a daemon without hijacking the live one's
 # PROJECT_ROOT/mind_api/state. Unset (production default) -> the canonical path,
 # byte-identical to prior behavior. Mirrors lifecycle.runtime_dir / owncloud_sync.
-RT_DIR="${MIND_RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
+RT_DIR="${RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
 PID_FILE="$RT_DIR/daemon.pid"
 PORT_FILE="$RT_DIR/daemon.port"
 PARENT_PID_FILE="$RT_DIR/daemon.parent.pid"

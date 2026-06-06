@@ -189,7 +189,7 @@ signal than procedural-hook drift and needs a different ledger.
 The `/fresh-eyes-program` ritual is the sibling of `/fresh-eyes-review` at
 the world-purpose scope: it assembles a briefing from `world/program.md`
 plus each agent's `self.md` plus cross-agent portfolio, writes the briefing
-to `agents/<agent>/reports/`, and posts a one-line summary to the coordination
+to `agents/<agent>/temp/`, and posts a one-line summary to the coordination
 board. No email push, no user-approval gate — the user reviews via git log
 and tracked signals at their own pace. Cadence parameters live in
 `core/config/aspirations.yaml` → `fresh_eyes_program` (goal-count cadence

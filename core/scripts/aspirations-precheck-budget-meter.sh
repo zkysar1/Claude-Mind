@@ -20,7 +20,7 @@
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
 #                parent-supersession-sweep, unblock-parent-status-sweep,
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
-#                felt-sense-cadence
+#                felt-sense-cadence, health-regression-cadence
 #
 # Unknown sweep names default to medium tier (conservative — less likely to
 # get dropped). Add new sweeps here when introducing them.
@@ -76,7 +76,7 @@ sweep_tier() {
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|fresh-eyes-cadence|fresh-eyes-program-cadence|felt-sense-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|fresh-eyes-cadence|fresh-eyes-program-cadence|felt-sense-cadence|health-regression-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration

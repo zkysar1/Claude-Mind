@@ -101,8 +101,8 @@ already uses correct set difference for the orphan_md / missing_md pair.
   for orphan_md and the inverse for missing_md).
 - `world/reasoning-bank.jsonl` rb-707 (the original incident — net delta
   hid 27× more breakage).
-- `bravo/reports/verify-real-cluster-catalog-2026-05-07.md` Candidate 2
-  (catalog entry for this structural-guard ship).
+- verify-real-cluster-catalog Candidate 2 (catalog entry for this
+  structural-guard ship; git-archived).
 - Sibling structural guards: deploy-state-verification (rb-711),
   loop-state-merge-gate (rb-715), pre-completion uncommitted-work-gate
   (commit `7ed1414`).

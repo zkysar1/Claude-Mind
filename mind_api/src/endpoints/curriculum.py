@@ -50,6 +50,8 @@ from pathlib import Path
 
 import yaml
 
+from ..agent_paths import assert_not_cruft
+
 
 # ---------------------------------------------------------------------------
 # Agent-header gate (all 5 commands are agent-scoped)
@@ -100,6 +102,7 @@ def _read_yaml(path):
 
 def _write_yaml(path, data):
     p = Path(path)
+    assert_not_cruft(p.parent, "mkdir (curriculum write_yaml)")
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(p) + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
@@ -122,6 +125,7 @@ def _read_jsonl(path):
 
 def _append_jsonl(path, item):
     p = Path(path)
+    assert_not_cruft(p.parent, "mkdir (curriculum append_jsonl)")
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(item, ensure_ascii=True) + "\n")

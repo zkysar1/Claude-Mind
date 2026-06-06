@@ -1,6 +1,6 @@
 """End-to-end integration test: _fileops public ops routed through OwnCloudBackend.
 
-Flips MIND_STORAGE_BACKEND=own-cloud and drives the REAL _fileops public
+Flips STORAGE_BACKEND=own-cloud and drives the REAL _fileops public
 functions so the whole seam is exercised — get_backend() ->
 OwnCloudBackend.from_env() -> boto3 -> moto. Proves writes/appends land as S3
 objects, locks land as DDB items, and in-lock reads are force-fresh from S3.
@@ -33,9 +33,9 @@ from moto import mock_aws  # noqa: E402
 import _fileops  # noqa: E402
 from storage_backend import reset_backend_for_tests  # noqa: E402
 
-BUCKET = "lodestar-data"
-LOCKS = "lodestar-locks"
-SESSIONS = "lodestar-sessions"
+BUCKET = "zds-data"
+LOCKS = "zds-locks"
+SESSIONS = "zds-sessions"
 REGION = "us-east-2"
 ENV_ID = "ayoai-mind"
 
@@ -58,15 +58,15 @@ def seam(monkeypatch, tmp_path):
     # (moto's fake creds) so the fail-closed MIND_AWS_* guard in from_env does
     # not fire — the cred gate is covered by test_owncloud_backend.py.
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "own-cloud")
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_ENV_ID", ENV_ID)
-    monkeypatch.setenv("MIND_MACHINE_ID", "test-machine-ci")  # G5: from_env fail-closes without it
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
+    monkeypatch.setenv("MACHINE_ID", "test-machine-ci")  # G5: from_env fail-closes without it
     monkeypatch.setenv("MIND_WORLD", str(world))
     monkeypatch.setenv("MIND_META", str(meta))
-    monkeypatch.setenv("MIND_AGENTS_ROOT", str(agents))
+    monkeypatch.setenv("AGENTS_ROOT", str(agents))
     # _fileops.WORLD_DIR is frozen at import (the real agent's world, or None);
     # tmp paths are under neither, so resolve_base_dir() -> None and the
     # raw-local save_history/append_changelog side paths stay dormant. That

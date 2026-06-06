@@ -1,4 +1,4 @@
-"""B16: lifecycle.runtime_dir honors MIND_RUNTIME_DIR so a daemon-integration
+"""B16: lifecycle.runtime_dir honors RUNTIME_DIR so a daemon-integration
 test can isolate its runtime files (daemon.pid/port) into a tmp dir instead of
 hijacking the live daemon's PROJECT_ROOT/mind_api/state (the daemon-storm)."""
 import sys
@@ -15,7 +15,7 @@ from mind_api.src import lifecycle  # noqa: E402
 
 def test_override_redirects_runtime_dir(tmp_path, monkeypatch):
     override = tmp_path / "isolated_state"
-    monkeypatch.setenv("MIND_RUNTIME_DIR", str(override))
+    monkeypatch.setenv("RUNTIME_DIR", str(override))
     # project_root arg is IGNORED when the override is set
     d = lifecycle.runtime_dir(tmp_path / "proj" / "root")
     assert d == override
@@ -26,7 +26,7 @@ def test_override_redirects_runtime_dir(tmp_path, monkeypatch):
 
 
 def test_default_without_override(tmp_path, monkeypatch):
-    monkeypatch.delenv("MIND_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("RUNTIME_DIR", raising=False)
     pr = tmp_path / "proj"
     d = lifecycle.runtime_dir(pr)
     assert d == pr / "mind_api" / "state"  # byte-identical to prior behavior

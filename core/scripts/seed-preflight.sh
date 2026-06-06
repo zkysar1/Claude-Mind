@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # seed-preflight.sh — Source publishability gate aggregator.
 #
-# Runs six publishability checks against the source repo before allowing
+# Runs seven publishability checks against the source repo before allowing
 # a seed transplant to proceed. Each check is a single-responsibility
 # standalone script; the aggregator collects results and exits non-zero
 # if ANY check FAILed.
@@ -56,6 +56,7 @@ CHECKS=(
     "forged-skill-tagging|Forged-skill registry bidirectional consistency|bash $SCRIPT_DIR/audit-forged-skill-tagging.sh"
     "aspirations-templates|Agent-aspirations starter templates domain-free|bash $SCRIPT_DIR/audit-aspirations-templates-clean.sh"
     "toplevel-allowlist|core/ + .claude/ top-level allowlist|bash $SCRIPT_DIR/audit-toplevel-allowlist.sh"
+    "releases-current|RELEASES.json newest entry matches __version__|bash $SCRIPT_DIR/check-releases-current.sh"
 )
 
 PASSES=()

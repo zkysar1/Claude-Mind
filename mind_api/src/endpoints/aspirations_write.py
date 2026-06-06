@@ -1190,6 +1190,18 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # concurrent writers can't allocate the same g-NNN-NN sequence.
     goal.setdefault("status", "pending")
     goal.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    # blocked_since auto-stamp on add: parity with add(ctx) (full-aspiration
+    # add, ~L3186) and cmd_update_goal's blocked_by cascade. A goal added WITH
+    # blocked_by MUST carry blocked_since — otherwise goal-selector's
+    # dependency-timeout check reads the null timestamp as an EXPIRED
+    # dependency (fail-open) and the blocked goal leaks into the executable
+    # ranked list, where another agent may be handed a goal whose
+    # prerequisites have not run. Single-goal add was the one blocked_by-write
+    # path missing this stamp (observed: HTN decomposition children added with
+    # inline blocked_by surfaced as top-ranked executable while genuinely
+    # blocked). Applied outside the lock with the other no-file-state defaults.
+    if goal.get("blocked_by") and not goal.get("blocked_since"):
+        goal["blocked_since"] = datetime.now().isoformat(timespec="seconds")
 
     # --- Full pipeline (advisories + mutators + blockers) runs BEFORE the
     # lock so slow I/O (git log, target-state probe, tree YAML read) does

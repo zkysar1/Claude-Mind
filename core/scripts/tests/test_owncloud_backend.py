@@ -28,21 +28,21 @@ boto3 = pytest.importorskip("boto3")
 from botocore.exceptions import ClientError  # noqa: E402
 from moto import mock_aws  # noqa: E402
 
-BUCKET = "lodestar-data"
-LOCKS = "lodestar-locks"
-SESSIONS = "lodestar-sessions"
+BUCKET = "zds-data"
+LOCKS = "zds-locks"
+SESSIONS = "zds-sessions"
 REGION = "us-east-2"
 ENV_ID = "ayoai-mind"
 
 
 @pytest.fixture(autouse=True)
 def _default_machine_id(monkeypatch):
-    """G5: from_env() fail-closes when MIND_MACHINE_ID is unset/'unknown' (two
+    """G5: from_env() fail-closes when MACHINE_ID is unset/'unknown' (two
     machines both 'unknown' can false-release each other's DDB locks). Default a
     valid id for every test here so the from_env-constructing tests pass the
     guard; the guard's own test unsets it explicitly. __init__-based construction
     (the _backend helper) passes machine_id directly and is unaffected."""
-    monkeypatch.setenv("MIND_MACHINE_ID", "test-machine-ci")
+    monkeypatch.setenv("MACHINE_ID", "test-machine-ci")
 
 
 @pytest.fixture
@@ -390,13 +390,13 @@ def test_from_env_builds_three_root_map(cloud, tmp_path, monkeypatch):
     # into the default  chain so the fail-closed MIND_AWS_* guard (which
     # would otherwise raise before _resolve_root_map runs) does not fire.
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_ENV_ID", ENV_ID)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
     monkeypatch.setenv("MIND_WORLD", str(world))
     monkeypatch.setenv("MIND_META", str(meta))
-    monkeypatch.setenv("MIND_AGENTS_ROOT", str(agents))
+    monkeypatch.setenv("AGENTS_ROOT", str(agents))
     b = OwnCloudBackend.from_env()                           # builds its own  clients (moto-mocked)
     prefixes = {prefix: root for root, prefix in b._roots}
     assert prefixes["world"] == world and prefixes["meta"] == meta and prefixes["agents"] == agents
@@ -422,9 +422,9 @@ def test_from_env_routes_scoped_creds_to_session(monkeypatch, tmp_path):
             return _FakeClient()
 
     monkeypatch.setattr(ocb.boto3, "Session", _FakeSession)
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     monkeypatch.setenv("MIND_AWS_ACCESS_KEY_ID", "SCOPED_AKID")
     monkeypatch.setenv("MIND_AWS_SECRET_ACCESS_KEY", "scoped_secret")
@@ -442,9 +442,9 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
     # it is actually exercising (not the fail-closed cred gate, which would
     # otherwise raise first and pass this test for the wrong reason).
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.delenv("MIND_WORLD", raising=False)
     monkeypatch.delenv("WORLD_PATH", raising=False)
     monkeypatch.delenv("MIND_META", raising=False)
@@ -454,7 +454,7 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
 
 
 def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
-    # Security: with MIND_STORAGE_BACKEND=own-cloud but MIND_AWS_* UNSET and no
+    # Security: with STORAGE_BACKEND=own-cloud but MIND_AWS_* UNSET and no
     # explicit opt-in, from_env MUST refuse rather than silently fall back to the
     # default  chain (which on this deployment resolves the root AWS_* lambda
     # keys). Root-style AWS_* present, MIND_AWS_* absent -> RuntimeError.
@@ -464,9 +464,9 @@ def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
     monkeypatch.delenv("MIND_AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("MIND_AWS_SECRET_ACCESS_KEY", raising=False)
     monkeypatch.delenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", raising=False)
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     with pytest.raises(RuntimeError, match="MIND_AWS"):
         OwnCloudBackend.from_env()
@@ -483,9 +483,9 @@ def test_from_env_allows_default_chain_when_opted_in(cloud, monkeypatch, tmp_pat
     monkeypatch.delenv("MIND_AWS_ACCESS_KEY_ID", raising=False)
     monkeypatch.delenv("MIND_AWS_SECRET_ACCESS_KEY", raising=False)
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     b = OwnCloudBackend.from_env()
     assert b.name == "own-cloud"
@@ -499,17 +499,17 @@ def test_from_env_fails_closed_when_machine_id_unset(monkeypatch, tmp_path):
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
         monkeypatch.setenv(k, "testing")
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
-    monkeypatch.setenv("MIND_S3_BUCKET", BUCKET)
-    monkeypatch.setenv("MIND_DDB_LOCK_TABLE", LOCKS)
-    monkeypatch.setenv("MIND_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
-    monkeypatch.delenv("MIND_MACHINE_ID", raising=False)        # the condition under test
-    with pytest.raises(RuntimeError, match="MIND_MACHINE_ID"):
+    monkeypatch.delenv("MACHINE_ID", raising=False)        # the condition under test
+    with pytest.raises(RuntimeError, match="MACHINE_ID"):
         OwnCloudBackend.from_env()
     # the old silent default value is refused too (not just absence)
-    monkeypatch.setenv("MIND_MACHINE_ID", "unknown")
-    with pytest.raises(RuntimeError, match="MIND_MACHINE_ID"):
+    monkeypatch.setenv("MACHINE_ID", "unknown")
+    with pytest.raises(RuntimeError, match="MACHINE_ID"):
         OwnCloudBackend.from_env()
     # a real id satisfies the guard
-    monkeypatch.setenv("MIND_MACHINE_ID", "machine-1")
+    monkeypatch.setenv("MACHINE_ID", "machine-1")
     assert OwnCloudBackend.from_env().machine_id == "machine-1"

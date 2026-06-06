@@ -31,7 +31,7 @@ from .agent_paths import assert_not_cruft
 def runtime_dir(project_root: Path) -> Path:
     """Return the runtime state directory. Creates it if missing.
 
-    Honors MIND_RUNTIME_DIR (B16): an absolute override points the daemon's
+    Honors RUNTIME_DIR (B16): an absolute override points the daemon's
     runtime files (daemon.pid/port/parent.pid, logs) at an ISOLATED directory so
     a subprocess-spawning daemon-integration test never hijacks the live daemon's
     PROJECT_ROOT/mind_api/state — the daemon-storm failure mode where two daemons
@@ -39,7 +39,7 @@ def runtime_dir(project_root: Path) -> Path:
     PROJECT_ROOT/mind_api/state, byte-identical to prior behavior, so the override
     is dormant for the live daemon. Same env contract as
     core/scripts/owncloud_sync.py and mind-api-start.sh's RT_DIR."""
-    override = os.environ.get("MIND_RUNTIME_DIR")
+    override = os.environ.get("RUNTIME_DIR")
     d = Path(override) if override else (project_root / "mind_api" / "state")
     assert_not_cruft(d, "mkdir (runtime_dir)")
     d.mkdir(parents=True, exist_ok=True)

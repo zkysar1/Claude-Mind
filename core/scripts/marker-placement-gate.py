@@ -73,6 +73,7 @@ ALLOWLIST = {
     ".claude/skills/seed/SKILL.md",  # scanner sentinel patterns, see fresh-eyes review 2026-05-19
     ".claude/skills/verify-learning/SKILL.md",  # documents the marker in verify-check assertions
     "core/config/conventions/learning-routing.md",  # documents the marker as Layer C in decision tree
+    "core/config/conventions/domain-recipe-seed-purity.md",  # documents the marker in invariant 2 (D1 seed-purity convention)
 }
 
 MARKER_TOKEN = "domain-leak-exempt:"

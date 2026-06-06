@@ -63,13 +63,8 @@ agent_dir() {
         printf '%s/%s' "$PROJECT_ROOT" "$1"
     fi
 }
-# Deployment-prefix-agnostic: the production gate passes the agent to
-# heartbeat-stale.sh via the LOCAL env prefix — MIND_AGENT upstream,
-# MIND_AGENT in MIND_* deployments. Read whichever is set so this test is
-# portable across deployments (the gate diverged by prefix only). In a native
-# session exactly one prefix is ambient and the gate's per-call value wins;
-# the precedence here only matters under cross-deployment test runs.
-AGENT_NAME="${MIND_AGENT:-${MIND_AGENT:-}}"
+# The production gate passes the agent to heartbeat-stale.sh via MIND_AGENT.
+AGENT_NAME="${MIND_AGENT:-}"
 if [ -n "$AGENT_NAME" ]; then
     AGENT_DIR="$(agent_dir "$AGENT_NAME")"
 else

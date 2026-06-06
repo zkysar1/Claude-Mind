@@ -1,0 +1,36 @@
+# compatibility.yaml — Cross-world framework compatibility matrix (FRAMEWORK).
+#
+# Generic, domain-free, travels with the seed. Declares the promotion-chain
+# roles, the per-version compatibility ranges, and the monotonicity invariant.
+# Concrete repo names + release-feed URLs live in the DOMAIN OVERLAY at
+# world/config/compatibility.yaml (which does NOT travel with the seed).
+#
+# Consumed by: release.sh (invariant rule reference), check-upstream.sh and
+# promote-to-upstream.sh (Wave 2 — role resolution + range checks).
+# Schema + rationale: rails design A.3; domain-overlay-pattern.md.
+
+schema_version: 1
+
+# The one-way flow of framework releases. Each role is a position in the chain;
+# the concrete repo filling each role is named in the domain overlay
+# (world/config/compatibility.yaml), never here.
+promotion_chain:
+  - role: frontier      # develops core, cuts releases first
+  - role: seed          # domain-free seed source
+  - role: downstream    # consumes the seed
+
+# Per-version minimum-version requirements on the other roles. Newest first.
+# A downstream reading this knows the floor it must reach to be compatible.
+compatibility:
+  - version: "0.2.0"
+    requires:
+      seed: ">=0.1.0"
+      downstream: ">=0.1.0"
+    notes: "Version SSOT established; rails bootstrap. Non-breaking."
+
+# The hard monotonicity invariant. Enforced by construction (releases flow one
+# way) and verified at three moments: release.sh step 6 (hard at frontier, with
+# --force-release escape), promote-to-upstream.sh step 2 (hard), check-upstream.sh
+# step 8 (hard). See guardrail CW2.
+invariant:
+  rule: "core(frontier) >= core(seed) >= core(downstream)"

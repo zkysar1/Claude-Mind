@@ -445,12 +445,12 @@ def cmd_consolidation(args, config, compact):
 # ─────────────────────────────────────────────────────────────────────────
 
 def _has_recent_reports(asp_id, recent_goals, age_days):
-    """Whether any agents/<agent>/temp/*.md or reports/*.md was filed within
+    """Whether any agents/<agent>/temp/*.md was filed within
     `age_days` for this aspiration or any of its `recent_goals`. Filename
     substring match against aspiration id OR goal id. Walks every agent's
-    temp/ and reports/ dirs under PROJECT_ROOT/agents/ (N-agent safe — not
+    temp/ dir under PROJECT_ROOT/agents/ (N-agent safe — not
     hardcoded to alpha/bravo; Phase 2.5.D layout). Briefings moved reports/
-    -> temp/ in the file-model normalization; reports/ is the frozen archive.
+    -> temp/ in the file-model normalization; reports/ was abolished 2026-06-02.
 
     Origin: g-115-188. The cycle detector's zero_learning_velocity branch
     flagged actively-shipping aspirations that produced reports/commits but
@@ -474,10 +474,10 @@ def _has_recent_reports(asp_id, recent_goals, age_days):
     for entry in agents_parent.iterdir():
         if not entry.is_dir():
             continue
-        # Briefings/reports activity: scan temp/ (new home — file-model
-        # normalization moved briefings reports/ -> temp/) AND reports/
-        # (frozen archive, until the Phase-6 legacy drain empties it).
-        for sub in ("temp", "reports"):
+        # Briefings activity: scan temp/ (the briefing home — file-model
+        # normalization moved briefings reports/ -> temp/; reports/ was
+        # abolished 2026-06-02, git history is its archive).
+        for sub in ("temp",):
             scan_dir = entry / sub
             if not scan_dir.is_dir():
                 continue
@@ -592,7 +592,7 @@ def cmd_cycles(args, config, compact):
                             if traj.get("current_velocity") == 0:
                                 # : trajectory.sh counts only rb/guard/
                                 # tree-node encodings, not analytical reports.
-                                # Suppress when <agent>/reports/*.md exist for
+                                # Suppress when <agent>/temp/*.md exist for
                                 # this aspiration or its recent goals — those
                                 # ARE substantive learning artifacts.
                                 if not _has_recent_reports(asp.get("id"), recent, report_age_days):
