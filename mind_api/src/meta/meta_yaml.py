@@ -244,6 +244,7 @@ def _append_log(ctx, file_rel, dotpath, old_value, new_value, reason="") -> str:
         "date": _now(), "meta_change_id": mc_id, "strategy_file": file_rel,
         "field": dotpath, "old_value": old_value, "new_value": new_value, "reason": reason,
     }
+    assert_not_cruft(log_path.parent, "mkdir (meta_yaml append_log)")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
@@ -487,6 +488,7 @@ def log_record(ctx) -> "Response":  # type: ignore[name-defined]
     except (ValueError, json.JSONDecodeError) as e:
         return Response.error(400, "invalid_json", "body is not valid JSON: {}".format(e))
     log_path = ctx.paths.meta / "meta-log.jsonl"
+    assert_not_cruft(log_path.parent, "mkdir (meta_yaml log endpoint)")
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(raw + "\n")

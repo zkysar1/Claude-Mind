@@ -415,14 +415,14 @@ _ACTIVE_BACKEND: Optional[StorageBackend] = None
 def get_backend() -> StorageBackend:
     """Return the process-wide active storage backend.
 
-    Selected by ``MIND_STORAGE_BACKEND`` (``local`` default). ``own-cloud``
+    Selected by ``STORAGE_BACKEND`` (``local`` default). ``own-cloud``
     routes to the own-cloud object/record backend (s3). Unknown values raise —
     no silent fallback to local (that would recreate the split-brain the cutover
     exists to remove).
     """
     global _ACTIVE_BACKEND
     if _ACTIVE_BACKEND is None:
-        kind = os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower()
+        kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
         if kind in ("", "local", "local-files"):
             _ACTIVE_BACKEND = LocalBackend()
         elif kind == "own-cloud":
@@ -433,7 +433,7 @@ def get_backend() -> StorageBackend:
             _ACTIVE_BACKEND = OwnCloudBackend.from_env()
         else:
             raise NotImplementedError(
-                f"MIND_STORAGE_BACKEND={kind!r} is not available yet — "
+                f"STORAGE_BACKEND={kind!r} is not available yet — "
                 "'local' (s1) and 'own-cloud' (s3) are implemented. The "
                 "lodestar-hosted commons backend lands later."
             )

@@ -33,6 +33,7 @@ from pathlib import Path
 import yaml
 
 from .. import file_locks
+from ..agent_paths import assert_not_cruft
 
 # --- Constants lifted verbatim from wm.py ---------------------------------
 
@@ -121,7 +122,7 @@ def _write_wm(path: Path, data: dict) -> None:
     S3 directly. Excluded from the #38 own-cloud RMW conflict-retry on purpose
     (audited 2026-06-02):
 
-      1. Per-agent single-writer. MIND_OWNED_AGENTS pins each agent to one
+      1. Per-agent single-writer. MACHINE_OWNED_AGENTS pins each agent to one
          machine and _wm_lock() serialises that machine's own threads, so there
          is no concurrent multi-machine writer to conflict with. #38's
          conflict-retry targets SHARED world/meta files written by every agent;
@@ -137,6 +138,7 @@ def _write_wm(path: Path, data: dict) -> None:
     The repo cache is off OneDrive, so the bare tmp.replace needs no os.replace
     retry/fallback here. If WM ever becomes shared multi-writer, that is a tier
     change to reconsider — not a one-line write-path swap."""
+    assert_not_cruft(path.parent, "mkdir (wm_write)")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:

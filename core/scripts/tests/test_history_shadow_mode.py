@@ -42,20 +42,14 @@ def with_sandbox(test_fn):
     FILEOPS_HISTORY_USE_NEW_STORE so a test that disables it cannot leak the
     setting into a later test.
 
-    Sets BOTH MIND_* and MIND_* env var families so the same test file
-    runs in Ayoai-Mind (reads MIND_*) and Zak-Data-Solutions-Mind (reads
-    MIND_*) without modification."""
+    Sets MIND_WORLD/MIND_META/MIND_AGENT so _paths resolves the sandbox."""
     def wrapped():
         sandbox = Path(tempfile.mkdtemp(prefix="shadow_world_"))
         meta_sandbox = Path(tempfile.mkdtemp(prefix="shadow_meta_"))
         tracked = ("MIND_WORLD", "MIND_META", "MIND_AGENT",
-                   "MIND_WORLD", "MIND_META", "MIND_AGENT",
                    "FILEOPS_HISTORY_USE_NEW_STORE")
         prior = {k: os.environ.get(k) for k in tracked}
         try:
-            os.environ["MIND_WORLD"] = str(sandbox)
-            os.environ["MIND_META"] = str(meta_sandbox)
-            os.environ["MIND_AGENT"] = "zeta"
             os.environ["MIND_WORLD"] = str(sandbox)
             os.environ["MIND_META"] = str(meta_sandbox)
             os.environ["MIND_AGENT"] = "zeta"

@@ -1,5 +1,5 @@
 # domain-leak-exempt: regex pattern strings for transformation engine include literal AyoAI/Ayoai/Zachary tokens by design
-"""Transformation engine for /seed transplant.
+"""Transformation engine for /seed plant.
 
 Applies four transformation types to file contents at copy time:
   1. file_replace      — full content swap from seed-templates/
@@ -318,7 +318,7 @@ def select_rules_for_file(rel_path: str, transformations: list) -> dict:
         flagging pending_template_skip so the caller can WARN.
 
     The pending_template fallback behavior was introduced 2026-05-19 so the
-    initial transplant can proceed with partial template coverage; F3-F7 are
+    initial plant can proceed with partial template coverage; F3-F7 are
     intentionally `pending_template: true` until proper SKILL.md/convention
     templates are authored.
     """

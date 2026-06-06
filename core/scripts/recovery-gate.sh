@@ -264,6 +264,23 @@ _perform_recovery() {
     rm -f "$_adir/session/recovery-failure-count" 2>/dev/null || true
     rm -f "$_adir/session/recovery-failed-permanent" 2>/dev/null || true
 
+    # Session-telemetry crash close (WP4, 2026-06-03). The runner crashed — no
+    # graceful-stop D6.6 close ran — so finalize its durable telemetry record
+    # with status=crashed, ended_reason=recovery-gate. The record lives at
+    # $WORLD_DIR/telemetry/session-records/$agent/$sid_recorded.json; if WP1 never
+    # wrote an open record, write_close synthesizes from binding.yaml
+    # (wp1_missing=True) so even a crash-only session is captured. write_crash
+    # forces goals_completed=-1 (the crashed session's true outcome is unknown).
+    # Best-effort: a telemetry failure must NEVER abort recovery (|| true) and
+    # the module itself never raises. python3 is sanctioned here — this .sh
+    # sources _paths.sh (CLAUDE.md python-invocation rule); the import-a-pure-
+    # library form (no `scripts/X.py <subcmd>`) is clean past
+    # check-no-python-cli-fallback. guard-165: sid/agent/script-dir pass via
+    # ENV, python source single-quoted. Only when a crashed SID was recorded.
+    if [[ -n "$sid_recorded" ]]; then
+        TSID="$sid_recorded" TAGENT="$agent" TSDIR="$SCRIPT_DIR" python3 -c 'import os,sys; sys.path.insert(0, os.environ["TSDIR"]); from _session_telemetry import write_crash; write_crash(sid=os.environ["TSID"], agent=os.environ["TAGENT"])' 2>/dev/null || true
+    fi
+
     # Recovery notice — /prime surfaces this in the next session's PRIMED
     # block, then deletes the file. Single line; just human text.
     # Only written when state-set IDLE succeeded — never advertise success

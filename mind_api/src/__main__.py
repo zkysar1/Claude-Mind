@@ -41,7 +41,7 @@ _SUPERSEDE_CHECK_SECONDS = 10
 # local stat per governed file plus an S3 HEAD/PUT only for files that changed
 # since the last tick. 120s keeps cross-machine staleness of raw-write / LLM-tool
 # writes bounded without per-tick S3 cost on a quiescent tree. Override via
-# MIND_OWNCLOUD_SYNC_INTERVAL; disable entirely via MIND_OWNCLOUD_SYNC_DISABLE=1.
+# OWNCLOUD_SYNC_INTERVAL; disable entirely via OWNCLOUD_SYNC_DISABLE=1.
 _OWNCLOUD_SYNC_DEFAULT_INTERVAL = 120
 
 
@@ -50,23 +50,43 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
+# N3 de-overload (2026-06-05, user sign-off): the daemon loads from .env.local
+# ONLY this EXACT set of storage-backend config keys, plus the MIND_AWS_* scoped
+# credential FAMILY (prefix) and AWS_DEFAULT_REGION. Replaces the old broad
+# `startswith("MIND_")` filter — MIND_ now means EXCLUSIVELY the credential family,
+# so a stray host STORAGE_*/ENVIRONMENT_* var in .env.local cannot leak into the
+# daemon env. Hard cutover, no back-compat: .env.local MUST use the new key names
+# (the daemon will not see an old MIND_-prefixed storage key). Adding a NEW daemon
+# config var means adding its exact key here (intentional friction — the security
+# boundary is explicit).
+_N3_ALLOWED_EXACT = frozenset({
+    "MACHINE_ID", "MACHINE_MULTI", "RUNTIME_DIR", "STORAGE_BACKEND",
+    "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE", "STORAGE_DDB_LOCK_TABLE",
+    "OWNCLOUD_SYNC_DISABLE", "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
+    "ENVIRONMENT_ID", "MACHINE_OWNED_AGENTS",
+})
+
+
 def _load_env_local(project_root: Path) -> None:
     """Populate ``os.environ`` from ``.env.local`` for the keys the daemon needs
     to select + configure the storage backend (the ``own-cloud`` cutover, s7).
 
     The daemon does NOT otherwise read ``.env.local`` (it inherits its env from
     the spawning shell — ``WORLD_PATH``/``META_PATH`` arrive that way via
-    ``_paths.sh``). Without this, a ``MIND_STORAGE_BACKEND=own-cloud`` flip in
+    ``_paths.sh``). Without this, a ``STORAGE_BACKEND=own-cloud`` flip in
     ``.env.local`` would never reach ``get_backend()`` and the daemon would stay
     on the ``local`` default — a silent split-brain.
 
-    Security: loads ONLY ``MIND_*`` (the scoped own-cloud creds + backend config)
-    plus ``AWS_DEFAULT_REGION`` (a non-secret region string). It deliberately
-    NEVER loads the root ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` (which
-    on this deployment are reserved for unrelated lambda access, NOT the daemon —
-    the ``OwnCloudBackend.from_env`` fail-closed guard exists for exactly this).
-    The ``MIND_`` prefix filter excludes them by construction. ``setdefault`` so an
-    explicit launch-env value always wins; an already-set var is never clobbered.
+    Security (N3, 2026-06-05): loads ONLY the EXACT ``_N3_ALLOWED_EXACT`` storage
+    config keys + the ``MIND_AWS_*`` scoped-credential family + ``AWS_DEFAULT_REGION``
+    (a non-secret region string). It deliberately NEVER loads the root
+    ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` (reserved on this deployment
+    for unrelated lambda access, NOT the daemon — the ``OwnCloudBackend.from_env``
+    fail-closed guard exists for exactly this): they are neither in the exact
+    allowlist nor under the ``MIND_AWS_`` prefix, so they are excluded by
+    construction. N3 collapsed the old broad ``MIND_`` prefix to EXCLUSIVELY the
+    credential family. ``setdefault`` so an explicit launch-env value always wins;
+    an already-set var is never clobbered.
     """
     env_local = project_root / ".env.local"
     try:
@@ -79,17 +99,18 @@ def _load_env_local(project_root: Path) -> None:
             continue
         key, val = s.split("=", 1)
         key = key.strip()
-        if not (key.startswith("MIND_") or key == "AWS_DEFAULT_REGION"):
+        if not (key in _N3_ALLOWED_EXACT or key.startswith("MIND_AWS_")
+                or key == "AWS_DEFAULT_REGION"):
             continue
         # First whitespace token is the value (drops a trailing inline comment).
         tok = val.strip().split()[0] if val.strip() else ""
         # A token that IS a comment means the line had a blank value followed by a
         # `# ...` note — e.g. `.env.example` copied to `.env.local` without editing
-        # (`MIND_MACHINE_ID=  # UNIQUE per-machine id`). Treat as EMPTY so the
+        # (`MACHINE_ID=  # UNIQUE per-machine id`). Treat as EMPTY so the
         # required-var / G5 fail-closed checks trip VISIBLY, rather than loading a
         # bogus value like "#" that silently passes them (communication-clarity
         # rule 5: fail visibly over a silent inconsistent value). No legitimate
-        # MIND_* value begins with '#'.
+        # config value begins with '#'.
         if tok.startswith("#"):
             tok = ""
         os.environ.setdefault(key, tok)
@@ -111,7 +132,7 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
     rationale as ``_load_env_local`` for the backend selector.
 
     Local mode is untouched (zero added I/O): this runs ONLY when
-    ``MIND_STORAGE_BACKEND == own-cloud``. Uses ``setdefault`` so an explicit
+    ``STORAGE_BACKEND == own-cloud``. Uses ``setdefault`` so an explicit
     shell-exported root always wins, and reuses the daemon's own
     ``AgentPathResolver`` (``resolve(None)`` → the first agent's conf, i.e. the
     shared-world fallback) rather than re-implementing conf parsing. Fail-open:
@@ -119,7 +140,7 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
     raises its own specific per-request error rather than crash-loop the daemon
     at startup.
     """
-    if os.environ.get("MIND_STORAGE_BACKEND", "").strip().lower() != "own-cloud":
+    if os.environ.get("STORAGE_BACKEND", "").strip().lower() != "own-cloud":
         return
     have_world = os.environ.get("MIND_WORLD") or os.environ.get("WORLD_PATH")
     have_meta = os.environ.get("MIND_META") or os.environ.get("META_PATH")
@@ -135,7 +156,7 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
         return
     os.environ.setdefault("WORLD_PATH", str(paths.world))
     os.environ.setdefault("META_PATH", str(paths.meta))
-    os.environ.setdefault("MIND_AGENTS_ROOT", str(paths.agent.parent))
+    os.environ.setdefault("AGENTS_ROOT", str(paths.agent.parent))
 
 
 def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event"):
@@ -151,19 +172,19 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
     touching the daemon; every tick is wrapped so a transient S3/credential error
     logs and retries next interval, never killing the thread or the process. The
     thread is daemon=True (dies with the process) and waits on `shutdown` so a
-    graceful stop ends it promptly. Disable via MIND_OWNCLOUD_SYNC_DISABLE=1;
-    tune cadence via MIND_OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
+    graceful stop ends it promptly. Disable via OWNCLOUD_SYNC_DISABLE=1;
+    tune cadence via OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
 
     Returns the started Thread, or None when the sweep is not applicable."""
-    if os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower() != "own-cloud":
+    if os.environ.get("STORAGE_BACKEND", "local").strip().lower() != "own-cloud":
         return None
-    if os.environ.get("MIND_OWNCLOUD_SYNC_DISABLE", "").strip().lower() in (
+    if os.environ.get("OWNCLOUD_SYNC_DISABLE", "").strip().lower() in (
             "1", "true", "yes"):
         print("[runtime] own-cloud mirror sweep disabled "
-              "(MIND_OWNCLOUD_SYNC_DISABLE)", file=sys.stderr)
+              "(OWNCLOUD_SYNC_DISABLE)", file=sys.stderr)
         return None
     try:
-        interval = int(os.environ.get("MIND_OWNCLOUD_SYNC_INTERVAL",
+        interval = int(os.environ.get("OWNCLOUD_SYNC_INTERVAL",
                                       str(_OWNCLOUD_SYNC_DEFAULT_INTERVAL)))
     except ValueError:
         interval = _OWNCLOUD_SYNC_DEFAULT_INTERVAL
@@ -272,9 +293,9 @@ def main(argv=None) -> int:
 
     project_root = _project_root()
 
-    # Load .env.local MIND_* config (storage-backend selector + scoped own-cloud
-    # creds) into os.environ before any endpoint calls get_backend(). The daemon
-    # does not otherwise read .env.local; without this a MIND_STORAGE_BACKEND
+    # Load .env.local config — the N3 exact-allowlist storage keys + scoped own-cloud
+    # creds — into os.environ before any endpoint calls get_backend(). The daemon
+    # does not otherwise read .env.local; without this a STORAGE_BACKEND
     # cutover would never take effect in the daemon. See _load_env_local.
     _load_env_local(project_root)
 

@@ -12,8 +12,8 @@ reporting — zero writes, no history/changelog/lock (CLI docstring line 49).
 SCOPE: guardrails/rb report+candidates read WORLD only (no header). rules audit
 reads PROJECT_ROOT (.claude/rules, CLAUDE.md, core/config/{*.md,conventions/*.md},
 .claude/skills/*/SKILL.md), WORLD (guardrails/reasoning-bank/board), the bound
-agent's journal/experience/reports, AND every SIBLING agent's journal+experience+
-reports (via project_root/agents/*/local-paths.conf, skipping the bound agent) —
+agent's journal/experience/temp, AND every SIBLING agent's journal+experience+
+temp (via project_root/agents/*/local-paths.conf, skipping the bound agent) —
 so it REQUIRES X-Mind-Agent (400 missing_agent_header otherwise).
 
 BYTE-COMPATIBILITY:
@@ -271,7 +271,7 @@ def _gather_citation_haystack(ctx) -> str:
     if agent is not None:
         sources.append(agent / "journal.jsonl")
         sources.append(agent / "experience.jsonl")
-        for sub in ("experience", "reports", "temp"):
+        for sub in ("experience", "temp"):
             sub_dir = agent / sub
             if sub_dir.exists():
                 sources.extend(sorted(sub_dir.glob("*.md")))
@@ -281,7 +281,7 @@ def _gather_citation_haystack(ctx) -> str:
             if agent_d == agent:
                 continue
             sources.append(agent_d / "journal.jsonl")
-            for sub in ("experience", "reports", "temp"):
+            for sub in ("experience", "temp"):
                 sub_dir = agent_d / sub
                 if sub_dir.exists():
                     sources.extend(sorted(sub_dir.glob("*.md")))
@@ -315,7 +315,7 @@ def rules_audit(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(
             400, "missing_agent_header",
             "X-Mind-Agent header required for rules audit "
-            "(citation haystack reads the bound agent's journal/experience/reports/temp).")
+            "(citation haystack reads the bound agent's journal/experience/temp).")
 
     rules_dir = ctx.paths.project_root / ".claude" / "rules"
     if not rules_dir.exists():

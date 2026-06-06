@@ -41,13 +41,11 @@ def test(fn):
 
 @contextmanager
 def sandbox():
-    """Per-test sandbox with dual-set MIND_*/MIND_* env vars."""
+    """Per-test sandbox setting MIND_WORLD/MIND_META."""
     world = Path(tempfile.mkdtemp(prefix="stage3_world_"))
     meta = Path(tempfile.mkdtemp(prefix="stage3_meta_"))
-    tracked = ("MIND_WORLD", "MIND_META", "MIND_WORLD", "MIND_META")
+    tracked = ("MIND_WORLD", "MIND_META")
     prior = {k: os.environ.get(k) for k in tracked}
-    os.environ["MIND_WORLD"] = str(world)
-    os.environ["MIND_META"] = str(meta)
     os.environ["MIND_WORLD"] = str(world)
     os.environ["MIND_META"] = str(meta)
     for mod in list(sys.modules):

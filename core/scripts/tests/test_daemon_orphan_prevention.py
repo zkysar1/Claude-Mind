@@ -44,7 +44,7 @@ def _is_windows() -> bool:
 # mind-api-start.sh AND counts system-wide mind_api.src processes (Get-CimInstance),
 # so it conflicts with any live daemon (it would count/kill it). Exclude it from
 # live-daemon runs: pytest -m "not daemon_integration". Run only in a quiescent
-# window (agents stopped). The system-wide process count is why MIND_RUNTIME_DIR
+# window (agents stopped). The system-wide process count is why RUNTIME_DIR
 # isolation alone can't make this one safe — the marker is the right tool here.
 pytestmark = [
     pytest.mark.skipif(

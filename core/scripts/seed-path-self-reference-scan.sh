@@ -4,7 +4,7 @@
 # Transformations (especially G1/G2 — X-Ayoai-→X-Mind-, AYOAI_→MIND_) MUST NOT rewrite
 # these patterns, or the scanner will look for the post-transform values at destination
 # and report the GOOD (correctly-renamed) tokens as leaks. The marker exempts this whole
-# file from G1/G2/G3/G4 transformations during /seed transplant.
+# file from G1/G2/G3/G4 transformations during /seed plant.
 # /seed verify check 7 — scan destination for source-repo path self-references.
 #
 # Usage: seed-path-self-reference-scan.sh <destination>
@@ -42,7 +42,7 @@ for pat in "${PATTERNS[@]}"; do
         "$pat" "$DEST" 2>/dev/null || true)"
     if [ -n "$MATCHES" ]; then
         # Filter out:
-        #  - .seed-backup-* dirs (pre-transplant backups)
+        #  - .seed-backup-* dirs (pre-plant backups)
         #  - self-references in seed source / manifest
         #  - .claude/settings.local.json (per-machine, NOT shipped via manifest — pre-existing at destination)
         #  - .env.local (per-deployment secrets file, not shipped)

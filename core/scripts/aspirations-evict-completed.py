@@ -58,7 +58,7 @@ SAFETY
 
 USAGE
   Dry-run (read-only; reports projected eviction):
-    set -a; source .env.local; set +a   # MIND_STORAGE_BACKEND + scoped creds
+    set -a; source .env.local; set +a   # STORAGE_BACKEND + scoped creds
     MIND_AGENT=alpha py -3 core/scripts/aspirations-evict-completed.py --source world
   Apply:
     ... --source world --apply

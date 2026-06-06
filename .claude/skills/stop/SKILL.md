@@ -127,6 +127,19 @@ the in-turn chain is interrupted, but the normal path no longer depends on it �
    Bash: `runner_sid=$(cat agents/<agent>/session/running-session-id 2>/dev/null | tr -d '\r\n'); if [ -z "$runner_sid" ] || [ "$MIND_SID" = "$runner_sid" ]; then echo "runner"; else echo "observer"; fi`
 
    IF output is "observer":
+       # Session-telemetry observer close (session-telemetry WP2, observer
+       # variant, 2026-06-03): the observer got a WP1 `active` record at /start
+       # (observer Step 0.5). It never reaches the IDLE branch's WP2 — Step 1
+       # saw state=RUNNING (set by the runner), so /stop took THIS RUNNING
+       # branch, not the IDLE branch. Without a close here the observer's record
+       # would orphan as permanently-`active` and pollute the live-sessions
+       # query. Placed FIRST in the observer branch so it fires for BOTH the
+       # fresh and stale sub-paths below. Keyed on the OBSERVER's own $MIND_SID
+       # (not the runner's running-session-id). status=completed,
+       # ended_reason=user-stop. guard-165: SID/agent via ENV, python source
+       # single-quoted. `py -3` (Bash-tool context). Fire-and-forget (|| true).
+       Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
+
        # Two-way heartbeat probe (pure mtime):
        #   fresh → runner is alive; leave the signal for its next iteration.
        #   stale → runner crashed; route user to `/start --recover`.
@@ -181,6 +194,20 @@ the in-turn chain is interrupted, but the normal path no longer depends on it �
    ELSE (target_mode == "reader"):
      "Mode set to reader (read-only). `/start <agent-name> --mode assistant` to make
      edits; `/start <agent-name>` to resume autonomous."
+3.5. **Finalize session telemetry** (session-telemetry WP2, 2026-06-03): write the
+   durable close record for THIS (non-runner) session. The IDLE branch handles
+   `/stop` of an assistant/reader/observer session — it never reaches the
+   graceful-stop D6.6 close (that's the autonomous runner's path), so without
+   this step assistant/reader sessions would have an open WP1 record that never
+   closes. status=completed, ended_reason=user-stop, mode_at_end=<target_mode>.
+   The record lives at world/telemetry/session-records/<agent-name>/$MIND_SID.json;
+   the own-cloud sweep carries it to S3. Pure library module via `py -3 -c`
+   (no .sh wrapper / no daemon dependency — works even if the daemon is dead).
+   guard-165: SID/agent/mode pass through ENV VARS, python source single-quoted.
+   $MIND_SID and $MIND_AGENT are present here — the hook auto-injects
+   MIND_AGENT and the binding is not cleaned until Step 4 below. Fire-and-forget
+   (|| true): telemetry must never block the stop.
+   Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" TMODE="<target_mode>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop", mode_at_end=(os.environ.get("TMODE") or None))' >/dev/null 2>&1 || true`
 4. **Clean up this session's SID binding** (plan v1 step 0.10, 2026-05-19): the
    binding file at PROJECT_ROOT/.active-agent-$MIND_SID was created by /start
    (or rebound by Step 0.5c above). The RUNNING branch's runner-session path

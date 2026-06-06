@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# /seed verify <destination> — post-transplant smoke test (8 checks).
+# /seed verify <destination> — post-plant smoke test (8 checks).
 #
 # Usage: seed-verify.sh <destination> [--manifest <path>]
 #
@@ -63,7 +63,7 @@ run_check "Manifest completeness" "fail" "1" \
     --dest "$DEST"
 
 # --- Check 2: Domain leakage ---
-run_check "Domain leakage (excluded paths not transplanted)" "fail" "2" \
+run_check "Domain leakage (excluded paths not copied)" "fail" "2" \
     --engine "$SCRIPT_DIR/_seed_engine.py" \
     --cmd verify-leak-check \
     --manifest "$MANIFEST" \
@@ -90,7 +90,7 @@ if [ -d "$DEST/.git" ]; then
         echo "   clean: PASS"
     else
         N_DIRTY="$(echo "$STATUS" | wc -l)"
-        echo "   $N_DIRTY changed files (expected after transplant)"
+        echo "   $N_DIRTY changed files (expected after plant)"
     fi
 else
     echo "   INFO: no .git/ at destination"

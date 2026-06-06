@@ -2,7 +2,7 @@
 # functional infrastructure for the own-cloud storage tier (Lodestar cutover s3),
 # not a domain leak. The abstract seam (storage_backend.py) stays domain-free;
 # THIS is the concrete implementation the seam was built for. Lazily imported by
-# storage_backend.get_backend() only when MIND_STORAGE_BACKEND=own-cloud, so
+# storage_backend.get_backend() only when STORAGE_BACKEND=own-cloud, so
 # 100%-local users never import boto3.
 """OwnCloudBackend — StorageBackend over S3 (whole-file stores) + DynamoDB
 (cross-machine locks + agent-session coordination), for the Lodestar own-cloud
@@ -141,8 +141,8 @@ class OwnCloudBackend:
     # --- env wiring --------------------------------------------------------
     @classmethod
     def from_env(cls) -> "OwnCloudBackend":
-        """Build from MIND_* env vars. Required: MIND_S3_BUCKET, MIND_DDB_LOCK_TABLE,
-        MIND_DDB_SESSIONS_TABLE, and at least one of AYOAI_WORLD/WORLD_PATH or
+        """Build from env vars. Required: STORAGE_S3_BUCKET, STORAGE_DDB_LOCK_TABLE,
+        STORAGE_DDB_SESSIONS_TABLE, and at least one of AYOAI_WORLD/WORLD_PATH or
         AYOAI_META/META_PATH (so a governed path can resolve to a root). Also
         requires the scoped creds MIND_AWS_ACCESS_KEY_ID + MIND_AWS_SECRET_ACCESS_KEY
         UNLESS MIND_AWS_ALLOW_DEFAULT_CHAIN=1 is set (fail-closed — see below).
@@ -154,8 +154,8 @@ class OwnCloudBackend:
         daemon-context wiring (routing these through the per-request ctx.paths
         resolver instead of process env) is the s3-integration follow-up; the
         env form here is correct for CLI invocation and is fully test-controllable."""
-        missing = [v for v in ("MIND_S3_BUCKET", "MIND_DDB_LOCK_TABLE",
-                               "MIND_DDB_SESSIONS_TABLE")
+        missing = [v for v in ("STORAGE_S3_BUCKET", "STORAGE_DDB_LOCK_TABLE",
+                               "STORAGE_DDB_SESSIONS_TABLE")
                    if not os.environ.get(v)]
         if missing:
             raise RuntimeError(
@@ -196,25 +196,25 @@ class OwnCloudBackend:
         # machine A's LIVE lock -> false-release -> concurrent read-modify-write ->
         # data corruption. Refuse rather than run with that hazard (same
         # fail-visible posture as the creds guard above; communication-clarity.md
-        # rule 5). One line in .env.local (MIND_MACHINE_ID=<hostname>) satisfies it
+        # rule 5). One line in .env.local (MACHINE_ID=<hostname>) satisfies it
         # — and the machine-2 bring-up runbook sets it on every machine.
-        machine_id = os.environ.get("MIND_MACHINE_ID", "").strip()
+        machine_id = os.environ.get("MACHINE_ID", "").strip()
         if not machine_id or machine_id.lower() == "unknown":
             raise RuntimeError(
-                "OwnCloudBackend.from_env: MIND_MACHINE_ID is not set (or is "
+                "OwnCloudBackend.from_env: MACHINE_ID is not set (or is "
                 "'unknown'). The own-cloud DDB lock holder is machine_id:pid:tid; "
                 "two machines both defaulting to 'unknown' can have an identical "
                 "holder (pid+tid can coincide across hosts) and false-release each "
                 "other's locks -> concurrent read-modify-write -> data corruption. "
-                "Set MIND_MACHINE_ID to a unique per-machine value (the hostname is "
+                "Set MACHINE_ID to a unique per-machine value (the hostname is "
                 "a good default) in .env.local.")
         return cls(
-            env_id=os.environ.get("MIND_ENV_ID", "ayoai-mind"),
-            bucket=os.environ["MIND_S3_BUCKET"],
-            lock_table=os.environ["MIND_DDB_LOCK_TABLE"],
-            sessions_table=os.environ["MIND_DDB_SESSIONS_TABLE"],
+            env_id=os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
+            bucket=os.environ["STORAGE_S3_BUCKET"],
+            lock_table=os.environ["STORAGE_DDB_LOCK_TABLE"],
+            sessions_table=os.environ["STORAGE_DDB_SESSIONS_TABLE"],
             root_map=cls._resolve_root_map(),
-            cache_ttl=int(os.environ.get("MIND_CLOUD_CACHE_TTL", "30")),
+            cache_ttl=int(os.environ.get("OWNCLOUD_CACHE_TTL", "30")),
             machine_id=machine_id,
             region=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"),
             # Scoped least-privilege creds (Zak_first_test), separate from the
@@ -229,10 +229,10 @@ class OwnCloudBackend:
         """The three independent governed roots -> their logical prefixes.
         world/meta from env (AYOAI_* preferred, then *_PATH); agents-root is
         always PROJECT_ROOT/agents (derivable from this file's location, or
-        overridable via MIND_AGENTS_ROOT for tests)."""
+        overridable via AGENTS_ROOT for tests)."""
         world = os.environ.get("AYOAI_WORLD") or os.environ.get("WORLD_PATH")
         meta = os.environ.get("AYOAI_META") or os.environ.get("META_PATH")
-        agents = (os.environ.get("MIND_AGENTS_ROOT")
+        agents = (os.environ.get("AGENTS_ROOT")
                   or str(Path(__file__).resolve().parents[2] / "agents"))
         if not world and not meta:
             raise RuntimeError(

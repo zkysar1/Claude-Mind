@@ -38,12 +38,20 @@ extract_initial_state() {
 }
 
 # --- 1. Create directory structure ---
+# telemetry/session-records holds durable per-session telemetry records
+# (world/telemetry/session-records/<agent>/<sid>.json) written by
+# core/scripts/_session_telemetry.py. Establishing it here makes it a
+# first-class world dir carried by the own-cloud sweep; the writer module
+# also creates it lazily, so this is belt-and-suspenders (and documents intent).
+# NOT "telemetry/sessions" — owncloud_sync.py _EXCLUDE_DIRS walk-prunes the
+# "sessions" basename, which would block the S3 sweep (rb 2026-06-03).
 mkdir -p \
     "$WORLD/conventions" \
     "$WORLD/config" \
     "$WORLD/knowledge/tree" \
     "$WORLD/knowledge/patterns" \
-    "$WORLD/knowledge/strategies"
+    "$WORLD/knowledge/strategies" \
+    "$WORLD/telemetry/session-records"
 
 echo "  Created directory structure"
 
@@ -134,6 +142,28 @@ EOF
 # should be suppressed when the component crosses failing_streak_threshold.
 # Empty = streak alerts still fire but never reach the goal-selector.
 component_categories: {}
+EOF
+
+# Cross-world versioning DOMAIN OVERLAY (Wave 1). Names the concrete repos
+# filling each promotion-chain role + the release-feed URLs. Does NOT travel
+# with the seed — each deployment writes its own. The framework half is
+# core/config/compatibility.yaml. Read by release.sh step 6 + (Wave 2)
+# check-upstream.sh / promote-to-upstream.sh. Per-file guard: a populated
+# overlay is never clobbered on reseed (omni Q6).
+[[ -f "$WORLD/config/compatibility.yaml" ]] || cat > "$WORLD/config/compatibility.yaml" << 'EOF'
+# Cross-world DOMAIN OVERLAY — fill in for THIS deployment. Empty/placeholder
+# means release.sh's frontier-invariant pre-check (H1) cannot fetch the seed
+# feed and will require --force-release "<reason>" until the URLs are real.
+self_role: ""         # which role THIS repo plays: frontier | seed | downstream
+roles:
+  frontier: ""        # repo that develops core + cuts releases first
+  seed: ""            # domain-free seed source
+  downstream: []      # repos that consume the seed
+sources:
+  frontier:
+    releases_url: ""  # https://raw.githubusercontent.com/<org>/<frontier>/main/RELEASES.json
+  seed:
+    releases_url: ""  # https://raw.githubusercontent.com/<org>/<seed>/main/RELEASES.json
 EOF
 echo "  Seeded world/config/ stub overlay files (empty defaults)"
 
