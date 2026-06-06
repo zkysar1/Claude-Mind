@@ -30,15 +30,10 @@ def with_sandbox(test_fn):
         sandbox = Path(tempfile.mkdtemp(prefix="finding_fixes_world_"))
         meta_sandbox = Path(tempfile.mkdtemp(prefix="finding_fixes_meta_"))
         tracked = ("MIND_WORLD", "MIND_META",
-                   "MIND_WORLD", "MIND_META",
                    "FILEOPS_HISTORY_KEEP_LEGACY_WRITES",
                    "FILEOPS_HISTORY_USE_NEW_STORE")
         prior = {k: os.environ.get(k) for k in tracked}
         try:
-            os.environ["MIND_WORLD"] = str(sandbox)
-            os.environ["MIND_META"] = str(meta_sandbox)
-            # Dual-set MIND_*/MIND_* so the same test runs in Ayoai-Mind
-            # and Zak-Data-Solutions-Mind without modification.
             os.environ["MIND_WORLD"] = str(sandbox)
             os.environ["MIND_META"] = str(meta_sandbox)
             # Findings 1-4 test the LEGACY gz tree behavior (per-file

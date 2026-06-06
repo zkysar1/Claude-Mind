@@ -277,6 +277,19 @@ Bash: rm -f agents/<agent>/session/running-session-id agents/<agent>/session/asp
 # 0 silently. Goal/tree counts are 0 here because graceful-stop doesn't have a
 # rolling counter; future enhancement is to seed them from team-state intel.
 Bash: MIND_AGENT=<agent> SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && bash core/scripts/session-summary-write.sh --sid "$SID" --agent "<agent>" --reason graceful-stop >/dev/null || true
+# D6.6 (session-telemetry WP3, 2026-06-03): Finalize the durable per-session
+# telemetry record at world/telemetry/session-records/<agent>/<SID>.json with
+# status=completed, ended_reason=graceful-stop. The record lives under world/
+# so the own-cloud sweep (the D6.7 flush below, then the 120s periodic sweep)
+# carries it to S3 cross-machine with NO new infra. write_close reads the open
+# (WP1) record to preserve started_at/machine_id and compute duration; if WP1
+# was never written it synthesizes from binding.yaml (wp1_missing=True) so the
+# session is still captured. Pure library module invoked via `py -3 -c` (NOT a
+# .sh wrapper — avoids the no-python-cli-fallback gate; NOT a daemon endpoint —
+# the writer must work even when the daemon is dead). guard-165: SID/agent/mode
+# pass through ENV VARS, python source single-quoted — never interpolated.
+# Fire-and-forget (|| true): telemetry must never block the graceful stop.
+Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); TMODE=$(cat agents/<agent>/session/stop-target-mode 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && TSID="$SID" TAGENT="<agent>" TMODE="$TMODE" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="graceful-stop", mode_at_end=(os.environ.get("TMODE") or None))' >/dev/null 2>&1 || true
 # D6.7 (session-continuity redesign, 2026-06-02): Flush this machine's governed
 # writes to S3 NOW so a machine-move right after this clean stop cannot strand
 # the session's last continuity writes locally. By this point ALL continuity

@@ -10,10 +10,13 @@ converts SCRIPT_DIR via cygpath -w when available (falling through to plain
 SCRIPT_DIR on Linux/macOS where cygpath is absent and POSIX paths work
 natively).
 
-The two wrappers below were the ONLY pre-2026-05-14-migration scripts in
-core/scripts/ using the `exec python3 "$SCRIPT_DIR/<script>.py"` shape
-(grep verified the exhaustive list). New unmigrated wrappers adopting the
-same shape should be added to WRAPPERS_NEEDING_CYGPATH.
+WRAPPERS_NEEDING_CYGPATH is discovered dynamically (see
+_discover_direct_python_wrappers below): every core/scripts/*.sh that execs
+python3 with a SCRIPT_DIR-derived path is checked, and daemon-only wrappers
+are excluded automatically. As of 2026-06-03 the only direct-python wrapper
+left is insight-trigger-sweep.sh — utilization-stats.sh migrated to daemon-only
+on 2026-05-29 and correctly drops out of the dynamic list (which is what this
+file's prior hardcoded 2-entry list failed to reflect, breaking this suite).
 
 Refs: g-115-892 (this fix), .claude/rules/no-python-cli-fallback.md
 (daemon-only migration that bypassed these legacy direct-python wrappers).
@@ -24,10 +27,29 @@ from pathlib import Path
 
 CORE_SCRIPTS = Path(__file__).resolve().parent.parent
 
-WRAPPERS_NEEDING_CYGPATH = [
-    "utilization-stats.sh",
-    "insight-trigger-sweep.sh",
-]
+
+def _discover_direct_python_wrappers() -> list[str]:
+    """core/scripts/*.sh wrappers that `exec python3 "$SCRIPT_DIR.../<x>.py"`.
+
+    Self-maintaining: daemon-only wrappers (which route through rt_call in
+    _runtime.sh, no direct python3 exec) are excluded automatically, so a
+    wrapper migrating to daemon-only — e.g. utilization-stats.sh on 2026-05-29 —
+    drops off this list with no manual edit, and a new direct-python wrapper is
+    picked up the moment it lands. Replaces a hardcoded 2-entry list that went
+    stale on that migration. An empty result is correct (no wrapper execs
+    python3 directly -> none can carry the Windows path-mangling bug) and passes
+    the checks below vacuously.
+    """
+    wrappers = []
+    for sh in sorted(CORE_SCRIPTS.glob("*.sh")):
+        for line in sh.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("exec python3") and "SCRIPT_DIR" in line:
+                wrappers.append(sh.name)
+                break
+    return wrappers
+
+
+WRAPPERS_NEEDING_CYGPATH = _discover_direct_python_wrappers()
 
 
 def test_wrappers_use_cygpath_conversion() -> None:

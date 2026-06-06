@@ -1,11 +1,11 @@
 """test_seed_engine_anchoring.py — exclude_always pattern semantics for the seed engine.
 
 Background (2026-05-20, Bug E / testy-incident):
-  The /seed transplant pipeline excludes top-level domain state (world/, meta/,
+  The /seed plant pipeline excludes top-level domain state (world/, meta/,
   agents/) so destinations get their own copies. But bare-name `world/` matched
   ANYWHERE in the path — over-matching the legitimate Python packages
   `mind_api/src/world/` and `mind_api/src/meta/` that the daemon imports. A
-  destination repo transplanted with the old manifest got a broken daemon at
+  destination repo planted with the old manifest got a broken daemon at
   startup ("No module named '..world'"). The strategic fix is gitignore-style
   anchoring: a leading `/` restricts the pattern to top-level only.
 

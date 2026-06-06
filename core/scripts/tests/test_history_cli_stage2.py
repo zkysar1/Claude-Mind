@@ -40,19 +40,14 @@ def test(fn):
 def sandbox():
     """Per-test sandbox: tempdir as WORLD, second tempdir as META.
 
-    Sets BOTH MIND_* and MIND_* env var families so the same test file
-    runs in Ayoai-Mind (reads MIND_*) and Zak-Data-Solutions-Mind (reads
-    MIND_*) without modification. The unused family is a no-op in the
-    consuming repo's _paths.py.
+    Sets MIND_WORLD/MIND_META so _paths resolves the sandbox.
     """
     world = Path(tempfile.mkdtemp(prefix="hist_cli_stage2_world_"))
     meta = Path(tempfile.mkdtemp(prefix="hist_cli_stage2_meta_"))
-    tracked = ("MIND_WORLD", "MIND_META", "MIND_WORLD", "MIND_META",
+    tracked = ("MIND_WORLD", "MIND_META",
                "FILEOPS_HISTORY_USE_NEW_STORE",
                "FILEOPS_HISTORY_KEEP_LEGACY_WRITES")
     prior = {k: os.environ.get(k) for k in tracked}
-    os.environ["MIND_WORLD"] = str(world)
-    os.environ["MIND_META"] = str(meta)
     os.environ["MIND_WORLD"] = str(world)
     os.environ["MIND_META"] = str(meta)
     # Reload fresh modules so they pick up the new env.

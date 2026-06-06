@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# pre-push — M2 tag-escape gate (omni#3). Refuses to push any v* tag whose
+# version is NOT recorded in RELEASES.json.
+#
+# WHY: release.sh is the SOLE creator of v* tags and the SOLE writer of
+# RELEASES.json entries — the two are cut together in one commit. A v* tag that
+# reaches the remote with no matching RELEASES.json entry is an M2 invariant
+# violation: downstream/seed repos pull the tag but have no upgrade/rollback
+# recipe, no breaking/cross-world classification, no chain anchor. This hook is
+# the machine enforcement that the human can't push such a tag by hand.
+#
+# FAIL-CLOSED — the deliberate OPPOSITE of the post-commit daemon-recycle hook
+# beside it (which is fail-open, exit 0 on any error). Here, ANY error (no repo
+# root, missing/malformed RELEASES.json, unrecorded version) BLOCKS the push
+# (exit 1). A false-positive block is annoying but recoverable
+# (RELEASE_FORCE_PUSH_TAG=1); a false-negative lets an unrecorded tag escape,
+# which is the exact thing M2 exists to prevent.
+#
+# Tracked + propagated via core.hooksPath=core/githooks (install-git-hooks.sh,
+# auto-installed by sessionstart-orchestrator.sh Step 0.5) — same mechanism as
+# the pre-commit + post-commit hooks. No copy step; git reads core/githooks/.
+#
+# git pre-push stdin: one line per pushed ref, each
+#   <local-ref> SP <local-oid> SP <remote-ref> SP <remote-oid>
+# A tag DELETION carries an all-zero local-oid (skip — deleting a tag needs no
+# RELEASES.json entry). The kernel that does the actual lookup is
+# core/scripts/check-tag-in-releases.py (testable, daemon-free).
+
+# Emergency escape hatch (logged to stderr for audit). Use only when the gate
+# is a confirmed false positive and the tag genuinely must ship.
+if [ "${RELEASE_FORCE_PUSH_TAG:-}" = "1" ]; then
+    echo "[pre-push] AUDIT: RELEASE_FORCE_PUSH_TAG=1 — bypassing M2 tag gate" >&2
+    exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1   # fail-CLOSED
+[ -n "$ROOT" ] || { echo "[pre-push] ERROR: cannot resolve repo root — refusing push" >&2; exit 1; }
+RELEASES_PATH="$ROOT/RELEASES.json"
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) PY="py -3" ;;
+    *) PY="python3" ;;
+esac
+
+BLOCKED=0
+SAW_VTAG=0
+while read -r local_ref local_oid remote_ref remote_oid; do
+    # Only v* tag refs are gated; branch pushes and non-v tags pass through.
+    case "$local_ref" in
+        refs/tags/v*) ;;
+        *) continue ;;
+    esac
+    # Tag deletion: all-zero local-oid. Deleting a tag needs no RELEASES.json entry.
+    case "$local_oid" in
+        ''|*[!0]*) ;;          # non-empty AND contains a non-zero digit -> a real push
+        *) continue ;;         # empty or all-zeros -> deletion, skip
+    esac
+    SAW_VTAG=1
+    VERSION="${local_ref#refs/tags/v}"
+    if ! RELEASES_PATH="$RELEASES_PATH" $PY "$ROOT/core/scripts/check-tag-in-releases.py" "$VERSION"; then
+        BLOCKED=1   # accumulate ALL violations (e.g. `git push --tags`), don't stop at first
+    fi
+done
+
+if [ "$BLOCKED" = "1" ]; then
+    echo "[pre-push] Push REFUSED: one or more v* tags have no RELEASES.json entry." >&2
+    echo "[pre-push] Cut the release via core/scripts/release.sh, or set RELEASE_FORCE_PUSH_TAG=1 to override." >&2
+    exit 1
+fi
+exit 0   # no v* tags, or all recorded

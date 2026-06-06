@@ -36,6 +36,8 @@ from typing import Any, Dict, List
 
 import yaml
 
+from ..agent_paths import assert_not_cruft
+
 ROLLING_WINDOW = 20
 GRADE_MAP = {"good": 1.0, "average": 0.5, "poor": 0.0}
 DIMENSIONS = ["safety", "completeness", "executability", "maintainability", "cost_awareness"]
@@ -63,6 +65,7 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
 
 def _write_yaml(path: Path, data) -> None:
     """RAW write, DEFAULT yaml.Dumper, no lock/history/changelog (CLI 62-68)."""
+    assert_not_cruft(path.parent, "mkdir (skill_evaluate write_yaml)")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:

@@ -49,7 +49,7 @@ SAFETY
 
 USAGE
   Dry-run (read-only; reports projected shrink):
-    set -a; source .env.local; set +a   # load MIND_STORAGE_BACKEND + scoped creds
+    set -a; source .env.local; set +a   # load STORAGE_BACKEND + scoped creds
     MIND_AGENT=alpha py -3 core/scripts/aspirations-compact-completed.py --source world
   Apply:
     ... --source world --apply

@@ -6,7 +6,9 @@
 
 system:
   name: "Self"
-  version: "0.1.0"
+  # version SSOT is mind_api/src/__init__.py __version__ (single source). The
+  # former `version:` field here was a dual source (drifted to 0.1.0 while the
+  # SSOT was 0.2.0) read by zero code — removed in Wave 0 of the versioning rails.
   purpose: "Domain-agnostic continual learning agent that explores, builds knowledge, forms hypotheses, tracks outcomes, and self-evolves its capabilities over time"
 
 superforecasting:

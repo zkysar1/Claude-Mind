@@ -26,11 +26,26 @@ sys.path.insert(0, str(REPO_ROOT))
 
 # Hermetic storage backend (lodestar-s7 test isolation): tests must NEVER touch
 # real S3. After the own-cloud cutover, .env.local carries
-# MIND_STORAGE_BACKEND=own-cloud; the in-process daemon fixtures here resolve
+# STORAGE_BACKEND=own-cloud; the in-process daemon fixtures here resolve
 # get_backend() from os.environ, and any wrapper subprocess they spawn inherits
 # this env. Pin local for the whole pytest session so test daemons stay on the
 # LocalBackend rather than reaching for real S3 (or 500-ing on from_env).
-os.environ["MIND_STORAGE_BACKEND"] = "local"
+os.environ["STORAGE_BACKEND"] = "local"
+
+
+# Suppress the daemon stale-code check for the whole pytest session
+# (). The in-process test daemons spawned below report a
+# git_head_sha frozen at module-import time; when HEAD advances mid-run (a
+# real commit landing during a long suite, the canonical 74-failure incident
+# 2026-06-03), rt_check_staleness sees frozen != on-disk and fires a
+# disruptive auto-restart mid-wrapper, corrupting the wrapper's output
+# (JSONDecodeError). The check is meaningless for an in-process daemon that
+# IS the current code, so pre-set the "already warned" sentinel that
+# rt_check_staleness short-circuits on (_runtime.sh:169); every wrapper
+# subprocess inherits it via os.environ.copy(), giving full isolation from
+# both the frozen test-daemon sha AND any stale live daemon, with no
+# quiescent window required.
+os.environ["RT_STALENESS_WARNED"] = "1"
 
 
 @pytest.fixture

@@ -169,12 +169,20 @@ For each domain topic discussed with substantive new content:
     Read the node file
     Edit the node — append to "Key Insights" or relevant section
     Update front matter: last_updated = today,
-                        last_update_trigger = "encode-session"
+                        last_update_trigger = {type: "encode-session"}
+    # last_update_trigger MUST be the dict form {type: "..."}, NOT a bare
+    # string. T21 (tree-front-matter-sync.py) REFUSES to sync a string trigger
+    # and silently leaves _tree.yaml's last_updated stale — the 2026-06-04
+    # drift incident (node windows-maxpath-pathresolution lagged 5 months) was
+    # THIS lane writing the string form. The inline {type: ...} form is fine:
+    # T21 bumps last_updated for both the .md FM and _tree.yaml; it skips the
+    # session/source auto-fill for inline form (Layer B /tree edit fills those).
+    # Matches Lane 1.6's {type: "debt-reconciliation"} form.
     # No explicit tree-update.sh --set last_updated call — the PostToolUse
-    # hook (T21, `tree-front-matter-sync.py`) fires on every tree-node Edit
-    # and atomically bumps BOTH the .md front matter AND _tree.yaml's
-    # nodes[key].last_updated + top-level last_updated. Adding a redundant
-    # explicit call would just duplicate the hook's work.
+    # hook (T21) fires on every tree-node Edit and, given the dict trigger,
+    # atomically bumps BOTH the .md front matter AND _tree.yaml's
+    # nodes[key].last_updated + top-level last_updated. A redundant explicit
+    # call would just duplicate the hook's work.
     Print: ENCODED tree:<node.key> — "<one-line of what was added>"
   IF no node exists for a substantive new topic:
     PROPOSE creating it (do NOT auto-create from chat-context — too easy to

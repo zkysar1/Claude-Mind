@@ -5,11 +5,12 @@
 # Treating them as patterns to transform would cause double-rename + scanner-self-leak
 # (see fresh-eyes review 2026-05-19). file_replace / inline_edit ARE still applied.
 name: seed
-description: "Manages framework seed creation, transplantation to destination repos, and post-transplant verification. Use whenever the user says 'seed', 'transplant', 'copy framework to', 'publish to claude-mind', 'create a seed', 'verify the seed', 'diff against destination', or needs to reproduce the continual-learning framework into a new or existing repo. Sub-commands: create, transplant, verify, diff."
+description: "Manages the framework SEED: build the seed manifest, PLANT (publish) the domain-stripped framework into a destination repo, verify, and diff. The seed is domain-free — planting it grows a NEW, empty environment (e.g. claude-mind) with no agents, no world, no learned state. To relocate a LIVING mind WITH its agents, world, meta and identity onto another machine, that is a TRANSPLANT — use the separate /transplant skill instead. Use when the user says 'seed', 'plant the seed', 'publish the framework', 'publish to claude-mind', 'copy framework to', 'create a seed', 'verify the seed', or 'diff against destination'. Sub-commands: create, plant, verify, diff."
 user-invocable: true
 triggers:
   - "/seed"
-  - "transplant the framework"
+  - "plant the seed"
+  - "publish the framework"
   - "create a seed"
   - "publish to claude-mind"
   - "copy framework to"
@@ -17,10 +18,10 @@ triggers:
   - "diff against destination"
 parameters:
   - name: sub-command
-    description: "create | transplant <destination> | verify <destination> | diff <destination>"
+    description: "create | plant DEST | verify DEST | diff DEST"
     required: true
   - name: destination
-    description: "Absolute path to destination repo (required for transplant/verify/diff)"
+    description: "Absolute path to destination repo (required for plant/verify/diff)"
     required: false
   - name: flags
     description: "--dry-run, --diff, --backup/--no-backup, --force, --manifest <path>, --fresh-git, --commit, --clean-cruft/--no-clean-cruft, --include-bench"
@@ -42,6 +43,8 @@ The source repo (your working AyoAI deployment, or any domain deployment) stays
 UNTOUCHED. Cleanup happens at copy time via transformation rules defined in
 `core/config/seed-manifest.yaml`. This separates "your live working environment"
 from "the publishable framework abstraction."
+
+> **Naming (2026-06-03):** this skill's copy verb was renamed `transplant` → **`plant`**. A *seed* is domain-free — planting it grows a NEW, empty environment (e.g. claude-mind) with no agents, no world, no learned state. The word **transplant** is now reserved for relocating a *living* mind (its agents + world + meta + identity) to another machine — see the `/transplant` skill.
 
 ## Mode Gate
 
@@ -66,7 +69,7 @@ all conventions already loaded — proceed.
 
 ```
 /seed create [--manifest <path>] [--dry-run]
-/seed transplant <destination> [flags]
+/seed plant <destination> [flags]
 /seed verify <destination>
 /seed diff <destination>
 ```
@@ -91,7 +94,7 @@ Step 5: Report.
 (Initial manifest is committed by hand in Phase 1.5; auto-update logic
 is a follow-up implementation.)
 
-### `/seed transplant <destination>` — Copy Framework to Destination
+### `/seed plant <destination>` — Copy Framework to Destination
 
 The primary use case. Copies framework files per manifest from source to
 destination, applying transformations at copy time.
@@ -239,7 +242,7 @@ Runs 8-check verification on an existing destination. No copy.
 
 ## Constraints
 
-- NEVER transplant `.env.local`, `agents/`, `world/`, `meta/` (enforced by `exclude_always`)
+- NEVER copy (plant) `.env.local`, `agents/`, `world/`, `meta/` (enforced by `exclude_always`)
 - NEVER overwrite a running agent session at destination (Step 3c, NO override)
 - Always backup by default (`--backup` ON)
 - Always clean cruft by default (`--clean-cruft` ON)
@@ -251,7 +254,7 @@ Runs 8-check verification on an existing destination. No copy.
 
 The skill body is implemented in:
 
-- `core/scripts/seed-transplant.sh` — top-level transplant orchestrator (calls helpers below)
+- `core/scripts/seed-transplant.sh` — top-level orchestrator for `/seed plant` (filename keeps `transplant` to avoid churning the CLAUDE.md AGENTS_PARENT_DIR audit table + tests; calls helpers below)
 - `core/scripts/seed-create.sh` — manifest create/update sub-command
 - `core/scripts/seed-verify.sh` — post-transplant verification
 - `core/scripts/seed-diff.sh` — source-vs-destination diff
@@ -275,7 +278,7 @@ must NOT modify source content — they only READ source and WRITE destination.
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 Terminal action for each sub-command:
 - `/seed create`: final Bash echo summarizing manifest changes
-- `/seed transplant`: final Bash echo summarizing transplant outcome + verification result
+- `/seed plant`: final Bash echo summarizing transplant outcome + verification result
 - `/seed verify`: final Bash echo with PASS/FAIL/WARN summary
 - `/seed diff`: final Bash echo with diff summary
 

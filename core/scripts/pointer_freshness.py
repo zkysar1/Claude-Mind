@@ -255,11 +255,10 @@ def file_drift_goal(pointer_file, marker: dict, slug: str, project_root) -> dict
         "category": "knowledge-management",
         "origin_signal": f"investigate:freshness-drift-{slug}",
     }
-    # Repo-agnostic shell resolution (Windows WSL-bash lottery): _paths.sh
-    # exports MIND_SHELL (ZDS) / MIND_SHELL (Ayoai); RT_BASH is the watchdog's
-    # own var. Bare "bash" can hit the System32 WSL stub and fail rc=127.
+    # Repo-agnostic shell resolution (Windows WSL-bash lottery): _paths.sh exports
+    # MIND_SHELL (the canonical name); RT_BASH is the watchdog's own var. Bare
+    # "bash" can hit the System32 WSL stub and fail rc=127.
     _bash = (os.environ.get("MIND_SHELL")
-             or os.environ.get("MIND_SHELL")
              or os.environ.get("RT_BASH")
              or "bash")
     try:
@@ -486,7 +485,7 @@ def main() -> int:
     if args.world:
         world_dir = args.world
     if not world_dir:
-        print("pointer_freshness: WORLD_DIR unresolved (set --world or MIND_AGENT/MIND_AGENT).",
+        print("pointer_freshness: WORLD_DIR unresolved (set --world or MIND_AGENT).",
               file=sys.stderr)
         return 2
 

@@ -155,17 +155,24 @@ def main():
 
     existing = _existing_scripts()
 
+    # AGENT_DIR is None when no agent is bound (MIND_AGENT unset) — e.g. a
+    # manual or CI invocation. Degrade to a world-only scan rather than
+    # crashing on `None / "aspirations.jsonl"` (matches this module's
+    # documented fail-open contract: "unreadable JSONL yields empty result,
+    # exit 0"). When an agent IS bound, behavior is unchanged.
     sources = [
         (WORLD_DIR / "aspirations.jsonl", "world"),
-        (AGENT_DIR / "aspirations.jsonl", "agent"),
     ]
+    if AGENT_DIR is not None:
+        sources.append((AGENT_DIR / "aspirations.jsonl", "agent"))
     if args.include_archived:
         sources.append(
             (WORLD_DIR / "aspirations-archive.jsonl", "world-archive")
         )
-        sources.append(
-            (AGENT_DIR / "aspirations-archive.jsonl", "agent-archive")
-        )
+        if AGENT_DIR is not None:
+            sources.append(
+                (AGENT_DIR / "aspirations-archive.jsonl", "agent-archive")
+            )
 
     orphan_refs: list = []
     total_refs = 0

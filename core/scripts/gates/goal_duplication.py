@@ -71,6 +71,7 @@ from _target_state import (  # type: ignore
     is_read_intent,
     probe_target_state,
 )
+from gates.origin_signal import ALLOWED_PREFIXES  # type: ignore
 
 
 # Default PROJECT_ROOT for callers that pass project_root=None.
@@ -100,6 +101,15 @@ _RESPONSE_ORIGIN_PREFIXES = (
     "maintain:",
     "unblock:",
 )
+
+
+# Bare-tag origin_signals (the no-colon entries in
+# origin_signal.ALLOWED_PREFIXES, currently "user_directive" and
+# "idle_fallback") are generic standalone CATEGORIES, not unique symptom
+# keys — see _check_pending_queue Strategy 1 for why an exact-match block on
+# them is a false positive. Derived from the SSOT so the two gates never drift.
+_GENERIC_BARE_ORIGINS = frozenset(
+    t for t in ALLOWED_PREFIXES if not t.endswith(":"))
 
 
 # --- Signal extraction -------------------------------------------------------
@@ -942,8 +952,14 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
     # Symptom-keyed origin_signals are the strongest non-id duplicate
     # signal — e.g. "idea:dup-gate-pending-corpus-gap" or
     # "alert-email:s3-key/foo". Exact match blocks immediately.
+    # Bare-tag origins (user_directive, idle_fallback) are generic standalone
+    # categories shared by many legitimate distinct goals (a live queue carries
+    # 8+ pending user_directive goals), NOT unique symptom keys. Exact-matching
+    # them here false-positives every second user-directed goal (canonical: the
+    # update-goal cascade tests + the concurrent-add hammer, 2026-06-03). Real
+    # dups that share a bare-tag origin are still caught by Strategy 2 below.
     origin_matches = []
-    if proposed_origin:
+    if proposed_origin and proposed_origin not in _GENERIC_BARE_ORIGINS:
         for c in candidates:
             if c["origin_signal"] and c["origin_signal"] == proposed_origin:
                 origin_matches.append({
