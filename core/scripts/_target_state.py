@@ -76,10 +76,10 @@ _MAX_FILE_BYTES = 512 * 1024  # 512 KB — skip bigger files rather than hang.
 # the impl goal. Per-file breakdown showed the problem clearly but the
 # verdict aggregated across files.
 _DOCUMENTATION_ONLY_PATTERNS = [
-    re.compile(r"(?:^|/)reports/.*\.md$"),
     # temp/ briefings (fresh-eyes, felt-sense) are description-of-work staging
-    # files, not implementation targets — exclude like reports/ (the file-model
-    # normalization moved briefings reports/ -> temp/).
+    # files, not implementation targets. (This superseded the legacy reports/
+    # pattern: the file-model normalization moved briefings reports/ -> temp/,
+    # and reports/ was abolished 2026-06-02 — git history is its archive.)
     re.compile(r"(?:^|/)temp/.*\.md$"),
 ]
 

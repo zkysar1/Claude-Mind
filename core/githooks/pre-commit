@@ -75,3 +75,19 @@ bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"
 # filter both missed it. See script header for full pattern set +
 # bypass mechanisms.
 bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"
+
+# Gate 9: session-manifest sync_tier completeness (2026-06-03). Fail-closed
+# gate from the session-continuity redesign (#45). core/config/session-
+# manifest.yaml is the SSOT for own-cloud session-file sync disposition —
+# owncloud_sync.py derives the machine-local denylist + continuity pull-set
+# from each entry's `sync_tier`. A missing/invalid sync_tier makes the loader
+# fail closed (whole session/ tree treated machine-local), so a continuity
+# file would silently STOP syncing to S3 (knowledge loss on agent-move) — a
+# direct multi-machine hazard. Gated on the manifest being staged (the gate's
+# documented design intent + Gate 5's no-op-unless-staged precedent): the
+# validation is only meaningful when the manifest changes. Built 2026-06-02
+# but left unwired; wired here as one of the 7 orphan-script resolutions
+# (2026-06-03). Self-contained bash; needs no MIND_AGENT.
+if git diff --cached --name-only | grep -q '^core/config/session-manifest\.yaml$'; then
+    bash "$REPO/core/scripts/session-manifest-gate.sh"
+fi

@@ -1,6 +1,10 @@
 
 # Environment / secrets
-.env.local
+# Glob (.env.local*) not bare .env.local, so rollback backups such as
+# .env.local.pre-<recipe>.bak — which hold the same secrets — are ignored too.
+# Added 2026-06-06: the N4 migration recipe writes .env.local.pre-v2.0.0-n4.bak,
+# which the bare .env.local rule left untracked-but-stageable (a git add -A hazard).
+.env.local*
 .env
 *.env
 # Roblox auth cookies — never commit; transient, tied to per-session needs
@@ -30,6 +34,11 @@ tmp_*
 /*_tmp.txt
 /bitnet_*.txt
 /goal-selector-raw.txt
+# goal-selector debug dumps (gsel_iter.json / gsel_err.txt) from manual
+# `goal-selector.py >gsel_iter.json 2>gsel_err.txt` runs at repo-root CWD.
+# No code creator (a debugging convenience); defensive net like
+# goal-selector-raw.txt above. Added 2026-06-03 cruft cleanup.
+/gsel_*
 /tmp-*
 # Corrupted-path artifacts: a Windows drive-letter path (e.g. C:/Users/...)
 # treated as RELATIVE by POSIX/MSYS Python or bash creates a literal top-
@@ -187,6 +196,13 @@ core/logs/
 # tree (publishing them would defeat the seed transformation entirely).
 # Discovered in Phase 6 fresh-eyes review 2026-05-20.
 .seed-backup-*/
+
+# Transient transplant staging/unpack dirs — created by core/scripts/_transplant_pack.py
+# during offline pack (stage under PROJECT_ROOT) and land (unpack under dest.parent).
+# Normally removed in the engine's finally block; ignored for crash safety, same as
+# the seed-backup pattern above.
+.transplant-stage-*/
+.transplant-unpack-*/
 
 # Machine-local Claude Code settings (per-machine permissions + hardcoded
 # user-path allowlists). Per CLAUDE.md, this is the constitutional anchor —

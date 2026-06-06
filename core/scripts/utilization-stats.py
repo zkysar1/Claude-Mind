@@ -330,29 +330,29 @@ def _gather_citation_haystack():
     if AGENT_DIR is not None:
         sources.append(AGENT_DIR / "journal.jsonl")
         sources.append(AGENT_DIR / "experience.jsonl")
-        # Also include this agent's experience + report markdown content.
+        # Also include this agent's experience + temp markdown content.
         # experience.jsonl is metadata only; rule citations live in the
         # per-trace markdown content_path (<agent>/experience/<id>.md) and
-        # in <agent>/reports/*.md and <agent>/temp/*.md. Without these sources, rules cited only
+        # in <agent>/temp/*.md. Without these sources, rules cited only
         # in trace bodies show false-zero citation_count (,
         # evidence from  follow-up: 9-file probe confirmed
         # code-review-protocol.md / implementation-discipline.md /
         # learning-philosophy.md / pre-completion-review.md citations all
-        # land in agent experience+reports markdown).
-        for sub in ("experience", "reports", "temp"):
+        # land in agent experience+temp markdown; reports/ abolished 2026-06-02).
+        for sub in ("experience", "temp"):
             sub_dir = AGENT_DIR / sub
             if sub_dir.exists():
                 sources.extend(sorted(sub_dir.glob("*.md")))
-        # Also include other agents' journals + experience/reports markdown
+        # Also include other agents' journals + experience/temp markdown
         # — cross-agent citations count. Gated on local-paths.conf so only
         # registered agent dirs are scanned (avoids picking up stray
-        # top-level dirs that happen to contain experience/ or reports/).
+        # top-level dirs that happen to contain experience/ or temp/).
         for sib in sorted(_agents_root().glob("*/local-paths.conf")):
             agent_dir = sib.parent
             if agent_dir == AGENT_DIR:
                 continue
             sources.append(agent_dir / "journal.jsonl")
-            for sub in ("experience", "reports", "temp"):
+            for sub in ("experience", "temp"):
                 sub_dir = agent_dir / sub
                 if sub_dir.exists():
                     sources.extend(sorted(sub_dir.glob("*.md")))

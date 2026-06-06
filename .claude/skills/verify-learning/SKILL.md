@@ -129,6 +129,15 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # cadence so drift is surfaced even when no /start re-entry happens.
    Bash (inlined-_APD-drift): canonical=$(grep -E '^AGENTS_PARENT_DIR=' core/scripts/_paths.sh | head -1 | sed -E 's/^AGENTS_PARENT_DIR=//;s/^"//;s/"$//') && fail=0 && for f in core/scripts/session-state-get.sh core/scripts/session-mode-get.sh core/scripts/session-signal-exists.sh core/scripts/cleanup-stale-bindings.sh; do v=$(grep -E '^_APD=' "$f" | head -1 | sed -E 's/^_APD=//;s/^"//;s/"$//'); if [ "$v" != "$canonical" ]; then echo "FAIL: $f _APD=$v != _paths.sh AGENTS_PARENT_DIR=$canonical"; fail=1; fi; done && py=$(grep -E '^_AGENTS_PARENT_DIR' core/scripts/_wake_signals.py | head -1 | sed -E 's/^_AGENTS_PARENT_DIR[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/') && if [ "$py" != "$canonical" ]; then echo "FAIL: core/scripts/_wake_signals.py _AGENTS_PARENT_DIR=$py != _paths.sh AGENTS_PARENT_DIR=$canonical"; fail=1; fi && [ "$fail" = 0 ] && echo "PASS: all 5 inlined _APD/_AGENTS_PARENT_DIR sites match _paths.sh canonical \"$canonical\"" || true
 
+   # Wrapper-test daemon stale-code isolation (commit 5cce91b8; g-115-1328)
+   # In-process pytest wrapper daemons freeze git_head_sha at import; a commit
+   # landing mid-run trips rt_check_staleness -> one-shot auto-restart, which
+   # corrupts wrapper stdout (JSONDecodeError) — the ~70-failure incident
+   # (2026-06-02). conftest.py pre-sets RT_STALENESS_WARNED=1 to short-circuit
+   # _runtime.sh:169 before the restart arms. Guard against silent removal.
+   # Full narrative: tree node daemon-lifecycle-windows "Test-Side Mirror".
+   Bash (conftest-staleness-isolation): grep -q 'RT_STALENESS_WARNED' mind_api/tests/conftest.py && echo "PASS: conftest.py sets RT_STALENESS_WARNED (wrapper-test daemon stale-code isolation, commit 5cce91b8)" || echo "FAIL: RT_STALENESS_WARNED missing from mind_api/tests/conftest.py — the 74-failure wrapper-test daemon-staleness fix was removed (see g-115-1328, tree: daemon-lifecycle-windows)"
+
    # _world_config Mode G overlay loader (rb-1100, guard-590, Phase 2.5.D)
    # When _world_config.py used the pre-relocation root/agent/local-paths.conf
    # path (Mode G), it silently fell through to PROJECT_ROOT/world (nonexistent
@@ -1591,6 +1600,19 @@ else:
 try: open_long_path('core/scripts/__nonexistent_file_for_smoke__.py')
 except OSError: raised=True
 assert raised, 'open_long_path should raise OSError on missing file'; print('PASS')"
+
+   # Transplant pack — no shutil.copytree MAX_PATH regression guard (Section TRANSPLANT-MAXPATH — 2026-06-04, e48c16d9, rb-1455, guard-507)
+   # /transplant offline mode originally staged the external world/ + meta/ into a
+   # PROJECT_ROOT/.transplant-stage-* dir via shutil.copytree before archiving.
+   # On Windows that DOUBLED the path prefix (a 242-char source became a 266-char
+   # stage path → over the 260 MAX_PATH limit), crashing the pack with WinError 3
+   # AND leaking an un-deletable partial stage. shutil.copytree/rmtree/os.walk do
+   # NOT reliably honor the \\?\ extended-length prefix (verified 2026-06-04). The
+   # fix (e48c16d9) streams source → archive with relative member names (no
+   # path-length limit) and lands one file at a time via the \\?\ prefix on
+   # open/makedirs. Reintroducing copytree in the pack engine resurrects the
+   # showstopper. See tree node windows-maxpath-pathresolution.
+   Bash (transplant-no-copytree): test "$(grep -c 'shutil\.copytree(' core/scripts/_transplant_pack.py)" -eq 0 && echo "PASS: _transplant_pack.py has zero shutil.copytree calls (Windows MAX_PATH regression guard)" || echo "FAIL: shutil.copytree reintroduced in _transplant_pack.py — Windows MAX_PATH showstopper regression (rb-1455, e48c16d9); stream source→archive with relative members instead of staging a deep copy"
 
    # Blocker-ref schema + quiescence log invariants (Section BR — g-251-05)
    # Origin: fresh-eyes-review 2026-04-22 surfaced four structural invariants
@@ -5888,6 +5910,22 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    Bash (no-redundant-last-updated): test -z "$(grep -rhnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_updated' .claude/skills/ core/config/ 2>/dev/null)" && echo "PASS: no redundant explicit tree-update.sh --set last_updated invocations in .claude/skills/ or core/config/ pseudocode (T21 hook covers it)" || { echo "FAIL: redundant tree-update.sh --set last_updated invocation(s) found — T21 PostToolUse hook already covers this, the explicit calls are dead pseudocode"; grep -rnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_updated' .claude/skills/ core/config/; }
    Bash (no-redundant-last-update-trigger): test -z "$(grep -rhnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_update_trigger' .claude/skills/ core/config/ 2>/dev/null)" && echo "PASS: no redundant tree-update.sh --set last_update_trigger invocations (field lives only in .md front matter; _tree.yaml writes are dead per guard-531)" || { echo "FAIL: tree-update.sh --set last_update_trigger invocation(s) found — last_update_trigger lives in the .md front matter; _tree.yaml has no such field (guard-531)"; grep -rnE 'bash core/scripts/tree-update\.sh\s+--set\s+\S+\s+last_update_trigger' .claude/skills/ core/config/; }
 
+   # S48.12: Tree-sync inline-form trigger must NOT abort the last_updated bump (2026-06-04 _tree.yaml drift fix)
+   # tree-front-matter-sync.py (T21) used to sys.exit(0) ("REFUSED: trigger has inline
+   # form") whenever last_update_trigger was an inline dict `{type: ...}` AND AYOAI_SID
+   # was set. The real hook ALWAYS sets AYOAI_SID (tree-sync-check.sh derives it from the
+   # PostToolUse payload's session_id), and most skill instructions emit the inline form
+   # (encode-session Lane 1.6, research-topic, respond, reflect-on-outcome,
+   # aspirations-consolidate/execute) — so the abort silently left _tree.yaml's last_updated
+   # stale for every inline-trigger node (canonical: windows-maxpath-pathresolution lagged 5
+   # months). Fix: an inline-form trigger skips ONLY the secondary session/source auto-fill
+   # and falls through to the primary last_updated bump. The string-form refusal at line ~302
+   # is deliberate (legacy → Layer-B /tree-edit migration) and is preserved. Behavioral smoke
+   # below: run the sync on an inline-trigger fixture with a stale sentinel date; the date MUST
+   # change (proves the bump fired, not an abort). Uses a far-past sentinel (2020-01-01) so it
+   # can never collide with today.
+   Bash (tree-sync-inline-bumps): D="${TEMP:-/tmp}/vlsync-$$"; mkdir -p "$D"; printf '%s\n' '---' 'created: "2020-01-01"' 'last_updated: "2020-01-01"' 'last_update_trigger: {type: "smoke"}' '---' '' 'body' > "$D/n.md"; AYOAI_SID=vl-smoke py -3 core/scripts/tree-front-matter-sync.py --file "$D/n.md" --virtual-path "world/knowledge/tree/__vlsmoke__/n.md" >/dev/null 2>&1; V=$(grep '^last_updated:' "$D/n.md"); rm -rf "$D"; case "$V" in *2020-01-01*) echo "FAIL: inline-form trigger left last_updated stale ($V) — tree-front-matter-sync.py re-aborts on inline form (2026-06-04 regression: inline {type:...} must skip nested session/source yet still bump last_updated)";; *) echo "PASS: inline-form trigger bumps last_updated ($V), no abort";; esac
+
    # S48.11: Runtime-daemon cache-invalidate-inside-lock invariant (g-115-674 + g-115-677)
    # g-115-674 hardened mind_api/src/endpoints/aspirations_write.py to keep every
    # `_jsonl_cache().invalidate(live_path)` INSIDE the `with file_locks.locked(live_path):`
@@ -6071,6 +6109,17 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # (S48.4 now invokes tree-maintenance-read.sh not .py). Any orphan
    # surfacing now means a recent change dropped a reference.
    Bash: bash core/scripts/scripts-referenced-gate.sh 2>/dev/null | py -3 -c "import sys,json; r=json.load(sys.stdin); found=sorted(e['basename'] for e in r.get('script_orphans',[])); assert not found, f'FAIL: orphan scripts detected: {found}'; print('PASS: scripts-referenced-gate clean (0 orphans)')"
+
+   # S49.3b: Goal-script-orphan gate (inverse direction of S49.3) — no
+   # pending/in-progress goal's description or skill field may name a
+   # core/scripts/<name>.{sh,py} that is absent on disk. Companion gate filed
+   # via g-115-905 after a deleted script (override-ledger-consume) left a
+   # goal reference dangling undetected for a week. The gate was built
+   # 2026-05-18 but never verify-learning-wired (the loose end g-115-905 left
+   # open) AND crashed when run unbound (AGENT_DIR None) — both fixed
+   # 2026-06-03; wiring it here is one of the 7 orphan-script resolutions.
+   Check: `core/scripts/goal-script-orphan-gate.py` exists; `.sh` wrapper exists
+   Bash: bash core/scripts/goal-script-orphan-gate.sh 2>/dev/null | py -3 -c "import sys,json; r=json.load(sys.stdin); found=sorted({o['script_name'] for o in r.get('orphan_references',[])}); assert not found, f'FAIL: goals reference missing scripts: {found}'; print('PASS: goal-script-orphan-gate clean (0 orphan references)')"
 
    # S49.4: Fresh-eyes cadence-check contract — --print-current must emit a
    # bare non-negative integer and exit 0, unconditionally (bypasses config

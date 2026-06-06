@@ -140,37 +140,40 @@ The allowlist gate lives in `core/scripts/path-resolution-hook.py`
 the allowlist — the same mechanism that denies any future invented
 directory.
 
-## Migration (reports/ → temp/)
+## Migration (reports/ → temp/ → removed)
 
-`agents/<agent>/reports/` is a FROZEN git-tracked archive. Its existing files
-remain on disk (and in git) but no NEW files may be written there once the
-gate activates (Phase 4). Writers are repointed in Phase 3 BEFORE the gate
-activates — briefings (`fresh-eyes-*`, `felt-sense-*`) move to `temp/`;
-phase-cost telemetry and the completion delta-baseline move to `session/`;
-the timestamped completion-report archive is dropped entirely (the
-`COMPLETION-REPORT.md` pointer's git history is its archive).
+`agents/<agent>/reports/` no longer exists. It was the legacy slush pile for
+working docs (analyses, fresh-eyes reviews, phase plans); the file-model
+normalization replaced it with `temp/` (a staging area that DRAINS to the
+knowledge tree) plus this allowlist gate. reports/ was briefly retained as a
+FROZEN git-tracked archive — then **removed entirely** (user-directed,
+2026-06-02): all 665 legacy files across the 6 agents were `git rm`'d and the
+directories deleted. **Git history is the archive** — every removed file stays
+recoverable via `git log` / `git show`, so nothing is lost.
 
-**Frozen-archive, not mass-drain (Phase 6 — data-driven).** A census of the
-legacy corpus (627 `.md` across 6 agents) found it is overwhelmingly
-already-captured or stale: goal-closure artifacts whose learning was encoded
-into the tree at closure time, files already cited from tree nodes (~26 — and
-those citations resolve because the files stay on disk), or superseded
-proposals (e.g. zeta's `new-agents-staging/` proposed charlie/delta/echo, which
-now exist). Bulk-encoding that into the tree would inject stale, redundant nodes
-and DEGRADE retrieval — the precise failure this whole normalization exists to
-prevent. So `reports/` is kept as a frozen git archive, NOT mass-drained and NOT
-deleted: the Phase-4 gate stops new writes, Phase 6 removes it from the
-own-cloud S3 sweep (`_EXCLUDE_DIRS` — git is its cross-machine transport, not
-S3), and any genuinely-unencoded *current* document is drained selectively
-on demand (the same `/drain-temp` judgment applied to a named file). git history
-+ the on-disk archive preserve everything; nothing is lost.
+Writers were repointed in the earlier Phase 3 BEFORE the gate activated —
+briefings (`fresh-eyes-*`, `felt-sense-*`) write to `temp/`; phase-cost
+telemetry and the completion delta-baseline write to `session/`; the
+timestamped completion-report archive was dropped (the `COMPLETION-REPORT.md`
+pointer's git history is its archive). So no live writer targets reports/.
 
-There is NO migration-bypass marker and no agent-side gate override. The
-ordering IS the safety mechanism: every writer is repointed (Phase 3) and
-verified before the allowlist gate is turned on (Phase 4), so no live writer
-ever hits a denied `reports/` path. A genuinely needed bulk move uses shell
-(`git mv`) or an `init-*.sh` step, both of which bypass the Write/Edit hook
-by construction.
+**Why removed, not kept frozen (2026-06-02 override).** The earlier Phase-6
+frozen-archive compromise had already established that the legacy corpus was
+overwhelmingly already-captured or stale — goal-closure artifacts whose learning
+was encoded into the tree at closure, or superseded proposals. The ~26 tree-node
+citations that previously resolved to on-disk reports files have been folded: the
+dangling pointers were removed and any essential detail inlined into the node,
+with the source marked git-archived. With the corpus encoded-or-stale and the
+citations folded, the on-disk archive no longer earned its keep; removing it
+eliminates a second, disconnected retrieval surface entirely. git history
+preserves the bytes — `git show <rev>:agents/<agent>/reports/<file>` recovers any
+one of them.
+
+The Phase-4 allowlist gate still DENIES `reports/` (it is not on the permitted
+list), which prevents the directory from being silently recreated. There is no
+agent-side override — a genuinely needed write goes to `temp/` (working docs) or
+`session/` (operational state). A bulk historical recovery, if ever needed, uses
+`git checkout`/`git show` of the removed paths.
 
 ## Cross-references
 

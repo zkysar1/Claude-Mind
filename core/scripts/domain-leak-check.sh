@@ -155,6 +155,7 @@ ALLOWLIST=(
   ".claude/skills/seed/SKILL.md"
   ".claude/skills/verify-learning/SKILL.md"
   "core/config/conventions/learning-routing.md"
+  "core/config/conventions/domain-recipe-seed-purity.md"
 )
 
 scan_misplaced_markers() {

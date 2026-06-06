@@ -5,9 +5,9 @@ Verifies the helper:
   (2) raises CruftPathRefused on NTFS-rewritten-colon cruft shape
   (3) does NOT raise on legitimate absolute paths (Windows + POSIX)
   (4) does NOT raise on legitimate relative paths
-  (5) is wired into all 13 daemon mkdir sites (regression guard)
+  (5) is wired into all known daemon mkdir sites (regression guard)
 
-The 13 protected sites are listed below; if a new daemon mkdir lands without
+The protected sites are listed below; if a new daemon mkdir lands without
 a corresponding assert_not_cruft, the LIST_SITES guard test fails.
 
 Origin: 2026-05-21 audit closing the C-dir cruft loophole. The path
@@ -76,7 +76,7 @@ def test_default_operation_label():
     assert "write" in str(exc_info.value)
 
 
-# ─── Regression guard: list of 13 protected daemon mkdir sites ──────────
+# ─── Regression guard: list of protected daemon mkdir sites ──────────
 
 
 PROTECTED_SITES = [
@@ -93,10 +93,19 @@ PROTECTED_SITES = [
     ("mind_api/src/world/pipeline_write.py",         "pipeline_write._append_to_archive"),
     ("mind_api/src/world/pipeline_write.py",         "pipeline_write meta refresh"),
     ("mind_api/src/world/pipeline_write.py",         "pipeline_write meta_update"),
+    # Added 2026-06-03 — 7 sites that landed after the 2026-05-21 audit without
+    # a tripwire (caught by test_no_unprotected_mkdir_in_daemon).
+    ("mind_api/src/endpoints/curriculum.py",         "mkdir (curriculum write_yaml)"),
+    ("mind_api/src/endpoints/curriculum.py",         "mkdir (curriculum append_jsonl)"),
+    ("mind_api/src/endpoints/experience_write.py",   "mkdir (experience content_dir)"),
+    ("mind_api/src/endpoints/wm_write.py",           "mkdir (wm_write)"),
+    ("mind_api/src/meta/meta_yaml.py",               "mkdir (meta_yaml append_log)"),
+    ("mind_api/src/meta/meta_yaml.py",               "mkdir (meta_yaml log endpoint)"),
+    ("mind_api/src/meta/skill_evaluate.py",          "mkdir (skill_evaluate write_yaml)"),
 ]
 
 
-def test_all_13_sites_have_tripwire():
+def test_all_protected_sites_have_tripwire():
     """Regression guard: each known daemon mkdir site must have an
     assert_not_cruft call paired with it.
 

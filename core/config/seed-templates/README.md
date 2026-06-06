@@ -76,8 +76,8 @@ You don't need to do anything while it runs. But you can chat with it anytime �
 | `/tree <subcommand>` | Knowledge tree operations: `read`, `find`, `add`, `edit`, `stats`, `validate`, and more. Always route tree edits through this — never edit `_tree.yaml` directly. |
 | `/strategic-pulse` | Surface portfolio-shape patterns: tail consolidation pressure, work-class skew, aged or all-blocked aspirations. Auto-fires every 50 completed goals; invoke directly for an on-demand readout. |
 | `/felt-sense-checkin` | Force a deep 7-lane self-audit: memory hygiene, insight curation, unblocks, forward backlog, `/verify-learning` gaps, meta tuning. Auto-fires every 75 completed goals. |
-| `/fresh-eyes-review` | Periodic portfolio self-audit — assembles a briefing under `agents/<agent-name>/reports/`. Auto-fires every 25 completed goals; invoke directly when you want the agent to step back. |
-| `/seed transplant <dest>` | Copy this framework into another repo (applies generic-name transforms). |
+| `/fresh-eyes-review` | Periodic portfolio self-audit — assembles a briefing under `agents/<agent-name>/temp/`. Auto-fires every 25 completed goals; invoke directly when you want the agent to step back. |
+| `/seed plant <dest>` | Plant (publish) this domain-free framework into another repo — grows a fresh, empty environment (applies generic-name transforms; no agents/world/learned state copied). |
 
 ### Three Modes
 

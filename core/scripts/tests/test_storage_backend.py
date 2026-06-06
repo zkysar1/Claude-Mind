@@ -291,7 +291,7 @@ def test_write_version_advances(tmp_path):
 
 def test_get_backend_default_is_local(monkeypatch):
     reset_backend_for_tests()
-    monkeypatch.delenv("MIND_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
     be = get_backend()
     assert be.name == "local"
     assert isinstance(be, LocalBackend)
@@ -303,7 +303,7 @@ def test_get_backend_unknown_raises(monkeypatch):
     # 'own-cloud' is now implemented (s3); 'lodestar-hosted' is the still-unbuilt
     # commons backend that must keep raising NotImplementedError.
     reset_backend_for_tests()
-    monkeypatch.setenv("MIND_STORAGE_BACKEND", "lodestar-hosted")
+    monkeypatch.setenv("STORAGE_BACKEND", "lodestar-hosted")
     with pytest.raises(NotImplementedError):
         get_backend()
     reset_backend_for_tests()

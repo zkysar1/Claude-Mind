@@ -6,10 +6,10 @@
 # appear literally so the regex engine can match them. Genericizing them
 # would defeat the manifest's purpose. Functional, not pedagogical.
 #
-# Defines what files transplant from source repo to a destination "seed" repo,
+# Defines what files are copied (planted) from source repo into a destination "seed" repo,
 # what to exclude, and what transformations to apply at copy time.
 #
-# Consumed by: /seed transplant skill (.claude/skills/seed/SKILL.md)
+# Consumed by: /seed plant skill (.claude/skills/seed/SKILL.md)
 # Implementation: core/scripts/seed-transplant.sh + _seed_engine.py + _seed_transforms.py
 #
 # Schema version: 1
@@ -413,7 +413,7 @@ transformations:
     pattern: 'C:[/\\]+ZakNoCloud[/\\]+GitHub[/\\]+Claude-Mind'
     replacement: '<DESTINATION_REPO>'
     applies_to: ["**/*"]
-    reason: "Claude-Mind path used in /seed skill's user-facing example commands (e.g., `/seed transplant C:\\ZakNoCloud\\GitHub\\Claude-Mind`)."
+    reason: "Claude-Mind path used in /seed skill's user-facing example commands (e.g., `/seed plant C:\\ZakNoCloud\\GitHub\\Claude-Mind`)."
 
   - id: G5c
     type: global_regex
@@ -550,7 +550,7 @@ transformations:
 # =============================================================================
 # CRUFT_PATTERNS — removed at destination POST-COPY
 # =============================================================================
-# Cleaned at destination after transplant, even if they exist from prior /start
+# Cleaned at destination after plant, even if they exist from prior /start
 # attempts or other runtime activity at destination.
 cruft_patterns:
   - ".latest-session-id"
@@ -579,9 +579,9 @@ cruft_patterns:
   # future work — destructive, needs careful design.
   - "core/scripts/set-active-agent-env.sh"
 
-  # Forged skills — if pre-existing at destination from a prior transplant or
+  # Forged skills — if pre-existing at destination from a prior plant or
   # local /forge-skill, clean them up (manifest excludes them from copy, but
-  # the transplant ADDS files rather than DELETING absent ones, so stale
+  # the plant ADDS files rather than DELETING absent ones, so stale
   # forged skills from earlier seeds linger without this cleanup).
   - ".claude/skills/access-aws-services/"
   - ".claude/skills/access-efs-data/"
@@ -601,7 +601,7 @@ cruft_patterns:
 
 
 # =============================================================================
-# POST_COPY_ACTIONS — executed (or reported) after transplant
+# POST_COPY_ACTIONS — executed (or reported) after plant
 # =============================================================================
 post_copy_actions:
   - id: A1

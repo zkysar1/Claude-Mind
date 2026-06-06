@@ -61,6 +61,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5e.7 | fresh-eyes-tree-cadence | deferrable |
 | 0.5f | felt-sense-cadence | deferrable |
 | 0.5g | l1-skew-cadence | deferrable |
+| 0.5h | health-regression-cadence | deferrable |
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -998,7 +999,7 @@ local portfolio-direction briefing examining:
 1. Is the current Self still right?
 2. Are we working on the right problems?
 
-The briefing is archived to `agents/<agent>/reports/` and the agent self-assesses
+The briefing is archived to `agents/<agent>/temp/` and the agent self-assesses
 the outcome (act_now / act_later / no_change). No email is sent and no
 pending-question is filed — the user reviews via git log and tracked
 signals at their own pace.
@@ -1175,6 +1176,114 @@ so partners (alpha/bravo) have signal to interpret on their own iterations.
 See `core/scripts/l1-skew-check.py` and `core/scripts/tree.py
 _compute_by_l1_stats`.
 
+## Phase 0.5h: Health-Regression Detection + Revert Sweep (health-ledger subsystem)
+
+Periodic self-health regression check + (Phase-3) tiered revert. Spec:
+`core/config/conventions/health-ledger.md` §8–§11. Reads the per-agent health
+ledger (`agents/<agent>/health/<date>.jsonl`, appended each iteration by
+iteration-close.sh) and evaluates the triple-condition gate (negative composite
+trend AND composite below floor AND below_baseline) plus a
+consecutive-below-baseline counter (one-off bad iterations do not trip). On a
+trip it identifies the most-degraded component signal, attributes the regression
+to recent in-window file changes (ranked + constitutional-ring-classified), files
+an `Investigate:` goal, and — when revert-eligible — routes the top candidate to
+a tiered revert.
+
+**DORMANT until `health_regression.mode` advances.** In `collect-only` (the
+launch default) the detection script returns `tripped:false
+reason:"mode=collect-only"` immediately — this phase is a no-op until the mode is
+advanced to `detect-and-report` (Phase 2) or `full` (Phase 3). The script also
+self-gates on its own interval marker (every `detection.interval` goals).
+**Phase 2 = report only.** Reverts (Phase 3) require `mode == full` AND the
+calibration AND-gate (30 days AND 50 records) — surfaced as `revert_eligible` in
+the verdict and re-checked inside `health-revert.py` (the master safety gate;
+even a Ring-3 auto candidate routes to `not-eligible` until both hold). Reverts
+are file-granular (one file restored to its pre-regression content via
+`git show`), tagged with a `Health-Revert` git trailer, and verified
+`revert.verification_iterations` later — kept if the composite improved, else
+undone + dead-ended.
+
+```
+# Budget meter — deferrable cadence sweep (sibling to 0.5e/0.5f/0.5g).
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check health-regression-cadence)
+IF decision == "drop": SKIP this phase; continue to Phase 1
+
+# (Phase 3) Verify any pending reverts from prior iterations FIRST — keep or
+# undo+dead-end each whose verification window has elapsed. No-op unless
+# mode==full + calibrated + a pending entry exists. Cheap; runs every iteration.
+Bash: bash core/scripts/health-revert.sh verify --json   # outcomes logged to context
+
+Bash: verdict=$(bash core/scripts/health-regression-check.sh --json)
+Parse verdict JSON.
+
+# Calibration-complete edge (fires ONCE, in ANY mode incl. collect-only). When
+# the 30-day/50-record AND-gate is first satisfied, revert authority (Phase 3)
+# becomes mathematically eligible. File a one-time goal so the agent proactively
+# advances `health_regression.mode` along the rollout rather than silently
+# waiting. health-regression-check.py writes a per-agent `.calibrated` marker so
+# the edge never re-fires; the dedup query (incl. completed) makes it team-wide
+# idempotent — the first agent to calibrate files the single goal.
+IF verdict.calibration_just_completed == true:
+    Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress,completed --contains "<verdict.calibration_dedup_key>")
+    IF existing is empty:
+        Bash: bash core/scripts/aspirations-add-goal.sh asp-001 \
+                --title "health-ledger calibration complete — advance health_regression.mode when ready" \
+                --priority MEDIUM --participants agent,user --category framework-architecture \
+                --status pending \
+                --description "The health-ledger calibration AND-gate is now satisfied (<verdict.calibration.days> days / <verdict.calibration.records> records). Revert authority (Phase 3) is mathematically eligible. The rollout advances by editing health_regression.mode in core/config/aspirations.yaml; each step is reversible. (1) collect-only -> detect-and-report is LOW risk (adds Investigate reports, NEVER reverts) — agent-judgable. (2) detect-and-report -> full GRANTS the agent authority to auto-revert its own Ring-3 framework changes (Ring 1.5/2 route to agent/user Unblocks, Ring 1 to the user) — this is a deliberate, user-paced authority grant: leave at detect-and-report and let the user advance to full. Spec: core/config/conventions/health-ledger.md §10. dedup:<verdict.calibration_dedup_key>"
+
+IF verdict.tripped != true:
+    # collect-only no-op, interval not elapsed, or gate not tripped — all silent.
+    continue to Phase 1
+
+# TRIPPED (only reachable in detect-and-report / full mode). Dedup, then file.
+Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress --contains "<verdict.dedup_key>")
+IF existing is non-empty:
+    # An open Investigate for this regression already exists — do not double-file.
+    continue to Phase 1
+
+Compose the Investigate description from the verdict:
+  - degraded signal, window [after → before]
+  - composite vs baseline, composite_trend, consecutive count
+  - top attribution candidates: each "<score> ring=<ring> <authority> <path> (<commit>)"
+  - evolution_change_in_window (if true: "NOTE: a meta-strategy change occurred
+    in this window — the dip may be an intended evolution experiment, not a bug")
+  - calibration status + revert_eligible (so the reader knows whether Phase-3
+    reverts are active yet)
+  - the dedup_key (for the next sweep's dedup query)
+
+Bash: bash core/scripts/aspirations-add-goal.sh asp-001 \
+        --title "Investigate: health regression on <verdict.signal>" \
+        --priority MEDIUM --participants agent --category framework-architecture \
+        --description "<composed description above>"
+
+# (Phase 3) Tiered revert — only acts when verdict.revert_eligible (mode==full
+# AND calibrated). The route command re-checks the gate internally, so passing a
+# non-eligible verdict is a safe no-op.
+IF verdict.revert_eligible == true:
+    # OD-7 courtesy: if the top candidate's file was last committed by ANOTHER
+    # agent (git log -1 --format=%an <path>), post a coordination-board courtesy
+    # note BEFORE routing, so the partner sees the revert. (Mirror goal deferred.)
+    Bash: action=$(bash core/scripts/health-revert.sh route --verdict "$verdict" --json)
+    Parse action JSON:
+      - decision == "auto-revert": the file was reverted + tracked as pending
+        (the verify sweep above will keep/undo it later). Note action.revert.commit.
+      - decision in ("agent-unblock","user-unblock"): file the action.unblock spec
+        via aspirations-add-goal.sh (participants from action.unblock.participants;
+        for user-unblock, also notify the user via the forged notification skill
+        per .claude/rules/forged-skill-resolution.md).
+      - decision in ("not-eligible","skip-ring0"): no-op.
+
+continue to Phase 1
+Bash: echo "aspirations-precheck phase documented"
+```
+
+Why the Investigate is `participants: agent` (not user): detection surfaces an
+agent-diagnosable condition (attribution + revert are agent-capable per
+`.claude/rules/capability-before-user.md`). User involvement happens at REVERT
+time and ONLY for Ring-1 candidates (`user-unblock`), where the user owns the
+file's intent — never at detection time.
+
 ## Phase 1: Recurring Goal Check
 
 ```
@@ -1196,7 +1305,7 @@ Bash: bash core/scripts/aspirations-precheck-budget-meter.sh end
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (every iteration, first phase)
-- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection, hypothesis pipeline, accuracy gate), `aspirations-query.sh` (user-goal reclassification), `aspirations-update-goal.sh` (user-goal reclassification), `world-cat.sh` (capability-routing convention), `pipeline-read.sh` (hypothesis pipeline + accuracy health), `fresh-eyes-cadence-check.sh` (Phase 0.5e gate), `recurring-precondition-sweep.py` (Phase 0.5c), `/create-aspiration` (health + pipeline depth), `/fresh-eyes-review --cadence` (Phase 0.5e fire), CREATE_BLOCKER protocol
+- **Calls**: `aspirations-read.sh`, `aspirations-meta-update.sh`, `guardrail-check.sh`, `infra-health.sh`, `wm-read.sh`, `wm-set.sh`, `aspiration-trajectory.sh` (cycle detection), `aspirations-add-goal.sh` (cycle detection, hypothesis pipeline, accuracy gate), `aspirations-query.sh` (user-goal reclassification), `aspirations-update-goal.sh` (user-goal reclassification), `world-cat.sh` (capability-routing convention), `pipeline-read.sh` (hypothesis pipeline + accuracy health), `fresh-eyes-cadence-check.sh` (Phase 0.5e gate), `recurring-precondition-sweep.py` (Phase 0.5c), `health-regression-check.sh` (Phase 0.5h detection sweep), `health-revert.sh` (Phase 0.5h verify + tiered revert), `/create-aspiration` (health + pipeline depth), `/fresh-eyes-review --cadence` (Phase 0.5e fire), CREATE_BLOCKER protocol
 - **Reads**: Aspirations compact, working memory (blockers), guardrails, trajectory data (cycle detection), pipeline meta (hypothesis counts + accuracy), `core/config/aspirations.yaml` (pipeline_low_water_mark, hypothesis_pipeline_low_water_mark, accuracy_critical_threshold, accuracy_min_sample)
 
 ## Return Protocol

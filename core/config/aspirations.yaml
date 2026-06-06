@@ -313,7 +313,8 @@ stale_sentinel:
 #                defer-recheck (Phase 0.5b.4).
 #   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
 #                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
-#                (0.5e.5), felt-sense-cadence (0.5f). All are themselves
+#                (0.5e.5), felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
+#                health-regression-cadence (0.5h). All are themselves
 #                cadence-gated, so dropping them in tight zones is safe.
 #
 # Always-run sweeps fire 100% of the time regardless of zone or budget. If
@@ -456,7 +457,7 @@ plateau_detection:
 
 cycle_detection:
   lookback_window: 3              # Number of recent goals to check for cycles
-  report_signal_age_days: 7       # zero_learning_velocity suppression: any <agent>/reports/*.md mtime within N days for recent goal IDs counts as substantive learning artifact (g-115-188 false-positive fix)
+  report_signal_age_days: 7       # zero_learning_velocity suppression: any <agent>/temp/*.md mtime within N days for recent goal IDs counts as substantive learning artifact (g-115-188 false-positive fix; reports/ abolished 2026-06-02, temp/ is the scan target — key name retained for consumer compat)
   checks:                         # What the precheck skill looks for
     - repeated_failure             # Almost all recent goals skipped/blocked
     - zero_learning_velocity       # Same-category goals producing no learning artifacts
@@ -540,7 +541,7 @@ fresh_eyes_review:
   goal_cadence: 25              # Every N completed goals — goal-count cadence only
   wm_slot: last_fresh_eyes_review
   report_glob: "fresh-eyes-[0-9]*.md"  # g-115-1308 auto-reconcile: glob for THIS
-                                # ritual's archive reports under <agent>/reports/.
+                                # ritual's archive reports under <agent>/temp/.
                                 # The [0-9] excludes the program/tree siblings
                                 # (fresh-eyes-program-*, fresh-eyes-tree-*) whose
                                 # names have a letter after the dash. When a
@@ -1390,3 +1391,91 @@ infra_health:
 # force_tree_maintain / Phase 0-pre at precheck:57-75).
 experience_archival_gate:
   staleness_hours: 12              # mirrors EXPERIENCE_STALENESS_HOURS default
+
+# ------------------------------------------------------------------
+# Health-regression detection & tiered revert (health-ledger subsystem)
+# ------------------------------------------------------------------
+# Single source of truth for the per-agent self-health ledger. Full spec:
+# core/config/conventions/health-ledger.md. Design provenance: workflow
+# wf_b82a26e9-958 (2026-06-03). The subsystem ships DORMANT — see `mode` and
+# `calibration` below; no revert authority activates until the calibration
+# AND-gate is satisfied AND `mode` is advanced past detect-only.
+health_regression:
+  # Master mode switch. Advance deliberately, one phase at a time:
+  #   collect-only      — append ledger records; no detection, no reverts (Phase 1)
+  #   detect-and-report — + detection sweep files Investigate goals; no reverts (Phase 2)
+  #   full              — + tiered revert pipeline active (Phase 3, post-calibration)
+  mode: collect-only
+
+  # --- Composite weights (health-ledger §4). Reused signals from
+  # world/productivity-snapshots.jsonl — NOT recomputed. Renormalized over
+  # available signals when one drops. ---
+  weights:
+    composite_productivity: 0.40   # productivity-snapshots `score`
+    encoding_ratio: 0.25           # breakdown.encoding_ratio
+    deep_ratio: 0.20               # breakdown.deep_ratio
+    tree_writes: 0.15              # breakdown.counts.tree_writes (normalized by cap)
+  tree_writes_cap: 8               # tree_writes normalized as min(raw/cap, 1.0)
+  min_signals: 2                   # below this, composite=null (excluded from trend)
+  warmup_records: 2                # first N non-null records per session are warmup-excluded
+
+  # --- Baseline (reuses meta/audit-baselines.yaml ratchet under key health_composite) ---
+  baseline_tolerance: 0.10         # below_baseline = composite < baseline * (1 - tolerance)
+
+  # --- Detection gate (health-ledger §8; Phase 2). ALL three + the counter must hold. ---
+  detection:
+    interval: 10                   # sweep cadence (every N completed goals), medium-tier deferrable
+    slope_threshold: -0.02         # composite_trend must be below this (negative slope)
+    floor: 0.40                    # composite must be below this absolute floor
+    consecutive_below_baseline: 3  # require N consecutive below_baseline records before tripping
+
+  # --- Calibration AND-gate (health-ledger §10). BOTH must hold before `full` mode reverts. ---
+  calibration:
+    min_days: 30                   # ≥ N days of records, AND
+    min_records: 50                # ≥ N records (AND, not OR — prevents ~1-day activation)
+
+  # --- Revert pipeline (Phase 3) ---
+  revert:
+    confidence_gate: 0.70          # Ring 3 auto-revert requires attribution_score ≥ this (else demote to Ring 2)
+    verification_iterations: 5     # post-revert: keep if composite improves ≥ improve_delta within N iterations
+    improve_delta: 0.05            # min composite improvement to confirm a revert helped
+    dead_end_expiry_days: 30       # (file,signal) revert dead-ends expire after N days
+    chain_depth_cap: 1             # bidirectional dead-end cap — prevents revert↔undo oscillation
+
+  # --- Signal→file correlation map (health-ledger §9.3; consumed by
+  # health-attribution.py). When a signal degrades, files matching its globs
+  # are the most plausible causes. correlation_weight: 1.0 direct (the file
+  # governs the signal's machinery) / 0.5 indirect / 0.3 unknown (default for
+  # any changed file matching no rule). Agent-evolvable — start lean and let
+  # the map accrete from confirmed attributions (OD-4 re-seed cadence). All
+  # globs are framework-internal paths (domain-free). attribution_score =
+  # temporal_proximity × correlation_weight × recency_decay. ---
+  signal_file_correlation:
+    default_weight: 0.3            # unknown — any changed file matching no rule below
+    rules:
+      - signal: encoding_ratio    # how much the agent encodes per goal
+        weight: 1.0
+        globs:
+          - "core/config/memory-pipeline.yaml"
+          - ".claude/skills/aspirations-state-update/**"
+          - ".claude/skills/aspirations-consolidate/**"
+          - ".claude/skills/aspirations-learning-gate/**"
+          - "meta/encoding-strategy.yaml"
+      - signal: deep_ratio        # deep vs routine work mix
+        weight: 1.0
+        globs:
+          - "meta/goal-selection-strategy.yaml"
+          - "core/scripts/goal-selector.py"
+          - ".claude/skills/aspirations-execute/**"
+      - signal: tree_writes       # knowledge-tree write volume
+        weight: 1.0
+        globs:
+          - ".claude/skills/tree/**"
+          - "core/config/knowledge-conventions.md"
+          - "core/config/conventions/tree-retrieval.md"
+      - signal: composite_productivity  # the master score — broad, so indirect
+        weight: 0.5
+        globs:
+          - "core/config/aspirations.yaml"
+          - "core/scripts/productivity-stop-gate.sh"
+          - "meta/reflection-strategy.yaml"

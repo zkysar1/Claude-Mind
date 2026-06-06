@@ -62,7 +62,7 @@ Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
    Narrate "daemon_integration subset deferred to quiescent window" — NOT "full
    suite deferred" (the rest ran).
 
-`MIND_RUNTIME_DIR` (honored by `lifecycle.runtime_dir`, `mind-api-start.sh`'s
+`RUNTIME_DIR` (honored by `lifecycle.runtime_dir`, `mind-api-start.sh`'s
 `RT_DIR`, and `owncloud_sync.py`) lets a future test spawn an isolated daemon
 whose `daemon.pid/port` live in a tmp dir, so a spawn-and-check-own-files test
 need not hijack the live daemon's `mind_api/state`. It does NOT make the

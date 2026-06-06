@@ -232,7 +232,7 @@ ingredients (`team-state.in_flight`, `board/reasoning.jsonl`,
 `discovered_by`, `related_goals`) that COULD enable co-iteration, but none
 were wired together.
 
-Full design rationale + 30-day baseline: `alpha/reports/co-investigation-protocol-2026-05-09.md`.
+Full design rationale + 30-day baseline: co-investigation-protocol design (2026-05-09, git-archived).
 
 ### Schema additions
 

@@ -30,8 +30,9 @@
 #   bash core/scripts/session-manifest-gate.sh --file P   # validate an arbitrary manifest path (testing)
 #   bash core/scripts/session-manifest-gate.sh --quiet    # suppress the OK summary line
 #
-# Wired from: iteration-commit.sh pre-commit gate set (gated on
-#   core/config/session-manifest.yaml changes) and the Phase-6 recurring audit.
+# Wired from: core/githooks/pre-commit Gate 9 (2026-06-03), gated on
+#   core/config/session-manifest.yaml being staged in the commit. (A Phase-6
+#   recurring-audit wiring is planned but not yet in place.)
 
 set -uo pipefail
 

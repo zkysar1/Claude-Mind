@@ -9,13 +9,13 @@ B15 (writes that bypass the storage backend never reach the cloud, so they don't
 sync cross-machine).
 
 THE GAP (audited 2026-06-01)
-  Under MIND_STORAGE_BACKEND=own-cloud, the backend's write methods
+  Under STORAGE_BACKEND=own-cloud, the backend's write methods
   (atomic_write / write_text / write_bytes / append_jsonl_record / write_jsonl)
   and _fileops.locked_* push to S3 with an If-Match fence. But ~45 RAW write
   sites — `Path.write_text`, `open(...,'w'/'a')`, `shutil.copy`, `os.replace`,
   `echo >` — across the daemon and standalone scripts persist LOCAL-ONLY. So do
   every LLM Write/Edit-tool write (knowledge node bodies, self.md, program.md,
-  conventions, journals, experience bodies, reports). On one machine that is
+  conventions, journals, experience bodies, temp docs). On one machine that is
   invisible; the moment a SECOND machine reads from S3, that state is missing or
   stale. "The entire point of the cloud is that it syncs across machines."
 
@@ -48,7 +48,7 @@ MECHANISM (fence-safe, never clobbers local OR a peer's S3)
   ETag ("...-N") can't be compared so the file is treated as differing -> PUT
   (correct, just not skip-optimised).
 
-  A machine-local manifest (MIND_RUNTIME_DIR/owncloud-sync-manifest.json) stores
+  A machine-local manifest (RUNTIME_DIR/owncloud-sync-manifest.json) stores
   {rel_key: {mtime, md5}}: the mtime lets recurring sweeps skip files unchanged
   since their last confirmed sync (a 10-minute cadence does not HEAD thousands of
   files each time); the md5 is the content BASELINE the step-2 classifier uses to
@@ -62,14 +62,14 @@ MULTI-MACHINE SAFETY (H4 — the machine-2 gate)
   on a second, where the local copy of a file this machine only READ is a CACHE of
   S3 that a peer may have moved. Two defenses, both off by default (single-machine
   back-compat) and armed by env:
-    - MIND_OWNED_AGENTS="alpha,bravo"  (H4a) — the agents THIS machine runs. The
+    - MACHINE_OWNED_AGENTS="alpha,bravo"  (H4a) — the agents THIS machine runs. The
       sweep prunes agents/<name>/ for every name NOT listed: a peer agent's dir is
       a cache of the OWNING machine's writes, never to be pushed from here. Unset
       => own all agents (single-machine default).
     - the content baseline (H4b, above) guards world/ and meta/ (shared by all
       machines): a file at its baseline locally while S3 moved is a stale cache,
-      skipped — not pushed over the peer's newer bytes. MIND_MULTI_MACHINE=1 (or
-      any MIND_OWNED_AGENTS value) also makes a diverged file with NO baseline
+      skipped — not pushed over the peer's newer bytes. MACHINE_MULTI=1 (or
+      any MACHINE_OWNED_AGENTS value) also makes a diverged file with NO baseline
       skip rather than push (cannot prove local authority); the PostToolUse
       single-file path still pushes genuine local writes in real time.
   The If-Match fence ALONE does not prevent stale-clobber: it fences on the
@@ -102,7 +102,7 @@ MACHINE-LOCAL EXCLUSIONS (legitimately do NOT sync)
                               is scoped to the world/ root only).
 
 USAGE
-  set -a; source .env.local; set +a            # MIND_STORAGE_BACKEND + scoped creds
+  set -a; source .env.local; set +a            # STORAGE_BACKEND + scoped creds
   source core/scripts/_paths.sh                # exports WORLD_PATH/META_PATH
   export WORLD_PATH AYOAI_WORLD="$WORLD_PATH"   # from_env reads these
   # preview the full baseline:
@@ -136,12 +136,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _EXCLUDE_DIRS = {
     "sessions", ".history", "presence",
     "__pycache__", ".git", "node_modules", ".locks", ".pytest_cache",
-    # reports/ is a FROZEN git-tracked archive (file-model normalization): the
-    # Phase-4 gate blocks new writes, git is its cross-machine transport, and its
-    # learning was already encoded at goal-closure. It is not live state, so it
-    # must NOT consume S3 sync. Contrast temp/ (live working docs) which DOES
-    # sync. See core/config/conventions/temp-store.md.
-    "reports",
 }
 # Exact basenames never synced (per-machine config / runtime / append logs).
 _EXCLUDE_NAMES = {
@@ -264,7 +258,7 @@ def _session_file_machine_local(basename: str, rel_parts) -> bool:
 
 # --- manifest (machine-local mtime cache to skip unchanged files) ----------
 def _runtime_dir() -> Path:
-    rd = os.environ.get("MIND_RUNTIME_DIR")
+    rd = os.environ.get("RUNTIME_DIR")
     if rd:
         return Path(rd)
     return Path(__file__).resolve().parents[2] / "mind_api" / "state"
@@ -331,7 +325,7 @@ def _save_manifest(m: dict) -> None:
 
 # --- multi-machine ownership + freshness (H4 — machine-2 gate) -------------
 def _owned_agents():
-    """The set of agent names THIS machine runs, from MIND_OWNED_AGENTS
+    """The set of agent names THIS machine runs, from MACHINE_OWNED_AGENTS
     (comma-separated). None => own ALL agents (single-machine default / unset).
 
     On a SECOND machine the local copy of a PEER agent's dir is a stale CACHE of
@@ -340,7 +334,7 @@ def _owned_agents():
     fence does not stop it: the sweep fences on the just-observed CURRENT etag, so
     a stale-local PUT succeeds). When set, the sweep prunes agents/<name>/ for
     every name NOT listed."""
-    raw = os.environ.get("MIND_OWNED_AGENTS", "").strip()
+    raw = os.environ.get("MACHINE_OWNED_AGENTS", "").strip()
     if not raw:
         return None
     return {a.strip() for a in raw.split(",") if a.strip()}
@@ -348,11 +342,11 @@ def _owned_agents():
 
 def _multi_machine() -> bool:
     """True when this process shares the env with other machines. Declaring
-    MIND_OWNED_AGENTS is the signal (a single machine owns all agents and leaves
-    it unset); MIND_MULTI_MACHINE=1 forces it on. Enables the conservative
+    MACHINE_OWNED_AGENTS is the signal (a single machine owns all agents and leaves
+    it unset); MACHINE_MULTI=1 forces it on. Enables the conservative
     no-baseline stale-skip in _sync_one (cannot prove local authority => do not
     risk clobbering a peer)."""
-    if os.environ.get("MIND_MULTI_MACHINE", "").strip().lower() in (
+    if os.environ.get("MACHINE_MULTI", "").strip().lower() in (
             "1", "true", "yes"):
         return True
     return _owned_agents() is not None
@@ -371,7 +365,7 @@ def _manifest_entry(v):
 
 # --- backend wiring --------------------------------------------------------
 def _require_owncloud_backend():
-    kind = os.environ.get("MIND_STORAGE_BACKEND", "local").strip().lower()
+    kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
         print(f"[sync] backend is {kind!r}, not 'own-cloud' — nothing to mirror "
               "to S3 (the local files ARE the store under the local backend). "

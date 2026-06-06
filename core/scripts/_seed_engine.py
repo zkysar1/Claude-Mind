@@ -1,4 +1,4 @@
-"""Seed engine — orchestrator for /seed transplant + verify + diff sub-commands.
+"""Seed engine — orchestrator for /seed plant + verify + diff sub-commands.
 
 CLI sub-commands (consumed by core/scripts/seed-*.sh wrappers):
   build-plan        — parse manifest + walk source, emit JSON plan
@@ -225,7 +225,7 @@ def is_excluded_always(rel_path: str, manifest: dict) -> bool:
       4. `*.stackdump`       — fnmatch glob on basename
       5. `path/to/file.ext`  — exact path match
 
-    The anchoring distinction matters because the seed transplant ships a
+    The anchoring distinction matters because the seed plant ships a
     Python package at `mind_api/src/world/` (and `mind_api/src/meta/`) that
     shares basenames with the top-level domain dirs `world/` and `meta/`.
     Bare-name `world/` over-matches both; `/world/` matches only the top.
@@ -565,13 +565,13 @@ def do_clean_cruft(dest_root: Path, manifest: dict) -> dict:
 # they happen to exist at destination. Each is preserved for a specific reason.
 _ORPHAN_SCAN_SKIP_TOP = {
     ".git",                 # version control
-    ".seed-staging",        # transient staging from current/in-flight transplant
+    ".seed-staging",        # transient staging from current/in-flight plant
     "agents",               # per-deployment state (created by /start)
     "world",                # per-deployment domain state (external path in source)
     "meta",                 # per-deployment strategy state (external path in source)
 }
 
-# Specific destination paths that survive every transplant regardless of
+# Specific destination paths that survive every plant regardless of
 # manifest membership. Single source of truth for "preserved at dest".
 _ORPHAN_PRESERVE_FILES = {
     ".env.local",
@@ -582,7 +582,7 @@ _ORPHAN_PRESERVE_FILES = {
 def _is_preserved_at_dest(rel: str) -> bool:
     if rel in _ORPHAN_PRESERVE_FILES:
         return True
-    # .seed-backup-<timestamp>/ from prior transplants
+    # .seed-backup-<timestamp>/ from prior plants
     first = rel.split("/", 1)[0]
     if first.startswith(".seed-backup-"):
         return True

@@ -1460,6 +1460,18 @@ do_productivity_check() {
     bash "$SCRIPT_DIR/productivity-stop-gate.sh" \
         || echo "[iteration-close] WARN: productivity-stop-gate.sh failed — productivity threshold not evaluated this iteration" >&2
 
+    # Health-snapshot (health-ledger subsystem; core/config/conventions/health-ledger.md).
+    # Runs AFTER productivity-stop-gate.sh so THIS iteration's productivity snapshot
+    # exists to read — the 4 health signals are reused from it, not recomputed — and
+    # BEFORE the ITERATION COMPLETE imperative so it never delays loop continuation.
+    # Fire-and-forget / fail-open: a telemetry miss must never abort productivity-check.
+    # Phase 1 (collect-only): appends one record to agents/<agent>/health/<date>.jsonl;
+    # detection + revert activate in later phases per health_regression.mode. Direct
+    # python (no .sh wrapper) matches the sibling helper-python pattern below
+    # (agent-watchdog.py / stale-sentinel-canary.py). cygpath: Windows-Python file-arg.
+    python3 "$(cygpath -w "$SCRIPT_DIR/health-ledger-append.py")" \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
     # Agent watchdog tick — periodic session observability probes. Replaces the
     # detached daemon model (which died-on-parent-exit on Git Bash for Windows
     # due to flaky nohup+disown semantics). Reads prev state from

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# /seed transplant <destination> — orchestrate full transplant flow.
+# /seed plant <destination> — orchestrate full plant (publish) flow.
+# (Implements the renamed '/seed plant' verb, formerly '/seed transplant'.
+#  Filename keeps 'transplant' to avoid churning the CLAUDE.md AGENTS_PARENT_DIR
+#  audit table + tests. The word 'transplant' now means relocating a LIVING
+#  mind WITH its state to another machine — see the /transplant skill.)
 #
 # Usage:
 #   seed-transplant.sh <destination> [--dry-run] [--diff] [--no-backup]
@@ -108,7 +112,7 @@ if ls "$DEST"/.active-agent-* >/dev/null 2>&1; then
     echo "  REFUSE: active-agent binding present at destination" >&2
 fi
 if [ $RUNNING_AT_DEST -eq 1 ]; then
-    echo "  /stop the destination agent before transplanting (NO --force override)." >&2
+    echo "  /stop the destination agent before planting (NO --force override)." >&2
     exit 4
 fi
 
@@ -126,7 +130,7 @@ fi
 
 # Step 3.5: Source publishability gate (preflight)
 # Six publishability invariants run as a single aggregated check. Any FAIL
-# refuses the transplant — the bad source state must be fixed first, not
+# refuses the plant — the bad source state must be fixed first, not
 # carried into the destination. The --skip-preflight flag is an emergency
 # override that requires a written justification (audited to stderr).
 # See world/knowledge/tree/system/publication-pipeline.md for the gate
@@ -193,7 +197,7 @@ fi
 # Step 6: User confirmation (skip if --force)
 if [ $FORCE -eq 0 ]; then
     echo ""
-    echo "Proceed with transplant to $DEST ? [y/N]"
+    echo "Proceed with seed-plant to $DEST ? [y/N]"
     read -r ANSWER
     case "$ANSWER" in
         y|Y|yes|YES) ;;
@@ -249,7 +253,7 @@ else:
 fi
 
 # Step 10.5: Remove orphans — files at destination that are NOT in the
-# manifest-resolved include set (i.e. removed from source since last transplant).
+# manifest-resolved include set (i.e. removed from source since last plant).
 # This gives the destination true mirror semantics: source = dev, destination = prod.
 echo "[seed-transplant] Removing orphans at destination..."
 ORPHAN_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" remove-orphans --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
@@ -266,7 +270,7 @@ else:
     print('  no orphans found')"
 
 # Step 11: Handle git (init only — commit happens AFTER post-actions so
-# their outputs land in the same commit as the transplanted files)
+# their outputs land in the same commit as the planted files)
 if [ $FRESH_GIT -eq 1 ]; then
     echo "[seed-transplant] Re-initializing git at destination..."
     rm -rf "$DEST/.git"
@@ -283,7 +287,7 @@ py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" -
 # Step 12.5: Auto-commit (runs AFTER post-actions so regenerated files are
 # captured in the commit)
 if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
-    echo "[seed-transplant] Committing transplant at destination..."
+    echo "[seed-transplant] Committing planted files at destination..."
     git -C "$DEST" add -A
     TS="$(date +%Y-%m-%d)"
     # Generic, public-safe commit message — source path / repo name MUST NOT
@@ -296,4 +300,4 @@ fi
 echo "[seed-transplant] Running verification..."
 bash "$SCRIPT_DIR/seed-verify.sh" "$DEST" || echo "  (verification reported issues — see above)"
 
-echo "[seed-transplant] DONE. Transplanted $MOVED files to $DEST"
+echo "[seed-transplant] DONE. Planted $MOVED files to $DEST"
