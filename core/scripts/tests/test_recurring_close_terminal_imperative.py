@@ -50,7 +50,7 @@ RECURRING_CLOSE_SH = CORE_SCRIPTS / "recurring-close.sh"
 
 # Resolve bash absolutely (Windows App Paths WSL-bash defense — same pattern as
 # test_recurring_close_outcome_origin.py).
-BASH_PATH = shutil.which("bash") or "bash"
+from _bash_helpers import BASH as BASH_PATH  # rb-1472: bin-first, clean-PATH-safe
 
 
 def _run_imperative_shell(outcome: str) -> str:

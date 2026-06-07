@@ -591,6 +591,102 @@ def _is_preserved_at_dest(rel: str) -> bool:
     return False
 
 
+def _read_world_path_from_conf(conf: Path):
+    """Extract WORLD_PATH from a local-paths.conf.
+
+    Format: KEY=value lines, `#` comments, optional surrounding quotes.
+    Returns the value string, or None if absent/unreadable.
+    """
+    try:
+        text = conf.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == "WORLD_PATH":
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            return val or None
+    return None
+
+
+def _dest_forged_skill_names(dest_root: Path):
+    """Return the set of forged/domain skill NAMES registered at the
+    destination, or None if no registry can be located or parsed.
+
+    Lookup order:
+      1. <dest>/world/forged-skills.yaml  (local world dir, if present)
+      2. WORLD_PATH from <dest>/agents/*/local-paths.conf -> <world>/forged-skills.yaml
+         (external world dir — the normal layout, world/ lives off-repo)
+
+    Returns None (NOT an empty set) when no registry is found OR a located
+    registry is unparseable, so the caller fails SAFE toward preserving every
+    skill dir. An empty set is returned only when a registry IS found and
+    parsed but genuinely lists zero skills.
+    """
+    candidates = []
+    local = dest_root / "world" / "forged-skills.yaml"
+    if local.is_file():
+        candidates.append(local)
+    agents_dir = dest_root / "agents"
+    if agents_dir.is_dir():
+        for conf in sorted(agents_dir.glob("*/local-paths.conf")):
+            world_path = _read_world_path_from_conf(conf)
+            if world_path:
+                ext = Path(world_path) / "forged-skills.yaml"
+                if ext.is_file():
+                    candidates.append(ext)
+    if not candidates:
+        return None
+    names = set()
+    found_any = False
+    for reg in candidates:
+        try:
+            data = yaml.safe_load(reg.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            # A located-but-unparseable registry => fail safe (preserve all)
+            return None
+        if isinstance(data, dict) and isinstance(data.get("skills"), dict):
+            names.update(data["skills"].keys())
+            found_any = True
+    if not found_any:
+        return None
+    return names
+
+
+def _is_protected_dest_skill(rel: str, forged_prefixes: set,
+                             protect_all_skills: bool) -> bool:
+    """Whether `rel` belongs to a destination-owned skill orphan-removal must
+    never delete.
+
+    The destination may carry forged/domain skills absent from the source
+    include set (stripped during frontier->seed promotion). Those skill dirs
+    are registered in the destination's OWN forged-skills.yaml; deleting them
+    destroys the downstream world's domain capability — the failure mode this
+    guard prevents (omni, 2026-06-06).
+
+    - protect_all_skills=True (registry unlocatable/unparseable): preserve
+      EVERY `.claude/skills/<name>/` path — fail-safe toward preservation.
+    - otherwise: preserve only paths under a registered forged skill dir.
+
+    Base skills present in the source manifest are kept by the caller's
+    `rel in expected` check BEFORE this is consulted, so this only governs
+    skill dirs that are NOT in the source include set.
+    """
+    if not rel.startswith(".claude/skills/"):
+        return False
+    if protect_all_skills:
+        return True
+    for prefix in forged_prefixes:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
                       dry_run: bool = False) -> dict:
     """Remove files at destination that are NOT in the manifest-resolved include set.
@@ -598,11 +694,27 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
     Semantics: destination = mirror of (manifest ∩ source). Files that exist at
     destination but no longer at source (or are now excluded by manifest) are
     deleted. Preserved paths (.git, .env.local, .claude/settings.local.json,
-    .seed-backup-*, agents/, world/, meta/) are never touched.
+    .seed-backup-*, agents/, world/, meta/) are never touched. Additionally,
+    destination-owned forged/domain skill dirs (`.claude/skills/<name>/` for
+    <name> in the destination's own forged-skills.yaml) are preserved even
+    though they are absent from the source include set — see
+    _is_protected_dest_skill (omni orphan-removal guard, 2026-06-06).
 
     Returns {"removed": [...], "kept_preserved": [...], "dry_run": bool}.
     """
     expected = set(resolve_include_set(manifest, source_root))
+
+    # Destination-owned skill protection (omni orphan-removal guard, 2026-06-06).
+    # The destination may carry forged/domain skills absent from the source
+    # include set (stripped during frontier->seed promotion). Deleting them
+    # would destroy the downstream world's domain capability. Read the dest's
+    # OWN forged-skills.yaml and protect those skill dirs. Fail-safe: an
+    # unlocatable/unparseable registry protects ALL `.claude/skills/<name>/`.
+    dest_forged = _dest_forged_skill_names(dest_root)
+    protect_all_skills = dest_forged is None
+    forged_prefixes = set() if dest_forged is None else {
+        f".claude/skills/{n}" for n in dest_forged
+    }
 
     removed = []
     preserved = []
@@ -619,6 +731,9 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
             preserved.append(rel)
             continue
         if rel in expected:
+            continue
+        if _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills):
+            preserved.append(rel)
             continue
         # Orphan — would be removed
         if dry_run:

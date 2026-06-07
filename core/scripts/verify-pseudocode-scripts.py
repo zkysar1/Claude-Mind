@@ -39,9 +39,14 @@ def _resolve_bash():
     if env_shell and Path(env_shell).exists():
         return env_shell
     if sys.platform == "win32":
+        # Prefer Git\bin\bash.exe (login-launcher) over the raw usr/bin binary —
+        # the raw one doesn't self-configure PATH under a clean-PATH Windows
+        # parent, so coreutils go missing and nested SCRIPT_DIR-based bash calls
+        # fail rc=127 (rb-1472). Mirrors _bash_helpers.py / _runtime_bash.py.
         for candidate in (
-            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
         ):
             if Path(candidate).exists():
