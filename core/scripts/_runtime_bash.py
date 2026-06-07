@@ -53,9 +53,20 @@ def resolve_bash() -> str:
     if env_shell and Path(env_shell).exists():
         return env_shell
     if sys.platform == "win32":
+        # Prefer Git\bin\bash.exe (login-launcher) over Git\usr\bin\bash.exe
+        # (raw MSYS binary). rb-1472 (2026-06-06): when spawned by a
+        # Windows-process parent whose PATH lacks Git's usr/bin (daemon started
+        # without a shell env; a script run from cmd.exe/PowerShell), the raw
+        # usr/bin/bash.exe does NOT self-configure its PATH, so coreutils
+        # (dirname, sed, tr) are "command not found" and any wrapper computing
+        # SCRIPT_DIR via $(cd "$(dirname …)" && pwd) mis-resolves -> nested
+        # `bash $SCRIPT_DIR/sub.sh` rc=127. bin/bash.exe sources the MSYS
+        # profile and rebuilds PATH, so coreutils always resolve. Matches the
+        # _bash_helpers.py and infra-health.py (gold-standard) ordering.
         for candidate in (
-            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
         ):
             if Path(candidate).exists():

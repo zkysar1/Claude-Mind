@@ -98,7 +98,7 @@ def _load_ratios():
     # rb-198: Windows + bash invocation requires MIND_SHELL env var (set by hook)
     # plus posix-style path. Bare "bash" resolves to a different binary than
     # the shim path; backslash paths confuse bash's argument parser.
-    bash = os.environ.get("MIND_SHELL") or "bash"
+    from _runtime_bash import BASH as bash  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
     try:
         result = subprocess.run(
             [bash, LEARNING_RATIO_SH.as_posix(), "--scope", "goals", "--json"],

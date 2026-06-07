@@ -200,3 +200,154 @@ def test_realistic_mixed_manifest():
     assert is_excluded("core/scripts/_seed_engine.py", m) is False
     assert is_excluded("mind_api/src/server.py", m) is False
     assert is_excluded(".claude/skills/start/SKILL.md", m) is False
+
+
+# ============================================================================
+# Orphan removal — destination-owned forged/domain skill protection
+# ----------------------------------------------------------------------------
+# Background (2026-06-06, omni orphan-removal blocker):
+#   seed-transplant's do_remove_orphans mirrors (source ∩ manifest) onto the
+#   destination — files at dest absent from the source include set are deleted.
+#   The destination (e.g. zds-mind) carries forged/domain skills under
+#   `.claude/skills/<name>/` that DO NOT exist in the source (claude-mind seed),
+#   because the frontier->seed promotion strips forged skills. Those domain
+#   skill dirs were therefore classified as orphans and DELETED — destroying
+#   the downstream world's domain capability (11 skills: sam-gov-search,
+#   build-landing-page, etc.).
+#
+#   Fix: read the destination's OWN forged-skills.yaml and protect any
+#   `.claude/skills/<name>/` it registers. Fail-safe toward preservation — when
+#   no registry is locatable or it is unparseable, preserve EVERY skill dir.
+# ============================================================================
+
+def _w(path: Path, content: str = "x") -> None:
+    """Create a file (and parents) with `content`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+# Minimal forged-skills.yaml: skill names are the keys under `skills:`.
+_REGISTRY = "skills:\n  {name}:\n    type: domain\n    parent: null\n"
+
+
+def _src_with_base_skill(src: Path) -> dict:
+    """Source carries ONE base skill. Manifest includes the whole skills dir,
+    so the resolved include set is {.claude/skills/start/SKILL.md} — the
+    domain skills the destination owns are deliberately absent from source.
+    """
+    _w(src / ".claude" / "skills" / "start" / "SKILL.md", "base start skill")
+    return {"include": [{"path": ".claude/skills", "type": "dir"}],
+            "exclude_always": []}
+
+
+def test_orphan_removal_preserves_registered_dest_forged_skill(tmp_path):
+    """Headline: a dest forged skill absent from source survives because the
+    dest's own registry lists it; a genuine non-skill orphan is still removed."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_skill(src)
+
+    _w(dest / ".claude" / "skills" / "start" / "SKILL.md", "old base")          # in expected
+    _w(dest / ".claude" / "skills" / "sam-gov-search" / "SKILL.md", "domain")   # protected
+    _w(dest / ".claude" / "orphan-note.md", "removed upstream")                 # genuine orphan
+    _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="sam-gov-search"))
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".claude" / "skills" / "start" / "SKILL.md").exists()
+    assert (dest / ".claude" / "skills" / "sam-gov-search" / "SKILL.md").exists()
+    assert not (dest / ".claude" / "orphan-note.md").exists()
+    assert ".claude/orphan-note.md" in result["removed"]
+    assert ".claude/skills/sam-gov-search/SKILL.md" not in result["removed"]
+
+
+def test_orphan_removal_removes_unregistered_skill_when_registry_present(tmp_path):
+    """When a registry IS present, a skill dir absent from BOTH the source
+    include set AND the registry is a true orphan and is removed."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_skill(src)
+
+    _w(dest / ".claude" / "skills" / "start" / "SKILL.md", "old base")
+    _w(dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md", "not registered")
+    _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="sam-gov-search"))
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".claude" / "skills" / "start" / "SKILL.md").exists()
+    assert not (dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md").exists()
+    assert ".claude/skills/ghost-skill/SKILL.md" in result["removed"]
+
+
+def test_orphan_removal_fail_safe_preserves_all_skills_when_no_registry(tmp_path):
+    """No registry locatable at dest → protect_all_skills=True → EVERY skill
+    dir survives, registered or not. Non-skill orphans are still removed (the
+    fail-safe is scoped to `.claude/skills/`)."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_skill(src)
+
+    _w(dest / ".claude" / "skills" / "start" / "SKILL.md", "old base")
+    _w(dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md", "unregistered")
+    _w(dest / ".claude" / "orphan-note.md", "removed upstream")
+    # NO registry: no world/forged-skills.yaml, no agents/*/local-paths.conf
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".claude" / "skills" / "start" / "SKILL.md").exists()
+    assert (dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md").exists()
+    assert not (dest / ".claude" / "orphan-note.md").exists()
+
+
+def test_orphan_removal_protects_via_external_world_path(tmp_path):
+    """End-to-end: registry lives at an EXTERNAL world path (the normal layout),
+    discovered through agents/*/local-paths.conf. The registered domain skill
+    survives orphan-removal."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    ext_world = tmp_path / "ExternalWorld"
+    manifest = _src_with_base_skill(src)
+
+    _w(ext_world / "forged-skills.yaml", _REGISTRY.format(name="build-landing-page"))
+    _w(dest / "agents" / "omni" / "local-paths.conf",
+       f"WORLD_PATH={ext_world.as_posix()}\nMETA_PATH={(tmp_path / 'M').as_posix()}\n")
+    _w(dest / ".claude" / "skills" / "start" / "SKILL.md", "old base")
+    _w(dest / ".claude" / "skills" / "build-landing-page" / "SKILL.md", "domain")
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".claude" / "skills" / "build-landing-page" / "SKILL.md").exists()
+    assert ".claude/skills/build-landing-page/SKILL.md" not in result["removed"]
+
+
+def test_dest_forged_skill_names_none_when_unlocatable(tmp_path):
+    """No registry anywhere → None (NOT empty set), so callers fail safe."""
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    assert _engine._dest_forged_skill_names(dest) is None
+
+
+def test_dest_forged_skill_names_empty_set_when_registry_lists_none(tmp_path):
+    """A registry that IS found but lists zero skills → empty set (distinct from
+    None): base-skill orphan removal then proceeds normally."""
+    dest = tmp_path / "dest"
+    _w(dest / "world" / "forged-skills.yaml", "skills: {}\n")
+    assert _engine._dest_forged_skill_names(dest) == set()
+
+
+def test_dest_forged_skill_names_none_on_unparseable_registry(tmp_path):
+    """A located-but-unparseable registry → None (fail safe), never a crash."""
+    dest = tmp_path / "dest"
+    _w(dest / "world" / "forged-skills.yaml", "skills: {unterminated: [\n")
+    assert _engine._dest_forged_skill_names(dest) is None
+
+
+def test_read_world_path_from_conf_strips_quotes_and_comments(tmp_path):
+    conf = tmp_path / "local-paths.conf"
+    conf.write_text(
+        "# a comment\n"
+        "META_PATH=/tmp/meta\n"
+        'WORLD_PATH="/tmp/ext world"\n',
+        encoding="utf-8",
+    )
+    assert _engine._read_world_path_from_conf(conf) == "/tmp/ext world"

@@ -218,10 +218,23 @@ case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
         if [ -z "${MIND_SHELL:-}" ] && command -v cygpath &>/dev/null; then
             _bash_abs="$(cygpath -m "$(command -v bash)" 2>/dev/null)"
+            # rb-1472: prefer the login-launcher bin/bash.exe over the raw
+            # usr/bin/bash.exe. `command -v bash` yields /usr/bin/bash inside
+            # Git Bash, but the raw usr/bin binary does NOT self-configure its
+            # PATH when a Windows-process parent (a daemon, or pytest from a
+            # clean PATH) re-spawns it, so coreutils (dirname/sed/tr) go missing
+            # and wrappers computing SCRIPT_DIR via $(cd "$(dirname …)" && pwd)
+            # mis-resolve -> nested `bash $SCRIPT_DIR/sub.sh` rc=127. Substitute
+            # usr/bin -> bin when the sibling launcher exists (this MIND_SHELL
+            # is the SSOT every Python resolver honors first).
+            _bash_bin="${_bash_abs/usr\/bin/bin}"
+            if [ "$_bash_bin" != "$_bash_abs" ] && [ -x "$(cygpath -u "$_bash_bin" 2>/dev/null)" ]; then
+                _bash_abs="$_bash_bin"
+            fi
             if [ -n "$_bash_abs" ] && [ -x "$(cygpath -u "$_bash_abs" 2>/dev/null)" ]; then
                 export MIND_SHELL="$_bash_abs"
             fi
-            unset _bash_abs
+            unset _bash_abs _bash_bin
         fi
         # If auto-detect failed AND stderr is a TTY, surface to the user
         # once per interactive shell. Subprocess invocations (stderr

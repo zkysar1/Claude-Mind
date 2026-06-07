@@ -122,7 +122,8 @@ def _get_bash():
     Uses MIND_SHELL (set by background-jobs.sh) to ensure we use the same
     shell that invoked us — avoids WSL bash on Windows where Git Bash is intended.
     """
-    return os.environ.get("MIND_SHELL", "bash")
+    from _runtime_bash import BASH  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
+    return BASH
 
 
 def run_completion_check(cmd):

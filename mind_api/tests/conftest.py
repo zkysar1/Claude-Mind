@@ -24,6 +24,23 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+# rb-1472: the 21 test_wrapper_*/test_runtime_* helpers resolve bash via
+# `shutil.which("bash")`, which on a clean Windows PATH (pytest launched from
+# cmd.exe/PowerShell) picks the System32 WSL stub or the raw Git usr/bin/bash.exe
+# — the latter does NOT self-configure its PATH, so coreutils go missing and the
+# nested SCRIPT_DIR-based bash calls inside the wrappers fail rc=127. Prepend the
+# resolved Git bin/bash.exe (login-launcher) dir so every shutil.which("bash")
+# and inherited-PATH subprocess in this suite picks the robust launcher. Single
+# source of truth: core/scripts/tests/_bash_helpers.resolve_bash(). Fail-open.
+sys.path.insert(0, str(REPO_ROOT / "core" / "scripts" / "tests"))
+try:
+    from _bash_helpers import resolve_bash as _resolve_bash
+    _bash_dir = os.path.dirname(_resolve_bash())
+    if _bash_dir and _bash_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = _bash_dir + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass  # fail-open: tests fall back to the existing shutil.which behavior
+
 # Hermetic storage backend (lodestar-s7 test isolation): tests must NEVER touch
 # real S3. After the own-cloud cutover, .env.local carries
 # STORAGE_BACKEND=own-cloud; the in-process daemon fixtures here resolve

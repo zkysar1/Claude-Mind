@@ -380,15 +380,19 @@ def test_pr_gh_args_captured(tmp_path):
 
 
 @requires_git
-@pytest.mark.skipif(bool(shutil.which("gh")),
-                    reason="gh is installed — cannot hide it without a fully controlled PATH")
 def test_pr_gh_missing_warns_not_fails(tmp_path):
     """gh absent: promote WARNS and exits 0 (does NOT push or open a PR — the plant
-    stays committed on the local PR branch in the target)."""
+    stays committed on the local PR branch in the target).
+
+    Forced deterministically via PROMOTE_GH_BIN="" (set-but-empty) instead of the old
+    skipif(shutil.which("gh")): that was fragile because git-bash's `command -v` and
+    Python's `shutil.which` search DIFFERENT PATHs on Windows, so the skip condition
+    and the script disagreed about whether gh exists. The empty override forces the
+    not-found branch regardless of what is installed."""
     src = _setup_promote_source(tmp_path, "1.0.0")
     world = _mk_world(tmp_path, "frontier")
     tgt, bare = _mk_target_with_remote(tmp_path, "0.0.1")
-    r = _run_promote_pr(src, tgt, world)  # no shim -> command -v gh fails
+    r = _run_promote_pr(src, tgt, world, extra_env={"PROMOTE_GH_BIN": ""})  # force gh-missing
     assert r.returncode == 0, r.stdout + r.stderr
     out = r.stdout + r.stderr
     assert "not installed" in out
@@ -396,6 +400,23 @@ def test_pr_gh_missing_warns_not_fails(tmp_path):
     assert "promote/v1.0.0" not in _git(bare, "branch").stdout
     # But the plant IS committed on the local PR branch in the target.
     assert "promote/v1.0.0" in _git(tgt, "branch").stdout
+
+
+@requires_git
+def test_pr_gh_bin_override_used(tmp_path):
+    """PROMOTE_GH_BIN points the wrapper at a gh binary even when none is on PATH —
+    the Windows-git-bash case the fix addresses (gh installed off the MSYS PATH).
+    The shim is NOT added to PATH (shim_dir omitted), so `command -v gh` fails;
+    only the explicit override resolves it, and the resolved binary runs `pr create`."""
+    src = _setup_promote_source(tmp_path, "1.0.0")
+    world = _mk_world(tmp_path, "frontier")
+    tgt, bare = _mk_target_with_remote(tmp_path, "0.0.1")
+    shim, cap = _mk_gh_shim(tmp_path)
+    r = _run_promote_pr(src, tgt, world, gh_capture=cap,
+                        extra_env={"PROMOTE_GH_BIN": (shim / "gh").as_posix()})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "promote/v1.0.0" in _git(bare, "branch").stdout
+    assert "pr create" in cap.read_text(encoding="utf-8")
 
 
 @requires_git
