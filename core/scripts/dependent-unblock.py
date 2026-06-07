@@ -125,8 +125,9 @@ def _update(source, goal_id, field, value, dry_run):
     """
     if dry_run:
         return True, ""
+    from _runtime_bash import BASH  # rb-1472: bin-first, clean-PATH-safe (not bare "bash")
     cmd = [
-        "bash",
+        BASH,
         (SCRIPT_DIR / "aspirations-update-goal.sh").as_posix(),
         "--source", source,
         goal_id, field, value,

@@ -59,7 +59,7 @@ import pytest
 # wrong bash it errors `py: command not found` and emits zero findings.
 # shutil.which returns Git Bash here because pytest is launched from a context
 # where Git Bash is in PATH — matches production sweep behavior.
-BASH_PATH = shutil.which("bash") or "bash"
+from _bash_helpers import BASH as BASH_PATH  # rb-1472: bin-first, clean-PATH-safe
 
 TESTS_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = TESTS_DIR.parent

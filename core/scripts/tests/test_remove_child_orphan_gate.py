@@ -191,12 +191,7 @@ def _scenario_batch_refuses(tree_path: Path) -> bool:
             {"op": "remove-child", "key": "root", "child_key": "mid"},
         ],
     }
-    sh = os.environ.get("MIND_SHELL")
-    bash = sh or (
-        r"C:\Program Files\Git\usr\bin\bash.exe"
-        if sys.platform == "win32" and Path(r"C:\Program Files\Git\usr\bin\bash.exe").exists()
-        else "bash"
-    )
+    from _bash_helpers import BASH as bash  # rb-1472: bin-first, clean-PATH-safe
     env = os.environ.copy()
     env["MIND_WORLD"] = _TMP
     env.pop("MIND_AGENT", None)

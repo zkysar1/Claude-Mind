@@ -120,7 +120,7 @@ def _run_script(args, input_text=None, timeout=30):
     # is cross-platform — native bash also accepts forward slashes.
     cmd = [(Path(CORE_ROOT) / "scripts" / args[0]).as_posix()] + list(args[1:])
     # On Windows we need bash to execute the .sh wrapper.
-    bash = os.environ.get("MIND_SHELL") or "bash"
+    from _runtime_bash import BASH as bash  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
     full = [bash, *cmd]
     proc = subprocess.run(
         full,
