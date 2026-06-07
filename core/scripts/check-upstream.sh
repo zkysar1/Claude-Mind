@@ -191,9 +191,10 @@ if ! git -C "$PROJECT_ROOT" tag -f "$PRE_TAG" >/dev/null 2>&1; then
 fi
 say "pre-update snapshot tagged: $PRE_TAG"
 # The actual apply for a downstream is merging the upstream promotion PR (or a
-# git pull of the published branch) — a human/CI action, consistent with the
-# never-auto-merge philosophy (promote-to-upstream.sh also never merges). The
-# safety prep (IDLE gate + snapshot) is done; finish by merging upstream.
-say "ready to apply non-breaking update to $LATEST. Merge the upstream promotion PR / pull the published branch."
+# git pull of the published branch). The promote script never AUTO-merges, but
+# the agent MAY perform the merge once the PR is mergeable + checks pass
+# (user-granted 2026-06-06; guard-680). The safety prep (IDLE gate + snapshot)
+# is done; finish by merging upstream.
+say "ready to apply non-breaking update to $LATEST. Merge the upstream promotion PR (agent may merge once clean) / pull the published branch."
 say "rollback if needed: git reset --hard $PRE_TAG"
 exit 0

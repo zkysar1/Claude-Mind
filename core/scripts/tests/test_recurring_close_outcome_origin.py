@@ -57,7 +57,7 @@ RECURRING_CLOSE_SH = CORE_SCRIPTS / "recurring-close.sh"
 # test_iteration_close_outcome_normalize.py and
 # test_orphan_root_sweep_mode_d_integration.py — to bypass Windows App
 # Paths picking WSL bash via registry lookup.
-BASH_PATH = shutil.which("bash") or "bash"
+from _bash_helpers import BASH as BASH_PATH  # rb-1472: bin-first, clean-PATH-safe
 
 
 def _derive_origin_via_shell(original: str, final: str) -> str:

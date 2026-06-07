@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # promote-to-upstream.sh — Promote this repo's framework release ONE step down
 # the chain (frontier->seed, or seed->downstream) into a local clone of the
-# target repo, via the seed-plant machinery. The agent NEVER merges — at most
-# it opens a PR (with --pr); a human merges.
+# target repo, via the seed-plant machinery. The SCRIPT opens a PR (with --pr)
+# and never auto-merges; the AGENT may merge that PR as a separate verified step
+# once it is mergeable + checks pass (user-granted 2026-06-06; guard-680 /
+# capability-routing grant-002).
 #
 # Usage:
 #   bash core/scripts/promote-to-upstream.sh --target <path-to-target-clone> \
@@ -168,16 +170,40 @@ bash "$SCRIPT_DIR/seed-verify.sh" "$TARGET" || fail "post-promotion verify FAILE
 
 # --- Step 6: optional PR push (NEVER merges) -------------------------------
 if [[ $DO_PR -eq 1 ]]; then
-  if ! command -v gh >/dev/null 2>&1; then
-    say "WARNING: --pr requested but 'gh' is not installed. The plant is committed on branch '$BRANCH' at $TARGET."
+  # Resolve gh robustly. `command -v gh` ALONE is wrong on Windows git-bash:
+  # the GitHub CLI installs to "C:\Program Files\GitHub CLI", which is on the
+  # *Windows* PATH but NOT on the narrower MSYS PATH that command -v searches —
+  # so a real, authenticated gh reads as "not installed" and the promotion
+  # false-warns the operator into a manual-PR path (incident 2026-06-06: a live
+  # promotion did exactly this while gh 2.88 was installed + authed). Resolution
+  # order: explicit override -> command -v -> known installer dir -> Windows-PATH
+  # search via where.exe. PROMOTE_GH_BIN, when SET (even to ""), overrides
+  # detection entirely:
+  #   - non-empty -> use it verbatim (manual escape hatch; tests inject a shim)
+  #   - empty     -> force the not-found/warn branch (deterministic test of it)
+  if [[ -n "${PROMOTE_GH_BIN+x}" ]]; then
+    GH_BIN="$PROMOTE_GH_BIN"
+  else
+    GH_BIN="$(command -v gh 2>/dev/null || true)"
+    if [[ -z "$GH_BIN" ]]; then
+      for _cand in "/c/Program Files/GitHub CLI/gh.exe" "/c/Program Files (x86)/GitHub CLI/gh.exe"; do
+        [[ -x "$_cand" ]] && { GH_BIN="$_cand"; break; }
+      done
+    fi
+    if [[ -z "$GH_BIN" ]] && command -v where.exe >/dev/null 2>&1; then
+      GH_BIN="$(where.exe gh 2>/dev/null | head -n1 | tr -d '\r' || true)"
+    fi
+  fi
+  if [[ -z "$GH_BIN" ]]; then
+    say "WARNING: --pr requested but 'gh' is not installed/locatable. The plant is committed on branch '$BRANCH' at $TARGET."
     say "Open a PR manually:  (cd \"$TARGET\" && git push -u origin \"$BRANCH\" && gh pr create ...)"
   else
     ( cd "$TARGET" && git push -u origin "$BRANCH" && \
-      gh pr create --title "Promote framework v$LOCAL from $SELF_ROLE" \
-        --body "Automated framework promotion v$LOCAL ($SELF_ROLE -> $TARGET_ROLE). Review before merging. The agent does NOT merge." ) \
+      "$GH_BIN" pr create --title "Promote framework v$LOCAL from $SELF_ROLE" \
+        --body "Automated framework promotion v$LOCAL ($SELF_ROLE -> $TARGET_ROLE). The agent merges once mergeable + checks pass (user-granted 2026-06-06)." ) \
       || say "WARNING: PR push/create failed — the plant is committed on '$BRANCH' at $TARGET; open the PR manually."
   fi
 fi
 
 say "═══ PROMOTED v$LOCAL ($SELF_ROLE -> $TARGET_ROLE) ═══"
-say "Target: $TARGET  (a human reviews + merges; the agent never merges)"
+say "Target: $TARGET  (PR opened; the agent merges it once mergeable + checks pass — guard-680)"

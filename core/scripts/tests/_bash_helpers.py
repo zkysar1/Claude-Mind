@@ -66,9 +66,30 @@ def resolve_bash() -> str:
     if explicit and Path(explicit).exists():
         return explicit
     if sys.platform == "win32":
+        # Prefer Git\bin\bash.exe (the login-launcher) over Git\usr\bin\bash.exe
+        # (the raw MSYS binary). EMPIRICAL ROOT CAUSE (2026-06-06, rb-1472):
+        # when bash.exe is spawned by a Windows-process parent whose PATH lacks
+        # Git's usr/bin (e.g. pytest launched from cmd.exe / PowerShell rather
+        # than Git Bash), the RAW usr/bin/bash.exe does NOT self-configure its
+        # PATH, so coreutils (dirname, sed, tr, head) read as "command not
+        # found". Any wrapper computing SCRIPT_DIR via
+        # `$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)` then mis-resolves to
+        # cwd, and the nested `bash "$SCRIPT_DIR/sub.sh"` fails rc=127
+        # ("No such file") — the seed-preflight / test_promote failure class.
+        # bin/bash.exe sources the MSYS profile and rebuilds PATH, so coreutils
+        # are always found and the chain works regardless of the parent env.
+        # Verified end-to-end: real seed-preflight.sh under a clean
+        # System32-first PATH -> usr/bin rc=2 (dirname not found), bin rc=0
+        # (PUBLISHABLE). This supersedes rb-1468's incorrect
+        # "non-login MSYS can't open absolute paths" theory (which is why the
+        # three path-string-normalization fix attempts all failed — the lever
+        # is the bash BINARY, not the path form). Linux skips this whole block
+        # (sys.platform != "win32") and falls through to shutil.which, so the
+        # reorder is a no-op off Windows.
         for candidate in (
-            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+            r"C:\Program Files\Git\usr\bin\bash.exe",
             r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
         ):
             if Path(candidate).exists():

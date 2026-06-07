@@ -47,7 +47,7 @@ except ImportError:
 
 def _run(argv, input_text=None, timeout=30):
     """Run a shell command. Returns (stdout, stderr, returncode)."""
-    bash = os.environ.get("MIND_SHELL") or "bash"
+    from _runtime_bash import BASH as bash  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
     # POSIX-slash the script path. Git Bash / MSYS on Windows mangles
     # backslashes in argv (e.g. `C:\Zak\...` → `C:Zak...`), resulting in
     # "No such file or directory" for every helper .sh call. as_posix()

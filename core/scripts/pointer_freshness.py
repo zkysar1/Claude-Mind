@@ -258,9 +258,7 @@ def file_drift_goal(pointer_file, marker: dict, slug: str, project_root) -> dict
     # Repo-agnostic shell resolution (Windows WSL-bash lottery): _paths.sh exports
     # MIND_SHELL (the canonical name); RT_BASH is the watchdog's own var. Bare
     # "bash" can hit the System32 WSL stub and fail rc=127.
-    _bash = (os.environ.get("MIND_SHELL")
-             or os.environ.get("RT_BASH")
-             or "bash")
+    from _runtime_bash import BASH as _bash  # rb-1472: bin-first, honors MIND_SHELL, clean-PATH-safe
     try:
         proc = subprocess.run(
             [_bash, "core/scripts/aspirations-add-goal.sh", target_asp, "--source", source],

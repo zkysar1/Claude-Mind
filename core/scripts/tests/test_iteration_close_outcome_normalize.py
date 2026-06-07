@@ -51,7 +51,7 @@ ITERATION_CLOSE = SCRIPT_DIR / "iteration-close.sh"
 # Resolve bash absolutely so subprocess.run on Windows doesn't pick WSL
 # bash via App Paths registry lookup. Same pattern as
 # test_orphan_root_sweep_mode_d_integration.py.
-BASH_PATH = shutil.which("bash") or "bash"
+from _bash_helpers import BASH as BASH_PATH  # rb-1472: bin-first, clean-PATH-safe
 
 
 def _invoke(outcome: str | None) -> subprocess.CompletedProcess:
