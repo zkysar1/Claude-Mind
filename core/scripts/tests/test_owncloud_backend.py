@@ -32,7 +32,7 @@ BUCKET = "zds-data"
 LOCKS = "zds-locks"
 SESSIONS = "zds-sessions"
 REGION = "us-east-2"
-ENV_ID = "ayoai-mind"
+ENV_ID = "claude-mind"
 
 
 @pytest.fixture(autouse=True)
@@ -47,7 +47,7 @@ def _default_machine_id(monkeypatch):
 
 @pytest.fixture
 def aws_env(monkeypatch):
-    # Fake creds so  is satisfied; moto never contacts AWS.
+    # Fake creds so boto3 is satisfied; moto never contacts AWS.
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
               "AWS_SECURITY_TOKEN", "AWS_SESSION_TOKEN"):
         monkeypatch.setenv(k, "testing")
@@ -268,7 +268,7 @@ def test_stale_lock_is_breakable(cloud):
     lp = cloud["root"] / "world" / "r.lock"
     a.acquire_lock(lp)
     # Expire the lock's ttl into the past (no sleeping). Liveness is the
-    # app-level ttl<:now condition, NOT  TTL deletion (fix #1).
+    # app-level ttl<:now condition, NOT DynamoDB TTL deletion (fix #1).
     cloud["ddb"].update_item(
         TableName=LOCKS, Key={"lock_key": {"S": b_lock_key(a, lp)}},
         UpdateExpression="SET #t = :old",
@@ -345,6 +345,100 @@ def test_heartbeat_wrong_token_rejected(cloud):
         a.heartbeat("alpha", "WRONG-TOKEN")                 # not the runner_token
 
 
+# --- clean release: RUNNING->IDLE iff token matches (g-115-1337) -------------
+def test_release_runner_clean(cloud):
+    a = _backend(cloud, machine_id="A")
+    assert a.acquire_runner("alpha", "tokA") is True
+    assert a.release_runner("alpha", "tokA") is True        # we held it -> released
+    assert a.get_runner_state("alpha")["agent_state"] == "IDLE"
+
+
+def test_release_runner_idempotent_second_call(cloud):
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    assert a.release_runner("alpha", "tokA") is True
+    assert a.release_runner("alpha", "tokA") is False       # already IDLE -> no-op
+    assert a.get_runner_state("alpha")["agent_state"] == "IDLE"
+
+
+def test_release_runner_wrong_token_does_not_release(cloud):
+    # A peer (or a stale token) must NOT release a claim it does not hold: the
+    # row stays RUNNING and the real owner's token is untouched.
+    a = _backend(cloud, machine_id="A")
+    other = _backend(cloud, machine_id="B")
+    a.acquire_runner("alpha", "tokA")
+    assert other.release_runner("alpha", "tokB") is False    # wrong token -> no-op
+    assert a.get_runner_state("alpha")["agent_state"] == "RUNNING"
+    assert a.get_runner_state("alpha")["runner_token"] == "tokA"
+
+
+def test_release_runner_after_peer_reclaim_is_idempotent(cloud):
+    # Crash path: A acquires, heartbeat goes stale, peer B reclaims -> IDLE. When
+    # A finally reaches /stop and calls release_runner, the row is already IDLE;
+    # release must report not-transitioned (False) and NEVER raise.
+    a = _backend(cloud, machine_id="A")
+    other = _backend(cloud, machine_id="B")
+    a.acquire_runner("alpha", "tokA")
+    _set_heartbeat(cloud, "alpha", time.time() - 10_000)
+    assert other.reclaim_if_stale("alpha") is True
+    assert a.release_runner("alpha", "tokA") is False        # already reclaimed
+    assert a.get_runner_state("alpha")["agent_state"] == "IDLE"
+
+
+def test_release_runner_missing_item_noop(cloud):
+    # Releasing an agent that was never acquired (no row) is a no-op, not a raise.
+    a = _backend(cloud, machine_id="A")
+    assert a.release_runner("never-started", "tok") is False
+
+
+# --- list_runner_claims: env-scoped enumeration for ownership (g-115-1337) ---
+def test_list_runner_claims_empty(cloud):
+    a = _backend(cloud, machine_id="A")
+    assert a.list_runner_claims() == []
+
+
+def test_list_runner_claims_running_and_idle(cloud):
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")                        # RUNNING on A
+    a.acquire_runner("bravo", "tokB")
+    a.release_runner("bravo", "tokB")                        # IDLE
+    claims = {c.agent: c for c in a.list_runner_claims()}
+    assert set(claims) == {"alpha", "bravo"}
+    assert claims["alpha"].agent_state == "RUNNING"
+    assert claims["alpha"].machine_id == "A"
+    assert claims["alpha"].heartbeat_at > 0                  # int epoch, fresh
+    assert claims["bravo"].agent_state == "IDLE"
+
+
+def test_list_runner_claims_is_env_scoped(cloud):
+    # A claim under a DIFFERENT env-id must never leak into this env's owned-set.
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    cloud["ddb"].put_item(
+        TableName=SESSIONS,
+        Item={"session_key": {"S": "other-env/gamma"},
+              "agent_state": {"S": "RUNNING"},
+              "machine_id": {"S": "A"},
+              "heartbeat_at": {"N": str(int(time.time()))}})
+    agents = {c.agent for c in a.list_runner_claims()}
+    assert agents == {"alpha"}                               # other-env/gamma excluded
+
+
+def test_list_runner_claims_idle_row_defaults(cloud):
+    # A bare create-only IDLE row (no machine_id, no heartbeat) projects to
+    # machine_id=None and heartbeat_at=0 (treated as infinitely stale by §3).
+    a = _backend(cloud, machine_id="A")
+    cloud["ddb"].put_item(
+        TableName=SESSIONS,
+        Item={"session_key": {"S": f"{ENV_ID}/delta"},
+              "agent_state": {"S": "IDLE"}})
+    (claim,) = a.list_runner_claims()
+    assert claim.agent == "delta"
+    assert claim.machine_id is None
+    assert claim.heartbeat_at == 0
+    assert claim.agent_state == "IDLE"
+
+
 # --- multi-root key mapping (from_env wiring) -------------------------------
 def _multiroot(cloud, world, meta, agents):
     from owncloud_backend import OwnCloudBackend
@@ -357,9 +451,9 @@ def _multiroot(cloud, world, meta, agents):
 def test_multi_root_maps_each_root_to_its_prefix(cloud, tmp_path):
     world, meta, agents = tmp_path / "w", tmp_path / "m", tmp_path / "a"
     b = _multiroot(cloud, world, meta, agents)
-    assert b._s3_key(world / "reasoning-bank.jsonl") == "ayoai-mind/world/reasoning-bank.jsonl"
-    assert b._s3_key(meta / "spark-questions.jsonl") == "ayoai-mind/meta/spark-questions.jsonl"
-    assert b._s3_key(agents / "alpha" / "aspirations.jsonl") == "ayoai-mind/agents/alpha/aspirations.jsonl"
+    assert b._s3_key(world / "reasoning-bank.jsonl") == "claude-mind/world/reasoning-bank.jsonl"
+    assert b._s3_key(meta / "spark-questions.jsonl") == "claude-mind/meta/spark-questions.jsonl"
+    assert b._s3_key(agents / "alpha" / "aspirations.jsonl") == "claude-mind/agents/alpha/aspirations.jsonl"
 
 
 def test_rel_raises_on_unmapped_path(cloud, tmp_path):
@@ -375,8 +469,8 @@ def test_same_filename_different_roots_get_distinct_lock_keys(cloud, tmp_path):
     b = _multiroot(cloud, world, meta, agents)
     k1 = b._lock_key(world / "aspirations.lock")
     k2 = b._lock_key(agents / "alpha" / "aspirations.lock")
-    assert k1 == "ayoai-mind/world/aspirations.lock"
-    assert k2 == "ayoai-mind/agents/alpha/aspirations.lock"
+    assert k1 == "claude-mind/world/aspirations.lock"
+    assert k2 == "claude-mind/agents/alpha/aspirations.lock"
     assert k1 != k2
 
 
@@ -387,24 +481,24 @@ def test_from_env_builds_three_root_map(cloud, tmp_path, monkeypatch):
         monkeypatch.setenv(k, "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     # This test exercises the root-map wiring, not credential resolution. Opt
-    # into the default  chain so the fail-closed MIND_AWS_* guard (which
+    # into the default boto3 chain so the fail-closed MIND_AWS_* guard (which
     # would otherwise raise before _resolve_root_map runs) does not fire.
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
-    monkeypatch.setenv("MIND_WORLD", str(world))
-    monkeypatch.setenv("MIND_META", str(meta))
+    monkeypatch.setenv("AYOAI_WORLD", str(world))
+    monkeypatch.setenv("AYOAI_META", str(meta))
     monkeypatch.setenv("AGENTS_ROOT", str(agents))
-    b = OwnCloudBackend.from_env()                           # builds its own  clients (moto-mocked)
+    b = OwnCloudBackend.from_env()                           # builds its own boto3 clients (moto-mocked)
     prefixes = {prefix: root for root, prefix in b._roots}
     assert prefixes["world"] == world and prefixes["meta"] == meta and prefixes["agents"] == agents
-    assert b._s3_key(world / "x.jsonl") == "ayoai-mind/world/x.jsonl"
+    assert b._s3_key(world / "x.jsonl") == "claude-mind/world/x.jsonl"
 
 
 def test_from_env_routes_scoped_creds_to_session(monkeypatch, tmp_path):
-    # When MIND_AWS_* are set, from_env must build the  clients from a
+    # When MIND_AWS_* are set, from_env must build the boto3 clients from a
     # Session carrying THOSE creds (the scoped Zak_first_test user) — never the
     # process-wide root AWS_* keys. Monkeypatch Session to capture the creds;
     # no network, no moto needed.
@@ -425,7 +519,7 @@ def test_from_env_routes_scoped_creds_to_session(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
     monkeypatch.setenv("MIND_AWS_ACCESS_KEY_ID", "SCOPED_AKID")
     monkeypatch.setenv("MIND_AWS_SECRET_ACCESS_KEY", "scoped_secret")
     b = ocb.OwnCloudBackend.from_env()
@@ -445,9 +539,9 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.delenv("MIND_WORLD", raising=False)
+    monkeypatch.delenv("AYOAI_WORLD", raising=False)
     monkeypatch.delenv("WORLD_PATH", raising=False)
-    monkeypatch.delenv("MIND_META", raising=False)
+    monkeypatch.delenv("AYOAI_META", raising=False)
     monkeypatch.delenv("META_PATH", raising=False)
     with pytest.raises(RuntimeError, match="root"):
         OwnCloudBackend.from_env()
@@ -456,7 +550,7 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
 def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
     # Security: with STORAGE_BACKEND=own-cloud but MIND_AWS_* UNSET and no
     # explicit opt-in, from_env MUST refuse rather than silently fall back to the
-    # default  chain (which on this deployment resolves the root AWS_* lambda
+    # default boto3 chain (which on this deployment resolves the root AWS_* lambda
     # keys). Root-style AWS_* present, MIND_AWS_* absent -> RuntimeError.
     from owncloud_backend import OwnCloudBackend
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
@@ -467,7 +561,7 @@ def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
     with pytest.raises(RuntimeError, match="MIND_AWS"):
         OwnCloudBackend.from_env()
 
@@ -475,7 +569,7 @@ def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
 def test_from_env_allows_default_chain_when_opted_in(cloud, monkeypatch, tmp_path):
     # The escape hatch: MIND_AWS_ALLOW_DEFAULT_CHAIN=1 lets a deployment with no
     # static MIND_AWS_* (instance-role / ECS task-role) build successfully via
-    # the default chain. The fixture's moto creds satisfy .
+    # the default chain. The fixture's moto creds satisfy boto3.
     from owncloud_backend import OwnCloudBackend
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
         monkeypatch.setenv(k, "testing")
@@ -486,7 +580,7 @@ def test_from_env_allows_default_chain_when_opted_in(cloud, monkeypatch, tmp_pat
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
     b = OwnCloudBackend.from_env()
     assert b.name == "own-cloud"
 
@@ -502,7 +596,7 @@ def test_from_env_fails_closed_when_machine_id_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
     monkeypatch.delenv("MACHINE_ID", raising=False)        # the condition under test
     with pytest.raises(RuntimeError, match="MACHINE_ID"):
         OwnCloudBackend.from_env()

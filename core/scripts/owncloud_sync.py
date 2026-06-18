@@ -324,7 +324,17 @@ def _save_manifest(m: dict) -> None:
 
 
 # --- multi-machine ownership + freshness (H4 — machine-2 gate) -------------
-def _owned_agents():
+# OWNERSHIP_STALE_SECONDS (lodestar §9 / guard-594): a RUNNING claim whose
+# heartbeat_at is older than this is a CRASHED peer, not a live owner — so the
+# sweep stops deferring to its (now-stale) S3 state and the peer-side reclaim
+# (reclaim_if_stale, §5) can flip it to IDLE. Starting value = the architecture-doc
+# H5 15-minute threshold (900s); env-overridable for calibration against observed
+# heartbeat_at deltas (the heartbeat advances once per loop iteration via
+# iteration-close.sh). Read at call-time so calibration needs no process restart.
+_OWNERSHIP_STALE_SECONDS_DEFAULT = 900
+
+
+def _owned_agents_static():
     """The set of agent names THIS machine runs, from MACHINE_OWNED_AGENTS
     (comma-separated). None => own ALL agents (single-machine default / unset).
 
@@ -338,6 +348,70 @@ def _owned_agents():
     if not raw:
         return None
     return {a.strip() for a in raw.split(",") if a.strip()}
+
+
+def _owned_agents():
+    """Resolve the agent dirs this machine owns for the sweep. Gated by
+    OWNERSHIP_MODE (default 'static' => byte-identical to the pre-lodestar env-list
+    behaviour; the DYNAMIC path is INERT until the g-115-1340 cutover flips it).
+
+    DYNAMIC (OWNERSHIP_MODE='dynamic', lodestar §3): own X iff THIS machine holds a
+    live RUNNING DDB runner claim for X (zds-sessions). Sweep ownership is DERIVED
+    from the same runner claim that prevents dual-runners — no second source of
+    truth, no hand-maintained env list. Returns:
+      - None  : local backend / single-machine — own ALL (own-cloud off).
+      - a set : the agents this machine currently runs. May be EMPTY => own none;
+                the walk-prune's 'owned is not None' branch then prunes ALL agent
+                dirs, which is exactly right when this machine holds no claims.
+    The contract (None=own-all, set=own-only-those) is unchanged, so every call
+    site (the walk-prune and the single-target --file refusal) keeps working.
+
+    FAIL-SAFE: if the live claim list cannot be read (raises after its own internal
+    retries — guard-597), fall back to the STATIC env list, NOT own-all: own-all on
+    a second machine would clobber a peer's S3 writes. The static list is
+    empty-or-explicit — the conservative side. Same fallback if MACHINE_ID is
+    unresolved (cannot prove which machine we are).
+
+    COST (§3 cost-control): ONE list_runner_claims() per call — once per --all
+    sweep, once per --file push — never a per-file DDB read."""
+    mode = os.environ.get("OWNERSHIP_MODE", "static").strip().lower()
+    if mode != "dynamic":
+        return _owned_agents_static()
+
+    # Dynamic path. Own-cloud only; the local backend is single-machine => own-all.
+    kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    if kind != "own-cloud":
+        return None
+
+    try:
+        stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
+                                   _OWNERSHIP_STALE_SECONDS_DEFAULT))
+    except (TypeError, ValueError):
+        stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
+
+    try:
+        from storage_backend import get_backend
+        be = get_backend()
+        # be.machine_id is the value acquire_runner stamped onto the claim (SSOT),
+        # so the resolver's 'me' matches the claim's machine_id exactly.
+        me = getattr(be, "machine_id", None)
+        if not me or me == "unknown":
+            return _owned_agents_static()
+        claims = be.list_runner_claims()
+    except Exception as exc:
+        print(f"[sync] OWNERSHIP_MODE=dynamic: live claim read failed "
+              f"({type(exc).__name__}: {exc}); falling back to static "
+              "MACHINE_OWNED_AGENTS (conservative — never own-all on failure).",
+              file=sys.stderr)
+        return _owned_agents_static()
+
+    now = time.time()
+    return {
+        c.agent for c in claims
+        if c.machine_id == me
+        and c.agent_state == "RUNNING"
+        and (now - c.heartbeat_at) < stale
+    }
 
 
 def _multi_machine() -> bool:
@@ -525,7 +599,7 @@ def _roots(be, only_root: str | None):
     return rs
 
 
-def sweep(be, *, only_root, dry_run, use_manifest, full):
+def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     # Load the manifest whenever it is enabled — even on --full. --full disables
     # only the MTIME-skip optimization (the `not full` guard below); it must keep
     # the per-file content BASELINE so the stale-cache classifier still works.
@@ -535,7 +609,20 @@ def sweep(be, *, only_root, dry_run, use_manifest, full):
     manifest = _load_manifest() if use_manifest else {}
     new_manifest = dict(manifest)
     owned = _owned_agents()        # H4a: agent dirs this machine owns (None=all)
-    mm = _multi_machine()          # H4b: enables conservative no-baseline skip
+    # H4b/H4c: the flag _sync_one reads as "cannot prove local authority". The
+    # periodic sweep NEVER knows per-file authorship (unlike sync_file, which
+    # fires right after THIS machine wrote the file). It must therefore DEFER
+    # no-baseline / uncomparable content whenever local authority is unprovable:
+    #   - multi-machine (original H4b): a peer may own the file; AND
+    #   - own-cloud (H4c, g-115-1333): S3 is the authoritative store and local
+    #     files are caches / lazy-rehydrations. A transplant re-runs init-mind,
+    #     which writes ~29 default meta files locally with NO baseline; pushing
+    #     those over the learned S3 state would CLOBBER it. S3-ABSENT still
+    #     pushes (first bootstrap) — _sync_one's S3-absent branch never reaches
+    #     this guard. The real-time sync_file path proves authorship and keeps
+    #     passing multi_machine=False, so genuine local writes still mirror.
+    mm = _multi_machine() or (
+        os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud")
     stats = {"scanned": 0, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "skipped_unchanged": 0,
              "stale_skipped": 0, "diverged_skipped": 0, "nobaseline_skipped": 0,
@@ -549,9 +636,20 @@ def sweep(be, *, only_root, dry_run, use_manifest, full):
             # H4a: at the agents-root level, prune agent dirs this machine does
             # NOT own — the local copy of a peer's dir is a stale cache of THEIR
             # machine's S3 writes, and pushing it would clobber the peer.
-            if (prefix == "agents" and owned is not None
-                    and Path(dirpath) == root_path):
-                keep = [d for d in dirnames if d in owned]
+            if (prefix == "agents" and Path(dirpath) == root_path
+                    and (owned is not None or only_agent is not None)):
+                keep = list(dirnames)
+                # owned-prune: never push a peer's dir (None=own-all => no prune).
+                if owned is not None:
+                    keep = [d for d in keep if d in owned]
+                # per-agent scope (§6 /stop flush): narrow to exactly one agent
+                # dir. Applied AFTER the owned-prune so an unowned --agent target
+                # yields an empty walk (it was already dropped above) — never a
+                # peer clobber, even if --agent names a dir this machine does not
+                # own. guard-675: agents/<X>/ subdirs in _EXCLUDE_DIRS are still
+                # walk-pruned at deeper levels by the dirnames filter above.
+                if only_agent is not None:
+                    keep = [d for d in keep if d == only_agent]
                 stats["pruned_agents"] += len(dirnames) - len(keep)
                 dirnames[:] = keep
             # Session redesign: prune <agent>/session/scratch/ — the machine-local
@@ -877,6 +975,10 @@ def main() -> int:
                    help="sweep all governed roots (world/meta/agents)")
     g.add_argument("--file", metavar="PATH",
                    help="mirror a single governed file (PostToolUse hook mode)")
+    g.add_argument("--agent", metavar="NAME",
+                   help="flush a single OWNED agent dir (agents/<NAME>/) — the "
+                        "per-agent /stop flush scope (design §6); forces the "
+                        "agents root, prunes everything else")
     ap.add_argument("--root", choices=("world", "meta", "agents"),
                     help="limit --all to one root")
     ap.add_argument("--dry-run", action="store_true",
@@ -900,9 +1002,16 @@ def main() -> int:
               "Prefer a manifest-backed sweep (drop --no-manifest).",
               file=sys.stderr)
 
+    # --agent <NAME> forces the agents root, scoped to that one dir (§6).
+    if args.agent:
+        sweep_root, sweep_agent = "agents", args.agent
+    else:
+        sweep_root, sweep_agent = args.root, None
+
     t0 = time.time()
-    stats = sweep(be, only_root=args.root, dry_run=args.dry_run,
-                  use_manifest=not args.no_manifest, full=args.full)
+    stats = sweep(be, only_root=sweep_root, dry_run=args.dry_run,
+                  use_manifest=not args.no_manifest, full=args.full,
+                  only_agent=sweep_agent)
     dt = time.time() - t0
     mode = "DRY-RUN" if args.dry_run else "APPLIED"
     print(f"[sync] {mode} in {dt:.1f}s — scanned {stats['scanned']}, "
