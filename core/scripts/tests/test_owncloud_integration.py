@@ -37,7 +37,7 @@ BUCKET = "zds-data"
 LOCKS = "zds-locks"
 SESSIONS = "zds-sessions"
 REGION = "us-east-2"
-ENV_ID = "ayoai-mind"
+ENV_ID = "claude-mind"
 
 
 @pytest.fixture
@@ -54,7 +54,7 @@ def seam(monkeypatch, tmp_path):
         monkeypatch.setenv(k, "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     # This seam exercises the _fileops reroute (lock + atomic_write through the
-    # backend), not credential resolution. Opt into the default  chain
+    # backend), not credential resolution. Opt into the default boto3 chain
     # (moto's fake creds) so the fail-closed MIND_AWS_* guard in from_env does
     # not fire — the cred gate is covered by test_owncloud_backend.py.
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
@@ -64,8 +64,8 @@ def seam(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
     monkeypatch.setenv("MACHINE_ID", "test-machine-ci")  # G5: from_env fail-closes without it
-    monkeypatch.setenv("MIND_WORLD", str(world))
-    monkeypatch.setenv("MIND_META", str(meta))
+    monkeypatch.setenv("AYOAI_WORLD", str(world))
+    monkeypatch.setenv("AYOAI_META", str(meta))
     monkeypatch.setenv("AGENTS_ROOT", str(agents))
     # _fileops.WORLD_DIR is frozen at import (the real agent's world, or None);
     # tmp paths are under neither, so resolve_base_dir() -> None and the
@@ -97,7 +97,7 @@ def test_locked_write_jsonl_lands_in_s3(seam):
     p = seam["world"] / "store.jsonl"
     _fileops.locked_write_jsonl(p, [{"id": 1}, {"id": 2}])
     # Proof of routing: the object is in S3 at the env-scoped key.
-    assert _s3_lines(seam, "ayoai-mind/world/store.jsonl") == [{"id": 1}, {"id": 2}]
+    assert _s3_lines(seam, "claude-mind/world/store.jsonl") == [{"id": 1}, {"id": 2}]
     assert p.exists()  # local cache mirror also written (backend writes local-first)
 
 
@@ -105,13 +105,13 @@ def test_locked_modify_jsonl_write_lands_in_s3(seam):
     p = seam["world"] / "store.jsonl"
     _fileops.locked_write_jsonl(p, [{"id": 1}])
     _fileops.locked_modify_jsonl(p, lambda items: items + [{"id": 2}])
-    assert _s3_lines(seam, "ayoai-mind/world/store.jsonl") == [{"id": 1}, {"id": 2}]
+    assert _s3_lines(seam, "claude-mind/world/store.jsonl") == [{"id": 1}, {"id": 2}]
 
 
 # --- lock path routes through the cloud backend (DDB, not a local .lock file)-
 def test_acquire_release_lock_uses_ddb(seam):
     lock_path = seam["world"] / "r.lock"
-    key = {"lock_key": {"S": "ayoai-mind/world/r.lock"}}
+    key = {"lock_key": {"S": "claude-mind/world/r.lock"}}
     _fileops.acquire_lock(lock_path)
     assert "Item" in seam["ddb"].get_item(TableName=LOCKS, Key=key)  # lock in DDB
     assert not lock_path.exists()                                    # NOT a local file
@@ -124,14 +124,14 @@ def test_locked_append_jsonl_reaches_s3(seam):
     p = seam["world"] / "log.jsonl"
     _fileops.locked_write_jsonl(p, [{"a": 1}])
     _fileops.locked_append_jsonl(p, {"a": 2})     # routed -> append_jsonl_record -> S3
-    assert _s3_lines(seam, "ayoai-mind/world/log.jsonl") == [{"a": 1}, {"a": 2}]
+    assert _s3_lines(seam, "claude-mind/world/log.jsonl") == [{"a": 1}, {"a": 2}]
 
 
 def test_allocator_append_reaches_s3(seam):
     p = seam["world"] / "alloc.jsonl"
     _fileops.locked_write_jsonl(p, [{"n": 1}])
     _fileops.locked_append_jsonl_with_allocator(p, lambda items: {"n": len(items) + 1})
-    assert _s3_lines(seam, "ayoai-mind/world/alloc.jsonl") == [{"n": 1}, {"n": 2}]
+    assert _s3_lines(seam, "claude-mind/world/alloc.jsonl") == [{"n": 1}, {"n": 2}]
 
 
 # --- force-fresh in-lock read (fix #2 / Landmine 4f) ------------------------
@@ -141,7 +141,7 @@ def test_modify_reads_force_fresh_from_s3(seam):
     # the S3 version so the modifier operates on the latest state, not the
     # stale local cache — otherwise the out-of-band record is lost.
     p = seam["world"] / "store.jsonl"
-    key = "ayoai-mind/world/store.jsonl"
+    key = "claude-mind/world/store.jsonl"
     _fileops.locked_write_jsonl(p, [{"id": 1}])           # local + S3 in sync: [{1}]
     # Another machine appends {id:2} directly to S3; our local cache still shows [{1}].
     seam["s3"].put_object(Bucket=BUCKET, Key=key,
@@ -161,5 +161,5 @@ def test_modify_yaml_write_reaches_s3(seam):
     import yaml
     p = seam["world"] / "state.yaml"
     _fileops.locked_modify_yaml(p, lambda d: {**(d or {}), "k": "v"})
-    body = seam["s3"].get_object(Bucket=BUCKET, Key="ayoai-mind/world/state.yaml")["Body"].read()
+    body = seam["s3"].get_object(Bucket=BUCKET, Key="claude-mind/world/state.yaml")["Body"].read()
     assert yaml.safe_load(body.decode("utf-8")) == {"k": "v"}

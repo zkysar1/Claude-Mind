@@ -45,7 +45,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, NamedTuple, Optional, Union
 
 import boto3
 from botocore.config import Config as _BotoConfig
@@ -70,6 +70,20 @@ class ConflictError(Exception):
 class RunnerHeld(Exception):
     """``acquire_runner`` found the agent already RUNNING (and its heartbeat is
     not stale). The caller becomes an observer or refuses — never a second runner."""
+
+
+class RunnerClaim(NamedTuple):
+    """One ``zds-sessions`` row projected for ownership resolution. The dynamic
+    ``_owned_agents()`` resolver (design §3) consumes these by attribute
+    (``c.agent`` / ``c.machine_id`` / ``c.agent_state`` / ``c.heartbeat_at``).
+    ``heartbeat_at`` is epoch-seconds as ``int`` — 0 when the row was never
+    heartbeated (a create-only IDLE row), so the resolver's ``now - heartbeat_at``
+    staleness math needs no per-call coercion. ``machine_id`` is ``None`` for a
+    never-claimed IDLE row."""
+    agent: str
+    machine_id: Optional[str]
+    agent_state: str
+    heartbeat_at: int
 
 
 class OwnCloudBackend:
@@ -616,3 +630,71 @@ class OwnCloudBackend:
         if not item:
             return None
         return {k: (v.get("S") if "S" in v else v.get("N")) for k, v in item.items()}
+
+    def release_runner(self, agent_name: str, token: str) -> bool:
+        """Clean RUNNING→IDLE release — the companion to :meth:`acquire_runner`,
+        called at ``/stop`` AFTER the final S3 flush (design §4/§6). Transitions
+        only if we STILL hold the claim (``runner_token`` matches AND state is
+        RUNNING); that token condition is what distinguishes a clean self-release
+        from :meth:`reclaim_if_stale` (a PEER breaking a crashed claim).
+
+        Idempotent: on ConditionalCheckFailed (already reclaimed by a peer, or
+        already IDLE, or the token is no longer ours) the row is already in the
+        desired released state, so we treat it as released and return ``False``
+        WITHOUT raising — ``/stop`` must never fail because its claim was already
+        gone. Returns ``True`` iff THIS call performed the RUNNING→IDLE
+        transition. IAM: an ``UpdateItem`` (state→IDLE), covered by the existing
+        ``zds-sessions`` ``UpdateItem`` grant; the row persists at IDLE (NOT a
+        ``DeleteItem``)."""
+        try:
+            self.ddb.update_item(
+                TableName=self.sessions_table,
+                Key={"session_key": {"S": self._session_key(agent_name)}},
+                UpdateExpression="SET agent_state = :idle",
+                ConditionExpression="agent_state = :run AND runner_token = :tok",
+                ExpressionAttributeValues={":idle": {"S": "IDLE"},
+                                           ":run": {"S": "RUNNING"},
+                                           ":tok": {"S": token}})
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == _COND_FAILED:
+                return False  # already reclaimed/idle — idempotent no-op release
+            raise
+
+    def list_runner_claims(self) -> List[RunnerClaim]:
+        """Enumerate every runner claim under THIS env-id (one row per agent) for
+        the dynamic ownership resolver (design §3). env-id-scoped Scan: the
+        ``begins_with(session_key, :p)`` FilterExpression enforces the
+        ``<env-id>/`` prefix discipline (mirrors :meth:`list_dir`'s IAM-prefix
+        assert), and the code-side prefix recheck is defense-in-depth so a peer
+        env's row can never leak into this machine's owned-set. A Scan (not a
+        Query — ``session_key`` is the sole partition key, so prefix matching
+        cannot go through KeyConditionExpression) is cheap here: the table holds
+        one row per agent (≤ ~6 today). Returns a possibly-empty list of
+        :class:`RunnerClaim`; rows of every state (IDLE and RUNNING) are returned
+        — the §3 resolver does the machine_id / RUNNING / freshness filtering, not
+        this primitive."""
+        prefix = self.env_id + "/"
+        claims: List[RunnerClaim] = []
+        start_key = None
+        while True:
+            kw = dict(TableName=self.sessions_table,
+                      FilterExpression="begins_with(session_key, :p)",
+                      ExpressionAttributeValues={":p": {"S": prefix}})
+            if start_key:
+                kw["ExclusiveStartKey"] = start_key
+            resp = self.ddb.scan(**kw)
+            for item in resp.get("Items", []):
+                skey = item.get("session_key", {}).get("S", "")
+                if not skey.startswith(prefix):
+                    continue  # defense-in-depth: never leak a peer env's claim
+                hb_raw = item.get("heartbeat_at", {}).get("N")
+                claims.append(RunnerClaim(
+                    agent=skey[len(prefix):],
+                    machine_id=item.get("machine_id", {}).get("S"),
+                    agent_state=item.get("agent_state", {}).get("S", "IDLE"),
+                    heartbeat_at=int(hb_raw) if hb_raw is not None else 0))
+            start_key = resp.get("LastEvaluatedKey")
+            if not start_key:
+                break
+        return claims

@@ -13,6 +13,7 @@ machine from pushing a stale cache over a peer's newer S3 bytes — including th
 import hashlib
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import owncloud_sync as _mod  # noqa: E402 — importable module (the daemon imports it too)
-from owncloud_backend import ConflictError  # noqa: E402
+from owncloud_backend import ConflictError, RunnerClaim  # noqa: E402
 from storage_backend import FileStat  # noqa: E402
 
 
@@ -34,6 +35,12 @@ def _clean_multimachine_env(monkeypatch):
     behavior set them explicitly inside the test body."""
     monkeypatch.delenv("MACHINE_OWNED_AGENTS", raising=False)
     monkeypatch.delenv("MACHINE_MULTI", raising=False)
+    # Lodestar §3 dynamic-ownership env — default every test to the inert
+    # (static) state so a runner shell mid-cutover (OWNERSHIP_MODE=dynamic)
+    # cannot perturb the H4a/H4b tests; the dynamic tests set them explicitly.
+    monkeypatch.delenv("OWNERSHIP_MODE", raising=False)
+    monkeypatch.delenv("OWNERSHIP_STALE_SECONDS", raising=False)
+    monkeypatch.delenv("STORAGE_BACKEND", raising=False)
 
 
 def _md5(b: bytes) -> str:
@@ -847,6 +854,40 @@ def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
     assert be.s3[str(node)] == b"node body EDITED HERE"
 
 
+def test_sweep_owncloud_singlemachine_defers_nobaseline_no_clobber(tmp_path, monkeypatch):
+    """H4c / g-115-1333: under own-cloud on a SINGLE machine (MACHINE_OWNED_AGENTS
+    and MACHINE_MULTI both unset -> _multi_machine() is False), the periodic sweep
+    must NOT push a no-baseline local file that DIVERGES from a PRESENT S3 object.
+    The transplant scenario: /boot re-runs init-mind, which writes default meta
+    files locally with no manifest baseline, while S3 already holds the learned
+    state. Pre-fix the single-machine branch pushed local -> CLOBBERED S3. The fix
+    folds own-cloud into the sweep's 'cannot prove authority' flag, so it defers
+    (nobaseline_skipped) exactly as multi-machine does -- while S3-ABSENT files
+    still push, so a genuine first bootstrap stays intact."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    # MACHINE_OWNED_AGENTS / MACHINE_MULTI unset by the autouse fixture -> the
+    # pre-fix single-machine branch would have pushed (and clobbered).
+    assert _mod._multi_machine() is False          # precondition: would push pre-fix
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    # S3 already holds AUTHORITATIVE learned content for node.md (diverges from the
+    # local default b"node body"); NO manifest baseline (use_manifest=False).
+    node = tmp_path / "world" / "knowledge" / "node.md"
+    be.s3[str(node)] = b"S3 LEARNED AUTHORITATIVE META (do not clobber)"
+    # self.md is ABSENT on S3 -> the first-bootstrap push path must still fire.
+    self_md = tmp_path / "agents" / "alpha" / "self.md"
+    stats = _mod.sweep(be, only_root=None, dry_run=False,
+                       use_manifest=False, full=True)
+    # Clobber prevention: a no-baseline file diverging from PRESENT S3 is deferred.
+    assert str(node) not in be.puts
+    assert be.s3[str(node)] == b"S3 LEARNED AUTHORITATIVE META (do not clobber)"
+    assert stats.get("nobaseline_skipped", 0) >= 1
+    # First bootstrap intact: an S3-absent governed file still pushes under own-cloud.
+    assert str(self_md) in be.puts
+    assert be.s3[str(self_md)] == b"identity"
+
+
 # --- sweep agent-dir ownership scoping (H4a) -------------------------------
 def test_sweep_prunes_unowned_agent_dirs(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
@@ -875,6 +916,57 @@ def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
     assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
     assert str(bravo) in be.puts                  # unset => own all agents
     assert stats["pruned_agents"] == 0
+
+
+# --- sweep per-agent flush scope (§6 /stop flush — g-115-1339) --------------
+def test_sweep_only_agent_scopes_to_one_owned_dir(tmp_path, monkeypatch):
+    """only_agent=<name> flushes exactly agents/<name>/ and prunes every sibling
+    agent dir — the per-agent /stop flush scope (design §6). With own-all
+    (MACHINE_OWNED_AGENTS unset), the only_agent narrowing alone drops siblings."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    roots = _build_tree(tmp_path)                 # MACHINE_OWNED_AGENTS unset => own all
+    bravo = tmp_path / "agents" / "bravo" / "self.md"
+    bravo.parent.mkdir(parents=True, exist_ok=True)
+    bravo.write_bytes(b"bravo identity")
+    be = FakeBackend(roots)
+    stats = _mod.sweep(be, only_root="agents", dry_run=False,
+                       use_manifest=True, full=True, only_agent="alpha")
+    assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
+    assert str(bravo) not in be.puts              # sibling pruned by only_agent
+    assert stats["pruned_agents"] == 1            # bravo pruned, alpha kept
+
+
+def test_sweep_only_agent_never_pushes_unowned_target(tmp_path, monkeypatch):
+    """SAFETY (§6): naming an UNOWNED agent in only_agent yields an EMPTY flush.
+    The ownership filter drops the dir BEFORE the only_agent narrowing, so a
+    mis-targeted per-agent flush can never push a peer's stale cache — even when
+    --agent explicitly names that peer."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha")  # this machine owns only alpha
+    roots = _build_tree(tmp_path)
+    bravo = tmp_path / "agents" / "bravo" / "self.md"    # a peer we do NOT own
+    bravo.parent.mkdir(parents=True, exist_ok=True)
+    bravo.write_bytes(b"bravo identity")
+    be = FakeBackend(roots)
+    _mod.sweep(be, only_root="agents", dry_run=False,
+               use_manifest=True, full=True, only_agent="bravo")
+    assert be.puts == []                          # unowned target => nothing pushed
+    assert str(bravo) not in be.puts              # peer cache never clobbered
+
+
+def test_sweep_only_agent_none_preserves_full_owned_walk(tmp_path, monkeypatch):
+    """only_agent=None (the default — full-owned /stop flush) is byte-identical
+    to the pre-g-1339 behavior: every owned agent dir is walked."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    roots = _build_tree(tmp_path)                 # own all (unset)
+    bravo = tmp_path / "agents" / "bravo" / "self.md"
+    bravo.parent.mkdir(parents=True, exist_ok=True)
+    bravo.write_bytes(b"bravo identity")
+    be = FakeBackend(roots)
+    _mod.sweep(be, only_root="agents", dry_run=False,
+               use_manifest=True, full=True, only_agent=None)
+    assert str(tmp_path / "agents" / "alpha" / "self.md") in be.puts
+    assert str(bravo) in be.puts                  # default => all owned agents flushed
 
 
 # --- sync_file ownership (H4a, single-file PostToolUse path) ----------------
@@ -1157,6 +1249,182 @@ def test_pull_temp_dry_run_no_side_effects(tmp_path):
     assert stats["would_pull"] == 1 and stats["pulled"] == 0
     assert not f.exists()            # nothing materialized
     assert new_manifest == {}        # no baseline written in dry-run
+
+
+# --- lodestar §3: dynamic runner-claim ownership resolution -----------------
+# _owned_agents() gates on OWNERSHIP_MODE (default 'static' => the H4a env-list
+# path above; 'dynamic' => derive ownership from live DDB runner claims). The
+# dynamic path is INERT until the g-115-1340 cutover flips the flag. These tests
+# pin both the inertness of the default path and the §3 semantics table.
+
+class _FakeClaimBackend:
+    """Minimal backend exposing the two attributes _owned_agents()'s dynamic path
+    reads: machine_id (the SSOT discriminator acquire_runner stamped) and
+    list_runner_claims() (returns ALL claims; the resolver does the filtering)."""
+    def __init__(self, machine_id, claims):
+        self.machine_id = machine_id
+        self._claims = claims
+        self.calls = 0
+
+    def list_runner_claims(self):
+        self.calls += 1
+        return list(self._claims)
+
+
+class _RaisingClaimBackend:
+    """Backend whose claim read raises even after its (modeled) internal retries."""
+    machine_id = "m1"
+
+    def list_runner_claims(self):
+        raise RuntimeError("DDB unreachable")
+
+
+def _claim(agent, machine_id, state, age_s):
+    """A RunnerClaim with heartbeat_at = now - age_s (fresh when age_s < stale)."""
+    return RunnerClaim(agent=agent, machine_id=machine_id, agent_state=state,
+                       heartbeat_at=int(time.time()) - age_s)
+
+
+def _wire_dynamic(monkeypatch, backend, *, stale=None):
+    monkeypatch.setenv("OWNERSHIP_MODE", "dynamic")
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    if stale is not None:
+        monkeypatch.setenv("OWNERSHIP_STALE_SECONDS", str(stale))
+    import storage_backend
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: backend)
+
+
+def test_owned_agents_static_mode_is_inert_and_never_calls_backend(monkeypatch):
+    # OWNERSHIP_MODE unset => byte-identical to _owned_agents_static(); the backend
+    # must not even be resolved (rb-1477 inert-by-default).
+    import storage_backend
+
+    def _boom():
+        raise AssertionError("get_backend must NOT be called in static mode")
+
+    monkeypatch.setattr(storage_backend, "get_backend", _boom)
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha,bravo")
+    assert _mod._owned_agents() == {"alpha", "bravo"}
+    assert _mod._owned_agents() == _mod._owned_agents_static()
+
+
+def test_owned_agents_static_mode_unset_owns_all(monkeypatch):
+    # No MACHINE_OWNED_AGENTS, static mode => None (own-all single-machine default).
+    assert _mod._owned_agents() is None
+
+
+def test_owned_agents_dynamic_owns_only_this_machines_running_claims(monkeypatch):
+    be = _FakeClaimBackend("m1", [
+        _claim("alpha", "m1", "RUNNING", 10),     # mine, fresh -> owned
+        _claim("bravo", "m2", "RUNNING", 10),     # peer machine -> not owned
+    ])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == {"alpha"}
+
+
+def test_owned_agents_dynamic_excludes_stale_heartbeat(monkeypatch):
+    # RUNNING on my machine but heartbeat older than the threshold => crashed,
+    # not a live owner (§3 row 3). Excluded until peer-side reclaim flips it IDLE.
+    be = _FakeClaimBackend("m1", [_claim("alpha", "m1", "RUNNING", 100_000)])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == set()
+
+
+def test_owned_agents_dynamic_excludes_idle(monkeypatch):
+    # IDLE claim => owned by nobody for the sweep (§3 row 4): the real-time path
+    # already pushed; the sweep must not re-push a cache over S3.
+    be = _FakeClaimBackend("m1", [_claim("alpha", "m1", "IDLE", 10)])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == set()
+
+
+def test_owned_agents_dynamic_excludes_peer_running(monkeypatch):
+    be = _FakeClaimBackend("m1", [_claim("alpha", "m2", "RUNNING", 10)])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == set()
+
+
+def test_owned_agents_dynamic_empty_set_when_no_claims(monkeypatch):
+    # Empty set (own none) is load-bearing: distinct from None (own all). The
+    # walk-prune's 'owned is not None' branch prunes ALL agent dirs.
+    be = _FakeClaimBackend("m1", [])
+    _wire_dynamic(monkeypatch, be)
+    owned = _mod._owned_agents()
+    assert owned == set() and owned is not None
+
+
+def test_owned_agents_dynamic_multiple_owned(monkeypatch):
+    be = _FakeClaimBackend("m1", [
+        _claim("alpha", "m1", "RUNNING", 5),
+        _claim("gamma", "m1", "RUNNING", 5),
+        _claim("bravo", "m2", "RUNNING", 5),
+    ])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == {"alpha", "gamma"}
+
+
+def test_owned_agents_dynamic_none_machine_id_claim_excluded(monkeypatch):
+    # machine_id is Optional[str] (None on a create-only IDLE row). None == "m1"
+    # is False -> excluded, no crash.
+    be = _FakeClaimBackend("m1", [
+        RunnerClaim(agent="alpha", machine_id=None, agent_state="RUNNING",
+                    heartbeat_at=int(time.time())),
+    ])
+    _wire_dynamic(monkeypatch, be)
+    assert _mod._owned_agents() == set()
+
+
+def test_owned_agents_dynamic_local_backend_owns_all(monkeypatch):
+    # OWNERSHIP_MODE=dynamic but STORAGE_BACKEND != own-cloud => single-machine,
+    # own-all (None). No backend resolution needed.
+    monkeypatch.setenv("OWNERSHIP_MODE", "dynamic")
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    assert _mod._owned_agents() is None
+
+
+def test_owned_agents_dynamic_ddb_failure_falls_back_to_static_explicit(monkeypatch):
+    # FAIL-SAFE: a raise after internal retries => fall back to the static env
+    # list, NOT own-all. With an explicit list, the conservative net holds.
+    _wire_dynamic(monkeypatch, _RaisingClaimBackend())
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "alpha,bravo")
+    assert _mod._owned_agents() == {"alpha", "bravo"}
+
+
+def test_owned_agents_dynamic_ddb_failure_unset_static_is_own_all(monkeypatch):
+    # Documents the DESIGN's fallback (lodestar §3): failure => _owned_agents_static(),
+    # which is None (own-all) when MACHINE_OWNED_AGENTS is unset. Operational
+    # mitigation: KEEP MACHINE_OWNED_AGENTS set as a net during dynamic mode
+    # (g-115-1340 cutover concern) — surfaced to the design owner, not changed here.
+    _wire_dynamic(monkeypatch, _RaisingClaimBackend())
+    assert _mod._owned_agents() is None
+
+
+def test_owned_agents_dynamic_missing_machine_id_falls_back_to_static(monkeypatch):
+    be = _FakeClaimBackend("unknown", [_claim("alpha", "unknown", "RUNNING", 5)])
+    _wire_dynamic(monkeypatch, be)
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "zeta")
+    assert _mod._owned_agents() == {"zeta"}   # static fallback, not the claim
+    assert be.calls == 0                        # bailed before list_runner_claims
+
+
+def test_owned_agents_dynamic_stale_threshold_env_override(monkeypatch):
+    # OWNERSHIP_STALE_SECONDS calibrates the freshness window (guard-594).
+    be_fresh = _FakeClaimBackend("m1", [_claim("alpha", "m1", "RUNNING", 2)])
+    _wire_dynamic(monkeypatch, be_fresh, stale=5)
+    assert _mod._owned_agents() == {"alpha"}    # age 2 < 5 -> fresh
+
+    be_stale = _FakeClaimBackend("m1", [_claim("alpha", "m1", "RUNNING", 10)])
+    _wire_dynamic(monkeypatch, be_stale, stale=5)
+    assert _mod._owned_agents() == set()        # age 10 > 5 -> stale
+
+
+def test_owned_agents_dynamic_resolves_once_per_call(monkeypatch):
+    # Cost-control (§3): exactly one list_runner_claims() per _owned_agents() call,
+    # never a per-file DDB read.
+    be = _FakeClaimBackend("m1", [_claim("alpha", "m1", "RUNNING", 5)])
+    _wire_dynamic(monkeypatch, be)
+    _mod._owned_agents()
+    assert be.calls == 1
 
 
 if __name__ == "__main__":
