@@ -301,20 +301,103 @@ _perform_recovery() {
     echo "[recovery-gate] RECOVERED $agent: $cause" >&2
 }
 
+# POST_RECOVERY_EDIT_OVERRIDE="User-directed Path-B self-heal + SID-loss forensics (2026-06-18, bravo investigation). Recovery-flow framework fix authored in (IDLE,autonomous) before the user re-runs /start. Bug 1: Path B demoted a DEMONSTRABLY-ALIVE runner to IDLE after it lost running-session-id mid-run, killing the loop (3rd occurrence). Bug 2: the SID-loss deleter was never captured. Audited to world/post-recovery-edits.jsonl."
+
+# SID-loss forensic capture (g-398-investigation, 2026-06-18). 3rd occurrence
+# of the bug class: alpha 2026-04-25, bravo 2026-05-11, bravo 2026-06-18 — all
+# three left the original deleter unidentified because no watcher caught the
+# present->absent transition in time (the watchdog RunningSidProbe ticks only
+# at iteration-close; it sampled AROUND the mid-iteration deletion). Path B is
+# the ONE moment we are guaranteed to observe the degenerate state with full
+# context, yet it previously discarded everything and just recovered. This
+# records the discriminating signals to <agent>/session/sid-loss-forensics.jsonl
+# on EVERY Path-B trigger (self_heal OR recover), closing the sampling gap.
+#
+# Highest-value datum: runner_token_present. session-manifest-clear.sh removes
+# running-session-id AND runner-token TOGETHER, so runner-token STILL PRESENT
+# here proves the deleter was NOT a recovery manifest-clear — it is the
+# unidentified upstream deleter (cross-agent clear, OneDrive sync, or a write
+# race). runner-token ABSENT here means a manifest-clear (or graceful-stop,
+# but that is gated out by the stop-requested check) ran first.
+_capture_sid_loss_forensics() {
+    local agent="$1" latest="$2" rdc_rc="$3" decision="$4"
+    local _adir
+    _adir="$(agent_dir "$agent")"
+    mkdir -p "$_adir/session"
+    local rtok="false"
+    [[ -f "$_adir/session/runner-token" ]] && rtok="true"
+    local ts
+    ts="$(date +%Y-%m-%dT%H:%M:%S)"
+    # guard-165: all values pass via argv; python source single-quoted.
+    local entry
+    entry="$(python3 -c "import json,sys; print(json.dumps({'ts': sys.argv[1], 'agent': sys.argv[2], 'event': 'sid_loss_observed', 'trigger': 'path_b_state_corruption', 'running_session_id_present': False, 'runner_token_present': sys.argv[3]=='true', 'latest_session_id_present': bool(sys.argv[4]), 'latest_session_id': sys.argv[4] or None, 'runner_dead_check_rc': int(sys.argv[5]) if sys.argv[5].lstrip('-').isdigit() else None, 'verdict': {'0':'dead','1':'alive'}.get(sys.argv[5],'error_or_unknown'), 'decision': sys.argv[6], 'source': sys.argv[7] or None}))" \
+        "$ts" "$agent" "$rtok" "$latest" "$rdc_rc" "$decision" "${SOURCE:-}" 2>/dev/null || echo "")"
+    if [[ -n "$entry" ]]; then
+        printf '%s\n' "$entry" >> "$_adir/session/sid-loss-forensics.jsonl"
+    fi
+    local latest_present="false"; [[ -n "$latest" ]] && latest_present="true"
+    echo "[recovery-gate] SID-LOSS forensics: agent=$agent runner_token_present=$rtok latest_present=$latest_present rdc_rc=$rdc_rc decision=$decision" >&2
+}
+
+# Self-heal audit (companion to _perform_recovery). A Path-B self-heal restores
+# running-session-id from latest-session-id on a DEMONSTRABLY-ALIVE runner,
+# re-arming the stop-hook safety net WITHOUT demoting agent-state (the loop
+# stays RUNNING). Logged to recovery-log.jsonl with action=self_heal so the
+# audit stream is unified with recovery events. Does NOT touch the
+# recovery-failure-count (no recovery occurred) and does NOT write
+# recovery-notice (that signal means "demoted to IDLE"; self-heal is the
+# opposite — the loop was preserved).
+_record_self_heal() {
+    local agent="$1" sid="$2"
+    local _adir
+    _adir="$(agent_dir "$agent")"
+    mkdir -p "$_adir/session"
+    local ts
+    ts="$(date +%Y-%m-%dT%H:%M:%S)"
+    local entry
+    entry="$(python3 -c "import json,sys; print(json.dumps({'ts': sys.argv[1], 'agent': sys.argv[2], 'action': 'self_heal', 'cause': 'running-session-id missing while RUNNING but runner DEMONSTRABLY ALIVE (runner-dead-check rc=1); restored from latest-session-id, loop preserved (no IDLE demotion)', 'sid_restored': sys.argv[3]}))" \
+        "$ts" "$agent" "$sid" 2>/dev/null || echo "")"
+    if [[ -n "$entry" ]]; then
+        printf '%s\n' "$entry" >> "$_adir/session/recovery-log.jsonl"
+    fi
+    echo "[recovery-gate] SELF-HEAL $agent: restored running-session-id=$sid (runner alive; loop preserved, NOT demoted to IDLE)" >&2
+}
+
 # === PATH B: State-corruption detection (source-independent) ===
 # Triggers on the degenerate combination state=RUNNING + running-session-id
-# missing + no stop-requested. This intersection is provably impossible in a
-# healthy session: /start atomically pair-writes running-session-id +
-# state=RUNNING; aspirations-graceful-stop deletes running-session-id only
-# AFTER state has transitioned out of RUNNING; session-save-id.sh on
-# autocompact preserves the atomic relationship via the four-witness check.
-# So if we observe (RUNNING, missing, no stop-requested) together, a partial
-# recovery or unauthorized writer cleared the SID and the loop has lost its
-# safety net (stop-hook hits gate=no-runner, no longer BLOCKs turn-end).
-# Detection independent of heartbeat: even a fresh heartbeat doesn't redeem
-# a session that has no SID claim — observed 2026-04-25 alpha incident,
-# where the user manually drove "continue" prompts for hours after this
-# state appeared, but the loop died the moment the user paused.
+# missing + no stop-requested. This intersection should not exist in a healthy
+# session: /start atomically pair-writes running-session-id + state=RUNNING;
+# aspirations-graceful-stop deletes running-session-id only AFTER state has
+# transitioned out of RUNNING; session-save-id.sh on autocompact preserves the
+# atomic relationship via the four-witness check. So if we observe (RUNNING,
+# missing, no stop-requested) together, a partial recovery or unauthorized
+# writer cleared the SID and the loop has lost its safety net (stop-hook hits
+# gate=no-runner, no longer BLOCKs turn-end).
+#
+# DECISION (2026-06-18 self-heal, supersedes the old always-recover behavior):
+# the degenerate state has TWO causes — (a) a genuinely crashed/zombie runner,
+# or (b) a LIVE runner that lost running-session-id mid-run to the upstream
+# SID-loss bug. Demoting to IDLE is correct for (a) but a productivity-
+# destroying false positive for (b): the live session keeps executing the
+# in-flight goal while its loop heartbeat is dead, then ends silently at the
+# next pause. This was observed THREE times — the prior comment claimed "even a
+# fresh heartbeat doesn't redeem a session that has no SID claim," but that was
+# the rationale for the blunt kill, not a law: latest-session-id (preserved by
+# the manifest) still holds the live SID, so a DEMONSTRABLY-ALIVE runner CAN be
+# redeemed by restoring running-session-id rather than killed. The 2026-04-25
+# alpha incident (user drove "continue" for hours, loop died at the first
+# pause) is exactly the case self-heal now prevents.
+#
+# Liveness oracle: runner-dead-check.sh (the canonical 6-condition gate; note
+# it does NOT itself read running-session-id, so the missing SID does not skew
+# its verdict).
+#   rc=1  -> definitively ALIVE -> SELF-HEAL (requires latest-session-id).
+#   rc=0  -> definitively dead  -> recover (unchanged behavior).
+#   rc=2+ -> probe error/unknown -> recover (preserve prior blunt behavior;
+#           never resurrect a SID on an oracle error). Conservative bias:
+#           recover-unless-proven-alive — a wrong recover is user-fixable via
+#           /start, whereas a wrong self-heal of a dead runner would linger
+#           (until Path A's 6-condition gate reaches rc=0 next SessionStart).
 _check_state_corruption() {
     local agent="$1"
     local _adir
@@ -345,6 +428,36 @@ _check_state_corruption() {
     # session-save-id and recovery-gate hooks fired in parallel order.
     [[ -f "$_adir/session/compact-pending" ]] && return 0
 
+    # --- SELF-HEAL vs RECOVER (see DECISION block above) ---
+    local latest=""
+    if [[ -f "$_adir/session/latest-session-id" ]]; then
+        latest="$(tr -d '\r\n[:space:]' < "$_adir/session/latest-session-id")"
+    fi
+    MIND_AGENT="$agent" bash "$SCRIPT_DIR/runner-dead-check.sh" >/dev/null 2>&1
+    local rdc_rc=$?
+
+    if [[ -n "$latest" && "$rdc_rc" -eq 1 ]]; then
+        # Runner is DEMONSTRABLY ALIVE and we have a SID to restore. Re-arm the
+        # safety net by restoring running-session-id atomically (.tmp + mv).
+        # agent-state is NOT touched (stays RUNNING) — the live loop keeps
+        # running. This does NOT call _perform_recovery (no IDLE demotion, no
+        # manifest-clear), so the ordering invariant in
+        # test_recovery_ordering_invariant.py is unaffected.
+        _capture_sid_loss_forensics "$agent" "$latest" "$rdc_rc" "self_heal"
+        if printf '%s\n' "$latest" > "$_adir/session/running-session-id.tmp" 2>/dev/null \
+           && mv "$_adir/session/running-session-id.tmp" "$_adir/session/running-session-id" 2>/dev/null; then
+            _record_self_heal "$agent" "$latest"
+            return 0
+        fi
+        # Self-heal write failed (rare — local FS error). Fall through to
+        # recovery so the degenerate state does not persist unaddressed.
+        echo "[recovery-gate] SELF-HEAL write FAILED for $agent — falling through to recovery" >&2
+        _perform_recovery "$agent" "state corruption: running-session-id missing, runner alive but self-heal write failed"
+        return 0
+    fi
+
+    # Genuinely dead, oracle error/unknown, or no latest-session-id to restore.
+    _capture_sid_loss_forensics "$agent" "$latest" "$rdc_rc" "recover"
     local cause="state corruption: state=RUNNING, running-session-id missing, no stop-requested"
     _perform_recovery "$agent" "$cause"
 }
