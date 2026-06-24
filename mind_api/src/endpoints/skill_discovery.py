@@ -23,16 +23,19 @@ generated_at>) reproduces every now-dependent field byte-for-byte — the test
 harness does exactly this. score not-found prints {"skill":X,"found":false}
 then sys.exit(2); the daemon returns that body with HTTP 404.
 
-REPLICATED CLI BUG (intentional, for drop-in byte-compat): the CLI globs
-PROJECT_ROOT.glob("*/journal.jsonl") and PROJECT_ROOT.glob(
-"*/session/execution-diary.jsonl") at DEPTH 1 (CLI lines 215/324). Under
-AGENTS_PARENT_DIR="agents" the real journals live at agents/<name>/journal.jsonl
-(depth 2), so the globs match NOTHING and the journal/companion invocation
-sources are silently empty. The daemon reproduces the depth-1 glob so it is a
-faithful replacement of the CURRENT CLI. FIX DEFERRED: correcting both the CLI
-and this handler to scan agents/*/... is a behavioural change (raises invocation
-counts) that must land as its own post-cutover goal, NOT bundled into the
-inert daemonization. See impl-doc Batch 6 follow-ups.
+AGENTS-ROOT GLOB (g-115-1405, FIXED — was a replicated CLI bug): the CLI and
+this handler scan agents/<name>/journal.jsonl and agents/<name>/session/
+execution-diary.jsonl via the agents/ parent (CLI: agents_root() from _paths;
+daemon: ctx.paths.agents_root) — NEVER project_root.glob("*/...") at DEPTH 1.
+Under AGENTS_PARENT_DIR="agents" the real journals live at agents/<name>/...
+(depth 2 from the repo root); the prior depth-1 glob silently matched NOTHING,
+zeroing the journal + companion invocation sources for every skill (the agents/
+glob-drift bug class). During the inert daemonization the bug was deliberately
+replicated for drop-in byte-compat and deferred to its own post-cutover goal
+(g-115-1405) because correcting it raises invocation counts (behavioural). Both
+tiers now use the agents/ parent and STAY byte-compatible: the byte-compat tests
+use synthetic skill names absent from every journal, so both sources resolve
+empty byte-identically.
 """
 from __future__ import annotations
 
@@ -137,15 +140,18 @@ def _collect_invocation_dates(skill_name, quality_data, relations_data,
 
 
 def _collect_journal_skill_dates(ctx, skill_names):
-    """REPLICATED CLI BUG: depth-1 glob finds nothing under agents/ (see module
-    docstring). Faithful to the current CLI."""
+    """Scan agents/<name>/journal.jsonl across all agents for skill-name mentions.
+    Uses ctx.paths.agents_root (the agents/ parent), matching the CLI's _paths
+    agents_root() SSOT — NEVER ctx.paths.project_root.glob("*/...") (the agents/
+    glob-drift bug class: the depth-1 form silently matched nothing post-
+    AGENTS_PARENT_DIR relocation, g-115-1405)."""
     out = {name: [] for name in skill_names}
     if not skill_names:
         return out
     name_pattern = re.compile(
         r'(?<![\w-])(' + '|'.join(re.escape(n) for n in skill_names) + r')(?![\w-])'
     )
-    for journal_path in ctx.paths.project_root.glob("*/journal.jsonl"):
+    for journal_path in ctx.paths.agents_root.glob("*/journal.jsonl"):
         with open(journal_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -170,8 +176,11 @@ def _collect_journal_skill_dates(ctx, skill_names):
 
 
 def _collect_companion_script_dates(ctx, skill_names, forged_skills):
-    """REPLICATED CLI BUG: depth-1 glob finds nothing under agents/ (see module
-    docstring). Faithful to the current CLI."""
+    """Scan agents/<name>/session/execution-diary.jsonl across all agents for
+    companion-script-basename invocations. Uses ctx.paths.agents_root (matching
+    the CLI's _paths agents_root() SSOT) — NEVER ctx.paths.project_root.glob(
+    "*/...") (the agents/ glob-drift bug class: depth-1 silently matched nothing
+    post-relocation, g-115-1405)."""
     out = {name: [] for name in skill_names}
     if not skill_names or not forged_skills:
         return out
@@ -193,7 +202,7 @@ def _collect_companion_script_dates(ctx, skill_names, forged_skills):
     name_pattern = re.compile(
         r'(?<![\w.-])(' + '|'.join(re.escape(b) for b in script_to_skills) + r')(?![\w.-])'
     )
-    scan_paths = list(ctx.paths.project_root.glob("*/session/execution-diary.jsonl"))
+    scan_paths = list(ctx.paths.agents_root.glob("*/session/execution-diary.jsonl"))
     for path in scan_paths:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:

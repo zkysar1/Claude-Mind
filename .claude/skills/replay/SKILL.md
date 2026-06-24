@@ -72,6 +72,9 @@ Apply spaced repetition filter:
   Skip if replay_metadata.encoded_via_chronic == true
     # Chronic-CORRECTED items already encoded as a calibration guardrail by
     # Step 3.6 — re-replaying them yields zero new learning (g-115-1104).
+    # As of g-115-1421 pipeline.py's replay_candidates endpoint ALSO excludes
+    # these at the source, so they no longer appear in the candidate list;
+    # this LLM-side skip remains as defense-in-depth.
   IF replay_metadata.replay_count >= 5:
     # Hard cap (encoded or not): stop infinite cycling. Move to archived,
     # never delete (CLAUDE.md pipeline rule), then drop from candidates.
@@ -268,7 +271,18 @@ rejected by the pipeline update-field endpoint (pipeline_write.py
 Step 4 uses for experience `retrieval_stats`.
 
 ```
-FOR EACH replayed hypothesis WHERE replay_metadata.replay_count >= 3
+# g-115-1421: iterate the FULL Step 1 replay-candidate pool (the output of
+# `pipeline-read.sh --replay-candidates`), NOT only the top-N batch selected
+# for compressed replay above. Chronic rc>=3 CORRECTED items that rank below
+# the batch cut never reached this step, so they were never encoded and
+# re-surfaced every cycle (~3-5 wasted cycles each until the rc>=5 archive
+# cap). Sweeping the full pool encodes each chronic-CORRECTED hypothesis
+# exactly once; pipeline.py's replay_candidates filter then excludes it at
+# the source on subsequent cycles (defense-in-depth with Step 1's L72 skip).
+# SCHEMA: replay_count is stored as a string on some records — coerce to int
+# before the >= 3 comparison (int(replay_metadata.replay_count)).
+FOR EACH candidate hypothesis in the FULL Step 1 replay-candidate pool
+                              WHERE int(replay_metadata.replay_count) >= 3
                               AND outcome == "CORRECTED"
                               AND replay_metadata.encoded_via_chronic is not true:
 
@@ -372,6 +386,48 @@ print(json.dumps(s))")
        # utility_ratio when retrieval_stats is updated.
        bash core/scripts/experience-update-field.sh {exp-id} retrieval_stats "$updated"
 ```
+
+## Step 4.5: Stamp Replayed Candidates (g-115-1604)
+
+Spaced repetition depends on each replayed candidate's `replay_metadata`
+advancing AFTER the replay. Step 1's filter skips candidates replayed within
+the last 7 days (reads `last_replayed`), and `pipeline.py`'s `replay_candidates`
+endpoint excludes any candidate whose `next_review_date` is in the future.
+Neither field advances on its own — Step 1 only ARCHIVES at `replay_count >= 5`
+and Step 3.6 only sets `encoded_via_chronic`. Without this step, every candidate
+replayed this cycle RE-SURFACES on the next cycle (the spaced-repetition filter
+silently no-ops). Found firsthand during g-001-05 (2026-06-21): the 10 replayed
+candidates had to be stamped by hand because no step did it.
+
+Stamp every candidate REPLAYED in Step 2 (the compressed-replay set, ~`max_replay_items`)
+— NOT the full Step 1 candidate pool. Skip any candidate already terminal'd this
+cycle: those ARCHIVED by Step 1 (`replay_count >= 5`) or marked
+`encoded_via_chronic` by Step 3.6 have their own terminal writes; do not
+double-stamp.
+
+```
+# Compute today + today+7. `date -d "+7 days"` is unavailable on this Windows
+# Git Bash (guard-759 sibling) — compute both via py -3 datetime instead, e.g.:
+#   dates=$(py -3 -c "import datetime as d; t=d.date(2026,6,21); print(t.isoformat(), (t+d.timedelta(days=7)).isoformat())")
+# (pass the run date in; argless date construction is fine in a one-shot script.)
+today        = <YYYY-MM-DD>
+next_review  = <today + 7 days>
+FOR EACH candidate replayed in Step 2 (skip archived / encoded_via_chronic):
+    # WHOLE-OBJECT write — dotted field names are rejected by pipeline-update-field
+    # (same constraint as Step 3.6). Read current replay_metadata, merge the three
+    # fields, write the whole object back. replay_count is a string on some
+    # records — coerce to int before incrementing.
+    rm = dict(candidate.replay_metadata or {})
+    rm["replay_count"]     = int(rm.get("replay_count", 0)) + 1
+    rm["last_replayed"]    = today
+    rm["next_review_date"] = next_review
+    Bash: pipeline-update-field.sh {candidate.id} replay_metadata '<rm JSON>'
+    Log: "REPLAY STAMP: {candidate.id} rc={rm.replay_count} next_review={next_review}"
+```
+
+Both filters now exclude the candidate for 7 days: Step 1's `last_replayed`
+LLM-side skip AND the endpoint's `next_review_date` source-level skip
+(defense-in-depth, mirroring the dual Step-1 / Step-3.6 chronic-skip pattern).
 
 ## Step 5: Domain Transfer Check (--domain-transfer mode)
 

@@ -62,7 +62,30 @@ priority and may rot. With them, the target agent's boot surfaces it
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
-## Phase 6.5: Immediate Learning (reasoning bank + guardrails)
+**Step 0.5: Record this spark firing for sentinel dedup (g-115-1203)** — both
+fire paths for this skill funnel through here: (1) the in-turn FAST path, where
+the LLM fires Skill(aspirations-spark) directly from recurring-close.sh's
+stdout outcome-aware imperative, and (2) the pending_phase_6_spark sentinel,
+consumed by aspirations/SKILL.md Phase -0.5c.2 on next-iteration entry. Without
+a shared record, the fast path double-fires (fire #1 in-turn + fire #2 from the
+still-set sentinel). Recording the firing here lets Phase -0.5c.2's `check` skip
+the redundant re-fire. One-shot, fail-open — a dedup-record error must never
+block the spark.
+
+```
+goal_id = the just-completed goal this spark is evaluating (explicit on the
+          sentinel path via Phase -0.5c.2's goal_id arg; the current loop goal
+          on the fast path).
+IF goal_id is in context:
+    # Pipe the wm slot THROUGH the dedup helper in ONE bash call: wm-read emits
+    # the current map, spark-fire-dedup.py stamps goal_id and emits the new map,
+    # wm-set replaces the slot. The helper is pure stdin->stdout (it must NOT
+    # spawn `bash wm-*.sh` itself — that hangs, rb-225/rb-247).
+    Bash: bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py record <goal_id> | bash core/scripts/wm-set.sh spark_fired_session
+# No goal_id (rare — e.g. a manual non-goal-scoped invocation): skip the record.
+```
+
+## Phase 6.5: Immediate Learning (reasoning bank + guardrails + pattern outcomes)
 
 If this goal's outcome produced a clear, reusable reasoning insight or
 a safety lesson, capture it NOW — don't wait for /reflect.
@@ -102,11 +125,27 @@ doubt between framework and domain, pick domain.
           title: concise name for the insight
           type: success | failure   # success if from a working approach; failure if from debugging/fixing
           category: goal's category
-          content: the insight — what to do and why
+          # Differentiated extraction prompt by type (g-306-23, ReasoningBank §3:
+          # success and failure carry different reusable signal, so prompt them apart):
+          #   type==success → EXTRACT-VALIDATED-STRATEGIES: name the reusable
+          #     strategy/heuristic that WORKED, the preconditions under which it
+          #     applies, and WHY it succeeded — framed as a pattern to REPEAT.
+          #     ("What is the validated, transferable approach here?")
+          #   type==failure → EXTRACT-COUNTERFACTUAL-PITFALLS: name the specific
+          #     pitfall to AVOID, what went wrong, and the counterfactual — the
+          #     corrective action that SHOULD have been taken instead.
+          #     ("What is the avoidable pitfall, and what should have happened?")
+          content: per the type-matched prompt above — a validated strategy to repeat
+                   (success) OR a counterfactual pitfall + its correction (failure)
           applies_to: <any|framework|domain|specific>  # REQUIRED. any=cross-cutting methodology; framework=this framework's skills/scripts/gates; domain=this agent's deployment domain (the specific services, products, workflows the agent is deployed into); specific=single-incident
           when_to_use: when this insight applies
           source_goal: goal.id
           source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
+          poignancy: <1-10>   # g-306-26 producer (BRD Gap 1a / Generative Agents 2304.03442):
+                              # LLM-rated importance at write so the field populates (else the
+                              # g-306-08 retrieve blend stays a permanent no-op on an all-null corpus).
+                              # 1-3 routine/expected · 4-6 useful · 7-8 pivotal/surprising · 9-10 mission-altering.
+                              # Rate how durable + impactful this lesson is for FUTURE retrieval.
         Log in journal: "Immediate learning: created {rb-id from stdout} from {goal.id}"
 
     IF goal outcome revealed a safety hazard, a mistake to avoid, or a
@@ -173,6 +212,9 @@ doubt between framework and domain, pick domain.
                   when_to_use: {conditions: ["{error pattern or symptom}"], category: "{goal.category}"}
                   source_goal: goal.id
                   tags: ["ops-gotcha"]
+                  poignancy: <1-10>   # g-306-26 producer — see the 1-10 rubric in the
+                                      # reusable-reasoning-pattern block above. Ops gotchas
+                                      # are typically 5-8 (a reusable pitfall worth retrieving).
                 Log: "OPS GOTCHA (reasoning bank): {title} from {goal.id}"
             ELIF semantic overlap found:
                 Bash: reasoning-bank-increment.sh {entry.id} utilization.times_helpful
@@ -209,6 +251,43 @@ doubt between framework and domain, pick domain.
                 Add via aspirations-update.sh --source {source}
                 Log in journal: "Forge-ready gap detected during execution: {gap.id}"
                 Log: echo '{"date":"...","event":"forge-ready","details":"Gap {gap.id} detected in Phase 6.5 from {goal.id}","trigger_reason":"immediate-learning-forge"}' | bash core/scripts/evolution-log-append.sh
+
+    # -- Pattern-Outcome Recording (wire retrieved-and-applied signatures, g-115-1442) --
+    # Closes the loop the utilization-feedback path deliberately skips
+    # (pattern_signatures have NO utilization increment path --
+    # utilization-feedback.py:187 "pattern_signatures don't have utilization
+    # increment paths") and that reflect-on-outcome covers ONLY for
+    # hypothesis-linked patterns (its CONFIRMED/CORRECTED calls fire from ABC
+    # chains). Without this step a pattern RETRIEVED and APPLIED during ordinary
+    # goal execution -- never tied to a resolving hypothesis -- accrues
+    # retrieval_count while outcome_stats.total stays 0 forever, so calibration
+    # measures tracking-presence, not pattern value (g-115-1441 finding: 14/19
+    # active patterns unwired; this is the g-115-1442 fix). The recording API
+    # (pattern-signatures-record-outcome.sh) already exists; this is the missing
+    # AUTOMATIC TRIGGER for the non-hypothesis path. Record VALUE, not presence
+    # (rb-1554): a retrieved pattern you did NOT apply records NOTHING.
+    #
+    # SKIP entirely IF trivial_mode OR outcome_class == routine (no deliberation
+    # worth judging). Otherwise:
+    Bash: cat agents/<agent>/session/retrieval-session.json   # may be absent
+    IF file absent OR retrieval_performed == false: SKIP this block
+    retrieved_sigs = [e["id"] for e in (session.supplementary_detail or [])
+                      if e.get("type") == "pattern_signature"]
+    IF retrieved_sigs is empty: SKIP this block   # common case: no Step-4 patterns
+    FOR EACH sig_id in retrieved_sigs that you APPLIED to shape this execution
+        (the Step 4 Memory Deliberation ACTIVE set -- NOT merely retrieved):
+        # guard-575: a meta-pattern (one that predicts a prediction-error class,
+        # e.g. sig-003) is recorded via hypothesis resolution in
+        # reflect-on-outcome, NOT here -- skip those to avoid double-counting.
+        IF sig_id names a meta-pattern: continue
+        Judge against the ACTUAL outcome of this goal:
+          - the signature's expected_outcome / lesson HELD here -> CONFIRMED
+          - reality diverged / the lesson was wrong here        -> CORRECTED
+        Bash: pattern-signatures-record-outcome.sh {sig_id} {CONFIRMED|CORRECTED}
+        Log: "Pattern outcome: {sig_id} {verdict} from {goal.id}"
+    # A pattern retrieved but NOT applied records nothing -- not-applicable is
+    # not CORRECTED, and recording it would inflate outcome_stats.total with
+    # noise (the exact failure mode g-115-1441 warned against).
 ```
 
 ---
@@ -679,9 +758,14 @@ When sq-018 fires after goal completion:
    - New convention rule    → assertion that the documented rule holds in code
    - New hook / integration → run-once verification that wiring is live
 
-3. PROPOSE the check via a Maintain-style goal under asp-115 (framework hygiene).
-   Do NOT auto-edit `.claude/skills/verify-learning/SKILL.md` — it's a high-trust
-   file; the user reviews check additions before they land.
+3. FILE the check as a Maintain-style goal under asp-115 (framework hygiene). The goal
+   exists for SCOPE-DISCIPLINE -- adding the check inline during THIS goal's spark would
+   be scope creep (implementation-discipline.md) -- NOT because the agent lacks authority.
+   `.claude/skills/verify-learning/SKILL.md` is an agent-editable framework file
+   (`.claude/skills/**`); its executor applies the check by DIRECT EDIT, routing
+   `participants: [agent]`, with care (mirror an existing Step-2 sibling check, validate
+   before/after). Do NOT route to the user -- user-gating a verify-learning patch is the
+   g-115-792 anti-pattern (`.claude/rules/capability-before-user.md`; rb-1993).
 
    # origin_signal MUST come from the canonical list enforced by
    # core/scripts/origin-signal-gate.py. Bare "sq-018" is rejected — use the

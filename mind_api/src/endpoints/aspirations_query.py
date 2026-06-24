@@ -8,7 +8,8 @@ Query parameters (at least one required — same rule as the CLI):
     title_contains=<substring>           case-insensitive
     full=true|1|yes                      return the full canonical goal record
                                           (raw goal dict + {asp_id, source}) instead
-                                          of the 5-field projection (g-115-1304)
+                                          of the 6-field projection (g-115-1304;
+                                          category added g-115-1614)
 
 Response: application/json — `json.dumps(results, indent=2, ensure_ascii=True)`,
 byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
@@ -143,6 +144,7 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
                             "source": source_name,
                             "title": goal.get("title", ""),
                             "status": goal.get("status", ""),
+                            "category": goal.get("category", ""),
                         })
 
     # cmd_query uses ensure_ascii=True — match byte-for-byte.

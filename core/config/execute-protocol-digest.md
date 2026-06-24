@@ -35,9 +35,41 @@ Bash: aspirations-update-goal.sh --source {source} <goal-id> status in-progress
 Bash: aspirations-update-goal.sh --source {source} <goal-id> started <today>
 ```
 
-## Intelligent Retrieval Protocol (Steps 1-5c)
+## Phase 4-lw: Trivial-Goal Classification (lightweight mode — g-305-15)
+
+Predict whether this goal is trivial so the Phase 3.9-4.5 ceremony can be
+skipped. Runs ONCE here; `trivial_mode` is carried in-context for the rest of
+Phase 4 (exactly like `effort_level`), NOT re-read per phase.
 
 ```
+Bash: tg_json = py -3 core/scripts/trivial-goal-classify.py {goal.id} --source {source} --output json
+Parse tg_json.verdict → trivial_mode = (verdict == "trivial")
+# Master flag defaults OFF (g-306-08): verdict is "full" for EVERY goal until the
+# flag is validated + flipped on, so trivial_mode stays False and the loop is
+# byte-identical to pre-change behavior. Fail-to-full: any classifier error also
+# yields "full" — the classifier never blocks execution and never exits != 0.
+IF trivial_mode:
+    Output: "▸ Lightweight mode: TRIVIAL {tg_json.reasons} — skipping Phase 3.9-4.5 ceremony (Step 5e Gate D STILL runs)"
+    # Persist for compaction survival (in-flight Phase-4 state; auto-clears at
+    # LOOP_CONTINUE). On a mid-Phase-4 autocompact the resumed iteration may
+    # re-read phase_progress.trivial_mode OR simply re-run the classifier
+    # (idempotent — goal metadata is stable); absent either it defaults to full,
+    # which is the SAFE direction (re-pay ceremony, never lose learning).
+    Bash: loop-state-save.sh update --set "phase_progress.trivial_mode=true"
+    Bash: echo '{"entry_type":"observation","goal_id":"{goal.id}","content":"lightweight-mode trivial; skipping 3.9-4.5"}' | bash core/scripts/execution-diary.sh append
+ELSE:
+    trivial_mode = false   # full ceremony runs (default)
+```
+
+## Intelligent Retrieval Protocol (Steps 1-5c)
+
+LIGHTWEIGHT MODE (g-305-15): IF trivial_mode, SKIP Steps 1 through 5d entirely
+(`no_retrieval_call` guarantees retrieval adds nothing — the single largest
+saving) and jump to Step 5e. The skip region ENDS at the marker just before
+Step 5e; **Step 5e (Gate D) ALWAYS runs regardless of trivial_mode.**
+
+```
+IF NOT trivial_mode:   # Steps 1-5d run only on the full path (skip region ends at the END marker before Step 5e)
 Output: "▸ Intelligent retrieval: scanning knowledge tree..."
 
 # Step 1: Tree index (cached)
@@ -137,6 +169,51 @@ ELIF goal.primary_action OR goal.description references a subsystem without nami
     Read the top hit if unambiguous
 # Skip silently when goal metadata contains no concrete target reference.
 # This is a retrieval enrichment step, not a gate — never blocks execution.
+
+# ════ END lightweight-mode skip region (Steps 1-5d) ═══════════════════════
+# Step 5e ALWAYS RUNS — NEVER gated by trivial_mode. The retrieval-skip guard
+# above is scoped to Steps 1-5d ONLY (g-305-15 / brief §6). GATE-INTEGRITY: the
+# experiment seam stays byte-identical on BOTH the trivial and full paths.
+# ── Step 5e: Gate D commons-pattern injection (DORMANT — DEFAULT OFF) ──────
+# GATE-INTEGRITY (methodology 9.5): omni-blessed seam; agents MUST NOT modify.
+# Added to this digest 2026-06-11 (omni) — the seam originally lived only in the
+# full SKILL.md, which this digest supersedes at runtime; first pilot goal
+# (g-250-120) produced an orphan OUTCOME with no ASSIGNMENT as a result.
+Bash: gate_d_status = bash core/scripts/gate-d-check.sh
+IF gate_d_status == "on":
+    Bash: gate_d_json = bash core/scripts/gate-d-inject.sh             --goal-id "{goal.id}"             --goal-text "{goal.title}. {goal.description[:500]}"             --category "{goal.category}"
+    Parse gate_d_json -> arm, status, assignment_hash, patterns, patterns_injected,
+          pattern_signatures, injection_tokens, retrieval_precision, corpus_size, corpus_source
+    # SINGLE-BLIND: arm B + status "injected" ONLY — emit each pattern under the
+    # NEUTRAL heading below. NO "arm" / "Gate D" / "experiment" / "commons" token
+    # may appear in the execution context or any narration of this step.
+    IF arm == "B" AND status == "injected":
+        FOR index, p IN enumerate(patterns, start=1):
+            Output (into execution context, before goal.skill runs):
+              "-- SUPPLEMENTARY REFERENCE PATTERN ({index}/{patterns_injected}) --"
+              "Context:  {p.context}"
+              "Approach: {p.approach}"
+              "Lesson:   {p.lesson}"
+    # arm A / no_patterns / error: COMPLETE no-op.
+    # ASSIGNMENT telemetry — ONE line, append-only, BEFORE execution:
+    assignment_record = {
+        "record_type": "assignment", "goal_id": goal.id,
+        "aspiration_id": goal.aspiration_id, "agent": "$MIND_AGENT",
+        "world": "$GATE_D_WORLD", "arm": arm, "assignment_hash": assignment_hash,
+        "injection_status": status, "patterns_injected": patterns_injected,
+        "pattern_signatures": pattern_signatures, "injection_tokens": injection_tokens,
+        "retrieval_precision": retrieval_precision, "goal_category": goal.category,
+        "estimated_depth": ("deep" if goal is substantive else "routine"),
+        "excluded": (status == "error"), "corpus_source": corpus_source,
+        "corpus_size": corpus_size, "experiment_version": "gate-d-v1",
+        "timestamp": "$(date +%Y-%m-%dT%H:%M:%S)"
+    }
+    Bash: append the one-line assignment_record JSON to
+          agents/$MIND_AGENT/session/gate-d-telemetry.jsonl
+    # Diary breadcrumb (single-blind: NO status/arm — marker only, prevents re-run):
+    Bash: echo '{"entry_type":"observation","goal_id":"{goal.id}","content":"step-5e context preparation complete"}' | bash core/scripts/execution-diary.sh append
+# IF gate_d_status == "off" (DEFAULT): skip entirely — zero overhead.
+# ── End Step 5e ─────────────────────────────────────────────────────────────
 ```
 
 Execute primary goal: `result = invoke goal.skill with goal.args`
@@ -149,6 +226,19 @@ IF goal.recurring AND goal_succeeded AND no actionable items/new info:
     outcome_class = "routine"
 # Everything else remains "deep" — learning is the mission.
 # Non-recurring, failed, or uncertain → always "deep"
+
+# ESCAPE HATCH (lightweight mode — g-305-15 / brief §7): the classifier was a
+# PREDICTION. If execution falsified it, re-enable the full post-execution
+# ceremony so no learning is lost — converting a dangerous false-positive into a
+# recoverable one (we pay the tax slightly late, never lose it). Runs HERE,
+# before the Phase 4.25/4.26/4.5 guards below read trivial_mode.
+IF trivial_mode:
+    Bash: git -C {repo} diff --stat   # the repo(s) this goal could have touched
+    IF the goal produced a non-empty diff, OR a surprise fired, OR the goal failed:
+        trivial_mode = false
+        outcome_class = "deep"   # a falsified trivial prediction is deep by definition
+        Output: "▸ Lightweight mode: ESCAPE HATCH fired (diff/surprise/failure) — reverting to FULL; Phase 4.25/4.5/4.27 will run"
+        Bash: loop-state-save.sh update --set "phase_progress.trivial_mode=false"
 ```
 
 ## Phase 4.0: SKIP Fast-Path
@@ -183,7 +273,7 @@ IF guardrail_found_issues OR (goal failed AND infrastructure):
 IF guardrail_found_issues: outcome_class = "deep"  # override routine
 ```
 
-## Phase 4.2: Domain Post-Execution Steps
+## Phase 4.2: Domain Post-Execution Steps (IF NOT trivial_mode — already conditional on domain post-exec existing)
 
 ```
 Bash: load-conventions.sh post-execution → Read if returned
@@ -191,7 +281,7 @@ Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/post-exec
 IF exists: follow steps, collect external_changes + behavioral_observations
 ```
 
-## Phase 4.25: Experience Archival (SKIP if routine)
+## Phase 4.25: Experience Archival (SKIP if routine OR trivial_mode)
 
 ```
 IF productive:
@@ -202,7 +292,7 @@ IF productive:
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 
-## Phase 4.26: Context Utilization Feedback
+## Phase 4.26: Context Utilization Feedback (SKIP under lightweight mode — no retrieval-session.json; utilization-gate.sh backstop applies --all-unknown)
 
 ```
 # PRIMARY PATH (script-based — one command replaces the manual loop):
@@ -223,7 +313,7 @@ Bash: utilization-feedback.sh --goal {goal.id} --helpful "node1,node2,rb-001,gua
 # goals to force the LLM to attest or pass --no-retrieval-applicable.
 ```
 
-## Phase 4.5: Knowledge Reconciliation
+## Phase 4.5: Knowledge Reconciliation (IF NOT trivial_mode — no_diff ⇒ nothing to reconcile; escape hatch re-enables on diff)
 
 ```
 IF external_changes (from Phase 4.2):

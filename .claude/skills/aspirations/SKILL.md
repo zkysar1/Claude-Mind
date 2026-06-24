@@ -294,16 +294,41 @@ IF signal is not null:
         Output: "▸ PENDING-PHASE-6-SPARK: expired (set {expires_at}, age > 60min) — clearing without action"
         Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
     ELIF signal.outcome == "deep":
-        # Fire Phase 6 spark for the named recurring goal. The sentinel
-        # carries goal_id + source + summary so the spark handler has the
-        # context that the in-bg stdout would have provided.
-        Output: "▸ PENDING-PHASE-6-SPARK: outcome=deep for {signal.goal_id} — firing Skill(aspirations-spark) before precheck"
-        invoke /aspirations-spark with: goal_id={signal.goal_id},
-                                        source={signal.source},
-                                        outcome_class=deep,
-                                        summary={signal.summary}
-        # Clear AFTER spark dispatch (one-shot).
-        Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+        # Dedup against the fast-stdout-path double-fire (g-115-1203).
+        # recurring-close.sh writes THIS sentinel AND emits a stdout outcome-
+        # aware imperative. On the fast path the LLM already fired
+        # Skill(aspirations-spark) in-turn from that stdout, and aspirations-
+        # spark Step 0.5 recorded the firing via spark-fire-dedup.py. If this
+        # goal was sparked AT/AFTER this sentinel's set_at, this sentinel is a
+        # redundant re-fire — SKIP it and just clear. On the bg-timeout path
+        # (the LLM never saw the stdout, so no in-turn fire happened) the check
+        # returns "fire" and Phase 6 dispatches normally. Fail-open: on any
+        # error the check prints "fire", so a dedup bug never suppresses spark.
+        # Pipe the wm slot through the pure helper in ONE bash call (the helper
+        # must not spawn `bash wm-*.sh` itself — rb-225/rb-247 hang). Pass the
+        # sentinel's set_at so dedup is CONSUMPTION-BASED, not a fixed window:
+        # the prior 5-min window false-fired when the bg-timeout wall-clock
+        # between the in-turn fire and this check exceeded 5min (g-115-1404 /
+        # rb-1674). Older sentinels without set_at pass empty → fall back to the
+        # (now 60-min, TTL-aligned) window in spark-fire-dedup.py.
+        Bash: dedup=$(bash core/scripts/wm-read.sh spark_fired_session --json | py -3 core/scripts/spark-fire-dedup.py check {signal.goal_id} --sentinel-set-at "{signal.set_at}")
+        IF dedup == "skip":
+            Output: "▸ PENDING-PHASE-6-SPARK: dedup-skip for {signal.goal_id} — spark already fired in-turn (fast-stdout path) at/after this sentinel's set_at; clearing sentinel without re-firing (g-115-1203 / g-115-1404)"
+            Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
+        ELSE:
+            # "fire" — bg-timeout path: no in-turn fire, so the set_at
+            # comparison finds no same-close fire. (The legacy "5-min window
+            # elapsed" false-fire is fixed by the set_at basis — g-115-1404.)
+            # Fire Phase 6 spark for the named recurring goal. The sentinel
+            # carries goal_id + source + summary so the spark handler has the
+            # context that the in-bg stdout would have provided.
+            Output: "▸ PENDING-PHASE-6-SPARK: outcome=deep for {signal.goal_id} — firing Skill(aspirations-spark) before precheck"
+            invoke /aspirations-spark with: goal_id={signal.goal_id},
+                                            source={signal.source},
+                                            outcome_class=deep,
+                                            summary={signal.summary}
+            # Clear AFTER spark dispatch (one-shot).
+            Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
     ELSE:
         # outcome=routine — Phase 6 is skipped by the standard skip-rule.
         # Clear silently; the sentinel just records the close attempt.
@@ -363,6 +388,18 @@ Before the first VERIFY call in a session, load the residue digest:
 the first firing per session actually reads the file into context.)
 
 1. **VERIFY**: `Bash: iteration-close.sh --phase verify ...` + digest § VERIFY
+   (Gate D §4.6 [omni bless amendment 2026-06-11]: when `bash core/scripts/gate-d-check.sh`
+   returns "on", prefix the verify call — or the recurring-close.sh shortcut — with the
+   primary-outcome env vars: `GATE_D_VERIFY_FIRST_PASS=<true|false>
+   GATE_D_VERIFY_ESCALATION_DEPTH=<0-3> GATE_D_RETRY_COUNT=<n>`.
+   first_pass = Phase 5 verify accepted on the FIRST attempt (no Q1→Q2 escalation,
+   no re-execution). **A goal whose final status is `blocked` or `skipped` did NOT
+   first-pass — set GATE_D_VERIFY_FIRST_PASS=false for it** (amendment 6: the first
+   two pilot goals reported first_pass=true while ending blocked — a blocked goal
+   cannot have passed verification; compute the value from what actually happened,
+   never default it to true). These fields are arm-blind — never name or infer the
+   arm. Without this prefix the OUTCOME record's primary endpoint is null and the
+   goal is dropped at analysis join time.)
 2. **STATE**: `Bash: iteration-close.sh --phase state-update ...` + digest § STATE-UPDATE
 3. **MAINTAIN**: Working memory maintenance — sensory buffer, aging, prune (already bash)
 4. **LEARN**: `Bash: iteration-close.sh --phase learning-gate ...` + digest § LEARNING-GATE
@@ -546,3 +583,34 @@ with call-site and return semantics: **`core/config/aspirations-chaining-map.md`
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 The orchestrator's terminal action is always LOOP_CONTINUE (Skill call) or a Bash
 write (wm-set, session-signal-clear). Never end the loop with a text summary.
+
+### Deadman's-switch terminal-pair (DEFAULT-ON since 2026-06-23)
+
+The silent-loop-death gap — a turn ending on trailing text → no Stop event →
+loop dies and sits dead for hours (observed 2026-06-21: 5 of 6 agents dead
+1.5–4h) — is closed intrinsically by self-arming a resurrection wakeup. By
+DEFAULT (Stage 5 onward — unless the per-agent opt-out flag
+`agents/<agent>/session/deadman-disabled` is present), the iteration's terminal
+response emits TWO batched tool calls in this EXACT order:
+
+1. `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)` —
+   re-arm the deadman net. Single replace-slot (each iteration's re-arm
+   replaces the prior); never fires on a healthy loop (the session is never
+   idle 600s — the Skill chain re-arms it forward first); fires ONLY if a
+   text-death leaves the session idle past 600s, resurrecting the loop via the
+   sentinel.
+2. `Skill(aspirations)` with `args='loop'` — the PRIMARY re-entry, the LAST
+   call, continues the loop NOW exactly as before.
+
+`Skill(aspirations)` is and stays the primary re-entry; the ScheduleWakeup is a
+NET behind it, NOT a substitute (reconciles guard-511 / schedule-wakeup-
+correctness.md Anti-pattern C). The `iteration-close.sh` / `recurring-close.sh`
+imperatives print this pair by DEFAULT; they print `Skill(aspirations)` alone
+(the pre-deadman status quo) ONLY when the `deadman-disabled` opt-out flag is
+present. BOTH calls are mandatory EVERY iteration — emitting `Skill(aspirations)`
+alone keeps THIS iteration alive but leaves the NEXT one unprotected (the net
+covering iteration N+1 is the wakeup armed at iteration N's terminal). The arm is
+always safe to emit: the deadman is purely additive and fail-safe — worst case
+is a slow loop, never a dead one. Q5 (does Skill re-enter after the arm) RESOLVED
+favorable over charlie's first 24h (23/23 re-entries, 0 deaths, ARMED-OK). Full
+rationale + verified platform facts: `core/config/rationale/deadman-switch.md`.

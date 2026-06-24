@@ -27,6 +27,44 @@ if [ -z "$skill_name" ]; then
     exit 0  # No skill name — allow
 fi
 
+# Loop-orchestrator exemption (): the autonomous aspirations loop
+# re-invokes Skill(aspirations) — and its aspirations-* sub-skills — every
+# iteration to drive the heartbeat. Once the dedup gate became functional
+# ( resolves the bound agent from session_id and passes it as
+# MIND_AGENT to context-reads.py below), a tracked-path hit returns exit 2 on
+# that per-iteration re-invocation, which KILLS the loop ( confirmed).
+# These skills MUST always be allowed to re-invoke. This is an INTENTIONAL
+# scope decision — NOT a parse-error fail-open (cf. guard-487, which governs
+# the error-path semantics of suppression gates, not deliberate exemptions).
+orchestrator_exempt=0
+case "$skill_name" in
+    aspirations|aspirations-*) orchestrator_exempt=1 ;;
+esac
+
+# Resolve the bound agent from session_id for per-agent telemetry ().
+# This PreToolUse[Skill] hook is invoked directly by Claude Code, which does NOT
+# inject MIND_AGENT (only Bash *tool* calls get it via bash-agent-inject), so
+# _paths.sh leaves AGENT_DIR empty and the per-agent telemetry below would
+# silently no-op for every agent. The hook DOES carry session_id (parsed above),
+# so resolve the bound agent via the canonical session-binding resolver.
+#
+# ORDER-CRITICAL: this MUST stay BEFORE `source _platform.sh`. _platform.sh
+# exports MSYS_NO_PATHCONV=1, under which session-binding-read.sh resolves to
+# EMPTY on Git Bash (verified : MSYS_NO_PATHCONV breaks the resolver).
+# Resolving here, before that export, returns the agent correctly; setting
+# AGENT_DIR now (an MSYS path) also lets _platform.sh's existing
+# `if [ -n "$AGENT_DIR" ]` branch convert it to the Windows path the telemetry
+# python needs to open(). Fail-open: any failure leaves AGENT_DIR empty and the
+# telemetry block no-ops exactly as before.
+if [ -z "${AGENT_DIR:-}" ] && [ -n "$session_id" ]; then
+    _resolved_agent="$(bash "$CORE_ROOT/scripts/session-binding-read.sh" "$session_id" 2>/dev/null || true)"
+    if [ -n "$_resolved_agent" ]; then
+        AGENT_NAME="$_resolved_agent"
+        AGENT_DIR="$(agent_dir "$_resolved_agent")"
+    fi
+    unset _resolved_agent
+fi
+
 # Convert MSYS paths to Windows paths BEFORE constructing skill_path.
 # Python's Path.resolve() mishandles MSYS /c/... paths, producing C:/c/...
 source "$CORE_ROOT/scripts/_platform.sh"
@@ -46,15 +84,22 @@ fi
 # Use gate subcommand — it exits 0 (allow) for untracked AND out-of-scope paths,
 # exits 2 (block) only for tracked paths. The &&/|| idiom captures exit codes
 # safely under set -e (commands in &&/|| chains are exempt from errexit).
-python3 "$CORE_ROOT/scripts/context-reads.py" gate $sid_arg "$skill_path" >/dev/null 2>&1 && gate_rc=0 || gate_rc=$?
+MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" gate $sid_arg "$skill_path" >/dev/null 2>&1 && gate_rc=0 || gate_rc=$?
 
 if [ "$gate_rc" -eq 2 ]; then
+    if [ "$orchestrator_exempt" -eq 1 ]; then
+        # Orchestrator skill already tracked — allow the re-invocation (loop
+        # heartbeat) and exit WITHOUT re-recording: the path is already in the
+        # tracker, and append_tracker does not dedup, so re-recording every
+        # iteration would bloat the tracker with one duplicate line per cycle.
+        exit 0
+    fi
     echo "Skill /$skill_name instructions already in context — follow them from earlier in this conversation. Do NOT re-invoke." >&2
     exit 2
 fi
 
 # First invocation — record and allow
-python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$skill_path" 2>/dev/null || true
+MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$skill_path" 2>/dev/null || true
 
 # Long-term invocation telemetry — append to per-agent JSONL ledger.
 # Fail-open: any failure here must NOT block the skill from running.

@@ -1,4 +1,4 @@
-"""g-115-1340: dynamic runner-derived agent-ownership cutover regression.
+"""0: dynamic runner-derived agent-ownership cutover regression.
 
 Capstone of the g-115-1335 chain (g-1336 design, g-1337 DDB session-lock,
 g-1338 live-claim ownership resolution in owncloud_sync._owned_agents,

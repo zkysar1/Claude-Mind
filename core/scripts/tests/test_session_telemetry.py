@@ -6,6 +6,7 @@ No daemon dependency; pure filesystem + tmp_path.
 import os
 import sys
 import json
+import datetime
 from pathlib import Path
 
 import pytest
@@ -279,3 +280,151 @@ def test_path_traversal_rejected(tmp_path):
     # A traversal sid never writes a file outside the telemetry tree.
     st.write_open("../../../../evil_traversal_test", "alpha", "reader", "x", world_dir=tmp_path)
     assert not (tmp_path.parent.parent.parent.parent / "evil_traversal_test.json").exists()
+
+
+# ── Phase 1.5 stale-active reaper ─────────────────────────────────────────────
+# A fixed "now" so reaper tests never depend on the real wall clock; a stale
+# started_at 7 days before it (comfortably past the 24h freshness window).
+_NOW = datetime.datetime(2026, 6, 8, 0, 0, 0)
+_STALE_START = "2026-06-01T00:00:00"
+
+
+def _seed_record(tmp_path, agent, sid, **overrides):
+    """Write a telemetry record straight to disk (bypassing write_open) so reaper
+    tests control started_at / machine_id / status precisely. Defaults to a stale
+    active record on machine-A."""
+    rec = {
+        "schema_version": st.SCHEMA_VERSION,
+        "session_id": sid,
+        "agent": agent,
+        "status": "active",
+        "ended_reason": None,
+        "started_at": _STALE_START,
+        "ended_at": None,
+        "machine_id": "machine-A",
+        "duration_seconds": None,
+    }
+    rec.update(overrides)
+    p = tmp_path / "telemetry" / "session-records" / agent / (sid + ".json")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+    return p
+
+
+def _set_heartbeat(project_root, agent, when):
+    """Create agents/<agent>/session/runner-heartbeat with mtime == `when`
+    (a naive-local datetime). Round-trips exactly: `when` has zero sub-second
+    component so utime/fromtimestamp lose no precision."""
+    hb = project_root / "agents" / agent / "session" / "runner-heartbeat"
+    hb.parent.mkdir(parents=True, exist_ok=True)
+    hb.write_text("tick", encoding="utf-8")
+    ts = when.timestamp()
+    os.utime(hb, (ts, ts))
+    return hb
+
+
+def test_parse_local_iso():
+    assert st._parse_local_iso("2026-06-01T00:00:00") == datetime.datetime(2026, 6, 1, 0, 0, 0)
+    assert st._parse_local_iso("unknown") is None
+    assert st._parse_local_iso(None) is None
+    assert st._parse_local_iso("") is None
+    assert st._parse_local_iso("not-a-timestamp") is None
+
+
+def test_runner_recently_active_branches(tmp_path):
+    # project_root None -> True (cannot verify -> treat as alive -> do NOT reap)
+    assert st._runner_recently_active("alpha", _NOW, None) is True
+    # heartbeat absent -> False (no autonomous runner -> reapable)
+    assert st._runner_recently_active("alpha", _NOW, tmp_path) is False
+    cutoff = _NOW - datetime.timedelta(hours=6)
+    # heartbeat fresh (mtime >= cutoff) -> True (alive)
+    _set_heartbeat(tmp_path, "alpha", _NOW)
+    assert st._runner_recently_active("alpha", cutoff, tmp_path) is True
+    # heartbeat stale (mtime < cutoff) -> False (idle -> reapable)
+    _set_heartbeat(tmp_path, "bravo", _NOW - datetime.timedelta(hours=12))
+    assert st._runner_recently_active("bravo", cutoff, tmp_path) is False
+
+
+def test_reap_stale_active_flips_to_unknown(tmp_path):
+    _seed_record(tmp_path, "zeta", "sid-orphan", machine_id="machine-A")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["scanned"] == 1
+    assert summary["reaped"] == 1
+    assert "sid-orphan" in summary["reaped_ids"]
+    r = _read(tmp_path, "zeta", "sid-orphan")
+    assert r["status"] == "unknown"
+    assert r["ended_reason"] == "unknown"
+    assert r["ended_at"] == "2026-06-08T00:00:00"
+    assert r["end_machine_id"] == "machine-A"
+    assert r["duration_seconds"] == 7 * 86400  # 2026-06-01 -> 2026-06-08
+
+
+def test_reap_skips_fresh(tmp_path):
+    # started 4h before _NOW -> within the 24h freshness window
+    _seed_record(tmp_path, "zeta", "sid-fresh", started_at="2026-06-07T20:00:00")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 0
+    assert summary["skipped_fresh"] == 1
+    assert _read(tmp_path, "zeta", "sid-fresh")["status"] == "active"
+
+
+def test_reap_skips_live_runner(tmp_path):
+    # stale record, but the agent's runner ticked its heartbeat recently
+    _seed_record(tmp_path, "zeta", "sid-live")
+    _set_heartbeat(tmp_path, "zeta", _NOW)  # fresh heartbeat -> alive
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 0
+    assert summary["skipped_live"] == 1
+    assert _read(tmp_path, "zeta", "sid-live")["status"] == "active"
+
+
+def test_reap_skips_completed_and_crashed(tmp_path):
+    # Non-active records are scanned but never reaped (idempotent short-circuit).
+    _seed_record(tmp_path, "zeta", "sid-done", status="completed",
+                 ended_reason="user-stop")
+    _seed_record(tmp_path, "zeta", "sid-crash", status="crashed",
+                 ended_reason="recovery-gate")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["scanned"] == 2
+    assert summary["reaped"] == 0
+    assert summary["skipped_fresh"] == 0
+    assert summary["skipped_live"] == 0
+    assert _read(tmp_path, "zeta", "sid-done")["status"] == "completed"
+    assert _read(tmp_path, "zeta", "sid-crash")["status"] == "crashed"
+
+
+def test_reap_skips_other_machine(tmp_path):
+    # A record from machine-B is left for THAT machine's reaper (its runner
+    # liveness can't be checked from here).
+    _seed_record(tmp_path, "zeta", "sid-elsewhere", machine_id="machine-B")
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary["reaped"] == 0
+    assert summary["skipped_other_machine"] == 1
+    assert _read(tmp_path, "zeta", "sid-elsewhere")["status"] == "active"
+
+
+def test_reap_missing_records_dir_total(tmp_path):
+    # No telemetry dir at all -> zero summary, never raises.
+    summary = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                   now=_NOW, machine_id="machine-A")
+    assert summary == {"scanned": 0, "reaped": 0, "skipped_fresh": 0,
+                       "skipped_live": 0, "skipped_other_machine": 0,
+                       "reaped_ids": []}
+
+
+def test_reap_idempotent(tmp_path):
+    _seed_record(tmp_path, "zeta", "sid-once")
+    first = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                 now=_NOW, machine_id="machine-A")
+    assert first["reaped"] == 1
+    # Second pass: the record is now status=unknown -> not active -> not reaped.
+    second = st.reap_stale_active(world_dir=tmp_path, project_root=tmp_path,
+                                  now=_NOW, machine_id="machine-A")
+    assert second["scanned"] == 1
+    assert second["reaped"] == 0
+    assert _read(tmp_path, "zeta", "sid-once")["status"] == "unknown"

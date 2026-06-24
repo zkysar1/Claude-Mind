@@ -46,6 +46,11 @@ EMPTY_STATE = {
     "recent_completions": [],
     "agent_status": {},
     "critical_blockers": [],
+    # Inbox-derived backlog counter (). null when zero matching
+    # goals; else {count, oldest_age_hours, oldest_goal_id, updated_at}.
+    # Written by core/scripts/inbox-backlog-update.py (atomic, via this
+    # module's `update` CLI); read by aspirations-precheck Phase 0-pre.0.
+    "inbox_alert_backlog": None,
 }
 
 MAX_RECENT_COMPLETIONS = 50
@@ -141,6 +146,20 @@ def cmd_in_flight(args):
     target_agent = args.agent
     agent_author = args.author or _agent_name()
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    # current_focus: lane indicator for partner Theory-of-Mind (5).
+    # Aspiration (lane) parsed from goal_id (g-NNN-MM -> asp-NNN) + title, so
+    # partners track the actual lane instead of inferring from lagging
+    # completions. Persists across clear-in-flight (the last-claimed lane).
+    # MUST stay byte-identical to mind_api/src/world/team_state_write.py
+    # in_flight() (guard-742 dual-write).
+    _gp = (args.goal_id or "").split("-")
+    _asp = ("asp-" + _gp[1]) if len(_gp) >= 3 and _gp[0] == "g" and _gp[1].isdigit() else ""
+    if args.title and _asp:
+        _focus = _asp + ": " + args.title
+    elif args.title:
+        _focus = args.title
+    else:
+        _focus = _asp or args.goal_id
 
     def _modifier(state):
         for key, default in EMPTY_STATE.items():
@@ -157,6 +176,8 @@ def cmd_in_flight(args):
             "phase": args.phase,
         }
         state["agent_status"][target_agent]["last_active"] = now
+        state["agent_status"][target_agent]["current_focus"] = _focus
+        state["agent_status"][target_agent]["current_focus_updated_at"] = now
         return _stamp_metadata(state, agent_author)
 
     locked_modify_yaml(TEAM_STATE_PATH, _modifier, initial=dict(EMPTY_STATE))

@@ -72,6 +72,52 @@ runtime dir) — hence that one keeps the marker.
 This is a scoped exception, not a repeal — the full unrestricted suite still
 runs whenever no live daemon is present. Enforced by `guard-672`.
 
+### Progress-visible invocation (g-115-1496, 2026-06-17)
+
+The daemon-safe full suite takes ~32min (measured: 1916s; 2231 passed / 2 failed
+/ 1 skipped over 2234 selected). The runtime concentrates in a handful of
+subprocess/integration tests that shell out to real git/bash/filesystem ops
+under OneDrive contention — NOT primarily the daemon round-trips one might
+assume. The slowest 20 sum ~880s (~46% of total) over <1% of tests: `test_promote`
+seed-preflight/PR dry-runs (139s + 135s), `test_utilization_stats` real-repo
+audit (77s), `test_orphan_root_sweep_mode_d_integration` filesystem scans (~180s
+across 5), `test_post_state_update_gate_committed_files_only` daemon round-trips
+(~60s across 3). Three traps make a healthy-but-slow run look hung — know them
+before you kill a run or file a false "suite hangs" blocker:
+
+1. **Collection is silent for >50s** before the first result (heavy
+   module-level imports across 265 files). "No output yet" in the first minute
+   is NOT a hang — wait past collection before suspecting trouble.
+2. **Do NOT pipe a live run through `tail`** — `tail -f` (and most pipe
+   buffering) holds output until EOF on Windows, so you see nothing until the
+   run finishes, defeating the point. Instead redirect to a file and Read that
+   file directly (the Read tool shows partial content mid-run), forcing
+   unbuffered flushes so per-test dots land immediately:
+   ```
+   PYTHONUNBUFFERED=1 python -u -m pytest core/scripts/tests -m "not daemon_integration" \
+     > agents/<agent>/temp/suite.log 2>&1
+   ```
+   Then Read `agents/<agent>/temp/suite.log` to watch progress (add `-v` for one
+   line per test instead of dots).
+3. **A backgrounded run persists — don't trust a waiter or empty task-stdout to
+   say otherwise.** Under g-115-1496 the suite was backgrounded and ran to
+   completion (1916s) across turns — it was NOT killed. But a bounded waiter
+   loop timed out at ~12.5min ("may be hung") because the suite needs ~32min,
+   and the background task's own stdout looked empty because output went to the
+   redirect file. Both signals falsely read as "dead." Ground truth was the
+   redirect file, which accumulated steady progress the whole time. So: set any
+   waiter bound LONGER than the measured ~32min runtime, and never conclude
+   "hung/killed" from a waiter timeout or empty task-stdout alone — Read the
+   redirect file (`verify-before-assuming.md`: one signal is not enough for a
+   negative conclusion). Foreground-in-one-turn is also fine (the Bash tool
+   auto-backgrounds >2min commands but keeps them bound to the turn).
+
+The hang itself is now bounded by `faulthandler_timeout = 600` +
+`faulthandler_exit_on_timeout = true` in `pytest.ini` (g-115-1496): any single
+test exceeding 600s (10min — well past the 139.61s slowest legit test) dumps
+all-thread tracebacks and aborts the process, so a true hang fails loud with a
+stack pointing at the stall instead of buffering forever.
+
 ## Required Full-Suite Commands (per code area)
 
 ### Mind framework
@@ -81,7 +127,7 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 | `core/scripts/*.py` (non-test) | `cd PROJECT_ROOT && python -m pytest core/scripts/tests -q` | exit code 0, all collected tests pass |
 | `mind_api/src/*.py` | `python -m pytest core/scripts/tests -q` (runtime is exercised by daemon-aware wrappers in core/scripts/tests) | exit 0 |
 | `core/scripts/*.sh` (production wrapper) | Whatever the wrapper's daemon endpoint suite covers — typically `python -m pytest core/scripts/tests -q -k <endpoint>` | exit 0 |
-| `.claude/skills/*/SKILL.md` | `bash core/scripts/skill-evaluate.sh <skill-name>` AND consider `/verify-learning` for cross-skill grep checks | five-dim score ≥ acceptance threshold |
+| `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. (Do NOT use `skill-evaluate.sh` here. A bare `skill-evaluate.sh <skill-name>` errors `unknown subcommand`: it needs a subcommand (read/report/underperforming/score), and `score --skill <s> --goal <g>` rates RUNTIME skill-on-goal performance, not a static SKILL.md edit.) | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed |
 | `.claude/rules/*.md` | No automated check — re-read the rule and confirm wording matches intent | manual review |
 | `core/config/*.yaml` / `core/config/*.md` | Re-parse via affected consumers — `bash core/scripts/<consumer>.sh --dry-run` if available, otherwise `python -c "import yaml; yaml.safe_load(open('<path>'))"` | parse succeeds, no schema break |
 

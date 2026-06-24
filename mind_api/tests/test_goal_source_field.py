@@ -178,10 +178,25 @@ def test_fallback_path_imports_ssot():
     """aspirations.py (fallback / CLI path) must call the shared helper.
 
     Daemon-side parity (mind_api/src/endpoints/aspirations_write.py) is
-    tracked separately — see g-305-14 (filed as a follow-up). When that
-    goal lands, add a `test_daemon_path_imports_ssot` mirroring this one.
+    asserted by its mirror `test_daemon_path_imports_ssot` below (g-305-14,
+    landed 2026-06-12).
     """
     assert aspirations._apply_goal_source_default is _goal_source.apply_default
+
+
+def test_daemon_path_imports_ssot():
+    """mind_api daemon path (aspirations_write.py) must call the shared helper.
+
+    Daemon-side mirror of test_fallback_path_imports_ssot (g-305-14). The
+    add-goal hot path binds `_apply_goal_source_default` to the shared
+    `_goal_source.apply_default` at import time (aspirations_write.py ~L99)
+    and invokes it at Phase C.5 of `_run_add_goal_pipeline` (~L854). This
+    parity smoke test guards against a drift where the daemon path
+    re-implements or shadows the SSOT helper, which would leave daemon-filed
+    goals with `goal_source=null` while CLI-filed goals get it populated.
+    """
+    from mind_api.src.endpoints import aspirations_write
+    assert aspirations_write._apply_goal_source_default is _goal_source.apply_default
 
 
 # ---------------------------------------------------------------------------

@@ -1,41 +1,71 @@
 #!/usr/bin/env python3
-"""Inbox-Alert Age Escalation — scan  for aged alert-sweep Unblocks.
+"""Inbox-Alert Age Escalation - scan  for aged alert-sweep Unblocks.
 
 Closes finding (2) of g-115-822: when alert-sweep.sh files an Unblock for an
 inbound alert email and no agent claims it within a few hours, the alert
 silently ages. The bash gate is already in place upstream (alert-sweep.sh
 files Unblock goals with `origin_signal=f"alert-email:{s3_key}"`); this
-script is the precheck-side aging-escalation sweep — equivalent to Phase
+script is the precheck-side aging-escalation sweep - equivalent to Phase
 0.5b.1 (blocker_age_hours) but for the goal-queue surface rather than the
 working-memory `known_blockers` surface.
 
 Called by aspirations-precheck Phase 0.5b.1b. Reads asp-115 via the daemon
-(_rt.aspirations_read) and reads/appends working-memory
-`proactive_escalation_log` via the daemon (_rt.wm_read + wm-append.sh).
-Dry-run by default; pass --apply to actually fire notifications and write
-cooldown entries.
+(_rt.aspirations_read). Dry-run by default; pass --apply to actually fire
+notifications.
 
-Severity is determined per the goal's age vs.
-`config.proactive_escalation.inbox_alert_age_hours.{high,medium}`:
-  - age >= high_hours   → severity=high (notify if no prior fire within high_hours)
-  - age >= medium_hours → severity=medium (notify if no prior fire within medium_hours)
-  - otherwise           → skip (under threshold)
+Severity is determined by which configured interval the goal's age has passed.
+`config.proactive_escalation.inbox_alert_age_hours.{high,medium}` are the
+per-severity RE-NOTIFY intervals (a "high" alert re-notifies more frequently);
+classification maps the LONGER-aged alert to the MORE-urgent "high" severity
+(g-115-1539):
+  - age >= max(high_hours, medium_hours) -> severity=high   (aged furthest; re-notify every high_hours)
+  - age >= min(high_hours, medium_hours) -> severity=medium (aged moderately; re-notify every medium_hours)
+  - otherwise                            -> skip (under threshold)
+With the defaults (high=4h, medium=12h) a "high" alert is reached once aged past
+12h and re-notifies every 4h (frequent); "medium" is reached at 4h and
+re-notifies every 12h. (Before g-115-1539 the classifier checked high_hours
+first, so with high<medium the medium branch was unreachable dead code.)
 
 A goal that crosses the high threshold AFTER it already received a medium
-notification will re-fire under the high schedule (the cooldown lookup uses
-the SAME key but the threshold the lookup compares against is
-severity-dependent). This intentionally lets the user receive a fresh
-"upgraded to HIGH" notification when an alert ages further. Same pattern as
-Phase 0.5b.1 → Phase B7 escalation ladder.
+notification re-fires under the high schedule: the cooldown lookup keys on the
+SAME goal_id but compares the most-recent escalation age against the CURRENT
+severity's threshold, so a fresh "upgraded to HIGH" notification reaches the
+user as an alert ages further. Same pattern as Phase 0.5b.1 -> Phase B7 ladder.
 
-Fail-open at every layer:
-  - Missing config block          → fall back to high=4, medium=12 (same as YAML defaults)
-  - daemon unreachable            → exit 0, empty `candidates`, stderr note
-  - asp-115 not present in world  → exit 0, empty `candidates`
-  - wm-read errors                → empty cooldown log (everything fires)
-  - email-send failure (per goal) → log to stderr, KEEP cooldown entry to
-                                    avoid retry-storm; --apply continues to
-                                    remaining candidates
+Cooldown (g-115-1533 - SHARED + DURABLE, mirroring the g-115-1531 handoff
+sibling): an aged alert is re-escalated at most once per cooldown window across
+the WHOLE TEAM. The cooldown record is a coordination-board breadcrumb the
+escalation posts (`inbox-alert-aged,<goal_id>,severity:<sev>`): before sending
+the user email, the sweep scans the coordination board (`board-read.sh`) for an
+existing `inbox-alert-aged` post for this goal_id (from ANY agent) within the
+cooldown window. This replaced the original per-agent WM `proactive_escalation_log`
+cooldown, which carried the SAME two bugs g-115-1531 fixed in handoff-aging-check:
+(1) N-agent duplicate - each of the N agents kept its OWN WM log, so all N
+escalated the same unclaimed alert independently (N DUPLICATE USER EMAILS,
+arguably worse than the board-post duplication of the handoff sibling);
+(2) non-durable - a WM reset between iterations wiped the log and re-fired.
+
+WHY the board, not a new world-level ledger: the board IS the framework's
+shared-durable-append primitive (locking + persistence handled by
+board-post.sh / board-read.sh). Reusing it beats inventing a locked world-level
+JSONL ledger (rb-1534 multi-writer race concern) and keeps BOTH age-escalation
+sweeps on ONE pattern. The breadcrumb also gives partner agents cross-agent
+visibility into aging unclaimed alerts (a coordination signal: "someone should
+claim this"), so the post is genuinely useful, not just a cooldown hack.
+
+KEY DIFFERENCE from the handoff sibling: there the board post is BOTH the
+escalation and the cooldown; here the USER-FACING escalation is the email and
+the board post is the SHARED cooldown record + agent-facing visibility.
+
+Fail-open at every layer (the action is ADDITIVE escalation, never a
+destructive mutation):
+  - Missing config block          -> fall back to high=4, medium=12 (YAML defaults)
+  - daemon unreachable            -> exit 0, empty `candidates`, stderr note
+  - asp-115 not present in world  -> exit 0, empty `candidates`
+  - board scan fails              -> empty cooldown set (everything eligible fires)
+  - email-send failure (per goal) -> log to stderr; STILL post the board
+                                    breadcrumb to avoid retry-storm; --apply
+                                    continues to remaining candidates
 
 Exit codes: always 0. Use the JSON output's `applied` count to determine
 what changed.
@@ -43,8 +73,8 @@ what changed.
 Usage:
     python3 inbox-alert-age-check.py [--apply] [--asp-id asp-115]
                                      [--high-hours N] [--medium-hours N]
-                                     [--proactive-escalation-log <path>]  # tests only
-                                     [--no-email]                          # tests only
+                                     [--board-escalation-log <path>]  # tests only
+                                     [--no-email] [--no-board]        # tests only
 """
 
 import argparse
@@ -62,10 +92,6 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _runtime_bash import bash_cmd  # noqa: E402  # : Windows-safe bash resolution
-
-
-def _now_iso() -> str:
-    return dt.datetime.now().replace(microsecond=0).isoformat()
 
 
 def _parse_iso(s):
@@ -108,7 +134,7 @@ def _load_config(args) -> dict:
     except Exception as exc:
         # Fail-open: stderr note + YAML defaults.
         sys.stderr.write(
-            "inbox-alert-age-check: config load failed (%s) — using defaults\n" % exc)
+            "inbox-alert-age-check: config load failed (%s) - using defaults\n" % exc)
         if high is None:
             high = 4
         if medium is None:
@@ -124,83 +150,140 @@ def _read_aspiration(asp_id: str) -> dict:
         return json.loads(raw) if raw else {}
     except Exception as exc:
         sys.stderr.write(
-            "inbox-alert-age-check: aspirations_read(%s) failed (%s) — fail-open\n"
+            "inbox-alert-age-check: aspirations_read(%s) failed (%s) - fail-open\n"
             % (asp_id, exc))
         return {}
 
 
-def _read_proactive_log(log_path: Path = None) -> list:
-    """Read wm.proactive_escalation_log. Returns [] on any failure.
-
-    When `log_path` is provided (tests only), read it as JSON-list directly,
-    bypassing the daemon. Production callers must pass log_path=None so the
-    real WM is consulted via _rt.wm_read.
-    """
-    if log_path is not None:
-        try:
-            with open(log_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, list):
-                return data
-            return []
-        except Exception:
-            return []
-    try:
-        import _rt
-        raw = _rt.wm_read(slot="proactive_escalation_log", as_json=True)
-        if not raw:
-            return []
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return parsed
-        if parsed is None:
-            return []
-        # wm_read prints "null" + empty list both — normalize.
-        return []
-    except Exception as exc:
-        sys.stderr.write(
-            "inbox-alert-age-check: wm_read(proactive_escalation_log) failed (%s) — treating as empty\n"
-            % exc)
-        return []
-
-
 def _classify_severity(age_hours: float, thresholds: dict) -> str:
-    """Return "high", "medium", or "" if under threshold."""
+    """Return "high", "medium", or "" (alert under both thresholds).
+
+    The two configured values are per-severity RE-NOTIFY intervals, reused by
+    run()'s cooldown (`recent_age < thresholds[sev]`): a "high" alert re-notifies
+    every thresholds["high"] (default 4h, frequent), a "medium" every
+    thresholds["medium"] (default 12h, less frequent). Classification maps the
+    LONGER-aged alert to the MORE-urgent "high" severity -- so the age gate for
+    "high" is the LARGER of the two intervals, NOT thresholds["high"]. This
+    matches the module docstring's "upgraded to HIGH ... as an alert ages
+    further" escalation intent.
+
+    g-115-1539: the prior code checked `age >= thresholds["high"]` FIRST; with
+    the defaults high(4) < medium(12) that branch caught everything >= 4h, so the
+    medium branch was unreachable dead code and every aged alert classified
+    "high" (re-notifying every 4h). Using max()/min() keeps the older->high
+    mapping correct regardless of which config key holds the larger value.
+    """
     if age_hours is None:
         return ""
-    if age_hours >= thresholds["high"]:
+    longer = max(thresholds["high"], thresholds["medium"])
+    shorter = min(thresholds["high"], thresholds["medium"])
+    if age_hours >= longer:
         return "high"
-    if age_hours >= thresholds["medium"]:
+    if age_hours >= shorter:
         return "medium"
     return ""
 
 
-def _find_last_escalation(log: list, blocker_id: str) -> dict:
-    """Return the most-recent log entry for blocker_id, or None.
-    Most-recent is determined by sent_at ISO compare (lexicographic == chronological)."""
-    matches = [e for e in log if isinstance(e, dict) and e.get("blocker_id") == blocker_id]
-    if not matches:
-        return None
-    matches.sort(key=lambda e: e.get("sent_at", ""), reverse=True)
-    return matches[0]
+def _escalate_window_str(max_window_hours: float) -> str:
+    """board-read --since needs an int+unit duration; round up + 1h margin so
+    the read window safely covers the full cooldown window (the largest of the
+    severity thresholds)."""
+    import math
+    return "%dh" % (int(math.ceil(max_window_hours)) + 1)
 
 
-def _on_cooldown(last_entry: dict, threshold_hours: float, now: dt.datetime) -> bool:
-    """True if the last escalation is within `threshold_hours` of now."""
-    if not last_entry:
-        return False
-    sent_at = last_entry.get("sent_at")
-    age = _age_hours(sent_at, now)
-    if age is None:
-        # Corrupted entry — treat as expired (safer to re-notify than to suppress forever).
-        return False
-    return age < threshold_hours
+def _read_recent_escalations(thresholds: dict, now: dt.datetime,
+                             board_log_path: Path = None) -> dict:
+    """Return {goal_id: most_recent_age_hours} for `inbox-alert-aged`
+    coordination-board posts within the cooldown scan window - from ANY agent.
+
+    THE SHARED, DURABLE COOLDOWN (g-115-1533, mirroring g-115-1531). The board
+    breadcrumb `_post_board_cooldown` drops (tagged `inbox-alert-aged,<goal_id>,
+    severity:<sev>`) IS the cooldown record: it is shared (every agent reads the
+    same coordination board) and durable (board posts persist in world/board/,
+    unlike the per-agent WM `proactive_escalation_log` slot each agent kept
+    SEPARATELY and that WM resets wiped). Scanning the board before sending the
+    user email therefore fixes BOTH original bugs at once - the N-agent
+    duplicate (N agents each emailing the user about the same unclaimed alert)
+    and the non-durable cooldown (a WM reset between iterations re-fired the same
+    agent).
+
+    Returns the SMALLEST age (most-recent post) per goal_id. The caller compares
+    that against the CURRENT candidate's severity threshold (thresholds[sev]),
+    preserving the prior severity-aware cooldown semantics - only the store
+    moved from per-agent WM to the shared board.
+
+    `board_log_path` (tests only): read a JSON list of post dicts directly,
+    bypassing the daemon/subprocess board scan.
+
+    FAIL-OPEN: any read failure yields an empty dict -> no cooldown -> eligible
+    alerts re-escalate. Same direction as the prior empty-log fail-open.
+    """
+    # Scan back far enough to cover the longest cooldown window (the max threshold).
+    max_window = max(thresholds.values()) if thresholds else 12.0
+    posts = []
+    if board_log_path is not None:
+        try:
+            with open(board_log_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            posts = data if isinstance(data, list) else []
+        except Exception:
+            posts = []
+    else:
+        try:
+            proc = subprocess.run(
+                bash_cmd(SCRIPT_DIR / "board-read.sh",
+                         "--channel", "coordination",
+                         "--type", "status",
+                         "--since", _escalate_window_str(max_window),
+                         "--json"),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            if proc.returncode == 0:
+                for line in (proc.stdout or "").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        posts.append(json.loads(line))
+                    except Exception:
+                        continue
+            else:
+                sys.stderr.write(
+                    "inbox-alert-age-check: board-read.sh exit=%d stderr=%s - "
+                    "fail-open (no cooldown this sweep)\n"
+                    % (proc.returncode, (proc.stderr or "").strip()[:200]))
+        except Exception as exc:
+            sys.stderr.write(
+                "inbox-alert-age-check: board-read.sh exception (%s) - fail-open\n" % exc)
+
+    recent = {}
+    for p in posts:
+        if not isinstance(p, dict):
+            continue
+        tags = p.get("tags") or []
+        if "inbox-alert-aged" not in tags:
+            continue
+        age = _age_hours(p.get("timestamp") or p.get("ts"), now)
+        if age is None:
+            continue
+        for t in tags:
+            # The breadcrumb tags the goal_id (`g-*`); severity/agent tags never do.
+            if isinstance(t, str) and t.startswith("g-"):
+                # Keep the MOST-RECENT (smallest age) post per goal_id.
+                if t not in recent or age < recent[t]:
+                    recent[t] = age
+    return recent
 
 
 def _classifier_subject(goal: dict) -> str:
     """Extract the classifier subject from the alert. Falls back to ''."""
     # The alert-sweep filer doesn't bake the classifier subject into a top-level
-    # goal field — it lives in the description. The current alert-sweep.sh format
+    # goal field - it lives in the description. The current alert-sweep.sh format
     # puts the subject after "Subject: " in the description. Best-effort regex
     # so a description-format drift degrades to empty rather than crashing.
     import re
@@ -253,12 +336,12 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
                 world_dir = str(_paths.WORLD_DIR)
             except Exception:
                 sys.stderr.write(
-                    "inbox-alert-age-check: cannot resolve WORLD_DIR for email-send.sh — skipping notify\n")
+                    "inbox-alert-age-check: cannot resolve WORLD_DIR for email-send.sh - skipping notify\n")
                 return False, "no_world_dir"
         email_script = Path(world_dir) / "scripts" / "email-send.sh"
         if not email_script.is_file():
             sys.stderr.write(
-                "inbox-alert-age-check: email-send.sh not found at %s — skipping notify\n"
+                "inbox-alert-age-check: email-send.sh not found at %s - skipping notify\n"
                 % email_script)
             return False, "no_email_script"
         proc = subprocess.run(
@@ -278,65 +361,47 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
         return False, "email_send_nonzero:%d" % proc.returncode
     except Exception as exc:
         sys.stderr.write(
-            "inbox-alert-age-check: email-send.sh exception (%s) — skipping notify\n" % exc)
+            "inbox-alert-age-check: email-send.sh exception (%s) - skipping notify\n" % exc)
         return False, "email_send_exception:%s" % exc.__class__.__name__
 
 
-def _append_log(blocker_id: str, severity: str, sent_at: str, log_path: Path = None) -> bool:
-    """Append a cooldown entry. Test-mode writes directly to log_path; production writes via wm-append.sh.
+def _post_board_cooldown(goal_id: str, severity: str, no_board: bool) -> tuple:
+    """Post the shared+durable cooldown breadcrumb to the coordination board.
 
-    Returns True on success.
+    Returns (ok, detail). The post (tagged `inbox-alert-aged,<goal_id>,
+    severity:<sev>`) IS the shared cooldown record the next sweep (any agent)
+    reads via `_read_recent_escalations`, and a cross-agent visibility note that
+    an alert is aging unclaimed. When `no_board` is True (tests), skip the
+    subprocess and return (True, "no_board").
     """
-    entry = {
-        "blocker_id": blocker_id,
-        "severity": severity,
-        "sent_at": sent_at,
-    }
-    if log_path is not None:
-        # Test mode: read-modify-write the JSON file directly.
-        existing = []
-        try:
-            with open(log_path, "r", encoding="utf-8") as fh:
-                existing = json.load(fh)
-            if not isinstance(existing, list):
-                existing = []
-        except Exception:
-            existing = []
-        existing.append(entry)
-        try:
-            with open(log_path, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh)
-            return True
-        except Exception as exc:
-            sys.stderr.write(
-                "inbox-alert-age-check: test-mode log write failed (%s)\n" % exc)
-            return False
+    if no_board:
+        return True, "no_board"
     try:
-        # wm-append.sh appends one entry per stdin call. The slot is auto-init to
-        # an empty list by wm.py if missing.
-        # Windows path-separator fix ( audit): .as_posix() avoids
-        # the bash backslash-escape stripping that silently no-ops these
-        # invocations on Windows. Same pattern as dependent-unblock.py.
+        tags = "inbox-alert-aged,%s,severity:%s" % (goal_id, severity)
+        msg = ("Inbox alert aging unclaimed [%s] severity=%s -- claim the "
+               "alert-sweep Unblock (one agent should run it)" % (goal_id, severity))
         proc = subprocess.run(
-            bash_cmd(SCRIPT_DIR / "wm-append.sh",
-                     "proactive_escalation_log"),
-            input=json.dumps(entry),
+            bash_cmd(SCRIPT_DIR / "board-post.sh",
+                     "--channel", "coordination",
+                     "--type", "status",
+                     "--tags", tags),
+            input=msg,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=10,
+            timeout=30,
         )
         if proc.returncode == 0:
-            return True
+            return True, "posted"
         sys.stderr.write(
-            "inbox-alert-age-check: wm-append.sh exit=%d stderr=%s\n"
+            "inbox-alert-age-check: board-post.sh exit=%d stderr=%s\n"
             % (proc.returncode, (proc.stderr or "").strip()[:300]))
-        return False
+        return False, "board_post_nonzero:%d" % proc.returncode
     except Exception as exc:
         sys.stderr.write(
-            "inbox-alert-age-check: wm-append.sh exception (%s)\n" % exc)
-        return False
+            "inbox-alert-age-check: board-post.sh exception (%s) - skipping post\n" % exc)
+        return False, "board_post_exception:%s" % exc.__class__.__name__
 
 
 def run(args) -> dict:
@@ -345,10 +410,10 @@ def run(args) -> dict:
     now = dt.datetime.now()
     asp = _read_aspiration(args.asp_id)
     goals = (asp.get("goals") or []) if isinstance(asp, dict) else []
-    candidates = []
-    cooldown_log_path = Path(args.proactive_escalation_log) if args.proactive_escalation_log else None
-    log_entries = _read_proactive_log(cooldown_log_path)
+    board_log_path = Path(args.board_escalation_log) if args.board_escalation_log else None
+    recent_escalations = _read_recent_escalations(thresholds, now, board_log_path)
 
+    candidates = []
     for g in goals:
         if not isinstance(g, dict):
             continue
@@ -364,27 +429,21 @@ def run(args) -> dict:
         sev = _classify_severity(age, thresholds)
         if not sev:
             continue
-        blocker_id = "inbox_alert_%s" % g.get("id", "")
-        # Cooldown threshold is the severity's age threshold — re-notify after
-        # that many hours have elapsed since the last fire of the SAME severity.
-        # Using thresholds[sev] keeps the cadence matched to the severity's
-        # urgency: HIGH alerts re-fire every high_hours, MEDIUM every medium_hours.
-        last = _find_last_escalation(log_entries, blocker_id)
-        on_cooldown = False
-        if last:
-            # Severity-aware: a fresh HIGH fire should ignore old MEDIUM cooldown,
-            # but a recent HIGH should suppress a fresh MEDIUM. Implementation:
-            # compare against the threshold for the CURRENT severity.
-            on_cooldown = _on_cooldown(last, thresholds[sev], now)
+        goal_id = g.get("id", "")
+        # Severity-aware cooldown: a recent breadcrumb (from ANY agent) within
+        # thresholds[sev] hours suppresses. Mirrors the prior _on_cooldown logic
+        # (compare most-recent escalation age against the CURRENT severity's
+        # threshold), but the store is now the shared board, not per-agent WM.
+        recent_age = recent_escalations.get(goal_id)
+        on_cooldown = recent_age is not None and recent_age < thresholds[sev]
         candidates.append({
-            "goal_id": g.get("id"),
+            "goal_id": goal_id,
             "title": title,
             "age_hours": round(age, 2),
             "severity": sev,
-            "blocker_id": blocker_id,
+            "blocker_id": "inbox_alert_%s" % goal_id,
             "origin_signal": sig,
             "on_cooldown": on_cooldown,
-            "last_escalation": last,
         })
 
     fired = []
@@ -399,12 +458,13 @@ def run(args) -> dict:
             full = next((g for g in goals if g.get("id") == c["goal_id"]), None)
             if full is None:
                 continue
-            sent_iso = _now_iso()
             ok, detail = _send_email(full, c["severity"], c["age_hours"], args.no_email)
+            # Post the shared+durable cooldown breadcrumb REGARDLESS of email
+            # outcome - without it the next sweep tick (any agent) would retry
+            # within the minute, spamming the email infra. The board post IS the
+            # cooldown record the next sweep reads (fail-open: keep cooldown).
+            _post_board_cooldown(c["goal_id"], c["severity"], args.no_board)
             if ok:
-                # Append log regardless of email send outcome — see fail-open
-                # note above (keep cooldown to prevent retry storm).
-                _append_log(c["blocker_id"], c["severity"], sent_iso, cooldown_log_path)
                 fired.append({
                     "goal_id": c["goal_id"],
                     "severity": c["severity"],
@@ -412,10 +472,6 @@ def run(args) -> dict:
                     "detail": detail,
                 })
             else:
-                # email_send failed — STILL append log per fail-open contract:
-                # without it the next sweep tick would retry within the same
-                # minute, spamming the email infra.
-                _append_log(c["blocker_id"], c["severity"], sent_iso, cooldown_log_path)
                 failed.append({
                     "goal_id": c["goal_id"],
                     "severity": c["severity"],
@@ -439,17 +495,19 @@ def run(args) -> dict:
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--apply", action="store_true",
-                   help="Actually send notifications and append cooldown entries (default: dry-run).")
+                   help="Actually send notifications and post board breadcrumbs (default: dry-run).")
     p.add_argument("--asp-id", default="asp-115",
-                   help="Aspiration to scan (default: asp-115 — the alert-sweep target queue).")
+                   help="Aspiration to scan (default: asp-115 - the alert-sweep target queue).")
     p.add_argument("--high-hours", type=float, default=None,
                    help="Override high-severity threshold (default: config or 4).")
     p.add_argument("--medium-hours", type=float, default=None,
                    help="Override medium-severity threshold (default: config or 12).")
-    p.add_argument("--proactive-escalation-log", default=None,
-                   help="Test-only: path to a JSON file standing in for the WM proactive_escalation_log slot.")
+    p.add_argument("--board-escalation-log", default=None,
+                   help="Test-only: path to a JSON file of coordination-board posts standing in for the live board scan.")
     p.add_argument("--no-email", action="store_true",
                    help="Test-only: skip the email-send.sh subprocess and pretend it succeeded.")
+    p.add_argument("--no-board", action="store_true",
+                   help="Test-only: skip the board-post.sh cooldown breadcrumb and pretend it succeeded.")
     args = p.parse_args()
     result = run(args)
     json.dump(result, sys.stdout, indent=2)

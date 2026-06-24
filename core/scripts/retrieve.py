@@ -301,6 +301,78 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 # ---------------------------------------------------------------------------
+# Bi-temporal reader (g-306-36, BRD Gap 5 — consumes the g-306-35 writer fields)
+#
+# The writer path (g-306-35) stamps valid_from / valid_to on RB, guardrails,
+# beliefs, and tree records. Falsification is close-old (set valid_to=now) +
+# insert-new (valid_from=now), so a logically-evolving record accumulates a
+# version history of half-open [valid_from, valid_to) intervals. This reader
+# answers "what was the version valid at instant T?" — the point-in-time query
+# rb-335 mandates (without it the writer fields are dead weight).
+#
+# Lower-bound precedence: valid_from is the canonical bi-temporal field, but
+# records that predate g-306-35 carry no valid_from. `created` (RB/guardrails)
+# and `last_observed` (beliefs) are transaction-time proxies that give every
+# legacy record a real temporal floor — without the fallback, a legacy record
+# would read as "-inf lower bound" and wrongly surface in an as-of query for a
+# time BEFORE it was even written.
+# ---------------------------------------------------------------------------
+
+_VALID_LOWER_FIELDS = ("valid_from", "created", "last_observed")
+
+
+def _parse_iso(value):
+    """Parse an ISO-8601 datetime string; return None on any non-string or
+    unparseable value (callers treat None as 'unbounded on this edge')."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _valid_at(record, as_of_dt):
+    """Bi-temporal validity predicate (g-306-36): is `record` the version that
+    was valid at instant `as_of_dt`? Half-open interval [lower, upper):
+
+      lower = first parseable of valid_from / created / last_observed
+              (None => -inf: record has no temporal floor, always-valid lower)
+      upper = valid_to  (None => +inf: this IS the current, still-open version)
+
+    Returns True iff lower <= as_of_dt < upper. The half-open upper bound makes
+    a close-old/insert-new pair non-overlapping at the cut instant: the closed
+    version (valid_to=T) is valid up to but NOT including T; the new version
+    (valid_from=T) is valid from T onward — exactly one is valid at any instant.
+    """
+    lower = None
+    for field in _VALID_LOWER_FIELDS:
+        lower = _parse_iso(record.get(field))
+        if lower is not None:
+            break
+    if lower is not None and as_of_dt < lower:
+        return False
+    upper = _parse_iso(record.get("valid_to"))
+    if upper is not None and as_of_dt >= upper:
+        return False
+    return True
+
+
+def _as_of_dt_or_raise(as_of):
+    """Parse an as_of CLI/endpoint argument to a datetime, raising ValueError on
+    a malformed value so the caller surfaces a clear error rather than silently
+    treating every record as valid. None passes through (the default,
+    current-version path)."""
+    if as_of is None:
+        return None
+    dt = _parse_iso(as_of)
+    if dt is None:
+        raise ValueError(
+            f"Invalid as_of: {as_of!r} (expected ISO-8601 datetime, "
+            "e.g. 2026-06-19T01:00:00)")
+    return dt
+
+# ---------------------------------------------------------------------------
 # Tree node loading (main entry point for tree retrieval)
 # ---------------------------------------------------------------------------
 
@@ -601,24 +673,82 @@ def _entry_matches(entry, categories):
     return _entry_matches_text(entry, categories)
 
 def _sort_by_utility(entries):
-    """In-place sort by utilization.utilization_score desc, then created desc.
+    """In-place sort by utilization.utilization_score desc, provenance weight
+    desc (M-5), then created desc.
 
     Generic counterpart to `sort_universal_rbs` — applies to any record with
     the standard `utilization` sub-object schema (RB, guardrails, pattern
-    signatures). Tie-break by `created` ensures fresh entries surface above
-    older ones at equal utility. Mutates and returns the list.
+    signatures). M-5 adds provenance as a secondary sort key so DIRECT-provenance
+    entries surface above HEARSAY at equal (poignancy-weighted) utility. Tie-break
+    by `created` ensures fresh entries surface above older ones at equal
+    utility + provenance. Mutates and returns the list.
+
+    Poignancy blend (g-306-08): when enabled, utilization_score is MULTIPLIED by
+    the poignancy factor (1.0 .. poignancy_weight_max). Multiplicative (not
+    additive) is load-bearing: utilization_score values are tiny (p75 ~ 0.007 on
+    the live corpus) while an additive bonus of up to 0.5 would dwarf them and
+    let poignancy DOMINATE utilization — the g-306-08 A/B caught exactly that.
+    Multiplicative is scale-invariant and bounded: a record can be displaced only
+    by one within poignancy_weight_max x of its utilization, never by an
+    arbitrarily-lower-utility record (the "no known-good knowledge hidden"
+    property). The poignancy factor is a tertiary key so it still orders the
+    large utilization_score==0 mass (where util*factor==0 for all). Flag off or
+    null poignancy -> factor 1.0, so ordering is identical to pre-g-306-08 by
+    default; records without a poignancy field (guardrails, pattern signatures)
+    are unaffected.
     """
-    entries.sort(
-        key=lambda r: (
-            (r.get("utilization") or {}).get("utilization_score", 0) or 0,
-            r.get("created", "") or "",
-        ),
-        reverse=True,
-    )
+    cfg = _load_retrieval_config()
+    blend = cfg.get("poignancy_blend_enabled", False)
+
+    # M-5 provenance weights — duplicated from tree_match.PROVENANCE_WEIGHTS to
+    # avoid import-cycle risk (retrieve.py already imports from tree_match;
+    # tree_match must not import from retrieve). The enum is stable (M-1).
+    _PROV_WEIGHTS = {
+        "DIRECT": 1.0, "INFERRED": 0.7,
+        "SYNTHESIZED": 0.8, "HEARSAY": 0.5,
+    }
+    _PROV_DEFAULT = 0.9
+
+    def _prov_w(entry):
+        prov = entry.get("provenance")
+        if not prov:
+            return _PROV_DEFAULT
+        return _PROV_WEIGHTS.get(str(prov).upper(), _PROV_DEFAULT)
+
+    def _key(r):
+        util = (r.get("utilization") or {}).get("utilization_score", 0) or 0
+        # M-5: provenance is the secondary key (a trust signal — DIRECT over
+        # HEARSAY at equal utility). When the poignancy blend is on, the
+        # poignancy factor stays a lower-priority key so it still orders the
+        # large util*pf==0 mass within equal provenance.
+        if blend:
+            pf = _poignancy_weight(r, cfg)
+            return (util * pf, _prov_w(r), pf, r.get("created", "") or "")
+        return (util, _prov_w(r), r.get("created", "") or "")
+
+    entries.sort(key=_key, reverse=True)
     return entries
 
-def load_reasoning_bank(categories, depth="medium", read_only=False):
+def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=None,
+                        as_of=None):
     """Load active reasoning bank entries, partitioned into domain + universal.
+
+    entry_type (g-306-11): when non-null, restrict the candidate set to records
+    whose `entry_type` field equals it (e.g. "procedure"). The filter is applied
+    to `active` BEFORE partition/sort/cap/bump, so the bump-set==return-set
+    invariant below still holds and non-matching entries' retrieval_count is
+    never polluted. None (the default) = no filter — byte-identical to the
+    pre-g-306-11 behavior; existing callers need no change.
+
+    as_of (g-306-36): when non-null (an ISO-8601 instant T), switch from the
+    "current active records" view to the BI-TEMPORAL point-in-time view —
+    return the record VERSIONS that were valid at T (`_valid_at`), regardless
+    of current `status`. The status filter is DROPPED on this path on purpose:
+    a record that was active at T but has since been falsified (status retired,
+    valid_to=T2) must still surface for "what was believed at T". as_of also
+    forces NO counter bump — a historical read is observational and must not
+    inflate the retrieval_count that ranks CURRENT records. None (the default)
+    = exact pre-g-306-36 current-version behavior.
 
     Universal entries (framework-* category OR applies_to in {any, framework})
     are always surfaced as meta_lessons, capped at UNIVERSAL_RB_CAP, ordered by
@@ -649,8 +779,19 @@ def load_reasoning_bank(categories, depth="medium", read_only=False):
     next call picks it up. Acceptable.
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
+    as_of_dt = _as_of_dt_or_raise(as_of)
     records = read_jsonl(RB_PATH)
-    active = [r for r in records if r.get("status") == "active"]
+    # g-306-36: as_of set => point-in-time validity filter (versions valid at T,
+    # status-agnostic). as_of None => current-active view (byte-identical path).
+    if as_of_dt is None:
+        active = [r for r in records if r.get("status") == "active"]
+    else:
+        active = [r for r in records if _valid_at(r, as_of_dt)]
+    # g-306-11: optional entry_type filter (e.g. "procedure"). Applied here,
+    # before partition/sort/cap/bump, so both partitions and the bump-set are
+    # restricted consistently. None => no-op (default).
+    if entry_type is not None:
+        active = [r for r in active if r.get("entry_type") == entry_type]
     universal = [r for r in active if is_universal_rb(r)]
     domain = [r for r in active if not is_universal_rb(r)
               and _entry_matches(r, categories)]
@@ -659,7 +800,10 @@ def load_reasoning_bank(categories, depth="medium", read_only=False):
     sort_universal_rbs(universal)
     universal = universal[:UNIVERSAL_RB_CAP]
 
-    if not read_only:
+    # g-306-36: never bump on a point-in-time (as_of) read — it is observational
+    # history, not current usage, and would inflate the counters that rank
+    # current records (and could touch retired/closed versions).
+    if not read_only and as_of_dt is None:
         bump_ids = {r["id"] for r in domain} | {r["id"] for r in universal}
 
         def _should_bump(rec):
@@ -670,12 +814,16 @@ def load_reasoning_bank(categories, depth="medium", read_only=False):
 
     return domain, universal
 
-def load_guardrails(categories, depth="medium", read_only=False):
+def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
     """Load active guardrails matching the requested categories.
 
     Filtered by `_entry_matches` (strict category, then token-overlap fallback), sorted by
     `utilization.utilization_score` desc then `created` desc, capped at
     SUPPLEMENTARY_CAPS[depth].
+
+    as_of (g-306-36): point-in-time validity filter — see load_reasoning_bank.
+    Non-null as_of returns the guardrail VERSIONS valid at T (status-agnostic,
+    no counter bump). None = current-active view (byte-identical path).
 
     INVARIANT (utility_ratio alignment): bump fires only on the records
     actually returned. Mirrored by utilization-feedback.py
@@ -684,13 +832,17 @@ def load_guardrails(categories, depth="medium", read_only=False):
     Concurrent `guardrails-add.sh` writes are protected by the lock.
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
+    as_of_dt = _as_of_dt_or_raise(as_of)
     records = read_jsonl(GUARD_PATH)
-    active = [r for r in records if r.get("status") == "active"]
+    if as_of_dt is None:
+        active = [r for r in records if r.get("status") == "active"]
+    else:
+        active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
     _sort_by_utility(filtered)
     filtered = filtered[:cap]
 
-    if not read_only:
+    if not read_only and as_of_dt is None:
         bump_ids = {r["id"] for r in filtered}
 
         def _should_bump(rec):
@@ -701,25 +853,36 @@ def load_guardrails(categories, depth="medium", read_only=False):
 
     return filtered
 
-def load_pattern_signatures(categories, depth="medium", read_only=False):
+def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=None):
     """Load active pattern signatures matching the requested categories.
 
     Filtered by `_entry_matches` (strict category, then token-overlap fallback), sorted by utilization, capped at
     SUPPLEMENTARY_CAPS[depth]. Pattern signatures are tiny (~5 active today)
     so the cap rarely binds — the filter is what matters when the corpus grows.
 
+    as_of (g-306-36): point-in-time validity filter — see load_reasoning_bank.
+    Pattern signatures carry no explicit valid_from/valid_to yet (out of the
+    g-306-35 writer scope), but `_valid_at` falls back to `created`, so an as_of
+    query still returns a COHERENT point-in-time view (patterns that existed at
+    T) alongside the as_of-filtered RB/guardrails — not current patterns mixed
+    with historical RB. None = current-active view (byte-identical path).
+
     INVARIANT (utility_ratio alignment): bump fires only on returned records.
     See load_reasoning_bank docstring. Concurrent `pattern-signatures-add.sh`
     writes are protected by the lock.
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
+    as_of_dt = _as_of_dt_or_raise(as_of)
     records = read_jsonl(SIGS_PATH)
-    active = [r for r in records if r.get("status") == "active"]
+    if as_of_dt is None:
+        active = [r for r in records if r.get("status") == "active"]
+    else:
+        active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
     _sort_by_utility(filtered)
     filtered = filtered[:cap]
 
-    if not read_only:
+    if not read_only and as_of_dt is None:
         bump_ids = {r["id"] for r in filtered}
 
         def _should_bump(rec):
@@ -945,8 +1108,15 @@ def load_experiences(categories, depth, read_only=False):
 
     return selected
 
-def load_beliefs(categories):
-    """Load active/weakened beliefs. Returns list of belief dicts."""
+def load_beliefs(categories, as_of=None):
+    """Load active/weakened beliefs. Returns list of belief dicts.
+
+    as_of (g-306-36): when non-null, return the belief VERSIONS valid at the
+    instant T (`_valid_at`, status-agnostic) instead of the current
+    active/weakened set — "what did I believe at T". Beliefs carry valid_from /
+    valid_to (g-306-35 stamping) with last_observed as the legacy floor. None =
+    current view (byte-identical path).
+    """
     beliefs_data = read_yaml(BELIEFS_PATH)
     if not beliefs_data:
         return []
@@ -955,10 +1125,13 @@ def load_beliefs(categories):
     if not isinstance(beliefs_list, list):
         return []
 
-    return [
-        b for b in beliefs_list
-        if b.get("status") in ("active", "weakened")
-    ]
+    as_of_dt = _as_of_dt_or_raise(as_of)
+    if as_of_dt is None:
+        return [
+            b for b in beliefs_list
+            if b.get("status") in ("active", "weakened")
+        ]
+    return [b for b in beliefs_list if _valid_at(b, as_of_dt)]
 
 def load_experiential_index(categories):
     """Load experiential index entries for categories."""
@@ -999,6 +1172,23 @@ _DEFAULT_RETRIEVAL_CFG = {
     "utility_weight_min": 0.5,
     "utility_weight_max": 1.5,
     "utility_weight_neutral_below_retrievals": 5,
+    # Poignancy blend (g-306-08, BRD Gap 1a). DEFAULT OFF — mirrors
+    # core/config/tree.yaml retrieval:. When false, _poignancy_weight() returns
+    # 1.0 for every record and ranking is identical to pre-g-306-08.
+    "poignancy_blend_enabled": False,
+    "poignancy_weight_min": 1.0,
+    "poignancy_weight_max": 1.5,
+    # PPR blend (g-306-44, BRD Gap 1b+1c; HippoRAG 2405.14831). DEFAULT OFF —
+    # mirrors the poignancy blend above. When false, _ppr_weight() returns 1.0
+    # for every node AND _score_weight_limit skips the PPR pass entirely, so
+    # ranking is byte-identical to pre-g-306-44. When true, seeds Personalized
+    # PageRank from the top-N baseline (token-overlap) matches over the Mind
+    # knowledge-graph and applies a boost-only graph-proximity factor, surfacing
+    # multi-hop-relevant records a pure-lexical match misses.
+    "ppr_blend_enabled": False,
+    "ppr_weight_min": 1.0,
+    "ppr_weight_max": 1.5,
+    "ppr_seed_top_n": 5,
 }
 
 _RETRIEVAL_CFG_CACHE = None
@@ -1025,6 +1215,19 @@ def _utility_weight(node, cfg=None):
     rc = node.get("retrieval_count", 0) or 0
     if rc < cfg["utility_weight_neutral_below_retrievals"]:
         return 1.0
+    # Path-c no-feedback-signal exemption (origin/design g-115-1284, guard-393).
+    # A node with zero feedback of ANY kind is UNMEASURED, not unhelpful:
+    # times_inferred_helpful is starved (no realistic auto-increment path) while
+    # times_noise auto-accrues, so without this guard _utility_weight penalizes the
+    # absent positive signal as negative (utility_ratio -> 0, w -> 0.5 floor). Extends
+    # the "can't punish what hasn't had a chance" principle (the rc check above) from
+    # retrieval-count to feedback-signal. Any times_noise keeps the penalty (real
+    # negative signal); self-correcting -- junk accrues noise -> re-penalized,
+    # valuable-but-uncited stays neutral -> fair chance to be retrieved + attested.
+    if (node.get("times_helpful", 0) or 0) == 0 \
+       and (node.get("times_inferred_helpful", 0) or 0) == 0 \
+       and (node.get("times_noise", 0) or 0) == 0:
+        return 1.0
     ur = node.get("utility_ratio", 0) or 0
     w = 0.5 + float(ur)
     lo = float(cfg["utility_weight_min"])
@@ -1034,6 +1237,160 @@ def _utility_weight(node, cfg=None):
     if w > hi:
         return hi
     return w
+
+def _poignancy_weight(record, cfg=None):
+    """Map a record's poignancy (1-10) to a multiplicative score factor.
+
+    Boost-only, null-safe, flag-gated (g-306-08, BRD Gap 1a; Generative Agents
+    2304.03442). Returns 1.0 — a no-op factor — when the blend flag is off OR
+    the record carries no poignancy. When enabled and poignancy is set, maps
+    poignancy linearly from [1, 10] onto [poignancy_weight_min,
+    poignancy_weight_max]. With the default min of 1.0 the factor is always
+    >= 1.0, so the blend can only PROMOTE high-poignancy records — it never
+    demotes anything below its current effective score, which is what makes the
+    "no known-good knowledge hidden" A/B criterion hold by construction.
+
+    `record` is any dict carrying an optional top-level `poignancy` field
+    (a tree-node `_tree.yaml` entry OR a reasoning-bank record). Missing, None,
+    or unparseable poignancy -> neutral 1.0, so legacy records are null-safe
+    with no backfill required.
+    """
+    cfg = cfg or _load_retrieval_config()
+    if not cfg.get("poignancy_blend_enabled", False):
+        return 1.0
+    p = record.get("poignancy")
+    if p is None:
+        return 1.0
+    try:
+        p = float(p)
+    except (TypeError, ValueError):
+        return 1.0
+    if p < 1.0:
+        p = 1.0
+    elif p > 10.0:
+        p = 10.0
+    lo = float(cfg.get("poignancy_weight_min", 1.0))
+    hi = float(cfg.get("poignancy_weight_max", 1.5))
+    # p=1 -> lo, p=10 -> hi (linear interpolation).
+    return lo + (p - 1.0) / 9.0 * (hi - lo)
+
+_PPR_MODULE_CACHE = None
+
+def _load_ppr_module():
+    """importlib-load the hyphen-named knowledge-graph-ppr.py once per process.
+
+    Returns the module, or None if it cannot be loaded (fail-open: a missing or
+    broken PPR module just removes the blend, it never breaks retrieval). The
+    False sentinel records a prior failed attempt so we do not re-pay the import
+    cost on every call when the module is genuinely absent.
+    """
+    global _PPR_MODULE_CACHE
+    if _PPR_MODULE_CACHE is not None:
+        return _PPR_MODULE_CACHE or None
+    try:
+        import importlib.util
+        ppr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "knowledge-graph-ppr.py")
+        spec = importlib.util.spec_from_file_location("knowledge_graph_ppr",
+                                                      ppr_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PPR_MODULE_CACHE = mod
+        return mod
+    except Exception:
+        _PPR_MODULE_CACHE = False  # tried + failed; do not retry this process
+        return None
+
+def _compute_ppr_scores(seed_keys, cfg=None):
+    """Seed Personalized PageRank from graph-node keys; return {graph_key: norm}.
+
+    `norm` is the PPR score divided by the maximum in the ranking, so it lies in
+    [0, 1] and is directly consumable by _ppr_weight. Returns {} (-> _ppr_weight
+    no-ops to 1.0 everywhere) when the blend flag is off, there are no seeds, the
+    PPR module/graph is unavailable, or the ranking is empty. Fail-open at every
+    layer: a PPR failure never breaks retrieval — it removes the boost and leaves
+    the baseline ranking unchanged (g-306-44).
+    """
+    cfg = cfg or _load_retrieval_config()
+    if not cfg.get("ppr_blend_enabled", False) or not seed_keys:
+        return {}
+    mod = _load_ppr_module()
+    if mod is None:
+        return {}
+    try:
+        ranked, _meta = mod.compute(list(seed_keys), exclude_pseudo=False)
+    except Exception:
+        return {}
+    if not ranked:
+        return {}
+    max_score = ranked[0][1] or 0.0
+    if max_score <= 0:
+        return {}
+    return {node: (score / max_score) for node, score in ranked}
+
+def _ppr_weight(graph_key, ppr_scores, cfg=None):
+    """Map a node's normalized PPR score to a multiplicative boost factor.
+
+    Boost-only, null-safe, flag-gated (g-306-44, BRD Gap 1b+1c; HippoRAG
+    2405.14831). Mirrors _poignancy_weight: returns 1.0 (no-op) when the blend
+    flag is off, when ppr_scores is empty, or when this node is absent from the
+    PPR ranking. When enabled, maps the node's normalized PPR score (in [0, 1])
+    linearly onto [ppr_weight_min, ppr_weight_max]. With the default min of 1.0
+    the factor is always >= 1.0, so the blend can only PROMOTE graph-proximate
+    records -- never demotes -- preserving the no-regression A/B criterion by
+    construction (the same property the poignancy blend relies on).
+    """
+    cfg = cfg or _load_retrieval_config()
+    if not cfg.get("ppr_blend_enabled", False):
+        return 1.0
+    if not ppr_scores:
+        return 1.0
+    score = ppr_scores.get(graph_key)
+    if score is None:
+        return 1.0
+    lo = float(cfg.get("ppr_weight_min", 1.0))
+    hi = float(cfg.get("ppr_weight_max", 1.5))
+    return lo + float(score) * (hi - lo)
+
+def _graph_node_key_candidates(key, node):
+    """Knowledge-graph node ids ("node:<...>") a retrieval candidate may map to.
+
+    knowledge-graph-build.py keys a tree node by its front-matter `key` when
+    present, else by the tree-root-relative POSIX path (no .md suffix).
+    retrieve.load_tree_nodes keys the SAME node by BASENAME, so the naive
+    "node:"+key the PPR blend first shipped with matched ZERO graph nodes on real
+    data -- the blend was silently inert until g-306-45's multi-hop validation
+    found it (graph stores node:execution/.../framework-patterns; the blend seeded
+    node:framework-patterns). Recover the build's path form from the candidate's
+    `file` field and return it FIRST, then the basename form as a fallback (covers
+    synthetic test nodes that carry no `file`, and the minority of nodes the build
+    keyed by an explicit front-matter `key`). The caller picks whichever form is
+    actually present in the graph/PPR ranking.
+    """
+    out = []
+    f = str((node or {}).get("file") or "").replace("\\", "/")
+    marker = "/knowledge/tree/"
+    i = f.find(marker)
+    if i >= 0:
+        rel = f[i + len(marker):]
+        if rel.endswith(".md"):
+            rel = rel[:-3]
+        if rel:
+            out.append("node:" + rel)
+    bk = "node:" + key
+    if bk not in out:
+        out.append(bk)
+    return out
+
+def _resolve_ppr_key(key, node, ppr_scores):
+    """Pick this candidate's graph-node id that is present in the PPR ranking,
+    preferring the path-derived form (g-306-45). Falls back to the first
+    candidate when none is in the ranking (the weight then no-ops to 1.0)."""
+    cands = _graph_node_key_candidates(key, node)
+    for cand in cands:
+        if cand in ppr_scores:
+            return cand
+    return cands[0]
 
 def _score_weight_limit(matched, channels, limit,
                         query_text="", all_nodes=None):
@@ -1068,9 +1425,40 @@ def _score_weight_limit(matched, channels, limit,
             d_vm = idf_index["vectors"].get(key, ({}, 0.0))
             base += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)
         w = _utility_weight(node, cfg)
-        effective = base * w
+        # Poignancy blend (g-306-08): third multiplicative factor, 1.0 (no-op)
+        # when the blend flag is off or the node carries no poignancy.
+        p = _poignancy_weight(node, cfg)
+        effective = base * w * p
         scored.append((key, node, effective, channel, base, w))
     scored.sort(key=lambda x: -x[2])
+
+    # PPR blend (g-306-44): seed Personalized PageRank from the top-N baseline
+    # (token-overlap) matches and apply a boost-only graph-proximity factor, so
+    # records reachable in 1-2 hops from the recognized query entities surface
+    # above lexically-unrelated ones (HippoRAG 2405.14831). Skipped entirely when
+    # the flag is off -> ranking byte-identical to baseline (zero-cost no-op).
+    # Tree-node graph keys are "node:<key>" in the knowledge-graph build namespace.
+    if cfg.get("ppr_blend_enabled", False) and scored:
+        top_n = int(cfg.get("ppr_seed_top_n", 5) or 5)
+        # Seed from the top-N baseline matches, mapping each to its knowledge-graph
+        # node id (path-derived via _graph_node_key_candidates) rather than the
+        # naive "node:"+basename, which matched NOTHING in the graph -- the blend
+        # was inert on real data until g-306-45 (graph keys are node:<relpath>).
+        seed_keys = []
+        for entry in scored[:top_n]:
+            seed_keys.extend(_graph_node_key_candidates(entry[0], entry[1]))
+        ppr_scores = _compute_ppr_scores(seed_keys, cfg)
+        if ppr_scores:
+            rescored = [
+                (key, node,
+                 eff * _ppr_weight(_resolve_ppr_key(key, node, ppr_scores),
+                                   ppr_scores, cfg),
+                 channel, base, w)
+                for (key, node, eff, channel, base, w) in scored
+            ]
+            rescored.sort(key=lambda x: -x[2])
+            scored = rescored
+
     if all_nodes and len(scored) > limit:
         return _mmr_rerank(scored, all_nodes, limit)
     return scored[:limit]

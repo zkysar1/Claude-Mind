@@ -19,12 +19,17 @@
 # Behavior:
 #   - Resolves the bound agent via MIND_AGENT env var (injected by the
 #     PreToolUse[Bash] hook). Refuses to run with no binding.
-#   - Reads <agent>/session/pending-questions.yaml. Two on-disk shapes
-#     are tolerated:
-#       (A) top-level dict with `questions:` list  (canonical / newer)
-#       (B) list whose single element is a dict with `questions:` key (legacy)
-#     New entries are appended to the existing shape; the script does not
-#     normalize between A and B (out of scope; would surprise readers
+#   - Reads <agent>/session/pending-questions.yaml. Three on-disk shapes
+#     are tolerated, kept in lock-step with the reader
+#     pending-questions-sweep.py::_load_questions (rb-1786 — a paired
+#     reader/writer over one store MUST tolerate the same shapes):
+#       (A) top-level dict with `questions:` list             (canonical / newer)
+#       (B) list carrying a dict with a `questions:` key       (legacy wrapper)
+#       (C) bare top-level list of entry dicts                 (shape C)
+#       (mixed B+C) a list carrying BOTH a wrapper element and bare entry
+#                   dicts (alpha's real on-disk shape, 2026-06-14 audit)
+#     New entries are appended preserving the existing shape; the script does
+#     not normalize between shapes (out of scope; would surprise readers
 #     mid-session).
 #   - Refuses duplicate IDs.
 #   - Sets `status: pending` and `created: <local ISO timestamp>`.
@@ -126,35 +131,57 @@ context = os.environ.get("CONTEXT", "")
 with open(pq_file, "r", encoding="utf-8") as f:
     data = yaml.safe_load(f)
 
-# Detect on-disk shape. Two variants observed (2026-05-17 audit):
-#   shape A: {"questions": [ {...}, {...} ]}        — canonical / delta
-#   shape B: [ {"questions": [ {...}, {...} ]} ]    — legacy / alpha
-def get_list(d):
+# Detect on-disk shape. Three variants tolerated, kept in lock-step with the
+# reader pending-questions-sweep.py::_load_questions (rb-1786: a paired
+# reader/writer over one store MUST tolerate the same shapes):
+#   shape A:   {"questions": [ {...}, ... ]}            — canonical / delta
+#   shape B:   [ {"questions": [ {...}, ... ]}, ... ]   — list with wrapper element
+#   shape C:   [ {"id": ...}, {"id": ...}, ... ]        — bare list of entry dicts
+#   mixed B+C: a list carrying BOTH a wrapper element and bare entry dicts
+#              (alpha's real on-disk shape, 2026-06-14 audit)
+# resolve() returns (append_target, all_entries, ok):
+#   append_target — the list to .append() the new entry into (a wrapper's
+#                   "questions" list for A/B, or the top-level list itself for C)
+#   all_entries   — every existing entry dict, flattened across the whole
+#                   container, so the duplicate-id check sees bare entries too
+#   ok            — False when the container shape is unrecognized
+def resolve(d):
     if isinstance(d, dict) and isinstance(d.get("questions"), list):
-        return d["questions"], "A"
-    if (
-        isinstance(d, list)
-        and len(d) >= 1
-        and isinstance(d[0], dict)
-        and isinstance(d[0].get("questions"), list)
-    ):
-        return d[0]["questions"], "B"
-    return None, None
+        ql = d["questions"]
+        return ql, [e for e in ql if isinstance(e, dict)], True
+    if isinstance(d, list):
+        all_entries, wrapper = [], None
+        for item in d:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("questions"), list):
+                if wrapper is None:
+                    wrapper = item
+                all_entries.extend(
+                    e for e in item["questions"] if isinstance(e, dict)
+                )
+            elif "id" in item or "question" in item:
+                all_entries.append(item)
+        if wrapper is not None:
+            return wrapper["questions"], all_entries, True
+        # pure bare list (shape C): the top-level list IS the entry list
+        return d, all_entries, True
+    return None, None, False
 
 if data is None:
     # Empty file — start as shape A.
     data = {"questions": []}
-    questions, shape = data["questions"], "A"
+    append_target, existing = data["questions"], []
 else:
-    questions, shape = get_list(data)
-    if questions is None:
+    append_target, existing, ok = resolve(data)
+    if not ok:
         sys.stderr.write(
             f"pending-questions-add: {pq_file} schema not recognized\n"
         )
         sys.exit(2)
 
-# Refuse duplicate IDs.
-for q in questions:
+# Refuse duplicate IDs (across ALL entries, flattened — matches the reader).
+for q in existing:
     if isinstance(q, dict) and q.get("id") == new_id:
         sys.stderr.write(
             f"pending-questions-add: duplicate id '{new_id}' "
@@ -177,17 +204,12 @@ if qtype:
 if context:
     entry["context"] = context
 
-questions.append(entry)
+append_target.append(entry)
 
-# Preserve original shape on write.
-if shape == "A":
-    out = {"questions": questions}
-elif shape == "B":
-    data[0]["questions"] = questions
-    out = data
-else:
-    sys.stderr.write("pending-questions-add: internal shape error\n")
-    sys.exit(3)
+# In-place mutation above preserves the original container shape on write:
+# A/B append into the wrapper's "questions" list, C appends as a new
+# top-level list element.
+out = data
 
 try:
     with open(pq_file, "w", encoding="utf-8") as f:

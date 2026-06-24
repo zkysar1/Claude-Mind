@@ -236,9 +236,31 @@ fi
 #
 # Heuristic: an untracked file whose mtime is BEFORE committer.claimed_at
 # existed BEFORE this agent took ownership of its goal, therefore it is not
-# part of this commit's intent. Tolerate 5s of clock skew. The filter is OFF
-# when claimed_at is unavailable (fresh install, test repo) — fail-open since
-# we can't discriminate without the timestamp anchor.
+# part of this commit's intent. Tolerate 5s of clock skew.
+#
+# INERT-BY-DESIGN IN THE NORMAL CLOSE PATH (5 / , verified
+# 2026-06-10). committer_claimed_at_epoch resolves to 0 — so the pre-claim
+# filter below (guarded by `committer_claimed_at_epoch -gt 0`) is SKIPPED —
+# during EVERY normal deep-outcome close, not merely fresh-install/test repos.
+# iteration-close.sh do_verify ( Step 3) clears team-state.in_flight
+# BEFORE do_state_update invokes this script, so the live in_flight.claimed_at
+# read below returns null at commit time. self_claimed_at=0 is the RULE, not
+# the exception. This is the SAME root cause pinned for the sibling Python
+# filter _cross_agent_attribution_filter.py by 2, whose regression
+# test (test_attribution_filter_no_self_inflight.py) records the team decision:
+# do NOT add a "Source 4" claim-time anchor (e.g. snapshotting claimed_at into
+# iteration-checkpoint.json and reading THAT) — the standing bias is "never
+# silently drop self-authored work," and a stale/wrong anchor risks exactly
+# that. The PRIMARY defense for partner WIP at neutral paths is therefore the
+# partner-uncommitted-log filter (, below): it never reads claimed_at,
+# so it drops logged partner edits regardless of in_flight state, and its input
+# is comprehensive — every Write/Edit/MultiEdit routes through the
+# uncommitted-edits-record.sh PostToolUse hook. The residual uncovered surface
+# is partner files created via NON-hook paths (shell cp/touch/redirect) that
+# also predate the claim and are absent from the partner's log — narrow, and
+# accepted as best-effort here rather than closed with a fragile anchor.
+# Fail-open: when the anchor is genuinely absent (this path), the filter simply
+# does not fire.
 committer_claimed_at_epoch=0
 committer_claimed_at_iso=""
 if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" ]]; then
@@ -342,20 +364,33 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
           partner_uncommitted_owner["$recorded_path"]="$partner"
         fi
       done < <(LOG_PATH="$partner_log" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
-import json, os, sys
+import json, os, sys, time
 # Normalize recorded paths to PROJECT_ROOT-relative POSIX form so legacy
 # absolute uncommitted-edits.jsonl entries (C:/...) match the relative
 # git-status candidates checked below (0). SINGLE SOURCE OF TRUTH
-# (rb-1405): import the SAME normalizer the Python attribution filter uses so
-# the two uncommitted-edits.jsonl consumers cannot drift on path format.
+# (rb-1405): import the SAME normalizer AND age-cutoff helpers the Python
+# attribution filter uses so the two uncommitted-edits.jsonl consumers cannot
+# drift on path format OR staleness policy ().
 sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
 try:
-    from _cross_agent_attribution_filter import _normalize_rel_path
+    from _cross_agent_attribution_filter import (
+        _normalize_rel_path, _entry_is_stale, _max_age_sec,
+    )
 except Exception:
     def _normalize_rel_path(p, root):  # fail-open: identity if import fails
         return p
+    def _entry_is_stale(rec, max_age_sec, now_epoch):  # fail-open: never drop
+        return False
+    def _max_age_sec():
+        return 48 * 3600.0
 proot = os.environ.get("XAGENT_ROOT", "")
 p = os.environ.get("LOG_PATH", "")
+# : a partner claim older than the cutoff (edit_ts/mtime) is STALE and
+# must not suppress the committer's legitimate same-session edit (msg-1904 — a
+# 3-week-old charlie settings.json entry dropped alpha's edit). SSOT staleness
+# policy lives in _cross_agent_attribution_filter; both consumers call it.
+max_age_sec = _max_age_sec()
+now_epoch = int(time.time())
 try:
     with open(p, "r", encoding="utf-8") as f:
         for line in f:
@@ -367,7 +402,7 @@ try:
             except json.JSONDecodeError:
                 continue
             fp = entry.get("file", "")
-            if fp:
+            if fp and not _entry_is_stale(entry, max_age_sec, now_epoch):
                 print(_normalize_rel_path(fp, proot))
 except OSError:
     pass
@@ -400,8 +435,35 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
       recorded_path="${recorded_path%$'\r'}"
       [[ -z "$recorded_path" ]] && continue
       committer_authored_paths["$recorded_path"]=1
-    done < <(LOG_PATH="$own_log_snap" py -3 - 2>/dev/null <<'PYEOF' || true
+    done < <(LOG_PATH="$own_log_snap" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
 import json, os, sys
+# Normalize own-log paths to PROJECT_ROOT-relative POSIX form so the
+# committer_authored_paths membership check below (keyed on git-status
+# candidate `$path`, which IS repo-relative) compares equal regardless of
+# whether the entry was stored absolute (legacy C:/... entries) or relative.
+# WITHOUT this, an absolute own-log entry silently misses the relative
+# candidate, the  first-person-authorship exemption never fires, and
+# the concurrent-partner filter drops the committer's OWN file (over-exclusion;
+# guard-608 / commit 7f1df61d). SINGLE SOURCE OF TRUTH (rb-1405, 0):
+# this is the SAME _normalize_rel_path the partner-log snapshot above ()
+# imports, so the two uncommitted-edits.jsonl consumers cannot drift on path
+# format. Fix: 3 (the partner-log consumer got this fix at 0;
+# the own-log consumer added at  never did — asymmetry closed here).
+#
+# Deliberate asymmetry vs the partner block: the own-log applies normalization
+# but NOT the _entry_is_stale staleness filter. Staleness has opposite valence
+# per side — on the partner (DROP) side a stale claim must NOT suppress the
+# committer's edit; on the own (RETAIN) side a stale own entry suppressing the
+# exemption would cause MORE drops (over-exclusion), the very failure mode this
+# fix removes. So the retain side intentionally keeps the exemption regardless
+# of age. Do NOT "symmetrize" by adding staleness here.
+sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
+try:
+    from _cross_agent_attribution_filter import _normalize_rel_path
+except Exception:
+    def _normalize_rel_path(p, root):  # fail-open: identity if import fails
+        return p
+proot = os.environ.get("XAGENT_ROOT", "")
 p = os.environ.get("LOG_PATH", "")
 try:
     with open(p, "r", encoding="utf-8") as f:
@@ -415,7 +477,7 @@ try:
                 continue
             fp = entry.get("file", "")
             if fp:
-                print(fp)
+                print(_normalize_rel_path(fp, proot))
 except OSError:
     pass
 PYEOF
@@ -508,12 +570,14 @@ declare -a content_skipped_files=()
 # index entries until they fully reconcile).
 declare -a staged_files=()
 declare -a rm_only_files=()
+declare -a staged_del_files=()  # 0: already-staged deletions (porcelain "D ") — routed OUT of the git-add pathspec batch (an already-staged-deleted path matches nothing in worktree or index, so it aborts the whole `git add -A -- ...` with rc=128 and drops the entire commit)
 declare -a skipped_files=()
 declare -a cross_agent_files=()
 declare -a cross_agent_uncommitted=()  #  + 38fb983: untracked OR modified files predating claimed_at
 declare -a cross_agent_concurrent_partner=()  # : files edited DURING a partner's active in_flight (post-committer-claim)
 declare -a cross_agent_partner_uncommitted_log=()  # : files recorded in OTHER agent's uncommitted-edits.jsonl (between-claim gap)
 declare -a committer_authored_exempt=()  # : files retained despite partner in_flight because committer's OWN uncommitted-edits.jsonl proves first-person authorship
+declare -a committer_authored_log_exempt=()  # 0: files retained despite a partner ALSO recording them in uncommitted-edits.jsonl, because the committer's OWN log proves first-person authorship (the own-log check the  partner-log filter previously lacked — asymmetry with the  concurrent-partner filter)
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -626,6 +690,26 @@ while IFS= read -r line; do
       rm_only_files+=("$path")
       continue
     fi
+  fi
+
+  # Already-staged-deletion check (0): porcelain "D " (index column D,
+  # clean worktree) means the path is gone from BOTH the worktree AND the index.
+  # Including it in the batched `git add -A -- "${staged_files[@]}"` pathspec at
+  # the stage step makes git abort the ENTIRE batch with "pathspec did not match
+  # any files" (rc=128 → exit 2), silently dropping every legitimate file in this
+  # commit (confirmed empirically: a mixed `git add -A -- good staged_del
+  # also_good` stages NOTHING on the abort). The deletion is ALREADY correctly
+  # staged in the shared index and needs no re-staging — route it out of the add
+  # pathspec; the dedicated staging block below re-runs `git rm --cached
+  # --ignore-unmatch` on it (a safe rc=0 no-op on an already-removed index entry
+  # that preserves the staged deletion for the commit). Distinct from the orphan
+  # check above: that handles a WORKTREE deletion (" D") whose parent dir
+  # vanished; this handles an INDEX-staged deletion ("D ") regardless of
+  # parent-dir presence. (A " D" with parent PRESENT stages fine via add -A, so
+  # it is intentionally NOT caught here.)
+  if [[ "$status_code" == "D " ]]; then
+    staged_del_files+=("$path")
+    continue
   fi
 
   # Cross-agent uncommitted filter ( + 38fb983 extension): for files
@@ -810,14 +894,30 @@ PYEOF
     esac
   fi
   if [[ -n "$pl_match_owner" ]]; then
-    cross_agent_partner_uncommitted_log+=("$path|$pl_match_owner")
-    continue
+    if [[ -n "${committer_authored_paths["$path"]:-}" ]]; then
+      # 0: the committer's OWN uncommitted-edits.jsonl ALSO recorded
+      # this path — first-person authorship proof overrides the partner-log
+      # signal, mirroring the  own-log check in the concurrent-partner
+      # filter above (line ~818). The  partner-log filter was built
+      # WITHOUT this check (an asymmetry with the  filter), so a single
+      # physical edit double-recorded under BOTH the committer's and a partner's
+      # uncommitted-edits.jsonl (the  between-claim attribution overlap)
+      # was silently DROPPED from the committer's own commit. That drop is a WARN
+      # not an ERROR, so a deletion-free goal could report exit-0 success while
+      # leaving its own deep-close edits uncommitted (observed ,
+      # 9). Retain it; genuine partner edits absent from the committer's
+      # own log still drop via the else branch.
+      committer_authored_log_exempt+=("$path|$pl_match_owner")
+    else
+      cross_agent_partner_uncommitted_log+=("$path|$pl_match_owner")
+      continue
+    fi
   fi
 
   staged_files+=("$path")
 done <<< "$status_output"
 
-if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 ]]; then
+if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_files[@]} -eq 0 ]]; then
   # Additive reporting: print every filter category that fired non-zero
   # AND aggregate the totals. Replaces the prior mutually-exclusive branches
   # which dropped the partner-uncommitted-log message when other filters also
@@ -852,6 +952,11 @@ if [[ ${#rm_only_files[@]} -gt 0 ]]; then
   for f in "${rm_only_files[@]}"; do echo "  rm: $f" >&2; done
 fi
 
+if [[ ${#staged_del_files[@]} -gt 0 ]]; then
+  echo "[$SCRIPT_NAME] INFO: ${#staged_del_files[@]} already-staged deletion(s) (porcelain \"D \") — routed out of the git-add batch and re-staged idempotently via git rm --cached (g-115-1620: prevents the pathspec-not-found abort that would otherwise drop the whole commit)" >&2
+  for f in "${staged_del_files[@]}"; do echo "  staged-del: $f" >&2; done
+fi
+
 if [[ ${#cross_agent_files[@]} -gt 0 ]]; then
   echo "[$SCRIPT_NAME] INFO: namespace filter dropped ${#cross_agent_files[@]} cross-agent file(s) (committer=$MIND_AGENT, known agents=${known_agents[*]})" >&2
   for f in "${cross_agent_files[@]}"; do echo "  filtered (cross-agent): $f" >&2; done
@@ -877,6 +982,14 @@ if [[ ${#committer_authored_exempt[@]} -gt 0 ]]; then
   for entry in "${committer_authored_exempt[@]}"; do
     IFS='|' read -r ce_path ce_partner <<< "$entry"
     echo "  retained (committer-authored): $ce_path (partner=$ce_partner had concurrent in_flight; own-log overrode)" >&2
+  done
+fi
+
+if [[ ${#committer_authored_log_exempt[@]} -gt 0 ]]; then
+  echo "[$SCRIPT_NAME] INFO: g-115-1620 first-person-authorship exemption retained ${#committer_authored_log_exempt[@]} neutral-path file(s) the partner-uncommitted-log filter would have dropped (committer=$MIND_AGENT recorded them in its OWN uncommitted-edits.jsonl despite a partner ALSO recording them — g-115-695 between-claim double-recording)" >&2
+  for entry in "${committer_authored_log_exempt[@]}"; do
+    IFS='|' read -r cle_path cle_partner <<< "$entry"
+    echo "  retained (committer-authored-log): $cle_path (partner=$cle_partner also recorded; own-log overrode)" >&2
   done
 fi
 
@@ -927,9 +1040,52 @@ if [[ ${#stash_filtered_files[@]} -gt 0 ]]; then
     echo "  filtered (stash-overlap): $so_path (stash=$so_sha $so_ref — original author recovers via: git checkout $so_sha -- $so_path)" >&2
   done
   echo "[$SCRIPT_NAME] HINT: if these files ARE legitimately yours, recover under your signature with 'git checkout <stash-sha> -- <path>' then re-run iteration-commit. Stash entries are inspected via 'git stash list / git stash show <ref>'." >&2
-  if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 ]]; then
+  if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_files[@]} -eq 0 ]]; then
     echo "[$SCRIPT_NAME] INFO: all candidate files filtered by stash-overlap — nothing to commit" >&2
     exit 0
+  fi
+fi
+
+# --- Over-inclusion audit (6) ---------------------------------------
+# Detection-only complement to the attribution filters above. Those filters are
+# a DENYLIST: a neutral-path file is staged unless a partner signal fires
+# (namespace / mtime-vs-claim / partner in_flight / partner-log / stash). An
+# ORPHAN — a partner's uncommitted shared-path edit whose every signal has
+# lapsed (partner not in_flight, edit post-dates committer claim, edit never
+# recorded in any uncommitted-edits.jsonl) — is INDISTINGUISHABLE from the
+# committer's own unlogged neutral edit. test_concurrent_partner_no_partner_in_
+# flight_file_included pins that an own unlogged neutral file MUST stage, so an
+# orphan cannot be auto-dropped here without over-excluding legitimate own work.
+# Prevention at staging time is therefore impossible; this block makes the
+# residual over-inclusion VISIBLE + post-hoc-correctable instead of silently
+# swept under the committing goal_id (the  deep auto-override path).
+# A flagged file is EITHER a recording gap (own edit missing from the own-log)
+# OR a mis-attributed partner orphan — both actionable. The deny-vs-allow-list
+# contract question is the design decision tracked by 2 / 6.
+if [[ "$OUTCOME" == "deep" && ${#staged_files[@]} -gt 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -gt 0 ]]; then
+  declare -a unattributed_neutral=()
+  for sf in "${staged_files[@]}"; do
+    # neutral-path test: first segment is not a known agent dir (mirrors the
+    # agents/<agent>/ extraction the filters above use).
+    if [[ "$sf" == agents/* ]]; then
+      _oi_rest="${sf#agents/}"; _oi_top="${_oi_rest%%/*}"
+    else
+      _oi_top="${sf%%/*}"
+    fi
+    _oi_is_agent=0
+    for a in "${known_agents[@]}"; do
+      if [[ "$a" == "$_oi_top" ]]; then _oi_is_agent=1; break; fi
+    done
+    [[ $_oi_is_agent -eq 1 ]] && continue   # agent-dir paths handled by namespace filter
+    # neutral path: flag if NOT positively attributed via the committer own-log.
+    if [[ -z "${committer_authored_paths["$sf"]:-}" ]]; then
+      unattributed_neutral+=("$sf")
+    fi
+  done
+  if [[ ${#unattributed_neutral[@]} -gt 0 ]]; then
+    echo "[$SCRIPT_NAME] AUDIT (g-115-1426 over-inclusion): ${#unattributed_neutral[@]} neutral-path file(s) staged under goal=$GOAL_ID WITHOUT committer own-log attribution (committer=$MIND_AGENT). A partner's unrecorded shared-path edit is indistinguishable from the committer's own unlogged edit, so these cannot be auto-dropped without over-excluding legitimate own work (prevention at staging time is impossible) — review for mis-attribution:" >&2
+    for f in "${unattributed_neutral[@]}"; do echo "  unattributed (over-inclusion-risk): $f" >&2; done
+    echo "[$SCRIPT_NAME] HINT: reliable attribution requires the edit to be recorded in agents/<agent>/session/uncommitted-edits.jsonl. A flagged OWN file => recording gap; a flagged PARTNER file => mis-attribution. Deny-vs-allow-list design: g-115-1182." >&2
   fi
 fi
 
@@ -944,6 +1100,10 @@ if [[ $DRY_RUN -eq 1 ]]; then
   if [[ ${#rm_only_files[@]} -gt 0 ]]; then
     echo "files to stage (git rm --cached):"
     for f in "${rm_only_files[@]}"; do echo "  $f"; done
+  fi
+  if [[ ${#staged_del_files[@]} -gt 0 ]]; then
+    echo "files already staged for deletion (git rm --cached, idempotent):"
+    for f in "${staged_del_files[@]}"; do echo "  $f"; done
   fi
   exit 0
 fi
@@ -965,6 +1125,21 @@ if [[ ${#rm_only_files[@]} -gt 0 ]]; then
   staged_files+=("${rm_only_files[@]}")
 fi
 
+if [[ ${#staged_del_files[@]} -gt 0 ]]; then
+  # 0: already-staged deletions ("D "). The deletion is ALREADY in the
+  # shared index, so this git rm --cached --ignore-unmatch is a defensive rc=0
+  # no-op (the path is already absent from the index) — its real purpose was to
+  # keep these paths OUT of the `git add -A` pathspec above (done at routing
+  # time). --ignore-unmatch guarantees idempotence even on the already-removed
+  # entry. Runs AFTER the add (line above) so the deletion paths never re-enter
+  # the failing add batch.
+  git -C "$REPO" rm --cached --ignore-unmatch -- "${staged_del_files[@]}" 2>&1 || {
+    echo "[$SCRIPT_NAME] WARN: git rm --cached failed for staged deletions (continuing — deletion already in index)" >&2
+  }
+  # Append for JSON output so callers see the deletion was committed.
+  staged_files+=("${staged_del_files[@]}")
+fi
+
 # Commit via stdin to avoid arg-length issues with long messages.
 # Multi-agent retry loop (): git natively serializes via .git/index.lock,
 # but Windows-specific transient issues (antivirus scan holding files, sharing
@@ -973,6 +1148,23 @@ fi
 # add): the add operation is fast and less likely to collide. The mkdir-lock
 # above () now closes the cross-agent authorship-bleed race; this retry
 # handles transient infrastructure faults orthogonal to coordination semantics.
+#
+# PATHSPEC-SCOPED COMMIT (8, guard-741, rb-1907): commit ONLY the
+# attribution-filtered staged_files[] (which includes rm_only_files appended
+# above), NOT the whole index. The cross-agent filters above gate what THIS
+# script `git add`s, but a bare `git commit` commits the ENTIRE index -- so a
+# concurrent partner's PRE-STAGED WIP (staged outside this script, e.g. by a
+# partner mid-commit or a non-iteration-commit `git add`) was swept into this
+# agent's commit regardless of the filters (observed: 6, 7;
+# alpha's deliverable swept into zeta's commit despite the partner-log filter
+# correctly excluding it from staged_files[]). The `-- "${staged_files[@]}"`
+# pathspec restricts the commit to exactly the intended paths (verified: git
+# commit --only correctly commits adds+modifies+deletions and LEAVES foreign
+# pre-staged entries staged+uncommitted for the partner's own commit). This is
+# COMPLEMENTARY to the 6 detection audit, which covers the orthogonal
+# orphan-IN-staged_files case (indistinguishable from own work, so detect-only).
+# staged_files[] is guaranteed non-empty here (both-empty cases exit 0 at the
+# filter-skip guards ~L882/L992 before reaching this commit).
 MAX_RETRIES=3
 RETRY_BACKOFF_S=1
 commit_attempt=0
@@ -980,7 +1172,7 @@ commit_success=0
 commit_last_output=""
 while [[ $commit_attempt -lt $MAX_RETRIES ]]; do
   commit_attempt=$((commit_attempt + 1))
-  commit_last_output=$(echo "$commit_msg" | git -C "$REPO" commit -F - 2>&1) && {
+  commit_last_output=$(echo "$commit_msg" | git -C "$REPO" commit -F - -- "${staged_files[@]}" 2>&1) && {
     commit_success=1
     if [[ $commit_attempt -gt 1 ]]; then
       echo "[$SCRIPT_NAME] INFO: commit succeeded on retry $commit_attempt/$MAX_RETRIES" >&2
@@ -1016,8 +1208,26 @@ if [[ -n "${MIND_AGENT:-}" && ${#staged_files[@]} -gt 0 ]]; then
   if [[ -f "$own_log" ]]; then
     # Build newline-delimited set of committed rel paths.
     committed_set=$(printf '%s\n' "${staged_files[@]}")
-    OWN_LOG="$own_log" COMMITTED="$committed_set" py -3 - 2>/dev/null <<'PYEOF' || true
+    OWN_LOG="$own_log" COMMITTED="$committed_set" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
 import json, os, tempfile, sys
+# 3: normalize the own-log `file` to PROJECT_ROOT-relative POSIX before
+# the committed-set membership test — the SAME _normalize_rel_path the two
+# construction consumers use (0 partner snapshot, 3 own-log
+# snapshot), so this THIRD uncommitted-edits.jsonl consumer cannot drift on
+# path format (rb-1405 SSOT). WITHOUT this, a legacy-absolute or backslash-form
+# own-log entry never string-equals the relative committed path, so it is NEVER
+# pruned after the committer's own commit — it persists as a stale record that
+# then false-drops a partner's later legitimate edit at that path (the 
+# stale-record precondition / rb-2186). Normalizing can only ADD correct prunes
+# (canonical form never collides distinct files); it never removes a
+# legitimately-kept entry. Fail-open: identity normalizer if the import fails.
+sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
+try:
+    from _cross_agent_attribution_filter import _normalize_rel_path
+except Exception:
+    def _normalize_rel_path(p, root):  # fail-open: identity if import fails
+        return p
+proot = os.environ.get("XAGENT_ROOT", "")
 own = os.environ.get("OWN_LOG", "")
 committed = set(p.strip() for p in os.environ.get("COMMITTED", "").splitlines() if p.strip())
 if not own or not os.path.exists(own):
@@ -1033,7 +1243,7 @@ try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            fp = entry.get("file", "")
+            fp = _normalize_rel_path(entry.get("file", ""), proot)
             if fp and fp not in committed:
                 kept.append(line)
 except OSError:

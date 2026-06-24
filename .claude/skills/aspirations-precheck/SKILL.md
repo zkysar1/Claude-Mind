@@ -25,11 +25,13 @@ guardrails are checked, blockers are resolved, and recurring goals are tracked.
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter.
 
 **Step 0a: Budget Meter Start (Magic Wand 2 — g-115-509)** — initialize the
-precheck wall-clock cost meter. The meter tracks elapsed-ms across sweeps and
-returns "drop" for deferrable sweeps when the zone is `tight` OR cumulative
-elapsed exceeds `precheck.budget_pct * iteration_budget_ms` (config in
-`core/config/aspirations.yaml`). Always-run sweeps (Phase 0-pre, 0-pre2,
-0-pre3) NEVER drop. Decisions log to `agents/<agent>/session/precheck-drops.jsonl`.
+precheck cost meter. The meter returns "drop" for deferrable sweeps ONLY when
+the zone is `tight` (`zone_drop_rules.tight`). Always-run sweeps (Phase 0-pre,
+0-pre2, 0-pre3) NEVER drop. The former wall-clock budget-overrun drop path was
+REMOVED (g-115-1489 — `elapsed` measured inter-tool-call LLM latency, not script
+cost, so it dropped EVERY deferrable sweep every iteration and starved the
+fresh-eyes/felt-sense/health-regression cadence rituals). elapsed-ms is still
+logged for telemetry. Decisions log to `agents/<agent>/session/precheck-drops.jsonl`.
 
 ```
 Bash: bash core/scripts/aspirations-precheck-budget-meter.sh start
@@ -49,12 +51,15 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0 (Monitor Stale) | monitor-stale-check | medium |
 | 0.5.0 | precheck-eval | medium |
 | 0.5b.0.5 | blocker-recheck | medium |
-| 0.5b.1b | inbox-alert-age-check | medium |
+| 0.5b.1b | inbox-alert-age-check | always-run |
+| 0.5b.2b | handoff-aging-check | always-run |
 | 0.5b.3 | precondition-defer-recheck | medium |
 | 0.5b.4 | defer-recheck | medium |
 | 0.5b.5 | pending-questions-sweep | deferrable |
 | 0.5b.6 | parent-supersession-sweep | deferrable |
 | 0.5b.7 | unblock-parent-status-sweep | deferrable |
+| 0.5b.8 | routing-audit-target-status-sweep | deferrable |
+| 0.5b.10 | defer-drift-check | deferrable |
 | 0.5c | recurring-precondition-sweep | deferrable |
 | 0.5e | fresh-eyes-cadence | deferrable |
 | 0.5e.5 | fresh-eyes-program-cadence | deferrable |
@@ -66,7 +71,11 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
 2. `zone == tight` AND `tier ∈ zone_drop_rules.tight` (default `[deferrable]`)
-3. `tier == deferrable` AND cumulative `elapsed_ms > cap_ms` (budget overrun)
+(The former rule 3 — `tier == deferrable` AND `elapsed_ms > cap_ms` — was REMOVED
+in g-115-1489: wall-clock-since-meter-start is dominated by inter-tool-call LLM
+latency, not script cost, so it dropped every deferrable sweep every iteration and
+starved the cadence rituals. Zone-drop is now the sole drop path; `elapsed_ms` /
+`cap_ms` are telemetry-only.)
 
 Fail-open: any meter error returns `run`. The meter is velocity optimization,
 not safety gating — never block the loop on a meter bug.
@@ -97,10 +106,51 @@ IF partner.in_flight is non-null:
 ELSE IF partner.last_active:
     age_min = (now - partner.last_active).total_seconds() / 60
     Output: "▸ Partner ({partner-name}): no in_flight | last_active {age_min:.0f}m ago"
+
+# Inbox-alert backlog surface (g-115-849). Read inbox_alert_backlog from the
+# SAME team-state JSON already loaded above (no extra read). The domain inbox
+# sweep writes it via core/scripts/inbox-backlog-update.py (null when zero);
+# surface the aggregate queue depth so the iteration header shows how many
+# alert-derived Unblock goals are waiting un-claimed. Complements the
+# Phase 0.5b.1b age-escalation (single-alert notification) with a count.
+backlog = team_state.get("inbox_alert_backlog")  # absent/None -> treat as null
+IF backlog is a non-null dict AND backlog.get("count", 0) > 0:
+    Output: "▸ inbox-alert-backlog={backlog.count} oldest={backlog.oldest_age_hours}h goal={backlog.oldest_goal_id}"
+# ELSE: silent (null backlog or zero count)
+
 # Stash partner snapshot in iteration context for downstream phases (select drops
 # partner.in_flight.goal_id from candidates; execute Phase 4 re-reads for the
 # claim-conflict gate — re-read keeps single source of truth even if partner
 # transitioned between this read and the claim attempt).
+```
+
+## Phase 0-pre.0a: Partner-Belief Contradiction Check (g-306-29)
+
+Theory-of-Mind contradiction-triggered forced reflection — the CONSUME-side
+completion of the partner-belief loop (g-306-18 storage → g-306-28
+write+consume). Right after the live partner snapshot above (which already
+surfaced each partner's `current_focus`), compare that fresh observation against
+the domain-belief THIS agent holds about each partner. On N CONSECUTIVE
+contradicting observations (default 2 → no false-trigger on the FIRST), the held
+belief is REVISED (confidence lowered, or superseded) and the surprise is
+recorded. A belief only carries a checkable `domain` when fresh-eyes-review Phase
+2.6c wrote it with `--domain`; free-form beliefs are skipped (conservative — the
+source of the no-false-trigger guarantee for un-domained beliefs).
+
+Single bash call — daemon read + pure compute (`_belief_contradiction.py`,
+unit-tested) + conditional daemon write, all FAIL-OPEN (never blocks the loop).
+
+```
+Bash: bash core/scripts/belief-contradiction-check.sh
+# Reads team-state (each partner's current_focus + self.beliefs) + the
+# agent-private belief_contradiction_streaks WM slot, runs
+# _belief_contradiction.process_all, and on a sustained contradiction lowers/
+# supersedes the held belief via team-state-update + records the surprise to the
+# evolution log. Prints a one-line summary ("clean" when no domain-belief
+# contradiction exists). Tunables: BELIEF_CONTRADICTION_N (default 2),
+# BELIEF_CONTRADICTION_MODE (lower|supersede, default lower). Self-limiting: a
+# lowered belief decays below threshold and stops re-triggering, so the forced
+# reflection fires once per sustained contradiction, not every iteration.
 ```
 
 ## Phase 0-pre.0b: Boredom Signal Surface (observability, no action)
@@ -264,18 +314,36 @@ backlog cannot accumulate across iterations the way it did before this gate
 existed (33 core files / 605 LOC silently buffered when no consumer was wired).
 
 Pattern mirrors Phase 0-pre and Phase 0-pre2 verbatim — wm-read → if non-null →
-action → wm-set 'null'. The signal payload is the full gate JSON
-(`{"fired":true,"core_count":N,"loc_changed":N,"reason":"...","files":[...]}`),
+action → stamp `fresh_eyes_last_dispatch` → wm-set 'null'. The signal payload is
+the full gate JSON
+(`{"fired":true,"core_count":N,"loc_changed":N,"reason":"...","files":[...],"set_at":"..."}`),
 so the dispatcher has the file list + reason without re-running the gate.
+The `fresh_eyes_last_dispatch` stamp (g-115-1553) is consumed by
+`stale-sentinel-canary.py`: this sentinel is unique among the tracked four in
+that its writer (iteration-close.sh do_state_update) re-arms it on EVERY
+substantive deep close, so a bare presence-count canary false-fires even when
+this consumer keeps up. The canary keys on the dispatch timestamp ADVANCING
+across samples instead — hence the mandatory stamp on every handling.
 Cross-references: rb-428 (sentinel-lifecycle pattern), guard-343 (post-state-update
 review enforcement), g-115-280 (gap discovery — Phase 0-pre/0-pre2 had consumers,
-this slot did not).
+this slot did not), g-115-1553 (consumption-aware canary fix).
 
 ```
 Bash: wm-read.sh fresh_eyes_dispatch_pending --json
 IF signal is not null AND signal.fired == true:
     Output: "▸ FRESH-EYES-CODE GATE: fresh_eyes_dispatch_pending set ({signal.core_count} core files, {signal.loc_changed} LOC, reason={signal.reason}) — invoking /fresh-eyes-code before goal selection"
     invoke /fresh-eyes-code with files = signal.files
+    # Stamp the consumer-dispatch timestamp BEFORE clearing (g-115-1553).
+    # fresh_eyes_last_dispatch is the signal stale-sentinel-canary.py uses to
+    # tell "consumer kept up" from "consumer bypassed" — without it the canary
+    # reverts to bare presence-count and FALSE-fires, because iteration-close.sh
+    # re-arms this sentinel on EVERY substantive deep close (the canary samples
+    # AFTER the arming, so it would count consecutive-deep-closes, not bypass).
+    # Stamp on ANY handling: dispatch above OR a justified no-dispatch clear
+    # (e.g. the files turned out to be partner-attributed). Stamp FIRST so an
+    # interrupt leaves stamp-done + sentinel-still-set, which the canary reads
+    # as advanced -> reset (the safe direction).
+    printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh fresh_eyes_last_dispatch
     # Clear signal after dispatch (one-shot; next iteration's iteration-close
     # re-fires the gate if state-update produces new substantive changes).
     echo 'null' | Bash: wm-set.sh fresh_eyes_dispatch_pending
@@ -624,44 +692,60 @@ that Unblock within a few hours, the alert silently ages — no upstream
 escalation existed before this phase. The bash gate consolidates the
 scan + cooldown + notify logic into a single script call (rb-428 pattern).
 
-Severity ladder (config: `proactive_escalation.inbox_alert_age_hours`):
-  - age >= `high` (default 4h)   → fire HIGH-severity notification
-  - age >= `medium` (default 12h) → fire MEDIUM-severity notification
-  - Cooldown via `wm.proactive_escalation_log` keyed on
-    `inbox_alert_<goal_id>`. Re-fire interval matches the severity's
-    threshold (HIGH re-notify every 4h, MEDIUM every 12h) so urgency
-    cadence tracks severity. A goal aging FURTHER into HIGH after a
-    prior MEDIUM fire re-notifies under the HIGH schedule.
+Severity ladder (config: `proactive_escalation.inbox_alert_age_hours`; the two
+values are per-severity RE-NOTIFY intervals, so classification maps the
+LONGER-aged alert to the MORE-urgent HIGH — g-115-1539):
+  - age >= max(`high`, `medium`) (default 12h) → fire HIGH-severity notification
+  - age >= min(`high`, `medium`) (default 4h)  → fire MEDIUM-severity notification
+  - Cooldown via a SHARED, DURABLE coordination-board scan (g-115-1533):
+    before emailing, the sweep scans for a recent `inbox-alert-aged`
+    breadcrumb for this goal_id from ANY agent. Re-fire interval matches
+    the severity's threshold (HIGH re-notify every 4h, MEDIUM every 12h)
+    so urgency cadence tracks severity. A goal aging FURTHER into HIGH
+    after a prior MEDIUM fire re-notifies under the HIGH schedule. (The
+    original per-agent `wm.proactive_escalation_log` cooldown was the
+    email-side twin of the g-115-1531 handoff bug: N agents each emailed
+    the user about the same unclaimed alert, and a WM reset re-fired.)
 
 Fail-open at every layer: missing config, daemon unreachable, missing
-asp-115, missing alert-sweep ledger, and per-goal email-send failures all
-log to stderr and continue. `inbox-alert-age-check.py` is the single
-writer for the cooldown log entries it produces; the SKILL.md call is the
-single invoker.
+asp-115, a failed board scan (-> empty cooldown set, everything eligible
+fires), and per-goal email-send failures all log to stderr and continue.
+`inbox-alert-age-check.py` posts the `inbox-alert-aged` board breadcrumb it
+reads back as the shared cooldown; the SKILL.md call is the single invoker.
 
 ```
-# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
-Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check inbox-alert-age-check)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5b.2
+# Always-run safety gate (g-115-1526) — NOT meter-gated. This gate escalates
+# aged unclaimed alert-derived Unblock goals to the user (external party), so it
+# must fire reliably even in the tight zone; the cost is one daemon read +
+# cooldown check. Sibling of the always-run handoff-aging-check (Phase 0.5b.2b);
+# both notification-age safety gates always run. (Medium tier never dropped it
+# anyway — zone_drops=[deferrable] only — but the prior `meter check` call
+# emitted a spurious unknown-sweep WARN every iteration; sweep_tier() now
+# registers it always-run.)
 Bash: bash core/scripts/inbox-alert-age-check.sh --apply
 # Iterates asp-115 (the alert-sweep target queue). For each pending/in-progress
 # Unblock goal with origin_signal=alert-email:* whose age >= threshold:
-#   - Reads wm.proactive_escalation_log (caller-side cooldown).
+#   - Scans the coordination board for a recent `inbox-alert-aged` breadcrumb
+#     for this goal_id from ANY agent (shared+durable cooldown, g-115-1533).
 #   - On miss: fires email-send.sh notification (subject "Unclaimed alert >Nh:
 #     <goal title>", body includes goal_id + classifier subject + age + severity).
-#   - Appends a cooldown entry regardless of email-send outcome (prevents
-#     retry storm on transient email failures — same fail-open contract as
-#     blocker-recheck.sh / pending-questions-sweep.sh).
+#   - Posts an `inbox-alert-aged,<goal_id>,severity:<sev>` board breadcrumb
+#     regardless of email-send outcome (prevents retry storm on transient email
+#     failures — the breadcrumb IS the shared cooldown the next sweep reads).
 # JSON output includes `applied`, `skipped_cooldown`, and `failed`. Failure
 # counts are stderr-noted only — they do NOT block precheck.
 ```
 
-Tests: `core/scripts/tests/test_inbox_alert_age_check.py` (3 cases — no
-aged alert noop, aged HIGH alert fires, cooldown active noop). Closes the
-acceptance criterion "Tests: 3 cases" from g-115-848.
+Tests: `core/scripts/tests/test_inbox_alert_age_check.py` (7 cases — no
+aged alert noop, aged HIGH fires, cross-agent board-scan cooldown noop,
+board post outside window fires, other-goal board post does not suppress,
+plus the two candidate-filter skips). g-115-848 provided the first 3;
+g-115-1533 swapped the per-agent-WM cooldown case for the cross-agent
+board-scan cases (mirroring the g-115-1531 handoff sibling).
 
 See `core/scripts/inbox-alert-age-check.py` `_classify_severity` for the
-threshold ladder and `_on_cooldown` for the cooldown discipline.
+threshold ladder and `_read_recent_escalations` for the shared board-scan
+cooldown discipline.
 
 ## Phase 0.5b.2: Dependency Timeout Escalation
 
@@ -728,41 +812,44 @@ FOR EACH entry in dependency_blocked:
     Log: "DEPENDENCY AGING: {entry.goal_id} blocked {blocked_age:.0f}h by {root.goal_id} ({root.cause})"
 ```
 
-## Phase 0.5b.2b: Handoff Aging Escalation (Item 3)
+## Phase 0.5b.2b: Handoff Aging Escalation (Item 3; bash-enforced g-115-1524)
 
-Cross-agent handoff goals that sit in the world queue past `handoff_aging.escalate_hours`
-get a board post + proactive notification so the target agent doesn't miss them.
-Goal-selector already applies an escalating scoring bonus after `warn_hours`; this
-phase is the visibility escalation beyond that.
+Cross-agent handoff goals that sit in the world+agent queues past
+`handoff_aging.escalate_hours` (default 72) get a coordination-board
+visibility note so the target agent doesn't miss them. Goal-selector already
+applies an escalating scoring bonus after `warn_hours`; this phase is the
+visibility escalation beyond that.
+
+Bash-enforced (g-115-1524): the previous LLM-iterated pseudocode had NO bash
+backstop and silently skipped under abbreviation — a fresh-eyes-review on
+2026-06-18 found 6 handoffs aged 78-782h with an EMPTY escalation log.
+`handoff-aging-check.{py,sh}` consolidates the scan + cooldown + board-post
+into one script call (rb-428 sentinel-gate family), the bash-enforced sibling
+of Phase 0.5b.1b's `inbox-alert-age-check`. Runs unconditionally (no
+budget-meter gate — same as the original pseudocode; it is a cheap single
+daemon read + a safety gate whose whole point is that it ALWAYS runs).
 
 ```
-Read core/config/aspirations.yaml → handoff_aging.escalate_hours (default 72)
-Bash: wm-read.sh proactive_escalation_log --json
-Bash: load-aspirations-compact.sh  # world goals in context
-
-FOR EACH aspiration IN world compact data:
-    FOR EACH goal IN aspiration.goals:
-        IF goal.status NOT IN ("pending", "in-progress"): continue
-        ht = goal.get("handoff_to")
-        IF NOT ht OR ht == AGENT_NAME: continue  # only goals routed elsewhere
-        created = goal.get("handoff_created_at")
-        IF NOT created: continue
-        age_h = hours_since(created)
-        IF age_h < handoff_aging.escalate_hours: continue
-
-        escalation_key = f"handoff_{goal.id}"
-        last = find entry in proactive_escalation_log where blocker_id == escalation_key
-        IF last AND hours_since(last.sent_at) < handoff_aging.escalate_hours:
-            continue  # cooldown to avoid spam
-
-        msg = f"Handoff aged {age_h:.0f}h: {goal.title} [{goal.id}] waiting on {ht}"
-        echo "$msg" | Bash: board-post.sh --channel coordination --type status --tags handoff-aged,{goal.id},{ht}
-        echo '{"blocker_id":"'$escalation_key'","sent_at":"'$(date +%Y-%m-%dT%H:%M:%S)'"}' | Bash: wm-append.sh proactive_escalation_log
-        Log: "HANDOFF AGING: {goal.id} waiting on {ht} for {age_h:.0f}h — posted to board"
+Bash: bash core/scripts/handoff-aging-check.sh --apply
+# Iterates world + agent queues. For each pending/in-progress goal with
+# handoff_to != self AND handoff_created_at age >= handoff_aging.escalate_hours
+# AND no cooldown entry within escalate_hours: posts a coordination-board note
+# (msg "Handoff aged Nh: <title> [<id>] waiting on <ht>", tags
+# handoff-aged,<id>,<handoff_to>) and appends a cooldown entry keyed
+# handoff_<id> to wm.proactive_escalation_log. Single-invoker, idempotent
+# (cooldown), fail-open at every layer (additive board escalation — a missing
+# source just escalates fewer this run; contrast defer-recheck.py's guard-383
+# fatal posture, which protects a DESTRUCTIVE defer-clear). JSON output:
+# applied / skipped_cooldown / failed.
 ```
 
-Note: the target agent picks this up via its boot-time pending-handoffs scan
-(boot/SKILL.md Step 1.7) and via goal-selector's escalating handoff_bonus.
+Note: the target agent ALSO picks this up via its boot-time pending-handoffs
+scan (boot/SKILL.md Step 1.7) and via goal-selector's escalating handoff_bonus.
+
+Tests: `core/scripts/tests/test_handoff_aging_check.py` (5 cases — no-aged
+noop, aged fires, cooldown noop, self-routed skip, missing-created_at skip).
+See `core/scripts/handoff-aging-check.py` `run()` for the scan + cooldown
+logic and `_read_goals` for the fail-open all-queue read.
 
 ## Phase 0.5b.3: Structured Precondition Auto-Clear Sweep
 
@@ -958,6 +1045,112 @@ the three-source extraction priority and `_mark_skipped` for the atomic
 mutation. Tests at `core/scripts/tests/test_unblock_parent_status_sweep.py`
 pin the 12-case contract (canonical g-250-73 shape, three extraction
 paths, idempotency, terminal-state set, title-prefix discipline).
+
+## Phase 0.5b.8: Routing-Audit Target-Status Sweep (g-115-1353, rb-1478)
+
+Sibling to Phase 0.5b.7 — same terminal-target auto-close pattern, applied to
+the routing-audit goal class instead of the Layer-D Unblock class.
+`post-decompose-routing-audit.py` files `Investigate: routing-mismatch <target>`
+and `Investigate: routing-either-resolve <target>` goals into asp-115 when a
+freshly-stamped goal's `intended_agent` disagrees with the best Self.md
+domain-token Jaccard match. The audit goal's primary action is to re-stamp the
+TARGET's `intended_agent`. When the target lands in a terminal status
+(completed/archived/skipped/superseded), the re-stamp is MOOT and the audit goal
+survives as actionable work whose premise dissolved.
+
+Canonical incident (rb-1478 / exp-g-115-1329): routing-either-resolve fired a
+re-stamp (either→delta) on g-115-1328 which was ALREADY completed 2026-06-03
+(re-stamp moot) AND content-contradicted. This "terminal-target" sub-mode is
+distinct from the content-FP-on-a-PENDING-target sub-mode (g-115-1346) and the
+metric-bias root (rb-1249 / g-115-1200). The routing-mismatch path runs ~82% FP
+(rb-1478), so auto-closing on terminal target retires the dominant moot case; a
+genuine systemic capability_route table-gap, if real, re-fires on the next
+decompose (the audit runs every decompose) rather than lingering as a stale goal.
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check routing-audit-target-status-sweep)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+Bash: bash core/scripts/routing-audit-target-status-sweep.sh --apply
+# Iterates world + agent queues. For each pending/in-progress routing-audit goal
+# (discovered_by=post-decompose-routing-audit OR origin_signal/title routing-*)
+# with a parseable TARGET id whose target.status is terminal, marks the audit
+# goal status=skipped with outcome_note "routing-audit target resolved without
+# action needed (target_id=<X>, target.status=<Y>)". Single-writer, idempotent
+# (outcome_note prefix check), fail-quiet — same rb-428 pattern as
+# unblock-parent-status-sweep.sh / parent-supersession-sweep.sh.
+# Metrics log: <WORLD_PATH>/routing-audit-target-status-sweep-metrics.jsonl
+```
+
+See `core/scripts/routing-audit-target-status-sweep.py` `_parse_target_id` for
+the origin-signal-first extraction priority (discovered_by is the constant
+discoverer name, NOT a target id, so it is deliberately not a parse source) and
+`_mark_skipped` for the atomic mutation. Tests at
+`core/scripts/tests/test_routing_audit_target_status_sweep.py` pin the 15-case
+contract (both origin_signal forms, title fallback, unparseable generic shape,
+class membership incl. Unblock-rejection, idempotency, terminal-state set).
+
+## Phase 0.5b.10: Defer-Drift Detective Check (g-115-1406, rb defer-drift)
+
+Flags goals whose `deferred_until` has gone STALE (PAST) while a structured-
+defer marker persists. This is the precise complement of Phase 0.5b.3
+(`precondition-defer-recheck.py`), which deliberately SKIPS any goal that has
+`deferred_until` set ("the structured time gate is the authoritative scheduler
+signal"). Nothing re-probed the time gate ITSELF for drift — so when
+`deferred_until` falls into the past while the precondition it represents is
+still unmet, goal-selector's `deferred_readiness` criterion reads the expired
+gate as "defer just expired, re-evaluate now" and BOOSTS the not-ready goal to
+selector-top instead of filtering it.
+
+Canonical incident (2026-06-12, asp-304 Layer-5 cohort): g-304-11 carried
+`defer_reason "precondition_unmet: ... completes ~2026-07-11"` but
+`deferred_until=2026-05-26` — a date 16 days IN THE PAST relative to its own
+`defer_reason_set_at`. The selector surfaced it at score 8.84 despite ~18h of
+the required 30 days of telemetry. Four goals were hand-re-gated; this check
+makes the drift VISIBLE so it can never linger undetected again. See the
+reasoning-bank entry "deferred_until drift from defer_reason prose makes
+goal-selector deferred_readiness boost data-immature goals to top".
+
+DETECTIVE, NOT CORRECTIVE. The script never mutates: the correct future date
+lives in the `defer_reason` prose, which it cannot parse reliably (and clearing
+the defer would wrongly surface a genuinely not-ready goal). It SURFACES drift
+for re-gate-by-judgment — exactly the ~30s fix a human/agent applies once the
+drift is known. The LLM does the (deduplicated) Investigate filing below, not
+the script — same detective-script + LLM-acts pattern as precheck-eval flags.
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check defer-drift-check)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+Bash: bash core/scripts/defer-drift-check.sh --output json
+Parse drift_count + drifted[].
+IF drift_count == 0:
+    continue silently to Phase 0.5c   # the clean, common case
+ELSE:
+    Output: "▸ ⚠ DEFER-DRIFT: {drift_count} goal(s) with a PAST deferred_until + structured-defer marker (deferred_readiness pollution risk)"
+    FOR EACH d in drifted[:5]:
+        Output: "    {d.goal_id} ({d.source}): deferred_until={d.deferred_until} {d.hours_past}h past | {d.defer_prefix} | pc={d.precondition_status}"
+    # File ONE deduplicated Investigate so the drift gets re-gated by judgment.
+    # Dedup: skip if an open Investigate with origin_signal/title naming
+    # "defer-drift" already exists (a single open re-gate pass covers all
+    # current drift — mirrors the rb-428 sweep family's idempotency posture).
+    Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress --contains "defer-drift")
+    IF existing is empty:
+        Compose an Investigate listing each drifted goal + its precondition_status
+        (prose -> re-gate deferred_until to the correct future date from the
+        defer_reason; ready -> the gate is merely stale, clear the defer;
+        still_unmet -> re-gate). File via aspirations-add-goal.sh into asp-115
+        (participants: [agent], category framework-architecture, priority MEDIUM,
+        origin_signal "defer-drift-audit").
+```
+
+See `core/scripts/defer-drift-check.py` `_classify_drift` for the eligibility
+ladder (non-terminal + structured-defer prefix + `deferred_until` set, parseable,
+and PAST) and `_precondition_status` for the prose/ready/still_unmet annotation.
+Tests at `core/scripts/tests/test_defer_drift_check.py` pin the contract
+(canonical g-304-11 shape, future-gate rejection, terminal-status rejection,
+free-form-defer rejection, no-deferred_until rejection, malformed-date tolerance,
+min-hours-past suppression, all three structured prefixes).
 
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep
 

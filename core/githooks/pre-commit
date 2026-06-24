@@ -91,3 +91,18 @@ bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"
 if git diff --cached --name-only | grep -q '^core/config/session-manifest\.yaml$'; then
     bash "$REPO/core/scripts/session-manifest-gate.sh"
 fi
+
+# Gate 10: skill-edit earn-the-keep chokepoint (g-115-1467, earn-the-keep
+# Phase 1 / G3, 2026-06-14). A SKILL.md EDIT must not REGRESS structural
+# completeness (HEAD vs working tree) — front matter, Return Protocol section,
+# body substance, heading structure, procedure — scored through
+# eval_harness.gate(no_regression), the validation substrate the keystone
+# self-check validated (G3). Blocks the 2026-05-11 front-matter-loss incident
+# shape (.claude/rules/domain-free-examples.md) at commit time. Self-gates
+# (no-op when no SKILL.md is staged); the conditional avoids spawning Python
+# otherwise (Gate 5/9 no-op-unless-staged precedent). Bypass:
+# SKILL_EDIT_GATE_OVERRIDE="<justification>". See
+# core/scripts/skill-edit-precommit-gate.py.
+if git diff --cached --name-only | grep -qE '^\.claude/skills/[^/]+/SKILL\.md$'; then
+    $PY "$REPO/core/scripts/skill-edit-precommit-gate.py"
+fi

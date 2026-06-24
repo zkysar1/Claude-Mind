@@ -222,17 +222,29 @@ def main():
     # --- Loop state (critical for loop continuity) ---
     loop_state = all_slots.get("loop_state")
     if loop_state and isinstance(loop_state, dict):
+        signals = loop_state.get("signals") or {}
         parts = []
-        for key in ["goals_completed", "productive_goals", "evolutions",
-                     "routine_streak_global", "goals_since_last_tree_update",
-                     "consecutive_blocked_sleeps"]:
+        # goals_completed / productive_goals / evolutions live at the top level
+        # of loop_state; the three streak/drift counters are nested under
+        # loop_state["signals"]. Reading the nested keys at top-level returned
+        # None and silently dropped the boredom/streak signal from the
+        # post-autocompact display (2 / zeta-1385).
+        for key in ["goals_completed", "productive_goals", "evolutions"]:
             val = loop_state.get(key)
+            if val is not None and val != 0:
+                parts.append(f"{key}={val}")
+        for key in ["routine_streak_global", "goals_since_last_tree_update",
+                     "consecutive_blocked_sleeps"]:
+            val = signals.get(key)
             if val is not None and val != 0:
                 parts.append(f"{key}={val}")
         if parts:
             lines.append(f"LOOP STATE: {', '.join(parts)}")
-            # Show touched aspirations if present
-            touched = loop_state.get("touched_aspirations")
+            # Show touched aspirations if present. The canonical loop_state key
+            # is "touched" (written by the bash loop-state gates); the prior
+            # "touched_aspirations" lookup never matched and silently omitted
+            # the line (same display-vs-shape defect class, 2).
+            touched = loop_state.get("touched")
             if touched and isinstance(touched, list):
                 lines.append(f"  Touched aspirations: {', '.join(str(a) for a in touched[:10])}")
             lines.append("")

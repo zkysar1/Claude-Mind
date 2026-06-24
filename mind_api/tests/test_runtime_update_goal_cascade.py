@@ -939,11 +939,17 @@ def test_layer_d_emits_gate_firing_telemetry(running_daemon,
     assert filed_id is not None
 
     assert firings_path.exists()
-    new_text = firings_path.read_text(encoding="utf-8")
-    # Slice off any pre-existing records.
+    # Byte-slice off pre-existing records: pre_size is stat().st_size (raw
+    # bytes) and on Windows this file is CRLF-terminated. read_text's
+    # universal-newline translation collapses CRLF->LF, desyncing the offset by
+    # one byte per pre-existing line and dropping the new record's leading '{'
+    # (json.loads then fails "Extra data" on the headless line). Slice the raw
+    # bytes, then decode — matches the read_bytes() approach the tree
+    # byte-compat tests already use. 9.
+    new_bytes = firings_path.read_bytes()
     if pre_size:
-        new_text = new_text[pre_size:]
-    new_records = [json.loads(line) for line in new_text.splitlines()
+        new_bytes = new_bytes[pre_size:]
+    new_records = [json.loads(line) for line in new_bytes.decode("utf-8").splitlines()
                    if line.strip()]
     matching = [r for r in new_records
                 if r.get("gate_id") == "capability-gate-layer-d"]

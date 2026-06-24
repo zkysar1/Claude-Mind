@@ -19,9 +19,26 @@ Cases covered:
   G2 file-path overlap → BLOCK (rc.passed=False, matches non-empty)
   G3 structured-identifier hit_kw overlap → BLOCK (rc.passed=False,
      matches non-empty)
+  G4 generic-token inflation FP (g-115-1415) → DEMOTE: one structural topic
+     token (loop_state) + generic vocab (global/exists/populated/recurring/
+     class/close) must NOT block once the generics are stopwords (N drops to 1)
+  G5 over-suppression guard → BLOCK: two structural identifiers
+     (loop_state + iteration-checkpoint) still block after generic stopwording
 
-Companion to test_goal_duplication_gate_partner_in_flight.py. Same
-backup/restore pattern around team-state.yaml + findings.jsonl. Filed by
+Test isolation strategy (g-115-1375, 2026-06-09): redirect MIND_WORLD to a
+tmp directory and seed team-state.yaml THERE, so the live shared
+world/team-state.yaml is NEVER read or written. This removes the
+seed-clobber race (rb-1547): previously this test backed up / seeded /
+restored the LIVE team-state.yaml, which flaked when a partner agent wrote
+the file concurrently in the window between _seed_state and the gate
+subprocess read, AND the restore step risked clobbering that partner write.
+The gate reads no META and resolves team-state from world_dir (← MIND_WORLD;
+verified gate reads no meta env), so MIND_WORLD-only isolation is sufficient
+(mirrors the gold-standard test_goal_duplication_gate_pending_queue.py).
+
+Pytest-collectable via the thin `test_*` wrapper at the bottom; also runnable
+standalone via `py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py`.
+Companion to test_goal_duplication_gate_partner_in_flight.py. Filed by
 g-115-838 (verify-learning Section CO smoke check; sq-018 lens, 2026-05-16
 bravo encode-session Lane 5).
 """
@@ -30,8 +47,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -45,15 +64,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-from _paths import WORLD_DIR  # type: ignore
-
-TEAM_STATE_PATH = WORLD_DIR / "team-state.yaml"
-FINDINGS_PATH = WORLD_DIR / "board" / "findings.jsonl"
 GATE_PY = CORE_SCRIPTS / "goal-duplication-gate.py"
-
-PID = os.getpid()
-TEAM_STATE_BACKUP = TEAM_STATE_PATH.with_suffix(f".yaml.scs-test-backup.{PID}")
-FINDINGS_BACKUP = FINDINGS_PATH.with_suffix(f".jsonl.scs-test-backup.{PID}")
 
 
 def _now_iso(offset_hours: float = 0) -> str:
@@ -71,10 +82,13 @@ _FILLERS = [
 ]
 
 
-def _seed_state(target_entry):
-    """Write team-state.yaml with one TARGET recent_completion entry plus
-    filler entries that share no vocabulary with the target. Filler raises
-    IDF for the target's terms (g-248-12 rare-identifier path).
+def _seed_state(tmp_world: Path, target_entry):
+    """Write tmp_world/team-state.yaml with one TARGET recent_completion entry
+    plus filler entries that share no vocabulary with the target. Filler raises
+    IDF for the target's terms (g-248-12 rare-identifier path). Also writes an
+    empty tmp_world/board/findings.jsonl (insight_triggers clean) and an empty
+    tmp_world/aspirations.jsonl (pending_queue scan finds nothing). NEVER
+    touches the live world (rb-1547 seed-clobber fix).
 
     target_entry: dict with goal_id, completed_by, completed_at, key_finding.
     """
@@ -112,20 +126,27 @@ def _seed_state(target_entry):
         "agent_status": agent_status,
         "critical_blockers": [],
     }
-    TEAM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(TEAM_STATE_PATH, "w", encoding="utf-8") as f:
+    ts_path = tmp_world / "team-state.yaml"
+    ts_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ts_path, "w", encoding="utf-8") as f:
         yaml.dump(team_state, f, default_flow_style=False, sort_keys=False)
 
     # Empty findings.jsonl so insight_triggers stays clean.
-    FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(FINDINGS_PATH, "w", encoding="utf-8") as f:
+    findings_path = tmp_world / "board" / "findings.jsonl"
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(findings_path, "w", encoding="utf-8") as f:
+        f.write("")
+
+    # Empty aspirations.jsonl so the pending_queue check has a file to scan
+    # (finds nothing — these cases assert only on recent_completions).
+    with open(tmp_world / "aspirations.jsonl", "w", encoding="utf-8") as f:
         f.write("")
 
 
-def _run_gate(goal: dict, agent: str = "alpha") -> dict:
+def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
-    env["MIND_WORLD"] = str(WORLD_DIR)
+    env["MIND_WORLD"] = str(tmp_world)
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),
@@ -147,19 +168,16 @@ def _find_check(result, name):
 
 
 def main() -> int:
-    if TEAM_STATE_PATH.exists():
-        TEAM_STATE_BACKUP.write_bytes(TEAM_STATE_PATH.read_bytes())
-    if FINDINGS_PATH.exists():
-        FINDINGS_BACKUP.write_bytes(FINDINGS_PATH.read_bytes())
-
     failures = []
+
+    tmp_world = Path(tempfile.mkdtemp(prefix="scs-test-"))
 
     try:
         # ── G1: plain-words overlap → DEMOTE (no hard block) ─────────────
         # Recent completion's key_finding shares plain English words with
         # the proposed goal. No file paths, no -_0-9 in shared keywords.
         # Expected: strong=True, has_specific=False -> advisory only.
-        _seed_state({
+        _seed_state(tmp_world, {
             "goal_id": "g-scs-filler-G1",
             "completed_by": "bravo",
             "completed_at": _now_iso(-2),
@@ -177,7 +195,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        rg1 = _run_gate(case_g1)
+        rg1 = _run_gate(case_g1, tmp_world)
         rc1 = _find_check(rg1, "recent_completions")
         if rc1 is None:
             failures.append("G1: recent_completions check missing from result")
@@ -199,7 +217,7 @@ def main() -> int:
         # Proposed goal mentions a file the recent completion also touched
         # (key_finding contains the file path). has_specific = bool(hit_paths)
         # = True -> hard block.
-        _seed_state({
+        _seed_state(tmp_world, {
             "goal_id": "g-scs-filler-G2",
             "completed_by": "bravo",
             "completed_at": _now_iso(-2),
@@ -217,7 +235,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        rg2 = _run_gate(case_g2)
+        rg2 = _run_gate(case_g2, tmp_world)
         rc2 = _find_check(rg2, "recent_completions")
         if rc2 is None:
             failures.append("G2: recent_completions check missing from result")
@@ -240,7 +258,7 @@ def main() -> int:
         # No file paths, but a keyword carrying hyphens+digits (a goal-id)
         # is shared. has_specific = re.search(r"[-_0-9]", k) -> True ->
         # hard block. This is the rare-identifier path (rb-335).
-        _seed_state({
+        _seed_state(tmp_world, {
             "goal_id": "g-scs-filler-G3",
             "completed_by": "bravo",
             "completed_at": _now_iso(-2),
@@ -258,7 +276,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        rg3 = _run_gate(case_g3)
+        rg3 = _run_gate(case_g3, tmp_world)
         rc3 = _find_check(rg3, "recent_completions")
         if rc3 is None:
             failures.append("G3: recent_completions check missing from result")
@@ -286,21 +304,96 @@ def main() -> int:
                         f"{[m.get('keyword_hits') for m in matches]}"
                     )
 
+        # ── G4: generic-token inflation FP (5) → DEMOTE ──────────
+        # Two file-path-DISTINCT framework goals share ONE structural topic
+        # token (loop_state, underscore) PLUS generic framework vocabulary
+        # (global/exists/populated/recurring/class/close). Before the
+        # 5 stopword expansion each generic counted as a unique_hit,
+        # pushing N>=2 + weighted>=1.5 alongside the single structural
+        # co-signal -> false hard block on distinct work (alpha session 92:
+        # 4 such FPs; bravo: 2). After the fix the generics are stopwords, so
+        # only loop_state remains (N=1) -> advisory, never a block. A single
+        # shared structural token is intentionally NOT enough (MIN_UNIQUE_HITS=2).
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G4",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Adjusted loop_state global default so the populated flag "
+                "exists for recurring class close events in the scheduler."
+            ),
+        })
+        case_g4 = {
+            "title": "Investigate: loop_state populated check",
+            "description": (
+                "Verify loop_state global value exists and is populated "
+                "across the recurring class close path in a different module."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg4 = _run_gate(case_g4, tmp_world)
+        rc4 = _find_check(rg4, "recent_completions")
+        if rc4 is None:
+            failures.append("G4: recent_completions check missing from result")
+        elif rc4.get("passed") is not True:
+            failures.append(
+                "G4: recent_completions should PASS (generic-token FP demote, "
+                "g-115-1415). loop_state is the only real co-signal; "
+                "global/exists/populated/recurring/class/close are generic "
+                f"stopwords. reason={rc4.get('reason')} matches={rc4.get('matches')}"
+            )
+
+        # ── G5: genuine 2-identifier dup still BLOCKS after the 5 ─
+        # stopword expansion (over-suppression guard). Two goals sharing TWO
+        # structural identifiers (loop_state + iteration-checkpoint) keep
+        # N>=2 even after the generic tokens (recurring/close) are stopworded
+        # -> the legit duplicate signal is preserved, not collateral damage.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G5",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Fixed loop_state and iteration-checkpoint sync in the "
+                "recurring close path."
+            ),
+        })
+        case_g5 = {
+            "title": "Investigate: loop_state iteration-checkpoint divergence",
+            "description": (
+                "Resolve loop_state vs iteration-checkpoint divergence "
+                "during the recurring close window."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg5 = _run_gate(case_g5, tmp_world)
+        rc5 = _find_check(rg5, "recent_completions")
+        if rc5 is None:
+            failures.append("G5: recent_completions check missing from result")
+        elif rc5.get("passed") is not False:
+            failures.append(
+                "G5: recent_completions should BLOCK (two structural ids "
+                "loop_state + iteration-checkpoint survive generic stopwording). "
+                f"reason={rc5.get('reason')} matches={rc5.get('matches')}"
+            )
+
     finally:
-        if TEAM_STATE_BACKUP.exists():
-            TEAM_STATE_PATH.write_bytes(TEAM_STATE_BACKUP.read_bytes())
-            TEAM_STATE_BACKUP.unlink()
-        if FINDINGS_BACKUP.exists():
-            FINDINGS_PATH.write_bytes(FINDINGS_BACKUP.read_bytes())
-            FINDINGS_BACKUP.unlink()
+        shutil.rmtree(tmp_world, ignore_errors=True)
 
     if failures:
         print(f"FAIL ({len(failures)} cases)")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (3/3 cases)")
+    print("PASS (5/5 cases)")
     return 0
+
+
+def test_structural_co_signal_gate():
+    """Pytest entry point (5) — runs the 5-case suite in an isolated
+    tmp world and asserts all cases pass."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

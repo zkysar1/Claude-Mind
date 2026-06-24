@@ -477,6 +477,16 @@ agent-state, agent-mode, persona-active, or running-session-id.
 
    The PreToolUse[Bash] hook will auto-inject `MIND_AGENT=<agent-name>` on subsequent Bash calls. Write `MIND_AGENT=<other> <cmd>` explicitly if you need a cross-agent probe.
 
+0.4. **Write Body manifest** (FORK-BODY, Phase 1B — g-306-62): record this
+   observer session as a Body of the Mind. Observers are read-only and NEVER
+   fork the WM (`--role observer` → `forked_wm_hash: null`, no body-WM-file),
+   so Phase 1A routing stays agent-wide — this is purely a manifest record that
+   a Body exists. On close it will be marked `closed-pending-merge` by stop-hook
+   (wired in Phase 1C — g-306-63, where the body-merge consumer lands); in Phase
+   1B nothing consumes `body_state`, so a lingering `active` observer manifest is
+   fully INERT for routing. Fail-open — a manifest write must never block the bind.
+   Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent "<agent-name>" --role observer >/dev/null || echo "[start] body-manifest write failed (non-fatal, Phase 1B inert)" >&2`
+
 0.5. **Open session telemetry** (session-telemetry WP1, 2026-06-03): write the
    initial `status=active` record so this observer session is visible in the
    live-sessions view BEFORE it closes (the close is WP2 in /stop's IDLE branch).
@@ -519,6 +529,46 @@ agent-state, agent-mode, persona-active, or running-session-id.
 
 ### IDLE (agent-state contains "IDLE")
 
+0-pre. **Interrupted-stop check (FW-11, g-317-09 / g-317-14)**
+
+   Before any binding or resume work, detect an autocompact-interrupted graceful
+   stop so its consolidation/handoff is not lost when the user re-engages via
+   `/start` instead of a chat message. This is the explicit-resume twin of the
+   Session Start Protocol IDLE-branch check (CLAUDE.md, g-317-09): the passive
+   session-start path probes the same sentinel, but a user who runs `/start`
+   would otherwise skip straight to the IDLE→RUNNING flip below and strand the
+   half-finished stop's learning.
+
+   Bash: `MIND_AGENT=<agent-name> bash core/scripts/stop-checkpoint.sh resume-needed`
+
+   The explicit `MIND_AGENT=` prefix is REQUIRED — the Phase 2.6 binding is not
+   written until Step 0 below, so the PreToolUse[Bash] auto-inject hook cannot
+   resolve the agent yet; `stop_checkpoint.py` reads the agent from `MIND_AGENT`.
+
+   - **Exit 0** (a `stop-checkpoint.json` is present — a prior `/stop` was
+     interrupted mid-sequence, most often during the long D4 consolidate):
+     - Read the current on-disk mode: Bash:
+       `MIND_AGENT=<agent-name> bash core/scripts/session-mode-get.sh`
+     - **If current mode == `autonomous`** (the interrupted stop never reached
+       D7 — D7 is what sets the post-stop mode, and D4 consolidate runs before
+       D7, so a still-`autonomous` mode means the consolidation/handoff may be
+       incomplete): invoke `/aspirations-graceful-stop --resume`. That handler
+       idempotently completes the remaining stop obligations (consolidate,
+       handoff, set target mode, clear the checkpoint), emits its own
+       stop-complete message, and ends the turn. DONE — do NOT proceed to Step 0.
+       After it completes, display:
+       > Detected an autocompact-interrupted graceful stop and completed its
+       > consolidation/handoff first so no learning is lost. Re-run
+       > `/start <agent-name> [--mode <mode>]` to resume.
+     - **Else** (current mode is already `assistant`/`reader` — the interrupted
+       stop substantially completed; D7 ran, so D4 consolidate already landed,
+       and only the D7.1 checkpoint-clear was missed): Bash:
+       `MIND_AGENT=<agent-name> bash core/scripts/stop-checkpoint.sh clear`
+       to retire the stale sentinel, then continue to Step 0 normally.
+   - **Exit 1** (the common case — no interrupted stop, or the resume-count
+     breaker has tripped per `stop_checkpoint.py` MAX_RESUME_ATTEMPTS): continue
+     to Step 0 normally.
+
 0. **Rebind Agent to Session**
 
    Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; bash core/scripts/sid-collision-check.sh "<agent-name>" "$MIND_SID" || { echo "ERROR:SID_COLLISION"; exit 2; }; bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent "<agent-name>" --mode "<target-mode>" --retire-legacy >/dev/null && echo "BOUND:$MIND_SID" && printf '\n╔════════════════════════════════════════════════════════════╗\n║                                                            ║\n║    ✓  RACE_WINDOW_CLOSED                                   ║\n║       Safe to /start another agent in another terminal     ║\n║                                                            ║\n╚════════════════════════════════════════════════════════════╝\n\n'`
@@ -546,6 +596,19 @@ agent-state, agent-mode, persona-active, or running-session-id.
    > **Fix**: close this terminal AND relaunch Claude Code with `claude --fork-session` (which forces a new session_id). Or `/stop` the other agent first.
 
    The PreToolUse[Bash] hook will auto-inject `MIND_AGENT=<agent-name>` on subsequent Bash calls from the binding file. Write `MIND_AGENT=<other> <cmd>` explicitly if you need a deliberate cross-agent probe (the hook detects and preserves explicit overrides).
+
+0.4. **Write Body manifest** (FORK-BODY, Phase 1B — g-306-62) — reader/assistant
+   modes ONLY here. These observer-class sessions are recorded now with
+   `--role observer` (never forks; INERT for routing). For **autonomous** mode
+   the Body manifest is written LATER with `--role worker`, AFTER the
+   running-session-id claim (Step 3 below) — so the reducer-aware fork decision
+   reads the freshly-claimed running-session-id. Writing it here for autonomous
+   would read a stale/empty running-session-id and could wrongly fork the
+   reducer, so autonomous is intentionally skipped at this site. Fail-open.
+   - IF target-mode is `reader` or `assistant`:
+     Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent "<agent-name>" --role observer >/dev/null || echo "[start] body-manifest write failed (non-fatal, Phase 1B inert)" >&2`
+   - IF target-mode is `autonomous`: skip — the worker FORK-BODY step after the
+     runner claim (Step 3) writes it.
 
 0.5. **Open session telemetry** (session-telemetry WP1, 2026-06-03): write the
    initial `status=active` record for THIS session so it is visible in the
@@ -712,6 +775,22 @@ agent-state, agent-mode, persona-active, or running-session-id.
      **HALT ON RUNNER_TOKEN_GEN_FAILED** — if output contains `ERROR:RUNNER_TOKEN_GEN_FAILED`, STOP. Both `py -3` and `python3` failed to generate a UUID. Display to the user:
      > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
 
+   - **Write Body manifest** (FORK-BODY worker, Phase 1B — g-306-62): record this
+     autonomous session as a worker Body, AFTER the running-session-id claim above
+     so the reducer-aware fork decision reads the just-claimed running-session-id.
+     This is the CLAIM-REDUCER / FORK-BODY split: the triple-write above is
+     CLAIM-REDUCER (the existing single-runner claim — running-session-id ==
+     $MIND_SID now), and this is FORK-BODY (always writes the manifest). Because
+     this session IS the reducer (`is_reducer` true), FORK-BODY does NOT fork the
+     WM (`forked_wm_hash: null`, no body-WM-file) — Phase 1A routing stays
+     agent-wide, byte-identical to pre-Phase-1B behavior. Only a future 2nd+
+     worker (a Body started while a DIFFERENT reducer holds running-session-id)
+     forks. Safe before the state flip (per-session file write, touches no
+     observer-paired signal — keeps the RUNNING→/boot critical section empty per
+     the F4 rationale below). Fail-open — a manifest write must never block the
+     RUNNING transition.
+     Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent "<agent-name>" --role worker >/dev/null || echo "[start] body-manifest write failed (non-fatal, Phase 1B inert)" >&2`
+
    - Bash: `rm -f agents/<agent-name>/session/iteration-checkpoint.json agents/<agent-name>/session/compact-pending agents/<agent-name>/session/compact-checkpoint.yaml`
      (F4 reorder, 2026-05-20: moved BEFORE the state-set RUNNING below so the
      critical section between RUNNING and /boot is truly empty. These are
@@ -730,6 +809,20 @@ agent-state, agent-mode, persona-active, or running-session-id.
      autocompact boundary without a re-seed. /stop clears it explicitly
      via `wm-clear-identity.sh` in graceful-stop D4.5 — the ONE authorized
      clear site.)
+   - **DDB runner-claim acquire (dynamic-ownership lifecycle, design §4) — INERT until cutover.**
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
+     (Cross-machine half of single-runner enforcement: a conditional DDB IDLE->RUNNING
+     claim taken just BEFORE the local state-set below, using the runner-token from the
+     triple-write above. Gated INERT — runner-claim.sh no-ops (exit 0) unless
+     OWNERSHIP_MODE=dynamic, so the default keeps this byte-identical to pre-cutover
+     /start. **HALT ON ACQUIRE_RC=4**: a peer machine holds a live DDB claim for
+     `<agent-name>` — do NOT proceed to session-state-set RUNNING; state stays IDLE
+     (the observer-paired signals seeded above are harmless at IDLE). Display: "Cannot
+     start `<agent-name>` in autonomous mode — another machine holds a live runner
+     claim (DDB session-lock); stop the other runner or wait ~OWNERSHIP_STALE_SECONDS."
+     Any OTHER non-zero rc (1 = daemon/DDB error) is FAIL-OPEN: log and PROCEED — a
+     transient DDB hiccup must not block a legitimate start. The cutover (g-115-1340)
+     flips OWNERSHIP_MODE=dynamic to activate this; until then it never runs.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
      (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment.)
 
@@ -800,6 +893,25 @@ and creates `session/`. It NEVER writes `agent-state`/`agent-mode` (those stay
   other's goals (the DDB lock prevents file corruption, not this semantic
   collision). Also confirm `.env.local` is configured for own-cloud (the one
   manual step — secrets never travel in git)."
+
+  **Prerequisites check (ALL resume modes — transplant gap fix, g-115-1334).**
+  This rc=0 path does NOT run Phase A's A0 check (it skips Phase A/B/C init),
+  so a freshly-cloned machine can reach the daemon start (Step 2 → IDLE branch)
+  with Python deps missing — surfacing as a dead daemon instead of a friendly
+  error (the 2026-06-04 machine-2 bring-up: PyYAML, psutil, and the own-cloud
+  cloud-SDK all absent). Run the check here, before any state write or daemon
+  start:
+
+  Bash: `bash core/scripts/check-prerequisites.sh`
+
+  **HALT ON FAILURE** — if exit code ≠ 0, STOP, display the script's stderr
+  verbatim, and do NOT proceed to the Steps below. On an own-cloud machine
+  (`.env.local` sets `STORAGE_BACKEND=own-cloud`) the check also fails loudly
+  on a missing own-cloud cloud-SDK dependency; install per its hint
+  (`pip install -r mind_api/requirements-owncloud.txt`) and re-run
+  `/start <agent-name>`. (If `.env.local` is not configured for own-cloud yet,
+  the check correctly skips that check — the default local backend never needs
+  it.)
 
   Steps:
   1. Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh IDLE`
@@ -967,12 +1079,17 @@ B1. Ask for the **world directory** path. NON-SKIPPABLE per B0.5 gate:
    Multiple agents and machines can share this directory.
 
    **Suggested default** (simplest — single machine, single repo):
-     ./world  →  expands to <project_root>/world, alongside core/, mind_api/, agents/
+     .mind-data/world  →  expands to <project_root>/.mind-data/world
 
-   Everything stays inside the project — no external paths to manage. The
-   trade-off: agents in OTHER repos or on OTHER machines can't see this
+   `.mind-data/` is the standard local storage root (asp-330 convention):
+   world -> .mind-data/world, meta -> .mind-data/meta, all under one
+   gitignored dir that `_paths.py`/`_paths.sh` auto-detect (M1). Everything
+   stays inside the project — no external paths to manage, nothing committed.
+   The trade-off: agents in OTHER repos or on OTHER machines can't see this
    world. If you want multi-repo or multi-machine collaboration, put world/
-   on a shared remote (NAS, OneDrive, SharePoint, Dropbox, iCloud) instead.
+   on a shared remote (NAS, OneDrive, SharePoint, Dropbox, iCloud) instead —
+   that is the external-path case (B7 writes its WORLD_PATH into
+   local-paths.conf, the legacy/external mechanism).
 
    Other valid examples (use FORWARD slashes on every platform —
    backslashes get interpreted as escape sequences when bash sources the
@@ -982,11 +1099,18 @@ B1. Ask for the **world directory** path. NON-SKIPPABLE per B0.5 gate:
    - /home/you/mind-world                  (Linux — local single-machine)
 
    Where should the world directory be?
-   - Reply `./world` (or just "default", "use the suggestion", "yes") to
-     accept the in-project default
+   - Reply `.mind-data/world` (or just "default", "use the suggestion", "yes")
+     to accept the in-project `.mind-data/` default
    - Reply with an absolute/relative path to use a different location
    - Reply "you pick" / "I don't care" / "make it simple" to delegate
-     (= proceed with the in-project default per B0.5 rule 3)
+     (= proceed with the `.mind-data/` default per B0.5 rule 3)
+
+   When the chosen path is under `.mind-data/`, B3 creates it with `mkdir -p`
+   (so the `.mind-data/` parent is created too); `.mind-data/` is gitignored
+   (M3). When `.mind-data/` exists it OVERRIDES local-paths.conf per the M1
+   precedence chain (`_paths.py _resolve_tier`: env > .mind-data/.env.local >
+   .mind-data/{world,meta} > local-paths.conf), so for the local default the
+   conf B7 writes is a documented mirror, not the resolution authority.
    ```
 
    If the user pastes a Windows path with backslashes (e.g.,
@@ -1019,15 +1143,18 @@ B4. Ask for the **meta directory** path. NON-SKIPPABLE per B0.5 gate:
    Same rules as the world path: empty directory for fresh start, or existing
    meta directory; forward slashes only.
 
-   **Suggested default** (matches world layout):
-     ./meta  →  expands to <project_root>/meta, alongside core/, mind_api/, agents/, world/
+   **Suggested default** (matches world layout — same `.mind-data/` root):
+     .mind-data/meta  →  expands to <project_root>/.mind-data/meta
+
+   Keeps world + meta together under the one gitignored `.mind-data/` root
+   (asp-330 convention). B6 creates it with `mkdir -p` when chosen.
 
    Other valid examples (typically next to the world directory):
    - C:/Users/you/OneDrive/my-mind-meta    (Windows)
    - /Users/you/Documents/my-mind-meta     (macOS)
 
    Where should the meta directory be?
-   - Reply `./meta` / "default" / "yes" to accept the in-project default
+   - Reply `.mind-data/meta` / "default" / "yes" to accept the in-project default
    - Reply with an absolute/relative path for a different location
    - Reply "you pick" / "same place as world" to delegate (per B0.5 rule 3)
    ```
@@ -1851,6 +1978,13 @@ C9.9. RUNNER CLAIM — the agent-state RUNNING flip (Fix 2 critical section).
     - Seed session_start: Bash: `date +%Y-%m-%dT%H:%M:%S | MIND_AGENT=<agent-name> bash core/scripts/wm-set.sh session_start`
       (F4 reorder: moved before the state flip. Same rationale as IDLE→autonomous
       step 3 — wm-set is a pure-Bash write to a top-level WM key, safe at IDLE.)
+    - **DDB runner-claim acquire (dynamic-ownership lifecycle, design §4) — INERT until cutover.**
+      Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
+      (Cross-machine claim taken just before the local state-set below, using the
+      runner-token from the triple-write above. Gated INERT (no-op exit 0 unless
+      OWNERSHIP_MODE=dynamic). **HALT ON ACQUIRE_RC=4** (a peer holds a live DDB
+      claim) — do NOT proceed to RUNNING; state stays IDLE. Any OTHER non-zero rc
+      is FAIL-OPEN: log and PROCEED. Mirrors the IDLE→autonomous step-3 acquire.)
     - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
       (State flip — final write in the RUNNING-claim sequence. heartbeat-tick
       + triple-write are seeded first per rb-323/guard-403 so observers never

@@ -24,6 +24,16 @@ They are valuable, but they are means — not the mission.
    the correct response is to learn from it better — not to skip it.
 4. Learning from mistakes is the primary mission. You must learn to walk before you
    can run. Master the learning loop first; product excellence follows.
+5. **Subtraction is learning too.** Retiring a now-unnecessary gate, rule, guardrail, or
+   reasoning-bank entry — with evidence it is safe to remove (a measured no-regression, a
+   superseding consolidation) — is a first-class learning artifact, equal in value to adding
+   one. A session whose net diff is *negative* but which removed real carrying cost has not
+   under-produced; it has paid down debt. The framework's enforcement gradient is otherwise
+   additive-only (four layers push "encode more"; only an advisory whisper pushes "retire"),
+   so the loop must consciously credit removal — measured by `core/scripts/complexity_budget.py`
+   and acted on by the scar-tissue review cadence. Elegance is subtraction
+   (`communication-clarity.md` rule 4); this rule makes the loop *count* it.
+   (External advisory research pass, 2026-06-13 — the "complexity ratchet" finding.)
 
 ## Recognition (the positive half)
 

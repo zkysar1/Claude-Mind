@@ -82,6 +82,13 @@ if [ -d "$world_parent" ]; then
         if [ "$world_parent" = "$meta_parent" ] && [ "$name" = "$meta_basename" ]; then
             continue
         fi
+        # Allowed: upgrade-snapshots/ is the canonical pre-upgrade rollback
+        # backup store — _template.sh SNAP_DIR default is
+        # "$WORLD_PATH/../upgrade-snapshots/" (= world-parent). A legitimate
+        # version-snapshot store, NOT cruft; the location-only heuristic
+        # over-flagged it every weekly run (g-115-451 bravo FALSE POSITIVE;
+        # rb-1585 preserved this fix; g-115-1525 applied it).
+        if [ "$name" = "upgrade-snapshots" ]; then continue; fi
         kind="file"
         [ -d "$entry" ] && kind="dir"
         mtime="$(mtime_of "$entry")"

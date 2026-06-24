@@ -241,6 +241,38 @@ Superseded goals carry a `superseded_by_aspiration: <asp-id>` backref for trajec
 analysis. Goal-selector's `completion_pressure` scoring treats `superseded` as terminal —
 zombie aspirations that close via this pathway stop distorting priority signals automatically.
 
+## Aspiration-Level `deadline` Field
+
+An aspiration MAY carry an optional top-level `deadline` field — an ISO-8601 date
+(`YYYY-MM-DD`) naming a fixed external deadline for the whole aspiration (e.g. the
+ARC Prize 2026 final-submission clock, `2026-11-02`). It is distinct from a goal's
+`resolves_by`/`deadline`: it applies to every goal under the aspiration without each
+goal having to restate it.
+
+```yaml
+deadline: "2026-11-02"   # optional ISO-8601 date; omit when the aspiration has no fixed external deadline
+```
+
+**Consumption (goal-selector `deadline_urgency`, g-318-04):** when a candidate goal
+has no own `resolves_by`/`deadline`, the scorer inherits its aspiration's `deadline`
+(`goal.get("resolves_by") or goal.get("deadline") or asp.get("deadline")`). The
+urgency ramp is:
+
+| Days until deadline | `deadline_urgency` raw |
+|---|---|
+| <= 1 | 3 |
+| <= 3 | 2 |
+| <= 7 | 1 |
+| <= 30 | 0.5 |
+| <= 90 | 0.25 |
+| > 90 or unset | 0 |
+
+The long-horizon steps (0.5 at 30d, 0.25 at 90d) let a fixed deadline create gentle
+prioritization pull months out — enough to bias selection toward deadline-bound work
+without overriding near-term urgency (3/2/1) or `priority` weight. Omitting `deadline`
+leaves scoring byte-identical to the pre-g-318-04 behavior (the inherited value is
+`None`, so `remaining` is `None` and `deadline_urgency` is 0).
+
 ## Goal-ID Argument Convention (unified)
 
 Every script in this repo that takes a goal ID accepts ALL of these flag forms

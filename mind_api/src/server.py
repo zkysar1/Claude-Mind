@@ -202,11 +202,45 @@ class _Handler(BaseHTTPRequestHandler):
                 tenant=tenant_header,
             )
 
-            handler = self.routes.get((method, path))
-            if handler is None:
-                resp = Response.error(404, "not_found", f"no route for {method} {path}")
-            else:
-                resp = handler(ctx)
+            # T-c (1): multi-tenant customer activation + app-authz,
+            # GATED behind MIND_MULTI_TENANT (default OFF = today's single-tenant
+            # deployment). OFF: the tenant header is still propagated through
+            # ctx.tenant (the R4 seam, unchanged) but does NOT scope storage keys
+            # and is NOT authz-checked — byte-identical legacy behavior. ON: the
+            # daemon is authenticated for exactly one customer (MIND_CUSTOMER,
+            # default "default"); a mismatched X-Mind-Tenant is rejected 403
+            # BEFORE any handler/backend call (defense in depth behind the IAM
+            # prefix-conditions), and the matching customer is activated so the
+            # OwnCloudBackend key builders carry the <customer>/ prefix. The
+            # set/reset live in storage_backend (the -free seam) so this
+            # path never imports the cloud backend (LocalBackend hosts stay clean).
+            _cust_token = None
+            if os.environ.get("MIND_MULTI_TENANT", "").strip().lower() in (
+                    "1", "true", "yes"):
+                from storage_backend import set_customer, reset_customer
+                authed_customer = (os.environ.get("MIND_CUSTOMER", "")
+                                   or "default").strip().strip("/") or "default"
+                if ctx.tenant != authed_customer:
+                    resp = Response.error(
+                        403, "tenant_forbidden",
+                        f"X-Mind-Tenant {ctx.tenant!r} not authorized for this "
+                        f"daemon (serves {authed_customer!r})")
+                    self._write_response(resp)
+                    return
+                _cust_token = set_customer(ctx.tenant)
+
+            try:
+                handler = self.routes.get((method, path))
+                if handler is None:
+                    resp = Response.error(404, "not_found", f"no route for {method} {path}")
+                else:
+                    resp = handler(ctx)
+            finally:
+                # Reset within the request so the customer never leaks to the next
+                # request on a reused thread (defensive — ThreadingHTTPServer
+                # spawns per-request threads today, but a future pool must be safe).
+                if _cust_token is not None:
+                    reset_customer(_cust_token)
 
             self._write_response(resp)
         except Exception as e:  # pragma: no cover — defensive

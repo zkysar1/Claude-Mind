@@ -35,9 +35,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Read optional stdin JSON BEFORE sourcing _runtime.sh -----------------
+# guard-664: bound the OPTIONAL stdin read with a timeout. `[ ! -t 0 ]` only
+# proves stdin is non-tty, NOT that it will reach EOF: an inherited pipe with
+# no writer-close blocks a bare `cat` forever — this wrapper hung >90s
+# () and timed out rc=124 (2) on exactly that. `timeout`
+# bounds the blocking cat (verified on Git-bash), degrading a non-EOF stdin to
+# an empty string (enrichment skipped) instead of hanging. The warning keeps
+# the degradation visible rather than silent (rb-1189). EXPERIENCE_STDIN_TIMEOUT_S
+# mirrors experience.py _read_optional_stdin (single knob, default 10s).
 STDIN_JSON=""
 if [ ! -t 0 ]; then
-    STDIN_JSON="$(cat)"
+    _stdin_to="${EXPERIENCE_STDIN_TIMEOUT_S:-10}"
+    _rc=0
+    STDIN_JSON="$(timeout "$_stdin_to" cat)" || _rc=$?
+    if [ "$_rc" != 0 ]; then
+        STDIN_JSON=""
+        [ "$_rc" = 124 ] && echo "[experience-archive-goal] WARN: optional stdin read timed out after ${_stdin_to}s — proceeding without enrichment (guard-664)" >&2
+    fi
 fi
 
 # --- Daemon path ----------------------------------------------------------

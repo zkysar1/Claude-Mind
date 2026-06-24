@@ -22,6 +22,100 @@ with different SIDs (e.g., compact-checkpoint at autocompact resume). Plural
 `sessions/<SID>/` dirs when the 3-signal predicate (mtime > 24h + running-sid
 mismatch + heartbeat stale) fires. Per-session ephemerals go with the dir.
 
+## Phase 1B — Body Manifest (Mind/Body convergence, g-306-62)
+
+A **Body** is a forked instance of the Mind keyed by `unitKey` (locally the
+session SID). Each Body's `sessions/<unitKey>/` dir carries a
+`body-manifest.yaml` describing it. Written by `/start` FORK-BODY at session
+entry (Phase 1B — landed). On close it is marked `closed-pending-merge` by
+`stop-hook.sh` (the Gate-0 sid-mismatch producer) and consumed by the
+generalize-down merge (`aspirations-consolidate` Step -1) — both wired in
+**Phase 1C (g-306-63 — landed)**. Backward-compat: in single-runner no Body
+forks, so no `closed-pending-merge` manifest ever exists; both the producer and
+the merge are no-ops (a lingering `active` manifest is inert) until a 2nd worker
+Body forks (Phase 2, g-306-65).
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `unitKey` | string | This Body's id (= the session SID locally). The dir name IS the unitKey. |
+| `mindKey` | string | The Personality this Body belongs to (= agent name; `agents/<mindKey>/`). |
+| `env_id` | string | The environment this Body acts in (`local` by default; an Ayoai place/universe id when embedded). |
+| `role` | enum | `worker` (acts in the env) \| `observer` (read-only — reader/assistant sessions). |
+| `body_state` | enum | `active` \| `closed-pending-merge` \| `merged` \| `closed-stale`. Lifecycle below. |
+| `started_at` | ISO-8601 | Local time the Body was forked (FORK-BODY). |
+| `forked_wm_hash` | sha256 | Hash of the Mind's `working-memory.yaml` at fork time (the merge baseline). `null` for a non-forking reducer Body (see routing below). |
+
+**Lifecycle:** `active` (written by FORK-BODY — Phase 1B, landed) ->
+`closed-pending-merge` (written by `stop-hook.sh` on body close — Phase 1C) ->
+`merged` (written by the Phase 1C generalize-down merge in `aspirations-consolidate`
+Step -1) | `closed-stale` (written by `cleanup-stale-bindings.sh` when a Body's dir
+is swept before merge — deferred to Phase 1D stale-Body preservation, g-306-64).
+As of Phase 1C the `active`, `closed-pending-merge`, and `merged` writes are all
+wired (`closed-stale` remains the Phase 1D sweep). All are dormant until a 2nd
+worker Body forks.
+
+**Reducer is DERIVED, not stored** (rb / design SSOT `mind-engine-identity-bridge`):
+the reducer is whichever **worker** Body holds `agents/<mindKey>/session/running-session-id`
+(the single-runner SOT). There is no `reducer: true` field — deriving it from
+`running-session-id` keeps one source of truth.
+
+**Reducer-aware WM routing (the backward-compatibility keystone, g-306-62):**
+Phase 1A (`agent_paths.wm_path` / `bash-agent-inject.py`) routes a Body's WM ops
+to `sessions/<unitKey>/working-memory.yaml` when that Body's manifest exists.
+To keep the one-Body case identical to today, the **reducer Body always uses the
+agent-wide WM** (`session/working-memory.yaml`) and does NOT fork — its manifest
+carries `forked_wm_hash: null` and FORK-BODY skips the WM `cp`. **Observers never
+fork either** (read-only — reader/assistant sessions have no divergence to merge).
+Forking is therefore reserved for a **non-reducer worker** (a 2nd+ worker started
+once a reducer already holds `running-session-id`): only it `cp`s the Mind WM as
+its baseline, records `forked_wm_hash`, and merges back. (Implementation: FORK-BODY
+forks iff `role == "worker"` AND a different Body already holds `running-session-id`
+— see `body-manifest.py` `write_manifest` and `test_observer_never_forks`.) With
+exactly one Body (the reducer), routing collapses to today's agent-wide path — so
+Phase 1B is inert until a 2nd worker forks, and carries no dependency on the Phase
+1C merge for the single-Body case. See `core/scripts/body-manifest.py` (the schema's sole writer)
+and `core/scripts/tests/test_body_manifest.py`.
+
+### Phase 1C — generalize-down merge (g-306-63, landed)
+
+The JOIN half of `fork -> diverge -> generalize-down`. Two wirings around the
+existing reducer:
+
+- **Producer** (`stop-hook.sh`, Gate-0 sid-mismatch branch): when a session that
+  is NOT the runner is allowed to stop AND it is a forked non-reducer worker (it
+  has a `sessions/<unitKey>/working-memory.yaml`), its manifest is flipped
+  `active -> closed-pending-merge`. Guarded on the body-WM-file's existence, so it
+  is a single `[ -f ]` no-op in single-runner (observers hitting this gate never
+  fork). The `active`-guard prevents re-queuing an already-`merged` Body.
+- **Consumer** (`aspirations-consolidate` Step -1 -> `core/scripts/body-merge.py
+  generalize-down --agent <mind>`): the reducer (this consolidating session)
+  enumerates `sessions/*/body-manifest.yaml` with `closed-pending-merge`,
+  delta-merges each Body's forked WM into the reducer's WM, copies back, re-scans
+  once for late arrivals, and marks each `merged`. Runs FIRST so merged Body data
+  lands in the triage counts. Fail-open (a merge error never blocks consolidation).
+
+**Per-slot merge policy** (`body-merge.merge_wm`, driven by the `wm.py` schema;
+recursive for `loop_state` / nested `signals`):
+
+| Slot shape | Policy |
+|------------|--------|
+| arrays (`ARRAY_SLOTS`, `encoding_queue`, `goals_completed_this_session`) | append + content-hash dedup (reducer items first, then new body items) |
+| `active_context` / `archived_context` (MAP_SLOTS), `session_id`, `session_start` | reducer-wins (canonical session context) |
+| numeric counters (int/float, incl. nested `loop_state` counters) | SUM |
+| ISO-timestamp cadence-trackers (`last_*`) | latest-wins (lexical max) |
+| dicts (`loop_state`, `signals`) | recurse per key |
+| other scalars / type mismatch | reducer-wins |
+
+`forked_wm_hash` is the **no-op short-circuit**: a Body whose current WM still
+hashes to its fork baseline never diverged -> marked `merged` without a merge.
+(A true 3-way delta needs the baseline CONTENT, not just its hash — deferred to
+Phase 2 worker Bodies; the 2-way union+dedup here is correct for the dormant
+scaffolding.) See `core/scripts/body-merge.py` and
+`core/scripts/tests/test_body_merge.py` (9 tests: 1-body/0-body no-op, active
+not-merged, array+counter merge, active_context reducer-wins, timestamp
+latest-wins, loop_state recurse, body-only slot carry, hash short-circuit via
+the real fork path, multi-body).
+
 
 
 **Single source of truth:** new session files go into the YAML. Recovery

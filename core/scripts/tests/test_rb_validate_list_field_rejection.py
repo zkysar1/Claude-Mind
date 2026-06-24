@@ -78,6 +78,41 @@ def test_dict_valued_scalar_also_safe():
         validate_rb_record(None, rec, skip_id=False)
 
 
+# --- entry_type () --------------------------------------------------
+
+def test_entry_type_absent_passes():
+    """entry_type is OPTIONAL — a record without it validates (the common case)."""
+    rec = _minimal_rb()
+    assert "entry_type" not in rec
+    validate_rb_record(None, rec, skip_id=False)
+
+
+def test_entry_type_null_passes():
+    """An explicit null entry_type is valid (it is the default)."""
+    validate_rb_record(None, _minimal_rb(entry_type=None), skip_id=False)
+
+
+def test_entry_type_procedure_passes():
+    """The one valid non-null entry_type value validates."""
+    validate_rb_record(None, _minimal_rb(entry_type="procedure"), skip_id=False)
+
+
+def test_entry_type_unknown_string_rejected():
+    """A typo / unknown entry_type is a clean ValueError naming the field."""
+    with pytest.raises(ValueError) as ei:
+        validate_rb_record(None, _minimal_rb(entry_type="procedrue"), skip_id=False)
+    assert "entry_type" in str(ei.value).lower()
+
+
+def test_entry_type_list_valued_rejected_not_typeerror():
+    """B10 guard: a list-valued entry_type raises ValueError, never the cryptic
+    'unhashable type' TypeError that would 500 the write."""
+    with pytest.raises(ValueError) as ei:
+        validate_rb_record(None, _minimal_rb(entry_type=["procedure"]), skip_id=False)
+    assert "entry_type" in str(ei.value).lower()
+    assert "unhashable" not in str(ei.value).lower()
+
+
 def _run_all():
     """Standalone runner (no pytest) — manual param expansion."""
     failures = []

@@ -361,10 +361,11 @@ print("false")
     if [[ -n "$SUMMARY" ]]; then
         GID="$GOAL_ID" SUM="$SUMMARY" python3 -c '
 import json, os
+content = os.environ.get("SUM", "").encode("utf-8", errors="replace").decode("utf-8")
 print(json.dumps({
     "entry_type": "finding",
     "goal_id":    os.environ["GID"],
-    "content":    "verified: " + os.environ["SUM"],
+    "content":    "verified: " + content,
 }))
 ' | bash "$SCRIPT_DIR/execution-diary.sh" append || true
     fi
@@ -399,6 +400,61 @@ print(json.dumps({
         bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
             --set "intent_state=committed" || true
     fi
+
+    # ── Gate D OUTCOME telemetry (DORMANT — gated by GATE_D_ENABLED) ──────────
+    # Gate D experiment seam (methodology §4.6 / R7, RATIFIED 2026-06-10). Writes
+    # the per-goal OUTCOME record that R5 joins to the Step 5e ASSIGNMENT record
+    # on (agent, goal_id). DEFAULT OFF — fires ONLY when GATE_D_ENABLED == "true"
+    # (omni-only flag-flip). Append-only, per-agent, single line, to the SAME
+    # gate-d-telemetry.jsonl Step 5e writes. Bash-authoritative fields (goal_id,
+    # agent, world, outcome_class, blocker_created, timestamp) are always correct;
+    # LLM-execution-trace fields (verify_first_pass, verify_escalation_depth,
+    # retry_count, wall_clock_seconds) come from optional GATE_D_* env the verify
+    # caller MAY set, else null. GATE-INTEGRITY 9.5: agents MUST NOT set
+    # GATE_D_ENABLED, and MUST NOT alter this record's shape after omni blesses.
+    # Amendment 4 (omni 2026-06-11): gate on gate-d-check.sh, not raw env — the
+    # agent allowlist (core/config/gate-d-agents) must gate OUTCOME writes the
+    # same way it gates Step 5e ASSIGNMENT writes, else non-pilot agents append
+    # orphan OUTCOME records.
+    if [[ "$(bash "$PROJECT_ROOT/core/scripts/gate-d-check.sh" 2>/dev/null)" == "on" ]]; then
+        local _gd_blocker="false"
+        [[ "$GOAL_STATUS" == "blocked" ]] && _gd_blocker="true"
+        # python3 (not py -3) is correct inside this .sh — it sources _paths.sh.
+        # Values pass via env (guard-165), never interpolated into the source.
+        GD_GOAL="$GOAL_ID" GD_AGENT="$AGENT" GD_WORLD="${GATE_D_WORLD:-}" \
+        GD_OUTCOME="$OUTCOME" GD_BLOCKER="$_gd_blocker" \
+        GD_FIRSTPASS="${GATE_D_VERIFY_FIRST_PASS:-}" \
+        GD_ESCDEPTH="${GATE_D_VERIFY_ESCALATION_DEPTH:-}" \
+        GD_RETRY="${GATE_D_RETRY_COUNT:-}" GD_WALL="${GATE_D_WALL_CLOCK_SECONDS:-}" \
+        GD_TS="$(date +%Y-%m-%dT%H:%M:%S)" GD_FILE="$AGENT_DIR/session/gate-d-telemetry.jsonl" \
+        python3 -c '
+import json, os
+def _opt(name):
+    v = os.environ.get(name, "")
+    if v == "":
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return True if v == "true" else (False if v == "false" else v)
+rec = {
+    "record_type": "outcome",
+    "goal_id": os.environ["GD_GOAL"],
+    "agent": os.environ["GD_AGENT"],
+    "world": os.environ.get("GD_WORLD") or None,
+    "verify_first_pass": _opt("GD_FIRSTPASS"),
+    "verify_escalation_depth": _opt("GD_ESCDEPTH"),
+    "outcome_class": os.environ.get("GD_OUTCOME") or None,
+    "retry_count": _opt("GD_RETRY"),
+    "blocker_created": os.environ["GD_BLOCKER"] == "true",
+    "wall_clock_seconds": _opt("GD_WALL"),
+    "timestamp": os.environ["GD_TS"],
+}
+with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec) + "\n")
+' || echo "[iteration-close] WARN: gate-d outcome telemetry write failed for $GOAL_ID" >&2
+    fi
+    # ── End Gate D OUTCOME telemetry ──────────────────────────────────────────
 
     _checkpoint_refresh verify
     # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
@@ -658,8 +714,28 @@ except: print(0)' 2>/dev/null || echo 0)"
     # and sessions_active writers genuinely need asp_id and correctly stay inside
     # the lookup-gated block above.
     if [[ -n "$GOAL_ID" ]]; then
-        python3 "$(cygpath -w "$SCRIPT_DIR/loop-state-bump-counters.py")" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
+        local _lsbc
+        _lsbc="$(cygpath -w "$SCRIPT_DIR/loop-state-bump-counters.py")"
+        python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
             || echo "[iteration-close] WARN: loop-state-bump-counters failed for $GOAL_ID (fail-open; productivity-gate may stay stale this iteration)" >&2
+        # g-115-1470: the bump always exits 0 (fail-open at every layer), so rc
+        # CANNOT detect a silent no-op (stale-lock-steal / WM-write failure under
+        # the OneDrive+daemon background latency of guard-685 / g-115-1349). When
+        # do_state_update BACKGROUNDS on a deep close, the bump's stderr WARN is
+        # dropped from the task-output file, so the undercount is invisible and
+        # biases productivity-stop-gate math. Re-read the idempotency list: when
+        # GOAL_ID is confidently absent the bump did not take -> record it DURABLY
+        # (a queryable ledger that survives the lost stderr) and re-fire ONCE
+        # foreground. The re-fire is idempotent (g-115-664: counted_goals_this_session
+        # membership gate per rb-1823), so a spurious re-fire after a torn verify
+        # read is a harmless no-op.
+        if ! python3 "$_lsbc" --verify-counted "$GOAL_ID" 2>/dev/null; then
+            printf '{"ts":"%s","goal_id":"%s","outcome":"%s","event":"bump_noop_detected","action":"refire"}\n' \
+                "$NOW_ISO" "$GOAL_ID" "$OUTCOME" \
+                >> "$AGENT_DIR/session/loop-state-bump-failures.jsonl" 2>/dev/null || true
+            python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
+                || echo "[iteration-close] WARN: loop-state-bump re-fire failed for $GOAL_ID" >&2
+        fi
     fi
     echo "\"$SOURCE\"" | bash "$SCRIPT_DIR/wm-set.sh" current_goal_source || echo "[iteration-close] WARN: wm-set current_goal_source failed" >&2
 
@@ -698,11 +774,17 @@ except: print(0)' 2>/dev/null || echo 0)"
     # the influence line (no JSON layer, no parsing).
     _retrieval_influence="$(bash "$SCRIPT_DIR/wm-read.sh" retrieval_influence_last 2>/dev/null || echo "")"
     [[ "$_retrieval_influence" == "null" ]] && _retrieval_influence=""
+    # --work-class (g-317-15): pass the already-resolved work_class so
+    # journal-append.sh can derive the FW-5 value-framing presentation label.
+    # Additive + fail-open: empty work_class -> flag omitted -> the writer
+    # falls to the outcome_class's `unclassified` framing. No existing field
+    # or control-flow touched (hot-script discipline per the goal note).
     bash "$SCRIPT_DIR/journal-append.sh" \
         --goal "$GOAL_ID" \
         --outcome-class "$OUTCOME" \
         ${SUMMARY:+--summary "$SUMMARY"} \
         ${_retrieval_influence:+--retrieval-influence "$_retrieval_influence"} \
+        ${work_class:+--work-class "$work_class"} \
         || echo "[iteration-close] WARN: journal-append failed for $GOAL_ID (fail-open; iteration continues)" >&2
     # Reset the slot to null so a Phase 4 that articulates "no influence"
     # for the NEXT iteration produces an explicit signal, not a stale
@@ -866,7 +948,15 @@ print(sha)
         if [[ "$fired" == "true" ]]; then
             # Write WM signal the LLM residue checklist consumes. Storing the full
             # gate JSON preserves the files list + reason for the dispatcher.
-            echo "$gate_json" | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_dispatch_pending >/dev/null 2>&1 || true
+            # Stamp set_at (g-115-1553) so the stale-sentinel canary's Investigate
+            # diagnostic can report when the sentinel was armed vs when the
+            # consumer last dispatched. The canary's FIRING logic keys on the
+            # consumer's fresh_eyes_last_dispatch advancing (not on set_at) — but
+            # set_at gives the investigator the armed-at anchor. Fail-open: if the
+            # stamp injection errors, write the un-stamped gate_json unchanged.
+            local gate_json_stamped
+            gate_json_stamped=$(echo "$gate_json" | python3 -c "import json,sys,datetime; d=json.load(sys.stdin); d['set_at']=datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'); sys.stdout.write(json.dumps(d))" 2>/dev/null || echo "$gate_json")
+            echo "$gate_json_stamped" | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_dispatch_pending >/dev/null 2>&1 || true
             # DISPATCH line — LLM reads this in-turn and invokes /fresh-eyes-code.
             local core_count reason
             core_count=$(echo "$gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('core_count', '?'))" 2>/dev/null || echo "?")
@@ -1484,6 +1574,18 @@ do_productivity_check() {
     python3 "$(cygpath -w "$SCRIPT_DIR/agent-watchdog.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
+    # Monitor-tick -- FW-1b demoted pure-monitoring probes (g-317-13). Runs each
+    # ENABLED probe (allowlist in core/config/monitor-probes.yaml; ships empty =
+    # inert) at its own interval_hours, beside the watchdog tick -- same LOCAL-tick
+    # pattern, no daemon, no cloud cron (guard-441). A clean probe records a
+    # last-run marker in <agent>/session/monitor-tick-state.json and files NOTHING
+    # (no goal slot); a tripped probe converts to ONE deduped Investigate via
+    # monitor-finding-convert.py. Ships inert until probes are migrated into the
+    # allowlist (Phase-3 / Apply-3). Fail-open: errors routed to the diagnostic
+    # log, never aborts productivity-check. cygpath: Windows-Python file-arg.
+    python3 "$(cygpath -w "$SCRIPT_DIR/monitor-tick.py")" --tick \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
     # Stale-sentinel canary (g-115-717) — defense-in-depth for Cat C sentinels
     # (bash writer + SKILL-only consumer). Detects sentinels set continuously
     # across N canary runs without being cleared (consumer SKILL likely bypassed)
@@ -1542,8 +1644,33 @@ do_productivity_check() {
     # boundary marker.
     echo ""
     echo "[iteration-close] ═══ ITERATION COMPLETE ═══"
-    echo "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+    # Deadman's-switch terminal-pair (DEFAULT-ON since Stage 5, 2026-06-23).
+    # The terminal is [ScheduleWakeup(sentinel) THEN Skill(aspirations)] — a
+    # self-resurrection net behind the unchanged primary Skill re-entry — for
+    # EVERY agent by default. Opt out per-agent with
+    # `touch agents/<agent>/session/deadman-disabled` (reverts to the bare Skill
+    # imperative, byte-identical to the pre-deadman text). Proven safe before
+    # default-flip: charlie ran it 24h with 0 deaths / 23-of-23 loop re-entries
+    # (deadman-arm-audit ARMED-OK); fail-safe worst case is a slow loop, never a
+    # dead one. See aspirations/SKILL.md Return Protocol +
+    # core/config/rationale/deadman-switch.md.
+    if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
+        echo "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+    else
+        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
+    fi
     echo "[iteration-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
+
+    # Imperative-fired tracer (g-115-1126): independent observability lane confirming
+    # the ITERATION COMPLETE imperative above reached this code path. A future
+    # silent-loop-death investigation can grep core/logs/imperative-fires.jsonl to
+    # confirm the imperative fired this iteration. Append-only, fail-open (|| true) —
+    # never aborts productivity-check. Controlled values (timestamp/literal/agent),
+    # so printf-built JSON is injection-safe and avoids a per-iteration python spawn
+    # on this hot path.
+    printf '{"ts":"%s","script":"iteration-close","phase":"productivity-check","agent":"%s","event":"iteration-complete-imperative"}\n' \
+        "$(date +%Y-%m-%dT%H:%M:%S)" "${AYOAI_AGENT:-unknown}" \
+        >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 }
 
 # --------------------------- phase: recover (g-284-06) ---------------------------

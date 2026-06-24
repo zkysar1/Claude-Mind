@@ -125,6 +125,8 @@ Write {child_path}:
 ---
 topic: <key in title case>
 last_updated: '<today>'
+poignancy: <1-10>   # g-306-26: LLM-rated importance (readability copy; the
+                    # scoring value is the index poignancy set in step 3 — keep identical)
 last_update_trigger:
   type: tree_growth
   source: "/tree add"
@@ -139,8 +141,14 @@ last_update_trigger:
 #    L1 pick log (S9). Auto-logging fires regardless; this enriches the
 #    entry. Pass --encoding-reason "<short why>" when the call site has
 #    semantic context worth capturing (a one-line "why this L1").
+#    poignancy (g-306-26 producer, BRD Gap 1a / Generative Agents 2304.03442):
+#    include an LLM-rated 1-10 importance value in the child so the new node's
+#    INDEX poignancy is set AT CREATION (the g-306-08 retrieve blend reads the
+#    index value; absent → null and the blend no-ops). Keep it identical to the
+#    front-matter poignancy from step 2. Rubric: 1-3 routine · 4-6 useful ·
+#    7-8 pivotal · 9-10 mission-altering — how durable + impactful for FUTURE retrieval.
 echo '{"operations": [
-  {"op": "add-child", "key": "<parent>", "child": {"key": "<key>", "summary": "<summary>"}},
+  {"op": "add-child", "key": "<parent>", "child": {"key": "<key>", "summary": "<summary>", "poignancy": <1-10>}},
   {"op": "propagate", "key": "<parent>"}
 ]}' | bash core/scripts/tree-update.sh --batch --encoding-source tree-add
 ```
@@ -211,10 +219,14 @@ Read {node.file}
 #      matters for the productivity gate (maintenance vs real encoding).
 #      Edit the .md file's front-matter to add/update the type line.
 
-# 5. Check growth triggers
-Read core/config/tree.yaml for decompose_threshold
-line_count = count lines in node .md body (excluding YAML front matter)
-If line_count > decompose_threshold AND depth < D_max:
+# 5. Check structural growth trigger (K=D=4 retrieval-locality contract, g-306-13)
+# Growth is STRUCTURAL now, not line-count (outcome 3 — the old
+# `line_count > decompose_threshold` trigger is retired). Flag a node for
+# regroup when its direct children exceed K_max; retrieval-subtree leaf overflow
+# (> K_max^(D_retrieval-1) = 64) is computed at maintain time by
+# `tree-read.sh --decompose-candidates` / `--validate`.
+Read core/config/tree.yaml for K_max
+If child_count > K_max:
   bash core/scripts/tree-update.sh --set <key> growth_state ready_to_decompose
 
 # 6. Propagate if confidence changed
@@ -312,63 +324,66 @@ as the former `/tree-growth` skill.
 
 ### Operations (in order)
 
-#### 1. DECOMPOSE — Break apart monolithic leaf nodes
+> **K=D=4 retrieval-locality contract (g-306-13, board decision
+> msg-20260619-075228-bravo-086).** DECOMPOSE and REGROUP are STRUCTURAL,
+> not line-count (outcome 3 — the `decompose_threshold` line trigger is
+> retired). Per Zhong et al. (PRL 134:237402, 2025) recall saturates at
+> `K_max^(D_retrieval-1)` = 4^3 = 64 leaves under a retrieval entry point;
+> the locality bound is therefore <=K_max (4) children/node and <=64 leaves
+> under any retrieval root. Policy is HYBRID report-mode-first +
+> enforce-going-forward: **GRANDFATHER** the ~650 existing depth-5..8 nodes
+> (no forced whole-tree rebalance), and regroup a subtree **opportunistically
+> — only when maintain is already touching it.** Both operations introduce
+> intermediate category nodes and REPARENT existing children under them
+> (moving nodes, preserving content + history) — they do NOT split `.md`
+> sections.
 
-**Trigger**: leaf node where ALL of the following are true:
-- `.md` body > `decompose_threshold` (80 lines)
-- `depth < D_max` (20)
+#### 1. DECOMPOSE — Restore retrieval locality (subtree leaf overflow)
 
-article_count is NOT a gating condition — if a node is too big, decompose it
-regardless of how many articles it has.
-
-If `growth_state` field is missing from the node, check `decompose_threshold` directly
-(do not require `growth_state: ready_to_decompose`).
-
-**Steps**:
-1. Scan all leaf nodes for decompose triggers:
-   Bash: `tree-read.sh --decompose-candidates`
-2. For each monolithic leaf:
-   a. Read the `.md` file, identify all `##` sections
-   b. Cluster `##` sections semantically into 2-4 groups
-   c. Compute child directory from parent's file path: strip `.md` extension, use as
-      directory name
-   d. Create child leaf files in the new subdirectory, one per cluster:
-      - Each child gets minimal YAML front matter: `topic`, `last_updated: '<today>'`,
-        `last_update_trigger` (with `type: decompose`, `source: "/tree maintain"`,
-        `session: {current_session}`). node_type, depth, parent, capability_level
-        are set automatically by the `add-child` batch op (which also sets
-        `_tree.yaml.<key>.last_updated` per cmd_add_child).
-      - Move the relevant `##` sections into each child file
-   e-f. Atomically convert parent + register all children + propagate (ONE batch call).
-        --encoding-source attributes the new children to /tree maintain DECOMPOSE
-        in the L1 pick log (S9). The auto-logger uses this to distinguish
-        structural-debt-driven children from agent-judgment SPROUTs.
-      echo '{"operations": [
-        {"op": "set", "key": "<parent-key>", "field": "node_type", "value": "interior"},
-        {"op": "set", "key": "<parent-key>", "field": "article_count", "value": 0},
-        {"op": "add-child", "key": "<parent-key>", "child": {"key": "<child-1>", "summary": "..."}},
-        ...repeat for each child...
-        {"op": "propagate", "key": "<parent-key>"}
-      ]}' | bash core/scripts/tree-update.sh --batch --encoding-source tree-maintain-decompose
-   g. Append to `tree_growth_log`: `{op: DECOMPOSE, node, children, date, reason}`
-   Cap: process up to `config.max_decompose_per_invocation` candidates (default 50, largest first — single source of truth is core/config/tree.yaml, raised 30→50 in 2026-04-18 per g-115-79).
-
-#### 1.5. REDISTRIBUTE — Move interior node body content into children
-
-**Trigger**: interior node (has children) where `.md` body > `decompose_threshold` (80 lines).
+**Trigger** (STRUCTURAL): a non-root node whose retrieval subtree holds more
+than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
+`tree-read.sh --decompose-candidates` with `reason: leaf_overflow`,
+`recommended_action: decompose`, plus `subtree_leaves` / `depth` / `child_count`.
 
 **Steps**:
-1. Scan interior nodes for large bodies:
-   Bash: `tree-read.sh --redistribute-candidates`
-2. For each candidate:
-   a. Read the interior node's `.md` file, identify all `##` sections
-   b. Read each child node's `.md` file to understand its scope
-   c. For each `##` section in the parent:
-      - Semantic match to existing child? Move content there.
-      - No match and depth < D_max? Create new child leaf.
-      - No match and depth >= D_max? Leave in parent.
-   d. Replace parent body with brief summary (3-5 lines)
-   e. Update `_tree.yaml`, log to tree_growth_log
+1. Scan: `Bash: tree-read.sh --decompose-candidates`
+2. For each candidate (largest `subtree_leaves` first), restore the <=64 bound
+   by introducing intermediate category nodes that partition the children into
+   <=K_max balanced semantic groups:
+   a. Read the node and its children to find the natural clustering.
+   b. Choose <=K_max kebab-case intermediate category names.
+   c. Create the intermediate nodes as children of `<key>` (add-child), then
+      REPARENT the existing children under the appropriate category via
+      `bash core/scripts/tree-update.sh` reparent ops. Use `--encoding-source
+      tree-maintain-decompose` so the L1 pick log (S9) attributes the new
+      intermediates to structural maintenance, not agent-judgment SPROUTs.
+   d. **Depth guard / grandfather**: skip any reparent that would push a child
+      past `D_max` (20). If the subtree is already deep (grandfathered
+      depth-5..8) and cannot be regrouped without exceeding the ceiling, LEAVE
+      it — report-only, do not force-migrate.
+   e. Propagate confidence upward (`propagate` op).
+   f. Append to `tree_growth_log`: `{op: DECOMPOSE, node, intermediates, date, reason: leaf_overflow}`
+   Cap: process up to `config.max_decompose_per_invocation` candidates (default
+   50, largest first — single source of truth core/config/tree.yaml).
+
+#### 1.5. REGROUP — Cap fan-out at K_max (formerly REDISTRIBUTE)
+
+**Trigger** (STRUCTURAL): an interior node with more than `K_max` (4) children.
+Reported by `tree-read.sh --redistribute-candidates` with `reason: k_overflow`,
+`recommended_action: regroup`, plus `child_count` / `children` / `depth`.
+
+**Steps**:
+1. Scan: `Bash: tree-read.sh --redistribute-candidates`
+2. For each candidate (largest `child_count` first):
+   a. Cluster the >K_max children into <=K_max semantic groups (balanced
+      regrouping on overflow).
+   b. Create one intermediate category node per group as a child of `<key>`.
+   c. REPARENT each existing child under its group's intermediate node
+      (`tree-update.sh` reparent ops — moves nodes, preserves content/history).
+   d. **Depth guard / grandfather**: skip reparents that would exceed `D_max`
+      (20); leave grandfathered deep subtrees in place rather than force-migrate.
+   e. Replace the parent body with a brief routing summary; propagate.
+   f. Log to tree_growth_log: `{op: REGROUP, node, groups, date, reason: k_overflow}`
    Cap: process up to `config.max_redistribute_per_invocation` candidates (default 5).
 
 #### 1.75. DISTILL — Concentrate low-utility nodes to actionable kernel
@@ -428,11 +443,27 @@ of utility tracking have accumulated signal.
 #### 5. PRUNE — Remove empty dead-end nodes
 
 **Trigger**: `article_count == 0` AND `children` empty AND no merge candidate
+AND the node `.md` body is a STUB — fewer than `prune_stub_line_threshold`
+(config, default 10) non-blank body lines, excluding YAML front matter.
+
+> **`article_count == 0` is NOT an emptiness signal.** `article_count` counts
+> *attached articles*, not node body content — a leaf can hold 13-86 lines of
+> real `.md` body and still report `article_count == 0` (the field was simply
+> never incremented on an under-instrumented node). Pruning such a node
+> destroys real knowledge. The g-115-398 sweep flagged 25 such nodes; ALL were
+> content-bearing (g-115-1534; exp-g-115-1367: "article_count=0 is NORMAL —
+> it counts attached articles, not node body"). The body-read gate below is
+> mandatory (verify-before-assuming) — never prune on `article_count == 0` alone.
 
 **Steps**:
 1. Find empty childless nodes (skip L1 domains, skip `growth_state: growing`)
-2. Archive topic file to `world/knowledge/archive/`
-3. Remove from `_tree.yaml`, log to tree_growth_log
+2. **Body-read gate (mandatory)**: read the candidate `.md` and count non-blank
+   body lines (exclude YAML front matter). If `>= prune_stub_line_threshold`
+   (10) the node is content-bearing, NOT empty — SKIP prune. (The
+   under-instrumented `article_count` is a data-hygiene concern, not grounds
+   for deletion; leave the node in place.)
+3. Archive topic file to `world/knowledge/archive/`
+4. Remove from `_tree.yaml`, log to tree_growth_log
 
 #### 5.5. RETIRE — Remove never-consulted dead nodes
 
@@ -441,13 +472,21 @@ of utility tracking have accumulated signal.
 - Node has existed for 5+ sessions (`retire_sessions_unused` from config)
 - `growth_state` is not `growing`
 - NOT an L1 domain node (depth > 1)
+- `.md` body is a STUB — fewer than `prune_stub_line_threshold` (config,
+  default 10) non-blank body lines (excl. front matter). A content-bearing
+  leaf that was never retrieved is a retrieval-INDEXING gap, not dead
+  knowledge — route it to REVIEW, never auto-RETIRE (g-115-1534).
 
 **Steps**:
 1. Find candidates: leaf nodes with `retrieval_count == 0`, created before session N-5
    (check `tree_growth_log` for creation date, or node's `.md` front matter `last_update_trigger.session`)
-2. Archive `.md` content to `world/knowledge/archive/{key}-retired-{date}.md`
-3. Remove node: `bash core/scripts/tree-update.sh --remove-child <parent> <key>`
-4. Log to tree_growth_log: `{op: RETIRE, node, date, reason: "never retrieved in N sessions"}`
+2. **Body-read gate (mandatory)**: read the candidate `.md`; if non-blank body
+   lines `>= prune_stub_line_threshold` (10) the node holds real content — do
+   NOT retire. Flag in tree_growth_log: `{op: REVIEW, node, date, reason:
+   "content-bearing but never retrieved — retrieval-indexing gap"}` and move on.
+3. Archive `.md` content to `world/knowledge/archive/{key}-retired-{date}.md`
+4. Remove node: `bash core/scripts/tree-update.sh --remove-child <parent> <key>`
+5. Log to tree_growth_log: `{op: RETIRE, node, date, reason: "never retrieved in N sessions"}`
 
 **Interior node review**: If ALL children of an interior node have `utility_ratio < 0.3`:
 - Flag in tree_growth_log: `{op: REVIEW, node, date, reason: "all children low utility"}`
@@ -563,7 +602,7 @@ Other differences from standard mode:
 - Processes ALL candidates regardless of `growth_state` field value
   (standard mode requires `growth_state: ready_to_decompose` or checks threshold;
   backlog mode checks threshold directly for every leaf node)
-- Processes candidates largest-first (by .md line count)
+- Processes candidates largest-first (DECOMPOSE by `subtree_leaves`, REGROUP by `child_count`)
 
 **When to use**: Auto-invoked by aspirations loop Phase 8.7 and by
 consolidation Step 6 when
@@ -571,8 +610,8 @@ consolidation Step 6 when
 Can also be run manually after deploying threshold changes.
 
 **Steps**:
-1. `Bash: tree-read.sh --decompose-candidates` (uses current decompose_threshold)
-2. `Bash: tree-read.sh --redistribute-candidates`
+1. `Bash: tree-read.sh --decompose-candidates` (structural: subtree-leaves > leaf_cap)
+2. `Bash: tree-read.sh --redistribute-candidates` (structural: children > K_max)
 3. Compute elevated caps from `core/config/tree.yaml` standard × 1.5 (ceil),
    bounded by the `modifiable.max` ceiling for each parameter.
 4. Process DECOMPOSE candidates (up to elevated cap, largest first) —

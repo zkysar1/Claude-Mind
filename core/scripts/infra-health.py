@@ -177,18 +177,51 @@ def _find_bash():
 _BASH_CMD = _find_bash()
 
 
+def _probe_timeout_seconds(script_path, default=30):
+    """Per-probe subprocess timeout (seconds), optionally overridden in the
+    probe script's header.
+
+    The default 30s budget fits a single-target probe. A probe that
+    legitimately needs longer -- e.g. an end-to-end rollup that composes
+    several sub-probes in parallel (the slowest sub-probe sets the floor) --
+    may declare a larger budget in its header:
+
+        # infra-health-timeout-seconds: 60
+
+    Bounded to [1, 120] so a typo cannot hang the loop. An absent or malformed
+    directive falls back to `default`. Header-only scan (first 30 lines) keeps
+    it cheap. Plain string parse (no `re` import).
+    """
+    marker = "infra-health-timeout-seconds:"
+    try:
+        with open(script_path, "r", encoding="utf-8") as f:
+            for _ in range(30):
+                line = f.readline()
+                if not line:
+                    break
+                s = line.strip()
+                if s.startswith("#") and marker in s:
+                    tail = s.split(marker, 1)[1].split()
+                    if tail and tail[0].isdigit():
+                        return max(1, min(120, int(tail[0])))
+    except Exception:
+        pass
+    return default
+
+
 def _run_probe_script(script_path, component):
     """Run a domain-specific probe script and parse its JSON output.
 
     The script should output a JSON object with at least a "status" field.
     Valid status values: "ok", "failed", "no_credentials", "provisionable".
     """
+    timeout_s = _probe_timeout_seconds(script_path)
     start = time.time()
     try:
         result = subprocess.run(
             [_BASH_CMD, str(script_path)],  # str() — Git Bash handles Windows paths
             cwd=str(PROJECT_ROOT),
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=timeout_s,
         )
         latency_ms = int((time.time() - start) * 1000)
 
@@ -221,7 +254,7 @@ def _run_probe_script(script_path, component):
         return {"status": "failed", "error": error, "latency_ms": latency_ms}
 
     except subprocess.TimeoutExpired:
-        return {"status": "failed", "error": f"Probe script timed out (30s)"}
+        return {"status": "failed", "error": f"Probe script timed out ({timeout_s}s)"}
     except FileNotFoundError:
         return {"status": "failed", "error": "bash command not found"}
 
@@ -368,9 +401,82 @@ def cmd_check_all(args):
     print(json.dumps(results, ensure_ascii=False))
 
 
+def _load_status_staleness_hours():
+    """Staleness threshold (hours) for the cmd_status annotation.
+
+    A stored component value whose most-recent recorded result is older than
+    this many hours is flagged stale=true so a consumer does not misread the
+    last reading as the CURRENT state (the 2026-05-25 false roblox-down-10-days
+    alarm; structuralizes guard-647). Fail-open default 6.0 — a config read
+    failure must never break `status`. Tunable via core/config/aspirations.yaml
+    infra_health.status_staleness_hours.
+    """
+    hours = 6.0
+    try:
+        if ASPIRATIONS_CONFIG.exists():
+            with open(ASPIRATIONS_CONFIG, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            ih = cfg.get("infra_health") or {}
+            hours = float(ih.get("status_staleness_hours", hours))
+    except Exception:
+        pass
+    return hours
+
+
+def _component_staleness(entry, threshold_hours, now=None):
+    """Return (is_stale, last_check_iso, hours_ago) for a component entry.
+
+    last_check = the most recent of last_success / last_failure — the last time
+    a probe actually recorded a result (no_credentials / no_probe / no_target
+    update only session_last_checked, never a timestamp, so they cannot make a
+    value look fresh). A component whose last recorded result is older than
+    threshold_hours is STALE: its stored consecutive_failures / last_failure
+    must NOT be read as the CURRENT state (guard-647).
+
+    None / malformed timestamps are skipped, never crashed on (guard-420
+    None-guard before datetime arithmetic + guard-514 safe-getter on persisted
+    values): a component that never recorded a result returns (True, None, None)
+    — no current reading exists, so it is stale by definition.
+    """
+    if now is None:
+        now = datetime.now()
+    candidates = []
+    if isinstance(entry, dict):
+        for field in ("last_success", "last_failure"):
+            val = entry.get(field)
+            if not val:
+                continue  # guard-420: None-guard before datetime arithmetic
+            try:
+                candidates.append(datetime.fromisoformat(val))
+            except (ValueError, TypeError):
+                continue  # guard-514: malformed persisted timestamp -> skip
+    if not candidates:
+        return True, None, None
+    last_dt = max(candidates)
+    hours_ago = round((now - last_dt).total_seconds() / 3600, 1)
+    return (hours_ago > threshold_hours), last_dt.strftime("%Y-%m-%dT%H:%M:%S"), hours_ago
+
+
 def cmd_status(args):
-    """Read current health state."""
+    """Read current health state.
+
+    g-318-17: each component is annotated with a staleness guard so a stored
+    value older than infra_health.status_staleness_hours reports stale=true
+    (plus last_check + staleness_hours_ago) instead of presenting its last
+    reading as the current state (guard-647). Annotation is additive and
+    read-only — it is never written back to infra-health.yaml.
+    """
     data = load_health()
+    threshold = _load_status_staleness_hours()
+    now = datetime.now()
+    for entry in (data.get("components") or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        is_stale, last_check, hours_ago = _component_staleness(entry, threshold, now)
+        entry["stale"] = is_stale
+        entry["last_check"] = last_check
+        entry["staleness_hours_ago"] = hours_ago
+    data["staleness_threshold_hours"] = threshold
     print(json.dumps(data, ensure_ascii=False, default=str))
 
 

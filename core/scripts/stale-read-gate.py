@@ -8,8 +8,8 @@ adapter for the legacy invocation contract.
 
 Exit codes:
   exit 0 — pass (fresh read, legacy goal, no-parent skip, or override)
-  exit 1 — block (stale read or never-read, no override)
-  exit 2 — fail-open framework error (parent not found, bad input, etc.)
+  exit 1 — block (stale read with a tracked receipt, no override)
+  exit 2 — fail-open (parent not found, no read receipt / never-read, bad input, etc.)
 
 Override: `--override-stale-read "<justification>"` exits 0 and appends to
 `world/stale-read-overrides.jsonl` for audit.

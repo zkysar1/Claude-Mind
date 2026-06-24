@@ -66,9 +66,22 @@ class TestTreeSyncCheckAgentInject(unittest.TestCase):
         (self.agent_dir / "self.md").write_text(
             "---\nname: g115873test\n---\n# Test fixture agent\n", encoding="utf-8"
         )
+        # Sandbox WORLD_PATH/META_PATH UNDER the fixture agent dir. The SUT
+        # (tree-sync-check.sh) chains to meta-writers (gate-firings via
+        # _gate_log.py, changelog, trigger-firings) that resolve META_DIR
+        # from this conf. Pointing them at the real PROJECT_ROOT/{world,meta}
+        # let every run leak telemetry into the repo root, surviving tearDown
+        # (which only rmtree's agent_dir). Sandboxing under agent_dir means
+        # tearDown's existing rmtree cleans the telemetry too. (5 —
+        # orphan-root cruft; same pollution class as guard-652 l1-pick-log
+        # isolation, but via the local-paths.conf mechanism rather than env.)
+        self.sandbox_world = self.agent_dir / "world"
+        self.sandbox_meta = self.agent_dir / "meta"
+        self.sandbox_world.mkdir(parents=True, exist_ok=True)
+        self.sandbox_meta.mkdir(parents=True, exist_ok=True)
         (self.agent_dir / "local-paths.conf").write_text(
-            f"WORLD_PATH={PROJECT_ROOT / 'world'}\n"
-            f"META_PATH={PROJECT_ROOT / 'meta'}\n",
+            f"WORLD_PATH={self.sandbox_world}\n"
+            f"META_PATH={self.sandbox_meta}\n",
             encoding="utf-8",
         )
         # Create the .active-agent-<sid> binding file (this is what

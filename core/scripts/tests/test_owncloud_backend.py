@@ -13,6 +13,8 @@ mind_api/docs/lodestar-own-cloud-architecture.md:
 File basename starts with ``test_`` so domain-leak-check.sh skips it (the boto3 /
 S3 / DynamoDB tokens here are test infrastructure, not a domain leak).
 """
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -32,7 +34,7 @@ BUCKET = "zds-data"
 LOCKS = "zds-locks"
 SESSIONS = "zds-sessions"
 REGION = "us-east-2"
-ENV_ID = "claude-mind"
+ENV_ID = "ayoai-mind"
 
 
 @pytest.fixture(autouse=True)
@@ -45,9 +47,30 @@ def _default_machine_id(monkeypatch):
     monkeypatch.setenv("MACHINE_ID", "test-machine-ci")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sync_manifest(monkeypatch, tmp_path):
+    """4: _refresh's no-clobber guard lazily reads owncloud_sync's
+    persistent sync-manifest (located via RUNTIME_DIR). Point RUNTIME_DIR at a
+    per-test tmp dir so these tests are hermetic — they never read the real
+    mind_api/state/owncloud-sync-manifest.json (no dependency on machine state).
+    Tests that exercise the baseline write their manifest into this dir via
+    _write_sync_manifest()."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "_owncloud_rt"))
+
+
+def _write_sync_manifest(tmp_path, entries):
+    """Write owncloud_sync's persistent sync-manifest into the RUNTIME_DIR the
+    _isolate_sync_manifest fixture points at. `entries` maps rel_key ->
+    {"mtime": int, "md5": hexdigest}."""
+    rt = tmp_path / "_owncloud_rt"
+    rt.mkdir(parents=True, exist_ok=True)
+    (rt / "owncloud-sync-manifest.json").write_text(
+        json.dumps(entries), encoding="utf-8")
+
+
 @pytest.fixture
 def aws_env(monkeypatch):
-    # Fake creds so boto3 is satisfied; moto never contacts AWS.
+    # Fake creds so  is satisfied; moto never contacts AWS.
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
               "AWS_SECURITY_TOKEN", "AWS_SESSION_TOKEN"):
         monkeypatch.setenv(k, "testing")
@@ -268,7 +291,7 @@ def test_stale_lock_is_breakable(cloud):
     lp = cloud["root"] / "world" / "r.lock"
     a.acquire_lock(lp)
     # Expire the lock's ttl into the past (no sleeping). Liveness is the
-    # app-level ttl<:now condition, NOT DynamoDB TTL deletion (fix #1).
+    # app-level ttl<:now condition, NOT  TTL deletion (fix #1).
     cloud["ddb"].update_item(
         TableName=LOCKS, Key={"lock_key": {"S": b_lock_key(a, lp)}},
         UpdateExpression="SET #t = :old",
@@ -345,7 +368,7 @@ def test_heartbeat_wrong_token_rejected(cloud):
         a.heartbeat("alpha", "WRONG-TOKEN")                 # not the runner_token
 
 
-# --- clean release: RUNNING->IDLE iff token matches (g-115-1337) -------------
+# --- clean release: RUNNING->IDLE iff token matches (7) -------------
 def test_release_runner_clean(cloud):
     a = _backend(cloud, machine_id="A")
     assert a.acquire_runner("alpha", "tokA") is True
@@ -391,7 +414,7 @@ def test_release_runner_missing_item_noop(cloud):
     assert a.release_runner("never-started", "tok") is False
 
 
-# --- list_runner_claims: env-scoped enumeration for ownership (g-115-1337) ---
+# --- list_runner_claims: env-scoped enumeration for ownership (7) ---
 def test_list_runner_claims_empty(cloud):
     a = _backend(cloud, machine_id="A")
     assert a.list_runner_claims() == []
@@ -451,15 +474,97 @@ def _multiroot(cloud, world, meta, agents):
 def test_multi_root_maps_each_root_to_its_prefix(cloud, tmp_path):
     world, meta, agents = tmp_path / "w", tmp_path / "m", tmp_path / "a"
     b = _multiroot(cloud, world, meta, agents)
-    assert b._s3_key(world / "reasoning-bank.jsonl") == "claude-mind/world/reasoning-bank.jsonl"
-    assert b._s3_key(meta / "spark-questions.jsonl") == "claude-mind/meta/spark-questions.jsonl"
-    assert b._s3_key(agents / "alpha" / "aspirations.jsonl") == "claude-mind/agents/alpha/aspirations.jsonl"
+    assert b._s3_key(world / "reasoning-bank.jsonl") == "ayoai-mind/world/reasoning-bank.jsonl"
+    assert b._s3_key(meta / "spark-questions.jsonl") == "ayoai-mind/meta/spark-questions.jsonl"
+    assert b._s3_key(agents / "alpha" / "aspirations.jsonl") == "ayoai-mind/agents/alpha/aspirations.jsonl"
 
 
 def test_rel_raises_on_unmapped_path(cloud, tmp_path):
     b = _multiroot(cloud, tmp_path / "w", tmp_path / "m", tmp_path / "a")
     with pytest.raises(ValueError):
         b._s3_key(tmp_path / "nowhere" / "x.jsonl")         # under no root -> raise, not p.name
+
+
+# --- _refresh no-clobber guard (3 root cause / 4 fix) ------
+# The in-process self._etags cache is empty after a daemon restart, so the
+# first force_fresh refresh must NOT download stale S3 over a local file holding
+# unpushed writes. The guard gates the overwrite on the persistent sync-manifest
+# baseline, symmetric to owncloud_sync._pull_one. These four tests pin all four
+# _overwrite_decision branches: no_clobber, download(peer), identical, download(no-baseline).
+def test_refresh_no_clobber_unpushed_local_after_restart(cloud, tmp_path):
+    """3 regression: a restart empties _etags; the first force_fresh
+    refresh of a file whose local copy has unpushed writes (local != baseline)
+    must KEEP local, never clobber it with stale S3."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "reasoning-bank.jsonl"
+    key = b._s3_key(p)
+    stale = b'{"id":"rb-1","valid_from":0}\n'            # last-synced version on S3
+    fresh_local = b'{"id":"rb-1","valid_from":2020}\n'   # unpushed local backfill
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=stale)   # S3 = stale
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(fresh_local)                            # non-backend raw local write
+    # baseline == last reconciled (stale) content; local diverged -> unpushed.
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 1, "md5": hashlib.md5(stale).hexdigest()}})
+    b2 = _backend(cloud)                                  # restart: empty _etags
+    assert b2._etags == {}
+    got = b2.read_text(p, force_fresh=True)               # the _fileops in-lock RMW path
+    assert got == fresh_local.decode()                   # unpushed local survives
+    assert p.read_bytes() == fresh_local                 # on-disk file untouched
+
+
+def test_refresh_pulls_when_local_at_baseline_and_s3_moved(cloud, tmp_path):
+    """local == baseline and S3 != baseline -> a peer/other machine wrote; this
+    is NOT an unpushed-local case, so the guard MUST still pull (no over-block)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "peer.jsonl"
+    key = b._s3_key(p)
+    baseline = b'{"v":1}\n'
+    peer_new = b'{"v":2}\n'
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=peer_new)  # peer wrote v2
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(baseline)                              # local still at baseline v1
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 1, "md5": hashlib.md5(baseline).hexdigest()}})
+    b2 = _backend(cloud)
+    got = b2.read_text(p, force_fresh=True)
+    assert got == peer_new.decode()                     # pulled the peer's newer copy
+    assert p.read_bytes() == peer_new
+
+
+def test_refresh_identical_local_post_restart_adopts_fence(cloud, tmp_path):
+    """Post-restart with local already byte-identical to S3: short-circuit (no
+    re-download) and adopt the S3 ETag as the If-Match fence token."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "same.jsonl"
+    key = b._s3_key(p)
+    body = b'{"v":1}\n'
+    head = cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=body)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(body)                                  # local == S3
+    b2 = _backend(cloud)                                 # empty _etags
+    assert b2._etags == {}
+    got = b2.read_text(p, force_fresh=True)
+    assert got == body.decode()
+    assert b2._etags.get(key) == head["ETag"]           # fence token adopted
+
+
+def test_refresh_no_baseline_pulls_s3_authoritative(cloud, tmp_path):
+    """No manifest baseline + local differs from S3: cannot prove local
+    authority -> S3 is authoritative -> pull (matches _pull_one's no-baseline
+    branch; preserves the pre-fix force_fresh semantics)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "nobaseline.jsonl"
+    key = b._s3_key(p)
+    s3_body = b'{"v":2}\n'
+    local_body = b'{"v":1}\n'
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=s3_body)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(local_body)
+    # No manifest written -> baseline None.
+    b2 = _backend(cloud)
+    got = b2.read_text(p, force_fresh=True)
+    assert got == s3_body.decode()                      # pulled (S3-authoritative)
 
 
 def test_same_filename_different_roots_get_distinct_lock_keys(cloud, tmp_path):
@@ -469,8 +574,8 @@ def test_same_filename_different_roots_get_distinct_lock_keys(cloud, tmp_path):
     b = _multiroot(cloud, world, meta, agents)
     k1 = b._lock_key(world / "aspirations.lock")
     k2 = b._lock_key(agents / "alpha" / "aspirations.lock")
-    assert k1 == "claude-mind/world/aspirations.lock"
-    assert k2 == "claude-mind/agents/alpha/aspirations.lock"
+    assert k1 == "ayoai-mind/world/aspirations.lock"
+    assert k2 == "ayoai-mind/agents/alpha/aspirations.lock"
     assert k1 != k2
 
 
@@ -481,24 +586,24 @@ def test_from_env_builds_three_root_map(cloud, tmp_path, monkeypatch):
         monkeypatch.setenv(k, "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     # This test exercises the root-map wiring, not credential resolution. Opt
-    # into the default boto3 chain so the fail-closed MIND_AWS_* guard (which
+    # into the default  chain so the fail-closed MIND_AWS_* guard (which
     # would otherwise raise before _resolve_root_map runs) does not fire.
     monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
     monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
-    monkeypatch.setenv("AYOAI_WORLD", str(world))
-    monkeypatch.setenv("AYOAI_META", str(meta))
+    monkeypatch.setenv("MIND_WORLD", str(world))
+    monkeypatch.setenv("MIND_META", str(meta))
     monkeypatch.setenv("AGENTS_ROOT", str(agents))
-    b = OwnCloudBackend.from_env()                           # builds its own boto3 clients (moto-mocked)
+    b = OwnCloudBackend.from_env()                           # builds its own  clients (moto-mocked)
     prefixes = {prefix: root for root, prefix in b._roots}
     assert prefixes["world"] == world and prefixes["meta"] == meta and prefixes["agents"] == agents
-    assert b._s3_key(world / "x.jsonl") == "claude-mind/world/x.jsonl"
+    assert b._s3_key(world / "x.jsonl") == "ayoai-mind/world/x.jsonl"
 
 
 def test_from_env_routes_scoped_creds_to_session(monkeypatch, tmp_path):
-    # When MIND_AWS_* are set, from_env must build the boto3 clients from a
+    # When MIND_AWS_* are set, from_env must build the  clients from a
     # Session carrying THOSE creds (the scoped Zak_first_test user) — never the
     # process-wide root AWS_* keys. Monkeypatch Session to capture the creds;
     # no network, no moto needed.
@@ -519,7 +624,7 @@ def test_from_env_routes_scoped_creds_to_session(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     monkeypatch.setenv("MIND_AWS_ACCESS_KEY_ID", "SCOPED_AKID")
     monkeypatch.setenv("MIND_AWS_SECRET_ACCESS_KEY", "scoped_secret")
     b = ocb.OwnCloudBackend.from_env()
@@ -539,9 +644,9 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.delenv("AYOAI_WORLD", raising=False)
+    monkeypatch.delenv("MIND_WORLD", raising=False)
     monkeypatch.delenv("WORLD_PATH", raising=False)
-    monkeypatch.delenv("AYOAI_META", raising=False)
+    monkeypatch.delenv("MIND_META", raising=False)
     monkeypatch.delenv("META_PATH", raising=False)
     with pytest.raises(RuntimeError, match="root"):
         OwnCloudBackend.from_env()
@@ -550,7 +655,7 @@ def test_from_env_requires_a_world_or_meta_root(monkeypatch):
 def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
     # Security: with STORAGE_BACKEND=own-cloud but MIND_AWS_* UNSET and no
     # explicit opt-in, from_env MUST refuse rather than silently fall back to the
-    # default boto3 chain (which on this deployment resolves the root AWS_* lambda
+    # default  chain (which on this deployment resolves the root AWS_* lambda
     # keys). Root-style AWS_* present, MIND_AWS_* absent -> RuntimeError.
     from owncloud_backend import OwnCloudBackend
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
@@ -561,7 +666,7 @@ def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     with pytest.raises(RuntimeError, match="MIND_AWS"):
         OwnCloudBackend.from_env()
 
@@ -569,7 +674,7 @@ def test_from_env_fails_closed_when_scoped_creds_unset(monkeypatch, tmp_path):
 def test_from_env_allows_default_chain_when_opted_in(cloud, monkeypatch, tmp_path):
     # The escape hatch: MIND_AWS_ALLOW_DEFAULT_CHAIN=1 lets a deployment with no
     # static MIND_AWS_* (instance-role / ECS task-role) build successfully via
-    # the default chain. The fixture's moto creds satisfy boto3.
+    # the default chain. The fixture's moto creds satisfy .
     from owncloud_backend import OwnCloudBackend
     for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
         monkeypatch.setenv(k, "testing")
@@ -580,7 +685,7 @@ def test_from_env_allows_default_chain_when_opted_in(cloud, monkeypatch, tmp_pat
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     b = OwnCloudBackend.from_env()
     assert b.name == "own-cloud"
 
@@ -596,7 +701,7 @@ def test_from_env_fails_closed_when_machine_id_unset(monkeypatch, tmp_path):
     monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
     monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
     monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
-    monkeypatch.setenv("AYOAI_WORLD", str(tmp_path / "w"))
+    monkeypatch.setenv("MIND_WORLD", str(tmp_path / "w"))
     monkeypatch.delenv("MACHINE_ID", raising=False)        # the condition under test
     with pytest.raises(RuntimeError, match="MACHINE_ID"):
         OwnCloudBackend.from_env()
@@ -607,3 +712,112 @@ def test_from_env_fails_closed_when_machine_id_unset(monkeypatch, tmp_path):
     # a real id satisfies the guard
     monkeypatch.setenv("MACHINE_ID", "machine-1")
     assert OwnCloudBackend.from_env().machine_id == "machine-1"
+
+
+# --- multi-tenant customer dimension (T-b, 1) ----------------------
+# Brief mind_api/docs/lodestar-tenant-isolation-rearch.md sections 3/6/8. The
+# back-compat invariant (default customer => byte-identical legacy keys) is the
+# regression that protects the live ayoai-mind/* data; the customer-set cases
+# prove the new isolation; the concurrency case proves the contextvars seam has
+# no key bleed between simultaneous distinct-customer requests (risk #3).
+import owncloud_backend as _ocb  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_customer_ctx():
+    """contextvars persist across tests in one process — reset to the
+    single-tenant baseline after each test so a customer-set test cannot bleed
+    into the next."""
+    yield
+    _ocb.set_customer("default")
+
+
+def test_default_customer_keys_are_byte_identical_legacy(cloud):
+    """REGRESSION (back-compat invariant): with no customer set (the 'default'
+    baseline this deployment runs today), every key builder emits the legacy
+    env-id-only key — NO customer segment — so the live ayoai-mind/* data is
+    untouched. Pins the exact bytes BEFORE trusting the customer dimension."""
+    b = _backend(cloud)
+    assert _ocb.current_customer() == "default"
+    assert b._s3_key(cloud["root"] / "world" / "reasoning-bank.jsonl") == \
+        f"{ENV_ID}/world/reasoning-bank.jsonl"
+    assert b._lock_key(cloud["root"] / "world" / "aspirations.lock") == \
+        f"{ENV_ID}/world/aspirations.lock"
+    assert b._session_key("alpha") == f"{ENV_ID}/alpha"
+
+
+def test_customer_set_prepends_customer_segment(cloud):
+    """GIVEN X-Mind-Tenant: pearl (set_customer), WHEN keys are built, THEN the
+    customer segment leads: <customer>/<env-id>/<path> (brief section 8)."""
+    b = _backend(cloud)
+    tok = _ocb.set_customer("pearl")
+    try:
+        assert b._s3_key(cloud["root"] / "world" / "x.jsonl") == \
+            f"pearl/{ENV_ID}/world/x.jsonl"
+        assert b._lock_key(cloud["root"] / "world" / "x.lock") == \
+            f"pearl/{ENV_ID}/world/x.lock"
+        assert b._session_key("alpha") == f"pearl/{ENV_ID}/alpha"
+    finally:
+        _ocb.reset_customer(tok)
+    # after reset, back to the legacy baseline (byte-identical)
+    assert b._s3_key(cloud["root"] / "world" / "x.jsonl") == \
+        f"{ENV_ID}/world/x.jsonl"
+
+
+def test_set_customer_normalizes_and_rejects_slash(cloud):
+    """Surrounding slashes are stripped (header hygiene); an internal '/' is
+    rejected — it would corrupt prefix segmentation / escape the IAM-conditioned
+    customer prefix; blank/None => the default baseline."""
+    b = _backend(cloud)
+    tok = _ocb.set_customer("/pearl/")
+    try:
+        assert b._s3_key(cloud["root"] / "a.txt") == f"pearl/{ENV_ID}/a.txt"
+    finally:
+        _ocb.reset_customer(tok)
+    tok = _ocb.set_customer("   ")
+    try:
+        assert _ocb.current_customer() == "default"  # blank => baseline
+    finally:
+        _ocb.reset_customer(tok)
+    with pytest.raises(ValueError, match="must not contain"):
+        _ocb.set_customer("acme/evil")
+
+
+def test_list_dir_scoped_to_active_customer(cloud):
+    """list_dir's IAM-prefix assertion tracks the active customer: under pearl it
+    scopes to pearl/<env>/, and a pearl write is isolated from the default
+    tenant's namespace (no cross-customer read)."""
+    b = _backend(cloud)
+    b.write_text(cloud["root"] / "world" / "legacy.txt", "L")  # default tenant
+    tok = _ocb.set_customer("pearl")
+    try:
+        b.write_text(cloud["root"] / "world" / "pearl-only.txt", "P")
+        assert b.list_dir(cloud["root"] / "world") == ["pearl-only.txt"]
+    finally:
+        _ocb.reset_customer(tok)
+    # default context sees only the legacy object — no bleed either direction
+    assert b.list_dir(cloud["root"] / "world") == ["legacy.txt"]
+
+
+def test_no_key_bleed_across_concurrent_contexts(cloud):
+    """T-c concurrency (risk #3): the process-singleton backend serves two
+    simultaneous distinct-customer 'requests' with ZERO key bleed because the
+    customer lives in a contextvars.ContextVar (per-thread context), not
+    singleton state. The barrier forces both customers to be set before either
+    builds its key, maximizing the interleaving a singleton-attr design would
+    fail under."""
+    import threading
+    b = _backend(cloud)
+    results: dict = {}
+    barrier = threading.Barrier(2)
+
+    def worker(customer, name):
+        _ocb.set_customer(customer)
+        barrier.wait()  # both set simultaneously before either builds
+        results[name] = b._s3_key(cloud["root"] / "world" / "k.jsonl")
+
+    t1 = threading.Thread(target=worker, args=("pearl", "t1"))
+    t2 = threading.Thread(target=worker, args=("vinheim", "t2"))
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert results["t1"] == f"pearl/{ENV_ID}/world/k.jsonl"
+    assert results["t2"] == f"vinheim/{ENV_ID}/world/k.jsonl"

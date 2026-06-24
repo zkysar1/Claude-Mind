@@ -77,8 +77,35 @@ ALLOWED_PREFIXES = (
     "idea:",
     "maintain:",
     "drift_detected:",
+    # cycle-detector lane — automated detection-driven filers (0).
+    # These were filed in production (alert sweep, routing audit, insight
+    # sweep) but passed the gate only via Layer-D title auto-derive or
+    # --override-all, leaving their stored origin_signal unrecognized by
+    # _goal_source.infer() (goal_source=null). Registering them here lets
+    # is_valid() accept them as first-class signals. Keep locked with the
+    # cycle-detector branch in _goal_source.infer().
+    "alert-email:",             # inbox alert sweep auto-Unblocks
+    "routing-mismatch:",        # post-decompose routing audit (specific-agent)
+    "routing-either-resolve:",  # post-decompose routing audit (either-case)
+    "insight_trigger:",         # insight-trigger-sweep Apply/Investigate goals
     "idle_fallback",
     "program-change-proposal:",
+    # _goal_source.infer() parity (9). These prefixes were already
+    # recognized by _goal_source.py infer() as legitimate goal sources
+    # (user / recurring-cycle / cycle-detector / agent-self) but had drifted
+    # out of this whitelist. Goals carrying them passed source-inference yet
+    # were BLOCKED here, forcing callers to --override-signal -- the override
+    # rate gate-retirement-eval flagged TIGHTEN (51.6% over its window). The
+    # invariant: if infer() blesses a signal as a real source, the gate must
+    # accept it (else legitimate work is make-work-rejected). Keep locked with
+    # _goal_source.infer(); test_goal_source_infer_parity.py pins the full set.
+    "user-directed:",           # infer -> user
+    "user_directed:",           # infer -> user (underscore variant)
+    "recurring:",               # infer -> recurring-cycle (sibling of recurring_cadence:)
+    "monitor:",                 # infer -> cycle-detector (monitor proc-NNN goals)
+    "investigation:",           # infer -> agent-self (sibling of investigate:)
+    "apply:",                   # infer -> agent-self (Apply decomposition goals)
+    "brief:",                   # infer -> agent-self (analyst briefs)
 )
 
 _BARE_TAGS = frozenset(t for t in ALLOWED_PREFIXES if not t.endswith(":"))

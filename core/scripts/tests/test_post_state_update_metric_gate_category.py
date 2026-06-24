@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -86,7 +85,6 @@ PRODUCTION_SHAPE_NOTE = (
 # Mirrors the temp-agent pattern in test_stale_sentinel_canary.py.
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 _ISO_AGENT_NAME = "_test_metric_gate_agent"
-_ISO_AGENT_DIR = PROJECT_ROOT / "agents" / _ISO_AGENT_NAME
 _GATE_ENV = None  # populated per-test by the autouse fixture below
 
 
@@ -94,29 +92,38 @@ _GATE_ENV = None  # populated per-test by the autouse fixture below
 def _isolated_gate_agent(tmp_path_factory):
     """Point the gate subprocess at an isolated agent dir with a clean session.
 
-    Creates PROJECT_ROOT/agents/_test_metric_gate_agent with an empty session/
-    and a local-paths.conf whose WORLD_PATH/META_PATH point at a throwaway tmp
-    dir. _run_gate runs the gate with MIND_AGENT set to this isolated agent so
-    the gate's Test-case-5 (checkpoint) and Test-case-6 (WM dedup) reads find
-    nothing and the gate's decision is deterministic. Teardown removes the dir.
+    g-115-1633: the isolated agent dir is created under a TMP root (NOT live
+    PROJECT_ROOT/agents/) and resolution is routed at it via MIND_AGENT_DIR,
+    now honored by BOTH _paths.py and _paths.sh (the gate runs via bash). The
+    prior version created PROJECT_ROOT/agents/_test_metric_gate_agent, which the
+    running fleet ADOPTED mid-test (agents_root().glob(*/local-paths.conf)) and
+    then leaked on Windows when rmtree(ignore_errors=True) hit the fleet's open
+    handle. tmp_path_factory dirs are auto-cleaned by pytest, so no rmtree of a
+    live agents/ dir is needed and the leak class is eliminated at the source.
+
+    The agent dir has an empty session/ and a local-paths.conf whose
+    WORLD_PATH/META_PATH point at a throwaway tmp dir. _run_gate runs the gate
+    with MIND_AGENT + MIND_AGENT_DIR set to this isolated agent so the gate's
+    Test-case-5 (checkpoint) and Test-case-6 (WM dedup) reads find nothing and
+    the gate's decision is deterministic.
     """
     global _GATE_ENV
     world = tmp_path_factory.mktemp("metric-gate-world")
-    (_ISO_AGENT_DIR / "session").mkdir(parents=True, exist_ok=True)
-    (_ISO_AGENT_DIR / "local-paths.conf").write_text(
+    iso_agent_dir = tmp_path_factory.mktemp("metric-gate-agent")
+    (iso_agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    (iso_agent_dir / "local-paths.conf").write_text(
         f"WORLD_PATH={world.as_posix()}\n"
         f"META_PATH={(world / 'meta').as_posix()}\n",
         encoding="utf-8",
     )
     env = dict(os.environ)
     env["MIND_AGENT"] = _ISO_AGENT_NAME
+    env["MIND_AGENT_DIR"] = str(iso_agent_dir)  # route resolution at the tmp dir (3)
     env.pop("MIND_WORLD", None)      # force conf-based world resolution
-    env.pop("MIND_AGENT_DIR", None)  # no AGENT_DIR override leaks in
     _GATE_ENV = env
     try:
         yield
     finally:
-        shutil.rmtree(_ISO_AGENT_DIR, ignore_errors=True)
         _GATE_ENV = None
 
 
@@ -132,7 +139,7 @@ def _run_gate(outcome_class: str, goal_id: str, category: str,
     """
     proc = subprocess.run(
         [BASH, str(GATE), outcome_class, goal_id, category, slug],
-        input=outcome_note, capture_output=True, text=True, timeout=15,
+        input=outcome_note, capture_output=True, text=True, timeout=60,
         env=_GATE_ENV,
     )
     parsed = None

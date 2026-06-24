@@ -44,7 +44,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT  # type: ignore
+from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT, META_DIR  # type: ignore
 from _fileops import log_script_decision  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
 from _prefix_registry import PRIMITIVE_PREFIXES  # type: ignore
@@ -78,6 +78,22 @@ def _load_config():
     path = Path(PROJECT_ROOT) / "core" / "config" / "aspirations.yaml"
     if not path.exists():
         raise FileNotFoundError(f"aspirations.yaml not found at {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _load_cognitive_horizons():
+    """Load meta/cognitive-horizons.yaml (SSOT, BRD Gap 19 / ).
+
+    Fail loud on missing file (guard-424 + precheck-eval constraint #4 — no
+    hardcoded fallback; the yaml is the single source for horizon windows so
+    callers consume it rather than re-hardcoding literals, rb-335).
+    """
+    if META_DIR is None:
+        raise RuntimeError("META_DIR unresolved — cannot load cognitive-horizons.yaml")
+    path = Path(META_DIR) / "cognitive-horizons.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"cognitive-horizons.yaml not found at {path}")
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -298,7 +314,14 @@ def cmd_hypothesis_health(args, config, compact):
     discovered = _pipeline_query("--stage discovered") or []
     active = _pipeline_query("--stage active") or []
 
-    fresh_discovered = [h for h in discovered if _days_since(h.get("formed_date")) <= 7]
+    # Cognitive-horizon windows — single source: meta/cognitive-horizons.yaml
+    # (BRD Gap 19 / ; rb-335 reader-consumes). Fail loud, no fallback.
+    ch = _load_cognitive_horizons()
+    fresh_days = ch["pipeline_windows"]["fresh_discovered_window_days"]
+    short_win = ch["horizons"]["short"]["re_probe_window_hours"]
+    long_win = ch["horizons"]["long"]["re_probe_window_hours"]
+
+    fresh_discovered = [h for h in discovered if _days_since(h.get("formed_date")) <= fresh_days]
 
     now = _now()
     resolvable_active = []
@@ -308,9 +331,9 @@ def cmd_hypothesis_health(args, config, compact):
         formed = _parse_iso(h.get("formed_date"))
         if horizon in ("session", "micro"):
             resolvable_active.append(h)
-        elif horizon == "short" and formed and formed + timedelta(hours=12) <= now:
+        elif horizon == "short" and formed and formed + timedelta(hours=short_win) <= now:
             resolvable_active.append(h)
-        elif horizon == "long" and formed and formed + timedelta(hours=24) <= now:
+        elif horizon == "long" and formed and formed + timedelta(hours=long_win) <= now:
             resolvable_active.append(h)
         else:
             time_gated_active.append(h)

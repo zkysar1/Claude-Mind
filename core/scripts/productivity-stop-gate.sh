@@ -253,6 +253,37 @@ print(f"[productivity-gate] score={score:.2f} routine_ratio={routine_ratio:.2f} 
       f"(weighted={weighted_artifacts:.2f}, raw_total={total_artifacts}, {breakdown}) "
       f"deep_ratio={deep_ratio:.2f} goals={goals_completed} threshold={stop_threshold}")
 
+# --- Routine-streak surface ( / US-08) -------------------------------
+# Make the auto-deep flip counter visible at iteration close so the agent
+# catches the silent flip BEFORE it fires. The flip itself lives in
+# aspirations-loop-digest.md Phase 4.1 Block C (routine_streak_global >=
+# routine_streak_global_ceiling -> the outcome is reclassified deep). This is
+# the close-side twin of aspirations-precheck Phase 0-pre.0b's boredom surface,
+# which shows the same counter at iteration START. Reuses the loop_state /
+# signals / cfg already loaded above (no extra read). The ceiling is read with
+# a .get() default OUTSIDE the critical config block (lines 103-120) so a
+# missing `recurring` key never fail-opens the stop gate itself — at worst the
+# surface falls back to the documented default of 5.
+routine_streak_global = _to_int_count(signals.get("routine_streak_global"), 0)
+rs_ceiling = int((cfg.get("recurring") or {}).get("routine_streak_global_ceiling", 5))
+routine_streaks = loop_state.get("routine_streaks", {}) or {}
+_rs_top = sorted(
+    ((g, int(n)) for g, n in routine_streaks.items()
+     if isinstance(n, (int, float)) and not isinstance(n, bool) and n > 0),
+    key=lambda kv: kv[1], reverse=True,
+)[:3]
+_rs_per_goal = ", ".join(f"{g}={n}" for g, n in _rs_top) or "none"
+# Near-threshold warning fires within 2 of the ceiling (matches the ceiling-5
+# default to a 1-iteration heads-up before the flip; relative so it tracks any
+# retuned ceiling). Plain ASCII -- no em-dash on the Windows stdout path.
+if rs_ceiling > 0 and routine_streak_global >= rs_ceiling - 2:
+    print(f"[routine-streak] WARN global={routine_streak_global}/{rs_ceiling} -- "
+          f"auto-deep flip at {rs_ceiling}: pick a deep goal next or let the flip "
+          f"carry you | per-goal: {_rs_per_goal}")
+else:
+    print(f"[routine-streak] global={routine_streak_global}/{rs_ceiling} "
+          f"(auto-deep at {rs_ceiling}) | per-goal: {_rs_per_goal}")
+
 # --- G4: Productivity-score persistence (per world/conventions/self-program-evolution.md) ---
 # Append one line per iteration's productivity evaluation to
 # world/productivity-snapshots.jsonl. Signal #15 of the Self/Program evolution

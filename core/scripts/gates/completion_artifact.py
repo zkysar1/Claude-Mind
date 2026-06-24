@@ -83,7 +83,17 @@ ARTIFACT_PATH_RE = re.compile(
     r"(?:core/scripts|core/config|mind_api/src|"
     r"world/conventions|world/knowledge|"
     r"meta|\.claude/skills|\.claude/rules)"
-    r"/[\w/-]+\.(?:sh|py|md|yaml|yml|json|jsonl)"
+    # Extension alternation MUST be longest-first (jsonl before json) AND
+    # boundary-anchored. Python `re` alternation is leftmost-match, not
+    # longest-match: a bare `(...|json|jsonl)` matched `.json` inside `.jsonl`
+    # and truncated the path, so a real `meta/foo.jsonl` artifact resolved to
+    # a non-existent `meta/foo.json` and produced a false-positive
+    # missing-artifact block (5 / rb-1838 — the gate's own near_misses
+    # then mapped `.json` back to the existing `.jsonl`, surfacing the
+    # contradiction). The trailing `(?![A-Za-z0-9])` makes the full-extension
+    # match order-independent so a future extension addition cannot re-introduce
+    # the truncation class.
+    r"/[\w/-]+\.(?:sh|py|md|yaml|yml|jsonl|json)(?![A-Za-z0-9])"
 )
 
 

@@ -25,14 +25,28 @@ Cases covered:
   6. Multiple partners, one overlapping → would_block=True
      (still fires even with mixed signal)
 
-Test fixture seeds team-state.yaml with a controlled agent_status block;
-existing live file backed up + restored.
+Test isolation strategy (g-115-1376): redirect MIND_WORLD to a tmp directory
+so the real world/team-state.yaml + board/findings.jsonl are never touched —
+the gate's _resolve_world_dir() honors MIND_WORLD as a test-override, so the
+partner_in_flight check reads the seeded tmp fixtures. The gate's project_root
+still resolves to the real repo (PROJECT_ROOT/agents/*/aspirations.jsonl is
+read live), but the fixtures use uniquely-tagged synthetic identifiers
+("g-pif-…") that cannot collide with anything in real queues. Replaces the
+prior live-file backup/restore harness (rb-1547 seed-clobber race).
+
+Mirrors the gold-standard pending_queue variant. Run via:
+
+    py -3 core/scripts/tests/test_goal_duplication_gate_partner_in_flight.py
+
+Looks for "PASS (6/6 cases)" in stdout. Also pytest-collectable via
+test_partner_in_flight_gate().
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -49,31 +63,24 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-from _paths import WORLD_DIR  # type: ignore
-
-TEAM_STATE_PATH = WORLD_DIR / "team-state.yaml"
-FINDINGS_PATH = WORLD_DIR / "board" / "findings.jsonl"
 GATE_PY = CORE_SCRIPTS / "goal-duplication-gate.py"
-
-PID = os.getpid()
-TEAM_STATE_BACKUP = TEAM_STATE_PATH.with_suffix(f".yaml.pif-test-backup.{PID}")
-FINDINGS_BACKUP = FINDINGS_PATH.with_suffix(f".jsonl.pif-test-backup.{PID}")
 
 
 def _now_iso(offset_hours: float = 0) -> str:
     return (datetime.now() + timedelta(hours=offset_hours)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _seed_state(*, bravo_inflight=None, zeta_inflight=None, alpha_inflight=None,
-                recent_completions=None):
-    """Write a minimal team-state.yaml with controlled in_flight values.
+def _seed_state(tmp_world: Path, *, bravo_inflight=None, zeta_inflight=None,
+                alpha_inflight=None, recent_completions=None):
+    """Write a minimal team-state.yaml (into tmp_world) with controlled
+    in_flight values.
 
     None for any agent slot → that agent's in_flight is null.
     bravo_inflight/zeta_inflight/alpha_inflight: dict with goal_id/title/phase/claimed_at.
 
-    Also blanks findings.jsonl so insight_triggers check can't fire on
-    stale fixtures. recent_completions seeded with non-overlapping filler
-    so _check_recent_completions stays clean (we're isolating the
+    Also blanks tmp_world/board/findings.jsonl so insight_triggers check can't
+    fire on stale fixtures. recent_completions seeded with non-overlapping
+    filler so _check_recent_completions stays clean (we're isolating the
     in_flight check).
     """
     if recent_completions is None:
@@ -126,20 +133,22 @@ def _seed_state(*, bravo_inflight=None, zeta_inflight=None, alpha_inflight=None,
         "agent_status": agent_status,
         "critical_blockers": [],
     }
-    TEAM_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(TEAM_STATE_PATH, "w", encoding="utf-8") as f:
+    ts_path = tmp_world / "team-state.yaml"
+    ts_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(ts_path, "w", encoding="utf-8") as f:
         yaml.dump(team_state, f, default_flow_style=False, sort_keys=False)
 
     # Empty findings.jsonl so insight_triggers check is clean.
-    FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(FINDINGS_PATH, "w", encoding="utf-8") as f:
+    findings_path = tmp_world / "board" / "findings.jsonl"
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(findings_path, "w", encoding="utf-8") as f:
         f.write("")
 
 
-def _run_gate(goal: dict, agent: str = "alpha") -> dict:
+def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
-    env["MIND_WORLD"] = str(WORLD_DIR)
+    env["MIND_WORLD"] = str(tmp_world)
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),
@@ -161,16 +170,14 @@ def _find_check(result, name):
 
 
 def main() -> int:
-    if TEAM_STATE_PATH.exists():
-        TEAM_STATE_BACKUP.write_bytes(TEAM_STATE_PATH.read_bytes())
-    if FINDINGS_PATH.exists():
-        FINDINGS_BACKUP.write_bytes(FINDINGS_PATH.read_bytes())
-
     failures = []
+
+    # Create tmp world dir; cleaned up in finally.
+    tmp_world = Path(tempfile.mkdtemp(prefix="pif-test-"))
 
     try:
         # ── Case 1: partner in_flight with overlapping scope → BLOCK ─────
-        _seed_state(bravo_inflight={
+        _seed_state(tmp_world, bravo_inflight={
             "goal_id": "g-pif-bravo-001",
             "title": "Apply: execution-diary observer-session gate write paths",
             "phase": "4",
@@ -186,7 +193,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "parent_aspiration:asp-115",
         }
-        r1 = _run_gate(case1)
+        r1 = _run_gate(case1, tmp_world)
         pif1 = _find_check(r1, "partner_in_flight")
         if pif1 is None:
             failures.append("CASE 1: partner_in_flight check missing from result")
@@ -199,7 +206,7 @@ def main() -> int:
             failures.append(f"CASE 1: would_block should be True. result={r1.get('reason')}")
 
         # ── Case 2: partner in_flight with DIFFERENT scope → PASS ────────
-        _seed_state(bravo_inflight={
+        _seed_state(tmp_world, bravo_inflight={
             "goal_id": "g-pif-bravo-002",
             "title": "Reflect: hippocampal replay over resolved hypotheses",
             "phase": "4",
@@ -215,7 +222,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "parent_aspiration:asp-115",
         }
-        r2 = _run_gate(case2)
+        r2 = _run_gate(case2, tmp_world)
         pif2 = _find_check(r2, "partner_in_flight")
         if pif2 is None:
             failures.append("CASE 2: partner_in_flight check missing")
@@ -226,14 +233,14 @@ def main() -> int:
             )
 
         # ── Case 3: No partners in_flight (all null) → PASS ──────────────
-        _seed_state()  # all in_flight default to None
+        _seed_state(tmp_world)  # all in_flight default to None
         case3 = {
             "title": "Idea: execution-diary observer-session gate",
             "description": "Add observer-session guard to execution-diary writes.",
             "participants": ["agent"],
             "source": "world",
         }
-        r3 = _run_gate(case3)
+        r3 = _run_gate(case3, tmp_world)
         pif3 = _find_check(r3, "partner_in_flight")
         if pif3 is None:
             failures.append("CASE 3: partner_in_flight check missing")
@@ -247,7 +254,7 @@ def main() -> int:
 
         # ── Case 4: ONLY SELF in_flight → PASS ───────────────────────────
         # Self-in-flight should not trigger the check; only partners count.
-        _seed_state(alpha_inflight={
+        _seed_state(tmp_world, alpha_inflight={
             "goal_id": "g-pif-self-001",
             "title": "Apply: execution-diary observer-session gate write paths",
             "phase": "4",
@@ -259,7 +266,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        r4 = _run_gate(case4)
+        r4 = _run_gate(case4, tmp_world)
         pif4 = _find_check(r4, "partner_in_flight")
         if pif4 is None:
             failures.append("CASE 4: partner_in_flight check missing")
@@ -272,7 +279,7 @@ def main() -> int:
         # ── Case 5: Partner in_flight on SAME goal-id as proposed → PASS ─
         # Id reuse is a different bug — partner-claim filter handles it at
         # selection time, not at filing time. This check should skip.
-        _seed_state(bravo_inflight={
+        _seed_state(tmp_world, bravo_inflight={
             "goal_id": "g-pif-same-001",
             "title": "Apply: execution-diary observer-session gate identical scope",
             "phase": "4",
@@ -285,7 +292,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        r5 = _run_gate(case5)
+        r5 = _run_gate(case5, tmp_world)
         pif5 = _find_check(r5, "partner_in_flight")
         if pif5 is None:
             failures.append("CASE 5: partner_in_flight check missing")
@@ -297,6 +304,7 @@ def main() -> int:
 
         # ── Case 6: Multiple partners, one overlapping → BLOCK ───────────
         _seed_state(
+            tmp_world,
             bravo_inflight={
                 "goal_id": "g-pif-bravo-006",
                 "title": "Reflect: micro-hypothesis sweep",  # not overlapping
@@ -316,7 +324,7 @@ def main() -> int:
             "participants": ["agent"],
             "source": "world",
         }
-        r6 = _run_gate(case6)
+        r6 = _run_gate(case6, tmp_world)
         pif6 = _find_check(r6, "partner_in_flight")
         if pif6 is None:
             failures.append("CASE 6: partner_in_flight check missing")
@@ -337,12 +345,8 @@ def main() -> int:
                 )
 
     finally:
-        if TEAM_STATE_BACKUP.exists():
-            TEAM_STATE_PATH.write_bytes(TEAM_STATE_BACKUP.read_bytes())
-            TEAM_STATE_BACKUP.unlink()
-        if FINDINGS_BACKUP.exists():
-            FINDINGS_PATH.write_bytes(FINDINGS_BACKUP.read_bytes())
-            FINDINGS_BACKUP.unlink()
+        if tmp_world.exists():
+            shutil.rmtree(tmp_world, ignore_errors=True)
 
     if failures:
         print(f"FAIL ({len(failures)} cases)")
@@ -351,6 +355,12 @@ def main() -> int:
         return 1
     print("PASS (6/6 cases)")
     return 0
+
+
+def test_partner_in_flight_gate():
+    """Pytest entry point (6) — runs the 6-case suite (tmp-world
+    isolated) and asserts all cases pass."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

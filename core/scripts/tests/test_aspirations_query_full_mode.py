@@ -14,8 +14,9 @@ goal dict merged with {asp_id, source} metadata.
 Contract pinned here:
   1. full=true returns the FULL canonical record (description, verification,
      priority, intended_agent) + asp_id + source, in one goal-by-id call.
-  2. WITHOUT full, the response is the EXACT 5-field projection - byte-for-byte
-     unchanged (no regression). This is the discriminating axis.
+  2. WITHOUT full, the response is the EXACT default projection (6 fields as of
+     g-115-1614, which added "category") - byte-for-byte unchanged otherwise (no
+     regression). This is the discriminating axis.
   3. full=1 / full=yes / full=TRUE are accepted truthy spellings; full=false /
      absent fall through to the default projection.
 
@@ -42,9 +43,11 @@ from _daemon_fixture import DaemonFixture  # noqa: E402
 GOAL_ID = "g-qfull-001"
 ASP_ID = "asp-qfull"
 
-# Fields the default 5-field projection MUST drop and --full MUST surface.
+# Fields the default projection MUST drop and --full MUST surface.
 FULL_ONLY_FIELDS = {"description", "verification", "priority", "intended_agent"}
-DEFAULT_PROJECTION_KEYS = {"goal_id", "asp_id", "source", "title", "status"}
+# 4 added "category" to the default projection (npc-composition-sweep
+# needs it to key cat::prefix clusters instead of degenerating to bare-prefix).
+DEFAULT_PROJECTION_KEYS = {"goal_id", "asp_id", "source", "title", "status", "category"}
 
 
 def _seed_world(tmp: Path) -> Path:
@@ -136,6 +139,7 @@ def test_default_projection_unchanged():
         "source": "world",
         "title": "full-mode target goal",
         "status": "pending",
+        "category": "framework-architecture",
     }, rec
 
 

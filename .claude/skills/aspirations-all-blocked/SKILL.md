@@ -329,34 +329,36 @@ IF "create-aspiration: no viable aspirations found" in blocked_idle_attempts:
 
 ## Step B3: Evolution Gap Analysis (Even Outside Normal Triggers)
 
-Mutations in this step (`evolutions_this_session`, `last_evolution_goal_count`) are
-**local variables** here — the orchestrator reads `loop_state` fresh from WM on re-entry.
-Any mutation that must survive LOOP_CONTINUE must be persisted to WM via read-merge-write
-on the `loop_state` slot (see B3 LOOP_CONTINUE block below). Direct `wm-set.sh` with only
-the mutated field would clobber other counters (`goals_completed`, `productive_goals`,
-`alignment_check_at`, `touched`), so always read first, overlay, write merged state.
+Evolution accounting (`loop_state.evolutions`, `loop_state.last_evolution_at`) is
+BASH-OWNED as of g-115-1561: the `/aspirations-evolve` invocation below runs
+`loop-state-bump-counters.py --evolution-fired` internally (the single writer). B3
+therefore does NOT mutate or persist those fields in-context — a bare LOOP_CONTINUE
+is correct, and the orchestrator's Phase -0.5 restores the bash values next iteration.
+(B2.5 above and B7 below still read-merge-write `loop_state` for the genuinely
+LLM-owned `idle_fallback_created` / `consecutive_blocked_sleeps` fields, which have
+no bash writer.)
 
 ```
 IF evolutions_this_session < max_evolutions_per_session:
     Output: "▸ Attempting idle evolution gap analysis..."
     invoke /aspirations-evolve with: ["idle_blocked"]
-    evolutions_this_session += 1
-    last_evolution_goal_count = goals_completed_this_session
+    # g-115-1561: evolutions / last_evolution_at are BASH-OWNED — aspirations-evolve
+    # ran loop-state-bump-counters.py --evolution-fired internally (single writer).
+    # Do NOT increment in-context here (would double-count vs the bash write). The
+    # `evolutions_this_session < max` cap check above reads the bash-restored value.
     # Check if evolution created new executable goals
     Bash: goal-selector.sh
     IF parsed_output is a JSON array with length > 0:
         blocked_idle_attempts.append("evolve: SUCCESS — new executable goals")
         Output: "▸ Evolution created new executable goals"
 
-        # ── LOOP_CONTINUE with explicit loop_state persistence ──
-        # Read-merge-write: pull current loop_state, overlay our mutations,
-        # write back. This preserves counters we don't touch (goals_completed,
-        # productive_goals, etc.) that the orchestrator owns.
-        Bash: wm-read.sh loop_state --json
-        merged = current_loop_state
-        merged.evolutions = evolutions_this_session
-        merged.last_evolution_at = last_evolution_goal_count
-        echo '<merged as JSON>' | Bash: wm-set.sh loop_state
+        # ── LOOP_CONTINUE ──
+        # g-115-1561: evolutions / last_evolution_at are BASH-OWNED now
+        # (aspirations-evolve --evolution-fired persisted them to WM above). B3
+        # has no other loop_state mutation to carry, so a bare LOOP_CONTINUE is
+        # correct — the orchestrator's Phase -0.5 restores the bash values next
+        # iteration. (Removed the read-merge-write overlay whose stale in-context
+        # copies of evolutions/last_evolution clobbered the bash write.)
         Skill('aspirations') with args='loop'
     blocked_idle_attempts.append("evolve: completed but no new executable goals")
 ELSE:
@@ -415,7 +417,6 @@ IF rc == 0 (approved):
     # Skip the B7 backoff ladder entirely. Do NOT increment
     # consecutive_blocked_sleeps — quiescence is a different state.
     sleep_seconds = output.sleep_seconds
-    Output: "▸ Quiescence approved — sleeping {sleep_seconds}s on structured blocker_refs."
     # Magic Wand #2 (alpha session-60): set QUIESCENCE_SLEEP=1 so
     # interruptible-sleep.sh demotes informational wake signals
     # (board-activity, goal-claim-released — partner activity) without
@@ -424,7 +425,22 @@ IF rc == 0 (approved):
     # state changes that unblock work. See interruptible-sleep.sh
     # "Wake-signal classes" header for the contract.
     quiescence_sleep_env = "QUIESCENCE_SLEEP=1"
-    GOTO Step B7.2 with sleep_seconds + quiescence_sleep_env
+
+    # B6.8 (g-303-28): symmetric drainable-debt branch. When the queue is
+    # honestly user-gated AND drainable framework-hygiene work exists that does
+    # NOT depend on the user-gated blockers, drain ONE unit before sleeping
+    # instead of idling 30-60min on it. The gate computes approved_but_drainable
+    # ONLY on this approved path (the denied path routes to B6.7).
+    IF output.approved_but_drainable == true:
+        primary = output.drainable_summary.primary_target
+        primary_n = output.drainable_summary.primary_target_count
+        Output: "▸ Quiescence approved WITH drainable debt ({primary}={primary_n}) — draining one unit before sleep (B6.8), then sleeping {sleep_seconds}s."
+        CONTINUE to Step B6.8   # B6.8 drains one unit, then GOTOs B7.2 with sleep_seconds + quiescence_sleep_env
+    ELSE:
+        # No drainable evidence (or the daemon read failed → fields false/null):
+        # back-compatible behavior — straight to quiescent sleep, no B6.8.
+        Output: "▸ Quiescence approved — sleeping {sleep_seconds}s on structured blocker_refs."
+        GOTO Step B7.2 with sleep_seconds + quiescence_sleep_env
 
 ELSE IF rc == 1 (denied):
     # Gate evaluated but one or more conditions failed. The JSON stdout
@@ -581,6 +597,102 @@ IF B6.5 returned rc=1 (quiescence denied):
     Output: "▸ MW#5: No targeted deep work available — falling through to backoff sleep"
     blocked_idle_attempts.append("MW#5: no targeted work, fell through to B7")
 ```
+
+## Step B6.8: Drainable Hygiene When Quiescence Approves (Symmetric to B6.7)
+
+**g-303-28 (asp-303 Story A1; design recovered from git
+`899158fd:bravo/reports/a1-symmetric-quiescence-drain-design.md`).** B6.7 fires
+only when quiescence DENIES (rc=1). When it APPROVES (rc=0), the queue is
+honestly user-gated — but drainable framework-hygiene work that does NOT depend
+on the user-gated blockers (tree-decompose candidates, unreflected resolved
+hypotheses, actionable findings without a linked goal) may still exist. Without
+B6.8 the agent sleeps 30-60min on that work. B6.8 drains exactly ONE unit, then
+falls through to the SAME quiescent sleep (B7.2). The single-drain-per-cycle
+rule is load-bearing: looping-to-empty would convert "approved sleep" into a
+perpetual hygiene busy-loop — itself a new form of idle-path waste.
+
+### Trigger
+
+B6.8 fires when ALL of:
+1. B6.5 returned rc=0 (quiescence APPROVED).
+2. The gate's JSON `approved_but_drainable == true` (at least one of the four
+   drainable-evidence counts is ≥1; the gate computes this only on the approved
+   path).
+3. B6.8 has not already fired this iteration (single drain per cycle).
+
+`sleep_seconds` and `quiescence_sleep_env` carry in from B6.5 unchanged — the
+drain does not alter the approved sleep duration.
+
+### Three-Target Priority (drain the FIRST match, then sleep)
+
+Priority order: **decompose > hypothesis > finding** (highest
+long-term leverage first). Each target RE-READS its evidence at fire time, so a
+count the gate reported is re-validated against current state — if a partner
+drained it in the race window between gate check and B6.8 entry, the cycle falls
+through to the next target (staleness self-corrects). Drain ONE target, then
+GOTO B7.2.
+
+```
+# Single-drain guard: only enter once per iteration.
+drained = false
+
+# Target 1: freshest pending decompose candidate (PRIMARY — highest leverage).
+# Tree decomposition hardens the structural backbone; a multiplier on every
+# future retrieval. Decomposing a node removes it from the candidate set, so
+# the candidate count drops by 1 (the design-section-4 verification signal).
+Bash: tree-read.sh --decompose-candidates
+Parse JSON array. Sort by line_count DESC (debt proxy). Take first.
+IF non-empty:
+    acute = first candidate
+    Output: "▸ B6.8 Target 1: decomposing tree node {acute.key}"
+    invoke /tree decompose with: node_path=acute.key
+    drained = true; drain_target = "decompose:" + acute.key
+
+# Target 2: freshest unreflected resolved hypothesis.
+# Already-paid-for evidence whose lesson sits un-encoded. Cheap (one /reflect),
+# high yield (one reasoning-bank entry).
+IF NOT drained:
+    Bash: pipeline-read.sh --unreflected
+    Parse JSON; sort by resolved_at DESC; take first.
+    IF freshest_unreflected:
+        Output: "▸ B6.8 Target 2: reflecting on {freshest.id}"
+        invoke /reflect --on-hypothesis with: hypothesis_id=freshest.id
+        drained = true; drain_target = "hypothesis:" + freshest.id
+
+# Target 3: actionable finding without a linked goal.
+# Same filter the gate counted with, so what the gate saw is what we drain.
+IF NOT drained:
+    Bash: board-read.sh --channel findings --since 7d --json
+    Filter for posts with "actionable" tag AND no "goal_id" tag AND
+    author != MIND_AGENT.
+    IF non-empty:
+        chosen = sort by timestamp DESC, take first
+        Output: "▸ B6.8 Target 3: converting finding {chosen.id} to goal"
+        Build goal_json with origin_signal="board_post:" + chosen.id,
+            category from finding, title="Act on finding " + chosen.id[:48]
+        echo '<goal_json>' | bash core/scripts/aspirations-add-goal.sh --source agent asp-001
+        drained = true; drain_target = "finding:" + chosen.id
+
+# Drain complete (or all targets went stale). Either way → quiescent sleep.
+IF drained:
+    Output: "▸ B6.8 drained one unit ({drain_target}); now sleeping {sleep_seconds}s (B7.2)."
+ELSE:
+    # Fallback (design section 5): the gate saw drainable evidence but it went
+    # stale before B6.8 fired (e.g. a partner drained the only candidate in the
+    # race window). Do NOT block the sleep — quiescence approval is still valid.
+    Output: "▸ B6.8 entered but all three targets empty post-recheck; falling through to B7.2 sleep"
+GOTO Step B7.2 with sleep_seconds + quiescence_sleep_env
+```
+
+**Why single-drain, not loop-to-empty**: the quiescence cadence (30-60min) × one
+drain per cycle ≈ a few hygiene actions per shift, matched to the rate fresh
+evidence is produced. Looping to empty re-creates the busy-loop the quiescence
+gate exists to prevent. (Design risk analysis, section 6.)
+
+**Why B6.8 and B6.7 cannot collide**: B6.7 fires on rc=1, B6.8 on rc=0 —
+mutually exclusive for the same agent in the same iteration. Cross-agent races
+are the standard claim-conflict pattern already handled by `aspirations-claim.sh`
+and team-state `in_flight`.
 
 ## Step B7: Exponential Backoff Sleep
 

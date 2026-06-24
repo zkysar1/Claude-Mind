@@ -65,14 +65,19 @@ def _load_yaml(path: Path):
         return None
 
 
-def count_completed_goals() -> int:
-    """Sum of status=='completed' goals across world+agent aspirations & archive."""
+def count_completed_goals(world_only: bool = False) -> int:
+    """Sum of status=='completed' goals across world+agent aspirations & archive.
+
+    world_only=True skips the agent-queue files. Used by the team-aware gate
+    (g-115-1388): agent-inclusive counts differ per agent (each agent's own
+    queue history is private), so cross-agent comparisons against the shared
+    team stamp MUST use world-only counts on both sides."""
     agent = os.environ.get("MIND_AGENT", "")
     candidates = [
         _paths.WORLD_DIR / "aspirations.jsonl",
         _paths.WORLD_DIR / "aspirations-archive.jsonl",
     ]
-    if agent:
+    if agent and not world_only:
         candidates.extend([
             _paths.agent_dir(agent) / "aspirations.jsonl",
             _paths.agent_dir(agent) / "aspirations-archive.jsonl",
@@ -101,6 +106,24 @@ def count_completed_goals() -> int:
         except OSError:
             continue
     return total
+
+
+def team_stamp_value(slot_name: str):
+    """Read the shared team-fire stamp for `slot_name` from
+    world/team-state.yaml → shared_cadences.<slot_name> (g-115-1388).
+
+    Returns the stamp dict or None. Direct YAML file read (not the daemon):
+    the gate runs inside the precheck hot-ish path and must stay fail-open
+    under daemon flakiness — any read/parse error returns None, which the
+    caller treats as 'no team stamp; per-agent behavior'."""
+    doc = _load_yaml(_paths.WORLD_DIR / "team-state.yaml")
+    if not isinstance(doc, dict):
+        return None
+    stamps = doc.get("shared_cadences")
+    if not isinstance(stamps, dict):
+        return None
+    stamp = stamps.get(slot_name)
+    return stamp if isinstance(stamp, dict) else None
 
 
 def wm_slot_value(slot_name: str):
@@ -195,6 +218,15 @@ def main() -> int:
         help="Print current completed-goals count and exit 0 (skill Phase 8 uses this).",
     )
     ap.add_argument(
+        "--world-only",
+        action="store_true",
+        help=(
+            "With --print-current: print the WORLD-ONLY completed count (skip "
+            "agent queues). record-tick uses this for the team-aware shared "
+            "stamp — cross-agent comparable units (g-115-1388)."
+        ),
+    )
+    ap.add_argument(
         "--config-block",
         default=DEFAULT_CONFIG_BLOCK,
         help=(
@@ -210,7 +242,7 @@ def main() -> int:
     # step. It bypasses the cadence gate and always exits 0 so callers can use
     # `$(... --print-current)` without worrying about the cadence branch.
     if args.print_current:
-        print(count_completed_goals())
+        print(count_completed_goals(world_only=args.world_only))
         return 0
 
     cfg = _load_yaml(CONFIG_PATH)
@@ -315,6 +347,42 @@ def main() -> int:
             f"current={current} last={last_count} diff={diff} cadence={goal_cadence}"
         )
     if diff >= goal_cadence:
+        # 8 team-aware gate: shared-resource rituals (tree, program)
+        # have ONE time series, but the per-agent WM slot above never sees a
+        # TEAMMATE's fire — so an agent whose own slot is stale re-runs the
+        # ritual days after the team already reviewed (canonical incident:
+        # delta re-fired the tree review 24h after the 2026-06-09 team
+        # review). When the config block declares `team_aware: true`, consult
+        # world/team-state.yaml shared_cadences.<slot> (stamped by
+        # fresh-eyes-record-tick.sh on every fire) and noop while the team's
+        # last fire is within cadence. Units are WORLD-ONLY counts on both
+        # sides — agent-inclusive counts are not cross-agent comparable (each
+        # agent's private queue history differs by hundreds of goals).
+        # No slot sync: this gate re-noops each precheck (cheap — only
+        # reached when the per-agent cadence already crossed) until the world
+        # count elapses past the team stamp. Fail-open: missing file, missing
+        # stamp, missing field, or parse error → per-agent behavior.
+        if fe.get("team_aware"):
+            team = team_stamp_value(slot_name)
+            team_world = (team or {}).get("world_goals_count_at_last_fire")
+            if team_world is not None:
+                try:
+                    team_world = int(team_world)
+                except (TypeError, ValueError):
+                    team_world = None
+            if team_world is not None:
+                current_world = count_completed_goals(world_only=True)
+                team_diff = current_world - team_world
+                if team_diff < goal_cadence:
+                    if not args.verbose:
+                        print(
+                            f"fresh-eyes-cadence-check: noop (block={args.config_block}, "
+                            f"per-agent diff={diff}>=cadence={goal_cadence} but team-aware "
+                            f"gate: world diff={team_diff} since team fire by "
+                            f"{(team or {}).get('fired_by', 'unknown')} at "
+                            f"{(team or {}).get('timestamp', '?')} < cadence) [g-115-1388]"
+                        )
+                    return 1
         # 4 min_session_goals gate: world-goal completions tick every
         # agent's cadence counter, but per-agent rituals (Self briefing, felt-
         # sense lanes 1-6) need session-scoped data to do real work. When the

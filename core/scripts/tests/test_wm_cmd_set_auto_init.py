@@ -47,11 +47,23 @@ class TestWmCmdSetAutoInit(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="g115748-wm-test-")
         self.wm_path = Path(self.tmp.name) / "working-memory.yaml"
-        # Default state for each test: load a fresh wm module
+        # Route WM I/O to the tmp file via BODY_WM_PATH — the env var that
+        # wm.py's wm_path() honors per-call ( Mind/Body routing).
+        # The old `self.wm.WM_PATH = self.wm_path` patch is now a NO-OP and was
+        # DANGEROUS: WM_PATH became a dynamic module __getattr__ property, and
+        # read_wm()/write_wm() resolve through wm_path() (BODY_WM_PATH env →
+        # else AGENT_DIR/session/working-memory.yaml), NOT the module attribute.
+        # So patching WM_PATH left cmd_set targeting the REAL bound agent's WM —
+        # running this suite under MIND_AGENT (e.g. via run-full-suite-after-
+        # deep-code) wrote test slots into live working memory. (2026-06-23)
+        self._env = mock.patch.dict(os.environ, {"BODY_WM_PATH": str(self.wm_path)})
+        self._env.start()
+        # Load a fresh wm module per test (wm_path() reads BODY_WM_PATH lazily,
+        # so set order vs import does not matter — the env wins at call time).
         self.wm = _load_wm()
-        self.wm.WM_PATH = self.wm_path
 
     def tearDown(self):
+        self._env.stop()
         self.tmp.cleanup()
 
     def _set(self, slot: str, value_json: str):

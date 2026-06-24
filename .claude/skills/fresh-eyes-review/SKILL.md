@@ -7,7 +7,7 @@ triggers:
   - "fresh eyes review"
   - "step back review"
 tools_used: [Bash, Read, Write, Edit, Skill]
-companion_scripts: [core/scripts/fresh-eyes-cadence-check.sh]
+companion_scripts: [core/scripts/fresh-eyes-cadence-check.sh, core/scripts/team-belief-write.sh]
 conventions: [aspirations, session-state, working-memory]
 minimum_mode: assistant
 execution_history:
@@ -114,6 +114,61 @@ Bash: wm-read.sh portfolio_health_signal
 Bash: team-state-read.sh --json
   → capture partner.last_active, partner.current_focus, partner.live_phase, partner.session_goals_completed
   → capture recent_completions (last 5)
+  → ALSO capture agent_status.<partner>.beliefs for every partner (used by 2.6b)
+
+# 2.6b CONSUMER — partner beliefs ABOUT this agent (g-306-28, Theory-of-Mind; BRD Gap 9; OpenToM 2402.06044)
+# Each agent is the SOLE writer of agent_status.<self>.beliefs, so a partner's
+# sublist holds what THAT partner believes — including beliefs directed at THIS
+# agent. A fresh-eyes self-audit treats those external perspectives as
+# confidence- AND staleness-weighted HYPOTHESES about this agent's identity /
+# drift — NEVER as ground truth, and never substituting a partner's self.md or
+# aspirations for an observed belief. Canonical signal: bravo's "cross-domain
+# stretch" belief about alpha, which the 2026-06-18 briefing otherwise saw only
+# from alpha's OWN prior review — the team's external read was invisible until
+# this step. Reuse the team-state --json already read in 2.6 (no extra daemon call).
+FROM the agent_status read in 2.6:
+  belief_signals = []
+  FOR EACH partner != MIND_AGENT:
+    FOR EACH b in agent_status.<partner>.beliefs (list may be absent/empty/null — handle gracefully):
+      IF b.about == MIND_AGENT:
+        staleness_days = (today - date(b.last_observed)).days
+        weight = b.confidence * (1.0 if staleness_days <= 14 else 0.5)   # fresh + confident = stronger
+        belief_signals.append({holder: <partner>, claim: b.belief,
+                               confidence: b.confidence, staleness_days, weight})
+  → surface belief_signals to Phase 3 "Recent self-evolution signals" as
+    "<partner> believes (conf {confidence}, {staleness_days}d old): {claim}"
+  → these are WEIGHTED hypotheses, NOT verdicts: a low-confidence or stale
+    belief is a soft nudge. Do NOT auto-edit Self from them; they raise the
+    Phase 5.5 self_evolution_signals_count so a fresh, high-confidence, or
+    clustered external signal can tip the self-assess toward act_now/act_later.
+
+# 2.6c WRITER — record ONE belief about the primary partner observed (g-306-28, Theory-of-Mind)
+# The 25-goal fresh-eyes cadence IS the "real decision point, not every tick":
+# this fires once per review. Pick the SINGLE most salient partner observation
+# from the 2.6 activity read (e.g. a partner working notably outside its nominal
+# lane, an unusually high/low completion count, a stalled live_phase) and record
+# a calibrated single-observation belief (confidence ~0.5). team-belief-write.sh
+# SUPERSEDES the prior belief about that partner (one-per-partner, hard cap 10 —
+# no unbounded growth) and is lock-safe via the daemon. Skip SILENTLY if no
+# partner observation rises above noise this window — a belief must be grounded
+# in observed activity, NEVER fabricated to satisfy the step (communication-clarity
+# rule 6).
+IF a salient partner observation exists in the 2.6 activity read:
+  Bash: team-belief-write.sh --about <partner> \
+        --belief "<one-line observed claim, grounded in current_focus / completions / live_phase>" \
+        --confidence 0.5 \
+        [--domain "<partner.current_focus from the 2.6 read>"]
+  → confirm stdout "Updated agent_status.<self>.beliefs"
+  # --domain (g-306-29) is the OPTIONAL structured focus-domain this belief
+  # asserts the partner is working in — pass the partner's observed
+  # current_focus value VERBATIM when the belief is genuinely about WHICH
+  # DOMAIN the partner is working (the common case). It makes the belief
+  # contradiction-checkable: aspirations-precheck Phase 0-pre.0a later compares
+  # the partner's FRESH current_focus against this recorded domain and, on a
+  # sustained mismatch, forces a belief revision. OMIT --domain when the
+  # observation is not domain-shaped (e.g. an unusually high/low completion
+  # count, a stalled live_phase) — those beliefs stay free-form and the
+  # contradiction detector conservatively skips them.
 
 # 2.7 Goal-count context — how much work backs this review
 Bash: fresh-eyes-cadence-check.sh --verbose
@@ -146,6 +201,9 @@ Recent self-evolution signals (FYI):
 - {Evidence-backed bullet — e.g., "sq-012 flagged 'core purpose may
   be narrowing' in pq-NNN (2026-04-NN)."}
 - {Evidence-backed bullet — dev-stage / gap analysis signal, if any}
+- {Partner-belief bullet from Phase 2.6b belief_signals, if any — e.g.,
+  "bravo believes (conf 0.5, 4d old): alpha may be on a cross-domain stretch."
+  State it as a weighted external hypothesis, not a verdict.}
 
 ## Are we working on the right problems?
 
@@ -206,7 +264,7 @@ noted) and pass to the helper:
 SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
   "completion_health":              {0..1 — average completion ratio across active aspirations},
-  "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214). A self_evolution/self-drift finding on the board counts even when pending-questions.yaml is empty — this is the count that was silently 0 on 2026-05-24},
+  "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent (e.g. bravo's "cross-domain stretch" read of alpha) is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty — it was invisible before g-306-28},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
   "explicit_user_directive":        {true|false — outstanding /respond about purpose or portfolio},
   "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Self edit}
@@ -329,16 +387,18 @@ the skill does NOT end with text output.
 - **Called by**: User (`/fresh-eyes-review`), `/aspirations-precheck`
   Phase 0.5e (`/fresh-eyes-review --cadence`)
 - **Calls**: `fresh-eyes-cadence-check.sh`, `load-aspirations-compact.sh`,
-  `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`,
-  `self-assess-and-decide.sh`, `journal-add.sh`, `board-post.sh`,
-  `/tree add`, `/tree edit`, `tree-read.sh`, `reasoning-bank-add.sh`,
-  `guardrails-add.sh` (Phase 5.6 encoding)
+  `wm-read.sh`, `wm-set.sh`, `team-state-read.sh`, `team-belief-write.sh`
+  (Phase 2.6c writer), `self-assess-and-decide.sh`, `journal-add.sh`,
+  `board-post.sh`, `/tree add`, `/tree edit`, `tree-read.sh`,
+  `reasoning-bank-add.sh`, `guardrails-add.sh` (Phase 5.6 encoding)
 - **Reads**: `agents/<agent>/self.md`, `agents/<agent>/session/pending-questions.yaml`,
   `<meta>/evolution-log.jsonl`, world aspirations compact,
-  `agents/<agent>/session/working-memory.yaml`
+  `agents/<agent>/session/working-memory.yaml`,
+  `world/team-state.yaml` `agent_status.<partner>.beliefs` (Phase 2.6b consumer)
 - **Modifies**: `agents/<agent>/temp/fresh-eyes-*.md` (new staging file),
   `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_review slot),
   `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort),
+  `world/team-state.yaml` `agent_status.<self>.beliefs` (Phase 2.6c writer, supersede-or-cap),
   `world/knowledge/tree/` (Phase 5.6 new/edited nodes),
   `world/reasoning-bank.jsonl` (Phase 5.6 appends),
   `world/guardrails.jsonl` (Phase 5.6 appends)

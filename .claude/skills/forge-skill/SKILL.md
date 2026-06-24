@@ -189,6 +189,32 @@ then come back here for the integration requirements.
    `forged_date:` + (if applicable) `forged_from:` block right after `name:`,
    then re-run this check.
 
+3.5. **Tier-1 skill-quality gate** (earn-the-keep Phase 1, gate `eval-harness-forge-accept`):
+   Before registration, the new skill must clear the 5-dimension quality bar.
+   Score the candidate SKILL.md on `skill-evaluate.sh`'s five dims —
+   safety / completeness / executability / maintainability / cost_awareness —
+   judging each `good | average | poor` (the same rubric `skill-evaluate.sh score`
+   uses; map good=1.0, average=0.5, poor=0.0). A brand-new forge has no "before",
+   so it is gated against the human-competent baseline (all dims `average` = 0.5)
+   under `strict_improve` (epsilon=0.0): the candidate must BEAT the baseline on
+   the weighted mean — ties are rejected.
+
+   ```
+   Bash: py -3 core/scripts/skill_edit_gate.py gate \
+       --new-judgments '{"safety":"<g|a|p>","completeness":"<g|a|p>","executability":"<g|a|p>","maintainability":"<g|a|p>","cost_awareness":"<g|a|p>"}' \
+       --skill-name "{new-skill-name}" --caller "forge-skill:Step3.5"
+   # exit 0 = PASS  -> proceed to Step 4 registration.
+   # exit 1 = BLOCK -> the gate already logged the verdict to meta/gate-firings.jsonl
+   #          (id eval-harness-forge-accept) AND appended the rejected edit to
+   #          meta/skill-rejected-edits.jsonl (negative memory). Do NOT register:
+   #          STOP, revise the SKILL.md to fix the weakest dim(s), then re-run.
+   ```
+   For a refactor/edit of an EXISTING skill (not a new forge), pass
+   `--old-judgments` with the pre-edit scores and `--policy no_regression
+   --epsilon 0.02` instead (the edit must not regress). The gate is registered
+   in `core/config/gates.yaml` (`eval-harness-forge-accept`); every verdict is
+   telemetered to `meta/gate-firings.jsonl` via `_gate_log`.
+
 4. **Register in Forged Skills** (`world/forged-skills.yaml` + `.gitignore`):
    - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
    - Add `.claude/skills/{new-skill-name}/` to `.gitignore` under the forged skills section

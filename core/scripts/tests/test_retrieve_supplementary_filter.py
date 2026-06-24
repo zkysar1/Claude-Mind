@@ -53,8 +53,12 @@ if _ORIG_MIND_AGENT is not None:
     os.environ["MIND_AGENT"] = _ORIG_MIND_AGENT
 
 
-def _make_rb(rb_id, category, score=0.0, applies_to=None, created="2026-05-01"):
-    """Build a reasoning-bank record with the standard utilization shape."""
+def _make_rb(rb_id, category, score=0.0, applies_to=None, created="2026-05-01",
+             entry_type=None):
+    """Build a reasoning-bank record with the standard utilization shape.
+
+    entry_type (g-306-11): when given, tags the record so the load_reasoning_bank
+    entry_type filter can target it; omitted => an ordinary (untagged) lesson."""
     rec = {
         "id": rb_id,
         "title": f"test entry {rb_id}",
@@ -72,6 +76,8 @@ def _make_rb(rb_id, category, score=0.0, applies_to=None, created="2026-05-01"):
     }
     if applies_to is not None:
         rec["applies_to"] = applies_to
+    if entry_type is not None:
+        rec["entry_type"] = entry_type
     return rec
 
 
@@ -227,6 +233,96 @@ def test_load_rb_universal_cap_independent_of_supplementary():
 
     _, universal = _retrieve.load_reasoning_bank(["unrelated"], depth="deep", read_only=True)
     assert len(universal) == _retrieve.UNIVERSAL_RB_CAP
+
+
+# ---------------------------------------------------------------------------
+# load_reasoning_bank — entry_type filter ()
+# ---------------------------------------------------------------------------
+
+def test_load_rb_entry_type_filters_to_procedure():
+    """entry_type='procedure' returns ONLY procedure-tagged entries; untagged
+    (ordinary) entries are excluded from BOTH the domain and universal partitions."""
+    p = Path(_TMPDIR) / "reasoning-bank.jsonl"
+    _seed_jsonl(p, [
+        _make_rb("rb-proc1", "x", score=0.10, entry_type="procedure"),
+        _make_rb("rb-ord1", "x", score=0.20),                       # ordinary (no entry_type)
+        _make_rb("rb-proc2", "x", score=0.05, entry_type="procedure"),
+        _make_rb("rb-fwproc", "framework-x", score=0.10, entry_type="procedure"),  # universal procedure
+        _make_rb("rb-fword", "framework-x", score=0.10),            # universal ordinary
+    ])
+    _retrieve.RB_PATH = p
+
+    domain, universal = _retrieve.load_reasoning_bank(
+        ["x"], read_only=True, entry_type="procedure")
+    assert {r["id"] for r in domain} == {"rb-proc1", "rb-proc2"}, {r["id"] for r in domain}
+    # the universal partition is ALSO filtered to procedures
+    assert {r["id"] for r in universal} == {"rb-fwproc"}, {r["id"] for r in universal}
+
+
+def test_load_rb_entry_type_none_returns_all():
+    """Default (entry_type=None) is byte-identical to prior behavior: every entry
+    type returned, procedure and ordinary alike — no existing caller changes."""
+    p = Path(_TMPDIR) / "reasoning-bank.jsonl"
+    _seed_jsonl(p, [
+        _make_rb("rb-proc", "x", score=0.10, entry_type="procedure"),
+        _make_rb("rb-ord", "x", score=0.20),
+    ])
+    _retrieve.RB_PATH = p
+
+    domain, _ = _retrieve.load_reasoning_bank(["x"], read_only=True)  # no entry_type arg
+    assert {r["id"] for r in domain} == {"rb-proc", "rb-ord"}
+
+
+def test_load_rb_entry_type_no_matches_returns_empty():
+    """Filtering for procedure when none exist returns empty (NOT all) — the
+    filter must not silently fall open to the full set."""
+    p = Path(_TMPDIR) / "reasoning-bank.jsonl"
+    _seed_jsonl(p, [
+        _make_rb("rb-ord1", "x", score=0.10),
+        _make_rb("rb-ord2", "x", score=0.20),
+    ])
+    _retrieve.RB_PATH = p
+
+    domain, universal = _retrieve.load_reasoning_bank(
+        ["x"], read_only=True, entry_type="procedure")
+    assert domain == []
+    assert universal == []
+
+
+def test_bump_set_with_entry_type_filter_excludes_nonprocedure():
+    """The bump-set==return-set invariant holds UNDER the entry_type filter:
+    counter-bump fires ONLY on returned (procedure) entries; ordinary entries —
+    even category-matching ones — keep their pre-call retrieval_count (the filter
+    runs BEFORE the bump, so non-procedure counters are never polluted)."""
+    p = Path(_TMPDIR) / "reasoning-bank.jsonl"
+    procs = [_make_rb(f"rb-p-{i:02d}", "x", score=i * 0.001, entry_type="procedure")
+             for i in range(5)]
+    ords = [_make_rb(f"rb-o-{i:02d}", "x", score=i * 0.001) for i in range(5)]
+    _seed_jsonl(p, procs + ords)
+    _retrieve.RB_PATH = p
+
+    pre_rc = {}
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            pre_rc[rec["id"]] = (rec.get("utilization") or {}).get("retrieval_count", 0)
+
+    domain, universal = _retrieve.load_reasoning_bank(
+        ["x"], depth="deep", read_only=False, entry_type="procedure")
+    returned_ids = {r["id"] for r in domain} | {r["id"] for r in universal}
+    assert returned_ids == {f"rb-p-{i:02d}" for i in range(5)}, returned_ids
+
+    post_rc = {}
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            rec = json.loads(line)
+            post_rc[rec["id"]] = (rec.get("utilization") or {}).get("retrieval_count", 0)
+
+    bumped = {rid for rid in pre_rc if post_rc[rid] == pre_rc[rid] + 1}
+    assert bumped == returned_ids, f"bump diverged from return: {bumped ^ returned_ids}"
+    for i in range(5):
+        oid = f"rb-o-{i:02d}"
+        assert post_rc[oid] == pre_rc[oid], f"{oid} bumped but should be filtered out"
 
 
 # ---------------------------------------------------------------------------

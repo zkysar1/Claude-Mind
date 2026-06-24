@@ -50,7 +50,7 @@ scans those journal lines and logs false claims to
 - `goal`: The executed goal object (with verification field)
 - `result`: Execution result (from Phase 4)
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
-- `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
+- `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q1_5_passed`, `q1_5_checklist`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
 
 ## Outputs (to orchestrator)
 
@@ -158,6 +158,43 @@ ELSE:
     Skip
 ```
 
+### Collaborative Goal Agent-Leg Terminal State (g-305-04)
+
+Fires BEFORE Q1/Q2/Q3, ONLY for a collaborative goal that declares an agent
+leg. Lets the agent close its own leg cleanly instead of inventing closure
+justification for the user-gated portion (the US-04 anti-pattern: zeta hedged
+g-250-80 closure twice because the schema forced "agent done, user pending"
+through the single `outcomes` field). Backward-compatible: goals without
+`verification.outcomes_agent_leg`, or non-collaborative goals, skip this branch
+entirely and verify exactly as before.
+
+```
+IF "user" in (goal.participants or []) AND goal.verification.outcomes_agent_leg is a non-empty list:
+    # Evaluate ONLY the agent-leg outcomes against in-hand artifacts -- these
+    # are the criteria the agent can satisfy WITHOUT the user. Apply the same
+    # artifact-checking rigor as Q1 (cite the concrete artifact per outcome;
+    # no hedging on observed evidence, communication-clarity.md Rule 6).
+    agent_leg_met = every entry in outcomes_agent_leg is satisfied by a cited artifact
+    IF agent_leg_met:
+        # VALID TERMINAL STATE -- "agent-leg-complete". The agent leg is the
+        # authoritative closure criterion for the agent's portion. The user leg
+        # (outcomes minus outcomes_agent_leg) is tracked SEPARATELY via
+        # user_leg_scope + any follow-up goal -- NOT hedged into this closure
+        # and NOT a reason to hold the goal pending.
+        all_passed = true
+        status = completed
+        outcome_note = "agent-leg-complete; user-leg pending (user_leg_scope: <scope or participants:[...,user]>)"
+        Assert (Rule 6 form): "Agent leg complete because <artifact> satisfies each
+          outcomes_agent_leg entry; user leg (<remaining outcomes>) remains pending,
+          tracked via user_leg_scope -- closing agent-leg-complete, not hedged."
+        Bash: echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"agent-leg-complete terminal state: agent outcomes met, user leg pending"}' | bash core/scripts/execution-diary.sh append
+        SKIP Q1/Q2/Q3 -- agent-leg closure is established. Proceed to streak/attribution (Phase 5.3).
+    ELSE:
+        # The agent's OWN leg is not done yet -- fall through to the standard
+        # Q1/Q2/Q3 escalation below (do not close on a partial agent leg).
+        Continue to Empty-Checks Escalation Protocol.
+```
+
 ### Empty-Checks Escalation Protocol (Q1/Q2/Q3)
 
 When `len(checks) == 0`, the agent MUST answer three structured questions.
@@ -197,6 +234,54 @@ this goal succeeded?" Must reference a checkable artifact.
   append `verification_gap` to sensory_buffer citing the gate reason. Re-read
   the file before re-verifying. Known false positive → re-call with
   `--override "<justification>"`.
+
+**Q1.5 GENERATED CHECKLIST** (TICKing All the Boxes, 2410.03608 — BRD Gap 15;
+runs only when Q1 passed): decompose "did this goal succeed?" into a concrete,
+artifact-checkable checklist, then surface verification dimensions the goal's
+OWN criteria never declared. Primarily DETECTIVE — its escalation gate is
+conservative (covered-criterion failures only); its main product is the
+goal-template-improvement signal in `meta/missing-verification-criteria.jsonl`.
+- `IF prior_checks.q1_5_passed`: log `"Q1.5 skipped (prior checkpoint)"`; skip to Q2.
+- `IF outcome_class == "routine" OR context_budget.zone == "tight"`: abbreviate —
+  run a 3-item mental checklist, skip logging, log `"Q1.5 abbreviated ({condition})"`;
+  skip to Q2. (The gaps it would surface on routine / at-budget work are low-value.)
+- Else:
+  1. GENERATE 5–10 yes/no checklist items from `goal.title` + `goal.description`
+     + the goal's primary action/skill. Each item is one concrete property a
+     correct artifact MUST have — phrased as a checkable yes/no question, NOT a
+     restatement of the goal. Span four dimensions: deliverable PRESENCE, content
+     CORRECTNESS, INTEGRATION/wiring, and absence of obvious BREAKAGE.
+  2. EVALUATE each item against the produced artifact(s) → pass / fail / NA.
+     Reuse the evidence already in hand from Q1 plus targeted Read/Grep. Do NOT
+     re-execute the goal.
+  3. CLASSIFY each item's coverage: is this property already represented in
+     `goal.verification.outcomes` or `goal.verification.checks` (semantic match,
+     LLM judgment)? COVERED = an existing verification entry would catch its
+     failure; UNCOVERED otherwise.
+  4. `covered_failures`   = items with result==fail AND coverage==covered.
+     `uncovered_failures` = items with result==fail AND coverage==uncovered.
+  5. CONSERVATIVE HARD GATE: IF `covered_failures` is non-empty → the checklist
+     caught a real miss Q1's single-artifact check was too shallow to see:
+     `all_passed = false`, status → pending, append each covered failure to
+     sensory_buffer as a `verification_gap`. (UNCOVERED failures NEVER gate —
+     they are gaps in how the goal DECLARED its criteria, not current-goal
+     failures. This keeps Q1.5 low-risk per the BRD: an over-strict generated
+     item can only log, never block.)
+  6. RECORD `uncovered_failures` for later goal-template improvement (the BRD's
+     "misses → `missing-verification-criteria.jsonl`"). One append per verify:
+     ```bash
+     # only when uncovered_failures is non-empty
+     echo '{"goal_id":"<goal.id>","source":"<source>","category":"<goal.category>","artifact":"<Q1 artifact>","items":[<uncovered item strings>],"note":"Q1.5 generated-checklist gap"}' \
+       | bash core/scripts/missing-criteria-log.sh
+     ```
+     The companion script appends one locked JSONL line to
+     `meta/missing-verification-criteria.jsonl` (detective/telemetry only — it
+     never mutates goal state; fail-open so it cannot block verify).
+  7. On Q1.5 assessed (whether or not items failed):
+     ```bash
+     bash core/scripts/loop-state-save.sh update --set "phase_progress.q1_5_passed=true" --set "phase_progress.q1_5_checklist=<n_pass>/<n_total>"
+     echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q1.5 checklist: <n_pass>/<n_total> pass, <n_uncovered> uncovered gap(s) logged"}' | bash core/scripts/execution-diary.sh append
+     ```
 
 **Q2 NEGATIVE CHECK** (only when Q1 passes): "What would it look like if this
 APPEARED to succeed but actually failed? Did I check for that?"

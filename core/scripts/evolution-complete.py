@@ -342,6 +342,26 @@ def _propose_program_change(entry, reasoning):
 
     reason = (reasoning or "(no reason provided)").strip().splitlines()[0][:200]
     propose_script = str(SCRIPT_DIR / "program-change-propose.py")
+    if not os.path.exists(propose_script):
+        # Program cross-agent ack flow is INTENTIONALLY UNIMPLEMENTED. The
+        # producer (program-change-propose.py) and the downstream quorum sweep
+        # (program-ack-sweep.py) were specced in the SELF-PROGRAM-EVOLUTION
+        # bible's Phase 6/D2 design but never built; the bible was deleted on
+        # /encode-session promotion and only the consumer (this function) shipped
+        # with a graceful fall-through. Material program edits therefore finalize
+        # immediately and post to the decisions board for POST-HOC partner review
+        # — the guard-380 "notify after, revert if wrong" model the user chose for
+        # shared identity/purpose state (2026-04-22), not pre-ack consensus
+        # gating. Known disabled state, not an error: one clean line, fall back to
+        # finalize quietly (mirrors the F3 snapshot-metrics rc=64 pattern above).
+        # If a future goal builds the producer, this existence check passes and
+        # the ack flow activates with no further change here. (9)
+        print("INFO: program cross-agent ack flow not initiated — "
+              "program-change-propose.py intentionally unimplemented "
+              "(see world/conventions/self-program-evolution.md Phase 6). "
+              "Material program edit finalizes + posts to decisions board for "
+              "post-hoc review. Expected state, not a failure.", file=sys.stderr)
+        return None
     cmd = ["py", "-3", propose_script,
            "--revision-id", revision_id,
            "--file-path", file_path,
@@ -531,9 +551,18 @@ def main():
             and not args.dry_run):
         propose_outcome = _propose_program_change(new_entry, args.reasoning)
         if propose_outcome is None:
-            # Subprocess error — leave entry status=final and continue; the
-            # next program-ack-sweep will detect any missing proposal artifacts.
-            print("WARN: program-change-propose failed; finalizing without ack flow", file=sys.stderr)
+            # propose returned None — either the intentionally-unimplemented ack
+            # flow (the common+expected case; the helper already logged a clean
+            # INFO) or a genuine subprocess failure (helper logged the specific
+            # WARN). Either way the agent's edit is already on disk and status
+            # stays `final`; the decisions-board post below gives partners
+            # post-hoc visibility (guard-380 model). NOTE not WARN — finalizing
+            # without the ack flow is the documented expected behavior while the
+            # producer/sweep stay unimplemented, not a degradation. (9)
+            print("NOTE: program edit finalized without cross-agent ack flow "
+                  "(ack producer/sweep unimplemented — see _propose_program_change "
+                  "log above and self-program-evolution convention Phase 6).",
+                  file=sys.stderr)
         elif propose_outcome.get("single_agent_world"):
             # No partners → Self protocol (immediate finalize)
             print("NOTE: single-agent world detected; finalizing program edit without ack flow",

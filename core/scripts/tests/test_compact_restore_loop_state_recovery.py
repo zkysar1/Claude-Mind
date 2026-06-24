@@ -47,9 +47,12 @@ def _load_crs_module(tmpdir: Path):
     _paths.AGENT_DIR = tmpdir
 
     import wm as wm_module
+    # AGENT_DIR is the load-bearing isolation: wm_path() resolves BODY_WM_PATH
+    # env → else AGENT_DIR/session/working-memory.yaml, and read_wm/write_wm
+    # call wm_path() directly. Patching wm.WM_PATH / WORKING_MEMORY_PATH was a
+    # post- NO-OP for I/O (WM_PATH became a dynamic __getattr__
+    # property) and contradicted the conftest guidance — removed. (6)
     wm_module.AGENT_DIR = tmpdir
-    wm_module.WORKING_MEMORY_PATH = tmpdir / "session" / "working-memory.yaml"
-    wm_module.WM_PATH = tmpdir / "session" / "working-memory.yaml"
 
     spec = importlib.util.spec_from_file_location(
         "compact_restore_slots", SCRIPT_DIR / "compact-restore-slots.py"

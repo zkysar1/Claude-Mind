@@ -189,11 +189,19 @@ def _invoke_sweep(synth_root: Path) -> subprocess.CompletedProcess:
     to CreateProcess (Win32 API), not the shell.
     """
     env = os.environ.copy()
+    # 1: strip the ENTIRE ambient MIND_* namespace before invoking the
+    # sweep so it resolves agent/world/meta purely from MIND_AGENT (set below) +
+    # the synthetic local-paths.conf — immune to cross-test env pollution in the
+    # full suite. The subprocess inherits os.environ; conftest's autouse
+    # _restore_env_per_test restores only AGENT/WORLD/STORAGE_BACKEND, and the
+    # prior code popped only WORLD/META — so a leaked ambient MIND_* (e.g.
+    # MIND_SHELL, empirically proven to break the sweep when it points at a
+    # non-GNU shell) survived into this subprocess and flipped the Mode-D
+    # assertion. Sweeping the whole namespace closes the class regardless of
+    # which var leaked (guard-652: isolate more than WORLD in test fixtures).
+    for _ayoai_key in [k for k in env if k.startswith("MIND_")]:
+        del env[_ayoai_key]
     env["MIND_AGENT"] = "delta"
-    # Strip inherited MIND_WORLD/META so the env-var precedence in _paths.sh
-    # doesn't override the synthetic local-paths.conf values.
-    env.pop("MIND_WORLD", None)
-    env.pop("MIND_META", None)
     # PATH augmentation for `py` (Windows Python launcher) findability.
     # Pytest's bash subprocess (Git Bash via BASH_PATH) inherits Python's
     # PATH, but that PATH may not include `/c/Windows` where `py.exe` lives

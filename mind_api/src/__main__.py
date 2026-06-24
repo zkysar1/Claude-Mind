@@ -134,11 +134,15 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
     Local mode is untouched (zero added I/O): this runs ONLY when
     ``STORAGE_BACKEND == own-cloud``. Uses ``setdefault`` so an explicit
     shell-exported root always wins, and reuses the daemon's own
-    ``AgentPathResolver`` (``resolve(None)`` → the first agent's conf, i.e. the
-    shared-world fallback) rather than re-implementing conf parsing. Fail-open:
-    if no agent conf can be resolved, log to stderr and return — ``get_backend()``
-    raises its own specific per-request error rather than crash-loop the daemon
-    at startup.
+    ``AgentPathResolver`` — but ITERATES conf-bearing agents (skipping
+    ``_``-prefixed test/throwaway dirs) until one resolves, instead of trusting
+    ``resolve(None)``'s single first-agent pick. Fail-LOUD: if own-cloud is
+    selected and NO agent resolves the governed roots, raise rather than return.
+    A daemon that comes up "healthy" but 500s every storage op (because the
+    roots stayed unset) is far worse to diagnose than a startup refusal — the
+    g-115-1449 incident, where a ``_``-prefixed test agent whose conf lacked
+    ``WORLD_PATH`` sorted first, made ``resolve(None)`` raise, and the prior
+    silent fail-open then served own-cloud with no roots (rb-1796).
     """
     if os.environ.get("STORAGE_BACKEND", "").strip().lower() != "own-cloud":
         return
@@ -146,14 +150,38 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
     have_meta = os.environ.get("MIND_META") or os.environ.get("META_PATH")
     if have_world and have_meta:
         return
-    try:
-        from .agent_paths import AgentPathResolver
-        paths = AgentPathResolver(project_root).resolve(None)
-    except Exception as e:  # noqa: BLE001 — fail-open; lazy get_backend reports specifics
-        print(f"[runtime] _ensure_owncloud_roots: could not resolve world/meta "
-              f"roots for the own-cloud backend ({e}); storage ops will report "
-              f"the specific error per-request", file=sys.stderr)
-        return
+    from .agent_paths import AgentPathResolver
+    resolver = AgentPathResolver(project_root)
+    # Iterate conf-bearing agents until one resolves valid WORLD+META, rather
+    # than trusting resolve(None)'s single first-agent pick. A `_`-prefixed
+    # test/throwaway agent dir (e.g. _gate_test_throwaway_agent_) sorts BEFORE
+    # real agents; if its conf lacks WORLD_PATH, resolve(None) raises — and the
+    # prior silent fail-open then served own-cloud with NO roots, 500ing every
+    # governed-path op (9). Skip `_`-prefixed dirs and try each real
+    # agent; the first that resolves wins.
+    candidates = [c.parent.name
+                  for c in sorted(resolver._agents_root().glob("*/local-paths.conf"))
+                  if not c.parent.name.startswith("_")]
+    paths = None
+    errors = []
+    for _name in candidates:
+        try:
+            paths = resolver.resolve(_name)
+            break
+        except Exception as e:  # noqa: BLE001 — try the next conf-bearing agent
+            errors.append(f"{_name}: {e}")
+    if paths is None:
+        # FAIL LOUD. own-cloud is selected but no agent resolves the governed
+        # roots. A startup refusal is far easier to diagnose than a daemon that
+        # comes up healthy and 500s every storage op with unset roots (rb-1796).
+        raise RuntimeError(
+            "_ensure_owncloud_roots: STORAGE_BACKEND=own-cloud but no "
+            f"conf-bearing agent resolved WORLD/META roots (tried "
+            f"{len(candidates)}: {errors or 'no agents/*/local-paths.conf found'}). "
+            "Refusing to serve own-cloud with unset roots. Fix: ensure an "
+            "agents/<name>/local-paths.conf carries WORLD_PATH+META_PATH, or "
+            "export MIND_WORLD/MIND_META before launch."
+        )
     os.environ.setdefault("WORLD_PATH", str(paths.world))
     os.environ.setdefault("META_PATH", str(paths.meta))
     os.environ.setdefault("AGENTS_ROOT", str(paths.agent.parent))

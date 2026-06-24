@@ -37,5 +37,13 @@ if [ -n "$session_id" ]; then
     sid_arg="--session-id $session_id"
 fi
 
+# Resolve agent from session_id — MIND_AGENT is not injected in Read hooks.
+# ORDER-CRITICAL: must stay BEFORE `source _platform.sh`; MSYS_NO_PATHCONV
+# (set by _platform.sh) breaks session-binding-read.sh on Git Bash ().
+AGENT_NAME="${MIND_AGENT:-}"
+if [ -z "$AGENT_NAME" ] && [ -n "$session_id" ]; then
+    AGENT_NAME="$(bash "$CORE_ROOT/scripts/session-binding-read.sh" "$session_id" 2>/dev/null || true)"
+fi
+
 source "$CORE_ROOT/scripts/_platform.sh"
-exec python3 "$CORE_ROOT/scripts/context-reads.py" gate $sid_arg "$file_path"
+exec MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" gate $sid_arg "$file_path"

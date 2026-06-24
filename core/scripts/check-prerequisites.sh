@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# domain-leak-exempt: boto3 / S3 / DynamoDB here are FUNCTIONAL own-cloud-backend
+# references — the literal AWS SDK module checked via `import boto3` and its
+# backing services — not pedagogical domain examples. Mirrors the exempt
+# core/scripts/owncloud_backend.py and core/scripts/owncloud_sync.py.
 # check-prerequisites.sh — verify the Mind framework's runtime prerequisites.
 #
 # Created 2026-05-17 (Phase 2.1 packaging cleanup). Replaces the
@@ -13,6 +17,10 @@
 #
 # What's required vs warned:
 #   REQUIRED: Python 3.8+, PyYAML (`yaml` importable), bash 4+
+#   REQUIRED (own-cloud only): boto3 — checked ONLY when STORAGE_BACKEND=own-cloud
+#     (the S3/DynamoDB backend imports it lazily; local installs never need it).
+#     Missing boto3 on an own-cloud machine otherwise surfaces only as a dead
+#     daemon (g-115-1334, 2026-06-04 machine-2 bring-up).
 #   WARNING-ONLY: git (loop runs without git, but iteration audit trail
 #     + pre-commit gates + post-commit daemon recycle are disabled),
 #     psutil (agent-watchdog degrades gracefully)
@@ -91,6 +99,27 @@ if [[ -n "$PY" ]]; then
     if ! eval "$PY -c 'import psutil' " 2>/dev/null; then
         WARNINGS+=("psutil not installed — agent-watchdog process inspection degrades gracefully")
         DETAILS+=("  Optional install: $PY -m pip install psutil")
+    fi
+fi
+
+# --- boto3 (REQUIRED only when the own-cloud backend is configured) ---
+# boto3 is the AWS SDK that the own-cloud S3/DynamoDB backend imports lazily
+# (core/scripts/owncloud_backend.py). The DEFAULT local backend never needs it,
+# so gate the check on STORAGE_BACKEND: read the live env first, else parse the
+# one line from .env.local (the canonical location — loaded elsewhere via
+# `set -a; source .env.local`). We grep a single non-secret line rather than
+# sourcing the whole file, so no credentials enter this script's environment.
+STORAGE_BACKEND_VAL="${STORAGE_BACKEND:-}"
+if [[ -z "$STORAGE_BACKEND_VAL" && -f .env.local ]]; then
+    STORAGE_BACKEND_VAL="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' .env.local 2>/dev/null \
+        | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+fi
+STORAGE_BACKEND_VAL="$(printf '%s' "$STORAGE_BACKEND_VAL" | tr '[:upper:]' '[:lower:]')"
+if [[ "$STORAGE_BACKEND_VAL" == "own-cloud" && -n "$PY" ]]; then
+    if ! eval "$PY -c 'import boto3' " 2>/dev/null; then
+        REQUIRED_MISSING+=("boto3 (required for STORAGE_BACKEND=own-cloud — the S3/DynamoDB backend imports it)")
+        DETAILS+=("  Install: $PY -m pip install -r mind_api/requirements-owncloud.txt")
+        DETAILS+=("  Or:      $PY -m pip install boto3")
     fi
 fi
 

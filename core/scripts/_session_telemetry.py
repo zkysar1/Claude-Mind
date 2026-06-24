@@ -313,3 +313,129 @@ def write_crash(sid, agent, iterations_completed=0, world_dir=None, project_root
         iterations_completed=iterations_completed, goals_completed=-1,
         world_dir=world_dir, project_root=project_root,
     )
+
+
+# ── Phase 1.5: stale-active reaper (design doc §8.6 #1 + #3) ──────────────────
+
+def _parse_local_iso(s):
+    """Parse a local ISO-8601 (no-tz) timestamp to datetime, or None on any
+    failure / 'unknown' (mirrors the format _now_iso_local writes)."""
+    if not s or s == "unknown":
+        return None
+    try:
+        return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
+def _runner_recently_active(agent, cutoff_dt, project_root):
+    """True if an autonomous runner for `agent` ticked its heartbeat at/after
+    `cutoff_dt` — i.e. the agent is (recently) alive on THIS machine.
+
+    `project_root` is an already-resolved Path or None. The default on any
+    ambiguity is True (treat as alive → do NOT reap), because reaping a live
+    session's record is data corruption while leaving an orphan one cycle longer
+    is harmless:
+      * project_root unresolvable  → True  (cannot verify → skip)
+      * heartbeat file absent      → False (no autonomous runner → reapable)
+      * stat error on a present file → True  (uncertain → skip)
+    The heartbeat is ticked only by the autonomous loop (Phase -0.5), so this is
+    specifically "is a live autonomous runner present", which is exactly the
+    case §8.6 #3 must protect (its active record may still be keyed on the
+    pre-autocompact SID)."""
+    if project_root is None:
+        return True
+    hb = project_root / "agents" / agent / "session" / "runner-heartbeat"
+    try:
+        if not hb.exists():
+            return False
+        mtime = datetime.datetime.fromtimestamp(hb.stat().st_mtime)
+        return mtime >= cutoff_dt
+    except Exception:
+        return True
+
+
+def reap_stale_active(world_dir=None, project_root=None, freshness_hours=24,
+                      liveness_hours=6, now=None, machine_id=None):
+    """Phase 1.5 stale-active reaper. Flips ORPHANED ``status=active`` records to
+    ``status=unknown`` / ``ended_reason=unknown`` (design doc §8.6 #1 + #3).
+
+    A record is reaped only when ALL hold:
+      * ``status == "active"`` — idempotent; a closed record is never re-touched;
+      * ``machine_id`` equals this machine — cross-machine records are left to
+        THAT machine's reaper (their runner liveness can't be checked locally),
+        so one machine never clobbers another's live record;
+      * ``started_at`` is older than ``freshness_hours`` — the §8.6 #1 grace
+        window; a just-force-closed record gets time to close normally first;
+      * the owning agent's autonomous runner is NOT recently alive
+        (``runner-heartbeat`` mtime older than ``liveness_hours``).
+
+    The liveness guard is load-bearing, NOT belt-and-suspenders: an autonomous
+    runner stays ``active`` for the WHOLE session (the record is immutable
+    between write-points) and routinely runs >24h, and after autocompact its
+    live record may still be keyed on the pre-rotation SID (§8.6 #3 — the
+    old-SID→new-SID re-key is a separate, not-yet-built fix). Reaping on age
+    alone would therefore mark a live long-running runner ``unknown`` and drop
+    it from the live-sessions view. Gating on heartbeat freshness defers a live
+    agent's orphans until it idles, then reaps them — never corrupting a live
+    session.
+
+    Total (never raises → returns the partial summary). Returns a dict:
+    ``{scanned, reaped, skipped_fresh, skipped_live, skipped_other_machine,
+    reaped_ids}``."""
+    summary = {"scanned": 0, "reaped": 0, "skipped_fresh": 0,
+               "skipped_live": 0, "skipped_other_machine": 0, "reaped_ids": []}
+    try:
+        wd = _resolve_world_dir(world_dir)
+        if wd is None:
+            return summary
+        records_root = wd / "telemetry" / _RECORDS_SUBDIR
+        if not records_root.exists():
+            return summary
+        pr = _resolve_project_root(project_root)
+        this_machine = machine_id or _machine_id()
+        now_dt = now or datetime.datetime.now()
+        fresh_cutoff = now_dt - datetime.timedelta(hours=freshness_hours)
+        live_cutoff = now_dt - datetime.timedelta(hours=liveness_hours)
+        ended_at = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+        live_cache = {}
+        for agent_dir in sorted(records_root.iterdir()):
+            if not agent_dir.is_dir():
+                continue
+            agent = agent_dir.name
+            for rec_path in sorted(agent_dir.glob("*.json")):
+                summary["scanned"] += 1
+                try:
+                    record = json.loads(rec_path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if record.get("status") != "active":
+                    continue
+                rec_machine = record.get("machine_id")
+                if rec_machine and rec_machine != this_machine:
+                    summary["skipped_other_machine"] += 1
+                    continue
+                started_dt = _parse_local_iso(record.get("started_at"))
+                if started_dt is not None and started_dt > fresh_cutoff:
+                    summary["skipped_fresh"] += 1
+                    continue
+                if agent not in live_cache:
+                    live_cache[agent] = _runner_recently_active(
+                        agent, live_cutoff, pr)
+                if live_cache[agent]:
+                    summary["skipped_live"] += 1
+                    continue
+                record["status"] = "unknown"
+                record["ended_reason"] = "unknown"
+                record["ended_at"] = ended_at
+                record["end_machine_id"] = this_machine
+                record["duration_seconds"] = _duration_seconds(
+                    record.get("started_at"), ended_at)
+                record.setdefault("schema_version", SCHEMA_VERSION)
+                if _atomic_dump(rec_path, record):
+                    summary["reaped"] += 1
+                    summary["reaped_ids"].append(
+                        record.get("session_id") or rec_path.stem)
+        return summary
+    except Exception:
+        return summary

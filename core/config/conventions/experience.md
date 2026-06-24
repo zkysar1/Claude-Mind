@@ -15,6 +15,13 @@ Default: `goal_id` (null), `hypothesis_id` (null), `tree_nodes_related` ([]), `v
 ID format: `exp-{source-id-or-slug}` (regex: `^exp-[a-z0-9._-]+$`)
 Valid types: `goal_execution`, `hypothesis_formation`, `research`, `reflection`, `user_correction`, `user_interaction`, `execution_reflection`
 
+Element schemas (enforced by `experience-add.sh` validation):
+- `verbatim_anchors` — list of `{key, content}` objects, NOT plain strings.
+  `key` is a short slug; `content` is the verbatim excerpt. A list of bare
+  strings is rejected with `Each verbatim_anchor must have 'key' and 'content' fields`.
+- `tree_nodes_related` — list of node-key strings.
+- `created` is SCRIPT-OWNED (stamped at add time); do NOT supply it on stdin.
+
 ## Script-Based Access (Exclusive Data Layer)
 The LLM NEVER reads or edits experience JSONL files directly. All operations go through scripts:
 

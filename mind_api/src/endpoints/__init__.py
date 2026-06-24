@@ -23,6 +23,7 @@ def load_all() -> Routes:
     """Build the route table by importing every endpoint module."""
     routes: Routes = {}
     from . import health as _health
+    from . import ready as _ready
     from . import aspirations as _aspirations
     from . import wm as _wm
     from . import wm_write as _wm_write
@@ -79,6 +80,7 @@ def load_all() -> Routes:
     # Batch 5 — history list/diff/restore/prune/prune-legacy (4-base resolver)
     from . import history as _history_ep
     _health.register(routes)
+    _ready.register(routes)
     _aspirations.register(routes)
     _tree.register(routes)
     _wm.register(routes)

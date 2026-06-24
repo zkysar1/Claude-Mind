@@ -25,7 +25,13 @@ if hasattr(sys.stderr, "reconfigure"):
 import yaml
 
 from _paths import AGENT_DIR, assert_agent_dir
-from wm import WM_PATH, read_wm, write_wm
+# F8 (): import the wm_path() RESOLVER (aliased) rather than binding
+# the WM_PATH module attribute once at import. wm.py exposes WM_PATH via PEP 562
+# __getattr__ (body-WM-aware), but `from wm import WM_PATH` freezes the resolved
+# Path at import time; calling wm_path() per use re-resolves through BODY_WM_PATH
+# every time. Behavior-preserving here (short-lived CLI, env fixed at launch);
+# matches the per-use pattern in tree-encoding-drift-gate.py.
+from wm import wm_path as _resolve_wm_path, read_wm, write_wm
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
@@ -190,7 +196,7 @@ def main():
     # gate wrongly skip a legitimate general restore — the gate's premise is
     # "an iteration completed after PreCompact", which a recovery write does
     # NOT satisfy. 2.
-    _wm_fresher_than_checkpoint = _is_checkpoint_stale(CHECKPOINT_PATH, WM_PATH)
+    _wm_fresher_than_checkpoint = _is_checkpoint_stale(CHECKPOINT_PATH, _resolve_wm_path())
 
     # 2: recover loop_state if it was nulled/lost in the compaction
     # window. MUST run before the general merge — loop_state is in SKIP_SLOTS
@@ -207,7 +213,7 @@ def main():
     # the stale-skip path can no longer leak).
     if _wm_fresher_than_checkpoint:
         ck_mtime = CHECKPOINT_PATH.stat().st_mtime
-        wm_mtime = WM_PATH.stat().st_mtime
+        wm_mtime = _resolve_wm_path().stat().st_mtime
         delta = wm_mtime - ck_mtime
         print(
             f"checkpoint stale (wm.yaml is {delta:.0f}s fresher than checkpoint) — "

@@ -163,11 +163,14 @@ fi
 #   - signals.consecutive_blocked_sleeps (reset on deep)
 #   - goals_completed_this_session, productive_goals_this_session
 #
-# LLM still owns the LLM-only fields at LOOP_CONTINUE (evolutions, alignment
-# checks, aspirations_touched, consecutive_goal_failures, last_failed_goal_id,
-# idle_fallback_created). The LLM read-merge-write pattern at LOOP_CONTINUE
-# picks up bash mutations because Phase -0.5 of the next iteration restores
-# loop_state from WM. Mirrors tree-encoding-drift-gate.sh which is the
+# As of 1, bash ALSO owns evolutions / last_evolution_at /
+# alignment_check_at / aspirations_touched (loop-state-bump-counters.py:
+# --goal-id increments alignment+touched every close, --reset-alignment at
+# aspirations-select, --evolution-fired at aspirations-evolve). The only fields
+# the LLM still overlays at LOOP_CONTINUE are the circuit-breaker pair
+# (consecutive_goal_failures, last_failed_goal_id; learning-gate) and
+# idle_fallback_created (all-blocked) — narrow slot-specific read-merge-writes,
+# not a full-slot mirror. Mirrors tree-encoding-drift-gate.sh which is the
 # single writer for goals_since_last_tree_update (, rb-428 family).
 #
 # Stdout is the post-mutation outcome (routine|deep). Block A may flip
@@ -290,7 +293,8 @@ else
     OUTCOME_ORIGIN="genuine"
 fi
 
-GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" python3 - <<'PYEOF'
+NOW="$(date +%Y-%m-%dT%H:%M:%S)"
+GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" NOW="$NOW" python3 - <<'PYEOF'
 import json, os, subprocess, sys
 from pathlib import Path
 import yaml
@@ -304,8 +308,15 @@ sd      = Path(os.environ["SD"])
 
 # Read current consecutive_routine AND consecutive_deep counters. Both default
 # to 0 for legacy goals. Errors propagate.
+# : ALSO read the lifetime substantive-hit tally. substantive_hits is
+# the numerator, substantive_runs the denominator. Both default to 0 for legacy
+# goals — substantive_runs is counted from field-introduction (NOT seeded from
+# achievedCount) so the lifetime rate the chronic-low detector keys on is never
+# poisoned by pre-tracking run history.
 current = 0
 current_deep = 0
+current_sub_hits = 0
+current_sub_runs = 0
 with open(sf, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
@@ -316,6 +327,8 @@ with open(sf, "r", encoding="utf-8") as f:
             if g.get("id") == gid:
                 current = int(g.get("consecutive_routine", 0))
                 current_deep = int(g.get("consecutive_deep", 0))
+                current_sub_hits = int(g.get("substantive_hits", 0))
+                current_sub_runs = int(g.get("substantive_runs", 0))
                 break
 
 new_val = current + 1 if outcome == "routine" else 0
@@ -331,6 +344,17 @@ elif outcome == "deep":  # outcome_origin == "forced-flip"
     new_deep = current_deep  # unchanged — forced flips don't count toward contract
 else:  # routine
     new_deep = 0
+
+# : lifetime substantive-hit tally. substantive_runs is the denominator
+# (advances on EVERY close); substantive_hits is the numerator (GENUINE deep
+# only — a forced-flip is the anti-drift mechanism, not real substantive output,
+# so it must not inflate the lifetime rate chronic-low detection reads). Mirrors
+# the consecutive_deep genuine/forced split above.
+new_sub_runs = current_sub_runs + 1
+if outcome == "deep" and outcome_origin == "genuine":
+    new_sub_hits = current_sub_hits + 1
+else:
+    new_sub_hits = current_sub_hits
 
 upd = subprocess.run(
     [sys.executable, str(sd / "aspirations.py"),
@@ -364,6 +388,36 @@ upd_o = subprocess.run(
 if upd_o.returncode != 0:
     print(f"[recurring-close] update last_outcome_origin failed: {upd_o.stderr}", file=sys.stderr)
     # Non-fatal — purely observability field.
+
+# : persist the lifetime substantive-hit tally — the WRITER half of the
+# chronic-low detector (reader is cargo-cult-detector.py _score_recurring /
+# cmd_audit_all). Writer+reader ship together; reader-without-writer is the
+# retired-Path-A trap. All writes are NON-FATAL: the tally is detection
+# value-add, never load-bearing for the close.
+upd_sr = subprocess.run(
+    [sys.executable, str(sd / "aspirations.py"),
+     "--source", src, "update-goal", gid, "substantive_runs", str(new_sub_runs)],
+    capture_output=True, text=True, encoding="utf-8",
+)
+if upd_sr.returncode != 0:
+    print(f"[recurring-close] update substantive_runs failed: {upd_sr.stderr}", file=sys.stderr)
+if new_sub_hits != current_sub_hits:
+    # A GENUINE deep advanced the tally — write the count + stamp the last-catch
+    # timestamp (R1 'last catch'). NOW is local system time, passed via env.
+    upd_sh = subprocess.run(
+        [sys.executable, str(sd / "aspirations.py"),
+         "--source", src, "update-goal", gid, "substantive_hits", str(new_sub_hits)],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if upd_sh.returncode != 0:
+        print(f"[recurring-close] update substantive_hits failed: {upd_sh.stderr}", file=sys.stderr)
+    upd_lsa = subprocess.run(
+        [sys.executable, str(sd / "aspirations.py"),
+         "--source", src, "update-goal", gid, "last_substantive_at", os.environ["NOW"]],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    if upd_lsa.returncode != 0:
+        print(f"[recurring-close] update last_substantive_at failed: {upd_lsa.stderr}", file=sys.stderr)
 
 # Surface the decision so the loop's stderr stream captures it. Mirrors the
 # Block A/C flip notification line above (line ~192).
@@ -842,8 +896,14 @@ fi
 # non-bg cases. The sentinel is the authoritative transport.
 # Fail-open: errors echo to stderr and do not change MAX_RC.
 EXPIRES_AT="$(py -3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
+# set_at = sentinel creation time (now). Consumed by Phase -0.5c.2's dedup
+# (spark-fire-dedup.py check --sentinel-set-at): a spark recorded at/after this
+# set_at fired in response to THIS close (skip the re-fire); one from a prior
+# close fired before it (fire). Additive field — older consumers ignore it; the
+# new consumer prefers it over the time-window heuristic (4 / rb-1674).
+SET_AT="$(py -3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
 if [[ -n "$EXPIRES_AT" ]]; then
-    SENTINEL_PAYLOAD="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$EXPIRES_AT" py -3 -c "
+    SENTINEL_PAYLOAD="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$EXPIRES_AT" SETAT="$SET_AT" py -3 -c "
 import json, os
 print(json.dumps({
     'goal_id':    os.environ['GID'],
@@ -851,6 +911,7 @@ print(json.dumps({
     'source':     os.environ['SRC'],
     'summary':    os.environ.get('SUM',''),
     'expires_at': os.environ['EXP'],
+    'set_at':     os.environ.get('SETAT',''),
 }))
 " 2>/dev/null || true)"
     if [[ -n "$SENTINEL_PAYLOAD" ]]; then
@@ -865,11 +926,35 @@ fi
 
 echo ""
 echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
-if [[ "$OUTCOME" == "deep" ]]; then
-    echo "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
+# Deadman's-switch terminal-pair (DEFAULT-ON since Stage 5, 2026-06-23). Mirror
+# of iteration-close.sh. ON for every agent by default; opt out per-agent with
+# `touch agents/<agent>/session/deadman-disabled` (reverts to byte-identical
+# pre-deadman imperative). See aspirations/SKILL.md Return Protocol +
+# core/config/rationale/deadman-switch.md.
+if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
+    if [[ "$OUTCOME" == "deep" ]]; then
+        echo "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
+    else
+        echo "[recurring-close] OUTCOME=routine — NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+    fi
 else
-    echo "[recurring-close] OUTCOME=routine — NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+    _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600), the self-resurrection net, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
+    if [[ "$OUTCOME" == "deep" ]]; then
+        echo "[recurring-close] OUTCOME=deep (deadman-switch ON) — NEXT ACTION REQUIRED: Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
+    else
+        echo "[recurring-close] OUTCOME=routine (deadman-switch ON) — NEXT ACTION REQUIRED: ${_dm_pair}."
+    fi
 fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
+
+# Imperative-fired tracer (6): independent observability lane confirming
+# the ITERATION COMPLETE imperative above reached this code path (outcome-aware).
+# Mirror of the iteration-close.sh tracer; carries goal_id + outcome for the
+# recurring path. Append-only, fail-open (|| true) — runs BEFORE `exit $MAX_RC`
+# so it never affects the close exit code. Controlled values → printf JSON is
+# injection-safe and avoids a python spawn on this hot path.
+printf '{"ts":"%s","script":"recurring-close","goal_id":"%s","outcome":"%s","agent":"%s","event":"iteration-complete-imperative"}\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S)" "${GOAL_ID:-unknown}" "${OUTCOME:-unknown}" "${MIND_AGENT:-unknown}" \
+    >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
 exit $MAX_RC

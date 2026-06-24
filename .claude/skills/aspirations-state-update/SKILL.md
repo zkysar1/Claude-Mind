@@ -386,7 +386,39 @@ IF outcome_class == "routine":
             # Overflow items get second chance during session-end consolidation
         ELSE:
             Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f})"
-            # Proceed to step d (PRECISION AUDIT)
+            # c.6. MDL PARSIMONY ADVISORY (g-115-1468 / earn-the-keep Phase 1c):
+            # Measurable lexical backstop to the curator's semantic coverage check.
+            # The curator judges "does this add new info?" by LLM judgment; this adds
+            # a MEASURABLE second signal so near-duplicates aren't waved through under
+            # context pressure. ADVISORY ONLY — the curator's PASS stays authoritative;
+            # this surfaces lexical restatement and recommends merge-over-append. Logs
+            # a pass/block firing under gate id `mdl-encode-parsimony`
+            # (core/config/gates.yaml) via run_assess. Proportionality: only worth
+            # running when the node has enough existing content to BE redundant with.
+            IF the target node already has >= 3 existing insights (Verified Values /
+               Key Insights bullets):
+                Write agents/<agent>/session/mdl-existing-corpus.jsonl
+                  # transient scratch: one JSONL line {id, text} per existing node
+                  # insight (id = short tag). session/ always exists (L1-clean),
+                  # overwritten each close.
+                Bash: py -3 core/scripts/mdl_gate.py gate \
+                      --candidate "<the compressed insight from step c>" \
+                      --existing agents/<agent>/session/mdl-existing-corpus.jsonl \
+                      --node <node.key> --goal {goal.id} --caller aspirations-state-update
+                  # args, not python source -> guard-165 N/A. exit 0 keep / 1 near-dup.
+                Parse stdout JSON (keep, nearest_id, max_similarity, novelty, reason):
+                IF keep == false:
+                    Output: "▸ MDL ADVISORY: near-duplicate of {nearest_id} (sim {max_similarity:.2f}, nov {novelty:.2f}) — {reason}"
+                    # Reconcile with the curator PASS (curator saw NEW semantic info;
+                    # MDL sees lexical overlap):
+                    #   - genuine restatement, no new fact -> MERGE into {nearest_id}
+                    #     (Edit the existing node line) or demote to curator_overflow;
+                    #     do NOT append a near-duplicate line.
+                    #   - adds a concrete fact the lexical check missed -> append normally.
+                ELSE:
+                    Output: "▸ MDL ADVISORY: sufficiently novel (sim {max_similarity:.2f}, nov {novelty:.2f}) — proceed"
+            # else: node too sparse to be redundant with — skip advisory.
+            # Proceed to step d (PRECISION AUDIT).
      d. PRECISION AUDIT: Re-read node. Verify each manifest item appears in Verified Values.
      e. EXTRACT DECISION RULES: Bash-enforced via decision-rules-append.sh
         (rb-428 / guard-365). LLM residue: compose the IF clause (observable
@@ -572,7 +604,10 @@ IF step_8_wrote_insight:
     # Sub-skill handles: notability gate (cheap early-exit if nothing notable),
     # pattern signature matching/creation, contradiction detection,
     # investigation goal creation, experience archival, journal entry.
-    # Guardrails and reasoning bank are NOT created here (Phase 6.5 owns those).
+    # Guardrails and general reasoning-bank entries are NOT created here
+    # (Phase 6.5 owns those). EXCEPTION: reusable multi-step PROCEDURE entries
+    # (entry_type: procedure) are encoded by Step 8.75b below — a narrow,
+    # non-overlapping carve-out (g-306-11).
     #
     # Positive-state claim discipline (verify-before-assuming.md
     # Positive File-State Claims): any file-state assertion the reflection
@@ -586,6 +621,48 @@ IF step_8_wrote_insight:
 ```
 
 ```
+# ── Step 8.75b: Reusable Procedure Encoding (g-306-11) ───────────────
+# Narrow, NON-OVERLAPPING complement to Phase 6.5 (which captures general
+# reasoning patterns/heuristics + guardrails) and Step 8.75 (pattern-signature
+# + contradiction analysis): THIS step owns reusable MULTI-STEP PROCEDURE
+# entries specifically — an ordered how-to sequence worth repeating when a
+# recurring CLASS of task appears. Tagging it `entry_type: procedure` makes it
+# targetable via `retrieve.sh --entry-type procedure` at Phase 4 of a future
+# similar goal. Skipped by the routine early return (deep-only tail).
+#
+# Gate (LLM judgment, default SKIP): did THIS goal's execution produce a
+# reusable, ordered, multi-step procedure that a FUTURE goal of the same shape
+# would follow step-by-step? Most goals do NOT (a one-off fix, a single-file
+# edit, an observation → SKIP silently). Only a genuine repeatable sequence
+# qualifies — this is the "when one is produced" condition, not every iteration.
+
+IF the goal produced a reusable multi-step procedure (ordered steps a future
+   similar goal would repeat):
+    # Dedup vs Phase 6.5: if spark already captured this exact procedure this
+    # iteration, strengthen instead of duplicating (same pattern as spark).
+    Bash: reasoning-bank-read.sh --category {goal.category}
+    IF an existing active entry already states this procedure:
+        Bash: reasoning-bank-increment.sh {entry.id} utilization.times_helpful
+        Log: "PROCEDURE ENCODING: strengthened existing {entry.id} (no duplicate)"
+    ELSE:
+        Create reasoning bank entry via reasoning-bank-add.sh:
+          # `id` + `created` auto-set by the script — omit both; capture the
+          # assigned id from stdout's full-record JSON.
+          title: "Procedure: {concise name of the repeatable task}"
+          type: success
+          category: goal's category
+          content: the ordered, numbered steps, the preconditions under which
+                   the procedure applies, and any per-step gotchas
+          applies_to: <any|framework|domain|specific>  # REQUIRED
+          entry_type: procedure   # g-306-11 — retrievable via retrieve.sh
+                                  # --entry-type procedure (the whole point)
+          when_to_use: {conditions: ["{the recurring task shape}"], category: "{goal.category}"}
+          source_goal: goal.id
+          tags: ["procedure"]
+          poignancy: <1-10>   # how reusable/impactful the procedure is for future retrieval
+        Log: "PROCEDURE ENCODING: created {rb-id from stdout} (entry_type=procedure) from {goal.id}"
+# ELSE: no reusable procedure produced — SKIP silently (the common case).
+
 # ── Step 8.76: Skill Quality Assessment ───────────────────────────
 # SkillNet-inspired five-dimension quality scoring for the skill that
 # just executed. Accumulates in meta/skill-quality.yaml as a rolling

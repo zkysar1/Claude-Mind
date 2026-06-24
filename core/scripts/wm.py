@@ -14,6 +14,7 @@ Slot addressing:
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -37,9 +38,42 @@ from _fileops import acquire_lock, release_lock
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("wm")
 
-WM_PATH = AGENT_DIR / "session" / "working-memory.yaml"
-WM_LOCK_PATH = WM_PATH.with_suffix(".lock")
+def wm_path():
+    """Effective working-memory path for this process (Phase 1A Mind/Body routing, ).
+
+    BODY_WM_PATH (injected by bash-agent-inject.py when the bound session has a
+    body-manifest) routes WM ops to the per-Body file. Unset -> the agent-wide
+    WM at agents/<agent>/session/working-memory.yaml (today's behavior).
+    Backward-compatible: with no body-manifest (one Body) the routing collapses
+    to the agent-wide default. Resolved per-call (not cached at import) so the
+    env the bash hook injects is always honored.
+    """
+    body = os.environ.get("BODY_WM_PATH", "").strip()
+    if body:
+        return Path(body)
+    return AGENT_DIR / "session" / "working-memory.yaml"
+
+
+def wm_lock_path():
+    """Advisory-lock sibling of the effective WM path (per-Body aware)."""
+    return wm_path().with_suffix(".lock")
+
+
 CONFIG_PATH = CONFIG_DIR / "memory-pipeline.yaml"
+
+
+# Backward-compat: WM_PATH / WM_LOCK_PATH were module constants for years and
+# several importers reference them (compact-restore-slots, precompact-checkpoint,
+# goal-selector). PEP 562 module __getattr__ keeps those names working — each
+# resolves through the per-Body-aware functions above at access time, so both
+# `from wm import WM_PATH` (bound after bash-agent-inject sets the env) and
+# `wm.WM_PATH` honor BODY_WM_PATH.
+def __getattr__(name):
+    if name == "WM_PATH":
+        return wm_path()
+    if name == "WM_LOCK_PATH":
+        return wm_lock_path()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Cross-writer advisory lock for working-memory.yaml read-modify-write
 # cycles. See  / rb-508 / . wm.py's commands and the
@@ -61,11 +95,12 @@ def wm_lock():
     stale_seconds=10: WM RMW is sub-100ms; 30s default would block 6+ aspiration
     iterations on a crashed mid-RMW writer. 10s is still 100x cycle time.
     """
-    acquire_lock(WM_LOCK_PATH, stale_seconds=10)
+    lock = wm_lock_path()
+    acquire_lock(lock, stale_seconds=10)
     try:
         yield
     finally:
-        release_lock(WM_LOCK_PATH)
+        release_lock(lock)
 
 # Top-level keys (not inside slots:)
 TOP_LEVEL_KEYS = {
@@ -160,11 +195,11 @@ def write_yaml(path, data):
 
 def read_wm():
     """Read working memory file."""
-    return read_yaml(WM_PATH)
+    return read_yaml(wm_path())
 
 def write_wm(data):
     """Write working memory file atomically."""
-    write_yaml(WM_PATH, data)
+    write_yaml(wm_path(), data)
 
 def read_config():
     """Read memory pipeline config."""
@@ -449,6 +484,18 @@ def cmd_set(args):
             if gate_result.get("override_applied"):
                 # Echo override to stderr for audit trail
                 print(f"[loop-state-merge-gate] {gate_result['reason']}", file=sys.stderr)
+            # 8: monotonic-counter preservation. When the gate floored
+            # stale-lower top-level counters (goals_completed/productive_goals)
+            # or unioned a subset counted_goals_this_session against the on-disk
+            # committed state, write the PRESERVED value, not the raw incoming —
+            # the Mechanism C backstop for the non-CAS collateral writers.
+            if gate_result.get("counters_preserved"):
+                value = gate_result.get("preserved_value", value)
+                print(
+                    f"[loop-state-merge-gate] preserved monotonic counters "
+                    f"(g-115-1418): {gate_result.get('preserved_counters')}",
+                    file=sys.stderr,
+                )
 
         parent[key] = value
 

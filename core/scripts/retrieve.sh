@@ -51,6 +51,8 @@ INCLUDE_FRAMEWORK=""
 READ_ONLY=""
 GOAL=""
 TREE_NODES=""
+ENTRY_TYPE=""
+AS_OF=""
 
 # Value-arg helper: ${2-} uses empty when $2 is unset. Without this,
 # `retrieve.sh --category` (no value) crashes under set -u with "unbound
@@ -85,6 +87,17 @@ while [[ $# -gt 0 ]]; do
         --tree-nodes)
             TREE_NODES="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --entry-type)
+            # : restrict reasoning-bank results to this entry_type
+            # (e.g. procedure). Forwarded as the entry_type query param.
+            ENTRY_TYPE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --as-of)
+            # : bi-temporal point-in-time read. ISO-8601 instant T —
+            # returns the record versions valid at T (valid_from<=T<valid_to)
+            # across RB/guardrails/patterns/beliefs. Forwarded as as_of param.
+            AS_OF="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         *)
             # Unknown arg — drop it (no direct-python passthrough exists now).
             shift;;
@@ -109,6 +122,8 @@ QUERY="category=$(rt_url_encode "$CATEGORY")"
 [ -n "$INCLUDE_FRAMEWORK" ] && QUERY+="&include_framework=1"
 [ -n "$GOAL" ]              && QUERY+="&goal=$(rt_url_encode "$GOAL")"
 [ -n "$TREE_NODES" ]        && QUERY+="&tree_nodes=$(rt_url_encode "$TREE_NODES")"
+[ -n "$ENTRY_TYPE" ]        && QUERY+="&entry_type=$(rt_url_encode "$ENTRY_TYPE")"
+[ -n "$AS_OF" ]             && QUERY+="&as_of=$(rt_url_encode "$AS_OF")"
 
 rc=0
 rt_call GET /v1/retrieve --query "$QUERY" || rc=$?

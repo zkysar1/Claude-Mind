@@ -73,7 +73,8 @@ def main():
     # state-update-audit.sh at line 509.
     tree_updated = "--tree-updated" in sys.argv[1:]
 
-    wm_path = Path(AGENT_DIR) / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if not wm_path.exists():
         sys.exit(0)
 
@@ -139,20 +140,27 @@ def main():
         else:
             counter += 1
             if counter >= threshold:
-                # Set the force_tree_encoding sentinel in its own slot. Stored as
-                # the string "true" to match aspirations-state-update SKILL.md
-                # Step 8's `IF force_tree_encoding == "true"` check.
-                slots["force_tree_encoding"] = "true"
-                # ALSO set force_tree_maintain so the precheck Phase 0-pre
-                # consumer fires /tree maintain --backlog. The aspirations-
-                # state-update SKILL.md Step 8 consumer for force_tree_encoding
-                # only fires if the LLM explicitly invokes that sub-skill;
-                # the normal loop path (iteration-close.sh --phase state-update
-                # + recurring-close.sh) bypasses it entirely, leaving
-                # force_tree_encoding orphaned. Dual-write ensures the forced
-                # encoding action ALWAYS fires via the precheck consumer
-                # regardless of routing path (, hypothesis
-                # 2026-05-13_force-tree-encoding-sentinel-stuck CONFIRMED).
+                # Set force_tree_maintain so the precheck Phase 0-pre consumer
+                # handles the encoding-drift signal on the HOT path. This is the
+                # ONLY sentinel set here.
+                #
+                # 1: the former companion `force_tree_encoding` set was
+                # REMOVED. Its only consumer (aspirations-state-update SKILL.md
+                # Step 8) runs on the COLD path, which the normal loop
+                # (iteration-close.sh --phase state-update / recurring-close.sh)
+                # bypasses entirely — so force_tree_encoding was set on the hot
+                # path but never cleared, accumulating "true" until the
+                # stale-sentinel canary fired ( detector).  had
+                # already moved the delivered signal to force_tree_maintain (a
+                # hot-path-consumed sentinel); removing the orphaned
+                # force_tree_encoding set completes that fix at the source rather
+                # than leaving a vestige that only ever trips the canary.
+                #
+                # NOTE (follow-up, not this gate's concern): whether the
+                # encoding-drift signal actually DELIVERS encoding catch-up on
+                # the hot path — Phase 0-pre log-and-clears force_tree_maintain
+                # under source=="encoding-drift" () WITHOUT invoking
+                # /tree maintain — is tracked as a separate finding.
                 slots["force_tree_maintain"] = {
                     "triggered_at": _now_iso(),
                     "source": "encoding-drift",
@@ -182,7 +190,8 @@ def main():
     if sentinel_set:
         print(
             f"[tree-encoding-drift-gate] threshold {threshold} crossed — "
-            f"force_tree_encoding=true + force_tree_maintain set, counter reset to 0",
+            f"force_tree_maintain set (encoding-drift), counter reset to 0 "
+            f"(g-115-1521: orphaned force_tree_encoding set removed)",
             file=sys.stderr,
         )
     elif short_circuited:

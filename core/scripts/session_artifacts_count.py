@@ -85,7 +85,8 @@ def _iso(val):
 
 def read_session_start():
     """Return session_start ISO string from WM, or None if unset."""
-    wm_path = AGENT_DIR / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if not wm_path.exists():
         return None
     with open(wm_path, encoding="utf-8") as f:
@@ -321,7 +322,8 @@ def count_structural_progress(cutoff):
     # in the list is therefore implicitly within the current session by
     # construction. Do NOT add a cutoff filter here — there is no per-entry
     # timestamp to filter on, and the wm-reset invariant makes it unnecessary.
-    wm_path = AGENT_DIR / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if wm_path.exists():
         try:
             with open(wm_path, encoding="utf-8") as f:

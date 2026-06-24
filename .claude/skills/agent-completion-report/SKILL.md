@@ -199,6 +199,39 @@ All data comes from framework scripts — no direct JSONL reads.
     ELSE:
         outcome_delta_available = false
         divergence = false
+
+13. Recurring-goal lifetime substantive-hit data (FW-5/R1 -- g-317-16)
+    # Feeds the "Contribution" recognition section (Phase 3), which frames
+    # recurring/sweep goals that returned routine THIS window. g-317-02 shipped a
+    # lifetime substantive-hit tally WRITTEN by recurring-close.sh onto each
+    # recurring goal record:
+    #   substantive_runs    = denominator, advances on EVERY close
+    #   substantive_hits    = numerator, GENUINE-deep closes only (a forced
+    #                         anti-drift flip is NOT a real catch, so it is excluded)
+    #   last_substantive_at = date of the most recent genuine catch
+    # The slim aspirations-compact index (step 8) does NOT carry these fields, so
+    # gather them from the goal records for the recurring goals completed this
+    # window (the set the report already lists).
+    substantive_data = {}   # goal_id -> {hits, runs, last, rate}
+    FOR EACH goal_id in goals_completed (from step 1) that is recurring:
+        # Resolve aspiration_id via step 3b's goal_id -> aspiration mapping.
+        Bash: bash core/scripts/aspirations-read.sh --source {source} --id {aspiration_id}
+        → find the goal by goal_id; read substantive_hits / substantive_runs /
+          last_substantive_at. Default 0 / 0 / null when the fields are ABSENT
+          (legacy goals, or goals never closed via recurring-close.sh since the
+          g-317-02 writer shipped -- the expected early-data case).
+        runs = int(substantive_runs or 0); hits = int(substantive_hits or 0)
+        rate = round(hits / runs, 3) if runs > 0 else None
+        substantive_data[goal_id] = {"hits": hits, "runs": runs,
+                                     "last": last_substantive_at, "rate": rate}
+    # ALTERNATIVE aggregate/chronic view (ALL recurring goals, not just this
+    # window): `bash core/scripts/cargo-cult-detector.py --audit-all --dry-run`
+    # computes the same per-goal lifetime_hit_rate across world+agent queues and
+    # flags chronic-low-rate rows. Use it when the report wants the full upkeep
+    # track record rather than only this-window goals; parse its markdown table
+    # (--dry-run suppresses the Idea-goal filing side effect).
+    # Fail-open: a read error for any goal defaults that goal to runs=0 (graceful
+    # omit in Phase 3) -- never error the report on missing substantive data.
 ```
 
 ## Phase 3: Display Console Summary
@@ -307,6 +340,25 @@ Since: {since_timestamp} ({hours}h {min}m ago)
     → Upkeep is the connective tissue the whole team relies on. A sweep that returns
       0 today is the reason a regression didn't ship. Held cadence and clean sweeps
       are wins, not overhead (learning-philosophy.md "Recognition").
+    {Lifetime upkeep track record (FW-5/R1, g-317-16) -- from substantive_data
+     (Phase 2 step 13). For up to 5 recurring goals completed THIS window WHERE
+     substantive_data[gid].runs > 0, replace the generic "returns 0 today"
+     platitude with concrete proof the sweep HAS caught real things over its life.
+     Order by runs DESC:}
+      - {goal_id}: lifetime {hits} catch(es) / {runs} runs{", last catch " + last[:10]
+        when last is not null} -- a non-zero lifetime catch count is evidence the
+        cadence is load-bearing, not busywork.
+    {GRACEFUL OMIT (the early-data default): IF NO recurring goal completed this
+     window has runs > 0 -- the writer has not accumulated yet, or this window held
+     only non-recurring goals -- show NONE of the per-goal lines above; keep only the
+     generic recognition framing. NEVER print a "0/0" tally. Spinning an empty tally
+     as a win violates communication-clarity rule 6.}
+    → The journal's per-goal `Value:` line is the canonical one-line framing for each
+      recorded outcome (DERIVED from outcome_class + work_class by
+      `core/scripts/_value_framing.py`, value-framing-mapping.yaml). This
+      session-level Recognition section is the aggregate of those same per-goal
+      affirmations — keep the two surfaces consistent when either is edited (FW-5/R2,
+      g-317-15).
   Learning banked: {confirmed} hypotheses confirmed + {corrected} corrected.
     → A corrected prediction is a belief fixed before it cost the team — count it
       equal to a confirmation, not as a miss.

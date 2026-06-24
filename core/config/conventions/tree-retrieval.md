@@ -135,6 +135,54 @@ Implementation: `_mmr_rerank` in `core/scripts/tree_match.py`.
 
 Side effect: increments retrieval_count on all returned items.
 
+**Poignancy blend (g-306-08, BRD Gap 1a; Generative Agents 2304.03442 — DEFAULT
+OFF)**: tree nodes and reasoning-bank records may carry an optional `poignancy`
+field (1-10, an importance rating the LLM author self-assigns at write — the
+"one-shot LLM rating"). When the master flag
+`retrieval.poignancy_blend_enabled` in `core/config/tree.yaml` is `true`, a
+bounded multiplicative factor (1.0 .. `poignancy_weight_max`, default 1.5) is
+folded into the ranking:
+
+- **Tree nodes**: `effective = base_match * utility_weight * poignancy_factor`
+  in `_score_weight_limit` (`retrieve.py`). The node's poignancy is read from
+  its `_tree.yaml` entry.
+- **Supplementary stores (reasoning bank)**: `_sort_by_utility` sorts by
+  `(utilization_score * poignancy_factor, poignancy_factor, created)`. The
+  tertiary poignancy key orders the large `utilization_score == 0` mass.
+
+The blend is **boost-only and bounded**: `poignancy_weight_min` is 1.0, so the
+factor is always `>= 1.0`, and the multiplicative form is scale-invariant — a
+record can be displaced from top-k only by one within `poignancy_weight_max` x
+of its utilization, never by an arbitrarily-lower-utility record. This is the
+"no known-good knowledge hidden" guarantee. (Multiplicative is load-bearing: an
+additive bonus dominated the tiny utilization_score range and the g-306-08 A/B
+caught it.) **Null/absent poignancy → factor 1.0** (legacy records are
+null-safe; no backfill). With the flag off, the factor is 1.0 for every record
+and ranking is byte-identical to pre-g-306-08.
+
+How to set poignancy (the **g-306-26 producers** — the standard write paths now
+assign a rating at write time, so the field populates organically instead of
+staying all-null, which would otherwise leave the blend above a permanent no-op):
+- **Reasoning bank (Phase 6.5 immediate learning + /reflect)**: include
+  `"poignancy": N` in the `reasoning-bank-add.sh` JSON. Wired into
+  `aspirations-spark` Phase 6.5 (the reusable-pattern + ops-gotcha rb-adds) and
+  `reflect-on-outcome` (the confirmed-strategy + corrected-lesson rb-adds). The
+  rb store has no unknown-field gate; absent → null default.
+- **Tree node (`/tree add`, at creation)**: include `"poignancy": N` in the
+  add-child child JSON — `cmd_add_child` (and the batch add-child) now copy it at
+  creation so the INDEX value (the one `retrieve` scores) is set AT WRITE TIME.
+  Also write `poignancy: N` in the node `.md` front matter (readability copy —
+  keep identical to the index). To retrofit an EXISTING node, set the index via
+  `bash core/scripts/tree-update.sh <key> poignancy N` (`cmd_set` generic setter).
+- **Rubric (1-10, LLM-rated at write)**: 1-3 routine/expected · 4-6 useful ·
+  7-8 pivotal/surprising · 9-10 mission-altering. Rate how durable + impactful
+  the record is for FUTURE retrieval.
+
+Before enabling the flag in production, run the A/B gate
+`py -3 core/scripts/poignancy-ab-probe.py [--synthetic]` and confirm
+`no_known_good_hidden: true` on the live corpus (results recorded to
+`meta/experiments/poignancy-ab-results.jsonl`).
+
 ---
 
 # Memory Tree Script Access

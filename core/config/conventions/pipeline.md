@@ -12,7 +12,8 @@ Required: `id`, `title`, `stage`, `horizon`, `type`, `confidence`, `position`, `
 Defaults: `slug` (from id), `rationale` (""), `outcome` (null), `reflected` (false), `surprise` (null)
 Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `verification`, `resolves_by`,
           `resolves_no_earlier_than`, `strategy`, `depth`, `mechanism`, `context_manifest`,
-          `context_quality`, `process_score`, `replay_metadata`, `source_validation`, `experience_ref`
+          `context_quality`, `process_score`, `replay_metadata`, `source_validation`, `experience_ref`,
+          `evidence_for`, `evidence_override`
 
 ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
@@ -45,3 +46,28 @@ echo '{"outcome":"CONFIRMED","surprise":2,"outcome_date":"2026-03-09"}' | pipeli
 
 Scripts validate JSON schema before writing. On validation failure: exit non-zero with error.
 All backed by `core/scripts/pipeline.py` (Python 3, stdlib only except PyYAML for migration).
+
+## Resolution-Evidence Requirement (g-303-27)
+
+A move INTO the `resolved` stage with `outcome` of `CONFIRMED` or `CORRECTED`
+is REJECTED (`400 resolution_evidence_required`) unless the record carries at
+least one verifiable external-evidence pointer, so the accuracy number is
+independently auditable (from the g-303-15 calibration-honesty audit: ~53% of
+CONFIRMED/CORRECTED records had no `outcome_detail` at all). Enforced at the
+resolution single-writer (the daemon `pipeline_write.move` -> resolved, plus
+`add` at `stage=resolved`); `update`/`update-field` are tweak paths and stay
+ungated so legacy evidence-less records can still be edited.
+
+An evidence pointer is any of: a structured `experience_ref` / `evidence_for`
+field, OR a recognized shape in `outcome_detail` / `rationale` / `verification`
+/ `links` — a goal-id (`g-NNN-NN`), commit SHA, `file:line`, session-id, an
+`rb-`/`guard-`/`exp-`/`msg-` id, a canonical-script name (`foo.sh`/`foo.py`),
+or a percentage with measurement context. The detector is GENEROUS (any one
+shape passes); the precise compliance rate is tracked separately as
+`accuracy.evidence_pct` in `pipeline-meta.json` (surfaced via
+`pipeline-read.sh --accuracy`).
+
+`EXPIRED` / `UNRESOLVABLE` outcomes are exempt (no prediction was validated).
+Escape hatch: set `evidence_override` to a short non-empty reason string in the
+resolve merge JSON (e.g. a math proof where the derivation IS the evidence).
+The reason persists in the record (more auditable than a transient CLI flag).

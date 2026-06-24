@@ -24,7 +24,8 @@ from ..yaml_cache import cache
 
 
 # Mirrored from team-state.py EMPTY_STATE. When that schema gains a key,
-# mirror here. Cross-checked by mind_api/tests/test_runtime_team_state.py.
+# mirror here. Field-set parity cross-checked by
+# core/scripts/tests/test_daemon_cli_mirror_parity.py (4).
 _EMPTY_STATE_DEFAULTS = {
     "last_updated": None,
     "last_updated_by": None,
@@ -39,6 +40,10 @@ _EMPTY_STATE_DEFAULTS = {
     "recent_completions": [],
     "agent_status": {},
     "critical_blockers": [],
+    # Mirror of team-state.py inbox_alert_backlog (); null when zero
+    # matching goals. 9: this daemon mirror lagged the CLI schema add,
+    # so daemon writes dropped the trailing key vs the CLI (byte-compat drift).
+    "inbox_alert_backlog": None,
 }
 
 

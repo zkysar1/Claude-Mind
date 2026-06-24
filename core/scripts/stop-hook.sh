@@ -201,6 +201,34 @@ if [ ! -f "$RUNNER_FILE" ]; then
 fi
 RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
 if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
+    # --- Phase 2B producer (, refines ): close a worker Body on a
+    # GENUINE close ---
+    # This session is NOT the runner (sid-mismatch). If it is a forked non-reducer
+    # WORKER Body — i.e. it has a per-Body WM file (only non-reducer workers fork;
+    # the reducer and observers never do) — AND it has written a `body-closing`
+    # sentinel signalling its loop GENUINELY terminated (no more work / final
+    # STOP), flip its manifest active->closed-pending-merge so the reducer's next
+    # aspirations-consolidate Step -1 (body-merge generalize-down) merges its WM
+    # back. The sentinel is the Phase-2 refinement of 's "first not-runner
+    # turn-end" heuristic: a worker doing MULTIPLE work-units across turns must NOT
+    # be queued for merge after turn 1 (that would lose turns 2+ of divergence —
+    # the reducer merges + marks `merged`, then later turns diverge into a
+    # now-merged manifest the sessions-pass never revisits). The bash pre-guard
+    # ([ -f WM ] AND [ -f sentinel ]) keeps the dormant single-runner case at ZERO
+    # py-3 calls (no sentinel ever exists there) and collapses the prior
+    # read+set-state pair into ONE delegated, unit-tested call
+    # (body-manifest.close_body_on_genuine — re-checks state, marks only an active
+    # Body, and consumes the sentinel so a re-fire cannot re-mark). FAIL-OPEN:
+    # never affects the (already-decided) ALLOW below. Design SSOT: tree node
+    # mind-engine-identity-bridge.
+    _BODY_WM="$HOOK_AGENT_DIR/sessions/$HOOK_SID/working-memory.yaml"
+    _CLOSE_SENTINEL="$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-closing"
+    if [ -f "$_BODY_WM" ] && [ -f "$_CLOSE_SENTINEL" ]; then
+        _CLOSE_RESULT=$(py -3 "$CORE_ROOT/scripts/body-manifest.py" close-body-on-genuine --sid "$HOOK_SID" --agent "$HOOK_AGENT" 2>/dev/null || echo "")
+        echo "$(date +%Y-%m-%dT%H:%M:%S) BODY-CLOSE sid=$HOOK_SID agent=$HOOK_AGENT genuine-close result=$_CLOSE_RESULT" >> "$LOG" 2>/dev/null || true
+        unset _CLOSE_RESULT
+    fi
+    unset _BODY_WM _CLOSE_SENTINEL
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=sid-mismatch sid=$HOOK_SID runner=$RUNNER_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0  # Different session — not the autonomous loop runner, allow stop
 fi

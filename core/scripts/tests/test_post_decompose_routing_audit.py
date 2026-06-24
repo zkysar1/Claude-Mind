@@ -270,7 +270,13 @@ def test_g1245_specific_agent_weak_gap_below_min_gap_no_file(tmp_path, audit_mod
         "description": "Update solvers benchmark tracking.",
         "intended_agent": "alpha",
     }
-    decision = audit_mod.audit(goal, project_root=project_root, min_gap=0.15)
+    # min_best_score=0.0 disables the orthogonal absolute-floor (1):
+    # echo's synthetic Jaccard (~0.091) sits below the production floor 0.10, so
+    # without this the floor would suppress with a "min_best_score" reason and
+    # this test (which isolates the GAP-threshold mechanism) would never reach
+    # the gap branch. The floor has its own dedicated tests below.
+    decision = audit_mod.audit(goal, project_root=project_root,
+                               min_gap=0.15, min_best_score=0.0)
     assert decision["decision"] == "no_file", decision
     assert decision["best_agent"] == "echo", decision
     assert decision["gap"] < 0.15, decision
@@ -278,7 +284,8 @@ def test_g1245_specific_agent_weak_gap_below_min_gap_no_file(tmp_path, audit_mod
     assert decision["investigate_spec"] is None
     # Sanity: with an explicit lower threshold the SAME fixture files --
     # proving the gap is real and only the threshold suppresses it.
-    legacy = audit_mod.audit(goal, project_root=project_root, min_gap=0.05)
+    legacy = audit_mod.audit(goal, project_root=project_root,
+                             min_gap=0.05, min_best_score=0.0)
     assert legacy["decision"] == "file", legacy
     assert legacy["best_agent"] == "echo", legacy
 
@@ -440,7 +447,12 @@ def test_g1122_either_weak_match_below_threshold_no_file(tmp_path, audit_mod):
         "description": "Update solvers benchmark tracking.",
         "intended_agent": "either",
     }
-    decision = audit_mod.audit(goal, project_root=project_root, min_gap_either=0.15)
+    # min_best_score=0.0 disables the orthogonal absolute-floor (1) so
+    # this test isolates the either-case GAP-threshold mechanism (echo's
+    # synthetic Jaccard ~0.091 is below the production floor 0.10; the floor has
+    # its own dedicated tests below).
+    decision = audit_mod.audit(goal, project_root=project_root,
+                               min_gap_either=0.15, min_best_score=0.0)
     assert decision["decision"] == "no_file", decision
     assert decision["gap"] < 0.15, decision
     assert "min_gap_either" in decision["reason"], decision
@@ -528,3 +540,120 @@ def test_decision_schema_complete(tmp_path, audit_mod):
                          "title": "x", "description": "y"},
                         project_root=project_root)
     assert set(d.keys()) == expected_keys
+
+
+# ---------------------------------------------------------------------------
+# 1 / rb-1488: absolute min_best_score floor + insight-trigger guard
+# ---------------------------------------------------------------------------
+
+def test_g1351_floor_suppresses_nearzero_specific_agent(tmp_path, audit_mod):
+    """A near-zero absolute best_score with a wide GAP must be suppressed by the
+    min_best_score floor even though the gap clears min_gap. This is the FP
+    shape (best ~0.073-0.081 production / ~0.091 synthetic) that grew the
+    routing-mismatch FP cluster to an 82% all-time skip rate (rb-1478)."""
+    project_root = _seed_project_root(tmp_path, {
+        "alpha": _ALPHA_SELFMD, "bravo": _BRAVO_SELFMD,
+        "delta": _DELTA_SELFMD, "echo": _ECHO_SELFMD,
+    })
+    goal = {
+        "id": "g-999-floor",
+        "title": "Apply: refresh score tracking",
+        "description": "Update solvers benchmark tracking.",
+        "intended_agent": "alpha",
+    }
+    # Gap (~0.091) clears min_gap=0.05, so WITHOUT the floor this files --
+    # proving the gap is real and only the floor suppresses it.
+    filed = audit_mod.audit(goal, project_root=project_root,
+                            min_gap=0.05, min_best_score=0.0)
+    assert filed["decision"] == "file", filed
+    assert filed["best_agent"] == "echo", filed
+    # WITH the production floor (0.10), echo's near-zero absolute Jaccard
+    # (~0.091 < 0.10) means no real ownership signal -> suppressed.
+    suppressed = audit_mod.audit(goal, project_root=project_root,
+                                 min_gap=0.05, min_best_score=0.10)
+    assert suppressed["decision"] == "no_file", suppressed
+    assert "min_best_score" in suppressed["reason"], suppressed
+    assert suppressed["investigate_spec"] is None
+    assert suppressed["best_score"] < 0.10, suppressed
+    # The gap itself is unchanged in the returned dict — only the floor fired.
+    assert suppressed["gap"] == filed["gap"], (suppressed, filed)
+
+
+def test_g1351_floor_preserves_genuine_standout(tmp_path, audit_mod):
+    """The floor must NOT silence a genuine high-absolute-score stand-out.
+    echo's strong solver_v0 match (best_score well above 0.10) still files
+    under the default floor — the floor only kills near-zero contamination."""
+    project_root = _seed_project_root(tmp_path, {
+        "alpha": _ALPHA_SELFMD, "bravo": _BRAVO_SELFMD,
+        "delta": _DELTA_SELFMD, "echo": _ECHO_SELFMD,
+    })
+    goal = {
+        "id": "g-315-floor-ok",
+        "title": "Apply: solver_v0 client adapter — neural tree wiring",
+        "description": (
+            "Wire the solver_v0 hand-built neural tree into the "
+            "Ayoai-ARC-AGI-3-Integration client adapter so ARC game "
+            "sessions route per-tick frames through the the framework server."
+        ),
+        "intended_agent": "alpha",
+    }
+    decision = audit_mod.audit(goal, project_root=project_root)  # default 0.10
+    assert decision["decision"] == "file", decision
+    assert decision["best_agent"] == "echo", decision
+    assert decision["best_score"] >= 0.10, decision  # genuinely above the floor
+    assert decision["investigate_spec"] is not None
+
+
+def test_g1351_floor_suppresses_nearzero_either_case(tmp_path, audit_mod):
+    """The min_best_score floor applies to the either-case path too: an
+    either-stamped goal whose best agent scores below the floor is contamination
+    noise, not a re-route signal — even when the stand-out gap clears
+    min_gap_either."""
+    project_root = _seed_project_root(tmp_path, {
+        "alpha": _ALPHA_SELFMD, "bravo": _BRAVO_SELFMD,
+        "delta": _DELTA_SELFMD, "echo": _ECHO_SELFMD,
+    })
+    goal = {
+        "id": "g-999-either-floor",
+        "title": "Apply: refresh score tracking",
+        "description": "Update solvers benchmark tracking.",
+        "intended_agent": "either",
+    }
+    # gap clears min_gap_either=0.0; floor off -> file
+    filed = audit_mod.audit(goal, project_root=project_root,
+                            min_gap_either=0.0, min_best_score=0.0)
+    assert filed["decision"] == "file", filed
+    assert filed["best_agent"] == "echo", filed
+    # floor on (0.10) -> near-zero best_score suppressed on the either path
+    suppressed = audit_mod.audit(goal, project_root=project_root,
+                                 min_gap_either=0.0, min_best_score=0.10)
+    assert suppressed["decision"] == "no_file", suppressed
+    assert "min_best_score" in suppressed["reason"], suppressed
+    assert suppressed["investigate_spec"] is None
+
+
+def test_g1351_insight_trigger_recursion_guard_no_file(tmp_path, audit_mod):
+    """insight-trigger-derived goals carry author-curated routing (intended_agent
+    set from the finding's requires_action_by tag), so the routing audit must
+    NOT re-audit them — doing so spawns routing-mismatch FPs that the
+    insight-trigger sweep re-files (self-perpetuation chain g-1346 -> g-1329 ->
+    g-1351/1353 -> g-1348/1352/1354). The guard fires before scoring, so even a
+    goal whose text strongly matches another agent is suppressed."""
+    project_root = _seed_project_root(tmp_path, {
+        "alpha": _ALPHA_SELFMD, "bravo": _BRAVO_SELFMD,
+        "delta": _DELTA_SELFMD, "echo": _ECHO_SELFMD,
+    })
+    goal = {
+        "id": "g-115-1351",
+        "title": "Apply: post-decompose-routing-audit FP root fix",
+        "description": (
+            "Routing-mismatch FP root fix: add an absolute min_best_score "
+            "floor in the delta Jaccard solver benchmark scoring path."
+        ),
+        "intended_agent": "zeta",
+        "origin_signal": "insight_trigger:msg-20260607-072428-bravo-1795",
+    }
+    decision = audit_mod.audit(goal, project_root=project_root)
+    assert decision["decision"] == "no_file", decision
+    assert "recursion" in decision["reason"].lower(), decision
+    assert decision["investigate_spec"] is None

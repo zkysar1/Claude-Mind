@@ -48,7 +48,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import META_DIR, WORLD_DIR, PROJECT_ROOT
+from _paths import META_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
 
 
 FORGED_PATH = WORLD_DIR / "forged-skills.yaml"
@@ -212,7 +212,11 @@ def collect_journal_skill_dates(skill_names):
         r'(?<![\w-])(' + '|'.join(re.escape(n) for n in skill_names) + r')(?![\w-])'
     )
 
-    for journal_path in PROJECT_ROOT.glob("*/journal.jsonl"):
+    # AGENTS-ROOT GLOB (5): agent dirs live at PROJECT_ROOT/agents/<name>
+    # (AGENTS_PARENT_DIR), so journals are at agents/<name>/journal.jsonl. Use the
+    # _paths SSOT agents_root() — NEVER PROJECT_ROOT.glob("*/...") (depth-1 matches
+    # nothing post-relocation; the agents/ glob-drift bug class, CLAUDE.md sync-list).
+    for journal_path in agents_root().glob("*/journal.jsonl"):
         with open(journal_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -321,7 +325,10 @@ def collect_companion_script_dates(skill_names, forged_skills):
     # is intentionally excluded to keep the genuine-cold signal (e.g.
     # manage-roblox-scripts) at 0 even with historical mentions.
     # Glob is forgiving when a fresh agent has not yet created its session/ dir.
-    scan_paths = list(PROJECT_ROOT.glob("*/session/execution-diary.jsonl"))
+    # AGENTS-ROOT GLOB (5): diaries live at agents/<name>/session/
+    # execution-diary.jsonl — use _paths SSOT agents_root(), NEVER
+    # PROJECT_ROOT.glob("*/...") (agents/ glob-drift bug class, CLAUDE.md sync-list).
+    scan_paths = list(agents_root().glob("*/session/execution-diary.jsonl"))
 
     for path in scan_paths:
         with open(path, "r", encoding="utf-8") as f:

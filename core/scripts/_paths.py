@@ -195,20 +195,77 @@ def _absolutize(value: str) -> Path:
     return absolutize(value, PROJECT_ROOT)
 
 
-# --- Tier 2: Meta-strategies ---
-# Priority: env var MIND_META > _local.get("META_PATH") > None.
-# Plan v1 step 0.1 (2026-05-19): removed PROJECT_ROOT/meta fallback.
-def _resolve_external(env_key: str, conf_key: str):
-    """Two-source resolver: env var first, then local-paths.conf. Returns
-    None when neither is set — caller must guard. The previous fallback to
-    PROJECT_ROOT/{world,meta} was removed to refuse cruft creation."""
+# --- .mind-data/ local storage root ( M1, ) ---
+# When PROJECT_ROOT/.mind-data/ exists, it is the local storage root by
+# convention: world -> .mind-data/world, meta -> .mind-data/meta. An optional
+# .mind-data/.env.local (same key=value format as local-paths.conf) overrides
+# per-tier paths via the WORLD_PATH / META_PATH keys. This is the portable
+# default for a fresh-cloned or transplanted repo -- _transplant_pack.py already
+# writes world/meta under <dest>/.mind-data/ and a WORLD_PATH pointing there.
+# The whole tier is GATED on the .mind-data/ dir existing, so a repo WITHOUT it
+# keeps the legacy env -> local-paths.conf -> None chain byte-for-byte. Live
+# agents configured via external local-paths.conf have no .mind-data/ dir, so
+# resolution skips this tier and reaches their conf entry unchanged.
+# MUST stay in sync with the .mind-data/ blocks in _paths.sh and
+# mind_api/src/agent_paths.py (the 3 resolver layers cannot share code: shell
+# vs python-module vs import-cycle-proof daemon resolver).
+MIND_DATA_DIR = PROJECT_ROOT / ".mind-data"
+_MIND_DATA_SUBDIR = {"WORLD_PATH": "world", "META_PATH": "meta"}
+
+
+def _read_mind_data_env() -> dict:
+    """Parse .mind-data/.env.local into a dict (same format as local-paths.conf).
+    Returns {} when the file is absent or unreadable."""
+    envf = MIND_DATA_DIR / ".env.local"
+    if envf.exists():
+        try:
+            return _parse_conf(envf)
+        except OSError:
+            return {}
+    return {}
+
+
+_mind_data_env = _read_mind_data_env()
+
+
+def _resolve_tier(env_key, conf_key, *, mind_data_dir, mind_data_env, local_conf):
+    """Pure tier resolver (roots injected so it is testable without touching the
+    real PROJECT_ROOT/.mind-data). Priority chain (asp-330 M1):
+      1. MIND_{WORLD,META} env var
+      2. .mind-data/.env.local {WORLD,META}_PATH   (only when .mind-data/ exists)
+      3. .mind-data/{world,meta} bare default      (only when .mind-data/ exists)
+      4. local-paths.conf {WORLD,META}_PATH        (legacy fallback)
+      5. None (2026-05-19 hard-cut preserved when nothing configured; guard-551)
+    """
     val = os.environ.get(env_key)
     if val:
         return _absolutize(val)
-    val = _local.get(conf_key)
+    if mind_data_dir.is_dir():
+        val = mind_data_env.get(conf_key)
+        if val:
+            return _absolutize(val)
+        sub = _MIND_DATA_SUBDIR.get(conf_key)
+        if sub:
+            return mind_data_dir / sub
+    val = local_conf.get(conf_key)
     if val:
         return _absolutize(val)
     return None
+
+
+# --- Tier 2/3: Meta-strategies + Collective domain state ---
+# Module-bound wrapper over _resolve_tier. The previous PROJECT_ROOT/{world,meta}
+# fallback was removed (2026-05-19) to refuse cruft; the None return is still the
+# unconfigured terminus and callers MUST guard it (assert_world_dir /
+# assert_meta_dir; guard-551). Two callers (META_DIR, WORLD_DIR below).
+def _resolve_external(env_key: str, conf_key: str):
+    return _resolve_tier(
+        env_key,
+        conf_key,
+        mind_data_dir=MIND_DATA_DIR,
+        mind_data_env=_mind_data_env,
+        local_conf=_local,
+    )
 
 
 META_DIR = _resolve_external("MIND_META", "META_PATH")

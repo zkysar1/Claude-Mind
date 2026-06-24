@@ -127,6 +127,15 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             if not r.get("reflected", False):
                 continue
             replay = r.get("replay_metadata") or {}
+            # 1: a chronic-CORRECTED hypothesis encoded as a calibration
+            # guardrail by Replay Step 3.6 has zero further replay value. Archived
+            # records are merged into the candidate pool above, so without this
+            # source-level exclusion an encoded item re-surfaces every cycle
+            # (self-limited only by the rc>=5 cap, ~3-5 wasted cycles each). This
+            # bash-gates the skip that Replay Step 1's spaced-repetition filter
+            # also applies LLM-side — script-enforced > LLM-gated.
+            if replay.get("encoded_via_chronic") is True:
+                continue
             next_review = replay.get("next_review_date")
             if next_review:
                 try:

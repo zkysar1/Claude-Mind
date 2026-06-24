@@ -8,6 +8,10 @@ Lanes:
   3. Work-class skew: hygiene >2× target → pattern fires
   4. Idle aspiration: all goals blocked → pattern fires
   5. Aged aspiration: no completion in 60+ days → pattern fires
+  6. Strategic drift (US-06, g-305-06): recent self-initiated goals mostly
+     NOT moving the objective (outcome_class proxy) → pattern fires; silent
+     below the window, on a healthy ratio, on user-directed-only goals (US-01
+     composition), and on outcome_class data gaps.
 """
 from __future__ import annotations
 
@@ -44,7 +48,9 @@ def _make_asp(asp_id: str, *, completed: int = 0, total: int = 0,
               status: str = "active",
               all_blocked: bool = False,
               work_class: str = "product",
-              latest_completion: str | None = None) -> dict:
+              latest_completion: str | None = None,
+              outcome_classes: list[str] | None = None,
+              goal_source: str = "user") -> dict:
     goals = []
     for i in range(total):
         if i < completed:
@@ -62,6 +68,9 @@ def _make_asp(asp_id: str, *, completed: int = 0, total: int = 0,
                 "participants": ["agent"],
                 "work_class": work_class,
             }
+            g["goal_source"] = goal_source
+            if outcome_classes is not None:
+                g["outcome_class"] = outcome_classes[i % len(outcome_classes)]
         elif all_blocked:
             g = {
                 "id": f"{asp_id.replace('asp-', 'g-')}-{i+1:02d}",
@@ -206,6 +215,75 @@ def test_aged_aspiration_fires():
         assert "aged_aspirations" in names
         aged = next(p for p in pulses if p["pattern"] == "aged_aspirations")
         assert aged["evidence"]["aged_count"] == 1
+
+
+def test_strategic_drift_fires_on_low_substance_ratio():
+    """5 self-initiated goals, 2 deep / 3 routine → moved_ratio 0.4 < 0.5
+    → strategic_drift fires and names the aspiration."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        asps = [_make_asp("asp-600", completed=5, total=5,
+                          goal_source="agent-self",
+                          outcome_classes=["deep", "deep", "routine",
+                                           "routine", "routine"])]
+        world, agent_dir = _make_world(Path(tmpd), asps)
+        pulses = _run_pulse(world, agent_dir)
+        names = [p["pattern"] for p in pulses]
+        assert "strategic_drift" in names, names
+        sd = next(p for p in pulses if p["pattern"] == "strategic_drift")
+        ex = sd["evidence"]["examples"][0]
+        assert ex["asp_id"] == "asp-600"
+        assert ex["moved_ratio"] == 0.4
+        assert ex["window_size"] == 5
+
+
+def test_strategic_drift_silent_when_substance_healthy():
+    """5 self-initiated goals, 4 deep / 1 routine → ratio 0.8 ≥ 0.5
+    → no strategic_drift flag."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        asps = [_make_asp("asp-601", completed=5, total=5,
+                          goal_source="agent-self",
+                          outcome_classes=["deep", "deep", "deep",
+                                           "deep", "routine"])]
+        world, agent_dir = _make_world(Path(tmpd), asps)
+        pulses = _run_pulse(world, agent_dir)
+        assert "strategic_drift" not in [p["pattern"] for p in pulses]
+
+
+def test_strategic_drift_requires_full_window():
+    """Only 4 qualifying goals (< window of 5), all routine → insufficient
+    signal → no flag (a short run must not trip the detector)."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        asps = [_make_asp("asp-602", completed=4, total=4,
+                          goal_source="agent-self",
+                          outcome_classes=["routine"])]
+        world, agent_dir = _make_world(Path(tmpd), asps)
+        pulses = _run_pulse(world, agent_dir)
+        assert "strategic_drift" not in [p["pattern"] for p in pulses]
+
+
+def test_strategic_drift_excludes_user_directed_goals():
+    """5 routine goals but goal_source='user' → US-01 filter excludes them →
+    window empty → no flag (user-directed work is not agent strategic drift)."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        asps = [_make_asp("asp-603", completed=5, total=5,
+                          goal_source="user",
+                          outcome_classes=["routine"])]
+        world, agent_dir = _make_world(Path(tmpd), asps)
+        pulses = _run_pulse(world, agent_dir)
+        assert "strategic_drift" not in [p["pattern"] for p in pulses]
+
+
+def test_strategic_drift_data_gap_does_not_flag():
+    """5 self-initiated goals with NO outcome_class (and no
+    outcome_signal_source) → all excluded as undecidable → no flag. A data
+    gap must never manufacture a false drift flag."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        asps = [_make_asp("asp-604", completed=5, total=5,
+                          goal_source="agent-self",
+                          outcome_classes=None)]
+        world, agent_dir = _make_world(Path(tmpd), asps)
+        pulses = _run_pulse(world, agent_dir)
+        assert "strategic_drift" not in [p["pattern"] for p in pulses]
 
 
 if __name__ == "__main__":

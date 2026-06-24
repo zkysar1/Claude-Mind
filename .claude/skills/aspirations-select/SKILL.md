@@ -194,12 +194,20 @@ ELSE zone == "tight" (pct_to_autocompact >= 85): batch only if same-category + s
 
 ### Self-Alignment Check
 ```
-goals_since_last_alignment_check += 1
+# goals_since_last_alignment_check is RESTORED from loop_state.alignment_check_at
+# (orchestrator Phase -0.5) and INCREMENTED bash-side by iteration-close.sh
+# (loop-state-bump-counters.py --goal-id, fires every goal close, both outcomes).
+# Do NOT mutate it in-context here — bash owns it (g-283 single-writer). Before
+# g-115-1561 the in-context `+= 1` / `= 0` were discarded at LOOP_CONTINUE (the
+# field had no bash writer), so it stayed frozen at 0 and the goals-count branch
+# below NEVER fired — only all_recurring / recurring_heavy ever triggered the check.
 all_recurring = every entry in ranked_goals has recurring == true
 recurring_heavy = len(ranked_goals) >= 5 and (sum(1 for g in ranked_goals if g.recurring) / len(ranked_goals)) > 0.90
 
 IF all_recurring OR recurring_heavy OR goals_since_last_alignment_check >= check_interval_goals:
-    goals_since_last_alignment_check = 0
+    # Reset the bash-owned cadence counter (persists across iterations, unlike the
+    # retired in-context `= 0`). loop-state-bump-counters.py is the single writer.
+    Bash: py -3 core/scripts/loop-state-bump-counters.py --reset-alignment
     Bash: work-alignment.sh check --ranked-goals '<ranked_goals_json>'
     IF alignment data suggests planning valuable OR all_recurring:
         invoke /create-aspiration from-self --plan with: alignment_data

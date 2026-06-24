@@ -119,7 +119,7 @@ fi
 # bash-to-Python-heredoc data.
 EXTRACT_JSON=$(OUTCOME_NOTE="$OUTCOME_NOTE" py -3 - <<'PYEOF' 2>/dev/null
 import json, os, re
-text = os.environ.get("OUTCOME_NOTE", "")
+text = os.environ.get("OUTCOME_NOTE", "").encode("utf-8", errors="replace").decode("utf-8")
 
 findings = []
 seen_values = set()

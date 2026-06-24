@@ -284,5 +284,58 @@ def test_tool_response_missing_stdout_fails_open_to_generic(tmp_path):
     assert GENERIC_MARKER in ctx and DEEP_MARKER not in ctx
 
 
+# ── Orphaned-stdin regression (2): hook must NOT hang forever ──
+# Before the guard-664 daemon-thread+join(timeout) fix, json.load(sys.stdin)
+# blocked INDEFINITELY when the stdin pipe's write-end was held open by an
+# inherited/orphaned handle — pid-28404 ran 343h (stale-jobs-scan flagged it,
+# stale-scanner overage-deadlock). The fix makes the hook self-exit at the
+# timeout instead. This test holds the pipe open and asserts the process exits.
+
+
+def test_orphaned_stdin_does_not_hang_forever(tmp_path):
+    """Hold the hook's stdin pipe open (never write, never close) to simulate
+    the orphaned/inherited pipe that produced the 343h pid-28404 orphan. With
+    ITERATION_CLOSE_REMINDER_STDIN_TIMEOUT_S=2, the hook MUST self-exit (rc 0)
+    via the guard-664 daemon-thread + join() deadline rather than blocking on
+    json.load(sys.stdin). A regression to a bare blocking read makes p.wait
+    raise TimeoutExpired -> test fails. (g-115-1382)"""
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    env = os.environ.copy()
+    for k in list(env):
+        if k.startswith("MIND_") or k == "PROJECT_ROOT":
+            env.pop(k, None)
+    env["PROJECT_ROOT"] = str(proj).replace("\\", "/")
+    env["PYTHONPATH"] = str(CORE_SCRIPTS)
+    env["ITERATION_CLOSE_REMINDER_STDIN_TIMEOUT_S"] = "2"
+
+    proc = subprocess.Popen(
+        [sys.executable, str(HOOK_PY)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=str(proj),
+    )
+    try:
+        # Never write to or close proc.stdin: the reader thread blocks on
+        # read(), the 2s join() deadline must fire, and the process exits.
+        # 8s is a generous margin over the 2s stdin timeout.
+        rc = proc.wait(timeout=8)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        pytest.fail(
+            "hook hung > 8s on an orphaned stdin pipe — the guard-664 "
+            "daemon-thread+join(timeout) read regressed to a blocking "
+            "json.load(sys.stdin) (g-115-1382 343h-orphan class)"
+        )
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+    assert rc == 0, f"hook should fail-open rc=0 on stdin timeout; got rc={rc}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

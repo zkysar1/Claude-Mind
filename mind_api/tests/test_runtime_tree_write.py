@@ -626,6 +626,98 @@ def test_byte_compat_add_child(tmp_path):
     assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
 
 
+# Baseline with an EXPLICIT node_type=leaf parent so add-child exercises the
+# 7 leaf->interior flip (the _BASELINE_TREE parent has no node_type,
+# so .get("node_type") != "leaf" and the flip is a no-op there).
+_LEAF_PARENT_TREE = (
+    "nodes:\n"
+    "  root:\n"
+    "    file: null\n"
+    "    summary: Root node\n"
+    "    depth: 0\n"
+    "    children:\n"
+    "    - intelligence\n"
+    "    child_count: 1\n"
+    "  intelligence:\n"
+    "    file: world/knowledge/tree/intelligence.md\n"
+    "    summary: Intelligence L1\n"
+    "    depth: 1\n"
+    "    parent: root\n"
+    "    children: []\n"
+    "    child_count: 0\n"
+    "    node_type: leaf\n"
+    "    capability_level: CALIBRATE\n"
+    "    confidence: 0.5\n"
+    "    retrieval_count: 3\n"
+    "    times_helpful: 1\n"
+    "last_updated: '2026-01-01'\n"
+    "entity_index: {}\n"
+)
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_add_child_flips_leaf_parent(tmp_path):
+    """5: add-child onto an EXPLICIT node_type=leaf parent must flip the
+    parent leaf->interior (g-115-1437) in the daemon exactly as the CLI does. The
+    pre-fix daemon _apply_add_child left the parent node_type stale; this
+    byte-compat add proves the flip lands identically, and the explicit assertion
+    pins the parent is 'interior' on disk."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world_text(tmp_path, "cli", _LEAF_PARENT_TREE)
+    dae_world = _seed_world_text(tmp_path, "dae", _LEAF_PARENT_TREE)
+
+    child = {"key": "test-child", "summary": "a freshly added child node"}
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--add-child", "intelligence"], json.dumps(child))
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "add-child", "parent": "intelligence", "child": child}))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    # Explicit: the parent flipped leaf -> interior on the daemon side.
+    assert _read_tree(dae_world)["nodes"]["intelligence"]["node_type"] == "interior"
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_add_child_injects_origin_goal_id(tmp_path):
+    """5: add-child with NO explicit origin_goal_id auto-injects the
+    EXECUTING goal id from world/team-state.yaml in_flight (g-325-06 / g-115-1463)
+    in the daemon exactly as the CLI does. The pre-fix daemon dropped the inject;
+    seeding BOTH worlds with an identical in_flight goal proves the daemon now
+    records the same origin signal, and the explicit assertion pins origin_goal_id
+    on the child."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world(tmp_path, "cli")
+    dae_world = _seed_world(tmp_path, "dae")
+    # Identical in_flight goal for agent 'alpha' in BOTH worlds. The CLI reads
+    # WORLD_DIR/team-state.yaml (MIND_WORLD=cli_world, MIND_AGENT=alpha); the
+    # daemon reads world_path/team-state.yaml with the per-request agent. The
+    # file lives at the world ROOT, outside knowledge/tree, so _tree_bytes is
+    # unaffected by its presence — it is purely an inject INPUT.
+    team_state = ("agent_status:\n"
+                  "  alpha:\n"
+                  "    in_flight:\n"
+                  "      goal_id: g-999-42\n")
+    (cli_world / "team-state.yaml").write_text(team_state, encoding="utf-8")
+    (dae_world / "team-state.yaml").write_text(team_state, encoding="utf-8")
+
+    child = {"key": "test-child", "summary": "a freshly added child node"}
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--add-child", "intelligence"], json.dumps(child))
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "add-child", "parent": "intelligence", "child": child},
+        agent="alpha"))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    # Explicit: the child carries the in_flight goal id as origin_goal_id.
+    assert _read_tree(dae_world)["nodes"]["test-child"]["origin_goal_id"] == "g-999-42"
+
+
 @pytest.mark.skipif(not _HAS_LIBYAML,
                     reason="libyaml (CSafeDumper) required for byte-compat")
 @pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
@@ -815,6 +907,131 @@ def test_byte_compat_reparent(tmp_path):
                               meta=tmp_path / "dae-meta"))
 
     assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+
+
+# Baseline with TWO interior parents: 'intelligence' (2 children) exercises the
+# NON-flip path (remove one of two -> stays interior); 'spatial' (1 child)
+# exercises the 3 last-child-removal flip (interior -> leaf), the
+# inverse of the add-child leaf->interior flip and the gap _apply_remove_child
+# carried until 3 (it updated child_count but not node_type).
+_REMOVE_CHILD_TREE = (
+    "nodes:\n"
+    "  root:\n"
+    "    file: null\n"
+    "    summary: Root node\n"
+    "    depth: 0\n"
+    "    children:\n"
+    "    - intelligence\n"
+    "    - spatial\n"
+    "    child_count: 2\n"
+    "  intelligence:\n"
+    "    file: world/knowledge/tree/intelligence.md\n"
+    "    summary: Intelligence L1\n"
+    "    depth: 1\n"
+    "    parent: root\n"
+    "    children:\n"
+    "    - keep-me\n"
+    "    - remove-me\n"
+    "    child_count: 2\n"
+    "    node_type: interior\n"
+    "    capability_level: CALIBRATE\n"
+    "    confidence: 0.5\n"
+    "  keep-me:\n"
+    "    file: world/knowledge/tree/keep-me.md\n"
+    "    summary: Sibling that remains\n"
+    "    depth: 2\n"
+    "    parent: intelligence\n"
+    "    children: []\n"
+    "    child_count: 0\n"
+    "    node_type: leaf\n"
+    "    capability_level: EXPLORE\n"
+    "    confidence: 0.3\n"
+    "  remove-me:\n"
+    "    file: world/knowledge/tree/remove-me.md\n"
+    "    summary: Child to be removed\n"
+    "    depth: 2\n"
+    "    parent: intelligence\n"
+    "    children: []\n"
+    "    child_count: 0\n"
+    "    node_type: leaf\n"
+    "    capability_level: EXPLORE\n"
+    "    confidence: 0.3\n"
+    "  spatial:\n"
+    "    file: world/knowledge/tree/spatial.md\n"
+    "    summary: Spatial L1\n"
+    "    depth: 1\n"
+    "    parent: root\n"
+    "    children:\n"
+    "    - lone-child\n"
+    "    child_count: 1\n"
+    "    node_type: interior\n"
+    "    capability_level: CALIBRATE\n"
+    "    confidence: 0.5\n"
+    "  lone-child:\n"
+    "    file: world/knowledge/tree/lone-child.md\n"
+    "    summary: Only child of spatial\n"
+    "    depth: 2\n"
+    "    parent: spatial\n"
+    "    children: []\n"
+    "    child_count: 0\n"
+    "    node_type: leaf\n"
+    "    capability_level: EXPLORE\n"
+    "    confidence: 0.3\n"
+    "last_updated: '2026-01-01'\n"
+    "entity_index: {}\n"
+)
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_remove_child(tmp_path):
+    """Removing one of two children: parent keeps the sibling, child_count
+    decrements, node_type stays 'interior'. The daemon _tree.yaml is
+    byte-identical to the CLI's. No prior byte-compat coverage existed for
+    remove-child -- every other write op had one; g-115-1493 closes that gap."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world_text(tmp_path, "cli", _REMOVE_CHILD_TREE)
+    dae_world = _seed_world_text(tmp_path, "dae", _REMOVE_CHILD_TREE)
+
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--remove-child", "intelligence", "remove-me"], None)
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "remove-child", "parent": "intelligence", "child_key": "remove-me"}))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    # Parent still interior (one child remains); count decremented.
+    intel = _read_tree(dae_world)["nodes"]["intelligence"]
+    assert intel["node_type"] == "interior"
+    assert intel["child_count"] == 1
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_remove_child_flips_interior_parent(tmp_path):
+    """3: removing the LAST child of an interior parent flips it
+    interior->leaf in the daemon exactly as cmd_remove_child does (tree.py
+    g-115-1445) -- the inverse of the add-child leaf->interior flip. Pre-fix
+    _apply_remove_child updated child_count but left node_type stale at
+    'interior' on a now-childless parent, a byte-compat parity gap invisible to
+    BOTH the AST field-set test and the (previously absent) byte-compat suite."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world_text(tmp_path, "cli", _REMOVE_CHILD_TREE)
+    dae_world = _seed_world_text(tmp_path, "dae", _REMOVE_CHILD_TREE)
+
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--remove-child", "spatial", "lone-child"], None)
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "remove-child", "parent": "spatial", "child_key": "lone-child"}))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    # Parent flipped interior -> leaf (last child removed); count zero.
+    spatial = _read_tree(dae_world)["nodes"]["spatial"]
+    assert spatial["node_type"] == "leaf"
+    assert spatial["child_count"] == 0
 
 
 @pytest.mark.skipif(not _HAS_LIBYAML,

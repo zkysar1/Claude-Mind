@@ -394,3 +394,91 @@ def test_update_field_recomputes_meta(pipeline_daemon):
     assert meta.get("last_updated") is not None
     assert meta["stage_counts"]["active"] == 1
     assert meta["stage_counts"]["resolved"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pipeline/update (whole-record) — 5: archive-reach
+# ---------------------------------------------------------------------------
+
+def test_update_replaces_live_record(pipeline_daemon):
+    """Baseline: update() replaces a LIVE record in place (whole-record path)."""
+    project_root, port = pipeline_daemon
+    live = project_root / "world" / "pipeline.jsonl"
+
+    replacement = _rec(
+        id="2026-05-12_test-active", stage="active", horizon="session",
+        confidence=0.85,
+        position="YES this is a valid multi-word replacement position",
+        title="Replaced active hypothesis whole record",
+        claim="Replacement whole-record claim well over twenty characters long",
+    )
+    status, body = _post(
+        port, "/v1/pipeline/update", {"id": "2026-05-12_test-active"},
+        json.dumps(replacement).encode("utf-8"))
+    assert status == 200
+    resp = json.loads(body)
+    assert resp["ok"] is True
+    assert resp["record"]["confidence"] == 0.85
+
+    items = _read_jsonl(live)
+    rec = next(r for r in items if r["id"] == "2026-05-12_test-active")
+    assert rec["confidence"] == 0.85
+    assert "Replaced" in rec["title"]
+
+
+def test_update_reaches_archive(pipeline_daemon):
+    """5: update() probes the archive when the id is absent from
+    live, so a multi-field-corrupt ARCHIVED record — which rejects every
+    single-field update-field repair because the whole record re-validates on
+    each field write — can be repaired via this atomic whole-record path.
+    Before the fix, update() was live-only and 404'd on archived ids (rb-2239)."""
+    project_root, port = pipeline_daemon
+    live = project_root / "world" / "pipeline.jsonl"
+    archive = project_root / "world" / "pipeline-archive.jsonl"
+
+    # Seed an archived record directly (bypasses validation, mirroring how
+    # real archived records — including the corrupt ones — reach the file).
+    arch_seed = _rec(
+        id="2026-04-06_archived-hyp", stage="archived", horizon="session",
+        title="Archived hypothesis needing whole-record repair",
+        claim="Original archived claim well over twenty characters in length",
+        outcome="CONFIRMED",
+    )
+    archive.write_text(json.dumps(arch_seed) + "\n", encoding="utf-8")
+
+    replacement = _rec(
+        id="2026-04-06_archived-hyp", stage="archived", horizon="session",
+        confidence=0.8,
+        position="YES this is a valid multi-word repaired position",
+        title="Repaired archived hypothesis whole record",
+        claim="Repaired whole-record claim well over twenty characters in length",
+        outcome="CONFIRMED",
+    )
+    status, body = _post(
+        port, "/v1/pipeline/update", {"id": "2026-04-06_archived-hyp"},
+        json.dumps(replacement).encode("utf-8"))
+    assert status == 200
+    resp = json.loads(body)
+    assert resp["ok"] is True
+
+    # The archive file carries the repaired record; live stays untouched.
+    arch_items = _read_jsonl(archive)
+    rec = next(r for r in arch_items if r["id"] == "2026-04-06_archived-hyp")
+    assert rec["confidence"] == 0.8
+    assert "Repaired" in rec["title"]
+    assert not any(r["id"] == "2026-04-06_archived-hyp"
+                   for r in _read_jsonl(live))
+
+
+def test_update_not_found_in_either(pipeline_daemon):
+    """update() 404s when the id is in neither live nor archive."""
+    _, port = pipeline_daemon
+    replacement = _rec(
+        id="9999-01-01_nonexistent", stage="active", horizon="session",
+        position="YES this is a valid multi-word position claim",
+        claim="Nonexistent record claim well over twenty characters in length",
+    )
+    status, body = _post_expect_error(
+        port, "/v1/pipeline/update", {"id": "9999-01-01_nonexistent"},
+        json.dumps(replacement).encode("utf-8"))
+    assert status == 404

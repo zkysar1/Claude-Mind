@@ -37,7 +37,11 @@ def infer(origin_signal):
     if sig.startswith("recurring_cadence:") or sig.startswith("recurring:"):
         return "recurring-cycle"
     if sig.startswith(("failing_test:", "resolved_hypothesis:",
-                       "low_confidence_node:", "drift_detected:", "monitor:")):
+                       "low_confidence_node:", "drift_detected:", "monitor:",
+                       # automated detection-driven filers (0) — kept
+                       # locked with ALLOWED_PREFIXES in gates/origin_signal.py
+                       "alert-email:", "routing-mismatch:",
+                       "routing-either-resolve:", "insight_trigger:")):
         return "cycle-detector"
     if sig == "idle_fallback" or sig.startswith((
             "decomposition:", "parent_aspiration:", "unblock:",

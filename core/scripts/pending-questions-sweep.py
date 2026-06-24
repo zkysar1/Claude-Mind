@@ -76,6 +76,16 @@ NOOP_AUTO_RESOLVE_DAYS = 14
 
 RITUAL_TYPES = {"fresh-eyes-review", "fresh-eyes-program"}
 
+# Decision-log markers (g-115-1369): self.md Decision-Authority pending-questions
+# are filed with the decision ALREADY executed (default_action prefixed
+# "Already executed:") and framed for retroactive user review. They MUST outlive
+# their source goal so the user can override. _is_decision_log + the
+# _h_source_goal_completed exemption keep them out of source-goal-completion
+# auto-resolve. Observed types in real data: "infrastructure-decision",
+# "architecture-decision" (both end "-decision").
+DECISION_LOG_MARKER = "already executed:"
+DECISION_LOG_TYPES = {"decision-log", "decision_log", "decision"}
+
 
 # ---------------------------------------------------------------------------
 # YAML loading — handles both `questions: [...]` wrapper AND bare list shape
@@ -193,6 +203,29 @@ def _age_days(entry, now):
     return None  # unknown age
 
 
+def _is_decision_log(entry):
+    """True when the entry is a self.md Decision-Authority decision-log (g-115-1369).
+
+    Decision-logs are FILED at goal completion with the decision already
+    executed (default_action prefixed "Already executed:") so the user can
+    review and override retroactively (self.md "Decision Authority"). They are
+    MEANT to outlive their source goal — auto-resolving them the same iteration
+    the source goal completes silently defeats the oversight mechanism.
+
+    Either signal suffices:
+      - default_action begins with the "Already executed:" marker (primary;
+        matches the pq-ollama-numparallel-2026-06-08 incident exactly)
+      - an explicit decision-log type ("*-decision", or one of DECISION_LOG_TYPES)
+    """
+    da = str(entry.get("default_action") or "").strip().lower()
+    if da.startswith(DECISION_LOG_MARKER):
+        return True
+    qtype = str(entry.get("type") or "").strip().lower()
+    if qtype.endswith("-decision") or qtype in DECISION_LOG_TYPES:
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Heuristics — return (verdict, reason, confidence) or None to fall through
 # ---------------------------------------------------------------------------
@@ -245,6 +278,18 @@ def _h_source_goal_completed(entry, now, ctx):
     if sg not in completed_ids:
         return None
     if entry.get("status") in TERMINAL_STATUSES:
+        return None
+    # g-115-1369: EXEMPT decision-log pending-questions. A decision-log is the
+    # self.md Decision-Authority retroactive-review mechanism — filed AT goal
+    # completion, MEANT to outlive the source goal so the user can review the
+    # executed decision and override. Auto-resolving it the same iteration the
+    # source goal completes means it never reaches the user pending-review
+    # queue, silently defeating the oversight. Contrast a BLOCKING pending-
+    # question ("should I do X for goal G?"), which correctly becomes moot when
+    # G completes — this heuristic conflated the two shapes. Decision-logs fall
+    # through to _h_noop_auto_resolve (14d) / _h_pending_old (30d
+    # flag_for_review) / explicit user resolution instead.
+    if _is_decision_log(entry):
         return None
     return (
         "auto_resolve",

@@ -72,7 +72,7 @@ def test_companion_script_in_diary_increments_count(tmp_path: Path = None):
     tmpdir = Path(tempfile.mkdtemp(prefix="sd-companion-1-"))
     try:
         # alpha diary with two roblox-studio.sh invocations
-        alpha_diary = tmpdir / "alpha" / "session" / "execution-diary.jsonl"
+        alpha_diary = tmpdir / "agents" / "alpha" / "session" / "execution-diary.jsonl"
         _write_diary(alpha_diary, [
             {"entry_type": "phase_start", "phase": "phase-4-execute",
              "content": "bash world/scripts/roblox-studio.sh start-bridge",
@@ -90,7 +90,7 @@ def test_companion_script_in_diary_increments_count(tmp_path: Path = None):
                 ],
             },
         }
-        with unittest.mock.patch.object(mod, "PROJECT_ROOT", tmpdir), \
+        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
              unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
                 ["access-roblox-studio"], forged
@@ -116,7 +116,7 @@ def test_genuinely_cold_script_stays_at_zero():
     tmpdir = Path(tempfile.mkdtemp(prefix="sd-companion-2-"))
     try:
         # alpha diary with NO roblox-manage-script.sh invocations
-        alpha_diary = tmpdir / "alpha" / "session" / "execution-diary.jsonl"
+        alpha_diary = tmpdir / "agents" / "alpha" / "session" / "execution-diary.jsonl"
         _write_diary(alpha_diary, [
             {"entry_type": "finding",
              "content": "something unrelated to roblox-manage-script",
@@ -128,7 +128,7 @@ def test_genuinely_cold_script_stays_at_zero():
                 "companion_scripts": ["world/scripts/roblox-manage-script.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "PROJECT_ROOT", tmpdir), \
+        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
              unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
                 ["manage-roblox-scripts"], forged
@@ -155,7 +155,7 @@ def test_board_mentions_do_not_count():
     tmpdir = Path(tempfile.mkdtemp(prefix="sd-companion-3-"))
     try:
         # Empty diary
-        alpha_diary = tmpdir / "alpha" / "session" / "execution-diary.jsonl"
+        alpha_diary = tmpdir / "agents" / "alpha" / "session" / "execution-diary.jsonl"
         _write_diary(alpha_diary, [])
 
         # Board mention only
@@ -171,7 +171,7 @@ def test_board_mentions_do_not_count():
                 "companion_scripts": ["world/scripts/roblox-manage-script.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "PROJECT_ROOT", tmpdir), \
+        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
              unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
                 ["manage-roblox-scripts"], forged
@@ -195,7 +195,7 @@ def test_shared_companion_script_credits_all_skills():
     mod = _load_module()
     tmpdir = Path(tempfile.mkdtemp(prefix="sd-companion-4-"))
     try:
-        alpha_diary = tmpdir / "alpha" / "session" / "execution-diary.jsonl"
+        alpha_diary = tmpdir / "agents" / "alpha" / "session" / "execution-diary.jsonl"
         _write_diary(alpha_diary, [
             {"entry_type": "finding",
              "content": "bash world/scripts/roblox-studio.sh start-session",
@@ -216,7 +216,7 @@ def test_shared_companion_script_credits_all_skills():
                 ],
             },
         }
-        with unittest.mock.patch.object(mod, "PROJECT_ROOT", tmpdir), \
+        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
              unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
                 ["access-roblox-studio", "run-game-session"], forged
@@ -249,7 +249,7 @@ def test_same_second_events_dedup_upstream():
     mod = _load_module()
     tmpdir = Path(tempfile.mkdtemp(prefix="sd-companion-5-"))
     try:
-        alpha_diary = tmpdir / "alpha" / "session" / "execution-diary.jsonl"
+        alpha_diary = tmpdir / "agents" / "alpha" / "session" / "execution-diary.jsonl"
         # Two records, identical timestamps — represent the same execution
         # journaled twice (e.g., once by phase-start and once by a finding
         # in the same second).
@@ -267,7 +267,7 @@ def test_same_second_events_dedup_upstream():
                 "companion_scripts": ["world/scripts/aws-exec.sh"],
             },
         }
-        with unittest.mock.patch.object(mod, "PROJECT_ROOT", tmpdir), \
+        with unittest.mock.patch.object(mod, "agents_root", lambda: tmpdir / "agents"), \
              unittest.mock.patch.object(mod, "WORLD_DIR", tmpdir / "world"):
             companion_dates = mod.collect_companion_script_dates(
                 ["access-aws-services"], forged

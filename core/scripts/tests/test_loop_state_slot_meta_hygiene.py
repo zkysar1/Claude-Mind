@@ -100,42 +100,31 @@ def _run_helper(helper: Path, tmpdir: Path, *extra_args) -> tuple:
     return result.returncode, result.stdout, result.stderr
 
 
-def test_bump_advances_slot_meta() -> bool:
+def test_bump_advances_slot_meta():
     """loop-state-bump-counters.py advances slot_meta.loop_state.updated_at + update_count."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-meta-test-"))
     try:
         wm_path = _seed_wm(tmpdir, with_slot_meta=True)
         rc, _, stderr = _run_helper(BUMP_HELPER, tmpdir, "--outcome", "deep")
-        if rc != 0:
-            print(f"FAIL: bump rc={rc} stderr={stderr}", file=sys.stderr)
-            return False
+        assert rc == 0, f"bump rc={rc} stderr={stderr}"
         meta = _read_slot_meta(wm_path)
-        if not meta:
-            print("FAIL: bump — slot_meta.loop_state missing post-call", file=sys.stderr)
-            return False
-        if meta.get("updated_at") == SEED_TIMESTAMP:
-            print(
-                f"FAIL: bump — updated_at not advanced from seed (still {SEED_TIMESTAMP})",
-                file=sys.stderr,
-            )
-            return False
+        assert meta, "bump — slot_meta.loop_state missing post-call"
+        assert meta.get("updated_at") != SEED_TIMESTAMP, (
+            f"bump — updated_at not advanced from seed (still {SEED_TIMESTAMP})"
+        )
         expected_count = SEED_UPDATE_COUNT + 1
-        if meta.get("update_count") != expected_count:
-            print(
-                f"FAIL: bump — update_count expected {expected_count}, got {meta.get('update_count')}",
-                file=sys.stderr,
-            )
-            return False
+        assert meta.get("update_count") == expected_count, (
+            f"bump — update_count expected {expected_count}, got {meta.get('update_count')}"
+        )
         print(
             f"PASS: bump advances slot_meta (updated_at: {SEED_TIMESTAMP} → {meta['updated_at']}, "
             f"update_count: {SEED_UPDATE_COUNT} → {meta['update_count']})"
         )
-        return True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_mutate_advances_slot_meta() -> bool:
+def test_mutate_advances_slot_meta():
     """recurring-loop-state-mutate.py advances slot_meta.loop_state.updated_at + update_count."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-meta-test-"))
     try:
@@ -143,69 +132,45 @@ def test_mutate_advances_slot_meta() -> bool:
         rc, _, stderr = _run_helper(
             MUTATE_HELPER, tmpdir, "--goal-id", "g-test-001", "--outcome", "routine"
         )
-        if rc != 0:
-            print(f"FAIL: mutate rc={rc} stderr={stderr}", file=sys.stderr)
-            return False
+        assert rc == 0, f"mutate rc={rc} stderr={stderr}"
         meta = _read_slot_meta(wm_path)
-        if not meta:
-            print("FAIL: mutate — slot_meta.loop_state missing post-call", file=sys.stderr)
-            return False
-        if meta.get("updated_at") == SEED_TIMESTAMP:
-            print(
-                f"FAIL: mutate — updated_at not advanced from seed (still {SEED_TIMESTAMP})",
-                file=sys.stderr,
-            )
-            return False
+        assert meta, "mutate — slot_meta.loop_state missing post-call"
+        assert meta.get("updated_at") != SEED_TIMESTAMP, (
+            f"mutate — updated_at not advanced from seed (still {SEED_TIMESTAMP})"
+        )
         expected_count = SEED_UPDATE_COUNT + 1
-        if meta.get("update_count") != expected_count:
-            print(
-                f"FAIL: mutate — update_count expected {expected_count}, got {meta.get('update_count')}",
-                file=sys.stderr,
-            )
-            return False
+        assert meta.get("update_count") == expected_count, (
+            f"mutate — update_count expected {expected_count}, got {meta.get('update_count')}"
+        )
         print(
             f"PASS: mutate advances slot_meta (updated_at: {SEED_TIMESTAMP} → {meta['updated_at']}, "
             f"update_count: {SEED_UPDATE_COUNT} → {meta['update_count']})"
         )
-        return True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_bump_creates_slot_meta_when_missing() -> bool:
+def test_bump_creates_slot_meta_when_missing():
     """When slot_meta absent entirely, bump creates it with sensible defaults."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-meta-test-"))
     try:
         wm_path = _seed_wm(tmpdir, with_slot_meta=False)
         rc, _, stderr = _run_helper(BUMP_HELPER, tmpdir, "--outcome", "deep")
-        if rc != 0:
-            print(f"FAIL: bump-missing-meta rc={rc} stderr={stderr}", file=sys.stderr)
-            return False
+        assert rc == 0, f"bump-missing-meta rc={rc} stderr={stderr}"
         meta = _read_slot_meta(wm_path)
-        if not meta:
-            print(
-                "FAIL: bump-missing-meta — slot_meta.loop_state still missing after write",
-                file=sys.stderr,
-            )
-            return False
-        if meta.get("update_count") != 1:
-            print(
-                f"FAIL: bump-missing-meta — fresh update_count expected 1, got {meta.get('update_count')}",
-                file=sys.stderr,
-            )
-            return False
-        if not meta.get("updated_at"):
-            print("FAIL: bump-missing-meta — updated_at not set", file=sys.stderr)
-            return False
+        assert meta, "bump-missing-meta — slot_meta.loop_state still missing after write"
+        assert meta.get("update_count") == 1, (
+            f"bump-missing-meta — fresh update_count expected 1, got {meta.get('update_count')}"
+        )
+        assert meta.get("updated_at"), "bump-missing-meta — updated_at not set"
         print(
             f"PASS: bump creates slot_meta when missing (update_count=1, updated_at={meta['updated_at']})"
         )
-        return True
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_mutate_creates_slot_meta_when_missing() -> bool:
+def test_mutate_creates_slot_meta_when_missing():
     """When slot_meta absent entirely, mutate creates it with sensible defaults."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-meta-test-"))
     try:
@@ -213,47 +178,69 @@ def test_mutate_creates_slot_meta_when_missing() -> bool:
         rc, _, stderr = _run_helper(
             MUTATE_HELPER, tmpdir, "--goal-id", "g-test-002", "--outcome", "deep"
         )
-        if rc != 0:
-            print(f"FAIL: mutate-missing-meta rc={rc} stderr={stderr}", file=sys.stderr)
-            return False
+        assert rc == 0, f"mutate-missing-meta rc={rc} stderr={stderr}"
         meta = _read_slot_meta(wm_path)
-        if not meta:
-            print(
-                "FAIL: mutate-missing-meta — slot_meta.loop_state still missing after write",
-                file=sys.stderr,
-            )
-            return False
-        if meta.get("update_count") != 1:
-            print(
-                f"FAIL: mutate-missing-meta — fresh update_count expected 1, got {meta.get('update_count')}",
-                file=sys.stderr,
-            )
-            return False
-        if not meta.get("updated_at"):
-            print("FAIL: mutate-missing-meta — updated_at not set", file=sys.stderr)
-            return False
+        assert meta, "mutate-missing-meta — slot_meta.loop_state still missing after write"
+        assert meta.get("update_count") == 1, (
+            f"mutate-missing-meta — fresh update_count expected 1, got {meta.get('update_count')}"
+        )
+        assert meta.get("updated_at"), "mutate-missing-meta — updated_at not set"
         print(
             f"PASS: mutate creates slot_meta when missing (update_count=1, updated_at={meta['updated_at']})"
         )
-        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_field_op_advances_slot_meta():
+    """1 field-op mode (--evolution-fired) advances
+    slot_meta.loop_state.updated_at + update_count (guard-540 — the new bash
+    writers must not let slot_meta lag, else wm-prune evicts the slot). The
+    --reset-alignment / --evolution-fired path uses its OWN _run_field_op
+    write, separate from the --outcome bump, so it needs its own pin."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-meta-test-"))
+    try:
+        wm_path = _seed_wm(tmpdir, with_slot_meta=True)
+        rc, _, stderr = _run_helper(BUMP_HELPER, tmpdir, "--evolution-fired")
+        assert rc == 0, f"field-op rc={rc} stderr={stderr}"
+        meta = _read_slot_meta(wm_path)
+        assert meta, "field-op — slot_meta.loop_state missing post-call"
+        assert meta.get("updated_at") != SEED_TIMESTAMP, (
+            f"field-op — updated_at not advanced from seed (still {SEED_TIMESTAMP})"
+        )
+        expected_count = SEED_UPDATE_COUNT + 1
+        assert meta.get("update_count") == expected_count, (
+            f"field-op — update_count expected {expected_count}, got {meta.get('update_count')}"
+        )
+        print(
+            f"PASS: field-op (--evolution-fired) advances slot_meta "
+            f"(update_count: {SEED_UPDATE_COUNT} → {meta['update_count']})"
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main() -> int:
-    results = [
-        test_bump_advances_slot_meta(),
-        test_mutate_advances_slot_meta(),
-        test_bump_creates_slot_meta_when_missing(),
-        test_mutate_creates_slot_meta_when_missing(),
+    tests = [
+        test_bump_advances_slot_meta,
+        test_mutate_advances_slot_meta,
+        test_bump_creates_slot_meta_when_missing,
+        test_mutate_creates_slot_meta_when_missing,
+        test_field_op_advances_slot_meta,
     ]
-    if all(results):
+    pass_count = 0
+    for t in tests:
+        try:
+            t()
+            pass_count += 1
+        except AssertionError as e:
+            print(f"FAIL: {t.__name__}: {e}", file=sys.stderr)
+    if pass_count == len(tests):
         print("\n════════════════════════════════════════════")
-        print(f"  ALL {len(results)} TESTS PASS — slot_meta hygiene pinned for both writers")
+        print(f"  ALL {pass_count} TESTS PASS — slot_meta hygiene pinned for both writers")
         print("════════════════════════════════════════════")
         return 0
-    fail_count = sum(1 for r in results if not r)
-    print(f"\nFAIL: {fail_count}/{len(results)} test(s) failed", file=sys.stderr)
+    print(f"\nFAIL: {len(tests) - pass_count}/{len(tests)} test(s) failed", file=sys.stderr)
     return 1
 
 

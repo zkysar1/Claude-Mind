@@ -166,6 +166,23 @@ IF retrieval_manifest exists AND retrieval_manifest.sufficient == false:
             Output: "▸ ESCALATION GAP: Tiers 1-2 insufficient but Tier 3 (web) not attempted for {goal.id}"
 # Escalation gaps are logged as learning signals for reflection, not hard blockers.
 
+# ── Memory-utility curation scan (advisory, cadenced — g-115-1468 / Phase 1d) ──
+# HOT-PATH HOME: core/config/iteration-close-digest.md § LEARNING-GATE bullet 7.
+# This SKILL.md is the full-protocol copy for /boot, consolidation, and edge
+# cases — NOT the hot path; keep both in sync. The earn-the-keep KPI flip:
+# weight "was this later retrieved AND useful?" over "how much did we write?".
+IF goals_completed_this_session % 20 == 0:
+    Bash: export MIND_AGENT=<agent>; source core/scripts/_paths.sh
+    FOR store in (reasoning-bank, guardrails):
+        Bash: py -3 core/scripts/retrieval_utility_report.py --store "$WORLD_DIR/{store}.jsonl"
+    # From each report: zero_hit_high_exposure (retrieved >=5x, never helpful —
+    # noise) + never_retrieved (dead weight). Write counts + a capped sample
+    # (first 25 ids each, per store) to the memory_curation_candidates WM slot
+    # (overwrite) for /reflect --curate-memory.
+    echo '{"reasoning-bank": {...}, "guardrails": {...}, "scanned_at": "<iso>"}' | Bash: wm-set.sh memory_curation_candidates
+    # ADVISORY ONLY — NEVER auto-retire (guard-707): low times_helpful is usually
+    # under-attestation, not zero value; retirement is a /reflect-gated decision.
+
 # If goal genuinely has no matching tree nodes: pass silently.
 ```
 
@@ -350,9 +367,36 @@ After ALL gates and checks above are complete, this skill is the LAST phase of t
 iteration. It MUST end with LOOP_CONTINUE to re-enter the aspirations loop.
 
 ```
-# LOOP_CONTINUE: save iteration state to WM, then re-invoke the loop.
+# LOOP_CONTINUE: read-merge-write loop_state, then re-invoke the loop.
 # This is the mechanical heartbeat — without this tool call, the session dies.
-echo '<loop_state as JSON>' | Bash: wm-set.sh loop_state
+#
+# READ-MERGE-WRITE, never a bare overwrite (g-115-1072). The bash gates
+# (loop-state-bump-counters.py Phase 8; recurring-loop-state-mutate.py) are the
+# SINGLE WRITERS for the counters + most signals — they wrote authoritative
+# values to the WM FILE this iteration, invisible to the orchestrator's in-memory
+# copy (synced at Phase -0.5). A bare `echo '<loop_state as JSON>' | wm-set.sh
+# loop_state` from stale variables REVERTS them (goals_completed 47→46, dropped
+# counted_goals). Slot-specific, so siblings like pending_phase_6_spark survive —
+# the exact reversion signature. g-283 retired the per-iteration mirror but left
+# THIS overwrite; this completes it. Same pattern as aspirations-all-blocked Step
+# B3 and recurring-close.sh:166-170's documented contract.
+Bash: wm-read.sh loop_state --json
+merged = current_loop_state                  # fresh — carries bash-gate counters + signals
+# g-115-1561: evolutions / last_evolution_at / alignment_check_at / touched are
+# now BASH-OWNED (loop-state-bump-counters.py: --goal-id increments alignment +
+# touched every close; --reset-alignment at aspirations-select; --evolution-fired
+# at aspirations-evolve). They are NO LONGER overlaid here — overlaying the
+# in-context copies would CLOBBER the bash writes (e.g. select fires
+# --reset-alignment → disk=0 → iteration-close --goal-id → disk=1; a stale
+# in-context overlay of 0 reverts it). The four were orphaned BECAUSE this
+# LLM overlay was unreliable (zeta g-115-1557: touched=[] universally despite
+# 68-76 goals); bash ownership is the fix. Only the circuit-breaker pair below
+# stays LLM-owned (no bash writer yet — tracked separately).
+# Mutate signals IN PLACE (preserve bash-owned subkeys — routine_*, productive_streak,
+# *_cooldown_streak, *_tree_update; never replace merged.signals wholesale):
+merged.signals.consecutive_goal_failures = session_signals.consecutive_goal_failures
+merged.signals.last_failed_goal_id = session_signals.last_failed_goal_id
+echo '<merged as JSON>' | Bash: wm-set.sh loop_state
 Skill('aspirations') with args='loop'
 ```
 

@@ -668,6 +668,17 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  # ── Pearl Plan Gate C deliverable (, 2026-06-15) ────────────
+  # Durable eval report for the Gate C value-spine measurement (omni
+  # directive asp-004). Named artifact, overwritten if Gate C re-runs.
+  - file: gate-c-eval.md
+    purpose: Gate C (Pearl Plan Step 2.3) value-spine measurement report — verdict + test outputs + prerequisite analysis; produced by g-004-03
+    writer: aspirations-execute (g-004-03 Pearl Plan Gate C harness goal)
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
 # ── Desync invariants ───────────────────────────────────────────────
 # Rules checked by session-desync-check.sh. Violations are logged advisory
 # to <agent>/session/desync-warnings.jsonl but do NOT auto-fix.

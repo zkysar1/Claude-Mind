@@ -85,6 +85,7 @@ from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
+from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.user_leg_scope import evaluate as _user_leg_scope_eval  # noqa: E402
 from gates.defer_classifier import (  # noqa: E402
     is_narrative_defer as _is_narrative_defer,
@@ -220,6 +221,29 @@ def _validate_goal(goal: Dict[str, Any]) -> None:
         v = goal["interval_hours"]
         if not isinstance(v, (int, float)) or v <= 0:
             raise ValueError(f"Goal {goal['id']}: interval_hours must be positive")
+
+
+def _assert_no_prose_drift(goal: Dict[str, Any], *, ctx=None) -> None:
+    """Raise ValueError on prose-only verification drift (4).
+
+    The CLI validate_goal runs this check; the daemon _validate_goal subset
+    historically omitted it, so daemon-path goal adds bypassed the gate
+    entirely (realized FN: g-315-119, g-316-08). gates.prose_verification is
+    the single-source module that restores CLI/daemon parity (guard-547).
+    Called explicitly at the goal-ADD sites (add_goal, _validate_aspiration)
+    rather than from _validate_goal so the status-update candidate validation
+    (update_goal in-lock) does not retroactively block status changes on
+    legacy prose-drift goals. ctx threads the calling agent's meta_dir /
+    agent_name so the gate-firing record routes correctly (the module-level
+    _gate_log.META_DIR is frozen — see _gate_log_layer_d).
+    """
+    verdict = _prose_verification_eval(
+        goal,
+        meta_dir=(ctx.paths.meta if ctx is not None else None),
+        agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
+    )
+    if verdict["would_block"]:
+        raise ValueError(verdict["message"])
 
 
 # ---------------------------------------------------------------------------
@@ -1157,6 +1181,7 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
+    import sys  # local-import convention (this module imports sys per-function)
     from ..server import Response
 
     asp_id = (ctx.query.get("asp_id") or "").strip()
@@ -1190,6 +1215,17 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # concurrent writers can't allocate the same g-NNN-NN sequence.
     goal.setdefault("status", "pending")
     goal.setdefault("created_at", datetime.now().isoformat(timespec="seconds"))
+    # filed_by_agent (): stamp the filing agent at add time so the
+    # per-agent contribution-vs-harm scorecard can attribute churn ("who filed
+    # the goal that later expired?") without git-blame / which-queue heuristics.
+    # setdefault preserves an explicit caller-supplied value (e.g. a goal filed
+    # on behalf of another agent). Backward-compat: goals written before this
+    # field default to "unknown" at read time (no field requirement). Validated
+    # (null-or-string) in aspirations.py::validate_goal. `agent` resolved above
+    # via _agent_name(ctx); guard against an empty resolution (leave unset →
+    # read-time "unknown") rather than stamping a blank attribution.
+    if agent:
+        goal.setdefault("filed_by_agent", agent)
     # blocked_since auto-stamp on add: parity with add(ctx) (full-aspiration
     # add, ~L3186) and cmd_update_goal's blocked_by cascade. A goal added WITH
     # blocked_by MUST carry blocked_since — otherwise goal-selector's
@@ -1229,9 +1265,34 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
 
             if "id" not in goal:
                 goal["id"] = _allocate_goal_id(asp)
+            # Uniqueness guard (4): a caller-supplied id can collide
+            # with an existing goal in this aspiration — INCLUDING a completed
+            # one — the cross-Mind-promotion-injection corruption class that
+            # produced two distinct goals both id 9. Every id-based op
+            # (claim / update / complete-by) then targets the FIRST match and
+            # silently corrupts the wrong record. _allocate_goal_id returns
+            # max-seq+1 (strictly greater than every existing seq), so
+            # reassigning through it yields a fresh unique id. Reassign + warn
+            # rather than overwrite the colliding record or reject the add.
+            existing_ids = {g.get("id") for g in asp.get("goals", []) if g.get("id")}
+            if goal["id"] in existing_ids:
+                _collided_id = goal["id"]
+                goal["id"] = _allocate_goal_id(asp)
+                print(
+                    f"[daemon add_goal] WARN: goal id {_collided_id!r} already "
+                    f"exists in {asp_id}; reassigned to {goal['id']!r} "
+                    f"(uniqueness guard, g-115-1544)",
+                    file=sys.stderr,
+                )
 
             try:
                 _validate_goal(goal)
+                # Prose-verification-drift parity (4): the daemon
+                # _validate_goal subset omits this check that the CLI runs;
+                # without it a daemon-added prose-only goal (markers present,
+                # verification.checks empty) slips through. ctx routes the
+                # firing telemetry to the calling agent.
+                _assert_no_prose_drift(goal, ctx=ctx)
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
@@ -1504,6 +1565,25 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
 
             goal = asp["goals"][goal_idx]
 
+            # Prose-verification-drift on description / verification edits
+            # (4): the add path validates via _assert_no_prose_drift,
+            # but the description / verification edit path does not — catch
+            # post-add prose injection here. Build the post-write candidate
+            # (new value overlaid on the current goal) and re-use the shared
+            # gate so a goal whose description gains the markers without a
+            # structured verification.checks is rejected. Scoped to these two
+            # fields so status / other edits on a legacy drift goal are not
+            # retroactively blocked.
+            if field in ("description", "verification"):
+                candidate = dict(goal)
+                candidate[field] = value
+                pv = _prose_verification_eval(
+                    candidate, meta_dir=ctx.paths.meta,
+                    agent_name=ctx.paths.agent_name or None,
+                )
+                if pv["would_block"]:
+                    return Response.error(400, "validation_failed", pv["message"])
+
             # === PR 7i in-lock status guards ===
             # Guards that need goal state run AFTER the goal load and BEFORE
             # any mutation. Order mirrors cmd_update_goal: recurring-completed
@@ -1716,6 +1796,20 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             if (field == "status" and value in _TERMINAL_GOAL_STATUSES
                     and goal.get("completed_at") is None):
                 goal["completed_at"] = datetime.now().isoformat(timespec="seconds")
+
+            # 6b. completed_by auto-stamp on completion (2). Daemon
+            # mirror of the CLI completed_by stamp (aspirations.py cmd_update_goal,
+            # right after its completed_at stamp). The completion chokepoint:
+            # every non-recurring status->completed flows here (recurring is
+            # blocked above). Pre-fix only ~11% of completed world goals carried
+            # completed_by, so agent-attribution audits + the cross_queue
+            # graduation count (0) undercounted. Scoped to
+            # value=="completed"; agent from _agent_name(ctx) (the per-request
+            # caller — NOT the daemon's env, which the CLI sibling uses).
+            # Idempotent: only when unset, preserving complete-by / backfill.
+            if (field == "status" and value == "completed"
+                    and not goal.get("completed_by") and agent):
+                goal["completed_by"] = agent
 
             # 7. blocker_ref persist for status=blocked (mirror of lines
             # 2131-2136). The pre-lock header parse staged the validated ref
@@ -2348,6 +2442,13 @@ def _emit_streak_break_signal_daemon(ctx, goal_id: str,
 
     Daemon-side mirror of aspirations.py::_emit_streak_break_signal.
     Fail-silent so the recurring close path is never blocked.
+
+    KNOWN RACE (accept-with-doc, g-115-1595): this append shares NO lock with
+    the reflector's full-file rewrite (streak-break-reflector.py _write_signals,
+    os.replace). An interleave can leave a signal `processed: false` whose
+    canary was already filed. Impact is COSMETIC (48h dedup prevents duplicate
+    canaries); a lock was deliberately NOT added. Full analysis + revisit
+    trigger live in streak-break-reflector.py::_write_signals.
     """
     import sys
     session_dir = ctx.paths.agent / "session"
@@ -3133,6 +3234,11 @@ def _validate_aspiration(asp: Dict[str, Any]) -> None:
 
     for goal in asp["goals"]:
         _validate_goal(goal)
+        # Prose-verification-drift parity on the bulk aspiration-add path
+        # (4) — mirrors the CLI validate_aspiration, which runs the
+        # check via validate_goal on every embedded goal. No ctx here (pure
+        # validator); telemetry falls back to the module-default meta_dir.
+        _assert_no_prose_drift(goal)
 
 
 # ---------------------------------------------------------------------------

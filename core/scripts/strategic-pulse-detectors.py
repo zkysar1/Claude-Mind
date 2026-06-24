@@ -12,6 +12,12 @@ Detectors (Origin: LifingPolls plan item 10, 2026-05-08):
   2. work_class_skew        — one work_class >2× its target fraction
   3. aged_aspirations       — active aspirations >60d since last completion
   4. idle_aspirations       — active aspirations with all goals deferred/blocked
+  5. strategic_drift        — an aspiration's recent self-initiated goals are
+                              mostly NOT moving its objective (US-06, g-305-06).
+                              Proxy = outcome_class (deep=moved, routine=upkeep)
+                              because the literal signal outcome_signal_source
+                              is an orphaned, 0%-populated schema field — see
+                              detect_strategic_drift.
 
 Usage:
   py -3 core/scripts/strategic-pulse-detectors.py [--json|--text]
@@ -49,6 +55,23 @@ TAIL_CONSOLIDATION_MIN_COUNT = 5
 WORK_CLASS_SKEW_FACTOR = 2.0
 AGED_ASPIRATION_DAYS = 60
 IDLE_ASPIRATION_MIN_GOALS = 1
+# US-06 () strategic-drift detector.
+STRATEGIC_DRIFT_WINDOW = 5            # trailing self-initiated completed goals
+STRATEGIC_DRIFT_RATIO_THRESHOLD = 0.5  # flag when moved/window < this
+# Composition with US-01: only SELF-INITIATED goals count toward an
+# aspiration's drift score. User-directed / system-generated goals are not the
+# agent's own strategic choices, so off-objective work there is not agent drift.
+SELF_INITIATED_GOAL_SOURCES = {"agent-self", "agent"}
+# "Moved a criterion" proxy. The literal US-06 signal — outcome_signal_source
+# ("moved criterion Y") — is an orphaned schema field: 0/1834 goals populate
+# it and NO script produces or consumes it (verified 2026-06-16, its only
+# repo-wide reference is its own definition in goal-schemas.md). Until it is
+# populated (a strategic process decision routed to Bravo), the computable
+# proxy is outcome_class: a `deep` close materially moved something; `routine`
+# is upkeep. Goals with absent outcome_class are EXCLUDED from the window — a
+# data gap must never manufacture a false drift flag. _goal_moved_criterion
+# prefers outcome_signal_source when populated (forward-compatible).
+MOVED_OUTCOME_CLASSES = {"deep", "d", "productive"}
 
 
 def _read_aspirations() -> list[dict]:
@@ -291,13 +314,110 @@ def detect_idle_aspirations(asps: list[dict]) -> dict | None:
     }
 
 
+def _goal_moved_criterion(g: dict) -> bool | None:
+    """Did this completed goal move its aspiration's objective?
+
+    Returns True/False when a signal is available, None when undecidable (the
+    goal is then EXCLUDED from the window — a data gap is not a negative).
+    Prefers the literal US-06 signal (outcome_signal_source) when populated;
+    falls back to the outcome_class proxy. See MOVED_OUTCOME_CLASSES for why
+    the proxy is load-bearing today.
+    """
+    if g.get("outcome_signal_source"):
+        # Literal criterion pointer present (forward-compatible; 0% populated
+        # today). Its presence means the author asserted a measurable criterion
+        # for this goal — count as moved. (A richer did-it-actually-move join
+        # against outcome-metrics.yaml is future work, gated on population.)
+        return True
+    oc = g.get("outcome_class")
+    if oc is None:
+        return None
+    return oc in MOVED_OUTCOME_CLASSES
+
+
+def _strategic_drift_window(asp: dict) -> tuple[int, int]:
+    """(moved, window_size) over the trailing self-initiated completed goals.
+
+    Window = the most-recent STRATEGIC_DRIFT_WINDOW completed, non-recurring,
+    self-initiated goals carrying a usable moved/not-moved signal, ordered by
+    completed_date (most recent first; goals with no date sort oldest). Only
+    goals still resident in the aspiration record are visible — deep-archived
+    completed history is not folded in, so the window favours recent activity
+    by construction (acceptable: drift is a recent-trajectory signal).
+    """
+    candidates = []
+    for g in asp.get("goals", []):
+        if g.get("recurring") or g.get("status") != "completed":
+            continue
+        if g.get("goal_source") not in SELF_INITIATED_GOAL_SOURCES:
+            continue
+        moved = _goal_moved_criterion(g)
+        if moved is None:
+            continue  # data gap — exclude, never penalize
+        candidates.append((g.get("completed_date") or "", moved))
+    candidates.sort(key=lambda c: c[0], reverse=True)  # most recent first
+    window = candidates[:STRATEGIC_DRIFT_WINDOW]
+    return sum(1 for _, m in window if m), len(window)
+
+
+def detect_strategic_drift(asps: list[dict]) -> dict | None:
+    """US-06 (): per-aspiration strategic-drift early-warning.
+
+    Flags active aspirations whose trailing self-initiated goals are mostly
+    NOT moving the objective. Preventive complement to the reactive
+    cargo-cult/cycle detectors — surfaces a weak run at a full window of 5
+    rather than after 3 hard failures. Proxy + limitation: MOVED_OUTCOME_CLASSES.
+    """
+    flagged = []
+    for a in asps:
+        if a.get("status") != "active":
+            continue
+        moved, window = _strategic_drift_window(a)
+        if window < STRATEGIC_DRIFT_WINDOW:
+            continue  # insufficient signal — a full window is required to flag
+        ratio = moved / window
+        if ratio < STRATEGIC_DRIFT_RATIO_THRESHOLD:
+            flagged.append({
+                "asp_id": a["id"],
+                "title": a.get("title", "")[:80],
+                "moved_ratio": round(ratio, 3),
+                "window_size": window,
+                "moved": moved,
+            })
+    if not flagged:
+        return None
+    flagged.sort(key=lambda x: x["moved_ratio"])
+    return {
+        "pattern": "strategic_drift",
+        "magnitude": "high" if flagged[0]["moved_ratio"] < 0.3 else "medium",
+        "evidence": {
+            "drifting_count": len(flagged),
+            "examples": flagged[:5],
+            "window": STRATEGIC_DRIFT_WINDOW,
+            "ratio_threshold": STRATEGIC_DRIFT_RATIO_THRESHOLD,
+            "signal": "outcome_class proxy (outcome_signal_source orphaned/0%-populated)",
+        },
+        "suggestion": (
+            f"{len(flagged)} active aspiration(s) have a substance ratio below "
+            f"{STRATEGIC_DRIFT_RATIO_THRESHOLD:.0%} over their last "
+            f"{STRATEGIC_DRIFT_WINDOW} self-initiated goals — recent work is "
+            f"upkeep, not objective-moving. Re-check each aspiration's objective "
+            f"against the goals being filed under it BEFORE the reactive cycle "
+            f"detector fires. (Signal = outcome_class proxy; populating "
+            f"outcome_signal_source would sharpen this to true criterion-moved — "
+            f"a strategic decision for Bravo.)"
+        ),
+    }
+
+
 # ---- Composition ----------------------------------------------------------
 
 
 def compose_pulse(asps: list[dict]) -> list[dict]:
     out = []
     for fn in (detect_tail_consolidation, detect_work_class_skew,
-               detect_aged_aspirations, detect_idle_aspirations):
+               detect_aged_aspirations, detect_idle_aspirations,
+               detect_strategic_drift):
         result = fn(asps)
         if result is not None:
             out.append(result)
@@ -321,7 +441,7 @@ def render_text(pulses: list[dict]) -> str:
                 bits = []
                 for k, v in e.items():
                     if k in ("asp_id", "title", "completion_ratio",
-                             "days_since_last_activity"):
+                             "days_since_last_activity", "moved_ratio"):
                         bits.append(f"{k}={v}")
                 lines.append(f"    - {' '.join(bits)}")
     lines.append("\n═══════════════════════════════════════════════════")

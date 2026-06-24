@@ -54,6 +54,42 @@ def _iter_files():
         yield AGENT_DIR / "aspirations-archive.jsonl"
 
 
+def _source_for_aspiration(asp_id: str) -> str | None:
+    """Return the queue ('world' or 'agent') that contains asp_id, or None.
+
+    The filing path must tell _rt.aspirations_add_goal which queue the
+    aspiration lives in — the daemon defaults to source='world', so an
+    agent-source aspiration (e.g. asp-001 in <agent>/aspirations.jsonl)
+    fails with 'aspiration_not_found ... not found in world' without this.
+    Mirrors the g-001-24 fix pattern (streak-break-reflector.py:251).
+    Returns None when asp_id is in neither queue, in which case the
+    caller falls back to 'world'.
+    """
+    candidates: list[tuple[Path, str]] = []
+    if WORLD_DIR is not None:
+        candidates.append((WORLD_DIR / "aspirations.jsonl", "world"))
+    if AGENT_DIR is not None:
+        candidates.append((AGENT_DIR / "aspirations.jsonl", "agent"))
+    for path, source in candidates:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        asp = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if asp.get("id") == asp_id:
+                        return source
+        except OSError:
+            continue
+    return None
+
+
 def _latest_goal_completion() -> tuple[datetime | None, str | None]:
     """Scan all aspiration files for the most-recent goal completed_date.
 
@@ -149,12 +185,17 @@ def _file_investigate(asp_id: str, silence_hours: float, latest_id: str | None,
         },
         "origin_signal": "investigate:inactivity-silence",
     }
+    # Resolve which queue asp_id lives in so the daemon add-goal call routes
+    # correctly. Without this, _rt.aspirations_add_goal defaults to
+    # source="world" and agent-source aspirations (e.g. ) fail with
+    # "aspiration_not_found ... not found in world" (, ).
+    source = _source_for_aspiration(asp_id) or "world"
     if dry_run:
-        print(f"[dry-run] would file Investigate on {asp_id}: {title}")
+        print(f"[dry-run] would file Investigate on {asp_id} (source={source}): {title}")
         return True, "dry-run"
     try:
-        record = _rt.aspirations_add_goal(asp_id, payload)
-        return True, record.get("id") or "filed"
+        record = _rt.aspirations_add_goal(asp_id, payload, source=source)
+        return True, record.get("goal_id") or record.get("id") or "filed"
     except _rt.RtError as e:
         return False, (e.body or str(e)).strip()[:200]
 

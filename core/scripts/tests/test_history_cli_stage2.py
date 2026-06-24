@@ -36,6 +36,13 @@ def test(fn):
     return fn
 
 
+# `test` is a case-registration decorator, not a pytest test. Without this guard,
+# pytest's `test*` name rule collects it and errors on the missing `fn` fixture —
+# and unlike conftest `collect_ignore`, __test__=False also holds under explicit-
+# path invocation (`pytest <this-file>`), which overrides collect_ignore.
+test.__test__ = False
+
+
 @contextmanager
 def sandbox():
     """Per-test sandbox: tempdir as WORLD, second tempdir as META.

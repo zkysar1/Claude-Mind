@@ -375,3 +375,62 @@ def test_release_failure_keeps_goal(tmp_agent, monkeypatch, capsys):
     assert record["verdict"] == "release-failed"
     assert record["release_result"]["ok"] is False
     assert record["release_result"]["step"] == "aspirations-release"
+
+
+# ---------------------------------------------------------------------------
+# Digest-ordering invariant (1 / rb-1533)
+#
+# The sweep's "diary entry after claimed_at → KEPT" heuristic
+# (test_keeps_goal_with_recent_diary above) is only sound if a goal that
+# reached Phase 4 is GUARANTEED a phase-4-execute diary marker post-dating its
+# claim. That guarantee is not in this script — it lives in the loop digest's
+# Phase 4 ordering: `execution-diary.sh phase-start phase-4-execute` MUST be
+# emitted AFTER `aspirations-claim.sh`.
+#
+# The original (buggy) order wrote the marker BEFORE the claim, so a
+# claim-then-pause (backgrounded tests, stop-hook re-entry) left no diary
+# entry after claimed_at and the sweep false-released a legitimately in-flight
+# goal (rb-1533). A pre-claim diary window or in_flight match cannot fix this:
+# both signals also predate an autocompact orphan and would permanently freeze
+# the canonical empty-diary orphan. Reordering the digest so phase-start
+# post-dates the claim is the correct fix — phase-start then means "Phase 4
+# began", which uniquely discriminates a paused-but-working goal (has marker →
+# kept) from an autocompact orphan that never reached Phase 4 (no marker →
+# released). This test locks that ordering against regression.
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = CORE_SCRIPTS.parents[1]
+DIGEST = PROJECT_ROOT / "core" / "config" / "aspirations-loop-digest.md"
+
+
+def _phase_4_block_lines() -> List[str]:
+    """Lines of the digest's Phase 4 (claim-conflict gate) block, bounded by
+    the `Phase 4.` heading and the next `Phase 4.1.` heading."""
+    lines = DIGEST.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if ln.lstrip().startswith("Phase 4.")
+                 and "Claim-conflict gate" in ln)
+    end = next(i for i, ln in enumerate(lines)
+               if i > start and ln.lstrip().startswith("Phase 4.1."))
+    return lines[start:end]
+
+
+def test_digest_writes_phase_start_after_claim():
+    """phase-start phase-4-execute MUST appear after aspirations-claim.sh in
+    the digest's Phase 4 block (g-115-1371 / rb-1533 regression guard)."""
+    block = _phase_4_block_lines()
+    claim_idxs = [i for i, ln in enumerate(block) if "aspirations-claim.sh" in ln]
+    start_idxs = [i for i, ln in enumerate(block)
+                  if "phase-start phase-4-execute" in ln]
+
+    assert len(claim_idxs) == 1, (
+        f"expected exactly one aspirations-claim.sh line in the Phase 4 block, "
+        f"got {len(claim_idxs)}")
+    assert len(start_idxs) == 1, (
+        f"expected exactly one `phase-start phase-4-execute` line in the Phase 4 "
+        f"block, got {len(start_idxs)}")
+    assert start_idxs[0] > claim_idxs[0], (
+        "phase-start phase-4-execute must be emitted AFTER aspirations-claim.sh "
+        "so a paused-but-claimed goal carries a diary marker post-dating "
+        "claimed_at (rb-1533); found phase-start at block-line "
+        f"{start_idxs[0]} and claim at block-line {claim_idxs[0]}")

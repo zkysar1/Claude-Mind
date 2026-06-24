@@ -3002,6 +3002,10 @@ The aspirations-precheck has three precheck sentinel gates that follow the same 
     - `grep -q "force_experience_archival" core/scripts/experience-staleness-check.sh` AND `grep -q "force_experience_archival" .claude/skills/aspirations-precheck/SKILL.md`
     - `grep -q "fresh_eyes_dispatch_pending" core/scripts/iteration-close.sh` AND `grep -q "fresh_eyes_dispatch_pending" .claude/skills/aspirations-precheck/SKILL.md`
 35. **Static**: `grep -cE "echo 'null' \| Bash: wm-set.sh (force_tree_maintain|force_experience_archival|fresh_eyes_dispatch_pending)" .claude/skills/aspirations-precheck/SKILL.md` returns at least 3 — each consumer clears its own sentinel after firing (one-shot pattern). Without the clear, the gate re-fires every iteration and the LLM gets stuck in a dispatch loop.
+36. **Static (g-115-1553 — consumption-aware canary)**: the `fresh_eyes_dispatch_pending` consumer MUST stamp `fresh_eyes_last_dispatch` on handling, and the canary MUST read it. Unlike the other tracked sentinels, this one is re-armed by its writer on EVERY substantive deep close, so a bare presence-count canary false-fires even when the consumer keeps up; the canary instead keys on the dispatch timestamp advancing. All three must reference the slot:
+    - `grep -q "fresh_eyes_last_dispatch" .claude/skills/aspirations-precheck/SKILL.md` (consumer stamps before clear)
+    - `grep -q "fresh_eyes_last_dispatch" core/scripts/stale-sentinel-canary.py` (canary reads the advancement signal)
+    - `grep -q "CONSUMPTION_AWARE" core/scripts/stale-sentinel-canary.py` (canary uses advancement, not bare `_is_set`, for re-armed sentinels)
 
 ## BR9. Tree-Encoding-Drift Gate Tree-Encoded Signal Wiring (g-115-282)
 
