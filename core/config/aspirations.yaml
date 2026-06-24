@@ -308,6 +308,10 @@ stale_sentinel:
 # Sweep tiers (priority order):
 #   always-run:  Phase 0-pre (tree-debt), 0-pre2 (experience-archival),
 #                0-pre3 (fresh-eyes-code-dispatch). Safety-critical sentinels.
+#                Plus the two notification-age safety gates inbox-alert-age-check
+#                (0.5b.1b) + handoff-aging-check (0.5b.2b) — they escalate aged
+#                unclaimed work to external parties (user email / partner board),
+#                so they fire reliably; not meter-gated (6).
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval (run-all), blocker-recheck (Phase 0.5b.0.5),
 #                defer-recheck (Phase 0.5b.4).
@@ -329,6 +333,15 @@ precheck:
     normal: []                 # run all (under autocompact 50%)
     tight: [deferrable]        # drop deferrable sweeps in tight zone
   drop_log: precheck-drops.jsonl  # appended under <agent>/session/
+
+# --- ANTICIPATORY REFLECTION (Phase 3.96 / ; design: world/conventions/anticipated-failures.md) ---
+# Devil's-Advocate failure prediction BEFORE deep goals (Gate 1 = estimated_depth==deep),
+# scored over time as anticipation_accuracy (sibling of the Phase 3.95 depth-calibration signal).
+# DORMANT by default — flag off = zero behavior change. Flip on (or set env GATE_3_96_ENABLED)
+# for the Phase E A/B trial. A MISSING key reads false (fail-safe to dormant; bravo 
+# ship condition). This flag is the single off-ramp for the whole mechanism.
+anticipatory_reflection:
+  enabled: false               # default-OFF off-ramp; env override GATE_3_96_ENABLED for experiments
 
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals
@@ -509,6 +522,76 @@ exploration_mode:
     - tree_encoding                       # Knowledge encoded regardless of outcome
     - pattern_signatures                  # Patterns still matched and recorded
 
+# --- LIGHTWEIGHT GOAL MODE (; design ) ---
+# PRE-execution trivial-goal classifier. core/scripts/trivial-goal-classify.py
+# predicts whether a goal is TRIVIAL (no learning worth extracting) so Phase 4
+# can skip the ~17 ceremony sub-phases in the Phase 3.9-4.5 window (intelligent
+# retrieval, mid-exec drift/chunk encoding, episode chaining, causal-enabler
+# scan, experience archival, knowledge reconciliation). COMPLEMENTARY to the
+# POST-execution `routine` outcome_class (skips 4.25/6) and recurring-close.sh
+# (collapses 5/8/9.5/10) — this is the only mechanism that reaches the pre/mid/
+# immediate-post band, because it fires BEFORE execution.
+#
+# A goal is "trivial" ONLY when ALL THREE booleans hold (conservative AND-gate);
+# ANY uncertainty or error -> "full". Asymmetric risk is the decisive constraint:
+# a false-negative (trivial treated as full) costs only overhead, but a
+# false-positive (real goal treated as trivial) skips learning and is recoverable
+# only via the Phase-4-post escape hatch — so every ambiguity resolves to "full".
+#   1. empty_verification_checks — verification null OR checks empty
+#   2. no_diff_expected — explicit produces_diff:false, OR skill matches a
+#      pure_action_skills substring, OR category in action_only_categories.
+#      NEVER inferred from a code/framework/analysis category.
+#   3. no_retrieval_call — explicit retrieval:none, OR pure-action skill.
+#
+# `enabled` DEFAULTS OFF (: ship a behavior-changing factor flag-gated,
+# validate before activating). With enabled:false the classifier returns "full"
+# for every goal — byte-identical to pre-change loop behavior. Flip to true only
+# after an A/B / validation pass. Allowlists are domain-tunable (mirrors
+# class_balance.targets) — a domain extends them via world/config/aspirations.yaml.
+lightweight_mode:
+  enabled: false                    # master gate. Validated 2026-06-13 (g-305-16): kept OFF
+                                    # because INERT, not unsafe. With --assume-enabled, 0 of 1668
+                                    # recurring+completed goals classify trivial. Binding constraint is
+                                    # no_retrieval_call (boolean 3): NO goal sets retrieval:"none" /
+                                    # produces_diff:false, and no goal's skill-field matches a
+                                    # pure_action_skills substring. action_only_categories (boolean 2)
+                                    # CANNOT overcome boolean 3, so populating it is a no-op today.
+                                    # Flip ON only after the activation gap is closed (goals adopt the
+                                    # explicit-trivial fields, or boolean 3 gains a category path). See
+                                    # the  follow-up. ( ship-OFF-validate-enable pattern)
+                                    #  DECISION (2026-06-15, zeta): activation gap CLOSED by
+                                    # decision, not by flipping ON. Live-corpus repro (1840 active goals):
+                                    # b1=1723 pass, b2=0, b3=0 -> 0 trivial. Refines : b2 ALSO 0
+                                    # today (not just b3) -- both blocked by the same unpopulated metadata
+                                    # (retrieval=<absent> + produces_diff=<absent> on all 1723 empty-checks
+                                    # goals; skill=None on 1683, and the 40 with skill match 0 pure-action).
+                                    # Path (b) extend-boolean-3-to-category = REJECT (weakens the asymmetric-
+                                    # risk explicit-opt-in judgment guard -- the decisive design constraint).
+                                    # Path (c) align-pure_action_skills = REJECT (void: pure-action goals
+                                    # carry skill=None via forged-skill resolution; 0 corpus matches).
+                                    # Path (a) explicit per-goal retrieval:"none"/produces_diff:false (auto-
+                                    # stamp at goal-create) is the ONLY design-preserving route, but DEFERRED:
+                                    # the genuinely-trivial cohort is <=8 goals, all recurring -> already
+                                    # covered by recurring-close.sh (5/8/9.5/10) + routine (4.25/6); the only
+                                    # marginal gain is the Phase 3.9-4.5 band on those <=8, not worth a goal-
+                                    # create auto-stamp build now. Revisit (a) when the trivial cohort grows.
+                                    # Full trace: agents/zeta/experience/exp-. (rb-222: activate the
+                                    # existing explicit-field mechanism; don't add inference paths.)
+  pure_action_skills:               # skill-name substrings (case-insensitive) treated as pure-action
+    - notify
+    - health
+    - presence
+    - inbox
+  action_only_categories: []        # category names that are pure-action (no diff, no retrieval).
+                                     # Empty default = category inference disabled (explicit goal
+                                     # fields only); domain supplies monitoring/notification categories.
+  never_trivial_categories:         # asymmetric-risk denylist — these NEVER classify trivial even if
+                                     # the three booleans somehow hold (defense-in-depth for code/learning work)
+    - framework-architecture
+    - framework-engineering
+    - framework-meta
+    - framework-maintenance
+
 # --- STRATEGIC SCAN (Environmental Observation) ---
 # Periodic "step back and look" phase that reads world signals
 # and generates work from environmental observation rather than
@@ -518,7 +601,7 @@ strategic_scan:
   goal_cadence: 5               # Run scan every N completed goals (tightened from 8 to surface "is this serving the Program?" at ~60% higher frequency)
   hours_cadence: 4              # Run scan every N hours (regardless of goal count)
   recurring_ratio_trigger: 0.80 # Run scan when this fraction of recent goals are recurring
-  knowledge_staleness_days: 14  # Flag tree nodes not updated in this many days
+  knowledge_staleness_days: 30  # S2a staleness floor (raised 14->30, g-115-1410); combined with capability_level==EXPLORE scoping. Age alone is not drift on a mature tree.
   concentration_threshold: 0.70 # Flag when this fraction of work is in one category
   max_signals_per_scan: 10      # Cap signals to prevent over-generation
 
@@ -587,6 +670,14 @@ fresh_eyes_program:
                                 # of the three sibling rituals after a fresh
                                 # seed event. Spreads first-fires by ~10-15
                                 # goals between siblings (5 / 15 / 30).
+  team_aware: true              # g-115-1388: The Program is a SHARED resource with
+                                # one time series. Any agent's fire stamps
+                                # world/team-state.yaml shared_cadences.<wm_slot>
+                                # (record-tick), and the cadence gate noops while
+                                # current_world - stamp.world_goals_count_at_last_fire
+                                # < goal_cadence. Counts are WORLD-ONLY (agent-queue
+                                # counts differ per agent and are not comparable).
+                                # Per-agent WM slot stays as the secondary gate.
 
 # Sibling ritual to fresh_eyes_review and fresh_eyes_program. Targets the
 # knowledge tree's top-level taxonomy — the L1 set. Periodic local self-audit;
@@ -604,6 +695,11 @@ fresh_eyes_tree:
                                 # (default). Any agent crossing cadence can fire.
   first_fire_offset: 50         # Stagger first-fire 50 goals out — well clear
                                 # of review (+5), felt-sense (+15), program (+30).
+  team_aware: true              # g-115-1388: the tree is a SHARED resource — see
+                                # fresh_eyes_program.team_aware. Canonical incident:
+                                # delta re-fired the 200-goal tree review 24h after
+                                # the 2026-06-09 team review because per-agent WM
+                                # slots never see team-wide fires.
 
 # --- FELT-SENSE CHECK-IN (Periodic structured 7-lane self-audit) ---
 # Every N completed goals, the agent runs a structured 7-lane sweep that
@@ -654,6 +750,26 @@ l1_skew_check:
   first_fire_offset: 20         # Stagger first-fire so it doesn't collide with
                                 # fresh-eyes (+5) or felt-sense (+15) on a fresh
                                 # seed event — 20 goals out lands distinctly.
+
+# --- TREE-NODE CLUSTER ARCHIVAL (D2 — , design d2-cluster-archival-design.md) ---
+# LLM-reviewed, cluster-aware archival of STALE LEAF tree nodes. A leaf >180d past
+# its effective relevance is a candidate; its cluster (shared parent / source-asp /
+# tag-Jaccard) is REFRESHED instead of archived when any member was retrieved within
+# the lookback window (project-resurgence rule). Interior nodes are NEVER archived;
+# default-to-keep under uncertainty. Engine: core/scripts/tree_archive.py; lane:
+# reflect-maintain /reflect --curate-memory (tree-node-archival lane).
+#
+# NATURAL-GATED DORMANT (guard-348): archives_per_pass=0 means the autonomous lane
+# scans + LLM-reviews + applies keep/refresh (non-destructive) but applies ZERO
+# `archive` verdicts. Raise archives_per_pass above 0 to activate destructive
+# archival. The cap-of-0 IS the gate — no `enabled:` boolean (rb-395 SSOT pattern).
+tree_archival:
+  archive_threshold_days: 180     # A leaf > this many days past effective relevance is a candidate
+  refresh_lookback_days: 60       # Cluster member retrieved within this window → refresh whole cluster, skip archive
+  tag_jaccard_floor: 0.5          # Signal C: tags Jaccard >= floor (NOT mere intersection — mega-cluster guard)
+  max_cluster_size: 40            # Cluster blows past this → signal C too loose, fall back to A∪B
+  archives_per_pass: 0            # NATURAL GATE — 0 = dormant (no autonomous archive verdicts applied)
+  compounding_gate_enabled: false # D3 cross-link: gate eligibility on compounding_events==0 once that field ships
 
 # --- MAINTENANCE CADENCE (Protected time-based maintenance) ---
 # Protects maintenance work (tree curation, evolution) from goal-execution budget
@@ -716,7 +832,7 @@ recurring:
   saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring
   debt_threshold: 0.80            # Candidate ratio triggering debt recovery bonus
   debt_bonus: 3.0                 # Score bonus for non-recurring goals during recovery
-  streak_mult: 2.0                # Streak resets when elapsed > this * interval_hours.
+  streak_mult: 3.0                # Streak resets when elapsed > this * interval_hours.
                                   # Single source of truth for two readers
                                   # (, 2026-05-18):
                                   # - mind_api/src/endpoints/aspirations_write.py
@@ -733,6 +849,14 @@ recurring:
                                   # variable name (streak_mult) used at both
                                   # readers and in the zeta journals where the
                                   # constant's role was characterized.
+                                  # 2026-06-24 (user directive): raised 2.0 -> 3.0 to give
+                                  # recurring cadence more best-effort slack before flagging
+                                  # drift. Helps BOTH readers in the same direction:
+                                  # cmd_complete_by fires the streak-break signal later
+                                  # (fewer FP canaries), and the reflector's recovered-cadence
+                                  # auto-resolve window widens (more lingering canaries
+                                  # self-close). Pairs with the existing anti-flood gates
+                                  # 9 (filing-suppression) +  (auto-resolve).
   session_gap_threshold_hours: 2.0  # Auto-resolve threshold for streak-break canaries
                                     # that recover OUTSIDE the streak_mult window.
                                     # When a canary's source goal fires again later than
@@ -978,6 +1102,56 @@ handoff_aging:
   sender_decay_hours: 4              # partner-silence window for full penalty decay (sender side)
   partner_active_threshold_min: 30   # if partner last_active within this, penalty stays full
 
+# --- CRITICAL-BLOCKER SURFACE (, bravo US-07) ---
+# Boost candidates that ARE a high-downstream-unlock bottleneck recorded in
+# world/team-state.yaml critical_blockers[] (written by aspirations-consolidate
+# Step 8.87 as the top-3 bottlenecks, purged by team-state-sync-blockers.py once
+# resolved). Those entries are typically "ready-unclaimed" EXECUTABLE goals that
+# other work out-ranks indefinitely -- surfacing them lets "break one, unlock
+# five" fire. Consumed by goal-selector.py load_critical_blocker_surface_config()
+# + the critical_blocker_surface score_goal criterion; the WEIGHT lives in
+# meta/goal-selection-strategy.yaml weights.critical_blocker_surface (strict
+# SSOT -- not here). enabled is opt-in (default False in the loader); set true
+# here to activate.
+critical_blocker_surface:
+  enabled: true            # master switch for the selector criterion
+  min_downstream: 3        # ignore bottleneck entries below this downstream_count
+  downstream_cap: 10       # normalize boost -- downstream_count >= cap scores 1.0
+
+# --- UTILITY-SHAPED GOAL SCORER (BRD Gap 8, ) ---
+# Flag-gated SECOND scoring path in goal-selector.py::score_goal(). The additive
+# scorer stays the live default; set use_iaus: true ONLY after the sibling A/B
+# () demonstrates parity-or-improvement on the replay fixture.
+# Design: core/config/iaus-selector-design.md. Reversible by a single flag flip.
+# Utility scoring = multiply + veto-by-zero: a zero in the VETO tier (agent_executable)
+# zeros the whole score, so a goal with no capability cannot rank via high
+# completion_pressure the way additive scoring lets it.
+iaus_selector:
+  use_iaus: false        # default OFF -- additive scorer remains the default (R1 hot-path mitigation)
+  primary_floor: 0.1     # b-floor on PRIMARY axes so a legit-zero axis (e.g. recurring_urgency
+                         #   for a non-recurring goal) does NOT act as an unintended veto;
+                         #   only the VETO tier (b=0) zeros the score.
+  watermark: 0.0         # prune candidates whose post-veto base < watermark; 0.0 = no pruning
+  bonus_scale: 4.0       # divisor mapping the tier-3 weighted-sum into a bounded (0.5x-1.5x) multiplier
+
+# --- GO-EXPLORE CELL-RETURN BOOST (BRD Gap 17 child C, ) ---
+# Flag-gated, boost-only selection adjustment in goal-selector.py::apply_cell_return_boost().
+# Mirrors the  PPR blend (retrieve.py): DEFAULT OFF -> apply_cell_return_boost is a
+# byte-identical no-op (selection unchanged by construction, no regression). When ON, it seeds
+# Personalized PageRank from the top-N highest-value archived Go-Explore cells (the cells worth
+# RETURNING to), then adds a bounded, boost-only graph-proximity bonus to each candidate goal by
+# the SUM of PPR mass over the candidate's record-id entities (HippoRAG passage score, 2405.14831;
+# reuses the  cell store +  cell-similarity matcher + the /43 KG+PPR
+# substrate). Deterministic: the matcher's score is a deterministic function of (candidate, archive,
+# graph). Turn on ONLY after a sibling A/B validates parity-or-improvement (mirrors  for
+# ). Reversible by a single flag flip; no schema change, no data migration.
+cell_return:
+  enabled: false         # default OFF -- byte-identical no-op when off (no-regression by construction)
+  seed_top_n: 5          # number of top-by-score archived cells to seed PPR from (the cells to "return" toward)
+  bonus_scale: 3.0       # multiplier mapping a candidate's summed PPR mass into the additive bonus range
+  bonus_max: 1.5         # additive bonus cap (mirrors retrieve.py ppr_weight_max upper bound)
+  enrich_signature: false # g-306-51: when true, inject cat:<category> + tag: pseudo-node entities into each candidate signature so same-category high-value cells boost same-category candidates (a bare goal-id footprint is often graph-distant). Default OFF until an A/B (cell-return-ab-harness --enrich-signature) proves the enriched signal helps.
+
 # --- PRODUCTIVITY SELF-STOP GATE (Item 2) ---
 # Composite productivity score computed at end of each iteration (via
 # iteration-close.sh → productivity-stop-gate.sh). If the agent is padding the
@@ -1157,6 +1331,19 @@ cargo_cult:
   # three duplicate batches land in 4 iterations during bravo session 58 (,
   # , ). Set 0 to disable; default 72h spans typical recurring-cycle period.
   audit_all_batch_dedup_hours: 72
+  # Chronic-low lifetime-hit-rate detection (). The consecutive_routine
+  # trigger above misses a goal that is chronically-but-INTERMITTENTLY low-signal
+  # (e.g. 4% lifetime substantive yet never 3 routine in a row). --audit-all flags
+  # a goal "chronic" when it has accumulated >= chronic_min_runs TRACKED closes
+  # (substantive_runs, counted from field-introduction so pre-tracking achievedCount
+  # history never poisons the rate) AND its lifetime substantive rate
+  # (substantive_hits / substantive_runs) is below chronic_hit_rate_threshold.
+  # chronic_score_weight boosts such a goal's audit-all rank so it surfaces even
+  # when its consecutive_routine streak is short. substantive_hits counts GENUINE
+  # deeps only (forced-flips are anti-drift, not real signal -- mirrors consecutive_deep).
+  chronic_hit_rate_threshold: 0.15
+  chronic_min_runs: 8
+  chronic_score_weight: 2.0
 
 # --- RECURRING-GOAL CARGO-CULT DETECTION ---
 # Per the plan improve-recurring-goals-kind-yao.md (2026-04-19):
@@ -1250,7 +1437,7 @@ modifiable:
   strategic_scan.goal_cadence: {min: 3, max: 20, default: 8}
   strategic_scan.hours_cadence: {min: 1, max: 12, default: 4}
   strategic_scan.recurring_ratio_trigger: {min: 0.50, max: 0.95, default: 0.80}
-  strategic_scan.knowledge_staleness_days: {min: 7, max: 60, default: 14}
+  strategic_scan.knowledge_staleness_days: {min: 7, max: 60, default: 30}
   strategic_scan.concentration_threshold: {min: 0.50, max: 0.90, default: 0.70}
   strategic_scan.max_signals_per_scan: {min: 3, max: 20, default: 10}
   felt_sense.goal_cadence: {min: 25, max: 200, default: 75}
@@ -1361,6 +1548,13 @@ runner_heartbeat:
 infra_health:
   failing_streak_threshold: 3
   window_hours: 6
+  # : `infra-health.sh status` annotates each component stale=true when
+  # its most-recent recorded result (max of last_success/last_failure) is older
+  # than this many hours, so a stored value is not misread as the CURRENT state
+  # (the 2026-05-25 false roblox-down-10-days alarm; structuralizes guard-647).
+  # Advisory annotation only — never changes probe/streak/blocker behavior.
+  # Fail-open default 6.0 if unset.
+  status_staleness_hours: 6
   # : when a component crosses failing_streak_threshold, sync a
   # known_blocker entry into per-agent WM so goal-selector's blocker gate
   # (aspirations-precheck Phase 0.5b) can suppress dependent goals. Without

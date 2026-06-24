@@ -288,6 +288,12 @@ py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" -
 # captured in the commit)
 if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     echo "[seed-transplant] Committing planted files at destination..."
+    # SAFE bare add-A + commit (reviewed 4): $DEST is a fresh/re-init'd
+    # (Step 11) single-purpose publication target, NOT the live shared
+    # multi-agent tree. No concurrent autonomous agent stages WIP in $DEST, so
+    # guard-741's whole-index-sweep hazard (which motivated the pathspec scoping
+    # in iteration-commit.sh:1105 / release.sh Step 9) does not apply here; the
+    # transplant intends to capture ALL planted + post-action files in one commit.
     git -C "$DEST" add -A
     TS="$(date +%Y-%m-%d)"
     # Generic, public-safe commit message — source path / repo name MUST NOT

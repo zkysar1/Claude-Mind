@@ -45,6 +45,49 @@ def _iso_to_epoch(iso_str):
         return 0
 
 
+def _max_age_sec():
+    """Age cutoff (seconds) for partner uncommitted-edits entries. A claim
+    older than this is STALE — not active between-claim work — and must NOT
+    suppress the committer's own same-session edit to that path. Env-overridable
+    via PARTNER_UNCOMMITTED_MAX_AGE_HOURS (default 48h). A value <= 0 disables
+    the cutoff (every entry is considered fresh — the pre-g-115-752 behavior)."""
+    try:
+        hours = float(os.environ.get("PARTNER_UNCOMMITTED_MAX_AGE_HOURS", "48"))
+    except (TypeError, ValueError):
+        hours = 48.0
+    return hours * 3600.0
+
+
+def _entry_is_stale(rec, max_age_sec, now_epoch):
+    """True ONLY when a parseable timestamp proves the uncommitted-edits entry
+    is older than max_age_sec. An entry whose edit_ts/mtime is missing or
+    unparseable is treated as NOT stale (returns False) so the pre-g-115-752
+    filter behavior is preserved for malformed/legacy records.
+
+    g-115-752 (from bravo insight msg-20260514-143816, hardened by alpha
+    msg-1904): iteration-commit.sh and _read_uncommitted_log both built their
+    partner-uncommitted path set from EVERY log entry with no age check, so a
+    3-week-stale charlie .claude/settings.json entry (edit_ts 2026-05-20)
+    dropped alpha's legitimate same-session edit (commit 33cad03d). The cutoff
+    only ELIMINATES proven-stale false drops; it never widens a true-positive
+    drop (uncertain entries keep the prior behavior). Direction aligns with this
+    module's standing bias: never silently drop self-authored work."""
+    if max_age_sec <= 0:
+        return False
+    ts = rec.get("edit_ts")
+    if isinstance(ts, str) and ts and ts != "null":
+        ep = _iso_to_epoch(ts)
+        if ep > 0:
+            return (now_epoch - ep) > max_age_sec
+    mt = rec.get("mtime")
+    if isinstance(mt, (int, float)) and not isinstance(mt, bool):
+        try:
+            return (now_epoch - float(mt)) > max_age_sec
+        except (OverflowError, ValueError):
+            return False
+    return False
+
+
 def _file_mtime(repo_root, path):
     try:
         full = Path(repo_root) / path
@@ -112,6 +155,8 @@ def _read_team_state(world_dir):
 
 def _read_uncommitted_log(agent_dir):
     paths = set()
+    max_age_sec = _max_age_sec()
+    now_epoch = int(datetime.datetime.now().timestamp())
     try:
         log_path = agent_dir / "session" / "uncommitted-edits.jsonl"
         if not log_path.exists():
@@ -128,6 +173,10 @@ def _read_uncommitted_log(agent_dir):
             if not isinstance(p, str):
                 continue
             if not p:
+                continue
+            # : a claim older than the age cutoff is stale and must
+            # NOT suppress the committer's legitimate same-session edit.
+            if _entry_is_stale(rec, max_age_sec, now_epoch):
                 continue
             paths.add(p)
     except OSError:

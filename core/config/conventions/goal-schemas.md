@@ -55,6 +55,13 @@ completion_check:                                    # → verification.checks[0
 
 `verification.outcomes` = what success looks like (for spark checks, aspiration assessment).
 `verification.checks` = how to verify it (for Phase 5 completion, Phase 0 auto-detect).
+`verification.outcomes_agent_leg` (optional) = the agent-side subset of `outcomes`
+for a `participants: [agent, user]` collaborative goal. When present and all its
+entries are met, Phase 5 verify recognizes "agent leg complete, user leg pending"
+as a valid terminal state and closes the goal without inventing closure
+justification for the user-gated outcomes (US-04 / g-305-04). Omit on agent-only
+goals — `outcomes` alone governs them. The sibling `user_leg_scope` field (see
+Participant-Based Goal Routing below) names what the user leg requires.
 `verification.preconditions` = what must be true before execution. Supports two forms
 side by side — all must pass (AND semantics):
   - **String** — natural-language condition, evaluated by the LLM in
@@ -162,7 +169,7 @@ infer it from `origin_signal` prefix using the mapping in
 |------------------------|------------------------|
 | `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*` | `user` |
 | `recurring_cadence:*`, `recurring:*` | `recurring-cycle` |
-| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*` | `cycle-detector` |
+| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*` | `cycle-detector` |
 | `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `idle_fallback` | `agent-self` |
 
 Variant prefixes (`investigation:` vs canonical `investigate:`, `user-directed:`
@@ -202,6 +209,43 @@ Field is optional and defaults to `null` for goals predating this change. The
 backfill script populates `null` entries where the origin_signal prefix maps
 cleanly; entries that cannot be classified remain `null` and contribute zero
 to drift-detector denominators (excluded, not penalized).
+
+---
+
+# Filed-By Agent Field (g-318-01, 2026-06-13)
+
+Optional `filed_by_agent` field records **which agent filed (added) this goal**,
+stamped at add time from the requesting agent (the `X-Mind-Agent` header).
+Distinct from `goal_source` (the *initiation class* — user vs agent-self vs
+recurring) and from `completed_by` / `claimed_by` (which name the agent that
+*executed* the goal). `filed_by_agent` answers a question none of the others
+can: **"who filed the goal that later expired?"** — the churn signal for the
+per-agent contribution-vs-harm scorecard (asp-318 / g-318-02). Previously this
+could only be inferred by heuristics (which queue the goal lives in, or
+git-blame on the add).
+
+## Stamped at
+
+The sole live goal-add path: the daemon endpoint
+`mind_api/src/endpoints/aspirations_write.py` `add_goal` handler (what
+`aspirations-add-goal.sh` POSTs to). The pre-2026-05-14 Python CLI
+`cmd_add_goal` no longer exists (daemon-only migration). The stamp uses
+`goal.setdefault("filed_by_agent", agent)` — so an explicit caller-supplied
+value (a goal filed on behalf of another agent) is preserved, and an empty
+agent resolution leaves the field unset (read-time `unknown`) rather than blank.
+
+## Validation
+
+`aspirations.py::validate_goal` accepts null or string and rejects non-string.
+It is NOT constrained to the active-agent roster — a goal filed by an agent
+later removed from the team still validates (same policy as `abstained_by`).
+
+## Backward compatibility
+
+Field is optional; goals predating this change have no `filed_by_agent` and read
+as `unknown`. No requirement clause (absence never raises). Like `claimed_by`,
+the field is intentionally NOT in `COMPACT_GOAL_KEEP` — attribution fields are
+dropped from compact goals.
 
 ---
 
@@ -629,6 +673,99 @@ via the gate.
 - `g-282-05` — selection-side wiring (goal-selector.py reads field)
 - `g-282-06` — backfill of existing pending goals
 - `g-282-07` — explicit `--cross-lane` override + audit ledger
+
+---
+
+# Inner Refinement (`inner_refinement`)
+
+Optional Self-Refine inner loop (Madaan et al., *Self-Refine: Iterative
+Refinement with Self-Feedback*, arXiv 2303.17651; BRD Layer-1 Gap 4,
+g-306-10). When set on a goal, Phase 4 execution runs a bounded
+generate -> same-LLM critique -> regenerate loop on the goal's primary
+artifact before handing off to Phase 5 verify. Default OFF: a goal without
+this block (or with it `null`) executes exactly as before.
+
+## Field
+
+```yaml
+inner_refinement: null                       # default - OFF, no inner loop
+inner_refinement:
+  max_iters: 3                               # int in [1, 5]; the refinement pass cap
+  satisficed_when: "all verification.outcomes met by the draft"  # non-empty stop predicate
+```
+
+## Semantics
+
+When `inner_refinement` is set, after the primary action produces a first
+draft of the goal's artifact, execution loops:
+
+1. **Generate** - produce (or carry forward) the current draft.
+2. **Critique** - the SAME LLM critiques the draft against the goal's
+   `verification.outcomes` (and `verification.checks` where present),
+   naming concrete gaps. No external grader; the model judges its own work.
+3. **Regenerate** - revise the draft to close the named gaps.
+
+The loop stops at the FIRST of:
+- `satisficed_when` is met (the model judges the predicate true), OR
+- `min(max_iters, INNER_REFINEMENT_MAX_ITERS_CAP)` passes are exhausted.
+
+The clamp to `INNER_REFINEMENT_MAX_ITERS_CAP` (currently 5, defined in
+`core/scripts/aspirations.py`) is the structural termination guarantee:
+the loop can never run more than CAP passes regardless of the stored
+`max_iters` value, so it always terminates.
+
+## Worked example (one artifact)
+
+Goal: "Draft the retry-policy paragraph for the deploy runbook" with
+`verification.outcomes: ["names the backoff base", "names the max attempts",
+"names the give-up action"]` and
+`inner_refinement: {max_iters: 3, satisficed_when: "all three outcomes named"}`.
+
+- Pass 1 draft: "Retries use exponential backoff." Critique: backoff base
+  unstated; max attempts missing; give-up action missing. Not satisficed.
+- Pass 2 draft: "Retries use exponential backoff (base 2s) up to 5 attempts."
+  Critique: give-up action still missing. Not satisficed.
+- Pass 3 draft: "...up to 5 attempts; on exhaustion the deploy is rolled
+  back and an Unblock goal is filed." Critique: all three outcomes named.
+  Satisficed -> stop (before max_iters reached).
+
+The artifact improved monotonically across passes and the loop terminated on
+the stop predicate, not the cap. Had the predicate never been met, the
+`max_iters=3` clamp would have stopped it after pass 3 anyway - the
+termination guarantee that the bounded test in
+`core/scripts/tests/test_inner_refinement_validation.py` pins.
+
+## Validation
+
+`validate_goal()` in `core/scripts/aspirations.py` enforces, when the field
+is present and non-null:
+- `inner_refinement` is a dict (else ValueError)
+- `max_iters` is an int (not bool) in `[1, INNER_REFINEMENT_MAX_ITERS_CAP]`
+- `satisficed_when` is a non-empty string
+
+This validation is **CLI-only by design** - it follows the same optional-field
+pattern as `reallocatable`, `abstained_by`, and `intended_agent`, all of which
+validate in the CLI `validate_goal` only. The daemon `_validate_goal`
+(`mind_api/src/endpoints/aspirations_write.py`) deliberately validates a
+minimal subset (id/status/recurring/interval) per guard-547; optional-field
+validation is not duplicated there. Because the termination guarantee lives in
+the execution-side clamp (not in validation), it holds regardless of which
+write path created the goal.
+
+## Backward compatibility
+
+The field is optional and defaults to OFF. Goals without `inner_refinement`
+(every existing goal) score and execute exactly as before - the Phase 4
+execution path checks for the block and no-ops when it is absent or null.
+
+## Cross-references
+
+- `g-306-10` - this field's implementing goal (BRD Layer-1 Gap 4)
+- Self-Refine, arXiv 2303.17651 - the generate/critique/regenerate method
+- `core/scripts/aspirations.py` - `INNER_REFINEMENT_MAX_ITERS_CAP` + `validate_goal` block
+- `.claude/skills/aspirations-execute/SKILL.md` Phase 4 - the execution loop (clamped to CAP)
+- `core/scripts/tests/test_inner_refinement_validation.py` - bounded validation + termination test
+- guard-547 - the CLI/daemon validation split this field's CLI-only validation respects
 
 ---
 

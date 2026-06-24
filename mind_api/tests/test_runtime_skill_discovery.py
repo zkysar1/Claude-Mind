@@ -10,10 +10,11 @@ Layers:
      this reproduces every field byte-for-byte.
 
 The CLI's PROJECT_ROOT is script-pinned to the real repo; its journal/diary
-globs are depth-1 (the documented bug) so they match nothing. The daemon ctx
-sets project_root=REPO_ROOT so its (replicated) depth-1 globs scan the same
-tree. Synthetic skill names (disc-*) appear in no real journal -> the journal/
-companion sources are empty for both, byte-identically.
+globs now scan agents/<name>/... via agents_root() (g-115-1405 fix, was depth-1).
+The daemon ctx sets project_root=REPO_ROOT so ctx.paths.agents_root ==
+REPO_ROOT/agents scans the same tree. Synthetic skill names (disc-*) appear in
+no real journal -> the journal/companion sources are empty for both,
+byte-identically.
 """
 from __future__ import annotations
 
@@ -147,6 +148,11 @@ class _FakePaths:
         self.meta = meta
         self.agent = agent
         self.project_root = project_root
+
+    @property
+    def agents_root(self):
+        # Mirror AgentPaths.agents_root: PROJECT_ROOT/agents (5).
+        return self.project_root / "agents"
 
 
 class _FakeCtx:

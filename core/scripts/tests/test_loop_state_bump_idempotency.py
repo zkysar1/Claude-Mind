@@ -238,12 +238,152 @@ def test_preseeded_counted_set_prevents_first_bump() -> bool:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _run_verify(tmpdir: Path, goal_id: str):
+    """Invoke --verify-counted (read-only, no --outcome); return (rc, stderr)."""
+    env = os.environ.copy()
+    env["MIND_AGENT_DIR"] = str(tmpdir)
+    env["MIND_AGENT"] = "test-agent-isolated"
+    cmd = ["py", "-3", str(HELPER), "--verify-counted", goal_id]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    return result.returncode, result.stderr
+
+
+def test_verify_counted_present_exit0() -> bool:
+    """0: GOAL_ID present in counted set → exit 0 (bump landed)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
+    try:
+        _seed_wm(
+            tmpdir, goals_completed=11, productive_goals=9,
+            counted_goals=["g-test-vc1"],
+        )
+        rc, _ = _run_verify(tmpdir, "g-test-vc1")
+        if rc != 0:
+            print(f"FAIL: present goal expected exit 0, got {rc}", file=sys.stderr)
+            return False
+        print("PASS: verify-counted present → exit 0")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_verify_counted_absent_exit1() -> bool:
+    """0: loop_state present, GOAL_ID absent → exit 1 (no-op detected)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
+    try:
+        _seed_wm(
+            tmpdir, goals_completed=11, productive_goals=9,
+            counted_goals=["g-other"],
+        )
+        rc, _ = _run_verify(tmpdir, "g-test-vc-absent")
+        if rc != 1:
+            print(f"FAIL: absent goal expected exit 1, got {rc}", file=sys.stderr)
+            return False
+        print("PASS: verify-counted absent → exit 1")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_verify_counted_no_counted_list_exit1() -> bool:
+    """0: loop_state present but counted list missing → exit 1 (absent).
+
+    This is the first-goal-of-session shape: a bump that should have created
+    counted_goals_this_session=[goal] silently no-op'd, so the key never appears.
+    """
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
+    try:
+        # counted_goals=None omits the key entirely (see _seed_wm).
+        _seed_wm(tmpdir, goals_completed=10, productive_goals=8)
+        rc, _ = _run_verify(tmpdir, "g-test-vc-nolist")
+        if rc != 1:
+            print(
+                f"FAIL: missing counted list expected exit 1, got {rc}",
+                file=sys.stderr,
+            )
+            return False
+        print("PASS: verify-counted with no counted list → exit 1")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_verify_counted_missing_wm_exit0() -> bool:
+    """0: WM file absent → exit 0 (indeterminate; conservative no re-fire)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
+    try:
+        # Deliberately do NOT seed a WM — the file does not exist.
+        rc, _ = _run_verify(tmpdir, "g-test-vc-nowm")
+        if rc != 0:
+            print(
+                f"FAIL: missing WM expected exit 0 (indeterminate), got {rc}",
+                file=sys.stderr,
+            )
+            return False
+        print("PASS: verify-counted with missing WM → exit 0 (indeterminate)")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_refire_recovers_simulated_noop() -> bool:
+    """0: simulate a silent first-call no-op (counters frozen, goal
+    absent from the counted set), then prove the iteration-close.sh self-heal
+    sequence verify→re-fire→verify recovers the undercount."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-refire-"))
+    try:
+        # State AFTER a silent no-op: loop_state exists, counters frozen at 10/8,
+        # target goal NOT in counted set (the bump's lock-acquire or WM-write
+        # silently failed under bg latency).
+        wm_path = _seed_wm(
+            tmpdir, goals_completed=10, productive_goals=8,
+            counted_goals=["g-earlier"],
+        )
+        # 1) verify detects the no-op (goal confidently absent → exit 1).
+        rc_v1, _ = _run_verify(tmpdir, "g-test-refire")
+        if rc_v1 != 1:
+            print(f"FAIL: pre-refire verify expected 1, got {rc_v1}", file=sys.stderr)
+            return False
+        # 2) re-fire the bump foreground — recovers the undercount.
+        rc_r, _ = _run_helper(tmpdir, "deep", goal_id="g-test-refire")
+        if rc_r != 0:
+            print(f"FAIL: re-fire bump rc {rc_r}", file=sys.stderr)
+            return False
+        ls = _read_loop_state(wm_path)
+        if ls["goals_completed"] != 11 or ls["productive_goals"] != 9:
+            print(
+                f"FAIL: re-fire should advance to 11/9, got "
+                f"{ls['goals_completed']}/{ls['productive_goals']}",
+                file=sys.stderr,
+            )
+            return False
+        if "g-test-refire" not in ls.get("counted_goals_this_session", []):
+            print("FAIL: re-fire should add goal to counted set", file=sys.stderr)
+            return False
+        # 3) verify now confirms the goal landed (exit 0) — no second re-fire.
+        rc_v2, _ = _run_verify(tmpdir, "g-test-refire")
+        if rc_v2 != 0:
+            print(f"FAIL: post-refire verify expected 0, got {rc_v2}", file=sys.stderr)
+            return False
+        print(
+            "PASS: verify→re-fire→verify self-heals the simulated no-op "
+            "(undercount recovered)"
+        )
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     results = [
         test_double_invocation_same_goal_id_increments_once(),
         test_different_goal_ids_each_increment(),
         test_no_goal_id_preserves_unconditional_bump(),
         test_preseeded_counted_set_prevents_first_bump(),
+        test_verify_counted_present_exit0(),
+        test_verify_counted_absent_exit1(),
+        test_verify_counted_no_counted_list_exit1(),
+        test_verify_counted_missing_wm_exit0(),
+        test_refire_recovers_simulated_noop(),
     ]
     if all(results):
         print("\n════════════════════════════════════════════")

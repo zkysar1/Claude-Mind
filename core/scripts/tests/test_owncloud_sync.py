@@ -91,6 +91,14 @@ class FakeBackend:
                 names.add(kk[len(prefix):].split("/")[0])
         return sorted(names)
 
+    def read_bytes(self, key):
+        """Read raw bytes for a key from fake S3. Returns None if absent."""
+        return self.s3.get(str(key))
+
+    def write_bytes(self, key, data):
+        """Write raw bytes to fake S3 for a key (ownership-claim path)."""
+        self.s3[str(key)] = data
+
 
 # --- _is_machine_local policy ----------------------------------------------
 @pytest.mark.parametrize("name,prefix,excluded", [
@@ -855,7 +863,7 @@ def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
 
 
 def test_sweep_owncloud_singlemachine_defers_nobaseline_no_clobber(tmp_path, monkeypatch):
-    """H4c / g-115-1333: under own-cloud on a SINGLE machine (MACHINE_OWNED_AGENTS
+    """H4c / 3: under own-cloud on a SINGLE machine (MACHINE_OWNED_AGENTS
     and MACHINE_MULTI both unset -> _multi_machine() is False), the periodic sweep
     must NOT push a no-baseline local file that DIVERGES from a PRESENT S3 object.
     The transplant scenario: /boot re-runs init-mind, which writes default meta
@@ -918,7 +926,7 @@ def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
     assert stats["pruned_agents"] == 0
 
 
-# --- sweep per-agent flush scope (§6 /stop flush — g-115-1339) --------------
+# --- sweep per-agent flush scope (§6 /stop flush — 9) --------------
 def test_sweep_only_agent_scopes_to_one_owned_dir(tmp_path, monkeypatch):
     """only_agent=<name> flushes exactly agents/<name>/ and prunes every sibling
     agent dir — the per-agent /stop flush scope (design §6). With own-all
@@ -1254,7 +1262,7 @@ def test_pull_temp_dry_run_no_side_effects(tmp_path):
 # --- lodestar §3: dynamic runner-claim ownership resolution -----------------
 # _owned_agents() gates on OWNERSHIP_MODE (default 'static' => the H4a env-list
 # path above; 'dynamic' => derive ownership from live DDB runner claims). The
-# dynamic path is INERT until the g-115-1340 cutover flips the flag. These tests
+# dynamic path is INERT until the 0 cutover flips the flag. These tests
 # pin both the inertness of the default path and the §3 semantics table.
 
 class _FakeClaimBackend:
@@ -1394,7 +1402,7 @@ def test_owned_agents_dynamic_ddb_failure_unset_static_is_own_all(monkeypatch):
     # Documents the DESIGN's fallback (lodestar §3): failure => _owned_agents_static(),
     # which is None (own-all) when MACHINE_OWNED_AGENTS is unset. Operational
     # mitigation: KEEP MACHINE_OWNED_AGENTS set as a net during dynamic mode
-    # (g-115-1340 cutover concern) — surfaced to the design owner, not changed here.
+    # (0 cutover concern) — surfaced to the design owner, not changed here.
     _wire_dynamic(monkeypatch, _RaisingClaimBackend())
     assert _mod._owned_agents() is None
 
@@ -1425,6 +1433,140 @@ def test_owned_agents_dynamic_resolves_once_per_call(monkeypatch):
     _wire_dynamic(monkeypatch, be)
     _mod._owned_agents()
     assert be.calls == 1
+
+
+# --- runner-token ownership (_owned_agents_runner_token + _owned_agents default) ---
+# Zero-config ownership detection via agents/<name>/session/runner-token.
+# The file is machine_local (sweep never touches it), so the function does its
+# own S3 I/O via be.read_bytes / be.write_bytes. OWNERSHIP_MODE unset + be
+# provided → runner-token mode; OWNERSHIP_MODE unset + no be → static fallback.
+
+
+def _make_rt_backend(tmp_path, agents_relpath="agents"):
+    """Return a FakeBackend whose _roots points at tmp_path/<agents_relpath>."""
+    agents_root = tmp_path / agents_relpath
+    agents_root.mkdir(parents=True, exist_ok=True)
+    be = FakeBackend([(agents_root, "agents")])
+    return be, agents_root
+
+
+def _write_token(agents_root, agent_name, token="uuid-abc"):
+    """Write a runner-token file under agents_root/<agent>/session/."""
+    sess = agents_root / agent_name / "session"
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "runner-token").write_text(token, encoding="utf-8")
+    return token
+
+
+def test_rt_no_agents_dir_returns_none(tmp_path):
+    # Root exists but is empty → no agent dirs → None (own-all, single-machine).
+    be, agents_root = _make_rt_backend(tmp_path)
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result is None
+
+
+def test_rt_agent_no_session_token_not_owned(tmp_path):
+    # Agent dir exists but runner-token absent (agent IDLE or never started).
+    # No local tokens → can't assert multi-machine context → None (fall to static).
+    be, agents_root = _make_rt_backend(tmp_path)
+    (agents_root / "alpha" / "session").mkdir(parents=True)
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result is None
+
+
+def test_rt_s3_absent_claims_ownership_and_pushes(tmp_path):
+    # Local token exists, S3 has nothing → bootstrap → own it; push claim to S3.
+    be, agents_root = _make_rt_backend(tmp_path)
+    token = _write_token(agents_root, "alpha")
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result == {"alpha"}
+    # Claim was pushed to S3.
+    assert be.s3.get("agents/alpha/session/runner-token") == token.encode()
+
+
+def test_rt_s3_matching_token_claims_ownership(tmp_path):
+    # Local token matches S3 → this machine did the last /start → own it.
+    be, agents_root = _make_rt_backend(tmp_path)
+    token = _write_token(agents_root, "alpha")
+    be.s3["agents/alpha/session/runner-token"] = token.encode()
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result == {"alpha"}
+
+
+def test_rt_s3_different_token_not_owned(tmp_path):
+    # Another machine started alpha (different token in S3) → do not own.
+    be, agents_root = _make_rt_backend(tmp_path)
+    _write_token(agents_root, "alpha", token="local-token")
+    be.s3["agents/alpha/session/runner-token"] = b"other-machine-token"
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result == set()
+
+
+def test_rt_multiple_agents_mixed_ownership(tmp_path):
+    # alpha: S3 absent → owned; bravo: S3 matches → owned; gamma: S3 differs → not owned.
+    be, agents_root = _make_rt_backend(tmp_path)
+    _write_token(agents_root, "alpha", token="tok-a")
+    _write_token(agents_root, "bravo", token="tok-b")
+    _write_token(agents_root, "gamma", token="tok-g-local")
+    be.s3["agents/bravo/session/runner-token"] = b"tok-b"
+    be.s3["agents/gamma/session/runner-token"] = b"tok-g-other"
+    result = _mod._owned_agents_runner_token(be, agents_root)
+    assert result == {"alpha", "bravo"}
+
+
+def test_rt_s3_error_fails_open(tmp_path):
+    # S3 I/O raises → fail-open → claim ownership (single-machine compat).
+    be, agents_root = _make_rt_backend(tmp_path)
+    _write_token(agents_root, "alpha")
+
+    class _BrokenBackend(FakeBackend):
+        def read_bytes(self, key):
+            raise OSError("S3 unreachable")
+        def write_bytes(self, key, data):
+            raise OSError("S3 unreachable")
+
+    broken = _BrokenBackend([(agents_root, "agents")])
+    result = _mod._owned_agents_runner_token(broken, agents_root)
+    assert result == {"alpha"}  # fail-open
+
+
+def test_owned_agents_default_uses_runner_token(tmp_path, monkeypatch):
+    # OWNERSHIP_MODE unset + be provided → runner-token mode, not static.
+    monkeypatch.delenv("OWNERSHIP_MODE", raising=False)
+    monkeypatch.delenv("MACHINE_OWNED_AGENTS", raising=False)
+    be, agents_root = _make_rt_backend(tmp_path)
+    _write_token(agents_root, "alpha", token="tok-x")
+    result = _mod._owned_agents(be=be)
+    assert result == {"alpha"}
+
+
+def test_owned_agents_default_no_be_falls_to_static(monkeypatch):
+    # OWNERSHIP_MODE unset + no be → falls to _owned_agents_static().
+    monkeypatch.delenv("OWNERSHIP_MODE", raising=False)
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "zeta")
+    result = _mod._owned_agents()
+    assert result == {"zeta"}
+
+
+def test_owned_agents_static_explicit_mode_ignores_be(tmp_path, monkeypatch):
+    # OWNERSHIP_MODE=static → always _owned_agents_static(), even if be is provided.
+    monkeypatch.setenv("OWNERSHIP_MODE", "static")
+    monkeypatch.setenv("MACHINE_OWNED_AGENTS", "bravo")
+    be, agents_root = _make_rt_backend(tmp_path)
+    _write_token(agents_root, "alpha")  # different agent in runner-token
+    result = _mod._owned_agents(be=be)
+    assert result == {"bravo"}  # static wins, not runner-token
+
+
+def test_owned_agents_runner_token_falls_to_static_when_no_local_tokens(tmp_path, monkeypatch):
+    # All agents IDLE (no runner-token) → no multi-machine signal → fall to static.
+    # Static with MACHINE_OWNED_AGENTS unset → None (own all, single-machine compat).
+    monkeypatch.delenv("OWNERSHIP_MODE", raising=False)
+    monkeypatch.delenv("MACHINE_OWNED_AGENTS", raising=False)
+    be, agents_root = _make_rt_backend(tmp_path)
+    (agents_root / "alpha" / "session").mkdir(parents=True)  # no runner-token file
+    result = _mod._owned_agents(be=be)
+    assert result is None  # fell to static → own all
 
 
 if __name__ == "__main__":

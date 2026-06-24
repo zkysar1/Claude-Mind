@@ -158,10 +158,10 @@ gates:
     override_flag: "--override-stale-read"
     fp_cost: low
     fn_cost: medium
-    fp_description: "Agent forced to re-read parent (cmd_read --id <asp> or cmd_query) before filing child; ~1 extra read."
+    fp_description: "Agent with a stale tracked receipt forced to re-read parent before filing child; ~1 extra read. Never-read case (no receipt) retired g-115-1572 -- it passes (was fail-open under g-115-1569)."
     fn_description: "Child filed on stale parent context; constraints/decomposition shape derived from outdated requirements (g-115-410 class)."
     rb_evidence: []
-    tuning_notes: "g-115-410 sub-task 3. Skips when parent_goal absent OR parent has no last_modified (legacy). Compares parent.last_modified vs <agent>/session/goal-reads.jsonl most-recent read_at. Audit ledger: world/stale-read-overrides.jsonl."
+    tuning_notes: "g-115-410 sub-task 3. Skips when parent_goal absent OR parent has no last_modified (legacy). Block 2 compares parent.last_modified vs <agent>/session/goal-reads.jsonl most-recent read_at. g-115-1569: the never-read branch (no receipt) FAILS OPEN instead of blocking. g-115-1572 (decision B): never-read branch PERMANENTLY RETIRED -- option A (extract a daemon-safe goal-read writer to re-activate it) was REJECTED. The receipt mechanism is structurally false-positive-prone (parent context arrives via compact data / selector / prior session, not only daemon reads); all 29 ledger overrides were never-read FPs where the agent HAD read the parent, zero genuine. Restoring the writer would re-create that 100pct-override friction at write-on-every-read cost. Block 2 is itself DORMANT here (no path writes goal-reads.jsonl, so last_read is always None) -- retained as correct logic should receipts return; the gate is currently inert (a whole-gate-retirement candidate). Audit ledger: world/stale-read-overrides.jsonl."
     retirement_eligible: true
 
   # ─── Asymmetry: FP-dominant (the inversions) ─────────────────────────
@@ -236,9 +236,26 @@ gates:
     fn_cost: medium
     fp_description: "Legit structured goal flagged; author adds structure (~1 min)."
     fn_description: "Prose-only goal slips through; verify phase has no structured criteria; goal completes on hallucinated success."
-    rb_evidence: []
-    tuning_notes: "Generous toward structure requirement."
-    retirement_eligible: true
+    rb_evidence: ["g-115-1440"]
+    tuning_notes: >-
+      KEEP — do NOT retire (g-115-1440 scoping verdict, 2026-06-14). The
+      all-noop streak (446 in-window / 2204 all-time) is NOT drift-absence:
+      the prose check (aspirations.py:_check_prose_verification_drift,
+      reachable only via validate_goal) is ORPHANED from the live daemon
+      write path. Daemon add_goal (mind_api/src/endpoints/aspirations_write.py:1159)
+      and _validate_aspiration call the daemon's _validate_goal SUBSET (L202)
+      which omits the prose check (git log -S confirms it never had it); the
+      CLI's validate_aspiration is dead code (no callers). Both historical
+      blocks (g-test-3, g-115-28) predate the 2026-05-14 daemon cutover; 671
+      post-cutover firings produced 0 blocks. FN is REALIZED in the live queue:
+      g-315-119 (completed) and g-316-08 (pending) carry the "Verification
+      outcomes:" marker with zero verification.checks and slipped through.
+      rb-1235 pattern (guaranteed-noop because wired to a vestigial path).
+      FIX (queued, follow-up goal): wire _check_prose_verification_drift into
+      the daemon _validate_goal on add + update — restore daemon/CLI parity.
+      retirement_eligible set false so gate-retirement-eval emits "keep
+      (structural)" instead of re-flagging INVESTIGATE every cycle (guard-756).
+    retirement_eligible: false
 
   - id: agent-action-keywords
     script: core/scripts/precheck-eval.py
@@ -372,6 +389,43 @@ gates:
     tuning_notes: "EXCLUDED from semantic audit. Flag set is structural (Unix flags) and stable."
     retirement_eligible: false
 
+  # ─── Tier-1 skill-quality (earn-the-keep Phase 1) ────────────────────
+  - id: eval-harness-forge-accept
+    script: core/scripts/skill_edit_gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/forge-skill/SKILL.md", phase: "Step 3.5 (before world/forged-skills.yaml registration)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: generous
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "A genuinely-good forge scores <= the 0.5 human-competent baseline and is blocked; agent re-scores/revises (cheap)."
+    fn_description: "A low-quality forge scores > baseline and registers; caught later by its validation goal (medium)."
+    rb_evidence: []
+    tuning_notes: "Phase-1 earn-the-keep (g-115-1465). strict_improve eps=0.0 for new forges (ties rejected); no_regression eps~0.02 for refactors. Tune epsilon up once Tier-2 (g-115-1467) supplies a real noise estimate."
+    retirement_eligible: true
+
+  - id: mdl-encode-parsimony
+    script: core/scripts/mdl_gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-state-update/SKILL.md", phase: "Step 8 curator gate c.5 (advisory, alongside curator Coverage + the >=70% dedup)" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: conservative
+    override_flag: null
+    fp_cost: low
+    fn_cost: low
+    fp_description: "A genuinely-novel insight scores as near-duplicate/low-novelty and is recommended for drop; advisory-only, so the curator gate stays authoritative and the LLM keeps it when truly novel."
+    fn_description: "A near-duplicate insight passes the advisory check and is encoded; bloat accrues slowly, surfaced later by retrieval_utility_report (G4b) + /reflect --curate-memory."
+    rb_evidence: []
+    tuning_notes: "Phase-1 earn-the-keep (g-115-1468 / G4a). Advisory-first: logs keep/drop recommendation via _gate_log, does NOT change the curator decision. Conservative defaults (dup_threshold 0.80, min_novelty 0.20 -- favors keep). Tighten / enforce once advisory firings show a stable signal."
+    retirement_eligible: true
+
 # ─── Gates discovered in core/scripts/ but not in the Session-56 audit.
 # These need their own asymmetry analysis before tuning. Listed here so the
 # audit dashboard knows they exist and can prompt for the missing data.
@@ -388,6 +442,7 @@ pending_audit:
   - scripts-referenced-gate.py
   - self-drift-gate.py
   - signal-lifecycle-gate.py
+  - skill-edit-precommit-gate.py   # g-115-1467 — pre-commit SKILL.md earn-the-keep (HEAD vs worktree, eval_harness.gate)
   - skill-structure-gate.py
   - zero-count-gate.py
   - post-state-update-gate.sh

@@ -219,6 +219,22 @@ fallback vs the configured 90000ms). The fix forwards `$PROJECT_ROOT` from
 `_paths.sh` (SSOT); a `.parent.parent` fallback matches the current `agents/`
 layout.
 
+**Plus cross-agent glob consumers** sweep one file across ALL agent dirs via
+`agents_root().glob("*/...")` (CLI) or `ctx.paths.agents_root.glob("*/...")`
+(daemon). When correctly routed they auto-track an `AGENTS_PARENT_DIR` rename
+(need NO edit), but they are invisible to all THREE greps above — they neither
+define the constant, write a literal `agents/*`, nor use `.parent` — so a
+depth-1 redrift (`PROJECT_ROOT.glob("*/...")`, which matches NOTHING
+post-relocation) escapes every audit grep. This table is their only audit
+surface; check it on rename:
+
+| File(s) | Glob | Status |
+|---------|------|--------|
+| `core/scripts/skill-discovery.py` + `mind_api/src/endpoints/skill_discovery.py` | `*/journal.jsonl` + `*/session/execution-diary.jsonl` invocation sources | ✓ routed (`agents_root()` / `ctx.paths.agents_root`). Were depth-1 until g-115-1405 — the drift silently zeroed 2 of 4 invocation sources for EVERY skill, inflating `silently_undertriggering`. Regression-guarded by the `/verify-learning` glob-routing check + `test_skill_discovery*.py` byte-compat. |
+| `core/scripts/_paths.py`, `core/scripts/utilization-stats.py`, `mind_api/src/agent_paths.py` | `*/local-paths.conf` enumeration | ✓ routed (helper / imported `agents_root`) — the reference pattern to copy for any new cross-agent glob. |
+| `core/scripts/skill-coinvocation-discovery.py` | `*/skill-invocations.jsonl` ledger mining (co-invocation candidates) | ✓ routed (`read_ledger` base defaults to `agents_root()`; the `root=` param is a test-only override). Regression-guarded by the `/verify-learning` `skill-coinvocation-glob-routing` check + the `--apply` RMW tests in `test_skill_coinvocation_discovery.py` (g-304-24). |
+| `mind_api/src/endpoints/utilization.py` (~L278) | `*/local-paths.conf` enumeration | ⚠ LATENT hardcode `project_root / "agents"` (literal segment — works today, breaks on rename). SHOULD route through `ctx.paths.agents_root` like its CLI sibling `utilization-stats.py`. Surfaced by the g-115-1405 audit. |
+
 Helper API (available after sourcing `_paths.sh` or importing from `_paths`):
 - `agents_root()` — parent directory containing all agent dirs
 - `agent_dir(name)` — full path to a named agent's directory
@@ -400,7 +416,13 @@ After any action that changes the world, check if knowledge tree nodes need upda
    - **If NO_AGENT**: No agent bound. Suggest: `/start <agent-name>` to create/resume. DONE.
    - **If UNINITIALIZED**: Follow `.claude/rules/user-interaction.md` UNINITIALIZED protocol. DONE.
    - **If RUNNING**: Agent is in autonomous mode (another window or crashed session). If this is a new session (not an autocompact resume), suggest `/start <agent> --mode reader` for read-only access or `/start <agent> --mode assistant` for user-directed access. DONE — do not invoke boot or auto-resume.
-   - **If IDLE**: Bash: `session-mode-get.sh` → read mode (default: `reader`). Read `core/config/modes/{mode}.md`. Invoke `/prime`, then ready for user.
+   - **If IDLE**: Bash: `session-mode-get.sh` → read mode (default: `reader`).
+     **Interrupted-stop check (FW-11, g-317-09)**: Bash: `bash core/scripts/stop-checkpoint.sh resume-needed`.
+       - If it exits 0 (a `stop-checkpoint.json` is present — autocompact interrupted a prior `/stop` mid-sequence):
+         - If `mode == autonomous` (the stop never reached D7, so the target mode was never set): invoke `/aspirations-graceful-stop --resume`. That handler idempotently completes the remaining stop obligations (consolidate, handoff, set target mode, clear the checkpoint), emits its own stop-complete message, and ends the turn. DONE — do not load mode rules or invoke `/prime`.
+         - Else (`mode` is already `assistant`/`reader` — the stop substantially completed and only the checkpoint-clear was missed): Bash: `bash core/scripts/stop-checkpoint.sh clear` to retire the stale sentinel, then continue below.
+       - If it exits 1 (the common case — no interrupted stop): continue below.
+     Read `core/config/modes/{mode}.md`. Invoke `/prime`, then ready for user.
 
 ### Agent-Session Binding
 

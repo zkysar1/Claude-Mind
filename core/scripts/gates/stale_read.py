@@ -1,8 +1,15 @@
 """Stale-read gate logic — daemon-safe extraction (PR 7c/1).
 
 Blocks new goals filed by agents on stale parent context. Fires when the
-new goal cites `parent_goal` AND the parent was modified after the agent's
-most-recent read of that parent (or the agent never read it).
+new goal cites `parent_goal`, the agent HAS a tracked read receipt for that
+parent, AND the parent was modified after that read (Block 2 below). The
+"agent never read it" branch (formerly Block 1) is RETIRED (g-115-1572):
+it passes unconditionally. The read-receipt mechanism is structurally
+false-positive-prone -- parent context reaches an agent via compact data, the
+goal selector, or a prior session, not only daemon reads -- so an absent
+goal-reads.jsonl receipt is a zero signal (all 29 historical overrides were
+this branch, every one a false positive where the agent HAD read the parent).
+The gate now evaluates ONLY Block 2 (a tracked receipt that is stale).
 
 Public API:
     evaluate(payload, *, override, agent_name, world_dir, agent_dir) -> dict
@@ -232,36 +239,53 @@ def evaluate(payload: dict, *, override: Optional[str] = None,
 
     last_read = _agent_last_read(parent_goal, agent, agent_dir)
 
-    # Block 1: agent has no read entry for this parent.
+    # No read receipt for this parent: the never-read check is RETIRED
+    # (2, decision B; was a temporary fail-open under 9).
+    # The read-receipt mechanism is structurally false-positive-prone: an agent
+    # acquires parent context through many paths -- compact aspiration data, the
+    # goal selector's output, a prior session, a direct read -- but only a daemon
+    # goal-read would ever write goal-reads.jsonl, and the daemon read path does
+    # NOT write it (documented Phase-A/B scope-cut in
+    # mind_api/src/endpoints/aspirations.py + aspirations_query.py). So an absent
+    # receipt is a ZERO signal, not evidence of an unread parent
+    # (verify-before-assuming.md: a silently-absent signal is zero signals).
+    # Evidence: all 29 ledger overrides were this branch, every one a false
+    # positive where the agent HAD read the parent (world/stale-read-overrides
+    # .jsonl); zero genuine Block-2 stale-reads ever fired. Restoring a
+    # daemon-safe goal-read writer (option A) was REJECTED -- it would re-create
+    # that 100%-override friction (the FP cause is multi-path context
+    # acquisition, which a write-on-read receipt cannot capture) at the cost of
+    # write-on-every-goal-read amplification. The genuine check (Block 2 below)
+    # still fires when a tracked receipt EXISTS and is stale.
     if last_read is None:
-        if override:
-            _log_override(world_dir, parent_goal, agent, override, parent_lm, None)
-            out = {
-                "would_block": False,
-                "reason": "override applied (agent never read parent)",
-                "parent_goal": parent_goal,
-                "parent_last_modified": parent_lm,
-                "agent_last_read": None,
-                "override_applied": override,
-                "_fail_open": False,
-            }
-            _telemetry("override", out)
-            return out
         out = {
-            "would_block": True,
+            "would_block": False,
             "reason": (
-                f"agent {agent!r} has no read entry for parent_goal {parent_goal} — "
-                f"file the child only after reading the parent (cmd_read --id <asp> "
-                f"or cmd_query). Pass --override-stale-read \"<justification>\" if the "
-                f"agent has parent context from another source."
+                f"no tracked read receipt for parent_goal {parent_goal}; "
+                f"never-read check retired (g-115-1572). The gate evaluates only "
+                f"a tracked-receipt-that-is-stale (Block 2) -- pass."
             ),
             "parent_goal": parent_goal,
             "parent_last_modified": parent_lm,
             "agent_last_read": None,
             "override_applied": None,
-            "_fail_open": False,
+            "_fail_open": True,
         }
-        _telemetry("block", out)
+        # Telemetry decision is "pass", NOT "fail_open" (8). This
+        # branch is a retired-PASS: the never-read check no longer exists, it
+        # permits unconditionally -- exactly like Skip 3's legacy-goal pass --
+        # so the analytics bucket is "pass", not a gate-couldn't-evaluate
+        # fail-open. Logging it "fail_open" made gate-retirement-eval.py
+        # mislabel a by-design pass as "the gate raised an exception" and file
+        # a false Investigate goal every cycle. `_fail_open` STAYS True so the
+        # CLI shim keeps the deliberate 9/1572 exit-2 operational
+        # signal -- `_fail_open` is read ONLY by the CLI shim (stale-read-gate
+        # .py); the sole production consumer (daemon aspirations_write.py)
+        # branches on `would_block`, which is unchanged. Post-fix,
+        # decision="fail_open" uniquely identifies Skip-2 parent-not-found (a
+        # genuine fail-open) -- improving, not reducing, telemetry diagnosability
+        # (guard-502).
+        _telemetry("pass", out)
         return out
 
     # Block 2: parent modified after agent's most-recent read.

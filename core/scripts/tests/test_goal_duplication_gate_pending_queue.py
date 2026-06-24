@@ -382,6 +382,97 @@ def main() -> int:
                 f"reason={pq6.get('reason')} matches={pq6.get('matches')}"
             )
 
+        # ── P7: decomposition siblings (same parent origin) → PASS ────────
+        # 6: filing the 2nd+ child of one parent shares the parent's
+        # origin_signal ("decomposition:<parent>") BY DESIGN. The siblings are
+        # DISTINCT deliverables (low structural overlap). Strategy 1 must NOT
+        # exact-match-block them (the prefix is exempt); Strategy 2 must not
+        # fire on the low overlap. WITHOUT the fix this case BLOCKS via
+        # origin_signal. Canonical incident:  vs .
+        sib_origin = f"decomposition:g-{TAG}-parent"
+        seed_p7 = _mk_aspiration("asp-pendq-p7", [{
+            "id": "g-pendq-p7-existing",
+            "title": f"Apply: {TAG}-aaa writer persistence path",
+            "description": (f"First decomposition child: records persisted at "
+                            f"the {TAG}-aaa observation site."),
+            "status": "pending",
+            "origin_signal": sib_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p7])
+
+        case_p7 = {
+            "title": f"Apply: {TAG}-bbb divergence reflection pass",
+            "description": (f"Second decomposition child, distinct deliverable: "
+                            f"fires a {TAG}-bbb revision when a mismatch appears."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": sib_origin,
+        }
+        rp7 = _run_gate(case_p7, tmp_world)
+        pq7 = _find_check(rp7, "pending_queue")
+        if pq7 is None:
+            failures.append("P7: pending_queue check missing from result")
+        elif pq7.get("passed") is not True:
+            failures.append(
+                f"P7: distinct decomposition siblings sharing the parent "
+                f"origin_signal should PASS (sibling exemption). "
+                f"reason={pq7.get('reason')} matches={pq7.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq7.get("matches") or []}
+            if "origin_signal" in strategies:
+                failures.append(
+                    f"P7: origin_signal must NOT be a match strategy for "
+                    f"decomposition siblings, got strategies={strategies}"
+                )
+
+        # ── P8: TRUE-duplicate decomposition siblings → BLOCK (Strategy 2) ─
+        # The exemption only skips Strategy 1 (origin_signal). A genuine
+        # duplicate child (same parent origin AND shared file path) must STILL
+        # block via the structural overlap path — proving the exemption does
+        # not open a real-dup hole (6 verification outcome 2).
+        dup_origin = f"decomposition:g-{TAG}-parent2"
+        dup_path = f"core/scripts/{TAG}-p8-shared.py"
+        seed_p8 = _mk_aspiration("asp-pendq-p8", [{
+            "id": "g-pendq-p8-existing",
+            "title": f"Apply: refactor {dup_path} retry handling",
+            "description": (f"First child reworks {dup_path} retry/backoff "
+                            f"handling for the {TAG}-p8 path."),
+            "status": "pending",
+            "origin_signal": dup_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p8])
+
+        case_p8 = {
+            "title": f"Apply: fix retry handling in {dup_path}",
+            "description": (f"Duplicate child touching {dup_path} retry/backoff "
+                            f"for the {TAG}-p8 path."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": dup_origin,
+        }
+        rp8 = _run_gate(case_p8, tmp_world)
+        pq8 = _find_check(rp8, "pending_queue")
+        if pq8 is None:
+            failures.append("P8: pending_queue check missing from result")
+        elif pq8.get("passed") is not False:
+            failures.append(
+                f"P8: TRUE-duplicate decomposition siblings (shared file path) "
+                f"must STILL block via Strategy 2. "
+                f"reason={pq8.get('reason')} matches={pq8.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq8.get("matches") or []}
+            if "origin_signal" in strategies:
+                failures.append(
+                    f"P8: block must come from structural overlap, NOT "
+                    f"origin_signal (exempt for decomposition), got {strategies}"
+                )
+
     finally:
         if tmp_world.exists():
             shutil.rmtree(tmp_world, ignore_errors=True)
@@ -391,8 +482,14 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (6/6 cases)")
+    print("PASS (8/8 cases)")
     return 0
+
+
+def test_pending_queue_gate():
+    """Pytest entry point (5) — runs the 6-case suite (already
+    tmp-world isolated) and asserts all cases pass."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

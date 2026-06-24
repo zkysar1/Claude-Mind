@@ -36,6 +36,32 @@ The mode is still `autonomous` at invocation time (D4). If Phase -1.4 step order
 ```
 # Consolidation — run before session exit
 
+-1. GENERALIZE-DOWN BODY-WM MERGE (Phase 1C, g-306-63):
+   # The reducer IS this consolidating session (it holds running-session-id) —
+   # the EXISTING reducer the Mind/Body design merges into. Before triage reads
+   # WM, merge back every non-reducer worker Body that closed since the last
+   # consolidation: each carries body_state=closed-pending-merge (set by the
+   # stop-hook producer on Body close). generalize_down delta-merges each Body's
+   # forked WM into the reducer's WM under per-slot policies (arrays
+   # append+content-hash-dedup; active_context/session-identity reducer-wins;
+   # numeric counters SUM; ISO-timestamp cadence-trackers latest-wins; loop_state
+   # recurses), copies back to the reducer WM, re-scans once for late arrivals,
+   # and marks each manifest body_state=merged (the engine's session-termination
+   # memory-persistence merge). Running it FIRST means merged Body data (micro_hypotheses,
+   # encoding_queue, conclusions, ...) lands in the triage counts below and gets
+   # consolidated THIS pass.
+   #
+   # DORMANT in single-runner: no closed-pending-merge manifest exists, so this
+   # is a no-op (empty summary, reducer WM untouched) until a 2nd worker Body
+   # forks (Phase 2, g-306-65). Direct py -3 (NOT the .sh wrapper) per
+   # rb-225/rb-247 (Windows bash-subprocess hang). FAIL-OPEN: a merge error must
+   # never block consolidation — log and proceed to triage.
+   Bash: py -3 core/scripts/body-merge.py generalize-down --agent "$MIND_AGENT" --output json
+   # Parse the JSON summary. IF merged or noop non-empty:
+   #   Log "▸ GENERALIZE-DOWN: merged {len(merged)} Body(ies), {len(noop)} no-op,
+   #        {len(skipped)} skipped (scanned {scanned})".
+   # On a non-zero exit: Log the stderr line and CONTINUE to triage (fail-open).
+
 0.1. CONSOLIDATION TRIAGE GATE:
    # This logic is duplicated in core/scripts/consolidation-precheck.py.
    # If you change the checks here, update that script to match.
@@ -116,6 +142,86 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
      # This reflects on each unreflected hypothesis, sets reflected: true,
      # and pushes encoding items into encoding_queue for Step 1.
      Output: "▸ CONSOLIDATION: reflected on {count} unreflected hypotheses"
+
+0.6. Source-Integrity Verifier (Gap-16 — never-summarize-summaries):
+   # Invariant (GSD 2.0 / BRD Gap 16, guard-745): every summary level this
+   # skill generates — journal batch summary (Step 0), handoff session_summary
+   # (Step 9), team-state session summary (Step 8.87), tree-node summaries
+   # (Step 1+) — MUST regenerate from the RAW level below (journal + actual
+   # state), NEVER from a prior summary file. Summarizing a summary compounds
+   # lossy re-compression across session boundaries (the summary-of-summary
+   # degradation).
+   #
+   # The verifier fails LOUD (exit 1) when a source path is a summary artifact
+   # (handoff.yaml, session-summary*, *-summary.*, paths under /summaries/);
+   # raw sources (journal/, experience.jsonl, session state) pass (exit 0).
+   journal_src="agents/<agent>/journal/{YYYY}/{MM}/{YYYY-MM-DD}.md"
+   Bash: bash core/scripts/consolidate-source-verify.sh "$journal_src"
+   IF exit 1:
+       # A summary file was about to be consolidated AS a raw source — STOP.
+       # Re-point the source at the raw journal/state before summarizing. This
+       # is a fail-loud invariant (guard-745), not an advisory: do NOT proceed
+       # to summarize from a summary.
+       Output: "▸ CONSOLIDATION HALT (Gap-16): source '{journal_src}' is a summary artifact — re-point at raw journal+state before summarizing"
+   # Apply the SAME check to any other path used as a summary-generation source
+   # later in this skill (handoff session_summary inputs at Step 9, team-state
+   # session summary inputs at Step 8.87): each such source MUST be raw.
+
+0.65. Cluster-Then-Summarize the Session Journal (BRD Gap 1d, g-306-09):
+   # Lyfe Agents cluster-then-summarize, applied to the session journal:
+   # instead of ONE linear summary over all of today's journal entries, GROUP
+   # entries by similarity FIRST, then write ONE summary per cluster. Per-cluster
+   # summaries preserve the topical separation a single linear summary blurs, so
+   # the downstream handoff key_outcomes (Step 9, boot-retrievable) stays
+   # granular rather than mushy. This is the cheap half of the retrieval upgrade
+   # (before Gap 1b/1c). FULL path only (lean/fast sessions have too few entries
+   # for clustering to add value — this step lives inside `tier == "full"`).
+   #
+   # CLUSTERING METHOD = LEXICAL TOKEN-OVERLAP, NOT EMBEDDINGS (rb-1781 +
+   # first-principles.md). The BRD framed this as "embedding similarity," but a
+   # first-principles read of the premise rejects embeddings here:
+   #   (a) No embedding infrastructure exists in this framework — the retrieval
+   #       engine and goal_duplication.py both discriminate via IDF-weighted
+   #       token-overlap, and building an embedding service is the inherited-
+   #       solution anti-pattern g-305-05 already declined.
+   #   (b) A single session's journal entries are a semantically-HOMOGENEOUS
+   #       corpus (one agent, one session, shared framework vocabulary), exactly
+   #       the shape where topical embeddings are a PRECISION TRAP (rb-1781:
+   #       cosine>=0.7 fires between genuinely-different entries). Token-shape
+   #       (which subsystem/file/mechanism an entry names) discriminates better.
+   # The embedding->lexical decision is logged to pending-questions + the
+   # decisions board for the BRD author to review (executed, override-if-disagree).
+   Read today's RAW journal (already source-verified raw by Step 0.6):
+     agents/<agent>/journal/{YYYY}/{MM}/{YYYY-MM-DD}.md
+   entries = parsed per-goal journal entries for this session
+   IF len(entries) < 4:
+     # Too few to cluster meaningfully — fall back to the prior linear single
+     # summary. No degradation: clustering a 3-entry log is noise, not signal.
+     Output: "▸ Journal cluster-summarize: {len(entries)} entries < 4 — linear single summary (clustering skipped)"
+     clusters = [{label: "session", summary: <one compressed summary over all entries>}]
+   ELSE:
+     # Cluster by LEXICAL token-overlap. Group entries that share, in priority:
+     #   1. the same aspiration-prefix (the goal-id family, the strongest cheap
+     #      signal that two entries are the same thread of work), AND/OR
+     #   2. the same category, AND/OR
+     #   3. high significant-token overlap — drop the IDF-zero framework
+     #      stopwords (goal/deep/encoded/committed/verified/rb/exp) and keep the
+     #      discriminating tokens (subsystem names, file paths, mechanism words);
+     #      two entries naming the same surface merge even across aspirations.
+     clusters = group entries into topical clusters by the rules above
+     FOR EACH cluster:
+       cluster.label   = a short topical label (the shared aspiration / surface)
+       cluster.summary = ONE compressed summary of that cluster's entries only
+     Output: "▸ Journal cluster-summarize: {len(entries)} entries -> {len(clusters)} cluster(s): {[c.label for c in clusters]}"
+   # Retrievability (verification outcome 2): stash the per-cluster summaries in a
+   # WM slot. Step 9 reads this slot and makes each cluster.summary one
+   # key_outcomes entry in the handoff, so the per-cluster summaries survive to
+   # the next session (boot reads handoff.yaml) — they remain retrievable.
+   Bash: echo '<json array of {label, summary} per cluster>' | bash core/scripts/wm-set.sh journal_cluster_summaries
+   # Retrieval-not-degraded (verification outcome 3): every entry is still
+   # represented, now under a topical label — per-cluster summaries are strictly
+   # MORE granular than the prior single linear summary, so the next session can
+   # target a cluster instead of scanning one blob. No information is dropped.
 
 0.7. Operational Gotcha Sweep (safety net):
    # Catch error-then-fix patterns that Phase 6.5 missed (e.g., errors during
@@ -611,6 +717,15 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    blockers, debts, user_goals), then pipes it to `handoff-yaml-build.sh`
    which validates required fields, defaults optionals, and writes the
    handoff.yaml atomically via `locked_write_yaml`.
+
+   `key_outcomes` sourcing (BRD Gap 1d, g-306-09): read the
+   `journal_cluster_summaries` WM slot written by Step 0.65. Each cluster's
+   `summary` becomes one `key_outcomes` entry (prefixed with its `label`), so the
+   handoff carries the PER-CLUSTER journal summaries — topical and granular —
+   rather than one linear blob. IF the slot is null/empty (lean session, or < 4
+   journal entries so Step 0.65 produced a single "session" cluster), fall back
+   to the prior single linear key_outcomes list. Clear the slot after reading
+   (one-shot; next session's Step 0.65 re-populates it).
 
    Required payload fields (all others optional — script defaults them):
    `session_number`, `next_focus`, `first_action.goal_id`,

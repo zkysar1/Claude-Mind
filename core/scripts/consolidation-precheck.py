@@ -80,7 +80,8 @@ def main():
         return
 
     # --- 1. Working Memory (single YAML read) ---
-    wm_path = AGENT_DIR / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if wm_path.exists():
         with open(wm_path, "r", encoding="utf-8") as f:
             wm = yaml.safe_load(f) or {}

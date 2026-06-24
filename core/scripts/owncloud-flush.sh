@@ -25,16 +25,38 @@
 #   1  — daemon returned an error, OR the sweep reported per-file errors>0
 #        (so /stop D6.7's `|| echo WARN` fires and the user is told)
 #
-# Usage: bash core/scripts/owncloud-flush.sh
+# Optional --agent <name> (design §6 /stop flush): narrow the flush to
+# agents/<name>/ with full re-HEAD, so the stopping agent's dir is guaranteed
+# complete in S3 before its claim is released. Absent => full owned-set flush
+# (world/meta/all owned agents) — the periodic-sweep race-closer. The endpoint's
+# ownership filter prunes the dir if this machine does NOT own it, so --agent can
+# never push a peer's cache.
+#
+# Usage: bash core/scripts/owncloud-flush.sh [--agent <name>]
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+AGENT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --agent) AGENT="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+        *) echo "[owncloud-flush] unknown arg: $1" >&2; exit 2;;
+    esac
+done
+
 source "$CORE_ROOT/scripts/_runtime.sh"
 
-_do_call() { rt_call POST /v1/admin/owncloud-flush; }
+# rt_url_encode is defined by _runtime.sh (sourced above) — build the query only
+# after the source so the helper exists.
+if [ -n "$AGENT" ]; then
+    _FLUSH_QUERY="agent=$(rt_url_encode "$AGENT")"
+    _do_call() { rt_call POST /v1/admin/owncloud-flush --query "$_FLUSH_QUERY"; }
+else
+    _do_call() { rt_call POST /v1/admin/owncloud-flush; }
+fi
 
 # Capture STDOUT only (no 2>&1). rt_call routes the JSON body to stdout on
 # success; rt_check_staleness warnings ("[runtime] WARNING: daemon is running
@@ -92,9 +114,10 @@ if not r.get("flushed"):
     print(f"[owncloud-flush] no-op (backend={backend}; {r.get('reason','')})")
     sys.exit(0)
 errs = r.get("errors", 0)
-print(f"[owncloud-flush] backend={backend} pushed={r.get('pushed',0)} "
-      f"in_sync={r.get('in_sync',0)} scanned={r.get('scanned',0)} "
-      f"conflicts={r.get('conflicts',0)} errors={errs}")
+print(f"[owncloud-flush] backend={backend} scope={r.get('scope','all-owned')} "
+      f"pushed={r.get('pushed',0)} in_sync={r.get('in_sync',0)} "
+      f"scanned={r.get('scanned',0)} conflicts={r.get('conflicts',0)} "
+      f"errors={errs}")
 sys.exit(2 if errs else 0)
 PYEOF
 )" || pyrc=$?

@@ -283,12 +283,19 @@ def main():
     mp_norm = norm_path(paths.get("META_PATH") or "")
     if mp_norm:
         allowed_roots.append(("META_PATH", mp_norm))
-    # : optional agent-declared additional write root for cross-repo
-    # work (e.g., external product code). User-edited in local-paths.conf; agents
-    # cannot self-modify that file. Reversible by removing the line.
-    awp_norm = norm_path(paths.get("AGENT_WRITE_PATH") or "")
-    if awp_norm:
-        allowed_roots.append(("AGENT_WRITE_PATH", awp_norm))
+    #  / : optional agent-declared additional write root(s) for
+    # cross-repo work (e.g., external product code). Edited in local-paths.conf —
+    # by the user, or (per the  principal directive, 2026-06-07) by the
+    # agent under explicit user authorization. Reversible by removing the path.
+    # MULTI-ROOT (): the value may name several roots separated by ';'
+    # (e.g. "C:/.../Ayoai;C:/.../Zak-Data-Solutions") so an agent can write to
+    # more than one product workspace. Each becomes an independent allowed root;
+    # single-path values (no ';') are unchanged. read_paths_conf already stripped
+    # the surrounding quotes that bash-source safety requires in the conf.
+    for awp_part in (paths.get("AGENT_WRITE_PATH") or "").split(";"):
+        awp_norm = norm_path(awp_part.strip())
+        if awp_norm:
+            allowed_roots.append(("AGENT_WRITE_PATH", awp_norm))
 
     if not allowed_roots:
         approve_no_mutation()

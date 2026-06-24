@@ -273,6 +273,73 @@ IF decompose() returned [goal] unchanged (single-element list containing only th
     RETURN
 ```
 
+### Step 5.6: PDDL Symbolic-Plan Constraint (optional overlay; LLM tree retained as R3 fallback)
+
+If this world ships a PDDL decomposition-planning overlay, obtain a VALIDATED
+symbolic plan for the goal's decomposition SHAPE and use it to constrain the
+Step-5 LLM tree's leaves. The Step-5 LLM tree is the R3 fallback and is ALWAYS
+retained — the symbolic plan CONSTRAINS it, it does not replace it. This is the
+GO-path completion of the /decompose planning capstone (spike → per-shape
+domains → this wiring).
+
+The capability is a **world overlay**: the routing map and STRIPS domains live
+in `world/conventions/pddl-domain/` (`shape-map.json` + `mind-decompose-*.pddl`
++ `validate_plan_generic.py`). The core helper carries no domain terms; when no
+overlay exists (a fresh world) or the goal's shape is unmapped, it returns
+`applicable=false` and this step is a no-op — pure-LLM decomposition stands.
+
+SCOPE: this is the framework's own `/decompose` ONLY. Do NOT invoke or touch any
+domain-specific behavior planners (e.g. a separate htn/astar/dual
+behavior-planning track) — those are out of scope and carry their own goals.
+
+```
+# One fail-open call. The helper resolves the world overlay itself and re-runs
+# the planner only when a cached plan is missing/stale. Exit code is ALWAYS 0 —
+# branch on the JSON content, never the exit code (rb-2207: the plan is
+# independently re-validated inside the helper; trust `valid`, not "pyperplan
+# returned").
+Bash: py -3 core/scripts/decompose-pddl-plan.py \
+        --category "{goal.category}" \
+        --verb "{goal.skill or the goal's primary decomposition verb}" \
+        --title "{goal.title}" \
+        --goal-id "{goal.id}"
+plan = parse JSON stdout
+
+IF plan.applicable == false:
+    # No overlay, or shape unmapped. The Step-5 LLM tree IS the decomposition (R3).
+    Log: "decompose: PDDL constraint N/A ({plan.reason}) — pure-LLM tree retained"
+    # fall through to Companion Hypothesis Generation / Step 6 unchanged.
+
+ELIF plan.applicable == true AND plan.solvable == true:
+    # The shape's decomposition is symbolically solvable AND the plan was
+    # independently re-validated (plan.valid). plan.plan is the canonical
+    # primitive ORDERING for this shape. CONSTRAIN the Step-5 sub-goals to it:
+    #   - Re-order / set blocked_by so the generated sub-goals' sequence and
+    #     dependencies follow plan.plan's primitive order (the validated DAG).
+    #   - A generated leaf with no counterpart primitive is KEPT (the LLM tree
+    #     is richer than the skeleton). A primitive with no generated leaf is a
+    #     COVERAGE GAP — add a sub-goal covering it so the decomposition is
+    #     complete against the validated plan.
+    #   - Annotate the parent goal object (in-context, persisted by Step 6's
+    #     write) with:
+    #       pddl_plan: {shape: plan.shape, plan: plan.plan, valid: plan.valid,
+    #                   plan_length: plan.plan_length,
+    #                   source: "decompose-pddl-plan g-306-54"}
+    Log: "decompose: PDDL plan ({plan.shape}, {plan.plan_length} steps, valid={plan.valid}) constrains tree leaves"
+
+ELIF plan.applicable == true AND plan.solvable == false:
+    # The shape maps to a domain but has NO valid symbolic plan (structural
+    # decomposition problem). File a blocker inline — the goal cannot be cleanly
+    # decomposed under its shape. The Step-5 LLM tree is STILL retained as the R3
+    # fallback (do NOT discard it); the blocker flags the structural concern for
+    # review while the LLM decomposition proceeds.
+    invoke CREATE_BLOCKER(
+        affected_skill="/decompose",
+        issue="g-{goal.id} shape '{plan.shape}' is symbolically UNSOLVABLE: {plan.blocker_reason}",
+        ... per the CREATE_BLOCKER protocol in aspirations-execute)
+    Log: "decompose: PDDL UNSOLVABLE for {plan.shape} — blocker filed; LLM tree retained as R3"
+```
+
 ### Companion Hypothesis Generation
 
 When decomposing a goal, check: does this goal's work naturally produce a testable prediction?

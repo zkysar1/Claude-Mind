@@ -155,9 +155,25 @@ def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None) -> di
 
 @pytest.fixture(autouse=True)
 def _preserve_zeta_wm():
-    """Save/restore zeta's fresh_eyes_last_fire so a firing gate during the
-    test does not leave inert synthetic records in real WM. Best-effort — WM
-    hygiene, not test correctness; never fails the test on a save/restore error."""
+    """Save, NEUTRALIZE, then restore zeta's fresh_eyes_last_fire (3).
+
+    Root cause of the historical flake (g-115-1178): the gate's cooldown reads
+    agents/zeta/session/working-memory.yaml via the daemon-routed wm-read. That
+    path is NOT neutralized by the MIND_WORLD/MIND_META redirect (those cover
+    world/meta, not the per-agent WM), and the daemon does NOT honor
+    MIND_AGENT_DIR — it refuses to resolve a non-existent test agent
+    ("WORLD_PATH unresolved"), so a dedicated-test-agent isolation is infeasible
+    with the live daemon (guard-672). Consequently, when zeta's live WM carries a
+    recent fresh_eyes_last_fire whose file set matches the test's detected set,
+    the content-aware cooldown suppresses the gate (fired:false) and the
+    working-tree cases below fail non-deterministically.
+
+    Fix (the goal's fix-direction #2 — the one that works through the live
+    daemon): save the real slot, SET IT TO null (no recent review -> cooldown
+    inactive -> the gate fires deterministically regardless of live self/partner
+    fresh-eyes activity), run the test, then restore the real slot. The seed is
+    test correctness (rb-659: fresh fixture state per call); the restore is
+    best-effort WM hygiene and never fails the test on a save/restore error."""
     saved = "null"
     try:
         r = subprocess.run(
@@ -167,6 +183,18 @@ def _preserve_zeta_wm():
         )
         if r.returncode == 0 and r.stdout.strip():
             saved = r.stdout.strip()
+    except Exception:
+        pass
+    # Neutralize the cooldown BEFORE the gate run so the own-fresh read is
+    # deterministic. wm-set with "null" empties the slot (same path the restore
+    # below exercises when saved=="null"). Best-effort: a seed failure leaves the
+    # pre-existing flake but never aborts the test.
+    try:
+        subprocess.run(
+            [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
+            input="null", capture_output=True, text=True, timeout=30,
+            env={**os.environ, "MIND_AGENT": "zeta"},
+        )
     except Exception:
         pass
     yield

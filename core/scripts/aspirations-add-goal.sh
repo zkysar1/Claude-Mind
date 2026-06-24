@@ -140,9 +140,38 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Pre-daemon validation ------------------------------------------------
+# --schema: print the accepted stdin-body field schema (machine-readable JSON
+# form of the --help field list above) + a pointer to the authoritative
+# convention doc. Keep the field list in sync with the --help block above and
+# core/config/conventions/goal-schemas.md (the SSOT).
 if [ "$SCHEMA" = "1" ]; then
-    echo "Error: --schema is no longer available. See mind_api/src/endpoints/ for API docs." >&2
-    exit 1
+    cat <<'SCHEMA_JSON'
+{
+  "writer": "aspirations-add-goal.sh",
+  "input": "JSON goal object on stdin; <asp_id> as positional arg or --aspiration <id>",
+  "required": {
+    "title": "string - goal title (often prefixed Investigate:/Idea:/Apply:/Unblock:)",
+    "priority": "string - HIGH | MEDIUM | LOW",
+    "participants": "string[] - [agent], [agent,user], or [user]",
+    "origin_signal": "string - upstream cause; prefixes: user_directive, board_post:<id>, pending_question:<id>, failing_test:<id>, resolved_hypothesis:<id>, low_confidence_node:<path>, recurring_cadence:<id>, investigate:<...>, idea:<...>, parent_aspiration:<id>"
+  },
+  "optional": {
+    "description": "string",
+    "category": "string",
+    "skill": "string - e.g. /forge-skill; omit/null for inline code goals",
+    "status": "string - pending (default) | in-progress | completed | blocked | skipped | expired",
+    "recurring": "boolean",
+    "interval_hours": "number - positive; required when recurring=true",
+    "verification": "object - {outcomes: string[], checks: [{type,target,condition}], preconditions: [string | {type,id,...}]}",
+    "handoff_to": "string - target agent for cross-agent handoff",
+    "blocked_by": "string[] - goal-ids this goal is blocked on"
+  },
+  "auto_assigned": "id (format g-NNN-NN[N[N]]) and created - do NOT supply",
+  "note": "Goal fields go in the JSON body via stdin, NOT as CLI flags.",
+  "doc": "core/config/conventions/goal-schemas.md + core/config/conventions/aspirations.md"
+}
+SCHEMA_JSON
+    exit 0
 fi
 if [ -z "$ASP_ID" ]; then
     echo "Error: asp_id is required." >&2

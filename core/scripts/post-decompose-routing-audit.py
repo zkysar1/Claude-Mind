@@ -318,6 +318,7 @@ def audit(goal: dict, *, project_root: Path,
           agents_root: Optional[Path] = None,
           min_gap: float = 0.015,
           min_gap_either: float = 0.015,
+          min_best_score: float = 0.10,
           exclude_agents: Optional[set] = None) -> dict:
     """Audit a freshly-stamped goal and decide whether to file an Investigate
     goal for routing-mismatch detection.
@@ -347,6 +348,20 @@ def audit(goal: dict, *, project_root: Path,
                (same p90 floor as min_gap; either-case is signal-ambiguous by
                design — we want a clear stand-out before suggesting re-stamp).
                g-115-1122 / g-115-1200.
+      min_best_score: Absolute floor on the best agent's Jaccard score below
+               which NO routing-mismatch is filed, regardless of gap. Default
+               0.10 (rb-1488 / g-115-1351). The gap thresholds above catch
+               RELATIVE stand-outs, but bag-of-words contamination produces a
+               top-decile GAP between two NEAR-ZERO absolute scores — observed
+               FP band best ~0.073-0.081 vs stamped ~0.056-0.061 across
+               g-1348/1352/1354 (rb-1478, 82% all-time skip rate). When the
+               best agent's own absolute Jaccard is below this floor, no agent
+               has a real ownership signal, so the "mismatch" is contamination
+               noise, not a routing error. 0.10 sits just above the observed FP
+               band (guard-594 empirical calibration) — suppressing the
+               near-zero cluster without silencing genuine domain stand-outs
+               (true-domain wins score well above the floor). Applies to BOTH
+               the specific-agent and either-case paths.
       exclude_agents: Optional set of agent names to skip in scoring (e.g.,
                       {"delta"} when auditing a delta-bound goal). Defaults
                       to the empty set.
@@ -425,6 +440,26 @@ def audit(goal: dict, *, project_root: Path,
         return _make_decision(
             decision="no_file",
             reason="goal is itself an audit-filed Investigate (recursion guard)",
+            stamped_agent=stamped_agent, best_agent=None, best_score=0,
+            stamped_score=0, gap=0, scores={}, goal_id=goal_id,
+            investigate_spec=None,
+        )
+
+    # 1 / rb-1488: ALSO skip insight-trigger-derived goals. The
+    # insight-trigger sweep () files Apply/Investigate goals from
+    # findings-channel posts and stamps intended_agent from the finding
+    # author's requires_action_by tag — that routing is AUTHOR-CURATED, not
+    # classifier-inferred. The routing audit exists to catch CLASSIFIER
+    # mis-stamps, so it only produces FPs on author-curated routing. Worse,
+    # when such a goal's TEXT is about routing itself (agent names / Jaccard /
+    # "routing"), it Jaccard-matches the agent it MENTIONS rather than the one
+    # that should OWN it, spawning a routing-mismatch FP that the sweep
+    # re-files next cadence — a self-perpetuation chain (g-1346 -> g-1329 ->
+    # g-1351/1353 -> g-1348/1352/1354). Bail before scoring.
+    if isinstance(origin, str) and origin.startswith("insight_trigger:"):
+        return _make_decision(
+            decision="no_file",
+            reason="goal is insight-trigger-derived; routing is author-curated (recursion guard)",
             stamped_agent=stamped_agent, best_agent=None, best_score=0,
             stamped_score=0, gap=0, scores={}, goal_id=goal_id,
             investigate_spec=None,
@@ -509,6 +544,24 @@ def audit(goal: dict, *, project_root: Path,
                 investigate_spec=None,
             )
 
+    # Absolute min-best-score floor (rb-1488 / 1). The gap check below
+    # catches RELATIVE stand-outs, but bag-of-words contamination yields a
+    # top-decile GAP between two NEAR-ZERO absolute scores (FP band best
+    # ~0.073-0.081, rb-1478). When the best agent's own absolute Jaccard is
+    # below the floor, no agent has a real ownership signal — the "mismatch" is
+    # contamination noise. Suppress on BOTH paths (specific-agent + either).
+    # Placed before the gap check so the returned dict carries the real gap.
+    if best_score < min_best_score:
+        return _make_decision(
+            decision="no_file",
+            reason=(f"best_score {best_score} below min_best_score floor "
+                    f"{min_best_score} (no real ownership signal)"),
+            stamped_agent=stamped_agent, best_agent=best_agent,
+            best_score=best_score, stamped_score=stamped_score,
+            gap=gap, scores=scores, goal_id=goal_id,
+            investigate_spec=None,
+        )
+
     if gap < threshold:
         return _make_decision(
             decision="no_file",
@@ -577,6 +630,10 @@ def _cli_main(argv=None) -> int:
     parser.add_argument("--min-gap-either", type=float, default=0.015,
                         help="Minimum best-vs-second-best Jaccard gap to file "
                              "for the either-case (default: 0.015; g-115-1200)")
+    parser.add_argument("--min-best-score", type=float, default=0.10,
+                        help="Absolute floor on the best agent's Jaccard score "
+                             "below which no mismatch is filed regardless of "
+                             "gap (default: 0.10; rb-1488 / g-115-1351)")
     parser.add_argument("--exclude", default="",
                         help="Comma-separated agent names to exclude")
     args = parser.parse_args(argv)
@@ -600,6 +657,7 @@ def _cli_main(argv=None) -> int:
         project_root=Path(args.project_root).resolve(),
         min_gap=args.min_gap,
         min_gap_either=args.min_gap_either,
+        min_best_score=args.min_best_score,
         exclude_agents=exclude or None,
     )
     print(json.dumps(result, indent=2, ensure_ascii=False, sort_keys=True))

@@ -48,7 +48,11 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
     slot = q.get("slot") or None
     as_json = _flag(q, "json")  # default False — matches CLI's YAML default
 
-    wm_path = ctx.paths.agent / "session" / "working-memory.yaml"
+    # Per-Body WM routing (Phase 1A, ) — route by request SID; falls back
+    # to the agent-wide WM when there is no body-manifest (today's behavior). The
+    # path cache is keyed by path, so per-Body files get distinct cache entries.
+    sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
+    wm_path = ctx.paths.wm_path(sid or None)
     data = cache().get(wm_path)
 
     if data is None:

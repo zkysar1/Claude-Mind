@@ -17,9 +17,14 @@ agent owns its own file).
 
 Schema: {ts, agent, tool, goal_id, phase, seq, session_id}
 
-Activation: bound by .claude/settings.json PostToolUse hook with matcher='*'
-(see g-115-411 description; that hook addition is deny-list-blocked and
-requires user-side configuration). Until activated, this script is dormant.
+Activation: LIVE -- bound by .claude/settings.json PostToolUse hook with
+matcher='*' (settings.json ~L360-367; fires on every tool call). The
+"deny-list-blocked / dormant" note from g-115-411 is STALE: the hook is
+active on this install (g-115-1578, 2026-06-20 -- confirmed by live orphan
+evidence in core/logs/stale-scanner-report.jsonl + the settings.json
+matcher). Because it is live AND reads stdin, the read MUST be bounded (see
+_read_stdin_with_timeout) -- an orphaned pipe otherwise hangs this py.exe
+process forever (observed 120-129h before this guard).
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import datetime
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 #  / : force utf-8 on stdin/stdout/stderr (covers Windows
@@ -44,10 +50,45 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def _read_stdin_with_timeout(timeout_s=None):
+    """Bounded stdin read -- guard-664 / rb-1568 daemon-thread+join pattern.
+
+    A PostToolUse hook can be handed an inherited stdin pipe that never
+    reaches EOF (parent session dies, payload write interrupted). An
+    unbounded read of sys.stdin then blocks forever, orphaning this
+    py.exe child (g-115-1578: pid-18456 ran 129h, pid-23168 ran 120h).
+    select()/signal.alarm do NOT work on Windows pipes; a daemon reader
+    thread does -- when main() returns the interpreter exits and the
+    still-blocked daemon thread is killed with it. Fail open (return "")
+    on timeout so this visibility hook never blocks tool execution.
+    Canonical reference: experience.py::_read_optional_stdin.
+    """
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("PRESENCE_TICK_STDIN_TIMEOUT_S", "10"))
+    box = {"data": "", "done": False}
+
+    def _reader():
+        try:
+            box["data"] = sys.stdin.read()
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    return box["data"] if box["done"] else ""
+
+
 def main() -> int:
-    # Step 1: Parse hook payload from stdin
+    # Step 1: Parse hook payload from stdin (bounded read -- guard-664/rb-1568;
+    # an unbounded json.load here orphaned this hook 120-129h, 8).
+    raw = _read_stdin_with_timeout()
+    if not raw:
+        return 0
     try:
-        payload = json.load(sys.stdin)
+        payload = json.loads(raw)
     except Exception:
         return 0
 

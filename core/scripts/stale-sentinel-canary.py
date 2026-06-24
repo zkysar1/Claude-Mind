@@ -8,8 +8,18 @@ each tracked sentinel remains set.
 
 Tracked sentinels (force_* counter-gate family; set/clear semantics):
 
-    force_tree_encoding              — writer: tree-encoding-drift-gate.py
-                                       consumer: aspirations-state-update Step 8
+    force_tree_encoding              — writer: RETIRED (g-115-1521; was
+                                       tree-encoding-drift-gate.py). Its only
+                                       consumer (aspirations-state-update Step 8)
+                                       was on the COLD path the loop bypasses, so
+                                       the hot-path set was never cleared and
+                                       accumulated "true". The set was removed at
+                                       source; force_tree_maintain carries the
+                                       encoding-drift signal now. Kept in the
+                                       tracked list as a defensive tripwire — if
+                                       any future path re-introduces a set without
+                                       a hot-path consumer, the canary still
+                                       catches it.
     force_tree_maintain              — writer: tree-encoding-drift-gate.py +
                                                 iteration-close learning-gate
                                        consumer: aspirations-precheck Phase 0-pre
@@ -70,6 +80,34 @@ TRACKED_SENTINELS = [
 CANARY_SLOT = "stale_sentinel_canary"
 ASP_ID = ""  # framework-architecture aspiration
 DEFAULT_THRESHOLD = 3
+
+# Consumption-aware sentinels (3). Bare presence-count (_is_set)
+# false-fires for a sentinel whose WRITER re-arms it every iteration while
+# the CONSUMER keeps up: the count then measures consecutive-writer-arms
+# (e.g. consecutive substantive deep closes), NOT consumer-bypass. The
+# canonical case is fresh_eyes_dispatch_pending — iteration-close.sh
+# do_state_update re-arms it on every deep close with material core changes
+# (Phase 8), and the canary samples AFTER that arming (Phase 12,
+# do_productivity_check), so the sentinel is "set" at sample time on every
+# deep-close iteration even though precheck Phase 0-pre3 dispatched and
+# cleared it each time. The literal "fire when last_dispatch < set_at" form
+# ALSO false-fires here: within one iteration the consumer's last dispatch
+# (precheck, early) always precedes the writer's arming (state-update, late),
+# so last_dispatch < set_at holds in the healthy keeping-up flow. The
+# timing-correct discriminator is dispatch ADVANCEMENT: fire only when the
+# consumer's dispatch timestamp has NOT advanced across `threshold`
+# consecutive samples. The consumer (aspirations-precheck Phase 0-pre3 + the
+# in-iteration iteration-close-digest item-7 path) stamps the dispatch slot
+# on ANY handling — dispatch OR a justified no-dispatch clear (e.g. files
+# were partner-attributed). Maps sentinel -> consumer dispatch slot.
+CONSUMPTION_AWARE = {
+    "fresh_eyes_dispatch_pending": "fresh_eyes_last_dispatch",
+}
+# Canary-state key prefix for the last-observed consumer dispatch timestamp.
+# Stored alongside the per-sentinel stuck counts in CANARY_SLOT; the prefix
+# keeps it from ever colliding with a TRACKED_SENTINELS name (the run loop
+# iterates TRACKED_SENTINELS, so this extra key is inert there).
+LAST_SEEN_PREFIX = "_last_dispatch_seen__"
 
 
 def _now_iso() -> str:
@@ -196,7 +234,8 @@ def run(threshold: int, dry_run: bool) -> dict:
         report["skipped"] = "no_agent_bound"
         return report
 
-    wm_path = Path(AGENT_DIR) / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if not wm_path.exists():
         report["skipped"] = "no_working_memory_file"
         return report
@@ -226,14 +265,40 @@ def run(threshold: int, dry_run: bool) -> dict:
             value = slots.get(sentinel)
             is_set = _is_set(value)
             prev = int(counters.get(sentinel, 0) or 0)
-            new_count = prev + 1 if is_set else 0
 
             entry: dict = {
                 "is_set": is_set,
                 "prev_stuck_count": prev,
-                "new_stuck_count": new_count,
+                "new_stuck_count": 0,
                 "fired": False,
             }
+
+            if sentinel in CONSUMPTION_AWARE and is_set:
+                # Consumption-aware (3): count toward stuck only
+                # while the consumer's dispatch timestamp stays FROZEN. A
+                # writer re-arm with the consumer keeping up advances the
+                # dispatch slot, which resets the count — distinguishing
+                # "kept up" from "genuinely bypassed", which bare presence-
+                # count cannot. None-vs-None (consumer never stamped) counts;
+                # any change (incl. None -> first stamp) resets.
+                dispatch_slot = CONSUMPTION_AWARE[sentinel]
+                seen_key = LAST_SEEN_PREFIX + sentinel
+                current_dispatch = slots.get(dispatch_slot)
+                last_seen = counters.get(seen_key)
+                dispatch_advanced = current_dispatch != last_seen
+                new_count = 0 if dispatch_advanced else prev + 1
+                counters[seen_key] = current_dispatch
+                entry["consumption_aware"] = True
+                entry["current_dispatch"] = current_dispatch
+                entry["last_seen_dispatch"] = last_seen
+                entry["dispatch_advanced"] = dispatch_advanced
+                if isinstance(value, dict):
+                    entry["sentinel_set_at"] = value.get("set_at")
+            else:
+                # Presence-count (default): set -> +1, cleared -> reset to 0.
+                new_count = prev + 1 if is_set else 0
+
+            entry["new_stuck_count"] = new_count
 
             if new_count >= threshold:
                 entry["fired"] = True

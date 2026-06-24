@@ -516,6 +516,158 @@ def evaluate_fragmentation_downgrade(history, baseline_sleep_seconds, cfg):
     return baseline_sleep_seconds, False, True
 
 
+# --- B6.8: drainable-evidence collection () --------------------------
+#
+# When quiescence APPROVES (queue honestly user-gated), the agent would
+# otherwise sleep 30-60min even when drainable framework-hygiene work exists
+# that does NOT depend on the user-gated blockers (tree-decompose candidates,
+# unreflected resolved hypotheses, actionable findings without a linked goal).
+# The B6.8 branch (aspirations-all-blocked SKILL.md) drains ONE such unit per
+# cycle before sleeping. This gate supplies the evidence the orchestrator
+# branches on: approved_but_drainable + drainable_evidence + drainable_summary.
+#
+# Each source is INDEPENDENTLY fail-open (returns 0 on any error). The gate is a
+# script-gated decision with a fail-open caller wrapper, and a transient daemon
+# read hiccup must never crash quiescence or spuriously change its verdict.
+# Evidence is gathered ONLY on the approved path (cmd_check), so the denied path
+# (which routes to B6.7) pays no extra daemon round-trips.
+
+
+def _read_decompose_candidates_raw():
+    """Raw stdout of `tree.py read --decompose-candidates` (a JSON array).
+
+    Isolated for testability AND because this flag is NOT daemon-served:
+    tree-read.sh force-falls-back to `python3 tree.py read
+    --decompose-candidates` for the computationally-heavy candidate walk
+    (FORCE_FALLBACK=1), so GET /v1/tree/read 400s on this flag. We invoke
+    tree.py the SAME way the wrapper does — via sys.executable, NOT _rt (would
+    400) and NOT bash (rb-225/rb-247 Windows bash-subprocess hang); mirrors the
+    _wm_write_loop_state subprocess pattern. Raises on non-zero rc."""
+    py = sys.executable
+    script = CORE_ROOT / "scripts" / "tree.py"
+    r = subprocess.run(
+        [py, str(script), "read", "--decompose-candidates"],
+        capture_output=True, text=True, timeout=90,
+        encoding="utf-8", errors="replace",
+        cwd=str(CORE_ROOT.parent),  # PROJECT_ROOT — the wrapper cd's here
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"tree.py read --decompose-candidates rc={r.returncode}: "
+            f"{(r.stderr or '').strip()[:200]}")
+    return r.stdout
+
+
+def _count_tree_decompose_candidates():
+    """Count nodes from tree.py read --decompose-candidates (JSON array). 0 on error."""
+    try:
+        raw = _read_decompose_candidates_raw()
+        stripped = (raw or "").strip()
+        if not stripped:
+            return 0
+        obj = json.loads(stripped)
+        return len(obj) if isinstance(obj, list) else 0
+    except Exception as e:
+        print(f"[quiescence-gate] decompose-candidate count failed: {e}", file=sys.stderr)
+        return 0
+
+
+def _count_unreflected_hypotheses():
+    """Count hypotheses from pipeline-read --unreflected (JSON array). 0 on error."""
+    try:
+        raw = _rt.rt_call("GET", "/v1/pipeline/read", query="unreflected=1")
+        stripped = (raw or "").strip()
+        if not stripped:
+            return 0
+        obj = json.loads(stripped)
+        return len(obj) if isinstance(obj, list) else 0
+    except Exception as e:
+        print(f"[quiescence-gate] unreflected-hypothesis count failed: {e}", file=sys.stderr)
+        return 0
+
+
+def _count_actionable_findings_without_goal():
+    """Count findings (board, 7d) tagged 'actionable', NOT tagged goal_id, and
+    not authored by this agent — matching B6.8 Target 3's conversion filter so
+    the gate's count agrees with what the orchestrator would actually drain.
+    board-read emits JSONL (one post per line) or a JSON array; tolerate both.
+    0 on any error."""
+    try:
+        agent = os.environ.get("MIND_AGENT", "") or ""
+        raw = _rt.rt_call("GET", "/v1/board/read",
+                          query="channel=findings&since=7d&json=1")
+        stripped = (raw or "").strip()
+        if not stripped:
+            return 0
+        if stripped.startswith("["):
+            posts = json.loads(stripped)
+        else:
+            posts = []
+            for line in stripped.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    posts.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        count = 0
+        for post in posts:
+            if not isinstance(post, dict):
+                continue
+            tags = post.get("tags") or []
+            if not isinstance(tags, list):
+                continue
+            tag_strs = [str(t) for t in tags]
+            has_actionable = "actionable" in tag_strs
+            has_goal = any(t == "goal_id" or t.startswith("goal_id:") for t in tag_strs)
+            if has_actionable and not has_goal and post.get("author") != agent:
+                count += 1
+        return count
+    except Exception as e:
+        print(f"[quiescence-gate] actionable-finding count failed: {e}", file=sys.stderr)
+        return 0
+
+
+def _collect_drainable_evidence(cfg):
+    """Return the 3-field drainable_evidence dict (B6.8)."""
+    return {
+        "tree_decompose_candidates": _count_tree_decompose_candidates(),
+        "unreflected_hypotheses": _count_unreflected_hypotheses(),
+        "actionable_findings_without_goal": _count_actionable_findings_without_goal(),
+    }
+
+
+# Priority order MUST match the B6.8 three-target drain sequence
+# (aspirations-all-blocked SKILL.md): decompose > hypothesis > finding. drainable_summary.primary_target names the first target with a
+# non-zero count so the orchestrator's log line + routing agree with the gate.
+_DRAINABLE_PRIORITY = [
+    ("decompose", "tree_decompose_candidates"),
+    ("hypothesis", "unreflected_hypotheses"),
+    ("finding", "actionable_findings_without_goal"),
+]
+
+
+def _drainable_summary(evidence):
+    """Reduce drainable_evidence to {primary_target, primary_target_count,
+    any_target_available} using the B6.8 priority order."""
+    primary_target = None
+    primary_target_count = 0
+    for name, key in _DRAINABLE_PRIORITY:
+        n = int(evidence.get(key, 0) or 0)
+        if n >= 1:
+            primary_target = name
+            primary_target_count = n
+            break
+    any_available = any(int(evidence.get(k, 0) or 0) >= 1
+                        for _, k in _DRAINABLE_PRIORITY)
+    return {
+        "primary_target": primary_target,
+        "primary_target_count": primary_target_count,
+        "any_target_available": any_available,
+    }
+
+
 # --- Mode: --check ------------------------------------------------------------
 
 def cmd_check(args, cfg):
@@ -666,6 +818,12 @@ def cmd_check(args, cfg):
     # --- Sleep decision -------------------------------------------------------
     sleep_seconds = None
     fragmented_downgrade = False
+    # B6.8 (): drainable-evidence fields default to the "no drain"
+    # state; populated ONLY on the approved path below. The denied path routes
+    # to B6.7 (which gathers its own signal) and pays no extra daemon reads.
+    approved_but_drainable = False
+    drainable_evidence = None
+    drainable_summary = None
     if approved:
         sleep_seconds = int(cfg.get("sleep_seconds_min", 1800))
         # Cap respects config.sleep_seconds_max.
@@ -690,6 +848,14 @@ def cmd_check(args, cfg):
             q_new["fragmented_count"] = 0
 
         q_new["iters"] = int(q_new.get("iters", 0)) + 1
+
+        # B6.8 (): gather drainable hygiene evidence (design section
+        # 1/3). Only on the approved path. Mirrored into active_snapshot below
+        # so post-sleep verify-wake can audit whether the drain happened.
+        drainable_evidence = _collect_drainable_evidence(cfg)
+        drainable_summary = _drainable_summary(drainable_evidence)
+        approved_but_drainable = bool(drainable_summary["any_target_available"])
+
         # sleep_total_s is incremented by --verify-wake with the ACTUAL
         # time slept (which may be less than sleep_seconds if a wake signal
         # fired). Writing the planned seconds here would over-count.
@@ -702,6 +868,9 @@ def cmd_check(args, cfg):
             # absent at wake, the consumer skips the check (no baseline →
             # no comparison) — that is the correct semantic, not a fallback.
             "goal_count_at_entry": _total_goal_count(),
+            # B6.8 (): drainable evidence at entry, so post-sleep
+            # verify-wake can audit whether the drain actually reduced it.
+            "drainable_evidence": drainable_evidence,
         }
 
     # Merge signals.quiescence back into loop_state
@@ -724,6 +893,9 @@ def cmd_check(args, cfg):
         "sleep_seconds": sleep_seconds,
         "fragmented_downgrade": fragmented_downgrade,
         "fragmented_count": int(q_new.get("fragmented_count", 0) or 0),
+        # B6.8 (): persist the drain decision in the trail.
+        "approved_but_drainable": approved_but_drainable,
+        "drainable_summary": drainable_summary,
     }
     _append_log(cfg.get("log_file", "quiescence-log.jsonl"), record)
 
@@ -740,6 +912,12 @@ def cmd_check(args, cfg):
         "reasons": reasons,
         "fragmented_downgrade": fragmented_downgrade,
         "fragmented_count": int(q_new.get("fragmented_count", 0) or 0),
+        # B6.8 (): orchestrator branches on approved_but_drainable on
+        # the approved path. False/None on the denied path → back-compatible
+        # (absent-or-false routes straight to B7.2 sleep as before).
+        "approved_but_drainable": approved_but_drainable,
+        "drainable_evidence": drainable_evidence,
+        "drainable_summary": drainable_summary,
     }
     print(json.dumps(output, ensure_ascii=False, default=str))
 

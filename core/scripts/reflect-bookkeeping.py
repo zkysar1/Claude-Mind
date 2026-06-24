@@ -519,7 +519,8 @@ def _read_micro_hypotheses():
     """Read micro_hypotheses slot from working-memory.yaml."""
     if AGENT_DIR is None:
         return []
-    wm = Path(AGENT_DIR) / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm = _resolve_wm_path()
     if not wm.exists():
         return []
     data = _load_yaml(wm, {}) or {}

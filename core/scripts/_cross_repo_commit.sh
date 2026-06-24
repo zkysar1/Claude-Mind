@@ -72,27 +72,38 @@ cross_repo_commit_product() {
           | tr -d '\r' \
           | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
           | sed 's/^["'\''"]\(.*\)["'\''"]$/\1/')
-    [[ -z "$awp" || ! -d "$awp" ]] && return 0
+    [[ -z "$awp" ]] && return 0
 
-    # Enumerate direct children with .git/. Glob expansion handles spaces;
-    # we cap depth at 1 because the product workspace convention is one
-    # repo per top-level directory (Ayoai-Environment-Server, Ayoai-Roblox-
-    # Integration, etc.) — deeper nesting would be a submodule scenario
+    # MULTI-ROOT (g-321-05): $awp may name several write roots separated by ';'
+    # (e.g. ".../Ayoai;.../Zak-Data-Solutions") so an agent can commit across
+    # more than one product workspace. Split on ';' and enumerate each root.
+    # `IFS=';' read -ra` preserves paths containing spaces (only ';' splits).
+    local -a write_roots
+    IFS=';' read -ra write_roots <<< "$awp"
+
+    # Enumerate direct children with .git/ under EACH write root. Glob expansion
+    # handles spaces; we cap depth at 1 because the product workspace convention
+    # is one repo per top-level directory (Ayoai-Environment-Server, Ayoai-
+    # Roblox-Integration, etc.) — deeper nesting would be a submodule scenario
     # outside this helper's scope.
-    local repo_dir
-    for repo_dir in "$awp"/*/; do
-        repo_dir="${repo_dir%/}"
-        [[ ! -d "$repo_dir/.git" ]] && continue
-        local out
-        # iteration-commit.sh exit codes: 0 on success-or-no-op, non-zero
-        # on hard failure. `|| true` keeps state-update green even on
-        # sensitive-file-only changes or transient git-lock contention.
-        out="$(bash "$script_dir/iteration-commit.sh" \
-            --goal-id "$goal_id" \
-            --title "$title" \
-            --outcome "$outcome" \
-            --repo "$repo_dir" 2>&1 || true)"
-        echo "[iteration-close] cross-repo iteration-commit ($(basename "$repo_dir")): $out"
+    local write_root repo_dir
+    for write_root in "${write_roots[@]}"; do
+        write_root="$(printf '%s' "$write_root" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [[ -z "$write_root" || ! -d "$write_root" ]] && continue
+        for repo_dir in "$write_root"/*/; do
+            repo_dir="${repo_dir%/}"
+            [[ ! -d "$repo_dir/.git" ]] && continue
+            local out
+            # iteration-commit.sh exit codes: 0 on success-or-no-op, non-zero
+            # on hard failure. `|| true` keeps state-update green even on
+            # sensitive-file-only changes or transient git-lock contention.
+            out="$(bash "$script_dir/iteration-commit.sh" \
+                --goal-id "$goal_id" \
+                --title "$title" \
+                --outcome "$outcome" \
+                --repo "$repo_dir" 2>&1 || true)"
+            echo "[iteration-close] cross-repo iteration-commit ($(basename "$repo_dir")): $out"
+        done
     done
     return 0
 }

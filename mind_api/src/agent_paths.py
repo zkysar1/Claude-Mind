@@ -126,6 +126,69 @@ class AgentPaths:
         """Cross-session state dir (the singular 'session/'): agents/<name>/session/."""
         return self.agent / SESSION_DIRNAME
 
+    def body_wm_path(self, unit_key: str) -> Path:
+        """Per-Body working-memory path: agents/<name>/sessions/<unitKey>/working-memory.yaml.
+
+        The raw per-Body WM location (Phase 1A, Mind/Body convergence — g-306-61).
+        A Body is a forked instance of the Mind keyed by unitKey (locally the
+        session SID). See the `mind-engine-identity-bridge` tree node.
+        """
+        return self.session_dir(unit_key) / "working-memory.yaml"
+
+    def wm_path(self, unit_key: Optional[str] = None) -> Path:
+        """Effective working-memory path with reducer-aware per-Body routing
+        (Phase 1A, g-306-61; reducer-aware, g-306-62).
+
+        Routes to the per-Body WM (`body_wm_path`) when `unit_key` names a Body
+        whose forked body-WM-FILE exists (`sessions/<unitKey>/working-memory.yaml`);
+        otherwise the agent-wide WM (`state_dir/working-memory.yaml`).
+
+        The activation signal is the body-WM-FILE, NOT the body-manifest. /start
+        FORK-BODY writes a manifest for EVERY Body but `cp`s the WM (creating the
+        body-WM-file) ONLY for a NON-reducer Body. The REDUCER (the Body holding
+        running-session-id) gets a manifest but no body-WM-file, so it stays on
+        the agent-wide WM. Backward-compatible: with one Body (the reducer), or
+        no `unit_key`, this collapses to today's agent-wide path — inert until a
+        2nd Body forks, with no dependency on the Phase 1C merge for the
+        single-Body case. See conventions/session-state.md "Phase 1B".
+        """
+        if unit_key:
+            if self.body_wm_path(unit_key).exists():
+                return self.body_wm_path(unit_key)
+        return self.state_dir / "working-memory.yaml"
+
+    def retrieval_session_path(self, unit_key: Optional[str] = None) -> Path:
+        """Effective retrieval-session manifest path with reducer-aware per-Body
+        routing (Phase 1D, g-306-64).
+
+        Sibling of `wm_path` for the retrieve endpoint's utilization manifest.
+        Routes to the per-Body manifest
+        (`sessions/<unitKey>/body-retrieval-session.json`) when `unit_key` names
+        a Body whose forked body-WM-FILE exists; otherwise the agent-wide
+        `state_dir/retrieval-session.json`. SAME activation signal as `wm_path`
+        (the forked body-WM-file), so a reducer/observer — or no `unit_key` —
+        collapses to today's agent-wide path, inert until a 2nd Body forks. This
+        keeps concurrent Bodies from clobbering each other's retrieval/
+        utilization audit trail. The reducer-side consumers (utilization-feedback,
+        phase-4-26-gate, exhaustive-search-gate, iteration-close) still read the
+        agent-wide manifest; the Phase-2 worker-execute path adopts this resolver
+        when worker Bodies run the consuming phases.
+        """
+        if unit_key:
+            if self.body_wm_path(unit_key).exists():
+                return self.session_dir(unit_key) / "body-retrieval-session.json"
+        return self.state_dir / "retrieval-session.json"
+
+    @property
+    def agents_root(self) -> Path:
+        """Directory containing all agent subdirs: PROJECT_ROOT/agents/ (or
+        PROJECT_ROOT if legacy AGENTS_PARENT_DIR==''). Mirrors _paths.agents_root()
+        (CLI SSOT) and AgentPathResolver._agents_root(). Endpoints that glob across
+        ALL agents (e.g. skill_discovery journal/companion-script sources) MUST use
+        this — NEVER ctx.paths.project_root.glob("*/...") (agents/ glob-drift bug
+        class: depth-1 matches nothing post-relocation; g-115-1405)."""
+        return self.project_root / AGENTS_PARENT_DIR if AGENTS_PARENT_DIR else self.project_root
+
 
 def _parse_conf(conf_path: Path) -> Dict[str, str]:
     """Parse a local-paths.conf file into a dict. Mirrors _paths.py:_parse_conf."""
@@ -228,19 +291,46 @@ class AgentPathResolver:
                 if conf:
                     break
 
-        world_src = os.environ.get("MIND_WORLD") or conf.get("WORLD_PATH")
+        # asp-330 M1 (): .mind-data/ local storage root. Symmetric to
+        # _paths.py _resolve_tier and the _paths.sh .mind-data/ block (3 resolver
+        # layers, no shared code). When PROJECT_ROOT/.mind-data/ exists it is the
+        # local storage root by convention (world -> .mind-data/world,
+        # meta -> .mind-data/meta); an optional .mind-data/.env.local overrides
+        # per-tier paths. GATED on the dir existing, so a configured daemon
+        # (external local-paths.conf, no .mind-data/) resolves exactly as before.
+        mind_data = self.project_root / ".mind-data"
+        md_env = (
+            _parse_conf(mind_data / ".env.local")
+            if mind_data.is_dir() and (mind_data / ".env.local").exists()
+            else {}
+        )
+
+        def _resolve_src(env_key: str, conf_key: str, subdir: str) -> Optional[str]:
+            # 1. env override -> 2/3. .mind-data/ (.env.local | bare default, when
+            # the dir exists) -> 4. local-paths.conf -> None (caller raises).
+            val = os.environ.get(env_key)
+            if val:
+                return val
+            if mind_data.is_dir():
+                val = md_env.get(conf_key)
+                if val:
+                    return val
+                return str(mind_data / subdir)
+            return conf.get(conf_key)
+
+        world_src = _resolve_src("MIND_WORLD", "WORLD_PATH", "world")
         if not world_src:
             raise RuntimeError(
                 f"agent_paths: WORLD_PATH unresolved for agent={agent_name!r} "
-                f"(no MIND_WORLD env, no WORLD_PATH in local-paths.conf). "
-                f"Plan v1 step 0.1: no PROJECT_ROOT/world fallback."
+                f"(no MIND_WORLD env, no .mind-data/ root, no WORLD_PATH in "
+                f"local-paths.conf). Plan v1 step 0.1: no PROJECT_ROOT/world fallback."
             )
-        meta_src = os.environ.get("MIND_META") or conf.get("META_PATH")
+        meta_src = _resolve_src("MIND_META", "META_PATH", "meta")
         if not meta_src:
             raise RuntimeError(
                 f"agent_paths: META_PATH unresolved for agent={agent_name!r} "
-                f"(no MIND_META env, no META_PATH in local-paths.conf). "
-                f"Plan v1 step 0.1: no PROJECT_ROOT/meta fallback."
+                f"(no MIND_META env, no .mind-data/ root, no META_PATH in "
+                f"local-paths.conf). Plan v1 step 0.1: no PROJECT_ROOT/meta fallback."
             )
         if not agent_name:
             raise RuntimeError(

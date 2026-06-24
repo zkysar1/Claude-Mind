@@ -61,6 +61,50 @@ _should_delete_binding() {
     return 0
 }
 
+# : before reaping a stale Body dir, preserve its forked working-memory
+# to staging so the reducer's generalize-down (body-merge.py) can still reclaim
+# it (the Body closed/crashed before its WM was consolidated). Only a NON-reducer
+# worker Body forks a WM file; a reducer/observer never does -> nothing to stage.
+# A Body whose WM was ALREADY merged (manifest body_state == merged) is skipped
+# to avoid a double-merge on the next generalize-down. Staged files:
+# session/pending-body-merges/<unitKey>-wm.yaml (the WM) and
+# session/pending-body-merges/<unitKey>-wm.hash (: the forked_wm_hash
+# from the manifest); body-merge._consume_staged reads the hash to (a) no-op a
+# never-diverged orphan instead of merging it as if divergent, and (b) combined
+# with its already-merged set, close the cleanup/generalize-down double-merge
+# window. body-merge.py consumes+deletes both. The -wm.hash suffix mirrors
+# body-merge.py _STAGED_HASH_SUFFIX (bash/python boundary -- kept in sync by hand).
+# IRREDUCIBLY LOCAL: body_state + forked_wm_hash read via grep + bash
+# param-expansion, no python3.
+_preserve_unmerged_body_wm() {
+    local _BA="$1" _SD="$2" _SID="$3"
+    local _WMF="$_SD/working-memory.yaml"
+    [ -f "$_WMF" ] || return 0  # reducer/observer never forked a WM -> nothing to preserve
+    local _STATE="" _FHASH=""
+    if [ -f "$_SD/body-manifest.yaml" ]; then
+        _STATE=$(grep -m1 'body_state:' "$_SD/body-manifest.yaml" 2>/dev/null || true)
+        _STATE="${_STATE#*:}"
+        _STATE="${_STATE//[[:space:]]/}"
+        _STATE="${_STATE//\"/}"
+        _STATE="${_STATE//\'/}"
+        _FHASH=$(grep -m1 'forked_wm_hash:' "$_SD/body-manifest.yaml" 2>/dev/null || true)
+        _FHASH="${_FHASH#*:}"
+        _FHASH="${_FHASH//[[:space:]]/}"
+        _FHASH="${_FHASH//\"/}"
+        _FHASH="${_FHASH//\'/}"
+    fi
+    [ "$_STATE" = "merged" ] && return 0  # already consolidated -> no double-merge
+    local _STAGE_DIR
+    _STAGE_DIR="$(_agent_dir "$_BA")/session/pending-body-merges"
+    mkdir -p "$_STAGE_DIR" 2>/dev/null || return 0
+    cp "$_WMF" "$_STAGE_DIR/${_SID}-wm.yaml" 2>/dev/null || true
+    # Stage the forked_wm_hash only when it is a real value. A reducer/observer's
+    # null hash never reaches here (no WM file above); a worker fork always sets it.
+    if [ -n "$_FHASH" ] && [ "$_FHASH" != "null" ]; then
+        printf '%s' "$_FHASH" > "$_STAGE_DIR/${_SID}-wm.hash" 2>/dev/null || true
+    fi
+}
+
 # Legacy sweep: .active-agent-<SID> at PROJECT_ROOT (pre-Phase-2.6).
 for _AF in "$PROJECT_ROOT"/.active-agent-*; do
     [ -f "$_AF" ] || continue
@@ -90,6 +134,7 @@ for _ASR in "$(_agents_root)"/*; do
         [ -z "$(find "$_BFILE" -maxdepth 0 -mmin +1440 2>/dev/null)" ] && continue
         _BIND_SID="${_SD##*/}"
         if _should_delete_binding "$_BA" "$_BIND_SID"; then
+            _preserve_unmerged_body_wm "$_BA" "$_SD" "$_BIND_SID"
             rm -rf "$_SD"
         fi
     done

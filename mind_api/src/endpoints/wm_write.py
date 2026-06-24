@@ -78,7 +78,12 @@ def _is_cadence_tracker(slot_name: str) -> bool:
 # --- Paths ----------------------------------------------------------------
 
 def _wm_path(ctx) -> Path:
-    return ctx.paths.agent / "session" / "working-memory.yaml"
+    # Per-Body WM routing (Phase 1A, ): route by the request's session
+    # SID (X-Mind-Sid header). With no SID, or no body-manifest for it,
+    # ctx.paths.wm_path returns the agent-wide WM (today's behavior) — so this
+    # is backward-compatible and dormant until a 2nd Body exists.
+    sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
+    return ctx.paths.wm_path(sid or None)
 
 
 def _config_path(ctx) -> Path:
@@ -331,22 +336,73 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         with _wm_lock(ctx):
-            data = _read_yaml(_wm_path(ctx))
-            if not data:
-                data = _default_wm_data(ctx)  #  self-heal (set only)
-            parent, key, is_top = _resolve_slot(data, slot)
-            if parent is None:
-                return Response.error(400, "unresolvable_slot",
-                                      f"cannot resolve path '{slot}'")
             if slot == "loop_state":
-                on_disk = parent.get(key)
-                gate = _loop_state_merge_check(ctx, value, on_disk, override)
-                if gate.get("would_block"):
-                    return Response.error(400, "merge_gate_blocked", gate.get("reason", ""))
-            parent[key] = value
-            if not is_top:
-                _update_modified(data, slot)
-            _write_wm(_wm_path(ctx), data)
+                # 4: optimistic-concurrency on
+                # slot_meta.loop_state.update_count closes the stale-lock-steal
+                # race (9 mechanism B). The two CLI writers
+                # (loop-state-bump-counters.py, recurring-loop-state-mutate.py)
+                # use the SAME _fileops.loop_state_cas_retry helper. If a >10s
+                # stall lets a peer stale-break this lock and write, the token
+                # re-read catches it and the cycle re-reads fresh + re-runs the
+                # merge-gate + set on the peer's landed loop_state. The
+                # byte-compat _write_wm (default Dumper) is preserved unchanged.
+                from _fileops import loop_state_cas_retry
+
+                err_box = {}
+
+                def _read():
+                    data = _read_yaml(_wm_path(ctx))
+                    return data if data else _default_wm_data(ctx)  #  self-heal
+
+                def _mutate(data):
+                    # Returns True to commit; False (with err_box set) to abort
+                    # the write and surface an error response to the caller.
+                    parent, key, is_top = _resolve_slot(data, slot)
+                    if parent is None:
+                        err_box["resp"] = Response.error(
+                            400, "unresolvable_slot",
+                            f"cannot resolve path '{slot}'")
+                        return False
+                    on_disk = parent.get(key)
+                    gate = _loop_state_merge_check(ctx, value, on_disk, override)
+                    if gate.get("would_block"):
+                        err_box["resp"] = Response.error(
+                            400, "merge_gate_blocked", gate.get("reason", ""))
+                        return False
+                    # 8: write the preserved value when the gate floored
+                    # stale-lower monotonic counters. CAS re-runs this _mutate on a
+                    # stale-steal with FRESH on_disk, so the re-run gate sees the
+                    # peer's higher counter and floors `value` to it — the
+                    # Mechanism C backstop for the daemon full-slot path (CAS alone
+                    # retries the same value; it does not floor it).
+                    write_value = (
+                        gate.get("preserved_value", value)
+                        if gate.get("counters_preserved") else value
+                    )
+                    parent[key] = write_value
+                    # loop_state is never a TOP_LEVEL_KEYS slot, so meta always
+                    # advances (guard-540) — update_count is the CAS token.
+                    _update_modified(data, slot)
+                    return True
+
+                def _write(data):
+                    _write_wm(_wm_path(ctx), data)
+
+                loop_state_cas_retry(_read, _mutate, _write, slot="loop_state")
+                if err_box:
+                    return err_box["resp"]
+            else:
+                data = _read_yaml(_wm_path(ctx))
+                if not data:
+                    data = _default_wm_data(ctx)  #  self-heal (set only)
+                parent, key, is_top = _resolve_slot(data, slot)
+                if parent is None:
+                    return Response.error(400, "unresolvable_slot",
+                                          f"cannot resolve path '{slot}'")
+                parent[key] = value
+                if not is_top:
+                    _update_modified(data, slot)
+                _write_wm(_wm_path(ctx), data)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 

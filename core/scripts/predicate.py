@@ -11,6 +11,7 @@ Predicate types:
   file_check           — glob matches exist (no cutoff) — simple existence check
   metric_threshold     — allowlisted script emits count/int; compared against min/max
   after_time           — wall-clock anchor + delay_seconds elapsed (Monitor goals)
+  vcs_commits_since    — repo has >= min_count commits since a cutoff (event-gate)
 
 Unknown types, malformed predicates, and evaluator errors all fail closed for
 the offending predicate but NEVER crash the caller. The selector/caller
@@ -125,6 +126,30 @@ def resolve_after_ref(after_ref: str) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
+# Goal lookup (shared by goal_completed_after and vcs_commits_since)
+# ---------------------------------------------------------------------------
+
+def _lookup_goal_record(goal_id: str) -> Optional[dict]:
+    """Find a goal record by ID across world live, world archive, and the
+    bound agent's queue (in that order). Returns None if not found anywhere.
+    Shared by _eval_goal_completed_after and _eval_vcs_commits_since."""
+    import aspirations as asp_mod
+
+    def scan(path: Path) -> Optional[dict]:
+        if not path.exists():
+            return None
+        items = asp_mod.read_jsonl(path)
+        res = asp_mod.find_goal_in_aspirations(items, goal_id)
+        return res[2]["goals"][res[1]] if res else None
+
+    search_paths = [asp_mod.LIVE_PATH, asp_mod.ARCHIVE_PATH]
+    agent = os.environ.get("MIND_AGENT", "").strip()
+    if agent:
+        search_paths.append(_agent_dir(agent) / "aspirations.jsonl")
+    return next((g for g in (scan(p) for p in search_paths) if g is not None), None)
+
+
+# ---------------------------------------------------------------------------
 # Type handlers — each returns PredicateResult
 # ---------------------------------------------------------------------------
 
@@ -224,22 +249,7 @@ def _eval_goal_completed_after(p: dict) -> PredicateResult:
         return PredicateResult(False, "goal_completed_after", pid,
                                reason=f"unresolvable after_ref: {after_ref}")
 
-    # Lazy import to avoid startup cost and keep the module self-contained.
-    import aspirations as asp_mod
-
-    def scan(path: Path) -> Optional[dict]:
-        if not path.exists():
-            return None
-        items = asp_mod.read_jsonl(path)
-        res = asp_mod.find_goal_in_aspirations(items, goal_id)
-        return res[2]["goals"][res[1]] if res else None
-
-    search_paths = [asp_mod.LIVE_PATH, asp_mod.ARCHIVE_PATH]
-    agent = os.environ.get("MIND_AGENT", "").strip()
-    if agent:
-        search_paths.append(_agent_dir(agent) / "aspirations.jsonl")
-
-    goal = next((g for g in (scan(p) for p in search_paths) if g is not None), None)
+    goal = _lookup_goal_record(goal_id)
     if goal is None:
         return PredicateResult(False, "goal_completed_after", pid,
                                reason=f"goal {goal_id} not found in live or archive")
@@ -406,6 +416,109 @@ def _eval_after_time(p: dict) -> PredicateResult:
                                    f"available_at={available_at.strftime('%Y-%m-%dT%H:%M:%S')} > now"))
 
 
+def _eval_vcs_commits_since(p: dict) -> PredicateResult:
+    """Pass when `repo` has >= min_count commits committed strictly after a
+    cutoff timestamp. The cutoff comes from EITHER `since_goal_last_achieved`
+    (a goal_id whose lastAchievedAt/completed_date is the cutoff — the
+    event-gate form) OR `after_ref` (git:/iso:/file: grammar).
+
+    Event-gate semantics (the streak-contraction-artifact fix, g-115-1383):
+    a recurring review goal wires `since_goal_last_achieved: <its own goal_id>`
+    so it fires only when its lane repo received NEW commits since the goal
+    last ran. After it runs, lastAchievedAt advances past the triggering
+    commit, so the next eval sees zero new commits and the selector filters
+    the goal until the next commit — replacing the time proxy that produced
+    repeated manual interval rebases (g-001-241 / g-001-243).
+
+    No clock-skew grace is applied (contrast file_exists_after): the commit
+    date and lastAchievedAt are written by the SAME local clock, and a grace
+    window would re-count the triggering commit on the next pass, re-creating
+    the very re-fire artifact this predicate eliminates. Comparison is strict
+    (commit_date > cutoff).
+
+    Optional `paths` (str or list) is a git pathspec scoping the count to code
+    files, excluding per-iteration agent-state churn (agents/**) that would
+    otherwise keep the gate permanently open. Optional `author` / `grep` map
+    to `git log --author` / `--grep`.
+    """
+    pid = p.get("id")
+    min_count = int(p.get("min_count", 1))
+    repo = p.get("repo") or str(PROJECT_ROOT)
+    repo_path = Path(repo) if os.path.isabs(str(repo)) else (PROJECT_ROOT / str(repo))
+
+    # Resolve cutoff: since_goal_last_achieved (event-gate) takes precedence.
+    since_goal = p.get("since_goal_last_achieved")
+    after_ref = p.get("after_ref")
+    if since_goal:
+        rec = _lookup_goal_record(str(since_goal))
+        if rec is None:
+            return PredicateResult(False, "vcs_commits_since", pid,
+                                   reason=f"since_goal_last_achieved goal {since_goal} not found")
+        ts_str = rec.get("lastAchievedAt") or rec.get("completed_date")
+        if not ts_str:
+            return PredicateResult(False, "vcs_commits_since", pid,
+                                   observed_value={"status": rec.get("status")},
+                                   reason=f"goal {since_goal} has no lastAchievedAt/completed_date")
+        try:
+            cutoff = _to_local_naive(datetime.fromisoformat(str(ts_str)))
+        except (ValueError, TypeError):
+            return PredicateResult(False, "vcs_commits_since", pid,
+                                   reason=f"unparseable lastAchievedAt: {ts_str}")
+    elif after_ref:
+        cutoff = resolve_after_ref(after_ref)
+        if cutoff is None:
+            return PredicateResult(False, "vcs_commits_since", pid,
+                                   reason=f"unresolvable after_ref: {after_ref}")
+    else:
+        return PredicateResult(False, "vcs_commits_since", pid,
+                               reason="must specify since_goal_last_achieved or after_ref")
+
+    cmd = ["git", "-C", str(repo_path), "log", "--format=%cI"]
+    author = p.get("author")
+    if author:
+        cmd += ["--author", str(author)]
+    grep = p.get("grep")
+    if grep:
+        cmd += ["--grep", str(grep)]
+    paths = p.get("paths")
+    if paths:
+        if isinstance(paths, str):
+            paths = [paths]
+        cmd += ["--"] + [str(x) for x in paths]
+
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return PredicateResult(False, "vcs_commits_since", pid,
+                               reason=f"git invocation failed: {type(e).__name__}: {e}")
+    if out.returncode != 0:
+        return PredicateResult(False, "vcs_commits_since", pid,
+                               reason=f"git log rc={out.returncode} for repo {repo_path} (not a repo?)")
+
+    cutoff_ts = cutoff.timestamp()
+    count = 0
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cdt = _to_local_naive(datetime.fromisoformat(line))
+        except (ValueError, TypeError):
+            continue
+        if cdt.timestamp() > cutoff_ts:   # STRICT — no grace window (see docstring)
+            count += 1
+
+    passed = count >= min_count
+    return PredicateResult(
+        passed=passed,
+        type="vcs_commits_since",
+        predicate_id=pid,
+        observed_value={"commits_since": count, "cutoff": cutoff.isoformat(), "repo": str(repo_path)},
+        reason=("ok" if passed else
+                f"{count} commits since {cutoff.isoformat()} (need {min_count})"),
+    )
+
+
 PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "file_exists_after":    _eval_file_exists_after,
     "command_succeeds":     _eval_command_succeeds,
@@ -413,6 +526,7 @@ PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "file_check":           _eval_file_check,
     "metric_threshold":     _eval_metric_threshold,
     "after_time":           _eval_after_time,
+    "vcs_commits_since":    _eval_vcs_commits_since,
 }
 
 

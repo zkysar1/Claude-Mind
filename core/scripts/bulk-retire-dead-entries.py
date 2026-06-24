@@ -7,7 +7,7 @@ significant retrieval volume but produced zero helpful signal:
 
     status == "active"
     AND retrieval_count >= --min-retrievals (default 100)
-    AND times_helpful + times_cited == 0
+    AND times_helpful + times_cited + times_inferred_helpful == 0
     AND age >= --min-age-days (default 30)
     AND retirement is not already pending (no retirement_date set)
 
@@ -25,9 +25,14 @@ Background:
 
   Criteria intentionally avoid `utilization_score` and `times_skipped`
   because they are inflated by pre-2026-04-23 bulk-load behavior
-  (skipped > retrieved by 2-3x is documented in the audit). `times_helpful`
-  and `times_cited` only increment when an entry is genuinely used; they
-  cannot be inflated the same way.
+  (skipped > retrieved by 2-3x is documented in the audit). `times_helpful`,
+  `times_cited`, and `times_inferred_helpful` only increment on genuine use
+  (explicit feedback, citation, or --infer retrieval-application
+  respectively); they cannot be inflated the same way. times_inferred_helpful
+  was added to the zero-check (g-115-1605) so heavily-retrieved entries
+  attested only by the automatic --infer backstop are not mass-retired as
+  false-positive dead -- the rest of the system already counts it in
+  utility_ratio = (th + 0.5*tih)/rc, so the retire bar must stay consistent.
 
 Usage:
   py -3 core/scripts/bulk-retire-dead-entries.py                    # dry-run
@@ -83,9 +88,15 @@ def _is_candidate(rec, min_retrievals, min_age_days, today):
     rc = util.get("retrieval_count", 0) or 0
     helpful = util.get("times_helpful", 0) or 0
     cited = util.get("times_cited", 0) or 0
+    # times_inferred_helpful is the AUTOMATIC retrieval-application backstop
+    # (utilization-feedback --infer). The rest of the system counts it
+    # (utility_ratio = (th + 0.5*tih)/rc); the retire bar MUST too, else
+    # heavily-retrieved entries attested only by inference (e.g. rb-200 tih=8)
+    # mass-retire as false-positive dead (5).
+    inferred = util.get("times_inferred_helpful", 0) or 0
     if rc < min_retrievals:
         return False
-    if (helpful + cited) > 0:
+    if (helpful + cited + inferred) > 0:
         return False
     created = _parse_created(rec)
     if created is None:
@@ -194,7 +205,8 @@ def main():
     print(f"  status == active", file=sys.stderr)
     print(f"  AND retirement_date is unset", file=sys.stderr)
     print(f"  AND retrieval_count >= {args.min_retrievals}", file=sys.stderr)
-    print(f"  AND times_helpful + times_cited == 0", file=sys.stderr)
+    print(f"  AND times_helpful + times_cited + times_inferred_helpful == 0",
+          file=sys.stderr)
     print(f"  AND age >= {args.min_age_days} days "
           f"(created on or before {today - timedelta(days=args.min_age_days)})",
           file=sys.stderr)

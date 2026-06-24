@@ -69,6 +69,47 @@ REMINDER_TEXT_DEEP_RECURRING = (
     "</system-reminder>"
 )
 
+# Deadman-aware variants (default since Stage 5, 2026-06-23). When the agent
+# is deadman-ON (no deadman-disabled opt-out flag), the terminal is the PAIR
+# [ScheduleWakeup THEN Skill], not Skill alone. The Skill-only reminders above
+# are emitted ONLY when the agent has opted out. Keeping the hook aligned with
+# the close-script stdout pair imperative removes the contradiction that
+# produced the arm-without-Skill / split-orphan messiness (the system-reminder
+# outranks stdout, so a Skill-only reminder here actively suppressed the arm).
+REMINDER_TEXT_GENERIC_DEADMAN = (
+    "<system-reminder>\n"
+    "An iteration just closed (iteration-close.sh --phase productivity-check OR "
+    "recurring-close.sh OUTCOME=routine completed). The deadman-switch is ON "
+    "(default), so your terminal response MUST be EXACTLY these TWO batched tool "
+    "calls, IN THIS ORDER, in this ONE response:\n"
+    "  (1) ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", delaySeconds=600) "
+    "— the self-resurrection net; MANDATORY, do NOT omit it; THEN\n"
+    "  (2) Skill(aspirations) with args='loop' — the primary re-entry and the "
+    "LAST call, which continues the loop NOW.\n"
+    "Emit BOTH in this single response with NO text before or between them. Do "
+    "NOT emit a text summary and do NOT end with a Bash echo — a terminal text "
+    "paragraph ends the turn without re-entering the loop and kills the session. "
+    "Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one "
+    "unprotected against a silent text-death, so arm the net EVERY iteration. "
+    "See .claude/rules/return-protocol.md (deadman terminal-pair) and "
+    "schedule-wakeup-correctness.md.\n"
+    "</system-reminder>"
+)
+
+REMINDER_TEXT_DEEP_RECURRING_DEADMAN = (
+    "<system-reminder>\n"
+    "A deep recurring close just completed (recurring-close.sh OUTCOME=deep, "
+    "deadman-switch ON). Your VERY NEXT tool call MUST be Skill(aspirations-spark) "
+    "— Phase 6 spark fires on deep closes and is NOT wrapped by recurring-close.sh. "
+    "AFTER Phase 6 completes, re-enter the loop with the deadman PAIR, in this "
+    "order and in one response: ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", "
+    "delaySeconds=600) THEN Skill(aspirations) with args='loop'. Do NOT emit text "
+    "or a Bash echo before Skill(aspirations-spark). See "
+    ".claude/skills/aspirations/SKILL.md \"Recurring-goal shortcut\" section and "
+    ".claude/rules/return-protocol.md.\n"
+    "</system-reminder>"
+)
+
 # Marker emitted by recurring-close.sh:692-694 when OUTCOME=deep. The literal
 # uses an em-dash (U+2014) between "OUTCOME=deep" and "NEXT ACTION REQUIRED"
 # — NOT a double-hyphen. The pattern below matches by anchoring on the two
@@ -140,9 +181,66 @@ def _command_invokes_iteration_close(command: str) -> bool:
     return False
 
 
+def _read_stdin_with_timeout(timeout_s=None):
+    """Read the hook event JSON from stdin without blocking forever (guard-664).
+
+    This is a PostToolUse[Bash] hook: Claude Code pipes the event JSON and
+    normally closes the write-end, so EOF arrives in << timeout_s and the read
+    completes immediately. But if the hook is orphaned with the stdin pipe's
+    write-end held open by an inherited handle (a detached parent or a
+    long-lived sibling process), a bare `json.load(sys.stdin)` blocks
+    INDEFINITELY -- the mechanism behind the 343h-alive pid-28404 orphan
+    (g-115-1382): launched 2026-05-26T17:17:50, flagged by stale-jobs-scan at
+    343h, never terminated. guard-664's daemon-thread + join() deadline
+    degrades that hang to "no event read -> exit 0 (no injection)" instead of a
+    multi-day orphan. select()/signal.alarm do NOT work on Windows pipes; a
+    daemon thread does. Mirrors experience.py _read_optional_stdin.
+
+    Returns "" on a tty or on timeout. Tunable via
+    ITERATION_CLOSE_REMINDER_STDIN_TIMEOUT_S (default 10s) -- far above any real
+    piped delivery (EOF in ms), far below the orphan hang.
+    """
+    if sys.stdin.isatty():
+        return ""
+    if timeout_s is None:
+        try:
+            timeout_s = float(
+                os.environ.get("ITERATION_CLOSE_REMINDER_STDIN_TIMEOUT_S", "10")
+            )
+        except (ValueError, TypeError):
+            timeout_s = 10.0
+    import threading
+
+    box = {"data": "", "done": False}
+
+    def _reader():
+        try:
+            box["data"] = sys.stdin.read()
+        except Exception:
+            pass
+        finally:
+            box["done"] = True
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if not box["done"]:
+        # stdin never reached EOF -- orphaned/inherited pipe. Fail open: no
+        # reminder injected this turn (Stop hook + return-protocol discipline
+        # are the backstops), but the process EXITS instead of becoming a
+        # multi-day orphan (2).
+        return ""
+    return box["data"]
+
+
 def main():
+    raw = _read_stdin_with_timeout()
+    if not raw:
+        # tty, empty stdin, or stdin never reached EOF (orphaned pipe) -> fail
+        # open with no injection rather than hang forever (2).
+        sys.exit(0)
     try:
-        data = json.load(sys.stdin)
+        data = json.loads(raw)
     except Exception:
         sys.exit(0)
 
@@ -239,10 +337,17 @@ def main():
     # iteration-close.sh productivity-check AND to OUTCOME=routine recurring
     # closes AND to any unexpected tool_response shape (fail-open).
     tool_response = data.get("tool_response")
+    # Deadman-aware (default-ON since Stage 5): emit the terminal-PAIR reminder
+    # unless this agent opted out via a deadman-disabled flag — same flag the
+    # close scripts gate on. Without this, the Skill-only reminder (which
+    # outranks the close-script stdout pair imperative) suppressed the arm.
+    deadman_on = not os.path.isfile(os.path.join(session_dir, "deadman-disabled"))
     if _is_deep_recurring_close(tool_response):
-        reminder_text = REMINDER_TEXT_DEEP_RECURRING
+        reminder_text = (REMINDER_TEXT_DEEP_RECURRING_DEADMAN if deadman_on
+                         else REMINDER_TEXT_DEEP_RECURRING)
     else:
-        reminder_text = REMINDER_TEXT_GENERIC
+        reminder_text = (REMINDER_TEXT_GENERIC_DEADMAN if deadman_on
+                         else REMINDER_TEXT_GENERIC)
 
     # Inject the imperative as additionalContext. The model sees this in its
     # next turn's context window alongside the tool output, so ignoring it

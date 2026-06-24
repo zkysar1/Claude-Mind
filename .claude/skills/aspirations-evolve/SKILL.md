@@ -602,22 +602,25 @@ Bash: skill-evaluate.sh underperforming --threshold {quality_thresholds.retireme
 underperforming = parse JSON output
 
 FOR EACH skill in underperforming:
+    # FIELD NAME (g-115-1403): skill-evaluate.sh emits the skill name under
+    # key "skill" (record["skill"]), NOT "name". Use skill.skill — skill.name
+    # is None (silent schema drift, guard-359). Do NOT "correct" it back.
     IF skill.total_evaluations >= quality_thresholds.min_evaluations (5):
         Bash: world-cat.sh forged-skills.yaml
         IF skill is a forged skill (exists in world/forged-skills.yaml):
             # Check if any pending goals depend on this skill
             Bash: load-aspirations-compact.sh
             IF no pending goals use this skill:
-                Log: "SKILL CURATION: Retiring {skill.name} — quality {skill.overall} after {skill.total_evaluations} evaluations"
-                Add goal: "Retire forged skill: {skill.name}" to current/evolution aspiration
+                Log: "SKILL CURATION: Retiring {skill.skill} — quality {skill.overall} after {skill.total_evaluations} evaluations"
+                Add goal: "Retire forged skill: {skill.skill}" to current/evolution aspiration
             ELSE:
-                Log: "SKILL CURATION: {skill.name} underperforming but has pending goals — creating improvement goal"
-                Add goal: "Improve forged skill: {skill.name} (quality {skill.overall})" to current aspiration
+                Log: "SKILL CURATION: {skill.skill} underperforming but has pending goals — creating improvement goal"
+                Add goal: "Improve forged skill: {skill.skill} (quality {skill.overall})" to current aspiration
         ELSE:
             # Base skill — cannot retire. Flag for user attention.
-            Log: "SKILL ALERT: Base skill {skill.name} quality {skill.overall} — user review recommended"
+            Log: "SKILL ALERT: Base skill {skill.skill} quality {skill.overall} — user review recommended"
             Write to agents/<agent>/session/pending-questions.yaml:
-                question: "Base skill {skill.name} has quality {skill.overall}. Should I create a better forged alternative?"
+                question: "Base skill {skill.skill} has quality {skill.overall}. Should I create a better forged alternative?"
                 default_action: "Monitoring — will create improvement goal if quality drops further"
                 status: pending
 
@@ -661,28 +664,31 @@ flagged = parse JSON output → {generated_at, count, skills: [...]}
 Read meta/skill-discovery-strategy.yaml → strategy.goals
 
 FOR EACH skill in flagged.skills:
+    # FIELD NAME (g-115-1403): skill-discovery.py emits the skill name under
+    # key "skill" (record["skill"]), NOT "name". Use skill.skill — skill.name
+    # is None (silent schema drift, guard-359). Do NOT "correct" it back.
     # Bounded: one goal per skill at a time. The goal-selector and
     # aspirations-execute prevent duplicate execution; this guard prevents
     # duplicate FILING while a prior follow-up is still active. Resolved
     # goals do not block re-filing — if a prior investigation closed
     # without addressing the silence, we want a fresh signal.
     Bash: load-aspirations-compact.sh
-    IF any goal exists with skill.name in its title AND status in
+    IF any goal exists with skill.skill in its title AND status in
        (pending, in-progress, blocked) AND title contains any of
        ("silent", "discovery", "cold", "declining"):
-        Log: "DISCOVERY AUDIT: {skill.name} already has active follow-up — skipping"
+        Log: "DISCOVERY AUDIT: {skill.skill} already has active follow-up — skipping"
         continue
 
     # Map status → primitive + title. Primitives are encoded by title prefix
     # ("Investigate:" / "Idea:") per CLAUDE.md "Cognitive Primitives".
     IF skill.status == "silently_undertriggering":
-        title = "Investigate: forged skill " + skill.name + " silent for " + skill.days_since_forge + "d (0 invocations logged)"
+        title = "Investigate: forged skill " + skill.skill + " silent for " + skill.days_since_forge + "d (0 invocations logged)"
     ELIF skill.status == "cold_after_use":
-        title = "Idea: review forged skill " + skill.name + " — last invoked " + skill.days_since_last_invocation + "d ago"
+        title = "Idea: review forged skill " + skill.skill + " — last invoked " + skill.days_since_last_invocation + "d ago"
     ELIF skill.status == "declining":
         # decline_signal.ratio is a fraction (0.0-1.0); multiply for display.
         decline_pct = round(skill.decline_signal.ratio * 100)
-        title = "Idea: investigate declining usage of " + skill.name + " (rate " + decline_pct + "% of prior window)"
+        title = "Idea: investigate declining usage of " + skill.skill + " (rate " + decline_pct + "% of prior window)"
     ELSE:
         continue
 
@@ -693,7 +699,7 @@ FOR EACH skill in flagged.skills:
     # hints already cross-reference FSR-D, gap analysis, etc — copying them
     # verbatim avoids re-deriving the triage path inside this pseudocode.
     description = (
-        "Forged skill: " + skill.name + "\n"
+        "Forged skill: " + skill.skill + "\n"
         "Forged: " + skill.forged_date + " (" + skill.days_since_forge + " days ago)\n"
         "Total invocations: " + skill.total_invocations + " (sources: " + json(skill.invocation_sources) + ")\n"
         "Confidence: " + skill.confidence + "\n"
@@ -716,12 +722,12 @@ FOR EACH skill in flagged.skills:
         "priority": priority,
         "category": "framework-meta",
         "participants": ["agent"],
-        "origin_signal": "skill-discovery-audit:" + skill.name + ":" + skill.status,
+        "origin_signal": "skill-discovery-audit:" + skill.skill + ":" + skill.status,
     }
     Bash: echo '<goal_json>' | aspirations-add-goal.sh --source world {target_asp}
 
-    Log: "DISCOVERY AUDIT: filed goal for " + skill.name + " (" + skill.status + ")"
-    echo '<{"date":"...","event":"discovery-audit-fire","skill":skill.name,"status":skill.status}>' \
+    Log: "DISCOVERY AUDIT: filed goal for " + skill.skill + " (" + skill.status + ")"
+    echo '{"date":"<today>","event":"discovery-audit-fire","details":"discovery audit filed goal for {skill.skill} (status: {skill.status})","trigger_reason":"evolve-discovery-audit"}' \
         | bash core/scripts/evolution-log-append.sh
 ```
 
@@ -738,7 +744,7 @@ FOR EACH skill in flagged.skills:
    - `outcome_stats.accuracy < 0.80 AND outcome_stats.total >= 3` → flag for condition tightening (was false_positives/times_triggered > 0.20) <!-- DRIFT-EXEMPT: rename-documentation -->
    - `outcome_stats.total == 0 AND sessions_since_creation > 10` → flag as stale, consider loosening
    - `outcome_stats.confirmed >= 5 AND outcome_stats.accuracy >= 0.90` → graduate to `validated`, increase weight
-   - `utilization.retrieval_count >= 10 AND outcome_stats.total < 2` → retrieved but never matched; prune candidate
+   - `utilization.retrieval_count >= 10 AND outcome_stats.total < 2` → retrieved but rarely/never matched. **PRUNE ONLY IF outcome-recording is WIRED** for this pattern (it is a meta-pattern recorded via hypothesis resolution per guard-575, OR a `sig-NNN-auto-detect.py` auto-probe exists). If NO recording mechanism exists, `total < 2` reflects MISSING TRACKING, not pattern failure → RETAIN (a high `retrieval_count` is positive reference-value signal — LLMs keep finding it relevant). Audit 2026-06-14 (g-115-1441): 14/19 active patterns are unwired and ZERO auto-probe scripts exist, so this rule false-flags valuable reference patterns unless the wiring check gates it.
 2. For flagged patterns: propose specific condition changes
 3. Update `validation_status` based on current stats
 4. Log changes to pattern calibration via `echo '<json>' | bash core/scripts/evolution-log-append.sh`
@@ -811,6 +817,17 @@ updates the clock — preventing double-fires.
      cadence timestamps (rb-254 single-writer principle). -->
 ```
 echo '"'"$(date +%Y-%m-%dT%H:%M:%S)"'"' | bash core/scripts/wm-set.sh last_evolution_at_time
+# g-115-1561: bash-owned single-writer for the evolution ACCUMULATORS
+# (loop_state.evolutions + loop_state.last_evolution_at). Co-located with the
+# cadence-TIMESTAMP write above so exactly ONE place records "an evolution
+# fired", on EVERY path that reaches aspirations-evolve (Phase 8.8 cadence,
+# Phase 9 triggers, all-blocked B3 idle). Replaces the retired in-context
+# `evolutions_this_session += 1` (which lived ONLY in all-blocked B3 — the main
+# Phase 8.8/9 path never incremented it) plus the learning-gate / B3 overlays
+# that were discarded at LOOP_CONTINUE → evolutions frozen at 0 → the
+# per-session evolution cap was silently defeated. Fail-open (exits 0 on any
+# error); --evolution-fired needs no --outcome.
+py -3 core/scripts/loop-state-bump-counters.py --evolution-fired
 ```
 
 ### Return Protocol

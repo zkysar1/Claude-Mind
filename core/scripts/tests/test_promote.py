@@ -173,26 +173,17 @@ def test_shell_invariant_violation_higher_target_exit1(tmp_path):
     assert "INVARIANT VIOLATION" in r.stderr
 
 
-def test_shell_dry_run_lower_target_ok(tmp_path):
-    """Happy path: local >= target, all pre-flight + preflight pass, dry-run
-    reaches OK and writes NOTHING (no seed-transplant, no PR)."""
-    below = L.bump_version("0.0.0", "patch")  # "0.0.1" — guaranteed <= any real local
-    tgt = _mk_target(tmp_path, below)
-    r = run_promote("--target", str(tgt), "--dry-run")
-    assert r.returncode == 0, r.stderr
-    assert "[dry-run] OK" in r.stdout
-    assert "would: seed-transplant.sh" in r.stdout  # would, not did
-    # The target was NOT mutated by the dry-run.
-    assert (tgt / "mind_api" / "src" / "__init__.py").read_text(encoding="utf-8").strip() \
-        == f'__version__ = "{below}"'
-
-
-def test_shell_dry_run_equal_target_ok(tmp_path):
-    """Invariant is >= (equal is allowed)."""
-    tgt = _mk_target(tmp_path, _local_version())
-    r = run_promote("--target", str(tgt), "--dry-run")
-    assert r.returncode == 0, r.stderr
-    assert "[dry-run] OK" in r.stdout
+# NOTE (2): the dry-run HAPPY-PATH tests (lower/equal target -> "[dry-run]
+# OK") moved to section 7 and now run against an ISOLATED clean+tagged source with
+# a stubbed seed-preflight. run_promote() targets the LIVE repo, and promote Step 3
+# invokes seed-preflight UNCONDITIONALLY (dry-run softens only the Step-1b/1c
+# release-ceremony notes, NOT content publishability -- intentional since commit
+# c92777b1). So the happy path depended on the live committed repo being fully
+# publishable; any committed publishability defect (e.g. a domain-token leak in a
+# core/config design doc) failed both tests with seed-preflight exit 1, in CI as
+# well as dev -- and they were the suite's two slowest tests (~140s each, running
+# the real seed-preflight). The FAILURE-path dry-run tests above legitimately use
+# the live repo: they exit 1 BEFORE Step 3, so publishability never enters.
 
 
 # ===========================================================================
@@ -466,3 +457,84 @@ def test_pr_custom_branch_name(tmp_path):
     # gh pr create infers the head from the checked-out branch (no branch arg), so the
     # branch name is NOT in the gh args — what we verify is that gh ran on this cut.
     assert "pr create" in cap.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# 7. promote-to-upstream.sh — dry-run happy path + publishability gate
+#    (ISOLATED source, 2)
+# ===========================================================================
+# These exercise the dry-run "[dry-run] OK" path and the Step-3 seed-preflight
+# gate against an ISOLATED clean+tagged source with stubbed sub-steps -- the same
+# harness the --pr tests use (_setup_promote_source stubs seed-preflight -> exit 0).
+# They were previously run against the LIVE repo via run_promote(), which coupled
+# them to the live repo's incidental publishability: promote Step 3 invokes
+# seed-preflight UNCONDITIONALLY (dry-run softens only the Step-1b/1c release-
+# ceremony notes, NOT content publishability -- intentional since inception, commit
+# c92777b1). Any committed publishability defect anywhere (e.g. a domain-token leak
+# in a core/config design doc) failed both tests with returncode 1, in CI as well
+# as during development; they were also the suite's two slowest tests (~140s each,
+# running the real seed-preflight). Isolation makes them deterministic AND fast.
+def _run_promote_dry(src, target, world, *extra_args, extra_env=None):
+    """Run the ISOLATED source's promote in --dry-run against `target`."""
+    env = os.environ.copy()
+    for k in ("MIND_AGENT", "MIND_SID", "WORLD_PATH", "META_PATH", "MIND_META",
+              "MIND_GIT_AVAILABLE"):
+        env.pop(k, None)
+    env["MIND_WORLD"] = str(world)
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        [BASH, str(src / "core" / "scripts" / "promote-to-upstream.sh"),
+         "--target", str(target), "--dry-run", *extra_args],
+        capture_output=True, text=True, env=env, cwd=str(src),
+    )
+
+
+@requires_git
+def test_shell_dry_run_lower_target_ok(tmp_path):
+    """Happy path: local >= target, all pre-flight + preflight pass, dry-run
+    reaches OK and writes NOTHING (no seed-transplant, no PR). Isolated source so
+    the result is independent of the live repo's publishability (g-115-1512)."""
+    src = _setup_promote_source(tmp_path, "1.0.0")
+    world = _mk_world(tmp_path, "frontier")
+    below = L.bump_version("0.0.0", "patch")  # "0.0.1" -- <= source 1.0.0
+    tgt = _mk_target(tmp_path, below)
+    r = _run_promote_dry(src, tgt, world)
+    assert r.returncode == 0, r.stderr
+    assert "[dry-run] OK" in r.stdout
+    assert "would: seed-transplant.sh" in r.stdout  # would, not did
+    # The target was NOT mutated by the dry-run.
+    assert (tgt / "mind_api" / "src" / "__init__.py").read_text(encoding="utf-8").strip() \
+        == f'__version__ = "{below}"'
+
+
+@requires_git
+def test_shell_dry_run_equal_target_ok(tmp_path):
+    """Invariant is >= (equal is allowed). Isolated source pinned to the real local
+    __version__ so 'equal' is tested against a realistic version (g-115-1512)."""
+    ver = _local_version()
+    src = _setup_promote_source(tmp_path, ver)
+    world = _mk_world(tmp_path, "frontier")
+    tgt = _mk_target(tmp_path, ver)  # equal to the source version
+    r = _run_promote_dry(src, tgt, world)
+    assert r.returncode == 0, r.stderr
+    assert "[dry-run] OK" in r.stdout
+
+
+@requires_git
+def test_shell_dry_run_unpublishable_fails(tmp_path):
+    """Step 3 is a HARD gate even in --dry-run: when seed-preflight FAILs, dry-run
+    refuses (returncode 1) and never reaches "[dry-run] OK". Pins the intentional
+    design (dry-run validates content publishability) that the soft Step-1b/1c
+    release-ceremony notes do NOT extend to -- the behavior whose implicitness
+    drove the g-115-1512 investigation."""
+    src = _setup_promote_source(tmp_path, "1.0.0")
+    # Override the OK stub: force seed-preflight to FAIL.
+    (src / "core" / "scripts" / "seed-preflight.sh").write_text(
+        "#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    world = _mk_world(tmp_path, "frontier")
+    tgt = _mk_target(tmp_path, "0.0.1")  # valid lower target -> passes Step 2
+    r = _run_promote_dry(src, tgt, world)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "seed-preflight FAILED" in r.stderr
+    assert "[dry-run] OK" not in r.stdout

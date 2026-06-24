@@ -206,6 +206,13 @@ GUARD_ID_RE = re.compile(r"^guard-\d+$")
 RB_VALID_TYPES = {"success", "failure", "user_provided"}
 RB_VALID_STATUSES = {"active", "retired"}
 RB_VALID_APPLIES_TO = {"any", "framework", "domain", "specific"}
+# entry_type (, BRD Gap 7a-Mind): optional reasoning-bank taxonomy tag.
+# null (the default) = an ordinary reasoning lesson; "procedure" = a reusable
+# multi-step how-to that `retrieve.sh --entry-type procedure` can target.
+# Additive + null-safe (the rb validator has no unknown-field gate); NO
+# embeddings, NO new store. Extend this SET (not the validator body) to add
+# future entry types. Kept verbatim-in-sync with core/scripts/reasoning-bank.py.
+RB_VALID_ENTRY_TYPES = {"procedure"}
 GUARD_VALID_STATUSES = {"active", "retired"}
 
 RB_REQUIRED_FIELDS = {"id", "title", "type", "category", "content", "applies_to"}
@@ -214,11 +221,40 @@ RB_DEFAULT_FIELDS = {
     "description": "",
     "source_hypothesis": None,
     "source_goal": None,
+    # origin_goal_id (): the EXECUTING goal id at write time, for the
+    # Gate D spillover analysis (distinct from source_goal, the semantic source a
+    # caller may override). Auto-injected from team-state in_flight by the prepare
+    # hook; defaults null when no goal is executing. Additive — pre-
+    # readers ignore it (the rb validator has no unknown-field gate).
+    "origin_goal_id": None,
+    # poignancy (, BRD Gap 1a; Generative Agents 2304.03442): optional
+    # 1-10 importance rating set by the LLM author at write (one-shot
+    # self-rating). Additive + null-safe — the rb validator has no unknown-field
+    # gate, and retrieve scoring treats null as neutral (no backfill). Folded
+    # into ranking only when tree.yaml retrieval.poignancy_blend_enabled is true
+    # (default false), so this default is inert until the blend is enabled.
+    "poignancy": None,
     "outcome": None,
     "failure_lesson": None,
     "preventive_guardrail": None,
     "experience_ref": None,
     "tags": [],
+    # entry_type (): optional reasoning-bank taxonomy. null = ordinary
+    # lesson; "procedure" = reusable multi-step how-to, retrievable via
+    # retrieve.sh --entry-type procedure. Additive + null-safe (validator allows
+    # null or a value in RB_VALID_ENTRY_TYPES). Mirror of the CLI default in
+    # core/scripts/reasoning-bank.py.
+    "entry_type": None,
+    # valid_from / valid_to (, BRD Gap 5): optional bi-temporal
+    # record-level validity interval. null/null (the default) = a record with
+    # no explicit validity window (treated as currently-valid by the reader
+    # path). On falsification the OLD record gets valid_to=now and a NEW record
+    # is inserted with valid_from=now (close-old-insert-new, NOT in-place
+    # mutation). Additive + null-safe (no unknown-field gate on RB); validated
+    # by _validate_bitemporal. Mirror of the CLI default in
+    # core/scripts/reasoning-bank.py.
+    "valid_from": None,
+    "valid_to": None,
     "when_to_use": {"conditions": [], "category": ""},
     "utilization": {
         "retrieval_count": 0,
@@ -239,6 +275,14 @@ GUARD_DEFAULT_FIELDS = {
     "status": "active",
     "experience_ref": None,
     "trigger_pattern": None,
+    # valid_from / valid_to (, BRD Gap 5): optional bi-temporal validity
+    # interval (see RB_DEFAULT_FIELDS for semantics). Added to GUARD_DEFAULT_FIELDS
+    # so they flow into GUARD_KNOWN_FIELDS automatically (the unknown-field gate
+    # is `set(GUARD_DEFAULT_FIELDS.keys())` | ...), keeping the additive field
+    # accepted by the strict guardrail allowlist. Mirror of the CLI default in
+    # core/scripts/reasoning-bank.py.
+    "valid_from": None,
+    "valid_to": None,
     "when_to_use": {"conditions": [], "category": ""},
     "utilization": {
         "retrieval_count": 0,
@@ -343,6 +387,40 @@ def _stamp_now() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _validate_bitemporal(rec) -> None:
+    """Validate optional bi-temporal validity-interval fields (, BRD
+    Gap 5): valid_from / valid_to. Each is null/absent (the default) or an
+    ISO-8601 local-datetime string in the _stamp_now format
+    "%Y-%m-%dT%H:%M:%S". When BOTH are present, valid_from must be <= valid_to
+    (a record cannot stop being valid before it started). isinstance guard
+    precedes datetime.fromisoformat (B10: a non-str field would raise TypeError
+    on parse and 500 the write -- short-circuit to a clean ValueError).
+    guard-420: datetime comparison only on parsed datetimes, never on the raw
+    strings. Additive + null-safe: existing records without the fields pass
+    untouched. Kept verbatim-in-sync across mind_api/src/store_registry.py +
+    core/scripts/reasoning-bank.py."""
+    parsed = {}
+    for _bt_field in ("valid_from", "valid_to"):
+        val = rec.get(_bt_field)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            raise ValueError(
+                f"Invalid {_bt_field}: {val!r} "
+                f"(expected null or an ISO-8601 datetime string)")
+        try:
+            parsed[_bt_field] = datetime.fromisoformat(val)
+        except ValueError:
+            raise ValueError(
+                f"Invalid {_bt_field}: {val!r} "
+                f"(expected ISO-8601 datetime, e.g. 2026-06-19T01:00:00)")
+    if "valid_from" in parsed and "valid_to" in parsed:
+        if parsed["valid_from"] > parsed["valid_to"]:
+            raise ValueError(
+                f"valid_from ({rec['valid_from']!r}) must be <= "
+                f"valid_to ({rec['valid_to']!r})")
+
+
 def validate_rb_record(ctx, rec, *, skip_id: bool = False) -> None:
     """Verbatim port of reasoning-bank.py validate_rb_record.
     Leading ctx param for uniform StoreSpec.validate signature (unused)."""
@@ -367,9 +445,21 @@ def validate_rb_record(ctx, rec, *, skip_id: bool = False) -> None:
     if not isinstance(applies, str) or applies not in RB_VALID_APPLIES_TO:
         raise ValueError(
             f"Invalid applies_to: {applies!r} (expected one of {RB_VALID_APPLIES_TO})")
+    # entry_type (): optional. null/absent = ordinary lesson; otherwise
+    # must be a string in RB_VALID_ENTRY_TYPES. isinstance guard precedes
+    # membership (B10): a list-valued entry_type would raise TypeError on
+    # `list not in set` and 500 the write — short-circuit to a clean ValueError.
+    entry_type = rec.get("entry_type")
+    if entry_type is not None and (
+            not isinstance(entry_type, str)
+            or entry_type not in RB_VALID_ENTRY_TYPES):
+        raise ValueError(
+            f"Invalid entry_type: {entry_type!r} "
+            f"(expected null or one of {RB_VALID_ENTRY_TYPES})")
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    _validate_bitemporal(rec)
     _normalize_tags(rec)
 
 
@@ -399,15 +489,23 @@ def validate_guard_record(ctx, rec, *, skip_id: bool = False) -> None:
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    _validate_bitemporal(rec)
     _normalize_tags(rec)
 
 
 def _rb_inject_source_goal(ctx, rec):
-    """Auto-populate source_goal from team-state.yaml in_flight.goal_id.
-    Verbatim logic from reasoning-bank.py _read_in_flight_goal_id + rb_add
-    lines ~600-603. Reads from ctx.paths (not os.environ)."""
-    if "source_goal" in rec:
-        return  # caller wins (including explicit null)
+    """Auto-populate source_goal AND origin_goal_id from team-state.yaml
+    in_flight.goal_id (one read, sets both). source_goal is the SEMANTIC source
+    (a caller may override it to a different goal); origin_goal_id (g-325-06) is
+    the EXECUTING goal at write time, for the Gate D spillover analysis (SPILL-1:
+    which experiment-arm goal produced this knowledge). Each is caller-wins — an
+    explicit value (including null) is preserved independently. Verbatim base
+    logic from reasoning-bank.py _read_in_flight_goal_id + rb_add lines ~600-603.
+    Reads from ctx.paths (not os.environ)."""
+    need_source = "source_goal" not in rec
+    need_origin = "origin_goal_id" not in rec
+    if not need_source and not need_origin:
+        return  # caller set both (including explicit null) — caller wins
     try:
         import yaml  # lazy import — only needed in the auto-populate path
     except ImportError:
@@ -426,7 +524,10 @@ def _rb_inject_source_goal(ctx, rec):
                        .get("in_flight", {})
                        .get("goal_id"))
         if goal_id:
-            rec["source_goal"] = goal_id
+            if need_source:
+                rec["source_goal"] = goal_id
+            if need_origin:
+                rec["origin_goal_id"] = goal_id
     except Exception:
         return  # fail-open
 

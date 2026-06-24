@@ -11,9 +11,11 @@
 # bravo can see alpha is mid-execution on a 10-minute goal without waiting for the
 # next heartbeat tick. Lock contention: zero cross-agent (each agent owns its own file).
 #
-# Activation: bound by .claude/settings.json PostToolUse hook with matcher='*'
-# (deny-list-blocked, requires user-side configuration). Until activated, this
-# script is dormant.
+# Activation: LIVE -- bound by .claude/settings.json PostToolUse hook with
+# matcher='*' (settings.json ~L360-367; fires on every tool call). The
+# "deny-list-blocked / dormant" note is STALE (8, 2026-06-20): the
+# hook is active on this install. presence-tick.py bounds its stdin read so
+# an orphaned pipe cannot hang the process (was 120-129h py.exe orphans).
 set -uo pipefail
 exec 2>/dev/null  # silence stderr — visibility hook must never produce noise
 

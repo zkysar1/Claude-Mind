@@ -124,9 +124,21 @@ VALID_OPS = {"add-child", "set", "increment", "remove-child",
 # Fields copied verbatim from the add-child payload onto the new node, in the
 # SAME order as core/scripts/tree.py cmd_add_child._do_add (insertion order
 # matters for sort_keys=False byte-compat).
+# 4: re-synced origin_goal_id + poignancy to match the CLI copy list.
+# The CLI added both to cmd_add_child._do_add (origin_goal_id instrumentation;
+# poignancy ) but this mirror lagged, so a daemon add-child payload
+# carrying either field silently dropped it vs the CLI (byte-compat drift, same
+# class as 9). Enforced by
+# core/scripts/tests/test_daemon_cli_mirror_parity.py.
+# 3: node_type is intentionally NOT in this copy list — it is
+# derive-always from child-presence at the create path (_apply_add_child,
+# mirroring child_count). Do NOT re-add it; the copy-tuple parity test
+# (test_daemon_cli_mirror_parity.py) pins this against the CLI cmd_add_child
+# tuple, which also dropped it.
 _CHILD_COPY_FIELDS = (
     "summary", "domain_confidence", "capability_level", "confidence",
-    "article_count", "growth_state", "node_type",
+    "article_count", "growth_state", "origin_goal_id",
+    "poignancy",
 )
 
 # Mirror of core/scripts/tree.py:104-109. DO NOT edit independently — the
@@ -159,7 +171,7 @@ def _recompute_utility_ratio(node: Dict[str, Any]) -> None:
 
 
 def _apply_defaults(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Mirror of tree.py:347-379. Returns a new dict (does not mutate)."""
+    """Mirror of tree.py:347-394. Returns a new dict (does not mutate)."""
     out = dict(node)
     if "article_count" not in out:
         out["article_count"] = 0
@@ -178,6 +190,22 @@ def _apply_defaults(node: Dict[str, Any]) -> Dict[str, Any]:
         out["times_noise"] = 0
     if "utility_ratio" not in out:
         out["utility_ratio"] = 0.0
+    # 9: mirror tree.py apply_defaults' trailing fields (poignancy
+    # , last_relevant_at ) — inserted before last_updated in
+    # CLI order. This mirror had lagged tree.py:347-394, so daemon-created
+    # child nodes dropped both keys vs the CLI (byte-compat drift at the first
+    # post-utility_ratio key).
+    if "poignancy" not in out:
+        out["poignancy"] = None
+    if "last_relevant_at" not in out:
+        out["last_relevant_at"] = None
+    # valid_from / valid_to (, BRD Gap 5): mirror of tree.py
+    # apply_defaults' bi-temporal read-safe null defaults. Keep in lockstep with
+    # the CLI (byte-compat parity test asserts identical ordered out[] keys).
+    if "valid_from" not in out:
+        out["valid_from"] = None
+    if "valid_to" not in out:
+        out["valid_to"] = None
     return out
 
 
@@ -681,8 +709,35 @@ def _write_tree_locked(path: Path, data: Dict[str, Any], base_dir: Path,
 # Mutation helpers (mirror core/scripts/tree.py cmd_* _do_* closures exactly)
 # ---------------------------------------------------------------------------
 
+def _read_in_flight_goal_id(world_path: Path, agent: str):
+    """Daemon mirror of core/scripts/tree.py _read_in_flight_goal_id ().
+    Reads the EXECUTING goal id from world/team-state.yaml in_flight for the
+    per-request agent, producing the SAME origin signal the CLI records. Fail-open:
+    any error (no agent, missing file, parse error, no in_flight) returns None.
+
+    Unlike the CLI helper (which uses the _fileops._agent_name()/WORLD_DIR module
+    globals), the daemon is a shared multi-agent process — agent identity is
+    per-request, so it is passed explicitly alongside world_path. The OUTPUT is
+    byte-identical to the CLI for the same (agent, team-state) pair."""
+    try:
+        if not agent or world_path is None:
+            return None
+        path = world_path / "team-state.yaml"
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return (data.get("agent_status", {})
+                    .get(agent, {})
+                    .get("in_flight", {})
+                    .get("goal_id")) or None
+    except Exception:
+        return None
+
+
 def _apply_add_child(tree: Dict[str, Any], parent_key: str,
-                     child_data: Dict[str, Any], world_path: Path) -> Dict[str, Any]:
+                     child_data: Dict[str, Any], world_path: Path,
+                     agent: str) -> Dict[str, Any]:
     nodes = tree["nodes"]
     parent = nodes[parent_key]
     parent_depth = parent.get("depth", 0)
@@ -698,6 +753,11 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     child_node["parent"] = parent_key
     child_node["children"] = child_data.get("children", [])
     child_node["child_count"] = len(child_node["children"])
+    # 3: node_type is derive-always from child-presence (mirror
+    # child_count) — set at the create path, not copied (removed from
+    # _CHILD_COPY_FIELDS) and not via _apply_defaults' fill-if-absent (which
+    # also normalizes reads, masking on-disk drift). Sibling 7.
+    child_node["node_type"] = "interior" if child_node["children"] else "leaf"
     for field in _CHILD_COPY_FIELDS:
         if field in child_data:
             child_node[field] = child_data[field]
@@ -707,6 +767,16 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
             child_node["capability_level"] = parent_cl
     child_node = _apply_defaults(child_node)
     child_node["last_updated"] = date.today().isoformat()
+    # origin_goal_id (): record the EXECUTING goal that created this
+    # node, for the Gate D SPILL-1 spillover analysis. Caller-wins (an explicit
+    # value copied above is preserved); otherwise auto-inject from team-state
+    # in_flight. Mirrors tree.py cmd_add_child:1849-1852 ( / 3).
+    # Absent when no goal is executing (a manual add) — pre- readers
+    # ignore the unknown field, so existing consumers parse unchanged.
+    if "origin_goal_id" not in child_node:
+        _origin = _read_in_flight_goal_id(world_path, agent)
+        if _origin:
+            child_node["origin_goal_id"] = _origin
 
     nodes[child_key] = child_node
     if child_key not in parent.get("children", []):
@@ -714,6 +784,13 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
             parent["children"] = []
         parent["children"].append(child_key)
         parent["child_count"] = len(parent["children"])
+        # 7: a freshly-created parent that gains its first child via
+        # add-child must flip leaf->interior. add-child updates child_count but
+        # historically left node_type stale, mislabeling interior nodes as
+        # leaves (misleads retrieval/decompose and trips tree-validate). Mirrors
+        # tree.py cmd_add_child:1866-1867 and the cmd_reparent new-parent idiom.
+        if parent.get("node_type") == "leaf":
+            parent["node_type"] = "interior"
     nodes[parent_key] = parent
 
     tree["nodes"] = nodes
@@ -766,6 +843,15 @@ def _apply_remove_child(tree: Dict[str, Any], parent_key: str,
         children.remove(child_key)
     parent["children"] = children
     parent["child_count"] = len(children)
+    if not children:
+        # 3: last-child removal flips parent interior->leaf, mirroring
+        # cmd_remove_child (tree.py 5) + the daemon reparent old-parent
+        # path (L1431-1432). Pre-fix the daemon updated child_count but left
+        # node_type stale at "interior" on a now-childless parent -- a byte-compat
+        # parity gap vs the CLI and a present-but-wrong node_type (6
+        # validate ERROR class). Shared by the standalone remove-child op AND the
+        # batch remove-child sub-op (both call this helper).
+        parent["node_type"] = "leaf"
     nodes[parent_key] = parent
     if child_key in nodes:
         del nodes[child_key]
@@ -1131,7 +1217,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 if cl is not None:
                     return Response.error(409, "child_limit_reject", f"{cl}")
 
-                child_node = _apply_add_child(tree, parent_key, child, world_path)
+                child_node = _apply_add_child(tree, parent_key, child, world_path, agent)
 
                 # Optional .md body (daemon-only; CLI add-child writes no .md).
                 md_written = False
@@ -1525,7 +1611,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                             if cl is not None:
                                 return Response.error(
                                     409, "child_limit_reject", f"{cl}")
-                            _apply_add_child(tree, key, child, world_path)
+                            _apply_add_child(tree, key, child, world_path, agent)
                             updated_keys.add(child_key)
                             updated_keys.add(key)
                         elif op_type == "remove-child":

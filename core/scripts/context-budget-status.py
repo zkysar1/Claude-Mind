@@ -35,18 +35,22 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-#  / : force utf-8 on stdin/stdout/stderr (covers Windows
-# cp1252 fallback when callers bypass the _platform.sh PYTHONIOENCODING=utf-8
-# shim). Closes acceptance (4) of  — stdin-ingest sweep.
-from _stdio import reconfigure_stdio  # noqa: E402
-reconfigure_stdio()
-
-# Self-destruct after 10s — prevents zombie processes when parent session dies
-# without closing stdin (Windows doesn't propagate EOF to orphaned children).
-# MUST be daemon=True so normal exit isn't blocked waiting for the timer.
+# Self-destruct after 10s -- prevents zombie py.exe orphans when the parent
+# session dies without closing stdin (Windows doesn't propagate EOF to
+# orphaned children). daemon=True so normal exit isn't blocked on the timer.
+# Armed HERE (before the _stdio/_paths imports + reconfigure_stdio below) so
+# the guard covers the ENTIRE module-import window: 8 found a 57h
+# orphan (pid-19476) that hung before the timer armed when this block sat
+# AFTER reconfigure_stdio().
 _timer = threading.Timer(10, lambda: os._exit(0))
 _timer.daemon = True
 _timer.start()
+
+#  / : force utf-8 on stdin/stdout/stderr (covers Windows
+# cp1252 fallback when callers bypass the _platform.sh PYTHONIOENCODING=utf-8
+# shim). Closes acceptance (4) of  -- stdin-ingest sweep.
+from _stdio import reconfigure_stdio  # noqa: E402
+reconfigure_stdio()
 
 from _paths import AGENT_DIR, PROJECT_ROOT, agent_dir as _agent_dir, agents_root
 

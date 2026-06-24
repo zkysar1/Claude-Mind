@@ -132,6 +132,50 @@ count.
 **Safety:** same allowlist as `command_succeeds` (`bash core/scripts/`,
 `bash world/scripts/` prefix only). No field interpolation into the command.
 
+### `vcs_commits_since`
+
+Passes when a git repo has at least `min_count` commits committed **strictly
+after** a cutoff timestamp. The principled event-gate for recurring review
+goals: instead of a time-proxy interval, fire only when the lane repo received
+new commits since the goal last ran (eliminates the manual interval-rebase
+class — g-001-241 / g-001-243).
+
+```yaml
+- type: vcs_commits_since
+  id: pc-new-framework-commits
+  description: "Fire only when framework code changed since this goal last ran"
+  repo: "."                              # optional; default PROJECT_ROOT. Absolute or PROJECT_ROOT-relative.
+  since_goal_last_achieved: "g-001-12"   # cutoff = this goal's lastAchievedAt (event-gate form)
+  # --- OR, instead of since_goal_last_achieved: ---
+  # after_ref: "git:HEAD"                # cutoff via the after_ref grammar (git:/iso:/file:)
+  paths: ["core/scripts", "core/config", ".claude"]   # optional git pathspec — scope to code, exclude state churn
+  author: "Some Author"                  # optional git --author filter
+  grep: "Co-Authored-By: alpha"          # optional git --grep (commit-message) filter
+  min_count: 1                           # optional, default 1
+```
+
+**Cutoff source** (exactly one required):
+- `since_goal_last_achieved: <goal_id>` — resolves to that goal's
+  `lastAchievedAt` (recurring) or `completed_date`. A recurring review goal
+  wires its OWN id here so it self-gates on new commits. Looked up across the
+  world live queue, the archive, and the bound agent's queue.
+- `after_ref: <git:|iso:|file:>` — the shared after_ref grammar (see below).
+
+**Strict comparison, no grace window.** Unlike `file_exists_after`, this
+predicate uses a strict `commit_date > cutoff` with NO clock-skew grace. The
+commit date and `lastAchievedAt` come from the same local clock, and a grace
+window would re-count the triggering commit on the next pass — re-creating the
+streak-contraction artifact the predicate exists to eliminate.
+
+**`paths`** is a git pathspec (str or list). Use it to scope the count to code
+files and exclude per-iteration agent-state commits (`agents/**`) that would
+otherwise keep the gate permanently open in PROJECT_ROOT.
+
+**Safety:** no field is interpolated into a shell — `git log` runs with an argv
+list (`shell=False`), so `repo`/`paths`/`author`/`grep` cannot inject. Non-git
+`repo`, git errors, unresolvable cutoffs, and missing cutoff source all fail
+closed (predicate fails, never crashes).
+
 ## `after_ref` Grammar
 
 Shared by `file_exists_after` and `goal_completed_after`:

@@ -34,6 +34,15 @@ skill: "/review-hypotheses --hypothesis {hypothesis_id}"
 | `short` | formed_date + 12h | formed_date + 7d |
 | `long` | formed_date + 24h | formed_date + 90d |
 
+**Single source of truth (machine-consumed windows)**: the numeric re-probe
+windows above (`short` +12h, `long` +24h) and the fresh-discovered day window
+(7d, see § Accuracy reporting) are enumerated in `meta/cognitive-horizons.yaml`
+(g-306-02 / BRD Gap 19). `core/scripts/precheck-eval.py` `cmd_hypothesis_health`
+reads them from there — fail-loud, no hardcoded fallback (guard-424). Any new
+consumer of a horizon window MUST read the yaml rather than re-hardcode the
+literal (rb-335 writer-without-reader). This table is the human-readable mirror;
+the yaml is authoritative for code.
+
 ### Hypothesis-Goal Lifecycle
 
 ```

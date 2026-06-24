@@ -56,12 +56,24 @@ For each strategy with status: active:
 # to produce. Fix the field paths in the pseudocode below instead.
 Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
         --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
-        --field-names "utilization.utilization_score,utilization.retrieval_count"
+        --field-names "utilization.times_helpful,utilization.times_cited,utilization.retrieval_count"
 
 Bash: guardrails-read.sh --active
 For each guardrail with status: active:
-  low_util = utilization.utilization_score < 0.20 AND utilization.retrieval_count >= 5
-  If low_util: add to candidates with reason "low utilization after sufficient retrievals"
+  # Value-density criterion (guard-841) -- NOT bare v1 utilization_score (<0.20).
+  # v1 ignores times_helpful/times_cited and is pre-2026-04-23 bulk-load-inflated,
+  # over-flagging ~75% of active guardrails (rb-2165). times_helpful and times_cited
+  # increment on EXPLICIT use only; times_inferred_helpful is the AUTOMATIC backstop
+  # that increments on retrieval-application via utilization-feedback --infer. The
+  # rest of the system already counts it (utility_ratio = (th + 0.5*tih)/rc), so the
+  # retire bar MUST include it too -- else heavily-retrieved-but-only-inferred-helpful
+  # entries (e.g. rb-200 tih=8) mass-retire as false-positive dead (g-115-1605).
+  dead = (utilization.times_helpful + utilization.times_cited + utilization.times_inferred_helpful) == 0 AND utilization.retrieval_count >= 200 AND age_days >= 60
+  # guard-707 gate (apply in Step 2 BEFORE retiring ANY candidate): grep CLAUDE.md +
+  # .claude/skills + .claude/rules + core/config for the entry ID, EXCLUDING .history/ --
+  # KEEP entries cited by ID in live framework files regardless of counters (load-bearing).
+  # Canonical bulk tool for this criterion: core/scripts/bulk-retire-dead-entries.py.
+  If dead: add to candidates with reason "zero value-density (helpful+cited+inferred==0) after 200+ retrievals and 60+ days"
 ```
 
 ### 1c: Low-Utilization Reasoning Bank Entries
@@ -69,12 +81,24 @@ For each guardrail with status: active:
 # rb-245 pre-read: same contract as 1b.
 Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
         --jsonl-path "$WORLD_DIR/reasoning-bank.jsonl" \
-        --field-names "utilization.utilization_score,utilization.retrieval_count"
+        --field-names "utilization.times_helpful,utilization.times_cited,utilization.retrieval_count"
 
 Bash: reasoning-bank-read.sh --active
 For each reasoning bank entry with status: active:
-  low_util = utilization.utilization_score < 0.20 AND utilization.retrieval_count >= 5
-  If low_util: add to candidates with reason "low utilization after sufficient retrievals"
+  # Value-density criterion (guard-841) -- NOT bare v1 utilization_score (<0.20).
+  # v1 ignores times_helpful/times_cited and is pre-2026-04-23 bulk-load-inflated,
+  # over-flagging ~39% of active reasoning-bank entries (rb-2165). times_helpful and
+  # times_cited increment on EXPLICIT use only; times_inferred_helpful is the AUTOMATIC
+  # backstop that increments on retrieval-application via utilization-feedback --infer.
+  # The rest of the system already counts it (utility_ratio = (th + 0.5*tih)/rc), so the
+  # retire bar MUST include it too -- else heavily-retrieved-but-only-inferred-helpful
+  # entries (e.g. rb-200 tih=8) mass-retire as false-positive dead (g-115-1605).
+  dead = (utilization.times_helpful + utilization.times_cited + utilization.times_inferred_helpful) == 0 AND utilization.retrieval_count >= 200 AND age_days >= 60
+  # guard-707 gate (apply in Step 2 BEFORE retiring ANY candidate): grep CLAUDE.md +
+  # .claude/skills + .claude/rules + core/config for the entry ID, EXCLUDING .history/ --
+  # KEEP entries cited by ID in live framework files regardless of counters (load-bearing).
+  # Canonical bulk tool for this criterion: core/scripts/bulk-retire-dead-entries.py.
+  If dead: add to candidates with reason "zero value-density (helpful+cited+inferred==0) after 200+ retrievals and 60+ days"
 ```
 
 ### 1d: Contradicted/Stale/Noisy Pattern Signatures
@@ -205,6 +229,48 @@ For each leaf with retrieval_count == 0:
 # This step identifies candidates and reports them.
 ```
 
+### Step 2.7: Tree-Node Cluster Archival (D2 — g-303-29)
+
+LLM-reviewed, cluster-aware archival of stale LEAF nodes — the tree-node-specific
+lane of this fire (design: `agents/bravo/temp/d2-cluster-archival-design.md` §4).
+Engine: `core/scripts/tree-archive.sh`. **NATURAL-GATED DORMANT**: when
+`tree_archival.archives_per_pass == 0` (the default), this lane scans + LLM-reviews +
+applies keep/refresh ONLY — it applies ZERO `archive` verdicts. Raising the cap
+activates destructive archival. Interior nodes are NEVER archived; default-to-keep
+under uncertainty (verify-before-assuming applied to deletion). Single-writer for
+`last_relevant_at` + `node_type:archived` (guard-155/rb-254).
+
+```
+Bash: bash core/scripts/tree-archive.sh scan
+Parse JSON: candidates[], dormant, candidate_count.
+IF candidate_count == 0: skip this lane (no output).
+# Scoping (mirrors the fire's discipline): on a spark/stale_strategy or --full-cycle
+# trigger, restrict to candidates whose category was touched this session (pass
+# `scan --scope <comma-keys>`); the weekly recurring full-tree pass runs unscoped.
+FOR EACH candidate in candidates:
+    IF candidate.refresh_eligible:
+        # A cluster member was retrieved within the lookback window → project
+        # resurgence. Refresh the whole cluster (non-destructive), skip archival.
+        Bash: bash core/scripts/tree-archive.sh apply {candidate.key} refresh
+        Report: "tree-archival: refreshed cluster of {candidate.key} (resurgence)"
+        CONTINUE
+    # Per-candidate LLM review (design §3). Read the node body + cluster context
+    # (tree-read.sh the node; the scan JSON already carries cluster + members'
+    # last_retrieved). Decide exactly ONE verdict: keep | refresh | archive |
+    # decompose-first. DEFAULT TO KEEP under uncertainty — archival is
+    # high-blast-radius and the bytes are the team's persistent memory.
+    IF verdict in (keep, refresh, decompose-first):
+        Bash: bash core/scripts/tree-archive.sh apply {candidate.key} {verdict} --reason "{one-sentence evidence}"
+    ELIF verdict == archive:
+        IF dormant:
+            # Natural gate: report the recommendation but do NOT archive.
+            Report: "tree-archival: would archive {candidate.key} (dormant — archives_per_pass=0; not applied)"
+        ELSE:
+            Bash: bash core/scripts/tree-archive.sh apply {candidate.key} archive --reason "{one-sentence evidence}"
+            Report: "tree-archival: archived {candidate.key} (reversible: tree-archive.sh restore {candidate.key})"
+    Add to curation_result: {type: "tree_node_archival", key: candidate.key, decision: verdict}
+```
+
 ## Step 3: Execute Retirements
 
 For each RETIRE decision:
@@ -214,7 +280,7 @@ For each RETIRE decision:
 4. If strategy: append summary to `meta/strategy-archive.yaml` retired section
 5. Log retirement event via `evolution-log-append.sh`:
    ```json
-   {"event": "memory_curation", "action": "retired", "artifact_type": "{type}", "artifact_id": "{id}", "reason": "{reason}", "date": "{today}"}
+   {"date": "{today}", "event": "memory_curation", "details": "retired {type} {id}: {reason}"}
    ```
 
 ## Step 4: Journal Entry + Return Result
@@ -457,8 +523,8 @@ For each COMPLETE decision:
     CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status completed
   Bash: evolution-log-append.sh with:
-    {"event": "aspiration_grooming", "action": "completed", "goal_id": "{id}",
-     "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
+    {"date": "{today}", "event": "aspiration_grooming",
+     "details": "completed {id}: {reason} (evidence: {refs})"}
 
 For each SKIP decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
@@ -466,8 +532,8 @@ For each SKIP decision:
     CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} status skipped
   Bash: evolution-log-append.sh with:
-    {"event": "aspiration_grooming", "action": "skipped", "goal_id": "{id}",
-     "reason": "{reason}", "evidence": ["{refs}"], "date": "{today}"}
+    {"date": "{today}", "event": "aspiration_grooming",
+     "details": "skipped {id}: {reason} (evidence: {refs})"}
 
 For each SCOPE-DOWN decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
@@ -475,8 +541,8 @@ For each SCOPE-DOWN decision:
     CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} description "{revised description}"
   Bash: evolution-log-append.sh with:
-    {"event": "aspiration_grooming", "action": "scoped_down", "goal_id": "{id}",
-     "reason": "{reason}", "date": "{today}"}
+    {"date": "{today}", "event": "aspiration_grooming",
+     "details": "scoped_down {id}: {reason}"}
 
 For each UNBLOCK decision:
   IF goal.claimed_by is not null AND goal.claimed_by != "$MIND_AGENT":
@@ -484,8 +550,8 @@ For each UNBLOCK decision:
     CONTINUE
   Bash: aspirations-update-goal.sh --source {asp.source} {goal_id} blocked_by "[]"
   Bash: evolution-log-append.sh with:
-    {"event": "aspiration_grooming", "action": "unblocked", "goal_id": "{id}",
-     "reason": "{reason}", "date": "{today}"}
+    {"date": "{today}", "event": "aspiration_grooming",
+     "details": "unblocked {id}: {reason}"}
 
 # Post-decision sweep
 After all decisions executed:

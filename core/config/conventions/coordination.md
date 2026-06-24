@@ -368,6 +368,127 @@ text is a human-readable summary. Tags carry structured metadata:
 - Directives are advisory, not commands — the agent's own judgment still applies via
   metacognitive assessment (Phase 2.5)
 
+## Cross-Lane Evidence-Clear Coordination (FW-8)
+
+Coordination depth is 1: an agent that finds an evidence-clear issue in another
+agent's lane can post a finding or directive, but the work then waits for the
+owner to organically reach it. When the owner is dormant (between sessions, deep
+in a long goal), an evidence-clear one-line fix can sit for hours or days. This
+section adds two latency-reducing primitives along a spectrum of fix-clarity:
+
+| Fix clarity | Mechanism | Who acts |
+|---|---|---|
+| Trivial + unambiguous (one logical line, correct value evidence-confirmed) | **Discoverer-Applies-Trivial-Fix** (below) | discoverer (with mandatory notification) |
+| Clear but not trivial (owner's judgment needed, but evidence shows it matters NOW) | **Priority-Promotion-With-Evidence** (below) | owner (surfaces elevated next iteration) |
+| Needs design / multi-line / behavior change | Normal goal / finding / handoff (existing primitives) | owner |
+
+The discriminator is honest fix-clarity, not convenience. When in doubt between
+trivial and clear-but-not-trivial, promote (do not apply); between clear and
+needs-design, file a normal goal. Escalating clarity earns lighter coordination;
+overclaiming clarity to skip coordination is the anti-pattern this section guards.
+
+### Priority-Promotion-With-Evidence
+
+Board type: `priority-promotion` (coordination channel). An evidence-carrying
+elevation request: the discoverer found concrete evidence that work in the
+owner's lane deserves elevation NOW, and asks the OWNER to surface it elevated on
+the owner's next iteration.
+
+Distinct from its neighbors:
+- vs `directive` (priority_shift) -- a directive is a weight nudge the sender
+  applies to the receiver's scoring; a priority-promotion carries the EVIDENCE
+  that justifies the elevation, and is pull-based (owner verifies, then acts).
+- vs `finding` + `insight_trigger` (severity:invalidates|constrains|enables|informs)
+  -- an insight_trigger says "my finding affects your EXISTING goal"; a
+  priority-promotion says "here is evidence that work in your lane deserves
+  elevation NOW" and may name new work the owner should file.
+- vs `handoff` -- a handoff follows a COMPLETED goal needing follow-up; a
+  priority-promotion concerns a DISCOVERED issue with no completed predecessor.
+
+Payload (tags carry structured metadata, same convention as the Directive Protocol):
+
+| Tag | Format | Purpose |
+|-----|--------|---------|
+| `evidence:<locator>` | `evidence:core/scripts/foo.py:42` | **REQUIRED** -- concrete evidence (file:line, failing-probe id, measured regression). Its presence is what distinguishes a promotion from a bare directive. |
+| `owner:<agent>` | `owner:alpha` | the lane owner who should surface it elevated |
+| `promotes:<id>` | `promotes:g-317-09` | the existing goal to elevate; omit when the work is not yet a goal (then the body describes it and the owner files it) |
+| `weight:<N>` | `weight:+1.5` | additive scoring boost -- same semantics and units as the Directive Protocol `weight` tag |
+| `expires:<ISO>` | `expires:2026-06-25T00:00:00` | auto-expiry |
+
+Protocol flow:
+1. **Post**: discoverer posts `priority-promotion` to coordination with
+   `evidence:` + `owner:` + (`promotes:<id>` OR a body describing new work).
+2. **Scan**: the owner's Phase 2.07 (Directive & Insight Trigger Scan) reads
+   priority-promotions whose `owner:` matches it.
+3. **Verify + surface**: the owner reads the evidence (it is a locator, so it is
+   checkable). If confirmed -- when `promotes:<id>` is set, the elevation rides
+   the existing `directive_boost` scoring path (see wiring below); when no goal
+   exists, the owner files one from the evidence. If the evidence does NOT hold
+   on verification, the owner declines and replies with the disconfirming probe.
+4. **Acknowledge**: owner posts `--type status --reply-to <promotion-id>` tagged
+   `acknowledged,<agent>`.
+5. **Expire**: per the `expires` tag (same lifecycle as directives).
+
+Rules:
+- **Evidence is mandatory.** A priority-promotion without an `evidence:` tag is a
+  bare directive -- use `--type directive` instead. The evidence requirement is
+  what makes the mechanism pull-based and trustworthy: the owner verifies before
+  elevating, rather than boosting on the sender's say-so.
+- **Owner decides.** Like directives, a priority-promotion is advisory -- the
+  owner's metacognitive assessment (Phase 2.5) still applies. The owner may
+  decline with a disconfirming probe.
+- **Non-blocking.** The discoverer posts and moves on; it never waits.
+
+Wiring (implementation follow-up): `goal-selector.py`'s `directive_boost`
+criterion currently reads only `type=directive` posts. To make `promotes:<id>` +
+`weight:<N>` elevate the named goal, extend the directive reader's type filter to
+ALSO match `type=priority-promotion`. This reuses the existing scoring path (no
+new selector criterion -- avoids the rb-335 writer-without-reader trap). The
+Phase 2.07 consumer handling (acknowledge + file-from-evidence) is a SKILL.md
+edit to `aspirations-select`. Both are filed as wiring follow-ups; until wired, a
+priority-promotion is honored by the owner manually reading the post in Phase
+2.07 (the board type works the instant it is posted -- board.py does not enforce
+the `--type` enum).
+
+### Discoverer-Applies-Trivial-Fix
+
+When an agent discovers a one-line, evidence-confirmed fix in another agent's
+lane, waiting for a dormant owner is wasteful. The discoverer MAY apply the fix
+directly -- WITH mandatory cross-agent notification -- when ALL of the following
+hold:
+
+1. **Trivial**: one logical line; no design judgment; the change does not alter
+   behavior beyond the obvious correction (typo, wrong constant, wrong path
+   segment, off-by-one, missing flag).
+2. **Unambiguous evidence**: a probe, test, grep, or schema read confirms BOTH
+   the defect AND the corrected value -- not a hypothesis. The same evidence bar
+   as any negative/positive conclusion (`verify-before-assuming.md`).
+3. **Not a restricted file**: the target is NOT one of the script-gated shared
+   JSONL files (see [Restricted Files](#restricted-files-concurrent-modification-prevention))
+   and NOT inside another agent's private dir (`agents/<other>/...` routes
+   through the board, never direct edit -- see `path-resolution.md`). The
+   exception applies to shared, git-tracked framework files (`core/`, `.claude/`,
+   `core/config/`, `CLAUDE.md`) and product-repo code, where direct Edit is the
+   normal authoring path and git is the safety net.
+
+Commit + notify discipline (MANDATORY):
+- Commit with an EXPLICIT pathspec naming ONLY the fixed file (guard-741 -- never
+  a bare `git commit`; guard-1120 -- never `git add -A`). This keeps the
+  discoverer's one-line change from sweeping up the owner's uncommitted in-flight
+  work (guard-739/797/834).
+- Small, descriptive, goal-tagged commit message; co-author trailers as usual.
+- Notify the owner: post `--type handoff` to coordination naming the file, the
+  one-line change, the confirming evidence, and the commit hash, tagged
+  `affects:<path>,<owner>`. The owner reviews async (Review Gate) and reverts if
+  they disagree -- reversibility via git is what makes the direct apply safe.
+
+Boundary (respect guard-732 -- still file a goal for non-trivial work): if the
+fix needs design judgment, spans multiple lines, or changes behavior beyond the
+obvious correction, the discoverer does NOT apply it. They file a normal goal, or
+post a Priority-Promotion-With-Evidence (above) if it is evidence-clear and
+should be elevated. Overclaiming triviality to skip the owner's judgment is the
+anti-pattern this rule guards against -- when uncertain, promote, do not apply.
+
 ## Inbox Alert Flow (Generic Contract)
 
 Inbound alert events (production failures, deploy failures, monitoring noise,
@@ -470,7 +591,7 @@ recent_completions:  # ring buffer, last 50 (raised from 10 in asp-248 to deepen
 agent_status:
   <agent-name>:
     last_active: "ISO 8601 timestamp"
-    current_focus: "What the agent is working on (retrospective — set on completion)"
+    current_focus: "Lane the agent is working in — auto-stamped at claim by team-state-in-flight.sh as '<aspiration>: <title>' (prospective; persists across clear-in-flight as the last-claimed lane). Read by the ToM belief-contradiction check. (g-115-1575)"
     live_phase: "phase-4-execute g-115-157"  # set by heartbeat-tick from diary tail
       # Informational — NOT a liveness signal. Partners use last_active for
       # liveness; a stale live_phase just means heartbeat-tick stopped ticking.
@@ -494,6 +615,18 @@ agent_status:
       content_signatures:                       # g-115-573 amend-detection
         "path/relative/to/repo": "<sha1[:12]>"  # content hash at review time
         ...                                     # missing path = no sig (path-only fallback)
+    beliefs:                    # g-306-18 -- Theory-of-Mind: what THIS agent
+                                # BELIEVES about a partner, derived from
+                                # OBSERVATION (not the partner's self.md /
+                                # aspirations, which are claims-of-intent, not
+                                # ground truth). Supersede-or-cap list (g-306-28):
+                                # one entry per partner (the current belief),
+                                # hard cap 10. Writer: team-belief-write.sh.
+      - about: "agent-name"     # the partner this belief concerns
+        belief: "one-line observed claim about the partner's focus/behavior/state"
+        confidence: 0.0         # 0.0-1.0, calibrated: single observation -> ~0.5,
+                                # repeated-consistent -> higher, contradicted -> lower
+        last_observed: "ISO 8601 timestamp"  # when the supporting observation occurred
 
 critical_blockers:  # updated by consolidation, read by boot
   - goal_id: "g-NNN-NN"
@@ -502,7 +635,109 @@ critical_blockers:  # updated by consolidation, read by boot
     downstream_count: N
     updated_by: "agent-name"
     updated_at: "ISO 8601 timestamp"
+
+inbox_alert_backlog:  # g-115-849 — null when zero matching goals, else the map below
+  count: N                          # pending, un-claimed "Unblock:" inbox goals
+  oldest_age_hours: N.N             # age of the oldest such goal (hours)
+  oldest_goal_id: "g-NNN-NN"        # id of the oldest such goal
+  updated_at: "ISO 8601 timestamp"  # when this counter was last recomputed
 ```
+
+### beliefs Field -- Theory-of-Mind Partner Belief Tracking (g-306-18)
+
+`agent_status.<agent>.beliefs` holds what an agent BELIEVES about a partner,
+derived from OBSERVATION -- distinct from the partner's `self.md` / aspirations,
+which state intent, not ground truth. Motivated by BRD Gap 9 (OpenToM,
+2402.06044): an agent that treats a partner's stated role as fact misreads a
+partner who has drifted or is on a cross-domain stretch.
+
+- **Value**: supersede-or-cap list of `{about, belief, confidence, last_observed}`
+  (g-306-28); exactly one entry per partner is the current belief, hard cap 10.
+  `confidence` is calibrated (single observation ~= 0.5; repeated-consistent ->
+  higher; contradicted -> lower).
+- **Storage**: canonical writer is `team-belief-write.sh --about <partner>
+  --belief "<text>" [--confidence <0..1>]` (g-306-28). It reads the current
+  sublist via the daemon, runs the pure supersede/cap compute in
+  `_team_belief.py` (one entry per `about`, hard cap `MAX_BELIEFS=10`; unit-
+  tested in `core/scripts/tests/test_team_belief_write.py`), and writes the whole
+  list back via `team-state-update.sh ... --operation set` -- race-free at the
+  field level because each agent is the SOLE writer of its own `beliefs` sublist
+  (verified end-to-end against the live daemon, supersede held at list length 1,
+  2026-06-18). The low-level `--operation append` still works for ad-hoc use but
+  bypasses supersede -- prefer the wrapper. Read:
+  `team-state-read.sh --field agent_status.<partner>.beliefs --json` (returns
+  literal `null` for a partner with no beliefs yet -- handle gracefully).
+- **Rule (consumer discipline)**: a consumer MUST treat beliefs as
+  confidence/staleness-weighted hypotheses, NOT ground truth. When a partner's
+  observed action contradicts a held belief, that is a signal to REFLECT and
+  revise the belief (lower confidence / supersede) -- not to assume the belief
+  was right.
+- **Hygiene**: supersede the prior belief about a given partner rather than
+  growing the list unbounded. ENFORCED in code (g-306-28): `_team_belief.py`
+  drops every prior entry whose `about` matches before appending, then caps at
+  `MAX_BELIEFS=10`. No longer a writer-discipline honor rule.
+- **Write+consume loop (g-306-28, LANDED 2026-06-18)**: the WRITER runs at
+  `fresh-eyes-review` Phase 2.6c -- once per 25-goal review (a real decision
+  point, not every tick), it records ONE calibrated belief (~0.5) about the most
+  salient partner observed, via `team-belief-write.sh`. The CONSUMER runs at
+  `fresh-eyes-review` Phase 2.6b -- it reads every partner's `beliefs` sublist,
+  filters to beliefs `about` THIS agent, and surfaces them as confidence- AND
+  staleness-weighted self-evolution signals (NOT ground truth), feeding the
+  Phase 5.5 `self_evolution_signals_count`. Readers must still handle an
+  empty/`null`/short list gracefully.
+- **Contradiction -> forced-reflection trigger (g-306-29, LANDED 2026-06-18)**:
+  outcome 3 of the loop is built. `aspirations-precheck` Phase 0-pre.0a runs
+  `belief-contradiction-check.sh` (thin daemon orchestrator) +
+  `_belief_contradiction.py` (pure, unit-tested) once per iteration, right after
+  the Phase 0-pre.0 partner snapshot. It compares every partner's freshly OBSERVED
+  focus (`agent_status.<partner>.current_focus`) against the domain-belief THIS
+  agent holds about that partner. Beliefs carry an optional `domain` field (set by
+  the Phase 2.6c writer's `--domain` flag); only domain-tagged beliefs held at
+  confidence >= threshold (default 0.5) are contradiction-checkable -- free-form
+  beliefs skip, the conservative source of the no-false-trigger guarantee for
+  un-held beliefs. On N CONSECUTIVE contradicting observations of the SAME observed
+  domain (default N=2, persisted as per-partner streaks in agent-private WM
+  `belief_contradiction_streaks`), a forced reflection REVISES the held belief:
+  `mode=lower` (default) multiplies its confidence by 0.5 (keeps the held domain,
+  just less sure), or `mode=supersede` flips the domain to the observed reality at
+  a calibrated 0.5. Both stamp `prior_domain`/`prior_confidence`/`revised_at` onto
+  the belief (that annotation IS the recorded surprise) and append an
+  `evolution-log` entry. The N-consecutive gate is what guarantees NO false-trigger
+  on a FIRST or one-off divergence (count 1 < N): a `match` or `skip`, or an
+  observed-domain CHANGE, resets the streak, so only a SUSTAINED contradiction on
+  the same observed domain accumulates to the threshold. Fail-open: the check runs
+  in the precheck hot path and never blocks the loop -- a detector error degrades
+  to "no revision this iteration", never a stalled precheck. The manual
+  lower/supersede that the consumer-discipline rule above describes is now
+  automated.
+
+### inbox_alert_backlog Field — Inbox Backlog Counter (g-115-849)
+
+`inbox_alert_backlog` surfaces how many inbox-derived action goals are piling up
+unhandled. It is the team-state companion to the [Inbox Alert Flow](#inbox-alert-flow-generic-contract):
+the sweep files `Unblock:` / `Investigate:` goals tagged `origin_signal: alert-email:<key>`,
+and this counter reports the subset still waiting.
+
+- **Value**: `null` when zero matching goals; otherwise the map shown in the
+  schema (`count`, `oldest_age_hours`, `oldest_goal_id`, `updated_at`).
+- **Match criteria**: a goal counts when its `origin_signal` starts with the
+  configured prefix (`alert-email:`), its `status` is `pending` or
+  `in-progress`, it is **not** claimed (`claimed_by` absent), and its title
+  starts with `Unblock:`. Actively-claimed goals are excluded — they are being
+  handled, not backlogged.
+- **Writer**: `core/scripts/inbox-backlog-update.py` (framework, domain-free —
+  the aspiration id, origin prefix, and field name are arguments). It writes via
+  team-state.py's `update` CLI, so the write is atomic under the same lock as
+  every other team-state mutation. The domain sweep (`world/scripts/alert-sweep.sh`)
+  invokes it fail-open after each batch and on empty-inbox ticks, so the counter
+  drains as goals complete during quiet periods.
+- **Consumer**: `aspirations-precheck` Phase 0-pre.0 reads the field from the
+  per-iteration team-state snapshot and surfaces
+  `inbox-alert-backlog={count} oldest={age_hours}h goal={goal_id}` when
+  `count > 0`; silent when `null`. This complements the
+  [`Phase 0.5b.1b` age-escalation](#active-push-gap) — that one pushes a
+  notification when a single alert ages past threshold; this one shows the
+  aggregate queue depth in the iteration header.
 
 ### Script API
 

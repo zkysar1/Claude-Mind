@@ -141,6 +141,57 @@ def _load_routing_tables() -> tuple:
 TITLE_PREFIX_ROUTES, CATEGORY_ROUTES, DESCRIPTION_HEURISTICS = _load_routing_tables()
 
 
+def _route_covered_agents() -> set:
+    """Agent names appearing as a route target in ANY table (title prefix,
+    category, or description heuristic). The sentinel "either" is not an agent
+    and is excluded."""
+    covered: set = set()
+    for agent, _conf, _why in TITLE_PREFIX_ROUTES.values():
+        if agent and agent != "either":
+            covered.add(agent)
+    for agent, _conf, _why in CATEGORY_ROUTES.values():
+        if agent and agent != "either":
+            covered.add(agent)
+    for _phrase, agent, _delta, _why in DESCRIPTION_HEURISTICS:
+        if agent and agent != "either":
+            covered.add(agent)
+    return covered
+
+
+def _uncovered_active_agents() -> tuple:
+    """Active agents (from world/team-state.yaml via _agents) that have NO
+    route in any table — the classifier is structurally blind to them and can
+    never be returned as intended_agent.
+
+    Root-cause guard for the static-table vs dynamic-ACTIVE_AGENTS coverage gap
+    (g-115-908 / charlie F-001): _active_agents() grows when /start adds an
+    agent, but the route tables are seeded once from the world overlay. A
+    newly-added agent with no route is silently unroutable until someone
+    notices. Returns a sorted tuple for stable output."""
+    return tuple(sorted(set(_active_agents()) - _route_covered_agents()))
+
+
+# Coverage warning ( / charlie F-001): emit a loud one-time stderr
+# warning at import if any active agent has no route. stderr ONLY — the legacy
+# CLI's stdout JSON byte-equivalence contract is untouched. A WARNING, not an
+# assert: returning "either" for an uncovered agent is already the safe-default
+# posture, and a transient team-state carrying a just-added agent before its
+# routes land must not hard-crash goal-stamping for every other goal. Fail-safe
+# — any error here must never break import of the classifier.
+try:
+    _uncovered = _uncovered_active_agents()
+    if _uncovered:
+        sys.stderr.write(
+            "[capability_route] WARNING: active agent(s) with NO route in the "
+            "capability-routing overlay can never be returned as intended_agent: "
+            + ", ".join(_uncovered)
+            + ". Add title_prefix_routes / category_routes / description_heuristics "
+            "entries (see module docstring).\n"
+        )
+except Exception:
+    pass
+
+
 def _classify(title: str, category: str, description: str) -> dict:
     """Classify goal → {intended_agent, confidence, rationale}.
 

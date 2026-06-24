@@ -312,6 +312,83 @@ def validate_formation_quality(rec):
                 "prediction. Empty or <5-char field treated as missing."
             )
 
+# ---------------------------------------------------------------------------
+# Resolution-evidence requirement ()
+# ---------------------------------------------------------------------------
+# Mirror of mind_api/src/world/pipeline_write.py (the live single-writer).
+# Every CONFIRMED/CORRECTED resolution must carry >=1 verifiable external-
+# evidence pointer so the calibration number is independently auditable
+# ( audit: ~53% of CONFIRMED/CORRECTED records had no outcome_detail).
+# Generous detector (any one shape satisfies it); EXPIRED/UNRESOLVABLE exempt;
+# evidence_override field is the escape hatch. Kept in sync per DECISIONS.md #3.
+
+# Recognized evidence-pointer shapes in free-text resolution fields.
+_EVIDENCE_PATTERNS = (
+    re.compile(r"\bg-\d{3}-\d{2,4}\b"),                          # goal-id
+    re.compile(r"\b(?:rb|guard|sig|sa|bel)-\d+\b"),             # rb/guardrail/sig/...
+    re.compile(r"\bexp-[a-z0-9][\w-]+", re.I),                  # experience-ref
+    re.compile(r"\bmsg-\d{8}-"),                                # board message id
+    re.compile(r"[\w./-]+\.(?:py|sh|md|lua|js|ts|yaml|jsonl?|txt):\d+"),  # file:line
+    re.compile(r"\b[\w-]+\.(?:sh|py)\b"),                       # canonical-script name
+    re.compile(r"\d+(?:\.\d+)?\s*(?:%|pct|percent)", re.I),     # percentage w/ measurement
+    re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"),        # commit SHA (hex, >=1 letter)
+    re.compile(r"\bsession[\s_-]?\d+\b", re.I),                 # session-id (named)
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", re.I),  # session-id (UUID)
+)
+
+# Outcomes that assert a validated prediction and therefore require evidence.
+_EVIDENCE_REQUIRED_OUTCOMES = ("CONFIRMED", "CORRECTED")
+
+def has_resolution_evidence(rec):
+    """True if the record carries >=1 verifiable evidence pointer.
+
+    Checks structured pointer fields first (experience_ref, evidence_for),
+    then scans the free-text resolution fields for any recognized pointer
+    shape. Generous by design. Mirror of pipeline_write._has_resolution_evidence.
+    """
+    exp_ref = rec.get("experience_ref")
+    if isinstance(exp_ref, str) and exp_ref.strip():
+        return True
+    ev_for = rec.get("evidence_for")
+    if isinstance(ev_for, str) and ev_for.strip():
+        return True
+    if isinstance(ev_for, (list, dict)) and ev_for:
+        return True
+    text_parts = []
+    for field in ("outcome_detail", "outcome_notes", "rationale",
+                  "verification", "links"):
+        val = rec.get(field)
+        if isinstance(val, str):
+            text_parts.append(val)
+    text = "\n".join(text_parts)
+    return any(p.search(text) for p in _EVIDENCE_PATTERNS)
+
+def validate_resolution_evidence(rec):
+    """Require an external-evidence pointer on CONFIRMED/CORRECTED resolutions.
+
+    No-op for non-accuracy outcomes (None/EXPIRED/UNRESOLVABLE) and for any
+    record carrying a non-empty evidence_override reason. Raises ValueError
+    otherwise (g-303-27). Mirror of pipeline_write._validate_resolution_evidence.
+    """
+    if rec.get("outcome") not in _EVIDENCE_REQUIRED_OUTCOMES:
+        return
+    override = rec.get("evidence_override")
+    if isinstance(override, str) and override.strip():
+        return
+    if has_resolution_evidence(rec):
+        return
+    raise ValueError(
+        "Missing resolution evidence: a CONFIRMED/CORRECTED resolution must "
+        "record at least one verifiable external-evidence pointer so the "
+        "calibration number is independently auditable (g-303-27). Add one to "
+        "outcome_detail (or set experience_ref / evidence_for): a goal-id "
+        "(g-NNN-NN), commit SHA, file:line, session-id, an rb-/guard-/exp-/msg- "
+        "id, a canonical-script name (foo.sh/foo.py), or a percentage with "
+        "measurement context. For a genuinely pointer-free resolution (e.g. a "
+        "math proof where the derivation IS the evidence), set evidence_override "
+        "to a short reason string."
+    )
+
 def stringify_dates(obj):
     """Recursively convert date/datetime values to ISO strings in a dict."""
     if isinstance(obj, dict):
@@ -404,6 +481,8 @@ def empty_meta():
             "confirmed": 0,
             "corrected": 0,
             "accuracy_pct": 0.0,
+            "with_evidence": 0,
+            "evidence_pct": 0.0,
             "by_strategy": {},
             "by_time_horizon": {},
             "by_depth": {},
@@ -433,6 +512,13 @@ def compute_meta(live_items, archive_items):
     meta["accuracy"]["corrected"] = corrected
     total = confirmed + corrected
     meta["accuracy"]["accuracy_pct"] = round(confirmed / total * 100, 1) if total > 0 else 0.0
+
+    # Evidence coverage (): share of CONFIRMED/CORRECTED resolutions
+    # carrying >=1 verifiable evidence pointer. Mirror of pipeline_write._compute_meta.
+    with_evidence = sum(1 for r in resolved_records if has_resolution_evidence(r))
+    meta["accuracy"]["with_evidence"] = with_evidence
+    meta["accuracy"]["evidence_pct"] = (
+        round(with_evidence / len(resolved_records) * 100, 1) if resolved_records else 0.0)
 
     # by_strategy
     by_strategy = {}

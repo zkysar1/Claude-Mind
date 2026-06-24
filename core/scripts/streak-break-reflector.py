@@ -17,6 +17,19 @@ Dedup rules:
      (title regex match on goal_id).
   2. Skip entries already marked processed=True.
 
+Filing gate (added 2026-06-07, g-115-1319):
+  Before filing, a streak-break whose elapsed window is fully explained by
+  agent inactivity (execution-diary shows a gap >= recurring.session_gap_
+  threshold_hours across [timestamp - actual_elapsed_hours, timestamp]) is
+  SUPPRESSED, not filed. This is the writer-side ("Option A") counterpart to
+  the reader-side auto-resolve escape hatch (g-115-1031): it prevents the
+  fire-triggered-latency pile-up (g-115-1269) where a dormant source's canary
+  cannot self-resolve until the source fires AGAIN — which for a dormant
+  source never happens, leaving the canary open for days. Discriminating:
+  real drift (continuous activity, cadence still missed) shows NO session gap
+  and still files. The durable fix belongs at the writer (rb-1377: a
+  reader-side sweep is only as reliable as the writer's filing semantics).
+
 Auto-resolve sweep (added 2026-05-18, g-115-919):
   After the filing pass, scan open `investigate:streak-break:*` canaries
   across world+agent queues. For each, look up the source recurring goal's
@@ -210,7 +223,24 @@ def _read_signals(log_path: Path) -> list[dict]:
 
 
 def _write_signals(log_path: Path, entries: list[dict]) -> None:
-    """Atomically replace the log with the updated entries."""
+    """Atomically replace the log with the updated entries.
+
+    KNOWN RACE (accept-with-doc, g-115-1595): this full-file os.replace and the
+    signal writer's append (_emit_streak_break_signal_daemon in
+    mind_api/src/endpoints/aspirations_write.py, `open(log_path, "a")`) share
+    NO lock. Under OneDrive os.replace contention (guard-555/guard-710) or a
+    backgrounded-reflector overlap, an interleaved append can be clobbered, OR
+    this rewrite's `processed: true` flags can fail to persist -- leaving a
+    signal `processed: false` whose Investigate canary was ALREADY filed
+    (observed 2026-06-20: delta signals g-115-817@23:24 and g-115-754@00:00).
+    Impact is COSMETIC: `_recent_investigate_exists` 48h dedup prevents
+    duplicate canaries on the next run, so no duplicate goals and no canary
+    loss result -- the lingering `processed: false` is re-marked dedup_skipped
+    next pass. Decision (g-115-1595, investigated from g-115-1593): a
+    cross-boundary shared lock is NOT worth the carrying cost for a
+    cosmetic-only failure. REVISIT with a lock only if duplicate streak-break
+    canaries ever actually appear in the queue.
+    """
     tmp = log_path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         for entry in entries:
@@ -532,6 +562,8 @@ def main() -> int:
     log_path = AGENT_DIR / "session" / "streak-breaks.jsonl"
     filed_count = 0
     skipped_count = 0
+    gap_suppressed_count = 0
+    session_gap_threshold_h = _load_session_gap_threshold()
 
     # Pass 1: file Investigate canaries from new signals (existing behavior).
     # An absent or empty log skips this pass — the auto-resolve sweep below
@@ -553,6 +585,37 @@ def main() -> int:
             entry["dedup_skipped"] = True
             skipped_count += 1
             continue
+
+        # Option A filing gate — session-gap canary suppression (9).
+        # A streak-break whose elapsed window is explained by agent inactivity
+        # (the loop wasn't running) is structurally benign, not cadence drift.
+        # Filing a canary for it creates top-of-queue noise that Pass-2
+        # auto-resolve cannot clear until the source fires AGAIN
+        # (fire-triggered latency, 9) — and a dormant source never
+        # does, so the canary sits open accruing urgency for days (
+        # -> 9, ~6d). Discriminating: real drift (continuous activity,
+        # cadence still missed) shows NO session gap, so it still files. Uses
+        # the bound agent's diary — same per-agent attribution as the Pass-2
+        # escape hatch (1). Fail-open: a parse error or missing diary
+        # leaves the canary to file as before.
+        ts_raw = entry.get("timestamp")
+        elapsed_h = entry.get("actual_elapsed_hours")
+        if ts_raw and isinstance(elapsed_h, (int, float)) and elapsed_h > 0:
+            try:
+                window_end = datetime.fromisoformat(str(ts_raw))
+                window_start = window_end - timedelta(hours=float(elapsed_h))
+                gap = _has_session_gap(window_start, window_end, AGENT_DIR,
+                                       session_gap_threshold_h)
+            except (ValueError, TypeError):
+                gap = False
+            if gap:
+                entry["processed"] = True
+                entry["session_gap_suppressed"] = True
+                gap_suppressed_count += 1
+                print(f"[streak-break-reflector] session-gap suppressed canary "
+                      f"for {goal_id} ({elapsed_h}h window, agent inactive >= "
+                      f"{session_gap_threshold_h}h)")
+                continue
 
         # Resolve aspiration_id AND source. Signal entry may carry both
         # directly (preferred — no lookup cost); fall back to scanning
@@ -601,6 +664,7 @@ def main() -> int:
 
     print(f"[streak-break-reflector] {filed_count} filed, "
           f"{skipped_count} dedup-skipped, "
+          f"{gap_suppressed_count} session-gap-suppressed, "
           f"{resolved_count} auto-resolved")
     return 0
 

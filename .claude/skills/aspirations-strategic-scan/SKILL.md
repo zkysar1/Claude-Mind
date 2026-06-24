@@ -109,31 +109,56 @@ to explore.
 ```
 Read core/config/aspirations.yaml -> strategic_scan config
 
-# S2a: Stale nodes -- knowledge that may have drifted from reality
+# S2a: Stale FRONTIER nodes -- immature knowledge that may have drifted/been neglected.
+# CALIBRATION (g-115-1410): scope to capability_level=="EXPLORE" (the genuinely
+# under-development frontier). The prior `not in ("MASTER",)` exclusion was INERT --
+# this tree has 0 MASTER nodes (caps are EXPLORE/CALIBRATE/EXPLOIT/REFERENCE), so it
+# excluded nothing and flagged 93% of 1090 nodes (raw age != drift). Mature EXPLOIT and
+# maturing CALIBRATE being old is not drift; a stale EXPLORE node is neglected frontier.
 Bash: tree-read.sh --summary
 tree_summary = parse result
-stale_nodes = [node for node in tree_summary
+# tree-read.sh --summary returns {nodes:{node_key:{...fields}},total} -- a DICT
+# keyed by node-key, NOT a list of node dicts. Iterate .items() and bind the
+# dict KEY as node.key (the value dict carries no self-key field). Iterating
+# tree_summary directly yields only the 2 top-level keys (nodes,total) and 0
+# frontier signals -- inert detection. Companion to g-115-1410 (which fixed the
+# S2 FILTER predicates); this fixes the iteration SHAPE. (g-115-1420)
+node_list = [{**node_val, "key": node_key} for node_key, node_val in tree_summary["nodes"].items()]
+# REGRESSION GUARD (g-115-1420): this tree has EXPLORE-capability nodes, so a
+# correctly-shaped iteration MUST yield a nonzero EXPLORE count. explore_count == 0
+# is the iteration-shape-regression symptom (the {nodes,total} dict-key bug) --
+# re-check the .items() iteration above before trusting "no frontier signals".
+explore_count = sum(1 for node in node_list if node.capability_level == "EXPLORE")
+IF explore_count == 0:
+    Output: ">> WARN strategic-scan S2: 0 EXPLORE among {len(node_list)} nodes -- likely iteration-shape regression (g-115-1420); verify tree_summary['nodes'].items() iteration before trusting 'no frontier signals'"
+stale_nodes = [node for node in node_list
                if node.last_updated and days_since(node.last_updated) > strategic_scan.knowledge_staleness_days
-               and node.capability_level not in ("MASTER",)]
+               and node.capability_level == "EXPLORE"]
 
 IF len(stale_nodes) > 3:
     signals.append({
         type: "stale_knowledge",
-        description: "{len(stale_nodes)} tree nodes not updated in {strategic_scan.knowledge_staleness_days}+ days: {[n.key for n in stale_nodes[:5]]}",
+        description: "{len(stale_nodes)} EXPLORE-stage tree nodes not updated in {strategic_scan.knowledge_staleness_days}+ days: {[n.key for n in stale_nodes[:5]]}",
         severity: "MEDIUM",
         nodes: [n.key for n in stale_nodes[:5]]
     })
 
-# S2b: Thin nodes -- knowledge areas with minimal depth
-thin_nodes = [node for node in tree_summary
-              if node.get("article_count", 0) < 2
-              and node.capability_level not in ("MASTER", "EXPERT")
-              and node.depth >= 2]  # only leaf/near-leaf nodes
+# S2b: Thin FRONTIER nodes -- structurally under-developed leaf stubs.
+# CALIBRATION (g-115-1410): re-based from article_count to capability+leaf. The prior
+# `article_count < 2` flagged 96% of nodes because article_count is structurally ~0 here
+# (89% of nodes have 0 -- this tree's content lives in node .md bodies, not separate
+# "articles"), so it measured the wrong thing. A leaf (no children) still at EXPLORE stage
+# is a genuinely thin frontier stub. (The old `not in ("MASTER","EXPERT")` exclusion was
+# also inert -- no such nodes exist.)
+thin_nodes = [node for node in node_list
+              if not node.children
+              and node.capability_level == "EXPLORE"
+              and node.depth >= 2]  # under-developed leaf stubs
 
 IF len(thin_nodes) > 3:
     signals.append({
         type: "thin_knowledge",
-        description: "{len(thin_nodes)} tree nodes have minimal coverage: {[n.key for n in thin_nodes[:5]]}",
+        description: "{len(thin_nodes)} EXPLORE-stage leaf nodes structurally thin: {[n.key for n in thin_nodes[:5]]}",
         severity: "LOW",
         nodes: [n.key for n in thin_nodes[:5]]
     })
@@ -206,7 +231,7 @@ drive to explore and discover, not just maintain and fix.
 # S4a: Unexplored territory
 # Identify tree categories that have zero or minimal recent work.
 explored_cats = set(categories.keys())  # from S3
-all_L2_cats = set(node.key for node in tree_summary if node.depth <= 2)
+all_L2_cats = set(node.key for node in node_list if node.depth <= 2)
 unexplored = all_L2_cats - explored_cats
 
 IF unexplored:
@@ -233,6 +258,43 @@ FOR EACH insight in recent_insights:
         break  # One cross-pollination signal per scan is enough
 ```
 
+## Phase S4.5: Silent-Gap / Orphaned-Asset Audit (g-318-11)
+
+Systematizes the g-318-08 manual audit. Runs four detectors -- (a)
+written-never-read stores, (b) stale telemetry/probes, (c) zero-input
+mechanisms, (d) never-invoked skills -- behind the two LOAD-BEARING suppression
+gates the manual run proved are the whole point: the **rb-245 zero-count
+verification gate** (verify a field-name / grep-pattern / content-timestamp
+against a live record before concluding "orphaned") and **dedup-against-open-
+goals** (skip any gap already tracked by an open goal's title/description/
+origin_signal). Only genuinely-NEW, verified gaps are filed as Investigate
+goals. The COMMON CASE IS 0 NEW GAPS (per g-318-08, every gap is usually already
+tracked or resolved) -- the audit's value is the TAIL: catching the NEXT gap
+early, before it festers 24 days like ohs-trend did.
+
+This belongs HERE (the strategic-scan step-back point, ~5-goal/4h cadence) and
+NOT in a high-frequency precheck sweep: low cadence + strict dedup + rb-245
+keep signal/noise high. The audit self-files via `--apply` (its own dedup +
+rb-245 are the gate spurious/duplicate finds never pass), so its gaps do NOT
+also feed the S5 `signals` list -- that would double-file.
+
+```
+# Direct py -3 (NOT a bash wrapper) per rb-225/rb-247 (Windows bash-subprocess
+# hang). --apply files verified-NEW gaps into asp-115 via the daemon add-goal
+# endpoint; dedup makes re-filing idempotent across cadences.
+Bash: py -3 core/scripts/silent-gap-audit.py --apply --output json
+Parse the JSON result.
+Output: ">> Silent-gap audit: {new_gap_count} NEW filed | {len(suppressed_dedup)} dedup-suppressed | {len(suppressed_rb245)} rb-245-suppressed"
+FOR EACH g in new_gaps[:5]:
+    Output: "  NEW [{g.detector}] {g.target}: {g.summary[:80]}"
+FOR EACH f in filed:
+    Output: "  filed {f.goal_id} ({f.detector}:{f.target})"
+# Fail-open: any audit error (daemon read failure exits 1 by guard-383, a
+# detector exception, a filing timeout) is logged and the scan CONTINUES to S5.
+# The audit must never block the strategic scan. A filing that times out but
+# lands is self-corrected by next-cadence dedup (idempotent).
+```
+
 ## Phase S5: Signal Triage and Action
 
 Route signals to the appropriate action based on severity. This is where
@@ -243,7 +305,12 @@ observation becomes work.
 # (signals were collected in S1-S4) regardless of whether any fired.
 # The orchestrator's Phase 1.5 time_cadence trigger reads this slot.
 # Without this write, strategic_scan.hours_cadence silently never fires.
-echo "\"$(date +%Y-%m-%dT%H:%M:%S)\"" | Bash: wm-set.sh last_strategic_scan
+# Routed through verified-wm-set.sh (write -> read-back -> assert -> retry-once)
+# so a silent drop FAILS LOUD instead of re-firing the scan every iteration
+# undetected (g-115-1416; the bare write form dropped a stamp 2026-06-13). This
+# stays the single writer of the slot (guard-155); the verified wrapper only
+# hardens the write mechanism, it does not add a second writer.
+echo "\"$(date +%Y-%m-%dT%H:%M:%S)\"" | Bash: verified-wm-set.sh last_strategic_scan
 
 IF len(signals) == 0:
     Output: ">> Strategic scan ({scan_trigger}): no signals -- environment is healthy"
@@ -305,7 +372,7 @@ Bash: echo "Return to orchestrator -- continue to next phase"
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 1.5, conditional)
-- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `/create-aspiration` (for MEDIUM signals)
+- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `/create-aspiration` (for MEDIUM signals)
 - **Reads**: Aspiration compact data, experience entries, tree summary, reasoning bank, Self, config
 - **Writes**: Working memory (`last_strategic_scan`, `strategic_scan_signals`, `portfolio_health_signal` slots), investigation goals (HIGH signals), evolution log
 - **Source routing**: All `aspirations-*.sh` calls receive `--source {source}` from the orchestrator

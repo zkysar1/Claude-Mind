@@ -33,11 +33,17 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        # Redirect WM file paths to temp dir for the duration of the test.
-        original_wm_path = wm.WM_PATH
-        original_lock_path = wm.WM_LOCK_PATH
-        wm.WM_PATH = tmp / "working-memory.yaml"
-        wm.WM_LOCK_PATH = wm.WM_PATH.with_suffix(".lock")
+        # Route WM I/O to the temp dir via BODY_WM_PATH — the env var that
+        # wm.py's wm_path() honors per-call ( Mind/Body routing).
+        # Patching wm.WM_PATH is a NO-OP for I/O and was DANGEROUS: WM_PATH is
+        # a dynamic module __getattr__ property, and cmd_init/cmd_reset/read_wm/
+        # write_wm resolve through wm_path() (BODY_WM_PATH env -> else
+        # AGENT_DIR/session/working-memory.yaml), NOT the module attribute. The
+        # old wm.WM_PATH=tmp patch left cmd_init/cmd_reset targeting the REAL
+        # bound agent's WM -- running this under MIND_AGENT clobbered live
+        # working memory. (6, 2026-06-23)
+        original_body = os.environ.get("BODY_WM_PATH")
+        os.environ["BODY_WM_PATH"] = str(tmp / "working-memory.yaml")
         try:
             # 1. Initialize a fresh WM via cmd_init
             init_args = SimpleNamespace()
@@ -120,8 +126,10 @@ def main() -> int:
                 )
 
         finally:
-            wm.WM_PATH = original_wm_path
-            wm.WM_LOCK_PATH = original_lock_path
+            if original_body is None:
+                os.environ.pop("BODY_WM_PATH", None)
+            else:
+                os.environ["BODY_WM_PATH"] = original_body
 
     if failures:
         print("[test] FAIL — cmd_reset cadence-tracker preservation broken")
@@ -131,6 +139,15 @@ def main() -> int:
 
     print("[test] PASS — cmd_reset preserves cadence-tracker slots and session_start; nulls non-cadence slots")
     return 0
+
+
+def test_wm_reset_cadence_preservation():
+    """Pytest entry point — runs main() under BODY_WM_PATH isolation so the
+    cmd_reset cadence-preservation regression is actually exercised in the
+    suite. The file previously exposed only `main()` (no test_* fn), so pytest
+    collected 0 tests from it and the regression went un-run in CI. (g-115-1626)
+    """
+    assert main() == 0
 
 
 if __name__ == "__main__":

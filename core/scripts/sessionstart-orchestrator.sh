@@ -113,6 +113,17 @@ printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/session-save-id.sh" || true
 # established by Step 1.
 printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/recovery-gate.sh" || true
 
+# ─── Step 2.5: wm-contamination-check.sh ───────────────────────────────────
+# REMEDIAL cross-agent WM contamination detector (sibling to the PREVENTIVE
+# sid-collision-check.sh). Runs AFTER session-save-id + recovery-gate so the
+# binding is resolvable, BEFORE /prime so a contaminated WM is scrubbed before
+# the loop restores loop_state from it. Unconditional (NOT source=compact-gated)
+# because residual contamination persists in the WM regardless of how this
+# SessionStart was triggered. Daemon-independent (reads files directly) and
+# fail-open: a detector failure must never block session start. Its stdout is
+# silent on a clean WM, a loud quarantine block on detection.
+printf '%s' "$STDIN_JSON" | bash "$SCRIPT_DIR/wm-contamination-check.sh" || true
+
 # ─── Steps 3+4: source=compact only ────────────────────────────────────────
 if [ "$SOURCE" = "compact" ]; then
     # postcompact-restore.sh — re-inject context. Writes its restoration

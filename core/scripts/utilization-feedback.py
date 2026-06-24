@@ -712,6 +712,64 @@ def main():
                                          "auto_flagged_for_review", "true")
                 auto_flagged += 1
 
+    # M-6: Update per-module health metrics.
+    # Groups tree nodes by their top-level category (first path segment) and
+    # supplementary items by store type, then records each invocation outcome
+    # into world/module-health.yaml.  Fail-soft: module_health import or
+    # write errors are logged but never break the feedback flow.
+    _m6_updates = 0
+    try:
+        from module_health import load_module_health, save_module_health, record_invocation as mh_record
+
+        mh = load_module_health(WORLD_DIR)
+
+        # Tree nodes -> top-level category.  Key shape: "execution/sub/leaf"
+        # -> category "execution".  Root-level keys (no slash) use the key
+        # itself as the category.
+        def _tree_cat(key):
+            return key.split("/")[0] if "/" in key else key
+
+        # Map item outcome from the per-item partitions above.
+        for key in tree_helpful:
+            mh_record(mh, _tree_cat(key), "helpful")
+            _m6_updates += 1
+        for key in tree_inferred_helpful:
+            mh_record(mh, _tree_cat(key), "helpful")
+            _m6_updates += 1
+        for key in tree_noise:
+            mh_record(mh, _tree_cat(key), "noise")
+            _m6_updates += 1
+
+        # Supplementary items -> store type.  Type field values are
+        # "reasoning_bank", "guardrail", "pattern_signature".  Normalize
+        # "guardrail" -> "guardrails" and "pattern_signature" ->
+        # "pattern_signatures" to match SUPPLEMENTARY_MODULES.
+        _TYPE_NORMALIZE = {
+            "reasoning_bank": "reasoning_bank",
+            "guardrail": "guardrails",
+            "guardrails": "guardrails",
+            "pattern_signature": "pattern_signatures",
+            "pattern_signatures": "pattern_signatures",
+        }
+        for item in supp_helpful:
+            store = _TYPE_NORMALIZE.get(item.get("type", ""), item.get("type", ""))
+            mh_record(mh, store, "helpful")
+            _m6_updates += 1
+        for item in supp_inferred_helpful:
+            store = _TYPE_NORMALIZE.get(item.get("type", ""), item.get("type", ""))
+            mh_record(mh, store, "helpful")
+            _m6_updates += 1
+        for item in supp_noise:
+            store = _TYPE_NORMALIZE.get(item.get("type", ""), item.get("type", ""))
+            mh_record(mh, store, "noise")
+            _m6_updates += 1
+
+        if _m6_updates > 0:
+            save_module_health(WORLD_DIR, mh)
+    except Exception as e:
+        print(f"[utilization-feedback] M-6 module health update failed "
+              f"(non-fatal): {e}", file=sys.stderr)
+
     # Mark as processed (atomic write) — persist method + inference stats for audit
     session["utilization_pending"] = False
     session["utilization_completed_at"] = now_str()
@@ -732,6 +790,7 @@ def main():
                           "noise": supp_n, "inferred_unknown": supp_iu,
                           "auto_flagged": auto_flagged},
         "unknown": len(unknown_ids),
+        "module_health_updates": _m6_updates,
     }
     if inference_stats is not None:
         result["inference_stats"] = inference_stats

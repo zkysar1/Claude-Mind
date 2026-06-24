@@ -212,6 +212,20 @@ def in_flight(ctx) -> "Response":  # type: ignore[name-defined]
 
     agent_author = _agent_name(ctx)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    # current_focus: lane indicator for partner Theory-of-Mind (5).
+    # Aspiration (lane) parsed from goal_id (g-NNN-MM -> asp-NNN) + title, so
+    # partners track the actual lane instead of inferring from lagging
+    # completions. Persists across clear-in-flight (the last-claimed lane).
+    # MUST stay byte-identical to core/scripts/team-state.py cmd_in_flight
+    # (guard-742 dual-write).
+    _gp = goal_id.split("-")
+    _asp = ("asp-" + _gp[1]) if len(_gp) >= 3 and _gp[0] == "g" and _gp[1].isdigit() else ""
+    if title and _asp:
+        _focus = _asp + ": " + title
+    elif title:
+        _focus = title
+    else:
+        _focus = _asp or goal_id
 
     def _modifier(state):
         _backfill(state)
@@ -227,6 +241,8 @@ def in_flight(ctx) -> "Response":  # type: ignore[name-defined]
             "phase": phase,
         }
         entry["last_active"] = now
+        entry["current_focus"] = _focus
+        entry["current_focus_updated_at"] = now
         state["agent_status"][target_agent] = entry
         return _stamp_metadata(state, agent_author)
 

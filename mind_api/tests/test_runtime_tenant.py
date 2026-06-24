@@ -96,3 +96,72 @@ def test_tenant_defaults_to_default(project_root):
         httpd.shutdown()
         httpd.server_close()
         lifecycle.clear_runtime_files(project_root)
+
+
+# --- T-c: multi-tenant app-authz gate (1) --------------------------
+# The authz/activation is GATED behind MIND_MULTI_TENANT (default OFF). The OFF
+# path (acme-corp accepted + propagated) is covered by test_tenant_from_header
+# above; these cover the ON path + an explicit OFF-inert regression.
+
+def test_multi_tenant_authz_rejects_mismatch(project_root, monkeypatch):
+    """GIVEN multi-tenant ON + the daemon authed for 'pearl', WHEN a request
+    carries X-Mind-Tenant: vinheim, THEN it is rejected 403 before any handler
+    (brief section 8 app-authz criterion)."""
+    import urllib.error
+    monkeypatch.setenv("MIND_MULTI_TENANT", "1")
+    monkeypatch.setenv("MIND_CUSTOMER", "pearl")
+    httpd, port = _start_daemon_with_tenant_echo(project_root)
+    try:
+        try:
+            _get(port, "/v1/test/tenant", headers={
+                "X-Mind-Agent": "alpha",
+                "X-Mind-Tenant": "vinheim",
+            })
+            assert False, "expected HTTP 403 for tenant mismatch"
+        except urllib.error.HTTPError as e:
+            assert e.code == 403
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        lifecycle.clear_runtime_files(project_root)
+
+
+def test_multi_tenant_authz_accepts_match(project_root, monkeypatch):
+    """GIVEN multi-tenant ON + the daemon authed for 'pearl', WHEN the request
+    carries the matching X-Mind-Tenant: pearl, THEN it is accepted (200) and
+    ctx.tenant carries 'pearl'."""
+    monkeypatch.setenv("MIND_MULTI_TENANT", "1")
+    monkeypatch.setenv("MIND_CUSTOMER", "pearl")
+    httpd, port = _start_daemon_with_tenant_echo(project_root)
+    try:
+        status, body = _get(port, "/v1/test/tenant", headers={
+            "X-Mind-Agent": "alpha",
+            "X-Mind-Tenant": "pearl",
+        })
+        assert status == 200
+        assert body["tenant"] == "pearl"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        lifecycle.clear_runtime_files(project_root)
+
+
+def test_multi_tenant_disabled_gate_is_inert(project_root, monkeypatch):
+    """REGRESSION: with multi-tenant OFF (the default), a non-default tenant
+    header is accepted + propagated (the R4 seam) even when MIND_CUSTOMER is set
+    — the authz gate is inert unless MIND_MULTI_TENANT is explicitly enabled, so
+    the single-tenant deployment and the seam test keep working."""
+    monkeypatch.delenv("MIND_MULTI_TENANT", raising=False)
+    monkeypatch.setenv("MIND_CUSTOMER", "pearl")  # set but inert while MT off
+    httpd, port = _start_daemon_with_tenant_echo(project_root)
+    try:
+        status, body = _get(port, "/v1/test/tenant", headers={
+            "X-Mind-Agent": "alpha",
+            "X-Mind-Tenant": "vinheim",
+        })
+        assert status == 200
+        assert body["tenant"] == "vinheim"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        lifecycle.clear_runtime_files(project_root)

@@ -87,6 +87,17 @@ _STOPWORDS = {
     "make", "build", "wire", "pass", "fail", "test", "code", "file", "script",
     "when", "where", "what", "should", "would", "could", "goal", "goals",
     "aspiration", "goal-id", "source", "status", "participant", "participants",
+    # 5: generic structural/framework state-vocabulary that recurs
+    # across many framework-finding goals (loop_state checks, iteration-close
+    # audits, etc.). Each is a poor duplicate discriminator: shared alongside a
+    # single structural topic token (e.g. loop_state) they inflated unique_hits
+    # to >=2 and weighted to >=1.5, false-blocking file-path-DISTINCT goals
+    # (alpha session 92: 4 FPs; bravo: 2 FPs, each verified-distinct then
+    # override-cleared). Demoting them keeps a lone shared structural token at
+    # N=1 (advisory, not a block) while genuine multi-identifier duplicates
+    # still block. Token shape ([-_0-9]) remains the discriminator, not generic
+    # prose vocab. Expand this set as new generic-token FP classes surface.
+    "exists", "global", "populated", "recurring", "class", "close",
 }
 
 
@@ -110,6 +121,16 @@ _RESPONSE_ORIGIN_PREFIXES = (
 # them is a false positive. Derived from the SSOT so the two gates never drift.
 _GENERIC_BARE_ORIGINS = frozenset(
     t for t in ALLOWED_PREFIXES if not t.endswith(":"))
+
+# Decomposition siblings legitimately share the parent's origin_signal
+# ("decomposition:<parent-id>"): filing the 2nd+ child of one parent
+# exact-matches the 1st by origin_signal even though each child is a DISTINCT
+# deliverable. Same false-positive class as the bare-tag origins above, so the
+# prefix is exempt from Strategy-1 exact-match. Children of DIFFERENT parents
+# carry different strings (never collide); a TRUE duplicate child still trips
+# Strategy 2 (structural keyword/file overlap). 6; canonical incidents
+#  vs  and 2 (each needed --override-duplication).
+_SIBLING_SHARED_ORIGIN_PREFIXES = ("decomposition:",)
 
 
 # --- Signal extraction -------------------------------------------------------
@@ -171,9 +192,12 @@ def _count_non_stopword_tokens(text: str) -> int:
 # --- Check 1: recent_completions --------------------------------------------
 
 def _compute_idf(entries, terms):
-    """Return {term: idf_weight} using recent_completions key_findings as the
+    """Return (idf_map, n) using recent_completions key_findings as the
     corpus. g-248-12: rare identifiers contribute high weight; common ones
-    contribute near-zero. Returns {t: 1.0} fail-open when corpus is empty.
+    contribute near-zero. idf_map is {t: 1.0} and n is 0 (fail-open) when the
+    corpus is empty. g-115-1325: the corpus size n is returned so callers can
+    derive a df-equivalent IDF floor log(n/(1+CEIL)) from the LIVE corpus size
+    (a fixed IDF floor cannot span the two corpora — see STRUCT_IDF_DF_CEIL).
     """
     findings = []
     for e in entries:
@@ -183,13 +207,26 @@ def _compute_idf(entries, terms):
                 findings.append(kf)
     n = len(findings)
     if n == 0:
-        return {t: 1.0 for t in terms}
+        return {t: 1.0 for t in terms}, 0
     out = {}
     for t in terms:
         tl = t.lower()
         df = sum(1 for kf in findings if tl in kf)
         out[t] = math.log(n / (1 + df)) if df < n else 0.0
-    return out
+    return out, n
+
+
+# 5: a structured identifier (token shape [-_0-9]) counts toward the
+# strong-block co-signal ONLY when df(k) <= this ceiling in the IDF corpus —
+# i.e. it is rare (unique to the one compared goal), not cluster-common vocab.
+# DF_CEIL=1 is empirically forced (guard-594): the FP identifiers that
+# false-blocked 4 (b9568/ df=2,  df=3,  df=6)
+# are all df>=2; df=1 identifiers (the legit duplicate signal, structural-
+# co-signal gate test CASE G3) are preserved. Implemented as an IDF floor
+# log(n/(1+CEIL)) derived from the LIVE corpus size because a fixed floor
+# cannot span recent_completions (n~50, df=1 idf=3.22) and pending_queue
+# (n~337, df=1 idf=5.13). idf(k) >= log(n/(1+CEIL))  <=>  df(k) <= CEIL.
+STRUCT_IDF_DF_CEIL = 1
 
 
 def _is_expected_path(fp: str, expected_paths) -> bool:
@@ -238,7 +275,13 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
         entries = []
 
     all_terms = set(file_paths) | set(keywords)
-    idf = _compute_idf(entries, all_terms) if all_terms else {}
+    idf, idf_n = _compute_idf(entries, all_terms) if all_terms else ({}, 0)
+    # 5: per-term IDF floor for the token-shape strong path (below).
+    # idf(k) >= idf_floor  <=>  df(k) <= STRUCT_IDF_DF_CEIL — keeps only rare
+    # (unique) structured identifiers as discriminating co-signals. Derived
+    # from the LIVE corpus size; inert (0.0) on a corpus too small to discriminate.
+    idf_floor = (math.log(idf_n / (1 + STRUCT_IDF_DF_CEIL))
+                 if idf_n > (1 + STRUCT_IDF_DF_CEIL) else 0.0)
 
     WEIGHT_THRESHOLD = 1.5
     MIN_UNIQUE_HITS = 2
@@ -275,8 +318,14 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
         # vs recurring , weighted 5.3/6.4 on PLAIN words). Token
         # shape is the discriminator. Preserves  IDF intent + the
         # rare-identifier path (gate test CASE 3).
+        # 5 refinement: the structured-token branch ALSO requires
+        # per-term IDF >= idf_floor (df(k) <= STRUCT_IDF_DF_CEIL). This is a
+        # TIGHTENING, not "trusting the IDF sum" — a cluster-COMMON structured
+        # identifier (low per-term IDF; appears across many entries) is shared
+        # cluster vocab, not duplicate-work evidence. file-path hits unaffected.
         has_specific = bool(hit_paths) or any(
-            re.search(r"[-_0-9]", k) for k in hit_kws)
+            re.search(r"[-_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
+            for k in hit_kws)
         if strong and has_specific:
             matches.append({
                 "goal_id": goal_id,
@@ -959,7 +1008,8 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
     # update-goal cascade tests + the concurrent-add hammer, 2026-06-03). Real
     # dups that share a bare-tag origin are still caught by Strategy 2 below.
     origin_matches = []
-    if proposed_origin and proposed_origin not in _GENERIC_BARE_ORIGINS:
+    if (proposed_origin and proposed_origin not in _GENERIC_BARE_ORIGINS
+            and not proposed_origin.startswith(_SIBLING_SHARED_ORIGIN_PREFIXES)):
         for c in candidates:
             if c["origin_signal"] and c["origin_signal"] == proposed_origin:
                 origin_matches.append({
@@ -979,7 +1029,13 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
     # _compute_idf takes entries with `key_finding` field. Wrap candidate
     # text in that shape so the helper applies symmetrically.
     pseudo_entries = [{"key_finding": c["text"]} for c in candidates]
-    idf = _compute_idf(pseudo_entries, all_terms) if all_terms else {}
+    idf, idf_n = _compute_idf(pseudo_entries, all_terms) if all_terms else ({}, 0)
+    # 5: same per-term IDF floor as _check_recent_completions. The
+    # pending corpus is larger (~337) so cluster-common identifiers (,
+    # , b9568 — measured df 2-6) carry HIGHER absolute IDF here than in
+    # recent_completions; the live-n floor adapts. idf(k) >= floor <=> df<=CEIL.
+    idf_floor = (math.log(idf_n / (1 + STRUCT_IDF_DF_CEIL))
+                 if idf_n > (1 + STRUCT_IDF_DF_CEIL) else 0.0)
 
     WEIGHT_THRESHOLD = 1.5
     MIN_UNIQUE_HITS = 2
@@ -1009,8 +1065,13 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
         # (Strategy 1 above); structural overlap is the safety net for
         # cases where the duplicate was filed with a distinct
         # origin_signal but shares structural fingerprints.
+        # 5: the structured-token branch ALSO requires per-term IDF
+        # >= idf_floor (df(k) <= STRUCT_IDF_DF_CEIL) so cluster-common ids
+        # (/ referenced across many pending goals) no longer
+        # false-strong-block legit follow-ups (canonical: 4 filing).
         has_specific = bool(hit_paths) or any(
-            re.search(r"[_0-9]", k) for k in hit_kws)
+            re.search(r"[_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
+            for k in hit_kws)
         if strong and has_specific:
             structural_matches.append({
                 "source": c["source"],

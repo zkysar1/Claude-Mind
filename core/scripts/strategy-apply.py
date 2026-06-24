@@ -49,13 +49,29 @@ STRATEGY_FILES = [
 ]
 
 
+def _normalize_heuristics(raw):
+    """Coerce a heuristics field to a list of dicts.
+
+    A malformed strategy file can serialize an empty list as the string "[]"
+    (g-001-65): YAML then loads `generation_heuristics: '[]'` as the str "[]",
+    and `for h in heuristics` iterates it character-by-character ('[' , ']') --
+    bare strings that crash keyword_match's `.get()` with AttributeError. The
+    increment is fail-open at the call site, so the strategy->execution feedback
+    loop (times_applied) silently breaks whenever this fires. Coerce a non-list
+    to [] and drop any non-dict entries so the loop degrades gracefully.
+    """
+    if not isinstance(raw, list):
+        return []
+    return [h for h in raw if isinstance(h, dict)]
+
+
 def load(file_tuple):
     path = META_DIR / file_tuple[0]
     if not path.exists():
         return path, None, []
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    heuristics = data.get(file_tuple[1], []) or []
+    heuristics = _normalize_heuristics(data.get(file_tuple[1], []))
     return path, data, heuristics
 
 

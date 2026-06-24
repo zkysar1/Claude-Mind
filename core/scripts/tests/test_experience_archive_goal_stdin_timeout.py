@@ -145,5 +145,40 @@ def test_experience_archive_goal_stdin_timeout():
     assert main() == 0
 
 
+def test_wrapper_bash_stdin_is_timeout_bounded():
+    """Regression for 9 (zeta): the DAEMON-ONLY wrapper reads OPTIONAL
+    stdin in BASH, a SEPARATE site from experience.py `_read_optional_stdin()`
+    (cases A/B/C above only reach the Python helper). The mycelium daemon-only
+    cutover (fa618aa0) moved the read to bash and DROPPED the Python helper's
+    timeout bound — silently re-introducing the g-115-900/g-115-1232 >90s-hang
+    hazard (guard-664) at the bash layer.
+
+    Guard the STRUCTURAL fix rather than its runtime behavior: the bash stdin
+    read MUST be `timeout`-bounded so a future edit cannot revert to a bare
+    `$(cat)`. A behavioral spawn test is intrinsically flaky here — the wrapper
+    makes a REAL daemon call after the read, whose latency (~22s under
+    OneDrive/multi-agent write contention, guard-597/guard-710) swamps the few-
+    second stdin bound and makes any wall-clock threshold unreliable. The
+    recurrence vector is a code change dropping the bound, so a static guard on
+    the read site is the precise, non-flaky check (verified behaviorally by hand
+    during g-115-1399: the WARN fires on a held-open non-EOF stdin)."""
+    import re
+    wrapper = (CORE_SCRIPTS / "experience-archive-goal.sh").read_text(encoding="utf-8")
+    # The read must wrap `cat` in `timeout`, gated by the shared knob, and must
+    # NOT be a bare `$(cat)`.
+    assert "EXPERIENCE_STDIN_TIMEOUT_S" in wrapper, (
+        "wrapper lost the EXPERIENCE_STDIN_TIMEOUT_S optional-stdin bound "
+        "(guard-664 hang regression)"
+    )
+    assert re.search(r'STDIN_JSON="\$\(timeout\b', wrapper), (
+        "wrapper stdin read is not `timeout`-bounded — bare $(cat) re-introduces "
+        "the guard-664 >90s hang on a non-EOF inherited pipe"
+    )
+    assert 'STDIN_JSON="$(cat)"' not in wrapper, (
+        "wrapper reverted to bare `STDIN_JSON=\"$(cat)\"` — unbounded stdin read "
+        "(guard-664 hang regression returning)"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,0 +1,53 @@
+# Monitor-probes registry (FW-1b,  / asp-317).
+#
+# Demoted pure-monitoring probes that used to occupy a goal-selection slot every
+# cycle even when they returned "ok"/"clean"/guaranteed-null. monitor-tick.py
+# runs each ENABLED probe at its own interval_hours from iteration-close.sh
+# productivity-check (beside agent-watchdog --tick — LOCAL tick, never cloud
+# cron; guard-441). A clean probe records a last-run marker and emits nothing
+# (no goal, no slot). A tripped probe is converted to ONE deduped Investigate/
+# Unblock via monitor-finding-convert.py (origin_signal dedup, target_asp
+# routing) — so the scan leaves the queue but the FINDING re-enters it exactly
+# when there is work. Design: agents/delta/temp/drained/
+# fw-1b-monitoring-sweep-demotion-design.md.
+#
+# NATURAL-GATE (guard-348): `enabled_probes` is the allowlist. EMPTY = registry
+# inert (monitor-tick scans NOTHING and exits immediately). Migrate one probe id
+# at a time by adding it here AND setting the corresponding recurring goal
+# status:skipped with outcome_note "demoted to monitor-tick probe <id> (FW-1b)".
+# Removing an id reverts that probe to a normal queue goal. Presence in the
+# allowlist IS the gate — there is intentionally NO per-probe `enabled:` boolean.
+#
+# Ships inert. Phase-3 (Apply-3) migrates Bucket-A pure-probes first
+# (/03/106/151/831) one id at a time.
+enabled_probes: []
+
+# Probe definitions. A probe is a script that exits 0 when clean and NON-ZERO
+# when it trips; its combined stdout+stderr is captured as the trip evidence.
+# Per-probe schema:
+#   id                    unique probe id (matches the migrated recurring goal where applicable)
+#   script                path to the probe script, relative to PROJECT_ROOT
+#                         (e.g. world/scripts/probe-operator.sh, core/scripts/x.sh)
+#   interval_hours        minimum hours between runs (self-gated via the state file)
+#   on_trip               file_goal | post_finding
+#   target_asp            aspiration the trip goal is filed into (for on_trip: file_goal)
+#   origin_signal_prefix  origin_signal = "<prefix>:<probe-id>" (drives dedup)
+#   title                 (optional) goal title template; default derived from id + evidence
+#   priority              (optional) HIGH|MEDIUM|LOW; default MEDIUM
+#   category              (optional) goal category; default framework-architecture
+#   args                  (optional) list of extra args passed to the probe script
+#   description           (optional) human note for maintainers
+#
+# Example (commented — NOT enabled, since enabled_probes is empty):
+# probes:
+#   - id: operator-health
+#     script: world/scripts/probe-operator.sh
+#     interval_hours: 6
+#     on_trip: file_goal
+#     target_asp: asp-115
+#     origin_signal_prefix: monitor-probe
+#     title: "Unblock: operator API health probe tripped"
+#     priority: MEDIUM
+#     category: infrastructure
+#     description: "Demoted from recurring  (operator health)."
+probes: []

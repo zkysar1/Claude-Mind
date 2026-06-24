@@ -602,6 +602,110 @@ def test_auto_resolve_dry_run_does_not_close():
                 f"dry-run must NOT mutate; got status={status!r}")
 
 
+# ---- Option A filing gate: session-gap canary suppression (9) -----
+
+
+def _write_diary(agent_dir: Path, timestamps: list[str]):
+    """Write execution-diary.jsonl entries (each carries a timestamp).
+
+    _has_session_gap only reads the `timestamp` field; other fields are
+    decorative. Used to simulate agent activity / inactivity across a
+    streak-break window.
+    """
+    diary = agent_dir / "session" / "execution-diary.jsonl"
+    with open(diary, "w", encoding="utf-8") as f:
+        for ts in timestamps:
+            f.write(json.dumps({"timestamp": ts, "event": "tick"},
+                               ensure_ascii=False) + "\n")
+
+
+def test_session_gap_suppresses_filing():
+    """A streak-break whose elapsed window is explained by agent inactivity
+    is SUPPRESSED at filing time, not filed (Option A gate, g-115-1319).
+
+    Window = [2026-05-07T23:30, 2026-05-08T12:00] (12.5h). The diary has
+    entries only OUTSIDE that window, so there is no in-window activity and
+    the 12.5h span exceeds the 2h default threshold → session gap → suppress.
+    DaemonFixture isolates any errant filing into the test world (a live
+    daemon is otherwise reachable).
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_and_agent(Path(tmpd))
+        with DaemonFixture(world):
+            _write_diary(agent_dir, [
+                "2026-05-06T08:00:00",
+                "2026-05-09T08:00:00",
+            ])
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-100-01",
+                "aspiration_id": "asp-100",
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "lateness_ratio": 3.13,
+                "processed": False,
+            }
+            _write_signals(agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, agent_dir)
+            assert rc == 0, err
+
+            # No Investigate canary filed
+            asps = _read_aspirations(world, agent_dir)
+            asp_100 = next(a for a in asps if a["id"] == "asp-100")
+            new_goals = [g for g in asp_100["goals"]
+                         if "streak-break" in g.get("title", "").lower()]
+            assert len(new_goals) == 0, (
+                "session-gap break must NOT file a canary")
+
+            # Signal marked suppressed + processed (won't re-fire)
+            signals = _read_signals(agent_dir)
+            assert signals[0]["processed"] is True
+            assert signals[0].get("session_gap_suppressed") is True
+            assert "session-gap suppressed" in out
+            assert "1 session-gap-suppressed" in out
+
+
+def test_continuous_activity_still_files():
+    """Real drift (continuous activity, cadence still missed) has NO session
+    gap, so the canary still files — the gate is discriminating (g-115-1319).
+
+    Same 12.5h window as above, but the diary has a tick every 30 minutes
+    across it → no gap >= 2h → not a session gap → file normally.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_and_agent(Path(tmpd))
+        with DaemonFixture(world):
+            base = datetime.fromisoformat("2026-05-07T23:00:00")
+            ticks = [(base + timedelta(minutes=30 * i)).isoformat()
+                     for i in range(30)]  # 23:00 .. 13:30 next day, 30m apart
+            _write_diary(agent_dir, ticks)
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-100-01",
+                "aspiration_id": "asp-100",
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "lateness_ratio": 3.13,
+                "processed": False,
+            }
+            _write_signals(agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, agent_dir)
+            assert rc == 0, err
+
+            asps = _read_aspirations(world, agent_dir)
+            asp_100 = next(a for a in asps if a["id"] == "asp-100")
+            new_goals = [g for g in asp_100["goals"]
+                         if "streak-break" in g.get("title", "").lower()]
+            assert len(new_goals) == 1, (
+                "real-drift break (continuous activity) must still file")
+
+            signals = _read_signals(agent_dir)
+            assert signals[0]["processed"] is True
+            assert signals[0].get("session_gap_suppressed") is not True
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

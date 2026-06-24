@@ -168,6 +168,51 @@ def test_list_valued_fields_raise_valueerror_not_typeerror():
                 f"{field}: must be a clean ValueError, not unhashable TypeError: {e}"
 
 
+# --- entry_type () — CLI twin, kept in sync with the daemon validator
+# (mind_api/src/store_registry.py, tested by test_rb_validate_list_field_rejection.py).
+# The two validators MUST accept/reject the same entry_type inputs; these mirror
+# the daemon cases so a one-sided change to either fails here. ---
+
+def test_entry_type_absent_and_null_pass_cli():
+    """entry_type is OPTIONAL: absent and explicit-null both validate."""
+    rec = _seed_minimal_rb(applies_to="framework")
+    rb_mod.validate_rb_record(rec)  # absent — must not raise
+    rec["entry_type"] = None
+    rb_mod.validate_rb_record(rec)  # explicit null — must not raise
+
+
+def test_entry_type_procedure_passes_cli():
+    """The one valid non-null value validates on the CLI side too."""
+    rec = _seed_minimal_rb(applies_to="framework")
+    rec["entry_type"] = "procedure"
+    rb_mod.validate_rb_record(rec)  # must not raise
+
+
+def test_entry_type_unknown_rejected_cli():
+    """An unknown entry_type fails loud and names the field."""
+    rec = _seed_minimal_rb(applies_to="framework")
+    rec["entry_type"] = "procedrue"  # typo
+    try:
+        rb_mod.validate_rb_record(rec)
+        assert False, "expected ValueError on unknown entry_type"
+    except ValueError as e:
+        assert "entry_type" in str(e).lower(), f"error must name entry_type, got: {e}"
+
+
+def test_entry_type_list_valued_rejected_cli():
+    """B10: a list-valued entry_type raises a clean ValueError, never TypeError."""
+    rec = _seed_minimal_rb(applies_to="framework")
+    rec["entry_type"] = ["procedure"]
+    try:
+        rb_mod.validate_rb_record(rec)
+        assert False, "expected ValueError on list-valued entry_type"
+    except TypeError as e:  # noqa: F841
+        assert False, f"list entry_type raised TypeError (B10 regression): {e}"
+    except ValueError as e:
+        assert "unhashable" not in str(e).lower(), \
+            f"must be a clean ValueError, not unhashable TypeError: {e}"
+
+
 def _run_all():
     tests = [v for k, v in globals().items()
              if k.startswith("test_") and callable(v)]

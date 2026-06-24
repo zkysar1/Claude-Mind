@@ -238,15 +238,18 @@ Write the briefing body (from Phase 3) to agents/<agent>/temp/fresh-eyes-program
 Classify the review outcome via the deterministic helper and act on it.
 No escalation to the user — the agent decides and proceeds autonomously.
 
-For fresh-eyes-program, Program (shared purpose) edits are special: they
-require cross-agent ack per world/conventions/self-program-evolution.md. An
-`act_now` decision here does NOT mean "apply inline immediately" — it
-means "propose the edit; partners ack/reject before it finalizes." The
-existing autonomous edit path on `world/program.md` triggers the Phase 2
-hooks which detect file_kind=program + material and route through the
-cross-agent ack flow in `evolution-complete.py` (calls
-`program-change-propose.py`). The LLM merely applies the Edit; the
-infrastructure handles the proposal lifecycle.
+For fresh-eyes-program, an `act_now` decision applies the `world/program.md`
+edit inline and it finalizes IMMEDIATELY (status=final), then posts a
+`program-change` entry to the `decisions` board for POST-HOC partner review —
+the guard-380 "notify after, revert if wrong" model. Partners read the
+decisions-board post during `/prime` Phase 2 and revert via git if they
+disagree. NOTE: the cross-agent *pre-ack* flow documented in
+world/conventions/self-program-evolution.md Phase 6 (propose → partners
+ack/reject → finalize) is **DESIGNED BUT NOT IMPLEMENTED** (g-115-1619 verified
+2026-06-23: `program-change-propose.py` + `program-ack-sweep.py` were never
+built). Do NOT assume an `act_now` Program edit sits in `awaiting_acks` — it is
+live the moment `evolution-complete.sh` finalizes it. The LLM applies the Edit;
+`evolution-complete.py` finalizes + posts to the board.
 
 Extract signals from the Phase 3 briefing synthesis (scored 0..1 unless
 noted) and pass to the helper. Note `partner_alignment_score` is REQUIRED
@@ -277,11 +280,12 @@ Branch on decision:
   core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning
   "<≥80-char rationale citing fresh-eyes-program briefing signals + Phase
   3 evidence>" --signal-source fresh-eyes-program` to finalize. For
-  material classification, `evolution-complete.py` will automatically
-  route through `program-change-propose.py` to file ack goals for partner
-  agents (D2 protocol). The proposal sits in `awaiting_acks` until
-  `program-ack-sweep.py` (asp-115 recurring) sees the partners ack or
-  reject.
+  material classification, `evolution-complete.py` finalizes the edit
+  immediately and posts a `program-change` entry to the `decisions` board
+  for post-hoc partner review (guard-380 model). The D2 cross-agent pre-ack
+  flow (`program-change-propose.py` → `awaiting_acks` → `program-ack-sweep.py`)
+  is **NOT IMPLEMENTED** (g-115-1619) — the edit is live on finalize, not
+  pending ack.
 - **`act_later`** — file an Idea goal:
   `bash core/scripts/aspirations-add-goal.sh asp-115` with stdin
   `{"title":"Idea: Program refinement - <one-line>",

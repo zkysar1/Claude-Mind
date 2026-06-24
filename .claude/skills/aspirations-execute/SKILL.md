@@ -111,6 +111,68 @@ ELSE:
 SKILL.md references when calling an affected script. A non-cross-agent
 iteration sets it to empty string and the calls behave exactly as before.
 
+## Phase 4-lw: Lightweight Goal Mode — Trivial-Goal Classifier (g-305-15; design g-305-02)
+
+Runs ONCE at Phase-4 entry (after Setup, before the Cost-Ordered Preamble).
+Predicts whether this goal is TRIVIAL so the Phase 3.9-4.5 ceremony can be
+skipped. `trivial_mode` is carried in-context for the rest of Phase 4 (exactly
+like `effort_level`), NOT re-read per phase.
+
+```
+Bash: tg_json = py -3 core/scripts/trivial-goal-classify.py {goal.id} --source {source} --output json
+Parse tg_json.verdict → trivial_mode = (verdict == "trivial")
+# Master flag (aspirations.yaml lightweight_mode.enabled) defaults OFF (g-306-08):
+# verdict is "full" for EVERY goal until the flag is validated + flipped on, so
+# trivial_mode stays False and this spec is byte-identical to pre-change behavior.
+# Fail-to-full: any classifier error also yields "full" — never blocks execution.
+IF trivial_mode:
+    Output: "▸ Lightweight mode: TRIVIAL {tg_json.reasons} — skipping the SKIP-marked phases below (Step 5e Gate D STILL runs)"
+    Bash: loop-state-save.sh update --set "phase_progress.trivial_mode=true"   # compaction survival; auto-clears at LOOP_CONTINUE. On resume re-read this OR re-run the classifier (idempotent); absent either, default full (SAFE).
+    Bash: echo '{"entry_type":"observation","goal_id":"{goal.id}","content":"lightweight-mode trivial; skipping 3.9-4.5"}' | bash core/scripts/execution-diary.sh append
+ELSE:
+    trivial_mode = false   # full ceremony runs (default)
+```
+
+**Authoritative skip table** (consistent with `core/config/execute-protocol-digest.md`;
+both MUST stay in sync — supp-guard L1013: divergent dual specs silently regress).
+When `trivial_mode` is true, SKIP the **SKIP**-marked phases; **KEEP** phases ALWAYS
+run. The Phase 4-post escape hatch re-enables the SKIP phases if execution falsifies
+the prediction (diff / surprise / failure).
+
+| Phase | trivial_mode |
+|-------|--------------|
+| Phase 4 Setup (env routing) | KEEP |
+| Phase 4 Preamble — Cost-Ordered Preconditions | KEEP |
+| Phase 4-pre Target-State Probe | SKIP |
+| Phase 3.9 Pre-Execution Domain | SKIP (already conditional) |
+| Phase 3.95 Depth Estimate | SKIP |
+| Phase 3.97 Inbound Signal Sweep | SKIP |
+| Phase 4 Execute — Intelligent Retrieval Steps 1-5d | SKIP (largest single saving) |
+| **Phase 4 Execute — Step 5e Gate D** | **KEEP — UNTOUCHED (GATE-INTEGRITY; never gated by trivial_mode)** |
+| Phase 4 Execute — primary action | KEEP |
+| Phase 4.04 Decision-Rule Counter | SKIP |
+| Phase 4.05 Mid-Exec Drift + Chunked-Encoding | SKIP |
+| Phase 4-post Outcome Classification (+ escape hatch) | KEEP |
+| Phase 4-chain Episode Chain | SKIP |
+| Phase 4.0 SKIP Fast-Path | KEEP (conditional — infra-unavailable only) |
+| CREATE_BLOCKER | KEEP (conditional — failure only) |
+| Phase 4.1 Guardrails + Error Response | KEEP — SAFETY, never skip |
+| Phase 4.2 Domain Post-Execution | SKIP (already conditional) |
+| Phase 4.25 Experience Archival | SKIP (trivial⇒routine⇒already skipped) |
+| Phase 4.26 Utilization Feedback | SKIP (backstop applies --all-unknown) |
+| Phase 4.27 Causal Enabler Scan | SKIP |
+| Phase 4.28 Skill Co-Invocation | SKIP |
+| Phase 4.5 Knowledge Reconciliation | SKIP (no_diff ⇒ nothing to reconcile) |
+| Phase 4.6 Board Findings | SKIP (already conditional) |
+| Phase 4.7 Full-Suite Recommender | SKIP (already file-change-gated) |
+
+17 SKIP / 8 KEEP (2 conditional). The KEEP set is the irreducible spine: route
+writes (Setup, Preconditions), keep the experiment seam intact (Step 5e), do the
+work (primary), classify + escape-hatch (4-post), never skip safety (4.1) or the
+conditional failure handlers (4.0, CREATE_BLOCKER). Asymmetric risk is the design
+constraint: a false-negative costs only overhead; a false-positive skips learning
+and is recoverable only via the escape hatch — so the classifier fails to full.
+
 ## Phase 4 Preamble: Cost-Ordered Precondition Checking
 
 Before expensive data retrieval (SSH, large files, APIs), check local/cheap
@@ -150,7 +212,7 @@ precondition re-check defers the goal via `defer_reason` (auto-clears when
 the predicate flips). It does NOT create a blocker, does NOT cascade-block
 same-skill goals, does NOT notify the user.
 
-### Phase 4-pre: Target-State Probe (advisory, gated)
+### Phase 4-pre: Target-State Probe (advisory, gated) — lightweight: SKIP if trivial_mode
 
 Before spending retrieval + skill-invocation tokens, cheaply grep the
 target file(s) named in the goal description to check whether the
@@ -186,7 +248,7 @@ Guard: the probe is fail-open. A crash, a missing `aspirations-read.sh`,
 unreadable target files, or an extraction yielding zero identifiers all
 produce `verdict="unknown"` and a no-op — never a false block on real work.
 
-## Phase 3.9: Pre-Execution Domain Steps
+## Phase 3.9: Pre-Execution Domain Steps — lightweight: SKIP if trivial_mode (already conditional)
 
 ```
 Bash: load-conventions.sh pre-execution → IF path returned: Read it
@@ -195,7 +257,7 @@ Bash: test -f "$WORLD_DIR/conventions/pre-execution.md"
 IF exists: follow each step; any step returning SKIP → mark goal skipped, GOTO Phase 7.
 ```
 
-## Phase 3.95: Depth Estimate
+## Phase 3.95: Depth Estimate — lightweight: SKIP if trivial_mode
 
 Pre-commit to an expected depth tier so post-hoc rationalization can't drift the
 classification. `reflect-on-outcome` logs mismatches to `meta/depth-calibration.jsonl`
@@ -214,7 +276,42 @@ Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} estim
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} {goal.id} estimated_seconds {sec}
 ```
 
-## Phase 3.97: Inbound Signal Sweep (G6 / R10)
+## Phase 3.96: Anticipatory Reflection (Devil's Advocate) — lightweight: SKIP if trivial_mode
+
+Before executing a DEEP goal, predict the 1–4 most likely ways it will fail and record
+them — priming mitigation during execution AND producing an anticipation-accuracy signal
+that calibrates over time (the sibling of Phase 3.95 depth-calibration). Design + schema:
+`world/conventions/anticipated-failures.md` (g-306-22 / g-306-07). Engine (Phase B):
+`core/scripts/anticipated-failures.py` + add/read/update wrappers. DORMANT by default —
+Gate 2 flag off = zero behavior change (bravo g-306-30 ship condition).
+
+```
+# Gate 1: deep goals only. estimated_depth was set by Phase 3.95.
+IF goal.estimated_depth != "deep": SKIP   # no anticipation for routine/standard
+
+# Gate 2: feature flag — the single off-ramp. Read core/config/aspirations.yaml →
+# anticipatory_reflection.enabled. Treat a MISSING key (or any read error) as false —
+# fail-safe to dormant (bravo g-306-30 ship condition: a missing key must read false,
+# never error). Env override GATE_3_96_ENABLED wins when set truthy.
+IF anticipatory_reflection.enabled is not true (default false when key absent): SKIP   # dormant — the default on ship
+
+# Ground the prediction in how this goal CLASS has failed before.
+Bash: retrieve.sh --category "{goal.category} failure modes" --depth shallow
+  → pattern_signatures[] + reasoning_bank[] describing prior failures in this category
+
+# LLM step: name 1–4 of the MOST-LIKELY failure modes for THIS goal, grounded in:
+#   - the goal's verification.checks (what would make each check fail)
+#   - retrieved prior failures in this category (pattern_signatures / rb)
+#   - the goal's blast radius (core-loop edits → regression in adjacent code, etc.)
+# Each mode MUST be specific and falsifiable. "it might not work" is NOT a failure mode;
+# "testSymmetry regresses because the zero-clamp is too aggressive" IS.
+# Build a 1..4-element list; each element: {id:"af-N", mode, why,
+#   signal (the observable that CONFIRMS this failure), mitigation (optional)}.
+Bash: echo '<entry-json: goal_id, aspiration_id, category, estimated_depth:"deep", anticipated:[1..4 modes]>' | bash core/scripts/anticipated-failures-add.sh
+Output: "Anticipated {N} failure mode(s) for {goal.id}: {short mode labels}"
+```
+
+## Phase 3.97: Inbound Signal Sweep (G6 / R10) — lightweight: SKIP if trivial_mode
 
 Between goal selection and execution, inbound signals may have arrived —
 board posts from partner agents or partner team-state shifts. Without an
@@ -323,6 +420,9 @@ Parse JSON output from stdout:
 # ── End Encode-Stable-Facts Gate ───────────────────────────────────
 
 # ── Intelligent Retrieval Protocol ──────────────────────────────────
+# LIGHTWEIGHT MODE (g-305-15): IF trivial_mode, SKIP this entire block (the
+# digest's Retrieval Steps 1-5d) — `no_retrieval_call` guarantees retrieval adds
+# nothing. Step 5e below STILL runs. IF NOT trivial_mode, proceed:
 # Full pseudocode lives in the execute-protocol digest. Load on-demand:
 Bash: load-execute-protocol.sh → IF path returned: Read it
 # The digest covers Steps 1-5c (tree summary → primary nodes → supplementary
@@ -335,6 +435,77 @@ Bash: load-execute-protocol.sh → IF path returned: Read it
 #   - Step 4b (strategy-apply.sh) closes the meta-strategy → execution loop
 #   - Step 5b.1 persists deliberation onto the linked hypothesis record when present
 # ── End Intelligent Retrieval ───────────────────────────────────────
+
+# ════ Step 5e ALWAYS RUNS — NEVER gated by trivial_mode (lightweight mode, ═══
+# g-305-15 / brief §6). The lightweight retrieval-skip is scoped to Steps 1-5d
+# ONLY. GATE-INTEGRITY: the experiment seam stays byte-identical on BOTH the
+# trivial and full paths; the classifier never reads/infers/branches on Gate D
+# state, and no skip guard wraps this block.
+# ── Step 5e: Gate D commons-pattern injection (DORMANT — DEFAULT OFF) ──────
+# Gate D experiment seam (methodology §4.2, RATIFIED 2026-06-10; R1-R9 binding).
+# A/B test: do agents complete goals better when cross-world commons patterns
+# are injected at execution time? Arm A = control (no-op); arm B = top-K=5
+# commons-pattern injection. SINGLE-BLIND: the executing context reads the
+# patterns under a NEUTRAL heading with NO arm/experiment/commons labels (label
+# leakage would bias effort). DEFAULT OFF — gate-d-check.sh returns "off" until
+# omni flips GATE_D_ENABLED (omni-only; GATE-INTEGRITY 9.5 — agents MUST NOT set
+# it, and MUST NOT modify the assignment/flag logic after omni blesses the diff).
+# SEAM-1: arm A is a COMPLETE no-op — no injection, no context-budget reservation.
+Bash: gate_d_status = bash core/scripts/gate-d-check.sh
+IF gate_d_status == "on":
+    # Assign + retrieve in one call. goal-text caps description at 500 chars.
+    # _gate_d.py reads GATE_D_CORPUS_PATH from env; empty/missing corpus → no_patterns.
+    Bash: gate_d_json = bash core/scripts/gate-d-inject.sh \
+            --goal-id "{goal.id}" \
+            --goal-text "{goal.title}. {goal.description[:500]}" \
+            --category "{goal.category}"
+    Parse gate_d_json → arm, status, assignment_hash, patterns, patterns_injected,
+          pattern_signatures, injection_tokens, retrieval_precision, corpus_size, corpus_source
+
+    # SINGLE-BLIND INJECTION — arm B + status "injected" ONLY. Emit each pattern
+    # under a NEUTRAL heading. NO "arm", "Gate D", "experiment", "commons", or
+    # "B-arm" token may appear in what the executing context reads — the patterns
+    # must be indistinguishable from ordinary supplementary retrieval.
+    IF arm == "B" AND status == "injected":
+        FOR index, p IN enumerate(patterns, start=1):
+            Output (into execution context, before goal.skill runs):
+              "-- SUPPLEMENTARY REFERENCE PATTERN ({index}/{patterns_injected}) --"
+              "Context:  {p.context}"
+              "Approach: {p.approach}"
+              "Lesson:   {p.lesson}"
+    # arm == "A" (control) OR status in (no_patterns | error): COMPLETE no-op —
+    # nothing injected; execution proceeds identically to a Gate-D-off run.
+
+    # ASSIGNMENT telemetry (methodology §4.6) — written BEFORE execution, ONE line,
+    # strictly append-only, per-agent. R1: the ayoai-side agent env var is
+    # MIND_AGENT (the methodology's $MIND_AGENT is the zds-side name); resolve via
+    # $MIND_AGENT. world resolves from $GATE_D_WORLD (settings.json). excluded=true
+    # (E7) when status==error. R5: the OUTCOME record (iteration-close do_verify)
+    # joins on (agent, goal_id), so goal_id MUST match exactly.
+    estimated_depth = "deep" if goal is substantive else "routine"   # advisory heuristic
+    assignment_record = {
+        "record_type": "assignment", "goal_id": goal.id,
+        "aspiration_id": goal.aspiration_id, "agent": "$MIND_AGENT",
+        "world": "$GATE_D_WORLD", "arm": arm, "assignment_hash": assignment_hash,
+        "injection_status": status, "patterns_injected": patterns_injected,
+        "pattern_signatures": pattern_signatures, "injection_tokens": injection_tokens,
+        "retrieval_precision": retrieval_precision, "goal_category": goal.category,
+        "estimated_depth": estimated_depth, "excluded": (status == "error"),
+        "corpus_source": corpus_source, "corpus_size": corpus_size,
+        "experiment_version": "gate-d-v1", "timestamp": "$(date +%Y-%m-%dT%H:%M:%S)"
+    }
+    Bash: append the one-line assignment_record JSON to
+          agents/$MIND_AGENT/session/gate-d-telemetry.jsonl (append-only; the
+          session/ dir already exists, so no L1 new-top-level-entry concern).
+    # Diary breadcrumb (single-blind: NO status/arm — "status=injected" would
+    # unblind arm B to a post-compaction reader of this diary [omni bless
+    # amendment 2026-06-11]; the marker exists only so a recovered session knows
+    # Step 5e already ran for this goal and MUST NOT re-run it — a re-run would
+    # append a duplicate ASSIGNMENT record):
+    Bash: echo '{"entry_type":"observation","goal_id":"{goal.id}","content":"step-5e context preparation complete"}' | bash core/scripts/execution-diary.sh append
+# IF gate_d_status == "off" (the DEFAULT): skip Step 5e entirely — zero overhead,
+# no telemetry, execution identical to pre-Gate-D behavior.
+# ── End Step 5e ───────────────────────────────────────────────────────────
 
 # Team-Based Research Delegation (optional — tool, not rule)
 #
@@ -374,9 +545,46 @@ Bash: bash core/scripts/pre-apply-consult-gate.sh <goal.id>
 
 # Execute primary goal inline (host does ALL writing)
 result = invoke goal.skill with goal.args
+
+# ── Inner Refinement (Self-Refine, g-306-10 / BRD Gap 4) ───────────────────
+# OPTIONAL same-LLM generate -> critique -> regenerate loop on the artifact
+# `result` just produced. Gated on goal.inner_refinement; ABSENT or null = OFF,
+# so goals without the block behave EXACTLY as before (no extra passes, no cost).
+# The pass count is clamped to INNER_REFINEMENT_MAX_ITERS_CAP (=5, defined in
+# core/scripts/aspirations.py) -- this clamp is the EXECUTION-SIDE termination
+# guarantee: it holds even if the goal reached the queue via the daemon write
+# path, whose _validate_goal does NOT range-check max_iters (guard-547 split).
+# Schema + worked example: core/config/conventions/goal-schemas.md "Inner Refinement".
+IF goal.inner_refinement is not null:
+    ir = goal.inner_refinement
+    cap = INNER_REFINEMENT_MAX_ITERS_CAP        # = 5; mirrors the aspirations.py constant
+    max_passes = min(int(ir.max_iters), cap)    # defensive clamp -- never trust stored max_iters past cap
+    satisficed_when = ir.satisficed_when        # non-empty stop predicate (CLI-validated)
+    outcomes = (goal.verification.outcomes if goal.verification else []) or []
+    Output: "▸ INNER-REFINEMENT: {max_passes}-pass cap, stop-when=\"{satisficed_when}\""
+    FOR pass_n in 1..max_passes:
+        # CRITIQUE: the SAME LLM critiques `result` against the goal's
+        # verification.outcomes (+ checks where present). No external grader --
+        # self-feedback per Self-Refine 2303.17651.
+        critique = LLM critique of `result`:
+            "List each verification outcome this artifact does NOT yet satisfy,
+             with the specific gap. If all outcomes are satisfied AND
+             satisficed_when ({satisficed_when}) is met, reply exactly SATISFICED."
+        IF critique == "SATISFICED":
+            Output: "▸ INNER-REFINEMENT: satisficed at pass {pass_n}/{max_passes} -- stopping"
+            BREAK
+        # REGENERATE: revise `result` to close ONLY the named gaps (no scope
+        # creep -- implementation-discipline). Carry the improved draft forward.
+        result = LLM regenerate `result` addressing each gap named in `critique`
+        Output: "▸ INNER-REFINEMENT: pass {pass_n}/{max_passes} regenerated"
+    # Loop exits on SATISFICED or after max_passes (the clamp) -- ALWAYS terminates.
+    # If the primary action already persisted the artifact at first-draft time,
+    # re-persist the final refined `result` so Phase 5 verify reads the improved
+    # version, not the pre-refinement draft.
+# ── End Inner Refinement ───────────────────────────────────────────────────
 ```
 
-## Phase 4.04: Decision-Rule Application Counter (E8)
+## Phase 4.04: Decision-Rule Application Counter (E8) — lightweight: SKIP if trivial_mode
 
 Tree nodes carry `## Decision Rules` lines (`- IF X THEN Y — source: ...`)
 that the retrieval lane surfaces alongside the node body. When execution
@@ -412,7 +620,7 @@ IF cited_rules_by_node is non-empty:
 # legitimate — many goals are mechanical and run without rule citation.
 ```
 
-## Phase 4.05: Mid-Execution Drift Check (G4 / R11)
+## Phase 4.05: Mid-Execution Drift Check (G4 / R11) — lightweight: SKIP if trivial_mode
 
 Phase 4's retrieval snapshot is taken before goal invocation. For goals that
 take 30+ minutes wall-clock OR produce result text exceeding 4000 chars, the
@@ -540,9 +748,22 @@ IF outcome_class == "routine" AND goal.closes_knowledge_debt is non-empty:
 
 # SAFETY: Non-recurring, failed, recurring-with-findings, or debt-closing
 # goals ALWAYS remain "deep". Bias toward full treatment on any uncertainty.
+
+# ESCAPE HATCH (lightweight mode — g-305-15 / brief §7): the trivial classifier
+# was a PREDICTION. If execution falsified it, re-enable the full post-execution
+# ceremony so no learning is lost — converting a dangerous false-positive into a
+# recoverable one. Runs HERE, before the Phase 4.25/4.26/4.27/4.5 SKIP guards
+# read trivial_mode. (No-op when trivial_mode is already false — the common path.)
+IF trivial_mode:
+    Bash: git -C {repo} diff --stat   # the repo(s) this goal could have touched
+    IF the goal produced a non-empty diff, OR a surprise fired, OR the goal failed:
+        trivial_mode = false
+        outcome_class = "deep"   # a falsified trivial prediction is deep by definition
+        Output: "▸ Lightweight mode: ESCAPE HATCH fired (diff/surprise/failure) — reverting to FULL; the SKIP phases (4.25/4.27/4.5) will run"
+        Bash: loop-state-save.sh update --set "phase_progress.trivial_mode=false"
 ```
 
-## Phase 4-chain: Episode Chain Protocol (MR-Search)
+## Phase 4-chain: Episode Chain Protocol (MR-Search) — lightweight: SKIP if trivial_mode
 
 After Phase 4-post outcome classification, before proceeding to Phase 4.0/4.1,
 check if this goal should be retried with accumulated reflection context.
@@ -692,9 +913,26 @@ IF guardrail_found_issues OR (NOT goal_succeeded AND involved_infrastructure):
 # real issues, this IS new information regardless of skill result.
 IF guardrail_found_issues:
     outcome_class = "deep"  # guardrail issues → override to deep
+
+# ── Anticipation consumer (g-306-22 Phase C / design §4) — closes the Phase 3.96 loop ──
+# REUSES the error signal computed above (guardrail consultation + infra error alerts +
+# test failures) — NO new error-collection. No-op when no entry exists (Gate 2 flag was
+# off, or the goal was not deep), so it is dormant exactly when Phase 3.96 is.
+Bash: af_entry=$(bash core/scripts/anticipated-failures-read.sh {goal.id})   # record JSON, or "null"
+IF af_entry != "null" AND af_entry.outcome is null:
+    errors_observed = the actual error signatures from THIS execution's error-response
+                      path above (empty list when the goal ran clean)
+    FOR each anticipated mode in af_entry.anticipated:
+        HIT  if its `signal` matches an observed error (substring / LLM-judgment, NOT ==)
+        MISS otherwise
+    surprises     = observed errors matching NO anticipated mode
+    clean_success = (errors_observed is empty)
+    # anticipation_score is computed by Phase D (reflect-on-self §5), NOT here — emit 0.0.
+    Bash: echo '<outcome-json: executed_at, errors_observed[...], hits[af-N...], misses[af-N...], surprises[...], anticipation_score:0.0, clean_success>' | bash core/scripts/anticipated-failures-update.sh {goal.id}
+    Output: "Anticipation {goal.id}: {H} hit / {M} miss / {S} surprise"
 ```
 
-## Phase 4.2: Post-Execution Domain Steps
+## Phase 4.2: Post-Execution Domain Steps — lightweight: SKIP if trivial_mode (already conditional)
 
 ```
 # Load domain convention into context if not yet loaded (dedup).
@@ -716,7 +954,7 @@ ELSE:
     behavioral_observations = null
 ```
 
-## Phase 4.25: Archive Goal Execution Trace
+## Phase 4.25: Archive Goal Execution Trace — lightweight: SKIP if trivial_mode (trivial⇒routine⇒already skipped)
 
 SKIP if outcome_class == "routine". Otherwise:
 
@@ -754,7 +992,7 @@ echo '<stdin-json>' | bash core/scripts/experience-archive-goal.sh \
 echo '{"experience_refs":["exp-{goal.id}-{goal.skill_name_slug}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 
-## Phase 4.26: Context Utilization Feedback
+## Phase 4.26: Context Utilization Feedback — lightweight: SKIP if trivial_mode (backstop applies --all-unknown)
 
 ```
 IF outcome_class != "routine":
@@ -777,7 +1015,7 @@ MR-Search reflection-quality tracking: helpful items with `source_reflection_id`
 write positive downstream signal to `meta/reflection-strategy.yaml →
 reflection_quality_log`.
 
-## Phase 4.27: Causal Enabler Scan (MR-Search Temporal Credit)
+## Phase 4.27: Causal Enabler Scan (MR-Search Temporal Credit) — lightweight: SKIP if trivial_mode
 
 ```
 IF outcome_class != "routine" AND goal_succeeded:
@@ -789,7 +1027,7 @@ IF outcome_class != "routine" AND goal_succeeded:
                 '<append {experience_id: "exp-{item_source_goal}", relationship: "provided_foundation", temporal_distance: goals_between}>'
 ```
 
-## Phase 4.28: Skill Co-Invocation Logging
+## Phase 4.28: Skill Co-Invocation Logging — lightweight: SKIP if trivial_mode
 
 ```
 invoked_skills = [goal.skill stripped of "/" and params]
@@ -798,7 +1036,7 @@ IF len(invoked_skills) >= 2:
     Bash: skill-relations.sh co-invoke --goal {goal.id} --skills {comma_separated}
 ```
 
-## Phase 4.5: Knowledge Reconciliation Check
+## Phase 4.5: Knowledge Reconciliation Check — lightweight: SKIP if trivial_mode (no_diff ⇒ nothing to reconcile)
 
 After executing a goal, check if the knowledge that informed it needs updating.
 This closes the loop: knowledge -> action -> knowledge update.
@@ -956,7 +1194,7 @@ two will fire on any session-end path.
 
 **Cross-reference**: `core/config/conventions/encoding-triggers.md` E7 row.
 
-### Phase 4.6: Post Findings to Board
+### Phase 4.6: Post Findings to Board — lightweight: SKIP if trivial_mode (already conditional)
 
 After goal execution and knowledge reconciliation, post notable findings:
 
@@ -968,7 +1206,7 @@ IF goal produced actionable findings OR hypothesis was resolved:
 
 Skip for routine/maintenance goals that produce no new knowledge.
 
-### Phase 4.7: Full-Suite Test Recommender (g-115-858)
+### Phase 4.7: Full-Suite Test Recommender (g-115-858) — lightweight: SKIP if trivial_mode (already file-change-gated)
 
 Advisory banner that detects code changes from this goal (Mind framework
 under `core/scripts/`, `mind_api/src/`, `.claude/skills/`, `.claude/rules/`,

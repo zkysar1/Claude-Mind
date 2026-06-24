@@ -419,9 +419,26 @@ def _score_recurring(goal: dict) -> dict:
     else:
         signal_ratio = max(0.0, 1.0 - min(cons, ach) / ach)
 
+    # : lifetime substantive-hit rate — the SECOND, independent signal
+    # the consecutive_routine streak misses. substantive_runs is the tracked
+    # denominator (counted from field-introduction by recurring-close.sh, NOT
+    # achievedCount, so legacy run history never poisons the rate); substantive_hits
+    # is the genuine-deep numerator. No tracked data → rate 1.0 (assume productive,
+    # mirroring signal_ratio's no-data default; cmd_audit_all's chronic gate also
+    # requires substantive_runs >= chronic_min_runs, so a 0-run goal never flags).
+    sub_hits = int(goal.get("substantive_hits") or 0)
+    sub_runs = int(goal.get("substantive_runs") or 0)
+    if sub_runs <= 0:
+        lifetime_hit_rate = 1.0
+    else:
+        lifetime_hit_rate = max(0.0, min(1.0, sub_hits / sub_runs))
+
     # Weights chosen so consecutive_routine dominates when it's near threshold,
     # but low signal_ratio amplifies the suspicion. Interval enters via rank
     # tie-breaking only (shorter interval = bumped higher, all else equal).
+    # The chronic-low boost (a function of lifetime_hit_rate) is applied by the
+    # caller (cmd_audit_all) where the chronic thresholds are read — keeping this
+    # scorer config-free and the chronic policy single-sourced.
     score = cons * 2.0 + (1.0 - signal_ratio) * 1.5
     return {
         "goal_id": goal.get("id"),
@@ -430,6 +447,10 @@ def _score_recurring(goal: dict) -> dict:
         "achievedCount": ach,
         "consecutive_routine": cons,
         "signal_ratio": round(signal_ratio, 3),
+        "substantive_hits": sub_hits,
+        "substantive_runs": sub_runs,
+        "lifetime_hit_rate": round(lifetime_hit_rate, 3),
+        "last_substantive_at": goal.get("last_substantive_at"),
         "score": round(score, 2),
     }
 
@@ -524,6 +545,11 @@ def cmd_audit_all(args, cfg) -> int:
     # cfg is the cargo_cult sub-dict (see _load_detector_config), not the
     # parent aspirations.yaml — read keys directly without re-indexing.
     self_dedup_hours = float(cfg.get("audit_all_batch_dedup_hours", 0))
+    #  chronic-low thresholds (single-sourced here so _score_recurring
+    # stays config-free).
+    chronic_threshold = float(cfg.get("chronic_hit_rate_threshold", 0.15))
+    chronic_min_runs = int(cfg.get("chronic_min_runs", 8))
+    chronic_weight = float(cfg.get("chronic_score_weight", 2.0))
     if self_dedup_hours > 0 and _recent_audit_all_batch(self_dedup_hours):
         print(
             f"[cargo-cult audit-all] self-dedup HIT — batch goal landed "
@@ -567,6 +593,19 @@ def cmd_audit_all(args, cfg) -> int:
             if is_artifact:
                 continue
             scored = _score_recurring(goal)
+            # : chronic-low lifetime-rate flag + rank boost. A goal with
+            # enough TRACKED closes but a low lifetime substantive rate is suspect
+            # even when its consecutive_routine streak is short — the streak-based
+            # score alone ranks it near zero and the >=1 filter below would drop
+            # it. Flag it and boost its score so it surfaces in the batch.
+            chronic = (scored["substantive_runs"] >= chronic_min_runs
+                       and scored["lifetime_hit_rate"] < chronic_threshold)
+            scored["chronic"] = chronic
+            if chronic:
+                scored["score"] = round(
+                    scored["score"] + chronic_weight * (1.0 - scored["lifetime_hit_rate"]),
+                    2,
+                )
             proposed = _propose_new_interval(goal, cfg)
             if proposed is None:
                 continue
@@ -581,7 +620,12 @@ def cmd_audit_all(args, cfg) -> int:
 
     # Rank by score desc, take top slice. Empty → no-op.
     candidates.sort(key=lambda c: c["score"], reverse=True)
-    top = [c for c in candidates if c["consecutive_routine"] >= 1][:15]
+    # : include chronic-low goals even when consecutive_routine == 0 —
+    # the lifetime-rate signal is the whole point of the extension (a goal that
+    # never strings 3 routines together but is chronically low-signal would
+    # otherwise never be surfaced by the streak-only filter).
+    top = [c for c in candidates
+           if c["consecutive_routine"] >= 1 or c.get("chronic")][:15]
     if not top:
         print("[cargo-cult audit-all] no suspect recurring goals with consecutive_routine >= 1")
         _gate_log(
@@ -600,30 +644,58 @@ def cmd_audit_all(args, cfg) -> int:
         "Auto-filed by cargo-cult-detector --audit-all. Batch review of "
         "recurring-goal intervals across world + agent queues.\n",
         "",
-        "| Goal | Interval → Proposed | achievedCount | cons_routine | signal_ratio | Score |",
-        "|------|---------------------|---------------|--------------|--------------|-------|",
+        "| Goal | Scope | Interval → Proposed | achievedCount | cons_routine | signal_ratio | lifetime_rate | Score |",
+        "|------|-------|---------------------|---------------|--------------|--------------|---------------|-------|",
     ]
     for c in top:
         # Tag agent-side rows with owning agent so calibrators know which
         # agent's queue holds the data (). World rows stay
         # unchanged: shared queue, no owning agent.
+        # Scope column (8 / guard-762): make the apply policy explicit
+        # so the claiming agent does not have to infer ownership from the label.
+        # world queue -> "shared" (any claimer may direct-apply); agent queue ->
+        # "owned:<agent>" (the owner direct-applies; another claimer must
+        # surface-to-owner via the board, never unilaterally rewrite a partner's
+        # recurring cadence).
         if c.get("owning_agent"):
             src_label = f"agent: {c['owning_agent']}"
+            scope_label = f"owned:{c['owning_agent']}"
         else:
             src_label = c["source"]
+            scope_label = "shared"
+        # : surface the lifetime rate; tag chronic rows so the reviewer
+        # sees WHY a low-cons_routine goal was pulled into the batch.
+        lifetime_cell = f"{c['lifetime_hit_rate']}"
+        if c.get("chronic"):
+            lifetime_cell += f" [chronic {c['substantive_hits']}/{c['substantive_runs']}]"
         lines.append(
             f"| {c['goal_id']} ({src_label}) — {c['title']} "
+            f"| {scope_label} "
             f"| {c['interval_hours']:g}h → {c['proposed_interval_hours']:g}h "
             f"| {c['achievedCount']} "
             f"| {c['consecutive_routine']} "
             f"| {c['signal_ratio']} "
+            f"| {lifetime_cell} "
             f"| {c['score']} |"
         )
     lines += [
         "",
+        "Scope legend (g-115-1448 / guard-762): **shared** rows (world queue) "
+        "and **owned:<you>** rows are DIRECT-APPLY. An **owned:<other-agent>** "
+        "row is that agent's recurring cadence (part of their operating rhythm, "
+        "not a shared-resource parameter) -- SURFACE it to the owner via the "
+        "coordination/findings board; do NOT unilaterally rewrite another "
+        "agent's recurring interval.",
+        "",
         "For each row: consider (a) extending interval to proposed, (b) "
         "changing skill/args if the goal is finding nothing actionable, or "
         "(c) retiring if it produces no learning signal.",
+        "",
+        "A **[chronic hits/runs]** tag (g-317-02) marks a goal flagged on its "
+        "LIFETIME substantive rate (genuine-deep closes / tracked closes), not a "
+        "consecutive-routine streak. Chronic rows are the strongest retirement/"
+        "recalibration candidates: little real signal over many runs, yet they "
+        "never tripped the consecutive-routine trigger.",
         "",
         "This batch replaces the per-goal Idea filing to collapse "
         "symptom-chasing into one calibration pass. See "

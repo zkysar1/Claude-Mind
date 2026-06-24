@@ -38,10 +38,17 @@ extract_initial_state() {
 }
 
 # --- 1. Create directory structure ---
+# meta/eval/ holds the Tier-2 eval-harness calibration corpus (cases.jsonl)
+# consumed by core/scripts/eval_harness.py load_cases(). Created here as the
+# sanctioned init step so it bypasses the L1 new-top-level-entry cruft gate
+# (which blocks bare Write/Edit of a new dir under META_PATH but not shell
+# mkdir in an init-*.sh). See .claude/rules/path-resolution.md "L1 Cruft
+# Prevention" option 2 + 6.
 mkdir -p \
     "$META/experiments" \
     "$META/transfer" \
-    "$META/meta-knowledge"
+    "$META/meta-knowledge" \
+    "$META/eval"
 
 echo "  Created directory structure"
 

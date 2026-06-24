@@ -42,6 +42,7 @@ in ``_fileops`` — the backend is the raw storage layer beneath them.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import random
@@ -51,6 +52,55 @@ from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Union, runtime_checkable
 
 PathLike = Union[str, os.PathLike]
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant customer dimension (T-b/T-c, 1)
+# ---------------------------------------------------------------------------
+# The unit of isolation/billing is the CUSTOMER (the daemon's ctx.tenant); an
+# env-id is a world WITHIN a customer. OwnCloudBackend prepends a leading
+# ``<customer>/`` segment to every storage key so one shared bucket/table
+# isolates many customers by key-prefix (+ IAM prefix-conditions, owner-gated).
+#
+# customer == "default" (the single-tenant baseline this deployment runs today)
+# yields NO customer segment, so keys are BYTE-IDENTICAL to the legacy
+# env-id-only scheme — the live data needs no move (back-compat invariant).
+#
+# Lives HERE (the -free abstract seam), not in owncloud_backend, so the
+# daemon (server.py) can set/reset it per request WITHOUT importing the cloud
+# backend — server.py must stay importable on a LocalBackend-only host. Held in
+# a ``contextvars.ContextVar`` (NOT a singleton attr) so concurrent requests for
+# distinct customers each observe their own value with zero key bleed; contextvars
+# propagate across both threads and asyncio tasks. LocalBackend ignores it (one
+# local tree); only OwnCloudBackend consults it.
+_DEFAULT_CUSTOMER = "default"
+_current_customer: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "ayoai_storage_customer", default=_DEFAULT_CUSTOMER)
+
+
+def set_customer(customer: Optional[str]) -> "contextvars.Token":
+    """Set the active customer for the current context (the daemon request
+    handler). Returns a token for :func:`reset_customer` in a ``finally``. A
+    falsy/blank value resets to the default (single-tenant) baseline. A value
+    containing ``/`` is rejected — it would corrupt key-prefix segmentation and
+    could escape the customer's IAM-conditioned prefix."""
+    c = (customer or _DEFAULT_CUSTOMER).strip().strip("/")
+    if not c:
+        c = _DEFAULT_CUSTOMER
+    if "/" in c:
+        raise ValueError(f"customer {customer!r} must not contain '/'")
+    return _current_customer.set(c)
+
+
+def reset_customer(token: "contextvars.Token") -> None:
+    """Restore the customer the context held before the matching set_customer."""
+    _current_customer.reset(token)
+
+
+def current_customer() -> str:
+    """The customer active in the current context (the default baseline if unset
+    — i.e. every CLI invocation and every single-tenant request)."""
+    return _current_customer.get()
 
 
 # ---------------------------------------------------------------------------

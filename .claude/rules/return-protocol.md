@@ -14,6 +14,21 @@ There are exactly two valid terminal tool calls, selected by role:
 | **Sub-skill** (/reflect, /decompose, /tree, /aspirations-execute, /aspirations-verify, /aspirations-state-update, /aspirations-learning-gate, any other skill invoked mid-iteration) returning control up to the orchestrator | `Bash` — e.g., `echo "Return to orchestrator — continue to next phase"` | A Bash call hands control back without re-entering a new skill context. The orchestrator's next turn resumes from where it was. |
 | **Orchestrator** (`/aspirations` itself) at iteration close, after `iteration-close.sh --phase productivity-check` (or `recurring-close.sh`) has fired its `═══ ITERATION COMPLETE ═══` imperative | `Skill(aspirations)` with `args='loop'` | `iteration-close.sh productivity-check` and `recurring-close.sh` are the canonical end-of-iteration markers. After either has run, a Bash echo is **not sufficient** — it ends the turn without queuing another turn. Only `Skill(aspirations)` re-enters the loop. |
 
+### Deadman's-switch pair (orchestrator, DEFAULT-ON since 2026-06-23)
+
+By default (Stage 5 onward — see rationale doc), the orchestrator's terminal
+response is the **pair** `[ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
+delaySeconds=600), Skill(aspirations) args='loop']`. This does NOT violate the
+"terminal must be `Skill(aspirations)`" contract above: `Skill(aspirations)` is
+still the LAST call and the primary re-entry. The `ScheduleWakeup` is armed
+immediately before it as a self-resurrection NET that fires only if a text-death
+breaks the Skill chain (it never fires on a healthy loop). It is NOT a
+substitute for the Skill call (reconciles guard-511 / schedule-wakeup-correctness.md
+Anti-pattern C). Opt-out per agent: when
+`agents/<agent>/session/deadman-disabled` is present → terminal is
+`Skill(aspirations)` alone, exactly as the table above (the pre-deadman
+behavior). Rationale: `core/config/rationale/deadman-switch.md`.
+
 ## The Trap
 
 The failure mode observed on 2026-04-23 (alpha session 58) was:

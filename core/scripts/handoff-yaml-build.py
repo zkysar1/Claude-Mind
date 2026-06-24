@@ -109,7 +109,29 @@ def main():
                     help="Validate + assemble but do not write")
     ap.add_argument("--output-path", type=str, default=None,
                     help="Override output path (default: <agent>/session/handoff.yaml)")
+    ap.add_argument("--schema", action="store_true",
+                    help="Print the accepted JSON payload schema and exit (no agent needed)")
     args = ap.parse_args()
+
+    # --schema: emit the accepted-field schema, derived from the live
+    # validator constants (REQUIRED_TOP / *_REQUIRED) + _assemble() so it
+    # never drifts from the real schema. No agent binding required.
+    if args.schema:
+        _stub = {"session_number": 0, "next_focus": "", "first_action": {},
+                 "session_summary": {}}
+        optional_fields = [k for k in _assemble(_stub).keys()
+                           if k not in REQUIRED_TOP]
+        print(json.dumps({
+            "writer": "handoff-yaml-build.py",
+            "input": "JSON on stdin OR --payload FILE",
+            "required_top": REQUIRED_TOP,
+            "session_number_type": "int",
+            "first_action_required": FIRST_ACTION_REQUIRED,
+            "session_summary_required": SESSION_SUMMARY_REQUIRED,
+            "optional_fields": optional_fields,
+            "doc": "core/config/conventions/handoff-working-memory.md",
+        }, indent=2))
+        sys.exit(0)
 
     if AGENT_DIR is None:
         print(json.dumps({"error": "no agent bound", "flags": ["no_agent"]}))

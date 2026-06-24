@@ -28,7 +28,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # miss log can name the SPECIFIC failure mode instead of a single opaque
 # "no_active_agent_binding" (7). The legacy resolve() wrapper is no
 # longer imported here — the diagnostics variant supersedes it for the hook.
-from _session_binding import resolve_binding_with_diagnostics
+from _session_binding import (
+    resolve_binding_with_diagnostics,
+    _agent_dir,
+    _SESSIONS_DIRNAME,
+)
 
 # Shared helpers (): approve_no_mutation, stdin_json_or_approve.
 # emit_deny added 2026-05-19 for the F4 cruft gate below — bash-agent-inject
@@ -405,7 +409,35 @@ def main():
                     fail_reason = "binding-yaml-mid-session-disappeared"
                 _log_binding_miss_once(sid, project_root, fail_reason)
 
-    expected_prefix = f'export PATH="{shim_path}:$PATH"; {agent_clause}export MIND_SID={sid};'
+    # Phase 1A () + reducer-aware routing (): per-Body WM routing
+    # env. Inject BODY_WM_PATH when the bound session has a forked body-WM-FILE
+    # (`sessions/<sid>/working-memory.yaml`), so CLI WM consumers (wm.py + the
+    # gate scripts) route to the Body's forked WM instead of the agent-wide one.
+    # The body-WM-file is created by /start FORK-BODY ONLY for a NON-reducer Body
+    # (a 2nd+ worker); the REDUCER (the Body holding running-session-id) gets a
+    # manifest but NO body-WM-file, so it stays on the agent-wide WM. Routing on
+    # the FILE's existence (not the manifest's) is the backward-compat keystone:
+    # one Body == the reducer == today's behavior. Fail-open: any stat error ->
+    # no env -> agent-wide WM. See conventions/session-state.md "Phase 1B".
+    body_clause = ""
+    _agent_m = (re.search(r"export MIND_AGENT=(\S+);", agent_clause)
+                or re.search(r"(?:^|[\s;&|(])MIND_AGENT=([^\s;&|)]+)", command))
+    if _agent_m:
+        try:
+            # F7 (): route the body-WM path through the rename-tracking
+            # helpers instead of literal "agents"/"sessions" segments so an
+            # AGENTS_PARENT_DIR / SESSIONS_DIRNAME rename stays single-sourced
+            # in _session_binding (CLAUDE.md Agent-dir Resolution). Behavior-
+            # identical today: _agent_dir(root, name) == root/"agents"/name and
+            # _SESSIONS_DIRNAME == "sessions". No new module import (hot-path safe).
+            _body_wm = (_agent_dir(SCRIPT_DIR.parent.parent, _agent_m.group(1))
+                        / _SESSIONS_DIRNAME / sid / "working-memory.yaml")
+            if _body_wm.exists():
+                body_clause = f'export BODY_WM_PATH="{_body_wm.as_posix()}"; '
+        except OSError:
+            body_clause = ""
+
+    expected_prefix = f'export PATH="{shim_path}:$PATH"; {agent_clause}{body_clause}export MIND_SID={sid};'
     if command.startswith(expected_prefix):
         approve_no_mutation()
 

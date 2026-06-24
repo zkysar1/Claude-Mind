@@ -86,6 +86,42 @@ IF hypothesis record has `experience_ref` field:
     This replaces reliance on context_manifest paths alone — we now have what the content actually said
 ```
 
+## Step 1.5: Point-in-Time Belief Reconstruction (bi-temporal reader, g-306-36 / rb-335)
+
+The ABC antecedent below asks "what was believed when the hypothesis was
+formed?" Reading the CURRENT reasoning bank / guardrails / beliefs answers the
+wrong question — those stores have evolved since (records falsified, retired,
+or superseded via close-old/insert-new). The bi-temporal reader returns the
+record VERSIONS that were valid at formation time T, so the antecedent reflects
+what was ACTUALLY believed then, not what is believed now.
+
+```
+T = hypothesis.created  (the formation instant; falls back to the experience
+                         record's timestamp if `created` is absent)
+Bash: retrieve.sh --category "{hypothesis.category}" --as-of "{T}" --read-only
+# as_of returns the RB / guardrails / pattern_signatures / beliefs versions whose
+# validity interval contained T (valid_from <= T < valid_to; valid_to null =
+# still-current). It is status-agnostic (a since-retired record that was active
+# at T still surfaces) and never bumps retrieval counters (a historical read is
+# observational). Contrast a bare retrieve.sh (no --as-of), which returns the
+# CURRENT active set.
+#
+# Use the as-of result to populate abc_chain.antecedents.data_signals /
+# source_signals with the beliefs that were live at T. When the as-of belief
+# DIFFERS from the current belief, that delta IS the learning: a belief that
+# was confidently held at T and has since been falsified is the highest-value
+# ABC antecedent — it shows the reasoning operated on a premise later proven
+# wrong. Note the divergence explicitly in the reflection (Step 5 text).
+#
+# SCOPE NOTE (sq-009): beliefs use a bounded one-per-partner supersede-DROP
+# snapshot (g-306-35), NOT close-old/insert-new, so the belief store retains at
+# most the CURRENT version per partner — an as-of belief query returns the
+# current snapshot unless a closed interval was explicitly written. RB and
+# guardrails carry true append-only version history, so point-in-time reads
+# over THOSE stores are exact. Prefer RB/guardrail as-of evidence when the
+# formation-time premise must be reconstructed precisely.
+```
+
 ## Step 2: Generate ABC Chain
 
 Model the hypothesis as an Antecedent-Behavior-Consequence chain:
@@ -149,7 +185,10 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      (reasoning summary), type ("success"), applies_to (REQUIRED: pick
      `any`, `framework`, `domain`, or `specific` based on content scope),
      source_hypothesis, outcome, category, tags, status ("active"),
-     when_to_use (conditions, category, confidence_range). Utilization
+     when_to_use (conditions, category, confidence_range), poignancy
+     (g-306-26 producer: LLM-rated 1-10 importance at write — confirmed
+     strategies are typically 6-9; populates the BRD Gap 1a retrieve blend
+     that is otherwise a no-op on an all-null corpus). Utilization
      is initialized to zeros automatically.
   4. Include `when_to_use` field — structured trigger conditions:
      ```yaml
@@ -201,7 +240,9 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
      Include `applies_to` (REQUIRED): `any` (cross-cutting methodology),
      `framework` (this framework's skills/scripts/gates), `domain`
      (this agent's deployment domain — its specific services, products,
-     and integration points), or `specific` (single-incident).
+     and integration points), or `specific` (single-incident). Also include
+     `poignancy` (g-306-26 producer: LLM-rated 1-10 — corrected-hypothesis
+     lessons are often 7-9, a costly mistake worth surfacing in retrieval).
 
 ### Scripted Reflect-Bookkeeping
 

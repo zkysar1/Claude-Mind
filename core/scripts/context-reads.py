@@ -40,11 +40,40 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR
+from _paths import (
+    PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR, AGENT_NAME, agent_session_dir,
+)
 
 SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
-TRACKER_PATH = SESSION_DIR / "context-reads.txt" if SESSION_DIR else None
 CONVENTIONS_DIR = CONFIG_DIR / "conventions"
+
+
+def tracker_path(session_id=None):
+    """Effective context-reads tracker path — reducer-aware per-Body routing (Phase 1D, ).
+
+    Routes to the per-Body tracker (sessions/<unitKey>/body-context-reads.txt)
+    when session_id (the unitKey) names a Body whose forked body-WM-FILE exists
+    (sessions/<unitKey>/working-memory.yaml) -- the SAME activation signal as
+    wm.py's BODY_WM routing and AgentPaths.wm_path (the 1B reducer-aware re-key,
+    rb-2297). A reducer/observer (no forked body-WM-file) stays on the agent-wide
+    singleton (session/context-reads.txt), so with one Body this collapses to
+    today's behavior -- inert until a 2nd Body forks, and concurrent Bodies then
+    no longer clobber each other's session-scoped dedup state.
+
+    Resolved per-call (NOT a frozen module constant — the g-306-68 PEP-562
+    lesson) because session_id is only known at command dispatch, AND because
+    context-reads-record.sh / pre-edit-context-gate.sh are Read/Edit hooks where
+    bash-agent-inject.py does NOT inject BODY_WM_PATH (it only prepends env to
+    Bash-TOOL commands). The Body is therefore detected from the forked-WM-file's
+    existence directly, not the env var wm.py reads.
+    """
+    if SESSION_DIR is None:
+        return None
+    if session_id and AGENT_NAME:
+        body_dir = agent_session_dir(AGENT_NAME, session_id)
+        if (body_dir / "working-memory.yaml").exists():
+            return body_dir / "body-context-reads.txt"
+    return SESSION_DIR / "context-reads.txt"
 
 SESSION_HEADER_PREFIX = "#session:"
 
@@ -88,11 +117,12 @@ def is_in_scope(normalized):
     return False
 
 
-def _read_raw_lines():
+def _read_raw_lines(session_id=None):
     """Read tracker file, return (session_id_or_None, [path_lines])."""
-    if TRACKER_PATH is None or not TRACKER_PATH.exists():
+    tp = tracker_path(session_id)
+    if tp is None or not tp.exists():
         return None, []
-    lines = TRACKER_PATH.read_text(encoding="utf-8").strip().splitlines()
+    lines = tp.read_text(encoding="utf-8").strip().splitlines()
     if not lines:
         return None, []
     stored_sid = None
@@ -110,11 +140,12 @@ def read_tracker(session_id=None):
     file and returns empty. This self-healing behavior is the ONLY mechanism that
     clears stale trackers across sessions — do not remove it.
     """
-    stored_sid, path_lines = _read_raw_lines()
+    stored_sid, path_lines = _read_raw_lines(session_id)
 
     if session_id and stored_sid and session_id != stored_sid:
-        if TRACKER_PATH.exists():
-            TRACKER_PATH.unlink()
+        tp = tracker_path(session_id)
+        if tp is not None and tp.exists():
+            tp.unlink()
         return set()
 
     return set(line.strip() for line in path_lines if line.strip())
@@ -122,23 +153,31 @@ def read_tracker(session_id=None):
 
 def append_tracker(normalized, session_id=None):
     """Append a single path to the tracker file."""
-    if SESSION_DIR is None or not SESSION_DIR.is_dir():
-        return  # No agent bound, or dir gone
+    if SESSION_DIR is None:
+        return  # No agent bound
 
-    if not TRACKER_PATH.exists() or TRACKER_PATH.stat().st_size == 0:
+    tp = tracker_path(session_id)
+    # The per-Body tracker lives under sessions/<unitKey>/ (created by /start
+    # FORK-BODY); the agent-wide tracker under session/. Guard the parent dir so
+    # a torn-down dir is a no-op rather than a crash.
+    if tp is None or not tp.parent.is_dir():
+        return
+
+    if not tp.exists() or tp.stat().st_size == 0:
         # New tracker — write session header + first path
         header = f"{SESSION_HEADER_PREFIX}{session_id}\n" if session_id else ""
-        TRACKER_PATH.write_text(header + normalized + "\n", encoding="utf-8")
+        tp.write_text(header + normalized + "\n", encoding="utf-8")
     else:
-        with open(TRACKER_PATH, "a", encoding="utf-8") as f:
+        with open(tp, "a", encoding="utf-8") as f:
             f.write(normalized + "\n")
 
 
-def remove_from_tracker(normalized):
+def remove_from_tracker(normalized, session_id=None):
     """Remove a path from the tracker file if present."""
-    if TRACKER_PATH is None or not TRACKER_PATH.exists():
+    tp = tracker_path(session_id)
+    if tp is None or not tp.exists():
         return
-    lines = TRACKER_PATH.read_text(encoding="utf-8").strip().splitlines()
+    lines = tp.read_text(encoding="utf-8").strip().splitlines()
     # Preserve session header, filter path lines
     header_lines = [l for l in lines if l.startswith(SESSION_HEADER_PREFIX)]
     path_lines = [l for l in lines if not l.startswith(SESSION_HEADER_PREFIX)]
@@ -147,7 +186,7 @@ def remove_from_tracker(normalized):
         return  # Not found, nothing to do
     all_lines = header_lines + remaining
     content = ("\n".join(all_lines) + "\n") if all_lines else ""
-    TRACKER_PATH.write_text(content, encoding="utf-8")
+    tp.write_text(content, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +286,13 @@ def cmd_check(args):
 
 def cmd_clear(args):
     """Delete the tracker file."""
-    if TRACKER_PATH.exists():
-        TRACKER_PATH.unlink()
+    # clear carries no --session-id (PreCompact / reducer-side utility) -> the
+    # agent-wide tracker. A forked Body's tracker self-heals across sessions via
+    # the session-header mismatch in read_tracker; an explicit per-Body clear is
+    # a Phase-2 concern (worker Bodies don't run PreCompact).
+    tp = tracker_path(None)
+    if tp is not None and tp.exists():
+        tp.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +301,7 @@ def cmd_clear(args):
 
 def cmd_status(args):
     """Print tracker contents for debugging."""
-    stored_sid, path_lines = _read_raw_lines()
+    stored_sid, path_lines = _read_raw_lines(None)
     tracked = set(line.strip() for line in path_lines if line.strip())
     if not tracked:
         print("Context reads tracker: empty (no files tracked)")

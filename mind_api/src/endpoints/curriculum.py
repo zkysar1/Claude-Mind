@@ -181,6 +181,33 @@ def _count_matching_jsonl(agent_dir, file_rel, field, value):
     return count
 
 
+def _count_world_attributed(world_dir, field, value, agent):
+    """Count WORLD-queue goals matching field/value AND attributed to `agent`.
+
+    Cross-queue graduation counting (g-115-1560) — daemon mirror of
+    core/scripts/curriculum.py::count_world_attributed. Attribution is
+    completed_by (claimed_by is cleared on completion). Only goals[*]-flatten
+    fields are supported (the shape graduation completion gates use); a
+    non-flatten field returns 0.
+    """
+    if "[*]." not in field:
+        return 0
+    records = _read_jsonl(world_dir / "aspirations.jsonl")
+    array_field, sub_field = field.split("[*].", 1)
+    count = 0
+    for record in records:
+        arr = record.get(array_field, [])
+        if isinstance(arr, list):
+            for item in arr:
+                if not isinstance(item, dict):
+                    continue
+                item_val = _navigate_dotpath(item, sub_field)
+                if (value == "*" or str(item_val) == str(value)) \
+                        and item.get("completed_by") == agent:
+                    count += 1
+    return count
+
+
 def _compare(actual, operator, threshold):
     if actual is None:
         return False
@@ -200,7 +227,7 @@ def _compare(actual, operator, threshold):
     return False
 
 
-def _evaluate_gate(gate, agent_dir, project_root):
+def _evaluate_gate(gate, agent_dir, project_root, world_dir=None, agent_name=None):
     gate_type = gate.get("type", "")
 
     if gate_type == "metric_threshold":
@@ -218,6 +245,10 @@ def _evaluate_gate(gate, agent_dir, project_root):
         operator = gate.get("operator", ">=")
         threshold = gate.get("threshold", 0)
         current_value = _count_matching_jsonl(agent_dir, file_rel, field, value)
+        # Cross-queue graduation counting (0): opt-in; daemon mirror of
+        # core/scripts/curriculum.py. Unchanged unless the gate sets cross_queue.
+        if gate.get("cross_queue") and world_dir is not None and agent_name:
+            current_value += _count_world_attributed(world_dir, field, value, agent_name)
         passed = _compare(current_value, operator, threshold)
         return passed, current_value
 
@@ -364,7 +395,8 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
     gate_results = []
     all_passed = True
     for i, g in enumerate(gates):
-        passed, current_value = _evaluate_gate(g, agent_dir, project_root)
+        passed, current_value = _evaluate_gate(
+            g, agent_dir, project_root, Path(ctx.paths.world), ctx.paths.agent_name)
         gate_results.append({
             "gate_index": i,
             "id": g.get("id", f"gate_{i}"),
@@ -420,7 +452,8 @@ def promote(ctx) -> "Response":  # type: ignore[name-defined]
         all_passed = True
         gate_values = []
         for i, g in enumerate(gates):
-            passed, value = _evaluate_gate(g, agent_dir, project_root)
+            passed, value = _evaluate_gate(
+                g, agent_dir, project_root, Path(ctx.paths.world), ctx.paths.agent_name)
             gate_values.append({"gate_index": i, "value": value, "passed": passed})
             if not passed:
                 all_passed = False

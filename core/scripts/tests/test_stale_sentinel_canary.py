@@ -11,6 +11,12 @@ Asserts the canary's defense-in-depth contract:
   4. Multiple sentinels are tracked independently — one firing does not
      affect another's count.
   5. After firing, the persisted counter resets to 0 (post-fire reset).
+  6. Consumption-aware sentinels (fresh_eyes_dispatch_pending, g-115-1553):
+     a re-armed sentinel whose consumer keeps up (fresh_eyes_last_dispatch
+     advances) does NOT fire; a frozen dispatch timestamp across threshold
+     samples DOES fire; a resumed dispatch resets the count. This is the
+     fix for the false-positive where the writer re-arms the sentinel on
+     every deep close and the canary samples after the arming.
 
 The canary is invoked with --dry-run on the firing run so live aspirations
 state and live working-memory state are NEVER mutated by the firing path.
@@ -46,6 +52,38 @@ TRACKED = [
     "force_metric_encoding_pending",
 ]
 
+# rb-1324/rb-1565 class: the canary subprocess below inherits {**os.environ}
+# (os.environ.copy()), so a framework var leaked by an EARLIER test in
+# canonical collection order — MIND_WORLD / WORLD_DIR / MIND_AGENT_DIR /
+# MIND_META / RT_DIR / etc. — rides into the subprocess and overrides this
+# test's local-paths.conf during _paths resolution. The canary then resolves
+# WORLD_DIR/META_DIR from the LEAKED env instead of the throwaway tmp paths,
+# and a mode='w' write targets a dir that does not exist under polluted order
+# (5/5 full-suite FAILs, 5/5 isolation PASSes). conftest restores only
+# MIND_AGENT/MIND_WORLD/STORAGE_BACKEND — every other framework var leaks.
+# Stripping the whole framework prefix set is polluter-agnostic: env is the
+# only cross-test vector (no os.chdir in the suite), so a freshly-spawned
+# subprocess can only be perturbed via env. Mirrors the 0 fix in
+# test_uncommitted_edits_log_filter.py (rb-1569 / commit bdb74df6).
+_FRAMEWORK_ENV_PREFIXES = (
+    "MIND_", "WORLD_", "META_", "STORAGE_", "FILEOPS_", "RT_",
+    "RUNTIME_", "AGENTS_", "MACHINE_", "OWNERSHIP_", "ENVIRONMENT_", "MIND_",
+)
+
+
+def _hermetic_env(**overrides) -> dict:
+    """Subprocess env with the framework env-prefix namespace + PROJECT_ROOT
+    stripped, then `overrides` applied. Makes every run look like the clean
+    isolation case regardless of what an earlier test leaked into os.environ.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(_FRAMEWORK_ENV_PREFIXES) and k != "PROJECT_ROOT"
+    }
+    env.update(overrides)
+    return env
+
 
 class TestStaleSentinelCanary(unittest.TestCase):
     """ regression suite — uses an isolated temp agent dir.
@@ -59,8 +97,13 @@ class TestStaleSentinelCanary(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp_root = Path(tempfile.mkdtemp(prefix="stale-sentinel-canary-test-"))
         cls._tmp_agent_name = "_test_canary_agent"
-        # Phase 2.5.D layout: agent dirs live under agents/ parent.
-        cls._tmp_agent_dir = PROJECT_ROOT / "agents" / cls._tmp_agent_name
+        # 3: create the agent dir UNDER the tmp root, NOT live
+        # PROJECT_ROOT/agents/. Resolution routes here via MIND_AGENT_DIR (now
+        # honored by _paths.py AND _paths.sh) at the _hermetic_env call below.
+        # The prior PROJECT_ROOT/agents/_test_canary_agent was adopted by the
+        # running fleet mid-test and leaked on Windows (open handle defeats
+        # rmtree(ignore_errors=True)). tmp_root is removed in tearDownClass.
+        cls._tmp_agent_dir = cls._tmp_root / cls._tmp_agent_name
         cls._tmp_agent_dir.mkdir(parents=True, exist_ok=True)
         (cls._tmp_agent_dir / "session").mkdir(exist_ok=True)
         # Minimal local-paths.conf — point world+meta at the throwaway tmp
@@ -117,8 +160,10 @@ class TestStaleSentinelCanary(unittest.TestCase):
         args = [sys.executable, str(CANARY), "--threshold", str(threshold)]
         if dry_run:
             args.append("--dry-run")
-        env = os.environ.copy()
-        env["MIND_AGENT"] = self._tmp_agent_name
+        env = _hermetic_env(
+            MIND_AGENT=self._tmp_agent_name,
+            MIND_AGENT_DIR=str(self._tmp_agent_dir),  # route resolution at the tmp dir (3)
+        )
         result = subprocess.run(
             args, capture_output=True, text=True, timeout=60, env=env,
         )
@@ -215,6 +260,79 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self._set_slot("force_tree_maintain", None)
         r2 = self._run_canary(dry_run=False, threshold=3)
         self.assertEqual(r2["sentinels"]["force_tree_maintain"]["new_stuck_count"], 0)
+
+    # ---- Consumption-aware contract (3) -----------------------------
+
+    def test_consumption_aware_no_fire_when_dispatch_advances(self):
+        """fresh_eyes_dispatch_pending re-armed every run while the consumer
+        keeps up (fresh_eyes_last_dispatch advances) must NOT fire — this is
+        the false-positive the bare presence-count had: the writer
+        (iteration-close do_state_update) re-arms on every substantive deep
+        close and the canary samples AFTER the arming, so the sentinel is
+        'set' at sample time every iteration even though the consumer cleared
+        it each time."""
+        for i in range(5):
+            # Consumer dispatched + stamped a fresh timestamp this iteration.
+            self._set_slot("fresh_eyes_last_dispatch", f"2026-06-19T05:{i:02d}:30")
+            # Writer re-armed the sentinel (new set_at) — still set at sample.
+            self._set_slot(
+                "fresh_eyes_dispatch_pending",
+                {"fired": True, "set_at": f"2026-06-19T05:{i:02d}:45", "core_count": 5},
+            )
+            r = self._run_canary(dry_run=False, threshold=3)
+            fe = r["sentinels"]["fresh_eyes_dispatch_pending"]
+            self.assertTrue(fe["is_set"])
+            self.assertTrue(fe.get("dispatch_advanced"))
+            self.assertEqual(fe["new_stuck_count"], 0)
+            self.assertFalse(fe["fired"])
+
+    def test_consumption_aware_fires_when_dispatch_frozen(self):
+        """Consumer bypassed: sentinel stays armed AND fresh_eyes_last_dispatch
+        stays frozen across threshold consecutive samples -> fires. (Run 1 is a
+        grace sample: last_seen=None != current, read as advanced.)"""
+        # Frozen dispatch timestamp (consumer never stamps a newer one).
+        self._set_slot("fresh_eyes_last_dispatch", "2026-06-19T04:00:00")
+        self._set_slot(
+            "fresh_eyes_dispatch_pending",
+            {"fired": True, "set_at": "2026-06-19T05:00:00", "core_count": 5},
+        )
+        # Run 1 — grace: last_seen None != "04:00:00" -> advanced -> 0.
+        r1 = self._run_canary(dry_run=False, threshold=3)
+        self.assertEqual(r1["sentinels"]["fresh_eyes_dispatch_pending"]["new_stuck_count"], 0)
+        # Run 2 — frozen ("04:00:00" == last_seen) -> 1.
+        r2 = self._run_canary(dry_run=False, threshold=3)
+        self.assertEqual(r2["sentinels"]["fresh_eyes_dispatch_pending"]["new_stuck_count"], 1)
+        # Run 3 — frozen -> 2.
+        r3 = self._run_canary(dry_run=False, threshold=3)
+        self.assertEqual(r3["sentinels"]["fresh_eyes_dispatch_pending"]["new_stuck_count"], 2)
+        # Run 4 — frozen -> 3 -> fire (dry-run so no live add-goal).
+        r4 = self._run_canary(dry_run=True, threshold=3)
+        fe = r4["sentinels"]["fresh_eyes_dispatch_pending"]
+        self.assertTrue(fe["fired"])
+        self.assertFalse(fe.get("dispatch_advanced"))
+        self.assertEqual(len(r4["investigate_goals_filed"]), 1)
+        self.assertEqual(
+            r4["investigate_goals_filed"][0]["sentinel"], "fresh_eyes_dispatch_pending"
+        )
+
+    def test_consumption_aware_resets_when_dispatch_resumes(self):
+        """Dispatch frozen for a couple samples, then the consumer dispatches
+        again (timestamp advances) -> stuck_count resets to 0 (recovered)."""
+        self._set_slot("fresh_eyes_last_dispatch", "2026-06-19T04:00:00")
+        self._set_slot(
+            "fresh_eyes_dispatch_pending",
+            {"fired": True, "set_at": "2026-06-19T05:00:00", "core_count": 5},
+        )
+        self._run_canary(dry_run=False, threshold=3)        # grace -> 0
+        r2 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 1
+        self.assertEqual(r2["sentinels"]["fresh_eyes_dispatch_pending"]["new_stuck_count"], 1)
+        # Consumer resumes — stamps a newer dispatch timestamp.
+        self._set_slot("fresh_eyes_last_dispatch", "2026-06-19T05:30:00")
+        r3 = self._run_canary(dry_run=False, threshold=3)
+        fe = r3["sentinels"]["fresh_eyes_dispatch_pending"]
+        self.assertTrue(fe.get("dispatch_advanced"))
+        self.assertEqual(fe["new_stuck_count"], 0)
+        self.assertFalse(fe["fired"])
 
 
 if __name__ == "__main__":

@@ -59,7 +59,7 @@ RIGHT (user /loop):      ScheduleWakeup({prompt: "/loop investigate flaky test",
 RIGHT (external wait):   ScheduleWakeup({prompt: "check GitHub PR #142 CI run status", delaySeconds: 270})
 ```
 
-### C. Using ScheduleWakeup in the orchestrator return path
+### C. Using ScheduleWakeup AS A SUBSTITUTE for the orchestrator return path
 
 The autonomous-loop orchestrator's correct terminal call at iteration
 close is `Skill(aspirations)` with `args='loop'` — see
@@ -67,8 +67,76 @@ close is `Skill(aspirations)` with `args='loop'` — see
 for the Skill re-entry. The orchestrator does not need ScheduleWakeup
 to continue iterating; the Skill call queues the next turn synchronously.
 
+The prohibition is on SUBSTITUTION (using ScheduleWakeup *instead of* the
+Skill call to advance the loop). It is NOT a prohibition on the deadman's
+re-arm below, where ScheduleWakeup is a NET *behind* an unchanged Skill
+re-entry.
+
+## Sanctioned Exception: the deadman's-switch terminal-pair
+
+The silent-loop-death failure mode (a turn that ends on trailing TEXT
+instead of the terminal `Skill(aspirations)` call → no Stop event fires →
+the loop dies and sits dead for hours, observed 2026-06-21: 5 of 6 agents
+dead 1.5–4h) cannot be fixed by the Stop hook alone — Claude Code does not
+reliably emit the Stop event on a text-only turn-end (rb-629/guard-454),
+so the hook never fires to BLOCK it. The deadman's-switch closes that gap
+intrinsically: the agent arms its own resurrection.
+
+The mechanism is the **terminal-pair**. By default (Stage 5 onward,
+2026-06-23) — i.e. unless the per-agent opt-out flag
+`agents/<agent>/session/deadman-disabled` is present — the iteration's
+terminal response emits TWO batched tool calls, in this exact order:
+
+```
+1. ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)
+2. Skill(aspirations) with args='loop'
+```
+
+Why this is NOT a violation of Anti-pattern C:
+
+- `Skill(aspirations)` REMAINS the primary re-entry — it is the LAST call
+  and is what continues the loop synchronously, exactly as today. The
+  ScheduleWakeup does NOT replace it.
+- The ScheduleWakeup is a single replace-slot wakeup (the platform keeps
+  ONE pending wakeup; each iteration's re-arm REPLACES the prior). On a
+  healthy loop the session is never idle for `delaySeconds`, so the wakeup
+  NEVER fires — the Skill chain always re-arms it forward first.
+- It fires ONLY when the Skill chain breaks (a text-death leaves the
+  session idle past `delaySeconds`). Then the sentinel resurrects the loop.
+  This is "waiting on a signal the harness cannot track" — the signal being
+  *the absence of the next iteration* — which is squarely the legitimate
+  use, not state-machine advancement.
+
+Verified platform facts the design rests on (canary, 2026-06-21, dev
+session):
+
+- A tool batched AFTER ScheduleWakeup in the same response DOES execute
+  (so `Skill(aspirations)` after the arm runs — pending live re-validation
+  that the Skill specifically *re-enters* the loop, "Q5").
+- ScheduleWakeup is turn-terminal (ends the turn after the batch) — which
+  is why the arm must be at the TERMINAL, paired with Skill, never early
+  (an early arm would truncate the iteration).
+- A scheduled wakeup DOES fire after a text-only turn-end and re-invokes
+  the agent (the resurrection primitive — proven end-to-end).
+
+The gate (`schedule-wakeup-gate.py`) already passes the `<<autonomous-loop-dynamic>>`
+sentinel (`is_bad_slash_prefix` returns False), so the deadman call is
+approved unconditionally. guard-511 carries the matching carve-out.
+
+Fail-safe property: if the live Q5 re-validation shows `Skill(aspirations)`
+does NOT re-enter after ScheduleWakeup, the worst case is a SLOW loop
+(`delaySeconds`/iteration, driven by the wakeup) — still alive and still
+self-arming — NOT a dead loop. The change cannot make survival worse than
+the status quo.
+
+Rationale + full incident trace: `core/config/rationale/deadman-switch.md`.
+
+### D. Using ScheduleWakeup for EXTERNAL polling the harness already tracks
+
 ScheduleWakeup is for waiting on EXTERNAL signals the harness cannot
-track, not for advancing the loop's own state machine.
+track. Do NOT use it to advance the loop's own state machine (Anti-pattern
+C above) NOR to poll background Bash the harness auto-notifies on
+(Anti-pattern A above).
 
 ## Enforcement
 

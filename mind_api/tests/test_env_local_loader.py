@@ -17,6 +17,8 @@ endpoint calls get_backend():
 import os
 from pathlib import Path
 
+import pytest
+
 from mind_api.src.__main__ import _load_env_local, _ensure_owncloud_roots
 
 
@@ -151,16 +153,22 @@ _ROOT_KEYS = ("STORAGE_BACKEND", "WORLD_PATH", "META_PATH",
               "MIND_WORLD", "MIND_META", "AGENTS_ROOT")
 
 
-def _run_ensure(tmp_path: Path, backend=None, confs=None, preset=None):
+def _run_ensure(tmp_path: Path, backend=None, confs=None, preset=None, raw_confs=None):
     """Lay down agents/<name>/local-paths.conf under a fake project_root,
     snapshot os.environ, set the backend selector + presets, run
     _ensure_owncloud_roots, return the post-run environ, then fully restore
-    os.environ. `confs` maps agent_name -> (world_path, meta_path)."""
+    os.environ. `confs` maps agent_name -> (world_path, meta_path); `raw_confs`
+    maps agent_name -> verbatim conf text (for malformed / WORLD_PATH-less confs,
+    e.g. the g-115-1449 `_`-prefixed shadow case)."""
     for name, (world, meta) in (confs or {}).items():
         d = tmp_path / "agents" / name
         d.mkdir(parents=True, exist_ok=True)
         (d / "local-paths.conf").write_text(
             f"WORLD_PATH={world}\nMETA_PATH={meta}\n", encoding="utf-8")
+    for name, text in (raw_confs or {}).items():
+        d = tmp_path / "agents" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "local-paths.conf").write_text(text, encoding="utf-8")
     saved = dict(os.environ)
     try:
         for k in _ROOT_KEYS:
@@ -221,10 +229,41 @@ def test_ayoai_world_meta_preset_short_circuits(tmp_path):
     assert "META_PATH" not in env
 
 
-def test_fail_open_when_no_agent_conf(tmp_path):
-    # own-cloud selected but no agents/*/local-paths.conf → resolver raises,
-    # _ensure_owncloud_roots swallows it (fail-open): roots stay unset and the
-    # daemon does not crash at startup.
-    env = _run_ensure(tmp_path, backend="own-cloud", confs={})
-    assert "WORLD_PATH" not in env
-    assert "META_PATH" not in env
+def test_fail_loud_when_no_agent_conf(tmp_path):
+    # own-cloud selected but no agents/*/local-paths.conf → no agent resolves
+    # the governed roots. FAIL LOUD (9 / rb-1796): the prior silent
+    # fail-open served own-cloud with unset roots, 500ing every storage op — a
+    # startup refusal is far easier to diagnose than a healthy-but-broken daemon.
+    with pytest.raises(RuntimeError, match="no .*agent resolved WORLD/META"):
+        _run_ensure(tmp_path, backend="own-cloud", confs={})
+
+
+def test_owncloud_skips_underscore_test_agent_shadow(tmp_path):
+    # 9 canonical case: a `_`-prefixed test/throwaway agent whose conf
+    # lacks WORLD_PATH sorts BEFORE real agents. The OLD resolve(None) picked it
+    # first, raised, and silently fail-opened (roots unset). The fix skips
+    # `_`-prefixed dirs and resolves the real agent (alpha) instead.
+    w = tmp_path / "ext" / "world"
+    m = tmp_path / "ext" / "meta"
+    env = _run_ensure(
+        tmp_path, backend="own-cloud",
+        confs={"alpha": (w, m)},
+        raw_confs={"_gate_test_throwaway_agent_": "META_PATH=/tmp/junk-meta\n"},
+    )
+    assert Path(env["WORLD_PATH"]) == w   # resolved from alpha, not the shadow
+    assert Path(env["META_PATH"]) == m
+
+
+def test_owncloud_iterates_past_unresolvable_conf(tmp_path):
+    # Defense in depth: a non-`_` agent that sorts first but whose conf lacks
+    # WORLD_PATH must not break resolution — iterate past the raise to the next
+    # conf-bearing agent that resolves.
+    w = tmp_path / "ext" / "world"
+    m = tmp_path / "ext" / "meta"
+    env = _run_ensure(
+        tmp_path, backend="own-cloud",
+        confs={"zeta": (w, m)},                            # sorts AFTER 'aaa'
+        raw_confs={"aaa": "META_PATH=/tmp/junk-meta\n"},   # no WORLD_PATH → raises
+    )
+    assert Path(env["WORLD_PATH"]) == w   # resolved from zeta after aaa raised
+    assert Path(env["META_PATH"]) == m

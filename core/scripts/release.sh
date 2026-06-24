@@ -274,11 +274,19 @@ mv -f "$TMP_REL" "$RELEASES_JSON"
 say "prepended RELEASES.json entry for $NEW"
 
 # --- Step 9: git commit + annotated tag (M2 — sole tagger; NEVER pushes) ---
+# Pathspec-scope the commit to ONLY the release-bump files (mirrors
+# iteration-commit.sh:1105 / 8). A bare `git commit` records the WHOLE
+# index, so if an autonomous agent has pre-staged WIP in the shared tree when a
+# maintainer cuts a release, that WIP gets swept into the release commit
+# (guard-741). release.sh stages a fixed, known file set, so commit exactly those.
+release_paths=("$INIT_PY" "$RELEASES_JSON")
 git -C "$PROJECT_ROOT" add "$INIT_PY" "$RELEASES_JSON"
 if [[ -n "$UPGRADE_RECIPE" ]]; then
   git -C "$PROJECT_ROOT" add "$PROJECT_ROOT/$UPGRADE_RECIPE" "$PROJECT_ROOT/$ROLLBACK_RECIPE" 2>/dev/null || true
+  [[ -f "$PROJECT_ROOT/$UPGRADE_RECIPE" ]] && release_paths+=("$PROJECT_ROOT/$UPGRADE_RECIPE")
+  [[ -f "$PROJECT_ROOT/$ROLLBACK_RECIPE" ]] && release_paths+=("$PROJECT_ROOT/$ROLLBACK_RECIPE")
 fi
-git -C "$PROJECT_ROOT" commit -m "release: v$NEW" >/dev/null
+git -C "$PROJECT_ROOT" commit -m "release: v$NEW" -- "${release_paths[@]}" >/dev/null
 NEEDS_RESTORE=0   # bump is committed; the tag-failure handler below owns recovery
 TAGMSG="Release v$NEW: $SUMMARY"
 [[ $FORCE_RELEASE -eq 1 ]] && TAGMSG="$TAGMSG"$'\n'"OVERRIDE(force-release): $FORCE_REASON"

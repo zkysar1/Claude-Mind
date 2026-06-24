@@ -97,7 +97,14 @@ def test_update_uses_posix_path_no_backslash(dependent_unblock_module):
         f"expected exactly one subprocess.run call, "
         f"got {len(captured_cmd)}")
     cmd = captured_cmd[0]
-    assert cmd[0] == "bash", f"cmd[0] should be 'bash', got {cmd[0]!r}"
+    # rb-1472 (commit 5089de1a): the bash resolver now returns the full Git
+    # login-launcher path (e.g. C:\<WORKSPACE>\...\bash.exe), not the bare
+    # string "bash". Assert the interpreter's basename instead of strict
+    # equality. .replace("\\", "/") keeps basename robust on POSIX Python,
+    # where os.path.basename does not split backslash separators.
+    bash_base = os.path.basename(cmd[0].replace("\\", "/"))
+    assert bash_base in ("bash", "bash.exe"), (
+        f"cmd[0] should resolve to a bash interpreter, got {cmd[0]!r}")
     wrapper_path = cmd[1]
     # Core assertion: no backslash separators in the wrapper path
     # argument. On Windows, backslashes would be stripped by bash escape
@@ -137,38 +144,43 @@ def test_update_dry_run_skips_subprocess(dependent_unblock_module):
 
 
 def test_inbox_alert_uses_posix_path():
-    """inbox-alert-age-check.py invokes wm-append.sh through bash_cmd(),
-    which prepends the resolved BASH and emits the script path via
-    Path.as_posix() (guard-580 + guard-581). Audited as part of g-115-786
-    rb-428 sibling sweep; migrated to the shared bash_cmd() helper in
-    g-115-900 — the inline .as_posix() guarantee moved into
+    """inbox-alert-age-check.py invokes its .sh subprocesses (board-read.sh +
+    board-post.sh) through bash_cmd(), which prepends the resolved BASH and
+    emits the script path via Path.as_posix() (guard-580 + guard-581). Audited
+    as part of g-115-786 rb-428 sibling sweep; migrated to the shared bash_cmd()
+    helper in g-115-900 -- the inline .as_posix() guarantee moved into
     core/scripts/_runtime_bash.py:bash_cmd, pinned by
     test_runtime_bash_resolution.py::test_bash_cmd_posix_normalizes_path.
 
-    Static source check — confirms the safe pattern landed at the call
-    site. A full functional test would require seeding wm.py state and is
-    out of scope for this regression suite (the dependent-unblock test
-    above proves the path-shape contract; this asserts the sibling adopted
-    the helper).
+    g-115-1533 replaced the per-agent wm-append.sh cooldown with the shared,
+    durable coordination-board scan (board-read.sh) + breadcrumb (board-post.sh),
+    so the Windows-safe bash_cmd() guarantee now applies to THOSE call sites.
+
+    Static source check -- confirms the safe pattern landed at the call sites.
+    A full functional test would require a live board and is out of scope for
+    this regression suite (the dependent-unblock test above proves the
+    path-shape contract; this asserts the sibling adopted the helper).
     """
     src = (SCRIPTS_DIR / "inbox-alert-age-check.py").read_text(
         encoding="utf-8")
-    # Strong signal: the wm-append.sh invocation goes through bash_cmd(),
-    # which is Windows-safe by construction (resolved BASH + .as_posix()).
-    assert 'bash_cmd(SCRIPT_DIR / "wm-append.sh"' in src, (
-        "inbox-alert-age-check.py wm-append.sh invocation no longer uses "
-        "bash_cmd() — Windows path-separator stripping (or the System32 "
-        "WSL stub) would silently no-op proactive_escalation_log writes")
+    # Strong signal: the board .sh invocations go through bash_cmd(), which is
+    # Windows-safe by construction (resolved BASH + .as_posix()).
+    assert 'bash_cmd(SCRIPT_DIR / "board-read.sh"' in src, (
+        "inbox-alert-age-check.py board-read.sh invocation no longer uses "
+        "bash_cmd() -- Windows path-separator stripping (or the System32 "
+        "WSL stub) would silently no-op the shared cooldown board scan")
+    assert 'bash_cmd(SCRIPT_DIR / "board-post.sh"' in src, (
+        "inbox-alert-age-check.py board-post.sh invocation no longer uses "
+        "bash_cmd() -- the cooldown breadcrumb post would silently no-op on "
+        "Windows")
     # Negative assertions: the legacy vulnerable forms must NOT reappear at
-    # this call site — neither bare str(...) (backslash stripping) nor the
-    # literal "bash" prefix (System32 WSL stub, rc=127).
-    assert 'str(SCRIPT_DIR / "wm-append.sh")' not in src, (
+    # these call sites -- bare str(...) would let bash strip backslashes.
+    assert 'str(SCRIPT_DIR / "board-read.sh")' not in src, (
         "inbox-alert-age-check.py still uses str(SCRIPT_DIR / "
-        '"wm-append.sh") — vulnerable to bash backslash stripping')
-    assert '["bash", (SCRIPT_DIR / "wm-append.sh")' not in src, (
-        'inbox-alert-age-check.py still uses the literal "bash" prefix at '
-        "the wm-append.sh call site — bypasses resolve_bash(), risking the "
-        "System32 WSL stub (g-115-900)")
+        '"board-read.sh") -- vulnerable to bash backslash stripping')
+    assert 'str(SCRIPT_DIR / "board-post.sh")' not in src, (
+        "inbox-alert-age-check.py still uses str(SCRIPT_DIR / "
+        '"board-post.sh") -- vulnerable to bash backslash stripping')
 
 
 def test_blocker_recheck_uses_posix_path():

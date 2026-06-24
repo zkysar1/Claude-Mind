@@ -8,7 +8,7 @@ Reasoning bank entries use JSONL (one JSON object per line) with script-based ac
 ## Record Schema
 Required: `id`, `title`, `type`, `category`, `content`, `created`
 Defaults: `status` ("active"), `when_to_use` (""), `utilization` (zeros)
-Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`, `experience_ref`, `preventive_guardrail`
+Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`, `experience_ref`, `preventive_guardrail`, `entry_type`, `poignancy`
 
 `experience_ref` (format `exp-SLUG`, see `experience.md`) links the lesson
 to the full-fidelity trace it was learned from. Completes the evidence
@@ -34,6 +34,35 @@ the queue over time without forced migration.
 ID format: `rb-NNN` (zero-padded 3-digit, regex: `^rb-\d{3}$`)
 Valid types: `success`, `failure`, `user_provided`
 Valid statuses: `active`, `retired`
+Valid `entry_type`: `procedure` (or null — the default)
+
+### `entry_type` — optional reasoning-bank taxonomy (g-306-11)
+
+`entry_type` is an OPTIONAL tag that classifies an entry by SHAPE, orthogonal
+to `type` (success/failure) and `category` (the topic):
+
+- **null** (default) — an ordinary reasoning lesson (heuristic, diagnostic,
+  causal insight). The overwhelming majority of entries.
+- **`procedure`** — a reusable, repeatable MULTI-STEP how-to: an ordered
+  sequence of steps to follow when a recurring class of task appears (e.g.
+  "to add an optional field to a daemon-mirrored store: update both validators
+  verbatim-in-sync, both defaults, then the retrieve filter + wrapper + doc +
+  tests"). Set this only when `content` actually spells out reusable steps.
+
+Additive + null-safe: the RB validator has no unknown-field gate, and entries
+written before this field existed read back as null. **NO embeddings, NO new
+store** — `entry_type` is a single optional string on the existing JSONL
+record. Set it at write time by including `"entry_type": "procedure"` in the
+`reasoning-bank-add.sh` stdin JSON; retrofit an existing entry with
+`reasoning-bank-update-field.sh <id> entry_type procedure`.
+
+**Retrieval filter**: `retrieve.sh --entry-type procedure --category <cat>`
+restricts the returned `reasoning_bank` + `meta_lessons` to procedure-tagged
+entries (filter applied before sort/cap/counter-bump, so non-procedure
+entries' `retrieval_count` is never polluted). Omitting `--entry-type` is the
+default and returns all entry types unchanged. Producers: `/aspirations-spark`
+Phase 6.5 (general pattern capture) and `/aspirations-state-update`'s
+procedure-encoding step (reusable multi-step procedures specifically).
 
 ## Script-Based Access (Exclusive Data Layer)
 The LLM NEVER reads or edits `world/reasoning-bank.jsonl` directly. All operations go through scripts:

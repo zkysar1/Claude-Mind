@@ -71,24 +71,27 @@ def _read_loop_state(wm_path: Path) -> dict:
     return wm["slots"]["loop_state"]
 
 
-def _run_helper(tmpdir: Path, outcome: str) -> int:
+def _run_helper(tmpdir: Path, outcome: str = None, extra_args=None) -> int:
     """Invoke loop-state-bump-counters.py with AGENT_DIR pointed at tmpdir.
 
     _paths.py honors MIND_AGENT_DIR (test-only env override) — set it directly
     rather than trying to override PROJECT_ROOT (which is computed from
     script location and isn't env-overridable).
+
+    `outcome` adds `--outcome <outcome>` when given; `extra_args` (list) appends
+    arbitrary flags (g-115-1561: --goal-id / --reset-alignment / --evolution-fired).
     """
     env = os.environ.copy()
     env["MIND_AGENT_DIR"] = str(tmpdir)
     # MIND_AGENT still resolved from environment for consistency but the
     # path override above is what actually points the helper at our tmpdir.
     env["MIND_AGENT"] = "test-agent-isolated"
-    result = subprocess.run(
-        ["py", "-3", str(HELPER), "--outcome", outcome],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    cmd = ["py", "-3", str(HELPER)]
+    if outcome is not None:
+        cmd += ["--outcome", outcome]
+    if extra_args:
+        cmd += list(extra_args)
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
     return result.returncode, result.stderr
 
 
@@ -161,11 +164,102 @@ def test_fail_open_on_missing_wm() -> bool:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ── 1: orphaned-accumulator writers ────────────────────────────────
+
+def test_touched_and_alignment_advance() -> bool:
+    """--goal-id adds aspiration_id to touched AND increments alignment_check_at."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
+    try:
+        wm_path = _seed_wm(tmpdir, goals_completed=5, productive_goals=3)
+        rc, stderr = _run_helper(tmpdir, "deep", ["--goal-id", "g-115-1561"])
+        if rc != 0:
+            print(f"FAIL: touched — exit {rc}, stderr: {stderr}", file=sys.stderr)
+            return False
+        ls = _read_loop_state(wm_path)
+        if ls.get("touched") != ["asp-115"]:
+            print(f"FAIL: touched expected ['asp-115'], got {ls.get('touched')}", file=sys.stderr)
+            return False
+        if ls.get("alignment_check_at") != 1:
+            print(f"FAIL: alignment_check_at expected 1, got {ls.get('alignment_check_at')}", file=sys.stderr)
+            return False
+        print("PASS: --goal-id writes touched + increments alignment_check_at")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_touched_dedups_within_aspiration() -> bool:
+    """Two distinct goals in the same aspiration → touched holds asp-id once;
+    alignment increments per distinct goal (idempotency keys on goal_id)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
+    try:
+        wm_path = _seed_wm(tmpdir, goals_completed=5, productive_goals=3)
+        _run_helper(tmpdir, "deep", ["--goal-id", "g-115-1561"])
+        _run_helper(tmpdir, "routine", ["--goal-id", "g-115-1562"])
+        ls = _read_loop_state(wm_path)
+        if ls.get("touched") != ["asp-115"]:
+            print(f"FAIL: dedup — touched expected ['asp-115'], got {ls.get('touched')}", file=sys.stderr)
+            return False
+        if ls.get("alignment_check_at") != 2:
+            print(f"FAIL: dedup — alignment expected 2 (two distinct goals), got {ls.get('alignment_check_at')}", file=sys.stderr)
+            return False
+        print("PASS: touched dedups within aspiration; alignment counts distinct goals")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_reset_alignment_zeroes() -> bool:
+    """--reset-alignment zeroes alignment_check_at (bash-owned cadence reset)."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
+    try:
+        wm_path = _seed_wm(tmpdir, goals_completed=5, productive_goals=3)
+        _run_helper(tmpdir, "deep", ["--goal-id", "1"])  # alignment -> 1
+        rc, stderr = _run_helper(tmpdir, None, ["--reset-alignment"])
+        if rc != 0:
+            print(f"FAIL: reset — exit {rc}, stderr: {stderr}", file=sys.stderr)
+            return False
+        ls = _read_loop_state(wm_path)
+        if ls.get("alignment_check_at") != 0:
+            print(f"FAIL: reset — alignment expected 0, got {ls.get('alignment_check_at')}", file=sys.stderr)
+            return False
+        print("PASS: --reset-alignment zeroes alignment_check_at")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_evolution_fired_increments() -> bool:
+    """--evolution-fired increments evolutions and marks last_evolution_at."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
+    try:
+        wm_path = _seed_wm(tmpdir, goals_completed=10, productive_goals=8)
+        rc, stderr = _run_helper(tmpdir, None, ["--evolution-fired"])
+        if rc != 0:
+            print(f"FAIL: evolution — exit {rc}, stderr: {stderr}", file=sys.stderr)
+            return False
+        ls = _read_loop_state(wm_path)
+        if ls.get("evolutions") != 1:
+            print(f"FAIL: evolution — evolutions expected 1, got {ls.get('evolutions')}", file=sys.stderr)
+            return False
+        if ls.get("last_evolution_at") != 10:
+            print(f"FAIL: evolution — last_evolution_at expected 10, got {ls.get('last_evolution_at')}", file=sys.stderr)
+            return False
+        print("PASS: --evolution-fired increments evolutions + marks last_evolution_at")
+        return True
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def main() -> int:
     results = [
         test_deep_advances_both(),
         test_routine_advances_only_total(),
         test_fail_open_on_missing_wm(),
+        test_touched_and_alignment_advance(),
+        test_touched_dedups_within_aspiration(),
+        test_reset_alignment_zeroes(),
+        test_evolution_fired_increments(),
     ]
     if all(results):
         print("\n════════════════════════════════════════════")

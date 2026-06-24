@@ -1,0 +1,45 @@
+# Value-framing taxonomy (CORE — framework-universal). FW-5 / R2.
+#
+# Consumed by _value_framing.py -> resolve(outcome_class, work_class) -> a
+# positive, one-line framing string surfaced ONLY at presentation time
+# (journal-append.sh `Value:` line; agent-completion-report Contribution).
+#
+# WHY this exists (FW-5, .claude/rules/learning-philosophy.md Recognition half):
+# `outcome_class=routine` reads as "did not count" and demoralizes, even though
+# a routine sweep that returns clean is often the reason a regression did not
+# ship. The FW-5 reframe already lives in PROSE (learning-philosophy.md +
+# agent-completion-report); this mapping is the STRUCTURAL value-affirming
+# label at the point where routine is RECORDED.  design / .
+#
+# DERIVED-AT-PRESENTATION, NEVER STORED. outcome_class (routine|deep) stays the
+# ENUM that recurring-close.sh / cargo-cult-detector.py / goal-selector.py /
+# recurring-loop-state-mutate.py switch on (guard-541). This file adds NO enum,
+# touches NO stored field — it only re-presents the existing (outcome_class,
+# work_class) pair as an affirming sentence. Zero blast radius by construction.
+#
+# work_class values come from _work_class.py (core + world overlay):
+# product / framework / hygiene / research, plus "" or "unclassified" when a
+# category is unmapped. A missing/empty/unknown work_class falls to the
+# outcome_class's `unclassified` framing; an unknown outcome_class falls to
+# the top-level `default`. Fail-open everywhere (see _value_framing.py).
+#
+# ASCII only (guard-549): the framing flows through bash echo (journal-append)
+# and a bash-captured CLI on Windows MSYS, where a U+2014 em-dash can mangle.
+
+version: 1
+
+default: "Work recorded: every closed goal moves the loop forward."
+
+mapping:
+  routine:
+    hygiene: "Upkeep that held the line: a clean sweep is the reason a regression did not ship."
+    framework: "Connective tissue: routine framework cadence is what every other agent relies on."
+    research: "Steady signal: evidence kept current before it is needed."
+    product: "Quiet reliability: the surface users touch stayed solid."
+    unclassified: "Upkeep: 'routine' names the cadence, not the value."
+  deep:
+    hygiene: "Deep hygiene: plumbing hardened, not just patched."
+    framework: "Deep build: the cognitive engine is more capable now."
+    research: "Deep investigation: ambiguity converted into durable evidence."
+    product: "Deep product work: a concrete advance users will feel."
+    unclassified: "Deep work: a concrete, applied advance."

@@ -32,14 +32,33 @@ MIN_RATE_SAMPLES gates `block + override` (tighten). Both default to
 
   tighten        override / (block + override) > tighten_threshold (0.5)
                  AND (block + override) >= MIN_RATE_SAMPLES
+                 AND NOT recently-improved (recency suppression, below)
                  → FP-dominant: caller bypasses more than half the time.
                    Trigger pattern is too generous.
+                 Recency suppression (g-115-1509): if the RECENT window
+                 (TIGHTEN_RECENCY_DAYS) holds >= MIN_RATE_SAMPLES block+override
+                 AND its override rate has dropped to <= tighten_threshold, the
+                 over-firing has been addressed (e.g. a widened whitelist) and
+                 the high cumulative rate is lag — suppress tighten and fall
+                 through to keep. Suppresses ONLY on positive evidence of
+                 improvement; insufficient recent samples → tighten preserved
+                 (a low-volume, steadily-over-firing gate stays flagged).
 
   widen          noop / total >= widen_threshold (0.95)
                  AND total >= MIN_TOTAL_FIRINGS
                  AND retirement_eligible: true
                  AND keyword_bias == "generous" (i.e., FN-dominant intent)
+                 AND NOT recently-widened (recency suppression, below)
                  → Gate almost never triggers; may be missing real cases.
+                 Recency suppression (g-115-1510): if the RECENT window
+                 (WIDEN_RECENCY_DAYS) holds >= MIN_TOTAL_FIRINGS total firings
+                 AND its noop rate has dropped below widen_threshold, the gate
+                 has started catching cases (e.g. trigger patterns were added)
+                 and the high cumulative noop rate is lag — suppress widen and
+                 fall through to keep. The mirror image of the tighten recency
+                 suppression: measure the CURRENT under-firing rate, not the
+                 lagging one. Suppresses ONLY on positive evidence the gate now
+                 fires; insufficient recent samples → widen preserved.
 
   investigate    fail_open count > 0
                  → Gate threw an exception at least once. Look at the
@@ -85,6 +104,41 @@ FIRINGS_JSONL = META_DIR / "gate-firings.jsonl"
 
 TIGHTEN_THRESHOLD = 0.5  # override / (block + override) above this → tighten
 WIDEN_THRESHOLD = 0.95   # noop / total at or above this → widen (FN-only)
+FAIL_OPEN_RECENCY_DAYS = 7  # fail_opens older than this are HISTORICAL, not a
+                            # current bug. The investigate-on-fail_open rule
+                            # windows on recency so a long-resolved exception
+                            # burst inside the --days window stops re-flagging
+                            # every eval run (rb-1531 recency-windowing pattern;
+                            # 8 — origin-signal/capability/stale-read
+                            # each carried a May fail_open burst, 0 in last 7d).
+TIGHTEN_RECENCY_DAYS = 7    # block/override firings older than this are
+                            # HISTORICAL for the tighten signal. The tighten rule
+                            # measures override / (block + override) over the full
+                            # --days window; a gate FIXED inside that window
+                            # (widened whitelist, tightened pattern) keeps its
+                            # PRE-fix high-override firings for ~--days, so the
+                            # cumulative rate stays above threshold and the eval
+                            # re-recommends tighten ~25d after the fix landed
+                            # (9: origin-signal-gate re-flagged at 50.2%
+                            # on 2026-06-16 though 9 fixed it 2026-06-14;
+                            # verified post-fix rate 30.6%). Symmetric to
+                            # FAIL_OPEN_RECENCY_DAYS (rb-1531 — cumulative
+                            # counters are not current weaknesses): measure the
+                            # CURRENT over-firing rate, not the lagging one.
+WIDEN_RECENCY_DAYS = 7      # noop/total firings older than this are HISTORICAL
+                            # for the widen signal. The widen rule measures
+                            # noop / total over the full --days window; a gate
+                            # WIDENED inside that window (trigger patterns added
+                            # so it catches more) keeps its PRE-widen high-noop
+                            # firings for ~--days, so the cumulative noop rate
+                            # stays >= widen_threshold and the eval re-recommends
+                            # widen long after the fix landed — the identical
+                            # lagging-window staleness as tighten, mirror-imaged
+                            # (0, follow-on from 9). Symmetric
+                            # to TIGHTEN_RECENCY_DAYS / FAIL_OPEN_RECENCY_DAYS
+                            # (rb-1931 — recency-window the recommendation signal,
+                            # not just the cumulative rate): measure the CURRENT
+                            # under-firing rate, not the lagging one.
 
 
 def _load_gates():
@@ -146,13 +200,54 @@ def _load_firings(since):
               f"firing record(s)", file=sys.stderr)
 
 
-def _score_gate(gate, counts, min_fires):
+def _score_gate(gate, counts, min_fires,
+                recent_fail_open=None, latest_fail_open_ts=None,
+                recent_counts=None, recent_counts_widen=None):
     """Apply recommendation rules to one gate's count summary.
 
     Returns dict with `recommendation`, `reason`, and the raw evidence.
 
     `min_fires` is the single CLI knob, applied inside the function as two
     named thresholds — one per distinct sample set.
+
+    `recent_fail_open` windows the investigate-on-fail_open rule on recency
+    (rb-1531). It is the count of fail_open firings within the last
+    FAIL_OPEN_RECENCY_DAYS, computed by the aggregation loop:
+      - None  → caller did not supply a recency split (self-test / legacy
+                callers). Preserve the original behavior: any fail_open in
+                the --days window → investigate. This keeps the existing
+                self-test contract intact.
+      - >0    → a fail_open fired recently → investigate (current bug).
+      - ==0   → all fail_opens are HISTORICAL (older than the recency
+                window). The gate raised exceptions in the past but not
+                lately — a long-resolved burst, not a current bug. Fall
+                through to the normal asymmetry rules instead of re-flagging
+                every eval run (the g-115-1368 failure mode).
+    `latest_fail_open_ts` is the ISO timestamp of the most recent fail_open
+    (for evidence/audit only); None when there are no fail_opens.
+
+    `recent_counts` is a Counter of decisions within TIGHTEN_RECENCY_DAYS,
+    driving the tighten recency-improvement suppression (g-115-1509):
+      - None    → caller supplied no recency split (self-test / legacy).
+                  Tighten fires on the full-window rate alone — the original
+                  behavior, preserved so the existing self-test contract holds.
+      - Counter → suppress tighten ONLY when recent (block + override) >=
+                  MIN_RATE_SAMPLES AND the recent override rate has dropped to
+                  <= TIGHTEN_THRESHOLD (positive evidence the over-firing was
+                  fixed). Insufficient recent samples, or a still-high recent
+                  rate, → tighten preserved (no false suppression).
+
+    `recent_counts_widen` is a Counter of ALL decisions within
+    WIDEN_RECENCY_DAYS, driving the widen recency-improvement suppression
+    (g-115-1510) — the mirror image of `recent_counts` for the widen path:
+      - None    → caller supplied no recency split (self-test / legacy).
+                  Widen fires on the full-window noop rate alone — the original
+                  behavior, preserved so the existing self-test contract holds.
+      - Counter → suppress widen ONLY when recent total >= MIN_TOTAL_FIRINGS
+                  AND the recent noop rate has dropped below WIDEN_THRESHOLD
+                  (positive evidence the gate now catches cases). Insufficient
+                  recent samples, or a still-high recent noop rate, → widen
+                  preserved (no false suppression).
     """
     # Two volume guards — named for the sample set each gates, NOT the
     # threshold value. Do not collapse them: MIN_RATE_SAMPLES gates
@@ -203,13 +298,35 @@ def _score_gate(gate, counts, min_fires):
                           f"hot path, or telemetry was just enabled.",
                 "evidence": evidence}
 
-    # Fail-open is a hard signal — gate raised an exception, has a bug.
+    # Fail-open is a hard signal — gate raised an exception. But "raised an
+    # exception once, 4 weeks ago, since resolved" is NOT a current bug.
+    # Window the investigate trigger on recency (rb-1531): a fail_open inside
+    # the recency window is a live bug; a fail_open only OUTSIDE it is history.
     if fail_open > 0:
-        return {"recommendation": "investigate",
-                "reason": f"Gate fail_open count = {fail_open}. The gate "
-                          f"raised an exception at least once. Inspect the "
-                          f"`gate_error` field on those firings and fix.",
-                "evidence": evidence}
+        evidence["fail_open_recent"] = recent_fail_open
+        evidence["fail_open_recency_days"] = FAIL_OPEN_RECENCY_DAYS
+        evidence["latest_fail_open_ts"] = latest_fail_open_ts
+        if recent_fail_open is None:
+            # Legacy / self-test caller did not supply a recency split.
+            # Preserve original behavior: any fail_open → investigate.
+            return {"recommendation": "investigate",
+                    "reason": f"Gate fail_open count = {fail_open}. The gate "
+                              f"raised an exception at least once. Inspect the "
+                              f"`gate_error` field on those firings and fix.",
+                    "evidence": evidence}
+        if recent_fail_open > 0:
+            return {"recommendation": "investigate",
+                    "reason": f"Gate fail_open count = {fail_open} "
+                              f"({recent_fail_open} in the last "
+                              f"{FAIL_OPEN_RECENCY_DAYS}d; latest "
+                              f"{latest_fail_open_ts}). The gate raised an "
+                              f"exception recently. Inspect the `gate_error` "
+                              f"field on those firings and fix.",
+                    "evidence": evidence}
+        # recent_fail_open == 0: every fail_open is older than the recency
+        # window. Historical burst, not a current bug — do NOT early-return.
+        # Fall through to the normal asymmetry rules. The cumulative count
+        # is preserved in evidence["fail_open"] for the audit trail.
 
     # Total-volume insufficient_data check uses MIN_TOTAL_FIRINGS (the retire
     # rule's guard). This uses `total`, not `meaningful` — a gate with 100
@@ -263,17 +380,52 @@ def _score_gate(gate, counts, min_fires):
         override_rate = override / bo_total
         evidence["override_rate"] = round(override_rate, 3)
         if override_rate > TIGHTEN_THRESHOLD and bo_total >= MIN_RATE_SAMPLES:
-            return {"recommendation": "tighten",
-                    "reason": (
-                        f"Override rate {override_rate:.0%} of "
-                        f"({block} block + {override} override) = "
-                        f"{bo_total} firings (MIN_RATE_SAMPLES="
-                        f"{MIN_RATE_SAMPLES}) exceeds tighten threshold "
-                        f"{TIGHTEN_THRESHOLD:.0%}. Caller bypasses more often "
-                        f"than the gate blocks — trigger pattern is too "
-                        f"generous. Tighten or remove patterns that fire "
-                        f"on legitimate work."),
-                    "evidence": evidence}
+            # Recency-improvement suppression (9). The full-window
+            # override rate lags a fix by ~`--days`: a gate fixed inside the
+            # window keeps its pre-fix high-override firings, so the cumulative
+            # rate re-recommends tighten long after the fix landed. If the
+            # RECENT window (TIGHTEN_RECENCY_DAYS) holds enough samples AND
+            # shows the rate dropped to/below threshold, the over-firing was
+            # addressed — the cumulative rate is lag, not a current bug.
+            # Symmetric to the fail_open recency window above (rb-1531).
+            # Suppress ONLY on positive evidence of improvement: recent_counts
+            # is None (self-test/legacy) or recent samples insufficient →
+            # tighten preserved, so a low-volume steadily-over-firing gate
+            # stays flagged.
+            suppress_tighten = False
+            if recent_counts is not None:
+                r_block = recent_counts.get("block", 0)
+                r_override = recent_counts.get("override", 0)
+                r_bo = r_block + r_override
+                if r_bo >= MIN_RATE_SAMPLES:
+                    r_rate = r_override / r_bo
+                    evidence["override_rate_recent"] = round(r_rate, 3)
+                    evidence["bo_total_recent"] = r_bo
+                    evidence["tighten_recency_days"] = TIGHTEN_RECENCY_DAYS
+                    if r_rate <= TIGHTEN_THRESHOLD:
+                        suppress_tighten = True
+                        evidence["tighten_suppressed_reason"] = (
+                            f"Full-window override rate {override_rate:.0%} "
+                            f"exceeds threshold, but the recent "
+                            f"{TIGHTEN_RECENCY_DAYS}d window "
+                            f"({r_block} block + {r_override} override = "
+                            f"{r_bo}) shows {r_rate:.0%} <= "
+                            f"{TIGHTEN_THRESHOLD:.0%}. Over-firing has been "
+                            f"addressed; the cumulative rate is lag. "
+                            f"Suppressing tighten (g-115-1509).")
+            if not suppress_tighten:
+                return {"recommendation": "tighten",
+                        "reason": (
+                            f"Override rate {override_rate:.0%} of "
+                            f"({block} block + {override} override) = "
+                            f"{bo_total} firings (MIN_RATE_SAMPLES="
+                            f"{MIN_RATE_SAMPLES}) exceeds tighten threshold "
+                            f"{TIGHTEN_THRESHOLD:.0%}. Caller bypasses more often "
+                            f"than the gate blocks — trigger pattern is too "
+                            f"generous. Tighten or remove patterns that fire "
+                            f"on legitimate work."),
+                        "evidence": evidence}
+            # suppressed → fall through to widen / keep below
 
     # Widen path: gate almost never triggers, AND it's FN-dominant. Volume
     # guard is MIN_TOTAL_FIRINGS, enforced by the early return above —
@@ -283,15 +435,46 @@ def _score_gate(gate, counts, min_fires):
     if (noop_rate >= WIDEN_THRESHOLD
             and retirement_eligible
             and keyword_bias == "generous"):
-        return {"recommendation": "widen",
-                "reason": (
-                    f"Noop rate {noop_rate:.0%} ≥ widen threshold "
-                    f"{WIDEN_THRESHOLD:.0%} over {total} firings "
-                    f"(MIN_TOTAL_FIRINGS={MIN_TOTAL_FIRINGS}) and gate is "
-                    f"FN-dominant (keyword_bias=generous). Gate is missing "
-                    f"real cases — add trigger patterns. Compare to "
-                    f"gates.yaml fn_description for hints on what's escaping."),
-                "evidence": evidence}
+        # Recency-improvement suppression (0). The full-window noop
+        # rate lags a widen fix by ~`--days`: a gate widened inside the window
+        # keeps its pre-widen high-noop firings, so the cumulative rate
+        # re-recommends widen long after the patterns were added. If the RECENT
+        # window (WIDEN_RECENCY_DAYS) holds enough total firings AND shows the
+        # noop rate dropped below threshold, the gate now catches cases — the
+        # cumulative rate is lag, not a current FN gap. Mirror image of the
+        # tighten recency suppression above (rb-1931). Suppress ONLY on positive
+        # evidence the gate now fires: recent_counts_widen is None
+        # (self-test/legacy) or recent samples insufficient → widen preserved,
+        # so a low-volume steadily-under-firing gate stays flagged.
+        suppress_widen = False
+        if recent_counts_widen is not None:
+            r_total = sum(recent_counts_widen.values())
+            if r_total >= MIN_TOTAL_FIRINGS:
+                r_noop = recent_counts_widen.get("noop", 0)
+                r_noop_rate = r_noop / r_total
+                evidence["noop_rate_recent"] = round(r_noop_rate, 3)
+                evidence["total_recent"] = r_total
+                evidence["widen_recency_days"] = WIDEN_RECENCY_DAYS
+                if r_noop_rate < WIDEN_THRESHOLD:
+                    suppress_widen = True
+                    evidence["widen_suppressed_reason"] = (
+                        f"Full-window noop rate {noop_rate:.0%} meets the widen "
+                        f"threshold, but the recent {WIDEN_RECENCY_DAYS}d window "
+                        f"({r_noop} noop / {r_total} total) shows "
+                        f"{r_noop_rate:.0%} < {WIDEN_THRESHOLD:.0%}. The gate now "
+                        f"catches cases; the cumulative rate is lag. "
+                        f"Suppressing widen (g-115-1510).")
+        if not suppress_widen:
+            return {"recommendation": "widen",
+                    "reason": (
+                        f"Noop rate {noop_rate:.0%} ≥ widen threshold "
+                        f"{WIDEN_THRESHOLD:.0%} over {total} firings "
+                        f"(MIN_TOTAL_FIRINGS={MIN_TOTAL_FIRINGS}) and gate is "
+                        f"FN-dominant (keyword_bias=generous). Gate is missing "
+                        f"real cases — add trigger patterns. Compare to "
+                        f"gates.yaml fn_description for hints on what's escaping."),
+                    "evidence": evidence}
+        # suppressed → fall through to keep below
 
     return {"recommendation": "keep",
             "reason": "Gate behaving within expected envelope — neither "
@@ -398,6 +581,37 @@ def _self_test():
           "keyword_bias": "strict"},
          Counter({"noop": 6, "block": 1, "override": 3}),
          "keep"),
+        # ── Tighten recency-improvement suppression (9) ──────────
+        # Full-window override rate is high enough to tighten, but the RECENT
+        # window (recent_counts, position 5) shows the rate dropped below
+        # threshold with enough samples → the over-firing was fixed, the
+        # cumulative rate is lag → suppress tighten, fall through to keep.
+        # Mirrors the real origin-signal-gate case: full window 50%+, recent 7d
+        # 30.6% (11 override / 36) after 9 widened the whitelist.
+        ("tighten-suppressed-by-recent-improvement",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "strict"},
+         Counter({"block": 30, "override": 40, "noop": 1}),   # full 40/70 = 57%
+         "keep",
+         None,                                                 # recent_fail_open
+         Counter({"block": 25, "override": 11})),              # recent 11/36 = 31% <= 50%
+        # Insufficient recent samples → NO suppression: a low-volume steadily-
+        # over-firing gate must stay flagged. recent bo=3 < MIN_RATE_SAMPLES(5).
+        ("tighten-preserved-insufficient-recent-samples",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "strict"},
+         Counter({"block": 30, "override": 40, "noop": 1}),   # full 57%
+         "tighten",
+         None,
+         Counter({"block": 2, "override": 1})),                # recent bo=3 < 5
+        # Recent rate ALSO high → genuine current over-firing → tighten stands.
+        ("tighten-recent-also-high-still-tightens",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "strict"},
+         Counter({"block": 30, "override": 40, "noop": 1}),   # full 57%
+         "tighten",
+         None,
+         Counter({"block": 5, "override": 12})),               # recent 12/17 = 71% > 50%
         ("widen-high-noop-rate-fn-dominant",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "generous"},
@@ -408,11 +622,68 @@ def _self_test():
           "keyword_bias": "balanced"},
          Counter({"noop": 62, "block": 3}),
          "keep"),
+        # ── Widen recency-improvement suppression (0) ─────────────
+        # Full-window noop rate is high enough to widen, but the RECENT window
+        # (recent_counts_widen, position 6) shows the noop rate dropped below
+        # threshold with enough total firings → the gate now catches cases, the
+        # cumulative rate is lag → suppress widen, fall through to keep. Mirror
+        # image of tighten-suppressed-by-recent-improvement. Positions [4]/[5]
+        # are None so the recent_counts_widen lands at [6].
+        ("widen-suppressed-by-recent-improvement",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "generous"},
+         Counter({"noop": 60, "block": 3}),                  # full 60/63 = 95.2%
+         "keep",
+         None,                                                # recent_fail_open
+         None,                                                # recent_counts (tighten)
+         Counter({"noop": 5, "block": 5})),                   # recent 5/10 = 50% < 95%
+        # Insufficient recent samples → NO suppression: a low-volume steadily-
+        # under-firing gate must stay flagged. recent total=3 < MIN_TOTAL_FIRINGS(5).
+        ("widen-preserved-insufficient-recent-samples",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "generous"},
+         Counter({"noop": 60, "block": 3}),                  # full 95.2%
+         "widen",
+         None,
+         None,
+         Counter({"noop": 2, "block": 1})),                   # recent total=3 < 5
+        # Recent noop rate ALSO high → genuine current under-firing → widen
+        # stands. recent 19/20 = 95% is NOT < 95% (boundary: suppression needs
+        # strictly below threshold), so widen is preserved.
+        ("widen-recent-also-high-still-widens",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "generous"},
+         Counter({"noop": 60, "block": 3}),                  # full 95.2%
+         "widen",
+         None,
+         None,
+         Counter({"noop": 19, "block": 1})),                  # recent 19/20 = 95% (not < 95%)
         ("investigate-on-fail-open",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "balanced"},
          Counter({"block": 1, "fail_open": 1}),
          "investigate"),
+        # Recency-windowed fail_open (rb-1531 / 8). 5-tuple: the
+        # trailing int is recent_fail_open (count within FAIL_OPEN_RECENCY_DAYS).
+        # recent>0 → live bug → investigate (same verdict as the legacy case
+        # above, but now driven by the recency split, not the cumulative count).
+        ("investigate-on-recent-fail-open",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "balanced"},
+         Counter({"block": 1, "fail_open": 1}),
+         "investigate", 1),
+        # recent==0 → every fail_open is HISTORICAL (older than the window).
+        # The cumulative fail_open count is non-zero, but the gate has not
+        # raised an exception lately — fall through to the normal asymmetry
+        # rules instead of re-flagging. This is the exact 8 fix: a
+        # gate carrying a long-resolved May fail_open burst must NOT investigate
+        # forever. Counts mirror keep-balanced-firings + 5 historical fail_opens,
+        # so the expected verdict is the same "keep".
+        ("keep-historical-fail-open-only",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "balanced"},
+         Counter({"noop": 22, "block": 23, "override": 1, "fail_open": 5}),
+         "keep", 0),
         ("keep-balanced-firings",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "balanced"},
@@ -430,8 +701,26 @@ def _self_test():
          "uninstrumented"),
     ]
     failures = 0
-    for label, gate, counts, expected in cases:
-        result = _score_gate(gate, counts, min_fires)
+    for case in cases:
+        # Cases are positional tuples:
+        #   [0] label  [1] gate  [2] counts  [3] expected
+        #   [4] recent_fail_open (optional; None default — exercises the legacy
+        #       "any fail_open → investigate" branch, preserving the original
+        #       self-test contract)
+        #   [5] recent_counts (optional Counter; None default — exercises the
+        #       legacy "tighten fires on the full-window rate alone" branch,
+        #       9)
+        #   [6] recent_counts_widen (optional Counter; None default — exercises
+        #       the legacy "widen fires on the full-window noop rate alone"
+        #       branch, 0)
+        label, gate, counts, expected = case[0], case[1], case[2], case[3]
+        recent = case[4] if len(case) > 4 else None
+        recent_counts = case[5] if len(case) > 5 else None
+        recent_counts_widen = case[6] if len(case) > 6 else None
+        result = _score_gate(gate, counts, min_fires,
+                             recent_fail_open=recent,
+                             recent_counts=recent_counts,
+                             recent_counts_widen=recent_counts_widen)
         actual = result["recommendation"]
         ok = actual == expected
         if not ok:
@@ -479,7 +768,29 @@ def main(argv=None):
             return 2
 
     since = datetime.now() - timedelta(days=args.days)
+    # Recency window for the fail_open trigger (rb-1531). A fail_open whose
+    # ts is older than this is HISTORICAL (a long-resolved exception burst),
+    # not a current bug — the investigate trigger windows on it so the eval
+    # stops re-flagging the same May burst every run (8).
+    recency_cutoff = datetime.now() - timedelta(days=FAIL_OPEN_RECENCY_DAYS)
+    # Recency window for the tighten trigger (9). block/override
+    # firings older than this are HISTORICAL for the override-rate signal — a
+    # gate fixed inside the --days window keeps its pre-fix high-override
+    # firings, so the cumulative rate re-recommends tighten for ~--days after
+    # the fix landed. recent_counts_per_gate measures the CURRENT rate (rb-1531).
+    tighten_recency_cutoff = datetime.now() - timedelta(days=TIGHTEN_RECENCY_DAYS)
+    # Recency window for the widen trigger (0). noop/total firings
+    # older than this are HISTORICAL for the under-firing signal — a gate
+    # widened inside the --days window keeps its pre-widen high-noop firings,
+    # so the cumulative noop rate re-recommends widen for ~--days after the
+    # patterns were added. recent_counts_widen_per_gate measures the CURRENT
+    # noop rate (rb-1931), the mirror of the tighten window above.
+    widen_recency_cutoff = datetime.now() - timedelta(days=WIDEN_RECENCY_DAYS)
     counts_per_gate = {}
+    recent_fail_open_per_gate = {}      # fail_opens within FAIL_OPEN_RECENCY_DAYS
+    latest_fail_open_ts_per_gate = {}   # ISO ts of the most recent fail_open
+    recent_counts_per_gate = {}         # block/override within TIGHTEN_RECENCY_DAYS
+    recent_counts_widen_per_gate = {}   # ALL decisions within WIDEN_RECENCY_DAYS
     for rec in _load_firings(since):
         gid = rec.get("gate_id")
         if not gid:
@@ -489,13 +800,45 @@ def main(argv=None):
         # decision is guaranteed present and valid by _load_firings (see
         # _VALID_DECISIONS gate there). Any drift surfaces as a WARN skip,
         # not a silent "noop" miscount.
-        counts_per_gate.setdefault(gid, Counter())[rec["decision"]] += 1
+        dec = rec["decision"]
+        counts_per_gate.setdefault(gid, Counter())[dec] += 1
+        # ts is guaranteed parseable by _load_firings (it strptime'd the same
+        # value before yielding). ISO 'YYYY-MM-DDTHH:MM:SS' sorts lexically,
+        # so a string max IS the latest fail_open.
+        ts_raw = rec["ts"]
+        ts = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%S")
+        # Tighten recency bucketing (9): count block/override within
+        # the tighten recency window. Only those two decisions feed the
+        # override-rate suppression; noop/pass/fail_open are irrelevant to it.
+        if ts >= tighten_recency_cutoff and dec in ("block", "override"):
+            recent_counts_per_gate.setdefault(gid, Counter())[dec] += 1
+        # Widen recency bucketing (0): count ALL decisions within the
+        # widen recency window. The widen noop-rate suppression needs recent
+        # noop AND recent total, so unlike the tighten bucket (block/override
+        # only) this captures every decision.
+        if ts >= widen_recency_cutoff:
+            recent_counts_widen_per_gate.setdefault(gid, Counter())[dec] += 1
+        if dec == "fail_open":
+            prev = latest_fail_open_ts_per_gate.get(gid)
+            if prev is None or ts_raw > prev:
+                latest_fail_open_ts_per_gate[gid] = ts_raw
+            if ts >= recency_cutoff:
+                recent_fail_open_per_gate[gid] = \
+                    recent_fail_open_per_gate.get(gid, 0) + 1
 
     rows = []
     for gate in gates:
         gid = gate["id"]
         counts = counts_per_gate.get(gid, Counter())
-        scored = _score_gate(gate, counts, args.min_fires)
+        # Production path always passes an int (0 when no recent fail_opens),
+        # never None — so it never hits _score_gate's legacy None branch.
+        # Only the self-test exercises the None default.
+        scored = _score_gate(
+            gate, counts, args.min_fires,
+            recent_fail_open=recent_fail_open_per_gate.get(gid, 0),
+            latest_fail_open_ts=latest_fail_open_ts_per_gate.get(gid),
+            recent_counts=recent_counts_per_gate.get(gid, Counter()),
+            recent_counts_widen=recent_counts_widen_per_gate.get(gid, Counter()))
         scored["gate_id"] = gid
         rows.append(scored)
 

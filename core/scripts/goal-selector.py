@@ -70,12 +70,13 @@ import yaml  # Required — tree.py already depends on PyYAML
 
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT, agents_root as _agents_root
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
-from wm import read_wm, WM_PATH as WORKING_MEMORY_PATH  # noqa: E402
+from wm import read_wm  # noqa: E402
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
 from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
+from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
@@ -307,6 +308,56 @@ def load_recurring_config():
 RECURRING_CONFIG = load_recurring_config()
 
 
+def load_iaus_config():
+    """Load the utility-scorer flag + params from core/config/aspirations.yaml.
+
+    g-306-32 (BRD Gap 8): the utility scorer is a second, flag-gated code path in
+    score_goal(); the additive scorer stays the default. Routes through
+    _config_overlay.merged_config so meta/config-overrides.yaml entries keyed
+    `aspirations.iaus_selector.*` take effect. Default use_iaus=False keeps the
+    additive scorer the live default (R1 hot-path mitigation) — zero behavior
+    change until the sibling A/B (g-306-33) shows parity-or-improvement.
+    urgency_max mirrors RECURRING_CONFIG so recurring_urgency scales to [0,1]
+    against the same ceiling the additive path caps it at.
+    """
+    defaults = {
+        "use_iaus": False,
+        "primary_floor": 0.1,
+        "watermark": 0.0,
+        "bonus_scale": 4.0,
+        "urgency_max": float(RECURRING_CONFIG.get("urgency_max", 4.0)),
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        ic = asp_config.get("iaus_selector", {})
+        if isinstance(ic, dict):
+            for k, default in defaults.items():
+                v = ic.get(k)
+                if v is None:
+                    continue
+                if isinstance(default, bool):
+                    # YAML parses `false` as bool already; the string branch
+                    # defends config-overrides that store the flag as text.
+                    defaults[k] = (
+                        v.strip().lower() in ("true", "1", "yes", "on")
+                        if isinstance(v, str) else bool(v)
+                    )
+                else:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+IAUS_CONFIG = load_iaus_config()
+
+
 def load_per_goal_saturation_config():
     """Load per-goal rapid-repeat suppression config from aspirations.yaml.
 
@@ -339,6 +390,45 @@ def load_per_goal_saturation_config():
 
 
 PER_GOAL_SATURATION_CONFIG = load_per_goal_saturation_config()
+
+
+def load_cell_return_config():
+    """Load the Go-Explore cell-return boost params from core/config/aspirations.yaml.
+
+    BRD Gap 17 child C (g-306-49). Flag-gated, boost-only selection adjustment that
+    mirrors the g-306-44 retrieve.py PPR blend. DEFAULT OFF: when ``enabled`` is
+    false, apply_cell_return_boost() is a byte-identical no-op (no-regression by
+    construction). When on, seeds PPR from the top-N highest-value archived cells and
+    adds a bounded graph-proximity bonus to each candidate (reusing the g-306-47 store
+    + g-306-48 matcher). Same overlay/type-coerce shape as the sibling config loaders.
+    """
+    defaults = {
+        "enabled": False,
+        "seed_top_n": 5,
+        "bonus_scale": 3.0,
+        "bonus_max": 1.5,
+        "enrich_signature": False,
+    }
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        cr = asp_config.get("cell_return", {})
+        if isinstance(cr, dict):
+            for k, default in defaults.items():
+                v = cr.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+CELL_RETURN_CONFIG = load_cell_return_config()
 
 
 def load_user_signal_boost_config():
@@ -545,6 +635,66 @@ def load_handoff_config():
 
 
 HANDOFF_CONFIG = load_handoff_config()
+
+
+def load_critical_blocker_surface_config():
+    """Load critical-blocker-surface scoring params from core/config/aspirations.yaml.
+
+    g-305-07 (bravo US-07): surface long-blocked-but-EXECUTABLE bottleneck goals
+    recorded in world/team-state.yaml critical_blockers[] (written by
+    aspirations-consolidate Step 8.87, purged by team-state-sync-blockers.py once
+    resolved) so a high-downstream-unlock goal doesn't get out-ranked
+    indefinitely -- "break one, unlock five."
+
+    enabled:        master switch (default False -- opt-in, like co_invest).
+    min_downstream: ignore entries below this downstream_count (noise floor).
+    downstream_cap: normalize the boost -- downstream_count >= cap scores 1.0.
+    """
+    defaults = {"enabled": False, "min_downstream": 3, "downstream_cap": 10}
+    try:
+        with open(CONFIG_DIR / "aspirations.yaml", encoding="utf-8") as f:
+            asp_config = yaml.safe_load(f)
+        block = asp_config.get("critical_blocker_surface", {}) or {}
+        if "enabled" in block:
+            defaults["enabled"] = bool(block["enabled"])
+        if "min_downstream" in block:
+            defaults["min_downstream"] = int(block["min_downstream"])
+        if "downstream_cap" in block:
+            defaults["downstream_cap"] = int(block["downstream_cap"])
+    except Exception:
+        pass
+    return defaults
+
+
+def compute_critical_blocker_surface(goal_id, critical_blockers, min_downstream, downstream_cap):
+    """Pure boost computation for the critical_blocker_surface criterion ().
+
+    Returns min(downstream_count, cap) / cap in [0, 1] when goal_id matches a
+    team-state.critical_blockers[] entry whose downstream_count >= min_downstream;
+    0.0 otherwise. Fully fail-open: bad/missing inputs -> 0.0, never raises.
+    Extracted (mirrors compute_role_affinity) so the decision rule is unit-
+    testable without subprocess or file I/O. critical_blockers entries are
+    unique by goal_id (top-3 bottlenecks), so the first id match is terminal.
+    """
+    if not goal_id or not isinstance(critical_blockers, list):
+        return 0.0
+    try:
+        cap = float(downstream_cap)
+    except (TypeError, ValueError):
+        return 0.0
+    if cap <= 0:
+        return 0.0
+    for cb in critical_blockers:
+        if not isinstance(cb, dict) or cb.get("goal_id") != goal_id:
+            continue
+        ds = cb.get("downstream_count")
+        if isinstance(ds, (int, float)) and not isinstance(ds, bool) and ds >= min_downstream:
+            return min(float(ds), cap) / cap
+        return 0.0  # matched the goal but ds missing/below-floor/non-numeric
+    return 0.0  # no matching entry
+
+
+CRITICAL_BLOCKER_SURFACE_CONFIG = load_critical_blocker_surface_config()
 
 
 # Sentinel for the team-state read cache. None = not yet read this run.
@@ -895,7 +1045,8 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                        reallocation_hours=None,
                        abstention_timeout_hours=None,
                        defer_reason_timeout_hours=None,
-                       dependency_timeout_hours=None):
+                       dependency_timeout_hours=None,
+                       global_live_ids=None):
     """Return unblocked pending goals from active aspirations (Phase 2 FILTER + COLLECT).
 
     Args:
@@ -905,6 +1056,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         global_done_ids: set of completed/decomposed goal IDs across ALL aspirations
             (both world and agent). Enables cross-aspiration blocked_by enforcement.
             If None, falls back to per-aspiration done_ids (legacy behavior).
+        global_live_ids: set of goal IDs whose status is non-terminal (still able to
+            complete) across ALL aspirations. Used to re-validate dependency liveness
+            before honoring the dependency_timeout fail-open (g-115-1344) — a still-live
+            unmet dep keeps the goal blocked regardless of blocked_since age.
+            If None, falls back to per-aspiration live_ids (legacy behavior).
         claim_timeout_hours: hours after which a stale claim is treated as expired.
             If None, claims persist indefinitely (legacy behavior).
         reallocation_hours: hours after which an unclaimed goal with reallocatable=true
@@ -943,6 +1099,16 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         else:
             done_ids = {g["id"] for g in asp.get("goals", [])
                         if g.get("status") in ("completed", "decomposed")}
+
+        # live_ids: goal IDs that could still complete (non-terminal status).
+        # Re-validates dependency liveness before honoring the dependency_timeout
+        # fail-open (4). Mirrors done_ids: global set when supplied,
+        # else per-aspiration scope.
+        if global_live_ids is not None:
+            live_ids = global_live_ids
+        else:
+            live_ids = {g["id"] for g in asp.get("goals", [])
+                        if g.get("status") not in TERMINAL_GOAL_STATUSES}
 
         # verification.preconditions come in two forms:
         #   - strings → LLM-evaluated in aspirations-select Phase 2.2
@@ -986,15 +1152,22 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     else:
                         continue  # No expiry configured — legacy behavior
 
-            # blocked_by check (dependency timeout: expired blocks fall through)
+            # blocked_by check (dependency timeout — fail-CLOSED hardening, 4).
+            # Keep the goal blocked UNLESS the block is genuinely stale: blocked_since
+            # is set AND aged past the timeout AND every unmet dep is terminal-
+            # unresolvable (abandoned status or orphan ref — none still live).
+            #   (a) null/unparseable blocked_since => recently-blocked, not expired.
+            #   (b) a still-LIVE unmet dep => could still complete; keep blocked
+            #       regardless of age (re-validate completion before honoring timeout).
             unmet_deps = [b for b in _ensure_list(goal.get("blocked_by"))
                           if b not in done_ids]
             if unmet_deps:
                 if dependency_timeout_hours is not None:
                     dep_age = hours_since(goal.get("blocked_since"))
-                    if dep_age is not None and dep_age <= dependency_timeout_hours:
-                        continue  # Valid dependency block — skip
-                    # else: expired or no blocked_since — fall through (fail-open)
+                    live_unmet = [b for b in unmet_deps if b in live_ids]
+                    if dep_age is None or dep_age <= dependency_timeout_hours or live_unmet:
+                        continue  # Recent/valid block, or a live dep remains — skip
+                    # else: stale (aged) AND all unmet deps dead/orphan — fall through (fail-open)
                 else:
                     continue  # No expiry configured — legacy behavior
 
@@ -1143,7 +1316,8 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
                                    reallocation_hours=None,
                                    abstention_timeout_hours=None,
                                    defer_reason_timeout_hours=None,
-                                   dependency_timeout_hours=None):
+                                   dependency_timeout_hours=None,
+                                   global_live_ids=None):
     """Pull pending goals from sibling agent queues where intended_agent == agent_name.
 
     Closes the cross-agent stranding gap (g-115-946): the capability-route gate
@@ -1205,7 +1379,8 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
             reallocation_hours=reallocation_hours,
             abstention_timeout_hours=abstention_timeout_hours,
             defer_reason_timeout_hours=defer_reason_timeout_hours,
-            dependency_timeout_hours=dependency_timeout_hours)
+            dependency_timeout_hours=dependency_timeout_hours,
+            global_live_ids=global_live_ids)
         for c in sib_candidates:
             if c.get("goal", {}).get("intended_agent") == agent_name:
                 results.append(c)
@@ -1218,7 +1393,8 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
 
 def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     defer_reason_timeout_hours=None,
-                    dependency_timeout_hours=None):
+                    dependency_timeout_hours=None,
+                    global_live_ids=None):
     """Return blocked goals with reasons (inverse of collect_candidates).
 
     Checks blocking conditions in priority order (first match = primary reason):
@@ -1258,6 +1434,15 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
         else:
             done_ids = {g["id"] for g in asp.get("goals", [])
                         if g.get("status") in ("completed", "decomposed")}
+
+        # live_ids: mirror of collect_candidates — goal IDs still able to complete
+        # (non-terminal status). Re-validates dependency liveness so the timeout
+        # fail-open stays the logical complement across both functions (4).
+        if global_live_ids is not None:
+            live_ids = global_live_ids
+        else:
+            live_ids = {g["id"] for g in asp.get("goals", [])
+                        if g.get("status") not in TERMINAL_GOAL_STATUSES}
 
         for goal in asp.get("goals", []):
             status = goal.get("status", "")
@@ -1336,14 +1521,19 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
 
             # 3. Dependency (blocked_by with unmet prerequisites, timeout-aware).
             # SYMMETRY: must be the logical complement of the blocked_by check in
-            # collect_candidates. If you change one, change the other.
+            # collect_candidates. If you change one, change the other. (4
+            # fail-CLOSED hardening — same two branches: (a) null blocked_since and
+            # (b) live unmet dep both KEEP the goal blocked; fail-open only when the
+            # block is stale AND every unmet dep is dead/orphan.)
             unmet = [bid for bid in _ensure_list(goal.get("blocked_by")) if bid not in done_ids]
             if unmet:
                 if dependency_timeout_hours is not None:
                     dep_age = hours_since(goal.get("blocked_since"))
-                    if dep_age is None or dep_age > dependency_timeout_hours:
-                        pass  # Expired — not blocked (fail-open)
+                    live_unmet = [bid for bid in unmet if bid in live_ids]
+                    if dep_age is not None and dep_age > dependency_timeout_hours and not live_unmet:
+                        pass  # Genuinely stale (aged AND all unmet deps dead/orphan) — fail-open
                     else:
+                        # null blocked_since (fail-closed), within timeout, or a live dep remains
                         entry["block_reason"] = "dependency"
                         entry["block_detail"] = "Waiting on: {deps}".format(deps=", ".join(unmet))
                         entry["unmet_deps"] = unmet
@@ -1689,13 +1879,20 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     raw["priority"] = PRIORITY_MAP.get(
         goal.get("priority", asp.get("priority", "MEDIUM")), 2)
 
-    # 2. deadline_urgency (+3 ≤1d, +2 ≤3d, +1 ≤7d)
-    deadline = goal.get("resolves_by") or goal.get("deadline")
+    # 2. deadline_urgency (+3 <=1d, +2 <=3d, +1 <=7d; long-horizon ramp +0.5 <=30d, +0.25 <=90d)
+    # Inheritance (): a goal with no own deadline inherits its aspiration's
+    # `deadline`, so a fixed external deadline (e.g. the ARC clock, 2026-11-02) creates
+    # prioritization pull on every goal under that aspiration -- not only goals that
+    # individually carry resolves_by. The long-horizon ramp (0.5 at <=30d, 0.25 at <=90d)
+    # gives months-out pull without overriding near-term urgency or priority weight.
+    deadline = goal.get("resolves_by") or goal.get("deadline") or asp.get("deadline")
     remaining = days_until(deadline)
     raw["deadline_urgency"] = (
         3 if remaining is not None and remaining <= 1 else
         2 if remaining is not None and remaining <= 3 else
-        1 if remaining is not None and remaining <= 7 else 0)
+        1 if remaining is not None and remaining <= 7 else
+        0.5 if remaining is not None and remaining <= 30 else
+        0.25 if remaining is not None and remaining <= 90 else 0)
 
     # 3. agent_executable (+2 if current agent is eligible)
     participants = _ensure_list(goal.get("participants"), ["agent"])
@@ -1727,7 +1924,24 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
         la = hours_since(goal.get("lastAchievedAt"))
-        if la is None or (la >= interval and interval > 0):
+        # NEVER-FIRED FALLBACK (): a recurring goal with no lastAchievedAt
+        # has never fired. Deriving overdue_ratio from lastAchievedAt alone pins
+        # such a goal at urgency_base forever — a 41-day-old 24h-interval goal
+        # (the tree-decompose-drain  case: 0 fires since 2026-05-12)
+        # scored identically to one that fired moments ago, so the class-level
+        # recurring_saturation penalty (7b below) buried it under pickable rank
+        # indefinitely and its function silently never ran. The "truly overdue
+        # recurring goals overcome saturation via high recurring_urgency" design
+        # is defeated for never-fired goals because they cannot accrue urgency
+        # off a null baseline. Treat "never fired" as "overdue since
+        # created_at + interval" so the most-neglected recurring goal earns the
+        # urgency the escalator intends. Mirrors the created-age precedent at the
+        # reallocation filter (hours_since(goal.get("created")…)). created_at is
+        # the live field name (goal-schemas.md); `created` is the legacy alias.
+        never_fired = la is None
+        if never_fired:
+            la = hours_since(goal.get("created_at") or goal.get("created"))
+        if never_fired or (la is not None and la >= interval and interval > 0):
             if la is not None and interval > 0:
                 overdue_ratio = max((la - interval) / interval, 0.0)
             rec = RECURRING_CONFIG["urgency_base"] + math.log2(1 + overdue_ratio) * RECURRING_CONFIG["urgency_log_scale"]
@@ -2026,13 +2240,50 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
                 raw["co_invest_alignment"] = 1.0
                 break
 
+    # 13e. critical_blocker_surface (): boost candidates that ARE a
+    # high-downstream-unlock bottleneck recorded in team-state.critical_blockers[]
+    # (written by aspirations-consolidate Step 8.87, purged by
+    # team-state-sync-blockers when resolved). Those entries are typically
+    # "ready-unclaimed" EXECUTABLE goals that other work out-ranks; surfacing
+    # THIS candidate when its id matches lets break-one-unlock-five fire instead
+    # of the bottleneck coasting. Boost is proportional to downstream_count
+    # normalized by downstream_cap (>= cap -> 1.0). DESIGN NOTE (logged for
+    # bravo, the US-07 author): the read-only selector has no monotonic
+    # iteration counter for a literal "every 25 iterations" cadence, and
+    # critical_blockers[].updated_at tracks the consolidation WRITE, not the
+    # block's age -- so the US-07 every-N-iterations cadence is implemented as a
+    # PERSISTENT bounded boost that self-clears the moment team-state-sync-
+    # blockers purges the resolved entry. Simpler, same intent (the bottleneck
+    # surfaces until it resolves), one fewer piece of mutable state. Reads
+    # cached team-state; missing/empty/non-list/malformed -> 0.0 (fail-open,
+    # never blocks selection).
+    raw["critical_blocker_surface"] = 0.0
+    cbs_cfg = CRITICAL_BLOCKER_SURFACE_CONFIG
+    if cbs_cfg.get("enabled"):
+        raw["critical_blocker_surface"] = compute_critical_blocker_surface(
+            goal.get("id"),
+            _load_team_state_cached().get("critical_blockers"),
+            cbs_cfg["min_downstream"],
+            cbs_cfg["downstream_cap"],
+        )
+
     # 14. exploration_noise (random value scaled by developmental epsilon)
     raw["exploration_noise"] = random.random()
 
-    # Weighted total — static criteria + dynamic exploration noise
-    total = sum(raw[k] * WEIGHTS[k] for k in WEIGHTS)
+    # Weighted total — static criteria + dynamic exploration noise.
+    #  (BRD Gap 8): utility-shaped scoring is a flag-gated SECOND path
+    # (iaus_selector.use_iaus, default False). The additive sum stays the live
+    # default; veto-by-zero is the utility path's primary behavioral win. The
+    # exploration_noise term is added additively in BOTH paths so epsilon-greedy
+    # exploration is unchanged (design section 2c). Reversible by a single flag
+    # flip — no data migration, no schema change. A/B is the sibling .
     noise_weight = epsilon * noise_scale
-    total += raw["exploration_noise"] * noise_weight
+    if IAUS_CONFIG["use_iaus"]:
+        total = iaus_score(raw, WEIGHTS, IAUS_CONFIG)["score"]
+        total += raw["exploration_noise"] * noise_weight
+    else:
+        total = sum(raw[k] * WEIGHTS[k] for k in WEIGHTS)
+        total += raw["exploration_noise"] * noise_weight
 
     return {
         "goal_id": goal.get("id"),
@@ -2041,6 +2292,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "title": goal.get("title", ""),
         "skill": goal.get("skill"),
         "category": category,
+        "tags": _ensure_list(goal.get("tags")),
         "recurring": bool(goal.get("recurring")),
         "recurring_overdue_ratio": round(overdue_ratio, 3),
         "score": round(total, 2),
@@ -2055,6 +2307,153 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
             "noise_weight": round(noise_weight, 2),
         },
     }
+
+
+_CELL_SIM_MODULE_CACHE = None
+
+
+def _load_cell_sim_module():
+    """importlib-load the hyphen-named cell-similarity.py once per process.
+
+    Returns the module, or None if it cannot be loaded (fail-open: a missing or broken
+    matcher just removes the cell-return boost, it never breaks selection). The False
+    sentinel records a prior failed attempt so we do not re-pay the import cost on every
+    call when the module is genuinely absent. Mirrors retrieve.py::_load_ppr_module
+    (g-306-44). The matcher in turn loads the cell store (via its own _cells_module) and
+    the KG+PPR substrate, so this one loader reaches the whole g-306-42/43/47/48 stack.
+    """
+    global _CELL_SIM_MODULE_CACHE
+    if _CELL_SIM_MODULE_CACHE is not None:
+        return _CELL_SIM_MODULE_CACHE or None
+    try:
+        import importlib.util
+        sim_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "cell-similarity.py")
+        spec = importlib.util.spec_from_file_location("cell_similarity", sim_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _CELL_SIM_MODULE_CACHE = mod
+        return mod
+    except Exception:
+        _CELL_SIM_MODULE_CACHE = False  # tried + failed; do not retry this process
+        return None
+
+
+def _cell_score_of(rec):
+    """Best-trajectory score of a cell record, float-safe (-> 0.0 on any bad value)."""
+    try:
+        return float(rec.get("score") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _high_value_cell_seeds(sim, seed_top_n, *, cells_dir=None, agent=None):
+    """Record-id entities of the top-N highest-value archived Go-Explore cells.
+
+    These are the cells worth RETURNING to (Go-Explore return policy). Loads every
+    category from the cell archive (through the matcher's own _cells_module loader so
+    store access stays single-sourced), ranks records by descending score (tie-break by
+    state_signature for determinism), takes the top seed_top_n, and unions their
+    signature entities into the PPR seed set. Returns a SORTED unique list (sorted for
+    determinism). Fail-open to [] when the archive is empty/unavailable (-> no boost,
+    selection unchanged). cells_dir/agent default to None (the live per-agent archive);
+    tests inject a tmp dir for hermetic, daemon-free runs.
+    """
+    cells = sim._cells_module()
+    if cells is None:
+        return []
+    records = []
+    try:
+        for cat in cells.list_categories(agent=agent, cells_dir=cells_dir):
+            for rec in cells.load_category(cat, agent=agent, cells_dir=cells_dir).values():
+                records.append(rec)
+    except Exception:
+        return []
+    if not records:
+        return []
+    records.sort(key=lambda r: (-_cell_score_of(r), str(r.get("state_signature", ""))))
+    seeds = []
+    for rec in records[:max(1, int(seed_top_n))]:
+        seeds.extend(sim.signature_entities(rec.get("state_signature")))
+    return sorted(dict.fromkeys(seeds))
+
+
+def apply_cell_return_boost(scored, config, *, cells_dir=None, agent=None, graph_path=None):
+    """Go-Explore cell-return boost: promote candidates near the highest-value cells.
+
+    BRD Gap 17 child C (g-306-49). Flag-gated + boost-only, mirroring the g-306-44
+    retrieve.py PPR blend:
+      * config["enabled"] false -> EARLY RETURN, ``scored`` untouched. Selection is
+        byte-identical to pre-g-306-49 by construction (the no-regression criterion).
+      * enabled true -> seed Personalized PageRank from the top-N highest-value archived
+        cells (the cells worth RETURNING to), then for each candidate add a bounded
+        bonus = min(bonus_max, summed-PPR-mass * bonus_scale) over the candidate's
+        record-id entities (HippoRAG passage score, 2405.14831). The bonus is always
+        >= 0 (a sum of non-negative PPR masses) so the blend can only PROMOTE, never
+        demote -- the same no-regression-by-construction property the PPR weight relies
+        on.
+
+    Deterministic: the matcher's score is a pure function of (candidate, archive,
+    graph). Fail-open at every layer (missing matcher / empty archive / no graph signal
+    -> no boost). Mutates and returns ``scored`` in place; records the bonus in each
+    boosted candidate's breakdown + raw for telemetry. Same in-place + no-op-when-
+    disabled contract as apply_substantive_demotion; candidate signature is read from
+    the scored entry (goal_id + title + category), so it needs no extra inputs.
+    cells_dir/agent/graph_path default to None (the live archive + default knowledge
+    graph); tests inject tmp paths for hermetic, daemon-free runs.
+    """
+    if not config.get("enabled"):
+        return scored
+    sim = _load_cell_sim_module()
+    if sim is None:
+        return scored
+    seeds = _high_value_cell_seeds(sim, config.get("seed_top_n", 5),
+                                   cells_dir=cells_dir, agent=agent)
+    if not seeds:
+        return scored
+    ppr_scores, _personalized = sim._ppr_scores_for(seeds, graph_path)
+    if not ppr_scores:
+        return scored
+    bonus_scale = float(config.get("bonus_scale", 3.0))
+    bonus_max = float(config.get("bonus_max", 1.5))
+    enrich = bool(config.get("enrich_signature"))
+    for s in scored:
+        # Candidate signature: the goal's own id + title + category. The id is always a
+        # record entity; titles routinely reference g-/rb-/guard- ids. score_cell sums
+        # PPR mass over those entities -- the candidate's graph proximity to high-value
+        # cells (the deterministic "matching" that drives the return).
+        cand_sig = "{} {} {}".format(
+            s.get("goal_id", ""), s.get("title", ""), s.get("category", ""))
+        if enrich:
+            # : the _extract_refs regex (knowledge-graph-build) only emits
+            # rb-/guard-/g- record ids, so a bare category/tag never becomes an
+            # entity -- a candidate's reliable graph footprint is just its leaf
+            # goal-id, which is often absent from the periodically-rebuilt graph.
+            # Inject the cat:/tag: pseudo-node entities DIRECTLY (the graph already
+            # carries has_category/has_tag edges to them), so PPR mass from a
+            # same-category high-value cell lands on cat:<category> and boosts
+            # same-category candidates. Default-off until an A/B proves the
+            # enriched signal helps (cell-return-ab-harness --enrich-signature).
+            ents = list(sim.signature_entities(cand_sig))
+            cat = s.get("category")
+            if cat:
+                ents.append("cat:" + str(cat))
+            for t in (s.get("tags") or []):
+                if t:
+                    ents.append("tag:" + str(t))
+            cell_score, overlap = sim.score_entities(ents, ppr_scores)
+        else:
+            cell_score, overlap = sim.score_cell({"state_signature": cand_sig}, ppr_scores)
+        if cell_score <= 0:
+            continue
+        bonus = min(bonus_max, cell_score * bonus_scale)
+        if bonus <= 0:
+            continue
+        s["score"] = round(s["score"] + bonus, 2)
+        s.setdefault("breakdown", {})["cell_return_bonus"] = round(bonus, 2)
+        s.setdefault("raw", {})["cell_return_ppr_mass"] = round(cell_score, 4)
+        s["raw"]["cell_return_overlap"] = overlap
+    return scored
 
 
 def apply_substantive_demotion(scored, config):
@@ -2154,12 +2553,16 @@ def cmd_select(args):
     # (Mirrors the global goal_map approach already used by collect_blocked/trace_root_bottleneck.)
     all_aspirations = world_aspirations + agent_aspirations
     global_done_ids = set()
+    global_live_ids = set()  # non-terminal goals — dependency-liveness check (4)
     for asp in all_aspirations:
         if asp.get("status") != "active":
             continue
         for g in asp.get("goals", []):
-            if g.get("status") in ("completed", "decomposed"):
+            st = g.get("status")
+            if st in ("completed", "decomposed"):
                 global_done_ids.add(g["id"])
+            if st not in TERMINAL_GOAL_STATUSES:
+                global_live_ids.add(g["id"])
 
     # Load multi-agent coordination config from aspirations.yaml
     claim_timeout_hours = None
@@ -2196,13 +2599,15 @@ def cmd_select(args):
         reallocation_hours=reallocation_hours,
         abstention_timeout_hours=abstention_timeout_hours,
         defer_reason_timeout_hours=defer_reason_timeout_hours,
-        dependency_timeout_hours=dependency_timeout_hours)
+        dependency_timeout_hours=dependency_timeout_hours,
+        global_live_ids=global_live_ids)
     candidates += collect_candidates(
         agent_aspirations, known_blockers=known_blockers, source="agent",
         global_done_ids=global_done_ids, reallocation_hours=reallocation_hours,
         abstention_timeout_hours=abstention_timeout_hours,
         defer_reason_timeout_hours=defer_reason_timeout_hours,
-        dependency_timeout_hours=dependency_timeout_hours)
+        dependency_timeout_hours=dependency_timeout_hours,
+        global_live_ids=global_live_ids)
     #  — cross-agent stranding fix. Pull goals from sibling agent
     # queues where intended_agent matches AGENT_NAME. Catches goals filed by
     # another agent (capability-route gate stamps intended_agent on add) that
@@ -2218,7 +2623,8 @@ def cmd_select(args):
             reallocation_hours=reallocation_hours,
             abstention_timeout_hours=abstention_timeout_hours,
             defer_reason_timeout_hours=defer_reason_timeout_hours,
-            dependency_timeout_hours=dependency_timeout_hours)
+            dependency_timeout_hours=dependency_timeout_hours,
+            global_live_ids=global_live_ids)
     if not candidates:
         # VERIFY-BEFORE-ASSUMING (5): all_blocked is a NEGATIVE,
         # work-gating conclusion ("no executable goals exist"). The WORLD
@@ -2239,25 +2645,31 @@ def cmd_select(args):
         agent_retry = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
         all_aspirations_retry = world_retry + agent_retry
         global_done_ids_retry = set()
+        global_live_ids_retry = set()  # non-terminal goals (4)
         for asp in all_aspirations_retry:
             if asp.get("status") != "active":
                 continue
             for g in asp.get("goals", []):
-                if g.get("status") in ("completed", "decomposed"):
+                st = g.get("status")
+                if st in ("completed", "decomposed"):
                     global_done_ids_retry.add(g["id"])
+                if st not in TERMINAL_GOAL_STATUSES:
+                    global_live_ids_retry.add(g["id"])
         retry_candidates = collect_candidates(
             world_retry, known_blockers=known_blockers, source="world",
             global_done_ids=global_done_ids_retry, claim_timeout_hours=claim_timeout_hours,
             reallocation_hours=reallocation_hours,
             abstention_timeout_hours=abstention_timeout_hours,
             defer_reason_timeout_hours=defer_reason_timeout_hours,
-            dependency_timeout_hours=dependency_timeout_hours)
+            dependency_timeout_hours=dependency_timeout_hours,
+            global_live_ids=global_live_ids_retry)
         retry_candidates += collect_candidates(
             agent_retry, known_blockers=known_blockers, source="agent",
             global_done_ids=global_done_ids_retry, reallocation_hours=reallocation_hours,
             abstention_timeout_hours=abstention_timeout_hours,
             defer_reason_timeout_hours=defer_reason_timeout_hours,
-            dependency_timeout_hours=dependency_timeout_hours)
+            dependency_timeout_hours=dependency_timeout_hours,
+            global_live_ids=global_live_ids_retry)
         if AGENT_DIR is not None:
             retry_candidates += collect_cross_agent_candidates(
                 AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
@@ -2267,20 +2679,23 @@ def cmd_select(args):
                 reallocation_hours=reallocation_hours,
                 abstention_timeout_hours=abstention_timeout_hours,
                 defer_reason_timeout_hours=defer_reason_timeout_hours,
-                dependency_timeout_hours=dependency_timeout_hours)
+                dependency_timeout_hours=dependency_timeout_hours,
+                global_live_ids=global_live_ids_retry)
         if retry_candidates:
             _log_transient_allblocked_recovery(
                 world_aspirations, world_retry, len(retry_candidates))
             candidates = retry_candidates
             all_aspirations = all_aspirations_retry
             global_done_ids = global_done_ids_retry
+            global_live_ids = global_live_ids_retry
         else:
             # Two independent signals agree: genuinely all-blocked.
             # (Report blocked goals from the fresh retry read for consistency.)
             blocked = collect_blocked(all_aspirations_retry, known_blockers=known_blockers,
                                       global_done_ids=global_done_ids_retry,
                                       defer_reason_timeout_hours=defer_reason_timeout_hours,
-                                      dependency_timeout_hours=dependency_timeout_hours)
+                                      dependency_timeout_hours=dependency_timeout_hours,
+                                      global_live_ids=global_live_ids_retry)
             if blocked:
                 summary = {}
                 for b in blocked:
@@ -2334,6 +2749,13 @@ def cmd_select(args):
     # the substantive floor already reflects catch-up boosts; BEFORE the sort so
     # the demoted scores drive the ranking. See apply_substantive_demotion.
     apply_substantive_demotion(scored, RECURRING_CONFIG)
+
+    # Go-Explore cell-return boost (): flag-gated, boost-only, DEFAULT OFF.
+    # No-op + byte-identical selection when cell_return.enabled is false. Runs AFTER
+    # substantive_demotion so the bonus reflects the post-demotion baseline, and BEFORE
+    # the sort so the boost drives ranking (same placement rationale as the
+    # recurring_debt_bonus / substantive_demotion passes above).
+    apply_cell_return_boost(scored, CELL_RETURN_CONFIG)
 
     # Sort: highest score first, then lower aspiration number, then lower goal number
     scored.sort(key=lambda x: (-x["score"], x["aspiration_id"], x["goal_id"]))
@@ -2393,19 +2815,24 @@ def cmd_blocked(args):
     if not isinstance(known_blockers, list):
         known_blockers = []
 
-    # Build global done_ids for cross-aspiration dependency resolution
+    # Build global done_ids + live_ids for cross-aspiration dependency resolution
     global_done_ids = set()
+    global_live_ids = set()  # non-terminal goals — dependency-liveness check (4)
     for asp in aspirations:
         if asp.get("status") != "active":
             continue
         for g in asp.get("goals", []):
-            if g.get("status") in ("completed", "decomposed"):
+            st = g.get("status")
+            if st in ("completed", "decomposed"):
                 global_done_ids.add(g["id"])
+            if st not in TERMINAL_GOAL_STATUSES:
+                global_live_ids.add(g["id"])
 
     blocked = collect_blocked(aspirations, known_blockers=known_blockers,
                               global_done_ids=global_done_ids,
                               defer_reason_timeout_hours=defer_reason_timeout_hours,
-                              dependency_timeout_hours=dependency_timeout_hours)
+                              dependency_timeout_hours=dependency_timeout_hours,
+                              global_live_ids=global_live_ids)
 
     # Count total non-terminal goals across active aspirations
     total_active = 0

@@ -228,6 +228,97 @@ def _validate_formation_quality(rec: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Resolution-evidence requirement ()
+# ---------------------------------------------------------------------------
+# Every CONFIRMED/CORRECTED resolution must carry >=1 verifiable external-
+# evidence pointer so the calibration number is INDEPENDENTLY auditable. From
+# the  calibration-honesty audit: ~53% of CONFIRMED/CORRECTED records
+# had no outcome_detail at all, making accuracy unfalsifiable for the majority.
+# The gate is GENEROUS (any one recognized pointer shape satisfies it) -- its
+# job is to catch the empty/unverifiable cases, not to grade evidence quality;
+# the evidence_pct metric (computed in _compute_meta) tracks real compliance
+# over time. EXPIRED/UNRESOLVABLE are exempt (no prediction was validated, so
+# there is nothing to back). Escape hatch: set the evidence_override field to a
+# non-empty reason string (e.g. a math proof where the derivation IS the
+# evidence) -- the reason persists in the record, which is MORE auditable than
+# a transient CLI flag would be (the field rides the existing move-merge body,
+# so no wrapper plumbing is needed). Enforced at the resolution single-writer
+# (move -> resolved + add @ stage=resolved); update/update-field are tweak
+# paths and stay ungated so legacy evidence-less records can still be edited.
+
+# Recognized evidence-pointer shapes in free-text resolution fields.
+_EVIDENCE_PATTERNS = (
+    re.compile(r"\bg-\d{3}-\d{2,4}\b"),                          # goal-id
+    re.compile(r"\b(?:rb|guard|sig|sa|bel)-\d+\b"),             # rb/guardrail/sig/...
+    re.compile(r"\bexp-[a-z0-9][\w-]+", re.I),                  # experience-ref
+    re.compile(r"\bmsg-\d{8}-"),                                # board message id
+    re.compile(r"[\w./-]+\.(?:py|sh|md|lua|js|ts|yaml|jsonl?|txt):\d+"),  # file:line
+    re.compile(r"\b[\w-]+\.(?:sh|py)\b"),                       # canonical-script name
+    re.compile(r"\d+(?:\.\d+)?\s*(?:%|pct|percent)", re.I),     # percentage w/ measurement
+    re.compile(r"\b(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"),        # commit SHA (hex, >=1 letter)
+    re.compile(r"\bsession[\s_-]?\d+\b", re.I),                 # session-id (named)
+    re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-", re.I),  # session-id (UUID)
+)
+
+# Outcomes that assert a validated prediction and therefore require evidence.
+_EVIDENCE_REQUIRED_OUTCOMES = ("CONFIRMED", "CORRECTED")
+
+
+def _has_resolution_evidence(rec: Dict[str, Any]) -> bool:
+    """True if the record carries >=1 verifiable evidence pointer.
+
+    Checks structured pointer fields first (experience_ref, evidence_for),
+    then scans the free-text resolution fields for any recognized pointer
+    shape. Generous by design -- see module note above.
+    """
+    # Structured pointers.
+    exp_ref = rec.get("experience_ref")
+    if isinstance(exp_ref, str) and exp_ref.strip():
+        return True
+    ev_for = rec.get("evidence_for")
+    if isinstance(ev_for, str) and ev_for.strip():
+        return True
+    if isinstance(ev_for, (list, dict)) and ev_for:
+        return True
+    # Free-text pointer scan.
+    text_parts = []
+    for field in ("outcome_detail", "outcome_notes", "rationale",
+                  "verification", "links"):
+        val = rec.get(field)
+        if isinstance(val, str):
+            text_parts.append(val)
+    text = "\n".join(text_parts)
+    return any(p.search(text) for p in _EVIDENCE_PATTERNS)
+
+
+def _validate_resolution_evidence(rec: Dict[str, Any]) -> None:
+    """Require an external-evidence pointer on CONFIRMED/CORRECTED resolutions.
+
+    No-op for non-accuracy outcomes (None/EXPIRED/UNRESOLVABLE) and for any
+    record carrying a non-empty evidence_override reason. Raises ValueError
+    otherwise (g-303-27).
+    """
+    if rec.get("outcome") not in _EVIDENCE_REQUIRED_OUTCOMES:
+        return
+    override = rec.get("evidence_override")
+    if isinstance(override, str) and override.strip():
+        return
+    if _has_resolution_evidence(rec):
+        return
+    raise ValueError(
+        "Missing resolution evidence: a CONFIRMED/CORRECTED resolution must "
+        "record at least one verifiable external-evidence pointer so the "
+        "calibration number is independently auditable (g-303-27). Add one to "
+        "outcome_detail (or set experience_ref / evidence_for): a goal-id "
+        "(g-NNN-NN), commit SHA, file:line, session-id, an rb-/guard-/exp-/msg- "
+        "id, a canonical-script name (foo.sh/foo.py), or a percentage with "
+        "measurement context. For a genuinely pointer-free resolution (e.g. a "
+        "math proof where the derivation IS the evidence), set evidence_override "
+        "to a short reason string."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Record lookup
 # ---------------------------------------------------------------------------
 
@@ -362,6 +453,17 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                                           f"Formation-quality error on move to "
                                           f"{target_stage}: {e}")
 
+            # Resolution-evidence gate (): fires only on the move INTO
+            # resolved, so re-resolved->archived transitions of a legacy
+            # evidence-less record are unaffected. No-ops for EXPIRED/
+            # UNRESOLVABLE and for an evidence_override reason.
+            if target_stage == "resolved":
+                try:
+                    _validate_resolution_evidence(rec)
+                except ValueError as e:
+                    return Response.error(400, "resolution_evidence_required",
+                                          str(e))
+
             if target_stage == "archived":
                 _append_to_archive(archive_path, rec)
                 items.pop(idx)
@@ -418,6 +520,11 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     try:
         _validate_record(rec)
         _validate_formation_quality(rec)
+        # Resolution-evidence gate (): a record added directly at
+        # stage=resolved is a resolution event (fresh record -> no legacy-edit
+        # concern). No-ops unless outcome is CONFIRMED/CORRECTED.
+        if rec.get("stage") == "resolved":
+            _validate_resolution_evidence(rec)
     except ValueError as e:
         return Response.error(400, "validation_failed", str(e))
 
@@ -459,8 +566,11 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
 
     Body: JSON replacement record. The record is normalized, validated
     (both record and formation-quality), and written in place of the
-    existing record with the given id. Live file only (mirrors
-    pipeline.py cmd_update which does not search archive).
+    existing record with the given id. Searches live first, then the
+    archive file (g-115-1615): a multi-field-corrupt ARCHIVED record
+    rejects every single-field update-field repair (the whole record
+    re-validates on each field write), so this atomic whole-record path
+    is the only tool that can repair it once archived (rb-2239).
     """
     from ..server import Response
 
@@ -488,30 +598,46 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
     meta_path = base_dir / "pipeline-meta.json"
     agent = _agent_name(ctx)
 
+    # Probe live + archive outside the lock to pick the target file
+    # (5: mirror update_field's archive-probe below so a
+    # multi-field-corrupt ARCHIVED record can be repaired via this atomic
+    # whole-record path; before this, update() was live-only and 404'd on
+    # archived ids, leaving such records unrepairable by any tool — rb-2239).
+    live_items = _read_jsonl(live_path)
+    if _find_record(live_items, rec_id) is not None:
+        target_path = live_path
+    else:
+        archive_items = _read_jsonl(archive_path)
+        if _find_record(archive_items, rec_id) is not None:
+            target_path = archive_path
+        else:
+            return Response.error(404, "record_not_found",
+                                  f"Record {rec_id} not found")
+
     written_rec = {}
 
     try:
-        with file_locks.locked(live_path):
-            items = _read_jsonl(live_path)
+        with file_locks.locked(target_path):
+            items = _read_jsonl(target_path)
             found = _find_record(items, rec_id)
             if found is None:
                 return Response.error(404, "record_not_found",
-                                      f"Record {rec_id} not found in live file")
+                                      f"Record {rec_id} not found")
             idx = found[0]
             items[idx] = rec
             written_rec.update(rec)
 
-            history.snapshot(live_path, base_dir, agent,
+            history.snapshot(target_path, base_dir, agent,
                              summary=f"pipeline-update {rec_id}")
-            _atomic_write_jsonl(live_path, items)
-            changelog.append(base_dir, agent, live_path, "edit",
+            _atomic_write_jsonl(target_path, items)
+            changelog.append(base_dir, agent, target_path, "edit",
                              summary=f"pipeline-update {rec_id}",
                              lines_changed=len(items))
-            _jsonl_cache().invalidate(live_path)
+            _jsonl_cache().invalidate(target_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 
-    # Meta recomputation outside the live-path lock (mirrors archive_sweep
+    # Meta recomputation outside the target-path lock (mirrors archive_sweep
     # and pipeline.py cmd_update which calls _update_meta_counts after the
     # lock releases).
     try:
@@ -640,6 +766,8 @@ def _empty_meta() -> Dict[str, Any]:
             "confirmed": 0,
             "corrected": 0,
             "accuracy_pct": 0.0,
+            "with_evidence": 0,
+            "evidence_pct": 0.0,
             "by_strategy": {},
             "by_time_horizon": {},
             "by_depth": {},
@@ -670,6 +798,17 @@ def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
     total = confirmed + corrected
     meta["accuracy"]["accuracy_pct"] = (
         round(confirmed / total * 100, 1) if total > 0 else 0.0)
+
+    # Evidence coverage (): share of CONFIRMED/CORRECTED resolutions
+    # carrying >=1 verifiable evidence pointer. Surfaced alongside accuracy_pct
+    # via pipeline-read.sh --accuracy so calibration auditability is tracked
+    # over time. Denominator is the same resolved_records (CONFIRMED+CORRECTED).
+    with_evidence = sum(1 for r in resolved_records
+                        if _has_resolution_evidence(r))
+    meta["accuracy"]["with_evidence"] = with_evidence
+    meta["accuracy"]["evidence_pct"] = (
+        round(with_evidence / len(resolved_records) * 100, 1)
+        if resolved_records else 0.0)
 
     by_strategy: Dict[str, Any] = {}
     for r in resolved_records:
@@ -891,6 +1030,8 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
             "confirmed": 0,
             "corrected": 0,
             "accuracy_pct": 0.0,
+            "with_evidence": 0,
+            "evidence_pct": 0.0,
             "by_strategy": {},
             "by_time_horizon": {},
             "by_depth": {},

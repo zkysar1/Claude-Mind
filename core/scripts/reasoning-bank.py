@@ -83,6 +83,13 @@ RB_VALID_STATUSES = {"active", "retired"}
 # leaker class from re-forming. None is rejected; the missing-field check in
 # validate_rb_record catches absent keys.
 RB_VALID_APPLIES_TO = {"any", "framework", "domain", "specific"}
+# entry_type (g-306-11, BRD Gap 7a-Mind): optional reasoning-bank taxonomy tag.
+# null (the default) = an ordinary reasoning lesson; "procedure" = a reusable
+# multi-step how-to that `retrieve.sh --entry-type procedure` can target.
+# Additive + null-safe (the rb validator has no unknown-field gate); NO
+# embeddings, NO new store. Extend this SET (not the validator body) to add
+# future entry types. Kept verbatim-in-sync with mind_api/src/store_registry.py.
+RB_VALID_ENTRY_TYPES = {"procedure"}
 GUARD_VALID_STATUSES = {"active", "retired"}
 
 # `created` is SCRIPT-OWNED: stamped at write time by rb_add / guard_add from
@@ -104,6 +111,22 @@ RB_DEFAULT_FIELDS = {
     "preventive_guardrail": None,
     "experience_ref": None,
     "tags": [],
+    # entry_type (g-306-11): optional reasoning-bank taxonomy. null = ordinary
+    # lesson; "procedure" = reusable multi-step how-to, retrievable via
+    # retrieve.sh --entry-type procedure. Additive + null-safe (validator allows
+    # null or a value in RB_VALID_ENTRY_TYPES). Mirror of the daemon default in
+    # mind_api/src/store_registry.py.
+    "entry_type": None,
+    # valid_from / valid_to (g-306-35, BRD Gap 5): optional bi-temporal
+    # record-level validity interval. null/null (the default) = a record with
+    # no explicit validity window (treated as currently-valid by the reader
+    # path). On falsification the OLD record gets valid_to=now and a NEW record
+    # is inserted with valid_from=now (close-old-insert-new, NOT in-place
+    # mutation). Additive + null-safe (no unknown-field gate on RB); validated
+    # by _validate_bitemporal. Mirror of the daemon default in
+    # mind_api/src/store_registry.py.
+    "valid_from": None,
+    "valid_to": None,
     # applies_to is REQUIRED (in RB_REQUIRED_FIELDS). Made required 2026-05-10
     # after audit found 299/620 active entries (48%) silently defaulted to
     # None and the absent-→-specific convention misclassified 294 of them
@@ -136,6 +159,14 @@ GUARD_DEFAULT_FIELDS = {
                               # grep-detectable guardrails. Was silently dropped
                               # for guard-332 and guard-337 until this field and
                               # the GUARD_KNOWN_FIELDS gate landed.
+    # valid_from / valid_to (g-306-35, BRD Gap 5): optional bi-temporal validity
+    # interval (see RB_DEFAULT_FIELDS for semantics). Added to GUARD_DEFAULT_FIELDS
+    # so they flow into GUARD_KNOWN_FIELDS automatically (the unknown-field gate
+    # is `set(GUARD_DEFAULT_FIELDS.keys())` | ...), keeping the additive field
+    # accepted by the strict guardrail allowlist. Mirror of the daemon default in
+    # mind_api/src/store_registry.py.
+    "valid_from": None,
+    "valid_to": None,
     "when_to_use": {"conditions": [], "category": ""},
     "utilization": {
         "retrieval_count": 0,
@@ -405,6 +436,39 @@ def validate_utilization(util):
     if not isinstance(score, (int, float)) or isinstance(score, bool) or score < 0:
         raise ValueError(f"utilization.utilization_score must be a non-negative number, got: {score!r}")
 
+def _validate_bitemporal(rec) -> None:
+    """Validate optional bi-temporal validity-interval fields (g-306-35, BRD
+    Gap 5): valid_from / valid_to. Each is null/absent (the default) or an
+    ISO-8601 local-datetime string in the _stamp_now format
+    "%Y-%m-%dT%H:%M:%S". When BOTH are present, valid_from must be <= valid_to
+    (a record cannot stop being valid before it started). isinstance guard
+    precedes datetime.fromisoformat (B10: a non-str field would raise TypeError
+    on parse and 500 the write -- short-circuit to a clean ValueError).
+    guard-420: datetime comparison only on parsed datetimes, never on the raw
+    strings. Additive + null-safe: existing records without the fields pass
+    untouched. Kept verbatim-in-sync across mind_api/src/store_registry.py +
+    core/scripts/reasoning-bank.py."""
+    parsed = {}
+    for _bt_field in ("valid_from", "valid_to"):
+        val = rec.get(_bt_field)
+        if val is None:
+            continue
+        if not isinstance(val, str):
+            raise ValueError(
+                f"Invalid {_bt_field}: {val!r} "
+                f"(expected null or an ISO-8601 datetime string)")
+        try:
+            parsed[_bt_field] = datetime.fromisoformat(val)
+        except ValueError:
+            raise ValueError(
+                f"Invalid {_bt_field}: {val!r} "
+                f"(expected ISO-8601 datetime, e.g. 2026-06-19T01:00:00)")
+    if "valid_from" in parsed and "valid_to" in parsed:
+        if parsed["valid_from"] > parsed["valid_to"]:
+            raise ValueError(
+                f"valid_from ({rec['valid_from']!r}) must be <= "
+                f"valid_to ({rec['valid_to']!r})")
+
 def validate_rb_record(rec, *, skip_id_check=False):
     """Validate a reasoning bank record dict. Raises ValueError on invalid.
 
@@ -447,9 +511,24 @@ def validate_rb_record(rec, *, skip_id_check=False):
             f"Invalid applies_to: {applies!r} (expected one of {RB_VALID_APPLIES_TO})"
         )
 
+    # entry_type (g-306-11): optional. null/absent = ordinary lesson; otherwise
+    # must be a string in RB_VALID_ENTRY_TYPES. isinstance guard precedes
+    # membership (B10): a list-valued entry_type would raise TypeError on
+    # `list not in set` and 500 the write — short-circuit to a clean ValueError.
+    # Kept verbatim-in-sync with mind_api/src/store_registry.py.
+    entry_type = rec.get("entry_type")
+    if entry_type is not None and (
+            not isinstance(entry_type, str)
+            or entry_type not in RB_VALID_ENTRY_TYPES):
+        raise ValueError(
+            f"Invalid entry_type: {entry_type!r} "
+            f"(expected null or one of {RB_VALID_ENTRY_TYPES})"
+        )
+
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    _validate_bitemporal(rec)
 
     # Tag canonicalization (lowercase + kebab-case + dedup). Idempotent on
     # already-canonical tags. Mutates rec["tags"] in place. Runs after the
@@ -495,6 +574,7 @@ def validate_guard_record(rec, *, skip_id_check=False):
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    _validate_bitemporal(rec)
 
     # Tag canonicalization — same rule as validate_rb_record. Mutates in place.
     _normalize_tags(rec)

@@ -18,6 +18,16 @@ Read this once per session. Reference it at each of the three orchestrator phase
    goal succeeded. Verify it (Read, Grep, command output). If absent: goal is
    NOT verified; status stays `blocked` or `in-progress`.
 
+1.5. **Q1.5 GENERATED CHECKLIST** (TICKing All the Boxes, 2410.03608 — BRD
+   Gap 15) — when Q1 passed, generate a 5–10 item yes/no checklist from the
+   goal's title/desc/action and evaluate each against the artifact. A failure of
+   an item the goal's OWN `verification.outcomes`/`checks` declared = a real miss
+   → fail Q1 (conservative gate). A failure of an item the goal's criteria did
+   NOT cover → append to `meta/missing-verification-criteria.jsonl` via
+   `bash core/scripts/missing-criteria-log.sh` (goal-template-improvement signal,
+   not a current-goal failure). Skipped when `outcome_class == routine` or
+   `zone == tight`. Full protocol: aspirations-verify SKILL.md § Q1.5.
+
 2. **Q2 NEGATIVE CHECK** — Name the most likely failure mode. Check for it.
    If the goal made a negative claim (e.g., "field X is missing"): run
    `zero-count-gate.py` / `audit-schema-gate.py` / `exhaustive-search-gate.py`
@@ -28,6 +38,15 @@ Read this once per session. Reference it at each of the three orchestrator phase
 
 4. **Output summary** (one sentence): factual result for handoff + journal.
    Fed to `iteration-close.sh --summary "..."`.
+
+5. **Gate D primary-outcome env (only when `gate-d-check.sh` returns "on";
+   GATE-INTEGRITY — omni-blessed text, do not modify):** prefix the
+   iteration-close/recurring-close call with `GATE_D_VERIFY_FIRST_PASS=<true|false>
+   GATE_D_VERIFY_ESCALATION_DEPTH=<0-3> GATE_D_RETRY_COUNT=<n>`. first_pass=true
+   ONLY if Q1-Q3 accepted on the FIRST attempt with no re-execution AND the final
+   status is `completed`. **`blocked`/`skipped` goals are first_pass=false, always**
+   (amendment 6 — compute from what happened; never default to true). Arm-blind:
+   never name or infer the experiment arm.
 
 **On failure:** write the failure summary (one sentence, specific) and pass
 it via `--summary` so the diary captures it.
@@ -111,12 +130,20 @@ flags are never read.
 
 7. **Fresh-eyes dispatch (Step 8.78 — deep outcomes only)** — `iteration-close.sh
    do_state_update` runs `post-state-update-gate.sh deep` and, when it fires,
-   writes the full gate JSON to WM slot `fresh_eyes_dispatch_pending` AND prints
+   writes the full gate JSON (plus a `set_at` stamp) to WM slot
+   `fresh_eyes_dispatch_pending` AND prints
    a `[iteration-close] DISPATCH: /fresh-eyes-code required` line to stderr.
    When you see that line in this iteration's output (or when
    `wm-read.sh fresh_eyes_dispatch_pending` returns non-null), invoke
    `/fresh-eyes-code` with the file list from the JSON. After review completes,
-   clear the signal: `echo 'null' | wm-set.sh fresh_eyes_dispatch_pending`.
+   stamp the dispatch timestamp then clear the signal:
+   `printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | wm-set.sh fresh_eyes_last_dispatch`
+   then `echo 'null' | wm-set.sh fresh_eyes_dispatch_pending`. The stamp is
+   load-bearing (g-115-1553): `stale-sentinel-canary.py` keys on
+   `fresh_eyes_last_dispatch` ADVANCING to tell "consumer kept up" from
+   "consumer bypassed" — without it the canary false-fires because this
+   sentinel is re-armed on every substantive deep close. Stamp on ANY clear,
+   dispatch or justified-no-dispatch.
    Dispatch is LLM-only because Skill invocations cannot run from bash.
    Gate owner: guard-343 (threshold spec); caller-wiring: g-248-17 (rb-428
    pattern — same drift class as experience-archival). The bash enforces the
@@ -183,6 +210,21 @@ flags are never read.
    retroactively. Drift is self-correcting within one iteration — compose
    the record in-place (here) to avoid the retro-compose tax, not because
    the canary is optional.
+
+7. **Memory-utility curation scan (every 20 goals — advisory, g-115-1468 / Phase 1d)** —
+   if `goals_completed_this_session % 20 == 0`: run the retrieval-utility report
+   (the earn-the-keep KPI flip — weight "was this later retrieved AND useful?"
+   over "how much did we write?") over both stores:
+   `export MIND_AGENT=<agent>; source core/scripts/_paths.sh`, then for each of
+   `reasoning-bank` and `guardrails`:
+   `py -3 core/scripts/retrieval_utility_report.py --store "$WORLD_DIR/<store>.jsonl"`.
+   From each report take `zero_hit_high_exposure` (retrieved >=5x, never helpful —
+   noise) + `never_retrieved` (dead weight); write the counts + a capped sample
+   (first 25 ids each, per store) to the `memory_curation_candidates` WM slot
+   (overwrite via `wm-set.sh`) for `/reflect --curate-memory` to act on.
+   ADVISORY ONLY — surface, never act: NEVER auto-retire from this scan
+   (guard-707) — a low `times_helpful` is usually UNDER-ATTESTATION, not zero
+   value; retirement is a `/reflect`-gated decision with its own evidence bar.
 
 ---
 

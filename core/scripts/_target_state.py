@@ -495,9 +495,13 @@ def _resolve_search_roots(agent_name=None):
             for line in lines:
                 line = line.strip()
                 if line.startswith("AGENT_WRITE_PATH=") and "=" in line:
-                    val = line.split("=", 1)[1].strip()
-                    if val:
-                        roots.append(Path(val))
+                    # MULTI-ROOT (): ';'-separated, optionally quoted
+                    # for bash-source safety. Each part is its own search root.
+                    raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    for part in raw.split(";"):
+                        part = part.strip()
+                        if part:
+                            roots.append(Path(part))
     return roots
 
 

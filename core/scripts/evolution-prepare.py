@@ -370,6 +370,21 @@ def main():
         try:
             from _fileops import save_history, resolve_base_dir
             base = resolve_base_dir(abs_path)
+            if base is None and file_kind == "agent_self" and key:
+                # resolve_base_dir resolves agent paths via the module-level
+                # AGENT_DIR, which _paths derives from MIND_AGENT at import
+                # time. Edit/Write/MultiEdit PreToolUse hooks do NOT get
+                # MIND_AGENT injected (bash-agent-inject injects it for Bash
+                # calls only), so AGENT_DIR is None and resolve_base_dir returns
+                # None for agents/<agent>/self.md -- the `if base:` guard then
+                # silently skipped capture, leaving history_snapshot=None on
+                # EVERY agent_self edit (monitor cannot register). `key` is the
+                # file's agent (classify_path -> parts[1]); derive the per-agent
+                # base dir from it directly, independent of MIND_AGENT.
+                # (2; confirmed by probe -- resolve_base_dir returns
+                # None with MIND_AGENT unset, agents/<agent> with it set.)
+                from _paths import agent_dir
+                base = agent_dir(key)
             if base:
                 save_history(abs_path, base, agent, summary=f"pre-edit snapshot (file_kind={file_kind})")
                 # CAS-store migration (fix-ballooning-history, 2026-05-22):
@@ -384,8 +399,16 @@ def main():
                 snaps = _history_store.list_snapshots(abs_path, base)
                 if snaps:
                     history_snapshot = snaps[0]["snapshot_id"]
-        except Exception:
-            # Snapshot failure is non-fatal — Post will record without snapshot reference
+        except Exception as e:
+            # Snapshot failure is non-fatal -- Post will record without snapshot
+            # reference. Emit a stderr diagnostic so a real capture failure is
+            # VISIBLE rather than degrading silently to None (2 -- the
+            # prior bare swallow hid the agent_self root cause for days).
+            print(
+                f"[evolution-prepare] WARN: history snapshot failed for {abs_path} "
+                f"(file_kind={file_kind}, agent={agent}): {e!r}",
+                file=sys.stderr,
+            )
             history_snapshot = None
 
     # --- Build sidecar payload ---

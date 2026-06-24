@@ -32,6 +32,26 @@ D7 sets the target mode. The `minimum_mode: autonomous` front matter is evaluate
 at invocation time (before D1 runs), so the skill retains autonomous capabilities
 through D7 even though agent-state changes mid-skill.
 
+**Resume mode (`--resume`, FW-11 / g-317-09).** Autocompact can interrupt this
+handler mid-sequence — most often during the long D4 consolidate. Because D1
+flips agent-state to IDLE early, the aspirations loop then bails at its Phase
+-1.5 state gate and never re-enters Phase -1.4 to re-detect `stop-requested`
+(which D3 also clears), so the half-finished stop strands: consolidation/handoff
+incomplete, agent-mode stuck at autonomous, `loop_state` lingering. To make this
+recoverable, GS-0 writes a persistent `stop-checkpoint.json` sentinel that is
+cleared ONLY at clean completion (D7.1). Its presence is the detection signal:
+the Session Start Protocol (CLAUDE.md, IDLE branch) probes
+`stop-checkpoint.sh resume-needed` and, on a hit, invokes
+`/aspirations-graceful-stop --resume`. The `--resume` path is identical to the
+fresh path (GS-0 → GS-2) — every D-phase is idempotent (set-IDLE, clear-signal,
+consolidation-precheck FAST-when-done, `rm -f`, set-mode), so re-running the
+whole sequence is safe and correct. The only differences on `--resume`: (1) the
+caller has NOT verified `stop-requested` (the checkpoint is the trigger instead),
+and (2) GS-0 prefers the checkpoint's cached `target_mode` because D7 may have
+already deleted `stop-target-mode` before the interruption. A resume-count
+breaker (cap 3, in `stop_checkpoint.py`) stops auto-resuming a persistently
+failing stop and surfaces it for manual intervention.
+
 ## Inputs
 
 None mandatory. The skill reads directly from:
@@ -94,7 +114,24 @@ Bash: val=""
 # Valid values: "assistant" or "reader". Any other value should never be
 # produced by /stop's flag parser (stop/SKILL.md Step 0.5) — if seen,
 # treat as "assistant" defensively.
+
+# RESUME target_mode source (--resume only, FW-11 / g-317-09): on resume, the
+# stop-checkpoint is the authoritative record of the user's chosen post-stop
+# mode — D7 may have already deleted stop-target-mode before the interruption,
+# so the read above can have defaulted to "assistant" and lost the real choice.
+IF invoked with --resume:
+    Bash: cp_json=$(MIND_AGENT=<agent> bash core/scripts/stop-checkpoint.sh read)
+    IF cp_json != "null": target_mode = cp_json.target_mode   # checkpoint wins on resume
 Output: "▸ GRACEFUL STOP: target_mode = {target_mode} (cached for D7)"
+
+# Persist the stop-checkpoint sentinel (FW-11 / g-317-09). Its PRESENCE = "a
+# graceful stop is in progress / was interrupted"; it is cleared ONLY at D7.1
+# (clean completion). Fresh stop -> resume_count 0; --resume re-entry -> ++ (the
+# breaker input). Stdout (the confirmation JSON) is noise here so it is dropped;
+# stderr is preserved so a real write failure stays visible. Fire-and-forget —
+# a checkpoint-write failure degrades resume-detection but must NEVER block the
+# stop sequence.
+Bash: MIND_AGENT=<agent> bash core/scripts/stop-checkpoint.sh write --target-mode "{target_mode}" >/dev/null || echo "[graceful-stop] WARN: stop-checkpoint write failed (resume-detection degraded; stop proceeds)"
 ```
 
 ## Phase GS-1: Iteration Checkpoint Recovery
@@ -302,7 +339,47 @@ Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r
 # goes IDLE and will retry any file the flush missed, so a flush error warns
 # but never blocks the stop. (Runs as its own Bash line — its rc cannot break
 # D7's chain.)
-Bash: MIND_AGENT=<agent> bash core/scripts/owncloud-flush.sh || echo "[owncloud-flush] WARN: flush returned non-zero — periodic sweep (interval 120s) will retry; avoid an immediate machine-move until the next sweep tick"
+# D6.7+D6.8 (flush->VERIFY->release HARD GATE, design §6 — g-115-1339): the two
+# steps are fused into ONE Bash call so the flush's rc is in scope for the
+# release decision (shell vars do not persist across separate `Bash:` calls).
+#   D6.7 FLUSH: push this machine's governed writes to S3 NOW (full owned-set —
+#     world/meta/all owned agent dirs incl. agents/<agent>/). By this point ALL
+#     continuity files are written: handoff (D4), working-memory (D4.5/D5),
+#     execution-diary, session-summary (D6.5). On a non-zero flush, RETRY ONCE
+#     (transient S3/contention errors clear on retry). The full-flush scope is
+#     UNCHANGED from pre-g-1339 (NOT narrowed to --agent) so static mode stays
+#     byte-identical — owncloud-flush.sh runs in BOTH modes, it is NOT
+#     OWNERSHIP_MODE-gated, so narrowing its scope would be a non-inert live
+#     change. (The per-agent `owncloud-flush.sh --agent <name>` scope IS built
+#     for the g-1340 §7 A-stop-B-move acceptance test; agents/<agent>/ is a
+#     subset of this full flush, so the §6 "flush the agent dir before release"
+#     invariant holds either way.)
+#   D6.8 RELEASE: clean RUNNING->IDLE release of the cross-machine DDB
+#     session-lock — INERT until cutover (runner-claim.sh no-ops exit 0 unless
+#     OWNERSHIP_MODE=dynamic, so static /stop is byte-identical). GATED on a
+#     verified-clean flush: release runs ONLY if the flush (after one retry)
+#     succeeded. design §6: a failed-flush + release would strand INCOMPLETE S3
+#     state — the next machine that acquires would pull a partial agent dir. So
+#     on a persistent flush failure we SKIP the release; the claim stays RUNNING
+#     and expires via stale-lock-break (~OWNERSHIP_STALE_SECONDS) while the
+#     daemon's periodic sweep (120s) keeps retrying the flush. In static mode
+#     the release is a no-op regardless, so the gate is inert there; it bites
+#     only post-cutover. fail-open: the combined call always exits 0 — its rc
+#     cannot break D7's chain.
+Bash: MIND_AGENT=<agent> bash -c '
+  set +e
+  bash core/scripts/owncloud-flush.sh; frc=$?
+  if [ "$frc" -ne 0 ]; then
+    echo "[stop-flush] D6.7 flush rc=$frc — retrying once before the release decision" >&2
+    bash core/scripts/owncloud-flush.sh; frc=$?
+  fi
+  if [ "$frc" -eq 0 ]; then
+    bash core/scripts/runner-claim.sh release --agent "<agent>" || echo "[runner-claim] WARN: release rc nonzero — claim expires via stale-lock-break (~OWNERSHIP_STALE_SECONDS); proceeding with stop"
+  else
+    echo "[stop-flush] WARN: flush FAILED twice (rc=$frc) — SKIPPING runner-claim release per design §6 (a failed-flush+release strands incomplete S3 state). Claim stays RUNNING, expires via stale-lock-break; daemon periodic sweep (120s) keeps retrying. Avoid a machine-move until S3 is confirmed current." >&2
+  fi
+  exit 0
+'
 # D7: Apply post-stop mode AND emit the final user-facing message in ONE Bash
 # call. The Bash stdout IS the stop-complete message — there is no separate text
 # Output block after this. That makes the Bash invocation the unambiguous last
@@ -345,18 +422,24 @@ Mode set to reader (read-only). Chat and query knowledge freely — no writes al
 Type `/start --mode assistant` for user-directed edits, or `/start` to resume autonomous.
 EOF
 fi && echo "" && echo "═══ Stop verified ═══════════════════════════════" && echo "  state=$_STATE  |  mode=$_MODE  |  residual session files=$_RESID" && if [ "$_RESID" -gt 0 ]; then echo "  (residuals from D6 deny — /start's defensive sweep cleans on next session entry)"; fi && echo "═══════════════════════════════════════════════════"
-# D7.1: Final housekeeping — delete SID binding. Must run AFTER D7 so the
-# PreToolUse hook can resolve MIND_AGENT for D7's mode-set call in the event
-# that a future edit drops the explicit prefix (defense in depth against
-# prefix-forgetting regressions). This is the terminal Bash of the skill.
-# No text output may follow — return-protocol.md.
-Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && rm -f ".active-agent-$SID"
+# D7.1: Final housekeeping — clear the stop-checkpoint sentinel (the "stop
+# complete" marker, FW-11 / g-317-09) AND delete the SID binding. Must run
+# AFTER D7 so the PreToolUse hook can resolve MIND_AGENT for D7's mode-set call
+# in the event that a future edit drops the explicit prefix (defense in depth
+# against prefix-forgetting regressions). Clearing the checkpoint LAST (only
+# after D7 has set the target mode) is load-bearing: it is the single signal
+# that the stop ran to completion. If autocompact interrupts before this line,
+# the checkpoint persists and the Session Start Protocol re-invokes
+# /aspirations-graceful-stop --resume to finish. This is the terminal Bash of
+# the skill. No text output may follow — return-protocol.md.
+Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && rm -f ".active-agent-$SID"; MIND_AGENT=<agent> bash core/scripts/stop-checkpoint.sh clear >/dev/null || true
 ```
 
 ## Return Protocol
 
 Does NOT return control to the orchestrator. Control flow ends with D7.1 — a
-final single-line Bash command that deletes the SID binding file. D7 emits
+final single-line Bash command that clears the stop-checkpoint sentinel (marking
+the stop complete) and deletes the SID binding file. D7 emits
 the user-facing stop-complete message via heredoc; D7.1 is the trailing
 binding-cleanup that exists purely as the terminal tool call after D7's
 heredoc ends (which is itself a Bash tool call). The harness exits the session
@@ -371,7 +454,7 @@ which produces no user-visible output when the file exists).
 
 ## Chaining
 
-- **Called by**: `/aspirations` orchestrator Phase -1.4 (only when `stop-requested` signal exists)
-- **Calls**: `aspirations-verify`, `aspirations-state-update` (for in-flight obligation completion); `aspirations-consolidate` OR `load-consolidation-housekeeping.sh` (D4); many scripts for D1-D7
-- **Reads**: iteration-checkpoint.json, stop-target-mode, handoff context
-- **Writes**: agent-state (IDLE), agent-mode (target), various session signals
+- **Called by**: `/aspirations` orchestrator Phase -1.4 (fresh stop, when `stop-requested` exists); the Session Start Protocol IDLE branch with `--resume` (FW-11, when a `stop-checkpoint.json` is detected after an autocompact-interrupted stop)
+- **Calls**: `aspirations-verify`, `aspirations-state-update` (for in-flight obligation completion); `aspirations-consolidate` OR `load-consolidation-housekeeping.sh` (D4); `stop-checkpoint.sh` (write at GS-0 / clear at D7.1); many scripts for D1-D7
+- **Reads**: iteration-checkpoint.json, stop-checkpoint.json, stop-target-mode, handoff context
+- **Writes**: agent-state (IDLE), agent-mode (target), stop-checkpoint.json (write/clear), various session signals

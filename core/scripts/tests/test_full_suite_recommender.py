@@ -179,7 +179,7 @@ class TestMainEntrypoint(unittest.TestCase):
         buf = io.StringIO()
         # Patch internal detector + agent-write path to simulate clean tree
         with mock.patch.object(self.mod, "_git_changed_paths", return_value=[]), \
-             mock.patch.object(self.mod, "_agent_write_path", return_value=None), \
+             mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch("sys.stdout", buf), \
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):
             rc = self.mod.main()
@@ -191,7 +191,7 @@ class TestMainEntrypoint(unittest.TestCase):
         """Mind changes trigger banner with expected content."""
         buf = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
-             mock.patch.object(self.mod, "_agent_write_path", return_value=None), \
+             mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch("sys.stdout", buf), \
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):
             mock_git.return_value = ["core/scripts/foo.py"]
@@ -327,7 +327,7 @@ class TestPytestSuiteMutex(unittest.TestCase):
         """When main() emits the banner, the lock is released on exit."""
         buf = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
-             mock.patch.object(self.mod, "_agent_write_path", return_value=None), \
+             mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch.object(self.mod, "_pytest_lock_path",
                                 return_value=self.lock_path), \
              mock.patch("sys.stdout", buf), \
@@ -351,7 +351,7 @@ class TestPytestSuiteMutex(unittest.TestCase):
         )
         buf = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
-             mock.patch.object(self.mod, "_agent_write_path", return_value=None), \
+             mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch.object(self.mod, "_pytest_lock_path",
                                 return_value=self.lock_path), \
              mock.patch("sys.stdout", buf), \
@@ -372,7 +372,7 @@ class TestPytestSuiteMutex(unittest.TestCase):
         """When WORLD_DIR is unset, main() emits the banner without the mutex."""
         buf = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
-             mock.patch.object(self.mod, "_agent_write_path", return_value=None), \
+             mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch.object(self.mod, "_pytest_lock_path", return_value=None), \
              mock.patch("sys.stdout", buf), \
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):

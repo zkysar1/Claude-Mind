@@ -350,68 +350,157 @@ def _owned_agents_static():
     return {a.strip() for a in raw.split(",") if a.strip()}
 
 
-def _owned_agents():
-    """Resolve the agent dirs this machine owns for the sweep. Gated by
-    OWNERSHIP_MODE (default 'static' => byte-identical to the pre-lodestar env-list
-    behaviour; the DYNAMIC path is INERT until the g-115-1340 cutover flips it).
+def _owned_agents_runner_token(be, root_path: Path):
+    """Runner-token ownership detection for own-cloud multi-machine setups.
 
-    DYNAMIC (OWNERSHIP_MODE='dynamic', lodestar §3): own X iff THIS machine holds a
-    live RUNNING DDB runner claim for X (zds-sessions). Sweep ownership is DERIVED
-    from the same runner claim that prevents dual-runners — no second source of
-    truth, no hand-maintained env list. Returns:
-      - None  : local backend / single-machine — own ALL (own-cloud off).
-      - a set : the agents this machine currently runs. May be EMPTY => own none;
-                the walk-prune's 'owned is not None' branch then prunes ALL agent
-                dirs, which is exactly right when this machine holds no claims.
-    The contract (None=own-all, set=own-only-those) is unchanged, so every call
-    site (the walk-prune and the single-target --file refusal) keeps working.
+    Scans agents/<name>/session/runner-token locally. For each local token:
+      1. Reads the S3 copy via be.read_bytes().
+      2. If S3 is absent (bootstrap) or matches → this machine owns the agent;
+         pushes the local token to S3 as the authoritative claim.
+      3. If S3 has a different token → another machine started that agent last;
+         skip (do not push, do not prune-protect).
 
-    FAIL-SAFE: if the live claim list cannot be read (raises after its own internal
-    retries — guard-597), fall back to the STATIC env list, NOT own-all: own-all on
-    a second machine would clobber a peer's S3 writes. The static list is
-    empty-or-explicit — the conservative side. Same fallback if MACHINE_ID is
-    unresolved (cannot prove which machine we are).
+    Returns:
+      - None  if the agents dir doesn't exist (single-machine / pre-init layout).
+      - None  if no runner-token files are found locally — can't determine
+              multi-machine context; caller falls back to static
+              MACHINE_OWNED_AGENTS (backward-compatible for IDLE agents and
+              machines that have never run /start).
+      - set() if at least one local runner-token was found but NONE matched S3
+              (another machine owns all active agents; this machine owns none).
+      - {names} if one or more agents' tokens match S3 (or S3 was absent).
 
-    COST (§3 cost-control): ONE list_runner_claims() per call — once per --all
-    sweep, once per --file push — never a per-file DDB read."""
-    mode = os.environ.get("OWNERSHIP_MODE", "static").strip().lower()
-    if mode != "dynamic":
-        return _owned_agents_static()
+    The "found any token" distinction matters: returning None vs set() controls
+    whether the caller falls to static env-var ownership. Without a local token
+    we have no multi-machine signal — returning None is safer than claiming
+    zero ownership, which would prevent ANY agent dir from syncing on a single-
+    machine setup where /start has never been run.
 
-    # Dynamic path. Own-cloud only; the local backend is single-machine => own-all.
-    kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
-    if kind != "own-cloud":
+    The S3 comparison handles the concurrent-start race: the machine that wrote
+    last to S3 wins. Fail-open on S3 I/O errors (claim ownership) so single-
+    machine setups without MACHINE_OWNED_AGENTS keep working.
+
+    runner-token is machine_local in session-manifest.yaml (the sweep never
+    touches it), so this function handles its own S3 I/O via be.read_bytes /
+    be.write_bytes outside the normal sweep path.
+
+    root_path is the agents prefix root (the directory that contains alpha/,
+    bravo/, etc. directly) — NOT the parent directory. Callers must pass the
+    "agents"-prefixed root from _roots(), not the repo root."""
+    if not root_path.is_dir():
         return None
-
+    owned: set = set()
+    found_any_token = False
     try:
-        stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
-                                   _OWNERSHIP_STALE_SECONDS_DEFAULT))
-    except (TypeError, ValueError):
-        stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
+        agent_dirs = sorted(root_path.iterdir())
+    except OSError:
+        return None
+    for agent_dir in agent_dirs:
+        if not agent_dir.is_dir():
+            continue
+        token_path = agent_dir / "session" / "runner-token"
+        if not token_path.exists():
+            continue
+        try:
+            local_token = token_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not local_token:
+            continue
+        found_any_token = True
+        agent_name = agent_dir.name
+        s3_key = f"agents/{agent_name}/session/runner-token"
+        try:
+            s3_bytes = be.read_bytes(s3_key)
+            if s3_bytes is not None:
+                s3_token = s3_bytes.decode("utf-8", errors="replace").strip()
+                if s3_token != local_token:
+                    # Another machine has a newer claim — do not own.
+                    continue
+            # S3 absent (bootstrap) or matches → own it; push claim.
+            be.write_bytes(s3_key, local_token.encode("utf-8"))
+        except Exception:
+            # S3 unavailable — fail-open (claim ownership).
+            pass
+        owned.add(agent_name)
+    # No local tokens found → can't assert multi-machine context; caller falls
+    # back to static MACHINE_OWNED_AGENTS (backward-compatible behavior).
+    if not found_any_token:
+        return None
+    return owned
 
-    try:
-        from storage_backend import get_backend
-        be = get_backend()
-        # be.machine_id is the value acquire_runner stamped onto the claim (SSOT),
-        # so the resolver's 'me' matches the claim's machine_id exactly.
-        me = getattr(be, "machine_id", None)
-        if not me or me == "unknown":
+
+def _owned_agents(be=None):
+    """Resolve the agent dirs this machine owns for the sweep. Gated by
+    OWNERSHIP_MODE (default '' => runner-token when be is provided, else static):
+
+    runner-token (default when OWNERSHIP_MODE is unset and be is available):
+      Compare agents/<name>/session/runner-token to the S3 copy. Zero-config:
+      no env list to maintain; /start writes the token, the sweep reads it.
+      Eliminates MACHINE_OWNED_AGENTS for own-cloud setups.
+
+    dynamic (OWNERSHIP_MODE='dynamic', INERT until g-115-1340 cutover):
+      Live RUNNING DDB runner claims for this machine_id.
+
+    static (OWNERSHIP_MODE='static'):
+      Legacy MACHINE_OWNED_AGENTS env list.
+
+    Returns:
+      None  — single-machine / unset → own ALL agents.
+      set   — names this machine currently runs (may be empty → own none).
+
+    FAIL-SAFE: on any resolution error, falls back to static env list (never
+    own-all on failure — conservative, never clobbers a peer)."""
+    mode = os.environ.get("OWNERSHIP_MODE", "").strip().lower()
+
+    if mode == "dynamic":
+        # Dynamic path — INERT until g-115-1340 cutover. Own-cloud only.
+        kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+        if kind != "own-cloud":
+            return None
+        try:
+            stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
+                                       _OWNERSHIP_STALE_SECONDS_DEFAULT))
+        except (TypeError, ValueError):
+            stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
+        try:
+            from storage_backend import get_backend
+            be_dyn = get_backend()
+            # be_dyn.machine_id is the value acquire_runner stamped onto the claim
+            # (SSOT), so the resolver's 'me' matches the claim's machine_id exactly.
+            me = getattr(be_dyn, "machine_id", None)
+            if not me or me == "unknown":
+                return _owned_agents_static()
+            claims = be_dyn.list_runner_claims()
+        except Exception as exc:
+            print(f"[sync] OWNERSHIP_MODE=dynamic: live claim read failed "
+                  f"({type(exc).__name__}: {exc}); falling back to static "
+                  "MACHINE_OWNED_AGENTS (conservative — never own-all on failure).",
+                  file=sys.stderr)
             return _owned_agents_static()
-        claims = be.list_runner_claims()
-    except Exception as exc:
-        print(f"[sync] OWNERSHIP_MODE=dynamic: live claim read failed "
-              f"({type(exc).__name__}: {exc}); falling back to static "
-              "MACHINE_OWNED_AGENTS (conservative — never own-all on failure).",
-              file=sys.stderr)
+        now = time.time()
+        return {
+            c.agent for c in claims
+            if c.machine_id == me
+            and c.agent_state == "RUNNING"
+            and (now - c.heartbeat_at) < stale
+        }
+
+    if mode == "static":
         return _owned_agents_static()
 
-    now = time.time()
-    return {
-        c.agent for c in claims
-        if c.machine_id == me
-        and c.agent_state == "RUNNING"
-        and (now - c.heartbeat_at) < stale
-    }
+    # Default / "runner-token": auto-detect via S3 runner-token comparison.
+    if be is not None:
+        for rp, pfx in _roots(be, None):
+            if pfx == "agents":
+                result = _owned_agents_runner_token(be, rp)
+                if result is not None:
+                    return result
+                break  # agents root found but no runner-tokens → fall through
+
+    # Fallback: static env list (covers MACHINE_OWNED_AGENTS legacy and the
+    # no-be / local-backend case where runner-token comparison is impossible).
+    return _owned_agents_static()
 
 
 def _multi_machine() -> bool:
@@ -608,7 +697,7 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     # would clobber them.)
     manifest = _load_manifest() if use_manifest else {}
     new_manifest = dict(manifest)
-    owned = _owned_agents()        # H4a: agent dirs this machine owns (None=all)
+    owned = _owned_agents(be=be)   # H4a: agent dirs this machine owns (None=all)
     # H4b/H4c: the flag _sync_one reads as "cannot prove local authority". The
     # periodic sweep NEVER knows per-file authorship (unlike sync_file, which
     # fires right after THIS machine wrote the file). It must therefore DEFER
@@ -710,7 +799,7 @@ def sync_file(be, target: Path, *, dry_run) -> int:
         return 0
     # H4a: never push a PEER agent's file — its local copy is a stale cache of
     # the owning machine's S3 writes (this machine does not run that agent).
-    owned = _owned_agents()
+    owned = _owned_agents(be=be)
     if prefix == "agents" and owned is not None and matched_root is not None:
         parts = target.relative_to(matched_root).parts
         if parts and parts[0] not in owned:

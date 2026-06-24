@@ -5,8 +5,8 @@
 #
 # Usage: inbox-alert-age-check.sh [--apply] [--asp-id ]
 #                                 [--high-hours N] [--medium-hours N]
-#                                 [--proactive-escalation-log <path>]  # tests only
-#                                 [--no-email]                          # tests only
+#                                 [--board-escalation-log <path>]  # tests only
+#                                 [--no-email] [--no-board]        # tests only
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 exec python3 "$CORE_ROOT/scripts/inbox-alert-age-check.py" "$@"

@@ -52,6 +52,37 @@ def _to_bash_path(p) -> str:
     return s
 
 
+# Framework env namespace stripped before spawning the record-script
+# subprocess (0, rb-1324/rb-1565 non-hermetic-pollution class).
+# The record-script tests below spawn a fresh shell that sources _paths.sh;
+# a fresh subprocess can only be influenced by its parent via env + cwd. cwd
+# is never mutated by the suite (no os.chdir anywhere), so env is the sole
+# cross-test pollution vector. Earlier suite tests assign os.environ
+# MIND_*/WORLD_*/META_*/STORAGE_*/FILEOPS_*/RT_*/etc. and the conftest
+# autouse fixture only restores MIND_AGENT/MIND_WORLD/STORAGE_BACKEND — any
+# other leaked framework var rode into the subprocess via {**os.environ} and
+# perturbed _paths.sh path resolution under canonical collection order while
+# the file passed in isolation. Stripping the whole framework prefix set is
+# polluter-agnostic: path resolution falls back to BASH_SOURCE + the seeded
+# local-paths.conf, exactly as in isolation. OS/Windows vars (PATH,
+# SYSTEMROOT, TEMP, ...) do not match the prefixes and are preserved so
+# `py -3`/git/bash still run.
+_FRAMEWORK_ENV_PREFIXES = (
+    "MIND_", "WORLD_", "META_", "STORAGE_", "FILEOPS_", "RT_",
+    "RUNTIME_", "AGENTS_", "MACHINE_", "OWNERSHIP_", "ENVIRONMENT_", "MIND_",
+)
+
+
+def _hermetic_env(**overrides) -> dict:
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(_FRAMEWORK_ENV_PREFIXES) and k != "PROJECT_ROOT"
+    }
+    env.update(overrides)
+    return env
+
+
 # Resolve bash via shared helper (, 2026-05-16). See
 # core/scripts/tests/_bash_helpers.py for the canonical resolution
 # priority. GIT_BASH alias kept — _run_bash uses mount-prefix paths.
@@ -91,6 +122,21 @@ def _setup_repo(tmpdir: Path, agents=("alpha", "zeta")) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (core_scripts / ".gitkeep").write_text("")
+    # 3: the partner-log (), own-log (), AND
+    # post-commit-clear snapshots all import _normalize_rel_path from
+    # $REPO/core/scripts/_cross_agent_attribution_filter.py (which pulls
+    # _stdio). Copy both into the temp repo so the harness exercises the REAL
+    # normalization instead of the import's fail-open identity fallback —
+    # otherwise absolute-form log entries silently stay un-normalized in-test,
+    # the exact blind spot the sibling concurrent-partner harness closed at
+    # 3. Mirrors test_iteration_commit_concurrent_partner.py::_setup_repo.
+    for _mod in ("_cross_agent_attribution_filter.py", "_stdio.py"):
+        (core_scripts / _mod).write_bytes((CORE_SCRIPTS / _mod).read_bytes())
+    # Match production: __pycache__ is gitignored. Without this, the
+    # py-normalization subprocess that compiles the copied helpers leaves an
+    # untracked core/scripts/__pycache__/ that git-status surfaces as a staged
+    # neutral-path artifact, polluting commit/clear assertions.
+    (repo / ".gitignore").write_text("__pycache__/\n")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
     return repo
@@ -123,13 +169,24 @@ def _shim_iteration_commit(tmpdir: Path) -> Path:
 
 def _seed_partner_log(repo: Path, partner: str, files: list[str]) -> Path:
     """Write the partner's uncommitted-edits.jsonl with the given rel paths.
-    Mimics what uncommitted-edits-record.sh would write at edit time."""
+    Mimics what uncommitted-edits-record.sh would write at edit time.
+
+    g-115-1603: stamp a FRESH mtime/edit_ts (now) so the entry is within the
+    _entry_is_stale 48h window. These tests assert the partner-log filter FIRES
+    on a between-claim edit; the entry must read as ACTIVE, not age-stale. Before
+    _setup_repo copied _cross_agent_attribution_filter.py the import fail-open
+    made _entry_is_stale a no-op, so a hardcoded ancient timestamp was harmless;
+    once the real staleness check runs, an ancient seed would (correctly) be
+    dropped as stale and the firing assertions would fail spuriously."""
     log = repo / "agents" / partner / "session" / "uncommitted-edits.jsonl"
     log.parent.mkdir(parents=True, exist_ok=True)
+    now_epoch = int(time.time())
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now_epoch))
     with log.open("w", encoding="utf-8") as f:
         for rel in files:
             f.write(
-                '{"file":"' + rel + '","mtime":1747145000,"edit_ts":"2026-05-13T12:11:00","goal_id":"g-test"}\n'
+                '{"file":"' + rel + '","mtime":' + str(now_epoch)
+                + ',"edit_ts":"' + now_iso + '","goal_id":"g-test"}\n'
             )
     return log
 
@@ -227,6 +284,53 @@ def test_own_log_does_not_self_filter():
             f"Filter wrongly fired on own log. combined={combined!r}"
         assert "alpha-own.py" in combined, \
             f"Own file missing from staging. combined={combined!r}"
+
+
+def test_own_log_exempts_double_recorded_path():
+    """0 regression: when a neutral-path file is recorded in BOTH a
+    partner's uncommitted-edits.jsonl AND the committer's OWN log (the g-115-695
+    between-claim double-recording — one physical edit logged by two agents), the
+    committer's first-person authorship MUST override the partner-log drop and
+    the file is RETAINED.
+
+    Before the fix the partner-uncommitted-log filter (g-115-697) lacked the
+    own-log check the concurrent-partner filter (g-115-828, line ~818) has, so
+    the committer's own deep-close edit was silently dropped — and because the
+    drop is a WARN (not an ERROR), a deletion-free goal could report exit-0
+    success while leaving its own framework edits uncommitted (observed
+    g-303-33, g-115-1619). Mirrors the g-115-828 own-log exemption that
+    test_iteration_commit_concurrent_partner pins for the sibling filter."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+
+        shared = "core/scripts/shared-edit.py"
+        # Partner (zeta) recorded it...
+        _seed_partner_log(repo, "zeta", [shared])
+        # ...AND committer (alpha) ALSO recorded it — the double-recording overlap
+        # (one physical edit attributed to both agents' logs).
+        _seed_partner_log(repo, "alpha", [shared])
+
+        target = repo / "core" / "scripts" / "shared-edit.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# alpha's deep-close edit, also recorded under zeta\n")
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-1620-01", "--title", "Apply: alpha goal",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+
+        combined = result.stderr + result.stdout
+        # The own-log proof must override the partner-log drop.
+        assert "filtered (partner-uncommitted-log): core/scripts/shared-edit.py" not in combined, \
+            f"Own deep-close edit was wrongly dropped despite own-log proof. combined={combined!r}"
+        assert "retained (committer-authored-log)" in combined, \
+            f"g-115-1620 own-log exemption marker missing. combined={combined!r}"
+        assert "shared-edit.py" in combined, \
+            f"Retained file missing from staging. combined={combined!r}"
 
 
 def test_include_untracked_disables_partner_log_filter():
@@ -385,7 +489,7 @@ def test_record_filters_agent_prefixed_path_under_agents_parent():
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "MIND_AGENT": "alpha"},
+            env=_hermetic_env(MIND_AGENT="alpha"),
         )
         assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
         log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
@@ -412,7 +516,7 @@ def test_record_appends_neutral_path_under_agents_parent():
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "MIND_AGENT": "alpha"},
+            env=_hermetic_env(MIND_AGENT="alpha"),
         )
         assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
         log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
@@ -442,7 +546,7 @@ def test_record_filters_world_and_meta_virtual_prefixes():
                 capture_output=True,
                 text=True,
                 timeout=10,
-                env={**os.environ, "MIND_AGENT": "alpha"},
+                env=_hermetic_env(MIND_AGENT="alpha"),
             )
             assert result.returncode == 0, f"record script crashed: {result.stderr!r}"
         log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
@@ -495,3 +599,52 @@ def test_clear_on_success_removes_committed_paths():
             f"wrong entry remained: {remaining[0]!r}"
         assert "will-commit.py" not in remaining[0], \
             f"committed entry should be removed: {remaining[0]!r}"
+
+
+def test_clear_normalizes_absolute_own_log_entry():
+    """3 regression: the post-commit clear must prune an own-log entry
+    stored in LEGACY-ABSOLUTE form (C:/.../repo/core/foo.py), not just relative
+    form. The clear compares the entry's `file` against the relative committed
+    set; without _normalize_rel_path (the SAME normalizer the two construction
+    consumers use, g-115-1180 / g-115-1413, rb-1405 SSOT) an absolute entry
+    never string-equals the relative committed path, so it is NEVER pruned and
+    persists as a stale record that later false-drops a partner's legitimate
+    edit at that path (the g-306-51 stale-record precondition, rb-2186)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+
+        # Both entries stored ABSOLUTE (legacy form, pre-record.sh drive-letter
+        # normalization). will-commit-abs.py is created on disk (committed);
+        # wont-commit-abs.py is not (must survive the clear).
+        abs_will = (repo / "core" / "will-commit-abs.py").as_posix()
+        abs_wont = (repo / "core" / "wont-commit-abs.py").as_posix()
+        log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(
+            '{"file":"' + abs_will + '","mtime":1747145000,"edit_ts":"2026-05-13T12:11:00","goal_id":"g-test"}\n'
+            '{"file":"' + abs_wont + '","mtime":1747145001,"edit_ts":"2026-05-13T12:12:00","goal_id":"g-test"}\n'
+        )
+
+        target = repo / "core" / "will-commit-abs.py"
+        target.write_text("# committed via absolute-form own-log entry\n")
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-clear-abs-01", "--title", "Apply: alpha goal",
+             "--outcome", "deep", "--repo", str(repo)],
+            env={"MIND_AGENT": "alpha"},
+        )
+
+        assert result.returncode == 0, \
+            f"commit failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+
+        remaining = log.read_text(encoding="utf-8").strip().splitlines()
+        # The committed absolute entry MUST be pruned; only wont-commit survives.
+        assert len(remaining) == 1, \
+            f"expected 1 remaining entry (absolute committed entry pruned), got {len(remaining)}: {remaining!r}"
+        assert "wont-commit-abs.py" in remaining[0], \
+            f"wrong entry remained: {remaining[0]!r}"
+        assert "will-commit-abs.py" not in remaining[0], \
+            f"committed absolute entry should be removed (normalization gap): {remaining[0]!r}"

@@ -39,6 +39,7 @@ unified cache tree.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -51,7 +52,14 @@ import boto3
 from botocore.config import Config as _BotoConfig
 from botocore.exceptions import ClientError
 
-from storage_backend import FileStat, WriteResult
+from storage_backend import (
+    FileStat, WriteResult,
+    # Multi-tenant customer dimension (g-115-1601) — defined in the boto3-free
+    # seam so the daemon (server.py) can set/reset without importing this cloud
+    # backend; re-exported here so callers already importing owncloud_backend
+    # (tests, CLI) reach them unchanged.
+    _DEFAULT_CUSTOMER, current_customer, set_customer, reset_customer,
+)
 
 PathLike = Union[str, os.PathLike]
 
@@ -281,13 +289,23 @@ class OwnCloudBackend:
             f"({[str(r) for r, _ in self._roots]}) — cannot derive an "
             "env-scoped S3/lock key")
 
+    def _customer_prefix(self) -> str:
+        """Leading ``<customer>/`` segment for the active context, or ``""`` for
+        the "default" single-tenant baseline (⇒ byte-identical legacy keys). See
+        the module-level customer-contextvar block. Read per CALL (not cached on
+        the singleton) so a concurrent request for a different customer never
+        bleeds into this one."""
+        c = current_customer()
+        return "" if c == _DEFAULT_CUSTOMER else f"{c}/"
+
     def _s3_key(self, path: PathLike) -> str:
-        return f"{self.env_id}/{self._rel(path)}"
+        return f"{self._customer_prefix()}{self.env_id}/{self._rel(path)}"
 
     def _lock_key(self, lock_path: PathLike) -> str:
-        # The DDB lock key is the env-scoped logical path of the lock file. Acquire
-        # and release derive it identically, so the .lock suffix is harmless.
-        return f"{self.env_id}/{self._rel(lock_path)}"
+        # The DDB lock key is the customer+env-scoped logical path of the lock
+        # file. Acquire and release derive it identically, so the .lock suffix is
+        # harmless. The customer prefix isolates locks across tenants.
+        return f"{self._customer_prefix()}{self.env_id}/{self._rel(lock_path)}"
 
     def _holder(self) -> str:
         return f"{self.machine_id}:{os.getpid()}:{threading.get_ident()}"
@@ -319,12 +337,83 @@ class OwnCloudBackend:
         self._cache_check[str(local)] = now
         if local.exists() and self._etags.get(key) == etag:
             return local  # unchanged since our last download
+        # --- No-clobber guard (g-115-1574 / rb-2096) -------------------------
+        # self._etags (L151) is in-process and EMPTY after a daemon restart, so
+        # the equality check above CANNOT stop the first post-restart refresh
+        # from overwriting local with stale S3 -- even when local holds unpushed
+        # writes a non-backend writer made during a backend-down window (the
+        # g-115-1573 reasoning-bank.jsonl 2020->0 valid_from revert). Gate the
+        # overwrite on the PERSISTENT sync-manifest baseline, symmetric to
+        # owncloud_sync._pull_one (L781-805), so the read path and the sweep
+        # path share ONE clobber-safety semantics.
+        if local.exists():
+            decision = self._overwrite_decision(path, local, etag)
+            if decision == "identical":
+                # local already byte-identical to S3; the empty post-restart
+                # cache only made it look stale. Adopt the ETag as the fence
+                # token and skip the needless re-download.
+                self._etags[key] = etag
+                return local
+            if decision == "no_clobber":
+                # local is authoritative (unpushed writes, or an uncomparable
+                # multipart S3 ETag). Do NOT overwrite. Leave self._etags
+                # untouched so a later _put keeps its existing post-restart push
+                # behavior -- this guard is purely additive to the read path and
+                # never alters the write path.
+                return local
+            # decision == "download" -> fall through to the pull below.
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
         body = obj["Body"].read()
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(body)
         self._etags[key] = etag
         return local
+
+    def _overwrite_decision(self, path: PathLike, local: Path, etag: str) -> str:
+        """Classify whether _refresh may overwrite an EXISTING local file with
+        the S3 object at ``etag``, mirroring owncloud_sync._pull_one (L781-805)
+        so the read path shares the sweep path's no-clobber semantics
+        (g-115-1574 / rb-2096). Returns one of:
+
+          "identical"  local is byte-identical to S3 -> skip the download; the
+                       caller adopts the ETag as the fence token.
+          "no_clobber" local diverged from the PERSISTENT sync-manifest baseline
+                       (unpushed local writes -> local is authoritative), OR the
+                       S3 ETag is multipart (uncomparable) -> keep local, do NOT
+                       download.
+          "download"   safe to pull S3 over local: local == baseline and S3 moved
+                       (a peer/other machine wrote), or there is no baseline
+                       (S3-authoritative, matching _pull_one's no-baseline branch).
+
+        Fail-open: an unreadable local, or unavailable owncloud_sync helpers,
+        degrade to "download" (the pre-fix behavior for that single call) so a
+        manifest/import hiccup never wedges a read. _load_manifest is itself
+        fail-open (returns {} on any error -> no baseline -> "download")."""
+        try:
+            local_md5 = hashlib.md5(local.read_bytes()).hexdigest()
+        except OSError:
+            return "download"  # cannot preserve an unreadable local; S3 recovers
+        # Lazy import: keep owncloud_sync (heavy) off the backend's import path
+        # and reuse its manifest-format + ETag helpers as the single source of
+        # truth (sys.modules-cached after first use; no import cycle because
+        # owncloud_sync does not import this module at top level).
+        try:
+            from owncloud_sync import (_load_manifest, _manifest_entry,
+                                       _etag_matches, _etag_is_multipart)
+        except Exception:
+            return "download"
+        if _etag_matches(etag, local_md5):
+            return "identical"
+        try:
+            _mtime, baseline_md5 = _manifest_entry(
+                _load_manifest().get(self._rel(path)))
+        except Exception:
+            baseline_md5 = None
+        if baseline_md5 is not None and local_md5 != baseline_md5:
+            return "no_clobber"  # unpushed local writes -> local is authoritative
+        if _etag_is_multipart(etag):
+            return "no_clobber"  # uncomparable S3 ETag -> defer, never clobber
+        return "download"
 
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes:
         local = self._refresh(path, force_fresh)
@@ -359,8 +448,9 @@ class OwnCloudBackend:
         prefix = self._s3_key(path)
         if not prefix.endswith("/"):
             prefix += "/"
-        assert prefix.startswith(self.env_id + "/"), (
-            f"list_dir prefix {prefix!r} escapes env-id scope {self.env_id!r} "
+        expected = self._customer_prefix() + self.env_id + "/"
+        assert prefix.startswith(expected), (
+            f"list_dir prefix {prefix!r} escapes customer/env scope {expected!r} "
             "— IAM ListBucket is prefix-conditioned on it")
         names = set()
         token = None
@@ -556,7 +646,7 @@ class OwnCloudBackend:
 
     # --- agent-session coordination (SYNC-DDB tier; dual-runner + heartbeat)
     def _session_key(self, agent_name: str) -> str:
-        return f"{self.env_id}/{agent_name}"
+        return f"{self._customer_prefix()}{self.env_id}/{agent_name}"
 
     def acquire_runner(self, agent_name: str, token: str) -> bool:
         """Conditional IDLE→RUNNING (fix #4). Returns True on success; raises
@@ -674,7 +764,7 @@ class OwnCloudBackend:
         :class:`RunnerClaim`; rows of every state (IDLE and RUNNING) are returned
         — the §3 resolver does the machine_id / RUNNING / freshness filtering, not
         this primitive."""
-        prefix = self.env_id + "/"
+        prefix = self._customer_prefix() + self.env_id + "/"
         claims: List[RunnerClaim] = []
         start_key = None
         while True:

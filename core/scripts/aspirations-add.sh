@@ -51,10 +51,34 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Pre-daemon validation ------------------------------------------------
+# --schema: print the accepted stdin-body field schema (this writer adds an
+# ASPIRATION, not a goal) + a pointer to the authoritative convention doc.
+# Keep in sync with core/config/conventions/aspirations.md (the SSOT).
 for arg in "${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}"; do
     if [ "$arg" = "--schema" ]; then
-        echo "Error: --schema is no longer available. See mind_api/src/endpoints/ for API docs." >&2
-        exit 1
+        cat <<'SCHEMA_JSON'
+{
+  "writer": "aspirations-add.sh",
+  "input": "JSON aspiration object on stdin",
+  "required": {
+    "title": "string - aspiration title",
+    "priority": "string - HIGH | MEDIUM | LOW"
+  },
+  "optional": {
+    "status": "string - active (default) | completed | paused | retired",
+    "scope": "string - sprint | project | initiative",
+    "motivation": "string - why this aspiration exists",
+    "description": "string",
+    "tags": "string[]",
+    "origin_signal": "string - upstream cause (see goal-schemas.md prefixes)",
+    "goals": "array - goal objects; usually added separately via aspirations-add-goal.sh"
+  },
+  "auto_assigned": "id (format asp-NNN), progress, selection_count, archived - do NOT supply",
+  "note": "Goals are normally filed under the aspiration afterward via aspirations-add-goal.sh.",
+  "doc": "core/config/conventions/aspirations.md"
+}
+SCHEMA_JSON
+        exit 0
     fi
 done
 

@@ -61,6 +61,7 @@ OUTCOME=""
 SUMMARY=""
 SESSION_NUM=""
 RETRIEVAL_INFLUENCE=""
+WORK_CLASS=""
 
 # Argument parsing — mirrors iteration-close.sh's flag style for consistency
 while [[ $# -gt 0 ]]; do
@@ -70,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         --summary) SUMMARY="$2"; shift 2 ;;
         --session) SESSION_NUM="$2"; shift 2 ;;
         --retrieval-influence) RETRIEVAL_INFLUENCE="$2"; shift 2 ;;
+        --work-class) WORK_CLASS="$2"; shift 2 ;;
         *)
             echo "[journal-append] unknown arg: $1" >&2
             exit 2
@@ -91,15 +93,27 @@ journal_file="$journal_dir/$day.md"
 mkdir -p "$journal_dir"
 timestamp="$(date +%H:%M)"
 
+# Value framing (FW-5 / R2, ): a DERIVED, presentation-only affirming
+# label for the (outcome_class, work_class) pair, so a recorded `routine`
+# outcome carries its structural value instead of reading as "did not count"
+# (.claude/rules/learning-philosophy.md Recognition half). Never stored, no
+# enum touched — derived here at write time. work_class is optional (passed by
+# iteration-close.sh; other callers omit it -> the outcome_class's
+# `unclassified` framing). Fail-open: any helper error -> empty -> no Value line.
+VALUE_FRAMING="$(python3 "$CORE_ROOT/scripts/_value_framing.py" "$OUTCOME" "$WORK_CLASS" 2>/dev/null || true)"
+
 # Stable-format markdown append. Section headers MUST stay in this order
 # (## title, Outcome:, Summary:) — /verify-learning Section BE checks the
-# shape, and downstream readers (boot, consolidation) parse it.
+# shape, and downstream readers (boot, consolidation) parse it. The Value:
+# line is APPENDED after the existing optional lines (same position class as
+# Retrieval influence) so the Section BE order check is unaffected.
 {
     echo ""
     echo "## $timestamp — Goal: ${SUMMARY:-$GOAL_ID} ($GOAL_ID)"
     echo "Outcome: $OUTCOME"
     [[ -n "$SUMMARY" ]] && echo "Summary: $SUMMARY"
     [[ -n "$RETRIEVAL_INFLUENCE" ]] && echo "Retrieval influence: $RETRIEVAL_INFLUENCE"
+    [[ -n "$VALUE_FRAMING" ]] && echo "Value: $VALUE_FRAMING"
 } >> "$journal_file"
 
 # Citation scan (/): grep SUMMARY for rb-NNN / guard-NNN
@@ -158,7 +172,7 @@ if [[ -n "$SUMMARY" ]]; then
         # tokens are clean. Verified by core/scripts/tests/test_journal_tree_cite_scan.py.
         tree_cites="$(printf '%s' "$SUMMARY" | python3 -c '
 import os, re, sys
-summary = sys.stdin.read()
+summary = sys.stdin.buffer.read().decode("utf-8", errors="replace")
 tree_path = sys.argv[1]
 candidates = set(re.findall(r"\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b", summary))
 if not candidates:

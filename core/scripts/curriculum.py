@@ -23,7 +23,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT, PROJECT_ROOT, assert_agent_dir
+from _paths import AGENT_DIR, AGENT_NAME, CONFIG_DIR, CORE_ROOT, PROJECT_ROOT, WORLD_DIR, assert_agent_dir
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "curriculum.yaml"` TypeError class the next line would otherwise raise.
@@ -157,6 +157,42 @@ def count_matching_jsonl(file_rel, field, value):
     return count
 
 
+def count_world_attributed(field, value, agent):
+    """Count WORLD-queue goals matching field/value AND attributed to `agent`.
+
+    Cross-queue graduation counting (g-115-1560). Lane-specialized agents do
+    most of their work on the shared WORLD queue (WORLD_DIR/aspirations.jsonl),
+    not their private agents/<agent>/aspirations.jsonl. A count_check gate with
+    `cross_queue: true` adds this agent-attributed WORLD count to the agent-queue
+    count, so graduation reflects total demonstrated work rather than only the
+    private queue (where a world-queue executor accumulates ~nothing and stays
+    pinned at cur-01 forever despite meeting the competence gate).
+
+    Attribution is `completed_by` (the explicit "who completed this goal" field).
+    `claimed_by` is deliberately NOT used: it is cleared on completion (verified
+    2026-06-19 over the live world queue: 3/1609 completed goals retain
+    claimed_by vs 174 carrying completed_by). Only goals[*]-flatten fields are
+    supported — the shape every graduation completion gate uses; a non-flatten
+    field returns 0 (cross_queue is graduation-completion-scoped, not general).
+    """
+    if "[*]." not in field:
+        return 0
+    records = read_jsonl(WORLD_DIR / "aspirations.jsonl")
+    array_field, sub_field = field.split("[*].", 1)
+    count = 0
+    for record in records:
+        arr = record.get(array_field, [])
+        if isinstance(arr, list):
+            for item in arr:
+                if not isinstance(item, dict):
+                    continue
+                item_val = navigate_dotpath(item, sub_field)
+                if (value == "*" or str(item_val) == str(value)) \
+                        and item.get("completed_by") == agent:
+                    count += 1
+    return count
+
+
 def compare(actual, operator, threshold):
     """Compare a numeric value against a threshold using the given operator."""
     if actual is None:
@@ -179,7 +215,25 @@ def compare(actual, operator, threshold):
 
 
 def evaluate_gate(gate):
-    """Evaluate a single graduation gate. Returns (passed, current_value)."""
+    """Evaluate a single graduation gate. Returns (passed, current_value).
+
+    Deliberately NOT consolidated into core/scripts/predicate.py (g-241-02,
+    2026-06-10). Despite the surface-similar type-dispatch shape, the two
+    evaluators are semantically disjoint, so a delegate would be a leaky
+    adapter that ADDS coupling rather than a DRY win:
+      - Type vocabularies are disjoint except the NAME "metric_threshold".
+        curriculum gates = {metric_threshold, count_check, log_scan,
+        command_check}; predicate = {file_exists_after, command_succeeds,
+        goal_completed_after, file_check, metric_threshold, after_time,
+        vcs_commits_since}. count_check / log_scan / command_check have no
+        predicate equivalent.
+      - Even the shared "metric_threshold" has an incompatible schema:
+        curriculum resolves a NAMED metric via resolve_metric() with an
+        operator + threshold and returns a (passed, current_value) tuple;
+        predicate runs an allowlisted COMMAND with min/max bounds and returns
+        a PredicateResult. Different input field, comparison model, and return
+        contract.
+    """
     gate_type = gate.get("type", "")
 
     if gate_type == "metric_threshold":
@@ -197,6 +251,12 @@ def evaluate_gate(gate):
         operator = gate.get("operator", ">=")
         threshold = gate.get("threshold", 0)
         current_value = count_matching_jsonl(file_rel, field, value)
+        # Cross-queue graduation counting (0): opt-in. Without the flag,
+        # behavior is unchanged (agent-queue only) — no existing gate is affected.
+        # With cross_queue: true, add WORLD-queue goals attributed to this agent
+        # so a world-queue-executor's graduation reflects its real output.
+        if gate.get("cross_queue"):
+            current_value += count_world_attributed(field, value, AGENT_NAME)
         passed = compare(current_value, operator, threshold)
         return passed, current_value
 

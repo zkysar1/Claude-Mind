@@ -98,6 +98,41 @@ def _config_d_max():
     return _merged_config()["config"]["D_max"]
 
 
+def _config_k_max():
+    """Read K_max — max children per node (the Zhong K=4 fan-out cap).
+
+    Source: tree.yaml + meta/config-overrides.yaml overlay. Raises on missing
+    key (rb-215/rb-275 anti-drift — a silent fallback would change the
+    locality contract without anyone noticing)."""
+    return _merged_config()["config"]["K_max"]
+
+
+def _config_d_retrieval():
+    """Read D_retrieval — max depth BELOW a retrieval root (the Zhong D=4 cap).
+
+    Distinct from D_max (the absolute structural ceiling, ~20). The K=D=4
+    retrieval-locality contract (g-306-13) constrains depth *below a retrieval
+    entry point*, not absolute tree depth. Source: tree.yaml +
+    meta/config-overrides.yaml overlay."""
+    return _merged_config()["config"]["D_retrieval"]
+
+
+def _config_leaf_cap():
+    """Per-retrieval-subtree leaf cap, derived from K_max and D_retrieval.
+
+    Zhong et al. (PRL 134:237402, 2025): random-tree recall saturates at
+    K^(D-1) leaves under a retrieval entry point. With K_max=4, D_retrieval=4
+    this is 4^3 = 64. DERIVED rather than a 4th config knob so it can never
+    drift from K_max / D_retrieval (single source of truth — rb-215). An
+    explicit `config.leaf_cap` overrides the derivation when present (escape
+    hatch for non-default tunings)."""
+    cfg = _merged_config()["config"]
+    explicit = cfg.get("leaf_cap")
+    if explicit is not None:
+        return explicit
+    return cfg["K_max"] ** (cfg["D_retrieval"] - 1)
+
+
 # DO NOT INLINE THIS FORMULA. It must match utilization-feedback.py exactly.
 # Inferred hits count half — manual feedback keeps authoritative weight.
 # Changing this in one place without the other silently decouples the signal.
@@ -376,6 +411,32 @@ def apply_defaults(node):
         out["times_noise"] = 0
     if "utility_ratio" not in out:
         out["utility_ratio"] = 0.0
+    # poignancy (, BRD Gap 1a): optional 1-10 importance rating, null
+    # when unset. Null-safe — retrieve scoring treats None as neutral. Read-safe
+    # default (no disk write): legacy nodes present poignancy=None in-memory
+    # without rewriting the file, matching capability_level's defaulting above.
+    if "poignancy" not in out:
+        out["poignancy"] = None
+    # last_relevant_at (, D2 cluster-archival): optional ISO date marking
+    # demonstrated relevance, null when unset. Read-safe default (no disk write):
+    # null is treated as `last_updated` by the archival sweep's effective_relevance
+    # (back-filled to a concrete date only by the write path — tree-archive.sh
+    # scan/apply or `tree-update.sh --set last_relevant_at`). Single-writer: only
+    # the tree-archival lane writes it. See d2-cluster-archival-design.md §2/§4,
+    # guard-155/rb-254 (single-writer tree-maintenance state).
+    if "last_relevant_at" not in out:
+        out["last_relevant_at"] = None
+    # valid_from / valid_to (, BRD Gap 5): optional bi-temporal validity
+    # interval on a tree-node front matter. Read-safe null defaults (no disk
+    # write), matching poignancy / last_relevant_at above — legacy nodes present
+    # valid_from=valid_to=None in-memory without rewriting the file. The
+    # falsification / migration write paths set concrete values. Mirror of the
+    # daemon _apply_defaults in mind_api/src/world/tree_write.py (byte-compat
+    # parity test asserts identical ordered keys).
+    if "valid_from" not in out:
+        out["valid_from"] = None
+    if "valid_to" not in out:
+        out["valid_to"] = None
     return out
 
 
@@ -558,6 +619,31 @@ def get_active_content(tree, key):
     return {"key": key, "active_content": content, "sections_found": sections_found}
 
 
+def _analyze_node_body(text):
+    """Return (line_count, est_tokens, refresh_sections) for a node .md body.
+
+    est_tokens uses the ~4-chars/token markdown heuristic that underlies the
+    Read tool's ~25k-token cap. refresh_sections counts the dated append-grown
+    sweep headings (markdown headings whose text contains "refresh" or
+    "verified values", case-insensitive) that are the structural signature of a
+    recurring-sweep node — the shape the rb-2085 distill procedure targets.
+    Pure (string in, tuple out) so crit3 in get_distill_candidates is
+    unit-testable without filesystem / path-resolution fixtures. (g-115-1570)
+    """
+    line_count = 0
+    char_count = 0
+    refresh_sections = 0
+    for line in text.splitlines(keepends=True):
+        line_count += 1
+        char_count += len(line)
+        s = line.lstrip()
+        if s.startswith("#"):
+            low = s.lower()
+            if "refresh" in low or "verified values" in low:
+                refresh_sections += 1
+    return line_count, char_count // 4, refresh_sections
+
+
 def get_distill_candidates(tree, include_skipped=False):
     """Return leaf nodes eligible for DISTILL based on utility thresholds.
     Reads thresholds from core/config/tree.yaml pruning section.
@@ -578,6 +664,11 @@ def get_distill_candidates(tree, include_skipped=False):
     min_ret = pruning.get("distill_min_retrievals", 5)
     line_threshold = pruning.get("distill_line_threshold", 50)
     line_util_threshold = pruning.get("distill_line_utility_threshold", 0.5)
+    # crit3 (0): proactive oversized append-grown sweep node.
+    token_cap = pruning.get("distill_token_cap", 25000)            # Read tool ~25k-token cap
+    token_ratio = pruning.get("distill_token_ratio", 0.8)          # fire at this fraction of the cap
+    token_trigger = token_ratio * token_cap
+    refresh_min = pruning.get("distill_refresh_min_sections", 3)   # append-grown = 3+ dated refresh sections
 
     nodes = tree.get("nodes", {})
     candidates = []
@@ -602,13 +693,28 @@ def get_distill_candidates(tree, include_skipped=False):
         file_path = node.get("file", "")
         abs_path = str(resolve_file_path(file_path)) if file_path else ""
         line_count = 0
+        est_tokens = 0
+        refresh_sections = 0
         if abs_path and os.path.exists(abs_path):
             with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
+                line_count, est_tokens, refresh_sections = _analyze_node_body(f.read())
         # crit2 requires feedback too — same root cause as crit1 (zero-feedback
         # nodes have ur=0.0 by default and mis-fire as "mediocre"). .
         crit2 = line_count > line_threshold and ur < line_util_threshold and rc >= min_ret and has_feedback
-        if crit1 or crit2:
+        # Criterion 3 (0): proactive oversized append-grown sweep node.
+        # Fires BEFORE the node trips the Read ~25k-token cap that forces
+        # read-before-edit to re-read it on every recurring sweep (rb-2085's
+        # reactive-distill trigger). STRUCTURAL — independent of
+        # utility_ratio/feedback (crit1/crit2): the problem is the node is too
+        # large to Read at all, not that its payoff is low (these sweep nodes
+        # are typically HIGH-utility, so crit2's ur<0.5 gate never catches them).
+        # Both conditions required (near-cap size AND append-grown shape) so the
+        # false-positive rate stays near zero. Action reuses the rb-2085 distill
+        # procedure (archive verbatim + keep newest-N + dated rollup).
+        crit3 = est_tokens >= token_trigger and refresh_sections >= refresh_min
+        if crit1 or crit2 or crit3:
+            trigger = ("oversized_append_grown" if crit3
+                       else "low_utility" if crit1 else "large_mediocre")
             candidates.append({
                 "key": key,
                 "utility_ratio": ur,
@@ -616,8 +722,10 @@ def get_distill_candidates(tree, include_skipped=False):
                 "times_helpful": th,
                 "times_noise": tn,
                 "line_count": line_count,
+                "est_tokens": est_tokens,
+                "refresh_sections": refresh_sections,
                 "file": file_path,
-                "trigger": "low_utility" if crit1 else "large_mediocre",
+                "trigger": trigger,
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
@@ -627,7 +735,11 @@ def get_distill_candidates(tree, include_skipped=False):
                 skipped.append({"node_key": key, "skip_reason": "no_feedback"})
             else:
                 skipped.append({"node_key": key, "skip_reason": "utility_above_threshold"})
-    candidates.sort(key=lambda x: x["utility_ratio"])
+    # Surface proactive oversized-append-grown candidates FIRST: they block Read
+    # entirely (rb-2085), so they must win the max_distill_per_invocation budget
+    # over low-utility / large-mediocre leaves. Within each tier, lowest utility
+    # first (preserves the prior ordering for crit1/crit2 candidates). (0)
+    candidates.sort(key=lambda x: (0 if x["trigger"] == "oversized_append_grown" else 1, x["utility_ratio"]))
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
@@ -747,75 +859,114 @@ def _qualifies_for_decomposition(abs_path):
     return True, None
 
 
-def get_decompose_candidates(tree, threshold=50, include_skipped=False):
-    """Return leaf nodes whose .md file exceeds threshold lines and depth < D_max.
+def _subtree_leaf_counts(nodes):
+    """Map every node key -> number of leaf descendants in its subtree.
+
+    A leaf (no children) counts as 1 (itself); an interior node's count is the
+    sum of its children's counts. Memoized post-order over the node dict.
+    Cycle- and dangling-child-safe: a child key absent from `nodes` contributes
+    0, and a back-edge in a malformed cycle resolves to 0 without crashing
+    (validate_tree owns flagging structural corruption — this helper must never
+    raise on a bad tree). Used by the K=D=4 retrieval-locality checks
+    (g-306-13): a node whose subtree leaf count exceeds the leaf cap is a
+    retrieval entry point that violates the Zhong <=64-leaves locality bound.
+    """
+    counts = {}
+    visiting = set()
+
+    def _count(key):
+        if key in counts:
+            return counts[key]
+        node = nodes.get(key)
+        if node is None:
+            return 0
+        children = node.get("children", [])
+        if not children:
+            counts[key] = 1
+            return 1
+        if key in visiting:
+            return 0  # cycle back-edge — contribute 0, let the outer frame finish
+        visiting.add(key)
+        total = 0
+        for child in children:
+            total += _count(child)
+        visiting.discard(key)
+        counts[key] = total
+        return total
+
+    for k in nodes:
+        _count(k)
+    return counts
+
+
+def get_decompose_candidates(tree, include_skipped=False):
+    """Return non-root nodes whose retrieval subtree exceeds the leaf cap.
+
+    STRUCTURAL trigger (g-306-13): a node is a decompose candidate when the
+    number of leaves under it exceeds K_max^(D_retrieval-1) (the Zhong <=64
+    retrieval-locality bound) — NOT when its .md file exceeds a line count. The
+    line-count trigger (decompose_threshold) is retired here per g-306-13
+    outcome 3: existing tree depth is line-count-decompose residue (board
+    decision msg-20260619-075228-bravo-086). Root (depth 0) is excluded — it
+    holds every leaf and is the routing index, not a retrieval entry point.
+
+    Recommended action: decompose — add intermediate grouping so any retrieval
+    entry point sees <=leaf_cap leaves. Existing depth-5..8 nodes are
+    GRANDFATHERED; the maintain path regroups opportunistically, never
+    force-migrates (see .claude/skills/tree/SKILL.md maintain section).
 
     When include_skipped=True, returns {candidates, skipped} where skipped is a
-    list of {node_key, skip_reason}. Skip-reason enum:
-      no_file, depth_at_dmax, file_not_found, read_error, below_line_threshold,
-      insufficient_sections, short_sections_avg.
-    Non-leaf nodes are not iterated (get_all_leaves pre-filters them).
+    list of {node_key, skip_reason}. Skip-reason enum: is_root, within_leaf_cap.
     """
-    D_MAX = _config_d_max()
-    leaves = get_all_leaves(tree)
+    leaf_cap = _config_leaf_cap()
+    nodes = tree.get("nodes", {})
+    leaf_counts = _subtree_leaf_counts(nodes)
     candidates = []
     skipped = []
-    for leaf in leaves:
-        file_path = leaf.get("file", "")
-        depth = leaf.get("depth", 0)
-        key = leaf["key"]
-        if not file_path:
+    for key, node in nodes.items():
+        depth = node.get("depth", 0)
+        if depth < 1:
             if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "no_file"})
+                skipped.append({"node_key": key, "skip_reason": "is_root"})
             continue
-        if depth >= D_MAX:
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
-            continue
-        abs_path = str(resolve_file_path(file_path))
-        if not os.path.exists(abs_path):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
-            continue
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
-        except (OSError, UnicodeDecodeError):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "read_error"})
-            continue
-        if line_count > threshold:
-            qualifies, skip_reason = _qualifies_for_decomposition(abs_path)
-            if qualifies:
-                candidates.append({
-                    "key": key,
-                    "file": file_path,
-                    "line_count": line_count,
-                    "depth": depth,
-                    "growth_state": leaf.get("growth_state", "stable"),
-                })
-            elif include_skipped:
-                skipped.append({"node_key": key, "skip_reason": skip_reason})
+        subtree_leaves = leaf_counts.get(key, 0)
+        if subtree_leaves > leaf_cap:
+            candidates.append({
+                "key": key,
+                "file": node.get("file", ""),
+                "depth": depth,
+                "child_count": len(node.get("children", [])),
+                "subtree_leaves": subtree_leaves,
+                "leaf_cap": leaf_cap,
+                "reason": "leaf_overflow",
+                "recommended_action": "decompose",
+                "growth_state": node.get("growth_state", "stable"),
+            })
         elif include_skipped:
-            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
-    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+            skipped.append({"node_key": key, "skip_reason": "within_leaf_cap"})
+    candidates.sort(key=lambda c: c["subtree_leaves"], reverse=True)
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
 
 
-def get_redistribute_candidates(tree, threshold=50, include_skipped=False):
-    """Return interior nodes whose .md body exceeds threshold lines and depth < D_max.
+def get_redistribute_candidates(tree, include_skipped=False):
+    """Return interior nodes with more than K_max children (regroup candidates).
 
-    These nodes have children but retain large body content that should be
-    redistributed into those children or into new children.
+    STRUCTURAL trigger (g-306-13): a node is a regroup candidate when it has
+    more than K_max children (the Zhong K=4 fan-out cap) — NOT when its .md
+    body exceeds a line count. The line-count body trigger is retired here per
+    g-306-13 outcome 3.
+
+    Recommended action: regroup — group the >K_max children under <=K_max
+    intermediate category nodes (balanced regrouping on overflow). Existing
+    depth-5..8 nodes are GRANDFATHERED; the maintain path regroups
+    opportunistically (see .claude/skills/tree/SKILL.md maintain section).
 
     When include_skipped=True, returns {candidates, skipped} where skipped is a
-    list of {node_key, skip_reason}. Skip-reason enum:
-      no_children, no_file, depth_at_dmax, file_not_found, read_error,
-      below_line_threshold.
+    list of {node_key, skip_reason}. Skip-reason enum: no_children, within_k_max.
     """
-    D_MAX = _config_d_max()
+    k_max = _config_k_max()
     nodes = tree.get("nodes", {})
     candidates = []
     skipped = []
@@ -825,41 +976,21 @@ def get_redistribute_candidates(tree, threshold=50, include_skipped=False):
             if include_skipped:
                 skipped.append({"node_key": key, "skip_reason": "no_children"})
             continue  # leaves handled by get_decompose_candidates
-        file_path = node.get("file", "")
-        depth = node.get("depth", 0)
-        if not file_path:
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "no_file"})
-            continue
-        if depth >= D_MAX:
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
-            continue
-        abs_path = str(resolve_file_path(file_path))
-        if not os.path.exists(abs_path):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
-            continue
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
-        except (OSError, UnicodeDecodeError):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "read_error"})
-            continue
-        if line_count > threshold:
+        if len(children) > k_max:
             candidates.append({
                 "key": key,
-                "file": file_path,
-                "line_count": line_count,
-                "depth": depth,
+                "file": node.get("file", ""),
+                "depth": node.get("depth", 0),
                 "child_count": len(children),
                 "children": children,
+                "k_max": k_max,
+                "reason": "k_overflow",
+                "recommended_action": "regroup",
                 "growth_state": node.get("growth_state", "stable"),
             })
         elif include_skipped:
-            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
-    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+            skipped.append({"node_key": key, "skip_reason": "within_k_max"})
+    candidates.sort(key=lambda c: c["child_count"], reverse=True)
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
@@ -935,6 +1066,21 @@ def validate_tree(tree):
         if child_count is not None and child_count != len(children):
             errors.append("Node '{}' has child_count={} but {} children listed".format(key, child_count, len(children)))
 
+        # Check node_type consistency (6): a stored node_type must
+        # match the canonical derivation (interior if children else leaf).
+        # apply_defaults DERIVES node_type when ABSENT but does NOT mask a
+        # PRESENT-but-wrong value on reads, so validate is the right surface
+        # for the present-but-wrong case. Symmetric to the child_count ERROR
+        # above — both assert that a stored field matches the actual node
+        # structure. Legacy 'branch'/'fact' values (24 normalized 2026-06-16)
+        # surface here as wrong-value errors if they ever reappear.
+        node_type = node.get("node_type")
+        if node_type is not None:
+            expected_type = "interior" if children else "leaf"
+            if node_type != expected_type:
+                errors.append("Node '{}' has node_type='{}' but {} children listed (expected '{}')".format(
+                    key, node_type, len(children), expected_type))
+
         # Check depth consistency
         if parent is not None and parent in nodes:
             parent_depth = nodes[parent].get("depth", 0)
@@ -972,6 +1118,82 @@ def validate_tree(tree):
                 if _path_exists_longsafe(alt1) or _path_exists_longsafe(alt2):
                     continue  # found under a prefix — don't warn
             warnings.append("Node '{}' references file '{}' which does not exist on disk".format(key, file_path))
+
+    # --- Node-body dangling cross-reference check (9) ---
+    # The physical-file check above validates each node's OWN `file` field, but
+    # not the cross-references embedded in node .md BODIES. When a node is
+    # relocated (its `file` moves to a new path), every OTHER node whose body
+    # referenced the old path is left with a dangling inbound ref pointing at a
+    # path no longer on disk. Those never surfaced here because no check read
+    # node bodies — root cause of the  / 7 dangling-ref
+    # incidents (a single relocation left 6 inbound refs across 5 files). This
+    # block scans each node body for backtick-quoted tree-node references
+    # (paths ending in .md whose first segment is a live L1 tree directory) and
+    # warns when the target does not exist on disk. rb-8: treat every
+    # cross-reference as a positive-state assertion; probe target existence
+    # before trusting. Directory-style refs (ending in '/') and non-tree refs
+    # (core/, .claude/, world/conventions/, ...) are intentionally out of scope
+    # to keep false positives low.
+    import re  # local: keeps the whole 9 feature one contiguous block
+    tree_root = WORLD_DIR / "knowledge" / "tree"
+    # Derive the live set of L1 tree directories from node files (domain-agnostic
+    # — never hardcode category names; the tree owns its own taxonomy).
+    known_l1 = set()
+    for _n in nodes.values():
+        _fp = _n.get("file")
+        if not _fp:
+            continue
+        _rel = _fp
+        if _rel.startswith("world/knowledge/tree/"):
+            _rel = _rel[len("world/knowledge/tree/"):]
+        elif _rel.startswith(("world/", "meta/")):
+            continue  # non-tree world/meta file
+        _seg = _rel.split("/", 1)[0]
+        if _seg.endswith(".md"):
+            _seg = _seg[:-3]
+        if _seg:
+            known_l1.add(_seg)
+    _md_ref_re = re.compile(r"`([^`\n]+?\.md)`")
+    for key, node in nodes.items():
+        file_path = node.get("file")
+        if not file_path:
+            continue
+        body_abs = str(resolve_file_path(file_path))
+        if not _path_exists_longsafe(body_abs):
+            # Mirror the physical-file check's prefix tolerance before giving up.
+            if not file_path.startswith(("world/", "meta/")):
+                for _alt in (str(WORLD_DIR / file_path),
+                             str(WORLD_DIR / "knowledge" / "tree" / file_path)):
+                    if _path_exists_longsafe(_alt):
+                        body_abs = _alt
+                        break
+            if not _path_exists_longsafe(body_abs):
+                continue  # missing body already warned above
+        try:
+            with open(body_abs, "r", encoding="utf-8") as _bf:
+                body = _bf.read()
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable body — fail-open, never abort validation
+        seen_refs = set()
+        for _m in _md_ref_re.finditer(body):
+            ref = _m.group(1).strip()
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            # Skip illustrative/abbreviated paths: a literal '...' ellipsis (or
+            # its unicode form, U+2026) is a prose placeholder for omitted path
+            # segments, not a real target (9 live-validation finding).
+            if "..." in ref or "…" in ref:
+                continue
+            if ref.startswith("world/knowledge/tree/"):
+                rel = ref[len("world/knowledge/tree/"):]
+            elif ref.split("/", 1)[0] in known_l1:
+                rel = ref
+            else:
+                continue  # not a tree-node reference — out of scope
+            if not _path_exists_longsafe(str(tree_root / rel)):
+                warnings.append(
+                    "Node '{}' body references tree node '{}' which does not exist on disk".format(key, ref))
 
     # Check for orphan .md files (exist on disk but have no _tree.yaml entry)
     tree_dir = str(WORLD_DIR / "knowledge" / "tree")
@@ -1015,7 +1237,91 @@ def validate_tree(tree):
             virtual_dir = file_path[:-3] if file_path.endswith(".md") else file_path
             warnings.append("Interior node '{}' expected directory '{}/' but it does not exist".format(key, virtual_dir))
 
-    return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+    # --- K=D=4 retrieval-locality advisory () ---
+    # Per Zhong et al. (PRL 134:237402, 2025): random-tree recall is bounded by
+    # K=4 children, D=4 retrieval depth, saturating at K^(D-1)=64 leaves under
+    # any retrieval entry point. This block is ADVISORY (report-mode-first per
+    # the  HYBRID decision, board msg-20260619-075228-bravo-086): it
+    # emits violation counts + a decompose/regroup SIGNAL in a `locality` key
+    # and appends only SUMMARY warnings (never errors) — so `valid` stays true
+    # and `tree --validate` exits 0 (never blocks writes). Existing depth-5..8
+    # nodes are GRANDFATHERED: the D count is reported for visibility, not as an
+    # action item; only NEW depth/fan-out growth is constrained, at maintain
+    # time via the structural candidate functions.
+    try:
+        k_max = _config_k_max()
+        d_retrieval = _config_d_retrieval()
+        leaf_cap = _config_leaf_cap()
+    except (KeyError, TypeError):
+        # Config missing the locality keys — skip the advisory rather than
+        # break structural validation (fail-open; the rest of validate stands).
+        k_max = d_retrieval = leaf_cap = None
+
+    locality = None
+    if k_max is not None:
+        leaf_counts = _subtree_leaf_counts(nodes)
+        k_viol = []      # nodes with > k_max children (regroup)
+        d_count = 0      # nodes deeper than d_retrieval (grandfathered)
+        d_by_depth = {}
+        max_depth_seen = 0
+        leaf_viol = []   # non-root nodes whose subtree exceeds leaf_cap (decompose)
+        for key, node in nodes.items():
+            nchild = len(node.get("children", []))
+            if nchild > k_max:
+                k_viol.append({"key": key, "children": nchild})
+            depth = node.get("depth", 0)
+            if depth > max_depth_seen:
+                max_depth_seen = depth
+            if depth > d_retrieval:
+                d_count += 1
+                d_by_depth[depth] = d_by_depth.get(depth, 0) + 1
+            # Root (depth 0) holds every leaf and is the routing index, not a
+            # retrieval entry point — exclude it from the leaf-cap signal.
+            if depth >= 1 and leaf_counts.get(key, 0) > leaf_cap:
+                leaf_viol.append({"key": key, "leaves": leaf_counts[key]})
+
+        k_viol.sort(key=lambda v: v["children"], reverse=True)
+        leaf_viol.sort(key=lambda v: v["leaves"], reverse=True)
+
+        if k_viol and leaf_viol:
+            signal = "decompose+regroup"
+        elif leaf_viol:
+            signal = "decompose"
+        elif k_viol:
+            signal = "regroup"
+        else:
+            signal = "ok"
+
+        locality = {
+            "k_max": k_max,
+            "d_retrieval": d_retrieval,
+            "leaf_cap": leaf_cap,
+            "max_depth": max_depth_seen,
+            "k_violations": {"count": len(k_viol), "worst": k_viol[:10]},
+            "d_violations": {"count": d_count,
+                             "by_depth": {str(k): v for k, v in sorted(d_by_depth.items())},
+                             "grandfathered": True},
+            "leaf_violations": {"count": len(leaf_viol), "worst": leaf_viol[:10]},
+            "signal": signal,
+        }
+        # Summary warnings (advisory — never errors). One line per violation
+        # class that fired, naming the worst offender so the signal is
+        # actionable without parsing the full `locality` dict.
+        if k_viol:
+            warnings.append(
+                "K=D=4 locality: {} node(s) exceed {} children (worst: '{}' with {}) — regroup under <={} intermediates".format(
+                    len(k_viol), k_max, k_viol[0]["key"], k_viol[0]["children"], k_max))
+        if leaf_viol:
+            warnings.append(
+                "K=D=4 locality: {} retrieval-subtree(s) exceed {} leaves (worst: '{}' with {}) — decompose to restore retrieval locality".format(
+                    len(leaf_viol), leaf_cap, leaf_viol[0]["key"], leaf_viol[0]["leaves"]))
+        if d_count:
+            # Grandfathered — single informational line, no per-node spam.
+            warnings.append(
+                "K=D=4 locality: {} node(s) deeper than D_retrieval={} (max depth {}) — GRANDFATHERED (advisory; new depth growth constrained at maintain time)".format(
+                    d_count, d_retrieval, max_depth_seen))
+
+    return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings, "locality": locality}
 
 
 # ---------------------------------------------------------------------------
@@ -1264,17 +1570,19 @@ def cmd_read(args):
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
     elif args.decompose_candidates:
-        threshold = args.threshold if args.threshold is not None else _config_threshold()
+        # Structural trigger (): subtree-leaves > leaf_cap. The legacy
+        # --threshold line-count arg no longer applies to decompose candidates.
         result = get_decompose_candidates(
-            tree, threshold,
+            tree,
             include_skipped=getattr(args, "include_skipped", False),
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
     elif args.redistribute_candidates:
-        threshold = args.threshold if args.threshold is not None else _config_threshold()
+        # Structural trigger (): children > K_max. The legacy
+        # --threshold line-count arg no longer applies to regroup candidates.
         result = get_redistribute_candidates(
-            tree, threshold,
+            tree,
             include_skipped=getattr(args, "include_skipped", False),
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -1314,6 +1622,12 @@ def cmd_read(args):
                 "depth": node.get("depth", 0),
                 "capability_level": node.get("capability_level", ""),
                 "confidence": node.get("confidence"),
+                # last_updated + article_count: consumed by strategic-scan S2
+                # (knowledge-frontier staleness/thin detection). Both fields
+                # exist on every node; omitting them here left S2a/S2b dead.
+                # 8.
+                "last_updated": node.get("last_updated"),
+                "article_count": node.get("article_count", 0),
                 "children": node.get("children", []),
             }
         print(json.dumps({"nodes": compact, "total": len(compact)},
@@ -1422,10 +1736,10 @@ def cmd_record_maintenance(args):
         if with_run_record:
             distill_detail = get_distill_candidates(tree, include_skipped=True)
             decompose_detail = get_decompose_candidates(
-                tree, _config_threshold(), include_skipped=True,
+                tree, include_skipped=True,
             )
             redistribute_detail = get_redistribute_candidates(
-                tree, _config_threshold(), include_skipped=True,
+                tree, include_skipped=True,
             )
             distill_count = len(distill_detail["candidates"])
             decompose_count = len(decompose_detail["candidates"])
@@ -1434,7 +1748,7 @@ def cmd_record_maintenance(args):
             captured["redistribute_detail"] = redistribute_detail
         else:
             distill_count = len(get_distill_candidates(tree))
-            decompose_count = len(get_decompose_candidates(tree, _config_threshold()))
+            decompose_count = len(get_decompose_candidates(tree))
 
         post_debt = distill_count + decompose_count
         if post_debt <= debt_threshold:
@@ -1618,6 +1932,31 @@ def cmd_set(args):
     print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
+def _read_in_flight_goal_id():
+    """Read the EXECUTING goal id from world/team-state.yaml in_flight (,
+    Gate D spillover provenance). Fail-open: any error — no bound agent, missing
+    file, parse error, no in_flight — returns None. Mirrors store_registry.py
+    _rb_inject_source_goal so a tree-node write records the SAME executing goal an
+    rb write does, giving the SPILL-1 analysis a uniform origin signal across both
+    encoding stores."""
+    try:
+        from _fileops import _agent_name
+        agent_name = _agent_name()
+        if not agent_name or WORLD_DIR is None:
+            return None
+        path = WORLD_DIR / "team-state.yaml"
+        if not path.exists():
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return (data.get("agent_status", {})
+                    .get(agent_name, {})
+                    .get("in_flight", {})
+                    .get("goal_id")) or None
+    except Exception:
+        return None
+
+
 def cmd_add_child(args):
     # CRITICAL — DO NOT split this back into read_tree() ... write_tree(tree).
     # The dedup gate (_enforce_dedup) and child-limit gate are TOCTOU-vulnerable
@@ -1689,8 +2028,22 @@ def cmd_add_child(args):
         child_node["parent"] = parent_key
         child_node["children"] = child_data.get("children", [])
         child_node["child_count"] = len(child_node["children"])
+        # 3: node_type is derive-always from child-presence (mirror
+        # child_count) — set HERE at the create path, not copied (removed from
+        # the allowlist below) and not via apply_defaults' fill-if-absent (which
+        # also normalizes reads, masking on-disk drift). The parent-flip below
+        # keeps a later-childed node correct; this keeps it correct AT creation.
+        # Sibling 7.
+        child_node["node_type"] = "interior" if child_node["children"] else "leaf"
+        # poignancy (, BRD Gap 1a producer): copy an LLM-rated 1-10
+        # importance value at creation so the tree-node write path assigns
+        # poignancy AT WRITE TIME (the  blend consumes it). Absent →
+        # apply_defaults sets None (null-safe). Without this allowlist entry a
+        # poignancy in child_data would be silently dropped.
+        # node_type intentionally excluded — derive-always at create (3).
         for field in ("summary", "domain_confidence", "capability_level", "confidence",
-                      "article_count", "growth_state", "node_type"):
+                      "article_count", "growth_state", "origin_goal_id",
+                      "poignancy"):
             if field in child_data:
                 child_node[field] = child_data[field]
         # Inherit capability_level from parent when caller didn't specify one,
@@ -1705,6 +2058,15 @@ def cmd_add_child(args):
         # Stamp creation date so freshness/recency scoring has a real signal
         # on day 1 rather than waiting for the first content edit to backfill it.
         child_node["last_updated"] = date.today().isoformat()
+        # origin_goal_id (): record the EXECUTING goal that created this
+        # node, for the Gate D SPILL-1 spillover analysis. Caller-wins (an explicit
+        # value copied above is preserved); otherwise auto-inject from team-state
+        # in_flight. Absent when no goal is executing (a manual add) — pre-
+        # readers ignore the unknown field, so existing consumers parse unchanged.
+        if "origin_goal_id" not in child_node:
+            _origin = _read_in_flight_goal_id()
+            if _origin:
+                child_node["origin_goal_id"] = _origin
 
         nodes[child_key] = child_node
         if child_key not in parent.get("children", []):
@@ -1712,6 +2074,14 @@ def cmd_add_child(args):
                 parent["children"] = []
             parent["children"].append(child_key)
             parent["child_count"] = len(parent["children"])
+            # 7: a freshly-created parent that gains its first
+            # child via add-child must flip leaf->interior. add-child
+            # updates child_count but historically left node_type stale,
+            # mislabeling interior nodes as leaves (misleads retrieval/
+            # decompose and trips tree-validate). Mirrors the cmd_reparent
+            # new-parent idiom.
+            if parent.get("node_type") == "leaf":
+                parent["node_type"] = "interior"
         nodes[parent_key] = parent
 
         captured["child_node"] = dict(child_node)
@@ -1792,6 +2162,11 @@ def cmd_remove_child(args):
         children.remove(child_key)
         parent["children"] = children
         parent["child_count"] = len(children)
+        if not children:
+            # 5: removing the last child flips parent interior->leaf
+            # (mirrors cmd_reparent old-parent path; symmetric to the
+            # 7 add-child leaf->interior flip).
+            parent["node_type"] = "leaf"
         nodes[parent_key] = parent
         if child_key in nodes:
             del nodes[child_key]
@@ -2057,8 +2432,21 @@ def cmd_batch(args):
                 child_node["parent"] = parent_key
                 child_node["children"] = child_data.get("children", [])
                 child_node["child_count"] = len(child_node["children"])
+                # 3: node_type is derive-always from child-presence
+                # (mirror child_count) — set at the create path, not copied
+                # (removed from the allowlist below) and not via apply_defaults'
+                # fill-if-absent. Mirrors cmd_add_child. Sibling 7.
+                child_node["node_type"] = "interior" if child_node["children"] else "leaf"
+                # poignancy () + origin_goal_id ( / 3):
+                # batch add-child mirrors cmd_add_child — copy the LLM-rated 1-10
+                # poignancy AND the executing-goal provenance at creation. The
+                # origin_goal_id allowlist entry landed only in cmd_add_child, so
+                # every batch-created node was invisible to the Gate D SPILL-1
+                # attribution (duplicated-path divergence, rb-1776). Restored here.
+                # node_type intentionally excluded — derive-always at create (3).
                 for field in ("summary", "domain_confidence", "capability_level", "confidence",
-                              "article_count", "growth_state", "node_type"):
+                              "article_count", "growth_state", "origin_goal_id",
+                              "poignancy"):
                     if field in child_data:
                         child_node[field] = child_data[field]
                 if "capability_level" not in child_node:
@@ -2067,12 +2455,23 @@ def cmd_batch(args):
                         child_node["capability_level"] = parent_cl
                 child_node = apply_defaults(child_node)
                 child_node["last_updated"] = date.today().isoformat()
+                # origin_goal_id auto-inject ( / 3): mirror
+                # cmd_add_child — caller-wins (an explicit value copied above is
+                # preserved); otherwise auto-inject from team-state in_flight.
+                if "origin_goal_id" not in child_node:
+                    _origin = _read_in_flight_goal_id()
+                    if _origin:
+                        child_node["origin_goal_id"] = _origin
                 nodes[child_key] = child_node
                 if child_key not in parent.get("children", []):
                     if "children" not in parent:
                         parent["children"] = []
                     parent["children"].append(child_key)
                     parent["child_count"] = len(parent["children"])
+                    # 7: flip parent leaf->interior on first child
+                    # (mirrors cmd_add_child / cmd_reparent new-parent idiom).
+                    if parent.get("node_type") == "leaf":
+                        parent["node_type"] = "interior"
                 nodes[parent_key] = parent
                 updated_keys.add(child_key)
                 updated_keys.add(parent_key)
@@ -2103,6 +2502,11 @@ def cmd_batch(args):
                     children.remove(child_key)
                     parent["children"] = children
                     parent["child_count"] = len(children)
+                    if not children:
+                        # 5: last-child removal flips parent
+                        # interior->leaf (mirrors cmd_reparent; symmetric to
+                        # the 7 add-child path).
+                        parent["node_type"] = "leaf"
                 if child_key in nodes:
                     del nodes[child_key]
                     removed_slugs.append(child_key)  # : track for sweep

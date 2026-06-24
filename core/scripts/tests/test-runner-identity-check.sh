@@ -158,6 +158,78 @@ mkdir -p "$SANDBOX/agents/zeta/session"
 printf 'sid-runner-999\r\n' > "$SANDBOX/agents/zeta/session/running-session-id"
 run_case "9-crlf-non-runner-ejects" 1 "is NOT the runner" zeta sid-observer-222
 
+# === Write-attribution runner override (, US-09) ====================
+# mk_attrib <agent> <sid> <epoch> — pre-stamp the write-attribution file.
+mk_attrib() {
+    local name="$1" sid="$2" epoch="$3"
+    mkdir -p "$SANDBOX/agents/$name/session"
+    printf '%s %s\n' "$sid" "$epoch" > "$SANDBOX/agents/$name/session/runner-write-attribution"
+}
+
+# run_case_wa — like run_case but with a RUNNER_WRITE_ATTRIB_WINDOW_SEC override.
+# Any attribution file must be pre-created via mk_attrib before calling.
+run_case_wa() {
+    local label="$1" expected_exit="$2" expected_stderr="$3"
+    local agent_env="$4" sid_env="$5" window_env="$6"
+    local stderr_file rc=0
+    stderr_file=$(mktemp -t runner-identity-stderr-XXXXXX)
+    MIND_AGENT="$agent_env" MIND_SID="$sid_env" \
+      RUNNER_WRITE_ATTRIB_WINDOW_SEC="$window_env" bash "$GATE" 2>"$stderr_file" || rc=$?
+    local stderr_content; stderr_content=$(cat "$stderr_file"); rm -f "$stderr_file"
+    local ok=1
+    [ "$rc" = "$expected_exit" ] || ok=0
+    if [ -n "$expected_stderr" ] && ! printf '%s' "$stderr_content" | grep -qF "$expected_stderr"; then ok=0; fi
+    if [ "$ok" = "1" ]; then echo "PASS $label (exit=$rc)"; PASS_COUNT=$((PASS_COUNT + 1));
+    else echo "FAIL $label"; echo "  expected_exit=$expected_exit got=$rc";
+         echo "  expected_stderr=\"$expected_stderr\""; echo "  actual_stderr=\"$stderr_content\"";
+         FAIL_COUNT=$((FAIL_COUNT + 1)); fi
+}
+
+NOW_EPOCH=$(date +%s)
+
+# Case 10: stale pointer + FRESH self write-attribution -> override (exit 0).
+# The  core case: running-session-id points at a stale SID, but THIS
+# session stamped itself the confirmed runner seconds ago -> trust write-attrib.
+reset_state
+mk_runner zeta sid-runner-999
+mk_attrib zeta sid-observer-222 "$NOW_EPOCH"
+run_case_wa "10-stale-pointer-fresh-attrib-overrides" 0 \
+    "write-attribution shows this session was the confirmed runner" zeta sid-observer-222 300
+
+# Case 11: stale pointer + STALE self-attribution (> window) -> eject (exit 1).
+reset_state
+mk_runner zeta sid-runner-999
+mk_attrib zeta sid-observer-222 "$((NOW_EPOCH - 600))"
+run_case_wa "11-stale-pointer-stale-attrib-ejects" 1 "is NOT the runner" zeta sid-observer-222 300
+
+# Case 12: stale pointer + attribution belongs to ANOTHER sid -> eject (takeover).
+# A genuine new runner overwrote the shared stamp with its own SID; the old
+# runner must eject immediately, not ride its own (now-overwritten) evidence.
+reset_state
+mk_runner zeta sid-runner-999
+mk_attrib zeta sid-newrunner-333 "$NOW_EPOCH"
+run_case_wa "12-attrib-other-sid-ejects" 1 "is NOT the runner" zeta sid-observer-222 300
+
+# Case 13: confirmed runner STAMPS attribution (capture side).
+reset_state
+mk_runner zeta sid-abc-111
+run_case "13-runner-matches-still-passes" 0 "" zeta sid-abc-111
+ATTRIB="$SANDBOX/agents/zeta/session/runner-write-attribution"
+if [ -f "$ATTRIB" ] && grep -Eq '^sid-abc-111 [0-9]+$' "$ATTRIB"; then
+    echo "PASS 13b-confirmed-runner-stamps-attribution"
+    PASS_COUNT=$((PASS_COUNT + 1))
+else
+    echo "FAIL 13b-confirmed-runner-stamps-attribution"
+    echo "  attrib file: $([ -f "$ATTRIB" ] && cat "$ATTRIB" || echo MISSING)"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+fi
+
+# Case 14: window env override — a small window ages out a recent stamp -> eject.
+reset_state
+mk_runner zeta sid-runner-999
+mk_attrib zeta sid-observer-222 "$((NOW_EPOCH - 5))"
+run_case_wa "14-window-env-override-ejects" 1 "is NOT the runner" zeta sid-observer-222 1
+
 echo ""
 echo "──────────────────────────────────────────"
 echo "Total: $((PASS_COUNT + FAIL_COUNT))  Pass: $PASS_COUNT  Fail: $FAIL_COUNT"

@@ -25,10 +25,19 @@ pruning:
   distill_min_retrievals: 5               # minimum retrievals before DISTILL eligible
   distill_line_threshold: 50              # line count threshold for large-but-mediocre nodes
   distill_line_utility_threshold: 0.5     # utility threshold for line-count-based DISTILL
+  # crit3 (0): proactive trigger for append-grown recurring-sweep nodes.
+  # Fires DISTILL before a node trips the Read ~25k-token cap (which forces a
+  # read-before-edit re-read on every sweep), reusing the rb-2085 procedure.
+  # STRUCTURAL — keyed on size + append-grown shape, NOT utility/feedback, so it
+  # catches the HIGH-utility sweep nodes crit2's noisy line-count heuristic misses.
+  distill_token_cap: 25000                # Read tool ~25k-token cap (token-size estimate = chars // 4)
+  distill_token_ratio: 0.8                # crit3 fires at this fraction of distill_token_cap (proactive headroom)
+  distill_refresh_min_sections: 3         # append-grown signature: >= N dated "Refresh"/"Verified Values" headings
   max_distill_per_invocation: 10          # max DISTILL ops per /tree maintain run (raised 5→10 at config ceiling 2026-04-18 for backlog drain, g-115-79)
   retire_sessions_unused: 5              # sessions with 0 retrievals before RETIRE eligible
   retire_noise_threshold: 0.1            # utility below this with 10+ retrievals = actively harmful
   retire_noise_min_retrievals: 10
+  prune_stub_line_threshold: 10          # PRUNE/RETIRE empty-stub gate: a leaf with article_count==0 (PRUNE) or retrieval_count==0 (RETIRE) is a true empty/dead stub ONLY when its .md body has fewer than this many non-blank lines (excl. YAML front matter). article_count counts ATTACHED ARTICLES, not body content — content-bearing nodes (body >= threshold) hold real knowledge and must NOT be auto-pruned/retired (g-115-1534; zeta exp-g-115-1367 "article_count=0 is NORMAL"). g-115-398 flagged 25 content-bearing nodes (13-86 body lines); 10 cleanly separates stubs from content.
 
 # Three-tier maintenance budget — read this section top to bottom for the full
 # picture. The standard caps in `config:` above are the daily ceiling.
@@ -74,6 +83,20 @@ retrieval:
   utility_weight_min: 0.5                       # floor on reweight (zero-utility cap)
   utility_weight_max: 1.5                       # ceiling (proven-helpful cap)
   utility_weight_neutral_below_retrievals: 5    # nodes below this retrieval_count get weight 1.0
+  # Poignancy blend (, BRD Gap 1a; Generative Agents 2304.03442). A
+  # third multiplicative factor on the effective score, mapping a record's
+  # poignancy (1-10, LLM-rated at write) into [poignancy_weight_min,
+  # poignancy_weight_max]. DEFAULT OFF — when disabled the factor is 1.0 for
+  # every record, so retrieval ranking is byte-identical to pre-.
+  # Boost-only by construction: poignancy_weight_min is 1.0, so the factor is
+  # >= 1.0 always. The blend can only PROMOTE high-poignancy records, never
+  # demote anything below its current effective score — this structurally
+  # satisfies the "no known-good knowledge hidden" A/B criterion. Null/absent
+  # poignancy maps to 1.0 (neutral), so legacy records are null-safe with no
+  # backfill. Enable + A/B before trusting in production.
+  poignancy_blend_enabled: false                # master flag — false = current behavior
+  poignancy_weight_min: 1.0                      # factor at poignancy=1 (and null→neutral)
+  poignancy_weight_max: 1.5                      # factor at poignancy=10
 
 # Scheduled tree debt check (Phase 4 of cognitive-core curation plan).
 # Runs every N goals in the aspirations loop; invokes /tree maintain when
@@ -151,6 +174,7 @@ modifiable:
   distill_min_retrievals: {min: 3, max: 10, default: 5}
   max_distill_per_invocation: {min: 1, max: 10, default: 5}
   retire_sessions_unused: {min: 3, max: 10, default: 5}
+  prune_stub_line_threshold: {min: 3, max: 12, default: 10}   # max capped at 12 (< the 13-line smallest g-115-398 content node) so self-tuning can never re-flag a known content-bearing node
   dedup_sibling_overlap_threshold: {min: 0.3, max: 0.9, default: 0.6}
   dedup_min_tokens_for_overlap: {min: 2, max: 8, default: 3}
   dedup_enforce_from_depth: {min: 1, max: 5, default: 2}

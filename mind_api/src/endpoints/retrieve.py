@@ -9,6 +9,8 @@ Query parameters:
     read_only=1               optional — absent ⇒ counter-bump path
     goal=<goal-id>            optional — scopes the retrieval-session manifest
     tree_nodes=<k1,k2>        optional — extra node keys recorded in manifest
+    entry_type=<type>         optional — restrict reasoning_bank/meta_lessons to
+                              records whose entry_type equals it (e.g. procedure)
 
 Equivalence target: stdout JSON of
     py -3 core/scripts/retrieve.py --category <c> [--depth ...] [--read-only] \\
@@ -188,6 +190,21 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
     read_only = _flag(q, "read_only")
     goal = (q.get("goal") or "").strip() or None
     tree_nodes_param = (q.get("tree_nodes") or "").strip()
+    # : optional reasoning-bank entry_type filter (e.g. "procedure").
+    # Forwarded to _r.load_reasoning_bank; None => no filter (default).
+    entry_type = (q.get("entry_type") or "").strip() or None
+
+    # : optional bi-temporal point-in-time read. as_of=<ISO-8601> returns
+    # the record VERSIONS that were valid at that instant (valid_from<=T<valid_to)
+    # across RB/guardrails/patterns/beliefs — status-agnostic, no counter bump.
+    # Validated here via the engine's own parser so a malformed value fails loud
+    # (400) instead of silently treating every record as valid. None => default
+    # current-version view. Forwarded to the load_* loaders below.
+    as_of = (q.get("as_of") or "").strip() or None
+    if as_of is not None and _r._parse_iso(as_of) is None:
+        return Response.error(400, "invalid_param",
+                              "as_of must be an ISO-8601 datetime "
+                              "(e.g. 2026-06-19T01:00:00), got %r" % as_of)
 
     supplementary_only = _flag(q, "supplementary_only")
     full_content = _flag(q, "full_content")
@@ -291,14 +308,15 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
             # #24's "wrong agent's WORLD_DIR baked in" fear is handled by the
             # path swap + the MIND_AGENT env swap above.
             reasoning_bank, meta_lessons = _r.load_reasoning_bank(
-                categories, depth, read_only=read_only)
+                categories, depth, read_only=read_only, entry_type=entry_type,
+                as_of=as_of)
             guardrails = _r.load_guardrails(categories, depth,
-                                            read_only=read_only)
+                                            read_only=read_only, as_of=as_of)
             pattern_signatures = _r.load_pattern_signatures(
-                categories, depth, read_only=read_only)
+                categories, depth, read_only=read_only, as_of=as_of)
             experiences = _r.load_experiences(categories, depth,
                                               read_only=read_only)
-            beliefs = _r.load_beliefs(categories)
+            beliefs = _r.load_beliefs(categories, as_of=as_of)
             experiential_index = _r.load_experiential_index(categories)
 
             framework_rules = (_r.load_framework_rules(categories)
@@ -438,8 +456,16 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                 }
                 try:
                     from _fileops import locked_write_json
+                    # Phase 1D (): route the utilization manifest per-Body
+                    # by the request SID (the unitKey), reducer-aware via the same
+                    # forked-body-WM-file signal wm_path uses. A reducer/observer
+                    # (no forked WM file) -> agent-wide session/retrieval-session.json,
+                    # identical to pre-1D behavior; a forked worker Body -> its own
+                    # sessions/<sid>/body-retrieval-session.json so concurrent
+                    # Bodies don't clobber each other's utilization audit trail.
+                    sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
                     locked_write_json(
-                        agent_dir / "session" / "retrieval-session.json",
+                        ctx.paths.retrieval_session_path(sid or None),
                         session_record)
                 except Exception:
                     # Best-effort: a manifest write failure must not fail the

@@ -17,14 +17,27 @@ Cases covered:
 
 The test seeds a synthetic findings.jsonl + team-state recent_completions
 ring, runs goal-duplication-gate.py against staged goal JSON, and asserts
-the would_block verdict and reason match expectation. Live world files
-backed up + restored.
+the would_block verdict and reason match expectation.
+
+Test isolation strategy (g-115-1376): redirect MIND_WORLD to a tmp directory
+so the real world/board/findings.jsonl + team-state.yaml are never touched —
+the gate's _resolve_world_dir() honors MIND_WORLD as a test-override.
+Replaces the prior live-file backup/restore harness (which additionally
+unlinked the live findings.jsonl when no backup existed — rb-1547 seed-clobber
+/ data-loss risk).
+
+Run via:
+
+    py -3 core/scripts/tests/test_goal_duplication_gate_insight_trigger.py
+
+Also pytest-collectable via test_insight_trigger_gate().
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,16 +54,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-from _paths import WORLD_DIR  # type: ignore
-
-FINDINGS_PATH = WORLD_DIR / "board" / "findings.jsonl"
-TEAM_STATE_PATH = WORLD_DIR / "team-state.yaml"
 GATE_PY = CORE_SCRIPTS / "goal-duplication-gate.py"
-
-# Backup paths — same PID suffix so cleanup matches
-PID = os.getpid()
-FINDINGS_BACKUP = FINDINGS_PATH.with_suffix(f".jsonl.iat-test-backup.{PID}")
-TEAM_STATE_BACKUP = TEAM_STATE_PATH.with_suffix(f".yaml.iat-test-backup.{PID}")
 
 
 def _now_iso(offset_hours: float = 0) -> str:
@@ -58,14 +62,15 @@ def _now_iso(offset_hours: float = 0) -> str:
     return (datetime.now() + timedelta(hours=offset_hours)).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _seed_state():
+def _seed_state(tmp_world: Path):
     """Write a minimal findings.jsonl (one fresh insight_trigger from bravo
-    affecting iter-close-test.sh) and a minimal team-state.yaml with no
-    recent_completions. Designed so the gate's insight_trigger check fires
-    on overlapping file paths but recent_completions stays clean — tests
-    can isolate the file_path skip behavior.
+    affecting iter-close-test.sh) and a minimal team-state.yaml into tmp_world.
+    Designed so the gate's insight_trigger check fires on overlapping file
+    paths but recent_completions stays clean — tests can isolate the
+    file_path skip behavior.
     """
-    FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    findings_path = tmp_world / "board" / "findings.jsonl"
+    findings_path.parent.mkdir(parents=True, exist_ok=True)
     finding = {
         "id": "msg-iat-test-bravo",
         "channel": "findings",
@@ -80,7 +85,7 @@ def _seed_state():
         "timestamp": _now_iso(-1),  # 1h ago
         "body": "Synthetic finding for g-115-289 regression test",
     }
-    with open(FINDINGS_PATH, "w", encoding="utf-8") as f:
+    with open(findings_path, "w", encoding="utf-8") as f:
         f.write(json.dumps(finding) + "\n")
 
     # Seed multiple non-overlapping recent_completions so IDF can distinguish
@@ -134,14 +139,15 @@ def _seed_state():
         "agent_status": {},
         "critical_blockers": [],
     }
-    with open(TEAM_STATE_PATH, "w", encoding="utf-8") as f:
+    ts_path = tmp_world / "team-state.yaml"
+    with open(ts_path, "w", encoding="utf-8") as f:
         yaml.dump(team_state, f, default_flow_style=False, sort_keys=False)
 
 
-def _run_gate(goal: dict) -> dict:
+def _run_gate(goal: dict, tmp_world: Path) -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = "alpha"
-    env["MIND_WORLD"] = str(WORLD_DIR)
+    env["MIND_WORLD"] = str(tmp_world)
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),
@@ -156,16 +162,12 @@ def _run_gate(goal: dict) -> dict:
 
 
 def main() -> int:
-    # Backup live files
-    if FINDINGS_PATH.exists():
-        FINDINGS_BACKUP.write_bytes(FINDINGS_PATH.read_bytes())
-    if TEAM_STATE_PATH.exists():
-        TEAM_STATE_BACKUP.write_bytes(TEAM_STATE_PATH.read_bytes())
-
     failures = []
 
+    tmp_world = Path(tempfile.mkdtemp(prefix="iat-test-"))
+
     try:
-        _seed_state()
+        _seed_state(tmp_world)
 
         # Use a unique file path that won't collide with any real recent
         # completions. iter-close-test.sh is deliberately synthetic.
@@ -187,7 +189,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "idea:bravo-iat-test-response",
         }
-        r1 = _run_gate(case1)
+        r1 = _run_gate(case1, tmp_world)
         if r1.get("would_block") is not False:
             failures.append(f"CASE 1: response goal blocked unexpectedly. reason={r1.get('reason')}")
         if not r1.get("expected_coverage_paths"):
@@ -207,7 +209,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "parent_aspiration:asp-115",  # NOT a response prefix
         }
-        r2 = _run_gate(case2)
+        r2 = _run_gate(case2, tmp_world)
         if r2.get("would_block") is not True:
             failures.append(f"CASE 2: non-response goal NOT blocked (expected block). reason={r2.get('reason')}")
         if r2.get("expected_coverage_paths"):
@@ -226,7 +228,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "idea:bravo-iat-test-keyword-overlap",
         }
-        r3 = _run_gate(case3)
+        r3 = _run_gate(case3, tmp_world)
         if r3.get("would_block") is not True:
             failures.append(f"CASE 3: keyword duplicate not blocked (expected block). reason={r3.get('reason')}")
 
@@ -238,7 +240,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "idea:bravo-iat-test-no-overlap",
         }
-        r4 = _run_gate(case4)
+        r4 = _run_gate(case4, tmp_world)
         if r4.get("would_block") is not False:
             failures.append(f"CASE 4: no-overlap goal blocked. reason={r4.get('reason')}")
 
@@ -257,7 +259,8 @@ def main() -> int:
             ],
             "timestamp": _now_iso(-1),
         }
-        with open(FINDINGS_PATH, "w", encoding="utf-8") as f:
+        findings_path = tmp_world / "board" / "findings.jsonl"
+        with open(findings_path, "w", encoding="utf-8") as f:
             f.write(json.dumps(finding_self) + "\n")
 
         case5 = {
@@ -270,7 +273,7 @@ def main() -> int:
             "source": "world",
             "origin_signal": "idea:alpha-self-trigger-response",
         }
-        r5 = _run_gate(case5)
+        r5 = _run_gate(case5, tmp_world)
         # When the trigger author is self, expected_coverage_paths is empty;
         # the recent_completions check fires on file_path + keyword overlap.
         if r5.get("expected_coverage_paths"):
@@ -289,15 +292,14 @@ def main() -> int:
         print("           self-trigger response (block — peer-coverage requires non-self).")
         return 0
     finally:
-        # Restore live files
-        if FINDINGS_BACKUP.exists():
-            FINDINGS_PATH.write_bytes(FINDINGS_BACKUP.read_bytes())
-            FINDINGS_BACKUP.unlink()
-        elif FINDINGS_PATH.exists():
-            FINDINGS_PATH.unlink()
-        if TEAM_STATE_BACKUP.exists():
-            TEAM_STATE_PATH.write_bytes(TEAM_STATE_BACKUP.read_bytes())
-            TEAM_STATE_BACKUP.unlink()
+        if tmp_world.exists():
+            shutil.rmtree(tmp_world, ignore_errors=True)
+
+
+def test_insight_trigger_gate():
+    """Pytest entry point (6) — runs the 5-case suite (tmp-world
+    isolated) and asserts all cases pass."""
+    assert main() == 0
 
 
 if __name__ == "__main__":

@@ -88,7 +88,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 try:
     import yaml
     from _paths import AGENT_DIR, CORE_ROOT
-    from _fileops import acquire_lock, release_lock
+    from _fileops import acquire_lock, release_lock, loop_state_cas_retry
 except Exception:
     # Cannot resolve framework — fail-open with no-op echo.
     # We don't know the outcome arg yet; this branch should be unreachable
@@ -176,7 +176,8 @@ def main():
         print(final_outcome)
         sys.exit(0)
 
-    wm_path = Path(AGENT_DIR) / "session" / "working-memory.yaml"
+    from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    wm_path = _resolve_wm_path()
     if not wm_path.exists():
         print(final_outcome)
         sys.exit(0)
@@ -194,177 +195,210 @@ def main():
         sys.exit(0)
 
     try:
-        try:
-            wm = yaml.safe_load(wm_path.read_text(encoding="utf-8")) or {}
-        except Exception as e:
-            print(
-                f"[recurring-loop-state-mutate] WARN: WM read failed ({e})",
-                file=sys.stderr,
-            )
-            print(final_outcome)
-            sys.exit(0)
-
-        if not isinstance(wm, dict):
-            print(final_outcome)
-            sys.exit(0)
-
-        slots = wm.get("slots") or {}
-        loop_state = slots.get("loop_state")
-
-        #  (from zeta  investigation): self-initialize when
-        # loop_state is null instead of WARN-and-skip. The prior skip branch
-        # silently bypassed all four mutation blocks (A/B/C/D), letting routine
-        # closes accumulate without advancing streaks — cargo-cult detector
-        # went blind, productivity-stop-gate read stale 0, routine_streak_global
-        # never advanced (87 silent skips in zeta's session before discovery).
-        # Self-init writes the shared DEFAULT_LOOP_STATE shape (matches the
-        # orchestrator's first-iteration init in /aspirations Phase -0.5) and
-        # proceeds with mutations against the fresh defaults. Backfill is
-        # intentionally NOT attempted — over-counting historical closes would
-        # corrupt calibration. One-shot self-init is sufficient; future closes
-        # advance counters from the newly-written defaults.
-        if not isinstance(loop_state, dict):
-            from _loop_state_defaults import defaults as _loop_state_defaults
-            print(
-                f"[recurring-loop-state-mutate] info: loop_state was "
-                f"{type(loop_state).__name__} - initializing to default and proceeding",
-                file=sys.stderr,
-            )
-            loop_state = _loop_state_defaults()
-
-        # Initialize sub-containers if missing. Block A/B/C/D all assume
-        # these exist. Pre-existing loop_state may legitimately omit them on
-        # the very first iteration of a session before signals were seeded.
-        signals = loop_state.get("signals")
-        if not isinstance(signals, dict):
-            signals = {}
-        routine_streaks = loop_state.get("routine_streaks")
-        if not isinstance(routine_streaks, dict):
-            routine_streaks = {}
-
-        # ---- Block A — per-goal streak ----
+        # Config reads (static aspirations.yaml, NOT working memory) are hoisted
+        # out of the CAS loop below. They RAISE on missing/corrupt config and the
+        # exception propagates (release_lock fires via finally) so
+        # recurring-close.sh's `|| echo "$ORIGINAL_OUTCOME"` provides the
+        # fallback — a silent default would mask framework-config corruption
+        # (see _read_flip_threshold). Reading once (not per CAS attempt) is also
+        # correct: the config is invariant across the retry.
         flip_threshold = _read_flip_threshold()
-        per_goal_streak = _to_int(routine_streaks.get(goal_id, 0))
-
-        if outcome == "routine":
-            per_goal_streak += 1
-            if per_goal_streak >= flip_threshold:
-                # FLIP — Block B/C/D will see deep
-                outcome = "deep"
-                per_goal_streak = 0
-        elif outcome == "deep":
-            # Successful deep clears the per-goal streak — the goal advanced
-            # past the routine-only treadmill.
-            per_goal_streak = 0
-        routine_streaks[goal_id] = per_goal_streak
-
-        # ---- Block B — session signals (re-reads outcome) ----
-        routine_streak_global = _to_int(signals.get("routine_streak_global", 0))
-        routine_count_total = _to_int(signals.get("routine_count_total", 0))
-        productive_streak = _to_int(signals.get("productive_streak", 0))
-        consecutive_blocked_sleeps = _to_int(
-            signals.get("consecutive_blocked_sleeps", 0)
-        )
-
-        if outcome == "routine":
-            routine_streak_global += 1
-            routine_count_total += 1
-            productive_streak = 0
-        else:  # deep
-            routine_streak_global = 0
-            productive_streak += 1
-            # Deep work breaks the blocked-sleep run. Same reset the LLM
-            # applied previously (Phase 4.1 Block B per the digest).
-            consecutive_blocked_sleeps = 0
-
-        # ---- Block C — global + ratio anti-drift ----
-        # Pre-Block-C goals_completed_this_session: pre-INCREMENT value the
-        # ratio check uses. Block D increments it. If Block C flips outcome
-        # to deep, Block D will count this iteration as productive.
-        goals_completed_this_session = _to_int(
-            loop_state.get("goals_completed_this_session", 0)
-        )
-        productive_goals_this_session = _to_int(
-            loop_state.get("productive_goals_this_session", 0)
-        )
-
-        # 1. Global routine-streak ceiling — when >= ceiling routines in a row
-        #    across goals, force deep regardless of per-goal streak. Default 5,
-        #    configurable via recurring.routine_streak_global_ceiling. Lowered
-        #    from 8 → 5 on 2026-05-12 per bravo session-66 feedback.
         global_ceiling = _read_global_ceiling()
-        if routine_streak_global >= global_ceiling:
-            outcome = "deep"
-            routine_streak_global = 0
 
-        # 2. Ratio check — only when >=6 goals completed this session AND
-        #    >80% of them were routine. The 6-goal floor avoids early-
-        #    session false positives where a single deep would yield
-        #    routine_count_total/goals_completed = 1.0 trivially.
-        if (
-            outcome == "routine"
-            and goals_completed_this_session >= 6
-            and routine_count_total > 0.80 * goals_completed_this_session
-        ):
-            outcome = "deep"
+        # 4: the read-modify-write runs inside loop_state_cas_retry,
+        # which guards the stale-lock-steal race (9 mechanism B) via
+        # optimistic concurrency on slot_meta.loop_state.update_count. On a
+        # stale-steal the helper re-reads fresh and re-applies Blocks A-D on the
+        # peer's landed counters — the correct serialised result. The closures
+        # preserve this writer's exact self-init / Block A-D / byte-compat write.
+        result = {}
 
-        # ---- Block D — count productive AFTER all reclassification ----
-        goals_completed_this_session += 1
-        if outcome == "deep":
-            productive_goals_this_session += 1
-            # productive_streak handling differs by flip path — INTENTIONAL
-            # asymmetry that mirrors the digest spec. Block A flip routes
-            # Block B through the deep branch (productive_streak += 1).
-            # Block C flip happens AFTER Block B already ran in the routine
-            # branch, so productive_streak stays at 0 even though
-            # productive_goals advances here. Test case C2 enshrines this
-            # asymmetry. Do NOT "fix" it by incrementing productive_streak
-            # here — it would double-count when Block A also flipped, and
-            # the C1/C2 test expectations would have to flip in tandem.
+        def _read():
+            return yaml.safe_load(wm_path.read_text(encoding="utf-8")) or {}
 
-        # ---- Persist ----
-        signals["routine_streak_global"] = routine_streak_global
-        signals["routine_count_total"] = routine_count_total
-        signals["productive_streak"] = productive_streak
-        signals["consecutive_blocked_sleeps"] = consecutive_blocked_sleeps
-        loop_state["signals"] = signals
-        loop_state["routine_streaks"] = routine_streaks
-        loop_state["goals_completed_this_session"] = goals_completed_this_session
-        loop_state["productive_goals_this_session"] = productive_goals_this_session
-        slots["loop_state"] = loop_state
-        wm["slots"] = slots
+        def _mutate(wm):
+            # Returns True to commit; False for an idempotent no-op (no write).
+            if not isinstance(wm, dict):
+                return False
 
-        # : advance slot_meta.loop_state.updated_at + increment
-        # update_count so wm-prune's stale-detection sees this write.
-        _update_modified(wm, "loop_state")
+            slots = wm.get("slots") or {}
+            loop_state = slots.get("loop_state")
 
-        try:
+            #  (from zeta  investigation): self-initialize when
+            # loop_state is null instead of WARN-and-skip. The prior skip branch
+            # silently bypassed all four mutation blocks (A/B/C/D), letting routine
+            # closes accumulate without advancing streaks — cargo-cult detector
+            # went blind, productivity-stop-gate read stale 0, routine_streak_global
+            # never advanced (87 silent skips in zeta's session before discovery).
+            # Self-init writes the shared DEFAULT_LOOP_STATE shape (matches the
+            # orchestrator's first-iteration init in /aspirations Phase -0.5) and
+            # proceeds with mutations against the fresh defaults. Backfill is
+            # intentionally NOT attempted — over-counting historical closes would
+            # corrupt calibration. One-shot self-init is sufficient; future closes
+            # advance counters from the newly-written defaults.
+            if not isinstance(loop_state, dict):
+                from _loop_state_defaults import defaults as _loop_state_defaults
+                print(
+                    f"[recurring-loop-state-mutate] info: loop_state was "
+                    f"{type(loop_state).__name__} - initializing to default and proceeding",
+                    file=sys.stderr,
+                )
+                loop_state = _loop_state_defaults()
+
+            # Initialize sub-containers if missing. Block A/B/C/D all assume
+            # these exist. Pre-existing loop_state may legitimately omit them on
+            # the very first iteration of a session before signals were seeded.
+            signals = loop_state.get("signals")
+            if not isinstance(signals, dict):
+                signals = {}
+            routine_streaks = loop_state.get("routine_streaks")
+            if not isinstance(routine_streaks, dict):
+                routine_streaks = {}
+
+            # Local outcome copy — Blocks A/C may flip routine->deep. Kept local
+            # (not the outer `outcome`) so a CAS retry recomputes from the
+            # caller's claimed outcome against the peer's freshly-read counters.
+            oc = outcome
+
+            # ---- Block A — per-goal streak ----
+            per_goal_streak = _to_int(routine_streaks.get(goal_id, 0))
+
+            if oc == "routine":
+                per_goal_streak += 1
+                if per_goal_streak >= flip_threshold:
+                    # FLIP — Block B/C/D will see deep
+                    oc = "deep"
+                    per_goal_streak = 0
+            elif oc == "deep":
+                # Successful deep clears the per-goal streak — the goal advanced
+                # past the routine-only treadmill.
+                per_goal_streak = 0
+            routine_streaks[goal_id] = per_goal_streak
+
+            # ---- Block B — session signals (re-reads oc) ----
+            routine_streak_global = _to_int(signals.get("routine_streak_global", 0))
+            routine_count_total = _to_int(signals.get("routine_count_total", 0))
+            productive_streak = _to_int(signals.get("productive_streak", 0))
+            consecutive_blocked_sleeps = _to_int(
+                signals.get("consecutive_blocked_sleeps", 0)
+            )
+
+            if oc == "routine":
+                routine_streak_global += 1
+                routine_count_total += 1
+                productive_streak = 0
+            else:  # deep
+                routine_streak_global = 0
+                productive_streak += 1
+                # Deep work breaks the blocked-sleep run. Same reset the LLM
+                # applied previously (Phase 4.1 Block B per the digest).
+                consecutive_blocked_sleeps = 0
+
+            # ---- Block C — global + ratio anti-drift ----
+            # Pre-Block-C goals_completed_this_session: pre-INCREMENT value the
+            # ratio check uses. Block D increments it. If Block C flips outcome
+            # to deep, Block D will count this iteration as productive.
+            goals_completed_this_session = _to_int(
+                loop_state.get("goals_completed_this_session", 0)
+            )
+            productive_goals_this_session = _to_int(
+                loop_state.get("productive_goals_this_session", 0)
+            )
+
+            # 1. Global routine-streak ceiling — when >= ceiling routines in a row
+            #    across goals, force deep regardless of per-goal streak. Default 5,
+            #    configurable via recurring.routine_streak_global_ceiling. Lowered
+            #    from 8 → 5 on 2026-05-12 per bravo session-66 feedback.
+            if routine_streak_global >= global_ceiling:
+                oc = "deep"
+                routine_streak_global = 0
+
+            # 2. Ratio check — only when >=6 goals completed this session AND
+            #    >80% of them were routine. The 6-goal floor avoids early-
+            #    session false positives where a single deep would yield
+            #    routine_count_total/goals_completed = 1.0 trivially.
+            if (
+                oc == "routine"
+                and goals_completed_this_session >= 6
+                and routine_count_total > 0.80 * goals_completed_this_session
+            ):
+                oc = "deep"
+
+            # ---- Block D — count productive AFTER all reclassification ----
+            goals_completed_this_session += 1
+            if oc == "deep":
+                productive_goals_this_session += 1
+                # productive_streak handling differs by flip path — INTENTIONAL
+                # asymmetry that mirrors the digest spec. Block A flip routes
+                # Block B through the deep branch (productive_streak += 1).
+                # Block C flip happens AFTER Block B already ran in the routine
+                # branch, so productive_streak stays at 0 even though
+                # productive_goals advances here. Test case C2 enshrines this
+                # asymmetry. Do NOT "fix" it by incrementing productive_streak
+                # here — it would double-count when Block A also flipped, and
+                # the C1/C2 test expectations would have to flip in tandem.
+
+            # ---- Persist ----
+            signals["routine_streak_global"] = routine_streak_global
+            signals["routine_count_total"] = routine_count_total
+            signals["productive_streak"] = productive_streak
+            signals["consecutive_blocked_sleeps"] = consecutive_blocked_sleeps
+            loop_state["signals"] = signals
+            loop_state["routine_streaks"] = routine_streaks
+            loop_state["goals_completed_this_session"] = goals_completed_this_session
+            loop_state["productive_goals_this_session"] = productive_goals_this_session
+            slots["loop_state"] = loop_state
+            wm["slots"] = slots
+
+            # : advance slot_meta.loop_state.updated_at + increment
+            # update_count so wm-prune's stale-detection sees this write.
+            # update_count is ALSO the 4 CAS token the helper compares.
+            _update_modified(wm, "loop_state")
+
+            result["final_outcome"] = oc
+            result["summary"] = (
+                f"per_goal_streak={per_goal_streak} "
+                f"routine_streak_global={routine_streak_global} "
+                f"routine_count_total={routine_count_total} "
+                f"productive_streak={productive_streak} "
+                f"goals_completed={goals_completed_this_session} "
+                f"productive_goals={productive_goals_this_session} "
+                f"flip_threshold={flip_threshold}"
+            )
+            return True
+
+        def _write(wm):
             tmp = wm_path.with_suffix(wm_path.suffix + ".tmp")
             tmp.write_text(yaml.safe_dump(wm, sort_keys=False), encoding="utf-8")
             tmp.replace(wm_path)
+
+        try:
+            cas = loop_state_cas_retry(_read, _mutate, _write)
         except Exception as e:
+            # WM read/write failure (or unexpected mutate error) -> fail-open with
+            # the caller's claimed outcome (module docstring: "ANY error -> exit 0
+            # with the caller's claimed outcome"). Config errors are NOT caught
+            # here — they were read above the loop and propagate intentionally.
             print(
-                f"[recurring-loop-state-mutate] WARN: failed to write WM ({e})",
+                f"[recurring-loop-state-mutate] WARN: WM read/write failed ({e})",
                 file=sys.stderr,
             )
-            print(final_outcome)
-            sys.exit(0)
+            cas = {"noop": True}
 
-        final_outcome = outcome
-
-        # Stderr summary so the LLM can see what bash did this iteration.
-        print(
-            f"[recurring-loop-state-mutate] {goal_id}: "
-            f"outcome_in={args.outcome} outcome_out={final_outcome} "
-            f"per_goal_streak={per_goal_streak} "
-            f"routine_streak_global={routine_streak_global} "
-            f"routine_count_total={routine_count_total} "
-            f"productive_streak={productive_streak} "
-            f"goals_completed={goals_completed_this_session} "
-            f"productive_goals={productive_goals_this_session} "
-            f"flip_threshold={flip_threshold}",
-            file=sys.stderr,
-        )
+        if not cas.get("noop"):
+            final_outcome = result.get("final_outcome", final_outcome)
+            note = ""
+            if cas.get("exhausted"):
+                note = " cas=exhausted-committed-last"
+            elif cas.get("conflicted"):
+                note = f" cas=re-applied(attempts={cas.get('attempts')})"
+            # Stderr summary so the LLM can see what bash did this iteration.
+            print(
+                f"[recurring-loop-state-mutate] {goal_id}: "
+                f"outcome_in={args.outcome} outcome_out={final_outcome} "
+                f"{result.get('summary', '')}{note}",
+                file=sys.stderr,
+            )
     finally:
         release_lock(lock_path)
 

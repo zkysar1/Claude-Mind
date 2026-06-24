@@ -20,8 +20,14 @@ cache to lock in AGENT_DIR=None for the entire pytest session.
 Fix: in this conftest (which pytest loads BEFORE any test module), (1) set
 MIND_AGENT to the first available agent, (2) import `_paths` once to lock
 in AGENT_DIR. Subsequent test-module pops affect os.environ but cannot
-unset the now-cached `_paths.AGENT_DIR`. Tests that override paths still
-work — they patch module attributes directly (e.g. `wm.WM_PATH = tmp/...`).
+unset the now-cached `_paths.AGENT_DIR`. Tests that override the WM path
+must set the BODY_WM_PATH env var (e.g.
+`monkeypatch.setenv("BODY_WM_PATH", str(tmp))`) — NOT patch `wm.WM_PATH`:
+after g-306-61 WM_PATH is a dynamic `__getattr__` property and read_wm /
+write_wm / cmd_init / cmd_reset resolve through `wm_path()` (BODY_WM_PATH
+env → else AGENT_DIR/session/working-memory.yaml), so patching the module
+attribute is a no-op for I/O and silently targets the live bound-agent WM
+(running such a test under MIND_AGENT clobbers live working memory). (g-115-1626)
 
 Selection: honor an externally-set MIND_AGENT if present, else pick the
 first directory under PROJECT_ROOT containing a local-paths.conf.
@@ -70,16 +76,6 @@ _set_default_agent()
 # moto-mocked test_owncloud_backend.py, which constructs the backend directly
 # rather than via this env selector, so the pin does not reduce its coverage.
 os.environ["STORAGE_BACKEND"] = "local"
-
-# Standalone-runner test files (run via `py -3 <file>`, NOT pytest): they use a
-# `@test` decorator — `def test(fn)` — to register cases into a module-level
-# TESTS list. Pytest mis-collects the bare `def test` as a test needing an `fn`
-# fixture and reports a collection ERROR. Exclude them from collection so the
-# suite is green; the standalone runners are still invoked directly. (6)
-collect_ignore = [
-    "test_history_cli_stage2.py",
-    "test_history_prune_legacy_stage3.py",
-]
 
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE

@@ -100,6 +100,17 @@ def _find_user_only_goals(source_label: str, asp_path: Path) -> list:
                 continue
             if g.get("status") not in ("pending", "blocked"):
                 continue
+            # Skip deliberate user routing: the audit targets accidental
+            # agent-side drift ([user] wrongly set AT CREATION), not goals the
+            # user explicitly directed. origin_signal == "user_directive" marks
+            # a deliberate [user] choice (e.g. a participants:[user] park signal
+            # —  : "DO-NOT-TOUCH: park is participants:[user]
+            # ONLY ... Reversal = the user edits participants"). Auto-promoting
+            # it to [agent, user] would let the agent act on the goal, violating
+            # the directive. ( audit run, 2026-06-09: caught the
+            # felt-sense-checkin "lane" keyword false-positive on .)
+            if (g.get("origin_signal") or "").strip().lower() == "user_directive":
+                continue
             out.append({
                 "source": source_label,
                 "aspiration_id": asp.get("id"),

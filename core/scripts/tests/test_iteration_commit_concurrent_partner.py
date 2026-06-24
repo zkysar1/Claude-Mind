@@ -89,6 +89,21 @@ def _setup_repo(tmpdir: Path, agents=("alpha", "zeta")) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (core_scripts / ".gitkeep").write_text("")
+    # 3: the own-log () and partner-log () snapshots
+    # import _normalize_rel_path from $REPO/core/scripts/_cross_agent_attribution
+    # _filter.py (which pulls _stdio). Copy both into the temp repo so the harness
+    # exercises the REAL normalization instead of the import's fail-open identity
+    # fallback. Without these, absolute-form log entries silently stayed
+    # un-normalized in-test — the exact harness blind spot that let the own-log
+    # normalization asymmetry ship unnoticed.
+    for _mod in ("_cross_agent_attribution_filter.py", "_stdio.py"):
+        (core_scripts / _mod).write_bytes((CORE_SCRIPTS / _mod).read_bytes())
+    # Match production: __pycache__ is gitignored. Without this, the
+    # py-normalization subprocess that compiles the copied helper modules above
+    # leaves an untracked core/scripts/__pycache__/ that git-status surfaces as
+    # a staged neutral-path artifact — which the 6 over-inclusion audit
+    # then (correctly) flags, polluting the audit-silent assertion.
+    (repo / ".gitignore").write_text("__pycache__/\n")
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
     return repo
@@ -557,6 +572,74 @@ def test_g115828_own_log_does_not_exempt_unrelated_path():
 
 
 # ---------------------------------------------------------------------------
+# 3 — own-log path-normalization symmetry (over-exclusion fix)
+#
+# The  own-log exemption snapshot did raw `print(fp)` with NO
+# _normalize_rel_path, while the  partner-log snapshot DID normalize
+# (0). uncommitted-edits.jsonl demonstrably holds BOTH relative AND
+# absolute (legacy C:/...) `file` entries. So an ABSOLUTE own-log entry keyed
+# committer_authored_paths by the absolute string, while the git-status
+# candidate `$path` is repo-relative — the membership check missed, the
+# exemption never fired, and the concurrent-partner filter dropped the
+# committer's OWN file (over-exclusion; guard-608 / commit 7f1df61d). The fix
+# applies the SAME _normalize_rel_path both consumers now share (rb-1405 SSOT).
+# Marker: ` first-person-authorship exemption` must fire for an
+# absolute-form own-log entry.
+# ---------------------------------------------------------------------------
+
+
+def test_g1151413_absolute_own_log_entry_still_exempts():
+    """3: an own-log entry stored in ABSOLUTE (Windows-drive) form —
+    the legacy shape proven to coexist in real uncommitted-edits.jsonl files
+    (g-115-1180) — must STILL grant the g-115-828 first-person-authorship
+    exemption. Pre-fix the own-log snapshot did not normalize, so the absolute
+    key missed the repo-relative candidate and the committer's own file was
+    wrongly dropped by the concurrent-partner filter. This is the genuine
+    regression: it FAILS against the pre-fix script (file dropped) and PASSES
+    post-fix (file retained via the normalized own-log exemption)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        alpha_claim = "2026-05-13T09:00:00"
+        zeta_claim = "2026-05-13T09:17:00"
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": alpha_claim,
+            "zeta": zeta_claim,
+        })
+        edit_epoch = _iso_to_epoch("2026-05-13T09:20:00")
+
+        # alpha's own deliverable at a neutral path, mtime inside zeta's
+        # concurrent in_flight window (so the concurrent-partner filter would
+        # drop it absent the exemption).
+        authored = repo / "core" / "scripts" / "abs-own-log-1413.py"
+        authored.parent.mkdir(parents=True, exist_ok=True)
+        authored.write_text("# alpha's own deliverable; own-log entry is absolute-form\n")
+        os.utime(authored, (edit_epoch, edit_epoch))
+
+        # Seed alpha's own-log with the ABSOLUTE Windows-drive form. The script
+        # resolves proot=$REPO in MSYS form (/c/.../repo); _normalize_rel_path
+        # adds the cross-form (C:/.../repo) prefix, so this absolute entry
+        # normalizes to the repo-relative candidate `core/scripts/abs-own-log-1413.py`.
+        abs_form = str(repo).replace("\\", "/") + "/core/scripts/abs-own-log-1413.py"
+        _seed_own_uncommitted_log(repo, "alpha", [abs_form])
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-1413-01", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        assert "g-115-828 first-person-authorship exemption" in combined, \
+            f"Exemption did NOT fire for absolute-form own-log entry (own-log normalization missing?). combined={combined!r}"
+        assert "retained (committer-authored): core/scripts/abs-own-log-1413.py" in combined, \
+            f"Absolute-form own-log file not retained. combined={combined!r}"
+        assert "filtered (concurrent-partner): core/scripts/abs-own-log-1413.py" not in combined, \
+            f"Committer's own file wrongly dropped despite absolute-form own-log entry. combined={combined!r}"
+
+
+# ---------------------------------------------------------------------------
 #  /  — partner-uncommitted-log filter when partner has
 # NO current in_flight (cross-claim attribution gap closure)
 #
@@ -648,13 +731,40 @@ def test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared():
             f"Filter 2 fired despite null partner in_flight — shim broken or filter logic mis-routed. combined={combined!r}"
 
 
-def test_g115697_partner_log_does_not_exempt_own_authored_path():
-    """Sanity: a path in zeta's log MUST drop, but if alpha ALSO records
-    the same path in alpha's own log, the committer-own-log exemption is
-    NOT a defense here — Filter 3 (partner-log) and the g-115-828 own-log
-    exemption are SEPARATE branches. Filter 3 fires from partner_log
-    membership regardless of own-log content. Pins that the partner-log
-    drop is not silently overridden by own-log."""
+def test_g1151620_partner_log_exempts_own_authored_double_recorded_path():
+    """0 REVERSAL of the prior  default (this test replaces
+    test_g115697_partner_log_does_not_exempt_own_authored_path): when a contested
+    neutral path is recorded in BOTH the committer's OWN uncommitted-edits.jsonl
+    AND a partner's log (the g-115-695 double-recording overlap), the committer's
+    first-person authorship now OVERRIDES the partner-log drop — the file is
+    RETAINED, not dropped.
+
+    Prior behavior: Filter 3 (partner-log) and the g-115-828 own-log exemption
+    were SEPARATE branches, so Filter 3 dropped a contested path regardless of
+    own-log content when in_flight was null. That default silently ORPHANED the
+    committer's own deep-close work whenever a stale partner-log entry happened
+    to cover the same path. Root cause (investigated under g-115-1620):
+    uncommitted-edits.jsonl is cleared ONLY by the editing agent's own
+    iteration-commit self-commit, so a file a PARTNER commits first leaves a
+    persistent stale entry in the original editor's log (alpha's live log held
+    114 such framework-file entries). Within the 48h staleness window those
+    entries false-drop another agent's legitimate edits. Observed incidents:
+    g-303-33, g-115-1619 (zeta's evolution-complete.py / fresh-eyes-program /
+    verify-learning dropped — a WARN not an ERROR, so the goal closed exit-0
+    with its edits left uncommitted).
+
+    Failure-mode rationale for the reversal: dropping leaves the committer's own
+    work UNCOMMITTED/orphaned (no agent re-commits a file that isn't really
+    theirs); retaining at worst mis-attributes a genuinely co-edited file to the
+    committer's commit — but the work IS committed (the partner's worktree
+    version is already merged in the shared index). Lost work >> mild
+    mis-attribution, so the own-log entry — proof of CURRENT authorship interest —
+    now wins under BOTH double-recording interpretations. g-115-1620 closes the
+    asymmetry by giving the g-115-697 partner-log filter the same own-log check
+    the g-115-828 concurrent-partner filter already had.
+
+    A partner-ONLY log entry (no own-log presence) STILL drops — pinned by
+    test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared."""
     PROJECT_TMP.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
         tmp = Path(td)
@@ -665,32 +775,217 @@ def test_g115697_partner_log_does_not_exempt_own_authored_path():
             "zeta": None,
         })
         edit_epoch = _iso_to_epoch("2026-05-13T09:15:00")
-        target = repo / "core" / "scripts" / "contested-914.py"
+        target = repo / "core" / "scripts" / "contested-1620.py"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("# both alpha and zeta touched this — partner-log wins\n")
+        target.write_text("# both alpha and zeta logs record this — own-log wins (g-115-1620)\n")
         os.utime(target, (edit_epoch, edit_epoch))
 
         # Both alpha's own log AND zeta's partner log record the same path.
-        # Filter 3 (partner-log) fires first and drops; the 
-        # exemption only runs inside the Filter 2 branch (which doesn't
-        # fire here because in_flight=null). So the contested path drops.
-        _seed_own_uncommitted_log(repo, "alpha", ["core/scripts/contested-914.py"])
-        _seed_partner_uncommitted_log(repo, "zeta", ["core/scripts/contested-914.py"])
+        # 0: the own-log presence now exempts the contested path from
+        # the partner-log drop (first-person authorship overrides).
+        _seed_own_uncommitted_log(repo, "alpha", ["core/scripts/contested-1620.py"])
+        _seed_partner_uncommitted_log(repo, "zeta", ["core/scripts/contested-1620.py"])
 
         result = _run_bash(
-            [str(shim), "--goal-id", "g-test-914-02", "--title", "Apply: test",
+            [str(shim), "--goal-id", "g-test-1620-02", "--title", "Apply: test",
              "--outcome", "deep", "--repo", str(repo), "--dry-run"],
             env={"MIND_AGENT": "alpha"},
         )
         combined = result.stderr + result.stdout
-        # Filter 3 fires — partner-log membership wins over a same-path
-        # entry in alpha's own log when in_flight is null. (When in_flight
-        # is non-null AND the path is in own-log,  exemption
-        # applies — but that branch is a different code path.)
-        assert "filtered (partner-uncommitted-log)" in combined, \
-            f"Filter 3 did NOT fire on contested path. combined={combined!r}"
-        assert "contested-914.py" in combined, \
-            f"Contested file missing from filter output. combined={combined!r}"
+        # The own-log proof overrides the partner-log drop: the path is RETAINED.
+        assert "filtered (partner-uncommitted-log): core/scripts/contested-1620.py" not in combined, \
+            f"Contested own-authored path was wrongly dropped (g-115-1620 regression). combined={combined!r}"
+        assert "retained (committer-authored-log)" in combined, \
+            f"g-115-1620 own-log exemption marker missing. combined={combined!r}"
+        assert "contested-1620.py" in combined, \
+            f"Retained contested file missing from staging. combined={combined!r}"
+
+
+# ---------------------------------------------------------------------------
+# 6 — over-inclusion AUDIT (detection-only)
+#
+# The attribution filters above are a DENYLIST: a neutral-path file is staged
+# unless a partner signal fires. An ORPHAN — a partner's uncommitted shared-
+# path edit whose every signal has lapsed (partner not in_flight, edit post-
+# dates the committer claim, edit never recorded in any uncommitted-edits.jsonl)
+# — is byte-indistinguishable from the committer's own UNLOGGED neutral edit.
+# test_concurrent_partner_no_partner_in_flight_file_included pins that an own
+# unlogged neutral file MUST stage, so an orphan cannot be auto-dropped without
+# over-excluding legitimate own work. Staging-time PREVENTION is therefore
+# impossible; the 6 audit makes the residual over-inclusion VISIBLE +
+# post-hoc-correctable instead of silently swept under the committing goal_id
+# (the  deep auto-override path). A flagged file is EITHER a recording
+# gap (own edit missing from the own-log) OR a mis-attributed partner orphan —
+# both actionable. Deny-vs-allow-list contract: 2.
+#
+# The audit gates on OUTCOME==deep (the only path that bulk-stages neutral
+# files under one goal_id while bypassing the uncommitted-work-gate) and keys
+# the per-file flag on absence from committer_authored_paths — the SAME own-log
+# SSOT the  exemption uses, so attribution is consistent across the
+# retain-side (Filter 2 exemption) and the detect-side (this audit).
+# Marker: `AUDIT (6 over-inclusion)`.
+# ---------------------------------------------------------------------------
+
+
+def test_g1151426_over_inclusion_audit_flags_unattributed_not_attributed():
+    """6 (both branches in one scenario): under a deep outcome with
+    partner in_flight=null, two neutral-path files reach staging. One is
+    recorded in alpha's OWN uncommitted-edits.jsonl (attributed) -> must NOT be
+    flagged. The other is in NO own-log (orphan OR recording gap) -> MUST be
+    flagged `unattributed (over-inclusion-risk)`. Pins the audit-fires branch
+    AND the per-path own-log discrimination (guard-502: met AND not-met)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        # partner in_flight=null -> Filter 2/3 cannot fire; both files post-date
+        # alpha's claim -> Filter 1 cannot fire. Both stage and reach the audit.
+        alpha_claim = "2026-05-13T09:00:00"
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": alpha_claim,
+            "zeta": None,
+        })
+        edit_epoch = _iso_to_epoch(alpha_claim) + 1200
+
+        attributed = repo / "core" / "scripts" / "attributed-1426.py"
+        attributed.parent.mkdir(parents=True, exist_ok=True)
+        attributed.write_text("# alpha's own deliverable — recorded in own log\n")
+        os.utime(attributed, (edit_epoch, edit_epoch))
+
+        unattributed = repo / "core" / "scripts" / "unattributed-1426.py"
+        unattributed.write_text("# neutral edit with NO own-log entry (orphan-or-gap)\n")
+        os.utime(unattributed, (edit_epoch, edit_epoch))
+
+        # Only the attributed file is recorded in alpha's own log.
+        _seed_own_uncommitted_log(repo, "alpha", ["core/scripts/attributed-1426.py"])
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-1426-01", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        # Audit fired (deep + >=1 unattributed neutral staged file)
+        assert "AUDIT (g-115-1426 over-inclusion)" in combined, \
+            f"Over-inclusion audit did NOT fire. combined={combined!r}"
+        # Unattributed file flagged
+        assert "unattributed (over-inclusion-risk): core/scripts/unattributed-1426.py" in combined, \
+            f"Unattributed neutral file not flagged. combined={combined!r}"
+        # Own-logged file NOT flagged (per-path attribution discrimination)
+        assert "unattributed (over-inclusion-risk): core/scripts/attributed-1426.py" not in combined, \
+            f"Own-logged file wrongly flagged as unattributed. combined={combined!r}"
+        # Detection-only: both files still staged (audit changes nothing)
+        assert "unattributed-1426.py" in combined and "attributed-1426.py" in combined, \
+            f"Audit altered staging (must be detection-only). combined={combined!r}"
+
+
+def test_g1151426_audit_silent_when_all_neutral_attributed():
+    """Negative branch: under a deep outcome where EVERY staged neutral file is
+    recorded in the committer's own log, the `unattributed` set is empty so NO
+    `AUDIT (g-115-1426 over-inclusion)` line is emitted. Pins the audit-silent
+    path (guard-502: the empty-set branch must not false-fire on clean work)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        alpha_claim = "2026-05-13T09:00:00"
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": alpha_claim,
+            "zeta": None,
+        })
+        edit_epoch = _iso_to_epoch(alpha_claim) + 1200
+        target = repo / "core" / "scripts" / "all-attributed-1426.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# fully-attributed neutral edit (recorded in own log)\n")
+        os.utime(target, (edit_epoch, edit_epoch))
+
+        # The ONLY neutral staged file is recorded in alpha's own log.
+        _seed_own_uncommitted_log(repo, "alpha", ["core/scripts/all-attributed-1426.py"])
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-1426-02", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        assert "AUDIT (g-115-1426 over-inclusion)" not in combined, \
+            f"Audit false-fired with all neutral files attributed. combined={combined!r}"
+        # Deep dry-run still produces the staging plan; the file is staged.
+        assert "all-attributed-1426.py" in combined, \
+            f"Attributed neutral file missing from staging plan. combined={combined!r}"
+
+
+def test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit():
+    """8: a file PRE-STAGED in the shared index but EXCLUDED from this
+    committer's staged_files[] (here via the namespace filter -- agents/zeta/)
+    must NOT be swept into the committer's real commit. The cross-agent filters
+    gate what iteration-commit `git add`s, but a bare whole-index `git commit`
+    committed the ENTIRE index, sweeping a concurrent partner's pre-staged WIP
+    regardless (observed g-115-1486 / g-115-1497: alpha's deliverable swept into
+    zeta's commit despite the partner-log filter correctly excluding it). The
+    `-- "${staged_files[@]}"` pathspec restricts the commit to the intended
+    paths; the foreign pre-staged entry is excluded AND left staged for the
+    partner's own commit.
+
+    Genuine regression (FAILS pre-fix, PASSES post-fix): under the old whole-
+    index `git commit -F -`, the pre-staged agents/zeta/ file lands in HEAD; the
+    pathspec scope excludes it. Filter-agnostic -- the same protection holds
+    whatever excluded the file from staged_files[] (namespace / partner-log /
+    concurrent); namespace is used here for the cleanest deterministic setup.
+    Unlike the sibling tests, this one runs a REAL commit (no --dry-run) so it
+    inspects the resulting HEAD tree, not the staging plan.
+    """
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        # zeta has no in_flight -- isolate to the pre-staged sweep, not the
+        # concurrent-partner filter.
+        shim = _shim_iteration_commit_multi(
+            tmp, {"alpha": "2026-05-13T09:00:00", "zeta": None})
+
+        # alpha's own deliverable (own agent-dir -> always in staged_files[],
+        # never namespace-filtered): seed tracked, then modify so git sees ' M'.
+        alpha_file = _seed_tracked_file(
+            repo, "agents/alpha/deliverable-1498.md", "base\n")
+        alpha_file.write_text("base\nalpha deep change\n")
+
+        # FOREIGN partner WIP, pre-staged into the shared index BEFORE alpha's
+        # iteration-commit. Under agents/zeta/ -> the namespace filter excludes
+        # it from alpha's staged_files[]; the pre-stage puts it in the index.
+        foreign = repo / "agents" / "zeta" / "wip-prestaged-1498.md"
+        foreign.parent.mkdir(parents=True, exist_ok=True)
+        foreign.write_text("# zeta WIP, pre-staged by zeta mid-commit\n")
+        subprocess.run(["git", "add", str(foreign)], cwd=repo, check=True)
+
+        # REAL commit (no --dry-run).
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-1498-01", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo)],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+        assert result.returncode == 0, f"iteration-commit failed: {combined!r}"
+
+        head_files = subprocess.run(
+            ["git", "show", "--name-only", "--format=", "HEAD"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.split()
+
+        assert "agents/alpha/deliverable-1498.md" in head_files, \
+            f"alpha's own deliverable was NOT committed. head_files={head_files!r} combined={combined!r}"
+        assert "agents/zeta/wip-prestaged-1498.md" not in head_files, \
+            f"FOREIGN pre-staged file was SWEPT into alpha's commit (pathspec scope failed). head_files={head_files!r}"
+
+        # The foreign file must remain staged+uncommitted (left for zeta).
+        still_staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert "agents/zeta/wip-prestaged-1498.md" in still_staged, \
+            f"Foreign pre-staged file should remain staged for the partner. still_staged={still_staged!r}"
 
 
 if __name__ == "__main__":
@@ -704,6 +999,10 @@ if __name__ == "__main__":
     test_g115828_committer_own_log_exempts_and_genuine_partner_still_drops()
     test_g115828_no_own_log_failsafe_drops_as_before()
     test_g115828_own_log_does_not_exempt_unrelated_path()
+    test_g1151413_absolute_own_log_entry_still_exempts()
     test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared()
-    test_g115697_partner_log_does_not_exempt_own_authored_path()
-    print("All 12 concurrent-partner tests passed (7 g-115-692 + 3 g-115-828 + 2 g-115-697/914).")
+    test_g1151620_partner_log_exempts_own_authored_double_recorded_path()
+    test_g1151426_over_inclusion_audit_flags_unattributed_not_attributed()
+    test_g1151426_audit_silent_when_all_neutral_attributed()
+    test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit()
+    print("All 16 concurrent-partner tests passed (7 g-115-692 + 3 g-115-828 + 1 g-115-1413 + 1 g-115-697/914 + 1 g-115-1620 + 2 g-115-1426 + 1 g-115-1498).")

@@ -1342,6 +1342,125 @@ def _rmw_with_conflict_retry(path, cycle_fn):
             time.sleep(_conflict_backoff(c_attempt))
 
 
+# ---------------------------------------------------------------------------
+# Local-WM stale-lock-steal CAS retry (9 mechanism B — 4)
+# ---------------------------------------------------------------------------
+# The three loop_state writers — loop-state-bump-counters.py,
+# recurring-loop-state-mutate.py, and the daemon wm_write.set_slot — each hold
+# working-memory.yaml's .lock (stale_seconds=10) across a fresh-read
+# read-modify-write. The lock normally serialises them, but acquire_lock
+# STALE-BREAKS a lock whose file mtime exceeds stale_seconds: a holder that
+# stalls >10s mid-RMW (OneDrive/daemon write latency, guard-597) has its lock
+# stolen, two critical sections overlap, and the later write clobbers the
+# earlier counter increment (observed bravo session 85; analysis 9 and
+# the loop-state-integrity tree node "Lock-Atomicity & The Stale-Steal Residual
+# Race").
+#
+# This is the ROBUST tier of 9's fix hierarchy: optimistic concurrency
+# keyed on slot_meta[slot].update_count (already maintained by every writer's
+# _update_modified, guard-540/guard-449). A writer captures update_count BEFORE
+# mutating; just before writing it re-reads the on-disk update_count; if it
+# changed, a peer wrote during the stall, so it re-reads fresh and re-applies
+# the mutation. Same retry SHAPE as _rmw_with_conflict_retry above (reuses
+# _conflict_backoff), but the conflict token is the local update_count, not an
+# S3 etag: WM is local-only and is DELIBERATELY excluded from the backend
+# conflict path (see mind_api/src/endpoints/wm_write._write_wm docstring).
+#
+# Pure CONTROL helper: it performs NO filesystem write (no os.replace / tmp
+# rename), so it is NOT a locked_write_* function and guard-472's
+# _atomic_write_with_fallback requirement does not apply — each caller delegates
+# its existing byte-compat read/write via callbacks (CLI yaml.safe_dump vs the
+# daemon's default-Dumper _write_wm are preserved unchanged). The caller MUST
+# already hold the slot file's .lock; this helper only re-reads to detect a
+# steal that broke that lock mid-cycle. rb-1536 (DDB CAS-via-conditional-guard)
+# is the cross-store analogue of this optimistic-concurrency pattern.
+
+_LOOP_STATE_CAS_RETRY_CAP = 3
+
+
+def _slot_update_count(wm, slot):
+    """Extract slot_meta[slot].update_count from a working-memory dict.
+
+    Returns 0 when the dict, its slot_meta, the slot's meta, or the counter is
+    absent or non-integer — a missing counter compares equal to a fresh writer's
+    captured 0, so the no-contention first-write path is unaffected."""
+    if not isinstance(wm, dict):
+        return 0
+    meta = wm.get("slot_meta")
+    if not isinstance(meta, dict):
+        return 0
+    sm = meta.get(slot)
+    if not isinstance(sm, dict):
+        return 0
+    try:
+        return int(sm.get("update_count", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def loop_state_cas_retry(read_fn, mutate_fn, write_fn, *,
+                         slot="loop_state",
+                         retry_cap=_LOOP_STATE_CAS_RETRY_CAP,
+                         backoff_fn=None):
+    """Stale-lock-steal-safe read-modify-write for a structured WM slot.
+
+    The CALLER must already hold the slot file's .lock. Within that lock::
+
+        for attempt in range(retry_cap):
+            wm    = read_fn()                       # fresh read each attempt
+            token = slot_meta[slot].update_count    # captured BEFORE mutate
+            if not mutate_fn(wm):                    # apply delta + _update_modified
+                return {"noop": True, ...}           # idempotent no-op -> no write
+            if _slot_update_count(read_fn()) == token:   # re-read: peer didn't write
+                write_fn(wm); return {"conflicted": attempt>0, ...}
+            sleep(backoff(attempt))                  # peer stale-broke lock & wrote -> retry
+        write_fn(wm); return {"exhausted": True, ...}   # retries spent -> fail-open commit
+
+    Contract:
+      - ``read_fn()`` returns a fresh wm dict parsed from disk (may raise; the
+        caller's existing fail-open try/except wraps this call).
+      - ``mutate_fn(wm)`` mutates ``wm[slots][slot]`` IN PLACE reading every value
+        from the passed-in (fresh) wm — never a snapshot captured before the call —
+        so a retry re-applies the delta on the peer's landed write. It MUST call
+        the caller's ``_update_modified(wm, slot)`` (advancing update_count). It
+        returns truthy to commit, or falsy for an idempotent no-op (e.g. a goal
+        already counted) in which case NO write happens.
+      - ``write_fn(wm)`` performs the caller's existing atomic write of ``wm``.
+
+    A stale-lock-steal (a peer broke this holder's lock after a >10s stall and
+    wrote) bumps the on-disk update_count past ``token``, so the verify re-read
+    mismatches and the cycle re-reads + re-applies — no lost increment. A
+    verify-read FAILURE is treated as a conflict (retry), never as a synthesised
+    no-conflict (guard-160). On the common no-contention path the verify matches
+    on attempt 0: one extra read, identical write behaviour. When all retries
+    conflict the helper commits the last attempt (fail-open: a silently-dropped
+    increment is worse than a re-applied one, which the writers' own idempotency
+    guards already dedupe) and sets ``exhausted=True``. Returns a dict with keys
+    ``noop``, ``attempts``, ``conflicted``, ``exhausted``."""
+    if backoff_fn is None:
+        backoff_fn = _conflict_backoff
+    wm = None
+    for attempt in range(retry_cap):
+        wm = read_fn()
+        token = _slot_update_count(wm, slot)
+        if not mutate_fn(wm):
+            return {"noop": True, "attempts": attempt + 1,
+                    "conflicted": False, "exhausted": False}
+        try:
+            conflict = _slot_update_count(read_fn(), slot) != token
+        except Exception:
+            conflict = True
+        if not conflict:
+            write_fn(wm)
+            return {"noop": False, "attempts": attempt + 1,
+                    "conflicted": attempt > 0, "exhausted": False}
+        time.sleep(backoff_fn(attempt))
+    # Retries exhausted — fail-open commit of the last mutated state.
+    write_fn(wm)
+    return {"noop": False, "attempts": retry_cap,
+            "conflicted": True, "exhausted": True}
+
+
 def locked_append_jsonl(path, item):
     """Lock → history → JSONL append → changelog → unlock.
 

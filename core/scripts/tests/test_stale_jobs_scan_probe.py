@@ -344,5 +344,78 @@ class HookPythonOrphanTest(unittest.TestCase):
         self.assertNotIn(7001, {c["pid"] for c in cands})
 
 
+class ForeignRootOrphanScopingTest(unittest.TestCase):
+    """8: a hook-python orphan rooted in a SIBLING Mind install
+    (.../Zak-Data-Solutions-Mind/core/scripts/...) belongs to that install's
+    scanner, not ours. It must be EXCLUDED from our candidate set so it cannot
+    form a permanent floor that pins MAX_KILLS_PER_RUN and blocks auto-reap of
+    OUR own orphans (canonical g-115-106: 8 Tier-B orphans, 4 rooted in the
+    sibling install permanently held the count >3). Our own absolute-rooted
+    orphans, and relative/ambiguous ones, stay candidates."""
+
+    def _our_root(self):
+        from _paths import PROJECT_ROOT
+        return str(PROJECT_ROOT).replace("\\", "/")
+
+    def _abs_orphan(self, pid, root, script="presence-tick.py", age=40.0):
+        # ppid 999999 is absent from the procs list -> dead parent -> reap-eligible.
+        return _make_hook_python_proc(
+            pid, 999999, age,
+            cmdline=f"C:\\Windows\\py.exe {root}/core/scripts/{script}",
+        )
+
+    def test_orphan_is_foreign_helper(self):
+        ours = f"C:\\Windows\\py.exe {self._our_root()}/core/scripts/presence-tick.py"
+        foreign = ("C:\\Windows\\py.exe "
+                   "<REPO_ROOT>/"
+                   "Zak-Data-Solutions-Mind/core/scripts/presence-tick.py")
+        relative = ("C:\\Python312\\python.exe -c "
+                    "\"import sys; sys.path.insert(0, 'core/scripts')\"")
+        self.assertFalse(sjs.orphan_is_foreign(ours), "our own absolute root is not foreign")
+        self.assertTrue(sjs.orphan_is_foreign(foreign), "sibling-Mind absolute root is foreign")
+        self.assertFalse(sjs.orphan_is_foreign(relative),
+                         "relative core/scripts (no absolute root) is not foreign")
+        self.assertFalse(sjs.orphan_is_foreign(""), "empty cmdline is not foreign")
+
+    def test_foreign_orphan_excluded_own_kept(self):
+        """Canonical  shape: our orphan + a sibling-Mind orphan, both
+        aged + dead-parent. Only ours is a candidate; the sibling is scoped out."""
+        ours = self._abs_orphan(18456, self._our_root(), "presence-tick.py")
+        foreign = self._abs_orphan(
+            4428,
+            "<REPO_ROOT>/Zak-Data-Solutions-Mind",
+            "context-reads.py",
+        )
+        cands = sjs.identify_candidates([ours, foreign], None, [], set(),
+                                        sjs.DEFAULT_THRESHOLDS)
+        pids = {c["pid"] for c in cands}
+        self.assertIn(18456, pids, "our own absolute-rooted orphan stays a candidate")
+        self.assertNotIn(4428, pids,
+                         "sibling-Mind orphan must be scoped out (g-115-1518)")
+
+    def test_relative_core_scripts_still_candidate(self):
+        """Regression-catch: the inline `py -c` relative-core/scripts shape (no
+        absolute root) must remain a candidate -- the fix excludes only
+        POSITIVELY-foreign absolute roots, never relative/ambiguous ones."""
+        child = _make_hook_python_proc(7001, 6001, 1.0)  # default relative cmdline; parent absent
+        cands = sjs.identify_candidates([child], None, [], set(), sjs.DEFAULT_THRESHOLDS)
+        self.assertIn(7001, {c["pid"] for c in cands})
+
+    def test_foreign_floor_does_not_pin_gate(self):
+        """The whole point: N sibling orphans must NOT count toward the candidate
+        total. With 4 foreign + 2 ours, the candidate set is {ours} (size 2),
+        NOT 6 -- so a count-gated reaper sees only what it owns."""
+        ours = [self._abs_orphan(100 + i, self._our_root(), f"s{i}.py") for i in range(2)]
+        foreign = [self._abs_orphan(
+            200 + i,
+            "<REPO_ROOT>/Zak-Data-Solutions-Mind",
+            f"f{i}.py") for i in range(4)]
+        cands = sjs.identify_candidates(ours + foreign, None, [], set(),
+                                        sjs.DEFAULT_THRESHOLDS)
+        pids = {c["pid"] for c in cands}
+        self.assertEqual(pids, {100, 101},
+                         "only our 2 orphans count; the 4 sibling orphans are scoped out")
+
+
 if __name__ == "__main__":
     unittest.main()

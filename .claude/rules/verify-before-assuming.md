@@ -143,6 +143,29 @@ mapping) was correct; only the WHY-comment was unfounded. Fix going
 forward: when explaining why existing state exists, write observation +
 plausible-mechanism separately, never blurred.
 
+## Capability-Absence Claims ("Y Needs To Be Built")
+
+"Y needs to be built", "X must be created", "we need to add Z", and "there is
+no support for W yet" are negative conclusions too -- the build-side twin of
+"X doesn't exist". Both assert that a capability does NOT currently exist, and
+both misdirect work when wrong: the symmetric failure mode is building a
+duplicate of something that already exists (a script, a gate, a tree node, a
+convention) because no search was run first.
+
+Rule: Before concluding that something must be built, created, or added, apply
+the same discipline as any other negative conclusion -- the multi-signal
+requirement (rule 1) plus the exhaustive knowledge search of
+`core/config/conventions/exhaustive-search-before-negation.md`. Search the
+codebase, the skill/script registry, `world/forged-skills.yaml`, the knowledge
+tree, and `world/conventions/` for an existing implementation BEFORE filing
+build work; only when 2+ independent surfaces come back empty is "needs to be
+built" verified rather than assumed. Same root as
+`.claude/rules/encode-stable-facts.md` "retrieve before discovering" and
+`.claude/rules/capability-before-user.md` "check provisionability first". A
+goal-creation-time gate that flags build-verb goals lacking a prior-search
+note is a possible future hardening, deferred until the cycle detector shows
+the pattern is frequent enough to warrant it (g-305-10 scope decision).
+
 ## Anti-patterns
 
 - One failed curl = "it's down"
@@ -158,6 +181,9 @@ plausible-mechanism separately, never blurred.
   from "LLM compensating after rejection" was retracted after acknowledging
   no trace was ever consulted; observation and inference must be stated
   separately, not blurred by a causal connector)
+- "We need to build a script/gate for X" without grepping `core/scripts/`,
+  `world/forged-skills.yaml`, and the tree first -- the capability often
+  already exists (build-side twin of the "it's not built" anti-pattern above)
 
 **Detail:** `core/config/conventions/negative-conclusions.md` for enforcement points,
 verification tiers, and silent failure catalog.

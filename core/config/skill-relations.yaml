@@ -25,6 +25,12 @@ config:
   staleness_threshold_sessions: 20
   co_invocation_log_cap: 200
   discover_min_co_occurrences: 3
+  # Ledger-discovery knobs (skill-coinvocation-discovery.py, ) -- mines the
+  # raw skill-invocations.jsonl ledger for time-windowed episode co-occurrence;
+  # distinct from discover_min_co_occurrences, which gates the sparse co_invocation_log.
+  ledger_discover_gap_minutes: 15        # gap > N min between invocations starts a new episode
+  ledger_discover_min_co_occurrences: 3  # min episodes a pair must co-occur in to be proposed
+  ledger_discover_top: 30                # cap candidate count (0 = no cap)
 
 # --- RELATIONS (base skills) ---
 # Each: {source, target, type, confidence, evidence}

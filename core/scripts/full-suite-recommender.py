@@ -44,12 +44,16 @@ MIND_RULE_PREFIX = ".claude/rules/"
 MIND_CONFIG_PREFIX = "core/config/"
 
 # Product workspace (resolved from local-paths.conf at runtime)
-def _agent_write_path() -> Path | None:
-    """Return AGENT_WRITE_PATH from the bound agent's local-paths.conf, or from
-    the first discovered agent dir's conf if MIND_AGENT is unset. Returns None
-    if no agent dir has a local-paths.conf or the conf lacks AGENT_WRITE_PATH —
-    a fresh single-agent deployment without a product workspace yields None
-    and the recommender skips product-workspace detection."""
+def _agent_write_paths() -> list[Path]:
+    """Return AGENT_WRITE_PATH root(s) from the bound agent's local-paths.conf,
+    or from the first discovered agent dir's conf if MIND_AGENT is unset.
+    Returns [] if no agent dir has a local-paths.conf or the conf lacks
+    AGENT_WRITE_PATH — a fresh single-agent deployment without a product
+    workspace yields [] and the recommender skips product-workspace detection.
+
+    MULTI-ROOT (g-321-05): AGENT_WRITE_PATH may name several roots separated by
+    ';' (optionally quoted for bash-source safety). Each is returned as its own
+    Path so every product workspace gets change-detected."""
     agent = os.environ.get("MIND_AGENT", "").strip()
     candidates: list[Path] = []
     if agent:
@@ -65,8 +69,9 @@ def _agent_write_path() -> Path | None:
         for ln in conf.read_text(encoding="utf-8", errors="replace").splitlines():
             ln = ln.strip()
             if ln.startswith("AGENT_WRITE_PATH="):
-                return Path(ln.split("=", 1)[1].strip())
-    return None
+                raw = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                return [Path(p.strip()) for p in raw.split(";") if p.strip()]
+    return []
 
 
 # --- Git change detection ---------------------------------------------------
@@ -394,11 +399,10 @@ def main() -> int:
     mind_buckets = _classify_mind(mind_changed)
     mind_recs = _mind_recommendations(mind_buckets)
 
-    # Detect product changes
-    write_root = _agent_write_path()
+    # Detect product changes across every configured write root ()
     product_results: list[tuple[Path, str, list[str]]] = []
-    if write_root is not None:
-        product_results = _product_repos_with_changes(write_root)
+    for write_root in _agent_write_paths():
+        product_results.extend(_product_repos_with_changes(write_root))
 
     # Emit banner if anything detected; otherwise quiet skip
     any_changes = sum(len(v) for v in mind_buckets.values()) > 0 or len(product_results) > 0

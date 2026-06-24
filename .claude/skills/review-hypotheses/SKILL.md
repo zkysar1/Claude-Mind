@@ -57,12 +57,32 @@ Detects which active hypotheses have resolved, records outcomes, moves records, 
 ### Step 1: Load Hypotheses to Check
 
 ```
+# Step 1.0: Pre-scan discovered-stage records orphaned past resolves_by (g-115-1629).
+# review-hypotheses historically loaded ONLY active + measurement-pending, so
+# discovered records past resolves_by were invisible -- never resolved, never
+# fed accuracy stats (63 of 193 orphaned at filing, oldest >2mo). This sweep
+# EXPIRES clearly-unresolvable ones (short/session horizon past the observation
+# window -> archived UNRESOLVABLE, gate-exempt) and PROMOTES well-formed
+# evaluable ones to active so the resolution loop below catches them THIS run.
+# Direct py -3 (not a bash wrapper) per rb-225/rb-247.
+Bash: py -3 core/scripts/hypothesis-discovered-overdue-sweep.py --apply --output json
+# Parse {expired, promoted, needs_judgment}. `promoted` records are now
+# stage=active and WILL appear in the active load below (resolved this run).
+# `needs_judgment` (under-formed, recently overdue) are SURFACED, not auto-
+# resolved: for each, if evaluable, synthesize a claim from the position
+# (guard-798: leaving discovered needs claim>=20 + a resolution method), then
+# resolve/expire with judgment; else leave for the next cycle.
+
 # Primary source: all active hypotheses
 Bash: pipeline-read.sh --stage active
 
 # Also re-probe measurement-pending hypotheses (g-115-465 / rb-754) — these are
 # shelved waiting for measurement infrastructure to appear. Re-checking the channel
-# every cycle is cheap and lets them resolve as soon as data shows up.
+# every cycle is cheap and lets them resolve as soon as data shows up. A re-probed
+# measurement-pending record now past its hard resolves_by deadline with the channel
+# STILL empty is EXPIRED by Step 2.6a (g-115-1584 / rb-2122) — without that pass the
+# stage was a one-way shelf with no auto-expiry that grew unbounded (g-001-02 had to
+# hand-archive 35 past-deadline records).
 Bash: pipeline-read.sh --stage measurement-pending
 APPEND to candidate list
 
@@ -226,12 +246,25 @@ ELSE:  # 2+ sources
 
 This does NOT block resolution. Contested sources are noted but the agent still makes a judgment call on the outcome.
 
-### Step 2.6: Measurement-Pending Transition (g-115-465 / rb-754)
+### Step 2.6: Measurement-Pending Transition + Expiry (g-115-465 / rb-754 / g-115-1584)
 
 Catches hypotheses that are past `resolves_no_earlier_than` but whose
 measurement_channel produced no usable data. Without this step, such
 hypotheses stay in `active` status indefinitely, bloating the active pool
 and producing recurring INCONCLUSIVE results every cycle.
+
+Step 2.6a (g-115-1584 / rb-2122) closes the back half of that lifecycle: a
+record ALREADY shelved in measurement-pending whose hard `resolves_by`
+deadline has now passed with the channel still empty is EXPIRED (moved to
+archived, outcome=EXPIRED) instead of being re-shelved. Without it the
+measurement-pending stage was a one-way shelf with no auto-expiry — it grew
+unbounded (g-001-02 had to hand-archive 35 past-deadline records). The data
+model already documents this transition as intended (`pipeline.py` VALID_STAGES
+note: "measurement-pending→archived (at resolves_by absolute deadline)"); this
+step wires the trigger. Expiry is symmetric to Step 4.0's active-record expiry:
+EXPIRED records land in `archived` (never `resolved`), so they are excluded from
+accuracy stats (compute_meta counts only CONFIRMED/CORRECTED) and are never
+pulled into Mode 2 reflection (`--unreflected` = stage==resolved AND not reflected).
 
 Five gap subtypes (catalog at `world/knowledge/tree/system/system-constraints-loop/hypothesis-measurement-gap.md`):
 - **infra-missing**: writer/source emitter doesn't exist
@@ -248,6 +281,30 @@ IF actual_outcome was determined: continue to Step 3 (resolved path)
 ELIF threshold (resolves_no_earlier_than) has passed AND
      resolution attempt completed AND
      no value was observable in measurement_channel:
+
+    # ── Step 2.6a: HARD-DEADLINE expiry for already-shelved records (g-115-1584 / rb-2122) ──
+    # If THIS record is already in measurement-pending (it came in via Step 1's
+    # measurement-pending re-probe load) AND it carries a hard resolves_by deadline
+    # that has now passed, the measurement will not arrive in time — expire it to
+    # archived instead of re-shelving. Records with no resolves_by (null) or a
+    # still-future resolves_by fall through to the normal (re-)shelve below, so a
+    # hypothesis without a hard deadline keeps re-probing exactly as before.
+    # resolves_by may be a date (YYYY-MM-DD) or a datetime — compare the same way
+    # Step 4.0 does ("resolves_by has passed"). Mirrors Step 4.0's active-record
+    # expiry; EXPIRED lands in archived (never resolved).
+    IF record.stage == "measurement-pending"
+       AND record.resolves_by is not null
+       AND resolves_by has passed (parse date/datetime; compare to current_time):
+        expiry_merge = {
+            "outcome": "EXPIRED",
+            "outcome_date": "<today ISO>",
+            "outcome_detail": "Measurement-pending expired: past resolves_by ({resolves_by}); channel never produced data (gap_subtype: {record.measurement_gap_subtype}). Auto-expired by Mode 1 Step 2.6a.",
+        }
+        echo '<expiry_merge>' | bash core/scripts/pipeline-move.sh <id> archived
+        Add to resolve_result.expired_measurement_pending list.
+        Log: "EXPIRED measurement-pending {id} — resolves_by {resolves_by} passed, channel still empty"
+        Continue to next hypothesis.
+    # ── end Step 2.6a — records below have no passed hard deadline; (re-)shelve ──
 
     # Classify the gap subtype based on attempt failure mode
     gap_subtype = (
@@ -437,6 +494,16 @@ For each resolved hypothesis, execute this checklist IN ORDER.
        # surprise, replay_metadata, context_quality, process_score, reflected: false.
        # DO NOT skip fields — pipeline-move.sh merges them atomically.
        # Missing fields here = missing fields forever (reflect can't backfill structure).
+       # RESOLUTION-EVIDENCE GATE (g-303-27): a CONFIRMED/CORRECTED move to
+       # resolved is REJECTED (400 resolution_evidence_required) unless
+       # outcome_detail (or experience_ref / evidence_for) carries >=1
+       # verifiable pointer -- a goal-id (g-NNN-NN), commit SHA, file:line,
+       # session-id, an rb-/guard-/exp-/msg- id, a canonical-script name
+       # (foo.sh/foo.py), or a percentage with measurement context. This is
+       # almost always already present in a real resolution summary. For a
+       # genuinely pointer-free resolution (e.g. a math proof where the
+       # derivation IS the evidence), add "evidence_override": "<reason>" to
+       # the merge JSON. EXPIRED/UNRESOLVABLE outcomes are exempt.
        echo '<merge-json-with-ALL-4.1-fields>' | bash core/scripts/pipeline-move.sh <id> resolved
        This atomically: updates all fields, sets stage to resolved, recounts meta.
 
@@ -502,6 +569,8 @@ resolve_result:
   still_active: K
   skipped_not_due: J          # hypotheses whose resolves_no_earlier_than hasn't arrived
   resolving_soon: L           # within 48 hours of resolving
+  measurement_pending: P      # shelved this cycle (Step 2.6 — channel empty, no hard deadline passed)
+  expired_measurement_pending: Q  # archived/EXPIRED this cycle (Step 2.6a — past resolves_by, channel still empty)
   triggered_reviews: [...]   # any flags from Step 5
   resolved_hypotheses:
     - id: "2026-03-15_record-slug"

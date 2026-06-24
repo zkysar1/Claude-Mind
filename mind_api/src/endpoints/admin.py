@@ -35,7 +35,7 @@ def stats(ctx) -> "Response":  # type: ignore[name-defined]
 
 
 def owncloud_flush(ctx) -> "Response":  # type: ignore[name-defined]
-    """POST /v1/admin/owncloud-flush — force an immediate own-cloud mirror sweep.
+    """POST /v1/admin/owncloud-flush[?agent=<name>] — force an immediate own-cloud mirror sweep.
 
     Pushes every governed-dir file this machine owns (world, meta, owned-agent
     dirs INCLUDING session/ continuity files) to S3 *now*, instead of waiting
@@ -79,22 +79,37 @@ def owncloud_flush(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(
             {"backend": backend, "flushed": False,
              "error": f"import failed: {e}"}, status=500)
+    # Optional per-agent scope (design §6 /stop flush): ?agent=<name> narrows the
+    # sweep to agents/<name>/ with full=True (re-HEAD every file) so the stopping
+    # agent's dir is guaranteed complete in S3 BEFORE its claim is released. The
+    # ownership filter inside sweep() still prunes the dir if this machine does
+    # NOT own it, so the agent param can never push a peer's cache. Absent the
+    # param, the flush keeps its full-owned-set behavior (world/meta/all owned
+    # agents, manifest mtime-skip) — the periodic-sweep race-closer.
+    agent = (ctx.query.get("agent") or "").strip()
     try:
-        stats_d = owncloud_sync.sweep(
-            get_backend(), only_root=None, dry_run=False,
-            use_manifest=True, full=False)
+        if agent:
+            stats_d = owncloud_sync.sweep(
+                get_backend(), only_root="agents", dry_run=False,
+                use_manifest=True, full=True, only_agent=agent)
+        else:
+            stats_d = owncloud_sync.sweep(
+                get_backend(), only_root=None, dry_run=False,
+                use_manifest=True, full=False)
     except Exception as e:  # noqa: BLE001 — a bad sweep must not 500-with-stack
         return Response.json(
             {"backend": backend, "flushed": False,
              "error": f"sweep failed: {e}"}, status=500)
     return Response.json({
         "backend": backend, "flushed": True,
+        "scope": f"agent:{agent}" if agent else "all-owned",
         "pushed": stats_d.get("pushed", 0),
         "scanned": stats_d.get("scanned", 0),
         "in_sync": stats_d.get("in_sync", 0),
         "skipped_unchanged": stats_d.get("skipped_unchanged", 0),
         "conflicts": stats_d.get("conflicts", 0),
         "errors": stats_d.get("errors", 0),
+        "pruned_agents": stats_d.get("pruned_agents", 0),
     })
 
 
@@ -148,7 +163,157 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"backend": backend, "ok": ok, **stats})
 
 
+def _runner_preamble(ctx, *, need_token: bool = True):
+    """Shared front-half for the three runner-claim endpoints (design §4):
+    validate query params, short-circuit non-own-cloud backends, ensure
+    core/scripts is importable, and return get_backend(). Returns a tuple
+    ``(backend_name, get_backend_callable, early_response)`` where exactly one of
+    the latter two is non-None: ``early_response`` is set (and must be returned
+    as-is) for the bad-request / non-own-cloud / import-error short-circuits;
+    otherwise ``get_backend_callable`` is the resolved ``get_backend`` import."""
+    from ..server import Response
+    agent = (ctx.query.get("agent") or "").strip()
+    token = (ctx.query.get("token") or "").strip()
+    if not agent or (need_token and not token):
+        return (None, None, Response.json(
+            {"ok": False, "error": "agent and token query params required"},
+            status=400))
+    backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    if backend != "own-cloud":
+        # Single machine / local store — there is no DDB claim to mutate. A
+        # no-op success keeps the caller's gated path uniform across backends.
+        return (backend, None, Response.json(
+            {"backend": backend, "ok": True, "noop": True,
+             "reason": "non-own-cloud backend — no cross-machine DDB claim"}))
+    scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        from storage_backend import get_backend
+    except Exception as e:  # noqa: BLE001 — import broke: report, don't raise
+        return (backend, None, Response.json(
+            {"backend": backend, "ok": False, "error": f"import failed: {e}"},
+            status=500))
+    return (backend, get_backend, None)
+
+
+def runner_acquire(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/admin/runner-acquire?agent=<name>&token=<uuid> — acquire the DDB
+    runner claim (IDLE->RUNNING CAS) for <name> on this machine.
+
+    The cross-machine half of single-runner enforcement (lodestar dynamic-
+    ownership design §4): /start calls this alongside the filesystem
+    session-state-set RUNNING. On success this machine owns <name> for sync; on
+    RunnerHeld (another machine holds a live claim) the caller refuses the
+    autonomous start, mirroring the local runner-identity refusal. §5
+    stale-lock-break: on RunnerHeld this endpoint first attempts a conditional
+    reclaim of a CRASHED peer's frozen claim (heartbeat older than
+    runner_stale_seconds) and retries acquire once — so a crash-no-release can
+    never PIN ownership; only a genuinely-LIVE peer yields {"held": true} (a
+    successful stale reclaim returns acquired=true, reclaimed_stale=true).
+    {"held": true} is a NORMAL 200 answer (a live peer owns it), not an error.
+    No-op under the local
+    backend; import/DDB errors return 500 with the reason (the /start gate decides
+    — fail-open so a transient DDB hiccup never blocks a legitimate start)."""
+    from ..server import Response
+    agent = (ctx.query.get("agent") or "").strip()
+    token = (ctx.query.get("token") or "").strip()
+    backend, get_backend, early = _runner_preamble(ctx)
+    if early is not None:
+        return early
+    try:
+        from owncloud_backend import RunnerHeld
+    except Exception as e:  # noqa: BLE001
+        return Response.json(
+            {"backend": backend, "ok": False, "error": f"import failed: {e}"},
+            status=500)
+    try:
+        get_backend().acquire_runner(agent, token)
+    except RunnerHeld:
+        # §5 stale-lock-break: a crashed runner never reaches /stop, so its claim
+        # sits RUNNING with a frozen heartbeat_at. Without recovery that stale
+        # claim PINS ownership forever — no peer could ever acquire <name>.
+        # Attempt a conditional reclaim (RUNNING->IDLE iff heartbeat older than
+        # runner_stale_seconds); if it fires, the crashed claim is broken and we
+        # retry acquire ONCE. A genuinely-live peer (fresh heartbeat) is NOT
+        # reclaimed (the conditional check fails) so we still answer held=true.
+        # reclaim+re-acquire is the same race-safe conditional-CAS pair a peer
+        # /start would run (design §5): two machines cannot both win.
+        try:
+            reclaimed = get_backend().reclaim_if_stale(agent)
+            if reclaimed:
+                get_backend().acquire_runner(agent, token)
+                return Response.json(
+                    {"backend": backend, "ok": True, "acquired": True,
+                     "held": False, "reclaimed_stale": True})
+        except RunnerHeld:
+            pass  # raced: another machine acquired between our reclaim and retry
+        except Exception as e:  # noqa: BLE001 — reclaim/retry failure is non-fatal
+            return Response.json(
+                {"backend": backend, "ok": False,
+                 "error": f"reclaim-retry failed: {e}"}, status=500)
+        return Response.json(
+            {"backend": backend, "ok": True, "acquired": False, "held": True})
+    except Exception as e:  # noqa: BLE001 — a bad acquire must not 500-with-stack
+        return Response.json(
+            {"backend": backend, "ok": False, "error": f"acquire failed: {e}"},
+            status=500)
+    return Response.json(
+        {"backend": backend, "ok": True, "acquired": True, "held": False})
+
+
+def runner_heartbeat(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/admin/runner-heartbeat?agent=<name>&token=<uuid> — refresh the DDB
+    runner claim's heartbeat_at (token-conditional).
+
+    Called from the per-iteration heartbeat tick so the DDB heartbeat advances
+    with the local file mtime (design §4). Token-conditional in the backend: a
+    reclaimed runner cannot resurrect its heartbeat (mismatch raises). No-op under
+    the local backend; errors return 500 (heartbeat-tick.sh fails open on this — a
+    DDB hiccup must never block an iteration)."""
+    from ..server import Response
+    agent = (ctx.query.get("agent") or "").strip()
+    token = (ctx.query.get("token") or "").strip()
+    backend, get_backend, early = _runner_preamble(ctx)
+    if early is not None:
+        return early
+    try:
+        get_backend().heartbeat(agent, token)
+    except Exception as e:  # noqa: BLE001 — token-mismatch (reclaimed) or DDB error
+        return Response.json(
+            {"backend": backend, "ok": False, "error": f"heartbeat failed: {e}"},
+            status=500)
+    return Response.json({"backend": backend, "ok": True, "beat": True})
+
+
+def runner_release(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/admin/runner-release?agent=<name>&token=<uuid> — clean RUNNING->IDLE
+    release of the DDB runner claim (token-conditional, idempotent).
+
+    Called at /stop AFTER the final S3 flush (design §4/§6). The backend returns
+    transitioned=False (NOT an error) when the claim was already reclaimed/idle,
+    so /stop always succeeds. No-op under the local backend; errors return 500
+    (the /stop sequence warns and proceeds)."""
+    from ..server import Response
+    agent = (ctx.query.get("agent") or "").strip()
+    token = (ctx.query.get("token") or "").strip()
+    backend, get_backend, early = _runner_preamble(ctx)
+    if early is not None:
+        return early
+    try:
+        transitioned = get_backend().release_runner(agent, token)
+    except Exception as e:  # noqa: BLE001
+        return Response.json(
+            {"backend": backend, "ok": False, "error": f"release failed: {e}"},
+            status=500)
+    return Response.json(
+        {"backend": backend, "ok": True, "released": bool(transitioned)})
+
+
 def register(routes) -> None:
     routes[("GET", "/v1/admin/stats")] = stats
     routes[("POST", "/v1/admin/owncloud-flush")] = owncloud_flush
     routes[("POST", "/v1/admin/owncloud-pull")] = owncloud_pull
+    routes[("POST", "/v1/admin/runner-acquire")] = runner_acquire
+    routes[("POST", "/v1/admin/runner-heartbeat")] = runner_heartbeat
+    routes[("POST", "/v1/admin/runner-release")] = runner_release

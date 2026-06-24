@@ -2,7 +2,59 @@
 
 ## Overview
 
-`world/` and `meta/` live at user-supplied external paths (shared drive, NAS, OneDrive, etc.). Each agent stores its own path configuration in `agents/<agent>/local-paths.conf`. The local git repo contains only `core/`, `.claude/`, `mind_api/`, and `agents/<agent>/` directories.
+`world/` and `meta/` are *storage roots* resolved at runtime. There are two
+mechanisms, in precedence order:
+
+- **`.mind-data/` (default, asp-330 convention)** — a single gitignored dir at
+  `PROJECT_ROOT/.mind-data/` holding `world/` and `meta/` together. Local,
+  single-machine, auto-detected, zero config. This is what `/start` creates by
+  default for a new agent.
+- **`local-paths.conf` (legacy / external)** — `agents/<agent>/local-paths.conf`
+  pointing WORLD_PATH / META_PATH at user-supplied EXTERNAL paths (shared drive,
+  NAS, OneDrive). Use this for multi-repo / multi-machine collaboration. It is no
+  longer the default but is fully supported and is the ONLY mechanism for
+  external/shared storage.
+
+The local git repo itself contains only `core/`, `.claude/`, `mind_api/`, and
+`agents/<agent>/` directories; both storage mechanisms keep `world/` and `meta/`
+out of git (`.mind-data/` is gitignored; external paths live outside the repo).
+
+## `.mind-data/` Local Storage (Default Convention)
+
+`PROJECT_ROOT/.mind-data/` is the standard local storage root (asp-330
+".mind-data/ Universal Storage Architecture"). Layout:
+
+```
+PROJECT_ROOT/
+  .mind-data/                 (gitignored — never committed)
+    world/                    (collective domain state — resolves as world/)
+    meta/                     (improvement strategies — resolves as meta/)
+    .env.local                (OPTIONAL — WORLD_PATH/META_PATH overrides, same
+                               key=value format as local-paths.conf)
+    agents/                   (RESERVED — populated only by the M4 `--agent-dirs`
+                               migration; agents otherwise resolve at
+                               PROJECT_ROOT/agents/ via AGENTS_PARENT_DIR)
+```
+
+Properties:
+- **Auto-detected**: `_paths.py` / `_paths.sh` / `agent_paths.py` resolve
+  `world -> .mind-data/world`, `meta -> .mind-data/meta` whenever the dir exists
+  (see Path Resolution Priority tiers 2-3). No `local-paths.conf` needed.
+- **Gitignored**: `/.mind-data/` in `.gitignore` — it mirrors one machine's full
+  knowledge tree + meta strategies and must never be committed.
+- **Override**: `.mind-data/.env.local` may set WORLD_PATH/META_PATH to point a
+  tier elsewhere while keeping the rest under `.mind-data/`.
+- **Created by `/start`**: the UNINITIALIZED flow's suggested default is
+  `.mind-data/world` + `.mind-data/meta` (B1/B4); B3/B6 `mkdir -p` them on accept.
+- **Migration**: an existing external-conf setup is moved into `.mind-data/` by
+  `core/scripts/migrate-to-mind-data.sh` (asp-330 M4) — rsyncs WORLD_PATH ->
+  .mind-data/world and META_PATH -> .mind-data/meta, writes
+  `.mind-data/.env.local` with `STORAGE_BACKEND=local`, and backs up
+  local-paths.conf to `.bak`.
+
+`.mind-data/agents/` is NOT created on first boot — current path resolution keeps
+agent dirs at `PROJECT_ROOT/agents/` (`AGENTS_PARENT_DIR`); only the M4
+`--agent-dirs` migration relocates them under `.mind-data/`.
 
 ## Config File: `agents/<agent>/local-paths.conf`
 
@@ -20,10 +72,29 @@ META_PATH=C:/Users/Shared/claude-mind/meta
 
 ## Path Resolution Priority
 
+The single source of truth is `_resolve_tier()` in `core/scripts/_paths.py`
+(mirrored in `_paths.sh` and `mind_api/src/agent_paths.py`). For each of
+WORLD_PATH / META_PATH the chain is (asp-330 M1, g-330-01):
+
 1. **Environment variable**: `MIND_WORLD` / `MIND_META` (for CI/testing)
-2. **Agent config file**: `agents/<agent>/local-paths.conf` WORLD_PATH / META_PATH
-3. **Auto-detect**: If `MIND_AGENT` is not set but agent directories with `local-paths.conf` exist, use the first available config. This covers hooks and background processes that lack the env var.
-4. **Fail loud**: If no config can be resolved, WORLD_DIR/META_DIR are unset (bash) or `None` (Python). Plan v1 step 0.1 (2026-05-19) removed the `PROJECT_ROOT/world|meta` fallback to prevent silent root-cruft creation. Module-level callers should invoke `assert_world_dir()` / `assert_meta_dir()` to fail with a clear diagnostic.
+2. **`.mind-data/.env.local`**: WORLD_PATH / META_PATH keys — only when
+   `PROJECT_ROOT/.mind-data/` exists (same key=value format as local-paths.conf)
+3. **`.mind-data/{world,meta}` bare default**: only when `PROJECT_ROOT/.mind-data/`
+   exists — `world -> .mind-data/world`, `meta -> .mind-data/meta`
+4. **Agent config file** (legacy/external): `agents/<agent>/local-paths.conf`
+   WORLD_PATH / META_PATH. Resolution of WHICH conf: `MIND_AGENT` names the
+   agent; if unset, the first available `*/local-paths.conf` is used (covers
+   hooks and background processes that lack the env var).
+5. **Fail loud**: If no tier resolves, WORLD_DIR/META_DIR are unset (bash) or
+   `None` (Python). Plan v1 step 0.1 (2026-05-19) removed the
+   `PROJECT_ROOT/world|meta` fallback to prevent silent root-cruft creation.
+   Module-level callers should invoke `assert_world_dir()` / `assert_meta_dir()`
+   to fail with a clear diagnostic (guard-551).
+
+**Key consequence**: when `.mind-data/` exists, tiers 2-3 OVERRIDE the
+local-paths.conf tier (4). A repo WITHOUT `.mind-data/` keeps the legacy
+env -> local-paths.conf -> None chain byte-for-byte, so existing
+external-conf agents are unaffected.
 
 ## Resolution in Scripts
 

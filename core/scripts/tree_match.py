@@ -81,6 +81,26 @@ COSINE_BONUS_WEIGHT = 2.0
 RECENCY_MAX_BONUS = 0.5
 RECENCY_TAU_DAYS = 30
 
+# M-4 rehearsal-weighted decay defaults (overridden by tree.yaml retrieval: section).
+# Frequently-retrieved nodes get a longer TAU so their recency bonus persists.
+# Uses retrieval_count (monotonic counter, safe) -- NOT last_retrieved (incremented
+# by scoring via _locked_bump_jsonl, which would create runaway feedback).
+REHEARSAL_TAU_BASE = 30
+REHEARSAL_TAU_MAX = 120
+REHEARSAL_TAU_SCALE = 5.0
+REHEARSAL_NEUTRAL_BELOW = 5
+
+# M-5 provenance-based confidence modulation.
+# Weights applied to the confidence term only (NOT the full score).
+# ProvenanceTag values align with perception-module.md Section 1.
+PROVENANCE_WEIGHTS = {
+    "DIRECT": 1.0,
+    "INFERRED": 0.7,
+    "SYNTHESIZED": 0.8,
+    "HEARSAY": 0.5,
+}
+DEFAULT_PROVENANCE_WEIGHT = 0.9  # Legacy nodes without provenance field
+
 # MMR (Maximal Marginal Relevance) parameters (P2 #11, 2026-05-10).
 # Re-ranks the top-K to favor diversity when multiple high-relevance results
 # come from the same subtree (e.g., 5 siblings under one parent crowding out
@@ -94,10 +114,23 @@ RECENCY_TAU_DAYS = 30
 MMR_LAMBDA = 0.7
 
 
-def _recency_bonus(node):
-    """Exponential-decay recency bonus from `last_updated`. Missing → 0.
-    Future-dated entries (clock skew) are clamped to today so the bonus
-    cannot exceed RECENCY_MAX_BONUS."""
+def _recency_bonus(node, cfg=None):
+    """Exponential-decay recency bonus from ``last_updated``, with rehearsal-
+    adaptive TAU.  Frequently-retrieved nodes (high ``retrieval_count``) get a
+    longer TAU, meaning their recency bonus persists longer.
+
+    Missing ``last_updated`` -> 0.  Future-dated entries clamped to age=0.
+
+    M-4: TAU = clamp(base + retrieval_count / scale, base, max).
+    Below ``rehearsal_neutral_below`` retrievals TAU stays at base (no
+    rehearsal effect for under-retrieved nodes).
+
+    Source field is ``last_updated`` (content freshness), NOT ``last_retrieved``
+    (interest signal -- would create runaway feedback if amplified by scoring).
+    ``retrieval_count`` is safe: it is a monotonic counter that scoring does not
+    increment (only ``_locked_bump_jsonl`` in retrieve.py increments it, outside
+    the scoring path).
+    """
     lu = node.get("last_updated")
     if not lu:
         return 0.0
@@ -108,7 +141,40 @@ def _recency_bonus(node):
     age_days = (date.today() - d).days
     if age_days < 0:
         age_days = 0
-    return RECENCY_MAX_BONUS * math.exp(-age_days / RECENCY_TAU_DAYS)
+
+    # Rehearsal-adaptive TAU
+    rc = node.get("retrieval_count", 0) or 0
+    if cfg:
+        tau_base = float(cfg.get("rehearsal_tau_base", REHEARSAL_TAU_BASE))
+        tau_max = float(cfg.get("rehearsal_tau_max", REHEARSAL_TAU_MAX))
+        tau_scale = float(cfg.get("rehearsal_tau_scale", REHEARSAL_TAU_SCALE))
+        neutral = int(cfg.get("rehearsal_neutral_below", REHEARSAL_NEUTRAL_BELOW))
+    else:
+        tau_base = float(REHEARSAL_TAU_BASE)
+        tau_max = float(REHEARSAL_TAU_MAX)
+        tau_scale = float(REHEARSAL_TAU_SCALE)
+        neutral = REHEARSAL_NEUTRAL_BELOW
+
+    if rc < neutral:
+        tau = tau_base
+    else:
+        tau = min(tau_base + rc / tau_scale, tau_max)
+
+    return RECENCY_MAX_BONUS * math.exp(-age_days / tau)
+
+
+def _provenance_weight(node):
+    """Return the provenance-based weight for the confidence term.
+
+    Reads ``node['provenance']``; missing/unknown -> DEFAULT_PROVENANCE_WEIGHT.
+    Case-insensitive lookup.  M-5: modulates the confidence contribution in
+    ``_compute_match_score`` so DIRECT observations rank above INFERRED or
+    HEARSAY at equal raw confidence.
+    """
+    prov = node.get("provenance")
+    if not prov:
+        return DEFAULT_PROVENANCE_WEIGHT
+    return PROVENANCE_WEIGHTS.get(str(prov).upper(), DEFAULT_PROVENANCE_WEIGHT)
 
 
 # ---------------------------------------------------------------------------
@@ -386,8 +452,14 @@ def _mmr_rerank(scored, all_nodes, limit, lambda_=None):
     return selected
 
 
-def _compute_match_score(key, node, channel):
-    """Score a matched node by match quality. Higher = more relevant."""
+def _compute_match_score(key, node, channel, cfg=None):
+    """Score a matched node by match quality. Higher = more relevant.
+
+    ``cfg`` is the optional retrieval config dict (from tree.yaml retrieval:
+    section).  When provided, it is threaded to ``_recency_bonus`` for M-4
+    rehearsal-adaptive TAU.  When ``None`` (lightweight lookups via
+    ``_score_and_limit``), hardcoded module-level defaults are used.
+    """
     score = CHANNEL_SCORES.get(channel, 0.5)
 
     # Depth bonus: deeper = more specific knowledge (inverted from old depth-first)
@@ -399,15 +471,18 @@ def _compute_match_score(key, node, channel):
     elif depth == 1:
         score += 0.3
 
-    # Confidence (0-1 range). YAML null → Python None; guard against it.
-    score += node.get("confidence") or 0
+    # Confidence (0-1 range), modulated by provenance weight (M-5).
+    # DIRECT observations get full confidence credit; INFERRED/SYNTHESIZED/
+    # HEARSAY get progressively less.  Legacy nodes without provenance tag
+    # get DEFAULT_PROVENANCE_WEIGHT (0.9).  YAML null -> Python None; guard.
+    score += (node.get("confidence") or 0) * _provenance_weight(node)
 
     # Capability bonus
     score += CAPABILITY_BONUS.get(node.get("capability_level", ""), 0)
 
-    # Recency bonus (asymmetric — recently-updated content gets a boost,
+    # Recency bonus (asymmetric -- recently-updated content gets a boost,
     # stable old content gets no penalty). See _recency_bonus.
-    score += _recency_bonus(node)
+    score += _recency_bonus(node, cfg=cfg)
 
     return score
 

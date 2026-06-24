@@ -40,6 +40,11 @@ VALID_GOAL_STATUSES = {"pending", "in-progress", "completed", "blocked", "skippe
 # Adding/removing a member changes archival eligibility across the engine.
 TERMINAL_GOAL_STATUSES = {"completed", "skipped", "expired", "decomposed", "superseded"}
 
+# Inner-refinement (Self-Refine,  / BRD Gap 4) bounded-iteration cap.
+# max_iters MUST be <= this; the cap is the structural termination guarantee
+# (an inner_refinement loop can never exceed INNER_REFINEMENT_MAX_ITERS_CAP passes).
+INNER_REFINEMENT_MAX_ITERS_CAP = 5
+
 def _normalize_terminal_goal(goal):
     """Clear deferral/blocker state when a goal's status is terminal.
 
@@ -365,6 +370,14 @@ def validate_verification(verification, goal_id):
     outcomes = verification.get("outcomes")
     if outcomes is not None and not isinstance(outcomes, list):
         raise ValueError(f"Goal {goal_id}: verification.outcomes must be a list")
+    # outcomes_agent_leg: list of strings -- the agent-side subset of success
+    # criteria on a participants:[agent,user] collaborative goal, separate from
+    # outcomes (which span both legs). Lets Phase 5 verify close "agent leg
+    # complete, user leg pending" as a valid terminal state without inventing
+    # closure justification (US-04 / ). Validated like outcomes.
+    outcomes_agent_leg = verification.get("outcomes_agent_leg")
+    if outcomes_agent_leg is not None and not isinstance(outcomes_agent_leg, list):
+        raise ValueError(f"Goal {goal_id}: verification.outcomes_agent_leg must be a list")
     # checks: list of dicts (machine-verifiable conditions)
     checks = verification.get("checks")
     if checks is not None and not isinstance(checks, list):
@@ -476,6 +489,44 @@ def validate_goal(goal):
                 f"Goal {goal['id']}: goal_source must be null or one of "
                 f"{sorted(VALID_GOAL_SOURCES)}, got {val!r}"
             )
+    # Validate filed_by_agent attribution field (). Stamped at add time
+    # by the daemon add-goal endpoint (the filing agent) for the per-agent
+    # contribution-vs-harm scorecard. Kept a free string (like abstained_by),
+    # NOT constrained to the active-agent set, so a goal filed by an agent later
+    # removed from the roster still validates. Backward-compat: missing field =
+    # unknown (no requirement clause — never raise on absence).
+    if "filed_by_agent" in goal:
+        val = goal["filed_by_agent"]
+        if val is not None and not isinstance(val, str):
+            raise ValueError(
+                f"Goal {goal['id']}: filed_by_agent must be a string or null, got {val!r}"
+            )
+    # Validate inner_refinement field (optional Self-Refine inner loop,  / BRD Gap 4).
+    # Absent or null = OFF (default); goals without it behave exactly as before.
+    # When set: {max_iters: int in [1, INNER_REFINEMENT_MAX_ITERS_CAP], satisficed_when: non-empty str}.
+    # The max_iters cap is the structural termination guarantee. CLI-only by design
+    # (matches the reallocatable/abstained_by/intended_agent optional-field pattern;
+    # the daemon _validate_goal deliberately validates only id/status/recurring/interval).
+    # The execution-side clamp-to-CAP in aspirations-execute is the termination
+    # guarantee that holds regardless of which write path fired (guard-547 split).
+    if "inner_refinement" in goal:
+        val = goal["inner_refinement"]
+        if val is not None:
+            if not isinstance(val, dict):
+                raise ValueError(
+                    f"Goal {goal['id']}: inner_refinement must be a dict or null, got {val!r}"
+                )
+            mi = val.get("max_iters")
+            if not isinstance(mi, int) or isinstance(mi, bool) or mi < 1 or mi > INNER_REFINEMENT_MAX_ITERS_CAP:
+                raise ValueError(
+                    f"Goal {goal['id']}: inner_refinement.max_iters must be an int in "
+                    f"[1, {INNER_REFINEMENT_MAX_ITERS_CAP}], got {mi!r}"
+                )
+            sw = val.get("satisficed_when")
+            if not isinstance(sw, str) or not sw.strip():
+                raise ValueError(
+                    f"Goal {goal['id']}: inner_refinement.satisficed_when must be a non-empty string"
+                )
     # Prose-verification drift check (, rb-329 schema-drift family):
     # descriptions that advertise "Verification outcomes:" / "Verification checks:"
     # without a corresponding structured verification.checks entry silently slip
@@ -483,45 +534,24 @@ def validate_goal(goal):
     # can't enter the file in the first place.
     _check_prose_verification_drift(goal)
 
-PROSE_VERIFICATION_MARKERS = ("Verification outcomes:", "Verification checks:")
+# Prose-verification-drift markers + check live in the shared
+# gates.prose_verification module (4) so the CLI validate_goal path
+# and the daemon aspirations_write.py paths run IDENTICAL logic (guard-547
+# anti-drift — duplication is exactly the CLI/daemon split that produced the
+# original FN gap). Re-exported here for any caller that imported the constant
+# from this module.
+from gates.prose_verification import (  # noqa: E402
+    PROSE_VERIFICATION_MARKERS,  # noqa: F401
+    evaluate as _prose_verification_evaluate,
+)
+
 
 def _check_prose_verification_drift(goal):
-    # gate_id MUST match core/config/gates.yaml id.
-    _gid = goal.get("id", "<unassigned>")
-    desc = goal.get("description") or ""
-    if not isinstance(desc, str):
-        _gate_log("prose-verification-drift", "noop",
-                  caller=f"aspirations.py:_check_prose_verification_drift goal={_gid}",
-                  trigger_matched=None,
-                  extra={"reason": "description not a string"})
-        return
-    if not any(marker in desc for marker in PROSE_VERIFICATION_MARKERS):
-        _gate_log("prose-verification-drift", "noop",
-                  caller=f"aspirations.py:_check_prose_verification_drift goal={_gid}",
-                  trigger_matched=None)
-        return
-    markers_seen = [m for m in PROSE_VERIFICATION_MARKERS if m in desc]
-    verification = goal.get("verification") or {}
-    checks = verification.get("checks") if isinstance(verification, dict) else None
-    if isinstance(checks, list) and len(checks) > 0:
-        _gate_log("prose-verification-drift", "pass",
-                  caller=f"aspirations.py:_check_prose_verification_drift goal={_gid}",
-                  trigger_matched=",".join(markers_seen),
-                  extra={"checks_count": len(checks)})
-        return
-    _gate_log("prose-verification-drift", "block",
-              caller=f"aspirations.py:_check_prose_verification_drift goal={_gid}",
-              trigger_matched=",".join(markers_seen),
-              payload=desc[:500],
-              extra={"would_block": True})
-    raise ValueError(
-        f"Goal {_gid}: prose-only verification drift detected. "
-        f"Description contains {markers_seen} but verification.checks is absent or empty. "
-        f"Fix: either (a) move the prose bullets into a structured verification "
-        f"{{outcomes:[...], checks:[...]}} object, or (b) remove the 'Verification "
-        f"outcomes:/checks:' prose headers from the description. Prose-only "
-        f"verification silently bypasses /verify-learning S49.7 gates."
-    )
+    # Delegates to the shared gate, raising ValueError on prose-only drift so
+    # validate_goal's existing contract (raise → caller surfaces) is preserved.
+    result = _prose_verification_evaluate(goal)
+    if result["would_block"]:
+        raise ValueError(result["message"])
 
 def validate_evolution_event(evt):
     """Validate an evolution event dict. Raises ValueError on invalid."""
@@ -1629,6 +1659,20 @@ def cmd_update_goal(args):
             and goal.get("completed_at") is None
         ):
             goal["completed_at"] = datetime.now().isoformat(timespec="seconds")
+
+        # 2: stamp completed_by on the completion transition — the
+        # completion chokepoint every non-recurring status->completed flows
+        # through (recurring is blocked above). Pre-fix only ~11% (174/1609) of
+        # completed world goals carried completed_by (the rest closed via this
+        # path, which never stamped it), so agent-attribution audits and the
+        # cross_queue graduation count (0) undercounted real output.
+        # Scoped to value=="completed" (attribution = who completed it); agent
+        # from MIND_AGENT. Idempotent: only when unset, preserving explicit
+        # /aspirations-complete-by attribution and external backfill.
+        if field == "status" and value == "completed" and not goal.get("completed_by"):
+            _completed_by_agent = os.environ.get("MIND_AGENT", "").strip()
+            if _completed_by_agent:
+                goal["completed_by"] = _completed_by_agent
 
         # Persist blocker_ref alongside defer_reason when one was validated.
         # Store under the canonical key so goal-selector, quiescence-gate, and

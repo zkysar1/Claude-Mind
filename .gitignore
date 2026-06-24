@@ -182,6 +182,17 @@ core/logs/
 /world/
 /meta/
 
+# .mind-data/ — local storage root (asp-330 ".mind-data/ Universal Storage
+# Architecture", M3 init convention). When PROJECT_ROOT/.mind-data/ exists it is
+# the storage root by convention (world -> .mind-data/world, meta -> .mind-data/meta;
+# resolved by _paths.py/_paths.sh/agent_paths.py `_resolve_tier`, M1 g-330-01).
+# It mirrors the external world/meta storage — local, machine-specific, never
+# committed (publishing it would ship one machine's full knowledge tree + meta
+# strategies). The whole subtree is ignored, including the optional
+# .mind-data/.env.local override and any .mind-data/agents/ migrated via the M4
+# `--agent-dirs` migration (migrate-to-mind-data.sh).
+/.mind-data/
+
 # framework-runtime — transient PID/port/log files (one per repo)
 # Relocated 2026-05-19 (Phase 2 daemon consolidation): .runtime/ → mind_api/state/
 /mind_api/state/

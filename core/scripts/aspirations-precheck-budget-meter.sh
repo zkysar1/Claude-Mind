@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # aspirations-precheck-budget-meter.sh — Magic Wand 2 ()
 #
-# Budget cap on aspirations-precheck wall-clock cost. Tracks elapsed-ms
-# per sweep, drops deferrable sweeps when (zone == tight) OR cumulative
-# elapsed exceeds budget_pct of iteration_budget_ms. Always-run sweeps
-# NEVER drop. Decisions logged to <agent>/session/precheck-drops.jsonl.
+# Budget cap on aspirations-precheck. Drops deferrable sweeps ONLY when
+# zone == tight (zone_drop_rules.tight=[deferrable]). Always-run sweeps
+# NEVER drop. The former wall-clock "budget-exceeded" drop path was REMOVED
+# (9 — `elapsed` measured inter-tool-call LLM latency, not script
+# cost, and dropped every deferrable sweep every iteration, starving the
+# fresh-eyes/felt-sense/health-regression cadence rituals). elapsed-ms is
+# still tracked per sweep for drop-log telemetry only. Decisions logged to
+# <agent>/session/precheck-drops.jsonl.
 #
 # Operations:
 #   start              — snapshot start time + zone, init state file
@@ -14,7 +18,10 @@
 # Sweep tier table (single source of truth — keep in sync with
 # core/config/aspirations.yaml `precheck:` doc-block):
 #
-#   always-run:  tree-debt-gate, experience-archival-gate, fresh-eyes-code-gate
+#   always-run:  tree-debt-gate, experience-archival-gate, fresh-eyes-code-gate,
+#                inbox-alert-age-check, handoff-aging-check (the two
+#                notification-age safety gates — escalate aged unclaimed work to
+#                external parties, so they fire reliably; 6)
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
@@ -72,7 +79,7 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|fresh-eyes-code-gate)
+        tree-debt-gate|experience-archival-gate|fresh-eyes-code-gate|inbox-alert-age-check|handoff-aging-check)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck)
             echo "medium" ;;
@@ -240,9 +247,20 @@ if tier == 'always-run':
 elif tier in zone_drops:
     decision = 'drop'
     reason = f'zone-drop:{zone}'
-elif elapsed > cap_ms and tier == 'deferrable':
-    decision = 'drop'
-    reason = f'budget-exceeded:{elapsed}ms>{cap_ms}ms'
+# NOTE (9): the former `elif elapsed > cap_ms and tier == 'deferrable'`
+# wall-clock budget-drop path was REMOVED. `elapsed` is wall-clock since
+# `meter start` (the FIRST precheck phase), dominated by inter-tool-call
+# LLM+daemon latency BETWEEN sweeps, NOT script execution cost. Measured
+# 130k-1400k ms vs the 90s cap across ALL six agents at zone=fresh, so it
+# dropped EVERY deferrable sweep every iteration — permanently starving the
+# fresh-eyes (25-goal), felt-sense (75-goal), and health-regression cadence
+# rituals (they could never fire from precheck). A bash meter sampled only at
+# discrete `check` points cannot separate script time from LLM latency, so the
+# wall-clock proxy is unfixable in-place; a correct script-time meter would
+# essentially never drop (sweeps are sub-second) anyway. The zone-drop path
+# above is the correct, sufficient protection: drop deferrables only under
+# context-tight (zone_drop_rules.tight=[deferrable]). `elapsed`/`cap_ms` are
+# retained below for drop-log telemetry only.
 
 # Append to state.sweeps (list of {sweep, tier, decision, reason, elapsed_at_decision_ms})
 state.setdefault('sweeps', []).append({

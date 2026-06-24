@@ -80,6 +80,74 @@ def test_owncloud_flush_own_cloud_invokes_sweep_with_periodic_args(running_daemo
     assert calls[0]["only_root"] is None  # full coverage: world + meta + agents
 
 
+def test_owncloud_flush_agent_scope_narrows_to_per_agent_full(running_daemon, monkeypatch):
+    """?agent=<name> narrows the flush to agents/<name>/ with full=True — the §6
+    per-agent /stop flush scope (g-115-1339), distinct from the full-owned
+    periodic-sweep args (only_root=None, full=False). The ownership filter inside
+    sweep() still guards against pushing a peer's cache, so per-agent scope is
+    safe even if the agent name is mis-targeted."""
+    _, port = running_daemon
+
+    calls = []
+
+    fake_sync = types.ModuleType("owncloud_sync")
+
+    def fake_sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
+        calls.append({"only_root": only_root, "dry_run": dry_run,
+                      "use_manifest": use_manifest, "full": full,
+                      "only_agent": only_agent})
+        return {"pushed": 1, "scanned": 1, "in_sync": 0,
+                "skipped_unchanged": 0, "conflicts": 0, "errors": 0,
+                "pruned_agents": 1}
+
+    fake_sync.sweep = fake_sweep  # type: ignore[attr-defined]
+    fake_backend_mod = types.ModuleType("storage_backend")
+    fake_backend_mod.get_backend = lambda: object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
+    monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+
+    status, body = _post(port, "/v1/admin/owncloud-flush?agent=alpha")
+    assert status == 200
+    assert body["backend"] == "own-cloud"
+    assert body["flushed"] is True
+    assert body["scope"] == "agent:alpha"
+    assert body["pruned_agents"] == 1
+    # §6: per-agent flush is agents-root scoped, single agent, FULL re-HEAD —
+    # NOT the periodic-sweep (only_root=None, full=False) shape.
+    assert calls == [{"only_root": "agents", "dry_run": False,
+                      "use_manifest": True, "full": True, "only_agent": "alpha"}]
+
+
+def test_owncloud_flush_no_agent_keeps_full_owned_periodic_args(running_daemon, monkeypatch):
+    """Absent ?agent=, the flush keeps the full-owned periodic-sweep args
+    (only_root=None, full=False) — byte-identical to pre-g-1339, scope=all-owned."""
+    _, port = running_daemon
+
+    calls = []
+
+    fake_sync = types.ModuleType("owncloud_sync")
+
+    def fake_sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
+        calls.append({"only_root": only_root, "full": full, "only_agent": only_agent})
+        return {"pushed": 0, "scanned": 0, "in_sync": 0,
+                "skipped_unchanged": 0, "conflicts": 0, "errors": 0}
+
+    fake_sync.sweep = fake_sweep  # type: ignore[attr-defined]
+    fake_backend_mod = types.ModuleType("storage_backend")
+    fake_backend_mod.get_backend = lambda: object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
+    monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+
+    status, body = _post(port, "/v1/admin/owncloud-flush")
+    assert status == 200
+    assert body["scope"] == "all-owned"
+    assert calls == [{"only_root": None, "full": False, "only_agent": None}]
+
+
 def test_owncloud_flush_sweep_error_returns_500(running_daemon, monkeypatch):
     """A sweep that raises is reported as a 500 with the reason, NOT an
     unhandled stack — so /stop D6.7 can warn-and-proceed (the periodic sweep

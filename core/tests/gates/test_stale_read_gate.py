@@ -163,18 +163,22 @@ def test_parent_no_last_modified_passes(stale_read_env):
 # Block paths
 # ---------------------------------------------------------------------------
 
-def test_agent_never_read_blocks(stale_read_env):
-    """Parent has last_modified but agent has no read entry → block."""
+def test_agent_never_read_fails_open(stale_read_env):
+    """Parent has last_modified but agent has no read entry: the never-read
+    check is RETIRED (g-115-1572) -- fail-open, do NOT block."""
     out = _call_module(stale_read_env, {"parent_goal": "g-001-01"})
-    assert out["would_block"] is True
-    assert "no read entry" in out["reason"]
+    assert out["would_block"] is False
+    assert out["_fail_open"] is True
+    assert "receipt" in out["reason"].lower()
+    assert "retired" in out["reason"].lower()
     assert out["agent_last_read"] is None
     assert out["parent_last_modified"] == "2026-05-12T10:00:00"
 
 
-def test_agent_never_read_cli_returns_exit_1(stale_read_env):
+def test_agent_never_read_cli_returns_exit_2(stale_read_env):
+    """Never-read retired -> CLI fail-open (exit 2), not block (exit 1)."""
     rc, _, _ = _run_cli(stale_read_env, {"parent_goal": "g-001-01"})
-    assert rc == 1
+    assert rc == 2
 
 
 def test_stale_read_blocks(stale_read_env):
@@ -221,21 +225,19 @@ def test_read_at_exact_modification_time_passes(stale_read_env):
 # Override
 # ---------------------------------------------------------------------------
 
-def test_override_never_read(stale_read_env):
+def test_override_on_never_read_is_noop(stale_read_env):
+    """Never-read is retired (2): it never blocks, so an override flag
+    on a never-read case is a no-op -- override not applied, no audit write
+    (the ledger only records overrides that WOULD have blocked, i.e. Block 2)."""
     out = _call_module(
         stale_read_env, {"parent_goal": "g-001-01"},
         override="emergency unblock",
     )
     assert out["would_block"] is False
-    assert out["override_applied"] == "emergency unblock"
-    assert "agent never read" in out["reason"]
-    # Audit ledger was written
+    assert out["override_applied"] is None
+    assert "receipt" in out["reason"].lower()
     ledger = stale_read_env["world"] / "stale-read-overrides.jsonl"
-    assert ledger.exists()
-    entries = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines() if l]
-    assert len(entries) == 1
-    assert entries[0]["justification"] == "emergency unblock"
-    assert entries[0]["parent_goal"] == "g-001-01"
+    assert not ledger.exists()
 
 
 def test_override_stale_read(stale_read_env):
@@ -295,24 +297,35 @@ def test_cli_module_equivalent(stale_read_env, scenario):
     payload = {"parent_goal": "g-001-01"}
     rc, cli_out, _ = _run_cli(stale_read_env, payload)
     mod_out = _call_module(stale_read_env, payload)
-    mod_out.pop("_fail_open", None)
+    fail_open = mod_out.pop("_fail_open", False)
 
-    # CLI exit code must match decision
-    expected_rc = 1 if mod_out["would_block"] else 0
+    # CLI exit code must match decision: 1=block, 2=fail-open, 0=pass.
+    # never_read is retired (2) -> fail-open -> exit 2.
+    if mod_out["would_block"]:
+        expected_rc = 1
+    elif fail_open:
+        expected_rc = 2
+    else:
+        expected_rc = 0
     assert rc == expected_rc
     assert cli_out == mod_out
 
 
 def test_cli_module_equivalent_override(stale_read_env):
-    """Override path equivalence — both should write audit AND return
-    identical JSON. Audit ledger should have ONE entry (only the CLI run
-    writes; the module call sees the file already exists and appends a
-    second entry — verify both wrote)."""
+    """Override path equivalence on a Block-2 stale read (the only branch that
+    blocks + honours override post g-115-1572; never-read is retired). Both CLI
+    and module should write audit AND return identical verdict/reason. Ledger
+    ends with TWO entries (CLI writes one, module appends a second)."""
+    # Stale: agent read the parent BEFORE its last_modified -> Block 2 blocks.
+    stale_read_env["write_read_log"]([
+        {"goal_id": "g-001-01", "agent": stale_read_env["agent"],
+         "read_at": "2026-05-12T09:00:00"},
+    ])
     rc, cli_out, _ = _run_cli(
         stale_read_env, {"parent_goal": "g-001-01"},
         override="cli justification",
     )
-    assert rc == 0  # override → pass
+    assert rc == 0  # override -> pass
     cli_audit = (stale_read_env["world"] / "stale-read-overrides.jsonl").read_text(encoding="utf-8")
     assert "cli justification" in cli_audit
 

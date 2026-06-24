@@ -94,3 +94,16 @@ bash "$(dirname "$0")/team-state-update.sh" \
 # inside live-phase-emit.sh. Failures there must crash loudly so stderr
 # surfaces the problem and the next tick retries naturally.
 bash "$(dirname "$0")/live-phase-emit.sh" || true
+
+# ── DDB runner-claim heartbeat (lodestar dynamic-ownership §4) — INERT by default.
+# Advances the cross-machine DDB heartbeat_at alongside the local mtime above so a
+# peer machine's stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE
+# runner. The cheap env pre-check keeps THIS script IRREDUCIBLY LOCAL in the
+# default (static) configuration: NO subprocess, NO daemon hop until the gated
+# cutover (0) sets OWNERSHIP_MODE=dynamic. When dynamic, runner-claim.sh
+# routes through the LOCALHOST daemon (the annotation's stated maximum), fail-open
+# (|| true) so a DDB hiccup can NEVER block an iteration. runner-claim.sh self-gates
+# on the same flag too; this pre-check only avoids the subprocess spawn when inert.
+if [ "${OWNERSHIP_MODE:-static}" = "dynamic" ]; then
+    bash "$(dirname "$0")/runner-claim.sh" heartbeat --agent "$MIND_AGENT" || true
+fi

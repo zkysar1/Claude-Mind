@@ -143,7 +143,19 @@ agent_state_dir() {
 # resolve to empty strings when no conf is found, and `$WORLD_DIR/foo`
 # expansions produce `/foo` — clearly broken paths that fail loudly on the
 # next filesystem operation rather than silently writing into PROJECT_ROOT.
-if [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
+# MIND_AGENT_DIR (test-only override; UNSET in production) points agent-dir
+# resolution at a caller-supplied dir instead of live PROJECT_ROOT/agents/<name>.
+# Mirrors _paths.py L279-289. Closes the asymmetry (3) where _paths.py
+# honored the override but _paths.sh did not — which FORCED framework tests that
+# invoke a bash script to create a real agents/<name> dir under live PROJECT_ROOT
+# (the running fleet then ADOPTS it mid-test via agents_root().glob(*/local-paths.conf)
+# and writes into it; on Windows the open handle defeats rmtree(ignore_errors=True),
+# leaking the dir into live agents/). No-op in production where MIND_AGENT_DIR is
+# never set: _AGENT_DIR_OVERRIDE is empty and every branch below behaves as before.
+_AGENT_DIR_OVERRIDE="${MIND_AGENT_DIR:-}"
+if [ -n "$_AGENT_DIR_OVERRIDE" ] && [ -f "$_AGENT_DIR_OVERRIDE/local-paths.conf" ]; then
+    source "$_AGENT_DIR_OVERRIDE/local-paths.conf"
+elif [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
     source "$(agent_dir "$AGENT_NAME")/local-paths.conf"
 else
     # MIND_AGENT unset — use first available conf (hooks don't have the env var).
@@ -165,20 +177,48 @@ else
     unset _CONF
 fi
 
+# --- .mind-data/ local storage root ( M1, ) ---
+# Symmetric to the .mind-data/ block in _paths.py and mind_api/src/agent_paths.py
+# (3 resolver layers, no shared code). When PROJECT_ROOT/.mind-data/ exists it is
+# the local storage root by convention (world -> .mind-data/world,
+# meta -> .mind-data/meta); an optional .mind-data/.env.local overrides per-tier
+# paths via WORLD_PATH/META_PATH. GATED on the dir existing, so a repo without it
+# keeps the legacy env -> local-paths.conf -> empty chain. Live agents (external
+# local-paths.conf, no .mind-data/ dir) skip this tier and resolve via their conf.
+_MD_DIR="$PROJECT_ROOT/.mind-data"
+_MD_WORLD=""
+_MD_META=""
+if [ -d "$_MD_DIR" ]; then
+    if [ -f "$_MD_DIR/.env.local" ]; then
+        # Read overrides in subshells that FIRST unset the inherited legacy
+        # value, so the result reflects ONLY what .env.local sets (never the
+        # $WORLD_PATH/$META_PATH already sourced from local-paths.conf above).
+        _MD_WORLD="$( unset WORLD_PATH; . "$_MD_DIR/.env.local" >/dev/null 2>&1; printf '%s' "${WORLD_PATH:-}" )"
+        _MD_META="$( unset META_PATH; . "$_MD_DIR/.env.local" >/dev/null 2>&1; printf '%s' "${META_PATH:-}" )"
+    fi
+    [ -z "$_MD_WORLD" ] && _MD_WORLD="$_MD_DIR/world"
+    [ -z "$_MD_META" ] && _MD_META="$_MD_DIR/meta"
+fi
+
 # --- Tier 2: Meta-strategies ---
-# Priority: env var MIND_META > _local-conf META_PATH > empty.
-# Plan v1 step 0.1 (2026-05-19): removed PROJECT_ROOT/meta fallback.
-META_DIR="${MIND_META:-${META_PATH:-}}"
+# Priority: MIND_META env > .mind-data/ (.env.local META_PATH | meta default) >
+# legacy local-paths.conf META_PATH > empty. ( M1; 2026-05-19 hard-cut
+# preserved -- empty when nothing configured.)
+META_DIR="${MIND_META:-${_MD_META:-${META_PATH:-}}}"
 
 # --- Tier 3: Collective domain state ---
-# Priority: env var MIND_WORLD > _local-conf WORLD_PATH > empty.
-# Plan v1 step 0.1 (2026-05-19): removed PROJECT_ROOT/world fallback.
-WORLD_DIR="${MIND_WORLD:-${WORLD_PATH:-}}"
-if [ -n "$AGENT_NAME" ]; then
+# Priority: MIND_WORLD env > .mind-data/ (.env.local WORLD_PATH | world default) >
+# legacy local-paths.conf WORLD_PATH > empty. ( M1)
+WORLD_DIR="${MIND_WORLD:-${_MD_WORLD:-${WORLD_PATH:-}}}"
+unset _MD_DIR _MD_WORLD _MD_META
+if [ -n "$_AGENT_DIR_OVERRIDE" ]; then
+    AGENT_DIR="$_AGENT_DIR_OVERRIDE"   # test override (3); UNSET in prod
+elif [ -n "$AGENT_NAME" ]; then
     AGENT_DIR="$(agent_dir "$AGENT_NAME")"
 else
     AGENT_DIR=""
 fi
+unset _AGENT_DIR_OVERRIDE
 
 # --- Windows shell auto-detect ---
 # Python subprocess helpers (state-update-audit.py, precheck-eval.py, etc.) read
