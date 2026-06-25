@@ -34,6 +34,17 @@ except ImportError:
     print('ERROR: PyYAML required', file=sys.stderr)
     sys.exit(2)
 
+# A seed-role source (bare publication mirror) has no world overlay, so _paths
+# leaves WORLD_DIR unset (None). There is no forged-skills registry to audit
+# against, and the source's domain skills are stripped during transplant anyway,
+# so bidirectional consistency is trivially satisfied. Treat as PASS (N/A) rather
+# than crash. This is what lets a clean seed->downstream (PPE->prod) promotion
+# pass WITHOUT --skip-preflight. (Without this guard, the next line raises
+# TypeError: unsupported operand type(s) for /: 'NoneType' and 'str'.)
+if not WORLD_DIR:
+    print('INFO: no world overlay at source (seed-role mirror) — forged-skill registry audit N/A')
+    sys.exit(0)
+
 forged_path = WORLD_DIR / 'forged-skills.yaml'
 if not forged_path.is_file():
     print(f'INFO: no forged-skills.yaml at {forged_path} — nothing to audit')

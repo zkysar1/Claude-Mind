@@ -66,7 +66,7 @@ PathLike = Union[str, os.PathLike]
 # yields NO customer segment, so keys are BYTE-IDENTICAL to the legacy
 # env-id-only scheme — the live data needs no move (back-compat invariant).
 #
-# Lives HERE (the -free abstract seam), not in owncloud_backend, so the
+# Lives HERE (the cloud-SDK-free abstract seam), not in owncloud_backend, so the
 # daemon (server.py) can set/reset it per request WITHOUT importing the cloud
 # backend — server.py must stay importable on a LocalBackend-only host. Held in
 # a ``contextvars.ContextVar`` (NOT a singleton attr) so concurrent requests for
