@@ -212,7 +212,7 @@ class _Handler(BaseHTTPRequestHandler):
             # BEFORE any handler/backend call (defense in depth behind the IAM
             # prefix-conditions), and the matching customer is activated so the
             # OwnCloudBackend key builders carry the <customer>/ prefix. The
-            # set/reset live in storage_backend (the -free seam) so this
+            # set/reset live in storage_backend (the cloud-SDK-free seam) so this
             # path never imports the cloud backend (LocalBackend hosts stay clean).
             _cust_token = None
             if os.environ.get("MIND_MULTI_TENANT", "").strip().lower() in (

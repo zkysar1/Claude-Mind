@@ -26,8 +26,26 @@ CURRENT="$(grep -E '^__version__' "$INIT_PY" | sed -E 's/.*"([^"]+)".*/\1/' || t
 [[ -n "$CURRENT" ]] || { echo "script error: could not read __version__" >&2; exit 2; }
 
 if [[ ! -f "$RELEASES_JSON" ]]; then
-  echo "FAIL: RELEASES.json not found at repo root (run release.sh to establish release history)"
-  exit 1
+  # RELEASES.json is a FRONTIER-ONLY artifact: release.sh writes it, and only the
+  # frontier cuts releases (core/config/compatibility.yaml promotion_chain). A
+  # non-frontier source — a seed mirror (no world overlay) or a provisioned
+  # downstream — legitimately lacks it; the version SSOT (__version__) is
+  # authoritative there. So only a FRONTIER FAILs on a missing RELEASES.json;
+  # every other role treats it as N/A and PASSes. This is what lets a clean
+  # seed->downstream (PPE->prod) promotion pass WITHOUT --skip-preflight. self_role
+  # is read from the world overlay — the same source promote-to-upstream.sh /
+  # check-upstream.sh resolve role from.
+  SELF_ROLE=""
+  if [[ -n "${WORLD_DIR:-}" && -f "$WORLD_DIR/config/compatibility.yaml" ]]; then
+    SELF_ROLE="$(grep -E '^[[:space:]]*self_role:' "$WORLD_DIR/config/compatibility.yaml" 2>/dev/null \
+      | head -1 | sed -E 's/.*self_role:[[:space:]]*"?([A-Za-z]+)"?.*/\1/' || true)"
+  fi
+  if [[ "$SELF_ROLE" == "frontier" ]]; then
+    echo "FAIL: frontier source missing RELEASES.json (run release.sh to establish release history)"
+    exit 1
+  fi
+  echo "PASS: non-frontier source (self_role='${SELF_ROLE:-seed-mirror}') — RELEASES.json N/A; version SSOT __version__=$CURRENT is authoritative"
+  exit 0
 fi
 
 # Parse-or-fail (M1): a malformed RELEASES.json is a hard FAIL, not a silent pass.
