@@ -21,7 +21,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
 
 # Six hooks instrumented by . Order matches investigate-2.1.139 risk
-# severity (HIGH first).
+# severity (HIGH first).  / zeta allowlist audit S1: this is a DELIBERATE
+# instrumentation subset, NOT a mirror of the .claude/settings.json hook set
+# (25+ hooks) -- a parity test against settings.json would false-fail, and 2 of
+# these 6 (recovery-gate, session-save-id) are not even settings.json string
+# tokens (the names are fire-log sentinel filenames under core/logs/hook-fires/).
+# Growing this list is a judgment call about which hooks warrant fire-auditing,
+# not a sync obligation. => document, no test.
 HOOKS=(
     path-resolution-hook
     session-manifest-write-gate-hook

@@ -259,7 +259,7 @@ IF any entry has `type: fresh-eyes-review` AND `status: pending`:
   "I have a periodic fresh-eyes check waiting for you (id {pq.id}):
     1. Is the current Self still right?
     2. Are we working on the right problems?
-   Full briefing at `agents/<agent>/temp/{pq.id}.md`. Reply in this chat or via email;
+   Full briefing at `agents/<agent>/reports/{pq.id}.md`. Reply in this chat or via email;
    a 'Self is still right' / 'shift focus to X' answer is enough — I'll route it."
   (The fresh-eyes cadence gate fires every 25 completed goals. While this pq
    is pending, the next cycle is blocked — resolving it unblocks the cadence.
@@ -380,6 +380,90 @@ ELSE:
 Carry the surfaced rb/guard IDs into Step 7.5's interaction-learning records
 so the user's override (if any) becomes a first-class learning artifact.
 
+## Step 5.0a: Self-Escalation Chokepoint (guard-33 enforcement)
+
+Runs at the very start of directive processing, BEFORE Step 5 acts on anything
+and BEFORE any pending-question is written. Catches the one directive class
+that must NOT be self-authorized: a **self-escalating delegation** --- an action
+that expands the agent's OWN authority AND reverses a prior resolved user
+decision. The four `escalation_type`s (per
+`world/conventions/self-escalation-confirmation.md`):
+
+- **curriculum-graduation** --- promoting the agent's curriculum stage (e.g.,
+  cur-02 -> cur-03), unlocking gated capabilities
+- **capability-unlock** --- enabling a capability the agent was barred from
+  (e.g., bidding before Stage 1 graduation, sending external outreach
+  autonomously)
+- **scope-expansion** --- widening the operating scope beyond what a prior
+  resolved decision permitted
+- **other** --- any other authority expansion that reverses a resolved decision
+
+```
+IF the directive/decision is NOT a self-escalation (the common case --- new
+   aspiration, remember-fact, priority change, persona, idea, observation,
+   ordinary Self-update governed by guard-380): SKIP this step -> Step 5.
+
+IF it IS a self-escalation:
+    # guard-33 anti-pattern: a pending-questions answer is agent-writable and
+    # does NOT corroborate the escalation. Do NOT write a bare pending-question
+    # to self-authorize, and do NOT perform the action now. Route through the
+    # email round-trip instead.
+
+    0. Domain-overlay precondition: the self-escalation transport
+       (`world/scripts/self-escalation-register.sh` + the domain inbox-poll
+       skill) is domain-supplied. If `world/scripts/self-escalation-register.sh`
+       does NOT exist, guard-33 still holds --- do NOT self-authorize. Tell the
+       user the action needs a confirmation this world cannot route
+       automatically, file a participants:[agent, user] goal via
+       aspirations-add-goal.sh, and STOP (skip steps 1-4).
+
+    1. Register the escalation (mints the correlation-id, computes the 48h
+       fail-closed timeout, appends an awaiting_reply record --- the store owner
+       is the single writer):
+         Bash: bash world/scripts/self-escalation-register.sh \
+             --action "<human-readable action, e.g. graduate curriculum cur-02 -> cur-03>" \
+             --escalation-type <curriculum-graduation|capability-unlock|scope-expansion|other> \
+             --session "$MIND_SID"
+       Parse the JSON: {correlation_id, outbound_subject, expires_at, action,
+       body_correlation_line}.
+
+    2. Email the user the decision-needed confirmation.
+       (Check world/forged-skills.yaml for a skill whose triggers match
+        "notify the user" and invoke it with:
+          subject: <outbound_subject from step 1>
+          message: a short body stating the action, its consequence, then
+                   "Reply YES to approve or NO to deny.", and a FINAL line that
+                   is exactly <body_correlation_line> from step 1 (the
+                   redundant carrier the parser falls back to if the subject
+                   token is edited).
+        If no matching skill is registered, fall back to a
+        participants:[agent, user] goal via aspirations-add-goal.sh. Never
+        block on notification failure.)
+       This notification send is an INTERNAL agent-to-principal message, NOT
+       external outreach --- guard-12 / guard-29 per-send sign-off does NOT
+       apply to it.
+
+    3. Do NOT perform the escalating action this turn. It stays pending until
+       the user replies. Resolution is automatic: the domain inbox-poll skill
+       (the reply parser) runs on the next hourly drain and, when a reply carrying
+       the correlation-id arrives from USER_EMAIL, sets the record to
+       `confirmed` (YES) or `denied` (NO); 48h of silence -> `timed_out`
+       (fail-closed DENY --- absence of approval is not approval, mirroring
+       guard-12 / guard-29).
+
+    4. In THIS response, tell the user you have emailed a confirmation request
+       for the escalation and will proceed only on their YES.
+```
+
+**guard-33 invariant (MUST NOT weaken):** the escalating action proceeds ONLY
+when its pending-escalation record reaches status `confirmed` --- which requires
+an email-round-trip YES from USER_EMAIL, a tracked, non-agent-writable channel.
+A pending-questions-only authorization NEVER suffices. On a later turn, before
+acting on a previously-registered escalation, re-read its status from the store
+(`pending_escalations.py get --cid <id>`) and act ONLY on `confirmed`. This
+chokepoint is the positive mechanism that satisfies guard-33; the bare
+pending-questions write it replaces was the anti-pattern guard-33 forbids.
+
 ## Step 5: Directive Detection & Routing
 
 Applies in ALL states, persona on or off. When a user message contains a directive (not just a question/comment), detect the type and act:
@@ -395,13 +479,13 @@ For `/create-aspiration from-user`, the skill itself sets the aspiration's
 
 | Directive Type | Example | Action |
 |---------------|---------|--------|
-| Self update | "Change your purpose to..." / "You're actually a..." | Read `agents/<agent>/self.md` — current Self content (G14a: pre-read before edit). Edit `agents/<agent>/self.md` body. In the same Edit, update front matter: `last_updated: <today (YYYY-MM-DD)>` AND `last_update_trigger: user-correction` (both fields mandatory — mirror sites: aspirations-spark sq-012, felt-sense-checkin Material lane, encode-session Lane 7, all collapsed per world/conventions/self-program-evolution.md to call the same evolution-complete primitive). The Phase 2 PostToolUse hook captured the Edit as a stub in `world/self-evolution.jsonl`. Finalize via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user directive verbatim and citing it as the trigger>" --signal-source user-directive --signal-evidence '[{"type":"user_correction","id":"<turn-id-or-respond-step>","outcome":"applied"}]'`. The primitive auto-posts to decisions board AND triggers a confirmation email (cross-agent visibility surface). Confirm change to user in your response. |
+| Self update | "Change your purpose to..." / "You're actually a..." | Edit `agents/<agent>/self.md` body. In the same Edit, update front matter: `last_updated: <today (YYYY-MM-DD)>` AND `last_update_trigger: user-correction` (both fields mandatory — mirror sites: aspirations-spark sq-012, felt-sense-checkin Material lane, encode-session Lane 7, all collapsed per world/conventions/self-program-evolution.md to call the same evolution-complete primitive). The Phase 2 PostToolUse hook captured the Edit as a stub in `world/self-evolution.jsonl`. Finalize via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user directive verbatim and citing it as the trigger>" --signal-source user-directive --signal-evidence '[{"type":"user_correction","id":"<turn-id-or-respond-step>","outcome":"applied"}]'`. The primitive auto-posts to decisions board AND triggers a confirmation email (cross-agent visibility surface). Confirm change to user in your response. |
 | New aspiration | "Learn about cooking" | Invoke `/create-aspiration from-user` with the user's description |
-| Remove/pause aspiration | "Stop learning about politics" | Mark aspiration as `paused` via `aspirations-update.sh`, mark its goals as `skipped` |
-| Priority review | "Focus more on X than Y" / "show me priorities" / "reorder aspirations" / "asp-125 is most important" / response to priority-review pq | Invoke `/priority-review` with user's input. If a `type: priority-review` pending question exists with `status: pending`, pass its context to the skill. For simple single-aspiration priority changes (e.g., "make asp-125 HIGH"), update directly via `aspirations-update.sh` without invoking the full skill. |
+| Remove/pause aspiration | "Stop learning about politics" | Pause the aspiration via `aspirations-update.sh <asp-id> status paused`, then mark each of its goals `skipped` via `aspirations-update-goal.sh <goal-id> status skipped` |
+| Priority review | "Focus more on X than Y" / "show me priorities" / "reorder aspirations" / "asp-125 is most important" / response to priority-review pq | Invoke `/priority-review` with user's input. If a `type: priority-review` pending question exists with `status: pending`, pass its context to the skill. For simple single-aspiration priority changes (e.g., "make asp-125 HIGH"), update directly via `aspirations-update.sh <asp-id> priority <value>` (positional field-merge) without invoking the full skill. |
 | Fresh-eyes reply | "Self is still right" / "Self should be X" / "We're working on wrong problems — focus Y" / any reply referencing the two meta-questions from an open `type: fresh-eyes-review` pq | Split the user's reply into Self-portion and portfolio-portion. **Self-portion**: if the user says Self is still right, no self.md change — just record the confirmation. If they give a correction ("Self should be X" / "Update purpose to Y"), treat it as a Self update directive (row above) — edit `agents/<agent>/self.md` with `last_update_trigger: fresh-eyes-review`, then finalize the Phase 2 stub via `bash core/scripts/evolution-complete.sh --revision-id <stub-rev> --reasoning "<≥80-char rationale quoting the user's fresh-eyes correction verbatim>" --signal-source fresh-eyes-review --signal-evidence '[{"type":"fresh_eyes_reply","id":"<pq-id>","outcome":"correction-applied"}]'`, confirm. **Portfolio-portion**: if the user gives any priority guidance ("focus on X", "deprioritize Y", "Z is most important"), route to the Priority review row above (invoke `/priority-review` with the fresh-eyes pq context). Then mark the fresh-eyes-* pq `status: answered`, append a `resolution:` field with the full reply text, and `Bash: session-signal-set.sh pq-resolved`. The fresh-eyes cadence gate (`fresh-eyes-cadence-check.sh`) reads `skip_if_pending`, so flipping this pq to answered immediately unblocks the next 25-goal cycle. If the reply is ambiguous (only vague praise or critique), surface a follow-up clarifier in this same response before marking answered. |
 | Persona change | "Be more casual" | Update persona settings in `agents/<agent>/profile.yaml` |
-| Remember fact/preference | "Remember I prefer Python" | PLACEMENT CHECK: route domain-specific stable values (endpoints, paths, service names, account IDs, brand names) to `world/conventions/*.md` per `.claude/rules/encode-stable-facts.md`. Route universal behavioral preferences to working memory or a guardrail. Only create or edit a `.claude/rules/*.md` file for universal behavioral rules that apply regardless of domain — never for a domain-specific operational fact. Then Read the target convention file first (G14b: pre-read before edit) and write to the chosen target (`/tree add`, `wm-set.sh domain_data`, or Edit on the appropriate convention file). NEVER use platform auto-memory. |
+| Remember fact/preference | "Remember I prefer Python" | PLACEMENT CHECK: route domain-specific stable values (endpoints, paths, service names, account IDs, brand names) to `world/conventions/*.md` per `.claude/rules/encode-stable-facts.md`. Route universal behavioral preferences to working memory or a guardrail. Only create or edit a `.claude/rules/*.md` file for universal behavioral rules that apply regardless of domain — never for a domain-specific operational fact. Then write to the chosen target (`/tree add`, `wm-set.sh domain_data`, or Edit on the appropriate convention file). NEVER use platform auto-memory. |
 | Recurring task | "Check news every week" | Add as recurring goal to an appropriate aspiration |
 | Skill creation request | "Make a skill for X" / "Create a skill" / "Forge a skill for Y" | Route through forge pipeline. Read `meta/skill-gaps.yaml`. If a gap matches the user's description, create goal: title `"Forge skill: {gap.procedure_name}"`, `skill: "/forge-skill"`, `args: "skill {gap-id}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh`. If no matching gap exists, register a new gap in `meta/skill-gaps.yaml` (id: `gap-{next}`, status: `registered`, times_encountered: 1, procedure_name from user description, estimated_value: `medium`), then create the forge goal targeting it. If user was generic ("make a skill" with no specifics), create goal with `skill: "/forge-skill"`, `args: "list"`. Forge-skill gates (curriculum, threshold, stage) apply at execution time — do NOT pre-check here. Confirm: "I'll queue a skill forge for {description}." In UNINITIALIZED state, acknowledge verbally only. |
 | Idea/suggestion | "What if we...?" / "I had an idea..." | Create idea goal: title `"Idea: {user's suggestion}"`, priority MEDIUM, in best-fit aspiration via `aspirations-add-goal.sh` |

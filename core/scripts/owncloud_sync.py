@@ -184,6 +184,54 @@ def _is_machine_local(basename: str, prefix: str, *, full_path=None, root_path=N
     return False
 
 
+def refresh_would_clobber(be, target) -> bool:
+    """True iff a backend refresh of `target` would overwrite a per-machine file
+    with stale/empty remote data.
+
+    A `backend.refresh()` force-pulls the remote copy over the local file before
+    an in-lock read. That is correct for a SYNCED store (S3 holds the
+    authoritative copy) but a DATA-LOSS path for a per-machine store: such files
+    are never pushed to S3, so the pull overwrites the only good (local) copy
+    with whatever stale/empty object the remote happens to hold (guard-881; the
+    presence clobber, g-333-09). Callers guard `refresh()` with this predicate.
+
+    A file is per-machine (=> refresh unsafe => return True) when, under its
+    governing root, EITHER a directory segment is in `_EXCLUDE_DIRS` (presence/,
+    .history/, sessions/, ... -- pruned from the sync walk, so never pushed) OR
+    `_is_machine_local` matches the basename policy (EXCLUDE_NAMES / EXCLUDE_GLOBS
+    / world *-log.jsonl / the <agent>/session manifest). That union is exactly
+    the never-pushed set the sync walk (sync_all / sync_file) computes -- the
+    SSOT for sync candidacy lives here, not in the caller. The dir-segment half
+    is load-bearing: `_is_machine_local` alone returns False for
+    `world/presence/<agent>.jsonl` (basename not excluded), so a refresh guard
+    keyed only on `_is_machine_local` would still clobber the presence store
+    (verified 2026-06-26: all 6 presence files classify dir-excluded but
+    basename-synced).
+
+    Returns False (refresh is safe) when: the active backend has no remote
+    (LocalBackend -- `refresh` is a no-op, clobber impossible), or `target` is
+    not under any governed root (core/, .claude/, product repos are git-synced,
+    never S3). A PEER agent's file under a governed root is NOT skipped -- its
+    local copy is a stale cache, so pulling the owner's authoritative S3 copy is
+    the CORRECT outcome (H4a only blocks PUSHing a peer file, never the pull)."""
+    roots = getattr(be, "_roots", None)
+    if not roots:
+        return False  # LocalBackend (no-op refresh) or no governed roots
+    target = Path(target).resolve()
+    for root_path, prefix in roots:
+        try:
+            rel = target.relative_to(root_path)
+        except ValueError:
+            continue
+        # Directory-level exclusion (walk-pruned dirs are never pushed). Check
+        # only the directory segments, never the basename.
+        if any(seg in _EXCLUDE_DIRS for seg in rel.parts[:-1]):
+            return True
+        return _is_machine_local(target.name, prefix, full_path=target,
+                                 root_path=Path(root_path))
+    return False  # ungoverned root
+
+
 # --- session-file sync policy (SSOT: core/config/session-manifest.yaml) -----
 # <agent>/session/ is sync-by-default: each file's cross-machine disposition is
 # read from the manifest's sync_tier (machine_local | continuity | ephemeral).

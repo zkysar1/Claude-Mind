@@ -371,6 +371,23 @@ def main():
                 )
                 loop_state = _loop_state_defaults()
 
+            # : defensive signals sub-init. When loop_state is a dict but
+            # loop_state.signals is None/missing/non-dict, restore the default
+            # signals dict. Other writers (recurring-loop-state-mutate.py,
+            # quiescence-gate.py) self-heal on their next write, but state-update
+            # fires every iteration AND is the only writer for goals_completed/
+            # productive_goals — heal here so downstream readers (notably
+            # productivity-stop-gate.sh's signals.routine_count_total lookup) see
+            # a populated dict rather than a 0-fallback that masks real signal.
+            if not isinstance(loop_state.get("signals"), dict):
+                from _loop_state_defaults import defaults as _loop_state_defaults
+                loop_state["signals"] = _loop_state_defaults()["signals"]
+                print(
+                    "[loop-state-bump-counters] defensive sub-init: "
+                    "loop_state.signals was missing/non-dict — restored from defaults",
+                    file=sys.stderr,
+                )
+
             #  idempotency: when --goal-id is supplied, gate the bump on
             # membership in counted_goals_this_session. Backward-compat: --goal-id
             # omitted preserves the original unconditional-bump behavior so

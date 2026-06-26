@@ -364,9 +364,8 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
            # All non-recurring goals done, only recurring remain
            Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH→MEDIUM (recurring-only)"
-           Read full aspiration: Bash: aspirations-read.sh --id {asp.id}
-           Set priority to "MEDIUM" in parsed JSON
-           Pipe full modified JSON to: aspirations-update.sh {asp.id}
+           Demote priority — field-merge, single positional call (daemon merges only this field):
+           Bash: aspirations-update.sh {asp.id} priority MEDIUM
 
    # --- 2.75c: Misplaced Recurring Goal Detection ---
    # Recurring monitoring goals in sprint/project aspirations should live in the
@@ -410,9 +409,8 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                IF asp has no in-progress goals:
                    IF asp.last_worked is null OR hours_since(asp.last_worked) > stale_hours:
                        Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH with no activity for {stale_hours}+ hours"
-                       Read full aspiration: Bash: aspirations-read.sh --id {asp.id}
-                       Set priority to "MEDIUM" in parsed JSON
-                       Pipe full modified JSON to: aspirations-update.sh {asp.id}
+                       Demote priority — field-merge, single positional call (daemon merges only this field):
+                       Bash: aspirations-update.sh {asp.id} priority MEDIUM
 
    # --- 2.75e: Log portfolio health snapshot ---
    active_after = count of active aspirations (after archival/demotion)
@@ -588,7 +586,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
          - Route to target aspiration (current → matching category → `/create-aspiration from-self`)
          - Build goal: title `"Forge skill: {gap.procedure_name}"`,
            skill `"/forge-skill"`, args `"skill {gap.id}"`, priority `"MEDIUM"`
-         - Add via `aspirations-update.sh`
+         - Add via `aspirations-add-goal.sh` (goal JSON on stdin; asp-id as arg)
          - Log: `echo '{"date":"...","event":"forge-ready","details":"Gap {gap.id} met criteria in evolve Phase 9.2","trigger_reason":"evolve-forge-check"}' | bash core/scripts/evolution-log-append.sh`
 
 ### Skill Curation (Step 9.5 — after forge check)

@@ -68,7 +68,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
     import yaml
-    from _paths import AGENT_DIR, CORE_ROOT, PROJECT_ROOT
+    from _paths import AGENT_DIR, CORE_ROOT
     from _fileops import acquire_lock, release_lock
     from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
 except Exception:
@@ -82,7 +82,16 @@ TRACKED_SENTINELS = [
 ]
 
 CANARY_SLOT = "stale_sentinel_canary"
-ASP_ID = ""  # framework-architecture aspiration
+# Target aspiration for filed Investigate goals.  is the framework-
+# evolution world aspiration (the g-115-* queue) — the same framework-work
+# target used by other canary scripts (inbox-alert-age-check.py,
+# insight-trigger-sweep.py, blocker-recheck.py). It was empty ("") before
+# , so even when the path resolved the add-goal call filed to no
+# aspiration (daemon aspiration_not_found) — the canary could never actually
+# surface a stuck sentinel. Paired with the SCRIPT_DIR path fix in
+# _file_investigate (the rc-127 fix), the canary now reaches the daemon AND
+# names a real aspiration.
+ASP_ID = "asp-115"
 DEFAULT_THRESHOLD = 3
 
 # Consumption-aware sentinels (3). Bare presence-count (_is_set)
@@ -216,7 +225,14 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
     if dry_run:
         return {"dry_run": True, "payload_title": title}
 
-    script_path = (Path(PROJECT_ROOT) / "core" / "scripts" / "aspirations-add-goal.sh").as_posix()
+    # SCRIPT_DIR (Path(__file__).resolve().parent) is ALWAYS absolute and
+    # independent of cwd/env — unlike PROJECT_ROOT, which can resolve to an
+    # empty/relative value inside a nested subprocess (the canary runs nested:
+    # iteration-close do_productivity_check -> here), yielding a relative
+    # "core/scripts/aspirations-add-goal.sh" that bash cannot find (rc 127).
+    # Mirrors the proven obligation-audit.py pattern.
+    # aspirations-add-goal.sh lives in SCRIPT_DIR (core/scripts/).
+    script_path = (SCRIPT_DIR / "aspirations-add-goal.sh").as_posix()
     try:
         result = subprocess.run(
             bash_cmd(script_path, "--source", "world", ASP_ID),

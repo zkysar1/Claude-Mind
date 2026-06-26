@@ -17,6 +17,16 @@
 #                     agents/<name>/...  -> that agent's dir
 #                     agents/*/...       -> glob across all agent dirs
 #                   A '*' anywhere globs (e.g. world/board/*.jsonl).
+#                   GLOB ARCHIVE-EXCLUSION INVARIANT (): a '*' glob
+#                   NEVER matches an archive sink (<stem>-archive*.jsonl).
+#                   Rotation MOVES records INTO <stem>-archive<suffix>; if the
+#                   same glob re-matched that sink, the next sweep would rotate
+#                   it into <stem>-archive-archive -- an unbounded
+#                   archive-of-archive chain (observed 2026-06-26:
+#                   coordination-archive-archive.jsonl). Enforced in
+#                   jsonl_hygiene.py _glob_or_single. To deliberately bound ONE
+#                   archive, give its EXPLICIT path (no '*') -- single-path
+#                   targets still pass archives through.
 #   enabled:        bool. Sweep SKIPS entries that are not enabled (default false
 #                   via `defaults` below). An owner goal flips this to true.
 #   mode:           cap | rotate
@@ -29,6 +39,14 @@
 #                     lines  -> keep newest `max_lines` records.
 #                     age    -> keep records whose `ts_field` is within
 #                              `retention_days`; older are dropped/archived.
+#                     guard-362: before an owner goal enables `by: age` on a
+#                     store, it MUST enumerate the store's record classes and
+#                     confirm age IS staleness (evict) and not age IS signal
+#                     (protect) -- cadence trackers, resource locators, and
+#                     config slots are "age IS signal" and an age policy would
+#                     destroy their bookkeeping. gate-firings.jsonl (G5) uses
+#                     by:age -- its 4 readers all window by time (--days), so
+#                     age IS staleness; see its entry for the rate/window proof.
 #   max_lines:      int (by=lines).
 #   retention_days: int (by=age).
 #   ts_field:       record field holding the ISO timestamp (by=age).
@@ -41,6 +59,29 @@
 #
 # The bounds below are CONSERVATIVE PROPOSALS pending each owner goal's
 # verification. Do not assume they are final.
+#
+# ── Archive sinks: bounded-by-design, NOT registry-rotated ( / G8) ────
+# The archive files that rotate/compact MOVE records INTO (<stem>-archive.jsonl:
+# world/aspirations-archive, world/pipeline-archive, agents/*/experience-archive,
+# world/board/<channel>-archive) are deliberately NOT given their own registry
+# entries. Two reasons:
+#   1. They are COLD. The per-write-cost problem this whole system fights is on
+#      HOT append paths (every append = a full-file locked R-M-W = an S3 GET+PUT
+#      on own-cloud). Archive sinks are appended to ONLY during periodic
+#      archival, so they do not carry that cost.
+#   2. Most are TINY (verified 2026-06-26: aspirations-archive 296 lines,
+#      pipeline-archive 305, per-agent experience-archive 25-248). Rotating them
+#      is speculative carrying cost (implementation-discipline) and would only
+#      deepen the archive chain.
+# The ONE sink that grows non-trivially is world/board/coordination-archive.jsonl
+# (~117 posts/day rotate IN; ~2.3MB / 5k lines as of 2026-06-26) -- the board is
+# the one HOT-sourced store. It is still COLD on read (board.py reads the LIVE
+# file only), so its growth is a slow append-cost drip, not a current problem.
+# WHEN its measured append cost justifies action, bound it with an EXPLICIT-PATH
+# age-cap entry (mode: cap, by: age on world/board/coordination-archive.jsonl
+# directly -- the glob archive-exclusion lets a single explicit path through),
+# after a guard-362 retention-semantics check. NEVER add a glob that would match
+# archive sinks (the archive-of-archive defect  fixed).
 
 version: 1
 
@@ -50,19 +91,41 @@ defaults:
   by: lines
 
 stores:
-  # ── G5 (): FIFO-cap meta/gate-firings.jsonl ────────────────────────
-  # Phase 1+5 gate telemetry. Disposable beyond a recent window -> cap.
+  # ── G5 (): age-cap meta/gate-firings.jsonl ─────────────────────────
+  # Phase 1+5 gate telemetry. by:age (NOT lines): all 4 readers window by TIME
+  # (gate-stats / gate-retirement-eval / override-ledger-consume /
+  # team-contribution-report, each --days default 30); firing rate ~2486/day
+  # makes a 10k-line cap retain only ~4 days -- far under the 30-day reader
+  # window. retention_days:40 = 30d window + 33% margin (boundary + 24h cap
+  # cadence-gap + occasional larger --days); bounds growth that is otherwise
+  # unbounded (~50MB and climbing ~1MB/day). age IS staleness here (guard-362
+  # pass -- no reader needs full history). Verified  (delta): readers +
+  # rate (~3.2k/day over the window) + keystone cap+age path.
   - path: meta/gate-firings.jsonl
-    enabled: false
+    enabled: true
     mode: cap
-    by: lines
-    max_lines: 10000
+    by: age
+    retention_days: 40
+    ts_field: ts
     owner_goal: g-333-05
 
   # ── G6 (): world/changelog.jsonl rotation ──────────────────────────
   # Auto-appended audit trail of all world writes. History matters -> rotate.
+  # ENABLED  (zeta, 2026-06-26): activation step. The machine-local
+  # clobber gate (prior "machine-local -> blocked" reason) is RESOLVED -- 
+  # added "changelog.jsonl" to owncloud_sync._EXCLUDE_NAMES (owncloud_sync.py:142),
+  # so _is_machine_local classifies it machine-local -> refresh_would_clobber True
+  # -> jsonl_hygiene._snapshot SKIPS refresh (no -class clobber of the
+  # local-only 57MB file). Verified end-to-end (dry-run + apply, 2026-06-26):
+  # 411147 -> newest 20000 live + 391147 archived to changelog-archive.jsonl
+  # (recoverable); counts sum, no loss/dup; 4 pre-existing corrupt lines dropped
+  # from the live window. rotate is archive-FIRST + front-equality
+  # (jsonl_hygiene.py:404-417) so concurrent all-agent appends are preserved.
+  # NOTE: rotating this HOT store (every locked world write appends) may surface a
+  # transient Phase-2 lock error even when the writes land -- verify on-disk line
+  # counts, not the error report (the apply that landed this reduction did so).
   - path: world/changelog.jsonl
-    enabled: false
+    enabled: true
     mode: rotate
     by: lines
     max_lines: 20000
@@ -77,40 +140,109 @@ stores:
     max_lines: 10000
     owner_goal: g-333-07
 
-  # ── G9 (): truncate world/presence/<agent>.jsonl ───────────────────
-  # Per-agent presence ticks. Disposable telemetry -> cap; globs all agents.
+  # ── G9 (): cap world/presence/<agent>.jsonl ────────────────────────
+  # Per-agent presence ticks (one per Bash tool call). Disposable recency
+  # telemetry -> cap (atomic, no archive). by:lines (NOT age): the sole reader
+  # presence-read.sh is UNWIRED ("pending user-side hook activation" per
+  # scripts-referenced-gate.py) -- no consumer with a fixed time-window need.
+  # When activated it queries RECENCY (--since recent / --last N), needing the
+  # freshest tail, which by:lines preserves -- so the rb-2391 line-cap-starvation
+  # risk (a fixed-long-window reader, like gate-firings' 30d analysis) does NOT
+  # apply here. max_lines:500 confirmed safe: bounds the 6 files from ~16MB
+  # (delta alone 14816 lines / 2.4MB over 25d) to ~480KB total while keeping the
+  # newest 500 ticks (a generous recency window). Verified  (delta):
+  # reader-unwired + disposable + recency-semantics (no speculative cap bump --
+  # implementation-discipline).
   - path: world/presence/*.jsonl
-    enabled: false
+    enabled: true
     mode: cap
     by: lines
     max_lines: 500
     owner_goal: g-333-09
 
+  # ── G10 (): physical compaction of active knowledge stores ─────────
+  # reasoning-bank / guardrails / pattern-signatures use LOGICAL-only retirement
+  # (status flip in-place); retired/superseded records accumulate in the
+  # active-scan file forever (the G1/A2 cached-scan target never shrinks).
+  # mode=compact MOVES status in {retired,superseded} records OLDER than
+  # grace_days into <stem>-archive.jsonl (recoverable), keeping the cached active
+  # file small. AGE-GRACE (30d) preserves the recent-retire window: guardrails
+  # grace on retirement_date (precise -- guardrail_retire.restore reads retired
+  # records from the LIVE file); reasoning-bank / pattern-signatures fall back to
+  # created. Verified DRY-RUN (2026-06-26): would archive rb 112/125, guard
+  # 80/82, sig 2/2 non-active; all active records (rb 2209, guard 633, sig 21)
+  # untouched. valid_to is unused across these stores so no live bitemporal
+  # reader depends on retired-in-place; retrieval already excludes retired.
+  # ENABLED  (2026-06-26): activation step. Two gates cleared before the
+  # flip: (1) the test-safety blocker is resolved () --
+  # test_sweep_shipped_registry_dry_run_is_safe runs the shipped-registry sweep
+  # with apply=False (its SAFE set includes would-compact), so enabling here no
+  # longer compacts real stores during test runs; (2) guard-881 -- all three
+  # verified NOT machine-local per owncloud_sync._is_machine_local (basename not
+  # in _EXCLUDE_NAMES, no *-log.jsonl match), so jsonl_hygiene._snapshot's
+  # unconditional refresh pulls authoritative S3, no clobber (contrast G6/G7
+  # changelog, machine-local -> blocked). Retired records age >=30d move to
+  # <stem>-archive.jsonl (recoverable); retrieval already excludes retired so
+  # partner reads are unaffected.  (mechanism),  (activation).
+  - path: world/reasoning-bank.jsonl
+    enabled: true
+    mode: compact
+    grace_days: 30
+    owner_goal: g-333-10
+  - path: world/guardrails.jsonl
+    enabled: true
+    mode: compact
+    grace_days: 30
+    ts_field: retirement_date
+    owner_goal: g-333-10
+  - path: world/pattern-signatures.jsonl
+    enabled: true
+    mode: compact
+    grace_days: 30
+    owner_goal: g-333-10
+
   # ── G11 (): journal / evolution-log / skill-evolution / board ──────
   # Append-only logs whose history matters -> rotate.
+  # ENABLED  (delta, 2026-06-26). All 4 verified NOT machine-local per
+  # owncloud_sync._is_machine_local: journal.jsonl not under session/; meta/
+  # evolution-log.jsonl is meta-prefix so the world-scoped *-log.jsonl exclusion
+  # (owncloud_sync.py:170) does NOT apply (its own comment confirms it syncs);
+  # skill-evolution.jsonl ends -evolution.jsonl not -log.jsonl; board basenames
+  # (coordination/general/findings/decisions/...) none end -log.jsonl. So the
+  # jsonl_hygiene _snapshot UNCONDITIONAL refresh pulls correct S3 (no 
+  # clobber) -- G11 is INDEPENDENT of the in-flight 4 _snapshot fix
+  # (contrast G7 changelog/G6 world-changelog which ARE machine-local -> blocked).
+  # Bounds verified vs real content (2026-06-26): journal max 222 lines/agent
+  # (<< 5000 no-op), evolution-log 2068 (<< 10000 no-op), skill-evolution 2174
+  # (<< 5000 no-op); board: only coordination.jsonl over bound (10668 -> rotate
+  # to newest 5000 ~= 43d @ ~117 lines/day). Consumer board.py reads the LIVE
+  # file only (no archive read) -- cooldown scans need hours not weeks so 43d
+  # covers operational need; older posts archived (coordination-archive.jsonl)
+  # not deleted. rotate uses locked_modify_jsonl + front-equality so concurrent
+  # multi-agent board appends are preserved (guard-364/guard-832 safe).
   - path: agents/*/journal.jsonl
-    enabled: false
+    enabled: true
     mode: rotate
     by: lines
     max_lines: 5000
     owner_goal: g-333-11
 
   - path: meta/evolution-log.jsonl
-    enabled: false
+    enabled: true
     mode: rotate
     by: lines
     max_lines: 10000
     owner_goal: g-333-11
 
   - path: world/skill-evolution.jsonl
-    enabled: false
+    enabled: true
     mode: rotate
     by: lines
     max_lines: 5000
     owner_goal: g-333-11
 
   - path: world/board/*.jsonl
-    enabled: false
+    enabled: true
     mode: rotate
     by: lines
     max_lines: 5000

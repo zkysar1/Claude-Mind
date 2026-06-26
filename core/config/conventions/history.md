@@ -67,7 +67,7 @@ To add an entry:
    `core/scripts/tests/test_fileops_snapshot_blacklist_and_gzip.py` that
    asserts the new pattern is honored.
 
-## Per-File Snapshot Cap (Items 3 + 4)
+## Per-File Snapshot Cap
 
 Even with the blacklist and gzip, files written hundreds of times per day
 (aspirations.jsonl, reasoning-bank.jsonl, the board) accumulate snapshots
@@ -117,12 +117,12 @@ naturally over the next N writes (where N = current_count - cap).
 
 All write scripts delegate to `_fileops.py` locked write functions. These automatically:
 1. Acquire a file lock
-2. Check the snapshot blacklist; skip steps 3 + 7 for matching files
+2. Check the snapshot blacklist; skip steps 3 + 6 for matching files
 3. gzip-compress the current file into `.history/` (via `save_history`)
 4. Perform the atomic write
 5. Append to `changelog.jsonl`
-6. Release the lock
-7. Auto-prune the per-file snapshot dir to the cap (oldest dropped first)
+6. Auto-prune the per-file snapshot dir to the cap (oldest dropped first)
+7. Release the lock
 
 No manual history calls needed — it happens transparently on every write.
 

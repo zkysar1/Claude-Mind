@@ -265,12 +265,13 @@ class AgentPathResolver:
 
         Empty string if none. Skips empty or partial confs (e.g. an abandoned
         `/start <agent>` that created the agent dir + an empty local-paths.conf
-        but never completed path config), which would otherwise win by sorting
-        first and resolve WORLD_PATH-unresolved (canonical incident: an empty
-        agents/<name>/local-paths.conf sorted before a usable one, making
-        agent-less daemon requests -- including /v1/admin/health -- resolve to
-        that agent and raise WORLD_PATH-unresolved, which read as a daemon-down
-        500 and triggered a kill-and-respawn death spiral)."""
+        at Phase A2 but never completed Phase B path config) so a misconfigured
+        agent sorting first does NOT poison agent-less resolution. Mirrors the
+        _paths.py / _paths.sh first-available-conf fix (2026-06-14: an empty
+        agents/delta/local-paths.conf sorted before omni's, making agent-less
+        daemon requests — including /v1/admin/health — resolve agent='delta'
+        and raise WORLD_PATH-unresolved, which read as a daemon-down 500 and
+        triggered a kill-and-respawn death spiral)."""
         for conf in sorted(self._agents_root().glob("*/local-paths.conf")):
             if _parse_conf(conf).get("WORLD_PATH"):
                 return conf.parent.name

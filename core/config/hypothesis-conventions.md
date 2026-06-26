@@ -43,6 +43,26 @@ consumer of a horizon window MUST read the yaml rather than re-hardcode the
 literal (rb-335 writer-without-reader). This table is the human-readable mirror;
 the yaml is authoritative for code.
 
+### Discovered-Stage `resolves_by` Exemption (and the stall it can create)
+
+`resolves_by` is REQUIRED for `short`/`long` hypotheses **only once they reach the
+`active` stage**. `validate_formation_quality` (`core/scripts/pipeline.py`, mirrored
+in `mind_api/src/world/pipeline_write.py`) exempts `discovered`-stage records so a
+skeletal draft can be filed before its resolution window is fixed. The exemption is
+intentional, but it produces two stall modes that the resolve sweep must compensate
+for — both surface as the recurring `hypothesis-health:stalled_pipeline` precheck flag
+(flowing hypotheses below threshold):
+
+| Stall mode | Cause | Compensating mechanism |
+|---|---|---|
+| **Overdue-discovered** | A `discovered` short/long hypothesis HAS a `resolves_by` but ages past it while still in `discovered` — `/review-hypotheses --resolve` historically loaded only `active` + `measurement-pending`, never sweeping `discovered`. | rb-214 fix: `--resolve` Step 1 also sweeps `discovered` records whose `resolves_by`/`resolves_no_earlier_than` is past now. |
+| **Dateless-orphan** | A `discovered` short/long hypothesis never acquires a `resolves_by` at all (the exemption let it be filed without one), so the overdue sweep can't reach it — there is no date to be "past." | Backfill (one-time: `formed_date` + horizon window) + auto-default (two-site, at creation). |
+
+The two fixes compose: a backfilled dateless record gains a `resolves_by`, becomes
+overdue, and is then caught by the overdue-discovered sweep on the next resolve. When
+editing the requirement, change BOTH sites (CLI validator + daemon mirror) — they are
+a MIRROR-SYNC pair; a one-site change silently degrades the daemon add path.
+
 ### Hypothesis-Goal Lifecycle
 
 ```

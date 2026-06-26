@@ -7,8 +7,8 @@
 #
 # Usage:
 #   seed-transplant.sh <destination> [--dry-run] [--diff] [--no-backup]
-#                       [--force] [--yes] [--manifest <path>] [--fresh-git]
-#                       [--commit] [--no-clean-cruft]
+#                       [--force] [--manifest <path>] [--fresh-git] [--commit]
+#                       [--no-clean-cruft]
 #
 # Exits non-zero on failure. See .claude/skills/seed/SKILL.md for the spec.
 set -e
@@ -20,7 +20,8 @@ DRY_RUN=0
 DO_DIFF=0
 NO_BACKUP=0
 FORCE=0
-YES=0
+DO_YES=0
+LIVING_PROD=0
 MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
 FRESH_GIT=0
 DO_COMMIT=0
@@ -35,12 +36,13 @@ while [ $# -gt 0 ]; do
         --no-backup) NO_BACKUP=1 ;;
         --backup) NO_BACKUP=0 ;;
         --force) FORCE=1 ;;
-        --yes|--non-interactive) YES=1 ;;
         --manifest) MANIFEST="$2"; shift ;;
         --fresh-git) FRESH_GIT=1 ;;
         --commit) DO_COMMIT=1 ;;
         --no-clean-cruft) NO_CLEAN_CRUFT=1 ;;
         --clean-cruft) NO_CLEAN_CRUFT=0 ;;
+        --yes) DO_YES=1 ;;
+        --living-prod) LIVING_PROD=1 ;;
         --skip-preflight)
             SKIP_PREFLIGHT_JUSTIFICATION="$2"
             if [ -z "$SKIP_PREFLIGHT_JUSTIFICATION" ] || [[ "$SKIP_PREFLIGHT_JUSTIFICATION" == --* ]]; then
@@ -69,6 +71,9 @@ fi
 echo "[seed-transplant] source=$PROJECT_ROOT"
 echo "[seed-transplant] dest=$DEST"
 echo "[seed-transplant] manifest=$MANIFEST"
+if [ $LIVING_PROD -eq 1 ]; then
+    echo "[seed-transplant] mode=living-prod (deployment-local + domain files preserved)"
+fi
 
 # Step 3: Pre-flight checks
 echo "[seed-transplant] Pre-flight checks..."
@@ -196,18 +201,14 @@ if [ $DRY_RUN -eq 1 ]; then
     exit 0
 fi
 
-# Step 6: User confirmation (skip if --force or --yes; non-TTY requires opt-in)
-if [ $FORCE -eq 0 ] && [ $YES -eq 0 ]; then
-    if [ ! -t 0 ]; then
-        # Non-interactive stdin (piped/backgrounded): refuse rather than read
-        # EOF -> "" -> Aborted. The caller must opt in explicitly (FM-5,
-        # 2026-06-25 cutover: a backgrounded plant hit [y/N], got EOF, aborted).
-        echo "ERROR: stdin is not a TTY and neither --yes nor --force was given." >&2
-        echo "  Re-run with --yes (confirm non-interactively) or --force." >&2
-        exit 2
-    fi
+# Step 6: User confirmation (skip if --force or --yes)
+if [ $FORCE -eq 0 ] && [ $DO_YES -eq 0 ]; then
     echo ""
     echo "Proceed with seed-plant to $DEST ? [y/N]"
+    if [ ! -t 0 ]; then
+        echo "  stdin is not a terminal and --yes was not passed. Aborting (pass --yes or --force)." >&2
+        exit 2
+    fi
     read -r ANSWER
     case "$ANSWER" in
         y|Y|yes|YES) ;;
@@ -248,7 +249,11 @@ fi
 # Step 10: Clean cruft
 if [ $NO_CLEAN_CRUFT -eq 0 ]; then
     echo "[seed-transplant] Cleaning cruft at destination..."
-    CRUFT_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" clean-cruft --manifest "$MANIFEST" --dest "$DEST")"
+    CRUFT_EXTRA_FLAGS=""
+    if [ $LIVING_PROD -eq 1 ]; then
+        CRUFT_EXTRA_FLAGS="--preserve-deployment-local"
+    fi
+    CRUFT_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" clean-cruft --manifest "$MANIFEST" --dest "$DEST" $CRUFT_EXTRA_FLAGS)"
     echo "$CRUFT_JSON" | py -3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -259,7 +264,14 @@ if d['removed']:
     if len(d['removed']) > 10:
         print(f\"    ... and {len(d['removed'])-10} more\")
 else:
-    print('  no cruft found')"
+    print('  no cruft found')
+skipped = d.get('skipped_preserved', [])
+if skipped:
+    print(f\"  preserved (living-prod): {len(skipped)}\")
+    for s in skipped[:10]:
+        print(f\"    + {s}\")
+    if len(skipped) > 10:
+        print(f\"    ... and {len(skipped)-10} more\")"
 fi
 
 # Step 10.5: Remove orphans — files at destination that are NOT in the

@@ -363,52 +363,46 @@ def cmd_hypothesis_health(args, config, compact):
 # ─────────────────────────────────────────────────────────────────────────
 
 def cmd_accuracy(args, config, compact):
-    """Flag overconfidence drift on the calibration-relevant sample.
+    """Flag when accuracy < critical_threshold with adequate sample.
 
-    Exploration hypotheses are designed-uncertain probes whose low hit-rate is
-    healthy, not miscalibration. Flagging accuracy_low on the aggregate (all
-    types) chronically false-flags an exploration-heavy resolved set at small n
-    (e.g. aggregate 37.5% fires the gate while high-conviction is 2/2). The gate
-    now flags on the calibration-relevant accuracy = accuracy over the
-    COMMITMENT types (everything except exploration), where being wrong IS
-    overconfidence evidence. Falls back to the aggregate when by_type is absent
-    (legacy pipeline meta).
+    Type-segmented (g-001-96 / rb-268): when the daemon-computed meta carries
+    `by_type`, the accuracy_low flag is based on the CALIBRATION-RELEVANT subset
+    — all commitment types, i.e. everything EXCEPT `exploration` (designed-
+    uncertain probes whose low hit-rate must not drag the gate; canonical
+    incident g-001-84: aggregate 37.5% fired while high-conviction was 100% and
+    every miss was an exploration/calibration designed-uncertain probe). When
+    `by_type` is absent/empty (legacy pipeline meta), the flag falls back to the
+    aggregate accuracy_pct (flag_basis="aggregate"). `by_confidence_band`
+    (g-001-122 / rb-323) is passed through for surfacing WHERE overconfidence
+    concentrates, independent of the flag basis.
     """
     crit = config.get("accuracy_critical_threshold")
     min_sample = config.get("accuracy_min_sample")
     if crit is None or min_sample is None:
         raise KeyError("aspirations.yaml missing accuracy_critical_threshold / accuracy_min_sample")
 
-    # Exploration is a yield metric, not a calibration metric, so it is excluded
-    # from the overconfidence signal. All other types (high-conviction,
-    # calibration, contrarian) are commitments where a miss IS overconfidence
-    # evidence.
-    EXPLORATION_TYPES = {"exploration"}
-
     data = _pipeline_query("--accuracy") or {}
     total = data.get("total_resolved", 0)
     pct = data.get("accuracy_pct", 0)
     by_strategy = data.get("by_strategy") or {}
     by_type = data.get("by_type") or {}
-    # by_confidence_band surfaces WHERE overconfidence concentrates: a "high"
-    # band (>=0.80) with a low pct is overconfidence-drift evidence. Surfaced
-    # for visibility; does not change the gate (which fires on
-    # calibration-relevant type accuracy). Empty for legacy meta without bands.
     by_confidence_band = data.get("by_confidence_band") or {}
 
-    # Calibration-relevant sample: all resolved types except exploration.
-    cr = {t: s for t, s in by_type.items() if t not in EXPLORATION_TYPES}
-    cr_confirmed = sum((s or {}).get("confirmed", 0) for s in cr.values())
-    cr_total = sum((s or {}).get("total", 0) for s in cr.values())
-    cr_pct = round(cr_confirmed / cr_total * 100, 1) if cr_total > 0 else 0.0
-
+    # Calibration-relevant basis: when by_type is present, the gate flags on the
+    # commitment types only (exclude `exploration`). Otherwise fall back to the
+    # aggregate (legacy meta lacking by_type).
     if by_type:
-        # Type-segmented path (current pipeline meta): gate on the
-        # calibration-relevant accuracy, not the exploration-diluted aggregate.
-        flag_total, flag_pct, basis = cr_total, cr_pct, "calibration-relevant"
+        cr_confirmed = sum(s.get("confirmed", 0) for t, s in by_type.items()
+                           if t != "exploration" and isinstance(s, dict))
+        cr_total = sum(s.get("total", 0) for t, s in by_type.items()
+                       if t != "exploration" and isinstance(s, dict))
+        cr_pct = round(cr_confirmed / cr_total * 100, 1) if cr_total > 0 else 0.0
+        flag_basis = "calibration-relevant"
+        flag_total, flag_pct = cr_total, cr_pct
     else:
-        # Fallback (legacy meta without by_type): aggregate behavior preserved.
-        flag_total, flag_pct, basis = total, pct, "aggregate"
+        cr_total, cr_pct = 0, 0.0
+        flag_basis = "aggregate"
+        flag_total, flag_pct = total, pct
 
     flags = []
     worst = []
@@ -417,13 +411,10 @@ def cmd_accuracy(args, config, compact):
         worst = [name for name, stats in by_strategy.items()
                  if (stats or {}).get("pct", 100) < 40 and (stats or {}).get("total", 0) >= 3]
 
-    if flags:
-        summary = (f"accuracy: critical ({basis} {flag_pct}% < {crit*100}%, "
-                   f"n={flag_total}; aggregate {pct}% over {total})")
-    else:
-        summary = (f"accuracy: healthy ({basis} {flag_pct}% over n={flag_total}; "
-                   f"aggregate {pct}% over {total})")
-
+    summary = (
+        f"accuracy: critical ({flag_pct}% < {crit*100}%, n={flag_total}, basis={flag_basis})"
+        if flags else f"accuracy: healthy ({pct}% over {total} resolved, basis={flag_basis})"
+    )
     return {
         "subcommand": "accuracy",
         "summary": summary,
@@ -431,14 +422,13 @@ def cmd_accuracy(args, config, compact):
         "accuracy_pct": pct,
         "total_resolved": total,
         "confirmed": data.get("confirmed", 0),
-        "calibration_relevant_pct": cr_pct,
-        "calibration_relevant_total": cr_total,
-        "by_type": by_type,
-        "by_confidence_band": by_confidence_band,
-        "flag_basis": basis,
         "worst_strategies": worst[:3],
         "threshold_pct": round(crit * 100, 1),
         "min_sample": min_sample,
+        "flag_basis": flag_basis,
+        "calibration_relevant_total": cr_total,
+        "calibration_relevant_pct": cr_pct,
+        "by_confidence_band": by_confidence_band,
     }
 
 
@@ -644,14 +634,13 @@ def cmd_cycles(args, config, compact):
                     for g in recent
                 )
                 if not all_primitives:
-                    # completion-ratio gate: a near-complete aspiration
-                    # consolidating its final goals will naturally have all
-                    # recent goals in the same category, which is the
-                    # convergence shape of healthy consolidate-before-expand,
-                    # not unproductive cycling. Suppress the velocity probe when
-                    # completion_ratio >= completion_ratio_suppress (default
-                    # 0.8). Threshold lives in
-                    # cycle_detection.completion_ratio_suppress.
+                    # : completion-ratio gate. A near-complete
+                    # aspiration consolidating its final goals will
+                    # naturally have all recent goals in the same
+                    # category — that's the convergence shape of healthy
+                    # consolidate-before-expand, not unproductive cycling.
+                    # Suppress the velocity probe when completion_ratio >=
+                    # completion_ratio_suppress (default 0.8).
                     non_recurring = [g for g in goals if not g.get("recurring")]
                     completed = [g for g in non_recurring if g.get("status") == "completed"]
                     completion_ratio = (

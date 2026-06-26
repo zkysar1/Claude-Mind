@@ -1095,6 +1095,34 @@ print(sha)
         fi
     fi
 
+    # Step 8.79b Domain post-close pipeline-freshness hook (rb-428
+    # sentinel family). Pattern B domain-overlay seam (domain-overlay-pattern.md,
+    # mirrors aspirations-precheck's signal-refresh hook): CORE stays domain-
+    # agnostic — it only provides the seam + the sentinel write. The DOMAIN
+    # supplies the classifier at $WORLD_DIR/scripts/pipeline-reconcile-gate.sh.
+    # If that script is absent (fresh world, or a domain with no external
+    # pipeline), this is a one-test no-op. The gate decides "pipeline-affecting"
+    # and names the consumer skill in its JSON; aspirations-precheck consumes the
+    # pipeline_reconcile_pending sentinel on the NEXT iteration (deferred-consume
+    # shape survives autocompact via WM, keeps this close path cheap). Reversibility
+    # + the domain vocabulary both live in the gate (PIPELINE_HOOK_ENABLED=0
+    # disables sentinel writes). Fires for BOTH outcomes — a routine pipeline goal
+    # can still imply an un-recorded row; the reconcile is idempotent. Fail-open:
+    # any gate error is swallowed and never blocks state-update.
+    if [[ -n "${WORLD_DIR:-}" && -f "$WORLD_DIR/scripts/pipeline-reconcile-gate.sh" ]]; then
+        local pipe_gate_json pipe_fired
+        pipe_gate_json=$(WORLD_DIR="$WORLD_DIR" AGENT_DIR="$AGENT_DIR" \
+            bash "$WORLD_DIR/scripts/pipeline-reconcile-gate.sh" "$GOAL_ID" "$SOURCE" "$category" \
+            2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{"fired":false,"reason":"gate-error"}')
+        pipe_fired=$(echo "$pipe_gate_json" | python3 -c "import json,sys; print('true' if json.load(sys.stdin).get('fired') else 'false')" 2>/dev/null || echo false)
+        if [[ "$pipe_fired" == "true" ]]; then
+            echo "$pipe_gate_json" | bash "$SCRIPT_DIR/wm-set.sh" pipeline_reconcile_pending >/dev/null 2>&1 || true
+            local pipe_reason
+            pipe_reason=$(echo "$pipe_gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason',''))" 2>/dev/null || echo "")
+            echo "[iteration-close] PIPELINE-RECONCILE: $GOAL_ID pipeline-affecting ($pipe_reason) — pipeline_reconcile_pending set; precheck Phase 0-pre5 reconciles next iteration." >&2
+        fi
+    fi
+
     # Phase 8.0.5/8.0.6 bash-enforcement (g-248-75, rb-428 family).
     # Tree-encoding drift sentinel was LLM-residue: 'IF goals_since_last_tree_update
     # >= 3: wm-set force_tree_encoding=true; reset.' Observed iter-101 alpha
@@ -1123,6 +1151,35 @@ print(sha)
     [[ "$TREE_UPDATED" == "true" ]] && GATE_ARGS+=(--tree-updated)
     bash "$SCRIPT_DIR/tree-encoding-drift-gate.sh" "${GATE_ARGS[@]}" \
         || echo "[iteration-close] WARN: tree-encoding-drift-gate failed (non-fatal; sentinel not updated this iteration)" >&2
+
+    # ─── force_tree_encoding bypass-consumer (non-recurring hot path) ───
+    # The drift gate (above) sets force_tree_encoding="true" on threshold cross.
+    # Its INTENDED consumer is aspirations-state-update SKILL.md Step 8 (LLM
+    # path) — which the hot path (this script: /aspirations loop, hand-rolled
+    # closes) BYPASSES. recurring-close.sh added a drain for the RECURRING path
+    # (its own block, after run_phase state-update); THIS is the symmetric drain
+    # for the NON-recurring hot path. Without it the sentinel goes stuck on
+    # non-recurring closes — stale-sentinel-canary then fires a (failing)
+    # Investigate. Same log+clear semantics as recurring-close.sh:
+    # force_tree_maintain (the paired sentinel, consumed by precheck Phase 0-pre)
+    # backstops global tree maintenance; the per-goal encoding override is only
+    # honored on the SKILL.md path. Draining at this shared choke point covers
+    # BOTH close paths (recurring-close's own drain then finds it already null
+    # and no-ops — a benign redundant backup). Unconditional on outcome: the
+    # drift gate counts every goal, so the sentinel can be set on routine
+    # closes too.
+    FTE_VAL="$(bash "$SCRIPT_DIR/wm-read.sh" force_tree_encoding 2>/dev/null || echo null)"
+    if [[ "$FTE_VAL" == '"true"' || "$FTE_VAL" == 'true' ]]; then
+        FTE_NOW="$(date +%Y-%m-%dT%H:%M:%S)"
+        printf '{"date":"%s","entry_type":"observation","goal_id":"%s","content":"iteration-close force_tree_encoding bypass-consume (non-recurring hot path): sentinel set by tree-encoding-drift-gate during state-update; SKILL.md Step 8 consumer not on this path. force_tree_maintain backstops global tree maintenance; sentinel cleared so it does not go stuck."}' \
+            "$FTE_NOW" "$GOAL_ID" \
+            | bash "$SCRIPT_DIR/journal-add.sh" >/dev/null 2>&1 \
+            || echo "[iteration-close] WARN: force_tree_encoding bypass-journal-append failed (non-fatal)" >&2
+        echo '"false"' | bash "$SCRIPT_DIR/wm-set.sh" force_tree_encoding >/dev/null 2>&1 \
+            || echo "[iteration-close] WARN: force_tree_encoding clear failed (non-fatal — next iteration re-clears)" >&2
+        echo "[iteration-close] force_tree_encoding bypass-consumed for $GOAL_ID (cleared; per-goal encoding override n/a on hot path)" >&2
+    fi
+    # ─── end force_tree_encoding bypass-consumer ───
 
     # LLM residue at this phase (deep outcomes only):
     # Step 8a-c precision extraction + Key Insights compression,

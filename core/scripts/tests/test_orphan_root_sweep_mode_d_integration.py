@@ -225,7 +225,20 @@ def _invoke_sweep(synth_root: Path) -> subprocess.CompletedProcess:
         text=True,
         env=env,
         cwd=str(synth_root),
-        timeout=60,
+        # 8: 180s, not 60s. This subprocess (orphan-root-sweep.sh ->
+        # `py -3` predicate + `find` filesystem scans) runs ~6s in isolation but
+        # ~36s+ under full-suite load (Python launcher cold-start + OneDrive write
+        # contention + 5-6 concurrent agents on the shared tree). A 60s cap gave
+        # only ~1.6x headroom and tripped subprocess.TimeoutExpired INTERMITTENTLY
+        # in the daemon-safe full suite -- a DIFFERENT test_case each run
+        # (test_clean_root / test_u_f03a / test_multiple_cruft / ...), always a
+        # timeout, never a content-assertion failure (evidence: 6 suite logs
+        # ..g-33301). NOT collection-order pollution (pytest-randomly
+        # absent -> order is deterministic, yet outcome varied run-to-run). 180s
+        # = ~5x the observed full-suite per-test time, still well under pytest.ini
+        # faulthandler_timeout=600 so a genuine sweep hang still fails loud.
+        # rb-700: retry/timeout tolerance must match failure-mode recovery time.
+        timeout=180,
     )
 
 

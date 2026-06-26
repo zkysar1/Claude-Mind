@@ -165,7 +165,7 @@ PRECON_TIMEGATE_RE = re.compile(
     re.IGNORECASE,
 )
 PRECON_STUDIO_RE = re.compile(
-    r"precondition_unmet:\s*roblox_studio_session_required",
+    r"precondition_unmet:\s*(roblox_studio_session_required|domain_session_required)",
     re.IGNORECASE,
 )
 

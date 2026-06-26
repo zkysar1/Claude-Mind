@@ -22,4 +22,13 @@ if [ -f "$PROJECT_ROOT/.env.local" ]; then
   . "$PROJECT_ROOT/.env.local"
   set +a
 fi
+# OwnCloudBackend.from_env (owncloud_backend.py _resolve_root_map) maps governed
+# world/meta paths to roots via MIND_WORLD/MIND_META (or *_PATH). _paths.sh
+# resolves these as WORLD_DIR/META_DIR but does NOT export the MIND_* names the
+# backend reads, so the apply path errored ("cannot map a governed path to a
+# root") on governed stores like meta/gate-firings.jsonl under
+# STORAGE_BACKEND=owncloud. Re-expose them (BOTH together -- guard-652); an
+# already-set MIND_* (e.g. from .env.local) wins. .
+export MIND_WORLD="${MIND_WORLD:-$WORLD_DIR}"
+export MIND_META="${MIND_META:-$META_DIR}"
 exec py -3 "$SCRIPT_DIR/jsonl_hygiene.py" "$@"

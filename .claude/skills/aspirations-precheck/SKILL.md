@@ -422,6 +422,46 @@ as Phase 0-pre/0-pre2/0-pre3. Reversibility: edit `post-state-update-metric-
 gate.sh`'s `DISTINCT_COUNT_THRESHOLD` to a high value (e.g. 999) to stop
 sentinel writes without touching this consumer.
 
+## Phase 0-pre5: Pipeline-Reconcile Gate (rb-428 family)
+
+Runs AFTER the metric-encoding gate, BEFORE Phase 0 completion checks. Consumes
+the `pipeline_reconcile_pending` WM sentinel set by `iteration-close.sh
+do_state_update` (Step 8.79b domain-overlay seam) when the just-closed goal was
+**pipeline-affecting** — a goal that touched the domain's external lead/outreach/
+contact pipeline. Forces a reconcile before goal selection so external pipeline
+state (e.g. a remote CRM or external pipeline store) is never left stale after a
+relevant goal closes — the freshness guarantee the hook exists to provide.
+
+Domain-agnostic by construction: the sentinel JSON NAMES the skill to invoke
+(`signal.skill`, set by the domain gate at
+`$WORLD_DIR/scripts/pipeline-reconcile-gate.sh`). This phase invokes whatever
+skill the domain named — core hardcodes no domain skill. A fresh world that
+never sets the sentinel makes this a one-`wm-read` no-op.
+
+Pattern mirrors Phase 0-pre/0-pre2/0-pre3/0-pre4 verbatim — wm-read -> if non-null
+-> act -> wm-set 'null'. One-shot with retry: leave the sentinel set if the
+reconcile fails so the next iteration retries.
+
+```
+Bash: wm-read.sh pipeline_reconcile_pending --json
+IF signal is not null AND signal.fired == true:
+    skill = signal.skill            # domain-named consumer; core stays agnostic
+    goals = signal.goals            # the just-closed pipeline-affecting goal id(s)
+    Output: "▸ PIPELINE-RECONCILE GATE: {goals} was pipeline-affecting ({signal.reason}) — invoking {skill} reconcile before goal selection"
+    invoke {skill} with args "reconcile --goals {comma-joined goals}"
+    # Clear ONLY after the reconcile ran (one-shot; on failure leave the
+    # sentinel so the next iteration retries — same fail-open contract as the
+    # sibling gates).
+    echo 'null' | Bash: wm-set.sh pipeline_reconcile_pending
+    # Continue to Phase 0.
+```
+
+The gate does NOT write `stop-requested` or `stop-loop` — same precheck pattern
+as the sibling sentinel gates. Reversibility: the domain gate's
+`PIPELINE_HOOK_ENABLED=0` stops sentinel writes upstream; removing or renaming
+`$WORLD_DIR/scripts/pipeline-reconcile-gate.sh` makes the core seam a no-op.
+Either disables the feature without touching this consumer.
+
 ## Phase 0: Automated Completion Checks
 
 Run completion check runners to auto-detect completed goals.
@@ -1225,6 +1265,7 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5e.5
 Bash: core/scripts/fresh-eyes-cadence-check.sh
 IF exit 0 (fire):
+    Output: "▸ Fresh-eyes review cadence crossed — assembling briefing"
     Invoke /fresh-eyes-review --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1259,6 +1300,7 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5f
 Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program
 IF exit 0 (fire):
+    Output: "▸ Fresh-eyes PROGRAM cadence crossed — assembling shared-purpose briefing"
     Invoke /fresh-eyes-program --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1290,6 +1332,7 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5f
 Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_tree
 IF exit 0 (fire):
+    Output: "▸ Fresh-eyes TREE cadence crossed — assembling L1 taxonomy briefing"
     Invoke /fresh-eyes-tree --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1324,6 +1367,7 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fe
 IF decision == "drop": SKIP this phase; continue to Phase 1
 Bash: core/scripts/felt-sense-cadence-check.sh
 IF exit 0 (fire):
+    Output: "▸ Felt-sense check-in cadence crossed — running 7-lane sweep"
     Invoke /felt-sense-checkin --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently

@@ -393,7 +393,7 @@ existing_port="$(_read_port || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
    _health_probe "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
-    _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port, health-probe authoritative)"
+    _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port)"
     exit 0
 fi
 
@@ -411,7 +411,7 @@ if ! _acquire_spawn_lock; then
         new_port="$(_read_port || echo "")"
         if [ -n "$new_pid" ] && [ -n "$new_port" ] && \
            _health_probe "$new_port"; then
-            _log "daemon ready via concurrent spawn (PID=$new_pid port=$new_port, health-probe authoritative)"
+            _log "daemon ready via concurrent spawn (PID=$new_pid port=$new_port)"
             exit 0
         fi
         sleep 0.1
@@ -424,17 +424,18 @@ trap '_release_spawn_lock' EXIT
 
 # Re-probe inside the lock — daemon may have come up while we waited.
 # 0 fix: health-probe alone (kill -0 false-negatives on Windows).
-# 2 v3: also read parent_pid (py.exe launcher PID) for the kill
-# path — see _force_kill_tree.
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
-existing_parent_pid="$(_read_parent_pid || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
    _health_probe "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
-    _log "daemon came up during lock wait (PID=$existing_pid, port=$existing_port, health-probe authoritative)"
+    _log "daemon came up during lock wait (PID=$existing_pid, port=$existing_port)"
     exit 0
 fi
+
+# 2 v3: read parent_pid (py.exe launcher PID) for the kill
+# path — see _force_kill_tree.
+existing_parent_pid="$(_read_parent_pid || echo "")"
 
 # 1. Check if daemon is already up and healthy.
 # 0 fix: health-probe FIRST. POSIX `kill -0` false-negatives on
@@ -450,7 +451,7 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         # Daemon is alive and responsive — verified by health probe,
         # regardless of what kill -0 says about the PID.
         if [ "$FORCE_RESTART" != "1" ]; then
-            _log "daemon already running (PID=$existing_pid, port=$existing_port, health-probe authoritative)"
+            _log "daemon already running (PID=$existing_pid, port=$existing_port)"
             exit 0
         fi
         # --restart: healthy but a daemon-code commit landed, so the
@@ -486,8 +487,7 @@ fi
 #      parent (read from daemon.parent.pid). No Win32 Get-CimInstance
 #      .ParentProcessId lookup — that lookup silently no-op'd in ~17% of
 #      recycles when the child had already exited, orphaning the py.exe
-#      parent. Empirical evidence: 35 orphan daemon pairs accumulated over
-#      204 spawns in 37 hours (snapshot the user surfaced 2026-05-22).
+#      parent.
 #   3. Each Stop-Process is CommandLine-guarded against 'mind_api' to defend
 #      against Windows PID reuse.
 #   4. Results are logged to spawn.log — no more silent >/dev/null 2>&1.
@@ -506,9 +506,8 @@ _clean_runtime_files
 # cmdline, same regex — Win32_Process exposes no cwd/env discriminator).
 # The `_force_kill_tree` above (kill by KNOWN PIDs from daemon.parent.pid
 # + daemon.pid) is the authoritative reap and is repo-safe by construction.
-# Empirical 2026-05-22: 15 back-to-back --restart cycles produced 0 orphans
-# with no implicit sweep. User-invoked `daemon-orphan-sweep.sh --clean`
-# remains available for explicit cleanup if a regression slips through.
+# User-invoked `daemon-orphan-sweep.sh --clean` remains available for
+# explicit cleanup if a regression slips through.
 
 # 2. Spawn the daemon.
 py_cmd="$(_python_launcher)"

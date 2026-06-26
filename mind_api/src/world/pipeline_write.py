@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -142,6 +142,34 @@ def _normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
         val = rec.get(date_field)
         if val is not None and not isinstance(val, str):
             rec[date_field] = str(val)
+    # Auto-default resolves_by for discovered short/long hypotheses ().
+    # Mirror of pipeline.py normalize_record -- keep identical. validate_
+    # formation_quality soft-exempts stage=discovered from the resolves_by
+    # requirement, so a discovered short/long record created without one has no
+    # resolution anchor and sits un-resolvable. Default at creation: short ->
+    # +7d, long -> +30d from formed_date (matches the  backfill
+    # windows). Non-discovered stages keep the explicit-resolves_by contract
+    # enforced by _validate_formation_quality.
+    if (
+        rec.get("stage", "discovered") == "discovered"
+        and rec.get("horizon", "") in ("short", "long")
+        and not rec.get("resolves_by")
+        and rec.get("formed_date")
+    ):
+        try:
+            _formed = datetime.strptime(str(rec["formed_date"])[:10], "%Y-%m-%d").date()
+            _window = 7 if rec["horizon"] == "short" else 30
+            _anchor = (_formed + timedelta(days=_window)).isoformat()
+            rec["resolves_by"] = _anchor
+            # Match the  backfill precedent: also set
+            # resolves_no_earlier_than to the same anchor so the draft is gated
+            # from selection (goal-selector hypothesis-gate) and from premature
+            # resolution (review-hypotheses not-due gate) until the window
+            # elapses. Preserve any pre-existing resolves_no_earlier_than.
+            if not rec.get("resolves_no_earlier_than"):
+                rec["resolves_no_earlier_than"] = _anchor
+        except (ValueError, TypeError):
+            pass  # malformed formed_date -- leave unset; discovered stays exempt
     return rec
 
 
@@ -853,11 +881,13 @@ def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
     meta["accuracy"]["by_depth"] = by_depth
 
     # by_type (high-conviction / calibration / exploration / contrarian).
-    # Mirrors pipeline.py compute_meta - consumed by precheck-eval cmd_accuracy
-    # to keep designed-uncertain exploration probes out of the
-    # calibration-relevant overconfidence signal. The daemon's _compute_meta is
-    # the authoritative writer of pipeline-meta.json, so a missing block here
-    # means by_type never reaches the gate regardless of pipeline.py.
+    # Mirrors pipeline.py compute_meta -- consumed by precheck-eval cmd_accuracy to
+    # keep designed-uncertain exploration probes out of the calibration-relevant
+    # overconfidence signal (, rb-268). This block was the drift gap that
+    # left the live --accuracy path without by_type while pipeline.py had it
+    # (): the daemon's _compute_meta is the authoritative writer of
+    # pipeline-meta.json, so a missing block here meant by_type never reached the
+    # gate regardless of pipeline.py.
     by_type: Dict[str, Any] = {}
     for r in resolved_records:
         t = r.get("type")
@@ -871,10 +901,10 @@ def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
         t["pct"] = round(t["confirmed"] / t["total"] * 100, 1) if t["total"] > 0 else 0.0
     meta["accuracy"]["by_type"] = by_type
 
-    # by_confidence_band surfaces WHERE overconfidence concentrates. Bands:
-    # >=0.80 reliable ("high"); the 0.50-0.75 noise zone splits into "medium"
-    # (0.65-0.79) and "low" (<0.65). A high band with a low pct is the
-    # overconfidence-drift signal. Records without a numeric confidence are
+    # by_confidence_band -- surfaces WHERE overconfidence concentrates ().
+    # Bands per rb-323: >=0.80 reliable ("high"); the 0.50-0.75 noise zone splits
+    # into "medium" (0.65-0.79) and "low" (<0.65). A high band with a low pct is
+    # the overconfidence-drift signal. Records without a numeric confidence are
     # skipped (legacy). Symmetric to by_type / by_strategy / by_depth.
     by_confidence_band: Dict[str, Any] = {}
     for r in resolved_records:

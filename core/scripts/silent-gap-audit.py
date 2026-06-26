@@ -83,11 +83,20 @@ READER_SOURCE_EXTS = {".py", ".sh", ".md", ".yaml", ".yml", ".js", ".ts"}
 # Detector (a): append-only logs / per-design human-or-audit trails whose "no
 # programmatic reader" is BY DESIGN — excluded so they are never flagged.
 # (Matched as substrings of the store filename, case-insensitive.)
+# "-archive" excludes EVERY archive sink (<stem>-archive.jsonl, where -archive is
+# jsonl_hygiene's DEFAULT_ARCHIVE_SUFFIX). Archive sinks are write-only cold
+# recoverability tiers: store-hygiene rotate/compact MOVES retired/old records
+# INTO them and retrieval already excludes retired, so zero programmatic readers
+# is correct-by-design, not an orphaned-asset gap. Recovery is manual (git
+# history / direct read), mirroring the changelog/journal entries above. Without
+# this, the detector false-flags reasoning-bank-archive / guardrails-archive /
+# pipeline-archive / etc. every cadence (2, 0). Same
+# archive-exclusion principle as jsonl_hygiene._glob_or_single ().
 WRITTEN_NEVER_READ_EXCLUDE = (
     "changelog", "journal", "experience", "diary", "skill-invocations",
     "meta-log", "evolution-log", "gate-firings", "gate-eval", "override-bypass",
     "health", "metrics", "audit", "-log", "ledger", "drops", "skill-quality",
-    "blocker-gate-overrides", "recommendations", "feedback",
+    "blocker-gate-overrides", "recommendations", "feedback", "-archive",
 )
 
 # Detectors (b) telemetry-stale, (c) zero-input, and (d)'s situational-skill
