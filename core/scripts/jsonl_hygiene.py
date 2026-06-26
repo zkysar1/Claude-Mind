@@ -12,7 +12,7 @@ THE PROBLEM (alpha audit, msg-20260624-103842-alpha-2463)
 
 THE FIX (this helper)
   A store-agnostic bounding primitive that any append-only JSONL can wire into.
-  Two modes x two policies cover the Tier-B line/age cohort (G5/G6/G8/G9/G11):
+  Three modes: line/age bounding (G5/G6/G8/G9/G11) + status compaction (G10):
 
     mode=cap     drop the oldest entries beyond the bound. ATOMIC (one locked
                  read-modify-write, no second file). For disposable telemetry
@@ -25,16 +25,31 @@ THE FIX (this helper)
                  archive-sweep family (two-phase locked: append-to-archive then
                  rewrite-live with a fresh in-lock read so concurrent appends
                  are preserved).
+    mode=compact STATUS-based physical compaction for active knowledge stores
+                 (reasoning-bank/guardrails/pattern-signatures): MOVE records
+                 whose status is in {retired,superseded} -- and older than
+                 grace_days -- into <stem>-archive.jsonl, then drop them from the
+                 live file. Unlike cap/rotate (which act on the OLDEST front
+                 slice), compact selects SCATTERED non-active records by status,
+                 so retrieval-eligible (active) records always stay. Age-grace
+                 (ts_field, default `created`; guardrails use retirement_date)
+                 preserves the recent-retire / guardrail_retire.restore undo
+                 window. Archive-FIRST + drop-with-status-reverify: a record
+                 un-retired between snapshot and lock is kept (recoverable
+                 archive dup, never a live loss). Same locked_modify_jsonl path.
 
     by=lines     bound = max_lines newest records kept.
     by=age       bound = records with <ts_field> within retention_days kept;
                  older records dropped (cap) or archived (rotate).
 
-  NOT in scope (deliberately): status-based PHYSICAL compaction of active
-  knowledge stores (reasoning-bank/guardrails/pattern-signatures). That is
-  g-333-10 (G10) -- it is NOT in this keystone's stated collapse-set
-  (G5/G6/G8/G9/G11) and touching live retrievable knowledge needs its own
-  utility-aware policy. G10 may extend this helper with a `compact` mode.
+  COMPACT scope (g-333-10 / G10): the mode=compact path above is the keystone
+  extension for the active knowledge stores. It is status-aware (not oldest-N)
+  and age-graced, because those stores hold live retrievable knowledge whose
+  retirement carries a restore/audit window (guardrail_retire.restore reads
+  retired records from the live file; the age-grace keeps the recent-retire
+  window intact). Dropped records remain recoverable from <stem>-archive.jsonl
+  + the .history snapshot. valid_to is unused across these stores today, so no
+  live bitemporal reader depends on retired records staying in the live file.
 
 SAFETY
   - Every write routes through _fileops.locked_modify_jsonl -> cross-machine
@@ -133,7 +148,19 @@ def _glob_or_single(p: Path) -> list[Path]:
             if "*" in seg:
                 base = Path(*parts[:i]) if i else Path(".")
                 pattern = str(Path(*parts[i:]))
-                return sorted(base.glob(pattern))
+                # INVARIANT: a glob must NEVER match an archive sink. Rotation
+                # MOVES the oldest records INTO <stem>-archive<suffix>; if the
+                # same glob (e.g. world/board/*.jsonl) re-matched that sink, the
+                # next sweep would rotate it into a <stem>-archive-archive sink --
+                # an unbounded archive-of-archive chain (, observed
+                # 2026-06-26: coordination-archive-archive.jsonl). DEFAULT_ARCHIVE_SUFFIX
+                # is the sole archive marker (also used by _default_archive), so
+                # excluding it here keeps rotation from ever rotating the thing it
+                # rotates INTO. An EXPLICIT single-path target (no '*') still
+                # passes archives through, so a deliberate age-cap of one archive
+                # remains possible.
+                return [m for m in sorted(base.glob(pattern))
+                        if DEFAULT_ARCHIVE_SUFFIX not in m.stem]
         return []
     return [p]
 
@@ -151,7 +178,17 @@ def _snapshot(path: Path) -> list[dict]:
     Empty list if absent."""
     try:
         from storage_backend import get_backend
-        get_backend().refresh(path)
+        import owncloud_sync
+        be = get_backend()
+        # guard-881 / : refresh() force-pulls the remote copy over the
+        # local file. For a per-machine store (only-local writers, never pushed
+        # to S3) that overwrites the only good copy with stale/empty remote data
+        # -- a data-loss path. Skip refresh for any file owncloud_sync would
+        # never sync (presence/.history/sessions dirs + the basename machine-
+        # local policy); SYNCED stores (reasoning-bank, guardrails, ...) still
+        # refresh unchanged.
+        if not owncloud_sync.refresh_would_clobber(be, path):
+            be.refresh(path)
     except Exception as e:  # noqa: BLE001 - refresh is best-effort
         print(f"[jsonl-hygiene] (refresh skipped for {path.name}: {e})",
               file=sys.stderr)
@@ -223,6 +260,50 @@ def _select(items: list[dict], *, by: str, max_lines=None,
     raise ValueError(f"unknown by={by!r} (expected lines|age)")
 
 
+def _select_compact(items: list[dict], *, status_field="status",
+                    retired_values=("retired", "superseded"),
+                    grace_days=None, ts_field=None, today=None):
+    """Select non-active records eligible for status-based physical compaction.
+
+    Eligible = status in `retired_values` AND (no grace OR age >= grace_days).
+    Age is read from `ts_field`, falling back to `created` when absent on a
+    record (guardrails carry retirement_date; reasoning-bank / pattern-signatures
+    have only created/valid_from). A record whose age is unparseable is
+    CONSERVATIVELY KEPT (never archived on an undateable record), mirroring the
+    by=age cap policy. Active (retrieval-eligible) records are never selected.
+    Returns (eligible_records, reason).
+    """
+    retired = set(retired_values)
+    today = today or datetime.now().replace(microsecond=0)
+    cutoff = None if not grace_days or int(grace_days) <= 0 else \
+        today - timedelta(days=int(grace_days))
+    eligible = []
+    n_nonactive = 0
+    for rec in items:
+        if rec.get(status_field) not in retired:
+            continue
+        n_nonactive += 1
+        if cutoff is None:
+            eligible.append(rec)
+            continue
+        dt = _ts(rec, ts_field) if ts_field else None
+        if dt is None:
+            dt = _ts(rec, "created")
+        if dt is None:
+            continue  # conservative: never archive an undateable retired record
+        if dt < cutoff:
+            eligible.append(rec)
+    if n_nonactive == 0:
+        reason = f"no records with {status_field} in {sorted(retired)}"
+    elif not eligible:
+        reason = f"{n_nonactive} non-active, none older than grace ({grace_days}d)"
+    else:
+        reason = (f"{len(eligible)} of {n_nonactive} non-active eligible "
+                  f"(>= {grace_days}d old)" if cutoff else
+                  f"{len(eligible)} non-active (no grace)")
+    return eligible, reason
+
+
 def _default_archive(path: Path) -> Path:
     return path.with_name(path.stem + DEFAULT_ARCHIVE_SUFFIX + path.suffix)
 
@@ -232,11 +313,12 @@ def _default_archive(path: Path) -> Path:
 # ---------------------------------------------------------------------------
 def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
                 retention_days=None, ts_field=None, archive_path=None,
-                apply: bool = False) -> dict:
+                status_field="status", retired_values=("retired", "superseded"),
+                grace_days=None, apply: bool = False) -> dict:
     rep = {"path": str(path), "mode": mode, "by": by, "applied": False,
            "dropped": 0, "kept": None, "archive": None, "action": "none"}
-    if mode not in ("cap", "rotate"):
-        rep["error"] = f"unknown mode {mode!r} (expected cap|rotate)"
+    if mode not in ("cap", "rotate", "compact"):
+        rep["error"] = f"unknown mode {mode!r} (expected cap|rotate|compact)"
         return rep
 
     items = _snapshot(path)
@@ -244,6 +326,48 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
     rep["total"] = total
     if total == 0:
         rep["action"] = "absent-or-empty"
+        return rep
+
+    # mode=compact: status-based scattered selection ( / G10). A distinct
+    # path from the oldest-front-slice cap/rotate below — it moves status in
+    # {retired,superseded} records (older than grace_days) to the archive, so
+    # active retrieval-eligible records always stay.
+    if mode == "compact":
+        eligible, reason = _select_compact(
+            items, status_field=status_field, retired_values=retired_values,
+            grace_days=grace_days, ts_field=ts_field)
+        rep["reason"] = reason
+        rep["non_active"] = sum(
+            1 for r in items if r.get(status_field) in set(retired_values))
+        if not eligible:
+            rep["action"] = "within-bound"
+            rep["kept"] = total
+            return rep
+        archive = Path(archive_path) if archive_path else _default_archive(path)
+        rep["archive"] = str(archive)
+        rep["dropped"] = len(eligible)
+        rep["kept"] = total - len(eligible)
+        if not apply:
+            rep["action"] = "would-compact"
+            return rep
+        from _fileops import locked_modify_jsonl
+        # Phase 1: archive-FIRST (locked; a crash before Phase 2 leaves a
+        # recoverable dup in the archive, never a live loss).
+        locked_modify_jsonl(archive, lambda arch: (arch or []) + eligible)
+        # Phase 2: drop from live, re-verifying each target is STILL non-active in
+        # the fresh in-lock read. A record un-retired between snapshot and lock is
+        # KEPT (leaves a recoverable archive dup, never a live loss). Concurrent
+        # appends (new active records) survive untouched.
+        drop_ids = {r.get("id") for r in eligible if r.get("id")}
+        retired_set = set(retired_values)
+
+        def _drop_compacted(fresh):
+            return [r for r in fresh
+                    if not (r.get("id") in drop_ids
+                            and r.get(status_field) in retired_set)]
+        locked_modify_jsonl(path, _drop_compacted)
+        rep["action"] = "compacted"
+        rep["applied"] = True
         return rep
 
     n_drop, reason = _select(items, by=by, max_lines=max_lines,
@@ -343,6 +467,10 @@ def sweep(apply: bool = False) -> dict:
                     retention_days=cfg.get("retention_days"),
                     ts_field=cfg.get("ts_field"),
                     archive_path=cfg.get("archive_path"),
+                    status_field=cfg.get("status_field", "status"),
+                    retired_values=tuple(
+                        cfg.get("retired_values", ("retired", "superseded"))),
+                    grace_days=cfg.get("grace_days"),
                     apply=apply,
                 )
                 rep["owner_goal"] = cfg.get("owner_goal")
@@ -364,14 +492,22 @@ def main() -> int:
     r.add_argument("--path", required=True,
                    help="store path (virtual world/|meta/|agents/<a>/ prefix, "
                         "absolute, or cwd-relative; may contain a glob)")
-    r.add_argument("--mode", choices=("cap", "rotate"), default="rotate")
+    r.add_argument("--mode", choices=("cap", "rotate", "compact"), default="rotate")
     r.add_argument("--by", choices=("lines", "age"), default="lines")
     r.add_argument("--max-lines", type=int, default=None)
     r.add_argument("--retention-days", type=int, default=None)
     r.add_argument("--ts-field", default=None,
-                   help="record field holding the ISO timestamp (by=age)")
+                   help="record field holding the ISO timestamp (by=age, or "
+                        "compact age-grace; falls back to `created`)")
     r.add_argument("--archive-path", default=None,
-                   help="override archive file (rotate mode; default <stem>-archive<suffix>)")
+                   help="override archive file (rotate/compact mode; default <stem>-archive<suffix>)")
+    r.add_argument("--grace-days", type=int, default=None,
+                   help="compact mode: only archive non-active records older than "
+                        "this many days (default: no grace)")
+    r.add_argument("--status-field", default="status",
+                   help="compact mode: record field naming the lifecycle status")
+    r.add_argument("--retired-values", default="retired,superseded",
+                   help="compact mode: comma-separated status values to archive")
     r.add_argument("--apply", action="store_true", help="perform writes (default: dry-run)")
 
     s = sub.add_parser("sweep", help="bound every enabled store in store-hygiene.yaml")
@@ -395,7 +531,11 @@ def main() -> int:
             out.append(hygiene_one(
                 p, mode=args.mode, by=args.by, max_lines=args.max_lines,
                 retention_days=args.retention_days, ts_field=args.ts_field,
-                archive_path=args.archive_path, apply=args.apply))
+                archive_path=args.archive_path,
+                status_field=args.status_field,
+                retired_values=tuple(
+                    v.strip() for v in args.retired_values.split(",") if v.strip()),
+                grace_days=args.grace_days, apply=args.apply))
         except Exception as e:  # noqa: BLE001
             out.append({"path": str(p), "action": "error", "error": str(e)})
     print(json.dumps(out if len(out) > 1 else out[0], indent=2, default=str))

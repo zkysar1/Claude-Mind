@@ -31,6 +31,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -110,6 +111,64 @@ def is_skill(rel: str) -> bool:
     return rel.startswith(".claude/skills/")
 
 
+def git_last_commit_ts(repo_root: Path, rel_path: str) -> int | None:
+    """Return committer-date unix timestamp of the last commit touching rel_path, or None."""
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", rel_path],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return None
+
+
+def classify_direction(
+    src_root: Path, tgt_root: Path, rel_path: str,
+    src_abs: Path, tgt_abs: Path,
+) -> str:
+    """Classify a differing file as 'source_ahead', 'target_ahead', or 'ambiguous'."""
+    # Signal 1: git commit timestamps
+    src_ts = git_last_commit_ts(src_root, rel_path)
+    tgt_ts = git_last_commit_ts(tgt_root, rel_path)
+    if src_ts is not None and tgt_ts is not None:
+        if tgt_ts > src_ts:
+            return "target_ahead"
+        if src_ts > tgt_ts:
+            return "source_ahead"
+        # Equal timestamps -- fall through to content heuristic
+
+    # Signal 1b: filesystem mtime fallback (when git unavailable)
+    if src_ts is None or tgt_ts is None:
+        try:
+            s_mt = src_abs.stat().st_mtime
+            t_mt = tgt_abs.stat().st_mtime
+            # Require >60s difference to avoid filesystem noise
+            if t_mt - s_mt > 60:
+                return "target_ahead"
+            if s_mt - t_mt > 60:
+                return "source_ahead"
+        except OSError:
+            pass
+
+    # Signal 2: content-contains (strict superset check)
+    try:
+        src_content = src_abs.read_text(errors="replace")
+        tgt_content = tgt_abs.read_text(errors="replace")
+        src_lines = set(src_content.splitlines())
+        tgt_lines = set(tgt_content.splitlines())
+        if src_lines < tgt_lines:  # strict subset -> target is ahead
+            return "target_ahead"
+        if tgt_lines < src_lines:
+            return "source_ahead"
+    except Exception:
+        pass
+
+    return "ambiguous"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Promotion preflight drift gate (reconcile, not mirror).")
     ap.add_argument("--source", required=True, help="incoming repo (e.g. ../staging-repo)")
@@ -135,6 +194,19 @@ def main() -> int:
     source_only = sorted(s_keys - t_keys)
     differing = sorted(k for k in (s_keys & t_keys) if digest(S[k]) != digest(T[k]))
 
+    # Direction-classify every differing file
+    diff_target_ahead: list[str] = []
+    diff_source_ahead: list[str] = []
+    diff_ambiguous: list[str] = []
+    for k in differing:
+        direction = classify_direction(src, tgt, k, S[k], T[k])
+        if direction == "target_ahead":
+            diff_target_ahead.append(k)
+        elif direction == "source_ahead":
+            diff_source_ahead.append(k)
+        else:
+            diff_ambiguous.append(k)
+
     def bucket(keys):
         core = [k for k in keys if not is_skill(k) and k not in DEPLOYMENT_LOCAL]
         skills = [k for k in keys if is_skill(k)]
@@ -142,24 +214,28 @@ def main() -> int:
         return core, skills, deploy
 
     to_core, to_skills, to_deploy = bucket(target_only)      # ORPHAN RISK (target leads)
-    df_core, df_skills, df_deploy = bucket(differing)        # WILL CHANGE (direction unknown)
     so_core, so_skills, so_deploy = bucket(source_only)      # normal promotion payload
 
-    # Blocking drift: target-only core framework files are an UNAMBIGUOUS loss
-    # (a mirror promotion deletes them). With --strict, differing core files
-    # also block (each could be target-ahead).
-    blocking = list(to_core)
+    ta_core, ta_skills, ta_deploy = bucket(diff_target_ahead)
+    sa_core, sa_skills, sa_deploy = bucket(diff_source_ahead)
+    am_core, am_skills, am_deploy = bucket(diff_ambiguous)
+
+    # Blocking drift: target-only core (orphan risk) + target-ahead core (clobber risk)
+    # ALWAYS block -- not gated by --strict
+    blocking = list(to_core) + list(ta_core)
     if args.strict:
-        blocking += df_core
+        blocking += am_core  # ambiguous blocks only in strict mode
     drift = len(blocking) > 0
 
     if args.json:
         print(json.dumps({
             "source": str(src), "target": str(tgt), "strict": args.strict,
             "orphan_risk_core": to_core, "orphan_risk_skills": to_skills,
-            "differing_core": df_core, "differing_skills": df_skills,
-            "deployment_local_differing": sorted(set(to_deploy + df_deploy)),
-            "source_ahead_core": so_core, "source_ahead_skills": so_skills,
+            "target_ahead_core": ta_core, "target_ahead_skills": ta_skills,
+            "source_ahead_core": sa_core, "source_ahead_skills": sa_skills,
+            "ambiguous_core": am_core, "ambiguous_skills": am_skills,
+            "deployment_local_differing": sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy)),
+            "source_only_core": so_core, "source_only_skills": so_skills,
             "verdict": "DRIFT" if drift else "CLEAN", "exit": 2 if drift else 0,
         }, indent=2))
         return 2 if drift else 0
@@ -171,48 +247,55 @@ def main() -> int:
     print()
 
     if to_core:
-        print("⛔ ORPHAN RISK — framework files the TARGET has but SOURCE lacks.")
+        print("ORPHAN RISK -- framework files the TARGET has but SOURCE lacks.")
         print("   A mirror promotion would DELETE these. Back-port UP to source, or")
         print("   explicitly discard, BEFORE promoting:")
         for k in to_core:
             print(f"     {k}")
         print()
-    if df_core:
-        tag = "⛔ BLOCKED" if args.strict else "⚠ REVIEW"
-        print(f"{tag} — framework files that DIFFER (some may be target-ahead = clobber):")
-        for k in df_core:
+    if ta_core:
+        print("CLOBBER RISK -- framework files the TARGET LEADS ON (more recent).")
+        print("   A mirror promotion would REGRESS these. Back-port UP to source first:")
+        for k in ta_core:
             print(f"     {k}")
-        print("   Determine direction (target-ahead -> back-port first; source-ahead -> ok).")
+        print()
+    if am_core:
+        tag = "BLOCKED" if args.strict else "REVIEW"
+        print(f"{tag} -- framework files that DIFFER (direction ambiguous):")
+        for k in am_core:
+            print(f"     {k}")
+        print()
+    if sa_core:
+        print(f"source-ahead (verified): {len(sa_core)} core framework files (safe to overwrite)")
         print()
     if to_skills:
-        print(f"ℹ target-only skills ({len(to_skills)}) — usually domain/forged (deployment-local).")
+        print(f"target-only skills ({len(to_skills)}) -- usually domain/forged (deployment-local).")
         print("   VERIFY none is a base framework skill that drifted:")
         for k in to_skills[:40]:
             print(f"     {k.split('/')[2] if k.count('/') >= 2 else k}")
         if len(to_skills) > 40:
             print(f"     ... +{len(to_skills) - 40} more")
         print()
-    if to_deploy or df_deploy:
-        dl = sorted(set(to_deploy + df_deploy))
-        print(f"ℹ deployment-local files differing/only (expected, not drift): {', '.join(dl)}")
+    all_deploy = sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy))
+    if all_deploy:
+        print(f"deployment-local files differing/only (expected, not drift): {', '.join(all_deploy)}")
         print()
-    print(f"normal promotion payload (source-ahead): {len(so_core)} core + {len(so_skills)} skills + "
-          f"{len(df_skills)} differing skills")
+    print(f"normal promotion payload (source-only): {len(so_core)} core + {len(so_skills)} skills")
     print()
 
     if drift:
-        n = len(to_core) + (len(df_core) if args.strict else 0)
-        print(f"VERDICT: ⛔ DRIFT DETECTED — {len(to_core)} orphan-risk"
-              + (f" + {len(df_core)} differing(strict)" if args.strict else "")
+        print(f"VERDICT: DRIFT DETECTED -- {len(to_core)} orphan-risk"
+              + (f" + {len(ta_core)} target-ahead" if ta_core else "")
+              + (f" + {len(am_core)} ambiguous(strict)" if args.strict and am_core else "")
               + " framework file(s).")
         print("         Promotion would lose target-ahead content. Reconcile before overwriting. (exit 2)")
-        if not args.strict and df_core:
-            print(f"         (also {len(df_core)} differing framework files to review — run --strict to block on them too.)")
+        if not args.strict and am_core:
+            print(f"         (also {len(am_core)} ambiguous framework files -- run --strict to block on them too.)")
         return 2
 
-    print("VERDICT: ✅ CLEAN — target framework is a subset of source. Safe to promote. (exit 0)")
-    if df_core and not args.strict:
-        print(f"         (note: {len(df_core)} framework files differ — review with --strict if cautious.)")
+    print("VERDICT: CLEAN -- target framework is a subset of source. Safe to promote. (exit 0)")
+    if am_core and not args.strict:
+        print(f"         (note: {len(am_core)} ambiguous framework files -- review with --strict if cautious.)")
     return 0
 
 

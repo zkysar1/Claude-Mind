@@ -176,10 +176,41 @@ def test_cmd_cycles_through_real_projection():
     print("PASS: real-projection compact — tags stripped, Unblock: exclusion live")
 
 
+def test_near_complete_same_category_no_velocity_cycle():
+    """Aspiration with completion_ratio >= 0.8 and all recent goals in
+    same category -> no zero_learning_velocity cycle (g-001-12 fix).
+
+    Canonical incident: asp-006 (5/5 complete, value-proposition category)
+    was flagged zero_learning_velocity while having produced 4 distinct
+    knowledge tree nodes + an umbrella synthesis. The convergence shape
+    of a near-complete focused aspiration is NOT unproductive cycling.
+
+    Note: this test uses 5 completed goals in the same category. Without
+    the completion-ratio gate, the detector would proceed to the trajectory
+    probe (which would fail-open since no live trajectory exists in the
+    minimal compact fixture). The gate at completion_ratio >= 0.8 should
+    skip the probe entirely.
+    """
+    goals = [
+        {"id": f"g-test-{i}", "status": "completed", "title": f"P{i+1} work",
+         "tags": [], "category": "value-proposition"}
+        for i in range(5)
+    ]
+    compact = _build_compact(goals)
+    result = _run_cycles(compact)
+    cycles = result.get("cycles", [])
+    reasons = [c.get("reason") for c in cycles]
+    assert "zero_learning_velocity" not in reasons, (
+        f"Expected NO zero_learning_velocity for 5/5 complete aspiration, got: {cycles}"
+    )
+    print("PASS: 5/5 complete aspiration in same category -> no zero_learning_velocity (g-001-12)")
+
+
 if __name__ == "__main__":
     test_all_unblock_skips_no_cycle()
     test_genuine_repeated_failure_still_detected()
     test_synthetic_skips_fire_post_removal()
     test_cmd_cycles_through_real_projection()
+    test_near_complete_same_category_no_velocity_cycle()
     print()
-    print("ALL g-115-1211 cmd_cycles FILTER TESTS PASS")
+    print("ALL cmd_cycles FILTER TESTS PASS")

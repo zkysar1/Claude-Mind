@@ -36,6 +36,12 @@ SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
 ITERATION_CKPT_PATH = AGENT_DIR / "session" / "iteration-checkpoint.json"
 
 # Slots to skip in the "additional slots" section (already shown in dedicated sections)
+#  / zeta allowlist audit 8d: DEDICATED_SECTION_SLOTS + SCALAR_SLOTS_FULL
+# are a curated DISPLAY-FORMATTING subset of WM state, NOT a mirror of wm.py
+# DEFAULT_SLOT_TYPES. They intentionally include blocked_sleep_until -- a
+# compact-checkpoint field that is NOT a wm slot -- so a wm-slot parity test would
+# false-fail. A new wm slot simply falls through to the generic "additional slots"
+# display (graceful, not broken). => document, no test.
 DEDICATED_SECTION_SLOTS = {
     "active_context", "micro_hypotheses", "knowledge_debt",
     "known_blockers", "blocked_sleep_until",

@@ -821,3 +821,58 @@ def test_no_key_bleed_across_concurrent_contexts(cloud):
     t1.start(); t2.start(); t1.join(); t2.join()
     assert results["t1"] == f"pearl/{ENV_ID}/world/k.jsonl"
     assert results["t2"] == f"vinheim/{ENV_ID}/world/k.jsonl"
+
+
+# --- machine-local exclusion at the per-op backend (4 / rb-2396) ----
+# The exclusion policy (_EXCLUDE_DIRS dir-prune + _is_machine_local basenames)
+# lived only in owncloud_sync's periodic walk; the per-op backend was blind, so
+# jsonl_hygiene truncating world/presence/<agent>.jsonl via get_backend()._put
+# leaked it to S3. These pin the chokepoint guard added to _put / _refresh.
+def test_put_machine_local_path_writes_local_not_s3(cloud):
+    """world/presence/<agent>.jsonl is under _EXCLUDE_DIRS: _put writes the local
+    file but does NOT push to S3 (mirrors the sync-walk prune)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "presence" / "bravo.jsonl"
+    res = b.write_text(p, "tick\n")
+    assert p.read_text() == "tick\n"            # local written
+    assert res.fallback_used is False and res.version
+    key = b._s3_key(p)
+    with pytest.raises(ClientError):            # NO S3 object created
+        cloud["s3"].head_object(Bucket=BUCKET, Key=key)
+
+
+def test_put_normal_store_still_pushes_to_s3(cloud):
+    """A NORMAL governed store (world/reasoning-bank.jsonl) is NOT machine-local
+    and MUST still push to S3 -- guards the false-positive failure mode where an
+    over-broad exclusion silently stops a real store syncing to the commons."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "reasoning-bank.jsonl"
+    b.write_text(p, "real\n")
+    key = b._s3_key(p)
+    head = cloud["s3"].head_object(Bucket=BUCKET, Key=key)  # raises if absent
+    assert head["ContentLength"] == len("real\n")
+
+
+def test_refresh_machine_local_skips_s3_head(cloud, monkeypatch):
+    """_refresh on a machine-local path must not touch S3 (no HEAD/GET) -- the
+    local file is the source of truth, mirroring LocalBackend.refresh's no-op."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "presence" / "bravo.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("local-only\n")
+    def _boom(*a, **k):
+        raise AssertionError("head_object called for a machine-local path")
+    monkeypatch.setattr(b.s3, "head_object", _boom)
+    assert b.read_text(p, force_fresh=True) == "local-only\n"
+
+
+def test_machine_local_classification(cloud):
+    """_machine_local matches the sync-walk policy: _EXCLUDE_DIRS directories +
+    _is_machine_local basenames are local; ordinary world stores still sync."""
+    b = _backend(cloud)
+    R = cloud["root"]
+    assert b._machine_local(R / "world" / "presence" / "a.jsonl") is True   # _EXCLUDE_DIRS
+    assert b._machine_local(R / "world" / ".history" / "f.txt") is True     # _EXCLUDE_DIRS
+    assert b._machine_local(R / "world" / "changelog.jsonl") is True        # _EXCLUDE_NAMES
+    assert b._machine_local(R / "world" / "reasoning-bank.jsonl") is False  # syncs
+    assert b._machine_local(R / "world" / "knowledge" / "tree" / "x.md") is False  # syncs

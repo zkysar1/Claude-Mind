@@ -165,21 +165,16 @@ def _read_local_paths():
         )
         # fall through to the first-available glob below
 
-    # MIND_AGENT unset OR named a nonexistent agent — use first available conf.
-    # NOTE (8): do NOT warn on the empty-MIND_AGENT fall-through here,
-    # unlike _paths.sh. This module is imported at load time by pytest, the
-    # daemon, and direct `py -3` script runs where unset MIND_AGENT is normal —
-    # an unconditional warning floods all of them (and broke
-    # test_unset_agent_no_warning + collateral metric-gate tests when first
-    # tried).  deliberately kept the unset Python path silent; the
-    # named-but-nonexistent case above already warns. The hook-miss wrong-agent
-    # read is surfaced on the shell side (_paths.sh), which the PreToolUse hooks
-    # source with `2>/dev/null` so the warning fires only for LLM Bash tool calls.
-    # Skip empty or partial confs (no WORLD_PATH): an abandoned `/start <agent>`
-    # can leave an agent dir + an empty local-paths.conf that sorts first and
-    # would resolve WORLD_DIR=None (crashing the daemon at tree.py import when it
-    # runs agent-agnostic before any MIND_AGENT binding exists). Skipping
-    # WORLD_PATH-less confs lets the next usable conf win regardless of ordering.
+    # MIND_AGENT unset OR named a nonexistent agent — use the first available
+    # conf that actually resolves a WORLD_PATH. An empty or partial conf (e.g.
+    # an abandoned `/start <agent>` that created the agent dir + an empty
+    # local-paths.conf at Phase A2 but never completed Phase B path config)
+    # must NOT poison resolution by sorting first. Skipping WORLD_PATH-less
+    # confs lets the next usable conf win regardless of alphabetical ordering.
+    # (2026-06-14: an empty agents/delta/local-paths.conf sorted before omni's,
+    # resolving WORLD_DIR=None and crashing the daemon at tree.py import when
+    # the daemon ran agent-agnostic without MIND_AGENT — the SessionStart hook
+    # spawns it before any agent binding exists.)
     for conf in sorted(agents_root().glob("*/local-paths.conf")):
         parsed = _parse_conf(conf)
         if parsed.get("WORLD_PATH"):
@@ -296,6 +291,56 @@ else:
     AGENT_DIR = None
 
 
+# --- World contract vars ---
+# ENVIRONMENT_ID and COMMONS_POLICY live in .env.local (not local-paths.conf).
+# Priority for each: env var override > .env.local > default.
+# Fail-closed default for COMMONS_POLICY: 'private' (world-contract.md Rule 4).
+def _read_env_local() -> dict:
+    """Parse PROJECT_ROOT/.env.local, returning active KEY=value pairs.
+
+    Called once at import time to extract world-contract vars.
+    Returns {} when .env.local is absent (CI, fresh checkout).
+    Does not surface secrets — use env-read.sh for credential lookups.
+    """
+    import re
+    env_local = PROJECT_ROOT / ".env.local"
+    if not env_local.exists():
+        return {}
+    result = {}
+    _active = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+    for raw in env_local.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _active.match(line)
+        if m:
+            key, val = m.group(1), m.group(2).strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            result[key] = val
+    return result
+
+
+_env_local_vars = _read_env_local()
+
+# ENVIRONMENT_ID: stable world identity.
+# Used by: cross-world guardrails G4/G5, multi-world DDB isolation (Step 3.1),
+# generalization engine provenance (originWorldId). None when not configured.
+ENVIRONMENT_ID = (
+    os.environ.get("ENVIRONMENT_ID")
+    or _env_local_vars.get("ENVIRONMENT_ID")
+    or None
+)
+
+# COMMONS_POLICY: knowledge egress dial for the generalization engine.
+# Valid values: 'private' | 'selective' | 'public'.
+# Any unrecognized value fails closed to 'private' (world-contract.md Rule 4).
+_raw_policy = (
+    os.environ.get("COMMONS_POLICY") or _env_local_vars.get("COMMONS_POLICY") or ""
+).lower().strip()
+COMMONS_POLICY = _raw_policy if _raw_policy in ("private", "selective", "public") else "private"
+
+
 def assert_world_dir(module_name: str = "<unknown>") -> None:
     """Guard: raise loud RuntimeError if WORLD_DIR is None (no external path resolved).
 
@@ -373,6 +418,27 @@ def assert_agent_dir(module_name: str = "<unknown>") -> None:
         sys.stderr.write(msg)
         raise RuntimeError(
             f"{module_name}: MIND_AGENT not set — agent directory unresolved"
+        )
+
+
+def assert_environment_id(module_name: str = "<unknown>") -> None:
+    """Guard: raise loud RuntimeError if ENVIRONMENT_ID is None.
+
+    Consumers that require a world identity (cross-world guardrails G4/G5,
+    multi-world DDB isolation Step 3.1, provenance metadata) call this before
+    using ENVIRONMENT_ID to get a clear diagnostic instead of a silent None.
+
+    When ENVIRONMENT_ID IS set: silent no-op. Mirrors assert_world_dir pattern.
+    """
+    if ENVIRONMENT_ID is None:
+        msg = (
+            f"ERROR: {module_name}: ENVIRONMENT_ID not configured. Set "
+            f"ENVIRONMENT_ID=<world-name> in .env.local or as an env var. "
+            f"See core/config/conventions/world-contract.md.\n"
+        )
+        sys.stderr.write(msg)
+        raise RuntimeError(
+            f"{module_name}: ENVIRONMENT_ID not configured — world identity unknown"
         )
 
 

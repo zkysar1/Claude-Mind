@@ -1277,7 +1277,7 @@ else:
    # Return Protocol: EVERY sub-skill must end with a tool call, not text.
    # Dynamic check: every SKILL.md must contain a `## Return Protocol` section
    # EXCEPT hard-exempt user-only control commands that never run inside the loop.
-   # Exempt list: start, stop, open-questions, init, review, security-review, tree-reader.
+   # Exempt list: start, stop, open-questions, init, review, security-review, tree-reader, verify-learning.
    # Every other skill (base loop-invokable + hybrid + forged) needs RP.
    Bash: for f in .claude/skills/*/SKILL.md; do name=$(basename $(dirname "$f")); case "$name" in start|stop|open-questions|init|review|security-review|tree-reader|verify-learning) continue ;; esac; grep -q '^## Return Protocol' "$f" || echo "MISSING_RP: $name"; done → verify returns nothing (every non-exempt skill must have ## Return Protocol)
    # Branch-terminator audit: every procedural branch in every non-exempt skill must end with a tool call (Bash:/Skill(/invoke /), not text.

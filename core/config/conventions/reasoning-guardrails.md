@@ -6,9 +6,15 @@ Reasoning bank entries use JSONL (one JSON object per line) with script-based ac
 - `world/reasoning-bank.jsonl` — Live reasoning bank entries
 
 ## Record Schema
-Required: `id`, `title`, `type`, `category`, `content`, `created`
+Required: `id`, `title`, `type`, `category`, `content`, `applies_to`, `created`
 Defaults: `status` ("active"), `when_to_use` (""), `utilization` (zeros)
 Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`, `experience_ref`, `preventive_guardrail`, `entry_type`, `poignancy`
+
+`applies_to` (one of `any`, `framework`, `domain`, `specific`) scopes the
+lesson: `any` = cross-cutting methodology, `framework` = this framework's
+skills / scripts / gates, `domain` = the agent's deployment domain,
+`specific` = single-incident. Required on input — `reasoning-bank-add.sh`
+rejects records missing it.
 
 `experience_ref` (format `exp-SLUG`, see `experience.md`) links the lesson
 to the full-fidelity trace it was learned from. Completes the evidence

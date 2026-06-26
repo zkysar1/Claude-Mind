@@ -2820,6 +2820,28 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
         with file_locks.locked(live_path):
             items = _read_jsonl(live_path)
             found = _find_goal(items, goal_id)
+            # Detect goal-ID collision across queues.
+            # When the same goal_id exists in BOTH world and agent queues,
+            # claim previously resolved to the world copy silently regardless
+            # of caller intent. Now: if collision detected, refuse with 409
+            # so the caller picks a queue explicitly (agent-queue goals don't
+            # need claim; use recurring-close.sh or
+            # aspirations-update-goal.sh --source agent directly for those).
+            if found is not None:
+                agent_live = ctx.paths.agent / "aspirations.jsonl"
+                if agent_live.exists():
+                    try:
+                        agent_items = _read_jsonl(agent_live)
+                        if _find_goal(agent_items, goal_id) is not None:
+                            return Response.error(409, "goal_id_collision",
+                                f"Goal {goal_id} exists in BOTH world and "
+                                f"agent queues. Claim is ambiguous. Rename "
+                                f"one queue's copy, OR for the agent-queue "
+                                f"goal call recurring-close.sh / "
+                                f"aspirations-update-goal.sh --source agent "
+                                f"directly (agent goals don't require claims).")
+                    except Exception:
+                        pass
             if found is None:
                 agent_live = ctx.paths.agent / "aspirations.jsonl"
                 if agent_live.exists():

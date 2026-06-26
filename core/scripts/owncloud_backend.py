@@ -313,11 +313,50 @@ class OwnCloudBackend:
     def _local(self, path: PathLike) -> Path:
         return Path(path)
 
+    def _machine_local(self, path: PathLike) -> bool:
+        """True iff this path is machine-local per owncloud_sync's exclusion
+        policy -- the SAME _EXCLUDE_DIRS directory-prune + _is_machine_local
+        basename rules the periodic sync-walk applies (owncloud_sync L724 +
+        L751). The per-operation backend MUST honor it too: otherwise a per-op
+        write/refresh to an excluded path (e.g. jsonl_hygiene truncating
+        world/presence/<agent>.jsonl via get_backend()._put under
+        STORAGE_BACKEND=own-cloud) reaches S3 even though the walk prunes it,
+        diverging from the LocalBackend writer (presence-tick.py) and leaving
+        S3 lagging local for disposable per-agent telemetry (g-115-1654 /
+        rb-2396). NOTE _is_machine_local does NOT itself test _EXCLUDE_DIRS
+        (that is the walk's dirnames prune, not a per-file rule) -- so this
+        checks BOTH the directory-segment exclusion AND the basename policy.
+        Lazy import mirrors _overwrite_decision (L401): owncloud_sync is a peer
+        module imported at call time to avoid an import cycle. Fail-open: a
+        path under no configured root, or any owncloud_sync import error,
+        returns False (treat as syncable -- the exact pre-fix behavior)."""
+        try:
+            p = Path(path)
+            from owncloud_sync import _is_machine_local, _EXCLUDE_DIRS
+            for root, prefix in self._roots:
+                try:
+                    rel = p.relative_to(root)
+                except ValueError:
+                    continue
+                if any(seg in _EXCLUDE_DIRS for seg in rel.parts[:-1]):
+                    return True
+                return _is_machine_local(p.name, prefix,
+                                         full_path=p, root_path=root)
+        except Exception:
+            return False
+        return False
+
     # --- reads -------------------------------------------------------------
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
         """Ensure the local cache file is current vs S3, returning its path. On a
         fresh-enough cache (within cache_ttl) and not force_fresh, skips the HEAD.
         Records the current ETag in self._etags (the fence token, fix #3)."""
+        # g-115-1654: machine-local paths (_EXCLUDE_DIRS / _is_machine_local)
+        # are never on S3 -- the local file IS the source of truth. Skip the S3
+        # HEAD/GET entirely (mirrors LocalBackend.refresh's no-op), matching the
+        # sync-walk's exclusion so the per-op read path shares one policy.
+        if self._machine_local(path):
+            return self._local(path)
         key = self._s3_key(path)
         local = self._local(path)
         now = time.monotonic()
@@ -483,6 +522,19 @@ class OwnCloudBackend:
 
     # --- writes (with the If-Match fence) ----------------------------------
     def _put(self, path: PathLike, body: bytes) -> WriteResult:
+        # g-115-1654: machine-local paths (_EXCLUDE_DIRS / _is_machine_local)
+        # must NOT be pushed to S3 -- write the local file only, mirroring
+        # LocalBackend, so a per-op write (e.g. jsonl_hygiene presence
+        # truncation under own-cloud, reached via write_jsonl/append/mirror_put
+        # -> _put) shares the LocalBackend writer's backend and S3 never lags
+        # local for disposable per-agent telemetry (rb-2396). All writes funnel
+        # through _put, so this single guard covers every write path.
+        if self._machine_local(path):
+            local = self._local(path)
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(body)
+            return WriteResult(version=str(local.stat().st_mtime_ns),
+                               fallback_used=False)
         key = self._s3_key(path)
         local = self._local(path)
         local.parent.mkdir(parents=True, exist_ok=True)

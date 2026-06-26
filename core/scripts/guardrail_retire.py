@@ -364,7 +364,20 @@ def doc_referenced(guard_id, repo_root=None, corpus=None):
                 return (False, [])
         corpus = _read_doc_corpus(repo_root)
     needle = str(guard_id)
-    hits = [rel for rel, text in corpus if needle in text]
+    # Word-boundary match (): a raw substring containment check (the
+    # `in`-operator on each corpus text) lets a short guard ID (e.g. guard-14)
+    # collide with any longer cited ID sharing
+    # its prefix (guard-147), permanently shielding low-ID guards (guard-1..99)
+    # from retirement even when genuinely dormant. The over-keep direction is
+    # SAFE (doc_referenced is a HARD-KEEP gate, so the error never wrong-retires),
+    # but unlike the Layer-D coarse-match case (coarse-match-resilience tree node),
+    # there is NO downstream forced-analytical-pass to correct it — the over-keep
+    # is silent and permanent, so precision matters here. The trailing `(?![0-9])`
+    # blocks the guard-14-vs-guard-147 digit collision; the leading
+    # `(?<![A-Za-z0-9])` blocks partial-word matches (e.g. xguard-14). `re` is
+    # imported at module level; compile once, search each corpus entry.
+    pat = re.compile(r"(?<![A-Za-z0-9])" + re.escape(needle) + r"(?![0-9])")
+    hits = [rel for rel, text in corpus if pat.search(text)]
     return (bool(hits), hits)
 
 

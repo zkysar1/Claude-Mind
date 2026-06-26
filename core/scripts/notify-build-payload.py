@@ -102,10 +102,10 @@ def extract_self_identity(agent: str, project_root: Path) -> str:
     # Anchor on '# Self' heading. Works for both single- and double-front-matter
     # self.md shapes (bravo has two YAML blocks; alpha/echo/charlie/zeta/delta
     # have one) — the heading comes after all front matter in every shape.
-    # Relaxed from the original strict `^#+\s*Self\s*$` to also accept a
-    # labeled `# Self - <AgentName>` heading (some agents suffix the Self
-    # heading with the agent name). The strict form hard-exits(3) on a
-    # labeled heading, silently breaking that agent's notifications.
+    # Relaxed from the strict `^#+\s*Self\s*$` to also accept a labeled
+    # `# Self - <agent-name>` heading (some agents suffix the heading with the
+    # agent name); the strict form hard-exits(3) on a labeled heading, silently
+    # breaking that agent's notifications.
     heading = re.search(r"^#+\s*Self(\s.*)?$", text, re.MULTILINE)
     if not heading:
         print(

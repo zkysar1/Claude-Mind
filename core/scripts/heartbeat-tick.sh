@@ -34,6 +34,27 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 
+# --- Empty-AGENT_DIR gate ---------------------------------------------------
+# Refuse to tick when the agent env var was not injected — _paths.sh fail-opens
+# AGENT_DIR to empty string in that case (the loud-failure-on-next-FS-op
+# design from plan v1 step 0.1). Without this gate, `touch "$AGENT_DIR/...`
+# expands to `touch "/session/runner-heartbeat"` which fails with rc=1; set
+# -e then kills the script before team-state-update.sh and live-phase-emit.sh
+# run — both local + cross-agent heartbeats go stale silently.
+#
+# Root cause class: intermittent bash-agent-inject hook misses
+# (no_active_agent_binding telemetry confirms the class). Until the upstream
+# hook timing is fixed, this gate at least prevents the silent-skip downstream.
+#
+# Exit 2 (not 1) — matches the state-gate convention below: "refused, but
+# not a hard failure." Aspirations Phase -0.5 calls heartbeat-tick.sh
+# unconditionally and does not check rc; exit 2 keeps the loop alive.
+# stderr surfaces the diagnostic so the LLM-readable log captures the miss.
+if [ -z "${AGENT_DIR:-}" ] || [ -z "${MIND_AGENT:-}" ]; then
+    echo "heartbeat-tick: REFUSED — MIND_AGENT empty (AGENT_DIR=\"${AGENT_DIR:-}\"). bash-agent-inject hook likely did not fire for this Bash call. Heartbeat skipped (no /session write, no team-state update, no live-phase emit)." >&2
+    exit 2
+fi
+
 # --- State gate (g-115-NEW, 2026-05-13) -------------------------------------
 # Refuse to tick when agent-state=IDLE. Without this gate, a stop-hook-
 # cancelled loop death + recovery-gate's RUNNING→IDLE flip leaves callers

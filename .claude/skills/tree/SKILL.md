@@ -250,6 +250,19 @@ Break a single large node into children. Same as DECOMPOSE operation but targete
 node=$(bash core/scripts/tree-read.sh --node <key>)
 Read {node.file}
 
+# 1.5. COHERENCE GATE (rb-94: triage by coherence, not size). The size
+#      threshold over-flags long-form domain nodes. Before clustering, judge:
+#      do the ## sections cohere as ONE document (catalog with catalog-wide
+#      governance, single-source analysis, thesis, design spec with shared
+#      components, living list), or are they multiple INDEPENDENT topics that
+#      would each retrieve on their own? If COHERENT, do NOT decompose —
+#      mechanical splitting fragments retrieval and orphans cross-cutting
+#      sections. Record the judgment so the node never re-surfaces as a
+#      false-positive candidate:
+#        bash core/scripts/tree-update.sh --set <key> decompose_exempt true
+#      and STOP (get_decompose_candidates now skips decompose_exempt nodes).
+#      Only proceed to step 2+ when the node is genuinely INCOHERENT.
+
 # 2. Depth guard: abort if depth + 1 > D_max (6)
 IF node.depth + 1 > 6: abort "Cannot decompose — at max depth"
 
@@ -351,6 +364,17 @@ than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
    by introducing intermediate category nodes that partition the children into
    <=K_max balanced semantic groups:
    a. Read the node and its children to find the natural clustering.
+   a.5. COHERENCE GATE (rb-94: triage by coherence, not size). Before
+        clustering, judge whether the node's content coheres as ONE document
+        (catalog with catalog-wide governance, single-source analysis, thesis,
+        design spec with shared components, living list) or contains multiple
+        INDEPENDENT topics. If COHERENT, do NOT decompose — set
+        `bash core/scripts/tree-update.sh --set <key> decompose_exempt true`
+        and SKIP to the next candidate (the node is permanently exempted from
+        decompose candidacy; this is the durable fix for the long-form
+        false-positive churn rb-94 diagnosed). Only continue to b. when the
+        node is genuinely INCOHERENT. Default to COHERENT when ambiguous —
+        fragmenting a coherent doc is worse than leaving a large coherent one.
    b. Choose <=K_max kebab-case intermediate category names.
    c. Create the intermediate nodes as children of `<key>` (add-child), then
       REPARENT the existing children under the appropriate category via

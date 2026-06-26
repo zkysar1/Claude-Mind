@@ -539,6 +539,7 @@ fresh-eyes-tree:
   children: []
   type: review-ritual
   user-invocable: true
+  minimum_mode: assistant
   status: active
 seed:
   file: .claude/skills/seed/SKILL.md
@@ -546,4 +547,5 @@ seed:
   children: []
   type: utility
   user-invocable: true
+  minimum_mode: assistant
   status: active

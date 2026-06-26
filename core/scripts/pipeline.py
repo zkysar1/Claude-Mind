@@ -9,7 +9,7 @@ import json
 import os
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
@@ -438,6 +438,36 @@ def normalize_record(rec):
         if val is not None and not isinstance(val, str):
             rec[date_field] = str(val)
 
+    # Auto-default resolves_by for discovered short/long hypotheses ().
+    # validate_formation_quality soft-exempts stage=discovered from the
+    # resolves_by requirement, so a discovered short/long record created
+    # without one has no resolution anchor and sits un-resolvable until it is
+    # promoted (which re-validates) or manually backfilled -- the orphan class
+    #  had to clean up. Default it at creation: short -> +7d,
+    # long -> +30d from formed_date (matches the  backfill windows).
+    # Non-discovered stages keep the explicit-resolves_by contract enforced
+    # by validate_formation_quality.
+    if (
+        rec.get("stage", "discovered") == "discovered"
+        and rec.get("horizon", "") in ("short", "long")
+        and not rec.get("resolves_by")
+        and rec.get("formed_date")
+    ):
+        try:
+            _formed = datetime.strptime(str(rec["formed_date"])[:10], "%Y-%m-%d").date()
+            _window = 7 if rec["horizon"] == "short" else 30
+            _anchor = (_formed + timedelta(days=_window)).isoformat()
+            rec["resolves_by"] = _anchor
+            # Match the  backfill precedent: also set
+            # resolves_no_earlier_than to the same anchor so the draft is gated
+            # from selection (goal-selector hypothesis-gate) and from premature
+            # resolution (review-hypotheses not-due gate) until the window
+            # elapses. Preserve any pre-existing resolves_no_earlier_than.
+            if not rec.get("resolves_no_earlier_than"):
+                rec["resolves_no_earlier_than"] = _anchor
+        except (ValueError, TypeError):
+            pass  # malformed formed_date -- leave unset; discovered stays exempt
+
     return rec
 
 # ---------------------------------------------------------------------------
@@ -566,11 +596,11 @@ def compute_meta(live_items, archive_items):
         d["pct"] = round(d["confirmed"] / d["total"] * 100, 1) if d["total"] > 0 else 0.0
     meta["accuracy"]["by_depth"] = by_depth
 
-    # by_type (high-conviction / calibration / exploration / contrarian).
-    # Consumed by precheck-eval cmd_accuracy to segment the overconfidence
-    # signal: exploration hypotheses are designed-uncertain probes and must
-    # NOT drag the calibration-relevant accuracy that gates accuracy_low.
-    # Symmetric to by_strategy / by_time_horizon / by_depth.
+    # by_type ( / rb-268): segment resolved records by hypothesis type
+    # so the accuracy gate can exclude designed-uncertain `exploration` probes
+    # from the calibration-relevant overconfidence signal (canonical incident
+    # : aggregate 37.5% fired while high-conviction was 100% and the
+    # misses were all in exploration). Symmetric to by_depth above.
     by_type = {}
     for r in resolved_records:
         t = r.get("type")
@@ -584,25 +614,25 @@ def compute_meta(live_items, archive_items):
         t["pct"] = round(t["confirmed"] / t["total"] * 100, 1) if t["total"] > 0 else 0.0
     meta["accuracy"]["by_type"] = by_type
 
-    # by_confidence_band surfaces WHERE overconfidence concentrates. Bands:
-    # >=0.80 reliable ("high"); the 0.50-0.75 noise zone splits into "medium"
-    # (0.65-0.79) and "low" (<0.65). A high band with a low pct is the
-    # overconfidence-drift signal. Records without a numeric confidence are
-    # skipped (legacy). Mirror of pipeline_write._compute_meta - keep in sync.
-    by_confidence_band = {}
+    # by_confidence_band ( / rb-323): bucket resolved records by the
+    # confidence assigned at hypothesis time so cmd_accuracy can surface WHERE
+    # overconfidence concentrates. Bands: high>=0.80, medium 0.65-0.79, low<0.65.
+    # Records lacking a numeric confidence (or a bool, which is not a sensible
+    # confidence) are skipped — not bucketed.
+    by_band = {}
     for r in resolved_records:
         c = r.get("confidence")
-        if not isinstance(c, (int, float)):
+        if isinstance(c, bool) or not isinstance(c, (int, float)):
             continue
         band = "high" if c >= 0.80 else "medium" if c >= 0.65 else "low"
-        if band not in by_confidence_band:
-            by_confidence_band[band] = {"confirmed": 0, "total": 0, "pct": 0.0}
-        by_confidence_band[band]["total"] += 1
+        if band not in by_band:
+            by_band[band] = {"confirmed": 0, "total": 0, "pct": 0.0}
+        by_band[band]["total"] += 1
         if r["outcome"] == "CONFIRMED":
-            by_confidence_band[band]["confirmed"] += 1
-    for b in by_confidence_band.values():
+            by_band[band]["confirmed"] += 1
+    for b in by_band.values():
         b["pct"] = round(b["confirmed"] / b["total"] * 100, 1) if b["total"] > 0 else 0.0
-    meta["accuracy"]["by_confidence_band"] = by_confidence_band
+    meta["accuracy"]["by_confidence_band"] = by_band
 
     meta["last_updated"] = date.today().isoformat()
     return meta

@@ -12,7 +12,7 @@ config:
   split_threshold: 3
   merge_threshold: 1
   min_articles_per_child: 2
-  decompose_threshold: 80               # line count triggering DECOMPOSE of monolith files
+  decompose_threshold: 250              # line count triggering DECOMPOSE of monolith files (raised 80→250 — P50=213/P75=282/P90=329 leaf distribution; 80 was a default tuned for shorter-form content and was flagging 82% of leaves as candidates, fragmenting coherent theses/catalogs/source-analyses; 250 catches genuinely oversized nodes while preserving long-form document coherence)
   max_decompose_per_invocation: 50     # max DECOMPOSE ops per /tree maintain run (raised 30→50 at config ceiling 2026-04-18 to match framework-expansion growth rate, g-115-79)
   max_redistribute_per_invocation: 5   # max REDISTRIBUTE ops per /tree maintain run
   compression_ratio_formula: "10 * 1.5^(depth - 2)"  # target compression at each depth
@@ -97,6 +97,26 @@ retrieval:
   poignancy_blend_enabled: false                # master flag — false = current behavior
   poignancy_weight_min: 1.0                      # factor at poignancy=1 (and null→neutral)
   poignancy_weight_max: 1.5                      # factor at poignancy=10
+  # M-4: Rehearsal-weighted decay parameters.
+  # Frequently-retrieved nodes get a longer recency TAU, so their recency bonus
+  # persists longer. Uses retrieval_count (monotonic, safe) not last_retrieved
+  # (incremented by scoring — runaway feedback).
+  # Formula: effective_tau = clamp(base + retrieval_count / scale, base, max).
+  rehearsal_tau_base: 30              # base TAU_DAYS (matches RECENCY_TAU_DAYS)
+  rehearsal_tau_max: 120              # ceiling — even heavily-retrieved nodes decay eventually
+  rehearsal_tau_scale: 5.0            # retrieval_count units per +1 TAU day (linear ramp)
+  rehearsal_neutral_below: 5          # below this retrieval_count, TAU stays at base
+
+# M-6: Per-module success-rate tracking.
+# Tracks which retrieval modules (tree categories, supplementary stores) produce
+# helpful results.  Updated by utilization-feedback.py; read by retrieve.py for
+# retrieval-priority and by aspirations-evolve for reconsolidation triggers.
+# Storage: world/module-health.yaml (world-scoped, survives sessions).
+module_health:
+  tree_reconsolidation_threshold: 0.4       # success_rate below this triggers reconsolidation
+  tree_reconsolidation_min_invocations: 50   # minimum invocations before threshold applies
+  supp_reconsolidation_threshold: 0.3        # supplementary store threshold
+  supp_reconsolidation_min_invocations: 100  # supplementary store minimum invocations
 
 # Scheduled tree debt check (Phase 4 of cognitive-core curation plan).
 # Runs every N goals in the aspirations loop; invokes /tree maintain when
@@ -126,7 +146,7 @@ maintenance:
 # (EXPLOIT/MASTER 8→16, CALIBRATE 4→8) and mode reverted to `warn` to remove
 # write-time override ceremony while preserving the structural-fix signal.
 # Real distribution at retune time: 6 of 975 nodes over the 8-cap (0.6%);
-# under the new caps, only domain-intelligence (CALIBRATE, 15) is over-cap and
+# under the new caps, only a domain-specific junk-drawer category (CALIBRATE, 15) is over-cap and
 # IS a genuine junk drawer worth flagging via warn. EXPLORE stays at 2 —
 # early-stage parents should still genuinely deepen first.
 # Mode values: warn | block | off. Warn mode: log [child-limit] WARN to
@@ -162,7 +182,7 @@ modifiable:
   split_threshold: {min: 3, max: 10, default: 3}
   merge_threshold: {min: 1, max: 3, default: 1}
   min_articles_per_child: {min: 1, max: 4, default: 2}
-  decompose_threshold: {min: 50, max: 300, default: 80}
+  decompose_threshold: {min: 50, max: 300, default: 250}
   max_decompose_per_invocation: {min: 1, max: 50, default: 30}
   max_redistribute_per_invocation: {min: 1, max: 10, default: 5}
   max_entities: {min: 50, max: 500, default: 200}
@@ -185,6 +205,10 @@ modifiable:
   retrieval_utility_weight_min: {min: 0.1, max: 0.9, default: 0.5}
   retrieval_utility_weight_max: {min: 1.0, max: 2.5, default: 1.5}
   retrieval_utility_weight_neutral_below_retrievals: {min: 2, max: 20, default: 5}
+  # M-4 — rehearsal-weighted decay (adaptive TAU for recency bonus).
+  rehearsal_tau_base: {min: 10, max: 60, default: 30, step: 5}
+  rehearsal_tau_max: {min: 60, max: 365, default: 120, step: 30}
+  rehearsal_tau_scale: {min: 1.0, max: 20.0, default: 5.0, step: 1.0}
   # Phase 4 — scheduled tree debt check.
   tree_debt_check_interval_goals: {min: 1, max: 10, default: 3}
   tree_debt_check_debt_threshold: {min: 5, max: 100, default: 20}
@@ -274,6 +298,7 @@ node_templates:
     times_helpful: 0                       # Phase 4.26 feedback: node content informed execution
     times_noise: 0                         # Phase 4.26 feedback: node content was irrelevant/misleading
     utility_ratio: 0.0                     # computed: times_helpful / max(retrieval_count, 1)
+    # provenance: DIRECT | INFERRED | SYNTHESIZED | HEARSAY  # M-5: evidential weight tag (optional; legacy nodes default to 0.9 weight)
 
 
   # Generic YAML front matter for node .md files at any depth L2-L6

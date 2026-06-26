@@ -71,6 +71,14 @@ def _domain_prefixes():
 
 DOMAIN_PREFIXES = _domain_prefixes()
 
+#  / zeta allowlist audit 8a: METHODOLOGY_TERMS stays HARDCODED here by
+# design (no parity test, no externalization). Unlike DOMAIN_PREFIXES above --
+# which moved to the world overlay because domain prefixes are domain-specific --
+# these methodology terms are framework-GENERIC (identical in any domain), so
+# externalizing them to world/config would make them vanish in a fresh world and
+# break classification. There is no controlled upstream to diff against (the
+# jsonl category vocab grows organically); an unrecognized term simply falls to
+# "uncertain" -- a soft outcome, not a misclassification. => document, no test.
 METHODOLOGY_TERMS = {
     "code", "code-quality", "code-review",
     "hypothesis-accuracy", "hypothesis-calibration",

@@ -37,9 +37,16 @@ sys.path.insert(0, str(WORLD_SCRIPTS))
 
 import importlib.util
 
-spec = importlib.util.spec_from_file_location(
-    "stale_jobs_scan", WORLD_SCRIPTS / "stale-jobs-scan.py"
-)
+_TARGET = WORLD_SCRIPTS / "stale-jobs-scan.py"
+if not _TARGET.exists():
+    import pytest
+    pytest.skip(
+        f"stale-jobs-scan.py not found at {_TARGET} — domain-specific "
+        "regression test, no equivalent in this domain.",
+        allow_module_level=True,
+    )
+
+spec = importlib.util.spec_from_file_location("stale_jobs_scan", _TARGET)
 sjs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sjs)
 

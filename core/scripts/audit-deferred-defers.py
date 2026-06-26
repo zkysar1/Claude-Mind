@@ -67,6 +67,14 @@ DEFER_NARRATIVE_PATTERNS = [
 ]
 
 # Cat-A signals — structurally legitimate defers
+# g-303-21 / zeta allowlist audit 8b: GENUINE_PREFIXES/GENUINE_PATTERNS are
+# AUDIT-side heuristics ("is this existing defer genuine?"), deliberately broader
+# than and distinct in PURPOSE from gates/defer_classifier.STRUCTURED_DEFER_PREFIXES
+# (which ROUTES new defers). They overlap (precondition_unmet:, blocked_on_dependency)
+# but differ by design: the audit adds "time-gated:" and handles circuit-breaker via
+# the GENUINE_PATTERNS free-text list below, not a prefix. GENUINE_PATTERNS has no
+# source anchor (content heuristics). A forced parity test would false-fail.
+# => document, no test.
 GENUINE_PREFIXES = (
     "blocked_on_dependency:",
     "precondition_unmet:",

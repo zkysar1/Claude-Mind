@@ -354,99 +354,107 @@ def test_read_world_path_from_conf_strips_quotes_and_comments(tmp_path):
 
 
 # ============================================================================
-# Orphan removal -- living-prod-safe preservation (FM-2, 2026-06-25 cutover)
+# Cruft cleanup — living-prod preservation guard
 # ----------------------------------------------------------------------------
-# Background (2026-06-25, v2.1.1 cutover incident FM-2):
-#   remove-orphans deleted living-prod files absent from the dev source include
-#   set: the deployment-local .claude/rules/promotion-cycle.md (each repo names
-#   its own chain position) and gitignored operational dirs (.python-shim,
-#   core/logs, mind_api/state, .history). A framework promotion reconciles
-#   FRAMEWORK source files only -- these are per-deployment/runtime state and
-#   must survive. _is_preserved_at_dest is the single chokepoint; these tests
-#   pin the expanded preserve set without over-broadening (a genuine framework
-#   orphan is still removed).
+# Background (2026-06-25, FM-2 incident / seed-transplant-reconcile-gaps):
+#   do_clean_cruft iterates cruft_patterns from the manifest and deletes
+#   unconditionally. Unlike do_remove_orphans, it had NO _is_preserved_at_dest
+#   guard. If a cruft_pattern matches a deployment-local file or a domain
+#   forged-skill directory (e.g. .claude/skills/notify-user/), the function
+#   destroys it. Fix: when preserve_deployment_local=True (--living-prod mode),
+#   do_clean_cruft guards each deletion with _is_preserved_at_dest and
+#   _is_protected_dest_skill. Skipped items are reported in skipped_preserved.
 # ============================================================================
 
-def _src_with_base_file(src: Path) -> dict:
-    """Source carries one framework file; manifest includes core/scripts so the
-    resolved include set is {core/scripts/keep.sh}. Everything else at dest is
-    an orphan candidate unless preserved."""
-    _w(src / "core" / "scripts" / "keep.sh", "kept framework file")
-    return {"include": [{"path": "core/scripts", "type": "dir"}],
-            "exclude_always": []}
+def _cruft_manifest(cruft_patterns, extra_include=None):
+    """Build a minimal manifest with cruft_patterns."""
+    m = {"cruft_patterns": cruft_patterns, "include": [], "exclude_always": []}
+    if extra_include:
+        m["include"] = extra_include
+    return m
 
 
-def test_orphan_removal_preserves_deployment_local_promotion_cycle(tmp_path):
-    """promotion-cycle.md is deployment-local (each repo names its own chain
-    position) and absent from the dev source -- must NOT be orphan-deleted."""
-    src = tmp_path / "src"
+def test_clean_cruft_preserves_forged_skill_dir_with_living_prod(tmp_path):
+    """Headline: a domain forged-skill directory listed as cruft is NOT deleted
+    when preserve_deployment_local=True and the dest registry lists it."""
     dest = tmp_path / "dest"
-    manifest = _src_with_base_file(src)
+    _w(dest / ".claude" / "skills" / "notify-user" / "SKILL.md", "forged domain skill")
+    _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="notify-user"))
+    # Also create a genuine cruft file that SHOULD be removed
+    _w(dest / ".active-agent-abc123", "stale binding")
 
-    _w(dest / "core" / "scripts" / "keep.sh", "old framework")          # in expected
-    _w(dest / ".claude" / "rules" / "promotion-cycle.md", "ZDS prod")   # deployment-local
-    _w(dest / ".claude" / "orphan.md", "removed upstream")              # genuine orphan
+    manifest = _cruft_manifest([
+        ".claude/skills/notify-user/",   # domain skill — should be preserved
+        ".active-agent-*",               # genuine cruft — should be removed
+    ])
 
-    result = _engine.do_remove_orphans(dest, manifest, src)
+    result = _engine.do_clean_cruft(dest, manifest, preserve_deployment_local=True)
 
-    assert (dest / ".claude" / "rules" / "promotion-cycle.md").exists()
-    assert ".claude/rules/promotion-cycle.md" not in result["removed"]
-    assert not (dest / ".claude" / "orphan.md").exists()
-    assert ".claude/orphan.md" in result["removed"]
+    # Domain skill preserved
+    assert (dest / ".claude" / "skills" / "notify-user" / "SKILL.md").exists()
+    assert ".claude/skills/notify-user/" in result["skipped_preserved"]
+    # Genuine cruft removed
+    assert not (dest / ".active-agent-abc123").exists()
+    assert ".active-agent-abc123" in result["removed"]
 
 
-def test_orphan_removal_preserves_claude_md_and_settings(tmp_path):
-    """CLAUDE.md and .claude/settings.json are deployment-local -- preserved."""
-    src = tmp_path / "src"
+def test_clean_cruft_preserves_deployment_local_file_with_living_prod(tmp_path):
+    """A deployment-local file (.env.local) matched by a cruft pattern is NOT
+    deleted when preserve_deployment_local=True."""
     dest = tmp_path / "dest"
-    manifest = _src_with_base_file(src)
+    _w(dest / ".env.local", "SECRET=foo")
+    _w(dest / ".stale-lockfile", "cruft")
 
-    _w(dest / "core" / "scripts" / "keep.sh", "x")
-    _w(dest / "CLAUDE.md", "prod CLAUDE.md")
-    _w(dest / ".claude" / "settings.json", "{}")
+    manifest = _cruft_manifest([
+        ".env.local",        # deployment-local — should be preserved
+        ".stale-lockfile",   # genuine cruft — should be removed
+    ])
 
-    _engine.do_remove_orphans(dest, manifest, src)
+    result = _engine.do_clean_cruft(dest, manifest, preserve_deployment_local=True)
 
-    assert (dest / "CLAUDE.md").exists()
-    assert (dest / ".claude" / "settings.json").exists()
+    assert (dest / ".env.local").exists()
+    assert ".env.local" in result["skipped_preserved"]
+    assert not (dest / ".stale-lockfile").exists()
+    assert ".stale-lockfile" in result["removed"]
 
 
-def test_orphan_removal_preserves_gitignored_operational_paths(tmp_path):
-    """Gitignored operational dirs (daemon state, logs, shim, history) are
-    regenerable runtime state -- a framework promotion must never delete them."""
-    src = tmp_path / "src"
+def test_clean_cruft_removes_everything_without_living_prod(tmp_path):
+    """Without preserve_deployment_local, cruft cleanup removes everything
+    (backward-compatible behavior)."""
     dest = tmp_path / "dest"
-    manifest = _src_with_base_file(src)
+    _w(dest / ".claude" / "skills" / "notify-user" / "SKILL.md", "domain skill")
+    _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="notify-user"))
+    _w(dest / ".active-agent-abc123", "stale binding")
 
-    _w(dest / "core" / "scripts" / "keep.sh", "x")
-    _w(dest / ".python-shim" / "python3", "shim")
-    _w(dest / "core" / "logs" / "watchdog.jsonl", "log")
-    _w(dest / "mind_api" / "state" / "db.sqlite", "state")
-    _w(dest / ".history" / "blob", "hist")
-    _w(dest / ".claude" / ".history" / "edit", "hist")
+    manifest = _cruft_manifest([
+        ".claude/skills/notify-user/",
+        ".active-agent-*",
+    ])
 
-    result = _engine.do_remove_orphans(dest, manifest, src)
+    result = _engine.do_clean_cruft(dest, manifest, preserve_deployment_local=False)
 
-    assert (dest / ".python-shim" / "python3").exists()
-    assert (dest / "core" / "logs" / "watchdog.jsonl").exists()
-    assert (dest / "mind_api" / "state" / "db.sqlite").exists()
-    assert (dest / ".history" / "blob").exists()
-    assert (dest / ".claude" / ".history" / "edit").exists()
-    assert result["removed"] == []  # only preserved + expected present
+    # Everything removed — no preservation
+    assert not (dest / ".claude" / "skills" / "notify-user" / "SKILL.md").exists()
+    assert not (dest / ".active-agent-abc123").exists()
+    assert ".claude/skills/notify-user/" in result["removed"]
+    assert result["skipped_preserved"] == []
 
 
-def test_orphan_removal_still_removes_genuine_framework_orphan(tmp_path):
-    """Control: a real framework orphan (under core/, absent from source) is
-    still removed -- FM-2 preservation did not over-broaden."""
-    src = tmp_path / "src"
+def test_clean_cruft_preserves_operational_dir_with_living_prod(tmp_path):
+    """Gitignored operational directories (core/logs/) are preserved when
+    preserve_deployment_local=True and matched by a glob cruft pattern."""
     dest = tmp_path / "dest"
-    manifest = _src_with_base_file(src)
+    _w(dest / "core" / "logs" / "watchdog-alpha.jsonl", "log data")
+    _w(dest / "core" / "stale-cruft.tmp", "cruft")
 
-    _w(dest / "core" / "scripts" / "keep.sh", "x")
-    _w(dest / "core" / "scripts" / "removed-upstream.py", "stale")  # genuine orphan
+    manifest = _cruft_manifest([
+        "core/logs/",         # operational dir — should be preserved
+        "core/stale-cruft.tmp",  # genuine cruft — should be removed
+    ])
 
-    result = _engine.do_remove_orphans(dest, manifest, src)
+    result = _engine.do_clean_cruft(dest, manifest, preserve_deployment_local=True)
 
-    assert (dest / "core" / "scripts" / "keep.sh").exists()
-    assert not (dest / "core" / "scripts" / "removed-upstream.py").exists()
-    assert "core/scripts/removed-upstream.py" in result["removed"]
+    assert (dest / "core" / "logs" / "watchdog-alpha.jsonl").exists()
+    assert "core/logs/" in result["skipped_preserved"]
+    assert not (dest / "core" / "stale-cruft.tmp").exists()
+    assert "core/stale-cruft.tmp" in result["removed"]

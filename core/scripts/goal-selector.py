@@ -86,6 +86,12 @@ ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # termina
 # means the criterion contributes 0 — never errors when supports[] is unset.
 _ASP_COMPLETION_RATIOS: dict = {}
 _STRUCTURED_DEFER_PREFIXES_LOWER = tuple(p.lower() for p in STRUCTURED_DEFER_PREFIXES)
+# 6: the one structured prefix that NEVER auto-clears. collect_eligible
+# and collect_blocked exempt it from the 120h defer fall-through so a genuinely
+# human-gated goal stays suppressed-from-selector + counted-in-blocked[] (enabling
+# quiescence) instead of re-surfacing as a candidate every iteration. The other
+# structured prefixes keep the fail-open expiry (their sweeps auto-clear them).
+_HUMAN_BLOCKED_PREFIX = "human_blocked:"
 
 
 def _synth_blocker_ref_from_structured_defer(goal):
@@ -256,36 +262,6 @@ WEIGHTS = load_weights()
 # handoff_bonus: raw value IS the bonus (not scaled). Configured in
 # meta/goal-selection-strategy.yaml like every other weight — no setdefault
 # fallback (, rb-215 single-source-of-truth).
-
-
-# opportunity_boost: optional, config-driven scoring boost for "opportunity"
-# categories (revenue, growth, etc.) so a deployment can make that work outrank
-# ROUTINE recurring maintenance in the selector without a manual per-iteration
-# override. DORMANT by default: categories come from
-# meta/goal-selection-strategy.yaml (opportunity_categories) and are empty in
-# the framework default, so the boost is 0.0 for every goal and the selector is
-# unchanged. A deployment activates it by listing categories there AND setting
-# weights.opportunity_boost (clamped to [0,3] by load_weights). The boost only
-# reorders score-gated routine goals; it CANNOT starve sentinel-gated critical
-# maintenance (tree-debt, experience-archival, etc.), which is gated in
-# aspirations-precheck, not score-gated. Domain values live in domain config,
-# never hardcoded in the framework.
-def load_opportunity_categories():
-    """Load opportunity-pursuit categories from meta/goal-selection-strategy.yaml.
-
-    Returns a frozenset; empty when the key is absent (framework default).
-    """
-    try:
-        with open(META_GOAL_SELECTION, encoding="utf-8") as f:
-            meta = yaml.safe_load(f) or {}
-        cats = meta.get("opportunity_categories") or []
-        return frozenset(str(c) for c in cats)
-    except (OSError, TypeError, ValueError):
-        return frozenset()
-
-
-OPPORTUNITY_CATEGORIES = load_opportunity_categories()
-OPPORTUNITY_BOOST_VALUE = 2.0
 
 # Override-key prefix for aspirations.yaml — see world/conventions/capability-routing.md
 # "Currently wired readers" list. Keep in sync with _OVERRIDE_FILE_PREFIX in tree.py.
@@ -1259,6 +1235,14 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # never reached the time gate at L678-685.)
             if goal.get("defer_reason"):
                 if not goal.get("deferred_until"):
+                    # human_blocked: never expires (6). A genuinely
+                    # human-gated block can never auto-clear, so the 120h
+                    # fall-through below would wrongly re-surface it as a live
+                    # candidate every iteration. Always skip it (excluded from
+                    # candidates); collect_blocked routes it to blocked[] with a
+                    # synthesized blocker_ref so quiescence can fire.
+                    if (goal.get("defer_reason") or "").lower().startswith(_HUMAN_BLOCKED_PREFIX):
+                        continue
                     # No structural gate — apply expiry logic
                     if defer_reason_timeout_hours is not None:
                         defer_age = hours_since(goal.get("defer_reason_set_at"))
@@ -1621,6 +1605,17 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             # with both fields as "deferred" even when deferred_until had passed.)
             if goal.get("defer_reason"):
                 if not goal.get("deferred_until"):
+                    # human_blocked: never expires (6). Keep it in
+                    # blocked[] (synth blocker_ref already set on `entry` above by
+                    # _synth_blocker_ref_from_structured_defer) so all_blocked can
+                    # be asserted and quiescence fires, instead of falling through
+                    # to the candidate pool every iteration.
+                    if (goal.get("defer_reason") or "").lower().startswith(_HUMAN_BLOCKED_PREFIX):
+                        entry["block_reason"] = "deferred"
+                        entry["block_detail"] = "Human-blocked: {reason}".format(
+                            reason=goal.get("defer_reason", ""))
+                        blocked.append(entry)
+                        continue
                     # No structural gate — apply expiry logic
                     if defer_reason_timeout_hours is not None:
                         defer_age = hours_since(goal.get("defer_reason_set_at"))
@@ -2120,7 +2115,33 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     total_goals, done_goals = effective_counts(
         asp, exclude_statuses=ABANDONED_STATUSES)
     completion_ratio = done_goals / total_goals if total_goals > 0 else 0
-    raw["completion_pressure"] = (completion_ratio ** 2) * 2.5
+    # Completability factor (0; zeta rb-2384 / exp-0). Bare
+    # completion_ratio² radiated near-max pressure FOREVER from never-completable
+    # aspirations — recurring catch-alls (: recurring goals refill `total`
+    # indefinitely so the ratio is pinned ~0.96) and blocked tails (:
+    # gap-to-1.0 all blocked) — structurally starving achievable product lanes
+    # ( Vinheim, 8-day stall). `completability` = the share of the remaining
+    # gap that is genuine achievable terminal progress (pending/in-progress AND
+    # non-recurring; blocked + recurring goals never close the gap). Folding it
+    # into the ratio BEFORE squaring keeps the existing quadratic shape:
+    # completion_pressure becomes (achievable_completion_ratio)². A genuine all-
+    # pending tail (completability == 1.0) is BYTE-IDENTICAL to the prior formula;
+    # only recurring/blocked-dominated aspirations are discounted (by the square of
+    # their unachievable share). This is a completability FACTOR, NOT a denominator
+    # swap (done/achievable_total RAISES the blocked-tail ratio — wrong direction,
+    # rb-2384). Live goals are never evicted (eviction removes only NON-RECURRING
+    # TERMINAL goals, _goal_census.py:91) so the completable count is complete.
+    # Due hygiene is unaffected: it rides recurring_urgency + cadence-gating.
+    _remaining = total_goals - done_goals
+    if _remaining > 0:
+        _completable = sum(
+            1 for _g in (asp.get("goals") or [])
+            if _g.get("status") in ("pending", "in-progress")
+            and not _g.get("recurring"))
+        _completability = min(1.0, _completable / _remaining)
+    else:
+        _completability = 1.0
+    raw["completion_pressure"] = ((completion_ratio * _completability) ** 2) * 2.5
 
     # 8c. tail_bonus (surface frontier goals as an aspiration nears completion)
     # Zero below 50% completion. As the tail shrinks, each remaining goal gets
@@ -2194,16 +2215,6 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 13b. directive_boost (cross-agent priority influence from board directives)
     raw["directive_boost"] = directive_boost_score(
         goal.get("id", ""), category)
-
-    # 13b.1 opportunity_boost: config-driven category boost (dormant by
-    # default). When a deployment lists opportunity-pursuit categories in
-    # meta/goal-selection-strategy.yaml AND sets weights.opportunity_boost,
-    # goals in those categories outrank routine recurring maintenance without a
-    # per-iteration override. Empty categories (framework default) -> 0.0 for
-    # every goal. Only reorders score-gated routine goals; cannot starve
-    # sentinel-gated critical maintenance (see OPPORTUNITY_CATEGORIES).
-    raw["opportunity_boost"] = (
-        OPPORTUNITY_BOOST_VALUE if category in OPPORTUNITY_CATEGORIES else 0.0)
 
     # 13c. handoff_bonus (cross-agent handoff routing).
     # A planning/reviewer agent files implementer-targeted goals via

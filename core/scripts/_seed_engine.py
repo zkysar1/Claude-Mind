@@ -515,21 +515,69 @@ def do_swap(dest_root: Path) -> dict:
 # Cruft cleanup
 # ============================================================================
 
-def do_clean_cruft(dest_root: Path, manifest: dict) -> dict:
-    """Remove cruft_patterns at destination."""
+def do_clean_cruft(dest_root: Path, manifest: dict, *,
+                   preserve_deployment_local: bool = False) -> dict:
+    """Remove cruft_patterns at destination.
+
+    When *preserve_deployment_local* is True (``--living-prod`` mode),
+    every candidate is checked against ``_is_preserved_at_dest`` and
+    ``_is_protected_dest_skill`` before deletion. Matches are skipped
+    and reported in ``skipped_preserved`` so callers can see what was
+    protected.
+    """
     patterns = manifest.get("cruft_patterns", [])
     removed = []
+    skipped_preserved = []
+
+    # Build dest forged-skill protection set (same logic as do_remove_orphans)
+    if preserve_deployment_local:
+        dest_forged = _dest_forged_skill_names(dest_root)
+        protect_all_skills = dest_forged is None
+        forged_prefixes = set() if dest_forged is None else {
+            f".claude/skills/{n}" for n in dest_forged
+        }
+    else:
+        protect_all_skills = False
+        forged_prefixes = set()
+
+    def _should_preserve(rel: str) -> bool:
+        """Return True if *rel* must be kept at a living destination."""
+        if not preserve_deployment_local:
+            return False
+        if _is_preserved_at_dest(rel):
+            return True
+        if _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills):
+            return True
+        return False
+
     for p in patterns:
         # Patterns can be exact paths, glob, or directory paths with trailing /
         if p.endswith("/"):
             target = dest_root / p.rstrip("/")
             if target.exists() and target.is_dir():
+                rel = _norm(str(target.relative_to(dest_root)))
+                # Check if any file inside the directory tree is preserved
+                if preserve_deployment_local:
+                    has_preserved = False
+                    for child in target.rglob("*"):
+                        if child.is_file():
+                            child_rel = _norm(str(child.relative_to(dest_root)))
+                            if _should_preserve(child_rel):
+                                has_preserved = True
+                                break
+                    if has_preserved or _should_preserve(rel):
+                        skipped_preserved.append(p)
+                        continue
                 shutil.rmtree(target, ignore_errors=True)
                 removed.append(p)
         else:
             # Try exact file first
             target = dest_root / p
             if target.exists() and target.is_file():
+                rel = _norm(str(target.relative_to(dest_root)))
+                if _should_preserve(rel):
+                    skipped_preserved.append(p)
+                    continue
                 target.unlink()
                 removed.append(p)
                 continue
@@ -544,6 +592,10 @@ def do_clean_cruft(dest_root: Path, manifest: dict) -> dict:
                     matches = list(dest_root.glob(p))
                 for m in matches:
                     try:
+                        m_rel = _norm(str(m.relative_to(dest_root)))
+                        if _should_preserve(m_rel):
+                            skipped_preserved.append(m_rel)
+                            continue
                         if m.is_dir():
                             shutil.rmtree(m, ignore_errors=True)
                         else:
@@ -551,7 +603,7 @@ def do_clean_cruft(dest_root: Path, manifest: dict) -> dict:
                         removed.append(str(m.relative_to(dest_root)))
                     except (OSError, FileNotFoundError):
                         pass
-    return {"removed": removed}
+    return {"removed": removed, "skipped_preserved": skipped_preserved}
 
 
 # ============================================================================
@@ -571,14 +623,12 @@ _ORPHAN_SCAN_SKIP_TOP = {
     "meta",                 # per-deployment strategy state (external path in source)
 }
 
-# Specific destination paths that survive every plant regardless of
-# manifest membership. Single source of truth for "preserved at dest".
-# Deployment-local files (CLAUDE.md, settings.json, promotion-cycle.md) are
-# per-deployment by design -- each repo names its own chain position and carries
-# its own hooks/permission config -- so a framework promotion must never delete
-# them at the destination (FM-2, 2026-06-25 cutover incident: promotion-cycle.md
-# was orphan-deleted because it is absent from the dev source include set).
-_ORPHAN_PRESERVE_FILES = {
+# ── Unified deployment-local preservation (single source of truth) ──
+# Files that legitimately differ per deployment and MUST survive transplant.
+# Union of the three previously-independent lists (orphan-preserve, verify-
+# leak-check, promotion-preflight DEPLOYMENT_LOCAL). Consulted by BOTH
+# do_clean_cruft and do_remove_orphans via _is_preserved_at_dest.
+_DEPLOYMENT_LOCAL_FILES = {
     ".env.local",
     ".claude/settings.local.json",
     "CLAUDE.md",
@@ -586,24 +636,21 @@ _ORPHAN_PRESERVE_FILES = {
     ".claude/rules/promotion-cycle.md",
 }
 
-# Gitignored operational paths (regenerable runtime state) a living-prod
-# transplant must preserve. A framework promotion reconciles FRAMEWORK source
-# files only; these prefixes hold daemon state, logs, the python shim, and
-# editor history. The orphan pass would otherwise delete them (they are absent
-# from the manifest include set), disrupting a running deployment -- recoverable,
-# but the transplant should never touch them (FM-2, 2026-06-25 cutover incident).
-# Prefix-matched: an exact match or a child path under the prefix is preserved.
-_ORPHAN_PRESERVE_PREFIXES = (
-    ".python-shim",
+# Gitignored operational directories that must survive at a living production
+# destination. Paths are relative to dest_root; prefix-matched.
+_OPERATIONAL_DIRS = {
+    "core/scripts/.python-shim",
     "core/logs",
     "mind_api/state",
-    ".history",
-    ".claude/.history",
-)
+}
+
+# Backward-compatible alias — existing code that references _ORPHAN_PRESERVE_FILES
+# continues to work, but the canonical set is _DEPLOYMENT_LOCAL_FILES.
+_ORPHAN_PRESERVE_FILES = _DEPLOYMENT_LOCAL_FILES
 
 
 def _is_preserved_at_dest(rel: str) -> bool:
-    if rel in _ORPHAN_PRESERVE_FILES:
+    if rel in _DEPLOYMENT_LOCAL_FILES:
         return True
     # .seed-backup-<timestamp>/ from prior plants
     first = rel.split("/", 1)[0]
@@ -611,9 +658,9 @@ def _is_preserved_at_dest(rel: str) -> bool:
         return True
     if first in _ORPHAN_SCAN_SKIP_TOP:
         return True
-    # Gitignored operational paths (daemon state, logs, shim, history)
-    for prefix in _ORPHAN_PRESERVE_PREFIXES:
-        if rel == prefix or rel.startswith(prefix + "/"):
+    # Gitignored operational directories (prefix match)
+    for op_dir in _OPERATIONAL_DIRS:
+        if rel == op_dir or rel.startswith(op_dir + "/"):
             return True
     return False
 
@@ -781,9 +828,8 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
                 rel = str(path.relative_to(dest_root)).replace("\\", "/")
             except ValueError:
                 continue
-            # Same preserve chokepoint as the file pass so empty operational
-            # dirs (mind_api/state, core/logs, ...) are not rmdir'd (FM-2).
-            if _is_preserved_at_dest(rel):
+            first = rel.split("/", 1)[0]
+            if first in _ORPHAN_SCAN_SKIP_TOP or first.startswith(".seed-backup-"):
                 continue
             try:
                 if not any(path.iterdir()):
@@ -851,12 +897,10 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
         # Directory basenames (matched against target.name)
         "agents", "world", "meta",
     }
-    PRESERVED_PATHS = {
-        # Full repo-relative paths (matched against normalized pattern)
-        ".git/",
-        ".env.local",
-        ".claude/settings.local.json",
-    }
+    # Derive from the module-level single source of truth
+    PRESERVED_PATHS = {".git/"}
+    for _dlf in _DEPLOYMENT_LOCAL_FILES:
+        PRESERVED_PATHS.add(_dlf)
     leaked = []
     info = []
     for p in manifest.get("exclude_always", []):
@@ -1057,6 +1101,8 @@ def _parse_args():
     sp = sub.add_parser("clean-cruft")
     sp.add_argument("--manifest", required=True)
     sp.add_argument("--dest", required=True)
+    sp.add_argument("--preserve-deployment-local", action="store_true",
+                    help="Guard deployment-local and domain files from deletion")
 
     sp = sub.add_parser("remove-orphans")
     sp.add_argument("--manifest", required=True)
@@ -1121,7 +1167,9 @@ def main():
         if result["failures"]:
             sys.exit(1)
     elif args.cmd == "clean-cruft":
-        result = do_clean_cruft(dest_root, manifest)
+        pdl = getattr(args, "preserve_deployment_local", False)
+        result = do_clean_cruft(dest_root, manifest,
+                                preserve_deployment_local=pdl)
         print(json.dumps(result, indent=2))
     elif args.cmd == "remove-orphans":
         result = do_remove_orphans(dest_root, manifest, source_root,

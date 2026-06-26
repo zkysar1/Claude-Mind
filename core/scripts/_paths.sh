@@ -158,24 +158,28 @@ if [ -n "$_AGENT_DIR_OVERRIDE" ] && [ -f "$_AGENT_DIR_OVERRIDE/local-paths.conf"
 elif [ -n "$AGENT_NAME" ] && [ -f "$(agent_dir "$AGENT_NAME")/local-paths.conf" ]; then
     source "$(agent_dir "$AGENT_NAME")/local-paths.conf"
 else
-    # MIND_AGENT unset — use first available conf (hooks don't have the env var).
-    # Fall-through STAYS (prevents PROJECT_ROOT/world,meta cruft, ); the
-    # warning makes the silent wrong-agent read visible (6 root cause B).
-    # The two PreToolUse hooks that source this file (bash-agent-inject.sh,
-    # path-resolution-hook.sh) use `2>/dev/null`, which suppresses stderr emitted
-    # during sourcing — so the warning fires only for LLM Bash tool calls where
-    # the inject hook actually missed (MIND_AGENT genuinely empty at use time).
+    # MIND_AGENT unset — use the first available conf that actually sets
+    # WORLD_PATH (hooks/daemon don't have the env var). An empty or partial
+    # conf (e.g. an abandoned `/start <agent>` that created the agent dir + an
+    # empty local-paths.conf at Phase A2 but never completed Phase B path
+    # config) must NOT win just by sorting first. Mirrors the _paths.py
+    # _read_local_paths fix (2026-06-14: empty agents/delta/local-paths.conf
+    # sorted before omni's and resolved WORLD_DIR empty).
+    # The warning makes the silent wrong-agent read visible (6 root
+    # cause B). The two PreToolUse hooks that source this file
+    # (bash-agent-inject.sh, path-resolution-hook.sh) use `2>/dev/null`, which
+    # suppresses stderr emitted during sourcing — so the warning fires only for
+    # LLM Bash tool calls where the inject hook actually missed (MIND_AGENT
+    # genuinely empty at use time).
     for _CONF in "$(agents_root)"/*/local-paths.conf; do
         [ -f "$_CONF" ] || continue
         source "$_CONF"
-        # Skip empty/partial confs (no WORLD_PATH): an abandoned `/start <agent>`
-        # can leave an empty local-paths.conf that sorts first and resolves
-        # WORLD_DIR empty. Let the next usable conf win regardless of ordering.
-        [ -n "${WORLD_PATH:-}" ] || continue
-        if [ -z "$AGENT_NAME" ]; then
-            echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
+        if [ -n "${WORLD_PATH:-}" ]; then
+            if [ -z "$AGENT_NAME" ]; then
+                echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
+            fi
+            break
         fi
-        break
     done
     unset _CONF
 fi

@@ -252,6 +252,31 @@ def test_doc_referenced_excludes_history(tmp_path):
     assert ref3 is False                      # not present anywhere
 
 
+def test_doc_referenced_word_boundary_prefix_collision(tmp_path):
+    """: a low-ID guard must NOT substring-match a prefix-colliding
+    higher-ID guard. Before the word-boundary fix, doc_referenced("guard-14")
+    returned True against a corpus citing only guard-147 (raw `needle in text`),
+    permanently shielding low-ID guards (guard-1..99) from retirement even when
+    genuinely dormant. The fix uses a word-boundary regex; this test fails on the
+    old substring match and passes on the new one."""
+    repo = tmp_path / "repo"
+    (repo / ".claude" / "rules").mkdir(parents=True)
+    (repo / "core" / "config").mkdir(parents=True)
+    (repo / ".claude" / "rules" / "probe.md").write_text(
+        "cited: guard-147 only", encoding="utf-8")
+    (repo / "CLAUDE.md").write_text("see guard-22.", encoding="utf-8")
+
+    # The genuinely-cited IDs still match across boundary types (space, '.').
+    assert gr.doc_referenced("guard-147", repo_root=repo)[0] is True
+    assert gr.doc_referenced("guard-22", repo_root=repo)[0] is True
+
+    # The prefix-colliding low IDs must NOT match (the regression the fix closes).
+    ref14, files14 = gr.doc_referenced("guard-14", repo_root=repo)
+    assert ref14 is False and files14 == []   # guard-14 vs guard-147: (?![0-9]) blocks it
+    assert gr.doc_referenced("guard-1", repo_root=repo)[0] is False   # vs guard-147
+    assert gr.doc_referenced("guard-2", repo_root=repo)[0] is False   # vs guard-22
+
+
 # ---------------------------------------------------------------------------
 # GATING - apply / restore (records= + repo_root= passed; no subprocess)
 # ---------------------------------------------------------------------------

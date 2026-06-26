@@ -167,8 +167,8 @@ flags are never read.
 On deep outcomes, `iteration-close.sh --phase state-update` runs
 `iteration-commit.sh` (git add/commit, push if configured) in PROJECT_ROOT. On
 slow-filesystem deployments (a cloud-synced or network-mounted working tree, or
-a large repo) that commit can take long enough that the Bash tool BACKGROUNDS
-the whole state-update call. When it does:
+a large repo) that commit can take long enough that the Bash tool BACKGROUNDS the whole
+state-update call. When it does:
 
 1. **Do NOT wait for it.** Proceed IMMEDIATELY to the learning-gate phase (then
    productivity-check). The script writes the loop-state-bump
@@ -182,13 +182,13 @@ the whole state-update call. When it does:
 2. **NEVER wrap the state-update call in `timeout`.** A `timeout` firing
    mid-commit kills the git op half-done - `goals_completed` unbumped, files
    uncommitted - which then has to be reconciled the next iteration. (Observed
-   in practice: a `timeout 25 bash iteration-close.sh --phase state-update`
-   killed the commit mid-way; re-run without `timeout` fixed it.)
+   2026-06-07: `timeout 25 bash iteration-close.sh --phase state-update` killed
+   the commit mid-way; re-run without `timeout` fixed it.)
 
-Validated repeatedly in practice: launch state-update, proceed inline through
-learning-gate + productivity-check, let the commit land async - zero orphaning,
-zero stop-hook re-entry. Same applies to `recurring-close.sh` deep closes (same
-commit path).
+Validated 3x on 2026-06-07: launch state-update,
+proceed inline through learning-gate + productivity-check, let the commit land
+async - zero orphaning, zero stop-hook re-entry. Same applies to
+`recurring-close.sh` deep closes (same commit path).
 
 ---
 
