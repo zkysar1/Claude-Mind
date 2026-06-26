@@ -444,6 +444,70 @@ Experience JSON:
     content_path: "agents/<agent>/experience/{experience_id}.md"
 ```
 
+## Step 2.6c: Counterfactual Rollout (high-surprise / high-cost gate)
+
+Decoupled-simulator extraction (transfer from Qwen-AgentWorld, arXiv
+2606.24597): after a real outcome, simulate 1-2 alternative behaviors against
+the SAME antecedent and extract the predicted delta as extra learning. The
+real trajectory already paid its cost; a counterfactual mines additional
+signal from it. Gated to outcomes worth the extra reasoning (modest ROI by
+design — do NOT run it on every reflection).
+
+```
+# GATE — fire only for high-surprise OR high-cost outcomes. Cheap, expected
+# outcomes do not repay the extra simulation. Reuses surprise_level from the
+# Step 2 ABC chain (same >=7 threshold guard-520 uses for high-surprise
+# downstream reconciliation, so the two high-surprise paths stay consistent).
+high_surprise = abc_chain.consequence.surprise_level >= 7
+high_cost     = the outcome was expensive to be wrong about — ANY of:
+                 blocked >=2 downstream goals, a deep outcome that touched
+                 production logic, or re-execution was required to resolve.
+IF NOT (high_surprise OR high_cost):
+    Log: "Step 2.6c: counterfactual rollout skipped — outcome below high-surprise/high-cost gate"
+    SKIP to Step 2.7
+# (Self-gating: the micro/session lightweight path RETURNs before this Step,
+#  so no lightweight-path edit is needed — this fires only on the full path.)
+
+# SIMULATE — hold the Antecedent (Step 2 abc_chain.antecedents) FIXED; vary
+# only the Behavior. Generate 1-2 plausible alternative actions the agent
+# could have taken at the same antecedent (a different decision, source,
+# confidence, or sequencing).
+FOR each of 1-2 plausible alternative behaviors:
+    counterfactual:
+      alternative_behavior: "Had I done {X} instead of {actual behavior}"
+      predicted_consequence: "{Consequence'} — SIMULATED prediction, not observed"
+      actual_consequence:    "{the real Consequence from Step 2}"
+      delta:                 "{what the alternative would have changed + the transferable lesson}"
+
+# LABELING (MANDATORY — verify-before-assuming "Causal Attribution Claims",
+# and the rule:.claude/rules/verify-before-assuming.md). Every counterfactual
+# is a SIMULATED prediction, never an observed outcome:
+#   - Phrase predictions as "predicted (simulated)" / "would likely" — NEVER
+#     "would have {X}" stated as established fact.
+#   - The reasoning-bank entry MUST carry tags including "simulated" so a
+#     later reader never mistakes the delta for a real resolution.
+#   - A simulated delta MUST NOT enter the accuracy stats (Step 7), the
+#     belief registry (Step 7.6), or pattern-signature outcomes (Step 7.5).
+#     It is extraction-only.
+
+# EXTRACT — only when a counterfactual yields a reusable lesson (the
+# alternative was clearly better or worse for a TRANSFERABLE reason). A
+# counterfactual that merely restates the actual outcome records nothing.
+IF a counterfactual produced a transferable lesson:
+    echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
+      # `id`/`created` auto-set — omit both; capture id from stdout.
+      # Fields: title, content (the delta + lesson, predictions labeled
+      # simulated), type ("counterfactual" — same non-standard-type precedent
+      # as Step 2.6 "contrastive"), applies_to (REQUIRED: any|framework|
+      # domain|specific), category, source_hypothesis, when_to_use,
+      # tags (MUST include "simulated", "counterfactual"),
+      # poignancy (typically 4-6 — simulated signal is weaker than an observed
+      # outcome; do NOT over-rate a counterfactual above a real resolution).
+    Log: "COUNTERFACTUAL ROLLOUT: {N} simulated alternative(s) for {hypothesis_id} (gate: {high_surprise|high_cost})"
+ELSE:
+    Log: "Step 2.6c: counterfactual(s) explored, no transferable lesson — nothing recorded"
+```
+
 ## Step 2.7: Memory Encoding Score (Hippocampal Gate)
 
 Calculate encoding priority for this reflection — determines whether this observation

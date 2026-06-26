@@ -175,8 +175,15 @@ def _read_local_paths():
     # named-but-nonexistent case above already warns. The hook-miss wrong-agent
     # read is surfaced on the shell side (_paths.sh), which the PreToolUse hooks
     # source with `2>/dev/null` so the warning fires only for LLM Bash tool calls.
+    # Skip empty or partial confs (no WORLD_PATH): an abandoned `/start <agent>`
+    # can leave an agent dir + an empty local-paths.conf that sorts first and
+    # would resolve WORLD_DIR=None (crashing the daemon at tree.py import when it
+    # runs agent-agnostic before any MIND_AGENT binding exists). Skipping
+    # WORLD_PATH-less confs lets the next usable conf win regardless of ordering.
     for conf in sorted(agents_root().glob("*/local-paths.conf")):
-        return _parse_conf(conf)
+        parsed = _parse_conf(conf)
+        if parsed.get("WORLD_PATH"):
+            return parsed
     return {}
 
 _local = _read_local_paths()

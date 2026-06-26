@@ -178,6 +178,40 @@ def _has_session_gap(start_dt: datetime, end_dt: datetime,
     return False
 
 
+def _has_window_activity(start_dt: datetime, end_dt: datetime,
+                         agent_dir: Path) -> bool:
+    """True iff the execution-diary EXISTS and has >= 1 entry in [start, end].
+
+    Positive-evidence companion to `_has_session_gap`, used by the Pass-1
+    selector-contention gate (g-115-1643). `_has_session_gap` returning False
+    is NOT proof the agent was active — a missing or unreadable diary also
+    yields False (fail-open). Contention suppression must fire ONLY on
+    confirmed activity, so it requires this affirmative check. Fail-CLOSED for
+    suppression: a missing diary, an unreadable file, or zero in-window entries
+    all return False, so the canary FILES (the safe direction — never drop a
+    canary on unknown activity).
+    """
+    diary = agent_dir / "session" / "execution-diary.jsonl"
+    try:
+        if not diary.exists():
+            return False
+        text = diary.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            ts = datetime.fromisoformat(str(rec.get("timestamp", "")))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        if start_dt <= ts <= end_dt:
+            return True
+    return False
+
+
 def _load_streak_mult() -> float:
     """Load recurring.streak_mult from core/config/aspirations.yaml.
 
@@ -203,6 +237,40 @@ def _load_streak_mult() -> float:
         return float(v)
     except Exception:
         return 2.0
+
+
+def _load_contention_suppress() -> bool:
+    """Load recurring.streak_break_contention_suppress from aspirations.yaml.
+
+    Gates the Pass-1 selector-contention suppression (g-115-1643). When true
+    (default), a streak-break for a NON-HIGH recurring goal whose elapsed
+    window had the agent CONTINUOUSLY ACTIVE (no session gap) is suppressed
+    as benign selector contention rather than filed as a canary. Rationale:
+    recurring cadence is best-effort (rb-257) — a goal fires only when a
+    session runs AND the selector picks it over ~100 candidates, so in a
+    saturated queue LOW/MEDIUM recurring goals routinely exceed interval by
+    2-80x (measured median 4.77x across 99 world canaries, 98 of which closed
+    as transient/FP). That overage is the selector working as designed, not
+    drift. HIGH-priority goals still file (cadence matters there, and the
+    selector's overdue boost should have prevented the miss — a HIGH miss
+    despite continuous activity is worth investigating).
+
+    Fail-open: any read/parse error returns True (suppression on). Set
+    `streak_break_contention_suppress: false` in aspirations.yaml to restore
+    the pre-g-115-1643 behavior (continuous-activity non-HIGH breaks file).
+    """
+    cfg_path = PROJECT_ROOT / "core" / "config" / "aspirations.yaml"
+    try:
+        import yaml
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        v = (cfg.get("recurring") or {}).get(
+            "streak_break_contention_suppress")
+        if v is None:
+            return True
+        return bool(v)
+    except Exception:
+        return True
 
 
 def _read_signals(log_path: Path) -> list[dict]:
@@ -283,6 +351,42 @@ def _aspiration_for_goal(goal_id: str) -> tuple[str, str] | None:
                 for g in asp.get("goals", []):
                     if g.get("id") == goal_id:
                         return asp.get("id"), source
+    return None
+
+
+def _goal_priority(goal_id: str) -> str | None:
+    """Return a goal's priority (e.g. "HIGH"/"MEDIUM"/"LOW") or None.
+
+    Scans world + agent queues for the goal. Used by the Pass-1
+    selector-contention gate (g-115-1643) to keep HIGH-priority canaries
+    filing while suppressing non-HIGH ones. Fail-open: any read/parse error
+    or a missing goal returns None, which the caller treats as "do not
+    suppress" (file) — an unknown priority must never silently drop a
+    potentially-real HIGH signal.
+    """
+    candidates: list[Path] = []
+    if WORLD_DIR is not None:
+        candidates.append(WORLD_DIR / "aspirations.jsonl")
+    if AGENT_DIR is not None:
+        candidates.append(AGENT_DIR / "aspirations.jsonl")
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                asp = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            for g in asp.get("goals", []) or []:
+                if isinstance(g, dict) and g.get("id") == goal_id:
+                    return g.get("priority")
     return None
 
 
@@ -563,7 +667,9 @@ def main() -> int:
     filed_count = 0
     skipped_count = 0
     gap_suppressed_count = 0
+    contention_suppressed_count = 0
     session_gap_threshold_h = _load_session_gap_threshold()
+    contention_suppress = _load_contention_suppress()
 
     # Pass 1: file Investigate canaries from new signals (existing behavior).
     # An absent or empty log skips this pass — the auto-resolve sweep below
@@ -601,6 +707,7 @@ def main() -> int:
         ts_raw = entry.get("timestamp")
         elapsed_h = entry.get("actual_elapsed_hours")
         if ts_raw and isinstance(elapsed_h, (int, float)) and elapsed_h > 0:
+            window_start = window_end = None
             try:
                 window_end = datetime.fromisoformat(str(ts_raw))
                 window_start = window_end - timedelta(hours=float(elapsed_h))
@@ -616,6 +723,43 @@ def main() -> int:
                       f"for {goal_id} ({elapsed_h}h window, agent inactive >= "
                       f"{session_gap_threshold_h}h)")
                 continue
+
+            # Selector-contention suppression (3). Reached only when
+            # the window data is valid AND there is NO session gap — the agent
+            # was continuously active across the elapsed window. For a
+            # best-effort recurring goal (rb-257), an active-loop cadence miss
+            # is the selector reasonably prioritizing other work over ~100
+            # candidates, NOT drift (measured: 99 world canaries, median 4.77x
+            # interval, 98 closed transient/FP). Suppress for NON-HIGH goals;
+            # HIGH goals still file (cadence matters there, and the selector's
+            # overdue boost should have prevented the miss, so a HIGH miss
+            # despite continuous activity is worth investigating). Reader-side
+            # like the 9 session-gap gate above because the
+            # discriminator (continuous activity) needs the agent's
+            # execution-diary; rb-1377's writer-durability concern does not
+            # apply here — the reflector is the SOLE canary filer, so a
+            # reader-side suppression has no bypass-producer path to miss.
+            #
+            # POSITIVE-evidence requirement: suppress ONLY when the diary
+            # affirmatively shows in-window activity. A MISSING/empty diary
+            # makes gap=False too (fail-open), but that means "activity
+            # unknown", NOT "agent was active" — suppressing there would drop
+            # canaries whenever the diary is absent. _has_window_activity is
+            # the positive companion to _has_session_gap: True only when the
+            # diary exists AND has >= 1 entry inside the window.
+            if (contention_suppress and window_start is not None
+                    and _has_window_activity(window_start, window_end,
+                                             AGENT_DIR)):
+                prio = _goal_priority(goal_id)
+                if prio is not None and str(prio).upper() != "HIGH":
+                    entry["processed"] = True
+                    entry["contention_suppressed"] = True
+                    contention_suppressed_count += 1
+                    print(f"[streak-break-reflector] selector-contention "
+                          f"suppressed canary for {goal_id} (priority={prio}, "
+                          f"agent active throughout {elapsed_h}h window — "
+                          f"best-effort recurring cadence, rb-257)")
+                    continue
 
         # Resolve aspiration_id AND source. Signal entry may carry both
         # directly (preferred — no lookup cost); fall back to scanning
@@ -665,6 +809,7 @@ def main() -> int:
     print(f"[streak-break-reflector] {filed_count} filed, "
           f"{skipped_count} dedup-skipped, "
           f"{gap_suppressed_count} session-gap-suppressed, "
+          f"{contention_suppressed_count} contention-suppressed, "
           f"{resolved_count} auto-resolved")
     return 0
 

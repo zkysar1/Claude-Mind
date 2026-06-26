@@ -321,6 +321,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `audit-baselines.md` | `meta/audit-baselines.yaml` schema, verdicts (seeded/stable/ratcheted/regressed), when to add a baseline, /verify-learning integration |
 | `temp-store.md` | Canonical agent temp store (`agents/<agent>/temp/`), temp-vs-scratch lifecycle, the agent-dir write-surface allowlist, `reports/` freeze + migration |
 | `domain-recipe-seed-purity.md` | D1 decision (A): domain-specific upgrade recipes are `domain-leak-exempt` and travel in the seed; the 5 invariants (location/marker/FROM-state-guard/H3b/gate-scope), seed-down per-env-id semantics |
+| `transfer-bundle-export-shape.md` | OKF-aligned export shape for `meta/transfer/` bundles: bundle=unit-of-distribution, concept=one md+YAML, one required `type` discriminator, consumers-preserve-unknown-keys, git-shippable interchange (contract-on-shape, not a field schema) |
 
 Additional on-demand specs (not convention files):
 - `core/config/hypothesis-conventions.md` — Hypothesis record schemas, horizons, context manifests
@@ -444,6 +445,23 @@ Follow the retrieval escalation convention (`core/config/conventions/retrieval-e
 
 Stop at the first tier that provides sufficient knowledge. Never say "I don't have context"
 without attempting all eligible tiers.
+
+## External Knowledge Hubs
+
+Curated external knowledge bundles to consult when reasoning about improving
+self, framework, or agents. These are reference sources (distinct from the
+retrieval escalation above) — clone and read them when a goal calls for deeper
+grounding in agent-cognition theory.
+
+| Hub | Source | Contents | Consult when |
+|-----|--------|----------|--------------|
+| **Ayoai-Research-Analyst** | `https://github.com/zkysar1/Ayoai-Research-Analyst` (PRIVATE — authenticated clone via `gh auth` or a read-scoped token; local path varies per machine) | OKF v0.1 knowledge bundle on autonomous-agent cognition: perception, consciousness / cognitive-architecture, memory (RAG / hierarchical / temporal), planning, learning and adaptation (reflection, self-improvement), ABC modeling, market research | Reasoning about improving self, the framework, or agent design |
+
+Registered at the dev source of the promotion cycle (Mind-Mind → Claude-Mind →
+ZDS-Mind) so the reference stays ecosystem-consistent and flows downstream. The
+registration lives in committed files (this file, plus a Self-Evolution pointer
+each agent adds to its own `self.md`) because `world/` and `meta/` are external
+and gitignored — not reachable by a cloud clone.
 
 ## User Control Commands
 

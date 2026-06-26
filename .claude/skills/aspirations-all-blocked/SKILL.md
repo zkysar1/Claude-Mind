@@ -417,6 +417,34 @@ IF rc == 0 (approved):
     # Skip the B7 backoff ladder entirely. Do NOT increment
     # consecutive_blocked_sleeps — quiescence is a different state.
     sleep_seconds = output.sleep_seconds
+
+    # g-303-11: prolonged-quiescence escalating user-ping. When the gate reports
+    # the SAME user-gated blocker set has persisted past the wall-clock threshold
+    # (prolonged_quiescence_hours, default 4h) AND every blocked goal is gated by
+    # a user-only blocker_ref AND this hash has not been pinged this throttle
+    # window, surface ONE focused escalation naming the single highest-leverage
+    # blocker. The gate already wrote the per-hash throttle file, so should_notify
+    # is true AT MOST once per window — no email flood (the requirement that
+    # motivated this goal). Fires on BOTH the drainable and straight-to-sleep
+    # sub-paths below. Never block the sleep on notification failure.
+    IF output.prolonged_quiescence == true AND output.should_notify == true:
+        p = output.prolonged_payload
+        Output: "▸ PROLONGED QUIESCENCE: {p.hours_in_quiescence}h on one user-gated blocker set ({p.blocker_count} goals, {p.distinct_blocker_count} distinct blockers) — escalating ONE ping for highest-leverage blocker {p.highest_leverage_blocker_id}."
+        Notify the user about prolonged user-gated quiescence.
+        (Check world/forged-skills.yaml for a skill whose triggers match
+        "notify the user" and invoke it with a short subject and message:
+           subject = "Quiescence: {p.blocker_count} goal(s) waiting on you {p.hours_in_quiescence}h — clear {p.highest_leverage_blocker_id}"
+           message = names {p.highest_leverage_blocker_id} as the single action that
+             unblocks the most goals, lists p.sample_blocked_goal_titles, and notes
+             these goals are blocked ONLY on a user-only action (nothing the agent
+             can self-provision — the gate already verified every blocker_ref is a
+             user-only type).
+         If no matching skill is registered, fall back to a participants:[agent,user]
+         goal via aspirations-add-goal.sh under asp-001, titled
+         "Unblock: {p.blocker_count} user-gated goal(s) idle {p.hours_in_quiescence}h — clear {p.highest_leverage_blocker_id}",
+         with origin_signal "quiescence:prolonged-ping". Never block on notification
+         failure — proceed to the sleep branches below regardless.)
+
     # Magic Wand #2 (alpha session-60): set QUIESCENCE_SLEEP=1 so
     # interruptible-sleep.sh demotes informational wake signals
     # (board-activity, goal-claim-released — partner activity) without
@@ -615,7 +643,7 @@ perpetual hygiene busy-loop — itself a new form of idle-path waste.
 
 B6.8 fires when ALL of:
 1. B6.5 returned rc=0 (quiescence APPROVED).
-2. The gate's JSON `approved_but_drainable == true` (at least one of the four
+2. The gate's JSON `approved_but_drainable == true` (at least one of the three
    drainable-evidence counts is ≥1; the gate computes this only on the approved
    path).
 3. B6.8 has not already fired this iteration (single drain per cycle).

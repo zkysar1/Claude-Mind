@@ -192,6 +192,86 @@ def test_decompose_within_cap_not_flagged(monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# maintain_exempt -- durable per-node exemption (8)
+# --------------------------------------------------------------------------
+
+def test_redistribute_exempt_skips_overflow(monkeypatch):
+    # A node that overflows k_max but is durably exempted is NOT a candidate.
+    _patch_caps(monkeypatch, k_max=2)
+    nodes = {"nodes": {
+        "p": {"depth": 1, "children": ["a", "b", "c"], "file": "f",
+              "maintain_exempt": ["redistribute"]},   # 3 > 2 but exempt
+        "a": {"depth": 2, "children": []},
+        "b": {"depth": 2, "children": []},
+        "c": {"depth": 2, "children": []},
+    }}
+    res = tree.get_redistribute_candidates(nodes, include_skipped=True)
+    assert res["candidates"] == []
+    assert any(s["node_key"] == "p" and s["skip_reason"] == "redistribute_exempt"
+               for s in res["skipped"])
+
+
+def test_decompose_exempt_skips_overflow(monkeypatch):
+    # A node that overflows leaf_cap but is durably exempted is NOT a candidate.
+    _patch_caps(monkeypatch, k_max=10, leaf_cap=2)
+    nodes = {"nodes": {
+        "root": {"depth": 0, "children": ["p"]},
+        "p": {"depth": 1, "children": ["a", "b", "c"], "file": "f",
+              "maintain_exempt": ["decompose"]},      # 3 leaves > 2 but exempt
+        "a": {"depth": 2, "children": []},
+        "b": {"depth": 2, "children": []},
+        "c": {"depth": 2, "children": []},
+    }}
+    res = tree.get_decompose_candidates(nodes, include_skipped=True)
+    assert "p" not in [c["key"] for c in res["candidates"]]
+    assert any(s["node_key"] == "p" and s["skip_reason"] == "decompose_exempt"
+               for s in res["skipped"])
+
+
+def test_maintain_exempt_is_per_action(monkeypatch):
+    # decompose-exempt must NOT exempt redistribute (per-action, not blanket).
+    _patch_caps(monkeypatch, k_max=2)
+    nodes = {"nodes": {
+        "p": {"depth": 1, "children": ["a", "b", "c"], "file": "f",
+              "maintain_exempt": ["decompose"]},      # exempt decompose only
+        "a": {"depth": 2, "children": []},
+        "b": {"depth": 2, "children": []},
+        "c": {"depth": 2, "children": []},
+    }}
+    cands = tree.get_redistribute_candidates(nodes)
+    assert [c["key"] for c in cands] == ["p"]          # still a redistribute candidate
+
+
+def test_maintain_exempt_bare_string_coerced(monkeypatch):
+    # A bare-string maintain_exempt (not a list) is coerced and honored.
+    _patch_caps(monkeypatch, k_max=2)
+    nodes = {"nodes": {
+        "p": {"depth": 1, "children": ["a", "b", "c"], "file": "f",
+              "maintain_exempt": "redistribute"},      # string, not list
+        "a": {"depth": 2, "children": []},
+        "b": {"depth": 2, "children": []},
+        "c": {"depth": 2, "children": []},
+    }}
+    assert tree.get_redistribute_candidates(nodes) == []
+
+
+def test_validate_maintain_exempt_unknown_action(monkeypatch, tmp_path):
+    # An unknown action token surfaces as a validate_tree warning (typo guard).
+    _patch_world(monkeypatch, tmp_path)
+    _patch_caps(monkeypatch, k_max=4, leaf_cap=64)
+    nodes = {"nodes": {
+        "root": {"file": None, "depth": 0, "parent": None, "children": ["a"],
+                 "child_count": 1, "node_type": "interior"},
+        "a": {"file": None, "depth": 1, "parent": "root", "children": [],
+              "child_count": 0, "node_type": "leaf", "article_count": 0,
+              "growth_state": "stable", "maintain_exempt": ["redistribut"]},  # typo
+    }}
+    res = tree.validate_tree(nodes)
+    assert res["valid"] is True   # advisory -- never invalidates
+    assert any("maintain_exempt has unknown action" in w for w in res["warnings"])
+
+
+# --------------------------------------------------------------------------
 # validate_tree locality advisory
 # --------------------------------------------------------------------------
 

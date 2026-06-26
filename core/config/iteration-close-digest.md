@@ -162,6 +162,34 @@ flags are never read.
    readers see the full hook set. Per g-115-747 (Apply) / g-115-742
    (Investigate); 20+ days stale incident traced to hot-path bypass.
 
+### Slow-filesystem backgrounding (deep outcomes) - do NOT wait, do NOT `timeout`
+
+On deep outcomes, `iteration-close.sh --phase state-update` runs
+`iteration-commit.sh` (git add/commit, push if configured) in PROJECT_ROOT. On
+slow-filesystem deployments (a cloud-synced or network-mounted working tree, or
+a large repo) that commit can take long enough that the Bash tool BACKGROUNDS
+the whole state-update call. When it does:
+
+1. **Do NOT wait for it.** Proceed IMMEDIATELY to the learning-gate phase (then
+   productivity-check). The script writes the loop-state-bump
+   (`loop-state-bump-counters.py` -> `goals_completed`/`productive_goals` in WM)
+   EARLY, before the slow git tail - so the counters are already durable by the
+   time you reach learning-gate; the git commit finishes async and is confirmed
+   by the background-task completion notification. An idle turn-ending wait here
+   is exactly what lets the Stop hook fire mid-close and ORPHAN learning-gate +
+   productivity-check (the close tail never runs; the loop can stall).
+
+2. **NEVER wrap the state-update call in `timeout`.** A `timeout` firing
+   mid-commit kills the git op half-done - `goals_completed` unbumped, files
+   uncommitted - which then has to be reconciled the next iteration. (Observed
+   in practice: a `timeout 25 bash iteration-close.sh --phase state-update`
+   killed the commit mid-way; re-run without `timeout` fixed it.)
+
+Validated repeatedly in practice: launch state-update, proceed inline through
+learning-gate + productivity-check, let the commit land async - zero orphaning,
+zero stop-hook re-entry. Same applies to `recurring-close.sh` deep closes (same
+commit path).
+
 ---
 
 ## § LEARNING-GATE (Phase 12 — after `iteration-close.sh --phase learning-gate`)

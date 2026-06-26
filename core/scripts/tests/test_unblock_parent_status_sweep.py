@@ -173,15 +173,20 @@ def test_idempotency_already_swept_detection():
 
 
 def test_terminal_states_set():
-    """The four states that indicate 'no Unblock action is needed' are
-    locked: skipped, completed, superseded, archived. Pending/in-progress
-    must NOT be in this set or the sweep would clear actively-working
-    parents."""
+    """The terminal states that indicate 'no Unblock action is needed' are
+    locked to the SSOT aspirations.TERMINAL_GOAL_STATUSES: completed, skipped,
+    expired, decomposed, superseded. g-303-21 (zeta audit D1) removed the
+    bogus 'archived' (never a valid goal status) and added expired/decomposed,
+    which were silently dropping stale Unblock work on expired/decomposed
+    parents. Pending/in-progress/blocked must NOT be in this set or the sweep
+    would clear actively-working parents."""
     mod = _import_sweep()
     assert "skipped" in mod.TERMINAL_STATES
     assert "completed" in mod.TERMINAL_STATES
     assert "superseded" in mod.TERMINAL_STATES
-    assert "archived" in mod.TERMINAL_STATES
+    assert "expired" in mod.TERMINAL_STATES
+    assert "decomposed" in mod.TERMINAL_STATES
+    assert "archived" not in mod.TERMINAL_STATES  # not a valid goal status ()
     assert "pending" not in mod.TERMINAL_STATES
     assert "in-progress" not in mod.TERMINAL_STATES
     assert "blocked" not in mod.TERMINAL_STATES

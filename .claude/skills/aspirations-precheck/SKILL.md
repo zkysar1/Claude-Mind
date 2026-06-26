@@ -256,8 +256,25 @@ IF signal is not null:
         # source=tree-debt-critical (or missing), routing to the heavy path.
     ELSE:
         # source=tree-debt-critical or missing (legacy/learning-gate path)
-        Output: "▸ TREE-DEBT GATE: force_tree_maintain set (source={source}, count > threshold) — invoking /tree maintain --backlog before goal selection"
+        Output: "▸ TREE-DEBT GATE: force_tree_maintain set (source={source}, count > threshold)"
         invoke /tree maintain --backlog
+    # Stamp the consumer-dispatch timestamp BEFORE clearing (g-115-1649).
+    # stale-sentinel-canary.py CONSUMPTION_AWARE keys force_tree_maintain on this
+    # slot — mirrors Phase 0-pre3's fresh_eyes_last_dispatch stamp (g-115-1553).
+    # Without it the canary reverts to bare presence-count and FALSE-fires for
+    # deep-close-heavy agents: the drift-gate re-arms force_tree_maintain at
+    # iteration-close (do_state_update) and the canary samples it SET at the same
+    # close (do_productivity_check), BEFORE this consumer clears it next
+    # iteration — so the sentinel reads "set" at sample time even though it is
+    # consumed every iteration (charlie/echo accumulated stuck-counts while the
+    # sentinel was null between iterations). The consumption-aware canary counts
+    # toward "stuck" ONLY while this dispatch timestamp stays FROZEN, so a
+    # genuinely-bypassed consumer still fires while a keeping-up one does not.
+    # Stamp on ANY handling (both the encoding-drift lightweight path and the
+    # heavy /tree maintain path — this line is after the IF/ELSE, before the
+    # clear) and stamp FIRST: an interrupt then leaves stamp-done +
+    # sentinel-still-set, which the canary reads as advanced -> reset (safe dir).
+    printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh force_tree_maintain_last_dispatch
     # Clear signal after handling (one-shot; next iteration's drift gate or
     # learning-gate re-sets if still indicated).
     echo 'null' | Bash: wm-set.sh force_tree_maintain
@@ -282,7 +299,7 @@ persists and the gate fires again next iteration until the LLM succeeds.
 ```
 Bash: wm-read.sh force_experience_archival
 IF signal is not null:
-    Output: "▸ EXPERIENCE-ARCHIVAL GATE: force_experience_archival set (last entry {last_entry_id}, {age_hours}h stale) — composing missed experience record before goal selection"
+    Output: "▸ EXPERIENCE-ARCHIVAL GATE: force_experience_archival set (last entry {last_entry_id}, {age_hours}h stale)"
     # Compose the missed experience record per Phase 4.25 instructions
     # (execute-protocol-digest.md §4.25). Use the most-recent deep goal's
     # context reconstructible from:
@@ -1208,7 +1225,6 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5e.5
 Bash: core/scripts/fresh-eyes-cadence-check.sh
 IF exit 0 (fire):
-    Output: "▸ Fresh-eyes review cadence crossed — assembling briefing"
     Invoke /fresh-eyes-review --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1243,7 +1259,6 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5f
 Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_program
 IF exit 0 (fire):
-    Output: "▸ Fresh-eyes PROGRAM cadence crossed — assembling shared-purpose briefing"
     Invoke /fresh-eyes-program --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1275,7 +1290,6 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fr
 IF decision == "drop": SKIP this phase; continue to Phase 0.5f
 Bash: core/scripts/fresh-eyes-cadence-check.sh --config-block fresh_eyes_tree
 IF exit 0 (fire):
-    Output: "▸ Fresh-eyes TREE cadence crossed — assembling L1 taxonomy briefing"
     Invoke /fresh-eyes-tree --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently (no output)
@@ -1310,7 +1324,6 @@ Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check fe
 IF decision == "drop": SKIP this phase; continue to Phase 1
 Bash: core/scripts/felt-sense-cadence-check.sh
 IF exit 0 (fire):
-    Output: "▸ Felt-sense check-in cadence crossed — running 7-lane sweep"
     Invoke /felt-sense-checkin --cadence
 IF exit 1 (noop):
     # Cadence not crossed OR config disabled — continue silently

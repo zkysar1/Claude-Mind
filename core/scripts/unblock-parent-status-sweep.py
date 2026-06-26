@@ -109,7 +109,12 @@ TITLE_FOR_PATTERN = re.compile(r"\bfor\s+(g-\d+-\d+)\b")
 GOAL_ID_PATTERN = re.compile(r"^g-\d+-\d+$")
 
 # Parent states that imply "no Unblock action is needed"
-TERMINAL_STATES = {"skipped", "completed", "superseded", "archived"}
+#  (zeta allowlist audit D1): synced to the SSOT
+# aspirations.TERMINAL_GOAL_STATUSES. This is the mirror-source the two
+# insight-trigger scripts reference; it carried the identical drift (missing
+# expired+decomposed, bogus archived). Parity enforced by
+# tests/test_terminal_goal_states_parity.py.
+TERMINAL_STATES = {"completed", "skipped", "expired", "decomposed", "superseded"}
 
 
 def _resolve_metrics_log(cli_path):

@@ -334,6 +334,73 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self.assertEqual(fe["new_stuck_count"], 0)
         self.assertFalse(fe["fired"])
 
+    # ---- Consumption-aware contract for force_tree_maintain (9) ------
+    # force_tree_maintain joined CONSUMPTION_AWARE keyed on
+    # force_tree_maintain_last_dispatch. The drift-gate arms it (real shape:
+    # {triggered_at, source, threshold}, no "fired" key -> _is_set true via the
+    # non-empty-dict default) at iteration-close do_state_update, and the canary
+    # samples it at do_productivity_check (same close), BEFORE precheck Phase
+    # 0-pre clears it next iteration. The consumer stamps the dispatch slot on
+    # every handling -> a keeping-up consumer must NOT fire (the false fire that
+    # accumulated on charlie/echo); a genuinely-bypassed one (frozen dispatch)
+    # still must.
+
+    def _ftm_armed(self, minute):
+        """Real drift-gate sentinel shape (no 'fired' key)."""
+        return {
+            "triggered_at": f"2026-06-25T09:{minute:02d}:45",
+            "source": "encoding-drift",
+            "threshold": 3,
+        }
+
+    def test_ftm_consumption_aware_no_fire_when_dispatch_advances(self):
+        """force_tree_maintain re-armed every run while the consumer keeps up
+        (force_tree_maintain_last_dispatch advances) must NOT fire — the
+        false-positive bare presence-count had for deep-close-heavy agents."""
+        for i in range(5):
+            self._set_slot("force_tree_maintain_last_dispatch", f"2026-06-25T09:{i:02d}:30")
+            self._set_slot("force_tree_maintain", self._ftm_armed(i))
+            r = self._run_canary(dry_run=False, threshold=3)
+            ftm = r["sentinels"]["force_tree_maintain"]
+            self.assertTrue(ftm["is_set"])
+            self.assertTrue(ftm.get("dispatch_advanced"))
+            self.assertEqual(ftm["new_stuck_count"], 0)
+            self.assertFalse(ftm["fired"])
+
+    def test_ftm_consumption_aware_fires_when_dispatch_frozen(self):
+        """Consumer bypassed: force_tree_maintain stays armed AND its dispatch
+        slot stays frozen across threshold consecutive samples -> fires.
+        (Run 1 grace: last_seen=None != current -> advanced.)"""
+        self._set_slot("force_tree_maintain_last_dispatch", "2026-06-25T08:00:00")
+        self._set_slot("force_tree_maintain", self._ftm_armed(0))
+        r1 = self._run_canary(dry_run=False, threshold=3)
+        self.assertEqual(r1["sentinels"]["force_tree_maintain"]["new_stuck_count"], 0)
+        r2 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 1
+        self.assertEqual(r2["sentinels"]["force_tree_maintain"]["new_stuck_count"], 1)
+        r3 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 2
+        self.assertEqual(r3["sentinels"]["force_tree_maintain"]["new_stuck_count"], 2)
+        r4 = self._run_canary(dry_run=True, threshold=3)    # frozen -> 3 -> fire
+        ftm = r4["sentinels"]["force_tree_maintain"]
+        self.assertTrue(ftm["fired"])
+        self.assertFalse(ftm.get("dispatch_advanced"))
+        self.assertEqual(len(r4["investigate_goals_filed"]), 1)
+        self.assertEqual(r4["investigate_goals_filed"][0]["sentinel"], "force_tree_maintain")
+
+    def test_ftm_consumption_aware_resets_when_dispatch_resumes(self):
+        """Dispatch frozen a couple samples, then the consumer dispatches again
+        (timestamp advances) -> stuck_count resets to 0 (recovered)."""
+        self._set_slot("force_tree_maintain_last_dispatch", "2026-06-25T08:00:00")
+        self._set_slot("force_tree_maintain", self._ftm_armed(0))
+        self._run_canary(dry_run=False, threshold=3)        # grace -> 0
+        r2 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 1
+        self.assertEqual(r2["sentinels"]["force_tree_maintain"]["new_stuck_count"], 1)
+        self._set_slot("force_tree_maintain_last_dispatch", "2026-06-25T08:30:00")
+        r3 = self._run_canary(dry_run=False, threshold=3)
+        ftm = r3["sentinels"]["force_tree_maintain"]
+        self.assertTrue(ftm.get("dispatch_advanced"))
+        self.assertEqual(ftm["new_stuck_count"], 0)
+        self.assertFalse(ftm["fired"])
+
 
 if __name__ == "__main__":
     unittest.main()

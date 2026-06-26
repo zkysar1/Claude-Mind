@@ -81,20 +81,14 @@ GUARDRAILS (automatic — no opt-in required):
 
 OPTIONS:
   --target-aspiration <id>  Standard aspiration for the selector-visible goal (default: asp-115).
-                            Defense-in-depth (Layer 1): the asp-xw-* record's goals[]
-                            is ALREADY selector-visible (goal-selector collect_candidates
-                            iterates it + scores via live effective_counts), but the goal
-                            carries participants:[agent,user] + a non-standard g-xw-* ID, so
-                            this option ALSO injects a SECOND goal in standard g-{N}-{seq}
-                            format under a real aspiration. Pass the relevant aspiration ID.
-                            (g-115-1641: the asp-xw STORED-progress cache historically
-                            displayed (0/0) in --summary until the writer was fixed to
-                            populate it -- a count-display gap, never a selection gap.)
+                            Layer 1 fix: the asp-xw-* record stores goals in a nested goals[]
+                            array that the selector counts as (0/0). This option injects a
+                            SECOND goal record in g-{N}-{seq} format under a real aspiration,
+                            making it visible and scoreable. Pass the relevant aspiration ID.
 
 NOTES:
   - Each injection creates TWO records in the target's aspirations.jsonl:
-      1. asp-xw-* audit record (provenance trail; goals[] IS selector-visible —
-         g-115-1641 fixed the stored-progress cache that historically showed (0/0))
+      1. asp-xw-* audit record (provenance trail; nested goals[] not selector-visible)
       2. g-{asp_num}-{seq} goal record under --target-aspiration (selector-visible; Layer 1)
   - Layer 2: post-injection verification confirms the selector-visible goal is on disk.
   - The target world's agents see participants:[agent,user] and must wait for human approval
@@ -269,23 +263,6 @@ aspiration = {
     'cross_world_reason': reason,        # G5
     'cross_world_timestamp': timestamp,  # G5
     'goals': [goal],
-    # g-115-1641: populate the denormalized progress cache + initial_goal_count
-    # at injection. cross-world-inject-goal.sh appends the record RAW (bypassing
-    # cmd_add_goal, the path that normally calls recompute_progress), so without
-    # this the record carries NO progress field and the two STORED-progress
-    # readers (aspirations --summary endpoint + consolidation-health.py) display
-    # it as (0/0 goals) until a goal status-change first triggers recompute.
-    # NOTE: this fixes the COUNT display only -- the selector already surfaces
-    # these goals correctly (goal-selector collect_candidates iterates goals[]
-    # and scores via live _goal_census.effective_counts, never the stored cache).
-    # The injected goal is always a single pending non-recurring goal -> 0/1.
-    'initial_goal_count': 1,
-    'progress': {
-        'completed_goals': 0,
-        'total_goals': 1,
-        'recurring_goals': 0,
-        'fan_out_ratio': 1.0,
-    },
     'created_at': timestamp,
 }
 
@@ -297,7 +274,7 @@ print(json.dumps(aspiration, ensure_ascii=True))
 if [ "$DRY_RUN" = "true" ]; then
     echo "DRY-RUN: Would append TWO records to $ASP_FILE:"
     echo ""
-    echo "[1] Audit record (asp-xw-* -- provenance trail; goals[] IS selector-visible; progress cache now populated, g-115-1641):"
+    echo "[1] Audit record (asp-xw-* — provenance trail; goals[] NOT visible to selector):"
     echo "$RECORD" | py -3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))"
     echo ""
     echo "[2] Selector-visible goal (Layer 1): g-${TARGET_ASPIRATION#asp-}-<next_seq> in $TARGET_ASPIRATION"
@@ -325,133 +302,85 @@ trap "release_lock '$LOCK_FILE'" EXIT
 # Write [1]: audit record (asp-xw-* with embedded goals[] — for provenance only)
 echo "$RECORD" >> "$ASP_FILE"
 
-# Layer 1: find next goal sequence number -- scans embedded goals in TARGET_ASPIRATION
-# (g-115-1 fix: previously scanned only top-level record IDs, missing all embedded goals)
+# Layer 1: find next goal sequence number for TARGET_ASPIRATION (inside lock — race-safe)
 SECONDARY_GOAL_ID=$(py -3 -c "
 import json, sys, re
-asp_num  = sys.argv[1]
-asp_id   = sys.argv[2]
-asp_file = sys.argv[3]
+asp_num = sys.argv[1]
+asp_file = sys.argv[2]
 max_seq = 0
 pat = re.compile(r'^g-' + re.escape(asp_num) + r'-(\d+)\$')
 try:
     with open(asp_file, 'r', encoding='utf-8') as fh:
         for line in fh:
-            s = line.strip()
-            if not s:
+            line = line.strip()
+            if not line:
                 continue
             try:
-                rec = json.loads(s)
+                rec = json.loads(line)
             except Exception:
                 continue
-            if rec.get('id') == asp_id:
-                for goal in rec.get('goals', []):
-                    m = pat.match(goal.get('id', ''))
-                    if m:
-                        sq = int(m.group(1))
-                        if sq > max_seq:
-                            max_seq = sq
-            else:
-                m = pat.match(rec.get('id', ''))
-                if m:
-                    sq = int(m.group(1))
-                    if sq > max_seq:
-                        max_seq = sq
+            m = pat.match(rec.get('id', ''))
+            if m:
+                sq = int(m.group(1))
+                if sq > max_seq:
+                    max_seq = sq
 except FileNotFoundError:
     pass
 print(f'g-{asp_num}-{max_seq + 1}')
-" "$_ASP_NUM" "$TARGET_ASPIRATION" "$ASP_FILE")
+" "$_ASP_NUM" "$ASP_FILE")
 
-# Write [2]: inject goal into TARGET_ASPIRATION's goals[] array (in-place rewrite)
-# (g-115-1 fix: previously appended standalone records invisible to collect_candidates())
-WRITE2_RC=$(py -3 -c "
+# Write [2]: standard goal record (g-{asp_num}-{seq} — visible to selector)
+py -3 -c "
 import json, sys
-goal_id=sys.argv[1]; title=sys.argv[2]; description=sys.argv[3]
-priority=sys.argv[4]; category=sys.argv[5]; origin=sys.argv[6]
-reason=sys.argv[7]; timestamp=sys.argv[8]; audit_ref=sys.argv[9]
-target_asp=sys.argv[10]; asp_file=sys.argv[11]
 goal = {
-    'id':                    goal_id,
-    'title':                 title,
-    'description':           description,
+    'id':                    sys.argv[1],
+    'title':                 sys.argv[2],
+    'description':           sys.argv[3],
     'status':                'pending',
-    'priority':              priority,
-    'category':              category,
+    'priority':              sys.argv[4],
+    'category':              sys.argv[5],
     'participants':          ['agent', 'user'],
     'sandbox':               True,
-    'injected_by':           origin,
-    'cross_world_origin':    origin,
-    'cross_world_reason':    reason,
-    'cross_world_timestamp': timestamp,
-    'cross_world_audit_ref': audit_ref,
+    'injected_by':           sys.argv[6],
+    'cross_world_origin':    sys.argv[6],
+    'cross_world_reason':    sys.argv[7],
+    'cross_world_timestamp': sys.argv[8],
+    'cross_world_audit_ref': sys.argv[9],
     'origin_signal':         'user_directive',
-    'tags':                  list(dict.fromkeys([category, 'cross-world-signal', 'sandbox', 'xw-injected'])),
+    'tags':                  list(dict.fromkeys([sys.argv[5], 'cross-world-signal', 'sandbox', 'xw-injected'])),
     'work_class':            'unclassified',
     'goal_source':           'user',
     'intended_agent':        'either',
     'filed_by_agent':        'omni',
-    'created_at':            timestamp,
+    'created_at':            sys.argv[8],
 }
-output_lines = []
-found = False
-with open(asp_file, 'r', encoding='utf-8') as fh:
-    for line in fh:
-        s = line.strip()
-        if not s:
-            output_lines.append(line)
-            continue
-        try:
-            rec = json.loads(s)
-        except Exception:
-            output_lines.append(line)
-            continue
-        if rec.get('id') == target_asp and 'goals' in rec:
-            rec['goals'].append(goal)
-            output_lines.append(json.dumps(rec, ensure_ascii=True) + '\n')
-            found = True
-        else:
-            output_lines.append(line)
-if not found:
-    print(f'ERROR: target aspiration {target_asp} not found', file=sys.stderr)
-    sys.exit(1)
-with open(asp_file, 'w', encoding='utf-8', newline='\n') as fh:
-    fh.writelines(output_lines)
-print('ok')
+print(json.dumps(goal, ensure_ascii=True))
 " "$SECONDARY_GOAL_ID" "$TITLE" "$DESCRIPTION" "$PRIORITY" "$CATEGORY" \
-  "$ORIGIN" "$REASON" "$TIMESTAMP" "$ASP_ID" "$TARGET_ASPIRATION" "$ASP_FILE" \
-  2>&1)
+  "$ORIGIN" "$REASON" "$TIMESTAMP" "$ASP_ID" >> "$ASP_FILE"
 
 release_lock "$LOCK_FILE"
 trap - EXIT
 
-if [ "$WRITE2_RC" != "ok" ]; then
-    echo "ERROR: Write [2] FAILED -- $WRITE2_RC" >&2
-    exit 1
-fi
-
-# Layer 2: post-injection verification -- check goal embedded in TARGET_ASPIRATION's goals[]
+# Layer 2: post-injection verification — confirm selector-visible goal is on disk
 VERIFY=$(py -3 -c "
 import json, sys
-goal_id=sys.argv[1]; target_asp=sys.argv[2]; asp_file=sys.argv[3]
-with open(asp_file, 'r', encoding='utf-8') as fh:
+target = sys.argv[1]
+with open(sys.argv[2], 'r', encoding='utf-8') as fh:
     for line in fh:
         try:
-            rec = json.loads(line.strip())
+            if json.loads(line.strip()).get('id') == target:
+                print('ok')
+                sys.exit(0)
         except Exception:
-            continue
-        if rec.get('id') == target_asp:
-            for goal in rec.get('goals', []):
-                if goal.get('id') == goal_id:
-                    print('ok')
-                    sys.exit(0)
+            pass
 print('not_found')
-" "$SECONDARY_GOAL_ID" "$TARGET_ASPIRATION" "$ASP_FILE" 2>/dev/null || echo "error")
+" "$SECONDARY_GOAL_ID" "$ASP_FILE" 2>/dev/null || echo "error")
 
 if [ "$VERIFY" = "ok" ]; then
     echo "Injected: audit=$ASP_ID | selector-visible=$SECONDARY_GOAL_ID in $TARGET_ASPIRATION"
-    echo "G2 sandbox: true | G3 participants: [agent,user] | Layer 2 verified: embedded in goals[]"
+    echo "G2 sandbox: true | G3 participants: [agent,user] | Layer 2 verified: present"
 else
-    echo "ERROR: Layer 2 verify FAILED -- $SECONDARY_GOAL_ID not confirmed embedded in $TARGET_ASPIRATION" >&2
+    echo "ERROR: Layer 2 verify FAILED — $SECONDARY_GOAL_ID not confirmed in $ASP_FILE" >&2
     echo "Audit record $ASP_ID was written but selector-visible goal is missing." >&2
     echo "RECOVERY: Re-run injection or manually file goal into $TARGET_ASPIRATION" >&2
     exit 1

@@ -274,18 +274,22 @@ def test_case3_affects_missing_files_with_warning(sandbox, capsys):
 
 
 def test_case4_terminal_status_set_covers_all_terminal_states(sandbox, capsys):
-    """Sanity: skipped/superseded/archived also count as terminal.
+    """Sanity: every SSOT terminal goal status counts as terminal here.
 
-    Pins TERMINAL_GOAL_STATES contents. If any of the four states are
-    removed from the constant, this case detects the regression.
+    Integration guard that all five SSOT terminal statuses (completed,
+    skipped, superseded, expired, decomposed) skip-with-note and never spawn
+    an Investigate. g-303-21 (zeta audit D1) replaced the fictional 'archived'
+    case (never a valid goal status) with the real expired/decomposed cases
+    the fix added. The constant's exact contents are pinned against the SSOT
+    by test_terminal_goal_states_parity.py.
     """
-    # Build a single finding with FOUR affects entries, one per terminal
-    # state. All four MUST skip-with-note.
+    # Build a single finding with FIVE affects entries, one per terminal
+    # state. All five MUST skip-with-note.
     sandbox["findings"].write_text(
         _finding_record(
-            "msg-test-4-all-terminal", author="charlie",
+            "msg-test-5-all-terminal", author="charlie",
             requires_by="zeta-test", severity="invalidates",
-            affects=["g-100-c", "g-100-s", "g-100-u", "g-100-a"],
+            affects=["g-100-c", "g-100-s", "g-100-u", "g-100-e", "g-100-d"],
         ),
         encoding="utf-8",
     )
@@ -294,7 +298,8 @@ def test_case4_terminal_status_set_covers_all_terminal_states(sandbox, capsys):
             {"id": "g-100-c", "status": "completed", "title": "c"},
             {"id": "g-100-s", "status": "skipped", "title": "s"},
             {"id": "g-100-u", "status": "superseded", "title": "u"},
-            {"id": "g-100-a", "status": "archived", "title": "a"},
+            {"id": "g-100-e", "status": "expired", "title": "e"},
+            {"id": "g-100-d", "status": "decomposed", "title": "d"},
         ]),
         encoding="utf-8",
     )
@@ -304,11 +309,11 @@ def test_case4_terminal_status_set_covers_all_terminal_states(sandbox, capsys):
     summary = json.loads(out)
 
     assert rc == 0
-    assert summary["audit_stale"] == 4, (
-        "all four TERMINAL_GOAL_STATES must trigger audit-stale")
+    assert summary["audit_stale"] == 5, (
+        "all five SSOT terminal statuses must trigger audit-stale")
     assert summary["affects_missing"] == 0
     assert len(sandbox["add_goal_calls"]) == 0, (
         "no Investigate spawn for any terminal target")
-    assert len(sandbox["note_calls"]) == 4
+    assert len(sandbox["note_calls"]) == 5
     statuses_seen = {n["target_status"] for n in sandbox["note_calls"]}
-    assert statuses_seen == {"completed", "skipped", "superseded", "archived"}
+    assert statuses_seen == {"completed", "skipped", "superseded", "expired", "decomposed"}

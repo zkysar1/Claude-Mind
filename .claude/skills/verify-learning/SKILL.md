@@ -477,6 +477,20 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # rb-1279. This check guards that the findings-board read does not regress.
    Bash (fresh-eyes-reads-findings-board): grep -qE 'board-read\.sh --channel findings' .claude/skills/fresh-eyes-review/SKILL.md && grep -qF 'board_signals' .claude/skills/fresh-eyes-review/SKILL.md && echo "PASS: fresh-eyes-review Phase 2 reads the findings board for self_evolution/self-drift signals (g-115-1214)" || echo "FAIL: fresh-eyes-review Phase 2 no longer reads world/board/findings for self-evolution signals — the 2026-05-24 self_evolution_signals_count=0 blind spot regressed (g-115-1214, rb-1279); restore Phase 2.3b board-read + board_signals fold into self_evolution_signals_count"
 
+   # Cross-agent review floor (Section CAR -- g-303-23): the cross-agent review
+   # pattern (bravo<->alpha<->zeta mutual review; review-request gate Phase 5.7;
+   # insight_trigger findings; goal-duplication gate; fresh-eyes-code) was the
+   # single most valuable artifact named in the alpha session-60 retrospective,
+   # but emergent + unmeasured until codified in world/conventions/cross-agent-
+   # review.md. This check guards BOTH (a) the convention exists and (b) the live
+   # review-request rate stays above the calibrated floor (20/30d, ~40% of the
+   # 51/30d baseline) so a future refactor that scopes board posts or throttles
+   # the review gate cannot weaken the pattern silently. Requires the daemon up
+   # (board-read); an unexpected FAIL with the daemon down is a false positive --
+   # re-run once the daemon is healthy. rb-871 / b7c4caa / rb-2374 are the cited
+   # catches in the convention's Value section.
+   Bash (cross-agent-review-floor): source core/scripts/_paths.sh 2>/dev/null; conv="$WORLD_DIR/conventions/cross-agent-review.md"; if [ ! -f "$conv" ]; then echo "FAIL: world/conventions/cross-agent-review.md missing -- cross-agent review pattern uncodified (g-303-23)"; else floor=20; cnt=$(bash core/scripts/board-read.sh --channel coordination --type review-request --since 720h --json 2>/dev/null | grep -c '"id"' 2>/dev/null); case "$cnt" in (*[!0-9]*|"") cnt=0;; esac; if [ "$cnt" -lt "$floor" ]; then echo "FAIL: cross-agent review-request floor breached -- ${cnt}/30d < ${floor} (review gate Phase 5.7 stopped firing or board posts scoped away; verify daemon is up first; g-303-23, world/conventions/cross-agent-review.md)"; else echo "PASS: cross-agent review pattern alive -- ${cnt} review-requests/30d >= floor ${floor} (g-303-23)"; fi; fi
+
    # Partner-belief Theory-of-Mind loop (g-306-28, rb-1989): fresh-eyes-review
    # Phase 2.6c WRITES one calibrated belief about the most-salient partner per
    # 25-goal review (team-belief-write.sh) and Phase 2.6b CONSUMES partners'

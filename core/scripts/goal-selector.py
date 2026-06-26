@@ -71,6 +71,7 @@ import yaml  # Required — tree.py already depends on PyYAML
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT, agents_root as _agents_root
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm  # noqa: E402
+from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gated cadence)
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
@@ -255,6 +256,36 @@ WEIGHTS = load_weights()
 # handoff_bonus: raw value IS the bonus (not scaled). Configured in
 # meta/goal-selection-strategy.yaml like every other weight — no setdefault
 # fallback (, rb-215 single-source-of-truth).
+
+
+# opportunity_boost: optional, config-driven scoring boost for "opportunity"
+# categories (revenue, growth, etc.) so a deployment can make that work outrank
+# ROUTINE recurring maintenance in the selector without a manual per-iteration
+# override. DORMANT by default: categories come from
+# meta/goal-selection-strategy.yaml (opportunity_categories) and are empty in
+# the framework default, so the boost is 0.0 for every goal and the selector is
+# unchanged. A deployment activates it by listing categories there AND setting
+# weights.opportunity_boost (clamped to [0,3] by load_weights). The boost only
+# reorders score-gated routine goals; it CANNOT starve sentinel-gated critical
+# maintenance (tree-debt, experience-archival, etc.), which is gated in
+# aspirations-precheck, not score-gated. Domain values live in domain config,
+# never hardcoded in the framework.
+def load_opportunity_categories():
+    """Load opportunity-pursuit categories from meta/goal-selection-strategy.yaml.
+
+    Returns a frozenset; empty when the key is absent (framework default).
+    """
+    try:
+        with open(META_GOAL_SELECTION, encoding="utf-8") as f:
+            meta = yaml.safe_load(f) or {}
+        cats = meta.get("opportunity_categories") or []
+        return frozenset(str(c) for c in cats)
+    except (OSError, TypeError, ValueError):
+        return frozenset()
+
+
+OPPORTUNITY_CATEGORIES = load_opportunity_categories()
+OPPORTUNITY_BOOST_VALUE = 2.0
 
 # Override-key prefix for aspirations.yaml — see world/conventions/capability-routing.md
 # "Currently wired readers" list. Keep in sync with _OVERRIDE_FILE_PREFIX in tree.py.
@@ -1183,10 +1214,30 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
 
             # Recurring time gate (hour-level precision)
             if goal.get("recurring"):
-                interval = get_interval_hours(goal)
-                la = hours_since(goal.get("lastAchievedAt"))
-                if la is not None and la < interval:
-                    continue
+                # Signal-gated cadence ( / design ): when a
+                # recurring goal carries a `cadence_signal`, fire IFF that signal
+                # is PRESENT. Pure signal-gate (no `cadence_fallback_days`) skips
+                # entirely while the signal is absent; HYBRID (with fallback_days)
+                # falls back to a day-floor. Goals WITHOUT `cadence_signal` keep
+                # the legacy hour-interval gate below (backwards-compat by
+                # construction). Fail-open: an unknown/erroring signal returns
+                # True -> "fire" (cadence_signals.evaluate_cadence_signal).
+                cadence_signal = goal.get("cadence_signal")
+                if cadence_signal:
+                    if not evaluate_cadence_signal(cadence_signal, goal):
+                        fallback_days = goal.get("cadence_fallback_days")
+                        if fallback_days is None:
+                            continue  # pure signal-gate, signal absent -> skip
+                        la = hours_since(goal.get("lastAchievedAt"))
+                        if la is not None and la < float(fallback_days) * 24.0:
+                            continue  # hybrid: within fallback window -> skip
+                        # else: hybrid fallback floor elapsed -> fire
+                    # signal present -> fire (bypass the hour gate entirely)
+                else:
+                    interval = get_interval_hours(goal)
+                    la = hours_since(goal.get("lastAchievedAt"))
+                    if la is not None and la < interval:
+                        continue
 
             # Hypothesis time gate
             rne = goal.get("resolves_no_earlier_than")
@@ -2143,6 +2194,16 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 13b. directive_boost (cross-agent priority influence from board directives)
     raw["directive_boost"] = directive_boost_score(
         goal.get("id", ""), category)
+
+    # 13b.1 opportunity_boost: config-driven category boost (dormant by
+    # default). When a deployment lists opportunity-pursuit categories in
+    # meta/goal-selection-strategy.yaml AND sets weights.opportunity_boost,
+    # goals in those categories outrank routine recurring maintenance without a
+    # per-iteration override. Empty categories (framework default) -> 0.0 for
+    # every goal. Only reorders score-gated routine goals; cannot starve
+    # sentinel-gated critical maintenance (see OPPORTUNITY_CATEGORIES).
+    raw["opportunity_boost"] = (
+        OPPORTUNITY_BOOST_VALUE if category in OPPORTUNITY_CATEGORIES else 0.0)
 
     # 13c. handoff_bonus (cross-agent handoff routing).
     # A planning/reviewer agent files implementer-targeted goals via

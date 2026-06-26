@@ -255,6 +255,172 @@ def _compute_hash(blocker_refs):
     return h
 
 
+# Cache filename for the cross-iteration quiescence short-circuit ().
+# MUST equal quiescence-cycle-cache.py CACHE_NAME — a drift only causes a
+# fail-open cache MISS (the safe direction: the full cycle runs), never a
+# wrong short-circuit.
+CYCLE_CACHE_NAME = "quiescence-last-cycle.json"
+
+
+def _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds, goal_count, now):
+    """Write the approved-cycle cache consumed by quiescence-cycle-cache.py.
+
+    Single writer of <agent>/session/quiescence-last-cycle.json. Called ONLY on
+    the approved path of cmd_check (guarded by `if approved:`), so the cache
+    reflects the LAST GATE-APPROVED quiescence cycle. The fast-path script
+    (quiescence-cycle-cache.py) re-validates this snapshot (same blocker hash,
+    no blocker expired, no new work, no pending signal, cycle_count < cap) and
+    on a HIT increments cycle_count + re-sleeps WITHOUT reloading the heavy
+    skill chain.
+
+    cycle_count=0 here resets the consecutive-short-circuit counter on every
+    fresh gate approval. A changed blocker set yields a new current_hash, which
+    rewrites the cache with a 0 counter — the exact drift-reset the design
+    requires ("Reset the counter on any blocker_set_hash change").
+
+    Atomic tempfile+rename. Fail-soft: any error is logged to stderr and
+    swallowed — a cache write failure must never break the gate's approval
+    (the next fast-path check simply MISSES and runs the full cycle).
+    """
+    if AGENT_DIR is None:
+        return
+    payload = {
+        "blocker_set_hash": current_hash,
+        "blocker_refs": [
+            {"external_id": (r or {}).get("external_id"),
+             "expires_at": (r or {}).get("expires_at")}
+            for r in refs_for_hash if isinstance(r, dict)
+        ],
+        "sleep_seconds": sleep_seconds,
+        "goal_count": goal_count,
+        "cycle_count": 0,
+        "wake_outcome": None,
+        "approved_at": now.isoformat(timespec="seconds"),
+    }
+    p = AGENT_DIR / "session" / CYCLE_CACHE_NAME
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, default=str),
+                       encoding="utf-8")
+        tmp.replace(p)
+    except OSError as e:
+        print(f"[quiescence-gate] cycle-cache write failed: {e}", file=sys.stderr)
+
+
+# --- : prolonged-quiescence escalating user-ping --------------------
+#
+# Once an agent is in steady quiescence (same blocker_set hash for HOURS) AND
+# every blocked goal is gated by a user-only blocker_ref, silent sleep leaves
+# the user no signal about what they could clear. This emits ONE focused
+# escalation (the single highest-leverage blocker) per blocker_set_hash per
+# throttle window — NOT the email-flood pattern alpha flagged as miscalibrated.
+# The orchestrator (aspirations-all-blocked B6.5) reads prolonged_quiescence +
+# should_notify and fires /notify-user exactly once.
+
+# blocker_ref types ONLY the user can clear (mirror of capability-before-user.md
+# "human-only"). When EVERY blocked goal is gated by one of these, the queue is
+# genuinely user-bound and an escalating ping is warranted.
+USER_ONLY_BLOCKER_TYPES = frozenset({
+    "user_action", "credentials-required", "security-trust", "physical-hardware",
+})
+
+# Per-blocker_set_hash throttle file (recovery_action: clear on /start --recover).
+PROLONGED_PING_NAME = "prolonged-quiescence-pinged.json"
+
+
+def _read_prolonged_pinged():
+    """Read the {blocker_set_hash: last_pinged_iso} throttle map. {} on any error."""
+    if AGENT_DIR is None:
+        return {}
+    p = AGENT_DIR / "session" / PROLONGED_PING_NAME
+    try:
+        if not p.exists():
+            return {}
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[quiescence-gate] prolonged-ping read failed: {e}", file=sys.stderr)
+        return {}
+
+
+def _write_prolonged_pinged(pinged):
+    """Atomic write of the throttle map. Fail-soft (mirrors _write_cycle_cache)."""
+    if AGENT_DIR is None:
+        return
+    p = AGENT_DIR / "session" / PROLONGED_PING_NAME
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(pinged, ensure_ascii=False, default=str),
+                       encoding="utf-8")
+        tmp.replace(p)
+    except OSError as e:
+        print(f"[quiescence-gate] prolonged-ping write failed: {e}", file=sys.stderr)
+
+
+def _evaluate_prolonged_quiescence(blocked_entries, current_hash,
+                                   hash_first_seen_at, now, cfg):
+    """Decide whether a prolonged, all-user-gated quiescence warrants ONE
+    focused escalating user-ping (g-303-11).
+
+    Fires only when (a) the SAME blocker set has persisted >= prolonged_hours of
+    wall-clock (`hash_first_seen_at`), AND (b) EVERY blocked goal is gated by a
+    user-only blocker_ref type. Throttled per blocker_set_hash via a dedup file
+    so a long quiescence window produces at most ONE notification (the
+    anti-email-flood requirement that motivated this goal).
+
+    Returns a dict merged into the gate's stdout. `should_notify` is True at most
+    once per (hash, throttle window); the orchestrator reads it and fires
+    /notify-user. Pure decision + a single fail-soft file write — never raises.
+    """
+    out = {"prolonged_quiescence": False, "should_notify": False}
+    if not blocked_entries:
+        return out
+    hours = _hours_since(hash_first_seen_at)
+    threshold_h = float(cfg.get("prolonged_quiescence_hours", 4.0))
+    if hours is None or hours < threshold_h:
+        return out
+    # Every blocked goal must be gated by a user-only blocker_ref type.
+    all_user_gated = all(
+        isinstance(e.get("blocker_ref"), dict)
+        and e["blocker_ref"].get("type") in USER_ONLY_BLOCKER_TYPES
+        for e in blocked_entries
+    )
+    if not all_user_gated:
+        return out
+    # Highest-leverage blocker = the external_id gating the most blocked goals.
+    leverage = {}
+    titles_by_ext = {}
+    for e in blocked_entries:
+        ext = (e.get("blocker_ref") or {}).get("external_id") or "(unknown)"
+        leverage[ext] = leverage.get(ext, 0) + 1
+        titles_by_ext.setdefault(ext, []).append(
+            str(e.get("title") or e.get("goal_id") or "")[:80])
+    hi_ext = max(leverage, key=lambda k: leverage[k])
+    out["prolonged_quiescence"] = True
+    out["prolonged_payload"] = {
+        "highest_leverage_blocker_id": hi_ext,
+        "blocker_count": len(blocked_entries),
+        "distinct_blocker_count": len(leverage),
+        "hours_in_quiescence": round(hours, 1),
+        "sample_blocked_goal_titles": titles_by_ext.get(hi_ext, [])[:5],
+    }
+    # Throttle per blocker_set_hash: at most one ping per hash per window.
+    throttle_h = float(cfg.get("prolonged_throttle_hours", 12.0))
+    pinged = _read_prolonged_pinged()
+    last_h = _hours_since(pinged.get(current_hash))
+    if last_h is not None and last_h < throttle_h:
+        out["throttled_hours_remaining"] = round(throttle_h - last_h, 1)
+        return out  # should_notify stays False — already pinged this window
+    # Fire: record the ping (prune entries older than 2x window to stay bounded).
+    cutoff_h = throttle_h * 2
+    pinged = {h: t for h, t in pinged.items()
+              if h == current_hash or ((_hours_since(t) or 0.0) < cutoff_h)}
+    pinged[current_hash] = now.isoformat(timespec="seconds")
+    _write_prolonged_pinged(pinged)
+    out["should_notify"] = True
+    return out
+
+
 # --- Magic Wand 2: newly-arrived-work detection ------------------------------
 #
 # At quiescence-entry (cmd_check), capture total goal count in the active
@@ -765,6 +931,16 @@ def cmd_check(args, cfg):
     prior_hash = q.get("current_hash")
     prior_streak = int(q.get("streak", 0) or 0)
     streak = prior_streak + 1 if prior_hash == current_hash else 1
+    # : wall-clock anchor for prolonged-quiescence. Same lifecycle as
+    # current_hash/streak — it survives session_rollover (which preserves both,
+    # per the reset block above) and resets ONLY when the blocker set drifts.
+    # hash_first_seen_at marks when THIS hash was FIRST observed, so
+    # _evaluate_prolonged_quiescence can measure how long the user-bound queue
+    # has actually persisted (not just this session's slice of it).
+    if prior_hash == current_hash and q.get("hash_first_seen_at"):
+        hash_first_seen_at = q.get("hash_first_seen_at")
+    else:
+        hash_first_seen_at = now.isoformat(timespec="seconds")
     hysteresis = int(cfg.get("hysteresis_iters", 2))
     if streak < hysteresis:
         reasons.append({
@@ -810,6 +986,7 @@ def cmd_check(args, cfg):
     q_new = dict(q)
     q_new["current_hash"] = current_hash
     q_new["streak"] = streak
+    q_new["hash_first_seen_at"] = hash_first_seen_at  #  wall-clock anchor
     q_new["last_check_at"] = now.isoformat(timespec="seconds")
     q_new.setdefault("iters", 0)
     q_new.setdefault("sleep_total_s", sleep_total_s)
@@ -824,6 +1001,10 @@ def cmd_check(args, cfg):
     approved_but_drainable = False
     drainable_evidence = None
     drainable_summary = None
+    # : default "no escalation" — populated only on the approved path,
+    # mirroring the drainable-evidence defaults above. The denied path emits
+    # these as False/None, so the orchestrator's notify branch is a no-op there.
+    prolonged = {"prolonged_quiescence": False, "should_notify": False}
     if approved:
         sleep_seconds = int(cfg.get("sleep_seconds_min", 1800))
         # Cap respects config.sleep_seconds_max.
@@ -856,6 +1037,11 @@ def cmd_check(args, cfg):
         drainable_summary = _drainable_summary(drainable_evidence)
         approved_but_drainable = bool(drainable_summary["any_target_available"])
 
+        # Capture once so active_snapshot.goal_count_at_entry and the 
+        # cycle-cache see the SAME value (a second _total_goal_count() call
+        # could TOCTOU-skew between the two writes).
+        goal_count_at_entry = _total_goal_count()
+
         # sleep_total_s is incremented by --verify-wake with the ACTUAL
         # time slept (which may be less than sleep_seconds if a wake signal
         # fired). Writing the planned seconds here would over-count.
@@ -867,17 +1053,34 @@ def cmd_check(args, cfg):
             # cmd_verify_wake → _check_newly_arrived_work. If the field is
             # absent at wake, the consumer skips the check (no baseline →
             # no comparison) — that is the correct semantic, not a fallback.
-            "goal_count_at_entry": _total_goal_count(),
+            "goal_count_at_entry": goal_count_at_entry,
             # B6.8 (): drainable evidence at entry, so post-sleep
             # verify-wake can audit whether the drain actually reduced it.
             "drainable_evidence": drainable_evidence,
         }
+
+        # : prolonged-quiescence escalating user-ping. Evaluated ONLY on
+        # the approved path (we are about to sleep under this blocker set). Pure
+        # decision + at most one fail-soft throttle-file write; never raises. The
+        # throttle write here (like _write_cycle_cache below) is the single
+        # source of truth for "already pinged this window", so the orchestrator
+        # only has to act on should_notify, not re-derive the throttle.
+        prolonged = _evaluate_prolonged_quiescence(
+            blocked_entries, current_hash, hash_first_seen_at, now, cfg)
 
     # Merge signals.quiescence back into loop_state
     signals = dict(loop_state.get("signals") or {})
     signals["quiescence"] = q_new
     loop_state["signals"] = signals
     _wm_write_loop_state(loop_state)
+
+    # : on approval, write the cross-iteration short-circuit cache so
+    # quiescence-cycle-cache.py can collapse identical follow-on cycles WITHOUT
+    # reloading the heavy skill chain. Single writer; fail-soft (a write error
+    # never voids the approval — the fast path just MISSES next iteration).
+    if approved:
+        _write_cycle_cache(current_hash, refs_for_hash, sleep_seconds,
+                           goal_count_at_entry, now)
 
     # --- Log and return -------------------------------------------------------
     record = {
@@ -896,6 +1099,10 @@ def cmd_check(args, cfg):
         # B6.8 (): persist the drain decision in the trail.
         "approved_but_drainable": approved_but_drainable,
         "drainable_summary": drainable_summary,
+        # : prolonged-quiescence escalation decision in the trail.
+        "prolonged_quiescence": prolonged.get("prolonged_quiescence", False),
+        "prolonged_should_notify": prolonged.get("should_notify", False),
+        "prolonged_payload": prolonged.get("prolonged_payload"),
     }
     _append_log(cfg.get("log_file", "quiescence-log.jsonl"), record)
 
@@ -918,6 +1125,12 @@ def cmd_check(args, cfg):
         "approved_but_drainable": approved_but_drainable,
         "drainable_evidence": drainable_evidence,
         "drainable_summary": drainable_summary,
+        # : orchestrator (aspirations-all-blocked B6.5) reads these on
+        # the approved path and fires /notify-user exactly once per window.
+        "prolonged_quiescence": prolonged.get("prolonged_quiescence", False),
+        "should_notify": prolonged.get("should_notify", False),
+        "prolonged_payload": prolonged.get("prolonged_payload"),
+        "throttled_hours_remaining": prolonged.get("throttled_hours_remaining"),
     }
     print(json.dumps(output, ensure_ascii=False, default=str))
 

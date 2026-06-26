@@ -666,12 +666,38 @@ def test_session_gap_suppresses_filing():
             assert "1 session-gap-suppressed" in out
 
 
-def test_continuous_activity_still_files():
-    """Real drift (continuous activity, cadence still missed) has NO session
-    gap, so the canary still files — the gate is discriminating (g-115-1319).
+# ---- Pass-1 selector-contention suppression (3) ------------------
+#
+# Supersedes the prior `test_continuous_activity_still_files`. 9
+# treated "continuous activity, cadence missed" as real drift and filed.
+# The 3 investigation (99 world canaries, median 4.77x interval,
+# 98 closed transient/FP) showed that for best-effort recurring cadence
+# (rb-257) an active-loop miss of a NON-HIGH goal is the selector reasonably
+# prioritizing other work — not drift. The gate now suppresses NON-HIGH
+# continuous-activity breaks while preserving HIGH (cadence matters there).
 
-    Same 12.5h window as above, but the diary has a tick every 30 minutes
-    across it → no gap >= 2h → not a session gap → file normally.
+
+def _set_goal_priority(world: Path, asp_id: str, gid: str, priority: str):
+    """Patch a goal's priority directly on disk (test helper)."""
+    asp_path = world / "aspirations.jsonl"
+    asps = []
+    for line in asp_path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            asps.append(json.loads(line))
+    target = next(a for a in asps if a["id"] == asp_id)
+    g = next(x for x in target["goals"] if x["id"] == gid)
+    g["priority"] = priority
+    with open(asp_path, "w", encoding="utf-8") as f:
+        for a in asps:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+
+
+def test_continuous_activity_nonhigh_contention_suppressed():
+    """A NON-HIGH recurring goal whose elapsed window had the agent
+    continuously active (no session gap) is SUPPRESSED as selector contention,
+    not filed (g-115-1643). Same 12.5h window with a tick every 30 min (no gap
+    >= 2h); goal g-100-01 is MEDIUM → contention suppress. The diary has
+    in-window activity (positive evidence), so this is NOT the session-gap path.
     """
     with tempfile.TemporaryDirectory() as tmpd:
         world, agent_dir = _make_world_and_agent(Path(tmpd))
@@ -694,16 +720,96 @@ def test_continuous_activity_still_files():
             rc, out, err = _run_reflector(world, agent_dir)
             assert rc == 0, err
 
+            # No canary filed — suppressed as selector contention
+            asps = _read_aspirations(world, agent_dir)
+            asp_100 = next(a for a in asps if a["id"] == "asp-100")
+            new_goals = [g for g in asp_100["goals"]
+                         if "streak-break" in g.get("title", "").lower()]
+            assert len(new_goals) == 0, (
+                "MEDIUM continuous-activity break must be contention-suppressed")
+
+            signals = _read_signals(agent_dir)
+            assert signals[0]["processed"] is True
+            assert signals[0].get("contention_suppressed") is True
+            assert signals[0].get("session_gap_suppressed") is not True
+            assert "1 contention-suppressed" in out, (
+                f"summary missing contention count: out={out!r}")
+
+
+def test_continuous_activity_high_priority_still_files():
+    """A HIGH-priority recurring goal with continuous activity STILL files
+    (g-115-1643) — the gate preserves the discriminating signal for HIGH goals,
+    where cadence matters and the selector's overdue boost should have prevented
+    the miss. Same continuous-activity window as the MEDIUM suppression test,
+    but g-100-01 is patched to HIGH → files.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_and_agent(Path(tmpd))
+        with DaemonFixture(world):
+            _set_goal_priority(world, "asp-100", "g-100-01", "HIGH")
+            base = datetime.fromisoformat("2026-05-07T23:00:00")
+            ticks = [(base + timedelta(minutes=30 * i)).isoformat()
+                     for i in range(30)]
+            _write_diary(agent_dir, ticks)
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-100-01",
+                "aspiration_id": "asp-100",
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "lateness_ratio": 3.13,
+                "processed": False,
+            }
+            _write_signals(agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, agent_dir)
+            assert rc == 0, err
+
             asps = _read_aspirations(world, agent_dir)
             asp_100 = next(a for a in asps if a["id"] == "asp-100")
             new_goals = [g for g in asp_100["goals"]
                          if "streak-break" in g.get("title", "").lower()]
             assert len(new_goals) == 1, (
-                "real-drift break (continuous activity) must still file")
+                "HIGH-priority continuous-activity break must still file")
 
             signals = _read_signals(agent_dir)
             assert signals[0]["processed"] is True
-            assert signals[0].get("session_gap_suppressed") is not True
+            assert signals[0].get("contention_suppressed") is not True
+
+
+def test_missing_diary_continuous_activity_unknown_still_files():
+    """A MEDIUM break with NO execution-diary files normally — a missing diary
+    means activity is UNKNOWN, not 'agent active', so contention suppression
+    must NOT fire (g-115-1643 positive-evidence requirement). This pins the
+    fix's conservatism and guards the pre-existing 'file' contract that the
+    other no-diary tests rely on.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_and_agent(Path(tmpd))
+        with DaemonFixture(world):
+            # Intentionally write NO execution-diary.jsonl.
+            signal = {
+                "timestamp": "2026-05-08T12:00:00",
+                "goal_id": "g-100-01",
+                "aspiration_id": "asp-100",
+                "expected_interval_hours": 4,
+                "actual_elapsed_hours": 12.5,
+                "lateness_ratio": 3.13,
+                "processed": False,
+            }
+            _write_signals(agent_dir, [signal])
+
+            rc, out, err = _run_reflector(world, agent_dir)
+            assert rc == 0, err
+
+            asps = _read_aspirations(world, agent_dir)
+            asp_100 = next(a for a in asps if a["id"] == "asp-100")
+            new_goals = [g for g in asp_100["goals"]
+                         if "streak-break" in g.get("title", "").lower()]
+            assert len(new_goals) == 1, (
+                "no-diary break must file (activity unknown, not suppressed)")
+            signals = _read_signals(agent_dir)
+            assert signals[0].get("contention_suppressed") is not True
 
 
 if __name__ == "__main__":

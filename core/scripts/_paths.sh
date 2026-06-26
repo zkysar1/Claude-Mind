@@ -16,7 +16,7 @@
 # This is critical — it anchors all paths to core/scripts/ regardless of cwd.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"       # core/
-PROJECT_ROOT="$(cd "$CORE_ROOT/.." && pwd)"      # repo root
+export PROJECT_ROOT="$(cd "$CORE_ROOT/.." && pwd)"  # repo root (exported so world/scripts inherit it)
 CONFIG_DIR="$CORE_ROOT/config"
 REPO_ROOT="$PROJECT_ROOT"                        # legacy alias
 
@@ -166,13 +166,16 @@ else
     # during sourcing — so the warning fires only for LLM Bash tool calls where
     # the inject hook actually missed (MIND_AGENT genuinely empty at use time).
     for _CONF in "$(agents_root)"/*/local-paths.conf; do
-        if [ -f "$_CONF" ]; then
-            source "$_CONF"
-            if [ -z "$AGENT_NAME" ]; then
-                echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
-            fi
-            break
+        [ -f "$_CONF" ] || continue
+        source "$_CONF"
+        # Skip empty/partial confs (no WORLD_PATH): an abandoned `/start <agent>`
+        # can leave an empty local-paths.conf that sorts first and resolves
+        # WORLD_DIR empty. Let the next usable conf win regardless of ordering.
+        [ -n "${WORLD_PATH:-}" ] || continue
+        if [ -z "$AGENT_NAME" ]; then
+            echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
         fi
+        break
     done
     unset _CONF
 fi

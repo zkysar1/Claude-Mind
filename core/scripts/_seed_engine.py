@@ -573,10 +573,33 @@ _ORPHAN_SCAN_SKIP_TOP = {
 
 # Specific destination paths that survive every plant regardless of
 # manifest membership. Single source of truth for "preserved at dest".
+# Deployment-local files (CLAUDE.md, settings.json, promotion-cycle.md) are
+# per-deployment by design -- each repo names its own chain position and carries
+# its own hooks/permission config -- so a framework promotion must never delete
+# them at the destination (FM-2, 2026-06-25 cutover incident: promotion-cycle.md
+# was orphan-deleted because it is absent from the dev source include set).
 _ORPHAN_PRESERVE_FILES = {
     ".env.local",
     ".claude/settings.local.json",
+    "CLAUDE.md",
+    ".claude/settings.json",
+    ".claude/rules/promotion-cycle.md",
 }
+
+# Gitignored operational paths (regenerable runtime state) a living-prod
+# transplant must preserve. A framework promotion reconciles FRAMEWORK source
+# files only; these prefixes hold daemon state, logs, the python shim, and
+# editor history. The orphan pass would otherwise delete them (they are absent
+# from the manifest include set), disrupting a running deployment -- recoverable,
+# but the transplant should never touch them (FM-2, 2026-06-25 cutover incident).
+# Prefix-matched: an exact match or a child path under the prefix is preserved.
+_ORPHAN_PRESERVE_PREFIXES = (
+    ".python-shim",
+    "core/logs",
+    "mind_api/state",
+    ".history",
+    ".claude/.history",
+)
 
 
 def _is_preserved_at_dest(rel: str) -> bool:
@@ -588,6 +611,10 @@ def _is_preserved_at_dest(rel: str) -> bool:
         return True
     if first in _ORPHAN_SCAN_SKIP_TOP:
         return True
+    # Gitignored operational paths (daemon state, logs, shim, history)
+    for prefix in _ORPHAN_PRESERVE_PREFIXES:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            return True
     return False
 
 
@@ -754,8 +781,9 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
                 rel = str(path.relative_to(dest_root)).replace("\\", "/")
             except ValueError:
                 continue
-            first = rel.split("/", 1)[0]
-            if first in _ORPHAN_SCAN_SKIP_TOP or first.startswith(".seed-backup-"):
+            # Same preserve chokepoint as the file pass so empty operational
+            # dirs (mind_api/state, core/logs, ...) are not rmdir'd (FM-2).
+            if _is_preserved_at_dest(rel):
                 continue
             try:
                 if not any(path.iterdir()):

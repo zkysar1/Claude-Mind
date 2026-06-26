@@ -87,6 +87,17 @@ def _agent_last_read(parent_goal_id: str, agent: str,
                      agent_dir: Optional[Path]) -> Optional[str]:
     """Return the most-recent read_at ISO for parent_goal_id by agent. None
     if file missing, no matching entry, or every line unparseable.
+
+    RETIRED RECEIPT FILE (g-333-02): goal-reads.jsonl has no live writer
+    (aspirations.py:_log_goal_read removed at the 2026-05-14 daemon cutover;
+    the daemon read path never logged it). Its 3 stale files (~257k frozen
+    lines) were deleted under g-333-02, so in production this early-returns
+    None at the `if not log.exists()` guard below WITHOUT running the per-goal
+    O(n) scan -- the scan is now vestigial. Block 2 in evaluate() is
+    intentionally retained (g-115-1572 kept it) for the hypothetical
+    manually-restored-receipt case; do NOT resurrect the writer (rejected
+    under g-115-1572 -- the receipt mechanism is structurally
+    false-positive-prone).
     """
     if not agent or agent_dir is None:
         return None

@@ -7,8 +7,8 @@
 #
 # Usage:
 #   seed-transplant.sh <destination> [--dry-run] [--diff] [--no-backup]
-#                       [--force] [--manifest <path>] [--fresh-git] [--commit]
-#                       [--no-clean-cruft]
+#                       [--force] [--yes] [--manifest <path>] [--fresh-git]
+#                       [--commit] [--no-clean-cruft]
 #
 # Exits non-zero on failure. See .claude/skills/seed/SKILL.md for the spec.
 set -e
@@ -20,6 +20,7 @@ DRY_RUN=0
 DO_DIFF=0
 NO_BACKUP=0
 FORCE=0
+YES=0
 MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
 FRESH_GIT=0
 DO_COMMIT=0
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
         --no-backup) NO_BACKUP=1 ;;
         --backup) NO_BACKUP=0 ;;
         --force) FORCE=1 ;;
+        --yes|--non-interactive) YES=1 ;;
         --manifest) MANIFEST="$2"; shift ;;
         --fresh-git) FRESH_GIT=1 ;;
         --commit) DO_COMMIT=1 ;;
@@ -194,8 +196,16 @@ if [ $DRY_RUN -eq 1 ]; then
     exit 0
 fi
 
-# Step 6: User confirmation (skip if --force)
-if [ $FORCE -eq 0 ]; then
+# Step 6: User confirmation (skip if --force or --yes; non-TTY requires opt-in)
+if [ $FORCE -eq 0 ] && [ $YES -eq 0 ]; then
+    if [ ! -t 0 ]; then
+        # Non-interactive stdin (piped/backgrounded): refuse rather than read
+        # EOF -> "" -> Aborted. The caller must opt in explicitly (FM-5,
+        # 2026-06-25 cutover: a backgrounded plant hit [y/N], got EOF, aborted).
+        echo "ERROR: stdin is not a TTY and neither --yes nor --force was given." >&2
+        echo "  Re-run with --yes (confirm non-interactively) or --force." >&2
+        exit 2
+    fi
     echo ""
     echo "Proceed with seed-plant to $DEST ? [y/N]"
     read -r ANSWER

@@ -351,3 +351,102 @@ def test_read_world_path_from_conf_strips_quotes_and_comments(tmp_path):
         encoding="utf-8",
     )
     assert _engine._read_world_path_from_conf(conf) == "/tmp/ext world"
+
+
+# ============================================================================
+# Orphan removal -- living-prod-safe preservation (FM-2, 2026-06-25 cutover)
+# ----------------------------------------------------------------------------
+# Background (2026-06-25, v2.1.1 cutover incident FM-2):
+#   remove-orphans deleted living-prod files absent from the dev source include
+#   set: the deployment-local .claude/rules/promotion-cycle.md (each repo names
+#   its own chain position) and gitignored operational dirs (.python-shim,
+#   core/logs, mind_api/state, .history). A framework promotion reconciles
+#   FRAMEWORK source files only -- these are per-deployment/runtime state and
+#   must survive. _is_preserved_at_dest is the single chokepoint; these tests
+#   pin the expanded preserve set without over-broadening (a genuine framework
+#   orphan is still removed).
+# ============================================================================
+
+def _src_with_base_file(src: Path) -> dict:
+    """Source carries one framework file; manifest includes core/scripts so the
+    resolved include set is {core/scripts/keep.sh}. Everything else at dest is
+    an orphan candidate unless preserved."""
+    _w(src / "core" / "scripts" / "keep.sh", "kept framework file")
+    return {"include": [{"path": "core/scripts", "type": "dir"}],
+            "exclude_always": []}
+
+
+def test_orphan_removal_preserves_deployment_local_promotion_cycle(tmp_path):
+    """promotion-cycle.md is deployment-local (each repo names its own chain
+    position) and absent from the dev source -- must NOT be orphan-deleted."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_file(src)
+
+    _w(dest / "core" / "scripts" / "keep.sh", "old framework")          # in expected
+    _w(dest / ".claude" / "rules" / "promotion-cycle.md", "ZDS prod")   # deployment-local
+    _w(dest / ".claude" / "orphan.md", "removed upstream")              # genuine orphan
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".claude" / "rules" / "promotion-cycle.md").exists()
+    assert ".claude/rules/promotion-cycle.md" not in result["removed"]
+    assert not (dest / ".claude" / "orphan.md").exists()
+    assert ".claude/orphan.md" in result["removed"]
+
+
+def test_orphan_removal_preserves_claude_md_and_settings(tmp_path):
+    """CLAUDE.md and .claude/settings.json are deployment-local -- preserved."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_file(src)
+
+    _w(dest / "core" / "scripts" / "keep.sh", "x")
+    _w(dest / "CLAUDE.md", "prod CLAUDE.md")
+    _w(dest / ".claude" / "settings.json", "{}")
+
+    _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / "CLAUDE.md").exists()
+    assert (dest / ".claude" / "settings.json").exists()
+
+
+def test_orphan_removal_preserves_gitignored_operational_paths(tmp_path):
+    """Gitignored operational dirs (daemon state, logs, shim, history) are
+    regenerable runtime state -- a framework promotion must never delete them."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_file(src)
+
+    _w(dest / "core" / "scripts" / "keep.sh", "x")
+    _w(dest / ".python-shim" / "python3", "shim")
+    _w(dest / "core" / "logs" / "watchdog.jsonl", "log")
+    _w(dest / "mind_api" / "state" / "db.sqlite", "state")
+    _w(dest / ".history" / "blob", "hist")
+    _w(dest / ".claude" / ".history" / "edit", "hist")
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / ".python-shim" / "python3").exists()
+    assert (dest / "core" / "logs" / "watchdog.jsonl").exists()
+    assert (dest / "mind_api" / "state" / "db.sqlite").exists()
+    assert (dest / ".history" / "blob").exists()
+    assert (dest / ".claude" / ".history" / "edit").exists()
+    assert result["removed"] == []  # only preserved + expected present
+
+
+def test_orphan_removal_still_removes_genuine_framework_orphan(tmp_path):
+    """Control: a real framework orphan (under core/, absent from source) is
+    still removed -- FM-2 preservation did not over-broaden."""
+    src = tmp_path / "src"
+    dest = tmp_path / "dest"
+    manifest = _src_with_base_file(src)
+
+    _w(dest / "core" / "scripts" / "keep.sh", "x")
+    _w(dest / "core" / "scripts" / "removed-upstream.py", "stale")  # genuine orphan
+
+    result = _engine.do_remove_orphans(dest, manifest, src)
+
+    assert (dest / "core" / "scripts" / "keep.sh").exists()
+    assert not (dest / "core" / "scripts" / "removed-upstream.py").exists()
+    assert "core/scripts/removed-upstream.py" in result["removed"]

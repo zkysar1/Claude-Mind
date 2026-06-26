@@ -899,6 +899,36 @@ def _subtree_leaf_counts(nodes):
     return counts
 
 
+# Maintenance actions a node may be durably exempted from via its optional
+# per-node `maintain_exempt` field (8). A one-time semantic judgment
+# (set through /tree maintain's coherence gate) records that a node is
+# intentionally wide — a coherent interior hub (overview, chronological
+# build/research log) or a grandfathered top-level taxonomy cut — so the
+# candidate detectors below skip it instead of re-surfacing it every sweep.
+# Symmetric across both structural detectors: "decompose" exempts from
+# get_decompose_candidates, "redistribute" from get_redistribute_candidates.
+MAINTAIN_EXEMPT_ACTIONS = {"decompose", "redistribute"}
+
+
+def _node_maintain_exempt(node):
+    """Return the set of maintenance actions a node is durably exempted from.
+
+    Reads the optional per-node `maintain_exempt` field (g-115-1648). Accepts a
+    list/tuple/set (canonical), a bare string (single action), or absent/None
+    (no exemption). Permissive by design — an unknown or malformed value yields
+    no exemption (the detector simply never matches), so a typo is a silent
+    no-op that validate_tree surfaces as a warning rather than a hard error.
+    """
+    raw = node.get("maintain_exempt")
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        return {raw}
+    if isinstance(raw, (list, tuple, set)):
+        return set(raw)
+    return set()
+
+
 def get_decompose_candidates(tree, include_skipped=False):
     """Return non-root nodes whose retrieval subtree exceeds the leaf cap.
 
@@ -915,8 +945,13 @@ def get_decompose_candidates(tree, include_skipped=False):
     GRANDFATHERED; the maintain path regroups opportunistically, never
     force-migrates (see .claude/skills/tree/SKILL.md maintain section).
 
+    A node carrying "decompose" in its `maintain_exempt` field (g-115-1648) is
+    skipped regardless of subtree size — a durable coherence judgment that the
+    node is intentionally broad.
+
     When include_skipped=True, returns {candidates, skipped} where skipped is a
-    list of {node_key, skip_reason}. Skip-reason enum: is_root, within_leaf_cap.
+    list of {node_key, skip_reason}. Skip-reason enum: is_root,
+    decompose_exempt, within_leaf_cap.
     """
     leaf_cap = _config_leaf_cap()
     nodes = tree.get("nodes", {})
@@ -928,6 +963,10 @@ def get_decompose_candidates(tree, include_skipped=False):
         if depth < 1:
             if include_skipped:
                 skipped.append({"node_key": key, "skip_reason": "is_root"})
+            continue
+        if "decompose" in _node_maintain_exempt(node):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "decompose_exempt"})
             continue
         subtree_leaves = leaf_counts.get(key, 0)
         if subtree_leaves > leaf_cap:
@@ -963,8 +1002,14 @@ def get_redistribute_candidates(tree, include_skipped=False):
     depth-5..8 nodes are GRANDFATHERED; the maintain path regroups
     opportunistically (see .claude/skills/tree/SKILL.md maintain section).
 
+    A node carrying "redistribute" in its `maintain_exempt` field (g-115-1648)
+    is skipped regardless of child count — symmetric to the decompose path, for
+    coherent interior hubs (overviews, chronological build/research logs) that
+    are intentionally wide and would be fragmented by a regroup.
+
     When include_skipped=True, returns {candidates, skipped} where skipped is a
-    list of {node_key, skip_reason}. Skip-reason enum: no_children, within_k_max.
+    list of {node_key, skip_reason}. Skip-reason enum: no_children,
+    redistribute_exempt, within_k_max.
     """
     k_max = _config_k_max()
     nodes = tree.get("nodes", {})
@@ -976,6 +1021,10 @@ def get_redistribute_candidates(tree, include_skipped=False):
             if include_skipped:
                 skipped.append({"node_key": key, "skip_reason": "no_children"})
             continue  # leaves handled by get_decompose_candidates
+        if "redistribute" in _node_maintain_exempt(node):
+            if include_skipped:
+                skipped.append({"node_key": key, "skip_reason": "redistribute_exempt"})
+            continue
         if len(children) > k_max:
             candidates.append({
                 "key": key,
@@ -1097,6 +1146,24 @@ def validate_tree(tree):
         if "node_type" not in node:
             expected = "interior" if children else "leaf"
             warnings.append("Node '{}' missing 'node_type' (default: {})".format(key, expected))
+        # Validate optional maintain_exempt field (8): a list (or bare
+        # string) of known maintenance actions. Unknown/malformed values silently
+        # fail to exempt in the candidate detectors, so surface them here as a
+        # warning rather than letting a typo become an invisible no-op.
+        me = node.get("maintain_exempt")
+        if me is not None:
+            if isinstance(me, str):
+                me_set = {me}
+            elif isinstance(me, (list, tuple, set)):
+                me_set = set(me)
+            else:
+                me_set = None
+            if me_set is None:
+                warnings.append("Node '{}' has malformed 'maintain_exempt' (expected list of actions, got {})".format(key, type(me).__name__))
+            else:
+                unknown = me_set - MAINTAIN_EXEMPT_ACTIONS
+                if unknown:
+                    warnings.append("Node '{}' maintain_exempt has unknown action(s) {} (valid: {})".format(key, sorted(unknown), sorted(MAINTAIN_EXEMPT_ACTIONS)))
 
     # --- Physical-logical sync checks ---
 
