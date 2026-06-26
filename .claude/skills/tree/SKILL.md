@@ -360,7 +360,10 @@ than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
    d. **Depth guard / grandfather**: skip any reparent that would push a child
       past `D_max` (20). If the subtree is already deep (grandfathered
       depth-5..8) and cannot be regrouped without exceeding the ceiling, LEAVE
-      it — report-only, do not force-migrate.
+      it — report-only, do not force-migrate. For a node that is intentionally
+      broad by design (not just deep), record a durable `maintain_exempt`
+      `["decompose"]` judgment so it stops re-surfacing every sweep — see the
+      Durable exemption note (d2) under REGROUP below.
    e. Propagate confidence upward (`propagate` op).
    f. Append to `tree_growth_log`: `{op: DECOMPOSE, node, intermediates, date, reason: leaf_overflow}`
    Cap: process up to `config.max_decompose_per_invocation` candidates (default
@@ -382,6 +385,17 @@ Reported by `tree-read.sh --redistribute-candidates` with `reason: k_overflow`,
       (`tree-update.sh` reparent ops — moves nodes, preserves content/history).
    d. **Depth guard / grandfather**: skip reparents that would exceed `D_max`
       (20); leave grandfathered deep subtrees in place rather than force-migrate.
+   d2. **Durable exemption (coherence judgment, g-115-1648)**: if a candidate is
+      intentionally wide — a coherent interior hub (overview, chronological
+      build/research log) or a grandfathered taxonomy cut that would be
+      FRAGMENTED by a regroup — record that one-time judgment so it stops
+      re-surfacing every sweep instead of re-deciding "leave it" each pass:
+      `bash core/scripts/tree-update.sh update --set <key> maintain_exempt '["redistribute"]'`.
+      `get_redistribute_candidates` then skips it (skip_reason:
+      `redistribute_exempt`). Use sparingly — exemption is a durable assertion
+      that the node's width is correct by design, NOT a way to silence backlog.
+      To later re-include the node, set `maintain_exempt '[]'`. Symmetric
+      `"decompose"` exemption applies to the DECOMPOSE step above.
    e. Replace the parent body with a brief routing summary; propagate.
    f. Log to tree_growth_log: `{op: REGROUP, node, groups, date, reason: k_overflow}`
    Cap: process up to `config.max_redistribute_per_invocation` candidates (default 5).

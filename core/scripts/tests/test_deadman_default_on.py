@@ -99,5 +99,39 @@ def test_classify_arms_single_skill_one_assignment():
     assert res["B"] == "followed", f"B should be followed (owns the Skill); got {res['B']}"
 
 
+def test_verdict_splits_not_arming_from_quiet_on_reentries():
+    """arms=0 is split by the loop-re-entry signal: reentries>0 -> NOT-ARMING
+    (loop iterating but the paired arm is missing = deadman broken);
+    reentries==0 -> QUIET (ambiguous: long-iteration/idle OR death). Both stay
+    noncompliant — QUIET must NEVER be auto-suppressed (would hide a silent
+    death). Regression for the deadman audit verdict-quality fix (2026-06-24)."""
+    audit = _load_audit()
+    assert audit._verdict(False, 0, 0, 0) == "off", "unflagged -> off"
+    assert audit._verdict(True, 0, 0, 2) == "NOT-ARMING", (
+        "arms=0 + reentries>0 = iterating-but-not-arming (deadman broken)")
+    assert audit._verdict(True, 0, 0, 0) == "QUIET", (
+        "arms=0 + reentries=0 = ambiguous (check last_activity), not auto-benign")
+    assert audit._verdict(True, 3, 0, 5) == "ARMED-OK", "arms present + no orphans"
+    assert audit._verdict(True, 3, 1, 0) == "ORPHANS", "an orphan arm dominates"
+    # Safety invariant: QUIET is conservatively flagged. The _build_report bad
+    # filter MUST include all three failure verdicts so a possible silent death
+    # (QUIET) is never silently dropped from noncompliant.
+    src = AUDIT.read_text(encoding="utf-8")
+    assert '"ORPHANS", "NOT-ARMING", "QUIET"' in src, (
+        "QUIET must remain in the noncompliant filter — suppressing it could "
+        "hide a real silent loop death")
+
+
+def test_age_str_buckets():
+    """_age_str renders minutes/hours/days and never crashes on a bad input."""
+    from datetime import datetime, timezone, timedelta
+    audit = _load_audit()
+    now = datetime.now(timezone.utc)
+    assert audit._age_str((now - timedelta(minutes=5)).isoformat()).endswith("m ago")
+    assert audit._age_str((now - timedelta(hours=3)).isoformat()).endswith("h ago")
+    assert audit._age_str((now - timedelta(days=2)).isoformat()).endswith("d ago")
+    assert audit._age_str("not-a-timestamp") == "n/a"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

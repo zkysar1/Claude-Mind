@@ -400,9 +400,9 @@ files:
     required_when_running: false
 
   - file: goal-reads.jsonl
-    purpose: append-only log of cmd_read --id and cmd_query goal returns (g-115-410-b stale-read gate); consumed by stale-read-gate.py to compute MAX(read_at) per goal_id; aspirations-consolidate truncates to last 1000 entries
-    writer: aspirations.py:_log_goal_read (cmd_read, cmd_query)
-    recovery_action: preserve
+    purpose: RETIRED (g-333-02). Was an append-only log of cmd_read/cmd_query goal returns for the g-115-410-b stale-read gate. Writer dead since the 2026-05-14 daemon cutover (daemon read path does not log goal reads); 3 stale files (~257k frozen lines) deleted g-333-02. No truncation ever existed (the prior "truncates to last 1000" claim was false). stale_read.py _agent_last_read early-returns on the now-absent file, so the gate O(n) receipt scan is vestigial (Block 2 retained per g-115-1572 but unreachable in production).
+    writer: none (retired -- aspirations.py:_log_goal_read removed at 2026-05-14 daemon cutover)
+    recovery_action: clear
     sync_tier: continuity
     required_when_idle: false
     required_when_running: false

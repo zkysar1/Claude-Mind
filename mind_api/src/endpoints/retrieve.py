@@ -73,6 +73,7 @@ import retrieve as _r  # noqa: E402
 from tree_match import build_concept_index as _real_build_concept_index  # noqa: E402
 
 from ..yaml_cache import cache as _yaml_cache
+from ..jsonl_cache import cache as _jsonl_cache
 
 
 # Serialises (snapshot, swap, call, restore) so concurrent requests for
@@ -141,13 +142,41 @@ def _cached_read_yaml(path):
     return data if isinstance(data, dict) else {}
 
 
+def _cached_read_jsonl(path):
+    """Daemon-cached replacement for retrieve.read_jsonl. Routes through
+    jsonl_cache (mtime+size keyed, ensure_local-backed for own-cloud freshness
+    exactly like yaml_cache). Returns [] for missing files to match the
+    original read_jsonl's contract.
+
+    Mutation contract (audited g-333-01 before installing this patch):
+    jsonl_cache returns the SHARED list+dicts. retrieve's read_jsonl callers
+    (load_reasoning_bank :783, load_guardrails :836, load_pattern_signatures
+    :876, load_experiences :1071) build NEW lists via comprehensions and route
+    every counter bump through _locked_bump_jsonl — a SEPARATE locked file
+    read-modify-write that re-reads fresh and discards the in-memory snapshot
+    (see load_experiences' explicit comment). None mutate the cached list or
+    its dicts in place, so sharing the cache copy is safe.
+
+    Benefit profile (g-333-01): full on the read-only path (prime, reader mode,
+    --read-only) where no bump fires; partial on the non-read-only path, because
+    _locked_bump_jsonl rewrites a matched file's counters every call, changing
+    its mtime and forcing the next LOAD read to reload. The bump-rewrite cost
+    is out of this goal's scope (filed as a follow-up Idea).
+    """
+    data = _jsonl_cache().get(Path(path))
+    return data if isinstance(data, list) else []
+
+
 # Install the patches. From this point on, any code that calls
-# `retrieve.build_concept_index(...)` or `retrieve.read_yaml(...)` — which
-# includes all of retrieve's internal load_* functions — gets the cached
-# versions. The direct-python fallback path is unaffected because it imports
-# retrieve fresh in its own process.
+# `retrieve.build_concept_index(...)`, `retrieve.read_yaml(...)`, or
+# `retrieve.read_jsonl(...)` — which includes all of retrieve's internal
+# load_* functions (load_tree_nodes, load_reasoning_bank, load_guardrails,
+# load_pattern_signatures, load_experiences) — gets the cached versions. The
+# direct-python fallback path is unaffected because it imports retrieve fresh
+# in its own process.
 _r.build_concept_index = _cached_build_concept_index
 _r.read_yaml = _cached_read_yaml
+_r.read_jsonl = _cached_read_jsonl
 
 
 def _flag(q, name: str) -> bool:

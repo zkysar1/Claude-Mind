@@ -23,6 +23,10 @@ Tracked sentinels (force_* counter-gate family; set/clear semantics):
     force_tree_maintain              — writer: tree-encoding-drift-gate.py +
                                                 iteration-close learning-gate
                                        consumer: aspirations-precheck Phase 0-pre
+                                       (CONSUMPTION-AWARE since g-115-1649 —
+                                       keyed on force_tree_maintain_last_dispatch;
+                                       same arm-then-sample-before-clear false
+                                       fire that g-115-1553 fixed for the sibling)
     fresh_eyes_dispatch_pending      — writer: post-state-update-gate.sh
                                        consumer: aspirations-precheck Phase 0-pre3
     force_metric_encoding_pending    — writer: post-state-update-metric-gate.sh
@@ -102,6 +106,19 @@ DEFAULT_THRESHOLD = 3
 # were partner-attributed). Maps sentinel -> consumer dispatch slot.
 CONSUMPTION_AWARE = {
     "fresh_eyes_dispatch_pending": "fresh_eyes_last_dispatch",
+    # force_tree_maintain (9): same false-fire shape as the sibling
+    # above. Writer tree-encoding-drift-gate.py arms it in iteration-close
+    # do_state_update; the canary samples it in do_productivity_check (SAME
+    # close, AFTER the arm), BEFORE the next iteration's precheck Phase 0-pre
+    # consumer clears it — so a bare presence-count reads "set" at sample time
+    # on the arming close even though the consumer clears it every iteration.
+    # Deep-close-heavy agents (charlie/echo) accumulated stuck-counts to the
+    # fire threshold while the sentinel was null between iterations (false
+    # fire). The consumer (aspirations-precheck Phase 0-pre) now stamps
+    # force_tree_maintain_last_dispatch on ANY handling; the count climbs ONLY
+    # while that dispatch timestamp stays frozen, so a genuinely-bypassed
+    # consumer still fires while a keeping-up one does not.
+    "force_tree_maintain": "force_tree_maintain_last_dispatch",
 }
 # Canary-state key prefix for the last-observed consumer dispatch timestamp.
 # Stored alongside the per-sentinel stuck counts in CANARY_SLOT; the prefix

@@ -75,7 +75,13 @@ AFFECTS_RE = re.compile(r"^affects:(g-\d+-\d+)$")
 # Audit-time -> apply-time staleness gap (rb-1150): zeta's 06:37 audit
 # spawned a supersession-Apply at 18:11; the target had already closed at
 # 15:32. Re-probe at filing time catches that drift.
-TERMINAL_GOAL_STATES = {"completed", "skipped", "superseded", "archived"}
+#  (zeta allowlist audit D1): synced to the SSOT
+# aspirations.TERMINAL_GOAL_STATUSES -- previously drifted (missing
+# expired+decomposed, carried a bogus archived that is not a valid goal
+# status). Effect of the drift: expired/decomposed targets were mis-read as
+# non-terminal and still spawned supersession-Apply work. Parity enforced by
+# tests/test_terminal_goal_states_parity.py.
+TERMINAL_GOAL_STATES = {"completed", "skipped", "expired", "decomposed", "superseded"}
 
 
 # ---------------------------------------------------------------------------

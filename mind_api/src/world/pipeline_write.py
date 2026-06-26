@@ -771,6 +771,8 @@ def _empty_meta() -> Dict[str, Any]:
             "by_strategy": {},
             "by_time_horizon": {},
             "by_depth": {},
+            "by_type": {},
+            "by_confidence_band": {},
         },
         "micro_hypothesis_stats": {},
     }
@@ -849,6 +851,45 @@ def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
     for d in by_depth.values():
         d["pct"] = round(d["confirmed"] / d["total"] * 100, 1) if d["total"] > 0 else 0.0
     meta["accuracy"]["by_depth"] = by_depth
+
+    # by_type (high-conviction / calibration / exploration / contrarian).
+    # Mirrors pipeline.py compute_meta - consumed by precheck-eval cmd_accuracy
+    # to keep designed-uncertain exploration probes out of the
+    # calibration-relevant overconfidence signal. The daemon's _compute_meta is
+    # the authoritative writer of pipeline-meta.json, so a missing block here
+    # means by_type never reaches the gate regardless of pipeline.py.
+    by_type: Dict[str, Any] = {}
+    for r in resolved_records:
+        t = r.get("type")
+        if t:
+            if t not in by_type:
+                by_type[t] = {"confirmed": 0, "total": 0, "pct": 0.0}
+            by_type[t]["total"] += 1
+            if r["outcome"] == "CONFIRMED":
+                by_type[t]["confirmed"] += 1
+    for t in by_type.values():
+        t["pct"] = round(t["confirmed"] / t["total"] * 100, 1) if t["total"] > 0 else 0.0
+    meta["accuracy"]["by_type"] = by_type
+
+    # by_confidence_band surfaces WHERE overconfidence concentrates. Bands:
+    # >=0.80 reliable ("high"); the 0.50-0.75 noise zone splits into "medium"
+    # (0.65-0.79) and "low" (<0.65). A high band with a low pct is the
+    # overconfidence-drift signal. Records without a numeric confidence are
+    # skipped (legacy). Symmetric to by_type / by_strategy / by_depth.
+    by_confidence_band: Dict[str, Any] = {}
+    for r in resolved_records:
+        c = r.get("confidence")
+        if not isinstance(c, (int, float)):
+            continue
+        band = "high" if c >= 0.80 else "medium" if c >= 0.65 else "low"
+        if band not in by_confidence_band:
+            by_confidence_band[band] = {"confirmed": 0, "total": 0, "pct": 0.0}
+        by_confidence_band[band]["total"] += 1
+        if r["outcome"] == "CONFIRMED":
+            by_confidence_band[band]["confirmed"] += 1
+    for b in by_confidence_band.values():
+        b["pct"] = round(b["confirmed"] / b["total"] * 100, 1) if b["total"] > 0 else 0.0
+    meta["accuracy"]["by_confidence_band"] = by_confidence_band
 
     meta["last_updated"] = date.today().isoformat()
     return meta
@@ -1035,6 +1076,8 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
             "by_strategy": {},
             "by_time_horizon": {},
             "by_depth": {},
+            "by_type": {},
+            "by_confidence_band": {},
         },
         "micro_hypothesis_stats": {},
     }

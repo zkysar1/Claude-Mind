@@ -42,11 +42,32 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 import _fileops  # noqa: E402
 
-AGENTS = ["alpha", "bravo", "charlie", "delta", "echo", "zeta"]
 COMPLETION_OUTCOMES = {"deep", "routine"}
 
 
-def build_recon(agents_root):
+def _discover_agents(world_dir):
+    """Agent roster = the agent_status keys in world/team-state.yaml -- the
+    authoritative active-agent registry (the same source _agents.get_active_agents
+    reads). Derived dynamically so a new agent is picked up automatically, and a
+    system-identity dir like agents/omni/ (which carries a local-paths.conf but is
+    NOT a real agent and is absent from team-state) is correctly excluded.
+
+    Source-of-truth fix for the former hardcoded 6-agent list (g-303-21 / zeta
+    allowlist audit 1a; the audit named team-state agent_status as the SSOT). No
+    fallback to a directory scan: that would re-admit agents/omni/ and re-create
+    the stale-roster class this fix removes. A missing/unreadable team-state
+    fail-safes to an empty roster -- the backfill then stamps nothing and reports
+    a visible 0-count rather than acting on a stale list."""
+    import yaml
+    try:
+        with open(os.path.join(world_dir, "team-state.yaml"), encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return sorted((data.get("agent_status") or {}).keys())
+    except (OSError, yaml.YAMLError):
+        return []
+
+
+def build_recon(agents_root, agents):
     """goal_id -> {agent: [source-tags]} from journals + experience traces."""
     recon = collections.defaultdict(lambda: collections.defaultdict(list))
 
@@ -54,7 +75,7 @@ def build_recon(agents_root):
         if gid and agent:
             recon[gid][agent].append(source)
 
-    for agent in AGENTS:
+    for agent in agents:
         adir = os.path.join(agents_root, agent)
         jp = os.path.join(adir, "journal.jsonl")
         if os.path.exists(jp):
@@ -105,7 +126,8 @@ def main():
     apply = "--apply" in sys.argv[3:]
 
     asp_path = Path(world_dir) / "aspirations.jsonl"
-    recon = build_recon(agents_root)
+    agents = _discover_agents(world_dir)
+    recon = build_recon(agents_root, agents)
     attrib = unique_attributions(recon)
 
     # Compute the plan against current on-disk state (pre-lock preview).
@@ -129,7 +151,7 @@ def main():
                 cb = g.get("completed_by")
                 if cb:
                     stamped += 1
-                    if cb not in AGENTS and cb not in ("world", "omni", "user"):
+                    if cb not in agents and cb not in ("world", "omni", "user"):
                         malformed.append((g.get("id"), cb))
                     continue
                 gid = g.get("id")

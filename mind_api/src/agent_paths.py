@@ -261,9 +261,19 @@ class AgentPathResolver:
         return self._agents_root() / name
 
     def _first_available_agent(self) -> str:
-        """Find the first agent dir with a local-paths.conf. Empty string if none."""
+        """Find the first agent whose local-paths.conf resolves a WORLD_PATH.
+
+        Empty string if none. Skips empty or partial confs (e.g. an abandoned
+        `/start <agent>` that created the agent dir + an empty local-paths.conf
+        but never completed path config), which would otherwise win by sorting
+        first and resolve WORLD_PATH-unresolved (canonical incident: an empty
+        agents/<name>/local-paths.conf sorted before a usable one, making
+        agent-less daemon requests -- including /v1/admin/health -- resolve to
+        that agent and raise WORLD_PATH-unresolved, which read as a daemon-down
+        500 and triggered a kill-and-respawn death spiral)."""
         for conf in sorted(self._agents_root().glob("*/local-paths.conf")):
-            return conf.parent.name
+            if _parse_conf(conf).get("WORLD_PATH"):
+                return conf.parent.name
         return ""
 
     def _resolve_uncached(self, agent_name: str) -> AgentPaths:

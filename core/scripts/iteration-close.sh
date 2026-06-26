@@ -1540,6 +1540,17 @@ do_productivity_check() {
     # world/conventions/self-program-evolution.md "Stub Expiry".
     python3 "$(cygpath -w "$SCRIPT_DIR/evolution-stub-expiry.py")" --threshold-hours 24 \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Execution-diary trim (g-333-03, asp-333 A1): bound the otherwise-unbounded
+    # execution-diary.jsonl. It is appended every phase and full-scanned by
+    # presence-tick (on EVERY tool call), postcompact-restore, and skill_discovery.
+    # cmd_trim existed (execution-diary.py:261) with ZERO callers; wired here among
+    # the idempotent once-per-iteration maintenance sweeps. Cheap: cmd_trim
+    # early-returns without rewriting when nothing is older than 8h. Fail-open: the
+    # diary is observability — a missed trim is recovered next iteration. `|| true`
+    # + stderr redirect mirror the sibling sweeps; uses the .sh wrapper (proven at
+    # L370) rather than direct python3+cygpath.
+    bash "$SCRIPT_DIR/execution-diary.sh" trim --hours 8 \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # CRITICAL: productivity-stop-gate.sh is the ONLY authorized caller of
     # stop-requested outside /stop (per .claude/rules/stop-hook-compliance.md
     # productivity-gate exception). If the gate crashes, silently skipping means

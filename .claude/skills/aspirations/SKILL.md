@@ -334,7 +334,34 @@ IF signal is not null:
         # Clear silently; the sentinel just records the close attempt.
         Output: "▸ PENDING-PHASE-6-SPARK: outcome=routine for {signal.goal_id} — Phase 6 skipped per skip-rule, clearing sentinel"
         Bash: `echo 'null' | wm-set.sh pending_phase_6_spark`
-    # Continue to Phase -0.5e.
+    # Continue to Phase -0.5e.0.
+
+# Phase -0.5e.0: Quiescence-Cycle Fast-Path Short-Circuit (g-303-12)
+# Runs BEFORE idle-tick.sh. When the loop quiescence-approves repeatedly under
+# an UNCHANGED blocker set, each re-entry otherwise re-runs the full precheck/
+# select/all-blocked/quiescence-gate chain only to re-derive the same "all
+# blocked, approve, sleep" decision. This fast path re-validates the LAST
+# gate-approved cycle (same blocker hash, nothing expired, no new work, no
+# pending blocker signal, under the consecutive-short-circuit cap) and on a HIT
+# re-sleeps directly WITHOUT loading the heavy skill chain. The script does ALL
+# the validation: a cheap active_snapshot gate (skips the selector entirely when
+# not mid-quiescence) THEN a single live blocker-hash recompute. Every path
+# fails open to a MISS (empty stdout) so a bug here can only fall back to the
+# normal full cycle, never wrongly short-circuit. Common path (not in
+# quiescence) is ONE cheap script call returning empty.
+Bash: py -3 core/scripts/quiescence-cycle-cache.py check
+IF stdout contains "=== QUIESCENCE CACHE HIT ===":
+    # The directive names the EXACT single tool call to emit: an
+    # interruptible-sleep with run_in_background=true carrying the cached
+    # sleep_seconds. Emit ONLY that Bash call as the terminal action and RETURN.
+    # Do NOT run idle-tick.sh, do NOT load Skill(aspirations), do NOT run
+    # precheck/selection/execution. The bg sleep IS the terminal tool call;
+    # when the harness notifies you of its exit, re-enter via Skill(aspirations)
+    # args='loop'. Do NOT ScheduleWakeup to poll the sleep — the harness
+    # auto-notifies on bg completion (schedule-wakeup-correctness.md
+    # Anti-pattern A). This mirrors idle-tick.sh Branch A's terminal contract.
+    Emit the directive's single `Bash(... interruptible-sleep.sh {sleep_seconds}, run_in_background=true)` call. RETURN.
+# ELSE: cache MISS (empty stdout) — fall through to idle-tick.sh below.
 
 # Phase -0.5e: Blocked-Sleep Recovery — cheap-path sentinel + gated digest load.
 # DO NOT inline the digest here. Loading it every iteration (vs. only when a

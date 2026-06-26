@@ -75,7 +75,13 @@ from _paths import enumerate_agent_confs as _enumerate_agent_confs  # noqa: E402
 # `affects:<g-id>` can sit in the queue until /fresh-eyes-code fires this
 # gate at T+N hours; by then the target may have closed. Probing at filing
 # time avoids spawning duplicate Investigate work.
-TERMINAL_GOAL_STATES = {"completed", "skipped", "superseded", "archived"}
+#  (zeta allowlist audit D1): synced to the SSOT
+# aspirations.TERMINAL_GOAL_STATUSES -- previously drifted (missing
+# expired+decomposed, carried a bogus archived that is not a valid goal
+# status). Effect of the drift: expired/decomposed targets were mis-read as
+# non-terminal and still spawned Investigate work. Parity enforced by
+# tests/test_terminal_goal_states_parity.py.
+TERMINAL_GOAL_STATES = {"completed", "skipped", "expired", "decomposed", "superseded"}
 
 
 def _read_local_paths_conf(agent_name):

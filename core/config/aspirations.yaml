@@ -771,6 +771,21 @@ tree_archival:
   archives_per_pass: 0            # NATURAL GATE — 0 = dormant (no autonomous archive verdicts applied)
   compounding_gate_enabled: false # D3 cross-link: gate eligibility on compounding_events==0 once that field ships
 
+# --- GUARDRAIL RETIREMENT (D1, ) -- guardrail instantiation of the
+# shared cluster-refresh pattern (D2 = tree_archival above). LLM-reviewed,
+# cluster-aware retirement of stale guardrails. NATURAL-GATED DORMANT per
+# guard-348: retires_per_pass=0 means scan+keep+refresh run but ZERO retire
+# verdicts auto-apply. Engine: core/scripts/guardrail_retire.py +
+# guardrail-retire.sh. Design: agents/bravo/temp/d1-cluster-retirement-design.md.
+guardrail_retirement:
+  retire_threshold_days: 180      # Guard > this many days past effective relevance is a candidate (user-set, conservative; > guard-707's 60d floor)
+  refresh_lookback_days: 60       # Cluster member retrieved/fired within this window -> refresh whole cluster, skip retire
+  tag_jaccard_floor: 0.5          # Signal C: tags Jaccard >= floor (NOT mere intersection -- mega-cluster guard)
+  category_cohesion_floor: 40     # Signal A (category) is a STANDALONE edge only in categories smaller than this; large categories need B or C too
+  max_cluster_size: 30            # Cluster blows past this -> signals too loose, fall back to B-only (source-incident, the tightest signal)
+  retires_per_pass: 0             # NATURAL GATE -- 0 = dormant (no autonomous retire verdicts applied)
+  allowlist: []                   # class-(b1) rare-but-critical + (b3) constitutional guard ids: NEVER auto-retire
+
 # --- MAINTENANCE CADENCE (Protected time-based maintenance) ---
 # Protects maintenance work (tree curation, evolution) from goal-execution budget
 # competition. Patterned on strategic_scan.hours_cadence + last_strategic_scan WM slot.
@@ -875,6 +890,22 @@ recurring:
                                     # streak_mult-only window.
                                     # Single source of truth: streak-break-reflector.py
                                     # _load_session_gap_threshold() is the sole reader.
+  streak_break_contention_suppress: true  # (g-115-1643) Pass-1 selector-contention
+                                    # suppression. When true (default), a streak-break for a
+                                    # NON-HIGH recurring goal whose elapsed window had the
+                                    # agent CONTINUOUSLY ACTIVE (no session gap) is suppressed
+                                    # as benign selector contention, NOT filed as a canary.
+                                    # Best-effort recurring cadence (rb-257) means a goal fires
+                                    # only when the selector picks it over ~100 candidates, so
+                                    # LOW/MEDIUM goals routinely exceed interval 2-80x in a
+                                    # saturated queue (measured median 4.77x across 99 world
+                                    # canaries, 98 of which closed transient/FP). HIGH goals
+                                    # still file (cadence matters there; the selector's overdue
+                                    # boost should have prevented the miss). Set false to
+                                    # restore the pre-3 behavior (continuous-activity
+                                    # non-HIGH breaks file). Single source of truth:
+                                    # streak-break-reflector.py _load_contention_suppress()
+                                    # is the sole reader.
   cargo_cult_threshold: 3         # consecutive routine outcomes before auto-filing Idea
                                   # (see rb-335: YAML duplicate-key collision fix 2026-04-20)
   # --- CARGO-CULT PLACEHOLDER SUPPRESSION (9) ---
@@ -1270,6 +1301,19 @@ quiescence_gate:
   wake_miss_cooldown: 3           # N consecutive wake-misses → auto-disable session
   log_file: quiescence-log.jsonl  # relative to <agent>/session/ — decision trail
   audit_file: quiescence-audit.jsonl  # relative to <agent>/session/ — wake-miss record
+
+  # ---  (bravo, 2026-06-25) — prolonged-quiescence escalating user-ping ---
+  # When the SAME blocker-set hash has persisted >= prolonged_quiescence_hours of
+  # wall-clock (tracked via signals.quiescence.hash_first_seen_at) AND every
+  # blocked goal is gated by a user-only blocker_ref type (user_action,
+  # credentials-required, security-trust, physical-hardware), the gate emits
+  # prolonged_quiescence + should_notify so the orchestrator fires ONE focused
+  # /notify-user naming the single highest-leverage blocker. Throttled per
+  # blocker-set hash via <agent>/session/prolonged-quiescence-pinged.json so a
+  # long user-bound window produces AT MOST one ping per throttle period — the
+  # anti-email-flood requirement that motivated the goal.
+  prolonged_quiescence_hours: 4   # wall-clock under one hash before a ping is warranted
+  prolonged_throttle_hours: 12    # min hours between pings for the SAME blocker-set hash
 
   # --- Magic Wand #3 (alpha session-60, 2026-05-07) — fragmentation downgrade ---
   # When quiescence approves a sleep but external signals (board posts, claim

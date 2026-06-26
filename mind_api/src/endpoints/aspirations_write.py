@@ -140,8 +140,8 @@ _VALID_GOAL_STATUSES = {
 # yet (could be added — see _VALID_GOAL_STATUSES note above).
 _TERMINAL_GOAL_STATUSES = {"completed", "skipped", "expired",
                            "decomposed", "superseded"}
-_ASP_ID_RE = re.compile(r"^asp-\d{3}$")
-_GOAL_ID_RE = re.compile(r"^g-\d{3}-\d{2,4}(-[a-z])?$")  # 4-digit support: asp-115 hit  on 2026-05-19
+_ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
+_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit: asp-115 hit  (2026-05-19); g-xw-<ts>-NN cross-world ids (1 made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 # Mirrors aspirations.py::_AGENT_NAME_RE. Catches flag-name leak into the
 # agent_name positional/query slot (, 2026-05-14).
 _AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")

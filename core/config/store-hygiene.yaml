@@ -1,0 +1,117 @@
+# Store Hygiene Registry  ( KEYSTONE)
+#
+# Per-store bounding policy for append-only JSONL stores. Consumed by
+# `core/scripts/jsonl_hygiene.py sweep` (and its `.sh` wrapper), which the
+# recurring store-hygiene goal runs on a cadence.
+#
+# This file is the SINGLE SOURCE OF TRUTH for which stores get bounded and how.
+# The  keystone ships the MECHANISM + this SCHEMA; the Tier-B goals
+# (G5/G6/G8/G9/G11) each VERIFY their store's bound against real content +
+# consumers, then flip `enabled: true`. Until then every entry is DISABLED, so
+# nothing rotates and the keystone carries zero risk.
+#
+# ── Entry schema ────────────────────────────────────────────────────────────
+#   path:           store path. Virtual prefixes resolved by jsonl_hygiene.py:
+#                     world/...          -> $WORLD_DIR/...
+#                     meta/...           -> $META_DIR/...
+#                     agents/<name>/...  -> that agent's dir
+#                     agents/*/...       -> glob across all agent dirs
+#                   A '*' anywhere globs (e.g. world/board/*.jsonl).
+#   enabled:        bool. Sweep SKIPS entries that are not enabled (default false
+#                   via `defaults` below). An owner goal flips this to true.
+#   mode:           cap | rotate
+#                     cap    -> drop oldest beyond the bound (ATOMIC, no archive).
+#                              For disposable telemetry (no recoverable value).
+#                     rotate -> MOVE oldest beyond the bound into a sibling
+#                              <stem>-archive<suffix> file, then drop from live.
+#                              For logs whose history matters.
+#   by:             lines | age
+#                     lines  -> keep newest `max_lines` records.
+#                     age    -> keep records whose `ts_field` is within
+#                              `retention_days`; older are dropped/archived.
+#   max_lines:      int (by=lines).
+#   retention_days: int (by=age).
+#   ts_field:       record field holding the ISO timestamp (by=age).
+#   archive_path:   optional override for the rotate archive file.
+#   owner_goal:     the Tier-B goal responsible for verifying + enabling this.
+#
+# NOT handled here: status-based PHYSICAL compaction of active knowledge stores
+# (reasoning-bank / guardrails / pattern-signatures). That is  (G10),
+# which is NOT in this keystone's collapse-set and needs a utility-aware policy.
+#
+# The bounds below are CONSERVATIVE PROPOSALS pending each owner goal's
+# verification. Do not assume they are final.
+
+version: 1
+
+defaults:
+  enabled: false        # must be explicitly enabled by the owner Tier-B goal
+  mode: rotate
+  by: lines
+
+stores:
+  # ── G5 (): FIFO-cap meta/gate-firings.jsonl ────────────────────────
+  # Phase 1+5 gate telemetry. Disposable beyond a recent window -> cap.
+  - path: meta/gate-firings.jsonl
+    enabled: false
+    mode: cap
+    by: lines
+    max_lines: 10000
+    owner_goal: g-333-05
+
+  # ── G6 (): world/changelog.jsonl rotation ──────────────────────────
+  # Auto-appended audit trail of all world writes. History matters -> rotate.
+  - path: world/changelog.jsonl
+    enabled: false
+    mode: rotate
+    by: lines
+    max_lines: 20000
+    owner_goal: g-333-06
+
+  # ── G7 (): cap/stop read-never meta/changelog.jsonl ────────────────
+  # Meta-write audit trail; per the goal it is read-never -> cap.
+  - path: meta/changelog.jsonl
+    enabled: false
+    mode: cap
+    by: lines
+    max_lines: 10000
+    owner_goal: g-333-07
+
+  # ── G9 (): truncate world/presence/<agent>.jsonl ───────────────────
+  # Per-agent presence ticks. Disposable telemetry -> cap; globs all agents.
+  - path: world/presence/*.jsonl
+    enabled: false
+    mode: cap
+    by: lines
+    max_lines: 500
+    owner_goal: g-333-09
+
+  # ── G11 (): journal / evolution-log / skill-evolution / board ──────
+  # Append-only logs whose history matters -> rotate.
+  - path: agents/*/journal.jsonl
+    enabled: false
+    mode: rotate
+    by: lines
+    max_lines: 5000
+    owner_goal: g-333-11
+
+  - path: meta/evolution-log.jsonl
+    enabled: false
+    mode: rotate
+    by: lines
+    max_lines: 10000
+    owner_goal: g-333-11
+
+  - path: world/skill-evolution.jsonl
+    enabled: false
+    mode: rotate
+    by: lines
+    max_lines: 5000
+    owner_goal: g-333-11
+
+  - path: world/board/*.jsonl
+    enabled: false
+    mode: rotate
+    by: lines
+    max_lines: 5000
+    owner_goal: g-333-11

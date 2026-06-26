@@ -198,6 +198,28 @@ state = {
 }
 print(json.dumps(state))
 PYEOF
+        # Increment the cross-iteration retrospection tracker ().
+        # Persistent ACROSS iterations (NOT deleted on `end`, unlike STATE_FILE)
+        # -- tracks a DISCRETE per-iteration counter (incremented once per
+        # `meter start`) plus the iteration when a retrospection-class sweep last
+        # ran. guard-784: a discrete counter, never wall-clock.
+        TRACKER_FILE="$AGENT_DIR/session/precheck-retrospection-tracker.json"
+        TRACKER_E="$TRACKER_FILE" py -3 - <<'PYEOF' 2>/dev/null || true
+import os, json
+tf = os.environ['TRACKER_E']
+try:
+    with open(tf) as f:
+        t = json.load(f)
+except Exception:
+    t = {}
+t['iter'] = int(t.get('iter', 0)) + 1
+t.setdefault('last_retrospection_run_iter', 0)
+try:
+    with open(tf, 'w') as f:
+        json.dump(t, f)
+except Exception:
+    pass
+PYEOF
         ;;
 
     check)
@@ -213,6 +235,7 @@ PYEOF
         cur_ms=$(now_ms)
         # Decision logic in Python for atomic state update
         STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" SWEEP_E="$SWEEP_NAME" TIER_E="$tier" CUR_E="$cur_ms" \
+        SCRIPT_DIR_E="$SCRIPT_DIR" TRACKER_FILE_E="$AGENT_DIR/session/precheck-retrospection-tracker.json" \
         py -3 - <<'PYEOF' 2>/dev/null || echo "run"
 import os, json, sys
 state_file = os.environ['STATE_FILE_E']
@@ -261,6 +284,38 @@ elif tier in zone_drops:
 # above is the correct, sufficient protection: drop deferrables only under
 # context-tight (zone_drop_rules.tight=[deferrable]). `elapsed`/`cap_ms` are
 # retained below for drop-log telemetry only.
+
+# Retrospection-budget reservation (, bravo session-66 #4): override a
+# tight-zone DROP of a retrospection-class sweep to RUN when no retrospection
+# sweep has run in >= threshold iterations -- so the sweeps that catch boxed-in
+# patterns are NOT the first throttled under context pressure. Single-sourced in
+# _precheck_budget_reserve.reserve_decision (do NOT inline+duplicate the logic
+# here AND in the test -- that is the  duplicate-allowlist rot class).
+# guard-784: keyed on a DISCRETE iteration counter (the persistent tracker),
+# never wall-clock. Fail-open: any import/IO error leaves the base decision intact.
+try:
+    import sys as _sys
+    _sys.path.insert(0, os.environ.get('SCRIPT_DIR_E', ''))
+    from _precheck_budget_reserve import reserve_decision
+    _tracker_file = os.environ.get('TRACKER_FILE_E', '')
+    try:
+        with open(_tracker_file) as _tf:
+            _tr = json.load(_tf)
+    except Exception:
+        _tr = {}
+    _cur_iter = int(_tr.get('iter', 0))
+    _last_retro = int(_tr.get('last_retrospection_run_iter', 0))
+    decision, reason, _new_last = reserve_decision(
+        decision, reason, sweep, _cur_iter, _last_retro)
+    if _new_last != _last_retro:
+        _tr['last_retrospection_run_iter'] = _new_last
+        try:
+            with open(_tracker_file, 'w') as _tf:
+                json.dump(_tr, _tf)
+        except Exception:
+            pass
+except Exception:
+    pass  # fail-open -- the reservation must never break the meter
 
 # Append to state.sweeps (list of {sweep, tier, decision, reason, elapsed_at_decision_ms})
 state.setdefault('sweeps', []).append({

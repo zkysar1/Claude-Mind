@@ -199,8 +199,8 @@ def _emit_description_length_warning(goal, source):
             )
 
 VALID_SCOPES = {"sprint", "project", "initiative"}
-ASP_ID_RE = re.compile(r"^asp-\d{3}$")
-GOAL_ID_RE = re.compile(r"^g-\d{3}-\d{2,4}(-[a-z])?$")  # 4-digit support:  hit  on 2026-05-19
+ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (companion to GOAL_ID_RE xw branch below)
+GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit:  hit  (2026-05-19); g-xw-<ts>-NN cross-world ids (1 made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Single source of truth for the `add` (aspiration) and `add-goal` schemas —

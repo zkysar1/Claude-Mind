@@ -81,6 +81,28 @@ def _read_stdin_with_timeout(timeout_s=None):
     return box["data"] if box["done"] else ""
 
 
+def _read_last_line(path, encoding="utf-8", tail_bytes=8192):
+    """Last non-empty line of a file without loading the whole file ().
+
+    presence-tick fires on EVERY tool call (PostToolUse matcher='*') and Step 5
+    previously did f.read().splitlines() of the fully-unbounded
+    execution-diary.jsonl just to grab the last record's phase -- O(filesize)
+    per tool call. This seeks the final tail_bytes block instead (each diary
+    record is ~140 bytes, so the last complete line is always within it) and
+    returns the last non-empty line. A truncated first line in the block is
+    discarded (only the last line is used); errors='replace' tolerates a tail
+    cut mid-multibyte-char. Bounded O(tail_bytes) regardless of file size.
+    Fail-open is the caller's job (json.loads wrapped in try/except).
+    """
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - tail_bytes))
+        chunk = f.read()
+    lines = [ln for ln in chunk.decode(encoding, errors="replace").splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 def main() -> int:
     # Step 1: Parse hook payload from stdin (bounded read -- guard-664/rb-1568;
     # an unbounded json.load here orphaned this hook 120-129h, 8).
@@ -159,10 +181,9 @@ def main() -> int:
         diary = Path(AGENT_DIR) / "session" / "execution-diary.jsonl"
         if diary.exists():
             try:
-                with open(diary, encoding="utf-8") as f:
-                    lines = [l for l in f.read().splitlines() if l.strip()]
-                if lines:
-                    last = json.loads(lines[-1])
+                last_line = _read_last_line(diary)
+                if last_line:
+                    last = json.loads(last_line)
                     phase = last.get("phase", "") or ""
             except Exception:
                 pass

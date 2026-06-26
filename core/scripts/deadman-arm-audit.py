@@ -232,11 +232,43 @@ def _classify_arms(arm_events, skill_msgids, skill_events) -> list:
     return out
 
 
-def _verdict(flagged: bool, total: int, orphan: int) -> str:
+def _age_str(iso_utc: str) -> str:
+    """Human age ('Nm ago' / 'N.Nh ago' / 'N.Nd ago') for a UTC ISO timestamp."""
+    t = _parse_ts(iso_utc)
+    if t is None:
+        return "n/a"
+    secs = (datetime.now(timezone.utc) - t).total_seconds()
+    if secs < 0:
+        return "0m ago"
+    if secs < 3600:
+        return f"{int(secs / 60)}m ago"
+    if secs < 86400:
+        return f"{secs / 3600:.1f}h ago"
+    return f"{secs / 86400:.1f}d ago"
+
+
+def _verdict(flagged: bool, total: int, orphan: int, reentries: int = 0) -> str:
     if not flagged:
         return "off"
     if total == 0:
-        return "NOT-ARMING"   # flagged but no arm in window (no close yet, or dropped)
+        # No deadman arm in the window. Split the two arms=0 shapes using the
+        # loop-re-entry signal (Skill(aspirations) calls) — a hard transcript
+        # fact needing no calibration:
+        #   reentries>0 -> the loop demonstrably re-entered, but the PAIRED
+        #     ScheduleWakeup arm is missing -> deadman is broken for this agent
+        #     (high-confidence compliance failure).
+        #   reentries==0 -> no closes in the window at all. Could be a benign
+        #     long iteration / idle agent OR a real silent death. The transcript
+        #     alone CANNOT tell these apart at a single snapshot — a legit
+        #     backgrounded long run freezes the transcript exactly like a
+        #     text-death does. So QUIET stays CONSERVATIVELY in the noncompliant
+        #     set (never suppress a possible death); the human disambiguates via
+        #     the inline last_activity annotation in _print_human. Auto-
+        #     declassifying QUIET would need background-task awareness + cadence
+        #     calibration — documented future work, deliberately not done here.
+        if reentries > 0:
+            return "NOT-ARMING"   # iterating but not arming — investigate
+        return "QUIET"            # no closes in window — check last_activity
     if orphan > 0:
         return "ORPHANS"      # net armed but loop did not visibly re-enter (investigate)
     return "ARMED-OK"         # arming + loop re-enters every time (batched and/or split)
@@ -247,10 +279,12 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
     sid_to_agent = _session_to_agent(project_root)
     flagged = _flagged_agents(project_root)
     per_agent = {}
+    def _blank(fl):
+        return {"flagged": fl, "sids": [], "arms_total": 0,
+                "batched": 0, "followed": 0, "orphan": 0, "reentries": 0,
+                "last_activity_utc": None, "last_arm_utc": None}
     for agent in flagged:
-        per_agent[agent] = {"flagged": flagged[agent], "sids": [], "arms_total": 0,
-                            "batched": 0, "followed": 0, "orphan": 0,
-                            "last_arm_utc": None}
+        per_agent[agent] = _blank(flagged[agent])
     try:
         files = sorted(transcripts_dir.glob("*.jsonl"))
     except OSError:
@@ -259,14 +293,26 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
         agent = sid_to_agent.get(path.stem)
         if agent is None:
             continue
+        # Transcript file mtime = cheap liveness proxy (last time the agent
+        # emitted/received anything). Recorded for ALL mapped files — even those
+        # with no arms/reentries — so a fully-QUIET agent still gets a
+        # last_activity annotation to disambiguate alive-vs-dead.
+        try:
+            m_iso = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        except OSError:
+            m_iso = None
         arm_events, skill_msgids, skill_events = _collect_events(path, cutoff)
+        bucket = per_agent.setdefault(agent, _blank(flagged.get(agent, False)))
+        if m_iso is not None and (bucket["last_activity_utc"] is None
+                                  or m_iso > bucket["last_activity_utc"]):
+            bucket["last_activity_utc"] = m_iso
+        # reentries = loop re-entries (Skill(aspirations)) in window — collected
+        # even when arms=0, which is exactly the NOT-ARMING-vs-QUIET discriminator.
+        bucket["reentries"] += len(skill_events)
         if not arm_events:
             continue
-        arms = _classify_arms(arm_events, skill_msgids, skill_events)
-        bucket = per_agent.setdefault(agent, {
-            "flagged": flagged.get(agent, False), "sids": [], "arms_total": 0,
-            "batched": 0, "followed": 0, "orphan": 0, "last_arm_utc": None})
         bucket["sids"].append(path.stem)
+        arms = _classify_arms(arm_events, skill_msgids, skill_events)
         for a in arms:
             bucket["arms_total"] += 1
             bucket[a["klass"]] += 1
@@ -275,8 +321,12 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
     for agent, b in per_agent.items():
         b["batched_rate"] = (round(b["batched"] / b["arms_total"], 3)
                              if b["arms_total"] else None)
-        b["verdict"] = _verdict(b["flagged"], b["arms_total"], b["orphan"])
-    bad = [a for a, b in per_agent.items() if b["verdict"] in ("ORPHANS", "NOT-ARMING")]
+        b["verdict"] = _verdict(b["flagged"], b["arms_total"], b["orphan"],
+                                b.get("reentries", 0))
+    # QUIET stays in noncompliant (conservative — a possible silent death must
+    # never be suppressed; the human disambiguates via the last_activity column).
+    bad = [a for a, b in per_agent.items()
+           if b["verdict"] in ("ORPHANS", "NOT-ARMING", "QUIET")]
     totals = {
         "since_hours": since_hours,
         "cutoff_utc": cutoff.isoformat(),
@@ -298,10 +348,19 @@ def _print_human(report: dict) -> None:
     for agent, b in sorted(report["per_agent"].items()):
         rate = "n/a" if b["batched_rate"] is None else f"{b['batched_rate']*100:.0f}%"
         last = (b["last_arm_utc"] or "")[:19]
-        print(f"  {agent:8} flag={'ON ' if b['flagged'] else 'off'} "
-              f"verdict={b['verdict']:11} arms={b['arms_total']} "
-              f"batched={b['batched']} followed={b['followed']} orphan={b['orphan']} "
-              f"batched_rate={rate} last_arm={last}")
+        line = (f"  {agent:8} flag={'ON ' if b['flagged'] else 'off'} "
+                f"verdict={b['verdict']:11} arms={b['arms_total']} "
+                f"batched={b['batched']} followed={b['followed']} orphan={b['orphan']} "
+                f"batched_rate={rate} last_arm={last}")
+        # For anything not cleanly ARMED-OK, append the two disambiguation
+        # signals the reader otherwise has to probe for by hand: loop re-entries
+        # (separates iterating-not-arming from no-closes) and last transcript
+        # activity age (separates a live long-iteration from a real death).
+        if b["verdict"] not in ("ARMED-OK", "off"):
+            la = b.get("last_activity_utc")
+            line += (f"  | reentries={b.get('reentries', 0)} "
+                     f"last_activity={_age_str(la) if la else 'n/a'}")
+        print(line)
 
 
 def main():
