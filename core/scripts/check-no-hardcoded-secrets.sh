@@ -47,7 +47,7 @@ if [[ -n "${ALLOW_SECRETS_IN_COMMIT:-}" ]]; then
         echo "$(date +%Y-%m-%dT%H:%M:%S)" \
              "override=${ALLOW_SECRETS_IN_COMMIT}" \
              "user=${USER:-${USERNAME:-unknown}}" \
-             "agent=${AYOAI_AGENT:-unbound}"
+             "agent=${MIND_AGENT:-unbound}"
     } >> "$REPO/core/logs/secret-scanner-overrides.log"
     echo "[secret-scanner] OVERRIDDEN: ${ALLOW_SECRETS_IN_COMMIT}" >&2
     exit 0

@@ -104,7 +104,7 @@ MACHINE-LOCAL EXCLUSIONS (legitimately do NOT sync)
 USAGE
   set -a; source .env.local; set +a            # STORAGE_BACKEND + scoped creds
   source core/scripts/_paths.sh                # exports WORLD_PATH/META_PATH
-  export WORLD_PATH AYOAI_WORLD="$WORLD_PATH"   # from_env reads these
+  export WORLD_PATH MIND_WORLD="$WORLD_PATH"   # from_env reads these
   # preview the full baseline:
   py -3 core/scripts/owncloud_sync.py --all --full --dry-run
   # push everything to S3:

@@ -661,7 +661,7 @@ def evaluate(failure_reason: str, *,
         evidence_raw: structured evidence JSON string, or None.
         suggest_unblock: when True AND would_block, emit unblock_payload.
         for_goal_id: goal-id to interpolate into unblock_title.
-        agent_name: AYOAI_AGENT value for audit-log "agent" field.
+        agent_name: MIND_AGENT value for audit-log "agent" field.
         world_dir: WORLD_DIR for source-loaders + audit log. None
             disables all world-backed checks.
         skills_dir: SKILLS_DIR for SKILL.md scan. Defaults to repo's

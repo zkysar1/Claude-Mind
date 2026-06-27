@@ -16,7 +16,7 @@ Strategy:
     drift.
   * For keyword_block, use the stable real skill name
     "felt-sense-checkin" as the match anchor.
-  * Use a fake AYOAI_AGENT name (test-alpha-zzz) so the CLI doesn't
+  * Use a fake MIND_AGENT name (test-alpha-zzz) so the CLI doesn't
     inherit a real alpha/bravo/zeta local-paths.conf.
 """
 from __future__ import annotations
@@ -62,7 +62,7 @@ def _run_cli(failure_reason: str, *,
     if for_goal_id is not None:
         args.extend(["--for-goal-id", for_goal_id])
     env = os.environ.copy()
-    env["AYOAI_AGENT"] = agent
+    env["MIND_AGENT"] = agent
     proc = subprocess.run(args, env=env, capture_output=True, text=True,
                           check=False)
     if proc.stdout.strip():
@@ -403,7 +403,7 @@ def test_human_output_format():
     args = [sys.executable, str(CLI),
             "--failure-reason", fr, "--output", "human"]
     env = os.environ.copy()
-    env["AYOAI_AGENT"] = "test-alpha-zzz"
+    env["MIND_AGENT"] = "test-alpha-zzz"
     proc = subprocess.run(args, env=env, capture_output=True, text=True,
                           check=False)
     assert proc.returncode == 0

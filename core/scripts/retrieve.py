@@ -136,13 +136,13 @@ from tree_match import (
 def _infer_in_flight_goal_id():
     """Infer the agent's current in-flight goal_id from team-state.yaml.
 
-    Returns None if no AYOAI_AGENT binding, team-state missing, or no in_flight
+    Returns None if no MIND_AGENT binding, team-state missing, or no in_flight
     entry. Called when --goal is absent so utilization-feedback still fires —
     skills pass only --category (not --goal), which before this inference left
     retrieval-session.json unwritten and distill candidates with times_helpful=0
     AND times_noise=0. See g-115-137.
     """
-    agent = os.environ.get("AYOAI_AGENT")
+    agent = os.environ.get("MIND_AGENT")
     if not agent or WORLD_DIR is None:
         return None
     ts_path = WORLD_DIR / "team-state.yaml"
@@ -1567,7 +1567,7 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
 
     Schema:
       ts                — local ISO 8601
-      agent             — AYOAI_AGENT or "unknown"
+      agent             — MIND_AGENT or "unknown"
       goal_id           — args.goal or inferred in-flight, else null
       category          — query category (comma-separated multi)
       depth             — shallow|medium|deep
@@ -1609,7 +1609,7 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
         from datetime import datetime
         record = {
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "agent": os.environ.get("AYOAI_AGENT", "unknown"),
+            "agent": os.environ.get("MIND_AGENT", "unknown"),
             "goal_id": effective_goal or None,
             "category": category,
             "depth": depth,

@@ -164,8 +164,8 @@ class OwnCloudBackend:
     @classmethod
     def from_env(cls) -> "OwnCloudBackend":
         """Build from env vars. Required: STORAGE_S3_BUCKET, STORAGE_DDB_LOCK_TABLE,
-        STORAGE_DDB_SESSIONS_TABLE, and at least one of AYOAI_WORLD/WORLD_PATH or
-        AYOAI_META/META_PATH (so a governed path can resolve to a root). Also
+        STORAGE_DDB_SESSIONS_TABLE, and at least one of MIND_WORLD/WORLD_PATH or
+        MIND_META/META_PATH (so a governed path can resolve to a root). Also
         requires the scoped creds MIND_AWS_ACCESS_KEY_ID + MIND_AWS_SECRET_ACCESS_KEY
         UNLESS MIND_AWS_ALLOW_DEFAULT_CHAIN=1 is set (fail-closed — see below).
 
@@ -249,17 +249,17 @@ class OwnCloudBackend:
     @staticmethod
     def _resolve_root_map():
         """The three independent governed roots -> their logical prefixes.
-        world/meta from env (AYOAI_* preferred, then *_PATH); agents-root is
+        world/meta from env (MIND_* preferred, then *_PATH); agents-root is
         always PROJECT_ROOT/agents (derivable from this file's location, or
         overridable via AGENTS_ROOT for tests)."""
-        world = os.environ.get("AYOAI_WORLD") or os.environ.get("WORLD_PATH")
-        meta = os.environ.get("AYOAI_META") or os.environ.get("META_PATH")
+        world = os.environ.get("MIND_WORLD") or os.environ.get("WORLD_PATH")
+        meta = os.environ.get("MIND_META") or os.environ.get("META_PATH")
         agents = (os.environ.get("AGENTS_ROOT")
                   or str(Path(__file__).resolve().parents[2] / "agents"))
         if not world and not meta:
             raise RuntimeError(
-                "OwnCloudBackend.from_env: neither AYOAI_WORLD/WORLD_PATH nor "
-                "AYOAI_META/META_PATH is set — cannot map a governed path to a root")
+                "OwnCloudBackend.from_env: neither MIND_WORLD/WORLD_PATH nor "
+                "MIND_META/META_PATH is set — cannot map a governed path to a root")
         root_map = []
         if world:
             root_map.append((Path(world), "world"))

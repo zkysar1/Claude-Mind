@@ -32,7 +32,7 @@ from _rb_helpers import is_universal_rb, sort_universal_rbs
 from _jsonl_helpers import set_nested_field
 
 def _read_in_flight_goal_id():
-    """Read agent_status.<AYOAI_AGENT>.in_flight.goal_id from team-state.yaml.
+    """Read agent_status.<MIND_AGENT>.in_flight.goal_id from team-state.yaml.
 
     g-240-61 auto-population: rb entries attribute to their originating goal.
     Callers that forget to pass `source_goal` left orphan entries (rb-416, rb-418)
@@ -45,7 +45,7 @@ def _read_in_flight_goal_id():
         import yaml  # lazy import — only needed in the auto-populate path
     except ImportError:
         return None
-    agent = os.environ.get("AYOAI_AGENT")
+    agent = os.environ.get("MIND_AGENT")
     if not agent:
         return None
     path = WORLD_DIR / "team-state.yaml"

@@ -19,7 +19,7 @@
 # pre-scan status.
 #
 # Fail-open at multiple layers:
-#   - Missing AYOAI_AGENT       → return 0 (silent)
+#   - Missing MIND_AGENT       → return 0 (silent)
 #   - Missing local-paths.conf  → return 0 (silent)
 #   - Missing AGENT_WRITE_PATH  → return 0 (silent; AGENT_WRITE_PATH is
 #                                  optional per local-paths.conf schema)
@@ -50,7 +50,7 @@ cross_repo_commit_product() {
     # here to skip the local-paths.conf read entirely on the hot path.
     [[ "$outcome" != "deep" ]] && return 0
 
-    local agent="${AYOAI_AGENT:-}"
+    local agent="${MIND_AGENT:-}"
     [[ -z "$agent" ]] && return 0
 
     local script_dir

@@ -70,7 +70,7 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `world/program.md` is non-empty (The Program — shared purpose defined)
    Check: `<agent>/.initialized` exists (init-agent.sh ran successfully)
    Check: `agents/<agent>/self.md` is non-empty (agent identity defined)
-   Check: `$AYOAI_AGENT` env var is set and matches agent directory name
+   Check: `$MIND_AGENT` env var is set and matches agent directory name
    Check: `meta/spark-questions.jsonl` exists (moved from old mind/ to meta/)
    Check: `meta/skill-quality.yaml` exists (moved from old mind/ to meta/)
    Check: `meta/evolution-log.jsonl` exists (moved from old mind/ to meta/)
@@ -111,11 +111,11 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Check: `core/scripts/obligation-audit.py` counts `session_false_claims` from obligation-audit.jsonl records
    Check: `core/scripts/context-citation-audit.sh` scopes banner search per-OBLIGATION (neighborhood bounded by next claim's start), not per-block. Grep the script for `matches[i + 1].start()` must match.
 
-   # Agent resolution: AYOAI_AGENT env var is the ONLY mechanism (Section 4T continued)
+   # Agent resolution: MIND_AGENT env var is the ONLY mechanism (Section 4T continued)
    # No fallback files, no .active-agent global, no .latest-session-id.
-   Check: `core/scripts/_paths.py` `_resolve_agent_name` reads only `os.environ.get("AYOAI_AGENT")`
-   Check: `core/scripts/_paths.sh` resolves `AGENT_NAME="${AYOAI_AGENT:-}"` (one line, no fallbacks)
-   Bash: AYOAI_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent"
+   Check: `core/scripts/_paths.py` `_resolve_agent_name` reads only `os.environ.get("MIND_AGENT")`
+   Check: `core/scripts/_paths.sh` resolves `AGENT_NAME="${MIND_AGENT:-}"` (one line, no fallbacks)
+   Bash: MIND_AGENT=test-agent source core/scripts/_paths.sh && echo "$AGENT_NAME" → verify prints "test-agent"
 
    # Inlined-_APD drift detection (rb-1092, g-115-983)
    # AGENTS_PARENT_DIR is inlined at 5 sites for latency/import-cycle reasons
@@ -189,9 +189,9 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # (2) capability-routing overlay loads non-empty title_prefix_routes
    # rb-1100 calls this "silent safe-default degradation = sync-invariant audit missed a site".
    Check: `core/scripts/_world_config.py` `_resolve_world_dir()` returns non-None Path for a bound agent (Mode G regression — Phase 2.5.D missed sync site)
-   Bash (world-config-resolves): AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import _resolve_world_dir; p = _resolve_world_dir(); assert p is not None, 'FAIL: _resolve_world_dir() returned None (Mode G regression — silently falls through to PROJECT_ROOT/world)'; print(f'PASS: _world_config._resolve_world_dir() returned {p}')"
+   Bash (world-config-resolves): MIND_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import _resolve_world_dir; p = _resolve_world_dir(); assert p is not None, 'FAIL: _resolve_world_dir() returned None (Mode G regression — silently falls through to PROJECT_ROOT/world)'; print(f'PASS: _world_config._resolve_world_dir() returned {p}')"
    Check: `core/scripts/_world_config.py` `load_world_config('capability-routing')` returns non-empty title_prefix_routes (overlay file load works end-to-end)
-   Bash (capability-routing-non-empty): AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import load_world_config; cfg = load_world_config('capability-routing'); routes = cfg.get('title_prefix_routes', {}) if cfg else {}; assert len(routes) > 0, 'FAIL: title_prefix_routes is empty — overlay loader silently degraded (rb-1100)'; print(f'PASS: capability-routing overlay loaded {len(routes)} title_prefix_routes')"
+   Bash (capability-routing-non-empty): MIND_AGENT=alpha py -3 -c "import sys; sys.path.insert(0, 'core/scripts'); from _world_config import load_world_config; cfg = load_world_config('capability-routing'); routes = cfg.get('title_prefix_routes', {}) if cfg else {}; assert len(routes) > 0, 'FAIL: title_prefix_routes is empty — overlay loader silently degraded (rb-1100)'; print(f'PASS: capability-routing overlay loaded {len(routes)} title_prefix_routes')"
 
    # Hardcoded AGENTS_PARENT_DIR literal audit (g-115-1009, source: exp-encode-
    # session-2026-05-20-world-config-mode-g). Static-pattern companion to the
@@ -259,7 +259,7 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (tree-summary-projection-fields): fail=0; for f in core/scripts/tree.py mind_api/src/world/tree_read.py; do for k in last_updated article_count; do grep -qE "[\"']${k}[\"'][[:space:]]*:[[:space:]]*node\.get\([[:space:]]*[\"']${k}[\"']" "$f" || { echo "FAIL: $f --summary projection missing '${k}' key (strategic-scan S2a/S2b go dead — g-115-1408/g-115-1409)"; fail=1; }; done; done; [ "$fail" = 0 ] && echo "PASS: tree-read --summary projection carries last_updated + article_count in both paths (tree.py CLI + tree_read.py daemon)" || true
 
    # Bash-agent-inject hook evidence checks (Section 4T continued)
-   # The PreToolUse[Bash] hook auto-injects AYOAI_AGENT from .active-agent-<SID> so
+   # The PreToolUse[Bash] hook auto-injects MIND_AGENT from .active-agent-<SID> so
    # the LLM no longer needs to prefix every Bash call manually.
    Check: `core/scripts/bash-agent-inject.sh` and `core/scripts/bash-agent-inject.py` exist
    Check: `.claude/settings.json` has a PreToolUse hook with `matcher: "Bash"` pointing at `bash-agent-inject.sh`
@@ -269,10 +269,10 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (no-fallback-chain): grep -E '\|\|\s*(py|python)( |$)' core/scripts/*.sh → verify returns empty (no hook script uses python3||py||python fallback; single source of truth via _paths.sh shim)
    Bash (python-form-consistency): grep -E "(^|[^A-Za-z0-9_])py -(3|c)( |$)|\| py -(3|c) |exec py( |$)|[^A-Za-z0-9_]py - |[^A-Za-z0-9_]py \"\\\$" core/scripts/*.sh core/scripts/tests/*.sh → verify returns empty (inside .sh wrappers that source _paths.sh, use `python3` — never `py -3`, `py -c`, bare `py <file>`, `py -` stdin heredoc, or `py "$VAR"`; rb-471 audit-scope discipline companion to rb-370 — the five branches enumerate every legacy invocation variant so narrow greps do not mask scope)
    Bash (fail-open): echo 'not json' | bash core/scripts/bash-agent-inject.sh; echo "exit=$?" → verify exit=0 and empty stdout (malformed stdin must not block Bash tool)
-   Bash (override-preserved): echo '{"session_id":"test","tool_input":{"command":"AYOAI_AGENT=alpha pwd"}}' | bash core/scripts/bash-agent-inject.sh → verify empty stdout (explicit AYOAI_AGENT= at command boundary must skip injection so cross-agent probes work)
+   Bash (override-preserved): echo '{"session_id":"test","tool_input":{"command":"MIND_AGENT=alpha pwd"}}' | bash core/scripts/bash-agent-inject.sh → verify empty stdout (explicit MIND_AGENT= at command boundary must skip injection so cross-agent probes work)
 
    # Bash-inject diagnostic surface (rb-514, 2026-04-25)
-   # When binding resolution returns no agent AND no explicit AYOAI_AGENT= override,
+   # When binding resolution returns no agent AND no explicit MIND_AGENT= override,
    # the hook surfaces the silent-no-injection failure class via a greppable artifact.
    # Without this surface, NO_AGENT sessions made silent no-op Bash calls invisible —
    # the diagnostic turns the silent failure class into one that grep can find.
@@ -362,8 +362,8 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (no-start-spawn): ! grep -q "watchdog-start.sh" .claude/skills/start/SKILL.md && echo "PASS: /start no longer spawns a watchdog daemon" || echo "FAIL: /start still references retired watchdog-start.sh"
    Bash (no-stop-kill): ! grep -q "watchdog-stop.sh" .claude/skills/aspirations-graceful-stop/SKILL.md && echo "PASS: graceful-stop no longer kills a watchdog daemon" || echo "FAIL: aspirations-graceful-stop still references retired watchdog-stop.sh"
    Bash (no-recovery-stop): ! grep -q "watchdog-stop.sh" core/scripts/recovery-gate.sh && echo "PASS: recovery-gate.sh no longer references retired watchdog-stop.sh" || echo "FAIL: recovery-gate.sh still references retired watchdog-stop.sh"
-   Bash (tick-smoketest): LOG=core/logs/watchdog-alpha.jsonl; BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); STATE=agents/alpha/session/watchdog-prev-state.json; touch agents/alpha/session/running-session-id 2>/dev/null; AYOAI_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; AFTER=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); test -f "$STATE" && echo "PASS: tick wrote state file" || echo "FAIL: tick did not write $STATE"
-   Bash (tick-emits-on-transition): AYOAI_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; LOG=core/logs/watchdog-alpha.jsonl; BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); touch agents/alpha/session/running-session-id 2>/dev/null; AYOAI_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; AFTER=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); test "$AFTER" -gt "$BEFORE" && echo "PASS: tick emitted transition event on mtime change (before=$BEFORE after=$AFTER)" || echo "FAIL: tick did not detect mtime transition"
+   Bash (tick-smoketest): LOG=core/logs/watchdog-alpha.jsonl; BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); STATE=agents/alpha/session/watchdog-prev-state.json; touch agents/alpha/session/running-session-id 2>/dev/null; MIND_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; AFTER=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); test -f "$STATE" && echo "PASS: tick wrote state file" || echo "FAIL: tick did not write $STATE"
+   Bash (tick-emits-on-transition): MIND_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; LOG=core/logs/watchdog-alpha.jsonl; BEFORE=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); touch agents/alpha/session/running-session-id 2>/dev/null; MIND_AGENT=alpha py -3 core/scripts/agent-watchdog.py --tick >/dev/null 2>&1; AFTER=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ' || echo 0); test "$AFTER" -gt "$BEFORE" && echo "PASS: tick emitted transition event on mtime change (before=$BEFORE after=$AFTER)" || echo "FAIL: tick did not detect mtime transition"
 
    # Cross-Agent Attribution Deliverable Integrity (Section CAA — g-115-774, 2026-05-15)
    # g-115-741 found g-115-714's deliverables (_cross_agent_attribution_filter.py +
@@ -410,7 +410,7 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # module properties — read_wm/write_wm/cmd_init/cmd_reset resolve via wm_path()
    # (BODY_WM_PATH env else AGENT_DIR/session/working-memory.yaml). Patching the
    # MODULE ATTRIBUTE (`wm.WM_PATH = tmp`) is therefore an I/O no-op that silently
-   # targets the LIVE bound-agent WM (conftest sets AYOAI_AGENT), clobbering live
+   # targets the LIVE bound-agent WM (conftest sets MIND_AGENT), clobbering live
    # working memory. Allowed test isolation: BODY_WM_PATH env (monkeypatch.setenv)
    # or a wm.AGENT_DIR patch. This grep is the AUTOMATED backstop to guard-862 (the
    # authoring steer). Regex discipline (verified at authoring, g-115-1627): the
@@ -582,13 +582,13 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (save-id-verify-after-write): grep -q "_SID_ATTEMPT" core/scripts/session-save-id.sh && grep -q ".write-failures.jsonl" core/scripts/session-save-id.sh && echo "PASS: session-save-id.sh verifies after write with retry+log" || echo "FAIL: session-save-id.sh missing verify-after-write (Tier 2b)"
    Bash (recovery-retry-counter): grep -q "recovery-failure-count" core/scripts/recovery-gate.sh && grep -q "recovery-failed-permanent" core/scripts/recovery-gate.sh && echo "PASS: recovery-gate.sh has retry counter + permanent-fail signal" || echo "FAIL: recovery-gate.sh missing retry counter (Tier 2c)"
    Bash (manifest-runner-token): grep -q "^  - file: runner-token$" core/config/session-manifest.yaml && echo "PASS: manifest registers runner-token" || echo "FAIL: manifest missing runner-token entry (Tier 3a)"
-   # /start B10 AYOAI_AGENT-prefix on permissions-add.sh (g-115-1014, rb-1105, guard-307)
-   # B10 invokes `AYOAI_AGENT=<agent-name> bash core/scripts/permissions-add.sh` per the
+   # /start B10 MIND_AGENT-prefix on permissions-add.sh (g-115-1014, rb-1105, guard-307)
+   # B10 invokes `MIND_AGENT=<agent-name> bash core/scripts/permissions-add.sh` per the
    # post-aac64d27 hardening. If a future edit silently removes the prefix, the failure mode is
    # invisible on UNINITIALIZED first-run (only one local-paths.conf exists so first-conf
    # fallback resolves correctly) but produces wrong-agent path resolution on multi-agent
    # installs. This grep catches the regression at edit time.
-   Bash (start-b10-ayoai-agent-prefix): grep -qE 'AYOAI_AGENT=<agent-name> bash core/scripts/permissions-add\.sh' .claude/skills/start/SKILL.md && echo "PASS: /start B10 invocation carries explicit AYOAI_AGENT=<agent-name> prefix on permissions-add.sh (g-115-1014, guard-307)" || echo "FAIL: /start B10 invocation missing AYOAI_AGENT=<agent-name> prefix on permissions-add.sh — silent multi-agent-install regression risk (g-115-1014, rb-1105)"
+   Bash (start-b10-ayoai-agent-prefix): grep -qE 'MIND_AGENT=<agent-name> bash core/scripts/permissions-add\.sh' .claude/skills/start/SKILL.md && echo "PASS: /start B10 invocation carries explicit MIND_AGENT=<agent-name> prefix on permissions-add.sh (g-115-1014, guard-307)" || echo "FAIL: /start B10 invocation missing MIND_AGENT=<agent-name> prefix on permissions-add.sh — silent multi-agent-install regression risk (g-115-1014, rb-1105)"
    Bash (start-writes-runner-token): test "$(grep -c 'RUNNER_TOKEN=\$(' .claude/skills/start/SKILL.md)" -ge 2 && echo "PASS: /start writes runner-token at IDLE Step 3 + UNINITIALIZED C8" || echo "FAIL: /start missing runner-token write at one of the two canonical sites (Tier 3a)"
    Bash (stop-hook-logs-runner-token): test "$(grep -c 'runner_token=' core/scripts/stop-hook.sh)" -ge 6 && echo "PASS: stop-hook logs runner_token in BLOCK/ALLOW lines" || echo "FAIL: stop-hook missing runner_token logging (Tier 3a)"
    Bash (watchdog-correlates-runner-token): grep -q '"runner_token":' core/scripts/agent-watchdog.py && echo "PASS: watchdog RunningSidProbe includes runner_token in correlated context" || echo "FAIL: watchdog missing runner_token (Tier 3a)"
@@ -704,24 +704,24 @@ else:
    # Windows platform-friction fixes (Section WPF — 2026-04-19)
    # Four root-cause fixes for Windows MSYS bash + Python ergonomics. If any of
    # these regress, the symptoms reappear distributed across many scripts (cp1252
-   # mojibake in board posts, bare `python` failures in inline pipes, AYOAI_AGENT
+   # mojibake in board posts, bare `python` failures in inline pipes, MIND_AGENT
    # missed by hot-start scripts, --goal vs --goal-id parse errors). Single
    # source of truth: each fix lives in ONE file — do not patch symptoms.
    Check: `.claude/settings.json` `env` block contains `PYTHONUTF8: "1"` and `PYTHONIOENCODING: "utf-8"` — replaces ~40 per-script `sys.stdout.reconfigure(encoding="utf-8")` and `open(..., encoding="utf-8")` patches
    Check: `core/scripts/_paths.sh` creates BOTH `.python-shim/python` and `.python-shim/python3` — bare `python` on PATH is required because LLM-issued inline pipes (`... | python -c`) often drop the `3`
-   Check: `core/scripts/bash-agent-inject.py` prepends `export PATH="<shim>:$PATH"` AS PART of the same `expected_prefix` as `export AYOAI_AGENT=` — combined prefix means bare `python` works in EVERY hook-injected Bash call without requiring the LLM to source `_paths.sh` first
-   # AYOAI_SID export is the ONLY way for skill pseudocode to know the current Claude Code session_id.
+   Check: `core/scripts/bash-agent-inject.py` prepends `export PATH="<shim>:$PATH"` AS PART of the same `expected_prefix` as `export MIND_AGENT=` — combined prefix means bare `python` works in EVERY hook-injected Bash call without requiring the LLM to source `_paths.sh` first
+   # MIND_SID export is the ONLY way for skill pseudocode to know the current Claude Code session_id.
    # Removing it re-introduces the 2026-04-20 /stop hang (runner misidentified as observer — 101s idle).
    # Guard: guard-341. Do NOT drop this assertion when refactoring bash-agent-inject.py.
-   Check: `core/scripts/bash-agent-inject.py` exports AYOAI_SID in the same expected_prefix as AYOAI_AGENT
-   Bash: grep -c 'export AYOAI_SID=' core/scripts/bash-agent-inject.py → verify ≥1
+   Check: `core/scripts/bash-agent-inject.py` exports MIND_SID in the same expected_prefix as MIND_AGENT
+   Bash: grep -c 'export MIND_SID=' core/scripts/bash-agent-inject.py → verify ≥1
    Check: `core/scripts/session-save-id.sh` invokes the shared `core/scripts/cleanup-stale-bindings.sh` helper for proactive `.active-agent-*` stale-binding sweep (3-signal predicate: mtime>24h + SID-mismatch + heartbeat-stale). Predicate extracted to the helper on 2026-05-12 (g-303-25 B2) so stop-hook.sh and session-save-id.sh share a single source of truth — drift between two copies was the structural risk this extraction removed.
    Check: `core/scripts/_goal-arg-normalize.sh` exists and does NOT contain `[[ "$1" =~ ^g-` (the greedy bare-positional regex was removed because it hijacked free-text flag values like `iteration-close.sh --summary "g-NNN-NN"`). If you re-add it, you re-introduce the bug — instead, use explicit `--goal`/`--goal-id` flags
    Bash (normalizer): grep -L "_goal-arg-normalize.sh" core/scripts/{aspirations-claim,aspirations-release,aspirations-complete-by,aspirations-update-goal,agent-aspirations-update-goal,goal-completion-evidence,iteration-close,predicate-eval,utilization-feedback,background-jobs,pending-agents,meta-impk}.sh — must return empty (all 12 wrappers source the normalizer)
 
    # NO_AGENT state evidence checks (Section 4T continued)
-   Bash: AYOAI_AGENT="" python3 core/scripts/session.py state get → verify prints "NO_AGENT" (not crash)
-   Bash: AYOAI_AGENT="" python3 core/scripts/session.py persona get → verify prints "no_agent" (not crash)
+   Bash: MIND_AGENT="" python3 core/scripts/session.py state get → verify prints "NO_AGENT" (not crash)
+   Bash: MIND_AGENT="" python3 core/scripts/session.py persona get → verify prints "no_agent" (not crash)
    Check: `core/scripts/session.py` has `require_agent()` function that exits with clear error
    Check: session.py `cmd_state_set`, `cmd_persona_set`, `cmd_signal_set` all call `require_agent()` before SESSION_DIR access
 
@@ -762,12 +762,12 @@ else:
    Check: Phase 0.5 outputs "WORLD PRIME (no agent)" header
 
    # Session binding evidence checks (Section SB)
-   Bash: echo $AYOAI_AGENT → verify matches the agent directory name (LLM prefix contract)
-   Bash: echo $AYOAI_SID → verify non-empty (PreToolUse[Bash] hook injects this on every Bash call; guard-341)
+   Bash: echo $MIND_AGENT → verify matches the agent directory name (LLM prefix contract)
+   Bash: echo $MIND_SID → verify non-empty (PreToolUse[Bash] hook injects this on every Bash call; guard-341)
    Check: `.gitignore` contains `.active-agent-*` pattern
    Check: No `.active-agent` global file exists (eliminated — one mechanism only)
    # The project-root `.latest-session-id` bridge file was retired 2026-04-20 (rb-386).
-   # AYOAI_SID (PreToolUse hook export) is now the single source of truth for skill pseudocode.
+   # MIND_SID (PreToolUse hook export) is now the single source of truth for skill pseudocode.
    # session-save-id.sh MUST NOT write the bridge file (observer-clobber re-emergence).
    Check: `session-save-id.sh` does NOT write `.latest-session-id`
    Bash: grep -c '\.latest-session-id' core/scripts/session-save-id.sh → verify 0
@@ -944,16 +944,16 @@ else:
    Check: `core/config/conventions/board.md` has "Casual Reasoning Channel (`reasoning`)" subsection
 
    # Agent resolution checks (Section SE)
-   # One mechanism: AYOAI_AGENT env var. Hooks resolve from .active-agent-$SID.
+   # One mechanism: MIND_AGENT env var. Hooks resolve from .active-agent-$SID.
    # The project-root `.latest-session-id` bridge file was retired 2026-04-20 (rb-386).
    # No script anywhere should read or write it anymore — the PreToolUse hook exports
-   # AYOAI_SID directly, and /start reads $AYOAI_SID instead of the bridge.
+   # MIND_SID directly, and /start reads $MIND_SID instead of the bridge.
    # verify-learning itself is excluded: this file DOES mention the bridge on purpose
    # (anti-regression anchors), so self-matches are expected. Every other consumer must be clean.
    Bash: grep -rl '\.latest-session-id' core/scripts/ .claude/skills/ | grep -v 'verify-learning/SKILL.md' | wc -l → verify 0
-   Check: `start/SKILL.md` includes LLM prefix contract instruction (AYOAI_AGENT=<name>)
-   Check: Stop hook recovery message includes agent name and AYOAI_AGENT prefix instruction
-   Check: `start/SKILL.md` has Step 1 that uses `AYOAI_AGENT=<agent-name>` env prefix
+   Check: `start/SKILL.md` includes LLM prefix contract instruction (MIND_AGENT=<name>)
+   Check: Stop hook recovery message includes agent name and MIND_AGENT prefix instruction
+   Check: `start/SKILL.md` has Step 1 that uses `MIND_AGENT=<agent-name>` env prefix
    Check: `start/SKILL.md` RUNNING+autonomous sub-branch is a no-op (no state changes, warning only)
 
    # Hook-chain hardening (Section HCH)
@@ -988,9 +988,9 @@ else:
    Check: PreToolUse[Bash] hook timeout ≥ 8 (python3 -c "import json; d=json.load(open('.claude/settings.json')); print([h for h in d['hooks']['PreToolUse'] if h.get('matcher')=='Bash'][0]['hooks'][0]['timeout'])" → ≥8)
    Check: SessionStart (no matcher) session-save-id.sh timeout ≥ 8 (same approach, first SessionStart entry)
 
-   # /start SKILL.md belt-and-suspenders explicit AYOAI_AGENT prefix
+   # /start SKILL.md belt-and-suspenders explicit MIND_AGENT prefix
    # Defense against PreToolUse hook racing the binding file write.
-   Check: `/start SKILL.md` has explicit `AYOAI_AGENT=<agent-name>` prefix on state-writing calls (grep -c 'AYOAI_AGENT=<agent-name> bash core/scripts/session-' .claude/skills/start/SKILL.md → ≥10)
+   Check: `/start SKILL.md` has explicit `MIND_AGENT=<agent-name>` prefix on state-writing calls (grep -c 'MIND_AGENT=<agent-name> bash core/scripts/session-' .claude/skills/start/SKILL.md → ≥10)
 
    # Dead-code guard: if postcompact-restore.py starts reading stdin, the shell wrapper needs to re-feed it
    Check: `postcompact-restore.py` does NOT read sys.stdin (grep -c 'sys\.stdin\|stdin\.\|input()' core/scripts/postcompact-restore.py → 0). If this ever becomes ≥1, postcompact-restore.sh needs `<<< "$INPUT"` or equivalent tee pattern restored.
@@ -1011,15 +1011,15 @@ else:
    # only the runner-claim site (IDLE Step 3 / UNINITIALIZED C8) writes latest-session-id.
    Check: `start/SKILL.md` IDLE Step 0 does NOT write `agents/<agent>/session/latest-session-id` (moved to Step 3 pair-write)
    Bash: grep -c '> agents/<agent-name>/session/latest-session-id.tmp\|> agents/<agent-name>/session/latest-session-id' .claude/skills/start/SKILL.md → verify exactly 2 (IDLE Step 3 + UNINITIALIZED C8 only)
-   Check: `start/SKILL.md` IDLE Step 3 and UNINITIALIZED C8 use `$AYOAI_SID` for the canonical runner-claim pair-write
-   Bash: grep -c 'echo "\$AYOAI_SID" > agents/<agent-name>/session/running-session-id\.tmp' .claude/skills/start/SKILL.md → verify ≥2
-   # Visible-halt guard (rb-386): the pair-write must FAIL-VISIBLY on empty AYOAI_SID,
-   # not silently via `[ -n "$AYOAI_SID" ] && …` (which created invisible no-ops that
+   Check: `start/SKILL.md` IDLE Step 3 and UNINITIALIZED C8 use `$MIND_SID` for the canonical runner-claim pair-write
+   Bash: grep -c 'echo "\$MIND_SID" > agents/<agent-name>/session/running-session-id\.tmp' .claude/skills/start/SKILL.md → verify ≥2
+   # Visible-halt guard (rb-386): the pair-write must FAIL-VISIBLY on empty MIND_SID,
+   # not silently via `[ -n "$MIND_SID" ] && …` (which created invisible no-ops that
    # left the runner files unwritten and `/stop` later misdetecting runner-vs-observer).
-   Check: `start/SKILL.md` pair-write sites use `if [ -z "$AYOAI_SID" ]; then echo ERROR; exit 1; fi` (visible halt)
-   Bash: grep -c 'if \[ -z "\$AYOAI_SID" \]; then echo "ERROR:EMPTY_AYOAI_SID"' .claude/skills/start/SKILL.md → verify ≥3 (observer Step 0, IDLE Step 3, UNINITIALIZED C8; IDLE Step 0 + A2 share the same pattern so total ≥5 acceptable)
+   Check: `start/SKILL.md` pair-write sites use `if [ -z "$MIND_SID" ]; then echo ERROR; exit 1; fi` (visible halt)
+   Bash: grep -c 'if \[ -z "\$MIND_SID" \]; then echo "ERROR:EMPTY_MIND_SID"' .claude/skills/start/SKILL.md → verify ≥3 (observer Step 0, IDLE Step 3, UNINITIALIZED C8; IDLE Step 0 + A2 share the same pattern so total ≥5 acceptable)
    # Anti-regression: no silent-gate pattern allowed on SID writes
-   Bash: grep -c '\[ -n "\$AYOAI_SID" \] &&' .claude/skills/start/SKILL.md → verify 0
+   Bash: grep -c '\[ -n "\$MIND_SID" \] &&' .claude/skills/start/SKILL.md → verify 0
    # Visible-halt guard for session-mode-set.sh (g-115-1032, 2026-05-21): mode-set
    # failures at any of the 4 /start sites (IDLE Step 2, UNINITIALIZED Phase C
    # reader C4, assistant C8, autonomous C9) must HALT, not silently fall through.
@@ -1041,7 +1041,7 @@ else:
    Check: `.claude/settings.json` Stop hook command is `bash core/scripts/stop-hook.sh`
    Check: `.claude/settings.json` StopFailure hook exists with `bash core/scripts/stop-failure-hook.sh`
    Check: `.claude/settings.json` Stop hook timeout >= 30s (rb-453 floor — 8s revert silently re-opens post-iteration loop-kill window). Bash: `t=$(py -3 -c "import json; d=json.load(open('.claude/settings.json',encoding='utf-8')); print(d['hooks']['Stop'][0]['hooks'][0]['timeout'])"); test "$t" -ge 30 && echo "PASS: Stop timeout=$t (>=30)" || { echo "FAIL: Stop timeout=$t < 30 — regression to short timeout"; exit 1; }`
-   Check: `stop-hook.sh` uses `export AYOAI_AGENT=` (not `_A=` variable expansion)
+   Check: `stop-hook.sh` uses `export MIND_AGENT=` (not `_A=` variable expansion)
    Check: `stop-hook.sh` has NO counter increment (`session-counter-increment` not called)
    Check: `stop-hook.sh` has NO tier logic (no `Tier 1`, `Tier 4` reference)
    Check: `stop-hook.sh` has NO safety valve (no `COUNT -ge`)
@@ -1380,7 +1380,7 @@ else:
    Check: `aspirations.py --source agent claim` → rejected with error (world-only operation)
    IF agent claimed a world goal:
        Check: world/aspirations.jsonl has `claimed_by` and `claimed_at` fields on that goal
-       Check: `claimed_by` value matches `$AYOAI_AGENT`
+       Check: `claimed_by` value matches `$MIND_AGENT`
    # JSONL list-field normalization regression check
    Check: `goal-selector.py` defines `_ensure_list()` and every operational `.get("blocked_by")`, `.get("participants")`, `.get("tags")` call is wrapped in it. Only passthrough stores (goal_map building) may use raw `.get()`. Read the file and verify no unguarded iteration of these fields.
 
@@ -1812,7 +1812,7 @@ assert raised, 'open_long_path should raise OSError on missing file'; print('PAS
    # blocker_ref. Scans both world + agent aspirations.jsonl. A blocker_ref
    # of {} or empty value counts as missing (the structural payload is
    # what matters, not the field's mere presence).
-   Bash: AYOAI_AGENT=bravo py -3 -c "import sys, json; sys.path.insert(0,'core/scripts'); import _paths; viol=[]
+   Bash: MIND_AGENT=bravo py -3 -c "import sys, json; sys.path.insert(0,'core/scripts'); import _paths; viol=[]
 for p in (_paths.WORLD_DIR / 'aspirations.jsonl', _paths.AGENT_DIR / 'aspirations.jsonl' if _paths.AGENT_DIR else None):
     if p is None or not p.exists(): continue
     for line in p.read_text(encoding='utf-8').splitlines():
@@ -1827,7 +1827,7 @@ print('PASS')"
    # Quiescence log validity — absent file is fine, corrupt lines fail.
    # Probes the bound agent's session/ directory; if no agent bound, the
    # check passes trivially (no files to inspect).
-   Bash: AYOAI_AGENT=bravo py -3 -c "import sys, json; sys.path.insert(0,'core/scripts'); import _paths; bad=[]
+   Bash: MIND_AGENT=bravo py -3 -c "import sys, json; sys.path.insert(0,'core/scripts'); import _paths; bad=[]
 if _paths.AGENT_DIR is not None:
     for fname in ('quiescence-log.jsonl', 'quiescence-audit.jsonl'):
         p = _paths.AGENT_DIR / 'session' / fname
@@ -2165,10 +2165,10 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # Stop consolidation evidence checks (Section SC)
    Check: `stop/SKILL.md` RUNNING section sets `stop-requested` signal (consolidation delegated to Phase -1.4)
    Check: `stop/SKILL.md` Chaining "Does NOT call" list includes `/aspirations-consolidate`
-   # Runner/observer detection must use $AYOAI_SID, NOT stale persistent files (guard-341, rb-386).
+   # Runner/observer detection must use $MIND_SID, NOT stale persistent files (guard-341, rb-386).
    # The 2026-04-20 hang root-caused to cross-file comparison (latest vs running); single-source-of-truth fixes it.
-   Check: `stop/SKILL.md` Step 5 runner/observer detection uses `$AYOAI_SID` compared against `running-session-id`
-   Bash: grep -c '"\$AYOAI_SID" = "\$runner_sid"' .claude/skills/stop/SKILL.md → verify ≥1
+   Check: `stop/SKILL.md` Step 5 runner/observer detection uses `$MIND_SID` compared against `running-session-id`
+   Bash: grep -c '"\$MIND_SID" = "\$runner_sid"' .claude/skills/stop/SKILL.md → verify ≥1
    Bash: grep -c 'runner_sid=\$(cat agents/<agent>/session/running-session-id' .claude/skills/stop/SKILL.md → verify ≥1
    Check: `stop/SKILL.md` Step 5 does NOT read `agents/<agent>/session/latest-session-id` for detection (observer-clobber desync path)
    Bash: grep -c 'cat.*agents/<agent>/session/latest-session-id\|cat.*session/latest-session-id.*current_sid' .claude/skills/stop/SKILL.md → verify 0
@@ -2281,7 +2281,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # to detect crashed runners and route the user to /start <agent> --recover.
    # Staleness threshold lives in core/config/aspirations.yaml (no hardcoded default).
    Check: `aspirations/SKILL.md` Phase -0.5 calls `bash core/scripts/heartbeat-tick.sh` AFTER the `session-signal-set.sh loop-active` line (the script touches runner-heartbeat AND bumps team-state.last_active in one call — every iteration stamps mtime locally AND advertises liveness cross-agent). Pre-2026-04-20 this was inline `touch` + inline `team-state-update.sh`; the script extraction (rb-399) ensures future heartbeat additions apply in-flight to running loops without waiting for autocompact to reload SKILL.md.
-   Check: `core/scripts/heartbeat-tick.sh` exists, sources `_paths.sh`, touches `"$AGENT_DIR/session/runner-heartbeat"` (pure-mtime — no content write), AND calls `team-state-update.sh ... agent_status.$AYOAI_AGENT.last_active` (single-source heartbeat tick — adding heartbeat fields here, NOT to SKILL.md, applies in-flight to every running agent). Executable bit is irrelevant: every call site uses `bash <path>`, matching sibling heartbeat-stale.sh + team-state-update.sh which are also committed mode 100644 on Windows.
+   Check: `core/scripts/heartbeat-tick.sh` exists, sources `_paths.sh`, touches `"$AGENT_DIR/session/runner-heartbeat"` (pure-mtime — no content write), AND calls `team-state-update.sh ... agent_status.$MIND_AGENT.last_active` (single-source heartbeat tick — adding heartbeat fields here, NOT to SKILL.md, applies in-flight to every running agent). Executable bit is irrelevant: every call site uses `bash <path>`, matching sibling heartbeat-stale.sh + team-state-update.sh which are also committed mode 100644 on Windows.
    Bash: grep -cE '^\s*touch \"\$AGENT_DIR/session/runner-heartbeat\"' core/scripts/heartbeat-tick.sh → verify >= 1 (pure-mtime touch)
    Check: `core/scripts/heartbeat-tick.sh` does NOT use `2>/dev/null` on the team-state write — fail-open via `|| true` only (rb-400 silent-boundary). Bash: `grep -cE 'team-state-update\.sh.*2>/dev/null' core/scripts/heartbeat-tick.sh` must be 0 (anchored to the team-state call so the negative-narration comment 'no 2>/dev/null' on rb-400 doesn't false-positive).
    Check: `core/scripts/heartbeat-stale.sh` exists, is executable, and sources both `_paths.sh` and `_platform.sh` (same pattern as other shell wrappers)
@@ -2294,7 +2294,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `start/SKILL.md` Step 0.7 recovery branch runs BEFORE Step 1's state check
    Check: `start/SKILL.md` Step 0.7 preconditions: state is RUNNING AND (heartbeat stale OR `--force`). Refuses with clear error otherwise (no state changes).
    Check: `start/SKILL.md` Step 0.7 recovery clears `running-session-id`, `iteration-checkpoint.json`, `compact-pending`, `compact-checkpoint.yaml`, `runner-heartbeat`, and signals `stop-requested`/`stop-loop`/`loop-active`, then `session-state-set.sh IDLE`, then falls through to IDLE branch
-   Check: `start/SKILL.md` Step 0.7 precondition probes (`session-state-get.sh`, `heartbeat-stale.sh`) use explicit `AYOAI_AGENT=<agent-name>` prefix — Step 0.7 runs BEFORE the IDLE-branch session rebind so `_paths.sh`'s first-available-conf fallback would probe the wrong agent without the prefix. Enforced by guard-307 / rb-323.
+   Check: `start/SKILL.md` Step 0.7 precondition probes (`session-state-get.sh`, `heartbeat-stale.sh`) use explicit `MIND_AGENT=<agent-name>` prefix — Step 0.7 runs BEFORE the IDLE-branch session rebind so `_paths.sh`'s first-available-conf fallback would probe the wrong agent without the prefix. Enforced by guard-307 / rb-323.
    Check: `start/SKILL.md` IDLE autonomous sub-path touches `runner-heartbeat` BEFORE `session-state-set.sh RUNNING` — upholds the invariant "state=RUNNING ⟹ fresh heartbeat exists" from the transition moment, closing the observer-probe race documented in rb-323.
    Bash: awk '/^### IDLE/,/^### UNINITIALIZED/' .claude/skills/start/SKILL.md | grep -nE 'bash core/scripts/heartbeat-tick\.sh|bash core/scripts/session-state-set\.sh RUNNING' | head -2 → verify two lines, first matches `bash core/scripts/heartbeat-tick.sh` (the seed call that touches runner-heartbeat) and precedes the second matching `bash core/scripts/session-state-set.sh RUNNING`. Anchored to the `bash <path>` invocation so documentation prose that mentions the script names doesn't false-match.
    Check: `start/SKILL.md` RUNNING+autonomous branch invokes `heartbeat-stale.sh` and includes `--recover` hint in the refusal message when stale
@@ -2340,7 +2340,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # probe call MUST mirror recovery-gate.sh exactly; any divergence breaks the
    # "single source of truth" contract. Three failure modes prevented here:
    #   - B1: probe-script mismatch (pending-agents vs background-jobs) → divergent gates
-   #   - B2: probes without explicit AYOAI_AGENT prefix → _paths.sh's no-agent fallback
+   #   - B2: probes without explicit MIND_AGENT prefix → _paths.sh's no-agent fallback
    #     returns auto-recovery-passing values for every probe → live runners clobbered
    #   - B3: heartbeat-only liveness (Cond 2 alone) → transient platform-hook timeouts
    #     (e.g., 2.1.133 stop-hook regression) make heartbeat staleness false-positive,
@@ -2349,11 +2349,11 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `start/SKILL.md` RUNNING+autonomous branch lists the same 5 conditions as recovery-gate.sh's `run_gate_for_agent` (state=RUNNING, heartbeat=stale, no recent BLOCK, no stop-requested, `background-jobs.sh has-pending` exits 1) — NOT pending-agents.sh
    Bash: grep -nE 'pending-agents\.sh has-pending' .claude/skills/start/SKILL.md → verify 0 hits in the auto-recovery branch (use background-jobs.sh has-pending only; pending-agents.sh is the stop-hook's tracker, not the recovery gate's)
    Bash: grep -cE 'background-jobs\.sh has-pending' .claude/skills/start/SKILL.md → verify >= 1 (auto-recovery branch probes background-jobs to match recovery-gate.sh)
-   Check: `start/SKILL.md` RUNNING+autonomous branch every probe call (heartbeat-stale.sh, session-signal-exists.sh, background-jobs.sh) is prefixed with explicit `AYOAI_AGENT=<agent-name>` — without the prefix, _paths.sh's no-agent fallback (lines 68, 92-96) makes every probe return the auto-recovery-passing value regardless of agent health, clobbering live runners
-   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE '^Bash: .bash core/scripts/(heartbeat-stale|session-signal-exists|background-jobs|runner-recent-block)' → verify == 0 (every such Bash line MUST have AYOAI_AGENT=<agent-name> prefix; the bare-form count must be zero)
-   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'AYOAI_AGENT=<agent-name> bash core/scripts/(heartbeat-stale|session-signal-exists|background-jobs|runner-recent-block)' → verify >= 4 (one prefix per probe: heartbeat + recent-block + stop-requested + background-jobs)
-   Check: `start/SKILL.md` RUNNING+autonomous branch contains a CRITICAL warning paragraph naming the AYOAI_AGENT-prefix discipline as the failure mode (rb-510 / guard-433)
-   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'Every probe call MUST use the explicit .AYOAI_AGENT=' → verify >= 1 (the CRITICAL warning is present)
+   Check: `start/SKILL.md` RUNNING+autonomous branch every probe call (heartbeat-stale.sh, session-signal-exists.sh, background-jobs.sh) is prefixed with explicit `MIND_AGENT=<agent-name>` — without the prefix, _paths.sh's no-agent fallback (lines 68, 92-96) makes every probe return the auto-recovery-passing value regardless of agent health, clobbering live runners
+   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE '^Bash: .bash core/scripts/(heartbeat-stale|session-signal-exists|background-jobs|runner-recent-block)' → verify == 0 (every such Bash line MUST have MIND_AGENT=<agent-name> prefix; the bare-form count must be zero)
+   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'MIND_AGENT=<agent-name> bash core/scripts/(heartbeat-stale|session-signal-exists|background-jobs|runner-recent-block)' → verify >= 4 (one prefix per probe: heartbeat + recent-block + stop-requested + background-jobs)
+   Check: `start/SKILL.md` RUNNING+autonomous branch contains a CRITICAL warning paragraph naming the MIND_AGENT-prefix discipline as the failure mode (rb-510 / guard-433)
+   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'Every probe call MUST use the explicit .MIND_AGENT=' → verify >= 1 (the CRITICAL warning is present)
    Check: `start/SKILL.md` RUNNING+autonomous branch contains a CRITICAL note that the gate's conditions and probe scripts MUST match recovery-gate.sh (rb-511 cross-reference discipline)
    Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'MUST match .core/scripts/recovery-gate\.sh' → verify >= 1
    Check: `core/scripts/recovery-gate.sh` `run_gate_for_agent` has the reciprocal CRITICAL comment naming start/SKILL.md as the parallel implementation
@@ -2424,7 +2424,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # cargo-cult-detector.py narrow SourceUnavailable exception (rb-442 sister fix — 2026-04-22)
    # Previous `except SystemExit` in cmd_audit_all was over-broad — would swallow any
    # future sys.exit(1) from downstream code. Dedicated SourceUnavailable keeps the
-   # catch narrow to the one legitimate fail-open case (AYOAI_AGENT unbound).
+   # catch narrow to the one legitimate fail-open case (MIND_AGENT unbound).
    Check: cargo-cult-detector.py defines SourceUnavailable exception class
    Bash: grep -cE '^class SourceUnavailable' core/scripts/cargo-cult-detector.py → verify == 1
    Check: cmd_audit_all no longer catches bare SystemExit
@@ -2566,7 +2566,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `core/scripts/recovery-gate.sh` has the WHY-NO-PID-LIVENESS-CHECK comment block citing rb-357 (prevents future maintainers from re-adding a layer that mis-reports DEAD)
    Check: `core/scripts/session-manifest-clear.sh` exists and uses `subprocess.run([sys.executable, "core/scripts/session_snapshot.py", "--output", "json"], capture_output=True, text=True, check=True)` — NOT a shell pipe to python3 (rb-359: Windows OSError 22 footgun)
    Check: `core/scripts/session-manifest-clear.sh` has the WHY-subprocess-NOT-shell-pipe comment block (Windows guard)
-   Check: `core/scripts/session-manifest-clear.sh` exits 1 only when `AYOAI_AGENT` is unset (caller error); never deletes anything outside the manifest's `recovery_action: clear` entries with `exists: true`
+   Check: `core/scripts/session-manifest-clear.sh` exits 1 only when `MIND_AGENT` is unset (caller error); never deletes anything outside the manifest's `recovery_action: clear` entries with `exists: true`
    Check: `core/config/session-manifest.yaml` has NO `running-pid` entry (the ghost-PID layer was removed; re-adding would re-introduce rb-357)
    Check: `core/config/session-manifest.yaml` lists `recovery-notice` and `recovery-log.jsonl` with `recovery_action: preserve`
    Check: `core/scripts/runner-alive.sh` does NOT exist (the unimplementable PID layer was removed; re-creation would re-introduce rb-357)
@@ -2591,7 +2591,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: ls core/scripts/runner-alive.sh 2>/dev/null && echo FAIL || echo PASS → verify PASS (file must not exist)
    Bash: grep -E '^[^#]*\|\s*python3?\s+-' core/scripts/session-manifest-clear.sh && echo FAIL || echo PASS → verify PASS (no shell-pipe-to-python3 regression — rb-359)
    Bash: grep -nE 'running-pid' core/config/session-manifest.yaml && echo FAIL || echo PASS → verify PASS (no ghost-PID re-introduction — rb-357)
-   Bash: AYOAI_AGENT="" bash core/scripts/session-manifest-clear.sh 2>&1; rc=$?; [ $rc -eq 1 ] && echo PASS || echo FAIL → verify PASS (no-agent path exits 1, never silently clears)
+   Bash: MIND_AGENT="" bash core/scripts/session-manifest-clear.sh 2>&1; rc=$?; [ $rc -eq 1 ] && echo PASS || echo FAIL → verify PASS (no-agent path exits 1, never silently clears)
    Bash: grep -c 'recovery-gate.sh' .claude/settings.json → verify >= 1 (SessionStart hook is wired). FAIL means g-243-05 is still pending — user must add the hook entry manually because .claude/settings*.json is in the deny list.
 
    # Coordination gates — live observation checks (asp-248, added 2026-04-20)
@@ -2606,8 +2606,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: Does goal-duplication-gate catch any real overlaps? Audit `world/goal-duplication-overrides.jsonl` for override patterns — repeated `--override-duplication` on the same signal class (same file-paths, same keyword family) = tune the regex or stopword list in `goal-duplication-gate.py` (_FILE_PATH_RE line ~72, _STOPWORDS line ~78). Empty file = either no false positives OR gate never tripped — read it alongside `aspirations.jsonl` growth rate to disambiguate.
    Check: Does insight-trigger-gate fire? If `agents/<agent>/session/insight-actions.jsonl` stays empty across sessions, partner agents are not emitting properly-tagged findings — the problem moves upstream to the findings-emission side. Confirm by grepping partner's recent `world/board/findings.jsonl` entries for `"insight_trigger"` + `"severity:"` + `"requires_action_by:"` + `"affects:"` tag quadruple. Missing any tag breaks the gate's filter.
    Bash: [ -f world/goal-duplication-overrides.jsonl ] && wc -l world/goal-duplication-overrides.jsonl || echo "0 overrides file"  → any output is informational; the count is a health signal not pass/fail
-   Bash: AYOAI_AGENT=bravo py -3 core/scripts/insight-trigger-gate.py --dry-run --output human 2>&1 | grep -q "scanned=" && echo PASS || echo FAIL → verify PASS (gate runs without crashing)
-   Bash: echo '{"title":"verify-learning-probe","description":"nothing real","participants":["agent"]}' | AYOAI_AGENT=bravo py -3 core/scripts/goal-duplication-gate.py --output human 2>&1 | grep -q "would_block" && echo PASS || echo FAIL → verify PASS (gate runs end-to-end)
+   Bash: MIND_AGENT=bravo py -3 core/scripts/insight-trigger-gate.py --dry-run --output human 2>&1 | grep -q "scanned=" && echo PASS || echo FAIL → verify PASS (gate runs without crashing)
+   Bash: echo '{"title":"verify-learning-probe","description":"nothing real","participants":["agent"]}' | MIND_AGENT=bravo py -3 core/scripts/goal-duplication-gate.py --output human 2>&1 | grep -q "would_block" && echo PASS || echo FAIL → verify PASS (gate runs end-to-end)
 
    # partner_in_flight check regression (g-248-86, added 2026-05-11)
    # The partner_in_flight check detects cross-agent scope collisions while
@@ -2617,7 +2617,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # Check: `core/scripts/goal-duplication-gate.py` defines `_check_partner_in_flight`
    Bash: grep -q '_check_partner_in_flight' core/scripts/goal-duplication-gate.py && echo PASS || echo FAIL → verify PASS (function defined)
    Bash: grep -q '_check_partner_in_flight(goal, file_paths, keywords, self_agent' core/scripts/goal-duplication-gate.py && echo PASS || echo FAIL → verify PASS (wired into checks list in main())
-   Bash: AYOAI_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_partner_in_flight.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — overlap/no-overlap/null/self-only/same-id/multi-partner)
+   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_partner_in_flight.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — overlap/no-overlap/null/self-only/same-id/multi-partner)
 
    # Structural-co-signal invariant regression (g-115-838, added 2026-05-16; commits 9db5384 + 6e1563e)
    # _check_recent_completions HARD-blocks only when there is a STRUCTURAL
@@ -2630,7 +2630,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # check protects against the second class landing without smoke evidence.
    Check: `core/scripts/gates/goal_duplication.py` `_check_recent_completions` defines `has_specific = bool(hit_paths) or any(re.search(r"[-_0-9]", k) for k in hit_kws)` — the structural-co-signal predicate. Grep must match.
    Bash: grep -qE 'has_specific\s*=\s*bool\(hit_paths\)\s*or\s*any\(' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (structural-co-signal predicate present)
-   Bash: AYOAI_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py 2>&1 | grep -q "PASS (3/3 cases)" && echo PASS || echo FAIL → verify PASS (3-case regression — G1 plain-words demote / G2 file-path block / G3 structured-identifier block)
+   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py 2>&1 | grep -q "PASS (3/3 cases)" && echo PASS || echo FAIL → verify PASS (3-case regression — G1 plain-words demote / G2 file-path block / G3 structured-identifier block)
 
    # pending_queue check regression (g-115-783, added 2026-05-22)
    # The pending_queue check (6th corpus) scans world + per-agent
@@ -2650,8 +2650,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -q 'def _check_pending_queue' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (function defined)
    Bash: grep -q '_check_pending_queue(goal, file_paths, keywords, source_name' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (wired into checks list in evaluate())
    Check: stricter co-signal predicate — `re.search(r"[_0-9]", k)` (no hyphen) inside `_check_pending_queue`
-   Bash: AYOAI_AGENT=alpha py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from gates import goal_duplication as gd; import inspect; src=inspect.getsource(gd._check_pending_queue); sys.exit(0 if 're.search(r\"[_0-9]\", k)' in src and 'cross-agent' in src else 1)" && echo PASS || echo FAIL → verify PASS (stricter pending-queue co-signal predicate present, NOT hyphen-permissive)
-   Bash: AYOAI_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_pending_queue.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — P1 origin_signal / P2 file-path / P3 demote / P4 unrelated / P5 status-filter / P6 empty)
+   Bash: MIND_AGENT=alpha py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from gates import goal_duplication as gd; import inspect; src=inspect.getsource(gd._check_pending_queue); sys.exit(0 if 're.search(r\"[_0-9]\", k)' in src and 'cross-agent' in src else 1)" && echo PASS || echo FAIL → verify PASS (stricter pending-queue co-signal predicate present, NOT hyphen-permissive)
+   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_pending_queue.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — P1 origin_signal / P2 file-path / P3 demote / P4 unrelated / P5 status-filter / P6 empty)
 
    # Gate-test pytest-collectability invariant (g-115-1375 + g-115-1376, added 2026-06-09)
    # All 7 goal-duplication gate regression tests must define a top-level
@@ -2675,7 +2675,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -qE 'READ_INTENT_VERBS\s*=\s*frozenset' core/scripts/_target_state.py && echo PASS || echo FAIL → verify PASS (frozenset declared)
    Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _target_state import READ_INTENT_VERBS; expected={'investigate','audit','review','observe','research','analyze'}; print('PASS' if READ_INTENT_VERBS==expected else 'FAIL:'+str(READ_INTENT_VERBS^expected))" → verify PASS (exactly six verbs, no drift)
    Bash: grep -q 'is_read_intent' core/scripts/goal-duplication-gate.py && grep -q 'is_read_intent' core/scripts/target-state-probe.py && echo PASS || echo FAIL → verify PASS (both consumers import the shared helper)
-   Bash: echo '{"title":"Investigate: rb-404 probe","description":"Audit core/scripts/_target_state.py for READ_INTENT_VERBS and is_read_intent"}' | AYOAI_AGENT=bravo py -3 core/scripts/goal-duplication-gate.py --output json 2>&1 | py -3 -c "import sys,json; d=json.loads(sys.stdin.read()); ts=[c for c in d['checks'] if c['name']=='target_state'][0]; print('PASS' if ts['passed'] and 'READ-intent' in ts['reason'] else 'FAIL')" → verify PASS (Investigate title triggers the exemption)
+   Bash: echo '{"title":"Investigate: rb-404 probe","description":"Audit core/scripts/_target_state.py for READ_INTENT_VERBS and is_read_intent"}' | MIND_AGENT=bravo py -3 core/scripts/goal-duplication-gate.py --output json 2>&1 | py -3 -c "import sys,json; d=json.loads(sys.stdin.read()); ts=[c for c in d['checks'] if c['name']=='target_state'][0]; print('PASS' if ts['passed'] and 'READ-intent' in ts['reason'] else 'FAIL')" → verify PASS (Investigate title triggers the exemption)
 
    # stdin encoding (Section ENC, added 2026-04-19)
    # Python on Windows defaults stdin to cp1252; non-ASCII JSON (em-dashes,
@@ -2931,8 +2931,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: head -30 core/scripts/_paths.sh | grep -n "AGENT_NAME\|local-paths" → verify AGENT_NAME assignment appears BEFORE the source line
    Check: `core/scripts/_paths.sh` sources `agents/<agent>/local-paths.conf` (not project-root)
    Check: `core/scripts/_paths.sh` WORLD_DIR and META_DIR always have a value (PROJECT_ROOT fallback)
-   Check: `core/scripts/_paths.sh` WORLD_DIR uses priority: AYOAI_WORLD > WORLD_PATH > PROJECT_ROOT/world
-   Check: `core/scripts/_paths.sh` META_DIR uses priority: AYOAI_META > META_PATH > PROJECT_ROOT/meta
+   Check: `core/scripts/_paths.sh` WORLD_DIR uses priority: MIND_WORLD > WORLD_PATH > PROJECT_ROOT/world
+   Check: `core/scripts/_paths.sh` META_DIR uses priority: MIND_META > META_PATH > PROJECT_ROOT/meta
    Check: `core/scripts/_paths.py` has `_read_local_paths()` reading from agent directory
    Check: `core/scripts/_paths.py` WORLD_DIR is always a valid Path (falls back to PROJECT_ROOT/world)
    Check: `core/scripts/_paths.py` META_DIR is always a valid Path (falls back to PROJECT_ROOT/meta)
@@ -2943,7 +2943,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # Bare `if not <one of those names>:` defensive checks are dead code that
    # misleads readers into thinking the name can be None. Use `<path>.exists()`,
    # `.is_dir()`, or `.is_file()` for disk-state gating; check env presence via
-   # `os.environ.get('AYOAI_AGENT')` for the explicit AYOAI_AGENT-unset case.
+   # `os.environ.get('MIND_AGENT')` for the explicit MIND_AGENT-unset case.
    # Excludes test files (which may construct fake None-typed paths for sandbox).
    # Baseline 2026-05-16 delta iter-11: 11 known instances pending cleanup —
    # aspirations.py:2031, capture-insights.py:47, consolidation-precheck.py:77,
@@ -3037,7 +3037,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: test -f core/config/templates/post-execution-default.md && echo "PASS: post-execution template exists" || { echo "FAIL: core/config/templates/post-execution-default.md missing — /start C0.5 default seeding will break"; false; }
    Bash: grep -c "^## Step" core/config/templates/post-execution-default.md | py -3 -c "import sys; n=int(sys.stdin.read()); assert n <= 12, f'FAIL: template has {n} Step headers (>12 — convention-learning cap exceeded)'; print(f'PASS: {n} steps (<=12)')"
    Bash: grep -q "Invoke /fresh-eyes-code" core/config/templates/post-execution-default.md && echo "PASS: template invokes /fresh-eyes-code" || { echo "FAIL: post-execution template missing /fresh-eyes-code invocation — Step 1.75 structural wiring lost"; false; }
-   Bash: grep -q -- "--author \$AYOAI_AGENT" core/config/templates/post-execution-default.md && echo "PASS: template uses --author $AYOAI_AGENT filter" || { echo "FAIL: post-execution template missing --author \$AYOAI_AGENT — multi-agent leak guard per guard-493 lost"; false; }
+   Bash: grep -q -- "--author \$MIND_AGENT" core/config/templates/post-execution-default.md && echo "PASS: template uses --author $MIND_AGENT filter" || { echo "FAIL: post-execution template missing --author \$MIND_AGENT — multi-agent leak guard per guard-493 lost"; false; }
    Bash: py -3 -c "import pathlib; src=pathlib.Path('core/config/templates/post-execution-default.md').read_text(encoding='utf-8'); lines=[ln for ln in src.split('\n') if '\$pre_ts' in ln]; bad=[ln for ln in lines if 'Do not write' not in ln]; assert not bad, f'FAIL template: \$pre_ts in non-warning lines: {bad}'; print(f'PASS: template \$pre_ts only in warning text ({len(lines)} line(s))')"
    Bash: py -3 -c "import pathlib, re; src=pathlib.Path('core/config/templates/post-execution-default.md').read_text(encoding='utf-8'); pos={m.group(1): m.start() for m in re.finditer(r'^## Step (\d+\.?\d*)', src, re.M)}; ok=pos.get('1.5',0) < pos.get('1.75',0) < pos.get('2', 10**9); assert ok, f'FAIL: Step ordering broken in template — positions={pos}'; print('PASS: template Step 1.75 between Step 1.5 and Step 2')"
    # Check: `start/SKILL.md` C0.5 uses per-slot existence detection (NOT whole-directory short-circuit)
@@ -3491,7 +3491,7 @@ sys.exit(1)
    # Background jobs subsystem evidence checks (Section BG)
    Check: `core/scripts/background-jobs.py` exists with `register`, `deregister`, `check`, `list`, `has-pending`, `clear` subcommands
    Check: `core/scripts/background-jobs.sh` exists and sources `_paths.sh` + `_platform.sh`
-   Check: `core/scripts/background-jobs.sh` exports `AYOAI_SHELL` via cygpath (Windows Git Bash compatibility)
+   Check: `core/scripts/background-jobs.sh` exports `MIND_SHELL` via cygpath (Windows Git Bash compatibility)
    Check: `core/config/conventions/session-state.md` has "Background External Jobs" section
    Check: `session-state.md` documents `completion_check` delegation pattern
    Check: CLAUDE.md Core Systems table includes `Background jobs` entry
@@ -3634,8 +3634,8 @@ sys.exit(1)
        Check: `notify-user.triggers` contains "notify the user" (the canonical phrase used by base-skill callers — resolver matches this verbatim)
        Check: `notify-user.companion_scripts` contains "world/scripts/email-send.sh" (transport binding for attribution and rate-limit checks)
    IF world/scripts/email-send.sh exists:
-       Check: NOT contains `agent_name = 'Alpha'` (hardcoded attribution misroutes other agents' emails through a fixed prefix — single source is $AYOAI_AGENT; the literal 'Alpha' here is the historical regression string being grep'd for, not a design reference)
-       Check: NOT contains `os.environ.get('AYOAI_AGENT'` (silent fallback masks missing-env config errors — the bare `os.environ['AYOAI_AGENT']` subscript is intentional, fail-loud per communication-clarity.md)
+       Check: NOT contains `agent_name = 'Alpha'` (hardcoded attribution misroutes other agents' emails through a fixed prefix — single source is $MIND_AGENT; the literal 'Alpha' here is the historical regression string being grep'd for, not a design reference)
+       Check: NOT contains `os.environ.get('MIND_AGENT'` (silent fallback masks missing-env config errors — the bare `os.environ['MIND_AGENT']` subscript is intentional, fail-loud per communication-clarity.md)
    # notify-from-file.sh subshell error-propagation regression (rb-857, guard-522).
    # Without `shopt -s inherit_errexit`, command substitutions like
    # PAYLOAD=$(python3 ...) do NOT propagate the subshell's exit code under
@@ -4007,7 +4007,7 @@ sys.exit(1)
    # Closes the orphan-entry gap that produced rb-416 / rb-418 (null source_goal)
    # and tripped aspiration-trajectory.py false zero_learning_velocity.
    Check: `core/scripts/reasoning-bank.py` `RB_DEFAULT_FIELDS` contains `"source_goal": None` (peer of `source_hypothesis`) — missing → auto-populate path silently drops the field and attribution regresses
-   Check: `core/scripts/reasoning-bank.py` defines `_read_in_flight_goal_id()` that reads `$WORLD_DIR/team-state.yaml` via `yaml.safe_load`, dereferences `agent_status.<AYOAI_AGENT>.in_flight.goal_id`, and returns None on ANY error (fail-open — rb adds MUST NOT block on attribution lookup)
+   Check: `core/scripts/reasoning-bank.py` defines `_read_in_flight_goal_id()` that reads `$WORLD_DIR/team-state.yaml` via `yaml.safe_load`, dereferences `agent_status.<MIND_AGENT>.in_flight.goal_id`, and returns None on ANY error (fail-open — rb adds MUST NOT block on attribution lookup)
    # rb_add CLI removed in H2 Wave 2 (2026-05-15). source_goal auto-populate
    # now lives in _rb_inject_source_goal() in mind_api/src/store_registry.py,
    # invoked as the prepare hook by the daemon store append endpoint.
@@ -4286,7 +4286,7 @@ sys.exit(1)
    Check: `core/scripts/status.sh` exists (10-line wrapper that `exec`s status.py)
    Check: `core/scripts/status.py` exists and exposes `build_status()`, `render_pretty()`, `render_field()`
    Bash: bash core/scripts/status.sh --json | python3 -c "import sys,json; s=json.load(sys.stdin); assert 'session' in s and 'handoffs_inbound' in s and 'pipeline' in s and 'context' in s; h=s['handoffs_inbound']; assert 'ids' in h and 'top' in h, f'handoffs_inbound missing ids/top: {list(h.keys())}'; assert all('id' in p and 'title' in p for p in h.get('top', [])), 'top entries must carry id+title (consumed by boot/SKILL.md)'; print('PASS: status.sh --json schema intact')"
-   Bash: AYOAI_AGENT= bash core/scripts/status.sh | grep -q "NO_AGENT" && echo "PASS: NO_AGENT graceful output" || echo "FAIL: status.sh should print NO_AGENT when unbound"
+   Bash: MIND_AGENT= bash core/scripts/status.sh | grep -q "NO_AGENT" && echo "PASS: NO_AGENT graceful output" || echo "FAIL: status.sh should print NO_AGENT when unbound"
    # Boot must not re-implement the handoff scan — it consumes status.sh --field handoffs_inbound.
    # This prevents the old 45-line inline Python block (pre-2026-04-19) from reappearing.
    Check: `.claude/skills/boot/SKILL.md` invokes `status.sh --field handoffs_inbound` for pending-handoffs rendering
@@ -4296,7 +4296,7 @@ sys.exit(1)
    Check: `core/config/aspirations.yaml` has `handoff_aging.sender_decay_hours` (numeric, default 4)
    Check: `core/config/aspirations.yaml` has `handoff_aging.partner_active_threshold_min` (numeric, default 30)
    # Selector wiring: load_handoff_config must load all 6 keys (3 old + 3 new).
-   # AYOAI_AGENT is required because goal-selector.py's imports reach wm.py
+   # MIND_AGENT is required because goal-selector.py's imports reach wm.py
    # which resolves AGENT_DIR at module load.
    Bash: python3 -c "import sys; sys.path.insert(0,'core/scripts'); import importlib.util; spec=importlib.util.spec_from_file_location('gs','core/scripts/goal-selector.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); cfg=m.load_handoff_config(); needed={'handoff_bonus','handoff_sender_penalty','warn_hours','escalate_hours','sender_decay_hours','partner_active_threshold_min'}; missing=needed-set(cfg); assert not missing, f'Missing keys: {missing}'; print('PASS: load_handoff_config has all 6 keys')"
    # INVARIANT anchors: fail-open branch + clamp must keep their DO-NOT comments
@@ -4374,7 +4374,7 @@ sys.exit(1)
    Check: `core/scripts/tree.py` `normalize_virtual_path` has a branch that prepends `world/knowledge/tree/` when the path ends with `.md` and does NOT start with `world/` or `meta/` (canonicalization authority)
    Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from tree import normalize_virtual_path as n; assert n('intelligence/foo.md') == 'world/knowledge/tree/intelligence/foo.md'; assert n('world/knowledge/tree/bar.md') == 'world/knowledge/tree/bar.md'; print('PASS: normalize canonicalizes bare .md; leaves prefixed paths untouched')"
    Bash: py -3 -c "import sys,os; sys.path.insert(0,'core/scripts'); from _paths import resolve_file_path, PROJECT_ROOT; p = resolve_file_path('intelligence/foo.md'); assert str(p).startswith(str(PROJECT_ROOT)) and 'knowledge' not in str(p).split(str(PROJECT_ROOT),1)[1], f'reader added a fallback: {p}'; print('PASS: reader has no .md fallback — bare paths route to PROJECT_ROOT and fail visibly')"
-   Bash: AYOAI_AGENT=alpha bash core/scripts/_paths.sh >/dev/null 2>&1; source core/scripts/_paths.sh && export WORLD_DIR && py -3 -c "import os,yaml; t=yaml.safe_load(open(f'{os.environ[\"WORLD_DIR\"]}/knowledge/tree/_tree.yaml')); bare=[n['file'] for n in t.get('nodes',{}).values() if isinstance(n,dict) and n.get('file') and not (n['file'].startswith('world/') or n['file'].startswith('meta/'))]; assert not bare, f'bare paths leaked into _tree.yaml: {bare}'; print('PASS: _tree.yaml has zero bare-path file: fields')"
+   Bash: MIND_AGENT=alpha bash core/scripts/_paths.sh >/dev/null 2>&1; source core/scripts/_paths.sh && export WORLD_DIR && py -3 -c "import os,yaml; t=yaml.safe_load(open(f'{os.environ[\"WORLD_DIR\"]}/knowledge/tree/_tree.yaml')); bare=[n['file'] for n in t.get('nodes',{}).values() if isinstance(n,dict) and n.get('file') and not (n['file'].startswith('world/') or n['file'].startswith('meta/'))]; assert not bare, f'bare paths leaked into _tree.yaml: {bare}'; print('PASS: _tree.yaml has zero bare-path file: fields')"
 
    # STRUCT-PC: no regression in existing selector behaviour
    Bash: goal-selector.sh 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('PASS: selector returns ranked list' if isinstance(d,(list,dict)) else 'FAIL')"
@@ -4557,7 +4557,7 @@ sys.exit(1)
    # review before it surfaced as a production orphan warning).
    Check: `core/config/session-manifest.yaml` exists with both `files:` and `invariants:` top-level sections
    Check: `core/scripts/session_snapshot.py` `_load_manifest` has a `_flush` helper called at BOTH section headers (`files:` and `invariants:`) AND at end-of-loop. Bash: `grep -c "_flush()" core/scripts/session_snapshot.py` must be >= 3.
-   Bash (parser round-trips ground truth): `files=$(grep -c '^  - file:' core/config/session-manifest.yaml); invs=$(grep -c '^  - id:' core/config/session-manifest.yaml); out=$(AYOAI_AGENT=alpha bash core/scripts/session-snapshot.sh --output json); pf=$(echo "$out" | py -3 -c "import json,sys;print(len(json.load(sys.stdin)['files']))"); pi=$(echo "$out" | py -3 -c "import json,sys;print(len(json.load(sys.stdin)['invariants']))"); [ "$files" = "$pf" ] && [ "$invs" = "$pi" ] && echo PASS || { echo "MISMATCH files=$files parsed=$pf invs=$invs parsed=$pi"; exit 1; }`
+   Bash (parser round-trips ground truth): `files=$(grep -c '^  - file:' core/config/session-manifest.yaml); invs=$(grep -c '^  - id:' core/config/session-manifest.yaml); out=$(MIND_AGENT=alpha bash core/scripts/session-snapshot.sh --output json); pf=$(echo "$out" | py -3 -c "import json,sys;print(len(json.load(sys.stdin)['files']))"); pi=$(echo "$out" | py -3 -c "import json,sys;print(len(json.load(sys.stdin)['invariants']))"); [ "$files" = "$pf" ] && [ "$invs" = "$pi" ] && echo PASS || { echo "MISMATCH files=$files parsed=$pf invs=$invs parsed=$pi"; exit 1; }`
    Bash (no <NO_ID> invariants): `bash core/scripts/session-snapshot.sh --output json | py -3 -c "import json,sys; d=json.load(sys.stdin); bad=[i for i in d['invariants'] if not i.get('id')]; print('PASS' if not bad else f'FAIL: {bad}'); sys.exit(0 if not bad else 1)"`
 
    # SFM2: Single-source-of-truth for manifest parsing
@@ -4641,7 +4641,7 @@ sys.exit(1)
    # and start.SKILL.md autonomous session-start seed. Any extra writer is a regression.
    Check: team-state.py cmd_in_flight writes last_active alongside in_flight (Fix A). Bash: `py -3 -c "import re,sys; src=open('core/scripts/team-state.py').read(); m=re.search(r'def cmd_in_flight.*?def ', src, re.DOTALL); sys.exit(0 if (m and 'last_active' in m.group(0)) else 1)" && echo PASS || { echo "FAIL: cmd_in_flight no longer writes last_active — Fix A regressed"; exit 1; }`
    Check: team-state.py cmd_clear_in_flight writes last_active when in_flight present (Fix A symmetric). Bash: `py -3 -c "import re,sys; src=open('core/scripts/team-state.py').read(); m=re.search(r'def cmd_clear_in_flight.*?(?:\Z|def )', src, re.DOTALL); sys.exit(0 if (m and 'last_active' in m.group(0)) else 1)" && echo PASS || { echo "FAIL: cmd_clear_in_flight no longer writes last_active — Fix A regressed"; exit 1; }`
-   Check: per-iteration team-state heartbeat write lives in core/scripts/heartbeat-tick.sh (Fix B + script extraction rb-399 — moved out of SKILL.md so changes apply in-flight to running loops). Bash: `grep -cE 'agent_status\.\$AYOAI_AGENT\.last_active' core/scripts/heartbeat-tick.sh` must be >= 1 (single-pattern: the field path is unique to the heartbeat write; do NOT use `team-state-update.sh.*last_active` — those substrings live on different lines in the script and grep is single-line by default). Bash: `grep -c 'bash core/scripts/heartbeat-tick.sh' .claude/skills/aspirations/SKILL.md` must be >= 1 (Phase -0.5 must call the script).
+   Check: per-iteration team-state heartbeat write lives in core/scripts/heartbeat-tick.sh (Fix B + script extraction rb-399 — moved out of SKILL.md so changes apply in-flight to running loops). Bash: `grep -cE 'agent_status\.\$MIND_AGENT\.last_active' core/scripts/heartbeat-tick.sh` must be >= 1 (single-pattern: the field path is unique to the heartbeat write; do NOT use `team-state-update.sh.*last_active` — those substrings live on different lines in the script and grep is single-line by default). Bash: `grep -c 'bash core/scripts/heartbeat-tick.sh' .claude/skills/aspirations/SKILL.md` must be >= 1 (Phase -0.5 must call the script).
    Check: start/SKILL.md autonomous-mode block seeds last_active + resets current_focus before state-set RUNNING (Fix C). Bash: `awk '/\*\*Autonomous mode:\*\*/,/session-state-set\.sh RUNNING/' .claude/skills/start/SKILL.md | grep -cE 'agent_status\.<agent-name>\.(last_active|current_focus)'` must be >= 2.
    Check: start/SKILL.md autonomous-mode current_focus write uses empty value, NOT a prospective string like "starting" (commit b5bd9d8 — coordination.md:275 documents current_focus as retrospective; only aspirations-state-update and aspirations-consolidate may write non-empty values, both of which fire AFTER work completes). Bash: `awk '/\*\*Autonomous mode:\*\*/,/session-state-set\.sh RUNNING/' .claude/skills/start/SKILL.md | grep -cE 'current_focus.*--value\s+"\\"starting\\""'` must be 0. (Regex matches only the bash-escaped --value argument form; the comment word "starting" has no backslashes and won't match.)
    Check: iteration-close.sh do_state_update no longer has the redundant explicit last_active write (cleanup commit 1c57d8b). Bash: `grep -cE '^\s*bash.*team-state-update\.sh.*agent_status\.\$AGENT\.last_active' core/scripts/iteration-close.sh` must be 0 (only the comment block referencing it should remain). Bash: `grep -c 'SINGLE SOURCE OF TRUTH for last_active at goal completion' core/scripts/iteration-close.sh` must be >= 1.
@@ -4655,7 +4655,7 @@ sys.exit(1)
    # AND cross-agent agent_status.*.last_fresh_eyes_run (team-state) and unions them
    # for subset-suppression (yes:self / yes:peer / yes:union / no verdicts).
    Check: /fresh-eyes-code SKILL.md has Phase 5b that writes last_fresh_eyes_run via team-state-update.sh. Bash: `grep -cE "Phase 5b|last_fresh_eyes_run" .claude/skills/fresh-eyes-code/SKILL.md` must be >= 2.
-   Check: /fresh-eyes-code Phase 5b uses agent_status.<self>.last_fresh_eyes_run path. Bash: `grep -c 'agent_status\.\${\?AYOAI_AGENT' .claude/skills/fresh-eyes-code/SKILL.md` must be >= 1.
+   Check: /fresh-eyes-code Phase 5b uses agent_status.<self>.last_fresh_eyes_run path. Bash: `grep -c 'agent_status\.\${\?MIND_AGENT' .claude/skills/fresh-eyes-code/SKILL.md` must be >= 1.
    Check: post-state-update-gate.sh cooldown body reads team-state.yaml peer files. Bash: `grep -cE 'TEAM_STATE_PATH|last_fresh_eyes_run' core/scripts/post-state-update-gate.sh` must be >= 2.
    Check: post-state-update-gate.sh emits distinct yes:peer/yes:self/yes:union verdicts. Bash: `grep -cE '"yes:(peer|self|union)"' core/scripts/post-state-update-gate.sh` must be >= 3.
    Check: post-state-update-gate.sh cooldown filters self-agent in peer iteration (cross-agent symmetry). Bash: `grep -cE 'agent_name == self_agent|SELF_AGENT' core/scripts/post-state-update-gate.sh` must be >= 1.
@@ -4888,15 +4888,15 @@ print('PASS')
    # touched (WM survives autocompact; re-seeding would clobber cross-restart continuity).
    Check: 6 wm-set session_start seeds in start/SKILL.md. Bash: `n=$(grep -c 'wm-set.sh session_start' .claude/skills/start/SKILL.md); [ "$n" = "6" ] && echo PASS || { echo "FAIL: start/SKILL.md has $n wm-set.sh session_start seeds, expected 6 — entry path missing (rb-437)"; exit 1; }`
 
-   # ESD3: session-artifacts-count.sh wrapper exits 2 without AYOAI_AGENT.
+   # ESD3: session-artifacts-count.sh wrapper exits 2 without MIND_AGENT.
    # _paths.sh has a first-available-conf fallback that could probe the wrong agent's WM.
    # The wrapper must refuse rather than silently cross-probe.
-   Check: wrapper fail-loud on missing agent. Bash: `env -u AYOAI_AGENT bash core/scripts/session-artifacts-count.sh >/dev/null 2>&1; rc=$?; [ "$rc" = "2" ] && echo PASS || { echo "FAIL: session-artifacts-count.sh exit=$rc without AYOAI_AGENT, expected 2 — cross-agent misprobe possible"; exit 1; }`
+   Check: wrapper fail-loud on missing agent. Bash: `env -u MIND_AGENT bash core/scripts/session-artifacts-count.sh >/dev/null 2>&1; rc=$?; [ "$rc" = "2" ] && echo PASS || { echo "FAIL: session-artifacts-count.sh exit=$rc without MIND_AGENT, expected 2 — cross-agent misprobe possible"; exit 1; }`
 
    # ESD4: session_artifacts_count.py exits 2 when WM.session_start is unset.
    # Fail-loud contract replacing the silent fabrication. Stop-gate consumer treats
    # exit-2 as 0 artifacts (starvation direction) — correct for a gate.
-   Check: helper fail-loud on null session_start. Bash (ESD4 fail-loud): `AYOAI_AGENT=alpha py -3 -c "
+   Check: helper fail-loud on null session_start. Bash (ESD4 fail-loud): `MIND_AGENT=alpha py -3 -c "
 import sys, subprocess, yaml
 sys.path.insert(0, 'core/scripts')
 from _paths import AGENT_DIR
@@ -4927,7 +4927,7 @@ finally:
    # source of truth for which fields survive reset.
    Check: SESSION_IDENTITY_FIELDS defined in wm.py. Bash: `grep -q 'SESSION_IDENTITY_FIELDS = {"session_start"}' core/scripts/wm.py && echo PASS || { echo "FAIL: wm.py SESSION_IDENTITY_FIELDS missing or mutated — preservation contract broken (g-240-68)"; exit 1; }`
    Check: cmd_reset reads existing WM before building template. Bash: `py -3 -c "import re,sys; s=open('core/scripts/wm.py',encoding='utf-8').read(); m=re.search(r'def cmd_reset\(args\):.*?def cmd_', s, re.DOTALL); body=m.group(0) if m else ''; sys.exit(0 if 'existing = read_wm()' in body and 'SESSION_IDENTITY_FIELDS' in body else 1)" && echo PASS || { echo "FAIL: cmd_reset missing existing-WM read or SESSION_IDENTITY_FIELDS loop (g-240-68)"; exit 1; }`
-   Check: wm-reset preserves session_start round-trip. Bash (ESD6 functional — pure bash to avoid py→subprocess→bash hook-cascade hangs on Windows): `AYOAI_AGENT=alpha bash -c 'set -e; WM=$(AYOAI_AGENT=alpha bash core/scripts/_paths.sh >/dev/null 2>&1; echo agents/alpha/session/working-memory.yaml); ORIG=$(cat "$WM" 2>/dev/null || true); trap '"'"'[ -n "$ORIG" ] && printf "%s" "$ORIG" > "$WM"'"'"' EXIT; echo "\"TEST-ESD6\"" | AYOAI_AGENT=alpha bash core/scripts/wm-set.sh session_start >/dev/null; AYOAI_AGENT=alpha bash core/scripts/wm-reset.sh >/dev/null; AFTER=$(AYOAI_AGENT=alpha bash core/scripts/wm-read.sh session_start 2>/dev/null); [ "$AFTER" = "TEST-ESD6" ] && echo PASS || { echo "FAIL: wm-reset did not preserve session_start (got: $AFTER) — SESSION_IDENTITY_FIELDS contract broken (g-240-68)"; exit 1; }'`
+   Check: wm-reset preserves session_start round-trip. Bash (ESD6 functional — pure bash to avoid py→subprocess→bash hook-cascade hangs on Windows): `MIND_AGENT=alpha bash -c 'set -e; WM=$(MIND_AGENT=alpha bash core/scripts/_paths.sh >/dev/null 2>&1; echo agents/alpha/session/working-memory.yaml); ORIG=$(cat "$WM" 2>/dev/null || true); trap '"'"'[ -n "$ORIG" ] && printf "%s" "$ORIG" > "$WM"'"'"' EXIT; echo "\"TEST-ESD6\"" | MIND_AGENT=alpha bash core/scripts/wm-set.sh session_start >/dev/null; MIND_AGENT=alpha bash core/scripts/wm-reset.sh >/dev/null; AFTER=$(MIND_AGENT=alpha bash core/scripts/wm-read.sh session_start 2>/dev/null); [ "$AFTER" = "TEST-ESD6" ] && echo PASS || { echo "FAIL: wm-reset did not preserve session_start (got: $AFTER) — SESSION_IDENTITY_FIELDS contract broken (g-240-68)"; exit 1; }'`
 
    # ESD7: wm-clear-identity.sh is the single authorized identity-clear site, wired into /stop.
    # /stop's graceful-stop D4.5 must call this wrapper. If removed, session_start persists
@@ -4982,7 +4982,7 @@ print(f'PASS: all {len(keys)} ARTIFACT_KEYS members appear in breakdown')
    # ESD10: pending-questions sweep wired (Lane B, 2026-05-08).
    Check: sweep script exists. Bash: `test -f core/scripts/pending-questions-sweep.py && test -f core/scripts/pending-questions-sweep.sh && echo PASS || { echo "FAIL: pending-questions-sweep.py or .sh missing — Lane B reverted"; exit 1; }`
    Check: sweep wired into Step 2.8. Bash: `grep -q 'pending-questions-sweep.sh' core/config/consolidation-housekeeping.md && echo PASS || { echo "FAIL: consolidation-housekeeping.md Step 2.8 does not invoke pending-questions-sweep"; exit 1; }`
-   Check: sweep produces valid JSON on alpha's data. Bash: `AYOAI_AGENT=alpha bash core/scripts/pending-questions-sweep.sh stats 2>/dev/null | py -3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('subcommand')=='stats' else 1)" && echo PASS || { echo "FAIL: pending-questions-sweep.sh stats output not valid JSON"; exit 1; }`
+   Check: sweep produces valid JSON on alpha's data. Bash: `MIND_AGENT=alpha bash core/scripts/pending-questions-sweep.sh stats 2>/dev/null | py -3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('subcommand')=='stats' else 1)" && echo PASS || { echo "FAIL: pending-questions-sweep.sh stats output not valid JSON"; exit 1; }`
 
    # Spark-question handler pairing invariant (Section SQH — guard-473, sq-018 self-application
    # from encode-session-2026-05-07 / g-240-86 / g-115-407). Right-direction probe: every handler
@@ -5213,15 +5213,15 @@ else:
    # Regression guard for the signal-lifecycle-gate finding: slot had 3 readers and 0 writers.
    # A future editor who restores the no-agent fail-open branch re-opens the silent-world-only bug.
    Check: `core/scripts/consolidation-health.sh` exists and is executable
-   Check: `core/scripts/consolidation-health.py` has the no-agent fail-hard guard. Bash: `grep -c 'AYOAI_AGENT not set' core/scripts/consolidation-health.py` → verify ≥1
-   Check: `core/scripts/consolidation-health.py` does NOT return a snapshot when AYOAI_AGENT is unset. Bash: `grep -c 'no agent bound' core/scripts/consolidation-health.py` → verify 0 (regression guard: the old note field that lied about scope must not reappear)
+   Check: `core/scripts/consolidation-health.py` has the no-agent fail-hard guard. Bash: `grep -c 'MIND_AGENT not set' core/scripts/consolidation-health.py` → verify ≥1
+   Check: `core/scripts/consolidation-health.py` does NOT return a snapshot when MIND_AGENT is unset. Bash: `grep -c 'no agent bound' core/scripts/consolidation-health.py` → verify 0 (regression guard: the old note field that lied about scope must not reappear)
    Check: precheck writer wiring present. Bash: `grep -c 'bash core/scripts/consolidation-health.sh --write' .claude/skills/aspirations-precheck/SKILL.md` → verify ≥1 (the single writer call site)
    Check: 3 readers still consume the slot. Bash: `grep -l 'consolidation_health' .claude/skills/aspirations-evolve/SKILL.md .claude/skills/aspirations-select/SKILL.md .claude/skills/create-aspiration/SKILL.md | wc -l` → verify 3
 
    # Test-Harness Hygiene checks (Section TH — 2026-04-22, rb-460, rb-461, guard-384)
    # Regression guard for the silent-pass-as-fail finding. If these fail, tests
    # are measuring the fail-open path (rb-347) instead of the policy logic.
-   Check: `core/scripts/test-capability-gate.sh` auto-binds AYOAI_AGENT before running. Bash: `grep -c 'AUTO_BOUND=' core/scripts/test-capability-gate.sh` → verify ≥1
+   Check: `core/scripts/test-capability-gate.sh` auto-binds MIND_AGENT before running. Bash: `grep -c 'AUTO_BOUND=' core/scripts/test-capability-gate.sh` → verify ≥1
    Check: `core/scripts/test-capability-gate.sh` uses sys.executable, not argv-conditional. Bash: `grep -c 'sys.executable' core/scripts/test-capability-gate.sh` → verify ≥1
    Check: `core/scripts/test-capability-gate.sh` has NO dead py-fallback branch. Bash: `grep -cE '"python" in sys.argv\[0\]' core/scripts/test-capability-gate.sh` → verify 0 (dead code guard — the heredoc marker "-" never matches)
    Check: `core/scripts/test-capability-gate.sh` has NO outer py-launcher fallback. Bash: `grep -cE 'command -v py\b' core/scripts/test-capability-gate.sh` → verify 0
@@ -5369,12 +5369,12 @@ else:
    # Daemon endpoints in mind_api/src/ must route environment-or-conf-sourced
    # path values through absolutize() (defined in core/scripts/_path_helpers.py
    # and used by mind_api/src/agent_paths.py). A raw Path() constructor receiving
-   # os.environ.get("AYOAI_*") or conf.get("*_PATH") bypasses the cwd-anchoring
+   # os.environ.get("MIND_*") or conf.get("*_PATH") bypasses the cwd-anchoring
    # defense — on POSIX Python a Windows-absolute string like "C:/foo" parses
    # as RELATIVE, silently producing a mirror tree under the wrong root (the
    # external-path-resolution cruft failure mode catalogued in g-115-733).
    # agent_paths.py is the routing source itself and is excluded.
-   Check: no raw Path() bypass of absolutize in mind_api/src/. Bash: `py -3 -c "import re,sys,pathlib; runtime_dir=pathlib.Path('mind_api/src'); violations=[]; pat=re.compile(r'Path\(\s*[^()]*?(os\.environ\.get\([^)]*AYOAI_|conf\.get\([^)]*_PATH)', re.DOTALL); [violations.append(f'{f.relative_to(pathlib.Path(chr(46)))}:{text[:m.start()].count(chr(10))+1}') for f in runtime_dir.rglob('*.py') if f.name != 'agent_paths.py' for text in [f.read_text(encoding='utf-8')] for m in pat.finditer(text) if 'absolutize' not in text[max(0,m.start()-60):m.start()]]; print(f'FAIL: {len(violations)} raw Path() bypass(es) in mind_api/src/: {violations[:5]} - must route through absolutize() per guard-552/rb-933') if violations else print('PASS: no raw Path() bypassing absolutize in mind_api/src/ (excluding agent_paths.py)'); sys.exit(1 if violations else 0)"`
+   Check: no raw Path() bypass of absolutize in mind_api/src/. Bash: `py -3 -c "import re,sys,pathlib; runtime_dir=pathlib.Path('mind_api/src'); violations=[]; pat=re.compile(r'Path\(\s*[^()]*?(os\.environ\.get\([^)]*MIND_|conf\.get\([^)]*_PATH)', re.DOTALL); [violations.append(f'{f.relative_to(pathlib.Path(chr(46)))}:{text[:m.start()].count(chr(10))+1}') for f in runtime_dir.rglob('*.py') if f.name != 'agent_paths.py' for text in [f.read_text(encoding='utf-8')] for m in pat.finditer(text) if 'absolutize' not in text[max(0,m.start()-60):m.start()]]; print(f'FAIL: {len(violations)} raw Path() bypass(es) in mind_api/src/: {violations[:5]} - must route through absolutize() per guard-552/rb-933') if violations else print('PASS: no raw Path() bypassing absolutize in mind_api/src/ (excluding agent_paths.py)'); sys.exit(1 if violations else 0)"`
 
    # Section FST: Forged-Skill Tagging consistency (Phase 1.3 packaging cleanup, 2026-05-17)
    # Every entry in world/forged-skills.yaml MUST have `forged: true` in its
@@ -5444,7 +5444,7 @@ else:
    # Section TPD: Test Pollution Defense — conftest autouse env-restore fixture
    # (commit 7f05915d, rb-1096, guard-588, tree node test-pollution-defense, 2026-05-19)
    # Pytest's collection phase imports ALL test modules before any test runs,
-   # so a module-level `os.environ.pop("AYOAI_AGENT", None)` in any single
+   # so a module-level `os.environ.pop("MIND_AGENT", None)` in any single
    # test file contaminates the env that every other test sees — even tests
    # that sort earlier alphabetically. This produced 18 of 20 baseline
    # failures (Clusters B-G, H) before the two-layer fix shipped.
@@ -5452,12 +5452,12 @@ else:
    # Layer 1 is per-file capture-restore in 11 polluter files (g-115-888) —
    # enforced by guard-588 discipline, not automation.
    # Layer 2 is the autouse `_restore_env_per_test` fixture in conftest.py
-   # that snapshots AYOAI_AGENT + AYOAI_WORLD at conftest load time (before
+   # that snapshots MIND_AGENT + MIND_WORLD at conftest load time (before
    # any polluter module imports) and restores them before every test.
    # This check guards Layer 2 — without it, any future test file with
    # module-level env mutation will silently re-introduce the 18-failure
    # regression, and the failure may not surface immediately (only when a
-   # downstream test depends on AYOAI_AGENT or AYOAI_WORLD).
+   # downstream test depends on MIND_AGENT or MIND_WORLD).
    Check: `core/scripts/tests/conftest.py` contains the `_restore_env_per_test` autouse fixture (Layer 2 of the test-pollution defense).
    Bash: `grep -q '_restore_env_per_test' core/scripts/tests/conftest.py && grep -q '@pytest.fixture(autouse=True)' core/scripts/tests/conftest.py && echo "PASS: conftest.py has _restore_env_per_test autouse fixture (Layer 2 test-pollution defense intact)" || (echo "FAIL: conftest.py is missing the _restore_env_per_test autouse fixture — Layer 2 of the test-pollution defense has regressed. See tree node test-pollution-defense, rb-1096, guard-588, commit 7f05915d. Without this fixture, module-level os.environ.pop in any new test file will re-contaminate the suite via pytest's collection-time imports." && exit 1)`
 
@@ -5561,7 +5561,7 @@ else:
    # checkout). Pattern: existing default-off invariants like user_signal_boost /
    # class_balance (lines 2626 / 2631).
    Check: `processor-config.yaml` strategy_extractor.motif_pairwise.enabled is false (or motif_pairwise block absent — both satisfy the default-off invariant)
-   Bash (motif-pairwise-default-off): awp=$(grep -E '^AGENT_WRITE_PATH=' "agents/$AYOAI_AGENT/local-paths.conf" 2>/dev/null | head -1 | sed -E 's/^AGENT_WRITE_PATH=//;s/^"//;s/"$//') && cfg="$awp/Ayoai-Environment-Processor/processor-config.yaml" && if [ ! -f "$cfg" ]; then echo "SKIP: processor-config.yaml not reachable for agent $AYOAI_AGENT (path=$cfg) — MOTIF check is product-domain"; else py -3 -c "import yaml,sys; c=yaml.safe_load(open(r'$cfg')) or {}; m=c.get('strategy_extractor',{}).get('motif_pairwise',{}); en=m.get('enabled'); sys.exit(0 if en is False or en is None else 1)" && echo "PASS: motif_pairwise.enabled is default-off (false or absent)" || echo "FAIL: motif_pairwise.enabled is true in $cfg — pre-flag baseline behavior is no longer the default (g-307-32 acceptance #1 violation, regression risk: LLM cost spike + behavior drift)"; fi
+   Bash (motif-pairwise-default-off): awp=$(grep -E '^AGENT_WRITE_PATH=' "agents/$MIND_AGENT/local-paths.conf" 2>/dev/null | head -1 | sed -E 's/^AGENT_WRITE_PATH=//;s/^"//;s/"$//') && cfg="$awp/Ayoai-Environment-Processor/processor-config.yaml" && if [ ! -f "$cfg" ]; then echo "SKIP: processor-config.yaml not reachable for agent $MIND_AGENT (path=$cfg) — MOTIF check is product-domain"; else py -3 -c "import yaml,sys; c=yaml.safe_load(open(r'$cfg')) or {}; m=c.get('strategy_extractor',{}).get('motif_pairwise',{}); en=m.get('enabled'); sys.exit(0 if en is False or en is None else 1)" && echo "PASS: motif_pairwise.enabled is default-off (false or absent)" || echo "FAIL: motif_pairwise.enabled is true in $cfg — pre-flag baseline behavior is no longer the default (g-307-32 acceptance #1 violation, regression risk: LLM cost spike + behavior drift)"; fi
 
    # Section SMJ: stderr-merge-into-json.loads regression class (guard-659, g-115-1265, 2026-05-26)
    # A shell command captured with `2>&1` whose output is fed to python
@@ -5740,7 +5740,7 @@ print(f'PASS: guard-056 active')
    # CLE1: Spark questions — first_principles and experiential_hypothesis promoted to active
    Check: `spark-questions.yaml` has sq-016 (first_principles) and sq-017 (experiential_hypothesis) in `seed_questions`
    Check: `spark-questions.yaml` `max_active_questions` is 17 (not 15)
-   Bash: AYOAI_AGENT=$AYOAI_AGENT spark-questions-read.sh --active → verify 17 active questions
+   Bash: MIND_AGENT=$MIND_AGENT spark-questions-read.sh --active → verify 17 active questions
    Bash: verify `first_principles` and `experiential_hypothesis` categories are present in active list
 
    # CLE2: Creative lens and routine lens templates exist
@@ -5795,7 +5795,7 @@ print(f'PASS: guard-056 active')
    # CLE9: Meta alignment
    # Use $META_DIR resolution explicitly — the bare `meta/` prefix in previous
    # versions produced false FAILs when a verification agent ran without
-   # AYOAI_AGENT bound and META_DIR fell back to project-root/meta.
+   # MIND_AGENT bound and META_DIR fell back to project-root/meta.
    Bash: source core/scripts/_paths.sh && grep -c "Creative-lens reflection for routine" "$META_DIR/improvement-instructions.md" → expect >= 1 (file exists AND contains the string)
    Bash: source core/scripts/_paths.sh && grep -c "Skip effort" "$META_DIR/improvement-instructions.md" → expect 0 (old anti-pattern retired)
    Check: guard-097 exists (artifact tracking inside conditional)
@@ -5938,12 +5938,12 @@ print(f'PASS: guard-056 active')
    # The "airport" token embeds the substring "port" — if substring matching
    # regressed, "port" would match port-8082 entries. With whole-token set
    # intersection, it does not.
-   Bash: AYOAI_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "airport terminal broken" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['match_count']==0, f'FAIL: substring false-positive regression ({r[\"match_count\"]} matches — \"airport\" matched \"port\"?)'; print('PASS: no substring false-positive on airport/port')"
+   Bash: MIND_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "airport terminal broken" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['match_count']==0, f'FAIL: substring false-positive regression ({r[\"match_count\"]} matches — \"airport\" matched \"port\"?)'; print('PASS: no substring false-positive on airport/port')"
 
    # CG3: Invariant #2 — markdown-table header-row skip
    Check: `core/scripts/capability-gate.py` _load_capability_routing tracks `seen_divider` and skips rows until divider seen
    Check: `core/scripts/capability-gate.py` _load_capability_routing resets `seen_divider = False` on each new `## ` heading
-   Bash: AYOAI_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "agent provisions this service" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['match_count']==0 or all('provisions' not in (m.get('row','') or '') for m in r['matches']), 'FAIL: header row captured'; print('PASS: header row skipped')"
+   Bash: MIND_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "agent provisions this service" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['match_count']==0 or all('provisions' not in (m.get('row','') or '') for m in r['matches']), 'FAIL: header row captured'; print('PASS: header row skipped')"
 
    # CG4: Invariant #3 — sys.executable, not bash subprocess, for Python children
    Check: `core/scripts/blocker-recheck.py` _py has the invariant comment "INVARIANT: uses sys.executable directly, not a bash subprocess"
@@ -5966,15 +5966,15 @@ print(f'PASS: guard-056 active')
 
    # CG8: Override flag works and is audited
    Check: `core/scripts/capability-gate.py` when --override-agent-match is provided, echoes justification to stderr with prefix "[capability-gate] override applied:"
-   Bash: AYOAI_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "llama-server on port 8082 is down" --intended-participants user --override-agent-match "synthetic test" --output json 2>&1 | py -3 -c "import sys; output=sys.stdin.read(); assert '[capability-gate] override applied' in output, 'FAIL: override not echoed to stderr'; assert '\"would_block\": false' in output.lower() or '\"would_block\":false' in output.lower(), 'FAIL: override did not unblock'; print('PASS: override audit + unblock both work')"
+   Bash: MIND_AGENT=bravo bash core/scripts/capability-gate.sh --failure-reason "llama-server on port 8082 is down" --intended-participants user --override-agent-match "synthetic test" --output json 2>&1 | py -3 -c "import sys; output=sys.stdin.read(); assert '[capability-gate] override applied' in output, 'FAIL: override not echoed to stderr'; assert '\"would_block\": false' in output.lower() or '\"would_block\":false' in output.lower(), 'FAIL: override did not unblock'; print('PASS: override audit + unblock both work')"
 
    # CG9: Enforcement pointer exists in capability-before-user rule
    Check: `.claude/rules/capability-before-user.md` has a blockquote (starts with `>`) referencing `capability-gate.py` or Step 2.6
    Check: `.claude/rules/capability-before-user.md` blockquote says the gate is a "safety net, not a replacement" (LLM-side checklist is still required)
 
    # CG10: Encoded lessons active
-   Bash: AYOAI_AGENT=bravo bash core/scripts/reasoning-bank-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={r.get('id') for r in d}; missing=[i for i in ('rb-223','rb-224','rb-225') if i not in ids]; assert not missing, f'FAIL: missing rb entries: {missing}'; print('PASS: rb-223/224/225 all active')"
-   Bash: AYOAI_AGENT=bravo bash core/scripts/guardrails-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={g.get('id') for g in d}; assert 'guard-142' in ids, 'FAIL: guard-142 not active'; print('PASS: guard-142 active')"
+   Bash: MIND_AGENT=bravo bash core/scripts/reasoning-bank-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={r.get('id') for r in d}; missing=[i for i in ('rb-223','rb-224','rb-225') if i not in ids]; assert not missing, f'FAIL: missing rb entries: {missing}'; print('PASS: rb-223/224/225 all active')"
+   Bash: MIND_AGENT=bravo bash core/scripts/guardrails-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={g.get('id') for g in d}; assert 'guard-142' in ids, 'FAIL: guard-142 not active'; print('PASS: guard-142 active')"
    Check: `world/knowledge/tree/_tree.yaml` contains `capability-routing-enforcement:` node registered under `system` parent
 
    # CG11: Probe Before Defer — sibling rule to capability-before-user
@@ -6035,8 +6035,8 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    Check: `core/scripts/capability-gate.py` `keyword_block` exempts when `session_req_classification != "user_keystroke_required"` (parallel to user_only_matches exemption)
    Check: `world/conventions/capability-routing.md` "Forbidden narrative framings" table contains a row referencing `SESSION_REQUIREMENT_PATTERN` and the keystroke-marker list (kept synced with capability-gate.py)
    Check: `core/scripts/tests/test_capability_gate_session_requirement.py` exists (regression test)
-   Bash (session-requirement-block): AYOAI_AGENT=alpha bash core/scripts/capability-gate.sh --failure-reason "requires multi-NPC RUN session >=8min" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['session_requirement_classification']=='agent_provisionable' and r['would_block']==True, f'FAIL: agent-provisionable RUN session not blocking ({r})'; print('PASS: agent-provisionable session-requirement blocks')"
-   Bash (session-requirement-keystroke-pass): AYOAI_AGENT=alpha bash core/scripts/capability-gate.sh --failure-reason "needs PLAY session with character spawn via F5-click" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['session_requirement_classification']=='user_keystroke_required' and r['would_block']==False, f'FAIL: keystroke session blocked ({r})'; print('PASS: keystroke session-requirement passes')"
+   Bash (session-requirement-block): MIND_AGENT=alpha bash core/scripts/capability-gate.sh --failure-reason "requires multi-NPC RUN session >=8min" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['session_requirement_classification']=='agent_provisionable' and r['would_block']==True, f'FAIL: agent-provisionable RUN session not blocking ({r})'; print('PASS: agent-provisionable session-requirement blocks')"
+   Bash (session-requirement-keystroke-pass): MIND_AGENT=alpha bash core/scripts/capability-gate.sh --failure-reason "needs PLAY session with character spawn via F5-click" --intended-participants user --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['session_requirement_classification']=='user_keystroke_required' and r['would_block']==False, f'FAIL: keystroke session blocked ({r})'; print('PASS: keystroke session-requirement passes')"
    Bash (session-requirement-regression): py -3 core/scripts/tests/test_capability_gate_session_requirement.py 2>&1 | tail -1 | grep -q "All 8 session-requirement cases verified" && echo "PASS: session-requirement regression suite 8/8" || echo "FAIL: session-requirement regression broke"
 
    # CG15: Stale narrative-defer audit (g-115-706 / g-271-12 canonical incident)
@@ -6089,7 +6089,7 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    Check: `core/scripts/blocker-create-gate.py` imports `locked_append_jsonl` directly via `from _fileops import ...` (not importlib)
 
    # S48.6: Encoded lessons from session-48 review passes
-   Bash: AYOAI_AGENT=bravo bash core/scripts/reasoning-bank-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={r.get('id') for r in d}; missing=[i for i in ('rb-268','rb-269') if i not in ids]; assert not missing, f'FAIL: missing rb entries: {missing}'; print('PASS: rb-268/269 both active')"
+   Bash: MIND_AGENT=bravo bash core/scripts/reasoning-bank-read.sh --active | py -3 -c "import sys,json; d=json.loads(sys.stdin.read() or '[]'); ids={r.get('id') for r in d}; missing=[i for i in ('rb-268','rb-269') if i not in ids]; assert not missing, f'FAIL: missing rb entries: {missing}'; print('PASS: rb-268/269 both active')"
 
    # S48.7: Concurrency-and-tree-engine regression suite (g-115-419, sq-018, /encode-session 2026-05-08 Lane 5)
    # Five regression tests built in g-115-417 + earlier sessions guard distinct
@@ -6137,8 +6137,8 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
 
    # S48.12: Tree-sync inline-form trigger must NOT abort the last_updated bump (2026-06-04 _tree.yaml drift fix)
    # tree-front-matter-sync.py (T21) used to sys.exit(0) ("REFUSED: trigger has inline
-   # form") whenever last_update_trigger was an inline dict `{type: ...}` AND AYOAI_SID
-   # was set. The real hook ALWAYS sets AYOAI_SID (tree-sync-check.sh derives it from the
+   # form") whenever last_update_trigger was an inline dict `{type: ...}` AND MIND_SID
+   # was set. The real hook ALWAYS sets MIND_SID (tree-sync-check.sh derives it from the
    # PostToolUse payload's session_id), and most skill instructions emit the inline form
    # (encode-session Lane 1.6, research-topic, respond, reflect-on-outcome,
    # aspirations-consolidate/execute) — so the abort silently left _tree.yaml's last_updated
@@ -6149,7 +6149,7 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # below: run the sync on an inline-trigger fixture with a stale sentinel date; the date MUST
    # change (proves the bump fired, not an abort). Uses a far-past sentinel (2020-01-01) so it
    # can never collide with today.
-   Bash (tree-sync-inline-bumps): D="${TEMP:-/tmp}/vlsync-$$"; mkdir -p "$D"; printf '%s\n' '---' 'created: "2020-01-01"' 'last_updated: "2020-01-01"' 'last_update_trigger: {type: "smoke"}' '---' '' 'body' > "$D/n.md"; AYOAI_SID=vl-smoke py -3 core/scripts/tree-front-matter-sync.py --file "$D/n.md" --virtual-path "world/knowledge/tree/__vlsmoke__/n.md" >/dev/null 2>&1; V=$(grep '^last_updated:' "$D/n.md"); rm -rf "$D"; case "$V" in *2020-01-01*) echo "FAIL: inline-form trigger left last_updated stale ($V) — tree-front-matter-sync.py re-aborts on inline form (2026-06-04 regression: inline {type:...} must skip nested session/source yet still bump last_updated)";; *) echo "PASS: inline-form trigger bumps last_updated ($V), no abort";; esac
+   Bash (tree-sync-inline-bumps): D="${TEMP:-/tmp}/vlsync-$$"; mkdir -p "$D"; printf '%s\n' '---' 'created: "2020-01-01"' 'last_updated: "2020-01-01"' 'last_update_trigger: {type: "smoke"}' '---' '' 'body' > "$D/n.md"; MIND_SID=vl-smoke py -3 core/scripts/tree-front-matter-sync.py --file "$D/n.md" --virtual-path "world/knowledge/tree/__vlsmoke__/n.md" >/dev/null 2>&1; V=$(grep '^last_updated:' "$D/n.md"); rm -rf "$D"; case "$V" in *2020-01-01*) echo "FAIL: inline-form trigger left last_updated stale ($V) — tree-front-matter-sync.py re-aborts on inline form (2026-06-04 regression: inline {type:...} must skip nested session/source yet still bump last_updated)";; *) echo "PASS: inline-form trigger bumps last_updated ($V), no abort";; esac
 
    # S48.11: Runtime-daemon cache-invalidate-inside-lock invariant (g-115-674 + g-115-677)
    # g-115-674 hardened mind_api/src/endpoints/aspirations_write.py to keep every
@@ -6634,7 +6634,7 @@ print('PASS: state-update flag-name contract intact — 3/3 prefixed pairs prese
    # placeholder values on schema drift (re-introducing the cognitive-load trap
    # the review removed) or the team-state.py validators stop catching
    # malformed agent_status..<field> writes (reopening the A7 gap where an
-   # unset AYOAI_AGENT silently corrupts the YAML). Applies rb-276 (boundary
+   # unset MIND_AGENT silently corrupts the YAML). Applies rb-276 (boundary
    # validation), rb-347 (one fail-open boundary), rb-386 (SSoT beats fallbacks).
    Check: `core/scripts/live-phase-emit.sh` exists and is executable
    Bash: test -x core/scripts/live-phase-emit.sh && echo "PASS: live-phase-emit.sh present and executable" || { echo "FAIL: live-phase-emit.sh missing or not executable"; false; }
@@ -6648,19 +6648,19 @@ print('PASS: state-update flag-name contract intact — 3/3 prefixed pairs prese
    Check: the single fail-open boundary (`|| true`) lives on the heartbeat-tick call site
    Bash: grep -cE 'live-phase-emit.sh.*\|\|\s*true' core/scripts/heartbeat-tick.sh | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=1, 'FAIL: heartbeat-tick.sh lost the || true on live-phase-emit.sh call — single-fail-open boundary missing. A crash in the emitter would now block the iteration.'; print('PASS: fail-open boundary present at call site')"
    Check: `core/scripts/team-state.py` defines both write-boundary validators
-   Bash: grep -cE '^def _validate_field_path|^def _validate_agent_name' core/scripts/team-state.py | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n==2, f'FAIL: team-state.py has {n} validator definitions (expected 2). _validate_field_path / _validate_agent_name protect against empty AYOAI_AGENT silently corrupting YAML with agent_status..<field> dot-paths. Without them the A7 gap returns.'; print('PASS: both write-boundary validators defined')"
+   Bash: grep -cE '^def _validate_field_path|^def _validate_agent_name' core/scripts/team-state.py | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n==2, f'FAIL: team-state.py has {n} validator definitions (expected 2). _validate_field_path / _validate_agent_name protect against empty MIND_AGENT silently corrupting YAML with agent_status..<field> dot-paths. Without them the A7 gap returns.'; print('PASS: both write-boundary validators defined')"
    Check: `_validate_field_path` called from `cmd_update` (write boundary 1)
    Bash: py -3 -c "import re; src=open('core/scripts/team-state.py',encoding='utf-8').read(); m=re.search(r'def cmd_update\\(.*?\\n((?:.{0,400}\\n){1,25})', src, re.DOTALL); body=m.group(1) if m else ''; assert '_validate_field_path' in body, 'FAIL: cmd_update does not call _validate_field_path in its first ~25 lines — malformed field paths can reach the YAML writer'; print('PASS: cmd_update guarded by _validate_field_path')"
    Check: `_validate_agent_name` called from `cmd_in_flight` and `cmd_clear_in_flight` (write boundaries 2 and 3)
    Bash: py -3 -c "import re; src=open('core/scripts/team-state.py',encoding='utf-8').read(); a=re.search(r'def cmd_in_flight\\(.*?\\n((?:.{0,400}\\n){1,25})', src, re.DOTALL); b=re.search(r'def cmd_clear_in_flight\\(.*?\\n((?:.{0,400}\\n){1,25})', src, re.DOTALL); assert '_validate_agent_name' in (a.group(1) if a else ''), 'FAIL: cmd_in_flight does not call _validate_agent_name'; assert '_validate_agent_name' in (b.group(1) if b else ''), 'FAIL: cmd_clear_in_flight does not call _validate_agent_name'; print('PASS: both in-flight entry points guarded')"
    # End-to-end smoke tests: exercise the write-boundary validators. Empty
    # field path and malformed dot-path (empty segment simulating unset
-   # $AYOAI_AGENT) must both be rejected loudly. Canonical regression probes
+   # $MIND_AGENT) must both be rejected loudly. Canonical regression probes
    # for the A7 gap this section closes.
    Check: empty `--field` is rejected by team-state-update (validator fires)
-   Bash: AYOAI_AGENT=alpha bash core/scripts/team-state-update.sh --field "" --value '"x"' 2>&1 | grep -c "empty --field" | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=1, 'FAIL: empty --field was NOT rejected — _validate_field_path is wired in but not firing, or team-state-update.sh bypasses the validator. A7 gap is open.'; print('PASS: empty --field rejected by write-boundary validator')"
-   Check: malformed dot-path (empty segment from unset $AYOAI_AGENT) is rejected
-   Bash: AYOAI_AGENT=alpha bash core/scripts/team-state-update.sh --field "agent_status..live_phase" --value '"x"' 2>&1 | grep -c "empty segment" | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=1, 'FAIL: agent_status..live_phase malformed dot-path was NOT rejected — unset AYOAI_AGENT would still silently corrupt the YAML. This is the exact A7 scenario the validator was added to close.'; print('PASS: empty-segment dot-path rejected')"
+   Bash: MIND_AGENT=alpha bash core/scripts/team-state-update.sh --field "" --value '"x"' 2>&1 | grep -c "empty --field" | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=1, 'FAIL: empty --field was NOT rejected — _validate_field_path is wired in but not firing, or team-state-update.sh bypasses the validator. A7 gap is open.'; print('PASS: empty --field rejected by write-boundary validator')"
+   Check: malformed dot-path (empty segment from unset $MIND_AGENT) is rejected
+   Bash: MIND_AGENT=alpha bash core/scripts/team-state-update.sh --field "agent_status..live_phase" --value '"x"' 2>&1 | grep -c "empty segment" | py -3 -c "import sys; n=int(sys.stdin.read().strip()); assert n>=1, 'FAIL: agent_status..live_phase malformed dot-path was NOT rejected — unset MIND_AGENT would still silently corrupt the YAML. This is the exact A7 scenario the validator was added to close.'; print('PASS: empty-segment dot-path rejected')"
    Check: `coordination.md` documents `live_phase` with all 4 legitimate values
    Bash: py -3 -c "t=open('core/config/conventions/coordination.md',encoding='utf-8').read(); missing=[v for v in ('live_phase','between-phases','finding','no-diary') if v not in t]; assert not missing, f'FAIL: coordination.md missing live_phase value(s): {missing}. Schema drift between doc and emitter output.'; print('PASS: coordination.md documents live_phase + all 4 values')"
    Check: `status.py` Team block renders `live_phase` alongside `current_focus`
@@ -6678,8 +6678,8 @@ print('PASS: state-update flag-name contract intact — 3/3 prefixed pairs prese
    Bash: grep -q "Candidate Self refinements" .claude/skills/fresh-eyes-review/SKILL.md && { echo 'FAIL: Candidate Self refinements subsection reintroduced'; false; } || echo 'PASS: Candidate Self refinements absent'
    Check: world post-execution.md Step 1.75 MUST contain "Invoke /fresh-eyes-code" (structured probe wiring)
    Bash: source core/scripts/_paths.sh && grep -q "Invoke /fresh-eyes-code" "$WORLD_DIR/conventions/post-execution.md" && echo 'PASS: post-execution.md invokes /fresh-eyes-code' || { echo 'FAIL: post-execution.md no longer invokes /fresh-eyes-code — Step 1.75 structured-probe wiring reverted'; false; }
-   Check: world post-execution.md Step 1.75 MUST contain "--author $AYOAI_AGENT" (multi-agent leak fix per guard-493)
-   Bash: source core/scripts/_paths.sh && grep -q -- "--author \$AYOAI_AGENT" "$WORLD_DIR/conventions/post-execution.md" && echo 'PASS: post-execution.md filters by author' || { echo 'FAIL: post-execution.md missing --author $AYOAI_AGENT — multi-agent leak per guard-493 returns'; false; }
+   Check: world post-execution.md Step 1.75 MUST contain "--author $MIND_AGENT" (multi-agent leak fix per guard-493)
+   Bash: source core/scripts/_paths.sh && grep -q -- "--author \$MIND_AGENT" "$WORLD_DIR/conventions/post-execution.md" && echo 'PASS: post-execution.md filters by author' || { echo 'FAIL: post-execution.md missing --author $MIND_AGENT — multi-agent leak per guard-493 returns'; false; }
    Check: world post-execution.md `$pre_ts` only appears in explanatory warning text per guard-492 (NOT in actual Bash commands)
    Bash: source core/scripts/_paths.sh && WORLD_DIR="$WORLD_DIR" py -3 -c 'import os,pathlib; src=pathlib.Path(os.environ["WORLD_DIR"]+"/conventions/post-execution.md").read_text(encoding="utf-8"); lines=[ln for ln in src.split("\n") if "$pre_ts" in ln]; bad=[ln for ln in lines if "Do not write" not in ln]; assert not bad, f"FAIL: $pre_ts in non-warning lines: {bad}"; print(f"PASS: $pre_ts only in warning text ({len(lines)} occurrences)")'
 

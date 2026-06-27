@@ -758,7 +758,7 @@ def main():
                                 "age_hours_at_clear": round(age_h, 2),
                                 "dep_ids": new_match.get("dep_ids", []),
                                 "clear_reason": new_match["pattern"],
-                                "agent": os.environ.get("AYOAI_AGENT", "") or None,
+                                "agent": os.environ.get("MIND_AGENT", "") or None,
                             })
                     details.append(entry)
                 else:
@@ -818,7 +818,7 @@ def main():
                     "age_hours_at_clear": round(age_h, 2),
                     "dep_ids": dep_ids,
                     "clear_reason": "deps_completed",
-                    "agent": os.environ.get("AYOAI_AGENT", "") or None,
+                    "agent": os.environ.get("MIND_AGENT", "") or None,
                 })
         details.append(entry)
 
@@ -836,7 +836,7 @@ def main():
         "cleared": cleared,
         "apply": args.apply,
         "max_age_hours": args.max_age_hours,
-        "agent": os.environ.get("AYOAI_AGENT", "") or None,
+        "agent": os.environ.get("MIND_AGENT", "") or None,
     })
 
     result = {
