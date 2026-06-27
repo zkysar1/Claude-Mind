@@ -5679,10 +5679,14 @@ else:
    Check: `respond/SKILL.md` Step 4b has "Priority Review Surfacing" section BEFORE "Pending Questions" section
    Check: `respond/SKILL.md` Step 5 table has "Priority review" directive type that invokes `/priority-review`
    Check: `create-aspiration/SKILL.md` has Step 8.6 with `from-self` mode gate
-   Check: `priority-review/SKILL.md` Phase 4 update uses stdin pipe pattern (`echo | aspirations-update.sh`), NOT command-line JSON arg
-   # This last check guards against the critical bug found during initial code review:
-   # aspirations-update.sh does FULL REPLACEMENT from stdin, not partial merge.
-   # Passing partial JSON as a CLI arg destroys all other aspiration fields.
+   Check: `priority-review/SKILL.md` priority update uses the POSITIONAL field-merge form (`aspirations-update.sh {asp-id} priority {value}`), NOT the retired stdin full-replacement pipe. Bash: grep -q 'aspirations-update.sh {asp-id} priority' .claude/skills/priority-review/SKILL.md && ! grep -qE "echo .*\| *(bash )?(core/scripts/)?aspirations-update\.sh" .claude/skills/priority-review/SKILL.md && echo "PASS: priority-review uses positional field-merge" || echo "FAIL: priority-review uses the retired stdin full-replacement form (g-001-17 / rb-42 regression)"
+   # Direction CORRECTED by g-001-17 / rb-42 / rb-46 (verified 2026-05-23 against the
+   # update_aspiration daemon handler): aspirations-update.sh is positional
+   # <asp_id> <field> <value> and does PER-FIELD MERGE (asp[field]=value), preserving
+   # all other fields — it reads NO stdin. The pre-2026-05-14-cutover stdin
+   # full-replacement form is retired (piping JSON → "asp_id, field, and value are all
+   # required"). The earlier check here enforced the stdin form from a stale
+   # initial-code-review reading; this check now enforces the canonical positional form.
    Check: `priority-review/SKILL.md` Phase 1 reads BOTH world (`load-aspirations-compact.sh`) AND agent-local (`agent-aspirations-read.sh`) aspirations
 
    # Multi-agent coordination evidence checks (Section MAC — arXiv 2603.28990)
