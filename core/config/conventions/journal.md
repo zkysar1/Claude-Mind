@@ -30,10 +30,11 @@ See session 96 (source of this convention) for the incident where this pairing
 was implicit and produced a false missing-detail-file audit.
 
 ## Record Schema
-Required on stdin: `journal_file` (path must match `agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md`)
-Auto-defaulted if absent: `session` (next integer), `date` (today ISO)
-Defaults: `goals_completed` (0), `goals_attempted` (0)
-Optional: `key_events`, `hypotheses_resolved`, `aspirations_created`
+Required on stdin: `journal_file` — the stored field VALUE is agent-name-scoped and carries **no `agents/` prefix**: it is the bound agent's name followed by `/journal/YYYY/MM/YYYY-MM-DD.md` (the validator anchors `^{agent}/journal/...$` with the literal bound-agent name). This field value is agent-relative — distinct from the on-disk path `agents/<agent>/journal/...` referenced above.
+Auto-allocated / auto-defaulted if absent: `session` (next integer = max+1), `date` (today ISO)
+Defaults: `goals_completed` (`[]`), `key_events` (`[]`), `tags` (`[]`), `hypotheses_resolved` (`0`), `hypotheses_created` (`0`)
+Array-of-strings fields (validator-enforced — rejects a non-list value or a non-string element): `goals_completed`, `key_events`, `tags`
+Authoritative schema: `mind_api/src/store_registry.py` → `STORE_REGISTRY["journal"]` + `_journal_validate` (daemon-only runtime).
 
 ## Script-Based Access (Exclusive Data Layer)
 The LLM NEVER reads or edits `agents/<agent>/journal.jsonl` directly. All operations go through scripts:

@@ -82,7 +82,7 @@ def assert_eq(actual, expected, msg=""):
 # ---------------------------------------------------------------------------
 
 @with_sandbox
-def save_history_skips_blacklisted_presence_dir(sandbox, meta_sandbox, _fileops):
+def test_save_history_skips_blacklisted_presence_dir(sandbox, meta_sandbox, _fileops):
     """presence/<agent>.jsonl under WORLD must NOT create a .history snapshot."""
     presence_dir = sandbox / "presence"
     presence_dir.mkdir(parents=True)
@@ -100,7 +100,7 @@ def save_history_skips_blacklisted_presence_dir(sandbox, meta_sandbox, _fileops)
 
 
 @with_sandbox
-def save_history_skips_blacklisted_gate_firings_meta(sandbox, meta_sandbox, _fileops):
+def test_save_history_skips_blacklisted_gate_firings_meta(sandbox, meta_sandbox, _fileops):
     """meta/gate-firings.jsonl must NOT create a .history snapshot."""
     target = meta_sandbox / "gate-firings.jsonl"
     target.write_text(json.dumps({"gate": "test", "rc": 0}) + "\n",
@@ -114,7 +114,7 @@ def save_history_skips_blacklisted_gate_firings_meta(sandbox, meta_sandbox, _fil
 
 
 @with_sandbox
-def save_history_does_not_skip_same_name_in_wrong_base(sandbox, meta_sandbox, _fileops):
+def test_save_history_does_not_skip_same_name_in_wrong_base(sandbox, meta_sandbox, _fileops):
     """gate-firings.jsonl pattern is META-only; a same-name file under WORLD must snapshot.
 
     Defends the dict-by-base structure of _SNAPSHOT_BLACKLIST. A meta pattern
@@ -136,7 +136,7 @@ def save_history_does_not_skip_same_name_in_wrong_base(sandbox, meta_sandbox, _f
 # ---------------------------------------------------------------------------
 
 @with_sandbox
-def save_history_writes_gzip_compressed_snapshot(sandbox, meta_sandbox, _fileops):
+def test_save_history_writes_gzip_compressed_snapshot(sandbox, meta_sandbox, _fileops):
     """A non-blacklisted file produces a `.gz` snapshot whose contents decompress
     to byte-equal original."""
     target = sandbox / "aspirations.jsonl"
@@ -168,7 +168,7 @@ def save_history_writes_gzip_compressed_snapshot(sandbox, meta_sandbox, _fileops
 
 
 @with_sandbox
-def save_history_gzip_reduces_size_meaningfully(sandbox, meta_sandbox, _fileops):
+def test_save_history_gzip_reduces_size_meaningfully(sandbox, meta_sandbox, _fileops):
     """A repetitive JSONL file should compress to a fraction of original size.
 
     Validates that the format choice is actually doing the job we built it
@@ -210,7 +210,7 @@ def save_history_gzip_reduces_size_meaningfully(sandbox, meta_sandbox, _fileops)
 # ---------------------------------------------------------------------------
 
 @with_sandbox
-def per_file_cap_drops_oldest_snapshots_on_write(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_drops_oldest_snapshots_on_write(sandbox, meta_sandbox, _fileops):
     """save_history enforces the per-file cap after each write — oldest first.
 
     Stamps 6 snapshots into the history dir by hand at known timestamps,
@@ -256,7 +256,7 @@ def per_file_cap_drops_oldest_snapshots_on_write(sandbox, meta_sandbox, _fileops
 
 
 @with_sandbox
-def per_file_cap_drops_paired_meta_sidecars(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_drops_paired_meta_sidecars(sandbox, meta_sandbox, _fileops):
     """When _prune_to_cap drops a snapshot, its `.meta` sidecar is dropped too."""
     target = sandbox / "aspirations.jsonl"
     target.write_text(json.dumps({"id": "x"}) + "\n", encoding="utf-8")
@@ -287,7 +287,7 @@ def per_file_cap_drops_paired_meta_sidecars(sandbox, meta_sandbox, _fileops):
 
 
 @with_sandbox
-def per_file_cap_leaves_unparseable_files_alone(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_leaves_unparseable_files_alone(sandbox, meta_sandbox, _fileops):
     """Files that don't match the snapshot-name format are NOT touched by the cap.
 
     Defends against accidentally deleting legacy or non-snapshot artifacts.
@@ -321,7 +321,7 @@ def per_file_cap_leaves_unparseable_files_alone(sandbox, meta_sandbox, _fileops)
 
 
 @with_sandbox
-def per_file_cap_uses_default_for_unlisted_files(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_uses_default_for_unlisted_files(sandbox, meta_sandbox, _fileops):
     """Files not in _PER_FILE_SNAPSHOT_CAP use DEFAULT_SNAPSHOT_CAP."""
     # An invented file name that's NOT in the overrides table.
     target = sandbox / "some-rare-file.yaml"
@@ -332,7 +332,7 @@ def per_file_cap_uses_default_for_unlisted_files(sandbox, meta_sandbox, _fileops
 
 
 @with_sandbox
-def per_file_cap_lookup_respects_base_kind(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_lookup_respects_base_kind(sandbox, meta_sandbox, _fileops):
     """A pattern under 'world' must not leak into 'meta' (parallel to blacklist)."""
     # aspirations.jsonl is capped at 100 under world, but not listed under meta.
     world_cap = _fileops._get_snapshot_cap(sandbox, Path("aspirations.jsonl"))
@@ -343,7 +343,7 @@ def per_file_cap_lookup_respects_base_kind(sandbox, meta_sandbox, _fileops):
 
 
 @with_sandbox
-def per_file_cap_bounds_drops_per_call(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_bounds_drops_per_call(sandbox, meta_sandbox, _fileops):
     """When existing surplus is huge, no single save_history call drops more
     than MAX_SNAPSHOTS_DROPPED_PER_CALL.
 
@@ -380,7 +380,7 @@ def per_file_cap_bounds_drops_per_call(sandbox, meta_sandbox, _fileops):
 
 
 @with_sandbox
-def per_file_cap_skips_when_under_cap(sandbox, meta_sandbox, _fileops):
+def test_per_file_cap_skips_when_under_cap(sandbox, meta_sandbox, _fileops):
     """No drops fire when snapshot count is <= cap. Counts return 0, files preserved."""
     target = sandbox / "aspirations.jsonl"
     target.write_text(json.dumps({"id": "x"}) + "\n", encoding="utf-8")
@@ -404,7 +404,7 @@ def per_file_cap_skips_when_under_cap(sandbox, meta_sandbox, _fileops):
 # ---------------------------------------------------------------------------
 
 @with_sandbox
-def save_history_raises_value_error_for_path_outside_base(sandbox, meta_sandbox, _fileops):
+def test_save_history_raises_value_error_for_path_outside_base(sandbox, meta_sandbox, _fileops):
     """A path outside base_dir raises ValueError BEFORE any JSONL parse runs.
 
     Verifies finding #1 cleanup: the try/except wrapping relative_to is gone
@@ -426,7 +426,7 @@ def save_history_raises_value_error_for_path_outside_base(sandbox, meta_sandbox,
 # Outcome 3 — history.parse_snapshot_name handles .gz
 # ---------------------------------------------------------------------------
 
-def parse_snapshot_name_strips_gz_suffix():
+def test_parse_snapshot_name_strips_gz_suffix():
     """parse_snapshot_name extracts timestamp + agent from a .gz filename."""
     import history  # noqa: F401 — module under test
     ts, agent = history.parse_snapshot_name("2026-05-22T09-15-00_zeta.jsonl.gz")
@@ -436,7 +436,7 @@ def parse_snapshot_name_strips_gz_suffix():
               "agent token must come from underlying ext, not .gz")
 
 
-def parse_snapshot_name_handles_legacy_uncompressed():
+def test_parse_snapshot_name_handles_legacy_uncompressed():
     """Legacy uncompressed filenames continue to parse correctly."""
     import history  # noqa: F401
     ts, agent = history.parse_snapshot_name("2026-05-22T09-15-00_alpha.md")
@@ -486,7 +486,7 @@ def _teardown_history_dir(sandbox):
     # subsequent tests via with_sandbox overwrite it.
 
 
-def resolve_version_path_accepts_literal_gz_filename():
+def test_resolve_version_path_accepts_literal_gz_filename():
     """Stage 2 successor _find_snapshot_by_name finds the literal name."""
     # Fixture MUST run before `import history` — _setup_history_dir clears
     # cached _paths/_fileops/history so the next import picks up the fresh
@@ -500,7 +500,7 @@ def resolve_version_path_accepts_literal_gz_filename():
         _teardown_history_dir(sandbox)
 
 
-def resolve_version_path_accepts_bare_filename_without_gz():
+def test_resolve_version_path_accepts_bare_filename_without_gz():
     """User passes 'foo.jsonl' but on-disk is 'foo.jsonl.gz' — must resolve."""
     sandbox, target, snap = _setup_history_dir()
     try:
@@ -513,7 +513,7 @@ def resolve_version_path_accepts_bare_filename_without_gz():
         _teardown_history_dir(sandbox)
 
 
-def resolve_version_path_returns_none_for_missing():
+def test_resolve_version_path_returns_none_for_missing():
     sandbox, target, _ = _setup_history_dir()
     try:
         import history
@@ -528,26 +528,26 @@ def resolve_version_path_returns_none_for_missing():
 # ---------------------------------------------------------------------------
 
 TESTS = [
-    save_history_skips_blacklisted_presence_dir,
-    save_history_skips_blacklisted_gate_firings_meta,
-    save_history_does_not_skip_same_name_in_wrong_base,
-    save_history_writes_gzip_compressed_snapshot,
-    save_history_gzip_reduces_size_meaningfully,
-    parse_snapshot_name_strips_gz_suffix,
-    parse_snapshot_name_handles_legacy_uncompressed,
-    resolve_version_path_accepts_literal_gz_filename,
-    resolve_version_path_accepts_bare_filename_without_gz,
-    resolve_version_path_returns_none_for_missing,
+    test_save_history_skips_blacklisted_presence_dir,
+    test_save_history_skips_blacklisted_gate_firings_meta,
+    test_save_history_does_not_skip_same_name_in_wrong_base,
+    test_save_history_writes_gzip_compressed_snapshot,
+    test_save_history_gzip_reduces_size_meaningfully,
+    test_parse_snapshot_name_strips_gz_suffix,
+    test_parse_snapshot_name_handles_legacy_uncompressed,
+    test_resolve_version_path_accepts_literal_gz_filename,
+    test_resolve_version_path_accepts_bare_filename_without_gz,
+    test_resolve_version_path_returns_none_for_missing,
     # Items 3 + 4 — per-file cap + auto-prune on write
-    per_file_cap_drops_oldest_snapshots_on_write,
-    per_file_cap_drops_paired_meta_sidecars,
-    per_file_cap_leaves_unparseable_files_alone,
-    per_file_cap_uses_default_for_unlisted_files,
-    per_file_cap_lookup_respects_base_kind,
-    per_file_cap_bounds_drops_per_call,
-    per_file_cap_skips_when_under_cap,
+    test_per_file_cap_drops_oldest_snapshots_on_write,
+    test_per_file_cap_drops_paired_meta_sidecars,
+    test_per_file_cap_leaves_unparseable_files_alone,
+    test_per_file_cap_uses_default_for_unlisted_files,
+    test_per_file_cap_lookup_respects_base_kind,
+    test_per_file_cap_bounds_drops_per_call,
+    test_per_file_cap_skips_when_under_cap,
     # Finding #1 cleanup — error precedence
-    save_history_raises_value_error_for_path_outside_base,
+    test_save_history_raises_value_error_for_path_outside_base,
 ]
 
 

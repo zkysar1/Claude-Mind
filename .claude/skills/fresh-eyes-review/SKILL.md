@@ -423,6 +423,28 @@ analysis, priority-review stays the user's anytime portfolio pull.
 Fresh-eyes produces a local briefing artifact and board post — the user
 reviews via git log and tracked signals at their own pace.
 
+## Restricted Operations
+
+This skill writes one live datastore: **partner-belief entries in
+`world/team-state.yaml`**, exclusively via the `team-belief-write.sh`
+companion (Phase 5.6 / Phase 8). The write boundary:
+
+- **Canonical writer is the daemon.** `team-belief-write.sh` composes the
+  read + set daemon wrappers around the supersede/cap compute in
+  `_team_belief.py`; the skill MUST NOT edit `world/team-state.yaml`
+  directly (Write/Edit/echo), which would bypass the shared team-state lock
+  and the supersede-not-grow hygiene.
+- **Each agent is the sole writer of its OWN belief sublist**
+  (`agent_status.<self>.beliefs`). This skill never writes another agent's
+  sublist — cross-agent signalling goes through `world/board/` per
+  `core/config/conventions/coordination.md`.
+- **Supersede, do not grow.** A new belief about a partner replaces the
+  prior one for that partner (bounded list); the hygiene lives in
+  `_team_belief.py`, not in this skill's pseudocode.
+
+No other datastore is mutated — the briefing artifact and board post are the
+skill's only other outputs, each through its own canonical path.
+
 ## Return Protocol
 
 See `.claude/rules/return-protocol.md` — last action must be a tool call,
