@@ -5612,6 +5612,62 @@ else:
    Bash (post-recovery-gate-wired): test $(grep -c "post-recovery-edit-gate" .claude/settings.json) -ge 3 && echo "PASS: post-recovery-edit-gate wired >=3 PreToolUse sites in settings.json" || echo "FAIL: post-recovery-edit-gate wired <3 sites in .claude/settings.json — Write/Edit/MultiEdit hook de-wired (g-001-16)"
    Bash (post-recovery-gate-deny-predicate): grep -q 'state != "IDLE" or mode != "autonomous"' core/scripts/post-recovery-edit-gate.py && echo "PASS: post-recovery-edit-gate deny predicate intact (IDLE/autonomous)" || echo "FAIL: post-recovery-edit-gate.py deny predicate changed — accidental tuple expansion would over-block (rb-1118, guard-595)"
 
+   # ════════════════════════════════════════════════════════════════════
+   # Section PRC: Promotion-Reconcile Back-Ported Checks (2026-06-27)
+   # The 2026-06-27 dev→staging→prod promotion reconcile (semantic 96-file
+   # classification) found these regression guards present in the production
+   # deployment but absent from dev. Per .claude/rules/promotion-cycle.md
+   # "Pre-Overwrite Drift Gate" (reconcile-not-mirror), they are back-ported
+   # here so the cutover — which overwrites verify-learning/SKILL.md at the
+   # destination — does not clobber them. JDV/FRO/CSV/D6.7-8 are framework-
+   # general (every guarded file exists in dev, staging, and prod); PROMO is
+   # self-gating (a prod-local deployment-topology guardrail, no-op where the
+   # promotion-cycle artifacts legitimately do not exist).
+   # ════════════════════════════════════════════════════════════════════
+
+   # Convention-doc vs daemon-validator consistency: journal store (Section JDV — g-001-53, 2026-05-30)
+   # core/config/conventions/journal.md is the human-facing schema doc; the daemon-enforced
+   # ground truth is mind_api/src/store_registry.py STORE_REGISTRY["journal"] + _journal_validate.
+   # When the doc drifts from the validator, callers build journal-add payloads from the doc and
+   # get rejected at runtime. Canonical incident (2026-05-30, rb-130): the doc showed journal_file
+   # with an `agents/` prefix (validator wants agent-relative, no prefix) AND goals_completed as
+   # integer 0 (validator wants array-of-strings) → two failed journal-add attempts before the
+   # validator was read. The journal.md doc was back-ported alongside this guard so both stay paired.
+   Check: `core/config/conventions/journal.md` documents `journal_file` as agent-relative (no `agents/` prefix). Bash: grep -qF 'no `agents/` prefix' core/config/conventions/journal.md && echo "PASS: journal.md documents agent-relative journal_file" || echo "FAIL: journal.md dropped the no-agents-prefix rule — doc drifted from _journal_validate regex (g-001-53 / rb-130 regression)"
+   Check: `core/config/conventions/journal.md` documents `goals_completed`/`key_events`/`tags` as array-of-strings. Bash: grep -qF 'Array-of-strings fields' core/config/conventions/journal.md && echo "PASS: journal.md documents array-of-strings fields" || echo "FAIL: journal.md dropped the array-of-strings field doc — doc drifted from validator (g-001-53 / rb-130 regression)"
+   Check: `core/config/conventions/journal.md` names `store_registry.py` as the authoritative schema source. Bash: grep -qF 'store_registry.py' core/config/conventions/journal.md && echo "PASS: journal.md points at the daemon validator as authoritative" || echo "FAIL: journal.md missing the authoritative-source pointer to store_registry.py — readers cannot find ground truth"
+
+   # Forged restricted-write Restricted Operations coverage (Section FRO — sq-018 / g-012-21, 2026-06-10)
+   # A forged SKILL.md whose companion_scripts list a dedicated live-datastore writer
+   # (a *-write.sh) MUST carry a `## Restricted Operations` section documenting the write
+   # boundary. Origin: g-012 contract skills shipped MISSING it (rb-120); poll-outreach-replies
+   # repeated the class (caught + fixed by g-012-21). Iterates whatever forged skills exist, so
+   # it is safe across deployments.
+   Bash (forged-restricted-ops): MISS=$(for f in .claude/skills/*/SKILL.md; do csline=$(awk 'NR==1&&/^---/{ff=1;next} ff&&/^---/{exit} ff&&/^companion_scripts:/{print}' "$f"); if echo "$csline" | grep -qE "[a-z0-9-]+-write\.sh"; then grep -qE "^## Restricted Operations" "$f" || echo "$(basename "$(dirname "$f")")"; fi; done); if [ -z "$MISS" ]; then echo "PASS: every forged skill with a -write.sh companion documents Restricted Operations"; else echo "FAIL: -write.sh companion but no ## Restricted Operations section: $MISS (sq-018/rb-120 regression — add the section)"; fi
+
+   # Notify-build-payload Self-heading regex tolerance (Section CSV partial — g-009-06, 2026-05-22)
+   # notify-build-payload.py was relaxed from the strict `^#+\s*Self\s*$` to `^#+\s*Self(\s.*)?$`
+   # so an agent self.md with a `# Self - <name>` heading (agent-name suffix) is accepted. A
+   # "tidy-up" back to the strict form would make notify-user's build payload reject that identity.
+   Check: `core/scripts/notify-build-payload.py` Self-heading regex accepts both `# Self` and `# Self - <name>`. Bash: grep -qF 'Self(\s.*)?' core/scripts/notify-build-payload.py && echo "PASS: notify-build-payload Self regex accepts agent-name-suffix shape" || { echo "FAIL: notify-build-payload Self regex regressed to strict form — a '# Self — <name>' identity would be rejected (g-009-06)"; exit 1; }
+
+   # D6.7+D6.8: owncloud flush + runner-claim release wiring (g-009-38, 2026-06-24)
+   # D6.7 calls owncloud-flush.sh to push governed writes to remote storage before stop;
+   # D6.8 calls runner-claim.sh release to drop the cross-machine session-lock. Both no-op under
+   # STORAGE_BACKEND=local; the wiring must stay so a backend cutover activates without SKILL.md edits.
+   Bash: grep -c "owncloud-flush.sh" .claude/skills/aspirations-graceful-stop/SKILL.md → verify >= 1 (D6.7 flush wired in graceful-stop)
+   Bash: test -f core/scripts/runner-claim.sh && echo "PASS: runner-claim.sh exists" || echo "FAIL: runner-claim.sh missing"
+
+   # Promotion-cycle enforcement layer (g-001-132, 2026-06-24) — SELF-GATING for portability
+   # Deployment-topology guardrail. The promotion-cycle.md rule + the CLAUDE.md "CRITICAL:
+   # Promotion Cycle" section are PROD-local (preserved at the production deployment via the seed
+   # engine's _DEPLOYMENT_LOCAL_FILES; dev/staging legitimately lack them). This check is
+   # conditional: a no-op in dev/staging (neither artifact present) and strict in prod (both
+   # present), so it travels with the framework via promotion yet only enforces where the
+   # guardrail actually lives — and it catches a partial-clobber where one artifact survives
+   # without the other.
+   Bash (promotion-cycle-gate): if [ -f .claude/rules/promotion-cycle.md ] || grep -q "CRITICAL.*Promotion" CLAUDE.md 2>/dev/null; then { [ -f .claude/rules/promotion-cycle.md ] && grep -q "CRITICAL.*Promotion" CLAUDE.md && echo "PASS: promotion-cycle enforcement layer intact (rule file + CLAUDE.md section)"; } || { echo "FAIL: promotion-cycle enforcement PARTIAL — one of {.claude/rules/promotion-cycle.md, CLAUDE.md CRITICAL: Promotion Cycle section} is missing (g-001-132 partial-clobber)"; exit 1; }; else echo "SKIP: promotion-cycle enforcement is prod-local — not present in this dev/staging deployment"; fi
+
 ## Step 4: Summary Report
 
    # Priority review skill integrity checks (Section PR)
