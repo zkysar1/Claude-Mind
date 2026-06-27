@@ -357,14 +357,15 @@ If yes, create a companion hypothesis goal alongside the sub-goals:
 ## Step 6: Write Decomposition
 
 ```
-1. Read current aspiration: Bash: aspirations-read.sh --id <aspiration-id>
-2. Set parent goal status to "decomposed"
-3. Add field: decomposed_into: [list of sub-goal IDs]
-4. Insert sub-goals into the aspiration's goals array
-5. Update aspiration progress.total_goals count
-6. Pipe updated aspiration JSON: echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh <asp-id>
-7. Update _index files if needed
-8. Notify the user about the decomposition.
+1. File each sub-goal under the aspiration — one call per sub-goal. The daemon
+   appends to the goals array AND recomputes progress.total_goals automatically:
+   echo '<sub-goal-json>' | bash core/scripts/aspirations-add-goal.sh <aspiration-id>
+2. Mark the parent goal decomposed (goal-level field-merge):
+   Bash: aspirations-update-goal.sh <parent-goal-id> status decomposed
+3. Record the children on the parent goal:
+   Bash: aspirations-update-goal.sh <parent-goal-id> decomposed_into '[<sub-goal-ids>]'
+4. Update _index files if needed
+5. Notify the user about the decomposition.
    (Check world/forged-skills.yaml for a skill whose triggers match
    "notify the user" and invoke it with:
      subject: "Aspiration Updated: <asp-title>"

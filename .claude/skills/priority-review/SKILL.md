@@ -181,13 +181,11 @@ Parse the user's natural language reordering intent. Common patterns:
 For each priority change:
 
 ```
-1. Read the full aspiration record:
-   Bash: aspirations-read.sh --id {asp-id}
-   Parse the JSON output into a variable
-
-2. Modify the priority field in the parsed JSON, then pipe the FULL aspiration back:
-   echo '{full modified JSON}' | aspirations-update.sh {asp-id}
-   # aspirations-update.sh requires COMPLETE aspiration JSON on stdin (full replacement, not merge)
+1. Apply the priority change directly — field-merge, no read-modify-write needed:
+   Bash: aspirations-update.sh {asp-id} priority {new-priority}
+   # Positional <asp_id> <field> <value>. The daemon (update_aspiration) merges
+   # ONLY the named field — `asp[field] = value` — preserving all other
+   # aspiration fields. The pre-2026-05-14 stdin full-replacement form is retired.
 ```
 
 After all updates:
