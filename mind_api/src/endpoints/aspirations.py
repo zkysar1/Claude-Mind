@@ -109,7 +109,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
     # which is a sensible default for daemon-internal calls — but for
     # source=agent we want an explicit choice from the caller.
     if source == "agent":
-        explicit_agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+        explicit_agent = (ctx.headers.get("x-mind-agent") or "").strip()
         if not explicit_agent:
             return Response.error(400, "agent_unset",
                                   "X-Mind-Agent header required for source=agent")

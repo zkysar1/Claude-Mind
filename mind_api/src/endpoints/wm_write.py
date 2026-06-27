@@ -82,7 +82,7 @@ def _wm_path(ctx) -> Path:
     # SID (X-Mind-Sid header). With no SID, or no body-manifest for it,
     # ctx.paths.wm_path returns the agent-wide WM (today's behavior) — so this
     # is backward-compatible and dormant until a 2nd Body exists.
-    sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
+    sid = (ctx.headers.get("x-mind-sid") or "").strip()
     return ctx.paths.wm_path(sid or None)
 
 
@@ -100,7 +100,7 @@ def _gate_path(ctx) -> Path:
 
 def _require_agent_header(ctx):
     from ..server import Response
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",

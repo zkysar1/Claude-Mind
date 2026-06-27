@@ -82,7 +82,7 @@ class _FakeCtx:
         self.paths = _FakePaths(meta, agent)
         self.query = query or {}
         self.body = body
-        self.headers = headers if headers is not None else {"x-ayoai-agent": "alpha"}
+        self.headers = headers if headers is not None else {"x-mind-agent": "alpha"}
 
 
 _TS_RE = re.compile(r'(created|resolved):\s*\S+')

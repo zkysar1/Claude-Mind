@@ -78,7 +78,7 @@ class _FakeCtx:
         self.paths = _FakePaths(meta)
         self.query = query or {}
         self.body = body
-        self.headers = headers if headers is not None else {"x-ayoai-agent": "alpha"}
+        self.headers = headers if headers is not None else {"x-mind-agent": "alpha"}
 
 
 _TS_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d")

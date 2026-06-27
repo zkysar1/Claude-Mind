@@ -746,7 +746,7 @@ rt_curl() {
     headers+=( -H "X-Mind-Tenant: ${MIND_TENANT:-default}" )
     # Forward the calling session's SID (always-injected by bash-agent-inject,
     # guard-341/rb-386) so endpoints that record session attribution
-    # (board_write reads x-ayoai-sid) are byte-compat with the CLI, which reads
+    # (board_write reads x-mind-sid) are byte-compat with the CLI, which reads
     # MIND_SID from the env. Endpoints that ignore it are unaffected.
     [ -n "${MIND_SID:-}" ] && headers+=( -H "X-Mind-Sid: $MIND_SID" )
     if [ ${#extra_headers[@]} -gt 0 ]; then

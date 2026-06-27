@@ -668,7 +668,7 @@ def _tree_path(ctx) -> Path:
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _parse_body_json(body: bytes) -> Any:
@@ -1778,7 +1778,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     # _agent_name's "system" default) so run_id matches the CLI
                     # byte-for-byte when an agent header is present, and uses the
                     # same "unknown" sentinel when it is absent.
-                    rr_agent = (ctx.headers.get("x-ayoai-agent") or "").strip() or "unknown"
+                    rr_agent = (ctx.headers.get("x-mind-agent") or "").strip() or "unknown"
                     run_id = ("maint-" + started_at.replace(":", "").replace("-", "")
                               + "-" + rr_agent)
 

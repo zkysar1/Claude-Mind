@@ -97,7 +97,7 @@ _BACKPRESSURE_DEFAULTS = {
 # ---------------------------------------------------------------------------
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _bp_path(ctx) -> Path:
@@ -715,7 +715,7 @@ def evolution_monitor(ctx) -> "Response":  # type: ignore[name-defined]
 
     agent = body.get("agent")
     if agent is None:
-        agent = (ctx.headers.get("x-ayoai-agent") or "").strip() or None
+        agent = (ctx.headers.get("x-mind-agent") or "").strip() or None
 
     ev_cfg = _load_evolution_config(ctx)
     data = _ensure_state(ctx)

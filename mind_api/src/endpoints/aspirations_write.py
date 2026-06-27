@@ -698,7 +698,7 @@ def _resolve_paths(ctx, source: str) -> Tuple[Path, Path]:
 def _agent_name(ctx) -> str:
     """Read X-Mind-Agent. Required for write paths — history and changelog
     record which agent made the change."""
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _require_explicit_agent(ctx, source: str) -> Optional["Response"]:  # type: ignore[name-defined]
@@ -719,7 +719,7 @@ def _require_explicit_agent(ctx, source: str) -> Optional["Response"]:  # type: 
     from ..server import Response
     if source != "agent":
         return None
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",

@@ -573,7 +573,7 @@ class _FakeCtx:
                  project_root: Path = REPO_ROOT, meta: Path | None = None):
         self.paths = _FakePaths(world, project_root, meta)
         self.body = json.dumps(body).encode("utf-8")
-        self.headers = {"x-ayoai-agent": agent}
+        self.headers = {"x-mind-agent": agent}
         self.query = {}
 
 

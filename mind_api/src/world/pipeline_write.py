@@ -378,7 +378,7 @@ def _resolve_paths(ctx) -> Tuple[Path, Path, Path]:
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _parse_body_json(body: bytes) -> Any:

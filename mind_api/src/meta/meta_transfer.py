@@ -44,7 +44,7 @@ from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noq
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -85,7 +85,7 @@ def _persist(ctx, path: Path, data: Any) -> None:
 
 def export(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response
-    agent_hdr = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent_hdr = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent_hdr:
         return Response.error(400, "missing_agent_header",
                               "X-Mind-Agent header required (export reads the agent self.md).")

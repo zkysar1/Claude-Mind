@@ -71,7 +71,7 @@ NEW_STORE_TOP_DIRS = ("snapshots", "blobs", "patches")
 # ---------------------------------------------------------------------------
 
 def _agent_header(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip()
+    return (ctx.headers.get("x-mind-agent") or "").strip()
 
 
 def _resolve_base_dir(ctx, path):

@@ -101,7 +101,7 @@ class _FakeCtx:
         self.paths = _FakePaths(world, meta, agent, project_root)
         self.query = query
         self.body = b""
-        self.headers = {"x-ayoai-agent": agent_name} if agent_name else {}
+        self.headers = {"x-mind-agent": agent_name} if agent_name else {}
 
 
 def _http(method, port, path, query=None, *, agent="alpha"):
