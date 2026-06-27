@@ -91,7 +91,7 @@ class _FakeCtx:
                                 project_root=project_root, agent_name=agent_name)
         self.query = query or {}
         self.body = body
-        self.headers = {"x-ayoai-agent": agent_name}
+        self.headers = {"x-mind-agent": agent_name}
 
 
 def _run_cli(script: Path, args, *, world: Path, meta: Path,

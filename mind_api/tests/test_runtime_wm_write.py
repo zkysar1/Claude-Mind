@@ -207,7 +207,7 @@ class _FakeCtx:
         self.paths = _FakePaths(agent, project_root, world)
         self.query = query
         self.body = body
-        self.headers = {"x-ayoai-agent": agent_name}
+        self.headers = {"x-mind-agent": agent_name}
 
 
 def _run_wm_cli(world, meta, agent_dir, args, stdin_text):

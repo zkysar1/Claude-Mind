@@ -59,7 +59,7 @@ from ..agent_paths import assert_not_cruft
 
 def _require_agent_header(ctx):
     from ..server import Response
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",

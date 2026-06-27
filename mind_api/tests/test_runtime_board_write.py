@@ -204,9 +204,9 @@ class _FakeCtx:
         self.paths = _FakePaths(world)
         self.query = query
         self.body = body
-        headers = {"x-ayoai-agent": agent}
+        headers = {"x-mind-agent": agent}
         if sid:
-            headers["x-ayoai-sid"] = sid
+            headers["x-mind-sid"] = sid
         self.headers = headers
 
 

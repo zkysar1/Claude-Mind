@@ -58,7 +58,7 @@ _VALID_PHASES = ("selection", "generation", "any")
 
 
 def _agent_name_or_none(ctx):
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or None
+    return (ctx.headers.get("x-mind-agent") or "").strip() or None
 
 
 def _atomic_write_yaml(path: Path, data: Any) -> None:
@@ -75,7 +75,7 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
 def _persist(ctx, path: Path, data: Any) -> None:
     """locked_write_yaml equivalent: CSafeDumper + history + changelog 'edit'."""
     base_dir = ctx.paths.meta
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    agent = (ctx.headers.get("x-mind-agent") or "").strip() or "system"
     assert_not_cruft(path.parent, "mkdir (strategy_apply)")
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_locks.locked(path):

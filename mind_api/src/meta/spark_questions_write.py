@@ -58,7 +58,7 @@ _INCREMENTABLE_FIELDS = ("times_asked", "sparks_generated")
 # ---------------------------------------------------------------------------
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _path(ctx) -> Path:

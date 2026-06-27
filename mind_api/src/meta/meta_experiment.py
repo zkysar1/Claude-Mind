@@ -46,7 +46,7 @@ from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noq
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _active_path(ctx) -> Path:

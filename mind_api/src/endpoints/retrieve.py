@@ -205,7 +205,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
     # agent; without it the resolver picks "first available agent" which
     # would silently route to the wrong store). Required on BOTH paths now —
     # the counter-bump path needs it to swap MIND_AGENT env correctly.
-    explicit_agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    explicit_agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not explicit_agent:
         return Response.error(400, "agent_unset",
                               "X-Mind-Agent header required for /v1/retrieve")
@@ -492,7 +492,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                     # identical to pre-1D behavior; a forked worker Body -> its own
                     # sessions/<sid>/body-retrieval-session.json so concurrent
                     # Bodies don't clobber each other's utilization audit trail.
-                    sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
+                    sid = (ctx.headers.get("x-mind-sid") or "").strip()
                     locked_write_json(
                         ctx.paths.retrieval_session_path(sid or None),
                         session_record)

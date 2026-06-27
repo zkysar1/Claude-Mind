@@ -174,7 +174,7 @@ def co_invocation(ctx) -> "Response":  # type: ignore[name-defined]
 def coverage(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response
 
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",

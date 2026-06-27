@@ -75,7 +75,7 @@ class _FakeCtx:
     def __init__(self, meta: Path, query=None, headers=None, body=None):
         self.paths = _FakePaths(meta)
         self.query = query or {}
-        self.headers = headers if headers is not None else {"x-ayoai-agent": "alpha"}
+        self.headers = headers if headers is not None else {"x-mind-agent": "alpha"}
         self.body = body
 
 

@@ -380,6 +380,13 @@ transformations:
     applies_to: ["**/*.py", "**/*.sh", "**/*.md", "**/*.yaml", "**/*.json"]
     reason: "HTTP header convention — ~113 hits across core/scripts/ + mind_api/"
 
+  - id: G1b
+    type: global_regex
+    pattern: 'x-ayoai-'
+    replacement: 'x-mind-'
+    applies_to: ["**/*.py", "**/*.sh", "**/*.md", "**/*.yaml", "**/*.json"]
+    reason: "HTTP header READS (lowercase) — the daemon does ctx.headers.get('x-ayoai-agent'/'x-ayoai-sid') in ~38 sites across mind_api/src/endpoints + meta. G1's case-sensitive 'X-Ayoai-' missed these, so MIND_-converged wrappers (which send X-Mind-Agent/Sid) mismatched the daemon's still-x-ayoai- reads, breaking EVERY agent-scoped endpoint (retrieve, agent writes, wm, history) at the destination. Surfaced 2026-06-27 prod cutover: /v1/retrieve returned agent_unset despite a correct X-Mind-Agent header. G1+G1b together converge both the uppercase send-side and lowercase read-side."
+
   - id: G2
     type: global_regex
     pattern: 'AYOAI_'

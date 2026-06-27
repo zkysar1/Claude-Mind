@@ -74,13 +74,13 @@ def _reads_sidecar_path(ctx, channel: str) -> Path:
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _require_agent_header(ctx):
     """Reject board writes when X-Mind-Agent is missing (mirrors store.py)."""
     from ..server import Response
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",
@@ -168,7 +168,7 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
     reply_to = ctx.query.get("reply_to") or None
     tags_raw = ctx.query.get("tags")
     tags = [t.strip() for t in tags_raw.split(",")] if tags_raw else []
-    session_id = (ctx.headers.get("x-ayoai-sid") or "").strip()
+    session_id = (ctx.headers.get("x-mind-sid") or "").strip()
 
     ch_path = _channel_path(ctx, channel)
     base = ctx.paths.world
@@ -262,7 +262,7 @@ def mark_read(ctx) -> "Response":  # type: ignore[name-defined]
                               "no message IDs (use ?ids=a,b,c or request body)")
 
     reader = (ctx.query.get("reader") or "").strip() or _agent_name(ctx)
-    reader_sid = (ctx.headers.get("x-ayoai-sid") or "").strip()
+    reader_sid = (ctx.headers.get("x-mind-sid") or "").strip()
     read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     sidecar = _reads_sidecar_path(ctx, channel)

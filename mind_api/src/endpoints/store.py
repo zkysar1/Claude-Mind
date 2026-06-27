@@ -103,7 +103,7 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 
 
 def _agent_name(ctx) -> str:
-    return (ctx.headers.get("x-ayoai-agent") or "").strip() or "system"
+    return (ctx.headers.get("x-mind-agent") or "").strip() or "system"
 
 
 def _require_agent_header(ctx) -> Optional["Response"]:  # type: ignore[name-defined]
@@ -126,7 +126,7 @@ def _require_agent_header(ctx) -> Optional["Response"]:  # type: ignore[name-def
     See g-115-957.
     """
     from ..server import Response
-    agent = (ctx.headers.get("x-ayoai-agent") or "").strip()
+    agent = (ctx.headers.get("x-mind-agent") or "").strip()
     if not agent:
         return Response.error(
             400, "missing_agent_header",

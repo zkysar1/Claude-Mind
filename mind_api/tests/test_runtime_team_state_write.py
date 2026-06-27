@@ -150,7 +150,7 @@ class _FakeCtx:
         self.paths = _FakePaths(world)
         self.query = query
         self.body = body
-        self.headers = {"x-ayoai-agent": agent}
+        self.headers = {"x-mind-agent": agent}
 
 
 def _run_ts_cli(world: Path, args):

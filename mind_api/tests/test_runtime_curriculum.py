@@ -154,7 +154,7 @@ class _FakeCtx:
         self.paths = _FakePaths(agent, project_root)
         self.query = query
         self.body = b""
-        self.headers = {"x-ayoai-agent": agent_name} if agent_name else {}
+        self.headers = {"x-mind-agent": agent_name} if agent_name else {}
 
 
 # ---------------------------------------------------------------------------

@@ -227,7 +227,7 @@ class TestByteCompat:
         dmn_bundle = dmn_meta / "transfer" / "bundle.yaml"
         cli_out = _run_cli(cli_meta, agent, ["export", "--output", str(cli_bundle)]).stdout
         resp = meta_transfer.export(_FakeCtx(
-            dmn_meta, agent, headers={"x-ayoai-agent": "alpha"},
+            dmn_meta, agent, headers={"x-mind-agent": "alpha"},
             body=json.dumps({"output": str(dmn_bundle)}).encode("utf-8")))
         assert resp.status == 200
         dmn_out = resp.body.decode("utf-8")

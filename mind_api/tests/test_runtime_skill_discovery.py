@@ -159,7 +159,7 @@ class _FakeCtx:
     def __init__(self, world, meta, agent, query=None, headers=None):
         self.paths = _FakePaths(world, meta, agent)
         self.query = query or {}
-        self.headers = headers if headers is not None else {"x-ayoai-agent": "alpha"}
+        self.headers = headers if headers is not None else {"x-mind-agent": "alpha"}
         self.body = None
 
 

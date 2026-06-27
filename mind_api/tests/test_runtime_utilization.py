@@ -131,7 +131,7 @@ class _FakeCtx:
                  query=None, headers=None):
         self.paths = _FakePaths(world, agent, meta, project_root)
         self.query = query or {}
-        self.headers = headers if headers is not None else {"x-ayoai-agent": "alpha"}
+        self.headers = headers if headers is not None else {"x-mind-agent": "alpha"}
         self.body = None
 
 
@@ -297,7 +297,7 @@ class TestRulesAuditByteCompat:
             )
             assert proc.returncode == 0, proc.stderr
             ctx = _FakeCtx(project_root=REPO_ROOT, agent=agent_dir,
-                           headers={"x-ayoai-agent": "alpha"})
+                           headers={"x-mind-agent": "alpha"})
             ctx.paths.world = cli_world
             ctx.paths.meta = cli_meta
             resp = utilization.rules_audit(ctx)
