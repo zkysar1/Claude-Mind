@@ -73,7 +73,7 @@ def _read_local_paths_conf(agent_name: str) -> dict:
 
 
 def _resolve_world_dir():
-    agent = os.environ.get("AYOAI_AGENT", "").strip()
+    agent = os.environ.get("MIND_AGENT", "").strip()
     if not agent:
         return None
     conf = _read_local_paths_conf(agent)
@@ -124,7 +124,7 @@ def main(argv=None) -> int:
             pass
 
     world_dir = _resolve_world_dir()
-    agent_name = os.environ.get("AYOAI_AGENT", "").strip()
+    agent_name = os.environ.get("MIND_AGENT", "").strip()
 
     result = evaluate(
         args.failure_reason,

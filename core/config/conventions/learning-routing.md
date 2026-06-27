@@ -267,7 +267,7 @@ production-services tree branch with confidence + capability tracking.
 > "When `subprocess.run(['bash', script])` runs on Windows, Python's PATH
 > resolution may pick `/mnt/c/-rooted WSL bash.exe` instead of Git Bash.
 > Symptom: silent partial output. Fix: prefer
-> `os.environ.get('AYOAI_SHELL') or sys.executable`."
+> `os.environ.get('MIND_SHELL') or sys.executable`."
 
 → `reasoning_bank`. Diagnostic chain (when X → cause Y → fix Z) reusable
 across any cross-platform subprocess wrapper.

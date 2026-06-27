@@ -516,7 +516,7 @@ def _resolve_pq_path(args):
     if args.pq_path:
         return Path(args.pq_path)
     if AGENT_DIR is None:
-        print(json.dumps({"error": "AYOAI_AGENT not resolved", "exit": 2}))
+        print(json.dumps({"error": "MIND_AGENT not resolved", "exit": 2}))
         sys.exit(2)
     return Path(AGENT_DIR) / "session" / "pending-questions.yaml"
 

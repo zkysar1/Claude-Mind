@@ -214,9 +214,9 @@ if [[ -z "$PHASE" ]]; then
     exit 2
 fi
 
-AGENT="${AYOAI_AGENT:-}"
+AGENT="${MIND_AGENT:-}"
 if [[ -z "$AGENT" ]]; then
-    echo "iteration-close: AYOAI_AGENT unset" >&2
+    echo "iteration-close: MIND_AGENT unset" >&2
     exit 2
 fi
 AGENT_DIR="$(agent_dir "$AGENT")"
@@ -516,7 +516,7 @@ do_state_update() {
     # Tier 1: read the combined compact index (fast-path, cached).
     # Tier 2: read source JSONL directly — bypasses subprocess.run which
     # on Windows (a) hangs on large stdout (g-001-125, iter 52) and
-    # (b) doesn't propagate AYOAI_AGENT to child bash (g-001-127, iter 56).
+    # (b) doesn't propagate MIND_AGENT to child bash (g-001-127, iter 56).
     # Source JSONL is newline-delimited JSON, each line is one aspiration.
     local compact_file="$AGENT_DIR/session/aspirations-compact.json"
     local agent_jsonl="$AGENT_DIR/aspirations.jsonl"
@@ -1737,7 +1737,7 @@ do_productivity_check() {
     # so printf-built JSON is injection-safe and avoids a per-iteration python spawn
     # on this hot path.
     printf '{"ts":"%s","script":"iteration-close","phase":"productivity-check","agent":"%s","event":"iteration-complete-imperative"}\n' \
-        "$(date +%Y-%m-%dT%H:%M:%S)" "${AYOAI_AGENT:-unknown}" \
+        "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" \
         >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 }
 

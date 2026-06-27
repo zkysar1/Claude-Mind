@@ -69,7 +69,7 @@ _GUARD_TEXT_FIELDS = ("rule", "trigger_condition", "when_to_use")
 
 
 def _agent_name() -> str:
-    return os.environ.get("AYOAI_AGENT", "system") or "system"
+    return os.environ.get("MIND_AGENT", "system") or "system"
 
 
 def _output_path() -> Path:

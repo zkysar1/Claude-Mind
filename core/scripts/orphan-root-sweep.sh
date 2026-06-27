@@ -229,7 +229,7 @@ fi
 # are supposed to live at external paths configured in local-paths.conf
 # (typically a OneDrive/NAS path). Their appearance at PROJECT_ROOT is the
 # signature of `_paths.{py,sh}` falling back to PROJECT_ROOT/{meta,world}
-# when local-paths.conf is missing OR AYOAI_AGENT resolves to a nonexistent
+# when local-paths.conf is missing OR MIND_AGENT resolves to a nonexistent
 # agent. Phase 0.1 removes the fallback to refuse the write — this sweep
 # is the periodic backstop for stragglers + any subprocess that still
 # evades the resolver fix.
@@ -292,7 +292,7 @@ if [ "$AUTO_CLEAN" = "true" ] && [ "${#mode_d_paths[@]}" -gt 0 ]; then
     echo ""
     echo "=== auto-clean (Mode D) ==="
     daemon_sha=""
-    daemon_url="${AYOAI_DAEMON_URL:-http://localhost:8765}/v1/admin/health"
+    daemon_url="${MIND_DAEMON_URL:-http://localhost:8765}/v1/admin/health"
     if command -v curl >/dev/null 2>&1; then
         # Quiet curl; if reachable, extract git_head_sha via py -3 (jq absent on Windows git-bash).
         daemon_response="$(curl -sf --max-time 3 "$daemon_url" 2>/dev/null || echo "")"
@@ -310,7 +310,7 @@ except Exception:
 
     if [ -z "$daemon_sha" ]; then
         echo "  SKIP: daemon health unreachable at $daemon_url"
-        echo "        — start the daemon or set AYOAI_DAEMON_URL, then re-run."
+        echo "        — start the daemon or set MIND_DAEMON_URL, then re-run."
     elif [ -z "$repo_sha" ]; then
         echo "  SKIP: git rev-parse HEAD failed (not in a git work tree?)"
     elif [ "$daemon_sha" != "$repo_sha" ]; then

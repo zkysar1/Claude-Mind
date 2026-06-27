@@ -40,7 +40,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 # Single source of truth for WORLD_DIR resolution. _paths.py reads the same
 # local-paths.conf via _resolve_agent_name + _read_local_paths and applies the
-# AYOAI_WORLD env override identically. Importing it here eliminates the prior
+# MIND_WORLD env override identically. Importing it here eliminates the prior
 # divergence where this file's own _resolve_world_dir() hardcoded
 # bravo-before-alpha agent fallback while _paths.py uses sorted(glob).
 sys.path.insert(0, str(SCRIPT_DIR))

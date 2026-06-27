@@ -19,7 +19,7 @@ NPC
 Roblox
 AyoBridge
 Studio Bridge
-MIND_API_KEY
+AYOAI_API_KEY
 AYO_OPERATOR_KEY
 game session
 Game session

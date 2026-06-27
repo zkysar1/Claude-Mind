@@ -405,11 +405,22 @@ def transform_file(
         new = apply_inline_edit(new, r)
         applied.append(r["id"])
 
-    if not is_exempt:
-        for r in rules["global_regex"]:
-            new = apply_global_regex(new, r, rel_path)
-            applied.append(r["id"])
+    # global_regex: per-rule exemption gating. A rule flagged
+    # apply_even_if_exempt:true (e.g. G2 MIND_->MIND_, a FUNCTIONAL env-var
+    # rename that MUST fire for a deployment to resolve its agent name) pierces
+    # the domain-leak-exempt marker. All OTHER global_regex rules (G3/G4 repo +
+    # product-name rewrites, etc.) stay skipped for exempt files — those rewrite
+    # the cosmetic domain strings the marker exists to protect. Seed machinery
+    # whose MIND_ is DATA (the G2 rule pattern itself, the self-reference
+    # scanner's detection literal, seed sentinels) is held out via the rule's
+    # own excludes_paths, which apply_global_regex -> _applies_to honors.
+    for r in rules["global_regex"]:
+        if is_exempt and not r.get("apply_even_if_exempt", False):
+            continue
+        new = apply_global_regex(new, r, rel_path)
+        applied.append(r["id"])
 
+    if not is_exempt:
         for r in rules["word_list_strip"]:
             new = apply_word_list_strip(new, r, rel_path)
             applied.append(r["id"])

@@ -63,7 +63,7 @@ def _read_local_paths_conf(agent_name: str) -> dict:
 def _resolve_world_dir():
     """Resolve WORLD_DIR for override-ledger writes. Returns None when the
     agent has no local-paths.conf or no WORLD_PATH key."""
-    agent = os.environ.get("AYOAI_AGENT", "").strip()
+    agent = os.environ.get("MIND_AGENT", "").strip()
     if not agent:
         return None
     conf = _read_local_paths_conf(agent)
@@ -94,7 +94,7 @@ def main() -> int:
         override=args.override,
         repo_path=Path(args.repo_path),
         world_dir=_resolve_world_dir(),
-        agent_name=os.environ.get("AYOAI_AGENT", "").strip(),
+        agent_name=os.environ.get("MIND_AGENT", "").strip(),
     )
 
     if args.output == "json":

@@ -9,7 +9,7 @@
 # "on" iff ALL THREE conditions hold:
 #   (1) GATE_D_ENABLED == "true"  — set ONLY by omni; DEFAULT OFF (empty), AND
 #   (2) the kill-file core/config/gate-d-kill is ABSENT — R4 emergency stop, AND
-#   (3) $AYOAI_AGENT appears in core/config/gate-d-agents (one name per line) —
+#   (3) $MIND_AGENT appears in core/config/gate-d-agents (one name per line) —
 #       pilot rollout control; file managed ONLY by omni. Missing file or unset
 #       agent → off.
 # Prints "on" or "off" on stdout; ALWAYS exits 0. Fail-closed: any ambiguity → off.
@@ -24,8 +24,8 @@ KILL_FILE="$PROJECT_ROOT/core/config/gate-d-kill"
 AGENTS_FILE="$PROJECT_ROOT/core/config/gate-d-agents"
 
 if [[ "${GATE_D_ENABLED:-}" == "true" && ! -f "$KILL_FILE" \
-      && -n "${AYOAI_AGENT:-}" && -f "$AGENTS_FILE" ]] \
-   && grep -qx "${AYOAI_AGENT}" "$AGENTS_FILE" 2>/dev/null; then
+      && -n "${MIND_AGENT:-}" && -f "$AGENTS_FILE" ]] \
+   && grep -qx "${MIND_AGENT}" "$AGENTS_FILE" 2>/dev/null; then
   echo "on"
 else
   echo "off"

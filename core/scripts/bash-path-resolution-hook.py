@@ -235,7 +235,7 @@ def main():
 
     # Resolve bound agent
     sid = data.get("session_id", "") or ""
-    agent = os.environ.get("AYOAI_AGENT", "") or ""
+    agent = os.environ.get("MIND_AGENT", "") or ""
     if not agent and sid:
         try:
             from _resolve_agent_from_sid import resolve as _resolve_agent

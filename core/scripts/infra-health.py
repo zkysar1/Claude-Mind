@@ -618,7 +618,7 @@ def _sync_known_blockers(alerts):
     """
     try:
         # Lazy import — wm.py is sibling script_root, AGENT_DIR resolution
-        # only succeeds when AYOAI_AGENT is set in env. Importing at module
+        # only succeeds when MIND_AGENT is set in env. Importing at module
         # top would crash any infra-health invocation lacking the env var
         # (sometimes intentional, e.g., cross-agent diagnostic probes).
         sys.path.insert(0, str(Path(__file__).resolve().parent))
