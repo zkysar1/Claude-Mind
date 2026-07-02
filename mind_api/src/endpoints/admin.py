@@ -310,6 +310,58 @@ def runner_release(ctx) -> "Response":  # type: ignore[name-defined]
         {"backend": backend, "ok": True, "released": bool(transitioned)})
 
 
+def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
+    """GET /v1/admin/runner-claims — list every runner claim under this env-id.
+
+    FR-7 fleet observability: returns all DDB session rows for the current
+    ENVIRONMENT_ID — agent name, owning machine_id, agent_state (RUNNING/IDLE),
+    and heartbeat_at (epoch-sec) — so a fleet-health view can show which machine
+    owns each agent's RUNNING slot and how fresh its heartbeat is. Read-only, no
+    agent/token param (unlike the acquire/heartbeat/release trio). Env-scoped in
+    the backend (`list_runner_claims` filters on the `<customer><env-id>/` prefix),
+    so a fleet env never sees prod's rows. No-op under the local backend (empty
+    claims list); import/DDB errors return 500 with the reason (a read-only
+    health probe must degrade to a diagnostic, never a stack)."""
+    from ..server import Response
+    backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    if backend != "own-cloud":
+        return Response.json(
+            {"backend": backend, "ok": True, "claims": [],
+             "reason": "non-own-cloud backend — no cross-machine DDB claims"})
+    scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        from storage_backend import get_backend
+    except Exception as e:  # noqa: BLE001 — import broke: report, don't raise
+        return Response.json(
+            {"backend": backend, "ok": False, "error": f"import failed: {e}"},
+            status=500)
+    try:
+        claims = get_backend().list_runner_claims()
+    except Exception as e:  # noqa: BLE001 — DDB Scan error must not 500-with-stack
+        msg = str(e)
+        payload = {"backend": backend, "ok": False,
+                   "error": f"list failed: {msg}"}
+        if "AccessDenied" in msg and "Scan" in msg:
+            payload["hint"] = (
+                "the daemon's IAM identity lacks dynamodb:Scan on the sessions "
+                "table for this ENVIRONMENT_ID — grant dynamodb:Scan (see "
+                "mind_api/scripts/provision_aws.py build_policy) or re-run the "
+                "provisioner for this env; the acquire/heartbeat/release trio is "
+                "unaffected (it does not Scan).")
+        return Response.json(payload, status=500)
+    return Response.json({
+        "backend": backend, "ok": True,
+        "environment_id": os.environ.get("ENVIRONMENT_ID", ""),
+        "claims": [
+            {"agent": c.agent, "machine_id": c.machine_id,
+             "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at}
+            for c in claims
+        ],
+    })
+
+
 def register(routes) -> None:
     routes[("GET", "/v1/admin/stats")] = stats
     routes[("POST", "/v1/admin/owncloud-flush")] = owncloud_flush
@@ -317,3 +369,4 @@ def register(routes) -> None:
     routes[("POST", "/v1/admin/runner-acquire")] = runner_acquire
     routes[("POST", "/v1/admin/runner-heartbeat")] = runner_heartbeat
     routes[("POST", "/v1/admin/runner-release")] = runner_release
+    routes[("GET", "/v1/admin/runner-claims")] = runner_claims

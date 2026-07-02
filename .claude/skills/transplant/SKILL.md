@@ -113,27 +113,20 @@ an exact bring-up checklist.
 
 **Step 4**: Emit the destination bring-up checklist.
   The wrapper prints the distilled `mind_api/docs/lodestar-machine-2-bring-up.md`
-  procedure, parameterized for the agents being moved (`--agents`, default = the
-  agents in `MACHINE_OWNED_AGENTS`):
+  procedure, parameterized for the agents being moved:
   1. `git clone <origin-url>` on the new machine.
-  2. **Install the daemon's Python deps** (the easily-missed step — g-115-1334):
-     `py -3 -m pip install -r requirements.txt` (PyYAML + psutil), then install
-     the own-cloud backend's cloud SDK separately — it is not yet in any
-     requirements file (g-115-1334 tracks adding it). A fresh clone has neither,
-     and the own-cloud daemon will not start without that SDK.
+  2. **Install Python deps**: `py -3 -m pip install -r mind_api/requirements-owncloud.txt`
+     (includes boto3 + base deps). Daemon will not start without boto3.
   3. Create `.env.local` from `.env.example` with: same `ENVIRONMENT_ID`, same
-     bucket/DDB tables, the scoped `MIND_AWS_*` creds, **a DISTINCT
-     `MACHINE_ID`** (G5 fail-closed — must differ from the source), and
-     `MACHINE_OWNED_AGENTS` = the moved agents. Optionally
-     `OWNCLOUD_SYNC_DISABLE=1` for the first boot.
+     bucket/DDB tables, the scoped `MIND_AWS_*` creds, and a **DISTINCT
+     `MACHINE_ID`** (G5 fail-closed — must differ from the source machine).
   4. Point each moved agent's `local-paths.conf` at FRESH empty WORLD_PATH/
      META_PATH dirs (cache populates from S3 on read). `/start` Phase A-0 writes a
      sane default if absent.
-  5. `/start <agent>` — Phase A-0 detects the cloned agent and resumes it
-     (autonomous by default; the loop runs).
-  6. **On the SOURCE machine**: narrow `MACHINE_OWNED_AGENTS` to drop the moved
-     agents and `/stop` them here, then restart the source daemon — never run the
-     same agent on two machines (the runbook §8 ownership rule).
+  5. `/stop <agent>` on the source machine (flushes to S3 + releases DDB claim).
+  6. `/start <agent>` on the new machine — Phase A-0 detects the cloned agent and
+     resumes it; dynamic ownership means this machine's claim IS the ownership signal.
+     No env edits needed on either machine.
 
 **Step 5**: Report (final Bash echo). State that no archive was produced (own-cloud
   uses git + S3), the continuity flush result, and the checklist location.
@@ -225,11 +218,12 @@ Checks at the destination:
   machine-local runner state must never travel.
 - NEVER run the same agent on two machines at once (own-cloud DDB lock prevents
   file corruption, NOT the same-identity goal-claim collision). The own-cloud
-  checklist always includes narrowing source `MACHINE_OWNED_AGENTS` + `/stop`.
+  checklist always includes `/stop` on source before `/start` on destination.
 - The source mind is READ-ONLY to this skill except the own-cloud continuity
   flush (a normal sync op). It does NOT edit `.env.local` (the user sets
-  `MACHINE_ID` / `MACHINE_OWNED_AGENTS` per the checklist — `.env.local` is
-  machine-local config the agent does not auto-edit).
+  `MACHINE_ID` per the checklist — `.env.local` is machine-local config the
+  agent does not auto-edit). No `MACHINE_OWNED_AGENTS` needed — ownership is
+  derived from live DDB runner claims.
 - Resume at the destination is `/start`'s job (Phase A-0). This skill never sets
   `agent-state`/`agent-mode` (guard-340) and never calls `/start`.
 
