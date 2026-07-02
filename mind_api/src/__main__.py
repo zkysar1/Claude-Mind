@@ -41,7 +41,7 @@ _SUPERSEDE_CHECK_SECONDS = 10
 # local stat per governed file plus an S3 HEAD/PUT only for files that changed
 # since the last tick. 120s keeps cross-machine staleness of raw-write / LLM-tool
 # writes bounded without per-tick S3 cost on a quiescent tree. Override via
-# OWNCLOUD_SYNC_INTERVAL; disable entirely via OWNCLOUD_SYNC_DISABLE=1.
+# OWNCLOUD_SYNC_INTERVAL to override.
 _OWNCLOUD_SYNC_DEFAULT_INTERVAL = 120
 
 
@@ -62,8 +62,14 @@ def _project_root() -> Path:
 _N3_ALLOWED_EXACT = frozenset({
     "MACHINE_ID", "MACHINE_MULTI", "RUNTIME_DIR", "STORAGE_BACKEND",
     "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE", "STORAGE_DDB_LOCK_TABLE",
-    "OWNCLOUD_SYNC_DISABLE", "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
-    "ENVIRONMENT_ID", "MACHINE_OWNED_AGENTS",
+    "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
+    "ENVIRONMENT_ID",
+    # FR-4/FR-5 (BRD DynamoDB-Backed Shared-State-API): daemon auth token (a secret,
+    # loaded like the MIND_AWS_* scoped-credential family) + the opt-in
+    # non-loopback bind interface. Both default-absent → localhost-only no-auth
+    # (byte-identical legacy behavior). MIND_API_BIND!=loopback fail-closes in
+    # server.start() unless MIND_API_TOKEN is set.
+    "MIND_API_TOKEN", "MIND_API_BIND",
 })
 
 
@@ -200,16 +206,11 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
     touching the daemon; every tick is wrapped so a transient S3/credential error
     logs and retries next interval, never killing the thread or the process. The
     thread is daemon=True (dies with the process) and waits on `shutdown` so a
-    graceful stop ends it promptly. Disable via OWNCLOUD_SYNC_DISABLE=1;
-    tune cadence via OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
+    graceful stop ends it promptly. Tune cadence via OWNCLOUD_SYNC_INTERVAL (clamped to >=30s).
+    To pause sync, stop the daemon (mind-api-stop.sh).
 
     Returns the started Thread, or None when the sweep is not applicable."""
     if os.environ.get("STORAGE_BACKEND", "local").strip().lower() != "own-cloud":
-        return None
-    if os.environ.get("OWNCLOUD_SYNC_DISABLE", "").strip().lower() in (
-            "1", "true", "yes"):
-        print("[runtime] own-cloud mirror sweep disabled "
-              "(OWNCLOUD_SYNC_DISABLE)", file=sys.stderr)
         return None
     try:
         interval = int(os.environ.get("OWNCLOUD_SYNC_INTERVAL",
