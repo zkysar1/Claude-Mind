@@ -277,59 +277,83 @@ def test_record_then_check_round_trip_semantics():
     assert spark_fire_dedup.recently_fired(fired, "g-XYZ-9", _NOW + timedelta(minutes=7), window_minutes=5) is False
 
 
-# -- 4 / rb-1674: consumption-based dedup (sentinel set_at) ----------
+# -- 4 / rb-1674 +  / rb-2615: consumption-window dedup -------
 #
 # The 5-min time window false-fired across the bg-timeout wall-clock between
 # record (aspirations-spark Step 0.5) and check (next loop entry): spark
 # increments + a >5min loop batch elapsed the window, so check returned "fire"
-# for an already-fired deep spark, double-firing it. The consumption-based path
-# compares the recorded fire time against THIS sentinel's set_at: a spark fired
-# in response to this close has fired_at >= set_at (skip); a spark from a
-# previous close has fired_at < set_at or no entry (fire). Assumption-free where
-# the window was not -- a short-interval recurring goal closing deep twice is
-# handled because the second close's set_at is strictly later than the first
-# close's fire. _NOW doubles as the sentinel set_at in these tests.
+# for an already-fired deep spark, double-firing it. The consumption path
+# brackets the recorded fire time against THIS sentinel's set_at with a window
+# [set_at - MAX_BG_CLOSE_DURATION_MIN, set_at + TTL]:
+#   - fired inside the window (EITHER side of set_at) = this close's spark -> skip.
+#     The NORMAL path fires AFTER set_at; the PROACTIVE path () fires off
+#     recurring-close.sh's stdout imperative up to ~MAX_BG_CLOSE_DURATION_MIN
+#     BEFORE the bg close writes set_at (incident : 6m11s early) -- the
+#     strict `>= set_at` test mis-read that as a prior close and false-fired.
+#   - fired well before the lower bound (recurring intervals are hours) or no
+#     entry -> a genuine previous close -> fire.
+# _NOW doubles as the sentinel set_at in these tests.
 
 
-def test_fired_at_or_after_fired_after_set_at_true():
-    """A spark fired AFTER the sentinel's set_at is a redundant re-fire -> skip."""
+def test_fired_in_consumption_window_fired_after_set_at_true():
+    """A spark fired AFTER set_at (within the lookahead) is this close's
+    re-fire -> skip."""
     fired = {"g-XYZ-1": (_NOW + timedelta(minutes=4)).isoformat(timespec="seconds")}
-    assert spark_fire_dedup.fired_at_or_after(fired, "g-XYZ-1", _NOW) is True
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
 
 
-def test_fired_at_or_after_fired_exactly_at_set_at_true():
-    """fired_at == set_at is AT-or-after (>=) -> skip (boundary case)."""
+def test_fired_in_consumption_window_fired_exactly_at_set_at_true():
+    """fired_at == set_at is inside the window -> skip (boundary case)."""
     fired = {"g-XYZ-1": _NOW.isoformat(timespec="seconds")}
-    assert spark_fire_dedup.fired_at_or_after(fired, "g-XYZ-1", _NOW) is True
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
 
 
-def test_fired_at_or_after_fired_before_set_at_false():
-    """A spark from a PREVIOUS close (fired_at < set_at) -> fire, not suppress."""
-    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=1)).isoformat(timespec="seconds")}
-    assert spark_fire_dedup.fired_at_or_after(fired, "g-XYZ-1", _NOW) is False
+def test_fired_in_consumption_window_proactive_before_set_at_true():
+    """ REGRESSION: a PROACTIVE fire recorded within
+    MAX_BG_CLOSE_DURATION_MIN before set_at is this close's consumption -> skip.
+    Pre-fix (strict fired_at >= set_at) this false-fired (incident g-115-399:
+    fire 6m11s before set_at)."""
+    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=6)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is True
 
 
-def test_fired_at_or_after_absent_goal_false():
+def test_fired_in_consumption_window_prior_close_before_window_false():
+    """A spark from a genuine PREVIOUS close (well before the lower bound --
+    recurring intervals are hours) -> fire, not suppress. 20 min exceeds the
+    10-min lookback, so it is outside the window."""
+    fired = {"g-XYZ-1": (_NOW - timedelta(minutes=20)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is False
+
+
+def test_fired_in_consumption_window_far_future_beyond_ttl_false():
+    """A fire far beyond set_at + TTL (clock skew / a stale entry past the
+    sentinel's ~60-min life) is not this close's consumption -> fire. Pins the
+    upper bound the window added over the old unbounded `>= set_at` test."""
+    fired = {"g-XYZ-1": (_NOW + timedelta(minutes=90)).isoformat(timespec="seconds")}
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is False
+
+
+def test_fired_in_consumption_window_absent_goal_false():
     """No entry for the goal -> never fired for this close -> fire (fail-safe)."""
-    assert spark_fire_dedup.fired_at_or_after({}, "g-XYZ-1", _NOW) is False
+    assert spark_fire_dedup.fired_in_consumption_window({}, "g-XYZ-1", _NOW) is False
 
 
-def test_fired_at_or_after_none_set_at_false():
+def test_fired_in_consumption_window_none_set_at_false():
     """A None set_at (no sentinel timestamp) -> fire; caller falls back to window."""
     fired = {"g-XYZ-1": _NOW.isoformat(timespec="seconds")}
-    assert spark_fire_dedup.fired_at_or_after(fired, "g-XYZ-1", None) is False
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", None) is False
 
 
-def test_fired_at_or_after_malformed_fired_ts_false():
+def test_fired_in_consumption_window_malformed_fired_ts_false():
     """An unparseable fired timestamp must NOT suppress the spark -> fire."""
     fired = {"g-XYZ-1": "not-a-timestamp"}
-    assert spark_fire_dedup.fired_at_or_after(fired, "g-XYZ-1", _NOW) is False
+    assert spark_fire_dedup.fired_in_consumption_window(fired, "g-XYZ-1", _NOW) is False
 
 
-def test_fired_at_or_after_non_dict_false():
+def test_fired_in_consumption_window_non_dict_false():
     """A non-dict map (corrupt wm slot) must degrade to fire, not raise."""
-    assert spark_fire_dedup.fired_at_or_after(None, "g-XYZ-1", _NOW) is False
-    assert spark_fire_dedup.fired_at_or_after("garbage", "g-XYZ-1", _NOW) is False
+    assert spark_fire_dedup.fired_in_consumption_window(None, "g-XYZ-1", _NOW) is False
+    assert spark_fire_dedup.fired_in_consumption_window("garbage", "g-XYZ-1", _NOW) is False
 
 
 def test_sentinel_set_at_precedes_expires_at_by_window():
@@ -466,13 +490,13 @@ def test_cli_check_skip_when_fired_at_or_after_set_at():
     assert rc == 1
 
 
-def test_cli_check_fire_when_fired_before_set_at():
+def test_cli_check_fire_when_fired_well_before_set_at():
     """check with --sentinel-set-at fires (exit 0) when the recorded fire
-    PREDATES set_at — a spark from a previous close, not this one. This is the
-    case the buggy time-window suppressed when the window happened to still
-    cover the prior fire (rb-1674)."""
+    PREDATES set_at by MORE than MAX_BG_CLOSE_DURATION_MIN — a spark from a
+    genuine previous close, not this one (recurring intervals are hours). 20 min
+    is outside the 10-min lookback window, so it still fires (rb-1674 / g-306-80)."""
     set_at = datetime.now()
-    fired_at = (set_at - timedelta(minutes=5)).isoformat(timespec="seconds")
+    fired_at = (set_at - timedelta(minutes=20)).isoformat(timespec="seconds")
     stdin = json.dumps({"g-XYZ-9": fired_at})
     rc, out = _run_dedup_cli(
         ["check", "g-XYZ-9", "--sentinel-set-at", set_at.isoformat(timespec="seconds")],
@@ -480,6 +504,23 @@ def test_cli_check_fire_when_fired_before_set_at():
     )
     assert out == "fire"
     assert rc == 0
+
+
+def test_cli_check_skip_proactive_fire_before_set_at():
+    """ REGRESSION (CLI): a PROACTIVE fire recorded ~6 min BEFORE set_at
+    (the LLM fired off recurring-close.sh's stdout imperative while the bg close
+    was still writing set_at) is inside the MAX_BG_CLOSE_DURATION_MIN lookback
+    -> skip (exit 1). Pre-fix the strict `>= set_at` test false-fired it next
+    iteration (incident g-115-399: fire 01:55:14 vs set_at 02:01:25)."""
+    set_at = datetime.now()
+    fired_at = (set_at - timedelta(minutes=6)).isoformat(timespec="seconds")
+    stdin = json.dumps({"g-XYZ-9": fired_at})
+    rc, out = _run_dedup_cli(
+        ["check", "g-XYZ-9", "--sentinel-set-at", set_at.isoformat(timespec="seconds")],
+        stdin,
+    )
+    assert out == "skip"
+    assert rc == 1
 
 
 def test_cli_check_set_at_absent_goal_fires():

@@ -8,13 +8,21 @@ files that used to scatter across `reports/` and ad-hoc locations.
 - **Lifecycle**: between-step staging — preserved across iterations,
   compactions, and recovery; drained to the knowledge tree by the
   `/drain-temp` skill (Phase 5 of the file-model normalization).
-- **Durability**: git-tracked AND own-cloud S3-synced. The owncloud sweep
+- **Durability**: own-cloud S3-synced (git-ignored). The owncloud sweep
   pushes `temp/` to S3 like other governed agent state (it is not in
   `_EXCLUDE_DIRS`), and `pull_temp` — folded into `pull_continuity`, run at
   `/start` — resumes it on a machine-move via a prefix listing + the same
   no-clobber freshness gate as session continuity. So temp/ working docs
   survive a cross-machine agent move without waiting on a git round-trip.
-  `temp/` is NOT gitignored, unlike `session/` and `sessions/`.
+  ALL of `temp/` is gitignored (g-115-1765) — working docs, the `drained/`
+  audit trail, pure ephemera (`.log`/`.txt`), and any ad-hoc scripts/subdirs.
+  Durability is the S3 sync above, not git: `temp/` is a transient staging area
+  (everything drains to the tree or is discarded), so it does not belong on the
+  shared git surface — and cross-agent temp peeking is an anti-pattern anyway
+  (see 'Searching temp/'). Only `.gitkeep` is tracked, to preserve the dir on a
+  fresh clone. Unlike `session/`/`sessions/`, the ignore is now a portable
+  committed `.gitignore` rule (it previously lived only in a machine-local
+  `.git/info/exclude`, which did not travel to fresh boxes — the g-115-1765 bug).
 
 ---
 
@@ -42,7 +50,7 @@ to live there permanently.
 | Recovery | preserve (drain is the only deletion path) | clear (`session-manifest.yaml recovery_action: clear`) |
 | Content | Working documents with reuse value that DRAIN to the tree: analyses, briefings, audits, design docs, snapshots | IO buffers with no reuse value: probe dumps, JSON staging, one-shot work files |
 | Drain target | Knowledge tree / reasoning bank / experience | Nowhere — ephemeral by definition |
-| Git | Tracked | Gitignored (`**/session/`) |
+| Git | Gitignored — all of `temp/` except `.gitkeep` (g-115-1765); durability via S3 sync | Gitignored (`**/session/`) |
 
 **Decision rule**: if the content might be worth encoding into the
 knowledge tree later, write to `temp/`. If it is a throwaway IO buffer
@@ -81,6 +89,42 @@ file to `temp/drained/` with its original name, leaving an audit trail of
 what was drained and when. `temp/drained/` contents older than 30 days
 carry zero retrieval value (their knowledge is in the tree) and may be
 removed by a maintenance goal.
+
+## Pure ephemera (.log/.txt) — purged, not drained
+
+temp/ holds TWO file classes, and only ONE of them drains:
+
+| Class | Extensions | Carries knowledge? | `/drain-temp` action |
+|---|---|---|---|
+| Drainable working docs | `.md`, `.json` | Yes — analyses, briefings, designs | Encode to tree/RB/experience, then move to `drained/` |
+| Pure ephemera | `.log`, `.txt` | No — test-suite output, tool dumps | **Purge (delete)** in Phase 1.5, once older than a 120-min age guard |
+
+Pure ephemera lands in temp/ legitimately — the framework's own guidance
+redirects test-suite output here (`.claude/rules/run-full-suite-after-deep-code.md`
+writes `agents/<agent>/temp/suite.log`), and one-shot tool dumps (`leak-check.txt`)
+follow the same path. These files have nothing to encode, so `/drain-temp`
+DELETES them rather than archiving to `drained/`: all of `temp/` (including
+`drained/`) is gitignored (g-115-1765), so archiving untracked ephemera into
+`drained/` would only relocate slush between two ignored paths. Deletion loses
+no history — there is none to lose (nothing under `temp/` is git-tracked). The
+gitignore is now a portable committed `.gitignore` rule; it previously lived
+ONLY in a machine-local `.git/info/exclude`, which did not travel to fresh
+boxes — so temp/ committed there every iteration until g-115-1765 moved the
+ignore into the shared `.gitignore`.
+
+Both classes feed the aspirations-precheck temp-pressure signal
+(`core/scripts/precheck-eval.py` `cmd_temp_pressure`): `count` (docs) +
+`ephemera_count` (.log/.txt) = `pressure_count`, which drives the warn / drain
+thresholds. Before g-115-1727 the metric AND the drain glob both saw only
+`.md`/`.json`, so ephemera-only accumulation was invisible to both and grew
+unbounded — the exact slush-directory failure mode this convention exists to
+prevent, for the one file class the drain missed.
+
+The 120-min purge age guard protects an actively-written `suite.log` from an
+in-flight run (the daemon-safe full suite is ~32 min); a just-completed log is
+purged on the next drain cycle. The temp-pressure metric applies NO age guard —
+it counts all ephemera so a recent slush still triggers the drain that will
+later purge it.
 
 ## Searching temp/
 

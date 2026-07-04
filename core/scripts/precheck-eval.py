@@ -802,13 +802,31 @@ def cmd_temp_pressure(args, config, compact):
             "aspirations.yaml missing temp_pressure."
             "{warn_threshold,drain_goal_threshold}")
 
-    # Undrained working docs = files directly under temp/, excluding drained/.
+    # temp/ holds TWO file classes (core/config/conventions/temp-store.md):
+    #   - drainable working docs (.md/.json) -> /drain-temp encodes to the tree
+    #     then archives to drained/. Counted as `count`.
+    #   - pure ephemera (.log/.txt: test-suite output, tool dumps like
+    #     leak-check.txt) -> carry NO knowledge; /drain-temp Phase 1.5 PURGES
+    #     them (deletes — gitignored + unencodable). Counted as `ephemera_count`.
+    # Both classes accumulate in temp/ root, so BOTH must feed the pressure
+    # signal — else the ephemera slush stays invisible to the drain trigger and
+    # grows unbounded (7: 7 .log/.txt survived a full drain because the
+    # glob AND this metric both saw only .md/.json). Threshold flags fire on the
+    # COMBINED pressure; the two counts stay distinct so the drain goal can name
+    # what it drains vs purges.
+    EPHEMERA_SUFFIXES = (".log", ".txt")
     count = 0
+    ephemera_count = 0
     temp_dir = (AGENT_DIR / "temp") if AGENT_DIR is not None else None
     if temp_dir is not None and temp_dir.is_dir():
         for f in temp_dir.iterdir():
-            if f.is_file() and f.suffix in (".md", ".json"):
+            if not f.is_file():
+                continue
+            if f.suffix in (".md", ".json"):
                 count += 1
+            elif f.suffix in EPHEMERA_SUFFIXES:
+                ephemera_count += 1
+    pressure_count = count + ephemera_count
 
     # Dedup: if a drain-temp goal is already open, do NOT re-suggest filing —
     # else every iteration above threshold would spawn a duplicate HIGH goal.
@@ -825,39 +843,54 @@ def cmd_temp_pressure(args, config, compact):
 
     flags = []
     suggested_goal = None
-    if count >= drain_threshold and existing is None:
+    if pressure_count >= drain_threshold and existing is None:
         flags.append("temp_drain_needed")
+        _purge_clause = (f" + purge {ephemera_count} ephemera .log/.txt file(s)"
+                         if ephemera_count else "")
         suggested_goal = {
             "title": (f"Maintain: drain {count} accumulated temp/ working docs "
-                      f"to the knowledge tree"),
+                      f"to the knowledge tree" + _purge_clause),
             "priority": "HIGH",
             "participants": ["agent"],
             "description": (
-                f"agents/<agent>/temp/ holds {count} undrained working docs "
-                f"(>= drain threshold {drain_threshold}). Invoke /drain-temp to "
-                f"encode each into the knowledge tree / reasoning bank / "
-                f"experience and move it to temp/drained/. temp/ is a staging "
-                f"SSOT, not an archive — undrained accumulation is the "
-                f"slush-directory failure mode the file-model normalization "
-                f"exists to prevent."
+                f"agents/<agent>/temp/ holds {count} undrained working docs"
+                + (f" and {ephemera_count} pure-ephemera .log/.txt file(s)"
+                   if ephemera_count else "")
+                + f" (combined >= drain threshold {drain_threshold}). Invoke "
+                f"/drain-temp to encode each working doc into the knowledge "
+                f"tree / reasoning bank / experience and move it to "
+                f"temp/drained/"
+                + (", and PURGE the stale ephemera (Phase 1.5 — pure ephemera "
+                   "carries no knowledge, so it is deleted, not archived)"
+                   if ephemera_count else "")
+                + ". temp/ is a staging SSOT, not an archive — undrained/"
+                f"unpurged accumulation is the slush-directory failure mode the "
+                f"file-model normalization exists to prevent."
             ),
         }
-    elif count >= drain_threshold and existing is not None:
+    elif pressure_count >= drain_threshold and existing is not None:
         flags.append("temp_drain_pending")
-    elif count >= warn_threshold:
+    elif pressure_count >= warn_threshold:
         flags.append("temp_pressure_warn")
 
-    summary = (
-        f"temp-pressure: {count} undrained doc(s) "
-        f"(warn>={warn_threshold}, drain>={drain_threshold}"
-        + (f"; open drain goal {existing}" if existing else "") + ")"
-        if count else "temp-pressure: clean"
-    )
+    if pressure_count:
+        _breakdown = f"{count} undrained doc(s)"
+        if ephemera_count:
+            _breakdown += f" + {ephemera_count} ephemera(.log/.txt)"
+        summary = (
+            f"temp-pressure: {_breakdown} "
+            f"(warn>={warn_threshold}, drain>={drain_threshold}"
+            + (f"; open drain goal {existing}" if existing else "") + ")"
+        )
+    else:
+        summary = "temp-pressure: clean"
     return {
         "subcommand": "temp-pressure",
         "summary": summary,
         "flags": flags,
         "count": count,
+        "ephemera_count": ephemera_count,
+        "pressure_count": pressure_count,
         "existing_drain_goal": existing,
         "thresholds": {"warn_threshold": warn_threshold,
                        "drain_goal_threshold": drain_threshold},

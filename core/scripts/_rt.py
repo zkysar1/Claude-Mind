@@ -79,6 +79,12 @@ def rt_call(method, path, query=None, body=None, headers=None):
     agent = os.environ.get("MIND_AGENT")
     if agent:
         h["X-Mind-Agent"] = agent
+    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when
+    # MIND_API_TOKEN is set (parity with _runtime.sh rt_curl). Unset → no header
+    # → byte-identical to today's localhost-only calls.
+    _api_token = os.environ.get("MIND_API_TOKEN", "").strip()
+    if _api_token:
+        h["Authorization"] = "Bearer " + _api_token
     if headers:
         h.update(headers)
 

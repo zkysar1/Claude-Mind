@@ -10,6 +10,15 @@
 #   bash core/scripts/daemon-orphan-sweep.sh --clean     # report + kill orphans
 #   bash core/scripts/daemon-orphan-sweep.sh --strict    # exit 1 if orphans exist
 #   bash core/scripts/daemon-orphan-sweep.sh --clean --strict
+#   bash core/scripts/daemon-orphan-sweep.sh --keep-repo <path>   # extra repo to protect
+#   bash core/scripts/daemon-orphan-sweep.sh --print-keepset      # show protected PIDs, no scan/kill
+#
+# CROSS-REPO SAFE (): --clean only reaps mind_api.src processes that are
+# NOT in ANY live deployment's published daemon pair. The keep-set is auto-built
+# from this repo PLUS every sibling deployment found under the deployments' parent
+# dir (default: dirname PROJECT_ROOT; override via ORPHAN_SWEEP_DEPLOY_PARENT) PLUS
+# any --keep-repo paths. So --clean run from one Mind repo never kills a sibling
+# repo's live daemon — it is no longer a multi-deployment footgun.
 #
 # Exit codes:
 #   0 — healthy (exactly 1 daemon pair, no orphans) OR --clean swept successfully
@@ -33,7 +42,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
 
-RT_DIR="$PROJECT_ROOT/mind_api/state"
+# Honor RUNTIME_DIR (B16) so a sweep run against an isolated runtime dir reads
+# the right local state — mirrors mind-api-start.sh:30 + lifecycle.runtime_dir.
+RT_DIR="${RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
 PID_FILE="$RT_DIR/daemon.pid"
 PORT_FILE="$RT_DIR/daemon.port"
 PARENT_PID_FILE="$RT_DIR/daemon.parent.pid"
@@ -41,20 +52,30 @@ PARENT_PID_FILE="$RT_DIR/daemon.parent.pid"
 CLEAN=0
 STRICT=0
 QUIET=0
-for arg in "$@"; do
-    case "$arg" in
+PRINT_KEEPSET=0
+KEEP_REPOS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
         --clean) CLEAN=1 ;;
         --strict) STRICT=1 ;;
         --quiet) QUIET=1 ;;
+        --print-keepset) PRINT_KEEPSET=1 ;;
+        --keep-repo)
+            shift
+            [ $# -gt 0 ] || { echo "[orphan-sweep] ERROR: --keep-repo needs a path" >&2; exit 2; }
+            KEEP_REPOS+=("$1")
+            ;;
+        --keep-repo=*) KEEP_REPOS+=("${1#--keep-repo=}") ;;
         -h|--help)
             sed -n '2,30p' "$0"
             exit 0
             ;;
         *)
-            echo "[orphan-sweep] ERROR: unknown arg: $arg" >&2
+            echo "[orphan-sweep] ERROR: unknown arg: $1" >&2
             exit 2
             ;;
     esac
+    shift
 done
 
 _say() {
@@ -74,6 +95,66 @@ current_child="$(_read_file "$PID_FILE" || echo "")"
 current_parent="$(_read_file "$PARENT_PID_FILE" || echo "")"
 current_port="$(_read_file "$PORT_FILE" || echo "")"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Cross-repo-safe keep-set (). The PowerShell/pgrep scan below is
+# SYSTEM-WIDE (Win32_Process / pgrep expose no cwd/env discriminator), so a
+# keep-set of ONLY this repo's pair would flag a SIBLING Mind deployment's live
+# daemon as an orphan and --clean would kill it (the cross-repo footgun the
+# promotion teardown hit 2026-06-28). Build the keep-set from EVERY reachable
+# live deployment's published pair: this repo + auto-discovered siblings under
+# the deployments' parent dir + any explicit --keep-repo paths. A deployment
+# whose daemon.pid has vanished (the teardown-orphan failure mode) is correctly
+# absent from the keep-set and stays sweepable.
+KEEP_PIDS=()        # all protected PIDs (children + parents)
+KEEP_CHILDREN=()    # child PIDs only — parents are derived on Windows if missing
+
+_collect_pair() {
+    # $1 = a mind_api/state dir. Appends its child (+ parent) PIDs to the keep-set.
+    local sdir="$1" c p
+    c="$(_read_file "$sdir/daemon.pid" || echo "")"
+    p="$(_read_file "$sdir/daemon.parent.pid" || echo "")"
+    if [ -n "$c" ]; then KEEP_PIDS+=("$c"); KEEP_CHILDREN+=("$c"); fi
+    if [ -n "$p" ]; then KEEP_PIDS+=("$p"); fi
+}
+
+# 1. This repo's pair (honors RUNTIME_DIR via RT_DIR).
+_collect_pair "$RT_DIR"
+
+# 2. Auto-discovered sibling deployments. Default parent = dirname PROJECT_ROOT;
+#    overridable via ORPHAN_SWEEP_DEPLOY_PARENT (test seam + non-default layouts).
+#    Glob both layouts: <repo>/mind_api/state/ and <repo>/.mind-data/mind_api/state/.
+DEPLOY_PARENT="${ORPHAN_SWEEP_DEPLOY_PARENT:-$(dirname "$PROJECT_ROOT")}"
+for _pidf in "$DEPLOY_PARENT"/*/mind_api/state/daemon.pid \
+             "$DEPLOY_PARENT"/*/.mind-data/mind_api/state/daemon.pid; do
+    [ -f "$_pidf" ] || continue              # unmatched glob expands to literal — skip
+    _sdir="$(dirname "$_pidf")"
+    [ "$_sdir" = "$RT_DIR" ] && continue      # this repo, already collected
+    _collect_pair "$_sdir"
+done
+
+# 3. Explicit --keep-repo paths (both layouts).
+for _repo in "${KEEP_REPOS[@]:-}"; do
+    [ -n "$_repo" ] || continue
+    [ -f "$_repo/mind_api/state/daemon.pid" ] && _collect_pair "$_repo/mind_api/state"
+    [ -f "$_repo/.mind-data/mind_api/state/daemon.pid" ] && _collect_pair "$_repo/.mind-data/mind_api/state"
+done
+
+# De-duplicate (a repo can appear via both the glob and --keep-repo).
+_dedup() { printf '%s\n' "$@" | awk 'NF && !seen[$0]++' | tr '\n' ' '; }
+# shellcheck disable=SC2207
+KEEP_PIDS=($(_dedup "${KEEP_PIDS[@]:-}"))
+# shellcheck disable=SC2207
+KEEP_CHILDREN=($(_dedup "${KEEP_CHILDREN[@]:-}"))
+
+if [ "$PRINT_KEEPSET" = "1" ]; then
+    # Debug/inspection + hermetic test seam: print the protected set and exit
+    # WITHOUT scanning processes or killing anything.
+    echo "KEEPSET_PIDS=$(IFS=,; echo "${KEEP_PIDS[*]:-}")"
+    echo "KEEPSET_CHILDREN=$(IFS=,; echo "${KEEP_CHILDREN[*]:-}")"
+    echo "DEPLOY_PARENT=$DEPLOY_PARENT"
+    exit 0
+fi
+
 _say "═══ Daemon orphan sweep ══════════════════════════════════"
 _say "  Published state:"
 _say "    daemon.pid         = ${current_child:-<missing>}"
@@ -90,10 +171,11 @@ if [ "$PLATFORM" = "posix" ]; then
     # POSIX: pgrep python processes running mind_api.src.
     mapfile -t pids < <(pgrep -f 'python.* -m mind_api\.src' 2>/dev/null)
     _say "  Alive mind_api.src processes (POSIX): ${#pids[@]}"
+    _in_keepset() { local x="$1" k; for k in "${KEEP_PIDS[@]:-}"; do [ "$x" = "$k" ] && return 0; done; return 1; }
     orphans=()
     for p in "${pids[@]}"; do
-        if [ "$p" = "$current_child" ] || [ "$p" = "$current_parent" ]; then
-            _say "    KEEP  PID=$p (matches published state)"
+        if _in_keepset "$p"; then
+            _say "    KEEP  PID=$p (live deployment pair)"
         else
             _say "    ORPH  PID=$p (orphan)"
             orphans+=("$p")
@@ -121,30 +203,35 @@ if [ "$PLATFORM" = "posix" ]; then
 fi
 
 # Windows: PowerShell + WMI.
-keep_c="${current_child:-0}"
-[ -z "$keep_c" ] && keep_c=0
-keep_p="${current_parent:-0}"
-[ -z "$keep_p" ] && keep_p=0
+# Serialize the cross-repo keep-set into PowerShell array literals.
+# Empty -> @() (no protected pair found; every mind_api.src proc is an orphan).
+keep_pids_ps="$(IFS=,; echo "${KEEP_PIDS[*]:-}")"
+keep_children_ps="$(IFS=,; echo "${KEEP_CHILDREN[*]:-}")"
 
 ps_script="
-    \$keep_child = $keep_c
-    \$keep_parent = $keep_p
+    \$keep_pids = @($keep_pids_ps)
+    \$keep_children = @($keep_children_ps)
     \$do_clean = \$$([ "$CLEAN" = "1" ] && echo "true" || echo "false")
     \$procs = Get-CimInstance Win32_Process -Filter \"Name='py.exe' OR Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -match 'mind_api\\.src' }
     \$total = (\$procs | Measure-Object).Count
 
-    # If keep_parent is unset (=0) but keep_child is alive, derive its actual
-    # parent process and treat that as legit. Handles the transition window
-    # where an OLD daemon (pre-v3 fix) wrote daemon.pid but not
-    # daemon.parent.pid — without this, the legit py.exe launcher would be
-    # flagged ORPHAN and a --clean would orphan the live daemon python.exe.
-    if (\$keep_parent -eq 0 -and \$keep_child -gt 0) {
-        \$alive_child = \$procs | Where-Object { \$_.ProcessId -eq \$keep_child } | Select-Object -First 1
+    # Derive the live parent for every protected child whose parent PID is not
+    # already in the keep-set. Handles (a) the pre-v3 transition window where a
+    # daemon wrote daemon.pid but not daemon.parent.pid, and (b) a sibling repo
+    # whose daemon.parent.pid file is missing — without this, the live py.exe
+    # launcher of a protected child would be flagged ORPHAN and --clean would
+    # orphan its python.exe. Generalized from the prior single-local-child
+    # derive to the whole cross-repo keep-set ().
+    foreach (\$kc in \$keep_children) {
+        \$alive_child = \$procs | Where-Object { \$_.ProcessId -eq \$kc } | Select-Object -First 1
         if (\$alive_child) {
-            \$derived_parent = Get-CimInstance Win32_Process -Filter \"ProcessId=\$(\$alive_child.ParentProcessId)\" -ErrorAction SilentlyContinue
-            if (\$derived_parent -and \$derived_parent.CommandLine -match 'mind_api\\.src') {
-                \$keep_parent = \$derived_parent.ProcessId
-                Write-Output \"DERIVED_PARENT=\$keep_parent\"
+            \$kppid = \$alive_child.ParentProcessId
+            if (\$keep_pids -notcontains \$kppid) {
+                \$derived_parent = Get-CimInstance Win32_Process -Filter \"ProcessId=\$kppid\" -ErrorAction SilentlyContinue
+                if (\$derived_parent -and \$derived_parent.CommandLine -match 'mind_api\\.src') {
+                    \$keep_pids += \$kppid
+                    Write-Output \"DERIVED_PARENT=\$kppid\"
+                }
             }
         }
     }
@@ -159,7 +246,7 @@ ps_script="
             Start = \$p.CreationDate
         }
         \$alive += \$entry
-        if (\$p.ProcessId -ne \$keep_child -and \$p.ProcessId -ne \$keep_parent) {
+        if (\$keep_pids -notcontains \$p.ProcessId) {
             \$orphans += \$entry
         }
     }

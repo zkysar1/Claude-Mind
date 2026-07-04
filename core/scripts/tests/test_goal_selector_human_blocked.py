@@ -204,3 +204,71 @@ def test_synth_blocker_ref_for_human_blocked():
     assert isinstance(ref, dict)
     assert ref.get("type") == "resource"
     assert str(ref.get("external_id", "")).startswith("structured-defer:")
+
+
+# ── 1: deferred_until (path b) takes precedence over a structured-prefix
+#    defer_reason (path a) when BOTH are present and deferred_until is future ──
+
+
+def _future_iso(days_ahead):
+    return (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _past_iso(days_ago):
+    return (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def test_synth_deferred_until_future_wins_over_structured_prefix():
+    # THE 1 REGRESSION: a goal carrying BOTH a structured-prefix
+    # defer_reason AND a far-future deferred_until must derive
+    # expires_at == deferred_until (path b), NOT set_at+120h (path a). The
+    # explicit deferred_until is the authoritative structural expiry. Before the
+    # fix, path (a) matched first and returned the shorter 120h expiry — already
+    # PAST for long-deferred goals — tripping quiescence-gate C3 (expires_at must
+    # be future) into false quiescence denial + B7 backoff churn.
+    du = _future_iso(90)  # ~3 months out, far beyond set_at+120h (~5 days)
+    g = _goal("g-both", "precondition_unmet: dep-x", set_at_hours_ago=1)
+    g["deferred_until"] = du
+    ref = synth_ref(g)
+    assert isinstance(ref, dict)
+    assert ref.get("expires_at") == du, (
+        f"deferred_until must win: expected expires_at={du}, got {ref.get('expires_at')}")
+    assert str(ref.get("external_id", "")).startswith("time-gate:"), (
+        f"path (b) must fire (time-gate), got external_id={ref.get('external_id')}")
+    assert not str(ref.get("external_id", "")).startswith("structured-defer:")
+
+
+def test_synth_deferred_until_past_falls_through_to_structured_prefix():
+    # Control: when deferred_until is already PAST, path (b) is skipped (not
+    # future) and path (a) fires unchanged — the structured-prefix 120h fail-open.
+    g = _goal("g-both-past", "precondition_unmet: dep-x", set_at_hours_ago=1)
+    g["deferred_until"] = _past_iso(2)
+    ref = synth_ref(g)
+    assert isinstance(ref, dict)
+    assert str(ref.get("external_id", "")).startswith("structured-defer:"), (
+        f"past deferred_until must fall through to path (a), got {ref.get('external_id')}")
+
+
+def test_synth_structured_prefix_no_deferred_until_unchanged():
+    # Control: a structured-prefix defer with NO deferred_until still gets path
+    # (a) (structured-defer, set_at+120h) — the reorder must not change this.
+    g = _goal("g-a-only", "precondition_unmet: dep-x", set_at_hours_ago=1)
+    ref = synth_ref(g)
+    assert isinstance(ref, dict)
+    assert str(ref.get("external_id", "")).startswith("structured-defer:")
+    exp = datetime.fromisoformat(ref["expires_at"])
+    set_at = datetime.fromisoformat(g["defer_reason_set_at"])
+    delta_h = (exp - set_at).total_seconds() / 3600
+    assert 119.9 < delta_h < 120.1, f"expected ~120h expiry, got {delta_h}h"
+
+
+def test_synth_deferred_until_only_no_structured_prefix_unchanged():
+    # Control: deferred_until future with a NON-structured defer_reason still gets
+    # path (b) (time-gate) — behavior unchanged by the reorder.
+    du = _future_iso(30)
+    g = _goal("g-b-only", "awaiting some free-form thing", set_at_hours_ago=1)
+    g["deferred_until"] = du
+    ref = synth_ref(g)
+    assert isinstance(ref, dict)
+    assert ref.get("expires_at") == du
+    assert str(ref.get("external_id", "")).startswith("time-gate:")

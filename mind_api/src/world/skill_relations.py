@@ -66,6 +66,8 @@ def _config_path(ctx) -> Path:
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
     """Mirror skill-relations.py:read_yaml (line 57). {} when missing."""
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:

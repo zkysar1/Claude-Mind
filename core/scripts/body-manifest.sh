@@ -3,7 +3,7 @@
 #
 # Usage:
 #   bash core/scripts/body-manifest.sh write --sid <unitKey> --agent <mindKey> \
-#       [--env-id local] [--role worker|observer]
+#       [--env-id local] [--role reducer|worker|observer]
 #   bash core/scripts/body-manifest.sh read      --sid <unitKey> --agent <mindKey>
 #   bash core/scripts/body-manifest.sh set-state  --sid <unitKey> --agent <mindKey> <state>
 #   bash core/scripts/body-manifest.sh is-reducer --sid <unitKey> --agent <mindKey>

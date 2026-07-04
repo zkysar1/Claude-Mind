@@ -178,6 +178,19 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (gate-d-5e-outside-skip-digest): F=core/config/execute-protocol-digest.md; S=$(grep -nE 'Step 5e ALWAYS RUNS' "$F" | head -1 | cut -d: -f1); H=$(grep -nE 'Step 5e: Gate D commons-pattern injection' "$F" | head -1 | cut -d: -f1); { [ -n "$S" ] && [ -n "$H" ] && [ "$S" -lt "$H" ]; } && echo "PASS: execute-protocol-digest.md positions 'Step 5e ALWAYS RUNS' (L$S) before the Step 5e Gate D section (L$H) — Step 5e is outside the trivial_mode skip region (g-115-1414)" || echo "FAIL: execute-protocol-digest.md no longer positions the 'Step 5e ALWAYS RUNS — never gated by trivial_mode' sentinel before the Step 5e Gate D section — Step 5e may have been pulled into the g-305-15 trivial_mode skip region (GATE-INTEGRITY regression, g-115-1414)"
    Bash (gate-d-5e-outside-skip-skill): F=.claude/skills/aspirations-execute/SKILL.md; S=$(grep -nE 'Step 5e ALWAYS RUNS' "$F" | head -1 | cut -d: -f1); H=$(grep -nE 'Step 5e: Gate D commons-pattern injection' "$F" | head -1 | cut -d: -f1); { [ -n "$S" ] && [ -n "$H" ] && [ "$S" -lt "$H" ]; } && echo "PASS: aspirations-execute/SKILL.md positions 'Step 5e ALWAYS RUNS' (L$S) before the Step 5e Gate D section (L$H) — Step 5e is outside the trivial_mode skip region (g-115-1414)" || echo "FAIL: aspirations-execute/SKILL.md no longer positions the 'Step 5e ALWAYS RUNS — never gated by trivial_mode' sentinel before the Step 5e Gate D section — Step 5e may have been pulled into the g-305-15 trivial_mode skip region (GATE-INTEGRITY regression, g-115-1414)"
 
+   # Micro-hypothesis resolves_when/consumer + auto-settle wiring (g-303-34, g-115-1665).
+   # g-303-34 made resolves_when + consumer REQUIRED at the micro-hyp filing sites and
+   # added the Step 1.5 auto-settle CONSUMER, fixing the dominant micro-hyp failure
+   # (zeta audit g-303-14: 71% never-resolve, 0% consumed). These are behavior-changing
+   # pseudocode edits a future edit could silently drop. The three checks pin: (1) the
+   # aspirations-spark sq-016 filing JSON still carries BOTH fields, (2) the reflect-on-
+   # outcome Step 1.5 consumer header still exists, (3) the sq-016 RB block still stamps
+   # source_horizon: micro (rb-876 first-principles attribution-gap fix). If the wording
+   # is deliberately reworded, update the grep pattern here in lockstep.
+   Bash (microhyp-spark-resolves-consumer): F=.claude/skills/aspirations-spark/SKILL.md; grep -qE '"source_step":"sq-016".*"resolves_when"' "$F" && grep -qE '"source_step":"sq-016".*"consumer"' "$F" && echo "PASS: aspirations-spark sq-016 micro-hyp filing JSON carries both resolves_when and consumer (g-303-34 non-resolution/no-consumer fix)" || echo "FAIL: aspirations-spark sq-016 micro-hyp filing lost resolves_when and/or consumer -- the g-303-34 REQUIRED-fields fix regressed (71%-never-settle / 0%-consumed failure mode returns)"
+   Bash (microhyp-autosettle-header): grep -q 'Auto-Settle Unresolved Micro-Hypotheses' .claude/skills/reflect-on-outcome/SKILL.md && echo "PASS: reflect-on-outcome has the Step 1.5 Auto-Settle Unresolved Micro-Hypotheses consumer (g-303-34)" || echo "FAIL: reflect-on-outcome lost the Step 1.5 Auto-Settle Unresolved Micro-Hypotheses step -- resolves_when is filed but never consumed (g-303-34 regressed)"
+   Bash (microhyp-spark-source-horizon): grep -q 'source_horizon: micro' .claude/skills/aspirations-spark/SKILL.md && echo "PASS: aspirations-spark sq-016 RB block stamps source_horizon: micro (g-303-34 / rb-876 first-principles-spark attribution-gap fix)" || echo "FAIL: aspirations-spark sq-016 RB block lost the source_horizon: micro stamp -- first-principles micro-horizon RB origin no longer traceable (g-303-34 / rb-876 regressed)"
+
    # _world_config Mode G overlay loader (rb-1100, guard-590, Phase 2.5.D)
    # When _world_config.py used the pre-relocation root/agent/local-paths.conf
    # path (Mode G), it silently fell through to PROJECT_ROOT/world (nonexistent
@@ -434,6 +447,18 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # contains `addopts=` and is therefore self-excluded.
    Bash (no-broken-pytest-idiom): BROKEN=$(grep -E '^[[:space:]]*Bash \(' .claude/skills/verify-learning/SKILL.md | grep -F 'pytest' | grep -F 'passed' | grep -v -F 'addopts='); [ -z "$BROKEN" ] && echo "PASS: every verify-learning pytest-summary-grep check uses -o addopts= (no silent FALSE-FAIL idiom)" || echo "FAIL: a Bash check greps pytest for 'passed' without -o addopts= — addopts=-q suppresses the summary, silent FALSE-FAIL (guard-656, g-115-1182). Offending: $BROKEN"
 
+   # Cadence-Gate Slot-Shape Guard (Section CGI -- g-115-1684, sq-018, 2026-06-28)
+   # The three cadence-check scripts read the goals_count_at_last_fire dict WM slot
+   # via last.get(...). A legacy/restored bare-timestamp-STRING slot makes last.get()
+   # raise AttributeError BEFORE the dict-writer runs, so the slot can never self-heal
+   # (rb-2482 self-heal-deadlock). g-115-1681/1682 added isinstance(last, dict) guards
+   # to all three (l1-skew-check.py, felt-sense-cadence-check.py,
+   # fresh-eyes-cadence-check.py). This assertion catches a future 4th cadence gate or
+   # a refactor reintroducing the unguarded read: any core/scripts/*.py reading
+   # goals_count_at_last_fire via last.get() MUST also contain isinstance(last, dict).
+   # Regex (not fixed-string) on the guard so a spacing variant still counts.
+   Bash (cadence-gate-isinstance-guard): VIOLATORS=$(for f in $(grep -lF 'goals_count_at_last_fire' core/scripts/*.py 2>/dev/null); do grep -qE 'last\.get' "$f" && ! grep -qE 'isinstance\(\s*last\s*,\s*dict\s*\)' "$f" && echo "$f"; done); [ -z "$VIOLATORS" ] && echo "PASS: every core/scripts/*.py reading goals_count_at_last_fire via last.get() also guards with isinstance(last, dict) (rb-2482 self-heal-deadlock)" || echo "FAIL: a cadence-gate script reads goals_count_at_last_fire via last.get() WITHOUT an isinstance(last, dict) guard -- a legacy bare-string slot raises AttributeError before the dict-writer self-heals (rb-2482, g-115-1681/1682). Offending: $VIOLATORS"
+
    # Committed-Files-Only Gate Scoping (Section CFO — g-115-1178, 2026-05-26)
    # post-state-update-gate.sh now scopes its fresh-eyes file-detection to the
    # files a commit actually landed when iteration-close.sh extracts the
@@ -588,8 +613,8 @@ Focus on what actually happened during the test — did the agent USE the new fe
    # invisible on UNINITIALIZED first-run (only one local-paths.conf exists so first-conf
    # fallback resolves correctly) but produces wrong-agent path resolution on multi-agent
    # installs. This grep catches the regression at edit time.
-   Bash (start-b10-ayoai-agent-prefix): grep -qE 'MIND_AGENT=<agent-name> bash core/scripts/permissions-add\.sh' .claude/skills/start/SKILL.md && echo "PASS: /start B10 invocation carries explicit MIND_AGENT=<agent-name> prefix on permissions-add.sh (g-115-1014, guard-307)" || echo "FAIL: /start B10 invocation missing MIND_AGENT=<agent-name> prefix on permissions-add.sh — silent multi-agent-install regression risk (g-115-1014, rb-1105)"
-   Bash (start-writes-runner-token): test "$(grep -c 'RUNNER_TOKEN=\$(' .claude/skills/start/SKILL.md)" -ge 2 && echo "PASS: /start writes runner-token at IDLE Step 3 + UNINITIALIZED C8" || echo "FAIL: /start missing runner-token write at one of the two canonical sites (Tier 3a)"
+   Bash (start-b10-ayoai-agent-prefix): grep -qE 'MIND_AGENT=<agent-name> bash core/scripts/permissions-add\.sh' .claude/skills/start/SKILL.md core/config/start-uninitialized-ceremony.md && echo "PASS: /start B10 invocation carries explicit MIND_AGENT=<agent-name> prefix on permissions-add.sh (g-115-1014, guard-307; B10 in core/config/start-uninitialized-ceremony.md digest since g-115-1723-b)" || echo "FAIL: /start B10 invocation missing MIND_AGENT=<agent-name> prefix on permissions-add.sh — silent multi-agent-install regression risk (g-115-1014, rb-1105)"
+   Bash (start-writes-runner-token): test "$(cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -c 'RUNNER_TOKEN=\$(')" -ge 2 && echo "PASS: /start writes runner-token at IDLE Step 3 (SKILL.md) + UNINITIALIZED C8 (start-phase-c.md digest)" || echo "FAIL: /start missing runner-token write at one of the two canonical sites (Tier 3a; C8 lives in core/config/start-phase-c.md since g-115-1723-a extracted Phase C)"
    Bash (stop-hook-logs-runner-token): test "$(grep -c 'runner_token=' core/scripts/stop-hook.sh)" -ge 6 && echo "PASS: stop-hook logs runner_token in BLOCK/ALLOW lines" || echo "FAIL: stop-hook missing runner_token logging (Tier 3a)"
    Bash (watchdog-correlates-runner-token): grep -q '"runner_token":' core/scripts/agent-watchdog.py && echo "PASS: watchdog RunningSidProbe includes runner_token in correlated context" || echo "FAIL: watchdog missing runner_token (Tier 3a)"
    Bash (precompact-poison-write): grep -q "autocompact-serialize-poison" core/scripts/precompact-serialize.sh && echo "PASS: precompact-serialize.sh writes poison marker on timeout" || echo "FAIL: precompact-serialize.sh missing poison marker (Tier 4a)"
@@ -1011,7 +1036,7 @@ else:
    # only the runner-claim site (IDLE Step 3 / UNINITIALIZED C8) writes latest-session-id.
    Check: `start/SKILL.md` IDLE Step 0 does NOT write `agents/<agent>/session/latest-session-id` (moved to Step 3 pair-write)
    Bash: grep -c '> agents/<agent-name>/session/latest-session-id.tmp\|> agents/<agent-name>/session/latest-session-id' .claude/skills/start/SKILL.md → verify exactly 2 (IDLE Step 3 + UNINITIALIZED C8 only)
-   Check: `start/SKILL.md` IDLE Step 3 and UNINITIALIZED C8 use `$MIND_SID` for the canonical runner-claim pair-write
+   Check: IDLE Step 3 (`start/SKILL.md`) and UNINITIALIZED C8 (`core/config/start-phase-c.md` digest, extracted g-115-1723-a) use `$MIND_SID` for the canonical runner-claim pair-write
    Bash: grep -c 'echo "\$MIND_SID" > agents/<agent-name>/session/running-session-id\.tmp' .claude/skills/start/SKILL.md → verify ≥2
    # Visible-halt guard (rb-386): the pair-write must FAIL-VISIBLY on empty MIND_SID,
    # not silently via `[ -n "$MIND_SID" ] && …` (which created invisible no-ops that
@@ -1062,7 +1087,7 @@ else:
    # is the autonomous loop runner. ONE creator (/start), ONE reader (stop hook),
    # ONE syncer (session-save-id.sh on autocompact), ONE deleter (/stop).
    Check: `start/SKILL.md` IDLE autonomous path writes `running-session-id` after `session-state-set.sh RUNNING`
-   Check: `start/SKILL.md` UNINITIALIZED autonomous path (C8) writes `running-session-id` after `session-state-set.sh RUNNING`
+   Check: `core/config/start-phase-c.md` (Phase C digest, extracted by g-115-1723-a) UNINITIALIZED autonomous path (C8) writes `running-session-id` after `session-state-set.sh RUNNING`
    Check: `aspirations-graceful-stop/SKILL.md` D-step deletes `running-session-id` (symmetric with /start creation; extracted from former stop/SKILL.md step 4b when Phase -1.4 moved to the graceful-stop sub-skill, Magic-Wand Item 2)
    Bash: grep -c 'rm.*running-session-id' .claude/skills/aspirations-graceful-stop/SKILL.md -> verify returns >= 1 (extraction preserves delete)
    Check: `boot/SKILL.md` Phase -1.5 whitelist includes `running-session-id` (boot must NOT delete it)
@@ -2271,7 +2296,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # (loop heartbeat) — keep it there; it does not belong in Step 2.5.
    Check: `start/SKILL.md` IDLE branch has Step 2.5 "Clear stale stop signals" running for ALL modes (single cleanup site)
    Check: `start/SKILL.md` IDLE autonomous sub-path does NOT re-clear `stop-requested` or `stop-loop` (Step 2.5 already did it)
-   Check: `start/SKILL.md` UNINITIALIZED Phase C8 autonomous has NO `session-signal-clear.sh stop-loop` or `session-signal-clear.sh stop-requested` calls
+   Check: `core/config/start-phase-c.md` (Phase C digest) UNINITIALIZED Phase C8 autonomous has NO `session-signal-clear.sh stop-loop` or `session-signal-clear.sh stop-requested` calls
    Bash: grep -cE 'session-signal-clear.sh (stop-loop|stop-requested)' .claude/skills/start/SKILL.md → verify exactly 4 hits (Step 0.7 recovery branch clears stop-requested + stop-loop = 2; Step 2.5 IDLE cleanup clears stop-requested + stop-loop = 2; total 4. If the count changes, trace the new caller — any new site may indicate an unauthorized stop-signal write outside /start and /stop.)
    Bash: grep -cE 'session-signal-clear.sh loop-active' .claude/skills/start/SKILL.md → verify >= 1 (autonomous sub-path clears loop-active, a different signal, correctly scoped)
 
@@ -2305,7 +2330,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: source core/scripts/_paths.sh && bash core/scripts/heartbeat-tick.sh --bypass-state && [ -f "$AGENT_DIR/session/runner-heartbeat" ] && echo PASS || echo FAIL → smoke test: source (not bash) is required so $AGENT_DIR survives into the [ -f ] check. `--bypass-state` is required because verify-learning may run from an IDLE assistant/observer session — without bypass the IDLE-state gate (2026-05-13 hardening, see heartbeat-tick.sh header for the `heartbeat_without_running` desync rationale) refuses the tick. Side effect: stamps NOW into team-state.last_active, which is the intended SSOT behavior.
    Check: `heartbeat-tick.sh` IDLE-state gate is present (2026-05-13, prevents the `heartbeat_without_running` desync — alpha cbb27ab3 incident). Bash: `grep -cE 'if \[ "\$STATE" = "IDLE" \]' core/scripts/heartbeat-tick.sh` must be >= 1.
    Check: `heartbeat-tick.sh` gate suppresses no stderr (rb-400 silent-boundary discipline). Bash: `grep -cE 'session-state-get\.sh.*2>/dev/null' core/scripts/heartbeat-tick.sh` must be 0 (any `2>/dev/null` on the state-get call regresses rb-400).
-   Check: `start/SKILL.md` IDLE Step 3 AND UNINITIALIZED Phase C8 both pass `--bypass-state` to heartbeat-tick (the only two authorized bypass sites). Bash: `grep -cE 'heartbeat-tick\.sh --bypass-state' .claude/skills/start/SKILL.md` must be >= 2.
+   Check: `start/SKILL.md` IDLE Step 3 (SKILL.md) AND UNINITIALIZED Phase C8 (core/config/start-phase-c.md digest) both pass `--bypass-state` to heartbeat-tick (the only two authorized bypass sites). Bash: `cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -cE 'heartbeat-tick\.sh --bypass-state'` must be >= 2.
    Check: `aspirations/SKILL.md` Phase -1.5 abort path terminates on a `Bash:` tool call, not a text `Output:` (guard-454 — trailing prose ends the loop). Bash: `awk '/^# Phase -1\.5: /,/^# Phase -1\.4: /' .claude/skills/aspirations/SKILL.md | grep -cE '^\s*Bash: \`echo'` must be >= 1. (The `: ` after the phase number anchors to section headers — bare `Phase -1.4` appears inside the CRITICAL comment as a reference and would terminate the awk range too early.)
    Bash: bash core/scripts/heartbeat-stale.sh | grep -qE '^(stale|fresh)$' && echo PASS || echo FAIL → verify PASS (probe prints exactly one of TWO values on stdout — fresh/stale; pure-mtime model, see compact-recovery.md)
 
@@ -2975,10 +3000,10 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
 
    Check: `.gitignore` contains `*/local-paths.conf` (per-agent, not project-root)
    Check: `core/scripts/_platform.sh` cygpath for WORLD_DIR and META_DIR are conditional (guarded by -n check)
-   Check: `start/SKILL.md` Phase A binds agent name, Phase B configures paths, Phase C asks for program
-   Check: `start/SKILL.md` Phase B skipped when `agents/<agent>/local-paths.conf` already exists
-   Check: `start/SKILL.md` Phase B step B9-B10 adds Read/Write/Edit permissions to `settings.local.json`
-   Check: `start/SKILL.md` Phase C sets state (C8) and invokes /prime (C8.5) BEFORE /create-aspiration (C9) for both assistant and autonomous modes
+   Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest, extracted g-115-1723-b) Phase A binds agent name, Phase B configures paths, program.md prompt (Phase C mode dispatch lives in start-phase-c.md)
+   Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) Phase B skipped when `agents/<agent>/local-paths.conf` already exists
+   Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) Phase B step B9-B10 adds Read/Write/Edit permissions to `settings.local.json`
+   Check: `core/config/start-phase-c.md` (Phase C digest) Phase C sets state (C8) and invokes /prime (C8.5) BEFORE /create-aspiration (C9) for both assistant and autonomous modes
    Check: `core/scripts/session-save-id.sh` skips auto-resume if agent directory does not exist
    Check: No `factory-reset.sh` exists in core/scripts/
    Check: No `.claude/skills/reset/` directory exists
@@ -3003,8 +3028,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: bash core/scripts/load-conventions.sh post-execution → verify returns a non-empty path
    Check: `aspirations-execute/SKILL.md` Phase 4.2 `test -f` uses `$WORLD_DIR/conventions/` (not hardcoded `world/conventions/`)
    Check: `execute-protocol-digest.md` Phase 4.2 `test -f` uses `$WORLD_DIR/conventions/` (not hardcoded `world/conventions/`)
-   Check: `start/SKILL.md` has Phase C0.5 "Configure domain conventions" between C0 and C1
-   Check: `start/SKILL.md` Phase C0.5 only runs when `world/conventions/` has no `.md` files (existing world skips)
+   Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) has Phase C0.5 "Configure domain conventions" between C0 and C1
+   Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) Phase C0.5 only runs when `world/conventions/` has no `.md` files (existing world skips)
    # guard-006 was retired without explicit metadata. The rule it codified (no
    # uncommitted code across session boundaries) is now enforced structurally by
    # iteration-commit.sh in Phase 8 state-update + post-execution.md Step 2's
@@ -3040,13 +3065,13 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -q -- "--author \$MIND_AGENT" core/config/templates/post-execution-default.md && echo "PASS: template uses --author $MIND_AGENT filter" || { echo "FAIL: post-execution template missing --author \$MIND_AGENT — multi-agent leak guard per guard-493 lost"; false; }
    Bash: py -3 -c "import pathlib; src=pathlib.Path('core/config/templates/post-execution-default.md').read_text(encoding='utf-8'); lines=[ln for ln in src.split('\n') if '\$pre_ts' in ln]; bad=[ln for ln in lines if 'Do not write' not in ln]; assert not bad, f'FAIL template: \$pre_ts in non-warning lines: {bad}'; print(f'PASS: template \$pre_ts only in warning text ({len(lines)} line(s))')"
    Bash: py -3 -c "import pathlib, re; src=pathlib.Path('core/config/templates/post-execution-default.md').read_text(encoding='utf-8'); pos={m.group(1): m.start() for m in re.finditer(r'^## Step (\d+\.?\d*)', src, re.M)}; ok=pos.get('1.5',0) < pos.get('1.75',0) < pos.get('2', 10**9); assert ok, f'FAIL: Step ordering broken in template — positions={pos}'; print('PASS: template Step 1.75 between Step 1.5 and Step 2')"
-   # Check: `start/SKILL.md` C0.5 uses per-slot existence detection (NOT whole-directory short-circuit)
-   Bash: grep -q "per-slot existence detection" .claude/skills/start/SKILL.md && echo "PASS: C0.5 documents per-slot detection" || { echo "FAIL: start/SKILL.md C0.5 reverted to whole-directory short-circuit — fresh worlds with any conventions/*.md will skip seeding"; false; }
-   # Check: `start/SKILL.md` C0.5 references the framework templates by path
+   # Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) C0.5 uses per-slot existence detection (NOT whole-directory short-circuit)
+   Bash: grep -q "per-slot existence detection" .claude/skills/start/SKILL.md core/config/start-uninitialized-ceremony.md && echo "PASS: C0.5 documents per-slot detection (in start-uninitialized-ceremony.md digest since g-115-1723-b)" || { echo "FAIL: C0.5 reverted to whole-directory short-circuit — fresh worlds with any conventions/*.md will skip seeding"; false; }
+   # Check: `core/config/start-uninitialized-ceremony.md` (first-boot digest) C0.5 references the framework templates by path
    # Accepts both literal filenames AND the parameterized `<slot>-default.md` form
    # (C0.5 uses the placeholder throughout its pseudocode; both are valid evidence
    # that the cp-from-template seeding path is wired).
-   Bash: grep -qE "core/config/templates/((pre|post)-execution|<slot>)-default\.md" .claude/skills/start/SKILL.md && echo "PASS: C0.5 references framework templates" || { echo "FAIL: start/SKILL.md C0.5 no longer references core/config/templates/ — template-based seeding regressed to LLM-write-from-prompt"; false; }
+   Bash: grep -qE "core/config/templates/((pre|post)-execution|<slot>)-default\.md" .claude/skills/start/SKILL.md core/config/start-uninitialized-ceremony.md && echo "PASS: C0.5 references framework templates" || { echo "FAIL: C0.5 no longer references core/config/templates/ — template-based seeding regressed to LLM-write-from-prompt"; false; }
 
    # Signal-refresh hook slot (Tranche C.1) — fail-open if no domain convention present
    Check: `aspirations-precheck/SKILL.md` Phase 0.5.0-pre invokes `load-conventions.sh signal-refresh` (NOT a direct `bash world/scripts/<...>.sh` invocation)
@@ -3910,6 +3935,25 @@ sys.exit(1)
        sys.exit(1)
    print('PASS: agent directory structure clean (no loose journals, no per-agent scripts/, journal index intact)')
    " → verify agent directory hygiene
+
+   # No-gitignored-temp-citation check (Section AH cont.) — guard-766 automated enforcement (g-115-1678)
+   # A committed framework file (core/, .claude/, mind_api/) must NOT cite an
+   # agents/<agent>/temp/ path in a docstring / comment / code pointer: that path
+   # is gitignored, so the reference is absent in every fresh clone (silent until
+   # `git check-ignore` is run). Origin g-115-1676: compounding-events.py cited an
+   # agents/<agent>/temp/ path in its module docstring — fixed by /drain-temp
+   # promotion to core/config/rationale/compounding-metric.md (the committed path
+   # the code now cites). guard-766 is the behavioral rule; this is its automated
+   # enforcement layer. The grep -vE allowlist is a single PERMANENT tier of legit
+   # describers — files whose JOB is to describe/exercise the path:
+   # core/config/rationale/ (drained->promoted records), core/scripts/tests/
+   # (synthetic fixtures), core/config/conventions/temp-store.md (the convention),
+   # .claude/rules/ (path-resolution etc.), this SKILL.md (the check itself),
+   # .claude/skills/drain-temp/ + seed/ (lifecycle docs), mind_api/docs/ (historical
+   # campaign-log records). The GRANDFATHERED tier (8 drained-design-doc pointers) was
+   # fully genericized + de-allowlisted 2026-06-28 (g-115-1679, the g-115-1678 follow-up);
+   # any new agents/<agent>/temp/ citation is now a FAIL, not a grandfathered pass.
+   Bash (no-gitignored-temp-citations): HITS=$(grep -rnE 'agents/[a-z]+/temp/' core/ .claude/ mind_api/ --include='*.py' --include='*.sh' --include='*.md' --include='*.yaml' --include='*.yml' 2>/dev/null | grep -vE '(core/config/rationale/|core/scripts/tests/|core/config/conventions/temp-store\.md|\.claude/rules/|\.claude/skills/verify-learning/SKILL\.md|\.claude/skills/drain-temp/|\.claude/skills/seed/SKILL\.md|mind_api/docs/)'); [ -z "$HITS" ] && echo "PASS: no committed framework code cites a gitignored agents/<agent>/temp/ path beyond the documented allowlist (guard-766)" || echo "FAIL: committed framework code cites a gitignored agents/<agent>/temp/ path (absent in fresh clones) — cite the promoted committed path or genericize (g-115-1676 / g-115-1678, guard-766). Offending: $HITS"
 
    # Programmatic utilization enforcement evidence checks (Section PU)
    # Three-layer enforcement: auto-manifest (retrieve.py), script feedback (utilization-feedback.sh), hook backstop (utilization-gate.sh)

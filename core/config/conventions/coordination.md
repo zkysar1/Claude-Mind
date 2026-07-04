@@ -126,7 +126,11 @@ normal pipeline resolution cycle.
    calibration gate used in spark Step 0.5 — read recent accuracy for the `code_review`
    category from resolved pipeline entries, compute `recent_accuracy`, and cap confidence
    accordingly (< 0.40 accuracy caps at 0.55, < 0.60 caps at 0.65, < 0.80 caps at 0.80).
-   Add to pipeline via `pipeline-add.sh` with `--type code_review --horizon short`.
+   Add to pipeline via `pipeline-add.sh`, which reads a JSON record on STDIN (NOT
+   `--type`/`--horizon` flags — the flag form sends an empty body and the wrapper
+   still exits 0). Use `type: calibration`, `category: code-review`, `horizon: short`,
+   and put the prediction in `position`. Confirm success from stdout (it has `id`+`stage`,
+   no `error` key) — the exit code is 0 even on a validation error.
 
 4. **Findings Post (R4)**: Share the review hypothesis on the findings channel with
    `board-post.sh --channel findings --type finding --tags "code_review,{goal_id}"`.

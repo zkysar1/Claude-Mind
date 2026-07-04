@@ -171,17 +171,30 @@ else
     # suppresses stderr emitted during sourcing — so the warning fires only for
     # LLM Bash tool calls where the inject hook actually missed (MIND_AGENT
     # genuinely empty at use time).
+    # Count agent confs first: the "hook miss" warning below is only meaningful
+    # when the first-agent fallthrough is AMBIGUOUS (2+ agents -- picking
+    # first-of-many can read the WRONG agent's world). A single-agent deployment
+    # has exactly one conf, so the fallthrough is unambiguous and the warning is
+    # pure noise -- suppress it there. Multi-agent deployments keep the warning:
+    # it is the signal that catches a genuine wrong-agent read ( / routed
+    # from a downstream single-agent deployment, ; preserves the
+    # 6 multi-agent hook-miss diagnostic).
+    _CONF_COUNT=0
+    for _CC in "$(agents_root)"/*/local-paths.conf; do
+        [ -f "$_CC" ] && _CONF_COUNT=$((_CONF_COUNT + 1))
+    done
+    unset _CC
     for _CONF in "$(agents_root)"/*/local-paths.conf; do
         [ -f "$_CONF" ] || continue
         source "$_CONF"
         if [ -n "${WORLD_PATH:-}" ]; then
-            if [ -z "$AGENT_NAME" ]; then
+            if [ -z "$AGENT_NAME" ] && [ "$_CONF_COUNT" -gt 1 ]; then
                 echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2
             fi
             break
         fi
     done
-    unset _CONF
+    unset _CONF _CONF_COUNT
 fi
 
 # --- .mind-data/ local storage root ( M1, ) ---
@@ -217,6 +230,21 @@ META_DIR="${MIND_META:-${_MD_META:-${META_PATH:-}}}"
 # Priority: MIND_WORLD env > .mind-data/ (.env.local WORLD_PATH | world default) >
 # legacy local-paths.conf WORLD_PATH > empty. ( M1)
 WORLD_DIR="${MIND_WORLD:-${_MD_WORLD:-${WORLD_PATH:-}}}"
+
+# : EXPORT the resolved roots under the names OwnCloudBackend.from_env
+# reads. from_env resolves a governed path via MIND_WORLD/WORLD_PATH and
+# MIND_META/META_PATH ONLY (never WORLD_DIR/META_DIR). _paths.sh computed
+# WORLD_DIR/META_DIR as PLAIN (non-exported) vars, so a direct-python subprocess
+# spawned by a _paths.sh-sourcing script (loop-state-bump-counters.py,
+# aspirations-increment-sessions-active, tree-encoding-drift-gate) that calls
+# from_env for a lock saw none of the four and failed lock-acquire (fail-open,
+# but froze loop counters + skipped drift ticks — observed fleet-wide on the
+# own-cloud boxes). Aliasing them to the resolved *_DIR fixes it. Guarded on
+# non-empty so an unconfigured repo exports nothing (empty == unset for from_env's
+# falsy check). Idempotent on re-source: *_DIR was computed FROM these same vars.
+[ -n "$WORLD_DIR" ] && export WORLD_DIR WORLD_PATH="$WORLD_DIR" MIND_WORLD="$WORLD_DIR"
+[ -n "$META_DIR" ] && export META_DIR META_PATH="$META_DIR" MIND_META="$META_DIR"
+
 unset _MD_DIR _MD_WORLD _MD_META
 if [ -n "$_AGENT_DIR_OVERRIDE" ]; then
     AGENT_DIR="$_AGENT_DIR_OVERRIDE"   # test override (3); UNSET in prod

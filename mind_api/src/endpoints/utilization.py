@@ -80,7 +80,9 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     The CLI prints a stderr WARN per corrupt line; the daemon drops it silently
     because byte-compat is measured on the JSON body (stdout), not stderr.
     """
+    from storage_backend import get_backend
     p = Path(path)
+    get_backend().ensure_local(p)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not p.exists():
         return []
     items = []

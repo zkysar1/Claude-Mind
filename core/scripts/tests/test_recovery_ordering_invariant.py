@@ -99,11 +99,16 @@ def test_start_skill_failure_path_diagnostic() -> None:
     text = path.read_text(encoding="utf-8")
     # Case-insensitive match: "(M|m)anifest-clear ... SKIPPED" appears at both
     # recovery branches (Step 0.7 + auto-recovery). The prose phrasing varies
-    # ("manifest-clear is SKIPPED" vs "Manifest-clear was SKIPPED") so we count
-    # the substring "SKIPPED" near "manifest-clear" instead of an exact phrase.
-    skipped_count = sum(
-        1 for line in text.splitlines()
-        if "SKIPPED" in line and ("manifest-clear" in line.lower())
+    # ("manifest-clear is SKIPPED" vs "Manifest-clear was SKIPPED") AND the two
+    # words may be split across a source line-wrap: the Step 0.7 error string
+    # wraps "Manifest-clear was" / "SKIPPED" onto separate lines after the
+    # 52c24aec prose-slimming refactor, though the runtime-visible message is
+    # unchanged. Match "manifest-clear ... SKIPPED" within a short window that
+    # spans an optional newline+indent (re.DOTALL), so a formatting reflow of
+    # the same documented behavior does not trip the test while a genuine
+    # deletion of the SKIPPED documentation from either branch still does.
+    skipped_count = len(
+        re.findall(r"manifest-clear\b.{0,40}?SKIPPED", text, re.IGNORECASE | re.DOTALL)
     )
     assert skipped_count >= 2, (
         f"both /start recovery branches must document the SKIPPED behavior on state-set failure; "

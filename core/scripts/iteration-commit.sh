@@ -1108,11 +1108,74 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
+# --- Stale git-lock auto-recovery (3, guard-883) --------------------
+# A git process that crashes mid add/commit on the shared 6-agent tree leaves
+# .git/index.lock (+ a sibling .git/<op>-<PID>.lock), which blocks EVERY agent's
+# next commit until cleared. Incident 2026-06-27: PID 51452 crashed mid git-add,
+# silently blocking bravo 's deep-close commit and echo's commit until
+# the lock was cleared by hand. This helper clears a VERIFIABLY-STALE lock and
+# lets the caller retry ONCE; it returns 0 only when ALL guard-883 conditions
+# hold (any doubt -> 1, caller surfaces the original failure). It MUST NOT clear
+# a LIVE lock (a partner's in-progress commit) -- that corrupts the index
+# (guard-853/guard-883). Every branch errs toward NOT clearing.
+GIT_LOCK_STALE_S="${ITERATION_COMMIT_GIT_LOCK_STALE_S:-30}"
+clear_stale_git_lock_if_dead() {
+  local gitdir="$REPO/.git"
+  local idxlock="$gitdir/index.lock"
+  [[ -f "$idxlock" ]] || return 1                  # no index.lock -- nothing to clear
+  # (c.1) age gate -- a lock younger than the stale threshold may be a live commit
+  local mt1 now age
+  mt1=$(stat -c %Y "$idxlock" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  age=$(( now - mt1 ))
+  [[ $age -ge $GIT_LOCK_STALE_S ]] || return 1     # too fresh -- assume live
+  # (a) parse the holder PID from a sibling .git/<op>-<PID>.lock (e.g. next-index-51452.lock)
+  local sib pid=""
+  for sib in "$gitdir"/*-[0-9]*.lock; do
+    [[ -e "$sib" ]] || continue
+    [[ "$sib" =~ -([0-9]+)\.lock$ ]] && pid="${BASH_REMATCH[1]}"
+  done
+  # (b) if a PID was found it MUST be dead (absent from `ps -W`). grep -w matches
+  # the PID as a whole word anywhere in ps output (PID or WINPID column); a
+  # coincidental match errs toward "alive" -- the SAFE direction (skip clearing).
+  if [[ -n "$pid" ]] && ps -W 2>/dev/null | grep -qw "$pid"; then
+    echo "[$SCRIPT_NAME] WARN: .git/index.lock holder PID $pid is ALIVE -- NOT clearing (guard-853/883)" >&2
+    return 1
+  fi
+  # (c.2) mtime FROZEN across two reads -- a live holder advances the lock mtime.
+  sleep 2
+  local mt2
+  mt2=$(stat -c %Y "$idxlock" 2>/dev/null || echo 0)
+  if [[ "$mt1" != "$mt2" ]]; then
+    echo "[$SCRIPT_NAME] WARN: .git/index.lock mtime advancing ($mt1->$mt2) -- live holder, NOT clearing (guard-883)" >&2
+    return 1
+  fi
+  # All guard-883 conditions hold: verifiably stale. Remove index.lock + the
+  # sibling PID lock(s). This rm is the SANCTIONED clear (guard-853 forbids the
+  # BLIND rm; this path has proven the lock dead + frozen first).
+  rm -f "$idxlock" 2>/dev/null || true
+  for sib in "$gitdir"/*-[0-9]*.lock; do rm -f "$sib" 2>/dev/null || true; done
+  echo "[$SCRIPT_NAME] WARN: cleared VERIFIABLY-STALE git lock (pid=${pid:-none} dead, mtime frozen, age ${age}s>=${GIT_LOCK_STALE_S}s) -- guard-883, retrying once" >&2
+  return 0
+}
+
 # --- Stage + commit ----------------------------------------------------------
 if [[ ${#staged_files[@]} -gt 0 ]]; then
-  git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1 || {
-    echo "[$SCRIPT_NAME] ERROR: git add failed in $REPO" >&2
-    exit 2
+  add_output=$(git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1) || {
+    # Stale-lock auto-recovery (3): if the add failed on an index.lock
+    # collision and the lock is verifiably stale, clear it and retry ONCE.
+    if printf '%s' "$add_output" | grep -qi -e "index.lock" -e "Another git process" \
+       && clear_stale_git_lock_if_dead; then
+      git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1 || {
+        echo "[$SCRIPT_NAME] ERROR: git add failed in $REPO (after stale-lock clear+retry)" >&2
+        exit 2
+      }
+      echo "[$SCRIPT_NAME] INFO: git add succeeded after stale-lock clear+retry (g-115-1673)" >&2
+    else
+      echo "[$SCRIPT_NAME] ERROR: git add failed in $REPO" >&2
+      [[ -n "$add_output" ]] && echo "[$SCRIPT_NAME] last error: $add_output" >&2
+      exit 2
+    fi
   }
 fi
 
@@ -1180,6 +1243,12 @@ while [[ $commit_attempt -lt $MAX_RETRIES ]]; do
     break
   }
   if [[ $commit_attempt -lt $MAX_RETRIES ]]; then
+    # Stale-lock auto-recovery (3): an index.lock-collision failure may
+    # be a crashed holder's stale lock -- clear it (only if verifiably dead) so
+    # the next retry can proceed. Never clears a live lock (guard-883).
+    if printf '%s' "$commit_last_output" | grep -qi -e "index.lock" -e "Another git process"; then
+      clear_stale_git_lock_if_dead || true
+    fi
     echo "[$SCRIPT_NAME] WARN: commit attempt $commit_attempt/$MAX_RETRIES failed (will retry in ${RETRY_BACKOFF_S}s): $commit_last_output" >&2
     sleep "$RETRY_BACKOFF_S"
   fi

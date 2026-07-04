@@ -9,7 +9,7 @@ maps over an in-memory 5-case corpus and runs gate() -- "earn the keep" for a
 skill edit, with NO corpus file and NO meta/eval/ dependency (so it is decoupled
 from G1 and lands first).
 
-Adopted from agents/alpha/temp/phase1-prep/skill_edit_gate_proto.py: the staged
+Adopted from a staged phase-1 prototype: the staged
 path shim is deleted now that this lives in core/scripts (eval_harness is a
 plain sibling import). Wired into .claude/skills/forge-skill/SKILL.md Step ~3.5:
 every forge scores candidate-vs-baseline and must clear strict_improve BEFORE

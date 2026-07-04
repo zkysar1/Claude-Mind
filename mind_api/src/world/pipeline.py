@@ -83,6 +83,8 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if flag(q, "counts"):
         meta_p = _meta_path(ctx)
+        from storage_backend import get_backend
+        get_backend().ensure_local(meta_p)  # own-cloud read-path fix: materialize S3-only file before local read
         if meta_p.exists():
             try:
                 meta = json.loads(meta_p.read_text(encoding="utf-8"))
@@ -102,6 +104,8 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if flag(q, "accuracy"):
         meta_p = _meta_path(ctx)
+        from storage_backend import get_backend
+        get_backend().ensure_local(meta_p)  # own-cloud read-path fix: materialize S3-only file before local read
         if meta_p.exists():
             try:
                 meta = json.loads(meta_p.read_text(encoding="utf-8"))
@@ -152,6 +156,8 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if flag(q, "meta"):
         meta_p = _meta_path(ctx)
+        from storage_backend import get_backend
+        get_backend().ensure_local(meta_p)  # own-cloud read-path fix: materialize S3-only file before local read
         if not meta_p.exists():
             return Response.text("{}", content_type="application/json")
         try:

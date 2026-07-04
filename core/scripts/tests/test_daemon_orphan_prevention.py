@@ -280,15 +280,29 @@ def test_sweep_strict_detects_and_clean_reaps_injected_orphan():
     # CROSS-REPO SAFETY: daemon-orphan-sweep.sh matches on cmdline
     # 'mind_api.src' alone — it cannot distinguish between daemons from
     # DIFFERENT repos (same cmdline, no cwd/env exposed via Win32_Process).
-    # If another repo's daemon is running concurrently, the sweep --clean
-    # invoked by this test would kill it (false-positive orphan). Skip the
-    # test rather than create cross-repo collateral.
+    # Skip only if a baseline pair is NOT in the sweep's keepset — meaning
+    # it belongs to another repo and --clean would kill it as a false-positive
+    # orphan.  Pairs fully inside the keepset are THIS repo's protected
+    # daemons; --clean will never touch them, so this test is safe to run.
     if baseline_pairs > 1:
-        pytest.skip(
-            f"multi-repo daemon environment detected ({baseline_pairs} pairs alive); "
-            f"daemon-orphan-sweep.sh is cross-repo dangerous — skipping to avoid "
-            f"killing daemons in other Ayoai-Mind / Zak-Data-Solutions-Mind / etc. repos"
-        )
+        ks_rc = _run_sweep(["--print-keepset"])
+        keepset_pids: set[int] = set()
+        for line in ks_rc.stdout.splitlines():
+            if line.startswith("KEEPSET_PIDS="):
+                raw = line.split("=", 1)[1].strip()
+                if raw:
+                    keepset_pids = {int(p) for p in raw.split(",") if p.strip().isdigit()}
+                break
+        unprotected = [
+            pair for pair in counts_before["pairs"]
+            if not (pair[0] in keepset_pids and pair[1] in keepset_pids)
+        ]
+        if unprotected:
+            pytest.skip(
+                f"multi-repo daemon environment: {len(unprotected)} unprotected pair(s) "
+                f"alive ({unprotected}); --clean would kill them — skipping to avoid "
+                f"cross-repo collateral"
+            )
 
     # Inject a real orphan: long-lived python whose CommandLine contains
     # the literal 'mind_api.src' substring (with the dot — that's what the

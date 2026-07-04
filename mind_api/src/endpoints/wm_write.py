@@ -127,8 +127,8 @@ def _write_wm(path: Path, data: dict) -> None:
     S3 directly. Excluded from the #38 own-cloud RMW conflict-retry on purpose
     (audited 2026-06-02):
 
-      1. Per-agent single-writer. MACHINE_OWNED_AGENTS pins each agent to one
-         machine and _wm_lock() serialises that machine's own threads, so there
+      1. Per-agent single-writer. The live DDB runner claim pins each agent to
+         one machine and _wm_lock() serialises that machine's own threads, so there
          is no concurrent multi-machine writer to conflict with. #38's
          conflict-retry targets SHARED world/meta files written by every agent;
          working memory is not one of them.
@@ -261,6 +261,8 @@ def _validate_knowledge_debt_entry(ctx, item) -> None:
         raise ValueError(
             f"knowledge_debt node_key must be non-empty string or null, got {node_key!r}")
     tree_path = _tree_path(ctx)
+    from storage_backend import get_backend
+    get_backend().ensure_local(tree_path)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     try:
         with open(tree_path, encoding="utf-8") as f:
             tree = yaml.safe_load(f) or {}

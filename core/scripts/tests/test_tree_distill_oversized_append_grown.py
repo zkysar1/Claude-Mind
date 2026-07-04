@@ -115,6 +115,30 @@ class TestCrit3GetDistillCandidates(unittest.TestCase):
         self.assertGreaterEqual(cands["sweep-node"]["refresh_sections"], 4)
         self.assertGreaterEqual(cands["sweep-node"]["est_tokens"], 20000)
 
+    def test_oversized_append_grown_fires_even_when_distill_exempt(self):
+        # 0: maintain_exempt:["distill"] suppresses the UTILITY triggers
+        # (crit1/crit2) but NOT the STRUCTURAL crit3 -- a coherent node too big to
+        # Read must still get the non-destructive rollup. Same oversized fixture as
+        # the test above, now distill-exempt: it MUST still surface as a candidate.
+        body = "## Refresh 2026-06-21\n" * 4 + ("payload line of sweep text\n" * 4000)
+        path = self._write_tmp(body)
+        tree = {"nodes": {"sweep-node": self._node(
+            file=path, retrieval_count=50, utility_ratio=0.95,
+            times_helpful=10, times_noise=0, maintain_exempt=["distill"])}}
+        cands = {c["key"]: c for c in tree_engine.get_distill_candidates(tree)}
+        self.assertIn("sweep-node", cands)  # crit3 fires despite the exemption
+        self.assertEqual(cands["sweep-node"]["trigger"], "oversized_append_grown")
+
+    def test_distill_exempt_suppresses_low_utility_crit1(self):
+        # The complement: a low-utility node (crit1) WITH the distill exemption is
+        # NOT a candidate -- the over-flag fix. No oversized body, so only crit1
+        # could fire, and the exemption clears it.
+        tree = {"nodes": {"niche-node": self._node(
+            file="", retrieval_count=10, utility_ratio=0.1,
+            times_helpful=1, times_noise=0, maintain_exempt=["distill"])}}
+        cands = {c["key"]: c for c in tree_engine.get_distill_candidates(tree)}
+        self.assertNotIn("niche-node", cands)
+
     def test_oversized_without_refresh_not_crit3(self):
         # Huge but ZERO refresh headings + high utility / no feedback -> no crit.
         body = "## Section heading 2026-06-21\n" * 4 + ("plain payload text line\n" * 4000)

@@ -17,6 +17,30 @@ Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `verification`, `r
 
 ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
+## Formation-Quality Gate (move to a non-discovered stage)
+
+`pipeline-add.sh` accepts a skeletal record (only the base Required fields
+above), but `pipeline-move.sh` INTO a non-discovered stage (`active` /
+`resolved`) enforces `validate_formation_quality` (g-240-36), which is
+STRICTER than the add-time schema. Populate these BEFORE the move or it is
+rejected with `formation_quality_failed`:
+
+- **`claim` >=20 chars** — required for ANY non-discovered stage; the testable
+  assertion. (Discovered stage is exempt when `claim` is absent — it falls back
+  to `title` — but a present-yet-<20-char `claim` is rejected even at discovered.)
+- **`resolves_by` + a resolution method** — short/long-horizon records must name
+  a resolution date (`resolves_by`) AND >=10 chars in one of
+  `resolution_criteria` / `resolution_method` / `rationale` (HOW the outcome gets
+  decided). Micro/session horizons are exempt (implicit self-check).
+- **`measurement_channel` >=5 chars** — short-horizon `active` records must name
+  the artifact/log/script/metric that settles the prediction (or
+  `verification_channel` / `resolution_source`). Long-horizon exempt (external
+  events); discovered exempt (still drafting).
+
+Include these in the INITIAL `pipeline-add.sh` payload to avoid the
+add-clean-then-move-rejected round-trip. Source of truth:
+`core/scripts/pipeline.py::validate_formation_quality`. (rb-2609)
+
 ## Script-Based Access (Exclusive Data Layer)
 The LLM NEVER reads or edits pipeline JSONL files directly. All operations go through scripts:
 

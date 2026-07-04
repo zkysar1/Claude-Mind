@@ -319,10 +319,10 @@ Beliefs: {count} active
  (clean streak state, IDLE session, or first iteration). Otherwise render:
    top3 = top 3 per_goal entries by value desc where value > 0, joined as "{gid}={n}"
    ratio = f"{total_routine}/{len(goals_completed)} routine" if goals_completed else f"{total_routine} routine"
-   IF global >= 6:
-     "Boredom: ⚠ routine_streak_global={global} (auto-deep at 8) | per-goal: {top3 or 'none'} | session: {ratio} — pattern-matching risk"
+   IF global >= 4:
+     "Boredom: ⚠ routine_streak_global={global} (auto-deep at 5) | per-goal: {top3 or 'none'} | session: {ratio} — pattern-matching risk"
    ELIF global > 0 OR top3:
-     "Boredom: routine_streak_global={global} (auto-deep at 8) | per-goal: {top3 or 'none'} | session: {ratio}"
+     "Boredom: routine_streak_global={global} (auto-deep at 5) | per-goal: {top3 or 'none'} | session: {ratio}"
 }
 Partner ({partner-name}): {if in_flight: "in_flight {goal_id} '{title[:40]}' phase={phase} ({Nm/h} ago)" else: "no in_flight"} | last_active {Nm/h ago}
 {Pending encodings (cross-agent) — OMIT entire block when pending_encodings is empty.

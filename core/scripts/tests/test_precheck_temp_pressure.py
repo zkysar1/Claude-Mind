@@ -36,8 +36,9 @@ class _Args:
     pass
 
 
-def _seed_temp(tmp_path, n_flat, n_drained=0):
-    """Create tmp_path/temp/ with n_flat working docs + n_drained in drained/."""
+def _seed_temp(tmp_path, n_flat, n_drained=0, n_ephemera=0):
+    """Create tmp_path/temp/ with n_flat working docs (.md) + n_drained in
+    drained/ + n_ephemera pure-ephemera .log/.txt files in temp/ root."""
     temp = tmp_path / "temp"
     temp.mkdir(parents=True, exist_ok=True)
     for i in range(n_flat):
@@ -46,6 +47,10 @@ def _seed_temp(tmp_path, n_flat, n_drained=0):
         (temp / "drained").mkdir(exist_ok=True)
         for i in range(n_drained):
             (temp / "drained" / f"old-{i:02d}.md").write_text("drained", encoding="utf-8")
+    for i in range(n_ephemera):
+        # alternate .log / .txt so both ephemera suffixes are exercised
+        suffix = ".log" if i % 2 == 0 else ".txt"
+        (temp / f"suite-{i:02d}{suffix}").write_text("ephemera", encoding="utf-8")
     return temp
 
 
@@ -53,8 +58,8 @@ def _compact(goals=None):
     return {"aspirations": [{"id": "asp-001", "status": "active", "goals": goals or []}]}
 
 
-def _run(tmp_path, monkeypatch, n_flat, n_drained=0, goals=None):
-    _seed_temp(tmp_path, n_flat, n_drained)
+def _run(tmp_path, monkeypatch, n_flat, n_drained=0, goals=None, n_ephemera=0):
+    _seed_temp(tmp_path, n_flat, n_drained, n_ephemera)
     monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
     return pe.cmd_temp_pressure(_Args(), CONFIG, _compact(goals))
 
@@ -133,6 +138,75 @@ def test_temp_pressure_missing_config_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
     with pytest.raises(KeyError):
         pe.cmd_temp_pressure(_Args(), {}, _compact())
+
+
+# ── Pure-ephemera (.log/.txt) counting (7) ───────────────────────
+# Pre-fix, .log/.txt files were invisible to BOTH the drain glob and this
+# metric, so ephemera-only accumulation emitted NO flag and grew unbounded.
+# The metric now counts ephemera separately and folds it into the combined
+# pressure that drives the threshold flags.
+
+def test_temp_pressure_ephemera_counted_separately(tmp_path, monkeypatch):
+    # 3 docs + 4 ephemera -> count=3, ephemera_count=4, pressure_count=7,
+    # below warn(10) so no flag; the two counts are NOT conflated.
+    r = _run(tmp_path, monkeypatch, n_flat=3, n_ephemera=4)
+    assert r["count"] == 3
+    assert r["ephemera_count"] == 4
+    assert r["pressure_count"] == 7
+    assert r["flags"] == []
+
+
+def test_temp_pressure_ephemera_only_triggers_warn(tmp_path, monkeypatch):
+    # 0 docs + 12 ephemera -> pressure_count=12 >= warn(10) -> temp_pressure_warn.
+    # This is the exact 7 bug: pre-fix, 12 invisible ephemera emitted
+    # NO flag; now they are seen.
+    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=12)
+    assert r["count"] == 0 and r["ephemera_count"] == 12
+    assert r["flags"] == ["temp_pressure_warn"]
+    assert r["suggested_goal"] is None
+
+
+def test_temp_pressure_ephemera_only_triggers_drain(tmp_path, monkeypatch):
+    # 0 docs + 20 ephemera -> pressure_count=20 >= drain(20) -> temp_drain_needed;
+    # the suggested goal names the ephemera purge.
+    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=20)
+    assert r["count"] == 0 and r["ephemera_count"] == 20
+    assert r["flags"] == ["temp_drain_needed"]
+    g = r["suggested_goal"]
+    assert g is not None and g["priority"] == "HIGH"
+    assert g["participants"] == ["agent"]          # capability-routing: agent, not user
+    assert "purge" in g["title"].lower() and "20" in g["title"]
+
+
+def test_temp_pressure_docs_plus_ephemera_combined(tmp_path, monkeypatch):
+    # 15 docs + 6 ephemera: neither alone crosses drain(20), combined
+    # pressure_count=21 does -> temp_drain_needed. The goal names both the
+    # drain (15 docs) and the purge (6 ephemera).
+    r = _run(tmp_path, monkeypatch, n_flat=15, n_ephemera=6)
+    assert r["count"] == 15 and r["ephemera_count"] == 6 and r["pressure_count"] == 21
+    assert r["flags"] == ["temp_drain_needed"]
+    g = r["suggested_goal"]
+    assert "drain 15" in g["title"] and "purge 6" in g["title"].lower()
+
+
+def test_temp_pressure_ephemera_clean_when_zero(tmp_path, monkeypatch):
+    # No docs, no ephemera -> clean.
+    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=0)
+    assert r["count"] == 0 and r["ephemera_count"] == 0 and r["pressure_count"] == 0
+    assert r["summary"] == "temp-pressure: clean"
+    assert r["flags"] == []
+
+
+def test_temp_pressure_ephemera_dedup_existing_goal(tmp_path, monkeypatch):
+    # ephemera pushes combined pressure over drain BUT an open drain goal exists
+    # -> temp_drain_pending, no second goal filed.
+    goals = [{"id": "g-001-99", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs"}]
+    r = _run(tmp_path, monkeypatch, n_flat=10, n_ephemera=12, goals=goals)
+    assert r["pressure_count"] == 22
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["existing_drain_goal"] == "g-001-99"
+    assert r["suggested_goal"] is None
 
 
 if __name__ == "__main__":

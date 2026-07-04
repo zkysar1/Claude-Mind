@@ -201,28 +201,25 @@ def cmd_own_cloud(args):
         # exit non-zero so callers know it is not yet ready.
 
     agents = [a for a in (args.agents or args.owned_agents or "").replace(",", " ").split() if a]
-    agents_str = ",".join(agents) if agents else "<the agents this machine should hand off>"
+    agents_str = ",".join(agents) if agents else "<agent>"
 
     print("")
     print("=== destination bring-up checklist (run on the NEW machine) ===")
     print(f"1. git clone <origin-url>            # brings core/, .claude/, and tracked agents/")
-    print(f"2. py -3 -m pip install -r requirements.txt   # PyYAML + psutil (the deps that ship)")
-    print(f"     py -3 -m pip install boto3               # own-cloud S3 SDK -- NOT yet in requirements.txt (g-115-1334)")
-    print(f"     # easily-missed: a fresh clone has neither; the own-cloud daemon will not start without boto3")
+    print(f"2. py -3 -m pip install -r mind_api/requirements-owncloud.txt  # boto3 + base deps")
+    print(f"     # the own-cloud daemon will not start without boto3")
     print(f"3. create .env.local from .env.example with:")
     print(f"     STORAGE_BACKEND=own-cloud")
     print(f"     ENVIRONMENT_ID=<same as source>            # shared world")
     print(f"     MACHINE_ID=<DISTINCT per-machine id>   # MUST differ from source (G5 fail-closed)")
-    print(f"     MACHINE_OWNED_AGENTS={agents_str}")
     print(f"     STORAGE_S3_BUCKET / STORAGE_DDB_LOCK_TABLE / STORAGE_DDB_SESSIONS_TABLE  # same as source")
     print(f"     MIND_AWS_ACCESS_KEY_ID / MIND_AWS_SECRET_ACCESS_KEY  # the scoped least-privilege keys")
     print(f"     AWS_DEFAULT_REGION=<region>")
-    print(f"     # optional first-boot safety: OWNCLOUD_SYNC_DISABLE=1")
     print(f"4. point each moved agent's local-paths.conf at FRESH empty WORLD_PATH/META_PATH")
     print(f"     (cache populates from S3 on read; /start writes a default if absent)")
-    print(f"5. /start <agent>                    # Phase A-0 detects the clone and resumes it")
-    print(f"6. ON THIS (source) machine: drop {agents_str} from MACHINE_OWNED_AGENTS, /stop them,")
-    print(f"     restart the daemon — never run the same agent on two machines at once")
+    print(f"5. ON THIS (source) machine: /stop {agents_str}  # flushes to S3 + releases DDB claim")
+    print(f"6. /start {agents_str}               # Phase A-0 detects the clone and resumes it")
+    print(f"     # Dynamic ownership: DDB claim IS the ownership signal. No env edits needed.")
     print("")
     print("Next (this machine): the skill flushes continuity to S3 (owncloud-flush.sh) "
           "so the destination picks up your latest handoff/working-memory on first read.")

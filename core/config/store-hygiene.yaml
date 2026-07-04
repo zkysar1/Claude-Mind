@@ -121,9 +121,16 @@ stores:
   # (recoverable); counts sum, no loss/dup; 4 pre-existing corrupt lines dropped
   # from the live window. rotate is archive-FIRST + front-equality
   # (jsonl_hygiene.py:404-417) so concurrent all-agent appends are preserved.
-  # NOTE: rotating this HOT store (every locked world write appends) may surface a
-  # transient Phase-2 lock error even when the writes land -- verify on-disk line
-  # counts, not the error report (the apply that landed this reduction did so).
+  # NOTE: rotating this HOT store (every locked world write appends) PREVIOUSLY
+  # surfaced a "transient Phase-2 lock error" -- that was the append_changelog
+  # self-deadlock: locked_modify_jsonl holds base_dir/changelog.lock across its RMW
+  # then calls append_changelog(path) post-write, which re-acquired the SAME
+  # non-reentrant lock when path==changelog.jsonl (10s acquire_lock timeout, cap
+  # never persisted). FIXED in 1 via an early-return in append_changelog
+  # (core/scripts/_fileops.py) that skips logging a changelog edit into the
+  # changelog itself -- single-source fix for all 7 lock-holding call sites + this
+  # rotate path. Cap/rotate on a changelog store no longer deadlocks (live-verified
+  # 2026-07-04: world 24189->20000, meta 11970->10000, live_lock_attempts:1).
   - path: world/changelog.jsonl
     enabled: true
     mode: rotate
@@ -131,10 +138,23 @@ stores:
     max_lines: 20000
     owner_goal: g-333-06
 
-  # ── G7 (): cap/stop read-never meta/changelog.jsonl ────────────────
-  # Meta-write audit trail; per the goal it is read-never -> cap.
+  # ── G7 (): cap/stop read-never meta/changelog.jsonl + history-save-telemetry.jsonl ──
+  # Meta-write audit trail; read-never -> cap.
+  # refresh_would_clobber guard (, owncloud_sync._EXCLUDE_NAMES) protects
+  # both files from backend clobber during _snapshot. Enabled 2026-06-29 after
+  # confirming 4 +  both complete and guard in codebase.
   - path: meta/changelog.jsonl
-    enabled: false
+    enabled: true
+    mode: cap
+    by: lines
+    max_lines: 10000
+    owner_goal: g-333-07
+
+  # Meta file-history save telemetry; written by _record_history_save_telemetry
+  # in _fileops.py. No reader confirmed (grepped core/scripts, mind_api, .claude).
+  # Also in owncloud_sync._EXCLUDE_NAMES -> refresh_would_clobber returns True.
+  - path: meta/history-save-telemetry.jsonl
+    enabled: true
     mode: cap
     by: lines
     max_lines: 10000

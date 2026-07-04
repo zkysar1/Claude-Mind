@@ -84,6 +84,8 @@ def _path(ctx) -> Path:
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     """Mirror meta-dead-ends.py:read_all (line 33) — strip + json.loads each
     non-empty line, no lock."""
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items

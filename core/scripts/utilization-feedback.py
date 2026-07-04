@@ -56,25 +56,6 @@ TREE_PATH = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
 SESSION_PATH = AGENT_DIR / "session" / "retrieval-session.json" if AGENT_DIR else None
 
 
-def read_yaml(path):
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with open(p, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
-
-
-def write_yaml(path, data):
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(p) + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=None, sort_keys=False,
-                  allow_unicode=True, width=200)
-    os.replace(str(tmp), str(p))
-
-
 def now_str():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -122,45 +103,60 @@ def _clear_legacy_backstop_noise(node):
 def update_tree_nodes(helpful_keys, noise_keys, inferred_helpful_keys=None):
     """Increment times_helpful/times_noise/times_inferred_helpful and recompute
     utility_ratio atomically. `inferred_helpful_keys` carries --infer hits, which
-    increment the half-weight counter instead of the authoritative one."""
+    increment the half-weight counter instead of the authoritative one.
+
+    guard-366: the read->mutate->write runs through _fileops.locked_modify_yaml,
+    which holds the lock across the ENTIRE cycle. This (a) closes the lost-update
+    race where two agents read the same _tree.yaml baseline and the second writer
+    clobbers the first, and (b) replaces the prior bare tempfile + os.replace
+    write that raised PermissionError (WinError 5) under OneDrive / partner-agent
+    contention (observed g-115-18 close 2026-06-29, which forced the
+    --all-unknown backstop). locked_modify_yaml's CSafeDumper output matches the
+    on-disk _tree.yaml format the rest of tree.py's mechanical ops write, so this
+    also retires the width=200 reformat churn the old write_yaml caused on every
+    successful write, and routes the mutation through the history + changelog
+    path it previously bypassed.
+    """
+    from _fileops import locked_modify_yaml
+
     inferred_helpful_keys = inferred_helpful_keys or []
     if not TREE_PATH.exists():
         return 0, 0, 0
+    # Nothing to apply -> skip the locked write entirely. locked_modify_yaml
+    # always writes once entered, so the original "only write when a counter
+    # moved" guard is preserved here by not entering on an empty key set.
+    if not (helpful_keys or inferred_helpful_keys or noise_keys):
+        return 0, 0, 0
 
-    tree = read_yaml(TREE_PATH)
-    nodes = tree.get("nodes", {})
-    h_count = 0
-    n_count = 0
-    ih_count = 0
+    counts = {"h": 0, "n": 0, "ih": 0}
 
-    for key in helpful_keys:
-        if key in nodes:
-            node = nodes[key]
-            node["times_helpful"] = node.get("times_helpful", 0) + 1
-            _clear_legacy_backstop_noise(node)
-            _recompute_utility_ratio(node)
-            h_count += 1
+    def _apply(tree):
+        nodes = tree.get("nodes", {})
+        for key in helpful_keys:
+            if key in nodes:
+                node = nodes[key]
+                node["times_helpful"] = node.get("times_helpful", 0) + 1
+                _clear_legacy_backstop_noise(node)
+                _recompute_utility_ratio(node)
+                counts["h"] += 1
+        for key in inferred_helpful_keys:
+            if key in nodes:
+                node = nodes[key]
+                node["times_inferred_helpful"] = node.get("times_inferred_helpful", 0) + 1
+                _clear_legacy_backstop_noise(node)
+                _recompute_utility_ratio(node)
+                counts["ih"] += 1
+        for key in noise_keys:
+            if key in nodes:
+                node = nodes[key]
+                node["times_noise"] = node.get("times_noise", 0) + 1
+                _mark_legacy_backstop_noise(node)
+                _recompute_utility_ratio(node)
+                counts["n"] += 1
+        return tree
 
-    for key in inferred_helpful_keys:
-        if key in nodes:
-            node = nodes[key]
-            node["times_inferred_helpful"] = node.get("times_inferred_helpful", 0) + 1
-            _clear_legacy_backstop_noise(node)
-            _recompute_utility_ratio(node)
-            ih_count += 1
-
-    for key in noise_keys:
-        if key in nodes:
-            node = nodes[key]
-            node["times_noise"] = node.get("times_noise", 0) + 1
-            _mark_legacy_backstop_noise(node)
-            _recompute_utility_ratio(node)
-            n_count += 1
-
-    if h_count > 0 or n_count > 0 or ih_count > 0:
-        write_yaml(TREE_PATH, tree)
-
-    return h_count, n_count, ih_count
+    locked_modify_yaml(TREE_PATH, _apply)
+    return counts["h"], counts["n"], counts["ih"]
 
 
 # ---------------------------------------------------------------------------
