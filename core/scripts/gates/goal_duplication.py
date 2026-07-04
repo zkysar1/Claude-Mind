@@ -98,6 +98,20 @@ _STOPWORDS = {
     # still block. Token shape ([-_0-9]) remains the discriminator, not generic
     # prose vocab. Expand this set as new generic-token FP classes surface.
     "exists", "global", "populated", "recurring", "class", "close",
+    # 6: generic English VERBS/adverbs (not structural vocab) that
+    # recur across unrelated framework-finding goals and are poor duplicate
+    # discriminators. Session-93 ground truth: the gate false-blocked FIVE
+    # legitimate goals on these (5 vs , 7 vs
+    # , 6, , drain-temp — all override-cleared, see
+    # world/goal-duplication-overrides.jsonl). "re-run" is doubly bad: its
+    # hyphen matched the has_specific co-signal (re.search(r"[-_0-9]") in
+    # _check_recent_completions), turning a ZERO-file-path generic-verb overlap
+    # into a HARD block. Demoting all of them removes the inflation; a genuine
+    # duplicate still needs a structural co-signal ([-_0-9] identifier or
+    # file-path), which these plain words never carry.
+    "cause", "caused", "causes", "confirm", "confirmed", "confirms",
+    "every", "harden", "hardened", "hardening", "rerun", "re-run",
+    "finding", "findings",
 }
 
 
@@ -131,6 +145,32 @@ _GENERIC_BARE_ORIGINS = frozenset(
 # Strategy 2 (structural keyword/file overlap). 6; canonical incidents
 #  vs  and 2 (each needed --override-duplication).
 _SIBLING_SHARED_ORIGIN_PREFIXES = ("decomposition:",)
+
+
+def _is_directive_routing_goal(goal: dict) -> bool:
+    """A directive/handoff goal that ROUTES work to a target agent. Its
+    description necessarily RECAPS that agent's domain work (keyword-dense), so
+    it structurally matches the target's COMPLETED goals in recent_completions
+    — a false-positive duplicate signal, NOT real duplicate work. The FP
+    DROPPED a Bravo handoff from the durable queue (g-115-23, directive
+    substance lost) and forced --override-duplication on an echo ARC directive
+    (g-115-1538). See rb-2462 / g-115-1674.
+
+    Two signals (per the goal spec): a user directive — the bare-tag
+    origin_signal "user_directive" (the only standalone directive origin in
+    gates.origin_signal.ALLOWED_PREFIXES) — OR a cross-agent handoff
+    (handoff_to set). ONLY _check_recent_completions consults this: the other
+    five checks (pending_queue, partner_in_flight, git_log, target_state,
+    insight_triggers) still run, so a TRUE duplicate directive (already
+    pending / in-flight / implemented) is still caught.
+    """
+    origin = (goal.get("origin_signal") or "").strip()
+    if origin == "user_directive":
+        return True
+    handoff_to = goal.get("handoff_to")
+    if handoff_to and str(handoff_to).strip():
+        return True
+    return False
 
 
 # --- Signal extraction -------------------------------------------------------
@@ -251,6 +291,21 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
     """N-agent correct: filters `completed_by != self_agent`. Scales to any
     N>=1 without config change. DO NOT add a `partner` param or peer-list
     lookup."""
+    # 4: directive/handoff-routing goals are EXEMPT from this
+    # keyword-overlap-vs-COMPLETED check (see _is_directive_routing_goal — the
+    # FP class that dropped  and forced --override on 8;
+    # rb-2462). Scoped to THIS check only; the other five still run, so a TRUE
+    # duplicate directive (already pending / in-flight / implemented) is still
+    # caught. Placed before the world_dir read: a directive is exempt regardless.
+    if _is_directive_routing_goal(goal):
+        return {
+            "name": "recent_completions",
+            "passed": True,
+            "reason": ("skipped (directive/handoff-routing goal — description "
+                       "recaps target-agent domain work; completed-overlap is a "
+                       "structural false positive, g-115-1674)"),
+            "matches": [],
+        }
     if world_dir is None:
         return {
             "name": "recent_completions",

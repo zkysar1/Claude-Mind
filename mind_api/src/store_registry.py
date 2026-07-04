@@ -514,6 +514,15 @@ def _rb_inject_source_goal(ctx, rec):
     if not agent_name:
         return
     path = ctx.paths.world / "team-state.yaml"
+    # own-cloud read-path fix (2026-07-02): materialize an S3-only team-state on
+    # a fresh box before the exists() gate, else source_goal injection silently
+    # no-ops. Best-effort (this whole helper is caller-wins enrichment); no-op on
+    # LocalBackend and for out-of-root paths (keystone).
+    try:
+        from storage_backend import get_backend
+        get_backend().ensure_local(path)
+    except Exception:
+        pass
     if not path.exists():
         return
     try:

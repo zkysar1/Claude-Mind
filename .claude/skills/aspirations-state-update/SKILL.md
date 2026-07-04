@@ -841,7 +841,7 @@ Bash: bash core/scripts/meta-backpressure.sh evolution-check
 
 # ── Skip conditions (fail-closed; default is NO push) ──
 IF outcome_class == "routine":
-    SKIP silent  # routine outcomes already degate via Part A's auto-deep at 8
+    SKIP silent  # routine outcomes already degate via Part A's auto-deep at 5
 IF NOT goal_succeeded:
     SKIP silent  # failures route via CREATE_BLOCKER → /notify-user category=blocker
 IF goal.category == "blocker" OR goal.title starts with "Blocker:":

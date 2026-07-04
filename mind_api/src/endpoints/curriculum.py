@@ -92,7 +92,9 @@ def _paths(ctx):
 # ---------------------------------------------------------------------------
 
 def _read_yaml(path):
+    from storage_backend import get_backend
     p = Path(path)
+    get_backend().ensure_local(p)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not p.exists():
         return {}
     with open(p, "r", encoding="utf-8") as f:
@@ -111,7 +113,9 @@ def _write_yaml(path, data):
 
 
 def _read_jsonl(path):
+    from storage_backend import get_backend
     p = Path(path)
+    get_backend().ensure_local(p)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not p.exists():
         return []
     items = []

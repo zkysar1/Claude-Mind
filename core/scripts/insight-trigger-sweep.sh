@@ -15,6 +15,14 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
 
+#  fix (rb-2702 own-cloud-latency class): own-cloud add-goal writes
+# exceed the default RT_CURL_TIMEOUT=30s (the daemon POST to the network-backed
+# world/agent aspirations.jsonl is slow), so a sweep run that HAS triggers to
+# file times out mid-batch (TimeoutError at _rt.rt_call -> exit 1, the whole
+# sweep fails). Raise the default to 180s for this write-heavy sweep; an
+# explicit caller-set RT_CURL_TIMEOUT still wins via the :- default.
+export RT_CURL_TIMEOUT="${RT_CURL_TIMEOUT:-180}"
+
 #  fix: under Git Bash on Windows, $(cd ... && pwd) returns POSIX
 # form /c/... Windows python3 misinterprets that as drive C: with a literal
 # subdir c/, yielding FileNotFoundError on C:\c\...\insight-trigger-sweep.py.

@@ -241,7 +241,7 @@ def test_runner_claims_scan_accessdenied_returns_actionable_hint(monkeypatch):
 
     class _Ctx:
         paths = _Paths()
-        headers = {"x-ayoai-agent": "alpha"}
+        headers = {"x-mind-agent": "alpha"}
 
     resp = runner_claims(_Ctx())
     assert resp.status == 500

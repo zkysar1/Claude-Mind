@@ -122,6 +122,24 @@ cases are the direct Q5 evidence (Skill batched after the arm, loop continued);
 the 21 split cases independently prove re-entry even when not batched. The
 fail-safe path below was never exercised because re-entry never failed.
 
+**Echo-harness extension (g-115-1672, 2026-06-27, zeta).** A prior-window echo
+observation claimed "emitting [ScheduleWakeup, Skill] stalled -- Skill never
+fired, stop-hook bounced," raising whether echo's harness differs. REFUTED on
+three independent signals: (1) echo's OWN aspirations re-entry cadence on
+2026-06-27 shows gaps of 2.5 / 7.0 / 7.7 min between consecutive
+Skill(aspirations) invocations -- all FAR under the 600s wakeup interval, which
+is ONLY reachable by Skill-driven re-entry (the wakeup cannot fire faster than
+600s and is re-armed forward each iteration), so echo's Skill re-entry IS
+firing; (2) echo runs with deadman ON (no agents/echo/session/deadman-disabled
+flag) and is alive (21 aspirations invocations across 2026-06-27); (3) a live
+zeta first-hand reproduction this same iteration -- ScheduleWakeup returned its
+expected turn-terminal "Nothing more to do this turn" message, and the
+Skill(aspirations) emitted AFTER it STILL fired and re-entered the loop. The
+prior echo claim was a MISREAD of that benign "Nothing more to do this turn"
+message (F2's expected text), not a confirmed harness difference. Q5 now holds
+across THREE harnesses (charlie, echo, zeta). Action: do NOT set
+agents/echo/session/deadman-disabled.
+
 Fail-safe property: if Q5 turns out false (Skill does NOT re-enter after the
 arm), the terminal response's wakeup still fires after 600s and resurrects the
 loop via the sentinel — so the loop runs at 600s/iteration (slow) but stays

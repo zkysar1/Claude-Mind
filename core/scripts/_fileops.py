@@ -30,7 +30,7 @@ from _path_helpers import looks_like_cruft
 # different backend without rewriting any caller. storage_backend imports only
 # stdlib, so there is no import cycle. Behavior is byte-identical when the
 # backend is "local" (the default); see core/scripts/tests/test_storage_backend.py.
-from storage_backend import get_backend
+from storage_backend import get_backend, LocalBackend
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,54 @@ class PostWriteValidationError(Exception):
 # File Locking
 # ---------------------------------------------------------------------------
 
+# Env-absent local-lock fallback state ( / rb-2764). Warn once per
+# process on the fallback path so a genuinely misconfigured box stays
+# observable (communication-clarity.md rule 5) without per-lock stderr spam.
+_LOCK_FALLBACK_WARNED = False
+
+
+def _lock_backend():
+    """Return the backend for a LOCK op, with a local-file fallback for the
+    bare-subprocess-on-own-cloud case (g-334-03 / rb-2764).
+
+    On an own-cloud box ``STORAGE_BACKEND=own-cloud`` is ambient in every
+    subprocess, but ``WORLD_PATH``/``META_PATH`` are exported only by *sourcing*
+    ``_paths.sh``. A bare ``py -3 core/scripts/X.py`` subprocess therefore
+    selects the own-cloud backend, yet ``OwnCloudBackend.from_env()`` cannot
+    resolve a governed root and raises. When exactly that condition holds
+    (own-cloud requested AND no governed root resolvable from the env) the ONLY
+    lock that could have been requested is a LOCAL path — a governed path is
+    unconstructible without the root env — so a local file lock is always
+    correct, and strictly better than the prior behavior (the raise propagated
+    and the caller skipped its whole read-modify-write; e.g.
+    ``loop-state-bump-counters --reset-alignment`` / ``--evolution-fired``
+    silently no-op'd their counter writes on every own-cloud box).
+
+    Sourced wrappers (env present) keep the distributed DDB lock — own-cloud
+    governed-path mutual exclusion is unchanged. Match the CONDITION, never the
+    exception message: any ``from_env`` failure with the governed root PRESENT
+    (missing bucket/table/creds) is a real misconfiguration and is re-raised.
+    """
+    global _LOCK_FALLBACK_WARNED
+    try:
+        return get_backend()
+    except RuntimeError:
+        kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+        governed_root_absent = not (os.environ.get("MIND_WORLD")
+                                    or os.environ.get("WORLD_PATH")
+                                    or os.environ.get("MIND_META")
+                                    or os.environ.get("META_PATH"))
+        if kind == "own-cloud" and governed_root_absent:
+            if not _LOCK_FALLBACK_WARNED:
+                print("[_fileops] STORAGE_BACKEND=own-cloud but no governed root "
+                      "in env (bare subprocess) — using a LOCAL file lock for "
+                      "this process; sourced wrappers keep the DDB lock. "
+                      "(g-334-03)", file=sys.stderr)
+                _LOCK_FALLBACK_WARNED = True
+            return LocalBackend()
+        raise
+
+
 def acquire_lock(lock_path, timeout=10, stale_seconds=30):
     """Acquire a file lock using atomic create. Breaks stale locks > stale_seconds (default 30s).
 
@@ -79,13 +127,13 @@ def acquire_lock(lock_path, timeout=10, stale_seconds=30):
     # create (never exists()+write — TOCTOU), the FileExistsError/PermissionError
     # POSIX-vs-Windows handling, and the stale-break all live there now.
     # Signature + semantics are unchanged for the 100+ callers of this function.
-    get_backend().acquire_lock(lock_path, timeout=timeout,
-                               stale_seconds=stale_seconds)
+    _lock_backend().acquire_lock(lock_path, timeout=timeout,
+                                 stale_seconds=stale_seconds)
 
 
 def release_lock(lock_path):
     """Release a file lock."""
-    get_backend().release_lock(lock_path)
+    _lock_backend().release_lock(lock_path)
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +589,26 @@ def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_
         return
 
     changelog = base_dir / "changelog.jsonl"
+
+    # 1: never log a changelog edit INTO the changelog itself. When
+    # file_path IS base_dir/changelog.jsonl this call is (a) self-referential
+    # noise a cap/rotate would immediately drop again, and (b) a hard self-
+    # deadlock when reached from any locked_* function: every
+    # locked_{modify,append,write}_jsonl holds path.with_suffix('.lock') across
+    # its RMW and then calls append_changelog(path) post-write (7 sites:
+    # L1299/1503/1645/1741/1821/1904/2025). For path==changelog.jsonl that held
+    # lock IS base_dir/changelog.lock, which this function re-acquires below —
+    # non-reentrant (locked_modify_jsonl docstring), so it blocks on itself
+    # until acquire_lock's 10s timeout and the cap never persists (store-hygiene
+    # cap on changelog.jsonl failed 4/4; meta stuck 11969>10000, world
+    # 24167>20000). Skipping the self-entry is the single-source fix for all
+    # call sites and the world/changelog rotate path. (rb-2736, guard-881, )
+    try:
+        _is_changelog_self = Path(file_path).resolve() == changelog.resolve()
+    except (OSError, ValueError):
+        _is_changelog_self = False
+    if _is_changelog_self:
+        return
 
     # Make file_path relative to base_dir for readability
     try:

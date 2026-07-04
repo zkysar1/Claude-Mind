@@ -231,6 +231,16 @@ def check_job(job):
         exit_code, output = run_completion_check(cmd)
         if exit_code == 0:
             result["status"] = "completed"
+        elif exit_code == 1:
+            # 1 = still running per run_completion_check's contract. Reached when
+            # the registered PID reads dead but the domain completion_check (the
+            # authoritative arbiter) reports the job alive -- e.g. a Windows/MSYS
+            # PID-namespace mismatch where the PID file holds an MSYS bash PID
+            # that WMI/os.kill cannot see (). Without this branch the
+            # "still running" signal fell through to "unknown", which MONITOR-
+            # style consumers treat like "failed" -- false-failing a healthy
+            # long-running job.
+            result["status"] = "running"
         elif exit_code == 2:
             result["status"] = "failed"
         else:

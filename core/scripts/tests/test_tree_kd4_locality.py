@@ -228,6 +228,43 @@ def test_decompose_exempt_skips_overflow(monkeypatch):
                for s in res["skipped"])
 
 
+def test_distill_exempt_skips_low_utility(monkeypatch):
+    # A low-utility leaf that WOULD be a crit1 distill candidate but is durably
+    # distill-exempt (coherence gate, guard-896 / 0) is NOT a candidate;
+    # its skip_reason is distill_exempt. A metric-identical non-exempt twin IS
+    # flagged -- proving the exemption is the only difference (the over-flag fix:
+    # low retrieval = niche value, not bloat). file="" => no crit2/crit3.
+    nodes = {"nodes": {
+        "coherent": {"depth": 2, "children": [], "file": "",
+                     "retrieval_count": 10, "times_helpful": 1, "times_noise": 0,
+                     "utility_ratio": 0.1, "maintain_exempt": ["distill"]},
+        "bloated":  {"depth": 2, "children": [], "file": "",
+                     "retrieval_count": 10, "times_helpful": 1, "times_noise": 0,
+                     "utility_ratio": 0.1},   # same metrics, NOT exempt
+    }}
+    res = tree.get_distill_candidates(nodes, include_skipped=True)
+    cand_keys = [c["key"] for c in res["candidates"]]
+    assert "coherent" not in cand_keys
+    assert "bloated" in cand_keys           # control: metric fires without exemption
+    assert any(s["node_key"] == "coherent" and s["skip_reason"] == "distill_exempt"
+               for s in res["skipped"])
+
+
+def test_distill_exempt_is_per_action(monkeypatch):
+    # distill-exempt must NOT exempt redistribute (per-action, not blanket) -- the
+    # symmetric guarantee to test_maintain_exempt_is_per_action below.
+    _patch_caps(monkeypatch, k_max=2)
+    nodes = {"nodes": {
+        "p": {"depth": 1, "children": ["a", "b", "c"], "file": "f",
+              "maintain_exempt": ["distill"]},      # exempt distill only
+        "a": {"depth": 2, "children": []},
+        "b": {"depth": 2, "children": []},
+        "c": {"depth": 2, "children": []},
+    }}
+    cands = tree.get_redistribute_candidates(nodes)
+    assert [c["key"] for c in cands] == ["p"]          # still a redistribute candidate
+
+
 def test_maintain_exempt_is_per_action(monkeypatch):
     # decompose-exempt must NOT exempt redistribute (per-action, not blanket).
     _patch_caps(monkeypatch, k_max=2)

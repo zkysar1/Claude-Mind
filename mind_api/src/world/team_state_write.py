@@ -313,6 +313,17 @@ def init(ctx) -> "Response":  # type: ignore[name-defined]
         return err
 
     ts_path = _ts_path(ctx)
+    # own-cloud read-path fix (2026-07-02): materialize an S3-only team-state on
+    # a fresh box BEFORE the exists() gate. Without it a fresh own-cloud box sees
+    # exists()==False and RE-CREATES team-state.yaml, clobbering the synced remote
+    # (and the CAS fence can't recover post-restart -> the write "deadlock" zeta
+    # flagged). No-op on LocalBackend / out-of-root (keystone); best-effort so
+    # init never crashes on a backend hiccup.
+    try:
+        from storage_backend import get_backend
+        get_backend().ensure_local(ts_path)
+    except Exception:
+        pass
     if ts_path.exists():
         return Response.json({"ok": True, "created": False,
                               "detail": "team-state.yaml already exists"})

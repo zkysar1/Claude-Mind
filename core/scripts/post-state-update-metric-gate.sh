@@ -261,6 +261,23 @@ case "$CATEGORY" in
 esac
 if [ -n "${WORLD_DIR:-}" ] && [ -n "$CANDIDATE_NODE_KEY" ]; then
   CANDIDATE_NODE_FILE="${WORLD_DIR}/knowledge/tree/${CANDIDATE_NODE_KEY}.md"
+  # 6: the category heuristic can name a node that does NOT exist
+  # (e.g. category "agent-health" -> agent-health.md, never created). A phantom
+  # candidate keeps the Phase 0-pre4 consumer stuck -- it cannot Edit a
+  # non-existent node, so encoding is skipped and the sentinel never clears
+  # (observed stuck 3 iterations). Verify existence: fall back to the L1 parent
+  # when the specific node is absent but its top-level ancestor exists, else
+  # blank the suggestion so the (advisory) consumer explicitly picks a real node.
+  if [ ! -f "$CANDIDATE_NODE_FILE" ]; then
+    PARENT_KEY="${CANDIDATE_NODE_KEY%/*}"
+    if [ "$PARENT_KEY" != "$CANDIDATE_NODE_KEY" ] && [ -f "${WORLD_DIR}/knowledge/tree/${PARENT_KEY}.md" ]; then
+      CANDIDATE_NODE_KEY="$PARENT_KEY"
+      CANDIDATE_NODE_FILE="${WORLD_DIR}/knowledge/tree/${PARENT_KEY}.md"
+    else
+      CANDIDATE_NODE_KEY=""
+      CANDIDATE_NODE_FILE=""
+    fi
+  fi
 fi
 
 # Fire -- sentinel will be written by caller (iteration-close.sh).

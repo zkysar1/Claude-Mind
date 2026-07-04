@@ -347,25 +347,23 @@ Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r
 #     continuity files are written: handoff (D4), working-memory (D4.5/D5),
 #     execution-diary, session-summary (D6.5). On a non-zero flush, RETRY ONCE
 #     (transient S3/contention errors clear on retry). The full-flush scope is
-#     UNCHANGED from pre-g-1339 (NOT narrowed to --agent) so static mode stays
-#     byte-identical — owncloud-flush.sh runs in BOTH modes, it is NOT
-#     OWNERSHIP_MODE-gated, so narrowing its scope would be a non-inert live
-#     change. (The per-agent `owncloud-flush.sh --agent <name>` scope IS built
-#     for the g-1340 §7 A-stop-B-move acceptance test; agents/<agent>/ is a
+#     the FULL owned-set (NOT narrowed to --agent) — owncloud-flush.sh is
+#     backend-agnostic (a no-op on the local backend, a real S3 push under
+#     own-cloud). (The per-agent `owncloud-flush.sh --agent <name>` scope exists
+#     for the §7 A-stop-B-move acceptance test; agents/<agent>/ is a
 #     subset of this full flush, so the §6 "flush the agent dir before release"
 #     invariant holds either way.)
 #   D6.8 RELEASE: clean RUNNING->IDLE release of the cross-machine DDB
-#     session-lock — INERT until cutover (runner-claim.sh no-ops exit 0 unless
-#     OWNERSHIP_MODE=dynamic, so static /stop is byte-identical). GATED on a
+#     session-lock. Under STORAGE_BACKEND=own-cloud the daemon does the real
+#     release; on any other backend runner-claim.sh no-ops (exit 0). GATED on a
 #     verified-clean flush: release runs ONLY if the flush (after one retry)
 #     succeeded. design §6: a failed-flush + release would strand INCOMPLETE S3
 #     state — the next machine that acquires would pull a partial agent dir. So
 #     on a persistent flush failure we SKIP the release; the claim stays RUNNING
 #     and expires via stale-lock-break (~OWNERSHIP_STALE_SECONDS) while the
-#     daemon's periodic sweep (120s) keeps retrying the flush. In static mode
-#     the release is a no-op regardless, so the gate is inert there; it bites
-#     only post-cutover. fail-open: the combined call always exits 0 — its rc
-#     cannot break D7's chain.
+#     daemon's periodic sweep (120s) keeps retrying the flush. On the local
+#     backend the release is a no-op regardless. fail-open: the combined call
+#     always exits 0 — its rc cannot break D7's chain.
 Bash: MIND_AGENT=<agent> bash -c '
   set +e
   bash core/scripts/owncloud-flush.sh; frc=$?

@@ -26,4 +26,21 @@ if [ "$CUR" != "$WANT" ]; then
     fi
 fi
 
+# Ensure the tracked hooks are executable in this working tree. core.hooksPath
+# points DIRECTLY at the tracked dir (not a copy in .git/hooks), so git uses the
+# working-tree exec bit to decide whether to run each hook — a non-exec bit makes
+# git SILENTLY SKIP the hook. Root cause of the 2026-05-15..2026-07-03 pre-commit
+# dormancy (): pre-commit was created at mode 100644 (3f93a4ef) and this
+# installer never ensured executability, so all 11 Layer-B gates were bypassed
+# fleet-wide for ~7 weeks. Idempotent (only chmods a non-exec hook) + fail-open
+# (a chmod hiccup must not block session start — guarded, never trips set -e).
+for _hook in pre-commit pre-push post-commit; do
+    _hp="$REPO_ROOT/core/githooks/$_hook"
+    if [ -f "$_hp" ] && [ ! -x "$_hp" ]; then
+        if chmod +x "$_hp" 2>/dev/null; then
+            echo "[install-git-hooks] restored +x on core/githooks/$_hook (was non-exec — git skips non-exec hooks)" >&2
+        fi
+    fi
+done
+
 exit 0

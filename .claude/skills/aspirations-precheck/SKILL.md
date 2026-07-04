@@ -183,15 +183,18 @@ top3       = sorted per_goal entries by value desc, keep value > 0, take 3
 per_goal_s = ", ".join(f"{gid}={n}" for gid,n in top3) or "none"
 ratio_s    = f"{total_rt}/{len(completed)} routine" if completed else f"{total_rt} routine"
 
-IF global >= 6:
-    # Near-threshold warning. Auto-deep flip at 8 is two iterations away.
+IF global >= 4:
+    # Near-threshold warning. global is capped in {0..4}: Block C flips
+    # outcome->deep AT routine_streak_global_ceiling=5 and resets to 0
+    # (recurring-loop-state-mutate.py), so the stored value never exceeds 4
+    # and global==4 means the NEXT routine close auto-deep-flips.
     # Bravo's complaint (2026-04-23): "When 7 routines stack up, I start
     # pattern-matching rather than reasoning." This surface makes the
     # counter visible BEFORE the flip, not silently after.
-    Output: "▸ ⚠ BOREDOM: routine_streak_global={global} (auto-deep at 8) | per-goal: {per_goal_s} | session: {ratio_s} — pattern-matching risk, deepen reasoning on next selection"
+    Output: "▸ ⚠ BOREDOM: routine_streak_global={global} (auto-deep at 5) | per-goal: {per_goal_s} | session: {ratio_s} — pattern-matching risk, deepen reasoning on next selection"
 ELSE:
     # Informational only — streak exists but below near-threshold.
-    Output: "▸ Boredom: routine_streak_global={global} (auto-deep at 8) | per-goal: {per_goal_s} | session: {ratio_s}"
+    Output: "▸ Boredom: routine_streak_global={global} (auto-deep at 5) | per-goal: {per_goal_s} | session: {ratio_s}"
 ```
 
 ## Phase 0-pre.0c: Stash Carryover Probe (g-115-1133)
@@ -258,22 +261,9 @@ IF signal is not null:
         # source=tree-debt-critical or missing (legacy/learning-gate path)
         Output: "▸ TREE-DEBT GATE: force_tree_maintain set (source={source}, count > threshold)"
         invoke /tree maintain --backlog
-    # Stamp the consumer-dispatch timestamp BEFORE clearing (g-115-1649).
-    # stale-sentinel-canary.py CONSUMPTION_AWARE keys force_tree_maintain on this
-    # slot — mirrors Phase 0-pre3's fresh_eyes_last_dispatch stamp (g-115-1553).
-    # Without it the canary reverts to bare presence-count and FALSE-fires for
-    # deep-close-heavy agents: the drift-gate re-arms force_tree_maintain at
-    # iteration-close (do_state_update) and the canary samples it SET at the same
-    # close (do_productivity_check), BEFORE this consumer clears it next
-    # iteration — so the sentinel reads "set" at sample time even though it is
-    # consumed every iteration (charlie/echo accumulated stuck-counts while the
-    # sentinel was null between iterations). The consumption-aware canary counts
-    # toward "stuck" ONLY while this dispatch timestamp stays FROZEN, so a
-    # genuinely-bypassed consumer still fires while a keeping-up one does not.
-    # Stamp on ANY handling (both the encoding-drift lightweight path and the
-    # heavy /tree maintain path — this line is after the IF/ELSE, before the
-    # clear) and stamp FIRST: an interrupt then leaves stamp-done +
-    # sentinel-still-set, which the canary reads as advanced -> reset (safe dir).
+    # Stamp consumer-dispatch timestamp BEFORE clearing — consumption-aware canary
+    # requires this; stamp FIRST so interrupts leave the safe direction.
+    # Rationale (WHY consumption-aware stamp): core/config/rationale/precheck-gates.md
     printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh force_tree_maintain_last_dispatch
     # Clear signal after handling (one-shot; next iteration's drift gate or
     # learning-gate re-sets if still indicated).
@@ -335,34 +325,18 @@ action → stamp `fresh_eyes_last_dispatch` → wm-set 'null'. The signal payloa
 the full gate JSON
 (`{"fired":true,"core_count":N,"loc_changed":N,"reason":"...","files":[...],"set_at":"..."}`),
 so the dispatcher has the file list + reason without re-running the gate.
-The `fresh_eyes_last_dispatch` stamp (g-115-1553) is consumed by
-`stale-sentinel-canary.py`: this sentinel is unique among the tracked four in
-that its writer (iteration-close.sh do_state_update) re-arms it on EVERY
-substantive deep close, so a bare presence-count canary false-fires even when
-this consumer keeps up. The canary keys on the dispatch timestamp ADVANCING
-across samples instead — hence the mandatory stamp on every handling.
-Cross-references: rb-428 (sentinel-lifecycle pattern), guard-343 (post-state-update
-review enforcement), g-115-280 (gap discovery — Phase 0-pre/0-pre2 had consumers,
-this slot did not), g-115-1553 (consumption-aware canary fix).
+Rationale (WHY fresh_eyes_last_dispatch stamp): `core/config/rationale/precheck-gates.md`
 
 ```
 Bash: wm-read.sh fresh_eyes_dispatch_pending --json
 IF signal is not null AND signal.fired == true:
     Output: "▸ FRESH-EYES-CODE GATE: fresh_eyes_dispatch_pending set ({signal.core_count} core files, {signal.loc_changed} LOC, reason={signal.reason}) — invoking /fresh-eyes-code before goal selection"
     invoke /fresh-eyes-code with files = signal.files
-    # Stamp the consumer-dispatch timestamp BEFORE clearing (g-115-1553).
-    # fresh_eyes_last_dispatch is the signal stale-sentinel-canary.py uses to
-    # tell "consumer kept up" from "consumer bypassed" — without it the canary
-    # reverts to bare presence-count and FALSE-fires, because iteration-close.sh
-    # re-arms this sentinel on EVERY substantive deep close (the canary samples
-    # AFTER the arming, so it would count consecutive-deep-closes, not bypass).
-    # Stamp on ANY handling: dispatch above OR a justified no-dispatch clear
-    # (e.g. the files turned out to be partner-attributed). Stamp FIRST so an
-    # interrupt leaves stamp-done + sentinel-still-set, which the canary reads
-    # as advanced -> reset (the safe direction).
+    # Stamp consumer-dispatch timestamp BEFORE clearing — canary requires advancing
+    # timestamp to detect bypass vs. keeping-up. Stamp FIRST for interrupt safety.
+    # Rationale (WHY fresh_eyes_last_dispatch stamp): core/config/rationale/precheck-gates.md
     printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh fresh_eyes_last_dispatch
-    # Clear signal after dispatch (one-shot; next iteration's iteration-close
-    # re-fires the gate if state-update produces new substantive changes).
+    # Clear signal after dispatch.
     echo 'null' | Bash: wm-set.sh fresh_eyes_dispatch_pending
     # Continue to Phase 0.
 ```
@@ -383,12 +357,7 @@ family (tree-debt, experience-archival, fresh-eyes-code, tree-encoding-drift)
 — catches "LLM did the encoding step on the wrong content" rather than
 "LLM skipped the encoding step entirely."
 
-Canonical incident (g-115-707): an agent closed a deep-outcome goal with
-measurable production metrics in outcome_note prose. Goal had
-`verification: null` — the Verified Values lived in free-form outcome_note. No
-bash gate inspected the content. Encoding lagged ~50 min until a partner
-agent's refresh sweep caught it manually. Filed g-115-707 Investigate →
-rb-917 + content-vs-counter-gate decision rule + g-115-724 Apply.
+Rationale (WHY metric-encoding gate): `core/config/rationale/precheck-gates.md` (canonical incident g-115-707)
 
 Pattern mirrors Phase 0-pre/0-pre2/0-pre3 verbatim — wm-read → if non-null →
 action → wm-set 'null'. The signal payload includes `candidates`,
@@ -411,6 +380,15 @@ IF signal is not null AND signal.fired == true:
         Add a Verified Values entry naming each candidate
         Include the source goal-id + completion timestamp
         Cross-reference rb-917 / g-115-707 for the pattern lineage
+    # Stamp consumer-dispatch timestamp BEFORE clearing — the stale-sentinel-canary
+    # is consumption-aware for this sentinel (g-115-1746), keyed on
+    # force_metric_encoding_last_dispatch. Advancing it on ANY handling (encode-and-
+    # clear here, OR a guard-655 justified no-dispatch clear when the candidate node
+    # is partner-attributed/phantom) tells the canary the consumer kept up, so a
+    # keeping-up consumer no longer false-fires the "stale sentinel set for N
+    # iterations" Investigate. Stamp FIRST for interrupt safety (mirrors Phase
+    # 0-pre / Phase 0-pre3).
+    printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | Bash: wm-set.sh force_metric_encoding_last_dispatch
     # Clear signal after encoding (one-shot; next iteration's iteration-close
     # re-fires the gate if state-update produces new substantive metrics).
     echo 'null' | Bash: wm-set.sh force_metric_encoding_pending
@@ -749,20 +727,7 @@ that Unblock within a few hours, the alert silently ages — no upstream
 escalation existed before this phase. The bash gate consolidates the
 scan + cooldown + notify logic into a single script call (rb-428 pattern).
 
-Severity ladder (config: `proactive_escalation.inbox_alert_age_hours`; the two
-values are per-severity RE-NOTIFY intervals, so classification maps the
-LONGER-aged alert to the MORE-urgent HIGH — g-115-1539):
-  - age >= max(`high`, `medium`) (default 12h) → fire HIGH-severity notification
-  - age >= min(`high`, `medium`) (default 4h)  → fire MEDIUM-severity notification
-  - Cooldown via a SHARED, DURABLE coordination-board scan (g-115-1533):
-    before emailing, the sweep scans for a recent `inbox-alert-aged`
-    breadcrumb for this goal_id from ANY agent. Re-fire interval matches
-    the severity's threshold (HIGH re-notify every 4h, MEDIUM every 12h)
-    so urgency cadence tracks severity. A goal aging FURTHER into HIGH
-    after a prior MEDIUM fire re-notifies under the HIGH schedule. (The
-    original per-agent `wm.proactive_escalation_log` cooldown was the
-    email-side twin of the g-115-1531 handoff bug: N agents each emailed
-    the user about the same unclaimed alert, and a WM reset re-fired.)
+Rationale (WHY severity ladder and shared cooldown): `core/config/rationale/precheck-gates.md`
 
 Fail-open at every layer: missing config, daemon unreachable, missing
 asp-115, a failed board scan (-> empty cooldown set, everything eligible
@@ -792,17 +757,6 @@ Bash: bash core/scripts/inbox-alert-age-check.sh --apply
 # JSON output includes `applied`, `skipped_cooldown`, and `failed`. Failure
 # counts are stderr-noted only — they do NOT block precheck.
 ```
-
-Tests: `core/scripts/tests/test_inbox_alert_age_check.py` (7 cases — no
-aged alert noop, aged HIGH fires, cross-agent board-scan cooldown noop,
-board post outside window fires, other-goal board post does not suppress,
-plus the two candidate-filter skips). g-115-848 provided the first 3;
-g-115-1533 swapped the per-agent-WM cooldown case for the cross-agent
-board-scan cases (mirroring the g-115-1531 handoff sibling).
-
-See `core/scripts/inbox-alert-age-check.py` `_classify_severity` for the
-threshold ladder and `_read_recent_escalations` for the shared board-scan
-cooldown discipline.
 
 ## Phase 0.5b.2: Dependency Timeout Escalation
 
@@ -903,11 +857,6 @@ Bash: bash core/scripts/handoff-aging-check.sh --apply
 Note: the target agent ALSO picks this up via its boot-time pending-handoffs
 scan (boot/SKILL.md Step 1.7) and via goal-selector's escalating handoff_bonus.
 
-Tests: `core/scripts/tests/test_handoff_aging_check.py` (5 cases — no-aged
-noop, aged fires, cooldown noop, self-routed skip, missing-created_at skip).
-See `core/scripts/handoff-aging-check.py` `run()` for the scan + cooldown
-logic and `_read_goals` for the fail-open all-queue read.
-
 ## Phase 0.5b.3: Structured Precondition Auto-Clear Sweep
 
 Counterpart to the pre-claim re-check in aspirations-execute. Scans goals
@@ -954,18 +903,7 @@ Counterpart to Phase 0.5b.3 for free-form dependency defers. Scans goals
 whose `defer_reason` names one or more dependency goal-ids (`g-NNN-NN`) and
 auto-clears the defer when ALL cited deps are `status: completed`.
 
-Motivation (session 55 iter 80): the agent's own g-115-71 sat deferred on
-g-115-87 for 3 days after g-115-87 completed — no mechanism re-probed
-the dependency chain until a manual inspection cleared it. This sweep
-mirrors `blocker-recheck.sh` (Layer C for participants:[user] blockers)
-and 0.5b.3 (structured preconditions), extending the same re-probe pattern
-to the LLM-authored free-form `defer_reason` surface.
-
-Conservative by design: skips non-pending goals (status filter), requires
-ALL cited deps to be completed (partial completion stays deferred), and
-uses two distinct regex patterns — structured (`blocked_on_dependency: g-X`)
-and proximity (`g-X <verb>` / `<verb> g-X`). Free-form defers that don't
-match either pattern are reported but not cleared.
+Rationale (WHY stale-defer dependency sweep): `core/config/rationale/precheck-gates.md`
 
 ```
 Bash: bash core/scripts/defer-recheck.sh --max-age-hours 2 --apply
@@ -974,31 +912,9 @@ Bash: bash core/scripts/defer-recheck.sh --max-age-hours 2 --apply
 # Fail-open: script exits 0 on all paths; a non-zero exit is a script bug.
 ```
 
-See `.claude/rules/probe-before-defer.md` and the rb-428 bash-consolidation
-drift family for the upstream pattern this sweep counters.
-
-The three STRUCTURED_DEFER_PREFIXES (defined in `core/scripts/gates/defer_classifier.py`)
-each have their own auto-clear path: `precondition_unmet:` is handled by
-Phase 0.5b.3 (precondition-defer-recheck.sh), `blocked_on_dependency:` is
-handled here in Phase 0.5b.4 (defer-recheck.sh dependency regex), and
-`Circuit breaker:` is filed by the aspirations loop's Phase 5.5
-(per `core/config/aspirations-loop-digest.md`) when
-`consecutive_goal_failures >= 3`, and cleared on the next successful
-attempt. All three bypass the capability-gate's
-narrative-defer check via `is_narrative_defer()` so machine-written
-internal markers never keyword-collide with forged skills.
-
 ## Phase 0.5b.5: Pending-Questions Sentinel-Lifecycle Sweep (g-115-486)
 
-Closes the gap discovered by g-115-485 / g-001-226: pending-questions whose
-`source_goal` field names a goal that has since completed/superseded silently
-linger forever (canonical incident: a publish-related pending-question
-lingered 12d after both its origin goal and a follow-up superseder both
-completed). The sweep adds a
-`source_goal-completed` heuristic and a `--apply` mutation flag — same single-
-writer, idempotent, fail-quiet pattern as `defer-recheck.sh --apply`,
-`blocker-recheck.sh --apply`, and `monitor-stale-check.sh --apply`. Cheap:
-single Python pass over <50 entries.
+Rationale (WHY pending-questions sentinel sweep): `core/config/rationale/precheck-gates.md`
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1012,29 +928,9 @@ Bash: bash core/scripts/pending-questions-sweep.sh sweep --apply
 # all yield empty results without aborting the sweep.
 ```
 
-See `core/scripts/pending-questions-sweep.py` `_h_source_goal_completed` for
-the heuristic and `_apply_auto_resolve` for the atomic mutation. Future
-sentinel-lifecycle gaps that also need same-iteration cleanup belong in this
-sweep, not in a new precheck phase.
-
 ## Phase 0.5b.6: Parent-Goal Supersession Sweep (g-248-85)
 
-Closes the supersession-blindness gap that produced g-268-10 (rb-842): a
-parent "Apply: X" goal carried `defer_reason: blocked_on_design` for
-hours while two sibling goals (Design + Apply decomposition) completed
-the same intent ABOVE it in the queue. The defer-recheck sweep cleared
-the defer but the parent re-emerged at high score because its
-description no longer pointed at unfinished work — leading to spurious
-selection. This sweep catches that incident shape at parent-supersession
-time, BEFORE the defer-recheck loop has a chance to re-promote it.
-
-Heuristic shape: parent goal carries `Apply:` title + has a temporal
-reference (`defer_reason_set_at` or `created_at`) + ≥2 sibling goals in
-the same aspiration with `Design:`/`Apply:` titles completed AFTER that
-reference timestamp. Sprint-scope guard: only aspirations with
-`≤max_aspiration_goals` (default 50) qualify — large recurring
-aspirations like asp-115 (611 goals) produce false positives at any
-threshold because parents and unrelated completions co-exist by design.
+Rationale (WHY parent-supersession sweep): `core/config/rationale/precheck-gates.md` (g-268-10, rb-842)
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1049,38 +945,9 @@ Bash: bash core/scripts/parent-supersession-sweep.sh --max-age-hours 24 --min-si
 # Metrics log: <WORLD_PATH>/parent-supersession-sweep-metrics.jsonl
 ```
 
-See `core/scripts/parent-supersession-sweep.py` `_find_superseding_siblings`
-for the heuristic (sibling lookup + temporal guard) and
-`_mark_superseded` for the atomic mutation. Tests at
-`core/scripts/tests/test_parent_supersession_sweep.py` pin the 8-case
-contract (canonical incident + 7 false-positive rejections).
-
 ## Phase 0.5b.7: Unblock-Parent-Status Sweep (g-250-76, rb-908)
 
-Closes the Layer-D-auto-Unblock-outlives-parent gap that produced
-g-250-73 (rb-908). When `capability-gate.py --suggest-unblock` files an
-auto-Unblock at defer-write time and the parent goal then lands in a
-terminal non-execution state — `skipped` (WRONG LAYER finding),
-`completed`, `superseded`, or `archived` — the Unblock survives as
-actionable work even though its premise has dissolved. Layer D writes
-synchronously and never re-probes the parent; this sweep is the
-re-probe.
-
-Canonical incident: g-250-73 'Unblock: behavior for g-250-69' filed at
-T+0s, g-250-69 SKIPPED at T+72s with WRONG LAYER finding ("bumping
-<JAVA_CLASS_NAME> weights would violate
-<JAVA_CLASS_NAME>:461; fix routes through
-<JAVA_CLASS_NAME>.scoreCandidate fallback instead"). Without this
-sweep, g-250-73 would have lingered as a pending Unblock until manual
-inspection caught it.
-
-Heuristic shape: Unblock-titled goal + parseable parent goal-id (from
-`origin_signal "unblock:<g-id>"`, title `"Unblock: <verb> for <g-id>"`,
-or `discovered_by` field) + parent.status in
-{skipped, completed, superseded, archived}. Title-anchored ("Unblock:"
-prefix) — does NOT match `Investigate:`/`Idea:`/`Apply:`/`Recurring:`
-goals that happen to carry `origin_signal: "unblock:..."` for unrelated
-reasons (false-positive shape observed in g-249-06 / g-250-77).
+Rationale (WHY unblock-parent-status sweep): `core/config/rationale/precheck-gates.md` (g-250-73, rb-908)
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1097,32 +964,9 @@ Bash: bash core/scripts/unblock-parent-status-sweep.sh --apply
 # Metrics log: <WORLD_PATH>/unblock-parent-status-sweep-metrics.jsonl
 ```
 
-See `core/scripts/unblock-parent-status-sweep.py` `_parse_parent_id` for
-the three-source extraction priority and `_mark_skipped` for the atomic
-mutation. Tests at `core/scripts/tests/test_unblock_parent_status_sweep.py`
-pin the 12-case contract (canonical g-250-73 shape, three extraction
-paths, idempotency, terminal-state set, title-prefix discipline).
-
 ## Phase 0.5b.8: Routing-Audit Target-Status Sweep (g-115-1353, rb-1478)
 
-Sibling to Phase 0.5b.7 — same terminal-target auto-close pattern, applied to
-the routing-audit goal class instead of the Layer-D Unblock class.
-`post-decompose-routing-audit.py` files `Investigate: routing-mismatch <target>`
-and `Investigate: routing-either-resolve <target>` goals into asp-115 when a
-freshly-stamped goal's `intended_agent` disagrees with the best Self.md
-domain-token Jaccard match. The audit goal's primary action is to re-stamp the
-TARGET's `intended_agent`. When the target lands in a terminal status
-(completed/archived/skipped/superseded), the re-stamp is MOOT and the audit goal
-survives as actionable work whose premise dissolved.
-
-Canonical incident (rb-1478 / exp-g-115-1329): routing-either-resolve fired a
-re-stamp (either→delta) on g-115-1328 which was ALREADY completed 2026-06-03
-(re-stamp moot) AND content-contradicted. This "terminal-target" sub-mode is
-distinct from the content-FP-on-a-PENDING-target sub-mode (g-115-1346) and the
-metric-bias root (rb-1249 / g-115-1200). The routing-mismatch path runs ~82% FP
-(rb-1478), so auto-closing on terminal target retires the dominant moot case; a
-genuine systemic capability_route table-gap, if real, re-fires on the next
-decompose (the audit runs every decompose) rather than lingering as a stale goal.
+Rationale (WHY routing-audit target-status sweep): `core/config/rationale/precheck-gates.md` (rb-1478)
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1139,41 +983,34 @@ Bash: bash core/scripts/routing-audit-target-status-sweep.sh --apply
 # Metrics log: <WORLD_PATH>/routing-audit-target-status-sweep-metrics.jsonl
 ```
 
-See `core/scripts/routing-audit-target-status-sweep.py` `_parse_target_id` for
-the origin-signal-first extraction priority (discovered_by is the constant
-discoverer name, NOT a target id, so it is deliberately not a parse source) and
-`_mark_skipped` for the atomic mutation. Tests at
-`core/scripts/tests/test_routing_audit_target_status_sweep.py` pin the 15-case
-contract (both origin_signal forms, title fallback, unparseable generic shape,
-class membership incl. Unblock-rejection, idempotency, terminal-state set).
+## Phase 0.5b.9: Credential Defer Auto-Clear (g-115-1709)
+
+Rationale (WHY credential-defer conservative guard): `core/config/rationale/precheck-gates.md`
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check credential-defer-recheck)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.10
+Bash: bash core/scripts/credential-defer-recheck.sh --apply
+# Scans world + agent queues. For each pending/in-progress goal with
+# defer_reason starting "human_blocked:" that is older than max_age_hours (2h):
+#   1. Extract env-var key from defer text using conservative pattern set
+#      (explicit env-read.sh has KEY > credential KEY > env var/key KEY > fallback)
+#   2. If no key extractable → skipped_no_key (human-only defer, never cleared)
+#   3. Run: bash core/scripts/env-read.sh has <KEY> → exit 0 means present
+#   4. If key still absent → skipped_probe_fail (defer stays)
+#   5. If key now present → clears defer_reason via aspirations.py update-goal
+#      (calls Python directly, not via bash, for Windows reliability)
+# Age gate (2h default): prevents thrash on freshly-set defers.
+# Metrics log: <WORLD_PATH>/credential-defer-recheck-metrics.jsonl
+# JSON output: {"scanned":N, "eligible":N, "skipped_no_key":N,
+#               "skipped_probe_fail":N, "cleared":N, "would_clear":[...],
+#               "details":[...]}
+```
 
 ## Phase 0.5b.10: Defer-Drift Detective Check (g-115-1406, rb defer-drift)
 
-Flags goals whose `deferred_until` has gone STALE (PAST) while a structured-
-defer marker persists. This is the precise complement of Phase 0.5b.3
-(`precondition-defer-recheck.py`), which deliberately SKIPS any goal that has
-`deferred_until` set ("the structured time gate is the authoritative scheduler
-signal"). Nothing re-probed the time gate ITSELF for drift — so when
-`deferred_until` falls into the past while the precondition it represents is
-still unmet, goal-selector's `deferred_readiness` criterion reads the expired
-gate as "defer just expired, re-evaluate now" and BOOSTS the not-ready goal to
-selector-top instead of filtering it.
-
-Canonical incident (2026-06-12, asp-304 Layer-5 cohort): g-304-11 carried
-`defer_reason "precondition_unmet: ... completes ~2026-07-11"` but
-`deferred_until=2026-05-26` — a date 16 days IN THE PAST relative to its own
-`defer_reason_set_at`. The selector surfaced it at score 8.84 despite ~18h of
-the required 30 days of telemetry. Four goals were hand-re-gated; this check
-makes the drift VISIBLE so it can never linger undetected again. See the
-reasoning-bank entry "deferred_until drift from defer_reason prose makes
-goal-selector deferred_readiness boost data-immature goals to top".
-
-DETECTIVE, NOT CORRECTIVE. The script never mutates: the correct future date
-lives in the `defer_reason` prose, which it cannot parse reliably (and clearing
-the defer would wrongly surface a genuinely not-ready goal). It SURFACES drift
-for re-gate-by-judgment — exactly the ~30s fix a human/agent applies once the
-drift is known. The LLM does the (deduplicated) Investigate filing below, not
-the script — same detective-script + LLM-acts pattern as precheck-eval flags.
+Rationale (WHY defer-drift detective): `core/config/rationale/precheck-gates.md` (2026-06-12 asp-304 incident)
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1201,28 +1038,9 @@ ELSE:
         origin_signal "defer-drift-audit").
 ```
 
-See `core/scripts/defer-drift-check.py` `_classify_drift` for the eligibility
-ladder (non-terminal + structured-defer prefix + `deferred_until` set, parseable,
-and PAST) and `_precondition_status` for the prose/ready/still_unmet annotation.
-Tests at `core/scripts/tests/test_defer_drift_check.py` pin the contract
-(canonical g-304-11 shape, future-gate rejection, terminal-status rejection,
-free-form-defer rejection, no-deferred_until rejection, malformed-date tolerance,
-min-hours-past suppression, all three structured prefixes).
-
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep
 
-Closes the "shape-recurring trap" (bravo reasoning-channel musing
-2026-04-21): recurring goals with STRUCTURED preconditions that fail at
-candidacy time never reach aspirations-execute, so their `lastAchievedAt`
-never advances. The goal-selector's urgency formula then inflates
-`overdue_ratio` unboundedly; when the precondition finally unlocks, the
-goal fires with massive urgency on trivially-met evidence, closes routine,
-and feeds cargo-cult.
-
-Distinct from 0.5b.3 (which clears explicit `defer_reason:
-precondition_unmet:*`). This sweep targets recurring goals that are NOT
-deferred — they silently drop out of COLLECT at the selector's predicate
-filter (goal-selector.py L680–692), leaving `lastAchievedAt` frozen.
+Rationale (WHY shape-recurring-trap sweep): `core/config/rationale/precheck-gates.md`
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
@@ -1439,19 +1257,8 @@ to recent in-window file changes (ranked + constitutional-ring-classified), file
 an `Investigate:` goal, and — when revert-eligible — routes the top candidate to
 a tiered revert.
 
-**DORMANT until `health_regression.mode` advances.** In `collect-only` (the
-launch default) the detection script returns `tripped:false
-reason:"mode=collect-only"` immediately — this phase is a no-op until the mode is
-advanced to `detect-and-report` (Phase 2) or `full` (Phase 3). The script also
-self-gates on its own interval marker (every `detection.interval` goals).
-**Phase 2 = report only.** Reverts (Phase 3) require `mode == full` AND the
-calibration AND-gate (30 days AND 50 records) — surfaced as `revert_eligible` in
-the verdict and re-checked inside `health-revert.py` (the master safety gate;
-even a Ring-3 auto candidate routes to `not-eligible` until both hold). Reverts
-are file-granular (one file restored to its pre-regression content via
-`git show`), tagged with a `Health-Revert` git trailer, and verified
-`revert.verification_iterations` later — kept if the composite improved, else
-undone + dead-ended.
+**DORMANT** (launch default `collect-only`): returns `tripped:false reason:"mode=collect-only"` — no-op until mode → `detect-and-report` (Phase 2) or `full` (Phase 3).
+Rationale (WHY DORMANT and mode gate): `core/config/rationale/precheck-gates.md`
 
 ```
 # Budget meter — deferrable cadence sweep (sibling to 0.5e/0.5f/0.5g).
@@ -1476,11 +1283,20 @@ Parse verdict JSON.
 IF verdict.calibration_just_completed == true:
     Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress,completed --contains "<verdict.calibration_dedup_key>")
     IF existing is empty:
-        Bash: bash core/scripts/aspirations-add-goal.sh asp-001 \
-                --title "health-ledger calibration complete — advance health_regression.mode when ready" \
-                --priority MEDIUM --participants agent,user --category framework-architecture \
-                --status pending \
-                --description "The health-ledger calibration AND-gate is now satisfied (<verdict.calibration.days> days / <verdict.calibration.records> records). Revert authority (Phase 3) is mathematically eligible. The rollout advances by editing health_regression.mode in core/config/aspirations.yaml; each step is reversible. (1) collect-only -> detect-and-report is LOW risk (adds Investigate reports, NEVER reverts) — agent-judgable. (2) detect-and-report -> full GRANTS the agent authority to auto-revert its own Ring-3 framework changes (Ring 1.5/2 route to agent/user Unblocks, Ring 1 to the user) — this is a deliberate, user-paced authority grant: leave at detect-and-report and let the user advance to full. Spec: core/config/conventions/health-ledger.md §10. dedup:<verdict.calibration_dedup_key>"
+        # Goal fields go in the JSON body via stdin -- NOT as CLI flags.
+        # aspirations-add-goal.sh hard-rejects --title/--priority/--participants/
+        # --category/--status/--description with exit 2 (script lines 97-105).
+        Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001
+        {
+          "title": "health-ledger calibration complete -- advance health_regression.mode when ready",
+          "priority": "MEDIUM",
+          "participants": ["agent", "user"],
+          "category": "framework-architecture",
+          "status": "pending",
+          "origin_signal": "idea:health-ledger-calibration-complete",
+          "description": "The health-ledger calibration AND-gate is now satisfied (<verdict.calibration.days> days / <verdict.calibration.records> records). Revert authority (Phase 3) is mathematically eligible. The rollout advances by editing health_regression.mode in core/config/aspirations.yaml; each step is reversible. (1) collect-only -> detect-and-report is LOW risk (adds Investigate reports, NEVER reverts) -- agent-judgable. (2) detect-and-report -> full GRANTS the agent authority to auto-revert its own Ring-3 framework changes (Ring 1.5/2 route to agent/user Unblocks, Ring 1 to the user) -- this is a deliberate, user-paced authority grant: leave at detect-and-report and let the user advance to full. Spec: core/config/conventions/health-ledger.md section 10. dedup:<verdict.calibration_dedup_key>"
+        }
+        JSON
 
 IF verdict.tripped != true:
     # collect-only no-op, interval not elapsed, or gate not tripped — all silent.
@@ -1502,10 +1318,18 @@ Compose the Investigate description from the verdict:
     reverts are active yet)
   - the dedup_key (for the next sweep's dedup query)
 
-Bash: bash core/scripts/aspirations-add-goal.sh asp-001 \
-        --title "Investigate: health regression on <verdict.signal>" \
-        --priority MEDIUM --participants agent --category framework-architecture \
-        --description "<composed description above>"
+# Goal fields go in the JSON body via stdin -- NOT as CLI flags (script rejects
+# --title/--priority/--participants/--category/--description with exit 2).
+Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001
+{
+  "title": "Investigate: health regression on <verdict.signal>",
+  "priority": "MEDIUM",
+  "participants": ["agent"],
+  "category": "framework-architecture",
+  "origin_signal": "investigate:health-regression-<verdict.signal>",
+  "description": "<composed description above>"
+}
+JSON
 
 # (Phase 3) Tiered revert — only acts when verdict.revert_eligible (mode==full
 # AND calibrated). The route command re-checks the gate internally, so passing a
@@ -1527,12 +1351,6 @@ IF verdict.revert_eligible == true:
 continue to Phase 1
 Bash: echo "aspirations-precheck phase documented"
 ```
-
-Why the Investigate is `participants: agent` (not user): detection surfaces an
-agent-diagnosable condition (attribution + revert are agent-capable per
-`.claude/rules/capability-before-user.md`). User involvement happens at REVERT
-time and ONLY for Ring-1 candidates (`user-unblock`), where the user owns the
-file's intent — never at detection time.
 
 ## Phase 1: Recurring Goal Check
 

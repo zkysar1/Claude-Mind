@@ -17,12 +17,12 @@
 #   release   — clean RUNNING->IDLE at /stop, AFTER the final S3 flush (§6).
 #
 # ════════════════════════════════════════════════════════════════════════════
-# CUTOVER GATE — INERT BY DEFAULT (design §7).
-# This wrapper no-ops (exit 0) unless OWNERSHIP_MODE=dynamic. Until the gated
-# cutover (0) flips that flag, every call here is a cheap no-op: the
-# default `static` path makes NO daemon call, NO DDB write — the lifecycle
-# call sites (/start, heartbeat-tick.sh, /stop) behave byte-for-byte as before.
-# The flag is the SAME one the §3 ownership resolver reads (one cutover switch).
+# BACKEND-POLYMORPHIC — no feature flag. The daemon endpoint (_runner_preamble in
+# mind_api/src/endpoints/admin.py) returns {ok:true, noop:true} for any
+# non-own-cloud backend, so this wrapper ALWAYS calls the daemon and the daemon
+# decides: real DDB CAS under STORAGE_BACKEND=own-cloud, a clean no-op otherwise.
+# There is no OWNERSHIP_MODE switch (removed 2026-07-02, 7) — single-
+# runner enforcement is unconditional, derived from STORAGE_BACKEND alone.
 # ════════════════════════════════════════════════════════════════════════════
 #
 # Usage:
@@ -32,7 +32,7 @@
 #   UUID4 at agents/<agent>/session/runner-token.
 #
 # Exit codes:
-#   0  — op succeeded, OR inert no-op (OWNERSHIP_MODE!=dynamic / local backend)
+#   0  — op succeeded, OR daemon no-op (non-own-cloud backend — nothing to claim)
 #   1  — daemon returned an error (caller decides; all three call sites fail open)
 #   2  — bad usage (unknown op / missing agent / missing token)
 #   4  — acquire only: another machine holds a live claim (held=true) -> refuse
@@ -60,12 +60,6 @@ case "$OP" in
     *) echo "[runner-claim] usage: runner-claim.sh <acquire|heartbeat|release> [--agent N] [--token T]" >&2; exit 2;;
 esac
 
-# ── Cutover gate (inert by default). Cheap env read — no subprocess, no file. ──
-if [ "${OWNERSHIP_MODE:-static}" != "dynamic" ]; then
-    echo "[runner-claim] no-op: OWNERSHIP_MODE=${OWNERSHIP_MODE:-static} (claim wiring inert until cutover)"
-    exit 0
-fi
-
 [ -z "$AGENT" ] && AGENT="${MIND_AGENT:-}"
 if [ -z "$AGENT" ]; then
     echo "[runner-claim] ERROR: no agent (pass --agent <name> or set MIND_AGENT)" >&2
@@ -75,7 +69,7 @@ fi
 # Token default: the framework-owned UUID4 written at /start (triple-written with
 # running-session-id + latest-session-id). Resolve the agent dir via _paths.sh so
 # the AGENTS_PARENT_DIR constant stays the single sync point (CLAUDE.md Agent-dir
-# Resolution). Only reached in dynamic mode — the inert path above already exited.
+# Resolution).
 if [ -z "$TOKEN" ]; then
     source "$CORE_ROOT/scripts/_paths.sh"
     _TOKFILE="$AGENT_DIR/session/runner-token"

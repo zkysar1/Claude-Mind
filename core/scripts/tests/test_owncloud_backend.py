@@ -199,6 +199,114 @@ def test_conflict_error_attribute_is_conflict_error(cloud):
     assert _backend(cloud).conflict_error is ConflictError
 
 
+# --- botocore IfMatch preflight (P0: zeta zakbox1 own-cloud write incident) ---
+# Own-cloud writes use PutObject(IfMatch=<etag>) compare-and-swap (needs
+# botocore>=1.35). Old botocore rejects IfMatch CLIENT-SIDE (ParamValidationError,
+# no network call), so every write silently fails while reads look healthy. The
+# init preflight turns that latent per-write crash into one clear startup error;
+# the _put catch is the runtime backstop.
+class _FakePutObjModel:
+    """Minimal stand-in for botocore's s3 service model, exposing only the
+    PutObject input-shape members the preflight introspects."""
+    def __init__(self, members):
+        self._members = members
+
+    def operation_model(self, name):
+        assert name == "PutObject"
+        shape = type("_Shape", (), {"members": self._members})()
+        return type("_Op", (), {"input_shape": shape})()
+
+
+class _FakeBotoSession:
+    def __init__(self, members):
+        self._members = members
+
+    def get_service_model(self, service):
+        assert service == "s3"
+        return _FakePutObjModel(self._members)
+
+
+def test_ifmatch_preflight_raises_when_model_lacks_ifmatch(monkeypatch):
+    """botocore<1.35 has no IfMatch on the PutObject model -> preflight fails
+    LOUD at init with the actionable upgrade guidance (the 'never silently
+    again' win)."""
+    import botocore.session
+    from owncloud_backend import _assert_ifmatch_supported
+    monkeypatch.setattr(botocore.session, "get_session",
+                        lambda: _FakeBotoSession(members={}))  # no IfMatch
+    with pytest.raises(RuntimeError, match="botocore>=1.35"):
+        _assert_ifmatch_supported()
+
+
+def test_ifmatch_preflight_passes_when_supported(monkeypatch):
+    """IfMatch present in the model -> preflight is a silent no-op."""
+    import botocore.session
+    from owncloud_backend import _assert_ifmatch_supported
+    monkeypatch.setattr(botocore.session, "get_session",
+                        lambda: _FakeBotoSession(members={"IfMatch": object()}))
+    _assert_ifmatch_supported()  # must not raise
+
+
+def test_ifmatch_preflight_fails_open_when_introspection_errors(monkeypatch):
+    """If the botocore model can't be introspected at all (internals change), the
+    preflight fails OPEN — the _put ParamValidationError catch is the runtime
+    backstop; a working backend must not be bricked by a meta-check error."""
+    import botocore.session
+    from owncloud_backend import _assert_ifmatch_supported
+
+    def _boom():
+        raise RuntimeError("botocore internals moved")
+    monkeypatch.setattr(botocore.session, "get_session", _boom)
+    _assert_ifmatch_supported()  # must not raise
+
+
+def test_put_paramvalidation_remapped_to_upgrade_message(cloud, monkeypatch):
+    """_put runtime backstop: a client-side ParamValidationError on a fenced PUT
+    (IfMatch in play) is remapped to the actionable upgrade RuntimeError, never
+    silently dropped."""
+    from botocore.exceptions import ParamValidationError
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "pv.txt"
+    b.write_text(p, "v1")                 # establishes the IfMatch fence for p
+
+    def _raise_pv(**kw):
+        raise ParamValidationError(report='Unknown parameter in input: "IfMatch"')
+    monkeypatch.setattr(b.s3, "put_object", _raise_pv)
+    with pytest.raises(RuntimeError, match="botocore>=1.35"):
+        b.write_text(p, "v2")             # fenced PUT -> ParamValidationError -> remap
+
+
+# --- read-path freshness keystone (own-cloud read-path class fix 2026-07-02) -
+def test_ensure_local_noop_for_out_of_root_path(cloud):
+    """Keystone: ensure_local on a git-shipped path under NO synced root
+    (e.g. core/config/*.yaml) is a no-op -- returns the path, never raises.
+    This lets dual-use readers (one code path reading BOTH a synced world/meta
+    file AND a git-shipped config) call ensure_local unconditionally."""
+    b = _backend(cloud)
+    outside = cloud["root"] / "core" / "config" / "tree.yaml"  # under no synced root
+    # _rel(outside) raises ValueError; the keystone swallows it in _refresh.
+    assert b.ensure_local(outside) == outside
+    b.refresh(outside)                    # force_fresh path is likewise a no-op
+
+
+def test_ensure_local_materializes_missing_file_from_s3(cloud):
+    """Fresh-box regression: an object present in S3 but ABSENT from the local
+    cache is materialized by ensure_local (head->get->write). This is the read
+    path a fresh own-cloud box hits for _tree.yaml -- the class the report
+    flagged. Reads that route through jsonl_cache/yaml_cache call ensure_local
+    before the stat, so this proves the fresh-box materialization they rely on."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "knowledge" / "tree" / "_tree.yaml"
+    b.write_text(p, "nodes: {}\n")        # lands in S3 AND local
+    p.unlink()                            # simulate a fresh box: blank local cache
+    b._etags.clear()                      # ...and no in-process etag memory
+    b._cache_check.clear()
+    assert not p.exists()
+    b.ensure_local(p)                     # must re-materialize from S3
+    assert p.exists()
+    assert p.read_text(encoding="utf-8") == "nodes: {}\n"
+
+
 # --- mirror_put (B15: local->S3 mirror sweep primitive) ---------------------
 def test_mirror_put_new_object_unconditional(cloud):
     b = _backend(cloud)
@@ -567,6 +675,32 @@ def test_refresh_no_baseline_pulls_s3_authoritative(cloud, tmp_path):
     assert got == s3_body.decode()                      # pulled (S3-authoritative)
 
 
+def test_refresh_multipart_etag_downloads_not_no_clobber(cloud, tmp_path):
+    """2026-07-02 fleet-wide-freeze regression: a multipart S3 ETag ('<hex>-N')
+    with local == baseline (no unpushed writes; the L499 gate did NOT fire) must
+    classify as "download" (S3-authoritative), NOT "no_clobber". The prior
+    "no_clobber" never refreshed the in-process fence (self._etags), so _put kept
+    sending IfMatch(stale) and every write to a multipart-stored file (the ~8MB
+    world/aspirations.jsonl) 412'd DETERMINISTICALLY -- a fleet-wide write freeze.
+    "download" pulls S3 and adopts the current ETag as the fence, curing it, while
+    the L499 baseline gate still protects genuine unpushed local writes (rb-2096)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "big.jsonl"
+    local_body = b'{"v":1}\n'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(local_body)
+    # local == baseline -> the unpushed-writes gate (L499) does NOT fire.
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 1, "md5": hashlib.md5(local_body).hexdigest()}})
+    multipart_etag = '"' + ("a" * 32) + '-3"'           # '<hex>-N' == multipart
+    assert b._overwrite_decision(p, p, multipart_etag) == "download"
+    # And a genuine unpushed local write under a multipart ETag is STILL protected
+    # by the baseline gate (local != baseline -> no_clobber, fence stays stale ->
+    # freeze-on-conflict, never a silent lost update).
+    p.write_bytes(b'{"v":2,"unpushed":true}\n')          # local now diverges from baseline
+    assert b._overwrite_decision(p, p, multipart_etag) == "no_clobber"
+
+
 def test_same_filename_different_roots_get_distinct_lock_keys(cloud, tmp_path):
     # Landmine 3 regression: world/aspirations.lock and agents/alpha/aspirations.lock
     # must NOT collapse to the same DDB key (the old p.name fallback did exactly that).
@@ -876,3 +1010,234 @@ def test_machine_local_classification(cloud):
     assert b._machine_local(R / "world" / "changelog.jsonl") is True        # _EXCLUDE_NAMES
     assert b._machine_local(R / "world" / "reasoning-bank.jsonl") is False  # syncs
     assert b._machine_local(R / "world" / "knowledge" / "tree" / "x.md") is False  # syncs
+
+
+# --- gap #5: both-diverged coordination-store merge () --------------
+# When local holds unpushed writes AND S3 moved (both-diverged), a REGISTERED
+# coordination store (reasoning-bank.jsonl, team-state.yaml) MERGES local+remote
+# instead of freezing (stale fence -> perpetual 412) or clobbering the peer
+# (empty post-restart fence -> unconditional PUT). See coordination_merge.py +
+# owncloud_backend._merge_reconcile_put.
+def _rb_blob(*recs):
+    return ("".join(json.dumps(r, ensure_ascii=True) + "\n" for r in recs)).encode()
+
+
+def _setup_both_diverged_rb(cloud, tmp_path, b):
+    """Drive `b` into the both-diverged state for reasoning-bank.jsonl: local
+    holds an unpushed machineA record (differs from the manifest baseline) and
+    S3 was moved out-of-band by a peer (machineB). Returns (path, key)."""
+    p = cloud["root"] / "world" / "reasoning-bank.jsonl"
+    key = b._s3_key(p)
+    base = _rb_blob({"id": "rb-1", "created": "2026-07-02T09:00:00", "title": "base"})
+    b.write_text(p, base.decode())              # S3 == local == base; fence recorded
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    localA = base + _rb_blob({"id": "rb-2", "created": "2026-07-02T10:00:00",
+                              "title": "machineA"})
+    b._local(p).write_bytes(localA)             # machineA unpushed local write
+    remoteB = base + _rb_blob({"id": "rb-2", "created": "2026-07-02T11:00:00",
+                               "title": "machineB"})
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=remoteB)  # peer moved S3
+    return p, key, localA
+
+
+def test_both_diverged_registered_store_merges_not_freezes(cloud, tmp_path):
+    """Stale-fence both-diverged write to reasoning-bank.jsonl MERGES: neither
+    machine's record is lost, the id collision is re-id'd, divergence clears."""
+    b = _backend(cloud)
+    p, key, localA = _setup_both_diverged_rb(cloud, tmp_path, b)
+    b.refresh(p)                                # RMW step 1: no_clobber -> flags key
+    assert key in b._diverged_keys
+    b.write_text(p, localA.decode())            # terminal write -> merge-reconcile
+    merged = b.read_text(p, force_fresh=True)
+    ids = {json.loads(l)["id"] for l in merged.splitlines()}
+    titles = {json.loads(l).get("title") for l in merged.splitlines()}
+    assert {"machineA", "machineB"} <= titles   # zero data loss (peer survives)
+    assert ids == {"rb-1", "rb-2", "rb-3"}      # collision re-id'd rbB -> rb-3
+    assert key not in b._diverged_keys          # divergence resolved
+
+
+def test_both_diverged_empty_fence_merges_not_clobbers(cloud, tmp_path):
+    """Post-restart (empty fence) both-diverged write MERGES instead of doing an
+    unconditional PUT that would silently clobber the peer's S3 write."""
+    b = _backend(cloud)
+    p, key, localA = _setup_both_diverged_rb(cloud, tmp_path, b)
+    b2 = _backend(cloud)                         # fresh backend == empty _etags fence
+    assert key not in b2._etags
+    b2.refresh(p)
+    assert key in b2._diverged_keys
+    b2.write_text(p, localA.decode())           # must merge, not unconditional clobber
+    titles = {json.loads(l).get("title")
+              for l in b2.read_text(p, force_fresh=True).splitlines()}
+    assert "machineB" in titles and "machineA" in titles  # peer NOT clobbered
+
+
+def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
+    """An unregistered store (no merge handler) keeps the safe-freeze: a
+    stale-fence both-diverged write raises ConflictError, never clobbers."""
+    from owncloud_backend import ConflictError
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "aspirations.jsonl"   # NOT merge-registered
+    assert b._machine_local(p) is False
+    key = b._s3_key(p)
+    base = b"line1\n"
+    b.write_text(p, base.decode())              # S3 == local == base; fence E0
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    b._local(p).write_bytes(base + b"localA\n")             # unpushed local write
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=base + b"remoteB\n")  # peer
+    b.refresh(p)
+    assert key in b._diverged_keys
+    with pytest.raises(ConflictError):
+        b.write_text(p, (base + b"localA\n").decode())      # stale fence -> 412
+    assert b._get_remote_raw(key)[0] == base + b"remoteB\n"  # peer intact, not clobbered
+
+
+def test_hot_coordination_store_412_merges_with_empty_diverged_flag(cloud, tmp_path):
+    """1: a HOT coordination store (team-state.yaml, written every
+    iteration) whose in-process fence went stale but whose key was NEVER added
+    to _diverged_keys -- because _refresh's warm-cache early-return skips the
+    no_clobber divergence detection for an always-warm cache -- MERGE-RECONCILES
+    on the _put 412 instead of dead-looping ConflictError. The merge PRE-check at
+    _put L663 MISSES here (empty _diverged_keys); the fix's 412-handler POST-check
+    routes to _merge_reconcile_put, which re-GETs the FRESH remote ETag. This is
+    the write-path twin of test_refresh_multipart_etag_downloads_not_no_clobber
+    (bdab36a's read-path fix) and the deterministic >22min single-writer deadlock
+    zeta observed on cc-02. Contrast the unregistered-store test above: an
+    UNregistered store still raises ConflictError here -- the fix is scoped to
+    stores with a commutative merge handler (rb-2096 freeze-safety preserved)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "team-state.yaml"          # merge-REGISTERED
+    key = b._s3_key(p)
+    base = (b"last_updated: '2026-07-02T09:00:00'\n"
+            b"agent_status:\n  alpha:\n    last_active: '2026-07-02T09:00:00'\n")
+    b.write_text(p, base.decode())                           # S3 == local; fence E0 recorded
+    # Peer moves S3 out-of-band -> the in-process fence (E0) is now stale.
+    # Crucially: NO refresh() is called, so _diverged_keys stays EMPTY -- exactly
+    # the always-warm-cache production case the L663 pre-check cannot catch.
+    peer = (b"last_updated: '2026-07-02T11:00:00'\n"
+            b"agent_status:\n  alpha:\n    last_active: '2026-07-02T09:00:00'\n"
+            b"  bravo:\n    last_active: '2026-07-02T11:00:00'\n")
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=peer)
+    assert key not in b._diverged_keys                       # the bug's precondition: NOT flagged
+    # This stale-fence write WOULD 412. PRE-fix: ConflictError -> _fileops RMW
+    # re-hits the same warm-cache-stale-fence 412 -> deterministic deadlock.
+    # POST-fix: the 412 handler routes to merge-reconcile (no exception).
+    localA = (b"last_updated: '2026-07-02T12:00:00'\n"
+              b"agent_status:\n  alpha:\n    last_active: '2026-07-02T12:00:00'\n")
+    b.write_text(p, localA.decode())                         # must merge-reconcile, NOT raise
+    merged = b.read_text(p, force_fresh=True).encode()
+    assert b"alpha" in merged                                # local write applied
+    assert b"bravo" in merged                                # peer's write PRESERVED (merged, not clobbered)
+    assert key not in b._diverged_keys                       # resolved (merge-reconcile discards on success)
+
+
+# --- list_dir on governed root (cold-bootstrap fix, 2) ---------------
+
+def _backend_root_map(cloud, root_map, machine_id="m1"):
+    """Build an OwnCloudBackend with an explicit root_map (not cache_root).
+    This exercises the _s3_key -> _rel path that produced the governed-root
+    prefix bug (g-115-1752): _rel maps a root path to '<prefix>/.' instead
+    of '<prefix>', so list_dir searched 'env-id/prefix/./' — matching nothing."""
+    from owncloud_backend import OwnCloudBackend
+    return OwnCloudBackend(
+        env_id=ENV_ID, bucket=BUCKET, lock_table=LOCKS,
+        sessions_table=SESSIONS, root_map=root_map,
+        machine_id=machine_id, region=REGION,
+        s3=cloud["s3"], ddb=cloud["ddb"])
+
+
+def test_list_dir_governed_root_returns_children(cloud):
+    """list_dir on a governed ROOT path (path == root in root_map) must list
+    S3 children under 'env-id/prefix/', NOT under 'env-id/prefix/./' which
+    matches nothing.  Regression test for the cold-bootstrap NO-OP
+    (g-115-1752): pull_bootstrap -> _materialize_tree calls
+    list_dir(root_path) as its first S3-walk step; a wrong prefix returns []
+    and the entire tree is skipped — 'scanned 0, pulled 0'."""
+    world = cloud["root"] / "world_governed"
+    world.mkdir()
+    b = _backend_root_map(cloud, [(str(world), "world")])
+    s3 = cloud["s3"]
+    s3.put_object(Bucket=BUCKET, Key=f"{ENV_ID}/world/.initialized", Body=b"")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/knowledge/tree/_tree.yaml",
+                  Body=b"nodes: {}\n")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/program.md",
+                  Body=b"# The Program\n")
+
+    children = b.list_dir(world)
+    assert ".initialized" in children
+    assert "knowledge" in children
+    assert "program.md" in children
+    assert len(children) == 3
+
+
+def test_list_dir_governed_root_subdir_still_works(cloud):
+    """list_dir on a subdirectory UNDER a governed root must keep working
+    (the fix must not break the non-root case)."""
+    world = cloud["root"] / "world_governed"
+    world.mkdir()
+    b = _backend_root_map(cloud, [(str(world), "world")])
+    s3 = cloud["s3"]
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/knowledge/tree/_tree.yaml",
+                  Body=b"nodes: {}\n")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/knowledge/tree/system/node.md",
+                  Body=b"system node\n")
+
+    children = b.list_dir(world / "knowledge")
+    assert children == ["tree"]
+    children2 = b.list_dir(world / "knowledge" / "tree")
+    assert "_tree.yaml" in children2
+    assert "system" in children2
+
+
+def test_pull_bootstrap_real_backend_materializes_tree(cloud, monkeypatch):
+    """End-to-end pull_bootstrap with a REAL OwnCloudBackend + moto S3 on an
+    EMPTY local dir.  The existing pull_bootstrap tests in test_owncloud_sync.py
+    use a FakeBackend whose list_dir works on local paths — they do NOT exercise
+    the real _s3_key -> list_objects_v2 prefix mapping, so they stay green while
+    the real backend returns 'scanned 0, pulled 0'.  This test catches that gap
+    (g-115-1752)."""
+    import owncloud_sync as _sync
+
+    world = cloud["root"] / "world_governed"
+    meta = cloud["root"] / "meta_governed"
+    world.mkdir()
+    meta.mkdir()
+    b = _backend_root_map(
+        cloud, [(str(world), "world"), (str(meta), "meta")])
+
+    # Seed S3 under the ENVIRONMENT_ID prefix with a minimal world tree.
+    s3 = cloud["s3"]
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/.initialized", Body=b"")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/knowledge/tree/_tree.yaml",
+                  Body=b"nodes: {}\n")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/knowledge/tree/system/node.md",
+                  Body=b"---\ntitle: system\n---\nSystem node\n")
+    s3.put_object(Bucket=BUCKET,
+                  Key=f"{ENV_ID}/world/program.md",
+                  Body=b"# The Program\n")
+
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("RUNTIME_DIR", str(cloud["root"] / "rt"))
+
+    # Local is EMPTY — the fresh-box case.
+    assert not (world / ".initialized").exists()
+
+    stats = _sync.pull_bootstrap(b, only_root="world")
+
+    assert stats["skipped"] is None
+    assert stats["pulled"] >= 4, (
+        f"expected >= 4 pulled files, got {stats['pulled']}; "
+        f"scanned={stats['scanned']} — list_dir may still be broken")
+    assert (world / ".initialized").exists()
+    assert (world / "knowledge" / "tree" / "_tree.yaml").exists()
+    assert (world / "knowledge" / "tree" / "_tree.yaml").read_bytes() == b"nodes: {}\n"
+    assert (world / "knowledge" / "tree" / "system" / "node.md").exists()
+    assert (world / "program.md").read_bytes() == b"# The Program\n"

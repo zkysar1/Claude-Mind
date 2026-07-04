@@ -20,6 +20,31 @@ source "$CORE_ROOT/scripts/_platform.sh"
 META="$META_DIR"
 CONFIG="$CONFIG_DIR"
 
+# --- Fail-loud guard: unresolvable META_DIR (g-328 fresh-box safety) ---
+# Symmetric to init-world.sh. A fresh box with no local-paths.conf resolves
+# META_DIR empty; proceeding would seed a blank meta/ at the filesystem root and
+# (on own-cloud) clobber the real S3 meta state on the sweep. The cache path is
+# per-machine, so init cannot invent it — fail loud with guidance instead.
+if [ -z "${META:-}" ]; then
+    echo "ERROR: init-meta.sh — META_DIR is empty/unresolvable; refusing to seed a blank meta/." >&2
+    echo "  Fix: provision agents/<name>/local-paths.conf with WORLD_PATH+META_PATH," >&2
+    echo "  or export MIND_META, before running init. On own-cloud a blank seed" >&2
+    echo "  would clobber the real S3 meta state on the next sweep." >&2
+    exit 1
+fi
+
+# --- Fresh-box bootstrap pull (durable closer) ---
+# Symmetric to init-world.sh: on own-cloud the LOCAL meta/.initialized marker
+# can be absent while meta/ is fully initialized in S3, so the gate below would
+# re-seed empty stubs over the real state. Pull meta/ from S3 FIRST. Fail-soft;
+# non-own-cloud no-ops. (init-mind.sh runs init-world.sh first, which pulls
+# world/; this independently covers a standalone init-meta.sh on a fresh box.)
+if [ ! -f "$META/.initialized" ] && [ "${STORAGE_BACKEND:-local}" = "own-cloud" ]; then
+    echo "  own-cloud fresh box: pulling meta/ from S3 before init gate..."
+    MIND_META="${MIND_META:-$META}" python3 "$CORE_ROOT/scripts/owncloud_sync.py" --pull --root meta \
+        || echo "  WARN: bootstrap meta-pull returned non-zero — proceeding (will seed if S3 truly empty)" >&2
+fi
+
 # --- Idempotent gate ---
 if [ -f "$META/.initialized" ]; then
     echo "meta/ already initialized — skipping"

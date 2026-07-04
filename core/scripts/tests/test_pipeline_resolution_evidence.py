@@ -192,3 +192,63 @@ def test_detector_parity(label, rec):
     assert (cli_pipeline.has_resolution_evidence(rec)
             == pipeline_write._has_resolution_evidence(rec)), (
         f"CLI/daemon detector disagree on {label}")
+
+
+# ---------------------------------------------------------------------------
+# normalize_record rename value-drop (7)
+#
+# DEFAULT_FIELDS pre-seeds surprise=None on every record. When a record reaches
+# normalize carrying BOTH surprise_level (a real value) and surprise=None, the
+# both-exist rename branch must copy the value forward before dropping the old
+# key — otherwise the value is lost and surprise stays None. Verified root cause
+# of 19/48 resolved records having surprise=None. The two mirrored modules
+# (vestigial CLI + live daemon writer) must behave identically (parity invariant).
+# ---------------------------------------------------------------------------
+
+NORMALIZE_FNS = [
+    pytest.param(cli_pipeline.normalize_record, id="cli"),
+    pytest.param(pipeline_write._normalize_record, id="daemon"),
+]
+
+
+@pytest.mark.parametrize("normalize", NORMALIZE_FNS)
+def test_normalize_preserves_renamed_value_over_none_default(normalize):
+    # Canonical incident: surprise_level carries the value, surprise is the
+    # pre-seeded None default → the value must survive the rename.
+    out = normalize({"surprise_level": 6, "surprise": None})
+    assert out["surprise"] == 6
+    assert "surprise_level" not in out
+
+
+@pytest.mark.parametrize("normalize", NORMALIZE_FNS)
+def test_normalize_real_new_value_wins_over_old(normalize):
+    # When BOTH names carry real values, the new name still wins (unchanged
+    # behavior — we only copy when the new name is at its None default).
+    out = normalize({"surprise_level": 6, "surprise": 9})
+    assert out["surprise"] == 9
+    assert "surprise_level" not in out
+
+
+@pytest.mark.parametrize("normalize", NORMALIZE_FNS)
+def test_normalize_old_name_only_carries_value(normalize):
+    # Only the old name present → first rename branch, value carried over.
+    out = normalize({"surprise_level": 6})
+    assert out["surprise"] == 6
+    assert "surprise_level" not in out
+
+
+@pytest.mark.parametrize("normalize", NORMALIZE_FNS)
+def test_normalize_legitimate_none_surprise_unchanged(normalize):
+    # No surprise_level at all → surprise stays None. guard-562: the fix does
+    # NOT change the default for records that legitimately have no value.
+    out = normalize({"surprise": None})
+    assert out["surprise"] is None
+
+
+@pytest.mark.parametrize("normalize", NORMALIZE_FNS)
+def test_normalize_value_preservation_covers_all_renames(normalize):
+    # The fix lives in the generic rename loop, so every rename pair is covered
+    # (the goal called this out: outcome_notes/resolved_date/created share the risk).
+    out = normalize({"outcome_notes": "ran probe X", "outcome_detail": None})
+    assert out["outcome_detail"] == "ran probe X"
+    assert "outcome_notes" not in out

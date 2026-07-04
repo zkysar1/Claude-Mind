@@ -232,7 +232,7 @@ For each leaf with retrieval_count == 0:
 ### Step 2.7: Tree-Node Cluster Archival (D2 — g-303-29)
 
 LLM-reviewed, cluster-aware archival of stale LEAF nodes — the tree-node-specific
-lane of this fire (design: `agents/bravo/temp/d2-cluster-archival-design.md` §4).
+lane of this fire (design: relevance-aware cluster-resurgence refresh, rb-2338).
 Engine: `core/scripts/tree-archive.sh`. **NATURAL-GATED DORMANT**: when
 `tree_archival.archives_per_pass == 0` (the default), this lane scans + LLM-reviews +
 applies keep/refresh ONLY — it applies ZERO `archive` verdicts. Raising the cap

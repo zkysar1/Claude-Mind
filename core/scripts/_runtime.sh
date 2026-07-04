@@ -744,6 +744,11 @@ rt_curl() {
     local headers=( -H "X-Runtime-Client: shell" )
     [ -n "$agent" ] && headers+=( -H "X-Mind-Agent: $agent" )
     headers+=( -H "X-Mind-Tenant: ${MIND_TENANT:-default}" )
+    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when
+    # MIND_API_TOKEN is set (remote/authenticated fleet daemon). Zero-latency env
+    # read — no remote indirection (respects the IRREDUCIBLY LOCAL contract).
+    # Unset → no header → byte-identical to today's localhost-only calls.
+    [ -n "${MIND_API_TOKEN:-}" ] && headers+=( -H "Authorization: Bearer ${MIND_API_TOKEN}" )
     # Forward the calling session's SID (always-injected by bash-agent-inject,
     # guard-341/rb-386) so endpoints that record session attribution
     # (board_write reads x-mind-sid) are byte-compat with the CLI, which reads

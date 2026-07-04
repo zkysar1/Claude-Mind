@@ -1,0 +1,8 @@
+# Environment registry entry -- local (, BRD environment-id-as-key).
+#
+# The local-files backend: the governed local directories ARE the store. No
+# cloud resources, so no bucket / DDB tables / region are needed. Use this
+# env-id for single-machine / hermetic / offline operation:
+#   ENVIRONMENT_ID=local
+environment_id: local
+backend: local

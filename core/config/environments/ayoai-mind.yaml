@@ -1,0 +1,19 @@
+# Environment registry entry -- ayoai-mind (, BRD environment-id-as-key).
+#
+# The operator sets ONE value in .env.local:  ENVIRONMENT_ID=ayoai-mind
+# The daemon (mind_api/src/__main__.py:_apply_environment_registry) derives ALL
+# storage wiring from THIS file, so STORAGE_BACKEND / STORAGE_S3_BUCKET /
+# STORAGE_DDB_* / AWS_DEFAULT_REGION need not (and should not) be set
+# independently in .env.local -- that independent-misconfiguration is exactly
+# what the registry eliminates. Legacy STORAGE_* vars still WIN if set
+# (setdefault precedence) but emit a deprecation warning; remove them and keep
+# only ENVIRONMENT_ID.
+#
+# Committed to core/ so it is ALWAYS locally readable (no chicken-and-egg with
+# the own-cloud store it configures).
+environment_id: ayoai-mind
+backend: own-cloud
+bucket: zds-own-cloud-data
+sessions_table: zds-sessions
+lock_table: zds-locks
+region: us-east-2

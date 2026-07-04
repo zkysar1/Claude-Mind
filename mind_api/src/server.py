@@ -11,6 +11,7 @@ touching endpoints.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
@@ -201,6 +202,30 @@ class _Handler(BaseHTTPRequestHandler):
                 headers={k.lower(): v for k, v in self.headers.items()},
                 tenant=tenant_header,
             )
+
+            # FR-4 (daemon auth, BRD Shared-State-API): bearer-token
+            # AUTHENTICATION for remote fleet clients, GATED behind MIND_API_TOKEN
+            # (unset = today's localhost-only no-auth default → byte-identical
+            # legacy behavior, NFR-1 back-compat). When set, EVERY request MUST
+            # present a matching `Authorization: Bearer <token>`; a missing or
+            # wrong token is refused 401 BEFORE any handler, tenant check, or
+            # backend call. This is authentication (401 — who are you), distinct
+            # from the tenant authz below (403 — you may not touch this customer).
+            # Constant-time compare (hmac.compare_digest) so a wrong token cannot
+            # be timing-probed. Paired with the FR-5 fail-closed bind guard in
+            # start(): a non-loopback bind REQUIRES this token to be set, so the
+            # daemon can never expose a routable interface without authentication.
+            _api_token = os.environ.get("MIND_API_TOKEN", "").strip()
+            if _api_token:
+                _auth = ctx.headers.get("authorization", "")
+                _presented = (_auth[7:].strip()
+                              if _auth[:7].lower() == "bearer " else "")
+                if not _presented or not hmac.compare_digest(_presented, _api_token):
+                    resp = Response.error(
+                        401, "unauthorized",
+                        "missing or invalid bearer token")
+                    self._write_response(resp)
+                    return
 
             # T-c (1): multi-tenant customer activation + app-authz,
             # GATED behind MIND_MULTI_TENANT (default OFF = today's single-tenant
@@ -397,9 +422,22 @@ class Server:
 
         port = self.requested_port if self.requested_port > 0 else 0
 
-        # AF_INET ipv4 only — Decision 6 binds to 127.0.0.1.
+        # AF_INET ipv4 only. FR-5 (guarded remote bind, BRD
+        # Shared-State-API): the daemon binds 127.0.0.1 by DEFAULT
+        # (Decision 6 — unchanged, back-compat). A non-loopback bind (e.g. a
+        # Tailscale IP so remote fleet clients can reach ONE canonical daemon,
+        # fleet-BRD §10a / Option B) is opt-in via MIND_API_BIND and is
+        # FAIL-CLOSED: refused unless FR-4 auth (MIND_API_TOKEN) is enabled, so
+        # the daemon can never expose a routable interface without authentication.
+        bind_addr = os.environ.get("MIND_API_BIND", "").strip() or "127.0.0.1"
+        if bind_addr not in {"127.0.0.1", "::1", "localhost"} and not \
+                os.environ.get("MIND_API_TOKEN", "").strip():
+            raise RuntimeError(
+                f"FATAL: MIND_API_BIND={bind_addr!r} is a non-loopback interface "
+                "but MIND_API_TOKEN is not set — refusing to bind a routable "
+                "interface without authentication (FR-5 fail-closed).")
         try:
-            self._http = _BackloggedHTTPServer(("127.0.0.1", port), handler_cls)
+            self._http = _BackloggedHTTPServer((bind_addr, port), handler_cls)
         except OSError as e:
             self._log_lifecycle("bind_failed", port=port, error=repr(e))
             raise

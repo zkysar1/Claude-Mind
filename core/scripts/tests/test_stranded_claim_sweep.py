@@ -378,6 +378,125 @@ def test_release_failure_keeps_goal(tmp_agent, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# 1: second shape — agent-source in-progress goals with NO claimed_by.
+# The claimed_by==agent query is structurally blind to them (agent-source goals
+# skip the claim wrapper, the sole claimed_by writer), so the sweep ALSO scans
+# the agent-source active aggregate for in-progress + no-claim goals, using
+# last_modified as the stale-age basis. Canonical incident:  sat
+# in-progress ~4 days with no claimed_by, uncatchable by the old sweep.
+# ---------------------------------------------------------------------------
+
+
+def _no_claim_goal(goal_id, last_modified, status="in-progress", title="No-claim"):
+    """An active-aggregate goal record with status but NO claimed_by field."""
+    return {"id": goal_id, "status": status,
+            "last_modified": last_modified, "title": title}
+
+
+def test_strands_no_claim_old_inprogress_dry_run(tmp_agent, monkeypatch, capsys):
+    """Agent-source in-progress, no claimed_by, stale last_modified, no diary
+    → STRANDED (dry-run), shape=no-claim, no daemon write."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])  # no claimed goals — exercise the no-claim path only
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-02", last_modified.isoformat())],
+    }])
+
+    summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
+
+    assert summary["scanned"] == 0
+    assert summary["scanned_no_claim"] == 1
+    assert summary["released"] == 0
+    no_claim_recs = [r for r in summary["stranded"] if r.get("shape") == "no-claim"]
+    assert len(no_claim_recs) == 1
+    assert no_claim_recs[0]["verdict"] == "stranded"
+    assert no_claim_recs[0]["goal_id"] == "g-001-02"
+    # dry-run: no update-goal write happened
+    update_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/update-goal"]
+    assert update_calls == []
+
+
+def test_keeps_fresh_no_claim(tmp_agent, monkeypatch, capsys):
+    """No-claim in-progress within the stale threshold → KEPT (race window)."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=2)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-09", last_modified.isoformat())],
+    }])
+
+    summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["kept"] == 1
+    assert summary["released"] == 0
+    assert [r for r in summary["stranded"] if r.get("shape") == "no-claim"] == []
+
+
+def test_keeps_no_claim_with_recent_diary(tmp_agent, monkeypatch, capsys):
+    """No-claim in-progress with a diary entry after last_modified → KEPT
+    (work is happening — the diary check carries the primary weight)."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    diary_ts = (last_modified + dt.timedelta(minutes=2)).isoformat()
+    _write_diary_entry(diary, "g-001-10", diary_ts)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-10", last_modified.isoformat())],
+    }])
+
+    summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["kept"] == 1
+    assert summary["released"] == 0
+
+
+def test_apply_flips_no_claim_to_pending(tmp_agent, monkeypatch, capsys):
+    """--apply flips a stranded no-claim goal to pending via update-goal; NO
+    release call (nothing to release for a never-claimed goal)."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-02", last_modified.isoformat())],
+    }])
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["released"] == 1
+    assert summary["kept"] == 0
+    rec = [r for r in summary["stranded"] if r.get("shape") == "no-claim"][0]
+    assert rec["verdict"] == "released"
+    assert rec["flip_result"]["ok"] is True
+
+    # update-goal status=pending was called; NO release call for a no-claim goal
+    update_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/update-goal"]
+    release_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/release"]
+    assert len(update_calls) == 1
+    assert update_calls[0]["query"]["field"] == "status"
+    assert json.loads(update_calls[0]["body"]) == "pending"
+    assert release_calls == []
+
+
+# ---------------------------------------------------------------------------
 # Digest-ordering invariant (1 / rb-1533)
 #
 # The sweep's "diary entry after claimed_at → KEPT" heuristic

@@ -129,6 +129,14 @@ def _normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
             rec[new_name] = rec[old_name]
             del rec[old_name]
         elif old_name in rec and new_name in rec:
+            # Both exist — prefer new name, but copy the old value when the new
+            # name is still at its None default and the old carries a real value.
+            # DEFAULT_FIELDS pre-seeds surprise=None on every record, so without
+            # this copy a {surprise_level: N} update always lost its value to the
+            # both-exist branch — surprise stayed None (7). Mirrors
+            # pipeline.py normalize_record (parity invariant, this module docstring).
+            if rec[new_name] is None and rec[old_name] is not None:
+                rec[new_name] = rec[old_name]
             del rec[old_name]
     if "slug" not in rec and "id" in rec:
         parts = rec["id"].split("_", 1)
@@ -945,6 +953,12 @@ def _update_meta(live_path: Path, archive_path: Path, meta_path: Path) -> None:
     meta = _compute_meta(live_items, archive_items)
 
     with file_locks.locked(meta_path):
+        # own-cloud read-path fix (2026-07-02): refresh from S3 inside the lock
+        # BEFORE the read, matching meta_update/recompute_meta (L1131/1198).
+        # Without it, a fresh box (or a stale-lock-break race) reads a missing/
+        # stale local pipeline-meta.json and drops a peer's micro_hypothesis_stats.
+        # No-op on LocalBackend; no-op for out-of-root paths (keystone).
+        get_backend().refresh(meta_path)
         # Preserve micro_hypothesis_stats from existing meta. Read inside the
         # lock so a concurrent meta_update can't lose its stats between our
         # read-old and our atomic-write-new.

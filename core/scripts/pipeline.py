@@ -416,7 +416,14 @@ def normalize_record(rec):
             rec[new_name] = rec[old_name]
             del rec[old_name]
         elif old_name in rec and new_name in rec:
-            # Both exist — prefer new name, drop old
+            # Both exist — prefer new name, but copy the old value when the new
+            # name is still at its None default and the old carries a real value.
+            # DEFAULT_FIELDS pre-seeds surprise=None on every record, so without
+            # this copy a {surprise_level: N} update always lost its value to the
+            # both-exist branch — surprise stayed None (7 /
+            # idea:normalize-record-rename-valuedrop). Applies to all renames.
+            if rec[new_name] is None and rec[old_name] is not None:
+                rec[new_name] = rec[old_name]
             del rec[old_name]
 
     # Derive slug from id if missing

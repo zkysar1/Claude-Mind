@@ -321,6 +321,7 @@ When you need schema, script API, or protocol details for a subsystem, read the 
 | `audit-baselines.md` | `meta/audit-baselines.yaml` schema, verdicts (seeded/stable/ratcheted/regressed), when to add a baseline, /verify-learning integration |
 | `temp-store.md` | Canonical agent temp store (`agents/<agent>/temp/`), temp-vs-scratch lifecycle, the agent-dir write-surface allowlist, `reports/` freeze + migration |
 | `domain-recipe-seed-purity.md` | D1 decision (A): domain-specific upgrade recipes are `domain-leak-exempt` and travel in the seed; the 5 invariants (location/marker/FROM-state-guard/H3b/gate-scope), seed-down per-env-id semantics |
+| `fleet-secret-provisioning.md` | Bootstrap-key → remote-vault self-service provisioner formalized as a framework capability: mechanism (5 steps), 7 invariants, vault-file contract, secrets hygiene, clone-home companion (guard-131), transplant integration, dev-origination promotion; the domain-specific `core/scripts/provision-from-vault.sh` (marker-exempt) instantiates it |
 | `transfer-bundle-export-shape.md` | OKF-aligned export shape for `meta/transfer/` bundles: bundle=unit-of-distribution, concept=one md+YAML, one required `type` discriminator, consumers-preserve-unknown-keys, git-shippable interchange (contract-on-shape, not a field schema) |
 
 Additional on-demand specs (not convention files):

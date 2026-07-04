@@ -48,6 +48,8 @@ def _agent_name(ctx) -> str:
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -108,6 +110,9 @@ def export(ctx) -> "Response":  # type: ignore[name-defined]
     # Provenance from the bound agent's self.md (verbatim line-scan, not yaml).
     self_path = ctx.paths.agent / "self.md" if ctx.paths.agent else None
     self_name = "unknown"
+    if self_path:
+        from storage_backend import get_backend
+        get_backend().ensure_local(self_path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if self_path and self_path.exists():
         with open(self_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -178,6 +183,8 @@ def import_bundle(ctx) -> "Response":  # type: ignore[name-defined]
     in_path = Path(input_raw)
     if not in_path.is_absolute():
         in_path = ctx.paths.meta / "transfer" / input_raw
+    from storage_backend import get_backend
+    get_backend().ensure_local(in_path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not in_path.exists():
         return Response.error(404, "not_found", "bundle not found: {}".format(input_raw))
     with open(in_path, "r", encoding="utf-8") as f:
