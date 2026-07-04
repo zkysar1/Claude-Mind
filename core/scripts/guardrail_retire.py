@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """guardrail_retire.py - D1 LLM-reviewed guardrail cluster retirement engine ().
 
-Implements the D1 design (agents/bravo/temp/d1-cluster-retirement-design.md), the
+Implements the D1 design (relevance-aware cluster-resurgence refresh, rb-2338), the
 guardrail instantiation of the shared cluster-refresh pattern whose reference
 instantiation is tree_archive.py (D2, g-303-29). D1 mirrors D2 Sections 2/3/4 with
 a guardrail-specific Section 1.

@@ -68,7 +68,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
     import yaml
-    from _paths import AGENT_DIR, CORE_ROOT
+    from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
     from _fileops import acquire_lock, release_lock
     from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
 except Exception:
@@ -93,6 +93,24 @@ CANARY_SLOT = "stale_sentinel_canary"
 # names a real aspiration.
 ASP_ID = "asp-115"
 DEFAULT_THRESHOLD = 3
+# Re-file suppression window (4). The stuck condition this canary
+# detects is INTERMITTENT (consumer-skip across a compact/stop boundary), so a
+# genuinely-stuck sentinel re-trips the count every few iterations. Without
+# dedup the canary filed a byte-identical Investigate on EACH fire — three
+# identical `investigate:stale-sentinel-canary:force_tree_maintain` goals
+# (5 06-24, 9 06-25, 4 06-29) polluted the queue,
+# the last ranking #1 in the selector at score 11.13 and displacing real work.
+# `_recent_investigate_exists` suppresses a re-file when an OPEN (pending/
+# in-progress) OR recently-filed (< DEDUP_HOURS) identical-origin_signal
+# Investigate already exists — the rb-428 sweep-family idempotency posture every
+# OTHER filer in this family already has, mirroring the sibling
+# streak-break-reflector._recent_investigate_exists. 168h (7d) because the
+# observed re-file gap was ~96h (9 -> 4); 48h (the
+# streak-break value) would not have caught it. The post-fire counter reset is
+# unchanged, so a still-stuck sentinel re-trips and re-checks dedup every
+# `threshold` runs (self-correcting: a persisting problem re-alerts once the
+# cooldown lapses).
+DEDUP_HOURS = 168
 
 # Consumption-aware sentinels (3). Bare presence-count (_is_set)
 # false-fires for a sentinel whose WRITER re-arms it every iteration while
@@ -128,6 +146,22 @@ CONSUMPTION_AWARE = {
     # while that dispatch timestamp stays frozen, so a genuinely-bypassed
     # consumer still fires while a keeping-up one does not.
     "force_tree_maintain": "force_tree_maintain_last_dispatch",
+    # force_metric_encoding_pending (6): the THIRD dispatch-consumer
+    # sentinel with the identical false-fire shape, left out of the consumption-
+    # aware treatment its two siblings received. Writer post-state-update-metric-
+    # gate.sh arms it in iteration-close do_state_update (Phase 8) on deep closes
+    # with >=2 distinct numeric findings; the canary samples it in
+    # do_productivity_check (Phase 12, SAME close, AFTER the arm), BEFORE the next
+    # iteration's precheck Phase 0-pre4 consumer clears it. A bare presence-count
+    # therefore reads "set" at sample time on every metric-arming deep close even
+    # though the consumer clears it every iteration -> 3 consecutive such closes
+    # false-fire. The consumer (aspirations-precheck Phase 0-pre4) now stamps
+    # force_metric_encoding_last_dispatch on ANY handling; the count climbs ONLY
+    # while that dispatch timestamp stays frozen (a GENUINE consumer bypass, e.g.
+    # a phantom candidate node the consumer cannot Edit -- the other 6
+    # cause fixed at post-state-update-metric-gate.sh:264), so a keeping-up
+    # consumer no longer false-fires.
+    "force_metric_encoding_pending": "force_metric_encoding_last_dispatch",
 }
 # Canary-state key prefix for the last-observed consumer dispatch timestamp.
 # Stored alongside the per-sentinel stuck counts in CANARY_SLOT; the prefix
@@ -177,6 +211,67 @@ def _read_threshold(override: int | None) -> int:
         return max(1, int(section.get("threshold_iterations", DEFAULT_THRESHOLD)))
     except (TypeError, ValueError):
         return DEFAULT_THRESHOLD
+
+
+def _recent_investigate_exists(sentinel: str, since_hours: int = DEDUP_HOURS) -> bool:
+    """Suppress a duplicate canary Investigate (4).
+
+    Returns True (suppress the file) when the world+agent queues already hold an
+    Investigate with origin_signal ``investigate:stale-sentinel-canary:<sentinel>``
+    that is EITHER open (pending/in-progress — a live duplicate) OR was created
+    within ``since_hours`` (recently filed/resolved — the intermittent re-trip
+    of a known-characterised condition). Matches on the precise origin_signal the
+    canary stamps, not a title regex (the sibling streak-break-reflector matches
+    title because its goals carry no stable origin token; this canary does).
+
+    guard-487 (suppression gates fail CLOSED): on any queue READ error, return
+    True (suppress). A swallowed error mapping to "no duplicate found" would
+    re-enable the spam this gate exists to stop. The post-fire counter reset
+    makes a genuinely-stuck sentinel re-trip and re-alert once the read recovers
+    (self-correcting), so erring toward suppression loses no durable signal.
+    """
+    origin = f"investigate:stale-sentinel-canary:{sentinel}"
+    cutoff = _dt.datetime.now() - _dt.timedelta(hours=since_hours)
+    candidates = []
+    if WORLD_DIR is not None:
+        candidates.append(Path(WORLD_DIR) / "aspirations.jsonl")
+    if AGENT_DIR is not None:
+        candidates.append(Path(AGENT_DIR) / "aspirations.jsonl")
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        asp = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # one bad line — skip, not a gate-disabling error
+                    for g in asp.get("goals", []):
+                        if (g.get("origin_signal") or "") != origin:
+                            continue
+                        # OPEN duplicate — always suppress, no time window.
+                        if g.get("status") in ("pending", "in-progress"):
+                            return True
+                        # Recently filed/resolved — suppress within cooldown.
+                        created = (g.get("created_at") or g.get("created_date")
+                                   or g.get("created"))
+                        if not created:
+                            return True  # origin match without date — assume recent
+                        try:
+                            c_dt = _dt.datetime.fromisoformat(str(created))
+                        except (ValueError, TypeError):
+                            continue
+                        if c_dt > cutoff:
+                            return True
+        except Exception:
+            # guard-487: fail CLOSED on a read error — suppress rather than risk
+            # re-enabling duplicate spam. Self-correcting via the post-fire re-trip.
+            return True
+    return False
 
 
 def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
@@ -261,6 +356,7 @@ def run(threshold: int, dry_run: bool) -> dict:
         "dry_run": dry_run,
         "sentinels": {},
         "investigate_goals_filed": [],
+        "investigate_goals_suppressed": [],
     }
 
     if AGENT_DIR is None:
@@ -361,6 +457,23 @@ def run(threshold: int, dry_run: bool) -> dict:
     # WM access during validation. Counters are already persisted with the
     # post-fire reset; if filing fails the next iteration starts fresh.
     for sentinel, stuck in fired_records:
+        # Dedup (4): on the LIVE filing path, suppress a re-file when an
+        # OPEN or recently-filed identical-origin_signal Investigate already
+        # exists. The counter was already reset post-fire, so a still-stuck
+        # sentinel re-trips and re-checks dedup every `threshold` runs
+        # (self-correcting). Gated on `not dry_run`: dedup is a FILING concern
+        # and dry-run files nothing — dry-run is the detection-preview/test path
+        # (the regression tests assert raw fire DETECTION via --dry-run), so it
+        # must report the fire unsuppressed. Production (iteration-close.sh) runs
+        # non-dry-run and always applies dedup.
+        if not dry_run and _recent_investigate_exists(sentinel):
+            report["sentinels"][sentinel]["filing_result"] = {"suppressed_dedup": True}
+            report["investigate_goals_suppressed"].append({
+                "sentinel": sentinel,
+                "stuck_count": stuck,
+                "reason": "open_or_recent_duplicate",
+            })
+            continue
         filing = _file_investigate(sentinel, stuck, dry_run)
         report["sentinels"][sentinel]["filing_result"] = filing
         report["investigate_goals_filed"].append({

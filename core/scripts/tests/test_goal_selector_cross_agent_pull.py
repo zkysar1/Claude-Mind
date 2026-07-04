@@ -251,8 +251,49 @@ def case_invalid_inputs_fail_open() -> tuple[bool, str]:
     return True, "ok"
 
 
+def case_callsite_shape_project_root_is_agents_parent() -> tuple[bool, str]:
+    """REGRESSION 4: the WIRED call site (goal-selector.py cmd_select)
+    passes AGENT_DIR.parent — the agents-parent (PROJECT_ROOT/agents), NOT
+    PROJECT_ROOT — as the project_root arg. The helper MUST still surface
+    sibling-routed goals from that arg shape.
+
+    Pre-fix the helper did `project_root / "agents"`, so this shape computed
+    <agents-parent>/agents (nonexistent) -> the is_dir() guard returned [] on
+    EVERY real call, leaving g-115-946's cross-agent stranding fix INERT from
+    the Phase 2.5.D relocation onward (empirically: alpha's live call returned 0
+    while a corrected call surfaced g-001-282). The other cases here all pass the
+    CONTRACT-correct project_root (=PROJECT_ROOT), so they never exercised the
+    call-site shape and the inert fix passed its own regression suite. Post-fix
+    the helper derives agents_parent = agent_dir.parent, so the call-site shape
+    works. This case pins the real-call path: a revert to `project_root/"agents"`
+    fails here."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        agents_parent = root / "agents"
+        foo_dir = agents_parent / "foo"
+        target_dir = agents_parent / TARGET_AGENT
+        _write_aspirations(foo_dir, [
+            _make_aspiration("asp-test", [
+                _make_goal("g-callsite-01", intended_agent=TARGET_AGENT),
+            ]),
+        ])
+        _write_aspirations(target_dir, [])
+        # Replicate the WIRED call site EXACTLY: project_root = agent_dir.parent
+        # (the agents-parent), NOT PROJECT_ROOT.
+        results = collect_cross_agent_candidates(target_dir.parent, target_dir, TARGET_AGENT)
+        if len(results) != 1:
+            return False, (f"call-site arg shape returned {len(results)} — pre-fix "
+                           f"bug: <agents-parent>/agents is nonexistent -> 0")
+        if results[0].get("goal", {}).get("id") != "g-callsite-01":
+            return False, f"wrong goal: {results[0].get('goal', {}).get('id')}"
+        if results[0].get("source") != "cross-agent:foo":
+            return False, f"wrong source: {results[0].get('source')!r}"
+        return True, "ok"
+
+
 CASES = [
     ("sibling-routed-goal-appears",     case_sibling_routed_goal_appears),
+    ("callsite-shape-agents-parent",    case_callsite_shape_project_root_is_agents_parent),
     ("own-queue-not-double-counted",    case_own_queue_not_double_counted),
     ("unreadable-sibling-fails-open",   case_unreadable_sibling_fails_open),
     ("strict-match-contract",           case_strict_match_contract),

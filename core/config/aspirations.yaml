@@ -593,6 +593,25 @@ lightweight_mode:
     - framework-maintenance
 
 # --- STRATEGIC SCAN (Environmental Observation) ---
+# ── Per-runner capability filter (0) ──
+# Declares what THIS box can do, so goal-selector drops candidates whose explicit
+# `requires_capability` this runner cannot satisfy (a capability-constrained fresh
+# box stops burning tokens ranking goals it cannot execute -- Class C fresh-box
+# gap). By DEFAULT the block is ABSENT and capabilities are PROBED at runtime
+# (aws CLI on PATH, numpy importable, nvidia-smi, AGENT_WRITE_PATH product repo,
+# git-push default-present). Uncomment + edit to OVERRIDE a wrong probe:
+#   provides: capabilities to force-ADD   (box asserts ground truth a probe misses)
+#   lacks:    capabilities to force-REMOVE (authoritative last word; a read-only
+#             clone sets `lacks: [git-push]`)
+#   probe:    false => config-only (no runtime probes), for a fully-declared box
+# Canonical tokens: ml-deps, aws, product-runtime, gpu, git-push, studio-session
+#   (see core/scripts/_runner_capabilities.py KNOWN_CAPABILITIES). A goal with NO
+#   requires_capability is ALWAYS executable -- untagged goals are never filtered.
+# runner_capabilities:
+#   provides: []
+#   lacks: []
+#   probe: true
+
 # Periodic "step back and look" phase that reads world signals
 # and generates work from environmental observation rather than
 # introspection. Runs conditionally — not every iteration.
@@ -771,12 +790,25 @@ tree_archival:
   archives_per_pass: 0            # NATURAL GATE — 0 = dormant (no autonomous archive verdicts applied)
   compounding_gate_enabled: false # D3 cross-link: gate eligibility on compounding_events==0 once that field ships
 
+# --- COMPOUNDING-KNOWLEDGE METRIC ( / design ) -- the SOURCE
+# signal the D1 guardrail-retirement + D2 tree_archival consumers reference
+# above (compounding_gate_enabled). Records load-bearing retrieval events
+# (an entry retrieved AND decision-shaping toward an external artifact -- a
+# strict superset of "helpful") to the sidecar world/compounding-events.jsonl
+# via core/scripts/compounding-events.py. Ships DORMANT (enabled:false) per the
+# gate-d / anticipatory-reflection discipline: the iteration-close emission is
+# inert until HIGH-confidence volume is measured (design Section 7). Headline is
+# value-density (guard-841), never raw count; downstream consumers are ADVISORY
+# ranking only and NEVER auto-prune on zero (guard-809).
+compounding_metric:
+  enabled: false                  # default-OFF off-ramp; flip true only after calibration (design Section 7)
+
 # --- GUARDRAIL RETIREMENT (D1, ) -- guardrail instantiation of the
 # shared cluster-refresh pattern (D2 = tree_archival above). LLM-reviewed,
 # cluster-aware retirement of stale guardrails. NATURAL-GATED DORMANT per
 # guard-348: retires_per_pass=0 means scan+keep+refresh run but ZERO retire
 # verdicts auto-apply. Engine: core/scripts/guardrail_retire.py +
-# guardrail-retire.sh. Design: agents/bravo/temp/d1-cluster-retirement-design.md.
+# guardrail-retire.sh. Design: relevance-aware cluster-resurgence-refresh retirement (rb-2338).
 guardrail_retirement:
   retire_threshold_days: 180      # Guard > this many days past effective relevance is a candidate (user-set, conservative; > guard-707's 60d floor)
   refresh_lookback_days: 60       # Cluster member retrieved/fired within this window -> refresh whole cluster, skip retire
@@ -1428,6 +1460,19 @@ multi_agent:
   # Goal reallocation: when a targeted goal hasn't been claimed within this window,
   # other agents may pick it up (if the goal has reallocatable: true).
   reallocation_hours: 8             # Hours before unclaimed targeted goals become eligible
+
+# Cross-agent goal SURFACING gate (2026-07-04, 4 follow-up).
+# goal-selector.py collect_cross_agent_candidates pulls pending goals from
+# sibling agent queues where intended_agent == this agent (). That
+# SURFACING half is built; the EXECUTION half (claim/update/complete resolving
+# a sibling's queue) is NOT — the daemon claim endpoint resolves only world +
+# the caller's own-agent queue, so a surfaced sibling-queue goal 404s at claim
+# -> hard selector livelock (6). Until the execution path is wired
+# (filed as a follow-up framework goal), keep surfacing OFF so the selector
+# does not repeatedly surface un-actionable cross-agent work. Flip to true once
+# claim/update/complete resolve sibling queues.
+cross_agent_surfacing:
+  enabled: false
 
 modifiable:
   multi_agent.dependency_timeout_hours: {min: 12, max: 168, default: 48}

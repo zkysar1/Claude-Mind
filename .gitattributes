@@ -17,3 +17,18 @@
 # future hook — critical because a fresh-clone machine (machine-2, CI) is exactly
 # where the pre-push M2 tag gate must still run.
 core/githooks/* text eol=lf
+
+# Cross-machine merge self-resolution for APPEND-ONLY agent ledgers (2026-07-03,
+# user-directed GitHub-sync bolstering). When the same agent identity commits
+# from two machines (e.g. container alpha + desktop alpha), both sides append
+# at EOF from a common base — a guaranteed textual conflict that would wedge
+# iteration-push.sh's integrate step every iteration. merge=union keeps BOTH
+# sides' lines (no data loss; consumers scan whole files, order-insensitive).
+# SCOPE IS EVIDENCE-GATED: only files with ZERO historical deleted lines
+# qualify (probe: git log -p, count '^-{' lines == 0). journal.jsonl (index
+# rewrites), changelog.jsonl (pruning), experience.jsonl (archival), and
+# aspirations.jsonl (RMW status updates) are NOT union-safe — a union there
+# would resurrect pruned/edited lines. Their conflicts abort loudly in
+# iteration-push.sh and surface for manual resolution instead.
+agents/*/skill-invocations.jsonl merge=union
+agents/*/health/*.jsonl merge=union

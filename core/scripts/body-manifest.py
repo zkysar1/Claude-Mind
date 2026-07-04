@@ -22,7 +22,7 @@ REDUCER-AWARE FORK (the backward-compatibility keystone):
 
 CLI:
   py -3 core/scripts/body-manifest.py write --sid <unitKey> --agent <mindKey>
-        [--env-id local] [--role worker|observer]
+        [--env-id local] [--role reducer|worker|observer]
   py -3 core/scripts/body-manifest.py read     --sid <unitKey> --agent <mindKey>
   py -3 core/scripts/body-manifest.py set-state --sid <unitKey> --agent <mindKey> <state>
   py -3 core/scripts/body-manifest.py is-reducer --sid <unitKey> --agent <mindKey>
@@ -68,11 +68,11 @@ _BASELINE_FILENAME = "forked-wm-baseline.yaml"
 # only when it is present, then consumes it.
 _CLOSE_SENTINEL_FILENAME = "body-closing"
 
-VALID_ROLES = ("worker", "observer")
+VALID_ROLES = ("reducer", "worker", "observer")
 VALID_STATES = ("active", "closed-pending-merge", "merged", "closed-stale")
 # Manifest field order — deterministic render keeps diffs stable.
 _FIELD_ORDER = (
-    "unitKey", "mindKey", "env_id", "role",
+    "unitKey", "mindKey", "env_id", "role", "reducer_sid",
     "body_state", "started_at", "forked_wm_hash",
 )
 
@@ -182,6 +182,12 @@ def write_manifest(sid: str, agent: str, env_id: str = "local",
     rsid = _read_running_sid(state_dir)
     fork_needed = (role == "worker") and bool(rsid) and (rsid != sid)
 
+    # reducer_sid: the SID of the active Reducer body ( / ).
+    # the framework-ES reads this field to locate the Reducer's ES snapshot for
+    # workers/observers. Null for the reducer itself (it IS the Reducer).
+    # For workers/observers: the value of running-session-id at write time.
+    reducer_sid = None if (role == "reducer") else (rsid or None)
+
     forked_wm_hash = None
     if fork_needed:
         agent_wm = state_dir / _WM_FILENAME
@@ -207,6 +213,7 @@ def write_manifest(sid: str, agent: str, env_id: str = "local",
         "mindKey": agent,
         "env_id": env_id,
         "role": role,
+        "reducer_sid": reducer_sid,
         "body_state": "active",
         "started_at": _now_iso_local(),
         "forked_wm_hash": forked_wm_hash,

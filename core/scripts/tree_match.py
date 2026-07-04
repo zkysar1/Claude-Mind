@@ -184,6 +184,17 @@ def _provenance_weight(node):
 def parse_front_matter(md_path):
     """Extract YAML front matter from a .md file. Returns dict or {}."""
     p = Path(md_path)
+    # own-cloud read-path fix (2026-07-02): materialize an S3-only node .md on a
+    # fresh box BEFORE the exists() gate. Node bodies under world/knowledge/tree/
+    # are synced; on a blank cache they'd read as absent, so the concept index
+    # would build from empty `entities` (degraded retrieval). Lowest-level reader
+    # -> covers every caller (build_concept_index et al.). Lazy, fail-open import;
+    # no-op on LocalBackend and for out-of-root paths (keystone).
+    try:
+        from storage_backend import get_backend
+        get_backend().ensure_local(p)
+    except Exception:
+        pass
     if not p.exists():
         return {}
     try:

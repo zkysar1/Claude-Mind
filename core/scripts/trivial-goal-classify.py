@@ -51,7 +51,7 @@ local classifier with no shared-state mutation, so the daemon-only architecture
 rule does not apply); it DOES use the _rt daemon client for the goal READ, like
 defer-drift-check.py.
 
-Design brief: agents/zeta/temp/g-305-02-lightweight-mode-brief.md.
+Design brief: lightweight-mode classifier (g-305-02).
 """
 
 import argparse

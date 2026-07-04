@@ -133,3 +133,39 @@ def test_non_recurring_has_zero_urgency():
     r = _score(g)
     assert r["raw"]["recurring_urgency"] == 0, r["raw"]["recurring_urgency"]
     assert r["recurring_overdue_ratio"] == 0.0, r["recurring_overdue_ratio"]
+
+
+def test_future_lastachieved_clock_skew_not_treated_as_overdue():
+    """3: a lastAchievedAt stamped in THIS box's FUTURE (an off-machine
+    ahead-clock agent stamped it) must NOT be misclassified as never-fired-stale.
+
+    Pre-fix: hours_since(future) returns None (the hours<0 clamp), never_fired was
+    `la is None` -> True, so the g-303-32 fallback derived urgency from created_at
+    (long past) -> overdue_ratio ~36x -> urgency_max (4.0). A just-achieved / not-due
+    goal thereby ranked ABOVE genuinely-due goals (evidence: g-115-754 scored 9.21
+    over genuinely-due g-001-01 at 9.18). Post-fix: never_fired keys on la_raw (the
+    FIELD's presence), so a present-but-future stamp falls through to the not-due
+    path -> recurring_urgency 0, overdue_ratio 0. The report's "clamp negative
+    elapsed" fix could not work: hours_since already returns None, not a negative.
+    """
+    future = _iso(datetime.now() + timedelta(hours=2))  # clock skew: 2h ahead
+    g = _base_recurring(
+        interval_hours=8,
+        lastAchievedAt=future,
+        created_at=_iso(datetime.now() - timedelta(days=12)),
+    )
+    r = _score(g)
+    assert r["recurring_overdue_ratio"] == 0.0, r["recurring_overdue_ratio"]
+    assert r["raw"]["recurring_urgency"] == 0, r["raw"]["recurring_urgency"]
+
+
+def test_future_lastachieved_does_not_starve_genuine_never_fired():
+    """Companion guard: the 3 fix must NOT weaken the  escalation.
+
+    A genuinely never-fired goal (lastAchievedAt absent) is still treated as
+    overdue-since-creation. This pins the two None-cases apart: absent field ->
+    never-fired escalation intact; present-but-future field -> not-due.
+    """
+    g = _base_recurring(interval_hours=24, created_at=_iso(datetime.now() - timedelta(days=41)))
+    r = _score(g)
+    assert r["raw"]["recurring_urgency"] == RC["urgency_max"], r["raw"]["recurring_urgency"]

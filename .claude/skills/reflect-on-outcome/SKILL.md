@@ -88,38 +88,13 @@ IF hypothesis record has `experience_ref` field:
 
 ## Step 1.5: Point-in-Time Belief Reconstruction (bi-temporal reader, g-306-36 / rb-335)
 
-The ABC antecedent below asks "what was believed when the hypothesis was
-formed?" Reading the CURRENT reasoning bank / guardrails / beliefs answers the
-wrong question — those stores have evolved since (records falsified, retired,
-or superseded via close-old/insert-new). The bi-temporal reader returns the
-record VERSIONS that were valid at formation time T, so the antecedent reflects
-what was ACTUALLY believed then, not what is believed now.
+Rationale (WHY `--as-of` vs bare `retrieve.sh`, belief-store scope): `core/config/rationale/reflect-on-outcome.md`
 
 ```
-T = hypothesis.created  (the formation instant; falls back to the experience
-                         record's timestamp if `created` is absent)
+T = hypothesis.created
 Bash: retrieve.sh --category "{hypothesis.category}" --as-of "{T}" --read-only
-# as_of returns the RB / guardrails / pattern_signatures / beliefs versions whose
-# validity interval contained T (valid_from <= T < valid_to; valid_to null =
-# still-current). It is status-agnostic (a since-retired record that was active
-# at T still surfaces) and never bumps retrieval counters (a historical read is
-# observational). Contrast a bare retrieve.sh (no --as-of), which returns the
-# CURRENT active set.
-#
-# Use the as-of result to populate abc_chain.antecedents.data_signals /
-# source_signals with the beliefs that were live at T. When the as-of belief
-# DIFFERS from the current belief, that delta IS the learning: a belief that
-# was confidently held at T and has since been falsified is the highest-value
-# ABC antecedent — it shows the reasoning operated on a premise later proven
-# wrong. Note the divergence explicitly in the reflection (Step 5 text).
-#
-# SCOPE NOTE (sq-009): beliefs use a bounded one-per-partner supersede-DROP
-# snapshot (g-306-35), NOT close-old/insert-new, so the belief store retains at
-# most the CURRENT version per partner — an as-of belief query returns the
-# current snapshot unless a closed interval was explicitly written. RB and
-# guardrails carry true append-only version history, so point-in-time reads
-# over THOSE stores are exact. Prefer RB/guardrail as-of evidence when the
-# formation-time premise must be reconstructed precisely.
+# Returns RB/guardrails/pattern_sigs/beliefs valid at T. Divergence between
+# as-of and current belief = highest-value ABC antecedent (log in Step 5 text).
 ```
 
 ## Step 2: Generate ABC Chain
@@ -446,12 +421,7 @@ Experience JSON:
 
 ## Step 2.6c: Counterfactual Rollout (high-surprise / high-cost gate)
 
-Decoupled-simulator extraction (transfer from Qwen-AgentWorld, arXiv
-2606.24597): after a real outcome, simulate 1-2 alternative behaviors against
-the SAME antecedent and extract the predicted delta as extra learning. The
-real trajectory already paid its cost; a counterfactual mines additional
-signal from it. Gated to outcomes worth the extra reasoning (modest ROI by
-design — do NOT run it on every reflection).
+Rationale (WHY counterfactual rollout and selective gate): `core/config/rationale/reflect-on-outcome.md`
 
 ```
 # GATE — fire only for high-surprise OR high-cost outcomes. Cheap, expected
@@ -589,10 +559,7 @@ If encoding_score 0.15-0.40 (review_range):
 
 ## Step 2.8: Divergent Alternatives (Creative Lens)
 
-Before the convergent textual reflection, generate alternative explanations.
-This step is the antidote to premature convergence — the pipeline produces
-a single ABC chain (Step 2) which becomes THE explanation. But there may be
-other explanations that are equally or more valid.
+Rationale (WHY divergent alternatives before textual reflection): `core/config/rationale/reflect-on-outcome.md`
 
 ```
 # Only fire for hypotheses with surprise >= 3 OR corrected outcomes
@@ -623,9 +590,14 @@ IF abc_chain.consequence.surprise_level >= 3 OR NOT abc_chain.consequence.confir
 
         # Check: does any alternative have plausibility > 0.4?
         # If so, it deserves its own hypothesis for future verification.
+        # resolves_when + consumer are REQUIRED (g-303-34, zeta audit g-303-14):
+        # test_description names HOW to test; resolves_when names the observable
+        # signal that test yields, and consumer names what uses the settled
+        # result. A divergent alt with no settling signal AND no consumer is
+        # noise. Keep both ASCII (this JSON is piped to wm-append.sh).
         FOR EACH alt in alternatives:
             IF alt.plausibility >= 0.4 AND alt.testable:
-                echo '{"claim":"{alt.alternative_explanation}","confidence":{alt.plausibility},"source_hypothesis":"{hypothesis.id}","source_step":"divergent_alternatives","horizon":"session","test_description":"{alt.test_description}"}' | Bash: wm-append.sh micro_hypotheses
+                echo '{"claim":"{alt.alternative_explanation}","confidence":{alt.plausibility},"source_hypothesis":"{hypothesis.id}","source_step":"divergent_alternatives","horizon":"session","test_description":"{alt.test_description}","resolves_when":"result of {alt.test_description}: does the alternative hold over the primary ABC explanation?","consumer":"reflection/encoding for {hypothesis.id}: supersede the primary ABC explanation if this alternative settles true"}' | Bash: wm-append.sh micro_hypotheses
                 Log: "DIVERGENT -> HYPOTHESIS: '{alt.alternative_explanation}' (plausibility {alt.plausibility})"
 
         # Store alternatives for use in Step 3 (enriches the textual reflection)
@@ -685,7 +657,11 @@ reflection:
    Ask EACH creative_lens question about this outcome.
    For each creative_lens answer that generates a non-trivial insight:
    - Append to the reflection's `creative_lens_findings` list
-   - If the insight suggests a testable prediction: add to micro_hypotheses in working memory
+   - If the insight suggests a testable prediction: add to micro_hypotheses in
+     working memory WITH the REQUIRED resolves_when (the concrete later signal
+     that settles it) + consumer (which decision/encoding uses the resolution)
+     fields (g-303-34) — same shape as the Step 2.8 divergent filing above. If no
+     concrete settling signal exists, do NOT file the micro-hyp (it is noise).
    Log: "Creative lens: {N}/{total} questions produced findings"
    IF Step 2.8 already ran: Log: "Creative lens: skipped (already ran in Step 2.8)"
 
@@ -1271,16 +1247,7 @@ IF len(signals) == 0:
 
 ## Step 0.75: Depth Calibration
 
-Compare the pre-execution depth estimate (Phase 3.95 of aspirations-execute)
-against the actual outcome_class and execution duration. Mismatches > 1 tier
-are logged to `meta/depth-calibration.jsonl` so bias drift can be surfaced
-in later reflect-on-self passes.
-
-This step runs for EVERY notable outcome (it's cheap — no retrieval, just
-a comparison and a file append). Over time the JSONL produces a
-per-category calibration signal: "recurring goals in category X tend to
-be deeper than estimated — default to standard" becomes an advisory in
-`meta/goal-selection-strategy.yaml`.
+Rationale (WHY calibrate every notable outcome and write advisory): `core/config/rationale/reflect-on-outcome.md`
 
 ```
 estimated = goal.estimated_depth             # routine | standard | deep | null
@@ -1600,6 +1567,38 @@ This sub-skill implements Mode 1b of `/reflect`. It is invoked by the parent `/r
 ```
 Bash: wm-read.sh micro_hypotheses --json
 If slot is empty or null: return { micro_reflected: 0 } and exit
+```
+
+## Step 1.5: Auto-Settle Unresolved Micro-Hypotheses via resolves_when (g-303-34)
+
+Rationale (WHY `resolves_when` is REQUIRED and why this runs before Step 2): `core/config/rationale/reflect-on-outcome.md`
+
+```
+settled = 0; pending = 0; unsettleable_no_signal = []
+FOR EACH m in micro_hypotheses WHERE m.outcome is null (unresolved):
+    IF m has no `resolves_when` field (legacy entry filed before g-303-34):
+        # Cannot auto-settle without a named signal — leave null, flag for
+        # filing discipline. Do NOT guess an outcome (that re-introduces noise).
+        unsettleable_no_signal.append(m's claim/id)
+        continue
+    # resolves_when is a concrete signal BY CONSTRUCTION (the filing gate
+    # requires it), so it is checkable against CURRENT observable state:
+    # this session's goal outcomes, the named goal's status, the next
+    # goal-selector ranking, the next ARC/OHS score, a tree/RB/guardrail state.
+    Evaluate whether m.resolves_when has OCCURRED yet:
+      - signal NOT yet observable (the later event has not happened):
+            pending += 1                      # stays null — re-checked next batch
+      - signal observable AND m's claim HELD:
+            m.outcome = "confirmed"; m.resolved_via = "resolves_when:auto-settle"
+            settled += 1
+      - signal observable AND m's claim did NOT hold:
+            m.outcome = "corrected"; m.resolved_via = "resolves_when:auto-settle"
+            settled += 1
+# Persist the mutated array (same write-back pattern Step 3 uses for `surprise`).
+IF settled > 0: echo '<updated micro_hypotheses array JSON>' | Bash: wm-set.sh micro_hypotheses
+Log: "AUTO-SETTLE: {settled} resolved via resolves_when, {pending} signal-not-yet-observable, {len(unsettleable_no_signal)} legacy/no-signal"
+IF len(unsettleable_no_signal) > 0:
+    Log: "FILING-DISCIPLINE: {len(unsettleable_no_signal)} micro-hyps lack resolves_when (filed pre-g-303-34 or by a non-compliant site) and cannot auto-settle — all filing sites now REQUIRE the field."
 ```
 
 ## Step 2: Compute Batch Statistics

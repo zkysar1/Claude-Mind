@@ -132,6 +132,16 @@ def main() -> int:
 
     current = count_completed_goals()
     last = wm_slot_value() or {}
+    # Defensive type-guard (2, mirror of l1-skew-check.py:307): a
+    # legacy/restored WM slot may hold a bare timestamp string (the
+    # pre-dict-migration shape) instead of the {goals_count_at_last_fire: N}
+    # dict the recorder writes. Without this, last.get() raises AttributeError
+    # at read time -- and because the read crash precedes the dict-write, the
+    # slot can never self-heal (self-heal deadlock, rb-2482). Coercing a
+    # non-dict to {} routes through the first-fire seed path, which rewrites
+    # the correct dict shape.
+    if not isinstance(last, dict):
+        last = {}
     last_count = int(last.get("goals_count_at_last_fire", 0) or 0)
 
     # Seed-stagger fix (, mirror of fresh-eyes-cadence-check.py

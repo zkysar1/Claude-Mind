@@ -60,16 +60,18 @@ MECHANISM (fence-safe, never clobbers local OR a peer's S3)
 MULTI-MACHINE SAFETY (H4 — the machine-2 gate)
   The sweep is LOCAL-AUTHORITATIVE: correct on one machine, a silent-clobber risk
   on a second, where the local copy of a file this machine only READ is a CACHE of
-  S3 that a peer may have moved. Two defenses, both off by default (single-machine
-  back-compat) and armed by env:
-    - MACHINE_OWNED_AGENTS="alpha,bravo"  (H4a) — the agents THIS machine runs. The
-      sweep prunes agents/<name>/ for every name NOT listed: a peer agent's dir is
-      a cache of the OWNING machine's writes, never to be pushed from here. Unset
-      => own all agents (single-machine default).
+  S3 that a peer may have moved. Two defenses, both inactive on the single-machine
+  local backend and armed automatically when STORAGE_BACKEND=own-cloud:
+    - live runner-claim ownership (H4a) — _owned_agents() reads the DDB runner
+      claims (the same single-runner lock table) and returns the agents THIS
+      machine holds a fresh RUNNING claim for. The sweep prunes agents/<name>/ for
+      every name NOT owned: a peer agent's dir is a cache of the OWNING machine's
+      writes, never pushed from here. Local backend => None => own all agents
+      (single-machine default).
     - the content baseline (H4b, above) guards world/ and meta/ (shared by all
       machines): a file at its baseline locally while S3 moved is a stale cache,
-      skipped — not pushed over the peer's newer bytes. MACHINE_MULTI=1 (or
-      any MACHINE_OWNED_AGENTS value) also makes a diverged file with NO baseline
+      skipped — not pushed over the peer's newer bytes. own-cloud (or MACHINE_MULTI=1
+      for local-backend testing) also makes a diverged file with NO baseline
       skip rather than push (cannot prove local authority); the PostToolUse
       single-file path still pushes genuine local writes in real time.
   The If-Match fence ALONE does not prevent stale-clobber: it fences on the
@@ -382,179 +384,65 @@ def _save_manifest(m: dict) -> None:
 _OWNERSHIP_STALE_SECONDS_DEFAULT = 900
 
 
-def _owned_agents_static():
-    """The set of agent names THIS machine runs, from MACHINE_OWNED_AGENTS
-    (comma-separated). None => own ALL agents (single-machine default / unset).
-
-    On a SECOND machine the local copy of a PEER agent's dir is a stale CACHE of
-    the owning machine's S3 writes, so this local-authoritative mirror sweep must
-    NOT push it — doing so clobbers the peer's newer S3 bytes (and the If-Match
-    fence does not stop it: the sweep fences on the just-observed CURRENT etag, so
-    a stale-local PUT succeeds). When set, the sweep prunes agents/<name>/ for
-    every name NOT listed."""
-    raw = os.environ.get("MACHINE_OWNED_AGENTS", "").strip()
-    if not raw:
-        return None
-    return {a.strip() for a in raw.split(",") if a.strip()}
-
-
-def _owned_agents_runner_token(be, root_path: Path):
-    """Runner-token ownership detection for own-cloud multi-machine setups.
-
-    Scans agents/<name>/session/runner-token locally. For each local token:
-      1. Reads the S3 copy via be.read_bytes().
-      2. If S3 is absent (bootstrap) or matches → this machine owns the agent;
-         pushes the local token to S3 as the authoritative claim.
-      3. If S3 has a different token → another machine started that agent last;
-         skip (do not push, do not prune-protect).
-
-    Returns:
-      - None  if the agents dir doesn't exist (single-machine / pre-init layout).
-      - None  if no runner-token files are found locally — can't determine
-              multi-machine context; caller falls back to static
-              MACHINE_OWNED_AGENTS (backward-compatible for IDLE agents and
-              machines that have never run /start).
-      - set() if at least one local runner-token was found but NONE matched S3
-              (another machine owns all active agents; this machine owns none).
-      - {names} if one or more agents' tokens match S3 (or S3 was absent).
-
-    The "found any token" distinction matters: returning None vs set() controls
-    whether the caller falls to static env-var ownership. Without a local token
-    we have no multi-machine signal — returning None is safer than claiming
-    zero ownership, which would prevent ANY agent dir from syncing on a single-
-    machine setup where /start has never been run.
-
-    The S3 comparison handles the concurrent-start race: the machine that wrote
-    last to S3 wins. Fail-open on S3 I/O errors (claim ownership) so single-
-    machine setups without MACHINE_OWNED_AGENTS keep working.
-
-    runner-token is machine_local in session-manifest.yaml (the sweep never
-    touches it), so this function handles its own S3 I/O via be.read_bytes /
-    be.write_bytes outside the normal sweep path.
-
-    root_path is the agents prefix root (the directory that contains alpha/,
-    bravo/, etc. directly) — NOT the parent directory. Callers must pass the
-    "agents"-prefixed root from _roots(), not the repo root."""
-    if not root_path.is_dir():
-        return None
-    owned: set = set()
-    found_any_token = False
-    try:
-        agent_dirs = sorted(root_path.iterdir())
-    except OSError:
-        return None
-    for agent_dir in agent_dirs:
-        if not agent_dir.is_dir():
-            continue
-        token_path = agent_dir / "session" / "runner-token"
-        if not token_path.exists():
-            continue
-        try:
-            local_token = token_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if not local_token:
-            continue
-        found_any_token = True
-        agent_name = agent_dir.name
-        s3_key = f"agents/{agent_name}/session/runner-token"
-        try:
-            s3_bytes = be.read_bytes(s3_key)
-            if s3_bytes is not None:
-                s3_token = s3_bytes.decode("utf-8", errors="replace").strip()
-                if s3_token != local_token:
-                    # Another machine has a newer claim — do not own.
-                    continue
-            # S3 absent (bootstrap) or matches → own it; push claim.
-            be.write_bytes(s3_key, local_token.encode("utf-8"))
-        except Exception:
-            # S3 unavailable — fail-open (claim ownership).
-            pass
-        owned.add(agent_name)
-    # No local tokens found → can't assert multi-machine context; caller falls
-    # back to static MACHINE_OWNED_AGENTS (backward-compatible behavior).
-    if not found_any_token:
-        return None
-    return owned
-
-
 def _owned_agents(be=None):
-    """Resolve the agent dirs this machine owns for the sweep. Gated by
-    OWNERSHIP_MODE (default '' => runner-token when be is provided, else static):
-
-    runner-token (default when OWNERSHIP_MODE is unset and be is available):
-      Compare agents/<name>/session/runner-token to the S3 copy. Zero-config:
-      no env list to maintain; /start writes the token, the sweep reads it.
-      Eliminates MACHINE_OWNED_AGENTS for own-cloud setups.
-
-    dynamic (OWNERSHIP_MODE='dynamic', INERT until g-115-1340 cutover):
-      Live RUNNING DDB runner claims for this machine_id.
-
-    static (OWNERSHIP_MODE='static'):
-      Legacy MACHINE_OWNED_AGENTS env list.
+    """Resolve the agent dirs THIS machine owns for the sweep, from the LIVE DDB
+    runner claims — the SAME single-runner claims the cross-machine lock uses
+    (lodestar dynamic-ownership design §3). STORAGE_BACKEND is the ONLY signal;
+    there is no OWNERSHIP_MODE flag and no MACHINE_OWNED_AGENTS env list.
 
     Returns:
-      None  — single-machine / unset → own ALL agents.
-      set   — names this machine currently runs (may be empty → own none).
+      None  — local backend → single machine, own ALL agents (no sync
+              contention; the periodic sweep pushes every agent dir).
+      set   — own-cloud → the agent names this machine currently holds a fresh
+              RUNNING claim for. May be EMPTY (own none this sweep → no agent
+              dir is pushed, but world/ and meta/ still sync).
 
-    FAIL-SAFE: on any resolution error, falls back to static env list (never
-    own-all on failure — conservative, never clobbers a peer)."""
-    mode = os.environ.get("OWNERSHIP_MODE", "").strip().lower()
-
-    if mode == "dynamic":
-        # Dynamic path — INERT until g-115-1340 cutover. Own-cloud only.
-        kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
-        if kind != "own-cloud":
-            return None
-        try:
-            stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
-                                       _OWNERSHIP_STALE_SECONDS_DEFAULT))
-        except (TypeError, ValueError):
-            stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
-        try:
-            from storage_backend import get_backend
-            be_dyn = get_backend()
-            # be_dyn.machine_id is the value acquire_runner stamped onto the claim
-            # (SSOT), so the resolver's 'me' matches the claim's machine_id exactly.
-            me = getattr(be_dyn, "machine_id", None)
-            if not me or me == "unknown":
-                return _owned_agents_static()
-            claims = be_dyn.list_runner_claims()
-        except Exception as exc:
-            print(f"[sync] OWNERSHIP_MODE=dynamic: live claim read failed "
-                  f"({type(exc).__name__}: {exc}); falling back to static "
-                  "MACHINE_OWNED_AGENTS (conservative — never own-all on failure).",
-                  file=sys.stderr)
-            return _owned_agents_static()
-        now = time.time()
-        return {
-            c.agent for c in claims
-            if c.machine_id == me
-            and c.agent_state == "RUNNING"
-            and (now - c.heartbeat_at) < stale
-        }
-
-    if mode == "static":
-        return _owned_agents_static()
-
-    # Default / "runner-token": auto-detect via S3 runner-token comparison.
-    if be is not None:
-        for rp, pfx in _roots(be, None):
-            if pfx == "agents":
-                result = _owned_agents_runner_token(be, rp)
-                if result is not None:
-                    return result
-                break  # agents root found but no runner-tokens → fall through
-
-    # Fallback: static env list (covers MACHINE_OWNED_AGENTS legacy and the
-    # no-be / local-backend case where runner-token comparison is impossible).
-    return _owned_agents_static()
+    FAIL-SAFE: on ANY DDB / resolution error, OR when this machine's identity is
+    unknown, return the EMPTY set (own none) — NEVER own-all. A machine that
+    cannot prove it holds the live claim must not push a peer's cached agent dir
+    over the peer's newer S3 bytes (the world/ + meta/ baseline defenses in
+    _sync_one still guard the shared trees). This replaces the pre-cutover
+    fallback to a static MACHINE_OWNED_AGENTS list, which silently degraded to
+    own-all whenever that (now-removed) env var was unset — the exact clobber
+    hole this empty-set fallback closes. The `be` parameter is accepted for
+    call-site compatibility and is unused — ownership now derives from the live
+    claim table, not a local runner-token scan."""
+    kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    if kind != "own-cloud":
+        return None
+    try:
+        stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
+                                   _OWNERSHIP_STALE_SECONDS_DEFAULT))
+    except (TypeError, ValueError):
+        stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
+    try:
+        from storage_backend import get_backend
+        be_dyn = get_backend()
+        # be_dyn.machine_id is the value acquire_runner stamped onto the claim
+        # (SSOT), so the resolver's 'me' matches the claim's machine_id exactly.
+        me = getattr(be_dyn, "machine_id", None)
+        if not me or me == "unknown":
+            return set()  # cannot identify this machine → own none (safe)
+        claims = be_dyn.list_runner_claims()
+    except Exception as exc:
+        print(f"[sync] live runner-claim read failed "
+              f"({type(exc).__name__}: {exc}); owning NO agent dirs this sweep "
+              "(conservative — never own-all, never clobber a peer).",
+              file=sys.stderr)
+        return set()
+    now = time.time()
+    return {
+        c.agent for c in claims
+        if c.machine_id == me
+        and c.agent_state == "RUNNING"
+        and (now - c.heartbeat_at) < stale
+    }
 
 
 def _multi_machine() -> bool:
-    """True when this process shares the env with other machines. Declaring
-    MACHINE_OWNED_AGENTS is the signal (a single machine owns all agents and leaves
-    it unset); MACHINE_MULTI=1 forces it on. Enables the conservative
+    """True when this process shares the env with peer machines. The own-cloud
+    backend IS the signal (_owned_agents returns a set, not None); MACHINE_MULTI=1
+    forces it on for local-backend testing. Enables the conservative
     no-baseline stale-skip in _sync_one (cannot prove local authority => do not
     risk clobbering a peer)."""
     if os.environ.get("MACHINE_MULTI", "").strip().lower() in (
@@ -694,9 +582,27 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # peer may own it. Conservative: do not push. A genuine local
             # raw-write is still pushed in real time by the PostToolUse
             # single-file path (sync_file), which KNOWS it was a local write.
+            #
+            # g-328-14 baseline-on-clone: MATCHING files (local==S3) ARE
+            # baselined on the first sweep by the in-sync branch above (it
+            # returns local_md5 -> recorded in the manifest, so the next sweep
+            # skips-unchanged). Only DIVERGENT no-baseline files reach here, and
+            # they are deliberately NOT auto-baselined: adopting S3's md5 as the
+            # baseline while keeping the divergent local would make the NEXT
+            # sweep read "local changed, S3 still at baseline" -> PUSH -> clobber
+            # S3 with a fresh-clone default. Re-evaluating every sweep (return
+            # None, keep no baseline) is the correct, clobber-safe behavior; a
+            # genuinely-authoritative local file reconciles via sync_file (proven
+            # authorship) or an explicit evidence-gated push, never by auto-adopt.
             stats["nobaseline_skipped"] = stats.get("nobaseline_skipped", 0) + 1
-            print(f"[sync] skip (diverged, no baseline, multi-machine — cannot "
-                  f"prove local authority): {full}", file=sys.stderr)
+            # No per-file print here (g-328-14 spawn.log flood): on a fresh
+            # 2nd-machine contact the manifest is empty, so EVERY governed file
+            # lands in this branch and a per-file stderr line floods spawn.log
+            # (zeta hit 13M). The aggregate `nobaseline_skipped` counter is
+            # surfaced in the sweep summary — that is the durable signal; the
+            # per-file detail is not worth the flood. (Sibling stale/conflict
+            # skip branches print far less on 2nd-machine contact because they
+            # require a pre-existing baseline, which a fresh box lacks.)
             return None
         # else: (local changed, S3 still at baseline) OR (single-machine,
         #        no baseline) -> local-authoritative content -> push below.
@@ -758,8 +664,11 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     #     pushes (first bootstrap) — _sync_one's S3-absent branch never reaches
     #     this guard. The real-time sync_file path proves authorship and keeps
     #     passing multi_machine=False, so genuine local writes still mirror.
-    mm = _multi_machine() or (
-        os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud")
+    # own-cloud is checked first (cheap env read) so the common fleet path skips
+    # the _multi_machine() DDB scan; the result is identical (own-cloud always
+    # implies multi-machine now that _owned_agents returns a set for it).
+    mm = (os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud"
+          ) or _multi_machine()
     stats = {"scanned": 0, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "skipped_unchanged": 0,
              "stale_skipped": 0, "diverged_skipped": 0, "nobaseline_skipped": 0,
@@ -1104,6 +1013,197 @@ def pull_temp(be, agent: str, *, dry_run: bool = False,
     return stats
 
 
+# --- fresh-box firmware materialization (g-328-13) -------------------------
+# Governed non-agent subtrees whose files are read/executed OUTSIDE the daemon
+# (bare-bash `world/scripts/*.sh`, plain-cat `world-cat.sh`, the LLM Read tool)
+# and are therefore NOT covered by lodestar's lazy store-read materialization
+# (retrieve.py / _fileops route store DATA reads through the backend; a bare
+# `bash world/scripts/email-send.sh` never touches the daemon). On a fresh
+# own-cloud clone these live only in S3, so day 1 email transport + the Layer-B
+# output-style gate are inoperative until a manual sync. `world/scripts` is the
+# VERIFIED breakage (email-send.sh, output-style-mode-guard.sh — g-029-14 zeta
+# bring-up on zakbox1). Extend this tuple to add more firmware subtrees; each
+# entry is (root_prefix, sub_path or None-for-whole-root). Do NOT add whole
+# `world`/`meta` roots here — `.history`/`sessions` are `_EXCLUDE_DIRS`-pruned
+# but the tree/board/knowledge bulk is lodestar-covered on read and pulling it
+# eagerly would bloat every fresh boot.
+_FIRMWARE_SUBPATHS = (("world", "scripts"),)
+
+
+def _materialize_tree(be, root_path: Path, cur: Path, prefix: str, *,
+                      stats: dict, manifest: dict, new_manifest: dict,
+                      dry_run: bool) -> None:
+    """Recursively enumerate S3 under `cur` (via be.list_dir) and _pull_one each
+    governed leaf to local, honoring _EXCLUDE_DIRS / _is_machine_local. On a
+    fresh box the local files do not exist yet, so we walk S3 (not os.walk, which
+    would find nothing) — the pull-side analogue of `sweep`'s os.walk. Sibling of
+    pull_temp's list_dir recursion, generalized to arbitrary depth and to a
+    dir/file split that does not depend on a filename extension (world/scripts
+    has extensionless entries and a `.python-shim/` subdir): a non-empty
+    be.list_dir(child) marks a prefix (recurse); an empty one marks a leaf
+    object (pull). `rel_key` is keyed off `root_path` (the governed root), not
+    `cur`, so manifest keys match the sweep/pull_continuity convention."""
+    try:
+        children = be.list_dir(cur)
+    except Exception as e:  # noqa: BLE001 — missing prefix lists empty; net error -> count
+        stats["errors"] += 1
+        print(f"[materialize] WARN: list_dir failed for {cur}: {e}", file=sys.stderr)
+        return
+    for name in sorted(children):
+        if name in _EXCLUDE_DIRS:
+            continue
+        child = cur / name
+        try:
+            grand = be.list_dir(child)
+        except Exception:  # noqa: BLE001 — treat an unlistable child as a leaf
+            grand = []
+        if grand:
+            _materialize_tree(be, root_path, child, prefix, stats=stats,
+                              manifest=manifest, new_manifest=new_manifest,
+                              dry_run=dry_run)
+            continue
+        # Leaf object.
+        if _is_machine_local(name, prefix, full_path=child, root_path=root_path):
+            continue
+        rel_key = f"{prefix}/{child.relative_to(root_path).as_posix()}"
+        _base_mtime, base_md5 = _manifest_entry(manifest.get(rel_key))
+        before = stats["pulled"]
+        new_md5 = _pull_one(be, child, dry_run=dry_run, stats=stats,
+                            baseline_md5=base_md5)
+        stats["scanned"] += 1
+        if stats["pulled"] > before:
+            stats["pulled_files"].append(rel_key)
+        if not dry_run and new_md5 is not None:
+            try:
+                mtime_ns = child.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = None
+            if mtime_ns is not None:
+                new_manifest[rel_key] = {"mtime": mtime_ns, "md5": new_md5}
+
+
+def materialize_firmware(be, project_root, *, dry_run: bool = False,
+                         force: bool = False) -> dict:
+    """Fresh-box firmware materialization (g-328-13).
+
+    Pull the governed non-agent firmware subtrees (`_FIRMWARE_SUBPATHS`, i.e.
+    `world/scripts`) from S3 to local ONCE per box, so bare-bash `world/scripts/
+    *.sh` and plain-cat reads work on day 1 of a fresh own-cloud clone. Reuses
+    `_pull_one`'s no-clobber baseline gate, so it never overwrites an
+    init-written default (no baseline + local differs -> S3 authoritative, pull;
+    but a genuinely unpushed local edit -> skip) or a peer's cache.
+
+    own-cloud only (no-op on local — the local files ARE the store). One-time per
+    box via a machine-local marker (`mind_api/state/.firmware-materialized`,
+    which is NOT synced), written ONLY after a clean (error-free) pass so a
+    partial failure retries on the next daemon start. `force=True` re-runs
+    ignoring the marker (test hook / manual re-materialize).
+
+    Called from the background owncloud-sync thread AFTER the daemon is already
+    serving (see mind_api/src/__main__._start_owncloud_sync_thread), so a slow
+    first pull can never delay the daemon publish and trigger a spawn-timeout
+    daemon storm. Fully fail-open: every error is counted + surfaced on stderr,
+    never raised — a broken materialization must not kill the sync thread."""
+    stats = {"backend": os.environ.get("STORAGE_BACKEND", "local").strip().lower(),
+             "materialized_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
+             "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
+             "multipart_deferred": 0, "errors": 0, "pulled_files": [],
+             "skipped": None}
+    if stats["backend"] != "own-cloud":
+        stats["skipped"] = "local backend (no-op)"
+        return stats
+    marker = Path(project_root) / "mind_api" / "state" / ".firmware-materialized"
+    if marker.exists() and not force:
+        stats["skipped"] = "already materialized (marker present)"
+        return stats
+
+    manifest = _load_manifest()
+    new_manifest = dict(manifest)
+    for prefix, sub in _FIRMWARE_SUBPATHS:
+        for root_path, _pfx in _roots(be, prefix):
+            base = (root_path / sub) if sub else root_path
+            _materialize_tree(be, root_path, base, prefix, stats=stats,
+                              manifest=manifest, new_manifest=new_manifest,
+                              dry_run=dry_run)
+            stats["materialized_roots"].append(f"{prefix}/{sub}" if sub else prefix)
+
+    if not dry_run:
+        _save_manifest(new_manifest)
+        # Write the one-time marker ONLY on a clean pass so a partial failure
+        # (some file's stat/refresh errored) retries next daemon start rather
+        # than being masked forever by a premature marker.
+        if stats["errors"] == 0:
+            try:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n",
+                                  encoding="utf-8")
+            except OSError as e:
+                print(f"[materialize] WARN: could not write marker {marker}: {e}",
+                      file=sys.stderr)
+    return stats
+
+
+# --- fresh-box bootstrap pull (durable closer) -----------------------------
+# Broader than firmware's world/scripts: the explicit pre-init --pull
+# materializes the FULL shared world/ + meta/ state so init-world.sh /
+# init-meta.sh see the true (S3) .initialized marker + a populated tree,
+# instead of an empty local cache — which their LOCAL-marker idempotency gate
+# misreads as "fresh" and re-seeds empty stubs OVER the real S3 state (the
+# fresh-own-cloud-box blank-tree failure, g-029-14 / BLOCKER 9). agents/ is
+# intentionally excluded: per-agent continuity is pulled freshness-aware at
+# /start by pull_continuity, and a full agent-history pull here would be huge
+# AND cross-machine-unsafe (a peer agent's dir is a cache of its OWNING
+# machine). Extend only with SHARED roots.
+_BOOTSTRAP_ROOTS = ("world", "meta")
+
+
+def pull_bootstrap(be, *, only_root=None, dry_run=False):
+    """Fresh-box bootstrap pull (durable closer).
+
+    S3-list-driven materialization of the full shared world/ + meta/ state to
+    local, callable BEFORE init on a fresh own-cloud box (init-world.sh and
+    init-meta.sh wire `--pull --root <r>` in FRONT of their idempotency gates)
+    so init reads the true initialized state from S3 instead of re-seeding
+    empty stubs over it.
+
+    Reuses `_materialize_tree` — the SAME S3-walk + `_pull_one` no-clobber
+    baseline gate as `materialize_firmware` — generalized from the world/scripts
+    subpath to whole roots. So it never overwrites a genuine unpushed local edit
+    (baseline gate) and on a fresh box (no local files, no baseline) it pulls S3
+    as authoritative. own-cloud only (no-op on local — the local files ARE the
+    store). Fully fail-open: every error is counted + surfaced on stderr, never
+    raised, so a partial pull degrades to the daemon's lazy per-read
+    materialization rather than crashing bring-up.
+
+    `only_root` limits to one root (the per-script `--root` wiring); None pulls
+    every _BOOTSTRAP_ROOTS entry. Unlike materialize_firmware there is NO
+    one-time marker — the caller's local `.initialized` gate is the freshness
+    signal, and the manifest + baseline make a re-run idempotent.
+    """
+    stats = {"backend": os.environ.get("STORAGE_BACKEND", "local").strip().lower(),
+             "pulled_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
+             "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
+             "multipart_deferred": 0, "errors": 0, "pulled_files": [],
+             "skipped": None}
+    if stats["backend"] != "own-cloud":
+        stats["skipped"] = "local backend (no-op)"
+        return stats
+    roots = _BOOTSTRAP_ROOTS if only_root is None else (only_root,)
+    manifest = _load_manifest()
+    new_manifest = dict(manifest)
+    for prefix in roots:
+        if prefix not in ("world", "meta", "agents"):
+            continue
+        for root_path, _pfx in _roots(be, prefix):
+            _materialize_tree(be, root_path, root_path, prefix, stats=stats,
+                              manifest=manifest, new_manifest=new_manifest,
+                              dry_run=dry_run)
+            stats["pulled_roots"].append(prefix)
+    if not dry_run:
+        _save_manifest(new_manifest)
+    return stats
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1116,8 +1216,13 @@ def main() -> int:
                    help="flush a single OWNED agent dir (agents/<NAME>/) — the "
                         "per-agent /stop flush scope (design §6); forces the "
                         "agents root, prunes everything else")
+    g.add_argument("--pull", action="store_true",
+                   help="fresh-box bootstrap: S3-list-driven PULL of world/+meta/ "
+                        "to local (run BEFORE init on a fresh own-cloud clone so "
+                        "init sees the true initialized state, not an empty "
+                        "cache). Honors --root to limit to one root.")
     ap.add_argument("--root", choices=("world", "meta", "agents"),
-                    help="limit --all to one root")
+                    help="limit --all / --pull to one root")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what WOULD push; no S3 writes")
     ap.add_argument("--full", action="store_true",
@@ -1132,6 +1237,29 @@ def main() -> int:
 
     if args.file:
         return sync_file(be, Path(args.file), dry_run=args.dry_run)
+
+    if args.pull:
+        t0 = time.time()
+        stats = pull_bootstrap(be, only_root=args.root, dry_run=args.dry_run)
+        dt = time.time() - t0
+        if stats.get("skipped"):
+            print(f"[pull] skipped: {stats['skipped']}")
+            return 0
+        mode = "DRY-RUN" if args.dry_run else "APPLIED"
+        print(f"[pull] {mode} in {dt:.1f}s — roots {stats['pulled_roots']}, "
+              f"scanned {stats['scanned']}, "
+              f"{'would-pull' if args.dry_run else 'pulled'} "
+              f"{stats['would_pull'] if args.dry_run else stats['pulled']}, "
+              f"in-sync {stats['in_sync']}, s3-absent {stats['s3_absent']}, "
+              f"local-ahead-skip {stats['local_ahead_skipped']}, "
+              f"multipart-defer {stats['multipart_deferred']}, "
+              f"errors {stats['errors']}")
+        if args.dry_run and stats["pulled_files"]:
+            for p in stats["pulled_files"][:40]:
+                print(f"           would pull: {p}")
+            if len(stats["pulled_files"]) > 40:
+                print(f"           ... and {len(stats['pulled_files']) - 40} more")
+        return 1 if stats["errors"] else 0
 
     if args.no_manifest and _multi_machine():
         print("[sync] WARNING: --no-manifest disables the content baseline; on a "

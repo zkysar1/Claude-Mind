@@ -295,6 +295,28 @@ Use when a node has accumulated narrative that inflates context without improvin
 node=$(bash core/scripts/tree-read.sh --node <key>)
 Read {node.file}
 
+# 1.5. COHERENCE GATE (rb-94 / guard-896 / g-115-1534: triage by coherence,
+#      not utility). util_ratio over-flags coherent low-RETRIEVAL nodes the same
+#      way article_count=0 over-flagged content-bearing nodes (g-115-1534).
+#      Before archiving anything, body-read the node and judge: do the ##
+#      sections cohere as ONE tight document (clean Decision Rules + Verified
+#      Values, narrative that supplies load-bearing context) flagged purely by
+#      LOW RETRIEVAL? Low retrieval signals under-instrumentation / niche value,
+#      NOT bloat — distilling it DESTROYS context. If COHERENT, do NOT distill —
+#      record the durable judgment so it never re-surfaces as a utility candidate
+#      (get_distill_candidates skips "distill" in maintain_exempt — crit1/crit2 only):
+#        bash core/scripts/tree-update.sh --set <key> maintain_exempt '["distill"]'
+#      (merge, don't clobber: if the node already carries a maintain_exempt list,
+#       set the UNION, e.g. '["redistribute","distill"]')
+#      and STOP. Only proceed to step 2+ when the node has genuine NARRATIVE
+#      BLOAT (sections that inflate context without improving decisions).
+#      Default to COHERENT when ambiguous — destroying context is worse than
+#      leaving a slightly-long coherent node. EXCEPTION: the oversized-append-grown
+#      structural trigger (trigger=oversized_append_grown / crit3, g-115-1570) is
+#      NOT exempt — a coherent node too big to Read still gets the non-destructive
+#      rollup (archive verbatim + keep newest-N); maintain_exempt:["distill"]
+#      suppresses only the utility triggers, never crit3.
+
 # 2. Archive full original content
 mkdir -p "$WORLD_DIR/knowledge/archive"    # WORLD_DIR from _paths.sh — NEVER use bare world/
 Write $WORLD_DIR/knowledge/archive/{key}-{date}.md:
@@ -435,7 +457,15 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
 **Steps**:
 1. Scan candidates: `Bash: tree-read.sh --distill-candidates`
 2. For each candidate (largest line_count first, up to `max_distill_per_invocation`):
-   Invoke `/tree distill <key>`
+   a. COHERENCE GATE (rb-94 / guard-896): body-read the candidate FIRST. If it
+      coheres as one tight document flagged purely by low retrieval (niche, not
+      bloated), set `maintain_exempt` to include "distill" and SKIP — do NOT
+      distill (low util = under-instrumented, not bloat; the g-115-1534 over-flag
+      class). The `/tree distill` sub-command enforces the same gate at step 1.5,
+      and get_distill_candidates then skips the node's utility triggers durably.
+      EXCEPTION: a candidate with `trigger == oversized_append_grown` (crit3) is
+      NOT exempt — its non-destructive rollup still fires (too big to Read).
+   b. Otherwise invoke `/tree distill <key>`.
 3. Log to tree_growth_log
 
 Note: DISTILL candidates require utility data from Phase 4.26. New nodes with zero

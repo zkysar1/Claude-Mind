@@ -87,6 +87,8 @@ def _persist(ctx, path: Path, data: Any) -> None:
 
 def _load(ctx, file_tuple):
     path = ctx.paths.meta / file_tuple[0]
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return path, None, []
     with open(path, "r", encoding="utf-8") as f:

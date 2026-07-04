@@ -37,17 +37,12 @@ if [ -z "$BACKEND" ] && [ -f "$PROJECT_ROOT/.env.local" ]; then
 fi
 BACKEND="${BACKEND:-local}"
 
-# Default owned-agents list (own-cloud checklist) from .env.local.
-OWNED=""
-if [ -f "$PROJECT_ROOT/.env.local" ]; then
-    OWNED="$(grep -E '^MACHINE_OWNED_AGENTS=' "$PROJECT_ROOT/.env.local" 2>/dev/null \
-        | head -1 | cut -d= -f2- | tr -d '\r' | awk '{print $1}' || true)"
-fi
-
+# Sync ownership is derived from live DDB runner claims (there is no
+# MACHINE_OWNED_AGENTS env list). To pack a specific subset, pass --agents
+# explicitly; it flows through "$@" to _transplant_pack.py.
 exec py -3 "$SCRIPT_DIR/_transplant_pack.py" "$SUB" \
     --project-root "$PROJECT_ROOT" \
     --world "${WORLD_PATH:-}" \
     --meta "${META_PATH:-}" \
     --backend "$BACKEND" \
-    --owned-agents "$OWNED" \
     "$@"

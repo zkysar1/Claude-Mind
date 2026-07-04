@@ -53,6 +53,8 @@ class _StrategyError(Exception):
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -152,6 +154,8 @@ def _collect_journal_skill_dates(ctx, skill_names):
         r'(?<![\w-])(' + '|'.join(re.escape(n) for n in skill_names) + r')(?![\w-])'
     )
     for journal_path in ctx.paths.agents_root.glob("*/journal.jsonl"):
+        from storage_backend import get_backend
+        get_backend().ensure_local(journal_path)  # own-cloud read-path fix: materialize per-agent journal before local read
         with open(journal_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -204,6 +208,8 @@ def _collect_companion_script_dates(ctx, skill_names, forged_skills):
     )
     scan_paths = list(ctx.paths.agents_root.glob("*/session/execution-diary.jsonl"))
     for path in scan_paths:
+        from storage_backend import get_backend
+        get_backend().ensure_local(path)  # own-cloud read-path fix: materialize per-agent execution-diary before local read
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()

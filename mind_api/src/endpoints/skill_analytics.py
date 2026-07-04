@@ -28,6 +28,7 @@ ctx.paths (META->meta, WORLD->world, AGENT->agent, CONFIG->project_root/core/con
 """
 from __future__ import annotations
 
+import datetime
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -37,6 +38,8 @@ import yaml
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -45,6 +48,8 @@ def _read_yaml(path: Path) -> Dict[str, Any]:
 
 
 def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix: materialize S3-only file before local read; no-op on LocalBackend and out-of-root paths
     if not path.exists():
         return []
     records = []
@@ -374,6 +379,97 @@ def trend(ctx) -> "Response":  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
+# GET /v1/skill-analytics/usage-report?window=N
+# ---------------------------------------------------------------------------
+
+def usage_report(ctx) -> "Response":  # type: ignore[name-defined]
+    from ..server import Response
+
+    window_raw = ctx.query.get("window", "")
+    try:
+        window_days = int(window_raw) if window_raw else 30
+    except ValueError:
+        return Response.error(400, "invalid_param", "window must be an integer")
+
+    cutoff = (datetime.date.today() - datetime.timedelta(days=window_days)).isoformat()
+    agents_root = ctx.paths.agents_root
+
+    all_invocations: List[Dict[str, Any]] = []
+    for inv_path in sorted(agents_root.glob("*/skill-invocations.jsonl")):
+        for rec in _read_jsonl(inv_path):
+            if isinstance(rec, dict) and rec.get("ts", "")[:10] >= cutoff:
+                all_invocations.append(rec)
+
+    skill_counts: Counter = Counter(r.get("skill", "") for r in all_invocations if r.get("skill"))
+    total = sum(skill_counts.values())
+
+    most_used = [
+        {"skill": s, "count": c, "pct": round(c / total * 100, 1) if total else 0.0}
+        for s, c in skill_counts.most_common(20)
+    ]
+
+    # Registered base + forged skills
+    registered: set = set()
+    skills_dir = ctx.paths.project_root / ".claude" / "skills"
+    if skills_dir.exists():
+        for skill_dir in skills_dir.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                registered.add(skill_dir.name)
+    forged_path = ctx.paths.world / "forged-skills.yaml"
+    if forged_path.exists():
+        fd = _read_yaml(forged_path)
+        for sk in fd.get("skills", []):
+            if isinstance(sk, dict) and sk.get("name"):
+                registered.add(sk["name"])
+    never_used = sorted(registered - set(skill_counts.keys()))
+
+    # Per-agent heatmap + model-vs-user split (top 30 skills by volume)
+    agents_per_skill: Dict[str, Any] = defaultdict(Counter)
+    model_vs_user: Dict[str, Any] = defaultdict(Counter)
+    for rec in all_invocations:
+        skill = rec.get("skill", "")
+        agent = rec.get("agent", "")
+        source = rec.get("invocation_source", "model")
+        if skill and agent:
+            agents_per_skill[skill][agent] += 1
+        if skill:
+            model_vs_user[skill][source] += 1
+    top30 = {s for s, _ in skill_counts.most_common(30)}
+    agents_per_skill_out = {s: dict(c) for s, c in agents_per_skill.items() if s in top30}
+    model_vs_user_out = {s: dict(c) for s, c in model_vs_user.items() if s in top30}
+
+    # Weekly trend for top 10 skills
+    weekly: Dict[str, Counter] = defaultdict(Counter)
+    for rec in all_invocations:
+        ts = rec.get("ts", "")
+        skill = rec.get("skill", "")
+        if ts and skill:
+            try:
+                d = datetime.date.fromisoformat(ts[:10])
+                week_label = d.strftime("%Y-W%W")
+            except ValueError:
+                continue
+            weekly[week_label][skill] += 1
+    top10_skills = [s for s, _ in skill_counts.most_common(10)]
+    weekly_out = {
+        week: {s: counts.get(s, 0) for s in top10_skills}
+        for week, counts in sorted(weekly.items())
+    }
+
+    return _out({
+        "window_days": window_days,
+        "data_start": cutoff,
+        "data_end": datetime.date.today().isoformat(),
+        "total_invocations": total,
+        "most_used": most_used,
+        "never_used": never_used,
+        "agents_per_skill": agents_per_skill_out,
+        "model_vs_user": model_vs_user_out,
+        "weekly_trend": weekly_out,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
 
@@ -383,3 +479,4 @@ def register(routes) -> None:
     routes[("GET", "/v1/skill-analytics/coverage")] = coverage
     routes[("GET", "/v1/skill-analytics/recommendations")] = recommendations
     routes[("GET", "/v1/skill-analytics/trend")] = trend
+    routes[("GET", "/v1/skill-analytics/usage-report")] = usage_report

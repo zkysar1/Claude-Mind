@@ -242,6 +242,48 @@ def test_close_genuine_marks_and_consumes(tmp_path):
     assert _read(tmp_path, "alpha", SID_A)["body_state"] == "closed-pending-merge"
 
 
+# ─────────────── : explicit reducer role + reducer_sid field ───────────────
+
+def test_explicit_reducer_role_no_fork(tmp_path):
+    # Passing role="reducer" explicitly: manifest records role=reducer,
+    # reducer_sid=null (reducer IS the Reducer), no WM fork (Phase 1B inert).
+    pr = _mk_agent(tmp_path, wm_text="slot: x\n")
+    path = bm.write_manifest(SID_A, "alpha", role="reducer", project_root=pr)
+    data = _read(pr, "alpha", SID_A)
+    assert data["role"] == "reducer"
+    assert data["reducer_sid"] is None, "reducer_sid must be null for the reducer itself"
+    assert data["forked_wm_hash"] is None, "reducer never forks its WM"
+    assert data["body_state"] == "active"
+    # NO body-WM-file -> Phase 1A routing stays agent-wide (backward-compatible).
+    body_wm = path.parent / "working-memory.yaml"
+    assert not body_wm.exists(), "reducer must not create a per-Body WM file"
+
+
+def test_worker_has_correct_reducer_sid(tmp_path):
+    # With SID_A holding running-session-id, a new worker body (SID_B) must record
+    # reducer_sid = SID_A so the framework-ES can locate the Reducer's es-snapshot.yaml.
+    pr = _mk_agent(tmp_path, running_sid=SID_A, wm_text="slot: x\n")
+    path = bm.write_manifest(SID_B, "alpha", role="worker", project_root=pr)
+    data = _read(pr, "alpha", SID_B)
+    assert data["role"] == "worker"
+    assert data["reducer_sid"] == SID_A, "worker must carry the reducer's SID"
+    # Non-reducer worker forks: hash and body-WM-file must both be present.
+    assert data["forked_wm_hash"] is not None
+    assert (path.parent / "working-memory.yaml").exists()
+
+
+def test_observer_has_correct_reducer_sid(tmp_path):
+    # Observer also records reducer_sid but never forks (read-only).
+    pr = _mk_agent(tmp_path, running_sid=SID_A, wm_text="slot: x\n")
+    path = bm.write_manifest(SID_B, "alpha", role="observer", project_root=pr)
+    data = _read(pr, "alpha", SID_B)
+    assert data["role"] == "observer"
+    assert data["reducer_sid"] == SID_A, "observer must carry the reducer's SID"
+    assert data["forked_wm_hash"] is None, "observer never forks"
+    assert not (path.parent / "working-memory.yaml").exists(), \
+        "observer must not create a per-Body WM file"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-q"]))

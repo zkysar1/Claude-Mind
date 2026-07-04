@@ -24,6 +24,18 @@ Cases covered:
      class/close) must NOT block once the generics are stopwords (N drops to 1)
   G5 over-suppression guard → BLOCK: two structural identifiers
      (loop_state + iteration-checkpoint) still block after generic stopwording
+  G6 directive-routing goal (origin_signal=user_directive) → EXEMPT
+     (rc.passed=True, reason names the exemption; g-115-1674)
+  G7 cross-agent handoff goal (handoff_to set) → EXEMPT (same skip; g-115-23)
+  G8 generic-VERB inflation FP (g-115-1726): generic English verbs
+     (cause/confirmed/every/hardening) + the hyphenated plain word re-run must
+     DEMOTE (not block) once they are stopwords. Session-93 ground truth:
+     g-115-1725 vs g-001-10, g-115-1727 vs g-001-33 (5 override entries).
+     re-run was the has_specific hyphen co-signal that turned a zero-file-path
+     generic-verb overlap into a hard block.
+  G9 over-suppression guard for the G8 verb stopwords: a genuine 2-identifier
+     dup (loop_state + g-115-999) carrying cause/confirmed still BLOCKS,
+     proving the verb stopwording did not suppress real duplicate detection.
 
 Test isolation strategy (g-115-1375, 2026-06-09): redirect MIND_WORLD to a
 tmp directory and seed team-state.yaml THERE, so the live shared
@@ -378,6 +390,167 @@ def main() -> int:
                 f"reason={rc5.get('reason')} matches={rc5.get('matches')}"
             )
 
+        # ── G6: directive-routing goal (origin_signal=user_directive) → EXEMPT
+        # Same file-path overlap as G2 (which BLOCKS), but this goal is a user
+        # directive — its description necessarily recaps the target agent's
+        # domain work, so completed-overlap is a structural FP. 4
+        # exempts it -> recent_completions SKIPPED (passed, reason names the
+        # exemption, matches empty). The shared file-path co-signal WOULD block
+        # a non-directive goal (see G2), so this proves the EXEMPTION, not mere
+        # absence of overlap.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G6",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Fixed cache concurrency bug in core/scripts/buffer-handler.py "
+                "after the recent refactor."
+            ),
+        })
+        case_g6 = {
+            "title": "Directive: optimize buffer-handler.py concurrency for delta",
+            "description": (
+                "Routing to delta per the user directive: refactor cache and "
+                "concurrency layers in core/scripts/buffer-handler.py."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": "user_directive",
+        }
+        rg6 = _run_gate(case_g6, tmp_world)
+        rc6 = _find_check(rg6, "recent_completions")
+        if rc6 is None:
+            failures.append("G6: recent_completions check missing from result")
+        elif rc6.get("passed") is not True:
+            failures.append(
+                "G6: directive goal (origin_signal=user_directive) should be "
+                f"EXEMPT (passed). reason={rc6.get('reason')} matches={rc6.get('matches')}"
+            )
+        elif "directive" not in (rc6.get("reason") or "").lower():
+            failures.append(
+                "G6: expected exemption reason to name 'directive', got "
+                f"reason={rc6.get('reason')}"
+            )
+        elif rc6.get("matches"):
+            failures.append(
+                f"G6: exemption must yield no matches, got {rc6.get('matches')}"
+            )
+
+        # ── G7: cross-agent handoff goal (handoff_to set) → EXEMPT ────────
+        # Same file-path overlap as G2, exempt because handoff_to is set (the
+        # Bravo-handoff incident shape, ). recent_completions SKIPPED.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G7",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Fixed cache concurrency bug in core/scripts/buffer-handler.py "
+                "after the recent refactor."
+            ),
+        })
+        case_g7 = {
+            "title": "Apply: buffer-handler.py concurrency fix",
+            "description": (
+                "Refactor cache and concurrency layers in "
+                "core/scripts/buffer-handler.py."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+            "handoff_to": "delta",
+        }
+        rg7 = _run_gate(case_g7, tmp_world)
+        rc7 = _find_check(rg7, "recent_completions")
+        if rc7 is None:
+            failures.append("G7: recent_completions check missing from result")
+        elif rc7.get("passed") is not True:
+            failures.append(
+                "G7: handoff goal (handoff_to set) should be EXEMPT (passed). "
+                f"reason={rc7.get('reason')} matches={rc7.get('matches')}"
+            )
+        elif ("directive" not in (rc7.get("reason") or "").lower()
+              and "handoff" not in (rc7.get("reason") or "").lower()):
+            failures.append(
+                "G7: expected exemption reason to name directive/handoff, got "
+                f"reason={rc7.get('reason')}"
+            )
+
+        # ── G8: generic-VERB inflation FP (6) → DEMOTE ────────────
+        # The recent_completions twin of G4, for generic English VERBS/adverbs
+        # rather than framework state-vocab. Two semantically-unrelated goals
+        # share ONLY common English words (cause/confirmed/every/hardening) plus
+        # the hyphenated plain word "re-run". Before the 6 stopword
+        # expansion "re-run" matched the has_specific hyphen co-signal
+        # (re.search(r"[-_0-9]") — line 368) and the five generics pushed
+        # N>=2 + weighted>=1.5, so a ZERO-file-path generic-verb overlap
+        # HARD-blocked (session-93 ground truth: 5 vs echo ,
+        # 7 vs delta  — 5 override-ledger entries). After the
+        # fix all five are stopwords -> no shared keyword survives -> PASS.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G8",
+            "completed_by": "echo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Every calibration hypothesis was confirmed after the recent "
+                "re-run; the root cause of the drift needed hardening."
+            ),
+        })
+        case_g8 = {
+            "title": "Investigate: changelog contention cause and hardening",
+            "description": (
+                "Confirmed every changelog write can re-run under contention; "
+                "trace the cause and apply hardening in a different module."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg8 = _run_gate(case_g8, tmp_world)
+        rc8 = _find_check(rg8, "recent_completions")
+        if rc8 is None:
+            failures.append("G8: recent_completions check missing from result")
+        elif rc8.get("passed") is not True:
+            failures.append(
+                "G8: recent_completions should PASS (generic-verb FP demote, "
+                "g-115-1726). cause/confirmed/every/hardening/re-run are generic "
+                "English stopwords, not duplicate-work evidence; zero file-path "
+                f"hits. reason={rc8.get('reason')} matches={rc8.get('matches')}"
+            )
+
+        # ── G9: over-suppression guard for the 6 verb stopwords ──
+        # A GENUINE 2-identifier duplicate that ALSO carries the newly-added
+        # generic verbs must still BLOCK — proving the verb stopwording did not
+        # suppress real duplicate-work detection. Shared structural ids
+        # loop_state (underscore) +  (goal-id, digits) survive
+        # stopwording -> N>=2 -> hard block, even though cause/confirmed are
+        # present and demoted.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G9",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Confirmed the cause of the loop_state desync referenced in "
+                "g-115-999 and applied the fix."
+            ),
+        })
+        case_g9 = {
+            "title": "Investigate: loop_state divergence from g-115-999",
+            "description": (
+                "Confirmed cause of loop_state divergence tracked in g-115-999; "
+                "resolve it in the restore path."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg9 = _run_gate(case_g9, tmp_world)
+        rc9 = _find_check(rg9, "recent_completions")
+        if rc9 is None:
+            failures.append("G9: recent_completions check missing from result")
+        elif rc9.get("passed") is not False:
+            failures.append(
+                "G9: recent_completions should BLOCK (loop_state + g-115-999 "
+                "survive the g-115-1726 verb stopwording; two structural ids). "
+                f"reason={rc9.get('reason')} matches={rc9.get('matches')}"
+            )
+
     finally:
         shutil.rmtree(tmp_world, ignore_errors=True)
 
@@ -386,12 +559,12 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (5/5 cases)")
+    print("PASS (9/9 cases)")
     return 0
 
 
 def test_structural_co_signal_gate():
-    """Pytest entry point (5) — runs the 5-case suite in an isolated
+    """Pytest entry point (5) — runs the 9-case suite in an isolated
     tmp world and asserts all cases pass."""
     assert main() == 0
 

@@ -57,6 +57,7 @@ import os
 import random
 import subprocess
 import sys
+import time
 from datetime import date, datetime, timedelta
 import hashlib
 from pathlib import Path
@@ -78,6 +79,9 @@ from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gate
 from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
+from _runner_capabilities import (  # noqa: E402  (0 per-runner capability filter)
+    derive_runner_capabilities,
+    goal_is_locally_executable, goal_required_capabilities)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
@@ -86,6 +90,36 @@ ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # termina
 # means the criterion contributes 0 — never errors when supports[] is unset.
 _ASP_COMPLETION_RATIOS: dict = {}
 _STRUCTURED_DEFER_PREFIXES_LOWER = tuple(p.lower() for p in STRUCTURED_DEFER_PREFIXES)
+
+# 0 per-runner capability filter. Lazily-computed, process-cached set of
+# capability tokens THIS runner provides (config override > cheap probes). Cached
+# because the probes (shutil.which / import checks) should run at most once per
+# process, and cmd_select reads it once per selection.
+_RUNNER_CAPABILITIES = None
+
+
+def _get_runner_capabilities():
+    """Return (process-cached) the capability set this runner provides. Reads the
+    `runner_capabilities` block from aspirations.yaml (provides/lacks/probe);
+    fail-open to probe-only on any config error, and to an empty set on any probe
+    error (an empty set never filters a goal that lacks requires_capability, so
+    the conservative default is a no-op filter)."""
+    global _RUNNER_CAPABILITIES
+    if _RUNNER_CAPABILITIES is not None:
+        return _RUNNER_CAPABILITIES
+    cfg = {}
+    try:
+        asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
+        rc = asp_config.get("runner_capabilities")
+        if isinstance(rc, dict):
+            cfg = rc
+    except Exception:
+        cfg = {}
+    try:
+        _RUNNER_CAPABILITIES = derive_runner_capabilities(cfg)
+    except Exception:
+        _RUNNER_CAPABILITIES = set()
+    return _RUNNER_CAPABILITIES
 # 6: the one structured prefix that NEVER auto-clears. collect_eligible
 # and collect_blocked exempt it from the 120h defer fall-through so a genuinely
 # human-gated goal stays suppressed-from-selector + counted-in-blocked[] (enabling
@@ -98,7 +132,8 @@ def _synth_blocker_ref_from_structured_defer(goal):
     """For quiescence-gate compatibility (): when a goal is structurally
     deferred but lacks an explicit blocker_ref, synthesize one so
     quiescence-gate.py C2 (blocker_ref_required) treats the structural marker as
-    structured-enough. Two paths:
+    structured-enough. Two paths (b is evaluated BEFORE a — g-115-1751: an explicit
+    future deferred_until is the authoritative expiry and wins over a's 120h fail-open):
       (a) defer_reason has STRUCTURED_DEFER_PREFIXES (precondition_unmet:,
           blocked_on_dependency:, Circuit breaker:). The structured-prefix
           bypass at write-time means cmd_update_goal accepts these defers
@@ -118,25 +153,14 @@ def _synth_blocker_ref_from_structured_defer(goal):
     defer = goal.get("defer_reason") or ""
     deferred_until = goal.get("deferred_until")
 
-    # Path (a): structured-prefix defer_reason
-    if defer and defer.lower().startswith(_STRUCTURED_DEFER_PREFIXES_LOWER):
-        set_at = goal.get("defer_reason_set_at")
-        try:
-            created = datetime.fromisoformat(str(set_at)) if set_at else datetime.now()
-        except (ValueError, TypeError):
-            created = datetime.now()
-        expires = created + timedelta(hours=120)
-        h = hashlib.md5(defer.encode("utf-8", errors="replace")).hexdigest()[:12]
-        return {
-            "type": "resource",
-            "external_id": f"structured-defer:{h}",
-            "state_hash": None,
-            "created_at": created.isoformat(timespec="seconds"),
-            "expires_at": expires.isoformat(timespec="seconds"),
-            "synthesized": True,
-        }
-
-    # Path (b): deferred_until time gate
+    # Path (b): deferred_until time gate. CHECKED BEFORE path (a) — 1:
+    # an explicit future deferred_until is the AUTHORITATIVE structural expiry and
+    # must win over the 120h structured-prefix fail-open. A goal carrying BOTH a
+    # structured-prefix defer_reason AND a future deferred_until previously matched
+    # path (a) first and got the shorter set_at+120h expiry — already PAST for
+    # long-deferred goals — tripping quiescence-gate C3 (expires_at must be future)
+    # into false quiescence denial + B7 backoff churn. When deferred_until is absent
+    # or already past, this block falls through to path (a) unchanged.
     if deferred_until:
         try:
             expires_dt = datetime.fromisoformat(str(deferred_until))
@@ -158,6 +182,25 @@ def _synth_blocker_ref_from_structured_defer(goal):
                 }
         except (ValueError, TypeError):
             pass
+
+    # Path (a): structured-prefix defer_reason (120h fail-open expiry). Reached only
+    # when there is no future deferred_until (path (b) above returns first for those).
+    if defer and defer.lower().startswith(_STRUCTURED_DEFER_PREFIXES_LOWER):
+        set_at = goal.get("defer_reason_set_at")
+        try:
+            created = datetime.fromisoformat(str(set_at)) if set_at else datetime.now()
+        except (ValueError, TypeError):
+            created = datetime.now()
+        expires = created + timedelta(hours=120)
+        h = hashlib.md5(defer.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return {
+            "type": "resource",
+            "external_id": f"structured-defer:{h}",
+            "state_hash": None,
+            "created_at": created.isoformat(timespec="seconds"),
+            "expires_at": expires.isoformat(timespec="seconds"),
+            "synthesized": True,
+        }
 
     # Path (c): hypothesis time gate via resolves_no_earlier_than (date string).
     # Hypothesis-tracked goals carry an ISO date; treat it as the structural expiry.
@@ -313,6 +356,42 @@ def load_recurring_config():
 
 
 RECURRING_CONFIG = load_recurring_config()
+
+
+def load_cross_agent_surfacing_enabled():
+    """Whether the selector surfaces sibling-queue goals routed via intended_agent.
+
+    Gated OFF by default (2026-07-04, g-115-1764 follow-up). g-115-946 built
+    cross-agent SURFACING (collect_cross_agent_candidates) but no endpoint ever
+    wired the cross-agent EXECUTION path (claim/update/complete sibling
+    resolution). The claim endpoint (aspirations_write.py claim()) resolves only
+    world + the caller's own-agent queue, so a surfaced sibling-queue goal 404s
+    at claim -> hard selector livelock (g-115-1766). Surfacing was inert (path
+    bug) until g-115-1764 fixed it; that exposed the missing execution half.
+    Until the execution path is wired, surfacing un-actionable cross-agent work
+    is worse than not surfacing it, so the call sites are gated here rather than
+    reverting the (correct) path fix. Flip aspirations.yaml
+    cross_agent_surfacing.enabled -> true once claim/update resolve sibling
+    queues. Empirical (alpha 2026-07-04): selector surfaced g-001-282
+    (intended_agent=alpha, in bravo's queue), then aspirations-claim.sh
+    g-001-282 -> 404 goal_not_found.
+    """
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py")
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        block = asp_config.get("cross_agent_surfacing", {})
+        if isinstance(block, dict) and block.get("enabled") is not None:
+            return bool(block.get("enabled"))
+    except Exception:
+        pass
+    return False
+
+
+CROSS_AGENT_SURFACING_ENABLED = load_cross_agent_surfacing_enabled()
 
 
 def load_iaus_config():
@@ -710,6 +789,15 @@ CRITICAL_BLOCKER_SURFACE_CONFIG = load_critical_blocker_surface_config()
 # so the module's read order matches its runtime order.
 _TEAM_STATE_CACHE = None
 
+# Parse-or-restore retry budget for the team-state read (rb-2429). team-state.yaml
+# is written by every agent via _atomic_write_with_fallback (core/scripts/_fileops.py),
+# which under sustained multi-agent sync contention can fall back to an in-place
+# truncate-rewrite (~25.7% of bursts, world/conventions/file-system-resilience.md).
+# That rewrite completes in ms, so a few short retries clear a transient partial-YAML
+# read before the reader fails open. Worst-case added latency = RETRIES * RETRY_SLEEP.
+_TEAM_STATE_READ_RETRIES = 3
+_TEAM_STATE_READ_RETRY_SLEEP = 0.05  # seconds between retries
+
 
 def _load_team_state_cached():
     """Read world/team-state.yaml once and cache for the selector run.
@@ -717,9 +805,19 @@ def _load_team_state_cached():
     The sender-side handoff penalty decay is gated by partner liveness
     (agent_status.<partner>.last_active). We read the file exactly once per
     selector invocation — not once per scored goal — to avoid per-goal I/O.
-    Missing file → {} (legitimate pre-coordination state). Corrupt yaml
-    raises — the selector should fail visibly on a malformed team-state,
-    not silently score every handoff with the penalty disengaged.
+    Missing file → {} (legitimate pre-coordination state).
+
+    Parse-or-restore recovery (rb-2429): team-state.yaml is written by every
+    agent via _atomic_write_with_fallback (core/scripts/_fileops.py), which
+    under sustained multi-agent sync contention exhausts its os.replace retry
+    budget and falls back to an in-place truncate-rewrite (~25.7% of bursts per
+    world/conventions/file-system-resilience.md). An unlocked reader caught
+    mid-fallback sees partial YAML. team-state is ADVISORY scoring input
+    (handoff liveness, critical_blockers) — never correctness-critical for
+    selection — so a partial/unreadable read must NOT crash the whole selector.
+    Retry a few times (the in-place write completes in ms), then fail open to {}.
+    The empty dict is cached for the rest of the run, consistent with the
+    read-once contract, so a persistently-broken file does not re-spin per goal.
     """
     global _TEAM_STATE_CACHE
     if _TEAM_STATE_CACHE is not None:
@@ -728,8 +826,28 @@ def _load_team_state_cached():
     if not path.exists():
         _TEAM_STATE_CACHE = {}
         return _TEAM_STATE_CACHE
-    with open(path, "r", encoding="utf-8") as f:
-        _TEAM_STATE_CACHE = yaml.safe_load(f) or {}
+    last_err = None
+    for attempt in range(_TEAM_STATE_READ_RETRIES):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                _TEAM_STATE_CACHE = yaml.safe_load(f) or {}
+            return _TEAM_STATE_CACHE
+        except (OSError, yaml.YAMLError) as e:
+            last_err = e
+            if attempt < _TEAM_STATE_READ_RETRIES - 1:
+                time.sleep(_TEAM_STATE_READ_RETRY_SLEEP)
+    # All retries saw a partial/unreadable file — fail open to {} (advisory
+    # input). Crashing here would block goal selection every iteration until
+    # the contending writer finishes (rb-2429). Warn on stderr for visibility;
+    # stdout (the selector's JSON) is untouched.
+    print(
+        f"[goal-selector] WARN: team-state.yaml unreadable after "
+        f"{_TEAM_STATE_READ_RETRIES} attempts "
+        f"({type(last_err).__name__}: {last_err}); failing open to {{}} — "
+        f"handoff-liveness + critical-blocker scoring disengaged this run (rb-2429)",
+        file=sys.stderr,
+    )
+    _TEAM_STATE_CACHE = {}
     return _TEAM_STATE_CACHE
 
 
@@ -1076,6 +1194,10 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
     """
     today = date.today()
     results = []
+    # Per-runner capability set (0 Slice 2) — derived once, cached
+    # module-wide so cmd_select AND quiescence-gate's candidate check skip
+    # locally-unexecutable goals consistently (no call-site threading).
+    runner_caps = _get_runner_capabilities()
 
     # Build set of skills blocked by infrastructure blockers
     blocked_skills = set()
@@ -1339,6 +1461,17 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     and intended_agent != "either"):
                 continue
 
+            # Per-runner capability skip (0 Slice 2): drop goals whose
+            # EXPLICIT requires_capability this runner cannot satisfy. A per-RUNNER
+            # gap (distinct from a global block) — executable by OTHER agents, just
+            # not on this box. Skipping keeps them out of ranking (mixed queue) AND
+            # lets a fully-constrained box reach all_blocked -> not_my_lane
+            # quiescence (collect_blocked classifies the same goals — the inverse).
+            # Conservative (rb-1028): only EXPLICIT requires_capability gates; an
+            # empty runner_caps (derivation failure) skips nothing.
+            if runner_caps and not goal_is_locally_executable(goal, runner_caps):
+                continue
+
             results.append({"goal": goal, "aspiration": asp, "source": source})
 
     return results
@@ -1380,9 +1513,21 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
     if project_root is None or agent_dir is None or not agent_name:
         return []
     results = []
-    # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/. Walk that
-    # parent — fall back to no-op if the parent is missing (fresh repo).
-    agents_parent = project_root / "agents"
+    # 4: derive the agents-parent from agent_dir.parent, NOT
+    # `project_root / "agents"`. Both wired call sites pass AGENT_DIR.parent
+    # (which is ALREADY the agents parent = PROJECT_ROOT/agents) as project_root,
+    # so `project_root / "agents"` computed PROJECT_ROOT/agents/agents
+    # (nonexistent) -> the is_dir() guard below returned [] on EVERY call ->
+    # 's cross-agent stranding fix was INERT from the Phase 2.5.D
+    # relocation (agent dirs moved under agents/) until now. Empirically: alpha's
+    # wired call returned 0 while a corrected call surfaced  (a live
+    # bravo->alpha routed goal alpha had never seen). agent_dir.parent is
+    # unambiguously the agents parent for BOTH the real call
+    # (PROJECT_ROOT/agents/<name> -> .parent) and any test caller (custom
+    # agent_dir -> its own parent), so it survives an AGENTS_PARENT_DIR rename
+    # and any project_root drift. (project_root is retained in the signature for
+    # backward compat + the None-guard; it is no longer used to locate siblings.)
+    agents_parent = agent_dir.parent
     if not agents_parent.is_dir():
         return []
     try:
@@ -1444,6 +1589,10 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
     """
     today = date.today()
     blocked = []
+    # Per-runner capability set (0 Slice 2) — derived once, cached
+    # module-wide (same accessor as collect_candidates) so the not_my_lane
+    # classification below is the exact inverse of the candidate skip.
+    runner_caps = _get_runner_capabilities()
 
     # Map skill -> blocker info for infrastructure blocks
     blocker_by_skill = {}
@@ -1669,6 +1818,44 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     entry["precondition_unmet"] = failed_ids
                     blocked.append(entry)
                     continue
+
+            # 7. Not-my-lane: this runner lacks a capability the goal EXPLICITLY
+            #    requires (0 Slice 2). A per-RUNNER gap, distinct from a
+            #    global block — the goal is executable by OTHER agents, just not on
+            #    this box. Classifying it blocked (the INVERSE of collect_candidates'
+            #    capability skip — same runner_caps + goal_is_locally_executable, so
+            #    a goal is a candidate XOR not_my_lane-blocked, never both) lets a
+            #    fully capability-constrained runner reach all_blocked -> quiescence
+            #    sleep instead of hot-looping on unexecutable goals. LAST check
+            #    (mirrors capability being the last collect_candidates filter): an
+            #    earlier real block (dependency/deferred/precondition) wins. Synth a
+            #    blocker_ref so quiescence C2/C3 accept it; type "resource" (NOT
+            #    user-only) -> only normal-quiescence short sleep, re-checked each
+            #    wake (self-healing as caps/queue change). Conservative (rb-1028):
+            #    only EXPLICIT requires_capability gates; an empty runner_caps
+            #    (derivation failure) classifies nothing (matches the skip guard).
+            if runner_caps and not goal_is_locally_executable(goal, runner_caps):
+                missing = sorted(goal_required_capabilities(goal) - set(runner_caps))
+                entry["block_reason"] = "not_my_lane"
+                entry["block_detail"] = (
+                    "Requires capability not on this runner: {m} (runner has: {r})".format(
+                        m=",".join(missing), r=",".join(sorted(runner_caps)) or "none"))
+                entry["missing_capabilities"] = missing
+                if not isinstance(entry.get("blocker_ref"), dict):
+                    _nml_now = datetime.now()
+                    _nml_key = "not-my-lane:" + ",".join(missing)
+                    entry["blocker_ref"] = {
+                        "type": "resource",
+                        "external_id": "not-my-lane:" + hashlib.md5(
+                            _nml_key.encode("utf-8")).hexdigest()[:12],
+                        "state_hash": None,
+                        "created_at": _nml_now.isoformat(timespec="seconds"),
+                        "expires_at": (_nml_now + timedelta(hours=120)).isoformat(
+                            timespec="seconds"),
+                        "synthesized": True,
+                    }
+                blocked.append(entry)
+                continue
 
             # Recurring cooldown is NOT a block — goal is just "not yet due"
 
@@ -1969,7 +2156,20 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
                          # post-scoring substantive-demotion exemption can read it.
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
-        la = hours_since(goal.get("lastAchievedAt"))
+        # 3 (cross-machine clock-skew fix): capture the RAW lastAchievedAt
+        # field separately from the computed elapsed. hours_since() returns None for
+        # BOTH an ABSENT lastAchievedAt AND a PRESENT-but-FUTURE one (an off-machine
+        # ahead-clock stamps lastAchievedAt in this box's future; the hours<0 clamp
+        # in hours_since() turns that into None). never_fired MUST key on the FIELD's
+        # absence (la_raw is None), NOT on la being None — otherwise a just-achieved
+        # goal whose stamp reads as future is misclassified as never-fired-since-
+        # creation and the  fallback below inflates it to urgency_max (probe:
+        # rec=4.0 for a not-due goal vs the correct 0). Keying on la_raw lets a
+        # future-stamp fall through to the not-due path (la stays None → the
+        # `la is not None and la >= interval` guard is False → rec stays 0), while a
+        # genuinely-absent field still triggers the  never-fired escalation.
+        la_raw = goal.get("lastAchievedAt")
+        la = hours_since(la_raw)
         # NEVER-FIRED FALLBACK (): a recurring goal with no lastAchievedAt
         # has never fired. Deriving overdue_ratio from lastAchievedAt alone pins
         # such a goal at urgency_base forever — a 41-day-old 24h-interval goal
@@ -1984,7 +2184,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # urgency the escalator intends. Mirrors the created-age precedent at the
         # reallocation filter (hours_since(goal.get("created")…)). created_at is
         # the live field name (goal-schemas.md); `created` is the legacy alias.
-        never_fired = la is None
+        never_fired = la_raw is None  # 3: FIELD absence, not `la is None`
         if never_fired:
             la = hours_since(goal.get("created_at") or goal.get("created"))
         if never_fired or (la is not None and la >= interval and interval > 0):
@@ -2686,7 +2886,10 @@ def cmd_select(args):
     # landed in the FILER's private queue and were invisible to the TARGET.
     # Strict-match contract: only intended_agent == AGENT_NAME pulls; "either"
     # and unset stay in their owner's queue. Fail-open per sibling.
-    if AGENT_DIR is not None:
+    # Gated OFF by default until the cross-agent EXECUTION path is wired
+    # (4 follow-up). See load_cross_agent_surfacing_enabled() — a
+    # surfaced sibling-queue goal currently 404s at claim (livelock, 6).
+    if AGENT_DIR is not None and CROSS_AGENT_SURFACING_ENABLED:
         candidates += collect_cross_agent_candidates(
             AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
             known_blockers=known_blockers,
@@ -2742,7 +2945,8 @@ def cmd_select(args):
             defer_reason_timeout_hours=defer_reason_timeout_hours,
             dependency_timeout_hours=dependency_timeout_hours,
             global_live_ids=global_live_ids_retry)
-        if AGENT_DIR is not None:
+        # Gated (see first call site + load_cross_agent_surfacing_enabled()).
+        if AGENT_DIR is not None and CROSS_AGENT_SURFACING_ENABLED:
             retry_candidates += collect_cross_agent_candidates(
                 AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
                 known_blockers=known_blockers,
@@ -2789,6 +2993,14 @@ def cmd_select(args):
                 print("[]")
             return
 
+    # Per-runner capability filtering happens at COLLECTION time (0
+    # Slice 2): collect_candidates skips locally-unexecutable goals and
+    # collect_blocked classifies them not_my_lane (same cached runner_caps, so
+    # the two stay exact inverses). A fully capability-constrained box therefore
+    # returns 0 candidates -> the re-read/all_blocked path ABOVE emits the
+    # not_my_lane blocks -> aspirations-select routes to quiescence sleep instead
+    # of hot-looping. No post-collection candidate filter is needed here; the
+    # mixed-queue case already has the unexecutable goals skipped from `candidates`.
     epsilon, noise_scale = load_exploration_params()
     # Precompute completion ratios for cross_aspiration_support criterion.
     # Origin: LifingPolls plan item 2 (2026-05-08). Builds a dict of

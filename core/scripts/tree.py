@@ -650,9 +650,12 @@ def get_distill_candidates(tree, include_skipped=False):
 
     When include_skipped=True, returns {candidates, skipped} where skipped is a
     list of {node_key, skip_reason}. Skip-reason enum:
-      has_children, insufficient_retrievals, utility_above_threshold.
+      has_children, distill_exempt, insufficient_retrievals, no_feedback,
+      utility_above_threshold.
     (file_not_found / read_error are NOT skip reasons here — a missing file
-    just yields line_count=0, which feeds into crit2.)
+    just yields line_count=0, which feeds into crit2. distill_exempt is the
+    durable coherence judgment g-115-1700/guard-896, suppressing the utility
+    triggers crit1/crit2 but NOT the structural crit3.)
     """
     config_path = str(CONFIG_DIR / "tree.yaml")
     pruning = {}
@@ -712,6 +715,18 @@ def get_distill_candidates(tree, include_skipped=False):
         # false-positive rate stays near zero. Action reuses the rb-2085 distill
         # procedure (archive verbatim + keep newest-N + dated rollup).
         crit3 = est_tokens >= token_trigger and refresh_sections >= refresh_min
+        # 0 / guard-896: a node durably marked distill-exempt via the
+        # coherence gate (rb-94 body-read judgment) is suppressed from the UTILITY
+        # triggers — low retrieval signals niche value, not bloat, so distilling it
+        # would DESTROY load-bearing context. This mirrors how "decompose"/
+        # "redistribute" exempt their detectors, EXCEPT it is inline (not a
+        # top-of-loop continue) because crit3 (oversized append-grown, 0)
+        # is STRUCTURAL + non-destructive (archive+keep-newest): an exempt node too
+        # big to Read must STILL get the rollup, so the exemption clears crit1/crit2
+        # only and leaves crit3 to fire.
+        is_distill_exempt = "distill" in _node_maintain_exempt(node)
+        if is_distill_exempt:
+            crit1 = crit2 = False
         if crit1 or crit2 or crit3:
             trigger = ("oversized_append_grown" if crit3
                        else "low_utility" if crit1 else "large_mediocre")
@@ -729,7 +744,11 @@ def get_distill_candidates(tree, include_skipped=False):
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
-            if rc < min_ret:
+            # distill_exempt first (the durable coherence judgment, 0) —
+            # mirrors get_decompose_candidates' decompose_exempt skip_reason.
+            if is_distill_exempt:
+                skipped.append({"node_key": key, "skip_reason": "distill_exempt"})
+            elif rc < min_ret:
                 skipped.append({"node_key": key, "skip_reason": "insufficient_retrievals"})
             elif not has_feedback:
                 skipped.append({"node_key": key, "skip_reason": "no_feedback"})
@@ -905,9 +924,15 @@ def _subtree_leaf_counts(nodes):
 # intentionally wide — a coherent interior hub (overview, chronological
 # build/research log) or a grandfathered top-level taxonomy cut — so the
 # candidate detectors below skip it instead of re-surfacing it every sweep.
-# Symmetric across both structural detectors: "decompose" exempts from
-# get_decompose_candidates, "redistribute" from get_redistribute_candidates.
-MAINTAIN_EXEMPT_ACTIONS = {"decompose", "redistribute"}
+# Symmetric across the candidate detectors: "decompose" exempts from
+# get_decompose_candidates, "redistribute" from get_redistribute_candidates,
+# and "distill" from get_distill_candidates' UTILITY triggers (crit1/crit2) — a
+# coherence judgment (guard-896 / 0) that a low-RETRIEVAL node is
+# niche-but-valuable, not bloated (the util_ratio over-flag class, sibling of
+# the 4 article_count=0 over-flag). NOTE distill-exempt does NOT suppress
+# the STRUCTURAL oversized-append-grown trigger (crit3, 0): a coherent
+# node too big to Read still gets the non-destructive rollup (archive+keep-newest).
+MAINTAIN_EXEMPT_ACTIONS = {"decompose", "redistribute", "distill"}
 
 
 def _node_maintain_exempt(node):
@@ -1969,12 +1994,18 @@ def cmd_set(args):
         if field == "file" and isinstance(v, str):
             v = normalize_virtual_path(v)
         node[field] = v
-        # Auto-bump per-node last_updated when the caller mutated something
-        # OTHER than last_updated itself (don't clobber explicit date sets).
-        # Replaces the manual `--set <key> last_updated <today>` ceremony
-        # the SKILL.md authors had to remember after every content change.
-        if field != "last_updated":
-            node["last_updated"] = date.today().isoformat()
+        # 3 (Option B): do NOT auto-bump per-node last_updated on a
+        # metadata --set. node .md front matter is the single source of truth
+        # (); the _tree.yaml index last_updated is synced to it ONLY by
+        # tree-front-matter-sync.py (the Edit/Write PostToolUse hook, which
+        # writes BOTH stores) and at node creation. The old auto-bump fired on
+        # ANY non-date field (confidence/growth_state/summary), marching the
+        # index AHEAD of the .md fm -> the index-ahead drift class (250 nodes;
+        # 2 audit). Rationale: performance/agent-performance/
+        # tree-maintenance-patterns.md "last_updated Index/Front-Matter Drift".
+        # Explicit `--set <k> last_updated <d>` still lands via node[field]=v
+        # above; the index-level data["last_updated"] below (tree-file write
+        # time) is a DIFFERENT field and is intentionally retained.
         nodes[key] = node
 
         if field == "confidence":
@@ -2456,8 +2487,11 @@ def cmd_batch(args):
                 if field == "file" and isinstance(value, str):
                     value = normalize_virtual_path(value)
                 node[field] = value
-                if field != "last_updated":
-                    node["last_updated"] = date.today().isoformat()
+                # 3 (Option B): no per-node last_updated auto-bump on
+                # batch --set, same as cmd_set above. node .md fm is the single
+                # source of truth (); the index last_updated is synced
+                # ONLY by tree-front-matter-sync.py + at node creation. Old
+                # auto-bump caused index-ahead drift on metadata-field sets.
                 nodes[key] = node
                 updated_keys.add(key)
 

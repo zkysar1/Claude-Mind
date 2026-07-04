@@ -50,7 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 SLOT = "spark_fired_session"  # documented here for callers; this script is slot-agnostic
 # Consumption-based dedup (4 / rb-1674): the PRIMARY path compares the
@@ -67,6 +67,18 @@ DEFAULT_WINDOW_MIN = 60
 # find it (on any iteration where an intervening spark fired and pruned). 90 =
 # 60-min TTL + slack so the set_at comparison always has the entry to compare.
 DEFAULT_PRUNE_MIN = 90
+#  /  / rb-2615: a PROACTIVELY-fired Phase-6 spark records its
+# fire BEFORE the bg recurring-close finishes writing the sentinel's set_at
+# (observed: fire 01:55:14 vs set_at 02:01:25 -> ~6m11s early, because the LLM
+# fires Skill(aspirations-spark) off the stdout imperative while recurring-close
+# is still backgrounded). The strict `fired_at >= set_at` skip test therefore
+# read a proactive fire as a PRIOR-close fire and false-fired the spark next
+# iteration. MAX_BG_CLOSE_DURATION_MIN widens the consumption window's LOWER
+# bound by this much so a proactive fire still counts as THIS close's
+# consumption. 10 covers the observed 6m11s with margin and stays well under any
+# recurring interval (hours), so it never suppresses a genuine SECOND deep-close
+# of the same goal.
+MAX_BG_CLOSE_DURATION_MIN = 10
 
 
 def _parse_dt(value):
@@ -97,17 +109,28 @@ def recently_fired(fired_map, goal_id, now, window_minutes=DEFAULT_WINDOW_MIN):
     return 0 <= delta < window_minutes * 60
 
 
-def fired_at_or_after(fired_map, goal_id, set_at):
-    """Consumption-based dedup (4 / rb-1674). True iff goal_id was
-    recorded AT OR AFTER `set_at` — the sentinel's creation time.
+def fired_in_consumption_window(fired_map, goal_id, set_at,
+                                lookback_minutes=MAX_BG_CLOSE_DURATION_MIN,
+                                lookahead_minutes=DEFAULT_WINDOW_MIN):
+    """Consumption-based dedup (4 / rb-1674; window widened by
+    g-306-80 / rb-2615). True iff goal_id was recorded within the consumption
+    window [set_at - lookback_minutes, set_at + lookahead_minutes] bracketing
+    the sentinel's creation time `set_at`.
 
-    A spark fired IN RESPONSE to this close has fired_at >= set_at (the close
-    writes the sentinel, then the LLM fires the spark), so it is a redundant
-    re-fire → skip. A spark from a PREVIOUS close has fired_at < set_at (or no
-    entry at all) → fire. This is assumption-free where the time-window
-    heuristic was not: it never suppresses a legitimate SECOND deep-close of the
-    same recurring goal regardless of how short that goal's interval is, because
-    the second close's set_at is strictly later than the first close's fire.
+    A spark fired IN RESPONSE to this close lands inside the window on either
+    side of set_at:
+      - NORMAL path: the close writes set_at, THEN the LLM fires → fired_at >=
+        set_at (the original g-115-1404 case).
+      - PROACTIVE path (g-306-80): the LLM fires off recurring-close.sh's stdout
+        imperative WHILE the bg close is still writing set_at → fired_at can be
+        up to ~MAX_BG_CLOSE_DURATION_MIN BEFORE set_at. The strict `>= set_at`
+        test mis-read this as a prior close and false-fired (incident g-115-399:
+        fire 01:55:14 vs set_at 02:01:25). The lower bound now catches it.
+    A spark from a genuine PREVIOUS close lands well before the lower bound
+    (recurring intervals are hours) or has no entry at all → fire. The upper
+    bound (set_at + TTL) keeps the match scoped to the sentinel's lifetime; a
+    far-future fire (clock skew / a stale entry beyond the sentinel's life) does
+    not count as this close's consumption.
 
     Fail-safe: a non-dict map, a None set_at, a missing entry, or an unparseable
     fired timestamp all return False (fire), never True — the dedup must never
@@ -119,7 +142,9 @@ def fired_at_or_after(fired_map, goal_id, set_at):
     ts = _parse_dt(fired_map.get(goal_id))
     if ts is None:
         return False
-    return ts >= set_at
+    lo = set_at - timedelta(minutes=lookback_minutes)
+    hi = set_at + timedelta(minutes=lookahead_minutes)
+    return lo <= ts <= hi
 
 
 def prune_and_record(fired_map, goal_id, now, prune_minutes=DEFAULT_PRUNE_MIN):
@@ -170,10 +195,14 @@ def cmd_check(args):
     fired = _read_stdin_map()
     set_at = _parse_dt(getattr(args, "sentinel_set_at", None))
     if set_at is not None:
-        # PRIMARY path (4): consumption-based — compare the recorded
-        # fire time against THIS sentinel's creation time. Robust against the
-        # bg-timeout wall-clock that broke the 5-min window (rb-1674).
-        deduped = fired_at_or_after(fired, args.goal_id, set_at)
+        # PRIMARY path (4): consumption-based — is the recorded fire
+        # inside THIS sentinel's consumption window? The window brackets set_at
+        # on both sides (): [set_at - MAX_BG_CLOSE_DURATION_MIN,
+        # set_at + TTL], so a proactive fire that lands just BEFORE set_at still
+        # counts as this-close consumption. Robust against the bg-timeout
+        # wall-clock that broke the 5-min window (rb-1674) AND the proactive
+        # before-set_at fire that broke the strict >= test (rb-2615).
+        deduped = fired_in_consumption_window(fired, args.goal_id, set_at)
     else:
         # FALLBACK (no sentinel set_at supplied): time-window heuristic.
         deduped = recently_fired(fired, args.goal_id, _now(), args.window_min)

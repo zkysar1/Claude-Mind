@@ -56,7 +56,17 @@ $PY "$REPO/core/scripts/check-settings-deny-baseline.py"
 # Investigate goals on the regular learning-gate cadence. Switch to
 # blocking by removing the `|| true` once existing leaks are fixed
 # (packaging plan Phase 6).
-bash "$REPO/core/scripts/domain-leak-check.sh" >&2 || true
+#
+# STAGED-SCOPED (g-001-314, 2026-07-03): domain-leak-check.sh --staged scans
+# ONLY this commit's staged files (git diff --cached), not the whole repo — ~4s
+# vs the >2min full-tree scan that g-001-312 had to time-cap at 30s (the dormant
+# hook, enabled in g-001-312, made every commit exceed the loop's 2min
+# iteration-commit Bash-timeout). Staged scope is both faster AND more correct:
+# it flags domain terms YOU introduce in this commit, not pre-existing leaks
+# elsewhere (the full-tree /verify-learning + manual/CI audits still cover
+# those). Advisory: `|| true` keeps it non-blocking — the signal surfaces on
+# stderr, never fails the commit.
+bash "$REPO/core/scripts/domain-leak-check.sh" --staged >&2 || true
 
 # Gate 7: Phase 2.6 bare-agent-prefix regression (2026-05-19). After
 # Phase 2.5.D, `<agent>/X/` references in SKILL.md/rule/convention
@@ -106,3 +116,15 @@ fi
 if git diff --cached --name-only | grep -qE '^\.claude/skills/[^/]+/SKILL\.md$'; then
     $PY "$REPO/core/scripts/skill-edit-precommit-gate.py"
 fi
+
+# Gate 11: OWNERSHIP_MODE / MACHINE_OWNED_AGENTS re-introduction (g-115-1737,
+# 2026-07-02). The OWNERSHIP_MODE cutover flag, the static MACHINE_OWNED_AGENTS
+# env list, and the runner-token sync-ownership fallback were removed —
+# single-runner ownership is now unconditional, keyed on STORAGE_BACKEND alone
+# (own-cloud => live DDB runner-claim resolution; any other backend => own-all).
+# Refuses commits that re-introduce a READ of either removed env var (env-read
+# pattern, NOT a bare mention — prose/comments legitimately name them). Scans
+# only STAGED added lines, so it is cheap and never blocks unrelated commits.
+# Sister to Gate 1. See .claude/rules/... + mind_api/docs/lodestar-dynamic-
+# ownership-design.md (SUPERSEDED note). Bypass is NOT the answer — fix the code.
+bash "$REPO/core/scripts/check-no-ownership-flag.sh"

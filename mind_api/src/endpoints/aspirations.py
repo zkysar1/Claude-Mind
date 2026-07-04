@@ -159,8 +159,9 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             recurring = progress.get("recurring_goals", 0)
             status = (asp.get("status", "unknown") or "unknown").upper()
             rec_suffix = f" + {recurring} recurring" if recurring else ""
+            pending = total - completed
             lines.append(
-                f"{asp['id']}: {asp['title']} [{status}] ({completed}/{total} goals{rec_suffix})"
+                f"{asp['id']}: {asp['title']} [{status}] ({pending} pending, {completed} done of {total}{rec_suffix})"
             )
         return Response.text("\n".join(lines), content_type="text/plain")
 
@@ -209,6 +210,8 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         )
 
     if _flag(q, "meta"):
+        from storage_backend import get_backend
+        get_backend().ensure_local(meta_path)  # own-cloud read-path fix: materialize S3-only file before local read
         if not meta_path.exists():
             return Response.text("{}", content_type="application/json")
         try:

@@ -116,7 +116,7 @@ an exact bring-up checklist.
   procedure, parameterized for the agents being moved:
   1. `git clone <origin-url>` on the new machine.
   2. **Install Python deps**: `py -3 -m pip install -r mind_api/requirements-owncloud.txt`
-     (includes boto3 + base deps). Daemon will not start without boto3.
+     (includes the AWS SDK + base deps). Daemon will not start without the own-cloud deps.
   3. Create `.env.local` from `.env.example` with: same `ENVIRONMENT_ID`, same
      bucket/DDB tables, the scoped `MIND_AWS_*` creds, and a **DISTINCT
      `MACHINE_ID`** (G5 fail-closed — must differ from the source machine).
@@ -222,8 +222,8 @@ Checks at the destination:
 - The source mind is READ-ONLY to this skill except the own-cloud continuity
   flush (a normal sync op). It does NOT edit `.env.local` (the user sets
   `MACHINE_ID` per the checklist — `.env.local` is machine-local config the
-  agent does not auto-edit). No `MACHINE_OWNED_AGENTS` needed — ownership is
-  derived from live DDB runner claims.
+  agent does not auto-edit). Sync ownership is derived from live DDB runner
+  claims — there is no `MACHINE_OWNED_AGENTS` env list to set.
 - Resume at the destination is `/start`'s job (Phase A-0). This skill never sets
   `agent-state`/`agent-mode` (guard-340) and never calls `/start`.
 

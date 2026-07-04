@@ -353,6 +353,86 @@ def test_compact_reverify_keeps_unretired_during_window(tmp_path, monkeypatch):
     assert arch_ids == ["r1", "r2"]                 # r1 = recoverable dup
 
 
+# ── : hot-store rotation lock-contention retry (Phase-2 live drop) ────
+def test_rotate_retries_live_lock_on_timeout(tmp_path, monkeypatch):
+    # The hottest store (changelog.jsonl) can transiently TimeoutError on the
+    # Phase-2 live-lock acquire under all-agent append contention. Retry-with-
+    # backoff gives it fresh windows so a transient miss succeeds in the SAME
+    # sweep instead of failing and waiting 24h for the next one ().
+    import _fileops
+    real = _fileops.locked_modify_jsonl
+    p = tmp_path / "j.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    state = {"live": 0}
+
+    def flaky(path, fn):
+        if Path(path).name == "j.jsonl":            # LIVE file = Phase 2
+            state["live"] += 1
+            if state["live"] <= 2:                  # first 2 acquires "time out"
+                raise TimeoutError(f"Could not acquire lock: {path}")
+        return real(path, fn)
+
+    monkeypatch.setattr(_fileops, "locked_modify_jsonl", flaky)
+    monkeypatch.setattr(jh.time, "sleep", lambda *_a, **_k: None)  # no real backoff
+    rep = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert rep["action"] == "rotated" and rep["applied"] is True
+    assert state["live"] == 3                        # 2 timeouts + 1 success
+    assert rep["live_lock_attempts"] == 3
+    assert [r["i"] for r in _read(p)] == [6, 7, 8, 9]
+    # archive appended exactly ONCE (Phase 1 not re-run on retry -> no orphan dup)
+    assert [r["i"] for r in _read(tmp_path / "j-archive.jsonl")] == [0, 1, 2, 3, 4, 5]
+
+
+def test_rotate_live_lock_exhausted_raises_and_archives_once(tmp_path, monkeypatch):
+    # All retries time out -> same failure surface as before the fix (raise; the
+    # sweep reports action=error, the next sweep retries). Live untouched (no
+    # loss), archive holds the recoverable front-slice appended exactly ONCE.
+    import _fileops
+    import pytest
+    real = _fileops.locked_modify_jsonl
+    p = tmp_path / "j.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    state = {"live": 0}
+
+    def always_timeout_live(path, fn):
+        if Path(path).name == "j.jsonl":
+            state["live"] += 1
+            raise TimeoutError(f"Could not acquire lock: {path}")
+        return real(path, fn)
+
+    monkeypatch.setattr(_fileops, "locked_modify_jsonl", always_timeout_live)
+    monkeypatch.setattr(jh.time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(TimeoutError):
+        jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert state["live"] == jh._ROTATE_LIVE_LOCK_RETRIES       # every window used
+    assert [r["i"] for r in _read(p)] == list(range(10))       # live untouched
+    assert [r["i"] for r in _read(tmp_path / "j-archive.jsonl")] == [0, 1, 2, 3, 4, 5]
+
+
+def test_rotate_front_shift_runtimeerror_not_retried(tmp_path, monkeypatch):
+    # The _drop_front front-shift guard raises RuntimeError (another rotation
+    # already dropped the slice). That is a CORRECTNESS signal, not lock
+    # contention -- it must propagate immediately, never be retried.
+    import _fileops
+    import pytest
+    real = _fileops.locked_modify_jsonl
+    p = tmp_path / "j.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    state = {"live": 0}
+
+    def runtime_on_live(path, fn):
+        if Path(path).name == "j.jsonl":
+            state["live"] += 1
+            raise RuntimeError("jsonl-hygiene rotate ABORT: live front shifted")
+        return real(path, fn)
+
+    monkeypatch.setattr(_fileops, "locked_modify_jsonl", runtime_on_live)
+    monkeypatch.setattr(jh.time, "sleep", lambda *_a, **_k: None)
+    with pytest.raises(RuntimeError):
+        jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert state["live"] == 1                                   # NOT retried
+
+
 def test_compact_dry_run_in_sweep_registry(tmp_path, monkeypatch):
     store = tmp_path / "rb.jsonl"
     _write(store, [_mk("a", "active"),

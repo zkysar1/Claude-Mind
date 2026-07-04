@@ -9,6 +9,7 @@
 #   coverage         -> GET /v1/skill-analytics/coverage
 #   recommendations  -> GET /v1/skill-analytics/recommendations
 #   trend            -> GET /v1/skill-analytics/trend?window=N
+#   usage-report     -> GET /v1/skill-analytics/usage-report?window=N
 #
 # All endpoints return byte-compat JSON (indent=2, ensure_ascii=False),
 # so the response body is emitted verbatim (no translation).
@@ -39,8 +40,9 @@ case "$CMD" in
     coverage)         ROUTE="/v1/skill-analytics/coverage";;
     recommendations)  ROUTE="/v1/skill-analytics/recommendations";;
     trend)            ROUTE="/v1/skill-analytics/trend";;
+    usage-report)     ROUTE="/v1/skill-analytics/usage-report";;
     *)
-        echo "Error: unknown subcommand '$CMD'. Expected one of: reuse-report, co-invocation, coverage, recommendations, trend" >&2
+        echo "Error: unknown subcommand '$CMD'. Expected one of: reuse-report, co-invocation, coverage, recommendations, trend, usage-report" >&2
         exit 1;;
 esac
 
@@ -51,8 +53,8 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 QUERY=""
 _append_q() { [ -n "$QUERY" ] && QUERY+="&"; QUERY+="$1"; }
 
-# trend accepts --window
-if [ "$CMD" = "trend" ] && [ -n "$WINDOW" ]; then
+# trend and usage-report accept --window
+if { [ "$CMD" = "trend" ] || [ "$CMD" = "usage-report" ]; } && [ -n "$WINDOW" ]; then
     _append_q "window=$(rt_url_encode "$WINDOW")"
 fi
 

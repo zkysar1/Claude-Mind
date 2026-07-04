@@ -401,6 +401,159 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self.assertEqual(ftm["new_stuck_count"], 0)
         self.assertFalse(ftm["fired"])
 
+    # ---- Consumption-aware contract for force_metric_encoding_pending (6)
+    # force_metric_encoding_pending is the THIRD dispatch-consumer sentinel; it
+    # joined CONSUMPTION_AWARE keyed on force_metric_encoding_last_dispatch. The
+    # metric gate arms it (real shape: {"fired": True, distinct_count, set_at,
+    # candidates, ...}) at iteration-close do_state_update (Phase 8) on deep closes
+    # with >=2 distinct numeric findings, and the canary samples it at
+    # do_productivity_check (SAME close), BEFORE precheck Phase 0-pre4 clears it
+    # next iteration. The consumer stamps the dispatch slot on every handling -> a
+    # keeping-up consumer must NOT fire (the latent false fire on metric-heavy
+    # sessions); a genuinely-bypassed one (frozen dispatch, e.g. a phantom
+    # candidate node it cannot Edit) still must.
+
+    def _fme_armed(self, minute):
+        """Real metric-gate sentinel shape (has a 'fired' key)."""
+        return {
+            "fired": True,
+            "distinct_count": 3,
+            "set_at": f"2026-07-04T00:{minute:02d}:45",
+            "candidate_node_key": "system/framework-architecture",
+            "reason": "3 distinct numeric findings in outcome_note",
+        }
+
+    def test_fme_consumption_aware_no_fire_when_dispatch_advances(self):
+        """force_metric_encoding_pending re-armed every run while the consumer
+        keeps up (force_metric_encoding_last_dispatch advances) must NOT fire —
+        the latent false-positive a bare presence-count had for metric-heavy
+        deep-close sessions."""
+        for i in range(5):
+            self._set_slot("force_metric_encoding_last_dispatch", f"2026-07-04T00:{i:02d}:30")
+            self._set_slot("force_metric_encoding_pending", self._fme_armed(i))
+            r = self._run_canary(dry_run=False, threshold=3)
+            fme = r["sentinels"]["force_metric_encoding_pending"]
+            self.assertTrue(fme["is_set"])
+            self.assertTrue(fme.get("dispatch_advanced"))
+            self.assertEqual(fme["new_stuck_count"], 0)
+            self.assertFalse(fme["fired"])
+
+    def test_fme_consumption_aware_fires_when_dispatch_frozen(self):
+        """Consumer bypassed: force_metric_encoding_pending stays armed AND its
+        dispatch slot stays frozen across threshold consecutive samples -> fires
+        (the genuine-stuck case, e.g. a phantom candidate node). Run 1 grace:
+        last_seen=None != current -> advanced."""
+        self._set_slot("force_metric_encoding_last_dispatch", "2026-07-04T00:00:00")
+        self._set_slot("force_metric_encoding_pending", self._fme_armed(0))
+        r1 = self._run_canary(dry_run=False, threshold=3)
+        self.assertEqual(r1["sentinels"]["force_metric_encoding_pending"]["new_stuck_count"], 0)
+        r2 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 1
+        self.assertEqual(r2["sentinels"]["force_metric_encoding_pending"]["new_stuck_count"], 1)
+        r3 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 2
+        self.assertEqual(r3["sentinels"]["force_metric_encoding_pending"]["new_stuck_count"], 2)
+        r4 = self._run_canary(dry_run=True, threshold=3)    # frozen -> 3 -> fire
+        fme = r4["sentinels"]["force_metric_encoding_pending"]
+        self.assertTrue(fme["fired"])
+        self.assertFalse(fme.get("dispatch_advanced"))
+        self.assertEqual(len(r4["investigate_goals_filed"]), 1)
+        self.assertEqual(
+            r4["investigate_goals_filed"][0]["sentinel"], "force_metric_encoding_pending"
+        )
+
+    def test_fme_consumption_aware_resets_when_dispatch_resumes(self):
+        """Dispatch frozen a couple samples, then the consumer dispatches again
+        (timestamp advances) -> stuck_count resets to 0 (recovered)."""
+        self._set_slot("force_metric_encoding_last_dispatch", "2026-07-04T00:00:00")
+        self._set_slot("force_metric_encoding_pending", self._fme_armed(0))
+        self._run_canary(dry_run=False, threshold=3)        # grace -> 0
+        r2 = self._run_canary(dry_run=False, threshold=3)   # frozen -> 1
+        self.assertEqual(r2["sentinels"]["force_metric_encoding_pending"]["new_stuck_count"], 1)
+        self._set_slot("force_metric_encoding_last_dispatch", "2026-07-04T00:30:00")
+        r3 = self._run_canary(dry_run=False, threshold=3)
+        fme = r3["sentinels"]["force_metric_encoding_pending"]
+        self.assertTrue(fme.get("dispatch_advanced"))
+        self.assertEqual(fme["new_stuck_count"], 0)
+        self.assertFalse(fme["fired"])
+
+
+class TestRecentInvestigateDedup(unittest.TestCase):
+    """4: `_recent_investigate_exists` suppresses a re-file when an
+    OPEN or recently-filed identical-origin_signal canary Investigate already
+    exists. Loads the hyphenated module via importlib and monkeypatches its
+    WORLD_DIR/AGENT_DIR module globals at a seeded temp queue — a pure unit test
+    of the dedup predicate, independent of the canary subprocess and the live
+    world queue (the canary filed three byte-identical
+    `investigate:stale-sentinel-canary:force_tree_maintain` goals before this).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_ssc_under_test", str(CANARY))
+        cls.ssc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.ssc)
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ssc-dedup-test-"))
+        self.world = self.tmp / "world"
+        self.agent = self.tmp / "agent"
+        self.world.mkdir(parents=True, exist_ok=True)
+        self.agent.mkdir(parents=True, exist_ok=True)
+        self._orig_world = self.ssc.WORLD_DIR
+        self._orig_agent = self.ssc.AGENT_DIR
+        self.ssc.WORLD_DIR = self.world
+        self.ssc.AGENT_DIR = self.agent
+
+    def tearDown(self):
+        self.ssc.WORLD_DIR = self._orig_world
+        self.ssc.AGENT_DIR = self._orig_agent
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _seed_world(self, goals):
+        line = json.dumps({"id": "asp-115", "goals": goals})
+        (self.world / "aspirations.jsonl").write_text(line + "\n", encoding="utf-8")
+
+    def _inv(self, sentinel, status="completed", created=None):
+        g = {
+            "id": "g-test",
+            "title": f"Investigate: stale sentinel {sentinel} ...",
+            "origin_signal": f"investigate:stale-sentinel-canary:{sentinel}",
+            "status": status,
+        }
+        if created is not None:
+            g["created_at"] = created
+        return g
+
+    def test_no_queue_file_no_suppress(self):
+        self.assertFalse(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
+    def test_open_duplicate_suppresses(self):
+        self._seed_world([self._inv("force_tree_maintain", status="pending")])
+        self.assertTrue(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
+    def test_recent_completed_suppresses(self):
+        recent = (self.ssc._dt.datetime.now()
+                  - self.ssc._dt.timedelta(hours=24)).isoformat()
+        self._seed_world([self._inv("force_tree_maintain", status="completed", created=recent)])
+        self.assertTrue(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
+    def test_old_completed_does_not_suppress(self):
+        old = (self.ssc._dt.datetime.now()
+               - self.ssc._dt.timedelta(hours=self.ssc.DEDUP_HOURS + 24)).isoformat()
+        self._seed_world([self._inv("force_tree_maintain", status="completed", created=old)])
+        self.assertFalse(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
+    def test_other_sentinel_does_not_suppress(self):
+        recent = self.ssc._dt.datetime.now().isoformat()
+        self._seed_world([self._inv("force_tree_maintain", status="pending", created=recent)])
+        self.assertFalse(self.ssc._recent_investigate_exists("fresh_eyes_dispatch_pending"))
+
+    def test_read_error_fails_closed(self):
+        # guard-487: an unreadable queue must SUPPRESS (fail closed), not file.
+        # A directory where aspirations.jsonl is expected makes open() raise.
+        (self.world / "aspirations.jsonl").mkdir(parents=True, exist_ok=True)
+        self.assertTrue(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
 
 if __name__ == "__main__":
     unittest.main()

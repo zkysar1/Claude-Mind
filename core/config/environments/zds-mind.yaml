@@ -1,0 +1,16 @@
+# Environment registry entry -- zds-mind (, BRD environment-id-as-key).
+#
+# Promotion target (dev-tier -> Claude-Mind -> ZDS-Mind). Defaults to the
+# local-files backend -- a safe, self-contained default that touches no cloud
+# resources, so committing it here cannot mix state into a wrong bucket. The
+# ZDS-Mind operator sets the own-cloud wiring HERE when cutting over:
+#   backend: own-cloud
+#   bucket: <zds bucket>
+#   sessions_table: <zds sessions table>
+#   lock_table: <zds lock table>
+#   region: <zds region>
+# Until then, legacy STORAGE_* vars in ZDS-Mind's .env.local still take effect
+# (setdefault precedence + deprecation warning), so promotion does NOT change
+# ZDS-Mind's running behavior.
+environment_id: zds-mind
+backend: local

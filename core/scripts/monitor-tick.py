@@ -14,7 +14,7 @@ cross-platform pure file I/O, self-gating via a per-probe last-run marker in
   - A tripped probe (exit != 0) is converted to ONE deduped goal via
     monitor-finding-convert.py (origin_signal dedup, target_asp routing).
 
-Design: agents/delta/temp/drained/fw-1b-monitoring-sweep-demotion-design.md.
+Design: FW-1b monitoring-sweep demotion (g-317-13 / asp-317), implemented in this module.
 
 Importable seam (hermetic test): run_tick(registry_path, state_path, ...) takes an
 injectable `probe_runner` (default subprocess) and `on_trip_fn` (default: the real
