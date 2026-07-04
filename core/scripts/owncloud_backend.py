@@ -50,7 +50,7 @@ from typing import Callable, List, NamedTuple, Optional, Union
 
 import boto3
 from botocore.config import Config as _BotoConfig
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
 
 from storage_backend import (
     FileStat, WriteResult,
@@ -67,6 +67,35 @@ PathLike = Union[str, os.PathLike]
 _NOT_FOUND = {"404", "NoSuchKey", "NotFound", "ResourceNotFoundException"}
 _PRECONDITION = {"PreconditionFailed", "412"}
 _COND_FAILED = "ConditionalCheckFailedException"
+
+# gap #5 (g-328-15): both-diverged coordination-store merge. _merge_reconcile_put
+# GETs remote, merges with the outgoing local bytes via a commutative handler,
+# and PUTs the result fenced on the remote ETag; if S3 moves mid-merge the fenced
+# PUT 412s and we re-GET/re-merge. The loop is bounded AND converges because the
+# handler is commutative (both machines compute identical merged bytes). See
+# core/scripts/coordination_merge.py.
+_MERGE_RECONCILE_CAP = 5
+
+
+def _conflict_backoff(attempt: int) -> float:
+    """Small capped exponential backoff between merge-reconcile retries. Kept
+    modest — the cross-machine lock already serializes most RMW, so this only
+    fires on a genuine mid-merge S3 move (a third writer)."""
+    return min(0.05 * (2 ** attempt), 1.0)
+
+
+def _coordination_merge_handler(path):
+    """Lazily resolve the commutative merge handler for a coordination store by
+    basename, or None. The lazy import keeps coordination_merge (and its yaml
+    import) off the backend's hot import path — it loads ONLY when a both-diverged
+    write to a registered store actually needs reconciling (mirrors
+    _overwrite_decision's lazy owncloud_sync import). Fail-open: any import error
+    => None => the caller keeps the safe-freeze-on-conflict behavior."""
+    try:
+        from coordination_merge import merge_handler_for
+        return merge_handler_for(path)
+    except Exception:
+        return None
 
 
 class ConflictError(Exception):
@@ -92,6 +121,37 @@ class RunnerClaim(NamedTuple):
     machine_id: Optional[str]
     agent_state: str
     heartbeat_at: int
+
+
+# Own-cloud writes use S3 PutObject(IfMatch=<etag>) compare-and-swap (fix #3 in
+# _put), an IfMatch-on-PutObject feature that requires botocore >= 1.35. Older
+# botocore (e.g. the 1.34.46 that Ubuntu apt ships) rejects the IfMatch param
+# CLIENT-SIDE with ParamValidationError, before any network call. Both the init
+# preflight and the _put runtime catch surface this ONE actionable message.
+_IFMATCH_UPGRADE_MSG = (
+    "own-cloud writes require botocore>=1.35 (PutObject IfMatch compare-and-swap). "
+    "The installed botocore rejects the IfMatch parameter client-side, so every "
+    "own-cloud write would silently fail while reads still look healthy. Run:\n"
+    "    pip install -U 'botocore>=1.35' 'boto3>=1.35'\n"
+    "then restart the daemon."
+)
+
+
+def _assert_ifmatch_supported() -> None:
+    """Startup preflight: fail LOUD (once, at backend init) when the installed
+    botocore is too old for PutObject IfMatch, instead of letting every write
+    crash cryptically at runtime while reads look healthy (the zeta zakbox1
+    bring-up incident). Fail-OPEN only when the botocore model cannot be
+    introspected at all — the _put ParamValidationError catch is the runtime
+    backstop; a botocore internals change must not brick a working backend."""
+    try:
+        import botocore.session
+        model = botocore.session.get_session().get_service_model("s3")
+        members = model.operation_model("PutObject").input_shape.members
+    except Exception:
+        return  # cannot introspect the model — defer to the _put runtime catch
+    if "IfMatch" not in members:
+        raise RuntimeError(_IFMATCH_UPGRADE_MSG)
 
 
 class OwnCloudBackend:
@@ -159,6 +219,19 @@ class OwnCloudBackend:
         self._etags: dict = {}
         # local-path -> monotonic time of the last HeadObject freshness check.
         self._cache_check: dict = {}
+        # S3 keys whose LAST _refresh saw the both-diverged state (local holds
+        # unpushed writes AND S3 moved -> "no_clobber"). _put consults this to
+        # route a REGISTERED coordination store (reasoning-bank.jsonl,
+        # team-state.yaml) to _merge_reconcile_put instead of freezing on a
+        # stale fence or clobbering the peer on an empty one (gap #5, g-328-15).
+        # Set only in _refresh's no_clobber branch; reset on every other verdict
+        # so it always reflects the latest refresh — which, in an RMW cycle,
+        # immediately precedes the _put that reads it under the same lock.
+        self._diverged_keys: set = set()
+        # Preflight: fail loud NOW if botocore is too old for PutObject IfMatch,
+        # rather than letting every _put crash cryptically at runtime (reads
+        # would still work, masking the break). See _assert_ifmatch_supported.
+        _assert_ifmatch_supported()
 
     # --- env wiring --------------------------------------------------------
     @classmethod
@@ -357,7 +430,24 @@ class OwnCloudBackend:
         # sync-walk's exclusion so the per-op read path shares one policy.
         if self._machine_local(path):
             return self._local(path)
-        key = self._s3_key(path)
+        # A path under NO configured world/meta/agents root is git-shipped
+        # (e.g. core/config/*.yaml) -- never on S3, always present locally on
+        # any clone. _s3_key -> _rel raises ValueError for it; there is nothing
+        # to fetch and nothing to fence, so ensure_local/refresh is a no-op.
+        # This lets a dual-use reader (one code path that reads BOTH a synced
+        # world/meta file AND a git-shipped core/config file) call ensure_local
+        # unconditionally without guarding the config case -- the keystone that
+        # makes the own-cloud read-path helper fixes trivial and un-reintroducible
+        # (own-cloud read-path class fix, 2026-07-02). The WRITE path (_put /
+        # _lock_key) still raises on out-of-root, by design (lock-key aliasing).
+        try:
+            key = self._s3_key(path)
+        except ValueError:
+            return self._local(path)
+        # Reset the both-diverged flag; only the no_clobber verdict below re-adds
+        # it. Every other outcome (identical / download / unchanged / absent /
+        # cache-fresh) means this key is NOT in a both-diverged state right now.
+        self._diverged_keys.discard(key)
         local = self._local(path)
         now = time.monotonic()
         if not force_fresh and local.exists():
@@ -394,11 +484,20 @@ class OwnCloudBackend:
                 self._etags[key] = etag
                 return local
             if decision == "no_clobber":
-                # local is authoritative (unpushed writes, or an uncomparable
-                # multipart S3 ETag). Do NOT overwrite. Leave self._etags
-                # untouched so a later _put keeps its existing post-restart push
-                # behavior -- this guard is purely additive to the read path and
-                # never alters the write path.
+                # local is authoritative: it holds unpushed writes (local != the
+                # persistent manifest baseline) AND S3 moved (a peer wrote) --
+                # the both-diverged state. Do NOT overwrite local here. Flag the
+                # key so a following _put can reconcile: for a REGISTERED
+                # coordination store (reasoning-bank.jsonl, team-state.yaml)
+                # _merge_reconcile_put MERGES local+remote (gap #5); for any
+                # OTHER file _put leaves self._etags untouched so a stale
+                # IfMatch 412s and the RMW conflict-retries -- the
+                # freeze-on-genuine-conflict that protects the unpushed write
+                # from a silent clobber. (Multipart ETags reach "no_clobber"
+                # ONLY via this same unpushed-writes gate now; multipart-with-
+                # local==baseline returns "download" so its fence refreshes --
+                # see _overwrite_decision, 2026-07-02 freeze fix.)
+                self._diverged_keys.add(key)
                 return local
             # decision == "download" -> fall through to the pull below.
         obj = self.s3.get_object(Bucket=self.bucket, Key=key)
@@ -417,12 +516,16 @@ class OwnCloudBackend:
           "identical"  local is byte-identical to S3 -> skip the download; the
                        caller adopts the ETag as the fence token.
           "no_clobber" local diverged from the PERSISTENT sync-manifest baseline
-                       (unpushed local writes -> local is authoritative), OR the
-                       S3 ETag is multipart (uncomparable) -> keep local, do NOT
-                       download.
+                       (unpushed local writes -> local is authoritative) -> keep
+                       local, do NOT download.
           "download"   safe to pull S3 over local: local == baseline and S3 moved
-                       (a peer/other machine wrote), or there is no baseline
-                       (S3-authoritative, matching _pull_one's no-baseline branch).
+                       (a peer/other machine wrote), there is no baseline
+                       (S3-authoritative, matching _pull_one's no-baseline branch),
+                       OR the S3 ETag is multipart (uncomparable by md5, but local
+                       == baseline is guaranteed here since the unpushed-writes
+                       gate above already returned, so S3 is authoritative -- and
+                       pulling refreshes the fence, without which multipart-stored
+                       files freeze on IfMatch forever; 2026-07-02 fix).
 
         Fail-open: an unreadable local, or unavailable owncloud_sync helpers,
         degrade to "download" (the pre-fix behavior for that single call) so a
@@ -451,7 +554,20 @@ class OwnCloudBackend:
         if baseline_md5 is not None and local_md5 != baseline_md5:
             return "no_clobber"  # unpushed local writes -> local is authoritative
         if _etag_is_multipart(etag):
-            return "no_clobber"  # uncomparable S3 ETag -> defer, never clobber
+            # (2026-07-02 fleet-wide-freeze fix) A multipart S3 ETag is
+            # uncomparable to a local md5, but reaching HERE guarantees local ==
+            # baseline: the L499 gate already returned "no_clobber" for
+            # local != baseline (unpushed local writes -> rb-2096 protection).
+            # So S3 is authoritative and safe to pull -- identical to the
+            # no-baseline "download" policy on the next line. The prior
+            # "no_clobber" here was over-conservative and CAUSED A FLEET-WIDE
+            # WRITE FREEZE: it never refreshed the in-process fence (self._etags),
+            # so _put kept sending IfMatch(stale) and every write to a
+            # multipart-stored file (e.g. the ~8MB world/aspirations.jsonl)
+            # 412'd DETERMINISTICALLY forever. "download" pulls S3 and adopts the
+            # current ETag as the fence (L456), curing the freeze; the L499
+            # baseline gate still protects unpushed local writes (rb-2096 intact).
+            return "download"
         return "download"
 
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes:
@@ -485,6 +601,14 @@ class OwnCloudBackend:
 
     def list_dir(self, path: PathLike) -> List[str]:
         prefix = self._s3_key(path)
+        # When `path` IS a governed root (path == root), _rel maps it to
+        # '<logical_prefix>/.' (Path('.').as_posix() == '.'), producing an
+        # S3 key like 'env-id/world/.' — no S3 key matches that trailing
+        # dot.  Strip it so the delimiter-list uses the correct prefix
+        # (e.g. 'env-id/world/').  Only list_dir hits this: file-level
+        # callers (_refresh, _put, stat, exists) never pass a bare root.
+        if prefix.endswith("/."):
+            prefix = prefix[:-1]
         if not prefix.endswith("/"):
             prefix += "/"
         expected = self._customer_prefix() + self.env_id + "/"
@@ -538,6 +662,16 @@ class OwnCloudBackend:
         key = self._s3_key(path)
         local = self._local(path)
         local.parent.mkdir(parents=True, exist_ok=True)
+        # gap #5 (g-328-15): the last _refresh saw the both-diverged state for
+        # this key (local unpushed writes + S3 moved). For a REGISTERED
+        # coordination store, MERGE local+remote instead of freezing (stale
+        # fence -> perpetual 412) or clobbering the peer (empty post-restart
+        # fence -> unconditional PUT). Unregistered files fall through to the
+        # normal fenced PUT, preserving their safe-freeze-on-conflict behavior.
+        if key in self._diverged_keys:
+            handler = _coordination_merge_handler(path)
+            if handler is not None:
+                return self._merge_reconcile_put(path, key, local, body, handler)
         kw = dict(Bucket=self.bucket, Key=key, Body=body)
         fence = self._etags.get(key)
         if fence is not None:
@@ -557,8 +691,41 @@ class OwnCloudBackend:
         # divergence; do NOT move the local write back above the PUT.)
         try:
             r = self.s3.put_object(**kw)
+        except ParamValidationError as e:
+            # botocore < 1.35 rejects PutObject(IfMatch=...) CLIENT-SIDE, before
+            # any network call — the exact failure the init preflight guards, but
+            # re-checked here so a version skew mid-process (or a backend built
+            # bypassing __init__) can never silently drop the write. Only remap
+            # when IfMatch was actually in play; an unrelated param error surfaces
+            # as-is. Do NOT retry without IfMatch — that would drop compare-and-swap.
+            if "IfMatch" in kw:
+                raise RuntimeError(
+                    _IFMATCH_UPGRADE_MSG + f"\n(original client-side error: {e})")
+            raise
         except ClientError as e:
             if e.response["Error"]["Code"] in _PRECONDITION:
+                # g-115-1741: a HOT coordination store (team-state.yaml, written
+                # every iteration by every agent) 412s HERE with an EMPTY
+                # _diverged_keys, because _refresh's warm-cache early-return
+                # (L456) returns BEFORE the no_clobber divergence detection that
+                # would have populated _diverged_keys -- the cache is ALWAYS warm
+                # for a per-iteration store, so that detection NEVER runs. The
+                # L663 merge PRE-check therefore misses and we reach here with a
+                # stale self._etags fence. Raising into the _fileops locked-RMW
+                # retry just re-hits the SAME warm-cache-stale-fence 412
+                # deterministically -- the >22min single-writer deadlock zeta
+                # observed on cc-02 (rb-2639: per-object stale-IfMatch deadlock).
+                # If the store has a commutative merge handler, reconcile NOW:
+                # _merge_reconcile_put re-GETs the CURRENT remote ETag, merges
+                # local+remote, and PUTs fenced on the FRESH ETag -- curing the
+                # freeze regardless of _diverged_keys state, and preserving
+                # unpushed local writes via the commutative merge (rb-2096 intact,
+                # NOT a clobber). Non-coordination stores keep the safe
+                # freeze-on-conflict -> RMW retry below. This is the write-path
+                # twin of bdab36a's read-path multipart fence-refresh fix.
+                handler = _coordination_merge_handler(path)
+                if handler is not None:
+                    return self._merge_reconcile_put(path, key, local, body, handler)
                 # fix A2: surface, never silently drop. Caller re-runs the RMW
                 # (G1 conflict-retry in _fileops' locked RMW helpers).
                 raise ConflictError(
@@ -569,7 +736,61 @@ class OwnCloudBackend:
         local.write_bytes(body)
         self._etags[key] = r["ETag"]
         self._cache_check[str(local)] = time.monotonic()
+        self._diverged_keys.discard(key)  # this write resolved any divergence
         return WriteResult(version=r["ETag"], fallback_used=False)
+
+    def _get_remote_raw(self, key: str):
+        """RAW S3 GET of the current object + ETag, BYPASSING the no-clobber
+        guard in _refresh — the "read-remote-authoritative" primitive the
+        both-diverged merge needs (refresh() refuses to surface remote when
+        local holds unpushed writes, which is exactly the state we must merge
+        out of). Returns (body_bytes, etag), or (b"", None) if the object is
+        absent. Does NOT touch the local cache or the fence."""
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return b"", None
+            raise
+        return obj["Body"].read(), obj["ETag"]
+
+    def _merge_reconcile_put(self, path: PathLike, key: str, local: Path,
+                             body: bytes, handler) -> WriteResult:
+        """Reconcile a both-diverged write to a registered coordination store:
+        GET the remote-authoritative bytes, MERGE them with the outgoing local
+        bytes via the store's commutative handler, and PUT the merged result
+        fenced on the remote ETag. If S3 moved again during the merge (a third
+        writer), the fenced PUT 412s and we re-GET / re-merge — a bounded CAS
+        loop that terminates because the handler is commutative (both machines
+        compute the same merged bytes). See core/scripts/coordination_merge.py."""
+        for attempt in range(_MERGE_RECONCILE_CAP):
+            remote_bytes, remote_etag = self._get_remote_raw(key)
+            try:
+                merged = handler(body, remote_bytes)
+            except Exception as e:
+                # A malformed store blob must not wedge writes forever. Surface
+                # as a ConflictError so the caller's RMW retry / operator sees
+                # it, rather than silently clobbering with un-merged local.
+                raise ConflictError(
+                    f"coordination merge failed for {key}: {e}")
+            kw = dict(Bucket=self.bucket, Key=key, Body=merged)
+            if remote_etag is not None:
+                kw["IfMatch"] = remote_etag  # CAS on the version we merged against
+            try:
+                r = self.s3.put_object(**kw)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in _PRECONDITION:
+                    time.sleep(_conflict_backoff(attempt))
+                    continue  # S3 moved during merge; re-GET and re-merge
+                raise
+            local.write_bytes(merged)
+            self._etags[key] = r["ETag"]
+            self._cache_check[str(local)] = time.monotonic()
+            self._diverged_keys.discard(key)
+            return WriteResult(version=r["ETag"], fallback_used=False)
+        raise ConflictError(
+            f"merge-reconcile exhausted {_MERGE_RECONCILE_CAP} retries for "
+            f"{key}: S3 kept moving mid-merge")
 
     def atomic_write(self, target: PathLike, write_to_handle,
                      *, max_retries: int = 10) -> WriteResult:

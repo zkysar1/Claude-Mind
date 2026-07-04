@@ -115,6 +115,14 @@ node_modules/
 # acquire and release, and prior to this rule the stranded entries were
 # repeatedly committed and deleted by sibling agents (g-280-08 origin).
 /.autocompact-serialize-lock/
+# .autocompact-serialize-poison is the timeout-marker SIBLING of the lock dir
+# above: precompact-serialize.sh writes it at PROJECT_ROOT on a 60s
+# lock-acquisition timeout (consumed+deleted by session-save-id.sh, stale-cleaned
+# after 5min). Overlooked when the lock dir was gitignored (g-280-08).
+# Untracked-but-stageable, it gets scanned into an iteration-commit drop list,
+# then vanishes before `git add`, failing the commit on a phantom pathspec
+# (observed 2026-06-27, zeta g-115-1670 close). Same transient-sentinel class.
+/.autocompact-serialize-poison
 # .iteration-commit-lock/ is acquired by core/scripts/iteration-commit.sh
 # as a per-repo mutex serializing the status→add→commit critical section
 # (g-280-11). Sibling-agent ping-pong risk is identical to the autocompact
@@ -221,3 +229,19 @@ core/logs/
 # would actively break any other user's deployment if shipped.
 # Discovered in Phase 6 fresh-eyes review 2026-05-20.
 .claude/settings.local.json
+
+# Agent temp store (g-115-1765): temp/ is a STAGING area for working docs that
+# DRAIN to the knowledge tree — nothing is meant to live there permanently.
+# Durability across a cross-machine agent move is provided by own-cloud S3 sync
+# (the owncloud sweep pushes temp/ to S3; pull_temp restores it at /start), NOT
+# by git. So git-ignore ALL of temp/ — working docs, the drained/ audit trail,
+# pure ephemera (.log/.txt), and any ad-hoc scripts/subdirs agents stage there.
+# WHY ALL, not a slush whitelist: temp/ accumulates many non-durable file types
+# (.py probes, .html, .jsonl, .exit markers, backup files, goal-scratch subdirs)
+# a whitelist can't keep pace with. The machine-local .git/info/exclude rule
+# that used to ignore temp/ did exactly this but did NOT travel to fresh boxes,
+# so temp/ committed there every iteration (the g-115-1765 bug). Moving the
+# ignore into this shared .gitignore makes it portable. .gitkeep stays tracked
+# to preserve the temp/ dir on a fresh clone.
+agents/*/temp/*
+!agents/*/temp/.gitkeep

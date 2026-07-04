@@ -20,6 +20,39 @@ source "$CORE_ROOT/scripts/_platform.sh"
 WORLD="$WORLD_DIR"
 CONFIG="$CONFIG_DIR"
 
+# --- Fail-loud guard: unresolvable WORLD_DIR (g-328 fresh-box safety) ---
+# On a fresh box with no agents/<name>/local-paths.conf (and no MIND_WORLD /
+# .mind-data default), WORLD_DIR resolves EMPTY. Proceeding would (a) run the
+# bootstrap pull with an empty root (silent no-op), then (b) seed a blank world
+# via `mkdir -p "$WORLD/conventions"` == `mkdir -p "/conventions"` — cruft at the
+# filesystem root — and on own-cloud the sweep would then push that blank tree
+# OVER the real S3 state (the catastrophic clobber). The own-cloud cache path is
+# per-machine, so init cannot invent it; fail loud with guidance instead
+# (mirrors the daemon-side _ensure_owncloud_roots fail-loud). Container/operator
+# provisioning must supply local-paths.conf (WORLD_PATH+META_PATH) before init.
+if [ -z "${WORLD:-}" ]; then
+    echo "ERROR: init-world.sh — WORLD_DIR is empty/unresolvable; refusing to seed a blank world." >&2
+    echo "  Fix: provision agents/<name>/local-paths.conf with WORLD_PATH+META_PATH," >&2
+    echo "  or export MIND_WORLD, before running init. On own-cloud a blank seed" >&2
+    echo "  would clobber the real S3 world tree on the next sweep." >&2
+    exit 1
+fi
+
+# --- Fresh-box bootstrap pull (durable closer) ---
+# On own-cloud the local cache can be empty while world/ is fully initialized
+# in S3. The LOCAL .initialized marker is then absent, so the gate below would
+# RE-SEED empty stubs OVER the real S3 state (fresh-own-cloud-box blank-tree
+# failure,  / BLOCKER 9). Pull world/ from S3 FIRST so the gate sees the
+# true initialized state. Runs standalone (no daemon: owncloud_sync talks to S3
+# directly via the AWS SDK), so it works BEFORE the daemon is up. Fail-soft: a
+# genuinely-first init (nothing in S3 yet) pulls nothing and proceeds to seed
+# normally; a non-own-cloud backend no-ops via the STORAGE_BACKEND guard.
+if [ ! -f "$WORLD/.initialized" ] && [ "${STORAGE_BACKEND:-local}" = "own-cloud" ]; then
+    echo "  own-cloud fresh box: pulling world/ from S3 before init gate..."
+    MIND_WORLD="${MIND_WORLD:-$WORLD}" python3 "$CORE_ROOT/scripts/owncloud_sync.py" --pull --root world \
+        || echo "  WARN: bootstrap world-pull returned non-zero — proceeding (will seed if S3 truly empty)" >&2
+fi
+
 # --- Idempotent gate ---
 if [ -f "$WORLD/.initialized" ]; then
     echo "world/ already initialized — skipping"

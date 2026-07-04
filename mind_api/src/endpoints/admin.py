@@ -343,6 +343,14 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         msg = str(e)
         payload = {"backend": backend, "ok": False,
                    "error": f"list failed: {msg}"}
+        # Actionable hint for the most common operational failure of THIS
+        # endpoint: the daemon's scoped creds lack dynamodb:Scan on the sessions
+        # table. list_runner_claims Scans; acquire/heartbeat/release do not — so
+        # a pre-FR-7 IAM policy (granted only Get/Put/Update) leaves exactly this
+        # read denied while the ownership trio still works. Observed 2026-07-01
+        # on the ayoai-mind dev creds vs zds-sessions. Fix: grant dynamodb:Scan
+        # (mind_api/scripts/provision_aws.py build_policy already does) — see
+        # decision-doc §6.
         if "AccessDenied" in msg and "Scan" in msg:
             payload["hint"] = (
                 "the daemon's IAM identity lacks dynamodb:Scan on the sessions "
@@ -353,7 +361,7 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(payload, status=500)
     return Response.json({
         "backend": backend, "ok": True,
-        "environment_id": os.environ.get("ENVIRONMENT_ID", ""),
+        "environment_id": os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
         "claims": [
             {"agent": c.agent, "machine_id": c.machine_id,
              "agent_state": c.agent_state, "heartbeat_at": c.heartbeat_at}

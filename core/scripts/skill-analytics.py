@@ -11,6 +11,7 @@ Subcommands:
   coverage         — Goal category skill coverage and success rates
   recommendations  — Forge/retire/improve/substitute suggestions
   trend            — Quality trend per skill over evaluations
+  usage-report     — Cross-agent skill invocation dashboard (most/never used, heatmap, trend)
 """
 
 import argparse
@@ -30,7 +31,9 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(1)
 
-from _paths import META_DIR, AGENT_DIR, CONFIG_DIR, WORLD_DIR
+import datetime
+
+from _paths import META_DIR, AGENT_DIR, CONFIG_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
 
 # Meta-strategies (meta/) — domain-agnostic
 QUALITY_PATH = META_DIR / "skill-quality.yaml"
@@ -337,6 +340,86 @@ def cmd_recommendations(args):
     print(json.dumps(output, indent=2, ensure_ascii=False))
 
 
+def cmd_usage_report(args):
+    """Cross-agent skill invocation dashboard."""
+    window_days = args.window
+    cutoff = (datetime.date.today() - datetime.timedelta(days=window_days)).isoformat()
+
+    all_invocations = []
+    for inv_path in sorted(agents_root().glob("*/skill-invocations.jsonl")):
+        for rec in read_jsonl(inv_path):
+            if isinstance(rec, dict) and rec.get("ts", "")[:10] >= cutoff:
+                all_invocations.append(rec)
+
+    skill_counts = Counter(r.get("skill", "") for r in all_invocations if r.get("skill"))
+    total = sum(skill_counts.values())
+
+    most_used = [
+        {"skill": s, "count": c, "pct": round(c / total * 100, 1) if total else 0.0}
+        for s, c in skill_counts.most_common(20)
+    ]
+
+    # Registered base + forged skills
+    registered = set()
+    skills_dir = PROJECT_ROOT / ".claude" / "skills"
+    if skills_dir.exists():
+        for skill_dir in skills_dir.iterdir():
+            if skill_dir.is_dir() and (skill_dir / "SKILL.md").exists():
+                registered.add(skill_dir.name)
+    forged_path = WORLD_DIR / "forged-skills.yaml"
+    if forged_path.exists():
+        fd = read_yaml(forged_path)
+        for sk in fd.get("skills", []):
+            if isinstance(sk, dict) and sk.get("name"):
+                registered.add(sk["name"])
+    never_used = sorted(registered - set(skill_counts.keys()))
+
+    # Per-agent heatmap + model-vs-user split (top 30 skills)
+    agents_per_skill = defaultdict(Counter)
+    model_vs_user = defaultdict(Counter)
+    for rec in all_invocations:
+        skill = rec.get("skill", "")
+        agent = rec.get("agent", "")
+        source = rec.get("invocation_source", "model")
+        if skill and agent:
+            agents_per_skill[skill][agent] += 1
+        if skill:
+            model_vs_user[skill][source] += 1
+    top30 = {s for s, _ in skill_counts.most_common(30)}
+    agents_per_skill_out = {s: dict(c) for s, c in agents_per_skill.items() if s in top30}
+    model_vs_user_out = {s: dict(c) for s, c in model_vs_user.items() if s in top30}
+
+    # Weekly trend for top 10 skills
+    weekly = defaultdict(Counter)
+    for rec in all_invocations:
+        ts = rec.get("ts", "")
+        skill = rec.get("skill", "")
+        if ts and skill:
+            try:
+                d = datetime.date.fromisoformat(ts[:10])
+                week_label = d.strftime("%Y-W%W")
+            except ValueError:
+                continue
+            weekly[week_label][skill] += 1
+    top10_skills = [s for s, _ in skill_counts.most_common(10)]
+    weekly_out = {
+        week: {s: counts.get(s, 0) for s in top10_skills}
+        for week, counts in sorted(weekly.items())
+    }
+
+    print(json.dumps({
+        "window_days": window_days,
+        "data_start": cutoff,
+        "data_end": datetime.date.today().isoformat(),
+        "total_invocations": total,
+        "most_used": most_used,
+        "never_used": never_used,
+        "agents_per_skill": agents_per_skill_out,
+        "model_vs_user": model_vs_user_out,
+        "weekly_trend": weekly_out,
+    }, indent=2, ensure_ascii=False))
+
+
 def cmd_trend(args):
     """Quality trend per skill over evaluations."""
     window = args.window
@@ -421,6 +504,9 @@ def main():
     p_trend = sub.add_parser("trend", help="Quality trend per skill")
     p_trend.add_argument("--window", type=int, default=10)
 
+    p_usage = sub.add_parser("usage-report", help="Cross-agent skill invocation dashboard")
+    p_usage.add_argument("--window", type=int, default=30, help="Days to look back (default: 30)")
+
     args = parser.parse_args()
     cmds = {
         "reuse-report": cmd_reuse_report,
@@ -428,6 +514,7 @@ def main():
         "coverage": cmd_coverage,
         "recommendations": cmd_recommendations,
         "trend": cmd_trend,
+        "usage-report": cmd_usage_report,
     }
     cmds[args.command](args)
 

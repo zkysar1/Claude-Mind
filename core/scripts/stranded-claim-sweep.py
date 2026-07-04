@@ -25,8 +25,26 @@ Sweep logic per g-115-1044:
       - POST /v1/aspirations/update-goal       # field=status, value="pending"
       - team-state.py clear-in-flight          # if in_flight matches goal_id
 
-Output (JSON to stdout): {"scanned": K, "stranded": [...], "released": N,
-"kept": M, "dry_run": bool, "agent": "<name>", "now": "<iso>"}.
+Output (JSON to stdout): {"scanned": K, "scanned_no_claim": J,
+"stranded": [...], "released": N, "kept": M, "dry_run": bool,
+"agent": "<name>", "now": "<iso>"}.
+
+Second shape (g-115-1691): the claimed_by==MIND_AGENT query above is
+structurally blind to agent-source goals that went in-progress WITHOUT a
+claim. Agent-source goals skip aspirations-claim.sh (loop digest Phase 4
+claims only IF source==world), and that wrapper is the sole writer of
+claimed_by — so a stranded agent-source in-progress goal carries
+claimed_by=unset and never matches the query. The sweep ALSO scans the
+agent-source active aggregate for status==in-progress goals with no
+claimed_by, using last_modified as the stale-age basis (no claimed_at
+exists — claimed_by/claimed_at are written together by the claim wrapper).
+For a genuinely stranded goal (no writes after it went in-progress)
+last_modified == the in-progress-transition moment; the diary check carries
+the primary detection weight regardless. A no-claim stranded goal has
+nothing to release (no claim) and no team-state in_flight to clear
+(in_flight is written at claim time): the operative action is the
+status->pending flip that returns it to the selectable pool. World goals
+always claim, so the no-claim shape is agent-source-only.
 
 Exit codes:
   0 — sweep ran (dry-run or apply). Output is JSON.
@@ -259,6 +277,67 @@ def _clear_team_in_flight(agent: str, goal_id: str) -> Dict[str, Any]:
     return {"cleared": True, "reason": "matched and cleared"}
 
 
+def _query_inprogress_no_claim(agent: str) -> List[Dict[str, Any]]:
+    """1: agent-source in-progress goals with NO claimed_by.
+
+    The claimed-by query path (_query_claimed_goals) cannot see these:
+    agent-source goals skip aspirations-claim.sh (the only claimed_by writer),
+    so they sit status=in-progress with claimed_by unset and never match the
+    claimed_by==agent filter. Read the agent-source active aggregate directly
+    and surface in-progress goals with no claim, carrying last_modified as the
+    stale-age basis (no claimed_at exists). Fail-open: any read/decode error
+    yields an empty list (the sweep degrades to claimed-only, never crashes).
+    """
+    try:
+        raw = _rt.aspirations_read(source="agent", active=True)
+    except _rt.RtError:
+        return []
+    try:
+        decoded = _rt.tolerant_decode_aggregate("active", raw)
+    except Exception:
+        return []
+    asps = decoded.get("aspirations", []) if isinstance(decoded, dict) else decoded
+    out: List[Dict[str, Any]] = []
+    for asp in asps or []:
+        asp_id = asp.get("id", "")
+        for g in asp.get("goals", []) or []:
+            if g.get("status") != "in-progress":
+                continue
+            if g.get("claimed_by"):  # has a claim — the claimed path handles it
+                continue
+            out.append({
+                "goal_id": g.get("id", ""),
+                "asp_id": asp_id,
+                "source": "agent",
+                "title": g.get("title", ""),
+                "last_modified": g.get("last_modified"),
+            })
+    return out
+
+
+def _flip_pending_no_claim(goal_id: str, source: str) -> Dict[str, Any]:
+    """Flip a stranded no-claim in-progress goal back to pending (1).
+
+    No claim to release (claimed_by was never set) and no team-state in_flight
+    to clear (in_flight is written at claim time). The single operative action
+    is the status->pending flip that returns the goal to the selectable pool.
+    """
+    try:
+        _rt.rt_call(
+            "POST",
+            "/v1/aspirations/update-goal",
+            query={"id": goal_id, "field": "status", "source": source},
+            body=json.dumps("pending"),
+        )
+    except _rt.RtError as e:
+        return {
+            "ok": False,
+            "step": "aspirations-update-goal-status",
+            "error": str(e)[:400],
+        }
+    return {"ok": True, "step": "flipped-pending"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Release stranded in-progress claims (post-autocompact recovery)",
@@ -359,6 +438,72 @@ def main() -> int:
             if rel.get("ok"):
                 clear = _clear_team_in_flight(agent, goal_id)
                 record["team_state_clear"] = clear
+                summary["released"] += 1
+                record["verdict"] = "released"
+            else:
+                summary["kept"] += 1
+                record["verdict"] = "release-failed"
+
+        summary["stranded"].append(record)
+
+    # 1: second shape — agent-source in-progress goals with NO
+    # claimed_by (structurally invisible to the claimed_by==agent query above).
+    no_claim = _query_inprogress_no_claim(agent)
+    summary["scanned_no_claim"] = len(no_claim)
+    for entry in no_claim:
+        goal_id = entry.get("goal_id", "")
+        asp_id = entry.get("asp_id", "")
+        source = entry.get("source", "agent")
+        title = entry.get("title", "")
+        lm_iso = entry.get("last_modified")
+        if not goal_id or not asp_id:
+            continue
+
+        if not lm_iso or not isinstance(lm_iso, str):
+            summary["stranded"].append({
+                "goal_id": goal_id, "asp_id": asp_id, "source": source,
+                "title": title, "shape": "no-claim", "verdict": "kept",
+                "reason": "last_modified missing/unreadable — cannot age; "
+                          "release manually if persistent",
+            })
+            summary["kept"] += 1
+            continue
+
+        lm = _parse_iso(lm_iso)
+        if lm is None:
+            summary["stranded"].append({
+                "goal_id": goal_id, "asp_id": asp_id, "source": source,
+                "title": title, "shape": "no-claim", "verdict": "kept",
+                "reason": f"last_modified unparseable ({lm_iso!r})",
+            })
+            summary["kept"] += 1
+            continue
+
+        has_recent_diary = _diary_has_entry_after(agent, goal_id, lm_iso)
+        age = now - lm
+
+        if has_recent_diary:
+            summary["kept"] += 1
+            continue  # work is happening — not stranded
+
+        if age < stale_threshold:
+            summary["kept"] += 1
+            continue  # too fresh — race / mid-transition window
+
+        record = {
+            "goal_id": goal_id, "asp_id": asp_id, "source": source,
+            "title": title, "shape": "no-claim",
+            "last_modified": lm_iso,
+            "age_minutes": round(age.total_seconds() / 60.0, 2),
+            "verdict": "stranded",
+            "reason": "in-progress with no claimed_by, no diary entry after "
+                      "last_modified AND age >= stale threshold",
+        }
+
+        if args.apply:
+            res = _flip_pending_no_claim(goal_id, source)
+            record["flip_result"] = res
+            if res.get("ok"):
                 summary["released"] += 1
                 record["verdict"] = "released"
             else:

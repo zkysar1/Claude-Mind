@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tree_archive.py — D2 LLM-reviewed tree-node cluster archival engine ().
 
-Implements the D2 design (agents/bravo/temp/d2-cluster-archival-design.md):
+Implements the D2 design (relevance-aware cluster-resurgence refresh, rb-2338):
 
   - compute_cluster(leaf_key): cluster of leaves sharing ANY of signal
     A (shared parent) / B (shared source_aspiration) / C (tags Jaccard >= floor).

@@ -64,7 +64,7 @@ _N3_ALLOWED_EXACT = frozenset({
     "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE", "STORAGE_DDB_LOCK_TABLE",
     "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
     "ENVIRONMENT_ID",
-    # FR-4/FR-5 (BRD DynamoDB-Backed Shared-State-API): daemon auth token (a secret,
+    # FR-4/FR-5 (BRD Shared-State-API): daemon auth token (a secret,
     # loaded like the MIND_AWS_* scoped-credential family) + the opt-in
     # non-loopback bind interface. Both default-absent → localhost-only no-auth
     # (byte-identical legacy behavior). MIND_API_BIND!=loopback fail-closes in
@@ -120,6 +120,126 @@ def _load_env_local(project_root: Path) -> None:
         if tok.startswith("#"):
             tok = ""
         os.environ.setdefault(key, tok)
+
+
+# Registry key (in core/config/environments/<env-id>.yaml) -> daemon env var.
+# The registry is the single source of truth for storage wiring; the operator
+# sets ONE value (ENVIRONMENT_ID) and these are DERIVED from it ().
+_REGISTRY_KEY_TO_ENV = {
+    "backend": "STORAGE_BACKEND",
+    "bucket": "STORAGE_S3_BUCKET",
+    "sessions_table": "STORAGE_DDB_SESSIONS_TABLE",
+    "lock_table": "STORAGE_DDB_LOCK_TABLE",
+    "region": "AWS_DEFAULT_REGION",
+}
+
+
+def _environments_dir(project_root: Path) -> Path:
+    """Directory holding the committed per-environment registry files."""
+    return project_root / "core" / "config" / "environments"
+
+
+def _valid_environment_ids(project_root: Path) -> "list[str]":
+    """Sorted env-ids for which a registry file exists (the ``*.yaml`` stems)."""
+    d = _environments_dir(project_root)
+    if not d.is_dir():
+        return []
+    return sorted(p.stem for p in d.glob("*.yaml"))
+
+
+def _apply_environment_registry(project_root: Path) -> None:
+    """Derive the storage-backend wiring from the local environment registry
+    (``core/config/environments/<ENVIRONMENT_ID>.yaml``) so the operator sets ONE
+    value -- ``ENVIRONMENT_ID`` -- instead of four independently-misconfigurable
+    ``STORAGE_*`` / ``AWS_DEFAULT_REGION`` vars that can silently mix state across
+    environments (g-328-11, BRD environment-id-as-key).
+
+    Runs in ``main()`` AFTER ``_load_env_local`` (which loads ``ENVIRONMENT_ID``
+    from ``.env.local``) and BEFORE ``_ensure_owncloud_roots`` / ``get_backend()``
+    (which read the derived ``STORAGE_*``). Semantics:
+
+    * ``ENVIRONMENT_ID`` unset -> NO-OP. Legacy N-var mode is fully preserved (the
+      zeta pilot / any env that configures ``STORAGE_*`` directly). This is also
+      why the hermetic test suite is unaffected: conftest pins
+      ``STORAGE_BACKEND=local`` and sets no ``ENVIRONMENT_ID``.
+    * ``ENVIRONMENT_ID`` set but NO registry file -> FAIL LOUD (raise) with the
+      list of valid ids. A typo'd env-id must never silently fall back to whatever
+      ``STORAGE_*`` happens to be set -- that is the exact state-mixing the
+      registry prevents. The registry is committed to ``core/`` so it is always
+      locally readable (no chicken-and-egg with the own-cloud store).
+    * ``ENVIRONMENT_ID`` set WITH a registry file -> derive each ``STORAGE_*`` via
+      ``setdefault`` (an explicit launch-env / ``.env.local`` value still WINS --
+      the same "explicit wins" contract as ``_load_env_local``) and emit a single
+      DEPRECATION warning naming any legacy storage var that co-exists with the
+      registry, so the operator migrates to ENVIRONMENT_ID-only. ``setdefault``
+      (not hard override) keeps promotion safe: a downstream env still running on
+      legacy vars does not change behavior the moment the registry lands.
+
+    An ``own-cloud`` registry entry MUST carry bucket + both DDB tables + region;
+    a half-configured own-cloud entry raises rather than silently 500-ing every
+    storage op later (same fail-loud rationale as ``_ensure_owncloud_roots``).
+    """
+    env_id = os.environ.get("ENVIRONMENT_ID", "").strip()
+    if not env_id:
+        return  # legacy N-var mode -- registry not in play
+    reg_file = _environments_dir(project_root) / f"{env_id}.yaml"
+    if not reg_file.is_file():
+        valid = _valid_environment_ids(project_root)
+        raise RuntimeError(
+            f"_apply_environment_registry: ENVIRONMENT_ID={env_id!r} has no "
+            f"registry entry at {reg_file}. Valid environment ids: "
+            f"{valid or '(none -- core/config/environments/ is empty)'}. "
+            "Fix: set ENVIRONMENT_ID to a valid id, or add the registry file. "
+            "Refusing to start rather than silently mixing state across "
+            "environments."
+        )
+    import yaml  # lazy -- mirrors _ensure_owncloud_roots' local import
+    try:
+        data = yaml.safe_load(reg_file.read_text(encoding="utf-8")) or {}
+    except Exception as e:  # noqa: BLE001 -- a malformed registry must fail loud
+        raise RuntimeError(
+            f"_apply_environment_registry: could not parse {reg_file}: {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"_apply_environment_registry: {reg_file} must be a YAML mapping, "
+            f"got {type(data).__name__}."
+        )
+
+    backend = str(data.get("backend", "")).strip().lower()
+    # An own-cloud entry must be fully specified -- fail loud on a half config
+    # rather than let get_backend() 500 every op later with a missing bucket/table.
+    if backend == "own-cloud":
+        missing = [k for k in ("bucket", "sessions_table", "lock_table", "region")
+                   if not str(data.get(k, "")).strip()]
+        if missing:
+            raise RuntimeError(
+                f"_apply_environment_registry: {reg_file} sets backend=own-cloud "
+                f"but is missing required key(s): {missing}. An own-cloud "
+                "environment must specify bucket, sessions_table, lock_table, and "
+                "region."
+            )
+
+    coexisting = []
+    for reg_key, env_key in _REGISTRY_KEY_TO_ENV.items():
+        reg_val = data.get(reg_key)
+        if reg_val is None or str(reg_val).strip() == "":
+            continue  # registry omits this key (e.g. local backend has no bucket)
+        reg_val = str(reg_val).strip()
+        if os.environ.get(env_key) is not None:
+            coexisting.append(env_key)  # legacy explicit value present -> it wins
+        os.environ.setdefault(env_key, reg_val)
+
+    if coexisting:
+        print(
+            f"[environment-registry] DEPRECATION: legacy storage env var(s) "
+            f"{sorted(coexisting)} are set alongside ENVIRONMENT_ID={env_id!r}. "
+            f"The registry (core/config/environments/{env_id}.yaml) is now the "
+            "single source of truth for storage wiring; the explicit var(s) still "
+            "take precedence for now, but remove them from .env.local and keep "
+            "ONLY ENVIRONMENT_ID.",
+            file=sys.stderr,
+        )
 
 
 def _ensure_owncloud_roots(project_root: Path) -> None:
@@ -224,15 +344,33 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
         sys.path.insert(0, scripts_dir)
 
     def _loop():
-        # Settle delay: don't fire during daemon startup churn.
-        if shutdown.wait(timeout=min(interval, 30)):
-            return
         try:
             import owncloud_sync
             from storage_backend import get_backend
         except Exception as e:  # noqa: BLE001 — import broke: disable, don't churn
             print(f"[owncloud-sync] import failed; mirror sweep disabled: {e}",
                   file=sys.stderr)
+            return
+        # Fresh-box firmware materialization (): ONE-TIME pull of the
+        # governed non-agent firmware (world/scripts) from S3 so bare-bash
+        # world/scripts/*.sh (email-send.sh, output-style-mode-guard.sh) work on
+        # day 1 of a fresh own-cloud clone. Runs BEFORE the settle delay so a
+        # fresh box materializes ASAP, but AFTER the daemon is already serving
+        # (this thread starts post-publish), so it is off the spawn critical path
+        # — a slow first pull can never delay daemon publish / trigger a
+        # spawn-timeout daemon storm. Marker-gated (one-time per box) + fully
+        # fail-open, so warm boots skip at ~1 stat and a bad pull never kills the
+        # sweep thread.
+        try:
+            mstats = owncloud_sync.materialize_firmware(get_backend(), project_root)
+            if mstats.get("pulled") or mstats.get("errors"):
+                print(f"[owncloud-materialize] roots={mstats.get('materialized_roots')} "
+                      f"pulled={mstats.get('pulled', 0)} in_sync={mstats.get('in_sync', 0)} "
+                      f"errors={mstats.get('errors', 0)}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001 — materialization must never kill the sweep
+            print(f"[owncloud-materialize] error (non-fatal): {e}", file=sys.stderr)
+        # Settle delay: don't fire the periodic PUSH sweep during startup churn.
+        if shutdown.wait(timeout=min(interval, 30)):
             return
         while not shutdown.is_set():
             t0 = time.monotonic()
@@ -327,6 +465,16 @@ def main(argv=None) -> int:
     # does not otherwise read .env.local; without this a STORAGE_BACKEND
     # cutover would never take effect in the daemon. See _load_env_local.
     _load_env_local(project_root)
+
+    # Derive storage wiring (STORAGE_BACKEND / STORAGE_S3_BUCKET / STORAGE_DDB_* /
+    # AWS_DEFAULT_REGION) from the local environment registry keyed on
+    # ENVIRONMENT_ID, so the operator sets ONE value instead of four
+    # independently-misconfigurable vars (). Runs AFTER _load_env_local
+    # (loads ENVIRONMENT_ID) and BEFORE _ensure_owncloud_roots / get_backend()
+    # (read the derived STORAGE_*). No-op when ENVIRONMENT_ID is unset; fails loud
+    # on an unknown ENVIRONMENT_ID (no silent state-mixing). See
+    # _apply_environment_registry.
+    _apply_environment_registry(project_root)
 
     # When own-cloud is selected, ensure the governed roots (WORLD_PATH/META_PATH)
     # are in os.environ so OwnCloudBackend.from_env can build its root map. They

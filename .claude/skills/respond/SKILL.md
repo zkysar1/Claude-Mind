@@ -203,16 +203,7 @@ encoding routing.
 
 ### Reader-Mode Observation Surfacing (E5)
 
-Reader mode has no write capability — observations the agent notices during
-retrieval (a node looks stale, two conventions contradict, a fact in the
-tree disagrees with a fact from the workspace codebase) would otherwise
-vanish at session end.
-
-Approach A (this implementation): the agent surfaces the observation in
-its response text. The user can either ignore it OR mode-switch to
-assistant and run `/encode-session` (or a targeted /respond directive)
-to capture it. Zero infrastructure — no carve-out from reader's no-write
-contract.
+Rationale (WHY reader mode surfaces observations in response text rather than writing): `core/config/rationale/respond.md`
 
 ```
 Bash: session-mode-get.sh → MODE
@@ -274,6 +265,22 @@ IF any entry has `type: fresh-eyes-review` AND `status: pending`:
 - When user answers, update status to `answered` and record the answer.
   After status transitions to `answered` or `superseded`: `Bash: session-signal-set.sh pq-resolved`
   (wakes any aspirations loop currently in blocked-sleep backoff; non-blocking)
+- **Stale user-gate clear (rb-2516 / g-115-1693).** If the answered pq was a
+  user-DECISION question that gated a parked goal -- its `context` or
+  `source_goal` names a goal whose `participants` still contains `user` (parked
+  per guard-571) -- AND the user's answer AUTHORIZES the agent portion (an
+  unambiguous go-ahead, NOT a "no" / "keep it parked" / partial-or-conditional
+  answer), drop `user` from that goal so it re-enters the agent selector lane:
+  `Bash: aspirations-update-goal.sh --source {goal.source} {goal.id} participants '["agent"]'`
+  (also set `handoff_to` if a specific agent should pick it up). This is a
+  JUDGMENT step and MUST live here at answer-time, NOT in a mechanical precheck
+  sweep: only here is the authorization semantics in context -- a "no/keep
+  parked" answer must leave the gate intact, which a participants-contains-user
+  + pq-answered sweep could not distinguish (it would wrongly unpark declined
+  work). Skip the drop whenever the answer declines, defers, or only partially
+  authorizes. Canonical miss: g-309-18 sat pending+unclaimed 3 days after the
+  gating pq was answered because the resolution left `participants:[agent,user]`
+  intact.
 
 ### User Goal Reminders
 
@@ -614,16 +621,7 @@ command, or directive with no knowledge-bearing content.
 
 ## Step 6.5: Post-Edit Tree Reconciliation (E2)
 
-Step 6 fires on user CORRECTIONS of belief ("X is actually Y"). Step 6.5
-fires on user-DIRECTED edits ("fix the bug in script X", "update convention
-Y to say Z") — world-changing actions that don't surface as belief
-corrections but still invalidate tree knowledge that describes the edited
-file. Without this step, the assistant-mode equivalent of autonomous Phase
-4.5 is missing: knowledge stays stale until the user happens to ask about
-the file and notices the tree is out of date.
-
-Sister mechanism to Step 6's broad re-retrieve (G12/R15), but driven by the
-agent's own writes rather than the user's narrative correction.
+Rationale (WHY Step 6.5 exists separately from Step 6, and the missing-without-this-step failure mode): `core/config/rationale/respond.md`
 
 ```
 1. Self-report: did THIS TURN involve any Edit/Write/MultiEdit tool calls
@@ -699,14 +697,7 @@ agent's own writes rather than the user's narrative correction.
    response on a debt-filing failure.
 ```
 
-**Order vs Step 6**: Step 6 runs FIRST (covers user-correction-driven
-reconciliation, which is more specific). Step 6.5 then handles the residual
-case where edits happened without belief correction.
-
-**Why not part of Step 5**: Step 5 routes directives into writes; Step 6/6.5
-react to writes already-done. Separation keeps Step 5's directive table
-clean (one row per directive type) and concentrates encoding-reaction in
-6.x.
+Rationale (WHY Step 6.5 runs after Step 6 and WHY it is not part of Step 5): `core/config/rationale/respond.md`
 
 **Cross-reference**: `core/config/conventions/encoding-triggers.md` E2 row.
 
@@ -1175,18 +1166,7 @@ a review), 7.5f's dedup step skips the duplicate.
 
 ## Step 7.6: Mid-Session Cadence Nudge (E4)
 
-In assistant mode the autonomous loop isn't running, so the only encoding
-trigger that fires automatically is the PostToolUse mechanical hook (T21).
-All substantive encoding lanes (Lane 1.x of `/encode-session`) require
-explicit user invocation. Long assistant sessions that end abruptly
-(window closed, network drop, user moves on) lose every learning that
-hasn't been encoded yet — including the `knowledge_debt` entries Steps 4.5
-and 6.5 just filed.
-
-This step is a cheap mitigation: count substantive turns, and at a
-configured cadence, surface a one-line nudge in the response inviting the
-user to run `/encode-session`. No forced writes. No blocking. The user can
-ignore the nudge; the counter resets on invocation.
+Rationale (WHY Step 7.6 uses a cadence nudge rather than forced encoding, and the failure mode without it): `core/config/rationale/respond.md`
 
 ### Mode and state gate
 

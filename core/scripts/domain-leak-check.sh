@@ -13,11 +13,18 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 BLOCKLIST="$PROJECT_ROOT/core/config/domain-term-blocklist.txt"
 VERBOSE=false
 CORE_ONLY=false
+STAGED=false
 
 for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;
     --core-only) CORE_ONLY=true ;;
+    # --staged (g-001-314): scan ONLY git-staged files (git diff --cached)
+    # instead of the whole tree. Wired into core/githooks/pre-commit so the
+    # advisory domain-leak check runs in ~seconds (the full-tree scan was >2min,
+    # capped at 30s as a stopgap in g-001-312). Full-tree scan (no --staged)
+    # stays the mode for /verify-learning + manual/CI audits.
+    --staged) STAGED=true ;;
   esac
 done
 
@@ -29,6 +36,10 @@ fi
 # --- Build forged-skill exclusion list from world/forged-skills.yaml ---
 # Single source of truth. If unavailable, scans everything (fail open).
 EXCLUDE_ARGS=()
+# Parallel plain-name list of the same forged skills. --exclude-dir (in
+# EXCLUDE_ARGS) only applies to recursive grep; --staged mode greps an explicit
+# file list, so it filters forged-skill files by name from this list instead.
+FORGED_NAMES=()
 
 if [[ -f "$SCRIPT_DIR/_paths.sh" ]]; then
   # shellcheck disable=SC1091
@@ -37,7 +48,7 @@ if [[ -f "$SCRIPT_DIR/_paths.sh" ]]; then
   if [[ -f "$FORGED" ]]; then
     # Skills are YAML keys at 2-space indent under 'skills:' (e.g., "  access-efs-data:")
     while IFS= read -r skill_name; do
-      [[ -n "$skill_name" ]] && EXCLUDE_ARGS+=("--exclude-dir=$skill_name")
+      [[ -n "$skill_name" ]] && { EXCLUDE_ARGS+=("--exclude-dir=$skill_name"); FORGED_NAMES+=("$skill_name"); }
     done < <(sed -n '/^skills:/,/^[^ ]/{ /^  [a-z]/{ s/: *$//; s/^ *//; p; } }' "$FORGED")
   fi
 fi
@@ -58,6 +69,38 @@ if [[ "$CORE_ONLY" == false ]]; then
   [[ -d "$PROJECT_ROOT/mind_api/tests" ]] && SCAN_DIRS+=("$PROJECT_ROOT/mind_api/tests")
 fi
 
+# --- Staged-files mode (g-001-314) ---
+# Build the absolute-path list of git-staged files that fall within SCAN_DIRS
+# scope, have a scannable extension, and are NOT under a forged-skill dir. The
+# per-term loop below greps THIS list (per dir) instead of recursing the whole
+# tree — the whole point of --staged (pre-commit hot-path speed). No staged
+# in-scope file => nothing this commit could leak => CLEAN exit.
+STAGED_FILES=()
+if [[ "$STAGED" == true ]]; then
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    case "$f" in *.md|*.yaml|*.yml|*.sh|*.py|*.txt) ;; *) continue ;; esac
+    abs="$PROJECT_ROOT/$f"
+    [[ -f "$abs" ]] || continue   # skip staged deletes / renames-away
+    in_scope=false
+    for d in "${SCAN_DIRS[@]}"; do [[ "$abs" == "$d"/* ]] && { in_scope=true; break; }; done
+    [[ "$in_scope" == true ]] || continue
+    skip=false
+    for fn in "${FORGED_NAMES[@]}"; do [[ "$f" == *".claude/skills/$fn/"* ]] && { skip=true; break; }; done
+    [[ "$skip" == true ]] && continue
+    STAGED_FILES+=("$abs")
+  done < <(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+
+  if [[ ${#STAGED_FILES[@]} -eq 0 ]]; then
+    echo "CLEAN: No in-scope staged files to check (--staged mode)."
+    bash "$SCRIPT_DIR/gate-log.sh" domain-leak-check noop \
+      --caller "domain-leak-check.sh:staged-empty" \
+      --trigger "no-staged-files" \
+      --extra-json '{"decision_path":"staged-empty"}' 2>/dev/null || true
+    exit 0
+  fi
+fi
+
 FOUND=0
 
 while IFS= read -r term; do
@@ -68,7 +111,23 @@ while IFS= read -r term; do
     [[ -d "$dir" ]] || continue
 
     # Case-sensitive, word-boundary search (blocklist specifies exact case)
-    hits=$(grep -rnw "${EXCLUDE_ARGS[@]}" --include="*.md" --include="*.yaml" --include="*.yml" --include="*.sh" --include="*.py" --include="*.txt" "$term" "$dir" 2>/dev/null || true)
+    if [[ "$STAGED" == true ]]; then
+      # Staged mode: grep only the staged files under THIS dir. --include /
+      # --exclude-dir are recursive-only, so extension + forged-skill filtering
+      # already happened when STAGED_FILES was built. No staged file under this
+      # dir => skip it (nothing to scan here this commit).
+      dir_targets=()
+      for sf in "${STAGED_FILES[@]}"; do [[ "$sf" == "$dir"/* ]] && dir_targets+=("$sf"); done
+      [[ ${#dir_targets[@]} -eq 0 ]] && continue
+      # -H forces the filename prefix even for a single-file list. Without it,
+      # grep omits the path when given exactly one file, which breaks EVERY
+      # downstream filter below (self-ref, test-fixture, marker-honor all key on
+      # the path in each hit line). Recursive -rnw always prefixes; -H makes the
+      # staged single-file output shape identical. (g-001-314)
+      hits=$(grep -Hnw "$term" "${dir_targets[@]}" 2>/dev/null || true)
+    else
+      hits=$(grep -rnw "${EXCLUDE_ARGS[@]}" --include="*.md" --include="*.yaml" --include="*.yml" --include="*.sh" --include="*.py" --include="*.txt" "$term" "$dir" 2>/dev/null || true)
+    fi
 
     if [[ -n "$hits" ]]; then
       # Filter out self-referential hits (blocklist, this script, the rule file)
@@ -195,10 +254,15 @@ scan_misplaced_markers() {
   done <<< "$hits"
 }
 
-if [[ "$CORE_ONLY" == false && -d "$PROJECT_ROOT/.claude/skills" ]]; then
+# Marker-misplacement audit is a full-tree scan — skip it in --staged mode
+# (the marker-placement-gate.sh PreToolUse hook already blocks new misplaced
+# markers at edit time, so re-auditing the whole tree on every commit is
+# redundant AND defeats --staged's hot-path speed). Full-tree runs (no
+# --staged: /verify-learning, manual, CI) still perform it.
+if [[ "$STAGED" == false && "$CORE_ONLY" == false && -d "$PROJECT_ROOT/.claude/skills" ]]; then
   scan_misplaced_markers "$PROJECT_ROOT/.claude/skills" "SKILL.md"
 fi
-if [[ -d "$PROJECT_ROOT/core/config/conventions" ]]; then
+if [[ "$STAGED" == false && -d "$PROJECT_ROOT/core/config/conventions" ]]; then
   scan_misplaced_markers "$PROJECT_ROOT/core/config/conventions" "*.md"
 fi
 

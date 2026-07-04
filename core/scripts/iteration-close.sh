@@ -65,6 +65,24 @@ source "$SCRIPT_DIR/_paths.sh"
 source "$SCRIPT_DIR/_platform.sh"
 cd "$PROJECT_ROOT"
 
+# _winpath <path>: portable path for `python3 <file>` invocations. The
+# .python-shim routes python3 to Windows Python (needs C:/ paths); native
+# Linux/macOS python3 needs the POSIX path. cygpath exists ONLY under MSYS/
+# Cygwin, so it must be guarded — an UNGUARDED `cygpath -w` crashed
+# do_state_update + do_productivity_check with rc=127 on a non-Windows box
+# (cc-03 Linux transplant), emptying the path so `python3 ""` failed and
+# loop_state counters + the maintenance sweeps silently stopped advancing.
+# Mirrors _platform.sh's `command -v cygpath` guard. Any future
+# `python3 <file-arg>` invocation in this file MUST route through this helper,
+# never a raw `cygpath -w`. (g-328 cygpath cross-platform fix.)
+_winpath() {
+    if command -v cygpath >/dev/null 2>&1; then
+        cygpath -w "$1" 2>/dev/null || printf '%s' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # Dual-accept goal-id: rewrite --goal-id, --goal=<id>, --goal-id=<id> into
 # the canonical --goal <id> before the strict parse loop below (which
 # rejects anything else). See _goal-arg-normalize.sh.
@@ -715,7 +733,7 @@ except: print(0)' 2>/dev/null || echo 0)"
     # the lookup-gated block above.
     if [[ -n "$GOAL_ID" ]]; then
         local _lsbc
-        _lsbc="$(cygpath -w "$SCRIPT_DIR/loop-state-bump-counters.py")"
+        _lsbc="$(_winpath "$SCRIPT_DIR/loop-state-bump-counters.py")"
         python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
             || echo "[iteration-close] WARN: loop-state-bump-counters failed for $GOAL_ID (fail-open; productivity-gate may stay stale this iteration)" >&2
         # g-115-1470: the bump always exits 0 (fail-open at every layer), so rc
@@ -963,6 +981,33 @@ print(sha)
             reason=$(echo "$gate_json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('reason', ''))" 2>/dev/null || echo "")
             echo "[iteration-close] DISPATCH: /fresh-eyes-code required — ${core_count} core files ($reason). See WM.fresh_eyes_dispatch_pending for full file list." >&2
         fi
+    fi
+
+    # Step 8.79 Compounding-knowledge metric emission (g-303-35, design Section 6).
+    # SHIPS DORMANT: compounding-events.py emit SELF-GATES on
+    # compounding_metric.enabled (default OFF in aspirations.yaml) -- when the flag
+    # is OFF this no-ops and writes nothing (one fast python invocation in the
+    # already-backgrounded deep-close path). When ON it JOINs the retrieval
+    # manifest with this close's commit-artifact signal (the _commit_sha above) to
+    # record load-bearing retrieval events. Strict HIGH-only (Section 7): with no
+    # explicit --cited citation list the wiring records every retrieved entry as a
+    # non-load-bearing DENOMINATOR event (the load_bearing_rate denominator);
+    # load-bearing numerator credit requires an explicit citation that a future
+    # enhancement supplies. python3 (NOT py -3) + $CORE_ROOT (Windows-form via
+    # _platform.sh, no cygpath) per this file's L49 invariant and the
+    # do_state_update sibling calls (L689/L1009/L1458). Fail-open three ways: the
+    # `|| true`, emit()'s never-raises contract, and its disabled/error reason
+    # returns -- emission MUST NEVER break the state-update path. Deep-only: the
+    # commit artifact it JOINs against exists only on deep closes (logs/ created
+    # by the gate block above on this same OUTCOME==deep path).
+    if [[ "$OUTCOME" == "deep" ]]; then
+        python3 "$CORE_ROOT/scripts/compounding-events.py" emit \
+            --goal "$GOAL_ID" \
+            --artifact-produced commit \
+            --artifact-ref "${_commit_sha:-}" \
+            --artifact-write-time "$(date +%Y-%m-%dT%H:%M:%S)" \
+            --manifest "$AGENT_DIR/session/retrieval-session.json" \
+            >/dev/null 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
     fi
 
     # Step 8.8-8.10 Scripted Audit Pass: velocity + backpressure + temporal-credit +
@@ -1566,14 +1611,14 @@ do_productivity_check() {
     # idempotent and cheap (scans recurring goals, advances lastAchievedAt
     # only when a structured precondition fails). Always exits 0.
     # cygpath: python3 via the shim routes to Windows Python, which cannot
-    # open /c/... paths — so convert $SCRIPT_DIR to C:\... form before
-    # passing. Same pattern any future python3 <file-arg> invocation in
-    # this file must use.
+    # open /c/... paths — so convert $SCRIPT_DIR via the guarded `_winpath`
+    # helper (cygpath on Windows, POSIX passthrough on Linux/macOS). The same
+    # helper any future python3 <file-arg> invocation in this file must use.
     # `|| true` justified: script documented as "Always exits 0" (L730) — the
     # `|| true` is belt-and-suspenders against python-level exceptions that would
     # otherwise abort productivity-check. Silent tolerance here is fine because
     # the script itself is the signal path, not its exit code.
-    python3 "$(cygpath -w "$SCRIPT_DIR/recurring-precondition-sweep.py")" || true
+    python3 "$(_winpath "$SCRIPT_DIR/recurring-precondition-sweep.py")" || true
     # Evolution-stub expiry sweep (F2, 2026-05-15). The historical
     # [AUTO-FILLED] auto-completion mechanism that guard-544 assumed would
     # finalize abandoned awaiting_completion stubs was never implemented, so
@@ -1595,7 +1640,7 @@ do_productivity_check() {
     # next iteration (idempotent + 24h threshold), so it must never abort
     # productivity-check. See guard-544 and
     # world/conventions/self-program-evolution.md "Stub Expiry".
-    python3 "$(cygpath -w "$SCRIPT_DIR/evolution-stub-expiry.py")" --threshold-hours 24 \
+    python3 "$(_winpath "$SCRIPT_DIR/evolution-stub-expiry.py")" --threshold-hours 24 \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Execution-diary trim (g-333-03, asp-333 A1): bound the otherwise-unbounded
     # execution-diary.jsonl. It is appended every phase and full-scanned by
@@ -1627,7 +1672,7 @@ do_productivity_check() {
     # detection + revert activate in later phases per health_regression.mode. Direct
     # python (no .sh wrapper) matches the sibling helper-python pattern below
     # (agent-watchdog.py / stale-sentinel-canary.py). cygpath: Windows-Python file-arg.
-    python3 "$(cygpath -w "$SCRIPT_DIR/health-ledger-append.py")" \
+    python3 "$(_winpath "$SCRIPT_DIR/health-ledger-append.py")" \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Agent watchdog tick — periodic session observability probes. Replaces the
@@ -1639,7 +1684,7 @@ do_productivity_check() {
     # pure file I/O — no daemonization needed. Fail-open: any error surfaces on
     # stderr (routed to iteration-close-stderr.log) but never aborts the phase.
     # See core/scripts/agent-watchdog.py docstring + --tick mode.
-    python3 "$(cygpath -w "$SCRIPT_DIR/agent-watchdog.py")" --tick \
+    python3 "$(_winpath "$SCRIPT_DIR/agent-watchdog.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Monitor-tick -- FW-1b demoted pure-monitoring probes (g-317-13). Runs each
@@ -1651,7 +1696,7 @@ do_productivity_check() {
     # monitor-finding-convert.py. Ships inert until probes are migrated into the
     # allowlist (Phase-3 / Apply-3). Fail-open: errors routed to the diagnostic
     # log, never aborts productivity-check. cygpath: Windows-Python file-arg.
-    python3 "$(cygpath -w "$SCRIPT_DIR/monitor-tick.py")" --tick \
+    python3 "$(_winpath "$SCRIPT_DIR/monitor-tick.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Stale-sentinel canary (g-115-717) — defense-in-depth for Cat C sentinels
@@ -1661,7 +1706,7 @@ do_productivity_check() {
     # in core/config/aspirations.yaml (default 3). Fail-open: any error is
     # non-fatal and routed to iteration-close-stderr.log. --quiet suppresses
     # the JSON report when nothing fired to keep clean iterations terse.
-    python3 "$(cygpath -w "$SCRIPT_DIR/stale-sentinel-canary.py")" --quiet \
+    python3 "$(_winpath "$SCRIPT_DIR/stale-sentinel-canary.py")" --quiet \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Orphan-root sweep (plan v1 D5, 2026-05-19) — periodic detector for
@@ -1683,6 +1728,19 @@ do_productivity_check() {
             echo "--- $(date +%Y-%m-%dT%H:%M:%S) iter sweep ---"
             bash "$SCRIPT_DIR/orphan-root-sweep.sh" --auto-clean
         } >>"$orphan_log" 2>&1
+    } || true
+
+    # Keep origin current (g-115-1734, USER DIRECTIVE Zachary 2026-07-02):
+    # fail-soft, rate-limited push of accumulated loop-commits. productivity-check
+    # is the terminal phase, so the state-update commit (do_state_update) has
+    # already landed. iteration-push.sh batches (pushes only when origin is behind
+    # by >= N commits OR the oldest unpushed commit is >= T minutes old), skips
+    # when .git/index.lock is held (guard-853), never force-pushes, and is
+    # fail-open — a push failure logs to stderr and NEVER aborts productivity-check
+    # or blocks loop continuation. Placed BEFORE the ITERATION COMPLETE imperative
+    # so that imperative stays the terminal stdout line (return-protocol).
+    {
+        bash "$SCRIPT_DIR/iteration-push.sh" --repo "$PROJECT_ROOT"
     } || true
 
     # Iteration-anchor cleanup (g-115-206 follow-up — bravo session-58 reflection).

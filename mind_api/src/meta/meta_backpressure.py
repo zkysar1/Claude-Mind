@@ -113,6 +113,8 @@ def _config_meta(ctx) -> Path:
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
+    from storage_backend import get_backend
+    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:

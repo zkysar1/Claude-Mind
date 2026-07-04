@@ -11,7 +11,11 @@ missing last_updated. Root cause:
 These tests exercise the prevention paths directly:
   - apply_defaults backfills capability_level="EXPLORE" when missing
   - cmd_add_child inherits capability_level from parent + stamps last_updated
-  - cmd_set auto-bumps per-node last_updated on every non-last_updated set
+  - cmd_set does NOT auto-bump per-node last_updated (g-115-1683 reverted the
+    2026-05-10 auto-bump: firing on every non-date field marched the _tree.yaml
+    index AHEAD of the node .md front matter — the source of truth — producing
+    index-ahead drift on 250 nodes / g-115-1612. last_updated is now synced to
+    the .md fm only by tree-front-matter-sync.py and at node creation.)
 
 End-to-end via subprocess so we exercise argparse + stdin pathways the LLM
 actually uses, not in-process function calls that bypass arg parsing.
@@ -199,9 +203,14 @@ def test_cmd_add_child_falls_back_to_explore_when_parent_lacks_capability():
 # cmd_set — auto-bump last_updated
 # ---------------------------------------------------------------------------
 
-def test_cmd_set_auto_bumps_last_updated():
-    """A `--set <key> summary <new>` call bumps last_updated to today
-    automatically — no more manual ceremony."""
+def test_cmd_set_does_not_bump_last_updated():
+    """3 (Option B): a metadata `--set <key> summary <new>` does NOT
+    auto-bump per-node last_updated — it stays at its seeded value. The node
+    .md front matter is the single source of truth (g-001-67); the _tree.yaml
+    index last_updated is synced to it ONLY by tree-front-matter-sync.py (the
+    Edit/Write PostToolUse hook, which writes both stores) and at node creation.
+    The prior auto-bump fired on every non-date field, marching the index AHEAD
+    of the .md fm (index-ahead drift, 250 nodes; g-115-1612 audit)."""
     _seed_tree({
         "root": {"file": "world/knowledge/tree/root.md", "depth": 0,
                  "children": [], "child_count": 0,
@@ -213,8 +222,9 @@ def test_cmd_set_auto_bumps_last_updated():
 
     tree = _read_tree()
     assert tree["nodes"]["root"]["summary"] == "new summary"
-    assert tree["nodes"]["root"]["last_updated"] == date.today().isoformat(), (
-        f"expected auto-bumped to today, got {tree['nodes']['root']['last_updated']}"
+    assert tree["nodes"]["root"]["last_updated"] == "2026-01-01", (
+        f"expected last_updated UNCHANGED (no auto-bump, g-115-1683), got "
+        f"{tree['nodes']['root']['last_updated']}"
     )
 
 

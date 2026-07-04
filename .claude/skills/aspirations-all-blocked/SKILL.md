@@ -137,11 +137,21 @@ FOR EACH review_msg NOT from this agent:
         #      - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
         #      - If recent_accuracy >= 0.60 and < 0.80: cap at 0.80
         #      - If recent_accuracy >= 0.80: no cap
-        # Add to pipeline:
-        #   Bash: pipeline-add.sh --title "Review: {prediction_summary}" \
-        #         --confidence {calibrated_confidence} --horizon short \
-        #         --type code_review --tags "review,{goal_id}" \
-        #         --context "{goal_id} review by {this_agent}"
+        # Add to pipeline. pipeline-add.sh reads a JSON record on STDIN — NOT
+        # --title/--confidence flags (the flag form sends an empty body and the
+        # wrapper STILL exits 0; see rb "pipeline-add.sh contract"). Required
+        # fields: id (YYYY-MM-DD_slug), title, stage, type, category, horizon,
+        # confidence, formed_date, position (the prediction). 'tags' is not a
+        # field — use category. Confirm success: stdout has id+stage and no
+        # 'error' key (exit code is 0 even on validation_failed/invalid_body).
+        #   Bash: cat <<'JSON' | pipeline-add.sh
+        #   {"id":"{today}_{slug}","title":"Review: {prediction_summary}",
+        #    "stage":"discovered","type":"calibration","category":"code-review",
+        #    "horizon":"short","confidence":{calibrated_confidence},
+        #    "formed_date":"{today}",
+        #    "position":"{falsifiable prediction: change to X causes Y in N executions}",
+        #    "rationale":"{goal_id} review by {this_agent}"}
+        #   JSON
 
         # R4 Post to Board:
         # Share review hypothesis on findings channel so both agents learn.

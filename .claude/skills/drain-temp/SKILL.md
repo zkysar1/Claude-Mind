@@ -1,6 +1,6 @@
 ---
 name: drain-temp
-description: "Drains the agent's temp/ working-doc store into the knowledge tree. Walks every undrained file under agents/<agent>/temp/ (analyses, briefings, audits, design docs, snapshots), classifies each against the learning-routing decision tree, encodes its reusable value into the right store (knowledge tree / reasoning bank / guardrails / experience), then moves the file to temp/drained/ as an audit trail. Use when the user says \"drain temp\", \"encode everything in temp\", \"clear out temp\", or when the aspirations-precheck temp-pressure check flags temp_drain_needed (>= drain threshold of undrained docs). Pass --dry-run to list what WOULD drain without encoding or moving."
+description: "Drains the agent's temp/ working-doc store into the knowledge tree. Walks every undrained file under agents/<agent>/temp/ (analyses, briefings, audits, design docs, snapshots), classifies each against the learning-routing decision tree, encodes its reusable value into the right store (knowledge tree / reasoning bank / guardrails / experience), then moves the file to temp/drained/ as an audit trail. Also PURGES stale pure-ephemera files (.log/.txt test-suite output, tool dumps) that carry no knowledge — deleting them rather than encoding (Phase 1.5). Use when the user says \"drain temp\", \"encode everything in temp\", \"clear out temp\", or when the aspirations-precheck temp-pressure check flags temp_drain_needed (>= drain threshold of undrained docs + ephemera). Pass --dry-run to list what WOULD drain or purge without encoding, moving, or deleting."
 user-invocable: true
 triggers:
   - "/drain-temp"
@@ -65,14 +65,58 @@ Bash: load-conventions.sh temp-store learning-routing
    Bash: ls -1 "$TEMP_DIR"/*.md "$TEMP_DIR"/*.json 2>/dev/null
    (drained/ is the archive subdir — never re-drain it; the glob above does not
    descend into it.)
-3. IF no files: report "temp/ is clean — nothing to drain." and DONE (Phase 4 with count 0).
-4. IF --file <name> given: restrict the list to that one file under "$TEMP_DIR".
+3. IF no drainable files (.md/.json): set docs_count=0 and skip Phase 2-3, but
+   STILL run Phase 1.5 — pure ephemera (.log/.txt) may need purging even when no
+   docs remain (the g-115-1727 case: 7 ephemera survived a full doc-drain).
+   Report "temp/ is clean" + DONE only if Phase 1.5 ALSO purges nothing.
+4. IF --file <name> given: restrict the list to that one file under "$TEMP_DIR"
+   and SKIP Phase 1.5 (single-file drain is a targeted op, not a full sweep).
 5. Sort oldest-first (timestamped filenames sort lexically = chronologically).
 ```
 
 `$AGENT_DIR` resolves to `agents/<bound-agent>/` via `_paths.sh` (`agent_dir()` is
 the documented helper). Never hardcode an agent name and never derive the path
 from world/ or meta/ (see `.claude/rules/path-resolution.md`).
+
+## Phase 1.5: Purge Pure Ephemera (.log/.txt)
+
+temp/ also collects PURE-EPHEMERA files that carry no knowledge — test-suite
+output (`suite-*.log`) and tool dumps (`leak-check.txt`). These are NOT drainable
+working docs: the framework's own guidance writes them here (see
+`.claude/rules/run-full-suite-after-deep-code.md` — "redirect to
+`agents/<agent>/temp/suite.log`"), but they have nothing to encode. Left alone
+they accumulate indefinitely — the slush-directory failure mode for a file class
+Phase 1's `.md`/`.json` glob deliberately never touches (g-115-1727).
+
+Purge them — DELETE, not archive. `agents/*/temp/` (including `drained/`) is
+gitignored (guard-872), so archiving ephemera to `drained/` would only relocate
+untracked slush; deletion is correct and loses no history (there is none to
+lose). Discard-only: no encode, no `drained/` move.
+
+```
+SKIP this phase entirely when invoked with --file (targeted single-doc drain).
+
+# Purge stale ephemera in temp/ ROOT only. `-maxdepth 1 -type f` lists files
+# directly under TEMP_DIR (drained/ is a depth-1 DIR excluded by -type f; its
+# files are depth-2, excluded by -maxdepth 1) — so drained/ is never touched.
+# Age guard (-mmin +120): skip files modified within the last 120 min so an
+# ACTIVELY-WRITTEN suite.log from an in-flight run (the daemon-safe full suite
+# is ~32 min; 120 min clears any realistic active run with wide margin) is never
+# deleted mid-write. A just-completed run's log is caught on a later drain cycle.
+Bash: source core/scripts/_paths.sh; TEMP_DIR="$AGENT_DIR/temp"
+Bash: find "$TEMP_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) -mmin +120
+  → capture the list = ephemera_to_purge (names go in the Phase 4 report)
+IF ephemera_to_purge is empty: purged_count = 0; continue.
+IF --dry-run: record the would-purge list only; DELETE NOTHING; purged_count = 0.
+ELSE:
+    Bash: find "$TEMP_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) -mmin +120 -delete
+    purged_count = len(ephemera_to_purge)
+```
+
+Ephemera NEWER than the age guard are left in place (a running suite's log); the
+temp-pressure metric still counts them (no age guard on the count — see
+`core/scripts/precheck-eval.py` `cmd_temp_pressure`), so they resurface for the
+next drain once stale.
 
 ## Phase 2: Classify and Encode Each File
 
@@ -128,6 +172,8 @@ In `--dry-run`, skip this phase entirely.
    Drained: {N} file(s)
      {file} -> {store}:{target}   (or DISCARD: {reason})
      ...
+   Purged (ephemera .log/.txt): {purged_count} file(s)   (omit line if 0)
+     {ephemera-file names, from Phase 1.5}
    Discarded: {M}    Remaining undrained: {0 unless --file}
    ═══════════════════════════════════════════════
 

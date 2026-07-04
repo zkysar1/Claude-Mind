@@ -47,6 +47,23 @@ only. Enforced by `guard-380` (autonomous-self-evolution). The previous
 pending-questions pre-approval gate is superseded — the user explicitly
 traded "ask first" for "notify after, revert if wrong" on 2026-04-22.
 
+## Front-Matter Hygiene (read-cap prevention)
+
+`last_update_trigger` MUST stay a SINGLE concise entry — one line / one
+sentence naming what prompted THIS change. Do NOT:
+- accumulate an inline `PRIOR:` chain of past triggers, or
+- write a multi-paragraph decision narrative into the field.
+
+History is already preserved by `previous_revision_id` (the revision-chain
+pointer) + the git history of `agents/<agent>/self.md` + the journal/experience
+archive — the front matter does not need to re-carry it. An unbounded
+`last_update_trigger` re-grows self.md past the ~25k Read-tool cap, which
+truncates post-compaction identity restoration (Session Start Protocol Phase
+-0.5d) at a fraction of the file. Narrative detail belongs in the journal,
+not the front matter. Enforced at edit time by `guard-380` action_hint step 4.
+(g-115-1687; rb-2077 read-cap over-growth recurrence, self.md surface-class —
+the agent-identity-file twin of the tree-node guard g-115-1570.)
+
 ## Maintenance
 - Written during first boot (/start UNINITIALIZED flow)
 - For existing agents: manually create agents/<agent>/self.md during upgrade

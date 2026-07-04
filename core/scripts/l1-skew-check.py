@@ -295,6 +295,17 @@ def _cadence_gate():
         return False, None, None
     current = _count_completed_goals()
     last = _wm_read(cfg["wm_slot"]) or {}
+    # Defensive: a legacy/restored slot may hold a bare timestamp string (the
+    # pre-dict-migration shape) instead of the {goals_count_at_last_fire: N}
+    # dict _record_fire now writes. Without this guard last.get() raises
+    # AttributeError and the gate crashes on EVERY fire — and because the crash
+    # precedes _record_fire (which writes the dict), the slot can never
+    # self-heal: a permanent migration deadlock that silently disabled the L1
+    # skew ritual. Coercing a non-dict to {} reseeds via the first-fire path
+    # below, after which _record_fire overwrites with the correct dict shape.
+    # (rb-810 type-guard-before-method-call; 8-session l1-skew fix.)
+    if not isinstance(last, dict):
+        last = {}
     last_count = int(last.get("goals_count_at_last_fire", 0) or 0)
     diff = current - last_count
     if last_count == 0:

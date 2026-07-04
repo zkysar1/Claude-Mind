@@ -812,12 +812,19 @@ When sq-016 fires after goal completion:
         applies_to: any  # surfaced assumptions are methodological — they apply across domains
         when_to_use: "{conditions where this assumption is relevant}"
         source_goal: goal.id
+        source_horizon: micro  # g-303-34 / rb-876 attribution gap: first-principles spark RBs are micro-horizon-originated; stamping makes the origin traceable. Passthrough field — reasoning-bank-add.sh forwards the full JSON, apply_defaults preserves extras, and the rb validator has no unknown-field gate, so this persists without a store-contract change.
         tags: ["first-principles", "inherited-assumption"]
       Log: "FIRST PRINCIPLES: Surfaced inherited assumption from {goal.id}: {assumption}"
    c. IF assumption is UNTESTED AND goal succeeded:
       # Most dangerous case — success reinforces unchecked assumptions
-      Create a micro-hypothesis in working memory:
-      echo '{"claim":"Goal {goal.id} succeeded despite untested assumption: {assumption}. This assumption may fail when {condition}.","confidence":0.40,"source_goal":"{goal.id}","source_step":"sq-016","horizon":"session"}' | Bash: wm-append.sh micro_hypotheses
+      Create a micro-hypothesis in working memory. resolves_when + consumer are
+      REQUIRED (g-303-34, zeta audit g-303-14): the dominant micro-hyp failure is
+      NON-RESOLUTION + NO-CONSUMER (71% never settle, 0% consumed). A micro-hyp
+      that cannot name BOTH a concrete later settling signal AND a downstream
+      consumer is noise — do NOT file it. resolves_when = the concrete later
+      signal that settles it (keep ASCII — this JSON is piped to wm-append.sh).
+      consumer = which decision/goal/encoding will use the resolution.
+      echo '{"claim":"Goal {goal.id} succeeded despite untested assumption: {assumption}. This assumption may fail when {condition}.","confidence":0.40,"source_goal":"{goal.id}","source_step":"sq-016","horizon":"session","resolves_when":"next {goal.category} goal that relies on {assumption}: observe whether it fails under {condition}","consumer":"reasoning-bank entry under {goal.category} gating future reliance on {assumption} if it fails"}' | Bash: wm-append.sh micro_hypotheses
       Log: "FIRST PRINCIPLES -> HYPOTHESIS: untested assumption '{assumption}' may fail under {condition}"
    # Only count as spark if at least one assumption was surfaced (step 4b or 4c fired)
    Bash: spark-questions-increment.sh sq-016 sparks_generated

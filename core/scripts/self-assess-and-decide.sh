@@ -19,6 +19,12 @@
 #   portfolio_drift_score        — degree work has drifted from Self/Program
 #   completion_health            — average completion ratio across active aspirations
 #   self_evolution_signals_count — int — recent sq-012 / ABC-chain / pattern self-evolution signals
+#   confirming_signal_fraction   — 0..1 — fraction of the counted self-evolution
+#                                  signals that CONFIRM the current lane (team consensus
+#                                  the agent is on-lane) vs. indicate drift. Default 0.0 =
+#                                  no direction info (legacy raw-count behavior). Down-weights
+#                                  evo_count so act_later fires on net-DIVERGENT signal, not
+#                                  gross volume (0).
 #   self_last_updated_days       — int — days since target md was last touched
 #   partner_alignment_score      — 0..1 — only for fresh-eyes-program; cross-agent alignment
 #   explicit_user_directive      — bool — true if user has asked about purpose/portfolio
@@ -40,7 +46,8 @@
 #                  (explicit_user_directive=true OR portfolio_drift_score >= 0.6
 #                   OR self_last_updated_days >= 60)
 #   act_later  — signal_actionable_score >= 0.4 OR
-#                  self_evolution_signals_count >= 2 OR
+#                  effective_evo_count (= self_evolution_signals_count *
+#                    (1 - confirming_signal_fraction)) >= 2 OR
 #                  portfolio_drift_score >= 0.4 OR
 #                  (fresh-eyes-program AND partner_alignment_score <= 0.4)
 #   no_change  — otherwise
@@ -139,6 +146,18 @@ actionable = num("signal_actionable_score")
 drift = num("portfolio_drift_score")
 health = num("completion_health")
 evo_count = int(num("self_evolution_signals_count"))
+# 0: confirming-vs-drift direction discriminator. A high count of
+# CONFIRMING self-evolution signals (team consensus the agent is on-lane) is
+# alignment evidence, NOT drift pressure — weighting evo_count by raw volume
+# misreads consensus as a reason to evolve Self (fresh-eyes 2026-06-28: evo=5
+# where 4/5 partner beliefs CONFIRMED zeta's lane wrongly read as act_later).
+# confirming_signal_fraction (0..1, clamped; default 0.0 = no direction info ->
+# legacy raw-count behavior) is the fraction of counted signals that CONFIRM the
+# current lane; the effective (net-divergent) count down-weights them so the
+# act_later gate fires on divergent signal, not gross volume. fraction=1.0 (all
+# confirming) -> 0 pressure.
+confirming_fraction = max(0.0, min(1.0, num("confirming_signal_fraction")))
+effective_evo_count = evo_count * (1.0 - confirming_fraction)
 stale_days = int(num("self_last_updated_days"))
 user_says = boolean("explicit_user_directive")
 partner_align = num("partner_alignment_score", default=1.0)
@@ -165,7 +184,7 @@ if actionable >= 0.7 and (
 # act_later — meaningful signal but not strong enough to auto-edit
 elif (
     actionable >= 0.4
-    or evo_count >= 2
+    or effective_evo_count >= 2
     or drift >= 0.4
     or (review_type == "fresh-eyes-program" and partner_align <= 0.4)
 ):
@@ -173,8 +192,13 @@ elif (
     triggers = []
     if actionable >= 0.4:
         triggers.append(f"actionable={actionable:.2f}")
-    if evo_count >= 2:
-        triggers.append(f"evo_signals={evo_count}")
+    if effective_evo_count >= 2:
+        triggers.append(
+            f"evo_signals={evo_count}"
+            + (f" (net-divergent {effective_evo_count:.1f} after "
+               f"{confirming_fraction:.0%} confirming)"
+               if confirming_fraction > 0 else "")
+        )
     if drift >= 0.4:
         triggers.append(f"drift={drift:.2f}")
     if review_type == "fresh-eyes-program" and partner_align <= 0.4:
@@ -188,7 +212,10 @@ else:
     rationale = (
         f"all signals below threshold "
         f"(actionable={actionable:.2f}, drift={drift:.2f}, "
-        f"evo={evo_count}, stale={stale_days}d)"
+        f"evo={evo_count}"
+        + (f" net={effective_evo_count:.1f}@{confirming_fraction:.0%}conf"
+           if confirming_fraction > 0 else "")
+        + f", stale={stale_days}d)"
     )
     recommended = "silent no-op; cadence will re-fire at next interval"
 

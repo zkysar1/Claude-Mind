@@ -636,6 +636,7 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
     value = _parse_value(value_str)
 
     p = _meta_path(ctx)
+    get_backend().ensure_local(p)  # own-cloud read-path fix: materialize S3-only file before RMW lock; no-op on LocalBackend and out-of-root paths
     data: dict = {}
     try:
         with file_locks.locked(p):

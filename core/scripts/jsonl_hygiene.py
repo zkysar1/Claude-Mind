@@ -81,7 +81,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -97,6 +99,22 @@ from _paths import (  # noqa: E402
 
 DEFAULT_ARCHIVE_SUFFIX = "-archive"
 REGISTRY_REL = "core/config/store-hygiene.yaml"
+
+# : hot-store rotation lock-contention retry. world/changelog.jsonl is
+# the system's HOTTEST store -- every locked world write by all 6 agents appends
+# to it -- so the rotate Phase-2 live-drop's non-fair 10s lock acquire
+# (_fileops.acquire_lock default timeout) can lose the race to rapid short
+# appends and raise TimeoutError. Observed 2026-06-27: two consecutive Phase-2
+# failures on world/changelog.jsonl while the SAME store rotated cleanly the
+# prior day -- the contention is PROBABILISTIC and self-healing (the next sweep
+# usually wins the race; the live/archive partition stays clean, no dup/loss).
+# Retry-with-backoff gives the live-lock acquire several fresh windows to catch a
+# quiescent gap, converting "fails this sweep, waits 24h for the next" into
+# "almost always succeeds this sweep". Tunable; cold stores acquire on attempt 0
+# so they pay no retry cost. See world/knowledge tree (changelog-rotation) + the
+#  investigation.
+_ROTATE_LIVE_LOCK_RETRIES = 4          # total Phase-2 live-drop acquire attempts
+_ROTATE_LIVE_LOCK_BASE_DELAY = 0.5     # seconds; backoff = base * 2**attempt + jitter
 
 
 # ---------------------------------------------------------------------------
@@ -395,29 +413,81 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
     if mode == "cap":
         # Atomic: keep the newest (total - n_drop). Using a fresh in-lock read,
         # keep the LAST `keep` records. Concurrent appends (newest) are kept.
+        # Retry-with-backoff mirrors rotate Phase-2 (): world/changelog
+        # and meta/changelog are both hot stores whose lock-acquire can time out
+        # under rapid concurrent appends. Without retry the cap silently fails
+        # (action=error) and the store stays unbounded until the next sweep.
         keep = total - n_drop
-        locked_modify_jsonl(path, lambda fresh: fresh[-keep:] if len(fresh) > keep else fresh)
+        _cap_keep = keep  # capture for lambda closure
+        _cap_last_timeout = None
+        for _cap_attempt in range(_ROTATE_LIVE_LOCK_RETRIES):
+            try:
+                locked_modify_jsonl(
+                    path,
+                    lambda fresh: fresh[-_cap_keep:] if len(fresh) > _cap_keep else fresh,
+                )
+                _cap_last_timeout = None
+                break
+            except TimeoutError as e:
+                _cap_last_timeout = e
+                if _cap_attempt < _ROTATE_LIVE_LOCK_RETRIES - 1:
+                    time.sleep(_ROTATE_LIVE_LOCK_BASE_DELAY * (2 ** _cap_attempt)
+                               + random.uniform(0, 0.25))
+        if _cap_last_timeout is not None:
+            raise _cap_last_timeout
         rep["action"] = "capped"
         rep["applied"] = True
+        rep["live_lock_attempts"] = _cap_attempt + 1
         return rep
 
     # mode == rotate: archive-FIRST, then drop from live.
     archive = Path(archive_path) if archive_path else _default_archive(path)
     # Phase 1: append the oldest n_drop to the archive (locked; creates if absent).
     locked_modify_jsonl(archive, lambda arch: (arch or []) + oldest)
-    # Phase 2: drop the oldest n_drop from the live file, re-verifying the front
-    # is unchanged so we drop exactly what we archived (never more, never less).
+    # Phase 2: drop the oldest n_drop from the live file. Drop by COUNT from
+    # the fresh in-lock read — do NOT compare content against the outside-lock
+    # snapshot. The content-equality check (`fresh[:n_drop] != oldest`) was
+    # designed to abort if a concurrent rotation rearranged the front, but it
+    # spuriously raises RuntimeError when the backend re-fetch inside
+    # locked_modify_jsonl returns a slightly different byte sequence than
+    # _snapshot() pulled (e.g. OwnCloud eventual-consistency, write-through
+    # cache lag, or per-machine vs remote serialization). Since changelog.jsonl
+    # is append-only (writes only add to the END), the front records can only
+    # change through another hygiene rotation. The `len(fresh) < n_drop` guard
+    # below catches that case safely (another agent rotated first → no-op).
+    # Archive-FIRST (Phase 1) already holds: the records to drop are in the
+    # archive before we touch the live file, so a crash here leaves a
+    # recoverable duplicate in the archive, never a live loss.
     def _drop_front(fresh):
-        if len(fresh) < n_drop or fresh[:n_drop] != oldest:
-            raise RuntimeError(
-                f"jsonl-hygiene rotate ABORT: live front of {path.name} shifted "
-                f"between snapshot and lock (have {len(fresh)} recs); archived "
-                f"{n_drop} to {archive.name} but NOT dropping from live to avoid "
-                f"loss. Re-run to retry (archive may hold a recoverable dup).")
+        if len(fresh) < n_drop:
+            # Another concurrent rotation already removed these records.
+            # Archive holds a recoverable duplicate; live is clean. No-op.
+            return fresh
         return fresh[n_drop:]
-    locked_modify_jsonl(path, _drop_front)
+    # Phase 2 live-drop, with hot-store lock-contention retry (). Catch
+    # ONLY TimeoutError (the acquire_lock failure: "Could not acquire lock").
+    # Phase 1 (archive append) is NOT re-run on retry, so a busy window never
+    # appends a duplicate orphan to the archive; archive-FIRST crash-safety holds.
+    last_timeout = None
+    for _attempt in range(_ROTATE_LIVE_LOCK_RETRIES):
+        try:
+            locked_modify_jsonl(path, _drop_front)
+            last_timeout = None
+            break
+        except TimeoutError as e:
+            last_timeout = e
+            if _attempt < _ROTATE_LIVE_LOCK_RETRIES - 1:
+                time.sleep(_ROTATE_LIVE_LOCK_BASE_DELAY * (2 ** _attempt)
+                           + random.uniform(0, 0.25))
+    if last_timeout is not None:
+        # Exhausted every window -- identical failure surface to pre-:
+        # the sweep's per-store try/except reports action=error and the next
+        # sweep retries. The archive holds a recoverable front-slice
+        # (archive-FIRST); the live file is untouched (no loss).
+        raise last_timeout
     rep["action"] = "rotated"
     rep["applied"] = True
+    rep["live_lock_attempts"] = _attempt + 1
     return rep
 
 

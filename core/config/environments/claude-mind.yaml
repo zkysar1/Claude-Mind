@@ -1,0 +1,15 @@
+# Environment registry entry -- claude-mind (, BRD environment-id-as-key).
+#
+# Middle promotion tier (dev-tier -> Claude-Mind -> ZDS-Mind). Defaults to the
+# local-files backend (safe, no cloud resources). The Claude-Mind operator sets
+# own-cloud wiring here when cutting over:
+#   backend: own-cloud
+#   bucket: <claude bucket>
+#   sessions_table: <claude sessions table>
+#   lock_table: <claude lock table>
+#   region: <claude region>
+# Until then, legacy STORAGE_* vars still take effect (setdefault precedence +
+# deprecation warning), so promotion does not change Claude-Mind's running
+# behavior.
+environment_id: claude-mind
+backend: local

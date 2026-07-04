@@ -8,8 +8,7 @@
 # (no goal, no slot). A tripped probe is converted to ONE deduped Investigate/
 # Unblock via monitor-finding-convert.py (origin_signal dedup, target_asp
 # routing) — so the scan leaves the queue but the FINDING re-enters it exactly
-# when there is work. Design: agents/delta/temp/drained/
-# fw-1b-monitoring-sweep-demotion-design.md.
+# when there is work. Design: FW-1b monitoring-sweep demotion ( / asp-317).
 #
 # NATURAL-GATE (guard-348): `enabled_probes` is the allowlist. EMPTY = registry
 # inert (monitor-tick scans NOTHING and exits immediately). Migrate one probe id

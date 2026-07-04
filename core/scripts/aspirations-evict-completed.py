@@ -60,8 +60,12 @@ USAGE
   Dry-run (read-only; reports projected eviction):
     set -a; source .env.local; set +a   # STORAGE_BACKEND + scoped creds
     MIND_AGENT=alpha py -3 core/scripts/aspirations-evict-completed.py --source world
-  Apply:
-    ... --source world --apply
+  Apply (own-cloud backend — the --apply WRITE needs the governed-root map too):
+    source core/scripts/_paths.sh                                     # sets WORLD_PATH/META_PATH (shell-local only)
+    export MIND_WORLD="$WORLD_PATH"; export MIND_META="$META_PATH"  # guard-879: _paths.sh does NOT export these to subprocesses; OwnCloudBackend.from_env needs one of MIND_WORLD/WORLD_PATH or MIND_META/META_PATH in the SUBPROCESS env or the --apply write aborts BEFORE the lock ("neither ... is set — cannot map a governed path to a root"). Dry-run does not hit this (read-only path resolution uses the Python _paths import). Local backend needs none of this.
+    set -a; source .env.local; set +a                                # STORAGE_BACKEND + scoped MIND_AWS_* creds
+    MIND_AGENT=alpha py -3 core/scripts/aspirations-evict-completed.py --source world --apply
+    ... then repeat with --source agent --apply
 """
 from __future__ import annotations
 

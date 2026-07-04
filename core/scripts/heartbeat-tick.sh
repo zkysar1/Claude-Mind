@@ -116,15 +116,22 @@ bash "$(dirname "$0")/team-state-update.sh" \
 # surfaces the problem and the next tick retries naturally.
 bash "$(dirname "$0")/live-phase-emit.sh" || true
 
-# ── DDB runner-claim heartbeat (lodestar dynamic-ownership §4) — INERT by default.
-# Advances the cross-machine DDB heartbeat_at alongside the local mtime above so a
-# peer machine's stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE
-# runner. The cheap env pre-check keeps THIS script IRREDUCIBLY LOCAL in the
-# default (static) configuration: NO subprocess, NO daemon hop until the gated
-# cutover (0) sets OWNERSHIP_MODE=dynamic. When dynamic, runner-claim.sh
-# routes through the LOCALHOST daemon (the annotation's stated maximum), fail-open
-# (|| true) so a DDB hiccup can NEVER block an iteration. runner-claim.sh self-gates
-# on the same flag too; this pre-check only avoids the subprocess spawn when inert.
-if [ "${OWNERSHIP_MODE:-static}" = "dynamic" ]; then
+# ── DDB runner-claim heartbeat (single-runner lock §4). Advances the cross-machine
+# DDB heartbeat_at alongside the local mtime above so a peer machine's
+# stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE runner. Gated on
+# STORAGE_BACKEND=own-cloud — the ONLY signal (no OWNERSHIP_MODE flag; removed
+# 2026-07-02 7) — so the local backend keeps THIS script IRREDUCIBLY
+# LOCAL: NO subprocess, NO daemon hop. STORAGE_BACKEND is not exported into the
+# agent shell, so resolve it the same cheap way check-prerequisites.sh does: live
+# env first, else one grepped .env.local line (no secret sourcing). When own-cloud,
+# runner-claim.sh routes through the LOCALHOST daemon (the annotation's stated
+# maximum), fail-open (|| true) so a DDB hiccup can NEVER block an iteration.
+_HB_BACKEND="${STORAGE_BACKEND:-}"
+if [ -z "$_HB_BACKEND" ] && [ -f "$PROJECT_ROOT/.env.local" ]; then
+    _HB_BACKEND="$(grep -E '^[[:space:]]*STORAGE_BACKEND[[:space:]]*=' "$PROJECT_ROOT/.env.local" 2>/dev/null \
+        | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/[[:space:]]*$//')"
+fi
+_HB_BACKEND="$(printf '%s' "$_HB_BACKEND" | tr '[:upper:]' '[:lower:]')"
+if [ "$_HB_BACKEND" = "own-cloud" ]; then
     bash "$(dirname "$0")/runner-claim.sh" heartbeat --agent "$MIND_AGENT" || true
 fi
