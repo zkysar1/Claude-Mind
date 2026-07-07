@@ -1,0 +1,108 @@
+version: 1
+last_updated: null
+
+# skill-discovery-strategy
+#
+# Behavioral measurement layer for forged-skill discoverability. Sibling of
+# meta/skill-quality-strategy.yaml — that file scores per-execution quality
+# (safety, completeness, executability, ...). This file detects the class
+# of failure where a skill never executes at all (rb-314 incident, 2026-04-19:
+# notify-user forged correctly but undertriggered ~28h because description
+# was weak; per-execution scoring produced zero data because nothing ran).
+#
+# Static authoring checks (description trigger phrasing, XML-safety) are
+# already enforced by verify-learning Section FSR-D. This strategy enforces
+# the BEHAVIORAL counterpart: actual invocation patterns over time.
+#
+# Companion script: core/scripts/skill-discovery.py
+# Consumer: aspirations-evolve Step 9.5.5 (Skill Discovery Audit)
+
+# Time-window thresholds (days). Tuned conservatively so new skills get a
+# grace period before discovery flags them.
+windows:
+  # New-skill grace period — skills forged within this window are not flagged
+  # as silent regardless of zero invocations.
+  grace_period_days: 7
+
+  # After this many days with zero invocations, a skill is silently_undertriggering.
+  # Distinct from grace_period_days so the strategy can widen the alert window
+  # without affecting the grace period.
+  silent_window_days: 7
+
+  # Used skill that has gone idle this long is cold_after_use.
+  staleness_window_days: 30
+
+  # Action thresholds (when to file goals, vs just observe).
+  # Detection alone is cheap; goal-creation is bounded — only file once
+  # the skill has been silent / cold long enough to warrant agent attention.
+  action_silent_days: 14
+  action_cold_days: 60
+
+# Rate-decline detection.
+decline:
+  # Compare last_window_days vs prior_window_days invocation counts.
+  # If new_rate < prior_rate * decline_threshold, flag as declining.
+  # Set to 0 to disable.
+  enabled: true
+  last_window_days: 14
+  prior_window_days: 30
+  decline_threshold: 0.5  # < 50% of prior rate
+
+# Minimum-data gates — strategy must not flag skills with too little data
+# to be meaningful.
+min_data:
+  # Don't flag declining unless prior window had at least this many invocations.
+  min_prior_invocations: 3
+
+# Goal-creation policy. The consumer (aspirations-evolve Step 9.5.5) is
+# responsible for dedup ("one active follow-up per skill" via
+# load-aspirations-compact.sh) and for handling the case where
+# target_aspiration is archived. This file declares policy values only,
+# not consumer behavior.
+goals:
+  # Aspiration to file discovery follow-up goals into. asp-115 (Recurring
+  # Infrastructure Monitoring) is the conventional home for maintenance
+  # follow-ups in this world; change this value if your world routes them
+  # elsewhere.
+  target_aspiration: asp-115
+
+  # Priorities by status.
+  priority:
+    silently_undertriggering: HIGH    # rb-314 class — agent silently lost a capability
+    cold_after_use: MEDIUM
+    declining: MEDIUM
+
+# Triage hints emitted per flagged skill. The discovery script populates
+# these from the skill's status; aspirations-evolve copies them into the
+# Investigate/Idea goal description so the agent reading the goal has
+# immediate next-action context. Cross-references FSR-D static check
+# without duplicating the check itself.
+triage_hint_templates:
+  silently_undertriggering: |
+    1. Confirm verify-learning Section FSR-D passes for this skill
+       (bash skill-description-lint.sh — must contain Use whenever / Fires when).
+    2. If FSR-D passed but skill is still silent: the description's WHEN clause
+       does not match real caller phrases. Compare description scenarios against
+       recent goals in aspirations.jsonl that should have invoked it.
+    3. If skill is forged: check world/forged-skills.yaml triggers list against
+       caller-phrase patterns in base skills (rb-314 lesson: triggers must match
+       what callers actually say, not what the gap claimed they would say).
+    4. If skill is base: check the gap analysis in meta/skill-gaps.yaml — the
+       capability the skill was authored against may have shifted.
+  cold_after_use: |
+    1. Skill was used, then went idle. Compare last-invocation-context against
+       current goal categories (skill-analytics.py coverage).
+    2. If categories shifted away: skill may be obsolete — consider retire.
+    3. If categories still match but skill is being skipped: description may
+       have decayed relative to evolved caller phrasing.
+  declining: |
+    1. Invocations dropped relative to prior window. Confirm the drop is real
+       and not seasonal (compare prior_window_days * 2 vs. last_window_days).
+    2. Check if a competing skill was forged (skill-relations.yaml may show a
+       new skill in the same category).
+
+# Reporting cadence — descriptive only; aspirations-evolve invokes
+# skill-discovery.sh on its own evolution cadence regardless of this value.
+# Documented here so other tools (operator-health-trend, etc.) can read the
+# intended cadence if they cross-reference.
+report_cadence_hint: per_evolve_pass

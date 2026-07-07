@@ -91,6 +91,60 @@ def test_earliest_future_wins():
     assert r["deferred_until"] == "2026-06-15T00:00:00"
 
 
+# ---- Lane 1b: due-date disambiguation (3) ------------------------
+# A "by <date> deadline" is a DUE date (work happens BEFORE it), NOT a
+# start-after date. It must NOT become deferred_until — that would freeze the
+# goal until its own deadline. Near-miss:  ARC final-submission.
+# Only absolute dates are guarded; start-after phrasings still match.
+
+
+def test_due_by_iso_not_matched():
+    """'by the <iso-date> deadline' is a due date — not a deferred_until."""
+    r = run_extractor(
+        "submit best-available progress-proxy by the 2026-11-02 deadline")
+    assert not r["matched"]
+    assert r["deferred_until"] is None
+
+
+def test_due_by_iso_no_deadline_word_not_matched():
+    """Bare 'by <iso-date>' (no trailing 'deadline') is still a due date."""
+    r = run_extractor("due by 2026-12-01")
+    assert not r["matched"]
+
+
+def test_deadline_after_date_not_matched():
+    """'<iso-date> deadline' (marker follows the date) is a due date."""
+    r = run_extractor("2026-11-02 deadline for the final submission")
+    assert not r["matched"]
+
+
+def test_due_by_month_name_not_matched():
+    """Due-by guard also covers month-name dates, not just ISO."""
+    r = run_extractor("ship by December 1, 2026")
+    assert not r["matched"]
+
+
+def test_no_later_than_not_matched():
+    """'no later than <date>' is a due-by phrasing → not a deferred_until."""
+    r = run_extractor("complete no later than 2026-09-01")
+    assert not r["matched"]
+
+
+def test_until_still_matches_despite_due_guard():
+    """Start-after 'until <date>' must STILL match after the due-date guard."""
+    r = run_extractor("waiting until 2026-08-01 for the flagger to accrue 30d")
+    assert r["matched"]
+    assert r["deferred_until"] == "2026-08-01T00:00:00"
+    assert r["pattern"] == "iso_date"
+
+
+def test_not_before_still_matches_despite_due_guard():
+    """'not before <date>' (start-after) is unaffected by the due-date guard."""
+    r = run_extractor("Not before 2026-07-14")
+    assert r["matched"]
+    assert r["deferred_until"] == "2026-07-14T00:00:00"
+
+
 # ---- Lane 2-4: wiring through cmd_update_goal ------------------------------
 # Direct-import the module + use a temp WORLD_DIR so we don't touch live state.
 

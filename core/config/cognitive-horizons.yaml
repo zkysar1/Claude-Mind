@@ -1,0 +1,52 @@
+# Cognitive Horizons - single source of truth (SSOT)
+#
+# BRD Gap 19 / . Enumerates every Mind cognitive-horizon constant.
+# Hypothesis horizons (micro/session/short/long) and their framework windows.
+#
+# rb-335 (writer-without-reader): this file is CONSUMED, not just written.
+# Reader: core/scripts/precheck-eval.py cmd_hypothesis_health (fail-loud, no
+# hardcoded fallback per guard-424 + precheck-eval constraint #4). Any new
+# consumer of a horizon window MUST read it here, not re-hardcode the literal.
+#
+# FRAMEWORK SCOPE: Mind cognition only. NOT the deployed-agent/environment runtime.
+
+horizons:
+  micro:
+    description: "Inline working-memory hypothesis; never enters /review-hypotheses"
+    re_probe_window_hours: 0          # resolves inline / immediate
+    overhead_level: "working-memory"
+    resolution: "inline"
+  session:
+    description: "This or next session (hours)"
+    re_probe_window_hours: 0          # resolvable immediately (self-check)
+    overhead_level: "lightweight"
+    resolution: "self-check"
+  short:
+    description: "1-7 days"
+    re_probe_window_hours: 12         # precheck-eval re-probe gate
+    overhead_level: "standard"
+    resolution: "full-external"
+  long:
+    description: "7+ days"
+    re_probe_window_hours: 24         # precheck-eval re-probe gate
+    overhead_level: "standard"
+    resolution: "full-external"
+
+# Pipeline windows keyed to the horizon model (not per-horizon nested).
+pipeline_windows:
+  fresh_discovered_window_days: 7     # a discovered hypothesis counts "fresh" within N days
+
+# Accuracy reporting bins (by_time_horizon). Binned by the raw horizon field;
+# these are the canonical bin labels, not computed day-boundaries.
+accuracy_bins: ["micro", "session", "short_term_7d", "medium_term_30d", "long_term_90d"]
+
+# Provenance: where each constant lived BEFORE consolidation (audit trail).
+provenance:
+  re_probe_window_hours: "core/scripts/precheck-eval.py cmd_hypothesis_health (was hardcoded timedelta(hours=12|24))"
+  fresh_discovered_window_days: "core/scripts/precheck-eval.py cmd_hypothesis_health (was hardcoded _days_since(...) <= 7)"
+  overhead_level: "core/config/hypothesis-conventions.md horizon-overhead table"
+  accuracy_bins: "core/config/hypothesis-conventions.md by_time_horizon"
+  description: "core/config/hypothesis-conventions.md horizon table"
+
+created: "2026-06-13"
+source_goal: "g-306-02 (BRD Gap 19)"

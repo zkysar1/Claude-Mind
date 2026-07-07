@@ -17,9 +17,26 @@ atomically bumps loop_state.goals_completed and (when outcome=deep)
 loop_state.productive_goals.
 
 Invocation:
-  loop-state-bump-counters.py --outcome <routine|deep> [--goal-id <id>]
+  loop-state-bump-counters.py --outcome <routine|deep> [--goal-id <id>] [--recurring <true|false>]
   loop-state-bump-counters.py --reset-alignment    # zero alignment_check_at (1)
   loop-state-bump-counters.py --evolution-fired     # bump evolutions + stamp last_evolution_at (1)
+
+g-115-1785 extension: on the --outcome path WITH --recurring false, this is ALSO
+the single writer for the NON-RECURRING signal-mutation streak fields
+(routine_streaks[goal.id], signals.routine_streak_global,
+signals.routine_count_total, signals.productive_streak,
+signals.consecutive_blocked_sleeps reset-on-deep) and the _this_session counters
+(goals_completed_this_session, productive_goals_this_session) — Block A/B/D plus
+the Block C ceiling RESET. Before this, the digest told the LLM to apply Block
+A/B/C/D manually for non-recurring goals, but the LOOP_CONTINUE contract forbids
+the LLM from persisting loop_state, so those streaks NEVER advanced (routine_
+streak_global reflected recurring closes only) and drifted on any interrupted /
+manual close. The streak block rides the SAME idempotency gate + CAS RMW + WM
+lock as the goals_completed bump. It is GATED to --recurring false: recurring
+goals get the identical mutation from recurring-loop-state-mutate.py (invoked by
+recurring-close.sh BEFORE the iteration-close phases), so applying it here too
+would double-apply. The Block A/C outcome FLIP is intentionally omitted on this
+path (core/config/rationale/signal-mutation.md "Non-recurring path").
 
 Atomic read-modify-write on working-memory.yaml under the same advisory
 lock recurring-loop-state-mutate.py uses (wm.yaml.lock, stale_seconds=10).
@@ -61,6 +78,9 @@ Cross-references:
   - g-115-1561 (touched / alignment_check_at / evolutions / last_evolution_at
     bash ownership — this extension)
   - g-115-1557 (zeta investigation that scoped the four orphaned fields)
+  - g-115-1785 (--recurring false → non-recurring Block A/B/C/D streak ownership,
+    closing the last split-brain: streaks had a recurring bash writer but no
+    non-recurring one, so the digest's LLM-manual path drifted on interrupted closes)
   - productivity-stop-gate.sh:188-189 (the consumer that reads the stale field)
 """
 
@@ -75,7 +95,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
     import yaml
-    from _paths import AGENT_DIR
+    from _paths import AGENT_DIR, CORE_ROOT
     from _fileops import acquire_lock, release_lock, loop_state_cas_retry
 except Exception:
     sys.exit(0)
@@ -115,6 +135,30 @@ def _to_int(v, default=0):
         except (ValueError, TypeError):
             return default
     return default
+
+
+# 5: non-recurring Block C ceiling read. Mirrors
+# recurring-loop-state-mutate.py::_read_global_ceiling but FAIL-SAFE, not
+# fail-loud. recurring-loop-state-mutate.py RAISES on config-read failure
+# because recurring-close.sh's `|| echo "$ORIGINAL_OUTCOME"` catches the
+# non-zero exit; this script has NO such caller — iteration-close.sh invokes it
+# fail-open and MUST NOT be blocked by a config glitch on the streak path. So a
+# missing/corrupt config falls back to the documented default (5) with a stderr
+# WARN (visible, never silent). Config is invariant across the CAS retry, so the
+# caller hoists this OUT of the RMW loop (read once).
+def _read_global_ceiling(default=5):
+    try:
+        cfg_path = Path(CORE_ROOT) / "config" / "aspirations.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        recurring = cfg.get("recurring") or {}
+        return int(recurring.get("routine_streak_global_ceiling", default))
+    except Exception as e:
+        print(
+            f"[loop-state-bump-counters] WARN: could not read "
+            f"routine_streak_global_ceiling ({e}) — using default {default}",
+            file=sys.stderr,
+        )
+        return default
 
 
 # 1: aspiration_id derivation for the orphaned `touched` accumulator.
@@ -265,6 +309,29 @@ def main():
             "double-bump if this goal_id is already in loop_state.counted_goals_this_session."
         ),
     )
+    # 5: non-recurring signal-mutation ownership. When "false", ALSO
+    # apply the Block A/B (streak counters) + Block C ceiling-reset + Block D
+    # (_this_session counters) mutation, atomically inside the SAME CAS RMW +
+    # idempotency gate as the goals_completed bump. "true"/omitted → SKIP the
+    # streak block: recurring goals get it from recurring-loop-state-mutate.py
+    # (invoked by recurring-close.sh BEFORE the iteration-close phases), and a
+    # double-apply here would corrupt cargo-cult detection. iteration-close.sh
+    # passes this ONLY for confirmed non-recurring goals; an unknown/failed
+    # recurring lookup omits the flag (fail-safe skip, no corruption).
+    parser.add_argument(
+        "--recurring",
+        required=False,
+        default=None,
+        choices=["true", "false"],
+        help=(
+            "Optional. 'false' → also apply the non-recurring Block A/B/C/D "
+            "streak mutation (routine_streaks, routine_streak_global, "
+            "routine_count_total, productive_streak, consecutive_blocked_sleeps "
+            "reset-on-deep, goals_completed_this_session, "
+            "productive_goals_this_session). 'true'/omitted → skip (recurring "
+            "path owns streaks via recurring-loop-state-mutate.py). g-115-1785."
+        ),
+    )
     # 0: read-only verification mode for iteration-close.sh self-heal.
     # Exit 1 == GOAL_ID confidently absent from counted_goals_this_session (the
     # bump silently no-op'd -> caller re-fires); exit 0 == counted or
@@ -322,6 +389,11 @@ def main():
             "--outcome is required unless --verify-counted / --reset-alignment / "
             "--evolution-fired is given"
         )
+
+    # 5: hoist the Block C ceiling read OUT of the CAS loop below
+    # (config is invariant across the retry, per recurring-loop-state-mutate.py's
+    # same hoist). Only the non-recurring streak path needs it.
+    global_ceiling = _read_global_ceiling() if args.recurring == "false" else None
 
     if not wm_path.exists():
         sys.exit(0)
@@ -448,6 +520,91 @@ def main():
             alignment = _to_int(loop_state.get("alignment_check_at", 0))
             loop_state["alignment_check_at"] = alignment + 1
 
+            # 5: NON-RECURRING signal-mutation (Block A/B/C/D streaks).
+            # Gated to --recurring false: recurring goals get this from
+            # recurring-loop-state-mutate.py (recurring-close.sh, BEFORE the
+            # iteration-close phases), so applying it here for a recurring goal
+            # would DOUBLE-apply and corrupt cargo-cult detection. Rides the SAME
+            # idempotency gate (counted_goals_this_session, checked above) + CAS
+            # RMW + WM lock as the goals_completed bump — an atomic single-writer
+            # for the non-recurring streak fields. Mirrors
+            # recurring-loop-state-mutate.py Blocks A/B/D + the Block C ceiling
+            # RESET. The Block A/C outcome FLIP (routine->deep reclassification)
+            # is INTENTIONALLY omitted here — see
+            # core/config/rationale/signal-mutation.md "Non-recurring path:
+            # counters without the flip": the flip cannot reach the already-run
+            # verify/spark of the current iteration (state-update is Phase 8; they
+            # ran at 5/6), and omitting it avoids a verify-vs-counter
+            # inconsistency. The ceiling RESET preserves the anti-runaway
+            # guarantee; the Phase 0-pre.0b boredom surface warns before the NEXT
+            # selection.
+            if args.recurring == "false":
+                signals = loop_state.get("signals")
+                if not isinstance(signals, dict):
+                    from _loop_state_defaults import defaults as _lsd_sig
+                    signals = _lsd_sig()["signals"]
+                routine_streaks = loop_state.get("routine_streaks")
+                if not isinstance(routine_streaks, dict):
+                    routine_streaks = {}
+
+                oc = args.outcome  # no re-flip on the non-recurring path
+
+                # Block A — per-goal streak. Inert for a true once-goal (never
+                # re-closes to reach the flip ceiling), applied for symmetry +
+                # robustness if a non-recurring id somehow re-closes.
+                if args.goal_id:
+                    per_goal = _to_int(routine_streaks.get(args.goal_id, 0))
+                    per_goal = per_goal + 1 if oc == "routine" else 0
+                    routine_streaks[args.goal_id] = per_goal
+                else:
+                    per_goal = 0
+
+                # Block B — session signals (uses --outcome directly, no flip).
+                rsg = _to_int(signals.get("routine_streak_global", 0))
+                rct = _to_int(signals.get("routine_count_total", 0))
+                pstreak = _to_int(signals.get("productive_streak", 0))
+                cbs = _to_int(signals.get("consecutive_blocked_sleeps", 0))
+                if oc == "routine":
+                    rsg += 1
+                    rct += 1
+                    pstreak = 0
+                else:  # deep
+                    rsg = 0
+                    pstreak += 1
+                    cbs = 0
+
+                # Block C — global ceiling RESET (anti-runaway; no outcome flip).
+                if global_ceiling is not None and rsg >= global_ceiling:
+                    rsg = 0
+
+                signals["routine_streak_global"] = rsg
+                signals["routine_count_total"] = rct
+                signals["productive_streak"] = pstreak
+                signals["consecutive_blocked_sleeps"] = cbs
+                loop_state["signals"] = signals
+                loop_state["routine_streaks"] = routine_streaks
+
+                # Block D — _this_session counters. The digest-line-44/45
+                # double-count trap: the digest attributed these to the LLM for
+                # non-recurring goals, but the LLM does NOT persist loop_state
+                # (LOOP_CONTINUE contract), so they never advanced on this path.
+                # Bash owns them now. Advancing them ALSO makes
+                # recurring-loop-state-mutate.py's Block C ratio denominator
+                # (goals_completed_this_session) count ALL closes, not just
+                # recurring ones — its routine ratio was previously skewed.
+                gcts = _to_int(loop_state.get("goals_completed_this_session", 0)) + 1
+                pgts = _to_int(loop_state.get("productive_goals_this_session", 0))
+                if oc == "deep":
+                    pgts += 1
+                loop_state["goals_completed_this_session"] = gcts
+                loop_state["productive_goals_this_session"] = pgts
+
+                summary["nonrecurring_streaks"] = (
+                    f"routine_streak_global={rsg} routine_count_total={rct} "
+                    f"productive_streak={pstreak} per_goal={per_goal} "
+                    f"goals_completed_this_session={gcts}"
+                )
+
             slots["loop_state"] = loop_state
             wm["slots"] = slots
 
@@ -481,10 +638,13 @@ def main():
             note = " (CAS retries exhausted — committed last attempt)"
         elif cas.get("conflicted"):
             note = f" (CAS re-applied after stale-steal, attempts={cas.get('attempts')})"
+        streak_note = ""
+        if summary.get("nonrecurring_streaks"):
+            streak_note = f" nonrecurring-streaks[{summary['nonrecurring_streaks']}]"
         print(
             f"[loop-state-bump-counters] outcome={args.outcome} "
             f"goals_completed={summary.get('goals_completed')} "
-            f"productive_goals={summary.get('productive_goals')}{note}",
+            f"productive_goals={summary.get('productive_goals')}{note}{streak_note}",
             file=sys.stderr,
         )
     finally:

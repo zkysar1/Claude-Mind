@@ -67,6 +67,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5f | felt-sense-cadence | deferrable |
 | 0.5g | l1-skew-cadence | deferrable |
 | 0.5h | health-regression-cadence | deferrable |
+| 0.5i | curriculum-cadence | deferrable |
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -1350,6 +1351,59 @@ IF verdict.revert_eligible == true:
 
 continue to Phase 1
 Bash: echo "aspirations-precheck phase documented"
+```
+
+## Phase 0.5i: Curriculum Re-Evaluation Cadence (g-115-1801)
+
+Time-gated re-evaluation of THIS agent's curriculum graduation gates so the
+stored snapshot never goes stale. The only OTHER `/curriculum-gates` triggers
+(session-end consolidation Step 8.6, cadence-gated evolution Step 10) can skip a
+continuously-looping agent for weeks — delta sat at Foundation a full month
+(eval frozen 2026-06-01, goals=3/competence=0.0) while its live values already
+qualified (goals=27/competence=0.589). Config: `core/config/aspirations.yaml` →
+`curriculum_cadence` (interval_hours default 24, wm_slot `last_curriculum_eval`).
+
+**guard-33 invariant (MUST NOT weaken)**: this cadence NEVER calls
+`curriculum-promote.sh` directly. `curriculum-evaluate.sh` is a read-only gate
+assessment (safe); only PROMOTION is the human-gated self-escalation. When gates
+pass, promotion routes through `/curriculum-gates` — the SOLE guard-33 promotion
+chokepoint (register + DEFER, non-blocking; deduped via the pending-escalations
+state machine). This makes precheck a THIRD caller of that chokepoint alongside
+consolidation + evolution; the contract is identical.
+
+```
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check curriculum-cadence)
+IF decision == "drop": SKIP this phase; continue to Phase 1
+
+Bash: bash core/scripts/curriculum-cadence-check.sh; rc=$?
+IF rc != 0:
+    # Interval not elapsed, config disabled/absent, or state-read error — all silent.
+    continue to Phase 1
+
+# FIRE — interval elapsed (or never evaluated). Re-evaluate this agent's gates.
+Bash: eval_json=$(bash core/scripts/curriculum-evaluate.sh)
+Parse eval_json: configured, current_stage, stage_name, all_passed,
+                 gates_passed_count, gates_total, next_stage
+
+# Stamp the cadence slot AFTER the evaluate (bare quoted-ISO string — the check
+# reads a bare string OR a {"timestamp": ...} dict). Stamping after (not before)
+# means a skipped/failed evaluate re-fires next iteration rather than silently
+# advancing the cadence past a missed eval (self-correcting drift direction).
+Bash: printf '"%s"' "$(date +%Y-%m-%dT%H:%M:%S)" | bash core/scripts/wm-set.sh last_curriculum_eval
+
+IF eval_json.configured == false:
+    # No curriculum configured for this agent — silent (stamp already advanced).
+    continue to Phase 1
+
+IF eval_json.all_passed == true AND eval_json.next_stage is a non-null string:
+    Output: "▸ CURRICULUM CADENCE: all {gates_total} gates pass at {stage_name} ({current_stage}) — routing to /curriculum-gates for promotion to {next_stage} (guard-33 email-confirmed, register+defer)"
+    invoke /curriculum-gates
+    # /curriculum-gates is non-blocking + deduped; it registers/defers the
+    # escalation (or applies a previously-confirmed one) and returns control.
+    continue to Phase 1
+ELSE:
+    Output: "▸ CURRICULUM CADENCE: re-evaluated {stage_name} ({current_stage}) — {gates_passed_count}/{gates_total} gates pass (not yet promotable); snapshot refreshed"
+    continue to Phase 1
 ```
 
 ## Phase 1: Recurring Goal Check
