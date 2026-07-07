@@ -59,12 +59,24 @@ def _discover_agents(world_dir):
     fail-safes to an empty roster -- the backfill then stamps nothing and reports
     a visible 0-count rather than acting on a stale list."""
     import yaml
+    names = set()
     try:
         with open(os.path.join(world_dir, "team-state.yaml"), encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-        return sorted((data.get("agent_status") or {}).keys())
+        names.update((data.get("agent_status") or {}).keys())
     except (OSError, yaml.YAMLError):
-        return []
+        pass
+    #  sharding: post-shard the roster lives as row-file stems under
+    # world/team-state/agents/ (core keys cover un-migrated deployments).
+    # Still excludes system-identity dirs like agents/omni/ — an agent only
+    # gains a row by stamping team-state, same registration semantics as the
+    # pre-shard agent_status keys.
+    try:
+        from _team_state import row_agent_names
+        names.update(row_agent_names(world_dir))
+    except Exception:
+        pass
+    return sorted(n for n in names if isinstance(n, str) and n)
 
 
 def build_recon(agents_root, agents):

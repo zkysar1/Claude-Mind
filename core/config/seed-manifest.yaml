@@ -369,10 +369,10 @@ transformations:
   - id: I18a
     type: inline_edit
     target: "core/config/aspirations.yaml"
-    pattern: '\b(alpha|bravo|charlie|delta|echo|zeta)\b'
+    pattern: '\b(alpha|bravo|charlie|delta|echo|foxtrot|zeta)\b'
     replacement: 'agent-name'
     when_in_context: "example_value"
-    reason: "Hardcoded agent names in pedagogical examples (Q4/Q9)"
+    reason: "Hardcoded agent names in pedagogical examples (Q4/Q9). charlie+delta retained for historical content (merged into foxtrot 2026-07-07)."
     note: "Word-boundary regex; only fires inside YAML 'example:' or 'e.g.' contexts. Q28 design."
 
   # ---------------------------------------------------------------------------
@@ -558,11 +558,11 @@ transformations:
 
   - id: W2
     type: word_list_strip
-    words: ["alpha", "bravo", "charlie", "delta", "echo", "zeta"]
+    words: ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "zeta"]
     applies_to: ["core/config/*.yaml", "core/config/*.md", ".claude/rules/*.md"]
     when_in_context: "example_marker"
     replacement: "agent-name"
-    reason: "Hardcoded agent names in pedagogical examples (Q4/Q9)"
+    reason: "Hardcoded agent names in pedagogical examples (Q4/Q9). charlie+delta retained for historical content (merged into foxtrot 2026-07-07)."
     note: "Strict word-boundary + context marker required (e.g.:, for example, example:); avoids false-positives on 'alphabet', 'betacarotene' etc. Q28 design."
 
 

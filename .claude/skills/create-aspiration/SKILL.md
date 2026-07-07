@@ -82,16 +82,15 @@ IF mode == "from-followup":
                       IF --source-goal provided: "idea:<source-goal-id>"
                       ELSE: "user_directive"
 
-    Determine next asp-NNN ID:
-      Bash: bash core/scripts/aspirations-read.sh --summary   → active IDs
-      Bash: bash core/scripts/aspirations-read.sh --archive   → archived IDs
-      asp-NNN = max(NNN across active ∪ archive) + 1
-      # aspirations-add.sh REFUSES on archive ID collision (aspirations.py:156) —
-      # there is no auto-retry. MUST read archive to pick a safe ID.
+    ID assignment — OMIT the "id" field (g-328-29):
+      # The daemon mints the next asp-NNN INSIDE the write lock (max+1
+      # across live ∪ archive of the target queue). Do NOT pre-compute it —
+      # client-side max+1 read outside the lock was the asp-334/asp-335
+      # double-mint race (two agents filing concurrently read the same max).
+      # Read the assigned id back from the response ("aspiration_id").
 
-    Build aspiration JSON (pipe to aspirations-add.sh):
+    Build aspiration JSON (pipe to aspirations-add.sh) — no "id", empty "goals":
       {
-        "id": "asp-NNN",
         "title": <derived>,
         "motivation": <derived>,
         "description": <derived>,
@@ -101,36 +100,43 @@ IF mode == "from-followup":
         "origin_signal": <derived>,
         "sessions_active": 0,
         "status": "active",
-        "goals": [
-          {
-            "id": "g-NNN-01",
-            "title": "Design implementation plan and file sub-goals under this aspiration",
-            "description": "Review the motivation, outline the work lifecycle (research / build / test / integrate / encode as applicable), then EITHER file at least 2 concrete sub-goals under this aspiration OR archive the aspiration via aspirations-retire.sh as not-worth-pursuing. This seed goal forces a decision at pickup so from-followup aspirations cannot silently coast.",
-            "skill": null,
-            "type": "idea",
-            "category": <same as aspiration>,
-            "status": "pending",
-            "priority": "MEDIUM",
-            "origin_signal": "parent_aspiration:asp-NNN",
-            "participants": ["agent"],
-            "verification": {
-              "outcomes": [
-                "Implementation plan documented in the aspiration description (via aspirations-update.sh)",
-                "At least 2 concrete sub-goals filed under this aspiration OR aspiration archived via aspirations-retire/complete as not-worth-pursuing"
-              ],
-              "checks": [],
-              "preconditions": []
-            },
-            "blocked_by": []
-          }
-        ]
+        "goals": []
       }
+      # goals MUST be [] here: the seed goal's origin_signal embeds the
+      # minted asp id (parent_aspiration:<asp-id>), unknown until the
+      # response arrives. Two-step filing; add-goal mints the goal id
+      # in-lock too.
 
-    Create:
+    Create + capture the minted id:
       Bash: echo '<aspiration-json>' | bash core/scripts/aspirations-add.sh
+      # Response carries "aspiration_id": "asp-NNN" + "id_allocated": true.
       # Failures surface as-is. Do NOT auto-retry with --override-signal or
       # --override-duplication — the error text is the signal the caller needs
       # to see and act on.
+
+    File the seed goal under the minted id (goal id minted server-side — omit "id"):
+      Bash: echo '<seed-goal-json>' | bash core/scripts/aspirations-add-goal.sh <asp-id>
+      where <seed-goal-json> =
+      {
+        "title": "Design implementation plan and file sub-goals under this aspiration",
+        "description": "Review the motivation, outline the work lifecycle (research / build / test / integrate / encode as applicable), then EITHER file at least 2 concrete sub-goals under this aspiration OR archive the aspiration via aspirations-retire.sh as not-worth-pursuing. This seed goal forces a decision at pickup so from-followup aspirations cannot silently coast.",
+        "skill": null,
+        "type": "idea",
+        "category": <same as aspiration>,
+        "status": "pending",
+        "priority": "MEDIUM",
+        "origin_signal": "parent_aspiration:<asp-id>",
+        "participants": ["agent"],
+        "verification": {
+          "outcomes": [
+            "Implementation plan documented in the aspiration description (via aspirations-update.sh)",
+            "At least 2 concrete sub-goals filed under this aspiration OR aspiration archived via aspirations-retire/complete as not-worth-pursuing"
+          ],
+          "checks": [],
+          "preconditions": []
+        },
+        "blocked_by": []
+      }
 
     Log:
       Bash: echo '{"date":"<today>","event":"aspiration_created","details":"<asp-id>: <title>","trigger_reason":"from-followup","origin_signal":"<origin_signal>"}' | bash core/scripts/evolution-log-append.sh
@@ -921,14 +927,18 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
          Bash: aspirations-complete.sh --source {asp.source} <asp-id>  # had progress
      Until within cap
 
-3. ID assignment:
-   Determine next asp-NNN ID from BOTH active AND archived aspirations.
-   Active IDs: from --summary output (Step 2).
-   Archived IDs: from stepping-stones output (Phase A.5), or if archive
-   may have more: aspirations-read.sh --archive | grep '"id"'
-   Pick the highest NNN across both sets, then use NNN+1.
-   If the script rejects with "already exists in archive", increment and retry.
-   Assign sequential goal IDs: g-NNN-01, g-NNN-02, etc.
+3. ID assignment (g-328-29 — server-side, in-lock):
+   OMIT "id" on the aspiration AND on every embedded goal. The daemon mints
+   asp-NNN inside the write lock (max+1 across active ∪ archive) and goal
+   ids g-NNN-01.. in array order; read them back from the response
+   ("aspiration_id" + "aspiration".goals[].id).
+   # Client-side max+1 was the asp-334/asp-335 double-mint race — two
+   # agents filing concurrently read the same max. Explicit ids remain
+   # supported for transplant/migration callers only.
+   IF goals need intra-record blocked_by references (g-NNN-02 waits on
+   g-NNN-01): file the aspiration with "goals": [], then add goals one at
+   a time via aspirations-add-goal.sh (which also mints in-lock), wiring
+   blocked_by to the ids read back from each response.
 ```
 
 ## Step 6: Create

@@ -151,14 +151,16 @@ def _infer_in_flight_goal_id():
     # backend (_fileops.locked_modify_yaml), so this read must match. Identity
     # on LocalBackend; best-effort — a genuinely missing file still returns None.
     ts_path = Path(get_backend().ensure_local(ts_path))
-    if not ts_path.exists():
-        return None
+    # g-328-27 sharding: the agent's live status is its ROW file
+    # (world/team-state/agents/<agent>.yaml); the core file only carries a
+    # pre-migration residual. Materialize the row via the backend too, then
+    # read row-first with core fallback (newest-wins).
+    from _team_state import read_agent_row, row_path as _ts_row_path
     try:
-        with open(ts_path, "r", encoding="utf-8") as f:
-            ts = yaml.safe_load(f) or {}
+        get_backend().ensure_local(_ts_row_path(WORLD_DIR, agent))
     except Exception:
-        return None
-    status = (ts.get("agent_status") or {}).get(agent) or {}
+        pass  # best-effort — a missing row falls back to the core residual
+    status = read_agent_row(WORLD_DIR, agent, core_path=ts_path) or {}
     inflight = status.get("in_flight")
     if not inflight or not isinstance(inflight, dict):
         return None

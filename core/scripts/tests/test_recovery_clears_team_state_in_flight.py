@@ -100,17 +100,33 @@ def run_manifest_clear() -> subprocess.CompletedProcess:
 
 
 def read_in_flight() -> object:
-    """Return TEST_AGENT.in_flight from current team-state.yaml, or None."""
-    if not TEAM_STATE_PATH.exists():
-        return None
-    data = yaml.safe_load(TEAM_STATE_PATH.read_text(encoding="utf-8")) or {}
-    return (data.get("agent_status") or {}).get(TEST_AGENT, {}).get("in_flight")
+    """Return TEST_AGENT.in_flight from the COMPOSED team state, or None.
+    g-328-27 sharding: clear-in-flight seeds+writes the agent's row file, so
+    the composed view (row wins newest-wins over the core residual) is the
+    correct assertion surface."""
+    data = {}
+    if TEAM_STATE_PATH.exists():
+        data = yaml.safe_load(TEAM_STATE_PATH.read_text(encoding="utf-8")) or {}
+    try:
+        from _team_state import compose_state
+        data = compose_state(data, WORLD_DIR)
+    except Exception:
+        pass
+    entry = (data.get("agent_status") or {}).get(TEST_AGENT) or {}
+    return entry.get("in_flight")
 
 
 def setup_test_agent_dir() -> Path:
     """Create minimal <agent>/session/ + local-paths.conf so MIND_AGENT resolves.
-    Returns the agent dir path so the caller can clean it up."""
-    agent_dir = PROJECT_ROOT / TEST_AGENT
+    Returns the agent dir path so the caller can clean it up.
+
+    Uses the Phase 2.5.D agents/ parent layout via _paths.agent_dir() — the
+    original PROJECT_ROOT/<name> join broke silently after the relocation
+    (session_snapshot.py exited 2 for the unresolvable agent, failing the
+    whole manifest-clear), unnoticed because this test is main()-style and
+    never pytest-collected."""
+    from _paths import agent_dir as resolve_agent_dir
+    agent_dir = resolve_agent_dir(TEST_AGENT)
     (agent_dir / "session").mkdir(parents=True, exist_ok=True)
     conf = agent_dir / "local-paths.conf"
     if not conf.exists():
@@ -184,6 +200,16 @@ def main() -> int:
     finally:
         # Tear down test agent dir.
         teardown_test_agent_dir(agent_dir)
+
+        # Remove the TEST_AGENT row file the clear seeded into the LIVE
+        # world's rows dir ( sharding).
+        try:
+            from _team_state import row_path
+            p = row_path(WORLD_DIR, TEST_AGENT)
+            if p.exists():
+                p.unlink()
+        except Exception as e:
+            print(f"WARN: row-file cleanup failed: {e}", file=sys.stderr)
 
         # Restore live team-state.yaml.
         if backed_up:
