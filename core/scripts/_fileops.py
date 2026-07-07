@@ -120,20 +120,44 @@ def acquire_lock(lock_path, timeout=10, stale_seconds=30):
     Sub-100ms cycles (working memory) should pass stale_seconds=10; subprocess-
     inside-lock paths (skill-quality scoring) may legitimately need 60s. The
     30s default preserves prior behavior for any caller that omits it.
+
+    g-328-28: same-path callers in THIS process first wait their turn in a
+    per-path FIFO (_write_queue) — under the daemon-only architecture that is
+    where multi-agent contention lands (ThreadingHTTPServer threads), so the
+    backend lock below is only ever contended cross-process (rare). Overload
+    surfaces the DISTINCT WriteQueueFullError/WriteQueueTimeoutError, never a
+    pile-up of raw lock timeouts. The turn spans acquire→release (see
+    release_lock); a backend failure releases the turn before re-raising.
     """
-    # Raw create-if-absent + stale-break now lives in the storage backend
-    # (LocalBackend.acquire_lock), moved byte-for-byte so a cloud backend can
-    # map the same lock_path onto a remote lock table. The O_CREAT|O_EXCL atomic
-    # create (never exists()+write — TOCTOU), the FileExistsError/PermissionError
-    # POSIX-vs-Windows handling, and the stale-break all live there now.
-    # Signature + semantics are unchanged for the 100+ callers of this function.
-    _lock_backend().acquire_lock(lock_path, timeout=timeout,
-                                 stale_seconds=stale_seconds)
+    from _write_queue import acquire_turn, release_turn
+    acquire_turn(lock_path, hold_stale=stale_seconds)
+    try:
+        # Raw create-if-absent + stale-break now lives in the storage backend
+        # (LocalBackend.acquire_lock), moved byte-for-byte so a cloud backend can
+        # map the same lock_path onto a remote lock table. The O_CREAT|O_EXCL atomic
+        # create (never exists()+write — TOCTOU), the FileExistsError/PermissionError
+        # POSIX-vs-Windows handling, and the stale-break all live there now.
+        # Signature + semantics are unchanged for the 100+ callers of this function.
+        _lock_backend().acquire_lock(lock_path, timeout=timeout,
+                                     stale_seconds=stale_seconds)
+    except BaseException:
+        release_turn(lock_path)
+        raise
 
 
 def release_lock(lock_path):
-    """Release a file lock."""
-    _lock_backend().release_lock(lock_path)
+    """Release a file lock, then hand the per-path FIFO turn to the next
+    waiter (g-328-28 — order matters: the lock file must be gone before the
+    next same-process writer is woken, or its backend acquire would spin on
+    our still-present lock). The turn release is in a finally so a backend
+    release failure never wedges the path's queue — the woken waiter then
+    contends on whatever lock residue remains and the backend's own
+    stale-break recovers it, same as cross-process contention."""
+    from _write_queue import release_turn
+    try:
+        _lock_backend().release_lock(lock_path)
+    finally:
+        release_turn(lock_path)
 
 
 # ---------------------------------------------------------------------------

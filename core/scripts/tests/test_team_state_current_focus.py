@@ -52,8 +52,15 @@ def _run_in_flight(world: Path, agent: str, goal_id: str, title: str,
 
 
 def _read_entry(world: Path, agent: str) -> dict:
-    state = yaml.safe_load((world / "team-state.yaml").read_text(
-        encoding="utf-8")) or {}
+    #  sharding: the claim stamp lands in the agent's ROW file
+    # (world/team-state/agents/<agent>.yaml); core file only holds residuals.
+    row = world / "team-state" / "agents" / f"{agent}.yaml"
+    if row.is_file():
+        return yaml.safe_load(row.read_text(encoding="utf-8")) or {}
+    core = world / "team-state.yaml"
+    if not core.is_file():
+        return {}
+    state = yaml.safe_load(core.read_text(encoding="utf-8")) or {}
     return (state.get("agent_status") or {}).get(agent) or {}
 
 

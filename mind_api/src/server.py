@@ -288,7 +288,22 @@ class _Handler(BaseHTTPRequestHandler):
                 _is_conflict = isinstance(e, get_backend().conflict_error)
             except Exception:
                 _is_conflict = False
-            if _is_conflict:
+            # : per-path FIFO backpressure (queue full / wait
+            # timeout) is orderly load-shedding, not an internal fault —
+            # map to 429 with the distinct error code the BRD requires
+            # (callers must never see a raw "Could not acquire lock" for
+            # daemon-queued paths). Lazy import, same pattern as above.
+            _is_backpressure = False
+            try:
+                from _write_queue import WriteQueueBackpressure
+                _is_backpressure = isinstance(e, WriteQueueBackpressure)
+            except Exception:
+                _is_backpressure = False
+            if _is_backpressure:
+                resp = Response.error(
+                    429, "write_queue_backpressure",
+                    type(e).__name__ + ": " + str(e)[:300])
+            elif _is_conflict:
                 resp = Response.error(
                     409, "write_conflict",
                     "optimistic-concurrency conflict: remote changed between "

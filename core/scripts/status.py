@@ -127,14 +127,23 @@ def collect_team_state() -> dict:
     intentionally removed when this contract tightened.
     """
     path = WORLD_DIR / "team-state.yaml"
-    if not path.exists():
-        return {}
+    data = {}
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    #  sharding: overlay per-agent row files (rows win newest-wins).
+    # Preserves the dict contract — compose failure returns the core dict.
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        from _team_state import compose_state
+        data = compose_state(data, WORLD_DIR)
     except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
+        pass
+    return data
 
 
 def collect_handoffs_inbound() -> dict:

@@ -701,6 +701,27 @@ def test_refresh_multipart_etag_downloads_not_no_clobber(cloud, tmp_path):
     assert b._overwrite_decision(p, p, multipart_etag) == "no_clobber"
 
 
+def test_refresh_nonmultipart_local_equals_baseline_downloads(cloud, tmp_path):
+    """7 BRD sub-case (a) PINNING: NON-multipart S3 ETag + local ==
+    baseline (no unpushed writes) + S3 moved (a peer wrote) -> "download"
+    (adopt S3 + refresh the fence). This is the final fall-through in
+    _overwrite_decision and already behaved correctly before g-115-1787 —
+    pinned here so a future edit cannot regress the fence-refresh path that
+    self-heals the sweep-lag false-positive freeze (the read-path mirror of
+    the multipart pin above, minus the multipart trigger)."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "small.jsonl"
+    local_body = b'{"v":1}\n'
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(local_body)
+    # local == baseline -> the unpushed-writes gate does NOT fire.
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 1, "md5": hashlib.md5(local_body).hexdigest()}})
+    # Non-multipart ETag of DIFFERENT content (a peer moved S3).
+    peer_etag = '"' + hashlib.md5(b'{"v":2}\n').hexdigest() + '"'
+    assert b._overwrite_decision(p, p, peer_etag) == "download"
+
+
 def test_same_filename_different_roots_get_distinct_lock_keys(cloud, tmp_path):
     # Landmine 3 regression: world/aspirations.lock and agents/alpha/aspirations.lock
     # must NOT collapse to the same DDB key (the old p.name fallback did exactly that).
@@ -1074,10 +1095,19 @@ def test_both_diverged_empty_fence_merges_not_clobbers(cloud, tmp_path):
 
 def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
     """An unregistered store (no merge handler) keeps the safe-freeze: a
-    stale-fence both-diverged write raises ConflictError, never clobbers."""
+    stale-fence both-diverged write raises ConflictError, never clobbers.
+
+    (g-115-1787 hygiene: this test previously used aspirations.jsonl labeled
+    "NOT merge-registered" — stale since 74d227cd registered it; it only kept
+    passing because the non-JSON body made the HANDLER raise. Re-pointed at a
+    genuinely unregistered basename so it pins the intended path — the
+    handler-is-None freeze — not the malformed-blob path, which now has its
+    own pin below.)"""
     from owncloud_backend import ConflictError
     b = _backend(cloud)
-    p = cloud["root"] / "world" / "aspirations.jsonl"   # NOT merge-registered
+    p = cloud["root"] / "world" / "unregistered-store.jsonl"  # no merge handler
+    from coordination_merge import merge_handler_for
+    assert merge_handler_for(p) is None                 # guard the premise
     assert b._machine_local(p) is False
     key = b._s3_key(p)
     base = b"line1\n"
@@ -1091,6 +1121,117 @@ def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
     with pytest.raises(ConflictError):
         b.write_text(p, (base + b"localA\n").decode())      # stale fence -> 412
     assert b._get_remote_raw(key)[0] == base + b"remoteB\n"  # peer intact, not clobbered
+
+
+def _hyp_line(rec_id, **kw):
+    """One pipeline.jsonl record line (writer byte format: ensure_ascii=True)."""
+    rec = {"id": rec_id, "title": f"hyp {rec_id}", "stage": "active",
+           "horizon": "short", "type": "calibration", "confidence": 0.5,
+           "position": "YES — a multi-word testable claim",
+           "formed_date": rec_id[:10], "category": "framework-architecture",
+           "outcome": None, "reflected": False, "surprise": None}
+    rec.update(kw)
+    return (json.dumps(rec, ensure_ascii=True) + "\n").encode("utf-8")
+
+
+def test_both_diverged_pipeline_store_merges_not_freezes(cloud, tmp_path):
+    """7 END-TO-END (BRD P0 sub-case (b)): the EXACT cc-04 freeze
+    shape — NON-multipart pipeline.jsonl, genuine both-diverged (real unpushed
+    local records AND S3 moved) — must union-merge with ZERO data loss
+    (local-only AND S3-only hypothesis records BOTH survive), refresh the
+    fence, and leave the NEXT write clean. Pre-fix this raised ConflictError
+    deterministically on every retry (fail-fast, cleared only by daemon
+    restart — bravo's direct probe), freezing every hypothesis
+    add/resolve/reflected fleet-wide. Mirror of the reasoning-bank e2e above;
+    the write-path sibling of bdab36ab's multipart read-path fix."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "pipeline.jsonl"           # merge-REGISTERED now
+    key = b._s3_key(p)
+    base = _hyp_line("2026-07-01_base")
+    b.write_text(p, base.decode())                            # S3 == local; fence E0
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    # Genuine both-diverged: local holds an unpushed record AND a peer moved S3.
+    local_a = base + _hyp_line("2026-07-05_machine-a")
+    b._local(p).write_bytes(local_a)
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key,
+                           Body=base + _hyp_line("2026-07-06_machine-b"))
+    b.refresh(p)                                              # no_clobber -> flags key
+    assert key in b._diverged_keys
+    b.write_text(p, local_a.decode())                         # must MERGE, not raise
+    merged = b.read_text(p, force_fresh=True)
+    ids = {json.loads(l)["id"] for l in merged.splitlines() if l.strip()}
+    assert {"2026-07-01_base", "2026-07-05_machine-a",
+            "2026-07-06_machine-b"} == ids                    # ZERO data loss
+    assert key not in b._diverged_keys                        # divergence resolved
+    # Fence refreshed: the very next fenced write lands clean (the freeze is
+    # cured end-to-end, not just for one merge).
+    b.write_text(p, merged + _hyp_line("2026-07-07_next").decode())
+    after = {json.loads(l)["id"]
+             for l in b.read_text(p, force_fresh=True).splitlines() if l.strip()}
+    assert "2026-07-07_next" in after and ids <= after
+
+
+def test_both_diverged_spark_store_merges_not_freezes(cloud, tmp_path):
+    """rb-2849's second named victim: meta/spark-questions.jsonl. Genuine
+    both-diverged counter bumps merge (per-counter MAX + derived yield_rate
+    recompute) and a peer's new candidate survives — no freeze, no clobber."""
+    b = _backend(cloud)
+    p = cloud["root"] / "meta" / "spark-questions.jsonl"      # merge-REGISTERED now
+    key = b._s3_key(p)
+
+    def sq(asked):
+        return (json.dumps(
+            {"id": "sq-001", "text": "Q1?", "times_asked": asked,
+             "sparks_generated": 3, "yield_rate": round(3 / max(asked, 1), 4),
+             "status": "active", "category": "discovery", "type": "question"},
+            ensure_ascii=True) + "\n").encode("utf-8")
+
+    cand = (json.dumps(
+        {"id": "sq-c01", "text": "C1?", "category": "discovery",
+         "type": "candidate", "proposed_session": 7},
+        ensure_ascii=True) + "\n").encode("utf-8")
+    base = sq(10)
+    b.write_text(p, base.decode())                            # S3 == local; fence E0
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    b._local(p).write_bytes(sq(11))                           # local: counter bump
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=sq(12) + cand)  # peer: bump + new candidate
+    b.refresh(p)
+    assert key in b._diverged_keys
+    b.write_text(p, sq(11).decode())                          # must MERGE, not raise
+    merged = [json.loads(l) for l in
+              b.read_text(p, force_fresh=True).splitlines() if l.strip()]
+    by_id = {r["id"]: r for r in merged}
+    assert set(by_id) == {"sq-001", "sq-c01"}                 # peer's candidate survives
+    assert by_id["sq-001"]["times_asked"] == 12               # counter MAX, no regress
+    assert by_id["sq-001"]["yield_rate"] == round(3 / 12, 4)  # derived recomputed
+    assert key not in b._diverged_keys
+
+
+def test_merge_failure_on_registered_store_raises_conflict_not_clobbers(cloud, tmp_path):
+    """A REGISTERED store whose remote blob is unparseable must surface
+    ConflictError (the _merge_reconcile_put handler-exception wrap) and leave
+    S3 intact — never clobber, never wedge silently. (Pins the malformed-blob
+    safety path that the pre-g-115-1787 'unregistered aspirations.jsonl' test
+    exercised by accident.)"""
+    from owncloud_backend import ConflictError
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "pipeline.jsonl"            # merge-REGISTERED
+    key = b._s3_key(p)
+    base = _hyp_line("2026-07-01_base")
+    b.write_text(p, base.decode())
+    _write_sync_manifest(tmp_path, {b._rel(p): {
+        "mtime": 0, "md5": hashlib.md5(base).hexdigest()}})
+    local_a = base + _hyp_line("2026-07-05_machine-a")
+    b._local(p).write_bytes(local_a)                          # unpushed local write
+    garbage = b"this is not json\n"
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=garbage)  # corrupt remote
+    b.refresh(p)
+    assert key in b._diverged_keys
+    with pytest.raises(ConflictError):
+        b.write_text(p, local_a.decode())                     # merge fails LOUD
+    assert b._get_remote_raw(key)[0] == garbage               # remote NOT clobbered
 
 
 def test_hot_coordination_store_412_merges_with_empty_diverged_flag(cloud, tmp_path):

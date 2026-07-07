@@ -200,27 +200,32 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # Validation
 # ---------------------------------------------------------------------------
 
-def _validate_goal(goal: Dict[str, Any]) -> None:
+def _validate_goal(goal: Dict[str, Any], *, require_id: bool = True) -> None:
     """Basic schema check — id format, status enum, type checks.
 
     Subset of aspirations.py::validate_goal. Skips verification-schema and
     co_parent_id checks (those depend on cross-record state). Callers that
     need the full validation should use the fallback path.
+
+    require_id=False is the g-328-29 auto-allocation path: the add endpoint
+    mints goal ids in-lock AFTER validation, so id absence is legal there.
+    An id that IS present must match the format either way.
     """
-    if "id" not in goal:
+    gid = goal.get("id") or "<auto>"
+    if require_id and "id" not in goal:
         raise ValueError("Goal missing 'id' field")
-    if not _GOAL_ID_RE.match(goal["id"]):
+    if "id" in goal and not _GOAL_ID_RE.match(goal["id"]):
         raise ValueError(f"Invalid goal ID format: {goal['id']} (expected g-NNN-NN[N[N]])")
     if "status" not in goal:
-        raise ValueError(f"Goal {goal['id']} missing 'status' field")
+        raise ValueError(f"Goal {gid} missing 'status' field")
     if goal["status"] not in _VALID_GOAL_STATUSES:
-        raise ValueError(f"Invalid goal status for {goal['id']}: {goal['status']}")
+        raise ValueError(f"Invalid goal status for {gid}: {goal['status']}")
     if "recurring" in goal and not isinstance(goal["recurring"], bool):
-        raise ValueError(f"Goal {goal['id']}: recurring must be a boolean")
+        raise ValueError(f"Goal {gid}: recurring must be a boolean")
     if "interval_hours" in goal:
         v = goal["interval_hours"]
         if not isinstance(v, (int, float)) or v <= 0:
-            raise ValueError(f"Goal {goal['id']}: interval_hours must be positive")
+            raise ValueError(f"Goal {gid}: interval_hours must be positive")
 
 
 def _assert_no_prose_drift(goal: Dict[str, Any], *, ctx=None) -> None:
@@ -3210,18 +3215,24 @@ def clear_stale_claims(ctx) -> "Response":  # type: ignore[name-defined]
 # Aspiration-level validation (mirrors aspirations.py::validate_aspiration)
 # ---------------------------------------------------------------------------
 
-def _validate_aspiration(asp: Dict[str, Any]) -> None:
+def _validate_aspiration(asp: Dict[str, Any], *, auto_id: bool = False) -> None:
     """Validate an aspiration dict. Raises ValueError on invalid.
 
     Mirror of aspirations.py::validate_aspiration — duplicated per
     DECISIONS.md #3 (no cross-import from script module).
+
+    auto_id=True (g-328-29): the add endpoint mints asp + goal ids in-lock
+    AFTER this runs, so the id field is legally absent here and embedded
+    goals are validated with require_id=False.
     """
     required = {"id", "title", "status", "goals", "priority", "archived"}
+    if auto_id:
+        required = required - {"id"}
     missing = required - set(asp.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
 
-    if not _ASP_ID_RE.match(asp["id"]):
+    if "id" in asp and not _ASP_ID_RE.match(asp["id"]):
         raise ValueError(f"Invalid aspiration ID format: {asp['id']} (expected asp-NNN)")
 
     if asp["status"] not in _VALID_ASP_STATUSES:
@@ -3255,7 +3266,7 @@ def _validate_aspiration(asp: Dict[str, Any]) -> None:
                 raise ValueError("co_investigators entries must be strings")
 
     for goal in asp["goals"]:
-        _validate_goal(goal)
+        _validate_goal(goal, require_id=not auto_id)
         # Prose-verification-drift parity on the bulk aspiration-add path
         # (4) — mirrors the CLI validate_aspiration, which runs the
         # check via validate_goal on every embedded goal. No ctx here (pure
@@ -3277,7 +3288,8 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
       4. Run origin-signal gate per goal (batch)
       5. Apply goal-source auto-derive per goal
       6. Run goal-duplication gate per goal
-      7. Lock: archive-check + dup-check + recompute_progress + write
+      7. Lock: mint asp/goal ids if omitted (g-328-29) + archive-check +
+         dup-check + recompute_progress + write
 
     Query params:
       source  — "world" (default) or "agent"
@@ -3311,6 +3323,24 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
 
+    # --- : server-side ID allocation ---------------------------------
+    # The id field is OPTIONAL. When absent (or "auto"/""), the daemon mints
+    # the next asp-NNN INSIDE the write lock below — max+1 across live ∪
+    # archive of the target queue. Client-side minting (SKILL-layer max+1
+    # computed outside any lock) was the asp-334/asp-335 double-mint race.
+    # Explicit ids remain supported (transplant/migration callers).
+    auto_id = str(asp.get("id") or "").strip().lower() in ("", "auto")
+    if auto_id:
+        asp.pop("id", None)
+        conflicted = [g.get("id") for g in asp.get("goals", []) if g.get("id")]
+        if conflicted:
+            return Response.error(
+                400, "auto_id_goal_conflict",
+                "aspiration id omitted (auto allocation) but embedded goals "
+                f"carry ids ({', '.join(map(str, conflicted))}) — the caller "
+                "cannot know the asp number yet. Omit goal ids too; they are "
+                "minted server-side as g-NNN-01.. in array order.")
+
     # --- Defaults (outside lock — no file-state dependency) ---
     asp.setdefault("archived", False)
     # initial_goal_count: non-recurring goal count at creation, stamped
@@ -3328,7 +3358,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
 
     # --- Validate ---
     try:
-        _validate_aspiration(asp)
+        _validate_aspiration(asp, auto_id=auto_id)
     except ValueError as e:
         return Response.error(400, "validation_failed", str(e))
 
@@ -3415,6 +3445,28 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             # Archive check — refuse reused archived IDs.
             archive_path = live_path.parent / "aspirations-archive.jsonl"
             archived = _read_jsonl(archive_path)
+
+            #  in-lock mint: max+1 across live ∪ archive, BOTH read
+            # under THIS lock — two concurrent auto adds serialize here and
+            # get distinct sequential ids. \d{3,} so a future 4-digit id
+            # still counts toward max (the minted format grows past 999
+            # naturally via :03d). Embedded goal ids are minted g-NNN-01..
+            # in array order (their absence was enforced pre-lock).
+            if auto_id:
+                max_n = 0
+                for rec in items:
+                    m = re.match(r"^asp-(\d{3,})$", str(rec.get("id") or ""))
+                    if m:
+                        max_n = max(max_n, int(m.group(1)))
+                for rec in archived:
+                    m = re.match(r"^asp-(\d{3,})$", str(rec.get("id") or ""))
+                    if m:
+                        max_n = max(max_n, int(m.group(1)))
+                asp["id"] = f"asp-{max_n + 1:03d}"
+                asp_num = asp["id"][len("asp-"):]
+                for seq, g in enumerate(asp.get("goals", []), start=1):
+                    g["id"] = f"g-{asp_num}-{seq:02d}"
+
             if any(a.get("id") == asp["id"] for a in archived):
                 return Response.error(
                     400, "archived_id_reuse",
@@ -3463,6 +3515,10 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         "source": source,
         "aspiration": asp,
     }
+    if auto_id:
+        # : tell the caller the id was minted server-side — the
+        # SKILL layer reads aspiration_id back instead of pre-computing it.
+        response_body["id_allocated"] = True
     if warnings:
         response_body["warnings"] = warnings
     return Response.json(response_body)

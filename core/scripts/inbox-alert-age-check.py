@@ -323,6 +323,10 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
     payload = {
         "InfoType": "Inbox Alert Age Escalation",
         "Title": subject,
+        # Body is what the email-rendering service renders in structured mode
+        # (Title present); InfoMessage is IGNORED there (plain-text fallback
+        # only). Without Body these escalations delivered as title + empty body.
+        "Body": "\n".join(body_lines),
         "InfoMessage": "\n".join(body_lines),
     }
     if no_email:

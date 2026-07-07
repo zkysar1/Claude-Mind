@@ -721,10 +721,10 @@ else:
    #   goal-selector.py:1681 rec = min(rec, RECURRING_CONFIG["urgency_max"]) in criterion 7
    #   aspirations.yaml:673 urgency_max: 4.0 under recurring block
    #   aspirations.yaml:1171 recurring.urgency_max: {...} in modifiable bounds
-   #   meta/goal-selection-strategy.yaml:29 agent_role_multipliers: block with 6 agents (alpha/bravo/zeta/charlie/delta/echo) at lines 30/36/42/48/54/60
+   #   meta/goal-selection-strategy.yaml:29 agent_role_multipliers: block with 5 agents (alpha/bravo/zeta/foxtrot/echo) — re-keyed 2026-07-07 agent-merge (charlie+delta -> foxtrot)
    Bash (recurring-urgency-max-cap): defaults=$(grep -c '"urgency_max": ' core/scripts/goal-selector.py); applied=$(grep -c 'min(rec, RECURRING_CONFIG\["urgency_max"\])' core/scripts/goal-selector.py); [ "$defaults" -ge 1 ] && [ "$applied" -ge 1 ] && echo "PASS: goal-selector.py urgency_max cap (defaults=$defaults, applied=$applied)" || echo "FAIL: goal-selector.py urgency_max cap missing (defaults=$defaults, applied=$applied — zeta-1477 fix reverted?)"
    Bash (recurring-urgency-max-config): recur=$(grep -c '^  urgency_max: ' core/config/aspirations.yaml); bounds=$(grep -c '^  recurring\.urgency_max:' core/config/aspirations.yaml); [ "$recur" -ge 1 ] && [ "$bounds" -ge 1 ] && echo "PASS: aspirations.yaml urgency_max (recurring=$recur, bounds=$bounds)" || echo "FAIL: aspirations.yaml urgency_max missing (recurring=$recur, bounds=$bounds — config drift, zeta-1477 cap not configurable)"
-   Bash (agent-role-multipliers-6): source core/scripts/_paths.sh; f="$META_DIR/goal-selection-strategy.yaml"; has_block=$(grep -c '^agent_role_multipliers:' "$f" 2>/dev/null || echo 0); missing=""; for a in alpha bravo zeta charlie delta echo; do grep -q "^  $a:" "$f" 2>/dev/null || missing="$missing $a"; done; [ "$has_block" -ge 1 ] && [ -z "$missing" ] && echo "PASS: agent_role_multipliers 6-agent table complete" || echo "FAIL: agent_role_multipliers issues (block=$has_block, missing=$missing — role-bonus drift, an agent's strategic boost lost)"
+   Bash (agent-role-multipliers-5): source core/scripts/_paths.sh; f="$META_DIR/goal-selection-strategy.yaml"; has_block=$(grep -c '^agent_role_multipliers:' "$f" 2>/dev/null || echo 0); missing=""; for a in alpha bravo zeta foxtrot echo; do grep -q "^  $a:" "$f" 2>/dev/null || missing="$missing $a"; done; [ "$has_block" -ge 1 ] && [ -z "$missing" ] && echo "PASS: agent_role_multipliers 5-agent table complete" || echo "FAIL: agent_role_multipliers issues (block=$has_block, missing=$missing — role-bonus drift, an agent's strategic boost lost)"
 
    # Windows platform-friction fixes (Section WPF — 2026-04-19)
    # Four root-cause fixes for Windows MSYS bash + Python ergonomics. If any of
@@ -3661,6 +3661,8 @@ sys.exit(1)
    IF world/scripts/email-send.sh exists:
        Check: NOT contains `agent_name = 'Alpha'` (hardcoded attribution misroutes other agents' emails through a fixed prefix — single source is $MIND_AGENT; the literal 'Alpha' here is the historical regression string being grep'd for, not a design reference)
        Check: NOT contains `os.environ.get('MIND_AGENT'` (silent fallback masks missing-env config errors — the bare `os.environ['MIND_AGENT']` subscript is intentional, fail-loud per communication-clarity.md)
+       Check: contains `Empty-body guard` (transport-level refusal of bodyless payloads — the SendInfoAlert Lambda IGNORES InfoMessage when Title is present, so Title-only payloads render title+border+EMPTY body: 2026-05-20 completion emails, 2026-07-07 delta stop email, inbox-alert escalations. Removing the guard reopens every freehand/hand-built-JSON bypass of notify-build-payload.py)
+   Check: `core/scripts/inbox-alert-age-check.py` contains `"Body": "\n".join(body_lines)` (unclaimed-alert escalation emails must set Body — the pre-2026-07-07 Title+InfoMessage-only payload rendered bodyless in the Lambda's structured mode)
    # notify-from-file.sh subshell error-propagation regression (rb-857, guard-522).
    # Without `shopt -s inherit_errexit`, command substitutions like
    # PAYLOAD=$(python3 ...) do NOT propagate the subshell's exit code under
