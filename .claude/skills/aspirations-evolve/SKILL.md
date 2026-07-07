@@ -575,6 +575,14 @@ Trigger evolution check — the system evaluates its own strategy and generates 
 8. Update `meta/meta-knowledge/_index.yaml` with any new self-model insights
 9. **Forge check**: Audit registries, then create goals for forge-ready gaps:
    - **Integrity audit**: invoke `/forge-skill check` (orphan detection, max_gaps, encounter log limits, tree cross-check)
+   - **Curriculum contract gate (g-115-1801)**: `Bash: curriculum-contract-check.sh --action allow_forge_skill`.
+     IF exit code 1 (forging not permitted by the current curriculum stage): SKIP the entire
+     forge-ready loop below and continue to Skill Curation. This is the stricter gate `/forge-skill`
+     enforces at its OWN Step 1 — filing a forge goal now would only ABORT there, queuing
+     un-executable work. The developmental-stage check below is a SEPARATE, complementary axis
+     (competence-based); dev-stage >= EXPLOIT can pass while the curriculum contract still blocks,
+     so gate on BOTH. (Mirrors the `allow_meta_edits` contract check already used at Step 2's META
+     EVAL above.) Log one line: `"FORGE CHECK: curriculum blocks allow_forge_skill at {stage_name} — skipping forge-ready loop"`.
    - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap where `status != "forged"`:
      - Read `core/config/skill-gaps.yaml` → `forge_threshold` (default: 2)
      - Read `agents/<agent>/developmental-stage.yaml` → current stage

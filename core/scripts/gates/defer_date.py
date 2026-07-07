@@ -92,6 +92,43 @@ RELATIVE_NEXT = re.compile(
 RELATIVE_TOMORROW = re.compile(r"\btomorrow\b", re.IGNORECASE)
 
 
+# ---- Due-date disambiguation (3) --------------------------------
+#
+# A date governed by DUE-BY language ("by 2026-11-02", "submit by X",
+# "X deadline") is a DUE date — work must happen BEFORE it — NOT a
+# start-after date. Storing such a date as `deferred_until` inverts the
+# semantics: it freezes the goal until its own deadline. Near-miss:
+#  (ARC final-submission) sat frozen on deferred_until=2026-11-02
+# extracted from "submit ... by the 2026-11-02 deadline".
+#
+# Only ABSOLUTE dates are guarded — relative phrasings ("in 7 days",
+# "next week", "tomorrow") are inherently start-after and cannot be
+# governed by a due-by preposition. Start-after markers ("until", "after",
+# "not before", "from") are deliberately NOT in the due-set, so the
+# module's intended inputs ("Not before 2026-07-14", "after July 14, 2026",
+# "Defer until 14 March 2027") keep matching.
+
+# A due-preposition immediately preceding the date (window ENDS with it).
+_DUE_BEFORE = re.compile(
+    r"\b(?:by|due(?:\s+by)?|submit(?:ted)?\s+by|complete[d]?\s+by|"
+    r"finish(?:ed)?\s+by|ship\s+by|deliver(?:ed)?\s+by|"
+    r"no\s+later\s+than|nlt)\s+(?:the\s+)?$",
+    re.IGNORECASE,
+)
+# "deadline" immediately following the date (window STARTS with it).
+_DUE_AFTER = re.compile(r"^\W*deadline\b", re.IGNORECASE)
+
+
+def _is_due_context(text: str, start: int, end: int) -> bool:
+    """True if the date at text[start:end] is governed by due-date language
+    ("by X", "X deadline") rather than start-after language ("until X",
+    "after X", "not before X"). Such a date is a due date and MUST NOT
+    become a deferred_until. See g-115-1783."""
+    before = text[max(0, start - 30):start]
+    after = text[end:end + 15]
+    return bool(_DUE_BEFORE.search(before) or _DUE_AFTER.match(after))
+
+
 # ---- Extraction ----------------------------------------------------------
 
 def extract(text: str, now: Optional[datetime] = None) -> dict:
@@ -112,6 +149,10 @@ def extract(text: str, now: Optional[datetime] = None) -> dict:
     matches: list[tuple[datetime, str, str]] = []
 
     for m in ISO_DATE.finditer(text):
+        # 3: skip due-by dates ("by X", "X deadline") — they are
+        # due dates, not start-after dates, and must not become deferred_until.
+        if _is_due_context(text, m.start(), m.end()):
+            continue
         try:
             dt = datetime(
                 int(m.group("year")), int(m.group("month")),
@@ -122,6 +163,8 @@ def extract(text: str, now: Optional[datetime] = None) -> dict:
             continue
 
     for m in MONTH_DAY_YEAR.finditer(text):
+        if _is_due_context(text, m.start(), m.end()):
+            continue
         mo = MONTHS.get(m.group("month").lower())
         if mo is None:
             continue
@@ -133,6 +176,8 @@ def extract(text: str, now: Optional[datetime] = None) -> dict:
             continue
 
     for m in DAY_MONTH_YEAR.finditer(text):
+        if _is_due_context(text, m.start(), m.end()):
+            continue
         mo = MONTHS.get(m.group("month").lower())
         if mo is None:
             continue

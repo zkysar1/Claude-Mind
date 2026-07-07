@@ -42,7 +42,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import os
+import random
 import threading
 import time
 from pathlib import Path
@@ -61,12 +63,29 @@ from storage_backend import (
     _DEFAULT_CUSTOMER, current_customer, set_customer, reset_customer,
 )
 
+# g-328-21: module logger for CAS (If-Match compare-and-swap) conflict telemetry.
+# Emits the running 409/412 conflict rate when a coordination-store merge-reconcile
+# recovers from (or exhausts retries on) a conflict — the durable, always-on
+# measurement surface complementing the per-process cas_metrics() accessor.
+_LOG = logging.getLogger(__name__)
+
 PathLike = Union[str, os.PathLike]
 
 # S3/DDB error codes that mean "object/item absent" across boto3 surfaces.
 _NOT_FOUND = {"404", "NoSuchKey", "NotFound", "ResourceNotFoundException"}
 _PRECONDITION = {"PreconditionFailed", "412"}
 _COND_FAILED = "ConditionalCheckFailedException"
+
+# g-328-20: error codes that mean "IAM/permission gap on a governed op" across
+# boto3 surfaces (S3 -> AccessDenied; DDB -> AccessDeniedException; EC2-family ->
+# UnauthorizedOperation). A governed op that hits one of these MUST fail loud
+# (raise OwnCloudPermissionError, below), never fall through to a conservative
+# no-op. The 2026-07-04 fleet-wedge (g-328-19): a missing dynamodb:Scan grant let
+# list_runner_claims' Scan silently degrade to "owns no agent dirs" for days.
+_ACCESS_DENIED = {
+    "AccessDenied", "AccessDeniedException", "UnauthorizedOperation",
+    "NotAuthorized",
+}
 
 # gap #5 (g-328-15): both-diverged coordination-store merge. _merge_reconcile_put
 # GETs remote, merges with the outgoing local bytes via a commutative handler,
@@ -78,10 +97,17 @@ _MERGE_RECONCILE_CAP = 5
 
 
 def _conflict_backoff(attempt: int) -> float:
-    """Small capped exponential backoff between merge-reconcile retries. Kept
-    modest — the cross-machine lock already serializes most RMW, so this only
-    fires on a genuine mid-merge S3 move (a third writer)."""
-    return min(0.05 * (2 ** attempt), 1.0)
+    """Capped exponential backoff with FULL jitter between merge-reconcile CAS
+    retries (g-328-21). Full jitter — a uniform draw over [0, capped-exponential]
+    rather than exponential + a small additive jitter — because this loop is the
+    CROSS-MACHINE CAS path: on a hot coordination store (team-state.yaml, written
+    every iteration by every agent) multiple machines genuinely 412 in lockstep
+    and re-merge together, the thundering-herd that rb-2639's >22min single-writer
+    deadlock exemplifies. Full jitter decorrelates the retry wave far better than
+    the additive form; the sibling caller-side retry in _fileops._conflict_backoff
+    is already lock-serialized (lower contention) so it keeps the modest additive
+    jitter. Cap 1.0s; attempt 0 => uniform[0, 0.05]."""
+    return random.uniform(0.0, min(0.05 * (2 ** attempt), 1.0))
 
 
 def _coordination_merge_handler(path):
@@ -107,6 +133,36 @@ class ConflictError(Exception):
 class RunnerHeld(Exception):
     """``acquire_runner`` found the agent already RUNNING (and its heartbeat is
     not stale). The caller becomes an observer or refuses — never a second runner."""
+
+
+class OwnCloudPermissionError(Exception):
+    """A governed DDB/S3 op hit an IAM/permission gap (``AccessDenied`` & family —
+    see ``_ACCESS_DENIED``). Raised by :func:`_reraise_access_denied` so a
+    permission gap FAILS LOUD with a diagnosable message (the op + the underlying
+    AWS error) instead of degrading to a conservative no-op. A DISTINCT type — not
+    a bare ``ClientError`` — precisely so a fail-open caller's ``except Exception``
+    can re-raise it rather than swallow a real permission gap as a transient error
+    (the 2026-07-04 fleet-wedge root cause, g-328-19/g-328-20)."""
+
+
+def _reraise_access_denied(e: ClientError, op: str) -> None:
+    """If ``e`` is an IAM/permission gap (code in ``_ACCESS_DENIED``), raise a
+    diagnosable :class:`OwnCloudPermissionError` naming the governed ``op`` and the
+    underlying AWS error; otherwise return (the caller's own ``raise`` handles the
+    non-permission case). Call this INSIDE a governed op's ``except ClientError``
+    block BEFORE that block's own ``raise`` (or when wrapping a previously
+    unguarded call), so an AccessDenied surfaces loudly (g-328-20) while every
+    other error keeps its existing handling."""
+    err = e.response.get("Error", {}) if getattr(e, "response", None) else {}
+    if err.get("Code", "") in _ACCESS_DENIED:
+        raise OwnCloudPermissionError(
+            f"own-cloud governed op {op!r} hit an IAM/permission gap: "
+            f"{err.get('Code')} — {err.get('Message', '')}. Fail-loud detection "
+            f"(g-328-20), NOT a silent conservative degrade: check the IAM grant "
+            f"for this op (e.g. dynamodb:Scan/Query/GetItem/UpdateItem on the "
+            f"sessions/lock table, or s3:ListBucket/GetObject on the governed "
+            f"prefix)."
+        ) from e
 
 
 class RunnerClaim(NamedTuple):
@@ -228,6 +284,16 @@ class OwnCloudBackend:
         # so it always reflects the latest refresh — which, in an RMW cycle,
         # immediately precedes the _put that reads it under the same lock.
         self._diverged_keys: set = set()
+        # g-328-21: CAS (If-Match compare-and-swap) conflict telemetry. Per-process
+        # counters (reset on daemon restart); the durable cross-restart measurement
+        # surface is the per-event _LOG line emitted from _merge_reconcile_put.
+        #   _cas_writes             = fenced put_object attempts        (denominator)
+        #   _cas_conflicts          = 412 PreconditionFailed events     (numerator)
+        #   _cas_conflicts_resolved = merge-reconciles that recovered after >=1 conflict
+        # cas_metrics() exposes the running 409/412 rate. Invariant: resolved <= conflicts.
+        self._cas_writes = 0
+        self._cas_conflicts = 0
+        self._cas_conflicts_resolved = 0
         # Preflight: fail loud NOW if botocore is too old for PutObject IfMatch,
         # rather than letting every _put crash cryptically at runtime (reads
         # would still work, masking the break). See _assert_ifmatch_supported.
@@ -621,7 +687,14 @@ class OwnCloudBackend:
             kw = dict(Bucket=self.bucket, Prefix=prefix, Delimiter="/")
             if token:
                 kw["ContinuationToken"] = token
-            resp = self.s3.list_objects_v2(**kw)
+            try:
+                resp = self.s3.list_objects_v2(**kw)
+            except ClientError as e:
+                # g-328-20: S3 enumeration twin of list_runner_claims' Scan — a
+                # missing s3:ListBucket grant would otherwise degrade to an empty
+                # dir listing. Surface it as a diagnosable permission error.
+                _reraise_access_denied(e, "list_dir ListObjectsV2")
+                raise
             for c in resp.get("Contents", []):
                 names.add(c["Key"][len(prefix):].split("/")[0])
             for cp in resp.get("CommonPrefixes", []):
@@ -689,6 +762,8 @@ class OwnCloudBackend:
         # the last good S3 version — no local-ahead divergence to lose. (This
         # reverses the prior "local first" order, which seeded exactly that
         # divergence; do NOT move the local write back above the PUT.)
+        if fence is not None:
+            self._cas_writes += 1  # g-328-21: CAS (fenced) write — conflict-rate denominator
         try:
             r = self.s3.put_object(**kw)
         except ParamValidationError as e:
@@ -704,6 +779,7 @@ class OwnCloudBackend:
             raise
         except ClientError as e:
             if e.response["Error"]["Code"] in _PRECONDITION:
+                self._cas_conflicts += 1  # g-328-21: 412 event (conflict-rate numerator)
                 # g-115-1741: a HOT coordination store (team-state.yaml, written
                 # every iteration by every agent) 412s HERE with an EMPTY
                 # _diverged_keys, because _refresh's warm-cache early-return
@@ -725,7 +801,8 @@ class OwnCloudBackend:
                 # twin of bdab36a's read-path multipart fence-refresh fix.
                 handler = _coordination_merge_handler(path)
                 if handler is not None:
-                    return self._merge_reconcile_put(path, key, local, body, handler)
+                    return self._merge_reconcile_put(
+                        path, key, local, body, handler, entered_from_conflict=True)
                 # fix A2: surface, never silently drop. Caller re-runs the RMW
                 # (G1 conflict-retry in _fileops' locked RMW helpers).
                 raise ConflictError(
@@ -755,14 +832,21 @@ class OwnCloudBackend:
         return obj["Body"].read(), obj["ETag"]
 
     def _merge_reconcile_put(self, path: PathLike, key: str, local: Path,
-                             body: bytes, handler) -> WriteResult:
+                             body: bytes, handler,
+                             entered_from_conflict: bool = False) -> WriteResult:
         """Reconcile a both-diverged write to a registered coordination store:
         GET the remote-authoritative bytes, MERGE them with the outgoing local
         bytes via the store's commutative handler, and PUT the merged result
         fenced on the remote ETag. If S3 moved again during the merge (a third
         writer), the fenced PUT 412s and we re-GET / re-merge — a bounded CAS
         loop that terminates because the handler is commutative (both machines
-        compute the same merged bytes). See core/scripts/coordination_merge.py."""
+        compute the same merged bytes). See core/scripts/coordination_merge.py.
+
+        entered_from_conflict (g-328-21): True when the caller reached here from a
+        412 it already counted (the _put PreconditionFailed path), so a successful
+        merge here counts as a RESOLVED conflict even if this loop sees no further
+        412. False for the proactive both-diverged pre-check dispatch (no 412 yet)."""
+        saw_conflict = entered_from_conflict
         for attempt in range(_MERGE_RECONCILE_CAP):
             remote_bytes, remote_etag = self._get_remote_raw(key)
             try:
@@ -776,10 +860,13 @@ class OwnCloudBackend:
             kw = dict(Bucket=self.bucket, Key=key, Body=merged)
             if remote_etag is not None:
                 kw["IfMatch"] = remote_etag  # CAS on the version we merged against
+            self._cas_writes += 1  # g-328-21: each merge attempt is a fenced write
             try:
                 r = self.s3.put_object(**kw)
             except ClientError as e:
                 if e.response["Error"]["Code"] in _PRECONDITION:
+                    self._cas_conflicts += 1  # g-328-21: 412 during merge
+                    saw_conflict = True
                     time.sleep(_conflict_backoff(attempt))
                     continue  # S3 moved during merge; re-GET and re-merge
                 raise
@@ -787,10 +874,41 @@ class OwnCloudBackend:
             self._etags[key] = r["ETag"]
             self._cache_check[str(local)] = time.monotonic()
             self._diverged_keys.discard(key)
+            if saw_conflict:
+                self._cas_conflicts_resolved += 1  # g-328-21: retry recovered
+                _LOG.info(
+                    "owncloud CAS conflict resolved for %s via merge-reconcile "
+                    "(attempt %d); running 409-rate %.3f (%d conflicts / %d writes)",
+                    key, attempt, self._cas_conflict_rate(),
+                    self._cas_conflicts, self._cas_writes)
             return WriteResult(version=r["ETag"], fallback_used=False)
+        _LOG.warning(
+            "owncloud CAS merge-reconcile EXHAUSTED %d retries for %s; running "
+            "409-rate %.3f (%d conflicts / %d writes)",
+            _MERGE_RECONCILE_CAP, key, self._cas_conflict_rate(),
+            self._cas_conflicts, self._cas_writes)
         raise ConflictError(
             f"merge-reconcile exhausted {_MERGE_RECONCILE_CAP} retries for "
             f"{key}: S3 kept moving mid-merge")
+
+    def _cas_conflict_rate(self) -> float:
+        """Running 409/412 conflict rate = conflicts / fenced-writes (g-328-21).
+        0.0 when no fenced writes have occurred yet."""
+        return self._cas_conflicts / self._cas_writes if self._cas_writes else 0.0
+
+    def cas_metrics(self) -> dict:
+        """Per-process CAS (If-Match compare-and-swap) conflict telemetry
+        (g-328-21). Makes the 409/412 rate MEASURABLE: writes = fenced put_object
+        attempts, conflicts = 412 events, resolved = merge-reconciles that
+        recovered after >=1 conflict, conflict_rate = conflicts/writes. Counters
+        are per-process (reset on daemon restart); the always-on cross-restart
+        surface is the _LOG line emitted on each merge-reconcile resolve/exhaust."""
+        return {
+            "writes": self._cas_writes,
+            "conflicts": self._cas_conflicts,
+            "resolved": self._cas_conflicts_resolved,
+            "conflict_rate": self._cas_conflict_rate(),
+        }
 
     def atomic_write(self, target: PathLike, write_to_handle,
                      *, max_retries: int = 10) -> WriteResult:
@@ -1046,7 +1164,14 @@ class OwnCloudBackend:
                       ExpressionAttributeValues={":p": {"S": prefix}})
             if start_key:
                 kw["ExclusiveStartKey"] = start_key
-            resp = self.ddb.scan(**kw)
+            try:
+                resp = self.ddb.scan(**kw)
+            except ClientError as e:
+                # g-328-20: a missing dynamodb:Scan grant here was the 2026-07-04
+                # fleet-wedge root cause — surface it as a diagnosable permission
+                # error, never let a caller degrade it to an empty owned-set.
+                _reraise_access_denied(e, "list_runner_claims Scan")
+                raise
             for item in resp.get("Items", []):
                 skey = item.get("session_key", {}).get("S", "")
                 if not skey.startswith(prefix):
@@ -1061,3 +1186,37 @@ class OwnCloudBackend:
             if not start_key:
                 break
         return claims
+
+    def health_check(self) -> dict:
+        """Proactive IAM/permission probe for the governed ops (g-328-20). Runs a
+        BOUNDED governed DDB Scan (``Limit=1`` on the sessions table) and a BOUNDED
+        governed S3 list (``MaxKeys=1`` on the env prefix) — the two enumeration
+        surfaces whose silent-AccessDenied degrade caused the 2026-07-04
+        fleet-wedge (g-328-19). On an IAM/permission gap this raises the
+        diagnosable :class:`OwnCloudPermissionError` (via
+        :func:`_reraise_access_denied`); any other ``ClientError`` propagates
+        unchanged. Returns ``{"ok": True, "checked": [...]}`` when both governed
+        surfaces are reachable. The infra-health own-cloud check calls this and
+        surfaces the raise as an ALERT, so a permission gap is detected at
+        health-check time — not days later, silently, inside a sweep."""
+        checked: List[str] = []
+        # Governed DDB surface: a Limit=1 Scan exercises dynamodb:Scan on the
+        # sessions table (the exact grant missing in g-328-19) without reading it.
+        try:
+            self.ddb.scan(TableName=self.sessions_table, Limit=1)
+            checked.append("ddb:Scan")
+        except ClientError as e:
+            _reraise_access_denied(e, "health_check ddb.Scan")
+            raise
+        # Governed S3 surface: a MaxKeys=1 list exercises s3:ListBucket on the
+        # env-scoped prefix.
+        try:
+            self.s3.list_objects_v2(
+                Bucket=self.bucket,
+                Prefix=self._customer_prefix() + self.env_id + "/",
+                MaxKeys=1)
+            checked.append("s3:ListBucket")
+        except ClientError as e:
+            _reraise_access_denied(e, "health_check s3.ListObjectsV2")
+            raise
+        return {"ok": True, "checked": checked}

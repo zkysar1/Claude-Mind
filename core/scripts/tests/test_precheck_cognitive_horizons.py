@@ -181,5 +181,29 @@ def test_hypothesis_health_missing_yaml_raises(tmp_path, monkeypatch):
         pe.cmd_hypothesis_health(_Args(), CONFIG, None)
 
 
+# ── init-seed parity (echo-2744 audit / ) ──────────────────────────
+
+def test_init_meta_seeds_cognitive_horizons():
+    """The consumer above fails loud when meta/cognitive-horizons.yaml is
+    absent, so init-meta.sh MUST seed it — else fresh-box init FileNotFoundErrors
+    (the ~3wk fleet-wide FNF since 2026-06-13 was this exact missing seed).
+
+    This is the init-seed-COVERAGE assertion the fixture tests above cannot
+    make: a self-written fixture proves the CONSUMER reads the yaml, NOT that a
+    fresh clone HAS it (rb init-seed-parity). The two are separate assertions —
+    the whole point of echo's finding msg-20260703-093826-echo-2744.
+    """
+    core = SCRIPT_DIR.parent  # core/
+    # 1. The git-tracked seed SOURCE exists.
+    src = core / "config" / "cognitive-horizons.yaml"
+    assert src.exists(), f"seed source missing: {src}"
+    # 2. init-meta.sh actually copies it into meta/ (cp from $CONFIG to $META).
+    body = (SCRIPT_DIR / "init-meta.sh").read_text(encoding="utf-8")
+    assert 'cp "$CONFIG/cognitive-horizons.yaml" "$META/cognitive-horizons.yaml"' in body, (
+        "init-meta.sh does not seed cognitive-horizons.yaml — fresh-box init "
+        "would FileNotFoundError in precheck-eval hypothesis-health"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -33,25 +33,42 @@ LOOP_CONTINUE. The LLM serializing them clobbers bash mutations and re-introduce
 the silent-corruption class Magic Wand #1 was designed to eliminate. Phase -0.5
 of the next iteration restores loop_state from WM, picking up bash values.
 
-| Field | Single writer | Trigger |
+Each streak/counter field has ONE writer PER PATH (a goal is either recurring or
+not — the two writers never race on the same close). g-115-1785 closed the last
+split-brain: the streak fields had a recurring writer but no non-recurring one,
+so the "LLM applies Block A/B/C/D for non-recurring" instruction below drifted
+(the LOOP_CONTINUE contract forbids the LLM from persisting loop_state, so the
+manual mutation never landed — routine_streak_global stayed non-zero after a
+non-recurring deep close instead of resetting).
+
+| Field | Single writer (recurring / non-recurring) | Trigger |
 |---|---|---|
-| `signals.goals_since_last_tree_update` | `tree-encoding-drift-gate.py` | iteration-close.sh state-update |
-| `routine_streaks[goal.id]` | `recurring-loop-state-mutate.py` | recurring-close.sh (Block A) |
-| `signals.routine_streak_global` | `recurring-loop-state-mutate.py` | recurring-close.sh (Block B/C) |
-| `signals.routine_count_total` | `recurring-loop-state-mutate.py` | recurring-close.sh (Block B) |
-| `signals.productive_streak` | `recurring-loop-state-mutate.py` | recurring-close.sh (Block B) |
-| `signals.consecutive_blocked_sleeps` | `recurring-loop-state-mutate.py` (deep reset) + LLM (Phase B7 backoff increment in all-blocked) | mixed |
-| `goals_completed_this_session` | `recurring-loop-state-mutate.py` (recurring) + LLM (non-recurring Phase 12) | recurring-close.sh + LLM |
-| `productive_goals_this_session` | `recurring-loop-state-mutate.py` (recurring) + LLM (non-recurring Phase 4.1 Block D) | recurring-close.sh + LLM |
+| `signals.goals_since_last_tree_update` | `tree-encoding-drift-gate.py` (both paths) | iteration-close.sh state-update |
+| `routine_streaks[goal.id]` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh (Block A) / iteration-close.sh state-update |
+| `signals.routine_streak_global` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh (Block B/C) / iteration-close.sh state-update (Block B + ceiling-reset) |
+| `signals.routine_count_total` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh (Block B) / iteration-close.sh state-update |
+| `signals.productive_streak` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh (Block B) / iteration-close.sh state-update |
+| `signals.consecutive_blocked_sleeps` | `recurring-loop-state-mutate.py` (deep reset) / `loop-state-bump-counters.py --recurring false` (deep reset) + LLM (Phase B7 backoff increment in all-blocked) | mixed |
+| `goals_completed_this_session` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh + iteration-close.sh state-update |
+| `productive_goals_this_session` | `recurring-loop-state-mutate.py` / `loop-state-bump-counters.py --recurring false` | recurring-close.sh + iteration-close.sh state-update |
 | `touched` (aspirations_touched_this_session) | `loop-state-bump-counters.py --goal-id` | iteration-close.sh state-update — every close (g-115-1561) |
 | `alignment_check_at` increment (goals_since_last_alignment_check) | `loop-state-bump-counters.py --goal-id` | iteration-close.sh state-update — every close (g-115-1561) |
 | `alignment_check_at` reset to 0 | `loop-state-bump-counters.py --reset-alignment` | aspirations-select Self-Alignment Check fires (g-115-1561) |
 | `evolutions` + `last_evolution_at` (evolutions_this_session, last_evolution_goal_count) | `loop-state-bump-counters.py --evolution-fired` | aspirations-evolve, every invocation (g-115-1561) |
 
-For the recurring path, the LLM does NOT need to apply Phase 4.1 Block A/B/C/D
-manually — `recurring-close.sh` invokes `recurring-loop-state-mutate.sh` BEFORE
-the four iteration-close phases and uses the post-flip outcome. The LLM continues
-to apply Block A/B/C/D for NON-recurring goals (path is unchanged).
+Signal mutation is FULLY bash-owned on BOTH paths (g-115-1785) — the LLM does
+NOT apply Phase 4.1 Block A/B/C/D manually for either:
+- **Recurring**: `recurring-close.sh` invokes `recurring-loop-state-mutate.sh`
+  BEFORE the four iteration-close phases and uses the post-flip outcome (so the
+  Block A/C routine→deep flip reaches verify/spark).
+- **Non-recurring**: `iteration-close.sh` state-update passes `--recurring false`
+  to `loop-state-bump-counters.py`, which applies Block A/B (streak counters) +
+  Block C ceiling-RESET + Block D (`_this_session` counters) atomically under the
+  same RMW as the goals_completed bump. The Block A/C outcome FLIP is omitted on
+  this path (non-recurring goals are classified `deep` by default, so there is no
+  routine→deep flip to make, and a state-update-time flip could not reach the
+  already-run verify/spark anyway — see
+  `core/config/rationale/signal-mutation.md` "Non-recurring path").
 
 ### LLM-owned fields (the only loop_state writes the LLM still makes)
 
@@ -156,17 +173,26 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: execution-diary.sh phase-end phase-4-execute --goal {goal.id}; LOOP_CONTINUE.
               Write iteration-checkpoint.json (phase_completed=execute, last_updated=now).
               Bash: execution-diary.sh phase-end phase-4-execute --goal {goal.id}
-  Phase 4.1.  SIGNAL MUTATION (anti-drift). TWO SEPARATE BLOCKS — re-evaluate
-              outcome_class between them. Flipping in Block A must reach Block B.
-              # RECURRING-PATH SHORTCUT (Magic Wand #1, alpha session-60):
-              # When the about-to-close goal is recurring AND the LLM is using the
-              # recurring-close.sh shortcut (collapses Phase 5/8/12 into one bash call),
-              # SKIP this Phase 4.1 entirely. recurring-close.sh invokes
-              # recurring-loop-state-mutate.sh which applies Block A/B/C/D atomically
-              # under the WM lock and returns the post-flip outcome on stdout. The
-              # bash-side mutation is the single writer; running this Phase 4.1 in
-              # parallel double-counts streaks and corrupts cargo-cult detection.
-              # NON-RECURRING goals continue to use the manual Block A/B/C/D below.
+  Phase 4.1.  SIGNAL MUTATION (anti-drift) — FULLY BASH-OWNED on BOTH paths
+              (g-115-1785). The LLM does NOT apply this manually anymore; the
+              Block A/B/C/D pseudocode below is REFERENCE for what the two bash
+              writers do. Persisting these fields from the LLM would violate the
+              LOOP_CONTINUE contract (no loop_state mirror) and double-count.
+              # RECURRING path (Magic Wand #1, alpha session-60): recurring-close.sh
+              # invokes recurring-loop-state-mutate.sh BEFORE the four iteration-close
+              # phases; it applies Block A/B/C/D atomically under the WM lock and
+              # returns the post-flip outcome on stdout (so the Block A/C routine→deep
+              # flip reaches verify/spark). Running Phase 4.1 in parallel here would
+              # double-count streaks + corrupt cargo-cult detection.
+              # NON-RECURRING path (g-115-1785): iteration-close.sh state-update passes
+              # --recurring false to loop-state-bump-counters.py, which applies Block
+              # A/B + the Block C ceiling-RESET + Block D _this_session counters under
+              # the same RMW as the goals_completed bump. The Block A/C outcome FLIP is
+              # OMITTED (non-recurring goals default to deep — no routine→deep flip to
+              # make — and a state-update-time flip can't reach the already-run
+              # verify/spark; see core/config/rationale/signal-mutation.md). A deep
+              # non-recurring close therefore RESETS routine_streak_global (the drift
+              # this fix eliminated) via bash, not via a fragile LLM patch.
               # Block A — per-goal streak:
               IF outcome_class == routine:
                 routine_streaks[goal.id] += 1

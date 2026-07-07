@@ -569,6 +569,86 @@ _check_hung_autocompact() {
     _perform_recovery "$agent" "$cause"
 }
 
+# === PATH D: Wedged-loop detection (heartbeat FRESH + unclosed phase, ) ===
+#
+# The 2026-07-04 own-cloud fleet-wedge ( failures #4/#5): a loop wedged
+# at phase-0-precheck behind a _fileops.acquire_lock exception kept re-ticking
+# the DDB heartbeat (FRESH) while diary writes stalled behind the wedged lock --
+# so Paths A/C (which BOTH require heartbeat STALE) never fired, and "a fresh
+# heartbeat masked the wedged loop." Path D is the mirror image: it fires ONLY
+# when the heartbeat is FRESH but an execution-diary phase_start has been left
+# unclosed past the wedge threshold (phase-wedge-check.py). Recovery (RUNNING ->
+# IDLE) lets the next SessionStart re-enter cleanly, breaking the wedge that
+# previously required the manual restart the incident documents.
+#
+# Fail-safe layering (why this cannot mis-recover a healthy agent):
+#   - heartbeat==fresh is the discriminator from Path A/C (stale-heartbeat);
+#   - the execute-in-flight suppressor (shared with Path A/C) protects a
+#     genuinely-long phase-4-execute deep-code goal (<4h);
+#   - the wedge threshold (runner_heartbeat.wedge_stale_minutes, 65min) is set
+#     ABOVE runner_heartbeat.stale_minutes (60min) BY DESIGN (): a
+#     HEALTHY non-phase-4 phase's local heartbeat ages WITH its phase_start, so
+#     by the time phase_start crosses 65min the heartbeat is already >60min ->
+#     STALE and the heartbeat-FRESH gate below suppresses FIRST. Only a genuine
+#     wedge (heartbeat re-ticked fresh while the diary freezes) reaches the wedge
+#     check. (At 45min < 60 a long precheck/state-update false-recovered a
+#     healthy agent -- the  defect this invariant fixes.)
+#   - phase-wedge-check.py fails OPEN to no-recovery (rc!=0) on any error.
+_check_wedged_loop() {
+    local agent="$1"
+    local _adir
+    _adir="$(agent_dir "$agent")"
+    [[ -d "$_adir/session" ]] || return 0
+
+    # state==RUNNING — recovery-vs-cleanup boundary (same as Path C).
+    local state
+    state="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/session-state-get.sh" 2>/dev/null || echo "")"
+    [[ "$state" == "RUNNING" ]] || return 0
+
+    # Heartbeat gate — FRESH is the Path-D discriminator. A stale heartbeat is
+    # Path A/C territory (dead/hung); a fresh heartbeat + a frozen diary is the
+    # wedge signature. Default to "stale" on probe error so a broken heartbeat
+    # probe suppresses Path D (conservative — fail toward no-recovery).
+    local hb
+    hb="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/heartbeat-stale.sh" 2>/dev/null || echo "stale")"
+    [[ "$hb" == "fresh" ]] || return 0
+
+    # Execute-in-flight suppressor (shared contract with Path A/C): a genuine
+    # mid-Phase-4 deep-code goal can hold phase-4-execute open >45min while
+    # progressing. Within 4h (240min) -> suppress. Beyond 4h -> Phase 4 itself
+    # is hung, let the wedge check decide.
+    local eif="$_adir/session/execute-in-flight"
+    if [[ -f "$eif" ]]; then
+        if [[ -z "$(find "$eif" -maxdepth 0 -mmin +240 2>/dev/null)" ]]; then
+            return 0
+        fi
+    fi
+
+    # Wedge detector: an execution-diary phase_start unclosed past the wedge
+    # threshold. rc=0 wedged, rc=1 clean, rc=2 error. ONLY rc=0 proceeds --
+    # rc=1 and rc=2 both suppress (the helper fails open to no-recovery).
+    # python3 (not py -3): this script sources _paths.sh, so python3 is the
+    # sanctioned form (CLAUDE.md python-invocation rule; matches the SOURCE
+    # parse call earlier in this script).
+    MIND_AGENT="$agent" python3 "$SCRIPT_DIR/phase-wedge-check.py" >/dev/null 2>&1
+    local wedge_rc=$?
+    [[ "$wedge_rc" -eq 0 ]] || return 0
+
+    # stop-requested gate: graceful /stop owns the wind-down (rb-762 rc=1-only;
+    # 0=signal-set and 2+=error both suppress).
+    MIND_AGENT="$agent" bash "$SCRIPT_DIR/session-signal-exists.sh" stop-requested >/dev/null 2>&1
+    local sr_rc=$?
+    [[ $sr_rc -eq 1 ]] || return 0
+
+    # No Tier-A background job (loop legitimately blocked on external work).
+    MIND_AGENT="$agent" bash "$SCRIPT_DIR/background-jobs.sh" has-pending >/dev/null 2>&1
+    local bg_rc=$?
+    [[ $bg_rc -eq 1 ]] || return 0
+
+    local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, no stop-requested, no pending bg job (g-328-23)"
+    _perform_recovery "$agent" "$cause"
+}
+
 # === PATH A: Crashed-runner detection (6-condition gate, source-gated) ===
 #
 # The 6 conditions are EXTRACTED to `core/scripts/runner-dead-check.sh`
@@ -640,6 +720,12 @@ _check_state_corruption "$BOUND_AGENT" || true
 # Path C — hung-autocompact detection. Source-independent (rationale in the
 # function-level comment above _check_hung_autocompact).
 _check_hung_autocompact "$BOUND_AGENT" || true
+
+# Path D — wedged-loop detection (heartbeat FRESH + unclosed phase, ).
+# Source-independent: a storage wedge can freeze the diary on any SessionStart
+# source. Runs after Path C; Paths A/C key on STALE heartbeat, Path D on FRESH,
+# so at most one path's heartbeat gate passes for a given liveness state.
+_check_wedged_loop "$BOUND_AGENT" || true
 
 # Source gate for Path A only.
 case "$SOURCE" in

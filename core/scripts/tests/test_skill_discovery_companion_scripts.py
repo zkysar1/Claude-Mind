@@ -296,6 +296,29 @@ def test_same_second_events_dedup_upstream():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_init_meta_seeds_skill_discovery_strategy():
+    """skill-discovery.py + mind_api/src/endpoints/skill_discovery.py hard-REQUIRE
+    meta/skill-discovery-strategy.yaml ("DO NOT add fallback defaults"; CLI exit 3
+    / raise when absent), so init-meta.sh MUST seed it — else fresh-box init
+    FileNotFoundErrors the moment aspirations-evolve Step 9.5.5 runs skill-discovery.
+
+    Init-seed-COVERAGE assertion (rb init-seed-parity, echo-2744 / g-328-26): the
+    fixture tests prove the CONSUMER reads the yaml, NOT that a fresh clone HAS it.
+    This is the SECOND gap the systematic audit found after cognitive-horizons.yaml
+    (test_precheck_cognitive_horizons.py carries the twin assertion).
+    """
+    core = CORE_SCRIPTS.parent  # core/
+    # 1. The git-tracked seed SOURCE exists.
+    src = core / "config" / "skill-discovery-strategy.yaml"
+    assert src.exists(), f"seed source missing: {src}"
+    # 2. init-meta.sh actually copies it into meta/ (cp from $CONFIG to $META).
+    body = (CORE_SCRIPTS / "init-meta.sh").read_text(encoding="utf-8")
+    assert 'cp "$CONFIG/skill-discovery-strategy.yaml" "$META/skill-discovery-strategy.yaml"' in body, (
+        "init-meta.sh does not seed skill-discovery-strategy.yaml — fresh-box init "
+        "would FileNotFoundError / exit-3 in skill-discovery"
+    )
+
+
 def main():
     """Manual test runner for environments without pytest."""
     import traceback
@@ -305,6 +328,7 @@ def main():
         ("board_mentions_do_not_count", test_board_mentions_do_not_count),
         ("shared_companion_script_credits_all_skills", test_shared_companion_script_credits_all_skills),
         ("same_second_events_dedup_upstream", test_same_second_events_dedup_upstream),
+        ("init_meta_seeds_skill_discovery_strategy", test_init_meta_seeds_skill_discovery_strategy),
     ]
     failed = []
     for name, fn in tests:
