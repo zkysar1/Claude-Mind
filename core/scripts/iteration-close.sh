@@ -734,7 +734,19 @@ except: print(0)' 2>/dev/null || echo 0)"
     if [[ -n "$GOAL_ID" ]]; then
         local _lsbc
         _lsbc="$(_winpath "$SCRIPT_DIR/loop-state-bump-counters.py")"
-        python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
+        # g-115-1785: pass --recurring false ONLY for a confirmed non-recurring
+        # goal so loop-state-bump-counters.py ALSO owns the non-recurring Block
+        # A/B/C/D streak mutation (the streaks previously had a recurring bash
+        # writer but no non-recurring one — the digest's LLM-manual path drifted
+        # on interrupted closes). Recurring goals ("true") get streaks from
+        # recurring-loop-state-mutate.py via recurring-close.sh; passing the flag
+        # for them would DOUBLE-apply. Unknown ("" — the aspiration lookup above
+        # failed) → omit the flag → skip streaks (fail-safe: no corruption, the
+        # streak just doesn't advance this once, exactly as pre-g-115-1785).
+        # $recurring is the local set by the lookup at the top of this function.
+        local _rec_flag=()
+        [[ "${recurring:-}" == "false" ]] && _rec_flag=(--recurring false)
+        python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" "${_rec_flag[@]}" \
             || echo "[iteration-close] WARN: loop-state-bump-counters failed for $GOAL_ID (fail-open; productivity-gate may stay stale this iteration)" >&2
         # g-115-1470: the bump always exits 0 (fail-open at every layer), so rc
         # CANNOT detect a silent no-op (stale-lock-steal / WM-write failure under
@@ -751,7 +763,7 @@ except: print(0)' 2>/dev/null || echo 0)"
             printf '{"ts":"%s","goal_id":"%s","outcome":"%s","event":"bump_noop_detected","action":"refire"}\n' \
                 "$NOW_ISO" "$GOAL_ID" "$OUTCOME" \
                 >> "$AGENT_DIR/session/loop-state-bump-failures.jsonl" 2>/dev/null || true
-            python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" \
+            python3 "$_lsbc" --outcome "$OUTCOME" --goal-id "$GOAL_ID" "${_rec_flag[@]}" \
                 || echo "[iteration-close] WARN: loop-state-bump re-fire failed for $GOAL_ID" >&2
         fi
     fi

@@ -91,10 +91,53 @@ two in the rule file:
 The split is healthy. The rule stays domain-agnostic behavioral
 discipline. The convention catalogs the gate spec.
 
+## Related Recovery Paths (B/C/D)
+
+The 6-condition gate above is **Path A** — crashed-runner recovery keyed on a
+STALE heartbeat. `recovery-gate.sh` runs three additional source-independent
+paths BEFORE the Path-A source gate (they fire on `compact`/`resume`
+SessionStart sources too, where Path A is skipped):
+
+| Path | Function | Trigger | Heartbeat |
+|---|---|---|---|
+| **B** — state-corruption | `_check_state_corruption` | Malformed/contradictory session-state signals | n/a |
+| **C** — hung-autocompact | `_check_hung_autocompact` | A compact/resume that never progressed | STALE |
+| **D** — wedged-loop (g-328-23) | `_check_wedged_loop` | Loop wedged behind a storage-layer `_fileops.acquire_lock` failure: the execution-diary's most-recent marker is an unclosed `phase_start` past `runner_heartbeat.wedge_stale_minutes` (65min, > `stale_minutes` by the g-328-25 invariant) | **FRESH** |
+
+Path D is the mirror image of Paths A/C: it keys on a **FRESH** heartbeat. The
+2026-07-04 own-cloud fleet-wedge (g-328-19 #4/#5) is its origin — a wedged loop
+keeps re-ticking the DDB heartbeat (which is a simple put) while diary writes
+stall behind the wedged `_fileops` lock, so Paths A/C's STALE-heartbeat gate
+never fires and the wedge required a manual restart. Path D shares Path A/C's
+suppressors: `state==RUNNING`, no `stop-requested`, no pending background job,
+plus the `execute-in-flight` suppressor (a genuine long `phase-4-execute` within
+240min is NOT recovered). Because A/C gate on STALE and D on FRESH, at most one
+path's heartbeat gate passes for a given liveness state — no double-recovery.
+Detector: `core/scripts/phase-wedge-check.py` (exit `0`=wedged, `1`=clean,
+`2`=error → fail-open to no-recovery). rb-2768: the wedge signal is the LAST
+unclosed `phase_start`, never the oldest — the execution-diary accumulates
+20+ historically-unclosed `phase_start`s across autocompact boundaries, so an
+oldest-marker detector false-positives on every call.
+
+**g-328-25 invariant** (`wedge_stale_minutes` MUST stay > `stale_minutes`,
+currently 65 > 60): a HEALTHY non-phase-4 phase's local `runner-heartbeat` ages
+WITH its `phase_start` (both stamped near the Phase -0.5 → Phase 0 boundary; no
+mid-phase re-tick during active work — `heartbeat-stale.sh` reads the local
+mtime, ticked only by `heartbeat-tick.sh` and `interruptible-sleep.sh`). So by
+the time a healthy `phase_start` crosses `wedge_stale`, its heartbeat is already
+past `stale_minutes` → STALE, and Path D's heartbeat-FRESH gate suppresses
+FIRST. Only a genuine wedge (heartbeat re-ticked FRESH while the diary freezes)
+presents `phase_start` > `wedge_stale` WITH a fresh heartbeat. At 45 (< 60) a
+long precheck/state-update could false-recover a HEALTHY agent (the g-328-25
+defect, found by fresh-eyes-code self-review of g-328-23). Raising the threshold
+is monotonically safe — it can only reduce Path D firings.
+
 ## Cross-References
 
 - `.claude/rules/stop-hook-compliance.md` — Behavioral rule (no LLM
   state mutation; recovery-gate exception clause)
+- `core/scripts/phase-wedge-check.py` — Path D wedge detector (g-328-23)
+- `core/config/aspirations.yaml` — `runner_heartbeat.wedge_stale_minutes` (Path D threshold)
 - `.claude/rules/user-interaction.md` — Immutable user-only constraints
 - `core/scripts/recovery-gate.sh` — The script implementing this gate
 - `core/scripts/heartbeat-stale.sh` — Condition 2 probe

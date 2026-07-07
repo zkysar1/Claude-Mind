@@ -116,6 +116,23 @@ extract_initial_state "$CONFIG/skill-gaps.yaml" "$META/skill-gaps.yaml"
 # Reflection templates: HOW to reflect (process templates)
 extract_initial_state "$CONFIG/reflection-templates.yaml" "$META/reflection-templates.yaml"
 
+# Cognitive horizons: SSOT for hypothesis-horizon constants ( / BRD Gap 19).
+# Static config consumed FAIL-LOUD by precheck-eval.py cmd_hypothesis_health (no
+# hardcoded fallback, guard-424). MUST be seeded here so fresh-box init does not
+# FileNotFoundError -- the ~3wk fleet-wide FNF since 2026-06-13 was this exact
+# missing seed (init-seed parity; echo-2744 audit / ).
+cp "$CONFIG/cognitive-horizons.yaml" "$META/cognitive-horizons.yaml"
+echo "  Seeded cognitive-horizons.yaml from core/config"
+
+# Skill-discovery strategy: SSOT for forged-skill discoverability thresholds +
+# triage templates. Consumed FAIL-LOUD by skill-discovery.py + the mind_api
+# skill_discovery endpoint ("DO NOT add fallback defaults"; CLI exit 3 / raise
+# when absent). MUST be seeded so fresh-box init does not FileNotFoundError the
+# moment aspirations-evolve Step 9.5.5 runs (init-seed parity; echo-2744
+# systematic audit /  — the second gap found after cognitive-horizons).
+cp "$CONFIG/skill-discovery-strategy.yaml" "$META/skill-discovery-strategy.yaml"
+echo "  Seeded skill-discovery-strategy.yaml from core/config"
+
 # Strategy archive: failed/replaced strategies
 cat > "$META/strategy-archive.yaml" << 'EOF'
 archive: []

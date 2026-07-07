@@ -1132,6 +1132,87 @@ def test_hot_coordination_store_412_merges_with_empty_diverged_flag(cloud, tmp_p
     assert key not in b._diverged_keys                       # resolved (merge-reconcile discards on success)
 
 
+# --- : CAS retry / backoff / jitter + 409-rate metric ----------------
+def test_cas_metrics_start_at_zero(cloud):
+    """A fresh backend reports an all-zero CAS metric snapshot — the "measurable"
+    409-rate surface the goal names exists and reads 0.0 before any fenced write."""
+    b = _backend(cloud)
+    assert b.cas_metrics() == {
+        "writes": 0, "conflicts": 0, "resolved": 0, "conflict_rate": 0.0}
+
+
+def test_conflict_backoff_is_jittered_and_bounded():
+    """: _conflict_backoff now draws FULL jitter over [0, capped-exp]
+    instead of the old deterministic min(0.05*2**n, 1.0). Assert (a) jitter is
+    present (repeated draws are NOT all identical — the pre-g-328-21 code returned
+    a constant), (b) every draw stays within [0, cap], (c) attempt 0 window is
+    <=0.05, (d) the 1.0s cap holds at a large attempt."""
+    from owncloud_backend import _conflict_backoff
+    a0 = [_conflict_backoff(0) for _ in range(200)]
+    assert all(0.0 <= v <= 0.05 for v in a0)           # attempt 0 window
+    assert len(set(a0)) > 1                             # jitter present (not constant)
+    a10 = [_conflict_backoff(10) for _ in range(200)]  # 0.05*2**10 = 51.2 -> capped 1.0
+    assert all(0.0 <= v <= 1.0 for v in a10)           # cap holds
+    assert len(set(a10)) > 1                            # jitter present at the cap too
+
+
+def test_cas_412_then_success_completes_via_retry(cloud, monkeypatch):
+    """The goal's named check: a 409 (412 PreconditionFailed) followed by success
+    COMPLETES via the bounded merge-reconcile retry loop rather than propagating a
+    hard failure. Drives TWO 412s — the _put stale-fence 412 (routes into
+    merge-reconcile) AND a synthetic 412 on the merge-reconcile's first PUT (a peer
+    moving S3 mid-merge) — so the jittered-backoff retry path (attempt>0) is
+    exercised before the retry succeeds. Asserts the write lands (no raise), the
+    peer write is preserved (merge, not clobber), and the 409-rate metric counted
+    both conflicts and the resolution."""
+    # No real sleep in the retry loop — patch the module-global backoff to 0
+    # (mirrors test_fileops_conflict_retry). Jitter itself is covered above.
+    monkeypatch.setattr("owncloud_backend._conflict_backoff", lambda *_: 0.0)
+
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "team-state.yaml"          # merge-REGISTERED
+    key = b._s3_key(p)
+    base = (b"last_updated: '2026-07-02T09:00:00'\n"
+            b"agent_status:\n  alpha:\n    last_active: '2026-07-02T09:00:00'\n")
+    b.write_text(p, base.decode())                           # S3 == local; fence E0
+    # Peer moves S3 out-of-band -> the in-process fence (E0) is now stale (a real
+    # 412 on the next fenced _put). Done through the real client BEFORE the flaky
+    # wrapper is installed, so this peer write is not intercepted.
+    peer = (b"last_updated: '2026-07-02T11:00:00'\n"
+            b"agent_status:\n  alpha:\n    last_active: '2026-07-02T09:00:00'\n"
+            b"  bravo:\n    last_active: '2026-07-02T11:00:00'\n")
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=peer)
+
+    # One-shot-412 wrapper: the 2nd put_object from here (the merge-reconcile's
+    # FIRST PUT) raises PreconditionFailed synthetically, so the bounded retry loop
+    # must back off and re-GET/re-merge before succeeding. Call #1 = the _put fenced
+    # PUT (moto 412s it naturally on the stale E0 fence).
+    real_put = b.s3.put_object
+    n = {"c": 0}
+
+    def flaky_put(**kw):
+        n["c"] += 1
+        if n["c"] == 2:
+            raise ClientError(
+                {"Error": {"Code": "PreconditionFailed",
+                           "Message": "peer moved S3 mid-merge"}}, "PutObject")
+        return real_put(**kw)
+
+    monkeypatch.setattr(b.s3, "put_object", flaky_put)
+
+    b.write_text(p, (b"last_updated: '2026-07-02T12:00:00'\n"
+                     b"agent_status:\n  alpha:\n"
+                     b"    last_active: '2026-07-02T12:00:00'\n").decode())
+
+    merged = b.read_text(p, force_fresh=True).encode()
+    assert b"alpha" in merged and b"bravo" in merged   # local applied, peer preserved
+    assert key not in b._diverged_keys                 # divergence resolved
+    m = b.cas_metrics()
+    assert m["conflicts"] == 2                          # _put 412 + merge-loop 412
+    assert m["resolved"] == 1                           # the terminal write recovered
+    assert m["writes"] >= 2 and m["conflict_rate"] > 0.0  # rate is measurable
+
+
 # --- list_dir on governed root (cold-bootstrap fix, 2) ---------------
 
 def _backend_root_map(cloud, root_map, machine_id="m1"):
@@ -1241,3 +1322,79 @@ def test_pull_bootstrap_real_backend_materializes_tree(cloud, monkeypatch):
     assert (world / "knowledge" / "tree" / "_tree.yaml").read_bytes() == b"nodes: {}\n"
     assert (world / "knowledge" / "tree" / "system" / "node.md").exists()
     assert (world / "program.md").read_bytes() == b"# The Program\n"
+
+
+# --- : fail-loud on IAM/permission gap (AccessDenied) ----------------
+# The 2026-07-04 fleet-wedge () root cause: a missing dynamodb:Scan grant
+# let list_runner_claims' Scan silently degrade to "owns no agent dirs" for days.
+# These tests pin the fix — a governed DDB/S3 op that hits AccessDenied surfaces a
+# diagnosable OwnCloudPermissionError, NOT an empty/no-op result. The injected
+#  client method is monkeypatched to raise, so the path under test is the
+# REAL production except-branch, not a fake backend walking local paths (guard-919).
+def _access_denied_error(code="AccessDeniedException", op="Scan", msg="not authorized"):
+    return ClientError({"Error": {"Code": code, "Message": msg}}, op)
+
+
+def _raiser(exc):
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
+def test_list_runner_claims_access_denied_fails_loud(cloud, monkeypatch):
+    from owncloud_backend import OwnCloudPermissionError
+    b = _backend(cloud)
+    monkeypatch.setattr(b.ddb, "scan", _raiser(_access_denied_error(
+        msg="User is not authorized to perform: dynamodb:Scan on resource: zds-sessions")))
+    with pytest.raises(OwnCloudPermissionError) as ei:
+        b.list_runner_claims()
+    msg = str(ei.value)
+    assert "list_runner_claims" in msg             # names the governed op
+    assert "IAM" in msg or "dynamodb:Scan" in msg  # points at the grant to check
+
+
+def test_list_dir_access_denied_fails_loud(cloud, monkeypatch):
+    from owncloud_backend import OwnCloudPermissionError
+    b = _backend(cloud)
+    monkeypatch.setattr(b.s3, "list_objects_v2", _raiser(_access_denied_error(
+        code="AccessDenied", op="ListObjectsV2", msg="not authorized: s3:ListBucket")))
+    with pytest.raises(OwnCloudPermissionError) as ei:
+        b.list_dir(cloud["root"] / "world")
+    assert "list_dir" in str(ei.value)
+
+
+def test_health_check_ok_when_permissions_present(cloud):
+    # moto grants everything and the fixture creates the sessions table + bucket.
+    result = _backend(cloud).health_check()
+    assert result["ok"] is True
+    assert set(result["checked"]) == {"ddb:Scan", "s3:ListBucket"}
+
+
+def test_health_check_fails_loud_on_ddb_access_denied(cloud, monkeypatch):
+    from owncloud_backend import OwnCloudPermissionError
+    b = _backend(cloud)
+    monkeypatch.setattr(b.ddb, "scan", _raiser(_access_denied_error(msg="no dynamodb:Scan")))
+    with pytest.raises(OwnCloudPermissionError):
+        b.health_check()
+
+
+def test_health_check_fails_loud_on_s3_access_denied(cloud, monkeypatch):
+    # DDB scan succeeds (moto), S3 list is denied — the probe still fails loud.
+    from owncloud_backend import OwnCloudPermissionError
+    b = _backend(cloud)
+    monkeypatch.setattr(b.s3, "list_objects_v2", _raiser(_access_denied_error(
+        code="AccessDenied", op="ListObjectsV2", msg="no s3:ListBucket")))
+    with pytest.raises(OwnCloudPermissionError):
+        b.health_check()
+
+
+def test_non_permission_client_error_not_masked(cloud, monkeypatch):
+    # A NON-permission ClientError (throttling) must NOT be reclassified as
+    # OwnCloudPermissionError — the helper fires only for _ACCESS_DENIED codes, so
+    # the original ClientError propagates unchanged (no over-broad masking).
+    b = _backend(cloud)
+    monkeypatch.setattr(b.ddb, "scan", _raiser(_access_denied_error(
+        code="ThrottlingException", op="Scan", msg="rate exceeded")))
+    with pytest.raises(ClientError) as ei:
+        b.list_runner_claims()
+    assert ei.value.response["Error"]["Code"] == "ThrottlingException"

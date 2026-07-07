@@ -410,6 +410,10 @@ def _owned_agents(be=None):
     kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
         return None
+    # g-328-20: the diagnosable permission-gap type. Safe to import here — own-cloud
+    # mode is confirmed above, so owncloud_backend is importable (get_backend below
+    # depends on it, so this import cannot fail where get_backend would succeed).
+    from owncloud_backend import OwnCloudPermissionError
     try:
         stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
                                    _OWNERSHIP_STALE_SECONDS_DEFAULT))
@@ -424,6 +428,17 @@ def _owned_agents(be=None):
         if not me or me == "unknown":
             return set()  # cannot identify this machine → own none (safe)
         claims = be_dyn.list_runner_claims()
+    except OwnCloudPermissionError:
+        # g-328-20: a PERSISTENT IAM/permission gap (e.g. the daemon's creds lack
+        # dynamodb:Scan on the sessions table) is NOT a transient error. Conservative-
+        # degrading to set() here is exactly what hid the gap for days in the
+        # 2026-07-04 fleet-wedge (g-328-19): list_runner_claims' AccessDenied looked
+        # identical to "owns no agent dirs", so the fleet silently synced nothing.
+        # Re-raise so the sweep fails LOUD (propagates out of sweep(), which does not
+        # catch at line 654) and the gap surfaces for remediation. The transient path
+        # below is unchanged — a real DDB blip still conservative-degrades, never
+        # clobbering a peer (test_ownership_ddb_failure_owns_none).
+        raise
     except Exception as exc:
         print(f"[sync] live runner-claim read failed "
               f"({type(exc).__name__}: {exc}); owning NO agent dirs this sweep "
@@ -501,7 +516,8 @@ def _etag_is_multipart(etag: str) -> bool:
 
 # --- core: one file --------------------------------------------------------
 def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
-              baseline_md5=None, multi_machine: bool = False):
+              baseline_md5=None, multi_machine: bool = False,
+              own_cloud_authority: bool = False):
     """HEAD-compare one governed file and decide push / skip.
 
     Returns the md5 to record as the new baseline (on push or in-sync), or None
@@ -521,7 +537,9 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
       local == baseline, S3 != baseline  -> peer moved S3 -> STALE  (skip, no clobber)
       local != baseline, S3 != baseline  -> concurrent divergence   (skip + warn)
       diverged, no baseline:
-          multi-machine -> skip + warn (cannot prove local authority)
+          own-cloud (S3 authoritative) -> PULL S3 -> local + adopt baseline
+              (g-328-22 deterministic reconcile; was an indefinite skip)
+          multi-machine, not own-cloud -> skip + warn (no single authority)
           single-machine -> push (legacy; local IS authoritative here)
       S3 ETag multipart (uncomparable to an md5):
           multi-machine -> skip + warn (defer; never clobber)
@@ -579,30 +597,58 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             return None
         if baseline_md5 is None and multi_machine:
             # No baseline to prove this machine authored the local content, and a
-            # peer may own it. Conservative: do not push. A genuine local
-            # raw-write is still pushed in real time by the PostToolUse
-            # single-file path (sync_file), which KNOWS it was a local write.
+            # peer may own it. Never PUSH — a fresh-clone init-mind default pushed
+            # over the learned S3 state would clobber it (g-328-14). A genuine
+            # local raw-write is pushed in real time by the PostToolUse single-file
+            # path (sync_file, multi_machine=False, which KNOWS it was a local
+            # write and records a baseline), so a no-baseline divergence reaching
+            # the PERIODIC sweep is a STALE CACHE, not an unpushed authored write.
             #
-            # g-328-14 baseline-on-clone: MATCHING files (local==S3) ARE
-            # baselined on the first sweep by the in-sync branch above (it
-            # returns local_md5 -> recorded in the manifest, so the next sweep
-            # skips-unchanged). Only DIVERGENT no-baseline files reach here, and
-            # they are deliberately NOT auto-baselined: adopting S3's md5 as the
-            # baseline while keeping the divergent local would make the NEXT
-            # sweep read "local changed, S3 still at baseline" -> PUSH -> clobber
-            # S3 with a fresh-clone default. Re-evaluating every sweep (return
-            # None, keep no baseline) is the correct, clobber-safe behavior; a
-            # genuinely-authoritative local file reconciles via sync_file (proven
-            # authorship) or an explicit evidence-gated push, never by auto-adopt.
+            # g-328-22 deterministic reconcile (root cause #3 of the 2026-07-04
+            # own-cloud fleet-wedge): the pre-g-328-22 behavior returned None here,
+            # re-evaluating the SAME divergence every sweep FOREVER — the cache
+            # stayed frozen ~24h+ and the agent read stale bytes indefinitely.
+            # Under own-cloud, S3 IS the authoritative store (H4c) and local is a
+            # cache, so resolve DETERMINISTICALLY by PULLING S3 -> local (the same
+            # S3-authoritative pull _pull_one already performs at bind time,
+            # "S3-authoritative at bind") and adopting S3's md5 as the baseline.
+            # This never PUSHES (no peer clobber), settles to local==S3 -> in-sync
+            # on the next sweep (deterministic + terminating), and is the correct
+            # transplant resume (adopt learned S3 state over fresh-clone defaults).
+            # Gated on own_cloud_authority: a pure local-backend multi-machine test
+            # (MACHINE_MULTI=1) has no single authority, so it keeps the skip below.
+            if own_cloud_authority:
+                if dry_run:
+                    stats["nobaseline_would_reconcile"] = \
+                        stats.get("nobaseline_would_reconcile", 0) + 1
+                    return None
+                try:
+                    be.refresh(full)  # GET S3 -> local cache (materialize authority)
+                except Exception as e:  # noqa: BLE001
+                    # Transient S3/refresh error -> fall back to the conservative
+                    # skip so a fetch failure never drops the local cache; the next
+                    # sweep retries. Bounded (fires only on a real refresh failure).
+                    print(f"[sync] WARN: reconcile refresh failed for {full}: {e}",
+                          file=sys.stderr)
+                    stats["nobaseline_skipped"] = \
+                        stats.get("nobaseline_skipped", 0) + 1
+                    return None
+                stats["nobaseline_reconciled"] = \
+                    stats.get("nobaseline_reconciled", 0) + 1
+                # Return S3's md5 (now the local content) so the manifest records
+                # the baseline and the next sweep skips-unchanged / reads in-sync.
+                # No per-file print (g-328-14 flood: on a fresh 2nd-machine contact
+                # every divergent governed file reconciles here; the aggregate
+                # nobaseline_reconciled counter in the sweep summary is the durable
+                # signal, not thousands of stderr lines).
+                try:
+                    return hashlib.md5(full.read_bytes()).hexdigest()
+                except OSError:
+                    return None
+            # Multi-machine but NOT own-cloud: no single authority to defer to ->
+            # keep the conservative clobber-safe skip (aggregate counter only;
+            # per-file print omitted for the same g-328-14 flood reason).
             stats["nobaseline_skipped"] = stats.get("nobaseline_skipped", 0) + 1
-            # No per-file print here (g-328-14 spawn.log flood): on a fresh
-            # 2nd-machine contact the manifest is empty, so EVERY governed file
-            # lands in this branch and a per-file stderr line floods spawn.log
-            # (zeta hit 13M). The aggregate `nobaseline_skipped` counter is
-            # surfaced in the sweep summary — that is the durable signal; the
-            # per-file detail is not worth the flood. (Sibling stale/conflict
-            # skip branches print far less on 2nd-machine contact because they
-            # require a pre-existing baseline, which a fresh box lacks.)
             return None
         # else: (local changed, S3 still at baseline) OR (single-machine,
         #        no baseline) -> local-authoritative content -> push below.
@@ -667,11 +713,17 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     # own-cloud is checked first (cheap env read) so the common fleet path skips
     # the _multi_machine() DDB scan; the result is identical (own-cloud always
     # implies multi-machine now that _owned_agents returns a set for it).
-    mm = (os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud"
-          ) or _multi_machine()
+    # own_cloud ALSO gates the g-328-22 deterministic reconcile in _sync_one:
+    # under own-cloud S3 is authoritative so a diverged no-baseline cache is
+    # PULLED (not skipped-forever); a pure local-backend MACHINE_MULTI test is
+    # NOT own-cloud, so it keeps the conservative skip.
+    own_cloud = (os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+                 == "own-cloud")
+    mm = own_cloud or _multi_machine()
     stats = {"scanned": 0, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "skipped_unchanged": 0,
              "stale_skipped": 0, "diverged_skipped": 0, "nobaseline_skipped": 0,
+             "nobaseline_reconciled": 0,
              "multipart_deferred": 0, "pruned_agents": 0, "push_paths": []}
     for root_path, prefix in _roots(be, only_root):
         if not root_path.exists():
@@ -723,7 +775,8 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                     stats["skipped_unchanged"] += 1
                     continue
                 new_md5 = _sync_one(be, full_path, dry_run=dry_run, stats=stats,
-                                    baseline_md5=base_md5, multi_machine=mm)
+                                    baseline_md5=base_md5, multi_machine=mm,
+                                    own_cloud_authority=own_cloud)
                 # Record {mtime, md5} only when a baseline was confirmed (pushed
                 # or in_sync). Skips/conflicts return None -> keep the old
                 # baseline so the next sweep re-evaluates instead of trusting a
@@ -1287,6 +1340,8 @@ def main() -> int:
           f"stale-skip {stats.get('stale_skipped', 0)}, "
           f"conflict-skip {stats.get('diverged_skipped', 0)}, "
           f"nobaseline-skip {stats.get('nobaseline_skipped', 0)}, "
+          f"{'nobaseline-would-reconcile' if args.dry_run else 'nobaseline-reconcile'} "
+          f"{stats.get('nobaseline_would_reconcile', 0) if args.dry_run else stats.get('nobaseline_reconciled', 0)}, "
           f"multipart-skip {stats.get('multipart_deferred', 0)}, "
           f"pruned-agents {stats.get('pruned_agents', 0)}, "
           f"conflicts {stats['conflicts']}, errors {stats['errors']}")

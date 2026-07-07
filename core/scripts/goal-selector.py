@@ -129,27 +129,57 @@ _HUMAN_BLOCKED_PREFIX = "human_blocked:"
 
 
 def _synth_blocker_ref_from_structured_defer(goal):
-    """For quiescence-gate compatibility (): when a goal is structurally
-    deferred but lacks an explicit blocker_ref, synthesize one so
-    quiescence-gate.py C2 (blocker_ref_required) treats the structural marker as
-    structured-enough. Two paths (b is evaluated BEFORE a — g-115-1751: an explicit
-    future deferred_until is the authoritative expiry and wins over a's 120h fail-open):
+    """For quiescence-gate compatibility (, extended 4): when a
+    goal is structurally deferred/blocked but lacks a valid typed blocker_ref,
+    synthesize one so quiescence-gate.py C2 (blocker_ref_required) + C3
+    (future-expiry) treat the structural marker as structured-enough. Evaluation
+    order (first match wins):
+      (f) BARE-STRING blocker_ref -> coerce to a typed resource ref, preserving
+          the original string in original_ref. Checked right after the dict
+          short-circuit so a legacy string ref is never DISCARDED (the L1659
+          call site would otherwise return None for it). (g-115-1794)
+      (b) deferred_until is a FUTURE ISO timestamp -> time gate is the structural
+          marker; expires_at=deferred_until. Evaluated BEFORE (a) — g-115-1751:
+          an explicit future deferred_until is the authoritative expiry and wins
+          over a's 120h fail-open.
       (a) defer_reason has STRUCTURED_DEFER_PREFIXES (precondition_unmet:,
-          blocked_on_dependency:, Circuit breaker:). The structured-prefix
-          bypass at write-time means cmd_update_goal accepts these defers
-          without --blocker-ref; without this synth, quiescence sees
-          blocker_ref=None and rejects forever.
-      (b) deferred_until is an ISO timestamp in the future. Time-gated defers
-          (e.g. "Deferred until 2026-05-15: ..." for telemetry soak windows)
-          have a structural expiry but no explicit blocker_ref. Treat the
-          time gate as the structural marker; expires_at=deferred_until.
-    Returns existing blocker_ref dict if present, else a synthesized one with
-    type=resource (catch-all for structural waits — see BLOCKER_REF_TYPES in
-    aspirations.py), else None. The synth uses md5(stable-key)[:12] for
-    external_id so quiescence C4 hysteresis hash stays stable across iters."""
+          blocked_on_dependency:, Circuit breaker:). Write-side accepts these
+          without --blocker-ref; without this synth quiescence sees None forever.
+          Expiry = defer_reason_set_at + 120h, ROLLED FORWARD to now+120h when
+          that window has already lapsed (g-115-1794 C3 fix — a long-lived
+          structured defer previously synthesized an already-expired ref,
+          tripping C3 into false denial + B7 churn).
+      (c) resolves_no_earlier_than FUTURE date -> hypothesis time gate.
+      (d) bare blocked_by (non-empty) with no structured defer -> dependency wait.
+          UNCONDITIONAL synth (safe: quiescence only evaluates in all-blocked,
+          where every dependency head is provably a non-candidate). (g-115-1794)
+      (e) any other non-empty defer_reason (narrative defer, no structured prefix,
+          no blocked_by) -> external gate that already passed the defer-time
+          capability gate (probe-before-defer.md). (g-115-1794)
+    All synthesized refs use type=resource (catch-all for structural waits — see
+    BLOCKER_REF_TYPES in aspirations.py) + md5(stable-key)[:12] external_id so C4
+    hysteresis hash stays stable across iters. Returns the existing dict ref
+    unchanged if present, a synthesized dict for (f/b/a/c/d/e), else None."""
     existing = goal.get("blocker_ref")
     if isinstance(existing, dict):
         return existing
+    # Path (f): legacy BARE-STRING blocker_ref (4). A plain-string
+    # blocker_ref (e.g. "worldbuilders-apikey-missing" from an older write path)
+    # is NOT a dict, so quiescence C2 counts it missing — AND the L1659 call site
+    # would DISCARD the string by returning None here. Coerce to a typed resource
+    # ref, preserving the original string so the human-readable signal survives.
+    if existing:
+        _now_f = datetime.now()
+        _h_f = hashlib.md5(str(existing).encode("utf-8", errors="replace")).hexdigest()[:12]
+        return {
+            "type": "resource",
+            "external_id": f"legacy-ref:{_h_f}",
+            "state_hash": None,
+            "created_at": _now_f.isoformat(timespec="seconds"),
+            "expires_at": (_now_f + timedelta(hours=120)).isoformat(timespec="seconds"),
+            "synthesized": True,
+            "original_ref": str(existing),
+        }
     defer = goal.get("defer_reason") or ""
     deferred_until = goal.get("deferred_until")
 
@@ -192,6 +222,17 @@ def _synth_blocker_ref_from_structured_defer(goal):
         except (ValueError, TypeError):
             created = datetime.now()
         expires = created + timedelta(hours=120)
+        # C3 roll-forward (4): a long-lived structured defer whose
+        # defer_reason_set_at is >120h in the past previously synthesized an
+        # ALREADY-EXPIRED ref (created+120h < now), tripping quiescence C3 into
+        # false denial + B7 churn (observed : set_at 2026-05-23 ->
+        # expires 2026-05-28). The 120h is a fail-open RE-CHECK window, not a real
+        # deadline — Phase 0.5b re-probes the defer independently — so roll the
+        # window to now+120h when it has lapsed (self-healing; created_at stays
+        # set_at, mirrors the not-my-lane / 0 rolling expiry).
+        _now_a = datetime.now()
+        if expires <= _now_a:
+            expires = _now_a + timedelta(hours=120)
         h = hashlib.md5(defer.encode("utf-8", errors="replace")).hexdigest()[:12]
         return {
             "type": "resource",
@@ -227,6 +268,56 @@ def _synth_blocker_ref_from_structured_defer(goal):
                 }
         except (ValueError, TypeError):
             pass
+
+    # Path (d): bare blocked_by dependency (4). A goal blocked on a
+    # machine-readable predecessor (blocked_by non-empty) but carrying NO
+    # structured-prefix defer_reason previously synthesized nothing -> quiescence
+    # C2 rejected it forever, forcing B7 backoff churn instead of honest quiescent
+    # sleep (observed /126, , , /05/07).
+    # UNCONDITIONAL synth is safe: quiescence only evaluates in the all-blocked
+    # state, where every dependency head is provably a non-candidate (an
+    # agent-executable head would be a candidate and break all-blocked BEFORE
+    # quiescence is reached), so no head-executability tracing is needed. Keyed on
+    # raw blocked_by (not `unmet`) because this fn lacks done_ids AND because
+    # explicit_status goals with blocked_by () never reach the dependency
+    # branch — they rely on this L1659 synth. type=resource + now+120h rolling
+    # expiry = self-healing (when the dep completes the goal leaves the blocked
+    # set and the synth vanishes). NOTE: a not_my_lane goal (branch 7) with a
+    # fully-COMPLETED blocked_by would get a "dependency:" external_id here rather
+    # than "not-my-lane:" — cosmetic only (both type=resource, identical C2/C3/C4;
+    # 0 current collisions verified 4).
+    blocked_by = goal.get("blocked_by") or []
+    if isinstance(blocked_by, list) and blocked_by:
+        _now_d = datetime.now()
+        _key_d = "dependency:" + ",".join(str(x) for x in sorted(blocked_by))
+        _h_d = hashlib.md5(_key_d.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return {
+            "type": "resource",
+            "external_id": f"dependency:{_h_d}",
+            "state_hash": None,
+            "created_at": _now_d.isoformat(timespec="seconds"),
+            "expires_at": (_now_d + timedelta(hours=120)).isoformat(timespec="seconds"),
+            "synthesized": True,
+        }
+
+    # Path (e): narrative defer_reason with no structured prefix (4). A
+    # goal deferred with free-text (e.g. "Requires solver-v0 baseline ...",
+    # observed ) that did NOT match a STRUCTURED_DEFER_PREFIX and has no
+    # blocked_by. By the time a defer_reason is persisted it has passed the
+    # defer-time capability gate (probe-before-defer.md) -> it names a genuine
+    # external gate -> synth so quiescence can account for it. Same self-healing
+    # rolling expiry. (Reached only after paths a/b/c and path d all skip.)
+    if defer:
+        _now_e = datetime.now()
+        _h_e = hashlib.md5(defer.encode("utf-8", errors="replace")).hexdigest()[:12]
+        return {
+            "type": "resource",
+            "external_id": f"narrative-defer:{_h_e}",
+            "state_hash": None,
+            "created_at": _now_e.isoformat(timespec="seconds"),
+            "expires_at": (_now_e + timedelta(hours=120)).isoformat(timespec="seconds"),
+            "synthesized": True,
+        }
 
     return None
 

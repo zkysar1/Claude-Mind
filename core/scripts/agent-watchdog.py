@@ -37,6 +37,9 @@ Active probes:
   - RunningSidProbe — running-session-id state transitions (2026-04-25 +
     2026-05-11 + 2026-05-12 incident class).
   - HeartbeatProbe — runner-heartbeat staleness during RUNNING state.
+  - StalledProbe — fresh-heartbeat + stale-execution-diary wedge (loop alive
+    but not progressing; the false-OK HeartbeatProbe structurally misses,
+    g-328-24 / root-cause-#5 of the 2026-07-04 fleet-wedge g-328-19).
   - BackgroundJobProbe — dead-PID / max-duration in background-jobs.yaml.
   - StopHookBlockProbe — stop-hook BLOCK thrash without heartbeat
     advancement (cross-binding stomp, rb-739).
@@ -559,6 +562,223 @@ class HeartbeatProbe(Probe):
             severity=severity,
             payload=payload,
             include_processes=(severity == "critical"),
+            summary=summary,
+        )
+
+    def to_dict(self) -> dict:
+        return {"last_state": self.last_state}
+
+    def from_dict(self, state: dict) -> None:
+        if state and "last_state" in state:
+            self.last_state = str(state["last_state"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# StalledProbe — fresh-heartbeat + frozen-diary wedge detector ()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _diary_stale_threshold_seconds() -> float:
+    """Read runner_heartbeat.stalled_diary_stale_minutes from aspirations.yaml.
+    Returns the threshold in seconds. Env override STALLED_DIARY_STALE_MINUTES
+    (used by tests). Falls back to 180 minutes (3h) when config + env are both
+    missing or malformed.
+
+    INVARIANT (mirrors the g-328-25 wedge_stale > stale invariant): this
+    threshold MUST exceed the heartbeat stale threshold
+    (runner_heartbeat.stale_minutes, default 60). WHY: a FRESH heartbeat and a
+    stale diary can only COEXIST when the diary threshold is the LARGER of the
+    two. Deep-close LLM work legitimately freezes the diary AND ages the
+    heartbeat together for 30-45 min (see the aspirations.yaml runner_heartbeat
+    comment). If the diary threshold were <= the heartbeat threshold, a diary
+    stale past it would imply a heartbeat also stale past ITS threshold, so
+    classify_stalled's fresh-heartbeat gate fails first and the STALLED verdict
+    is INERT. Only a genuine wedge — heartbeat re-ticked FRESH (loop iterating)
+    while the diary stays frozen far longer — presents fresh-heartbeat WITH
+    diary-stale > this threshold. 180 = 3x the 60-min heartbeat window, well
+    above the 45-min deep-close gap. Guarded by
+    test_agent_watchdog_stalled.py::test_config_invariant_diary_stale_exceeds_heartbeat_stale."""
+    env = os.environ.get("STALLED_DIARY_STALE_MINUTES")
+    if env:
+        try:
+            v = float(env)
+            if v > 0:
+                return v * 60.0
+        except ValueError:
+            pass
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "config" / "aspirations.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        m = ((cfg.get("runner_heartbeat") or {}).get("stalled_diary_stale_minutes"))
+        if isinstance(m, (int, float)) and m > 0:
+            return float(m) * 60.0
+    except Exception:
+        pass
+    return 180.0 * 60.0
+
+
+def classify_stalled(
+    agent_state: str,
+    heartbeat_age_s: Optional[float],
+    diary_age_s: Optional[float],
+    heartbeat_stale_threshold_s: float,
+    diary_stale_threshold_s: float,
+) -> Optional[str]:
+    """Pure classification of the fresh-heartbeat + stale-diary wedge signature.
+
+    Returns:
+      "stalled"  — agent RUNNING, heartbeat FRESH (age <= heartbeat threshold =
+                   the loop is actively re-ticking each iteration = process
+                   alive), AND diary STALE (age > diary threshold = no
+                   goal-execution progress). The conjunction is the wedge:
+                   alive but not progressing.
+      "progress" — agent RUNNING, heartbeat fresh, diary fresh (age <= diary
+                   threshold). Normal healthy state; used to reset the STALLED
+                   dedup gate when progress resumes.
+      None       — not classifiable: not RUNNING (a stale diary while IDLE is
+                   expected — the runner stopped), heartbeat missing or STALE (a
+                   stale heartbeat is HeartbeatProbe's stale_during_running, NOT
+                   this wedge), or a signal file is absent (fresh session before
+                   the first goal executes).
+
+    Note the asymmetry with HeartbeatProbe: THAT probe fires on a STALE heartbeat
+    (loop died / wedged with no re-tick). THIS classifier fires on a FRESH
+    heartbeat paired with a frozen diary (loop alive + re-ticking but not
+    progressing) — the false-OK HeartbeatProbe structurally cannot see (a fresh
+    heartbeat sets its last_state='fresh' and it emits nothing). g-328-24 /
+    root-cause-#5 of the 2026-07-04 own-cloud fleet-wedge (g-328-19), where
+    own-cloud write deadlock froze goal execution for DAYS while the loop kept
+    re-entering and ticking the heartbeat, and the watchdog reported OK the whole
+    time because it only ever looked at heartbeat freshness.
+
+    The fresh-heartbeat gate is checked FIRST (mirrors the g-328-25 ordering:
+    fresh-heartbeat gate before the stale-progress check) so a stale-heartbeat
+    reading can never be mislabelled STALLED."""
+    if agent_state != "RUNNING":
+        return None
+    if heartbeat_age_s is None or diary_age_s is None:
+        return None
+    # Heartbeat must be FRESH — a stale heartbeat is a dead / wedged-without-retick
+    # loop (HeartbeatProbe's job), not the alive-but-stalled signature.
+    if heartbeat_age_s > heartbeat_stale_threshold_s:
+        return None
+    # Strict greater (mirrors phase-wedge's strict-greater boundary): at exactly
+    # the threshold the diary is not YET stalled.
+    if diary_age_s > diary_stale_threshold_s:
+        return "stalled"
+    return "progress"
+
+
+class StalledProbe(Probe):
+    """Watches for the WEDGE signature the HeartbeatProbe structurally misses:
+    a FRESH runner-heartbeat (the loop is alive and re-ticking every iteration)
+    paired with a STALE execution-diary (no goal-execution progress for far
+    longer than any legitimate gap). The conjunction is the fingerprint of a
+    loop that is spinning but not progressing — root cause #5 of the 2026-07-04
+    own-cloud fleet-wedge (g-328-19), where own-cloud write deadlock froze goal
+    execution for DAYS while the loop kept re-entering and ticking the heartbeat,
+    and the watchdog reported OK the whole time because every probe only looked
+    at heartbeat freshness.
+
+    Relationship to sibling detectors:
+      - HeartbeatProbe fires on a STALE heartbeat (loop died / stopped ticking).
+        A FRESH heartbeat makes it emit nothing — the false-OK this probe closes.
+      - recovery-gate Path D (phase-wedge-check.py, g-328-23) catches the wedge
+        sub-case where a phase_start is left UNCLOSED, but only from the
+        SessionStart hook on the NEXT session. This probe runs every watchdog
+        tick (in-session) and fires on TOTAL diary freeze regardless of whether
+        a phase is open — catching the between-goals freeze (diary's last entry
+        a clean phase_end) that Path D's unclosed-phase_start detector misses.
+
+    Transitions (state-deduped, mirroring HeartbeatProbe):
+      - stalled_during_running (critical): entered the STALLED state — fresh
+        heartbeat + diary stale beyond threshold while RUNNING. Fires once per
+        episode; re-arms only after a fresh-diary (progress) observation.
+      - stall_recovered (info): diary advanced after a prior stalled event —
+        progress resumed.
+    """
+
+    name = "stalled"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.hb_path = ctx.agent_dir / "session" / "runner-heartbeat"
+        self.diary_path = ctx.agent_dir / "session" / "execution-diary.jsonl"
+        self.state_path = ctx.agent_dir / "session" / "agent-state"
+        self.heartbeat_threshold_seconds = _heartbeat_stale_threshold_seconds()
+        self.diary_threshold_seconds = _diary_stale_threshold_seconds()
+        self.last_state: str = "unknown"   # one of: ok, stalled, unknown
+
+    def _mtime_age(self, p: Path) -> Optional[float]:
+        """Seconds since p was last modified, or None if missing/unreadable."""
+        try:
+            if not p.exists():
+                return None
+            return time.time() - p.stat().st_mtime
+        except OSError:
+            return None
+
+    def check(self) -> list[Event]:
+        agent_state = (read_text_safe(self.state_path) or "").strip()
+        hb_age = self._mtime_age(self.hb_path)
+        diary_age = self._mtime_age(self.diary_path)
+        verdict = classify_stalled(
+            agent_state, hb_age, diary_age,
+            self.heartbeat_threshold_seconds, self.diary_threshold_seconds,
+        )
+        events: list[Event] = []
+        if verdict == "stalled":
+            if self.last_state != "stalled":
+                self.last_state = "stalled"
+                events.append(self._build_stalled_event(hb_age, diary_age, agent_state))
+        elif verdict == "progress":
+            if self.last_state == "stalled":
+                events.append(Event(
+                    probe=self.name,
+                    event="stall_recovered",
+                    severity="info",
+                    payload={
+                        "agent_state": agent_state,
+                        "diary_age_seconds": round(diary_age, 1) if diary_age is not None else None,
+                    },
+                    include_processes=False,
+                    summary=f"{self.name}: stall_recovered (diary advanced, progress resumed)",
+                ))
+            self.last_state = "ok"
+        # verdict is None -> not classifiable (IDLE / missing signal / stale
+        # heartbeat) -> leave last_state untouched, emit nothing.
+        return events
+
+    def _build_stalled_event(self, hb_age: Optional[float], diary_age: Optional[float],
+                             agent_state: str) -> Event:
+        try:
+            diary_mtime_iso = datetime.fromtimestamp(
+                self.diary_path.stat().st_mtime).isoformat(timespec="seconds")
+        except OSError:
+            diary_mtime_iso = None
+        payload = {
+            "agent_state": agent_state,
+            "heartbeat_age_seconds": round(hb_age, 1) if hb_age is not None else None,
+            "diary_age_seconds": round(diary_age, 1) if diary_age is not None else None,
+            "heartbeat_stale_threshold_seconds": self.heartbeat_threshold_seconds,
+            "diary_stale_threshold_seconds": self.diary_threshold_seconds,
+            "diary_mtime": diary_mtime_iso,
+            "diary_path": str(self.diary_path),
+        }
+        hb_s = round(hb_age, 1) if hb_age is not None else "-"
+        diary_s = round(diary_age, 1) if diary_age is not None else "-"
+        summary = (
+            f"{self.name}: stalled_during_running "
+            f"(heartbeat FRESH age={hb_s}s < {int(self.heartbeat_threshold_seconds)}s, "
+            f"diary STALE age={diary_s}s > {int(self.diary_threshold_seconds)}s) "
+            f"— loop alive but not progressing"
+        )
+        return Event(
+            probe=self.name,
+            event="stalled_during_running",
+            severity="critical",
+            payload=payload,
+            include_processes=True,
             summary=summary,
         )
 
@@ -1221,6 +1441,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
     return [
         RunningSidProbe(ctx),
         HeartbeatProbe(ctx),
+        StalledProbe(ctx),
         BackgroundJobProbe(ctx),
         StopHookBlockProbe(ctx),
         DaemonHealthProbe(ctx),

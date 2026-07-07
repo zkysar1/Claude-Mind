@@ -724,6 +724,107 @@ def test_sync_one_nobaseline_singlemachine_pushes(tmp_path):
     assert stats["pushed"] == 1 and be.s3[str(f)] == b"local"
 
 
+def test_sync_one_nobaseline_owncloud_reconciles_by_pull(tmp_path):
+    """: diverged, no baseline, own-cloud authoritative -> PULL S3 -> local
+    (adopt S3), NOT skip-forever. Never pushes (no clobber); returns S3's md5 as the
+    adopted baseline so the next sweep settles to in-sync (deterministic)."""
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"stale-local-cache")
+    be.s3[str(f)] = b"S3-authoritative"
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=None, multi_machine=True,
+                         own_cloud_authority=True)
+    # Reconciled by pull: local now holds S3's bytes; S3 untouched (never pushed).
+    assert f.read_bytes() == b"S3-authoritative"
+    assert str(f) not in be.puts and be.s3[str(f)] == b"S3-authoritative"
+    # Returns S3's md5 as the adopted baseline; counter incremented; not skipped.
+    assert out == _md5(b"S3-authoritative")
+    assert stats.get("nobaseline_reconciled") == 1
+    assert stats.get("nobaseline_skipped", 0) == 0 and stats["pushed"] == 0
+
+
+def test_sync_one_nobaseline_reconcile_settles_to_in_sync(tmp_path):
+    """ determinism/termination: after the reconcile pull, a SECOND
+    _sync_one on the same file (now local==S3) classifies in-sync — the reconcile
+    does NOT re-fire every sweep (the indefinite-skip bug it replaces)."""
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"stale-local-cache")
+    be.s3[str(f)] = b"S3-authoritative"
+    s1 = _new_stats()
+    _mod._sync_one(be, f, dry_run=False, stats=s1, baseline_md5=None,
+                   multi_machine=True, own_cloud_authority=True)
+    # Second pass: local == S3 now -> in-sync, no reconcile, no push.
+    s2 = _new_stats()
+    out2 = _mod._sync_one(be, f, dry_run=False, stats=s2, baseline_md5=None,
+                          multi_machine=True, own_cloud_authority=True)
+    assert out2 == _md5(b"S3-authoritative")
+    assert s2["in_sync"] == 1
+    assert s2.get("nobaseline_reconciled", 0) == 0 and s2["pushed"] == 0
+
+
+def test_sync_one_nobaseline_owncloud_dry_run_would_reconcile(tmp_path):
+    """: dry-run counts nobaseline_would_reconcile and writes NOTHING —
+    neither local nor S3 changes."""
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"stale-local-cache")
+    be.s3[str(f)] = b"S3-authoritative"
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=True, stats=stats,
+                         baseline_md5=None, multi_machine=True,
+                         own_cloud_authority=True)
+    assert out is None
+    assert stats.get("nobaseline_would_reconcile") == 1
+    assert f.read_bytes() == b"stale-local-cache"   # local untouched (dry-run)
+    assert str(f) not in be.puts and be.s3[str(f)] == b"S3-authoritative"
+
+
+def test_sync_one_nobaseline_owncloud_refresh_failure_falls_back_to_skip(tmp_path):
+    """: a transient refresh (S3 GET) failure must NOT crash or drop the
+    local cache — it falls back to the conservative nobaseline_skipped so the next
+    sweep retries."""
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"stale-local-cache")
+    be.s3[str(f)] = b"S3-authoritative"
+
+    def _boom(path):
+        raise RuntimeError("transient S3 GET failure")
+    be.refresh = _boom
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=None, multi_machine=True,
+                         own_cloud_authority=True)
+    assert out is None
+    assert stats.get("nobaseline_skipped") == 1
+    assert stats.get("nobaseline_reconciled", 0) == 0
+    # Local cache preserved (not dropped); S3 untouched.
+    assert f.read_bytes() == b"stale-local-cache"
+    assert be.s3[str(f)] == b"S3-authoritative"
+
+
+def test_sync_one_nobaseline_multimachine_not_owncloud_still_skips(tmp_path):
+    """ gating: multi-machine but NOT own-cloud (a pure local-backend
+    MACHINE_MULTI test) has no single authority -> keeps the conservative skip.
+    own_cloud_authority=False (its default), so the reconcile never fires off
+    own-cloud — this pins the backward-compatible behavior."""
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"local")
+    be.s3[str(f)] = b"remote"
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=None, multi_machine=True,
+                         own_cloud_authority=False)
+    assert out is None
+    assert stats.get("nobaseline_skipped") == 1
+    assert stats.get("nobaseline_reconciled", 0) == 0
+    assert be.s3[str(f)] == b"remote" and str(f) not in be.puts
+
+
 def test_sync_one_absent_pushes_even_multimachine(tmp_path):
     """S3 absent -> new local content -> push (no peer bytes to clobber), any mode."""
     be = FakeBackend([(tmp_path, "world")])
@@ -853,38 +954,44 @@ def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
     assert be.s3[str(node)] == b"node body EDITED HERE"
 
 
-def test_sweep_owncloud_singlemachine_defers_nobaseline_no_clobber(tmp_path, monkeypatch):
-    """H4c / 3: under own-cloud on a SINGLE machine (this machine owns
-    all agents -> _owned_agents monkeypatched to None), the periodic sweep must
-    NOT push a no-baseline local file that DIVERGES from a PRESENT S3 object.
-    The transplant scenario: /boot re-runs init-mind, which writes default meta
-    files locally with no manifest baseline, while S3 already holds the learned
-    state. Pre-fix the single-machine branch pushed local -> CLOBBERED S3. The fix
-    folds own-cloud into the sweep's 'cannot prove authority' flag, so it defers
-    (nobaseline_skipped) exactly as multi-machine does -- while S3-ABSENT files
-    still push, so a genuine first bootstrap stays intact."""
+def test_sweep_owncloud_reconciles_nobaseline_by_pull_no_clobber(tmp_path, monkeypatch):
+    """H4c / 3 + : under own-cloud the periodic sweep must NEVER
+    PUSH a no-baseline local file that DIVERGES from a PRESENT S3 object (pushing a
+    fresh-clone init-mind default would CLOBBER the learned S3 state). Pre-g-328-22
+    the sweep DEFERRED indefinitely (nobaseline_skipped) — clobber-safe, but the
+    cache stayed frozen on the stale local default ~24h+ (root cause #3 of the
+    2026-07-04 fleet-wedge). g-328-22 replaces the indefinite skip with a
+    DETERMINISTIC S3-authoritative reconcile: PULL S3 -> local (still never pushes,
+    so S3 is still never clobbered) and adopt the baseline, so the agent runs on the
+    learned S3 state rather than the fresh-clone default. S3-ABSENT files still push
+    (first bootstrap intact)."""
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
     # Own-all (None) so the agents-dir prune does not fire — this test targets the
-    # WORLD/META no-baseline clobber-prevention, driven by the sweep's own-cloud
-    # `mm` flag, not by agent ownership. With _owned_agents -> None, _multi_machine
-    # is False, so the protection below comes purely from the own-cloud branch.
+    # WORLD/META no-baseline reconcile, driven by the sweep's own-cloud flag, not by
+    # agent ownership. With _owned_agents -> None, _multi_machine is False, so the
+    # behavior below comes purely from the own-cloud branch.
     monkeypatch.setattr(_mod, "_owned_agents", lambda be=None: None)
-    assert _mod._multi_machine() is False          # precondition: would push pre-fix
+    assert _mod._multi_machine() is False          # precondition: would push pre-H4
     roots = _build_tree(tmp_path)
     be = FakeBackend(roots)
     # S3 already holds AUTHORITATIVE learned content for node.md (diverges from the
     # local default b"node body"); NO manifest baseline (use_manifest=False).
     node = tmp_path / "world" / "knowledge" / "node.md"
-    be.s3[str(node)] = b"S3 LEARNED AUTHORITATIVE META (do not clobber)"
+    s3_authoritative = b"S3 LEARNED AUTHORITATIVE META (adopt me)"
+    be.s3[str(node)] = s3_authoritative
     # self.md is ABSENT on S3 -> the first-bootstrap push path must still fire.
     self_md = tmp_path / "agents" / "alpha" / "self.md"
     stats = _mod.sweep(be, only_root=None, dry_run=False,
                        use_manifest=False, full=True)
-    # Clobber prevention: a no-baseline file diverging from PRESENT S3 is deferred.
+    # Clobber prevention: a no-baseline file diverging from PRESENT S3 is NEVER
+    # pushed — S3 keeps its authoritative bytes.
     assert str(node) not in be.puts
-    assert be.s3[str(node)] == b"S3 LEARNED AUTHORITATIVE META (do not clobber)"
-    assert stats.get("nobaseline_skipped", 0) >= 1
+    assert be.s3[str(node)] == s3_authoritative
+    # Deterministic reconcile (): the sweep PULLED S3 -> local, so the local
+    # cache now holds the authoritative bytes (no longer the stale local default).
+    assert node.read_bytes() == s3_authoritative
+    assert stats.get("nobaseline_reconciled", 0) >= 1
     # First bootstrap intact: an S3-absent governed file still pushes under own-cloud.
     assert str(self_md) in be.puts
     assert be.s3[str(self_md)] == b"identity"

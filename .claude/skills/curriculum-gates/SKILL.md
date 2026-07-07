@@ -56,8 +56,9 @@ escalation store IS the state machine
 (`awaiting_reply -> confirmed | denied | timed_out`) --- there is no marker file;
 `agents/<agent>/session/pending-escalations.yaml` is the single source of truth.
 
-This chokepoint sits at the SOLE promotion call site, so it covers BOTH callers
-(`/aspirations-consolidate` Step 8.6 and `/aspirations-evolve` Step 10) at once.
+This chokepoint sits at the SOLE promotion call site, so it covers ALL callers
+(`/aspirations-consolidate` Step 8.6, `/aspirations-evolve` Step 10, and
+`/aspirations-precheck` Phase 0.5i curriculum-cadence — g-115-1801) at once.
 Note: self.md evolution is NOT routed here --- it is governed by guard-380
 (notify-AFTER, pre-approval explicitly NOT required); routing it through this
 chokepoint would contradict guard-380. Curriculum graduation is the one
