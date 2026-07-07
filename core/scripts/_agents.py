@@ -66,6 +66,21 @@ def _agents_root(project_root: Path) -> Path:
     return project_root / AGENTS_PARENT_DIR if AGENTS_PARENT_DIR else project_root
 
 
+# Row-files subdir under WORLD_DIR ( sharding). Inlined from
+# core/scripts/_team_state.py ROWS_SUBDIR to stay import-cycle-proof —
+# keep in sync with that module.
+_ROWS_SUBDIR = ("team-state", "agents")
+
+
+def _rows_dir_for(ts_path: Path) -> Path:
+    """Rows directory for a resolved team-state.yaml path (sibling layout:
+    <world>/team-state.yaml + <world>/team-state/agents/)."""
+    d = ts_path.parent
+    for seg in _ROWS_SUBDIR:
+        d = d / seg
+    return d
+
+
 def _resolve_world_team_state(project_root: Path) -> Path | None:
     """Find team-state.yaml — at PROJECT_ROOT/world/ or at the configured
     external WORLD_PATH inside an agent's local-paths.conf."""
@@ -90,19 +105,29 @@ def _resolve_world_team_state(project_root: Path) -> Path | None:
 
 
 def _from_team_state(project_root: Path) -> Tuple[str, ...]:
+    """Roster = union of core-file agent_status keys and per-agent row-file
+    stems (g-328-27 sharding — post-shard the rows ARE the runtime truth;
+    core keys cover un-migrated deployments)."""
     ts = _resolve_world_team_state(project_root)
     if ts is None:
         return ()
+    names: set = set()
     try:
         import yaml  # noqa: PLC0415
         with open(ts, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
         agent_status = data.get("agent_status") or {}
-        if not isinstance(agent_status, dict):
-            return ()
-        return tuple(sorted(k for k in agent_status.keys() if isinstance(k, str) and k))
+        if isinstance(agent_status, dict):
+            names.update(k for k in agent_status.keys() if isinstance(k, str) and k)
     except Exception:
-        return ()
+        pass
+    try:
+        for p in _rows_dir_for(ts).iterdir():
+            if p.suffix == ".yaml" and p.is_file() and p.stem:
+                names.add(p.stem)
+    except OSError:
+        pass
+    return tuple(sorted(names))
 
 
 def _from_discovery(project_root: Path) -> Tuple[str, ...]:
@@ -142,6 +167,17 @@ def get_active_agents() -> Tuple[str, ...]:
             current_mtime = ts.stat().st_mtime
         except OSError:
             current_mtime = None
+        #  sharding: roster changes also arrive as row-file
+        # add/remove, which bumps the rows DIR mtime (content-only row
+        # updates don't change the key set, so dir mtime suffices).
+        # Fold it into the cache token so a /start that creates a new
+        # agent's row invalidates a long-lived daemon's cached roster.
+        if current_mtime is not None:
+            try:
+                current_mtime = (current_mtime,
+                                 _rows_dir_for(ts).stat().st_mtime)
+            except OSError:
+                current_mtime = (current_mtime, None)
 
     if (_CACHE is not None
             and _CACHE.get("mtime") == current_mtime

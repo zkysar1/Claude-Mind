@@ -40,5 +40,20 @@ def health(ctx) -> "Response":  # type: ignore[name-defined]
     )
 
 
+def write_queue(ctx) -> "Response":  # type: ignore[name-defined]
+    """GET /v1/admin/write-queue — per-path FIFO contention metrics
+    (g-328-28). conflict_rate = contended/enqueued is THE post-sharding
+    signal: if it stays high after g-328-27, that justifies the
+    remote-lock-table conditional-write escalation the BRD names."""
+    from ..server import Response  # local import — avoids cycle at module load
+    try:
+        from _write_queue import metrics_snapshot
+        return Response.json({"ok": True, **metrics_snapshot()})
+    except Exception as e:  # pragma: no cover — metrics must never 500 health tooling
+        return Response.json({"ok": False,
+                              "detail": type(e).__name__ + ": " + str(e)[:200]})
+
+
 def register(routes) -> None:
     routes[("GET", "/v1/admin/health")] = health
+    routes[("GET", "/v1/admin/write-queue")] = write_queue

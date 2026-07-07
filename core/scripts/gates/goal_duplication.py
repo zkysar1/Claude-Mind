@@ -457,9 +457,15 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
         }
     ts_path = world_dir / "team-state.yaml"
     try:
-        with open(ts_path, "r", encoding="utf-8") as f:
-            state = yaml.safe_load(f) or {}
-        agent_status = state.get("agent_status") or {}
+        state = {}
+        if ts_path.exists():
+            with open(ts_path, "r", encoding="utf-8") as f:
+                state = yaml.safe_load(f) or {}
+        #  sharding: overlay per-agent row files (rows win
+        # newest-wins) so partner in_flight reads the sharded truth.
+        from _team_state import compose_agent_status, load_rows
+        agent_status = compose_agent_status(
+            state.get("agent_status") or {}, load_rows(world_dir))
     except Exception as e:
         return {
             "name": "partner_in_flight",

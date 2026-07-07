@@ -612,6 +612,265 @@ def merge_aspirations(local: bytes, remote: bytes) -> bytes:
     return _dump_jsonl(ordered)
 
 
+# --- pipeline.jsonl / pipeline-archive.jsonl : union by content-derived id ---
+# (7 / rb-2849 — BRD P0, the cc-04 fleet wedge.) Hypothesis records
+# are EDITED IN PLACE (stage moves via pipeline-move, outcome/reflected/
+# surprise set by review-hypotheses), so the append-only LINE-UNION would
+# resurrect superseded versions as duplicate ids; the correct reconcile is
+# union-by-id + field-merge of same-id copies. Ids are CONTENT-DERIVED
+# (YYYY-MM-DD_slug — pipeline.py ID_RE), never allocated from a sequence, so
+# the rb/guard concurrent-allocation collision-reid does NOT apply here: two
+# machines minting the SAME id authored the same-day/same-slug hypothesis and
+# field-merging them is semantically right. Byte-exact: both writers —
+# pipeline.py via _fileops.locked_*_jsonl and mind_api pipeline_write.py
+# _atomic_write_jsonl — emit json.dumps(rec, ensure_ascii=True) + "\n"
+# (== _dump_jsonl). Verified per-store by reading each writer (rb-245).
+
+# Monotonic lifecycle rank: a record only moves FORWARD (pipeline-move
+# transitions: discovered->active, active->measurement-pending,
+# measurement-pending->resolved|archived, resolved->archived). The
+# further-along side is the merge base so a peer's concurrent metadata bump
+# can never revert a resolution. Unknown/missing stage ranks lowest.
+_PIPELINE_STAGE_RANK = {
+    "discovered": 0, "active": 1, "measurement-pending": 2,
+    "resolved": 3, "archived": 4,
+}
+# Monotonic timestamps — only advance; strictly-newer wins independent of base.
+_PIPELINE_NEWER_FIELDS = ("last_reviewed", "outcome_date", "reflected_date")
+# Resolution facts — written once at resolve time; a set value dominates null.
+_PIPELINE_SET_DOMINATES_FIELDS = (
+    "outcome", "surprise", "experience_ref", "outcome_detail")
+
+
+def _merge_pipeline_record(a: dict, b: dict) -> dict:
+    """Commutative merge of two records of the SAME hypothesis id, edited on
+    both machines. Base = the further-along side by stage rank (the lifecycle
+    is monotonic — a resolution/archival must never be reverted by a peer's
+    concurrent metadata bump), content tiebreak on equal rank. Then:
+      - side-only fields: unioned (a field present on one side is never lost)
+      - outcome / surprise / experience_ref / outcome_detail:
+        set-dominates-null (both set -> the base's stands, deterministically)
+      - reflected: True dominates (the reflect flag is monotonic)
+      - last_reviewed / outcome_date / reflected_date: strictly-newer wins
+      - formed_date: OLDER wins (stable formation timestamp)
+    Every rule is a symmetric function of (a, b) -> both machines converge."""
+    ra = _PIPELINE_STAGE_RANK.get(a.get("stage"), -1)
+    rb = _PIPELINE_STAGE_RANK.get(b.get("stage"), -1)
+    if ra != rb:
+        win, lose = (a, b) if ra > rb else (b, a)
+    else:
+        win, lose = (a, b) if _canon(a) >= _canon(b) else (b, a)
+    out = dict(win)
+    for k, v in lose.items():
+        if k not in out:
+            out[k] = v
+    for f in _PIPELINE_SET_DOMINATES_FIELDS:
+        if out.get(f) is None and lose.get(f) is not None:
+            out[f] = lose[f]
+    if bool(a.get("reflected")) or bool(b.get("reflected")):
+        out["reflected"] = True
+    for f in _PIPELINE_NEWER_FIELDS:
+        va, vb = a.get(f), b.get(f)
+        if va is None and vb is None:
+            continue
+        out[f] = va if (_newer(va, vb) or va == vb) else vb
+    fa, fb = a.get("formed_date"), b.get("formed_date")
+    if fa is not None and fb is not None:
+        out["formed_date"] = fb if _newer(fa, fb) else fa
+    return out
+
+
+def merge_pipeline(local: bytes, remote: bytes) -> bytes:
+    """Union two pipeline JSONL blobs (pipeline.jsonl and pipeline-archive.jsonl
+    share the record shape) by hypothesis id — a record on ONE side is kept;
+    the SAME id on both is field-merged (_merge_pipeline_record). Output sorted
+    by id (YYYY-MM-DD_slug sorts chronologically) for the byte-identical result
+    the fenced PUT / commutativity relies on.
+
+    Cures the 2026-07-04..06 cc-04 fleet wedge (g-115-1787 / rb-2849): the
+    ~530KB NON-multipart pipeline.jsonl hit _overwrite_decision's "no_clobber"
+    with no registered handler, so the stale IfMatch fence 412'd every
+    hypothesis add/resolve/reflected write DETERMINISTICALLY until daemon
+    restart — bdab36ab cured only the MULTIPART branch of the same freeze.
+
+    CONTENT-SORTED FOLD (not encounter-ordered): the live pipeline-archive.jsonl
+    already carries duplicate-id lines WITHIN one file (5 byte-identical groups
+    from historical re-appends — 2026-07-07 probe), so a single id can
+    contribute 3+ copies across the two sides. A pairwise fold in encounter
+    order would make the result depend on the (local, remote) argument order
+    unless _merge_pipeline_record were associative — instead each id's copies
+    are folded in canonical-content order, making the output a function of the
+    record SET alone (commutative + idempotent by construction; identical
+    duplicate lines collapse for free)."""
+    by_key: Dict[object, List[dict]] = {}
+    for rec in _parse_jsonl(local) + _parse_jsonl(remote):
+        k = (("id", rec["id"]) if isinstance(rec, dict) and rec.get("id")
+             else ("_canon", _canon(rec)))
+        by_key.setdefault(k, []).append(rec)
+    merged: Dict[object, object] = {}
+    for k, copies in by_key.items():
+        copies = sorted(copies, key=_canon)
+        if k[0] == "id" and all(isinstance(c, dict) for c in copies):
+            out = copies[0]
+            for c in copies[1:]:
+                out = _merge_pipeline_record(out, c)
+            merged[k] = out
+        else:
+            merged[k] = copies[-1]  # largest-canon (content tiebreak)
+    ordered = [merged[k] for k in sorted(merged, key=lambda t: (t[0], _canon(t[1])))]
+    return _dump_jsonl(ordered)
+
+
+# --- spark-questions.jsonl : union by stable text identity -------------------
+# (rb-2849 — frozen alongside pipeline.jsonl on cc-04.) Records are EDITED IN
+# PLACE (times_asked/sparks_generated counter bumps, status retire, candidate
+# -> question promotion), so line-union would duplicate. The union is keyed on
+# the question TEXT — the stable human-authored identity that survives promote
+# (spark_questions_write.promote REWRITES id sq-cNN -> sq-NNN and type
+# candidate -> question but keeps text), so a promoted copy and its stale
+# candidate twin collapse to ONE record instead of resurrecting the candidate.
+# Byte-exact: all three writers (CLI spark-questions.py via
+# _fileops.locked_modify_jsonl, the generic daemon store endpoint, and the
+# bespoke spark_questions_write increment/promote) emit
+# json.dumps(rec, ensure_ascii=True) + "\n" (== _dump_jsonl). rb-245-verified.
+
+_SPARK_COUNTER_FIELDS = ("times_asked", "sparks_generated")
+
+
+def _spark_identity(rec: dict) -> str:
+    """Stable cross-machine identity of a spark record: its question text.
+    Set at creation, stable under every edit (counter bumps, retire) AND under
+    promotion (which rewrites id + type but never text). Two DISTINCT records
+    sharing the exact text is implausible — a duplicate question IS the same
+    question — so keying on text never false-splits in practice."""
+    return str(rec.get("text") or "")
+
+
+def _merge_spark_record(a: dict, b: dict) -> dict:
+    """Field-merge two records sharing text identity. Commutative.
+      - candidate vs question: the QUESTION side wins wholesale — promotion is
+        monotonic, and promote deliberately RESET the counters, so the stale
+        candidate twin's fields must not bleed back in (it carries none anyway).
+      - same type: times_asked / sparks_generated -> per-counter MAX
+        (grow-only); yield_rate is DERIVED -> recomputed from the merged
+        counters (matches cmd_increment — a blind MAX would overstate it);
+        status: retired dominates (a retire is deliberate + monotonic);
+        everything else: content-tiebreak base + side-only field union."""
+    ta, tb = a.get("type"), b.get("type")
+    if ta != tb:
+        if ta == "question":
+            return dict(a)
+        if tb == "question":
+            return dict(b)
+        return dict(a) if _canon(a) >= _canon(b) else dict(b)
+    win, lose = (a, b) if _canon(a) >= _canon(b) else (b, a)
+    out = dict(win)
+    for k, v in lose.items():
+        if k not in out:
+            out[k] = v
+    for f in _SPARK_COUNTER_FIELDS:
+        nums = [v for v in (a.get(f), b.get(f))
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if nums:
+            out[f] = max(nums)
+    if "retired" in (a.get("status"), b.get("status")):
+        out["status"] = "retired"
+    if out.get("type") == "question" and "yield_rate" in out:
+        out["yield_rate"] = round(
+            out.get("sparks_generated", 0) / max(out.get("times_asked", 0), 1), 4)
+    return out
+
+
+def _spark_family(rec: dict):
+    """(family_tag, id_format) for a spark record — candidates and questions
+    allocate ids from SEPARATE sequences (next_id_for_prefix: sq-001.. 3-pad
+    for questions, sq-c01.. 2-pad for candidates), so a displaced record must
+    be re-id'd within its OWN family to stay byte-shaped like a minted id."""
+    if rec.get("type") == "candidate" or str(rec.get("id") or "").startswith("sq-c"):
+        return "candidate", lambda n: f"sq-c{n:02d}"
+    return "question", lambda n: f"sq-{n:03d}"
+
+
+def _spark_int_id(rec: dict):
+    """Numeric tail of a spark id within its family (sq-7 / sq-007 -> 7,
+    sq-c12 -> 12), or None for a malformed/missing id."""
+    rid = str(rec.get("id") or "")
+    family, _fmt = _spark_family(rec)
+    prefix = "sq-c" if family == "candidate" else "sq-"
+    if rid.startswith(prefix):
+        tail = rid[len(prefix):]
+        if tail.isdigit():
+            return int(tail)
+    return None
+
+
+def merge_spark_questions(local: bytes, remote: bytes) -> bytes:
+    """Union two spark-questions.jsonl blobs keyed by STABLE text identity
+    (survives candidate->question promotion — the promoted copy and its stale
+    candidate twin collapse to one record), field-merged via
+    _merge_spark_record. A true id collision (two DISTINCT texts under one id —
+    concurrent allocation under a cross-machine lock stale-break) is re-id'd:
+    the smaller-canon record keeps the contested id, the displaced one gets the
+    next free id in ITS OWN family (questions sq-{n:03d}, candidates
+    sq-c{n:02d} — matching next_id_for_prefix's zero-pad, which reproduces
+    every on-disk id byte-for-byte). Zero data loss. Output sorted questions-
+    then-candidates, numeric within family, for the byte-identical result the
+    fenced PUT / commutativity relies on."""
+    combined = _parse_jsonl(local) + _parse_jsonl(remote)
+
+    # 1. Collapse by text identity; field-merge same-identity copies. Folded
+    #    in canonical-content order (NOT encounter order) so the result is a
+    #    function of the record SET alone — commutative regardless of the
+    #    (local, remote) argument order even when one side carries duplicate
+    #    copies (same hardening as merge_pipeline's content-sorted fold).
+    raw_groups: Dict[str, List[dict]] = {}
+    for rec in combined:
+        raw_groups.setdefault(_spark_identity(rec), []).append(rec)
+    groups: Dict[str, dict] = {}
+    for ident, copies in raw_groups.items():
+        copies = sorted(copies, key=_canon)
+        out = dict(copies[0])
+        for c in copies[1:]:
+            out = _merge_spark_record(out, c)
+        groups[ident] = out
+
+    # 2. Bucket merged records by (family, final id) to detect true collisions.
+    by_id: Dict[tuple, List[dict]] = {}
+    for rec in groups.values():
+        fam, _fmt = _spark_family(rec)
+        by_id.setdefault((fam, _spark_int_id(rec)), []).append(rec)
+
+    # 3. Resolve collisions per family: smallest-canon keeps the contested id;
+    #    the rest (and any id-less record) get the next free numeric id in
+    #    their family. Symmetric => both machines converge.
+    keepers: List[tuple] = []      # (family, int_id, rec)
+    displaced: List[tuple] = []    # (family, rec)
+    taken: Dict[str, set] = {"question": set(), "candidate": set()}
+    for (fam, iid) in by_id:
+        recs = sorted(by_id[(fam, iid)], key=_canon)
+        if iid is None:
+            displaced.extend((fam, r) for r in recs)
+            continue
+        keepers.append((fam, iid, recs[0]))
+        taken[fam].add(iid)
+        displaced.extend((fam, r) for r in recs[1:])
+    displaced.sort(key=lambda t: (t[0], _canon(t[1])))
+    next_free = {"question": 1, "candidate": 1}
+    for fam, rec in displaced:
+        _same_fam, fmt = _spark_family(rec)
+        n = max(next_free[fam], (max(taken[fam]) + 1) if taken[fam] else 1)
+        while n in taken[fam]:
+            n += 1
+        rec = dict(rec)
+        rec["id"] = fmt(n)
+        keepers.append((fam, n, rec))
+        taken[fam].add(n)
+        next_free[fam] = n + 1
+
+    keepers.sort(key=lambda t: (0 if t[0] == "question" else 1, t[1]))
+    return _dump_jsonl([rec for _fam, _n, rec in keepers])
+
+
 # --- append-only logs : commutative LINE-UNION (NO field-merge) --------------
 # The LARGEST both-diverged freeze class by CONFLICT-skip volume (spawn.log
 # 2026-07-03: evolution-log 362, productivity-snapshots 341, gate-firings 157,
@@ -818,6 +1077,43 @@ def merge_aspirations_meta(local: bytes, remote: bytes) -> bytes:
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
+def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
+    """Field-level reconcile of two pipeline-meta.json documents (7 —
+    frozen in the same cc-04 flow: every pipeline add/move/update recomputes
+    and rewrites this file, so an unmergeable meta would re-freeze the flow the
+    pipeline.jsonl handler just unfroze). Everything except
+    micro_hypothesis_stats is DERIVED (stage_counts + accuracy are recomputed
+    from live+archive records by _update_meta / recompute-meta on every
+    mutation), so the LWW base by top-level 'last_updated' (day-precision —
+    content tiebreak settles the common same-day case) is self-correcting:
+    the next recompute overwrites any residual drift. micro_hypothesis_stats
+    is the ONE preserved-not-recomputed section (pipeline_write._update_meta
+    carries it across recomputes), so it is unioned per key (content-larger on
+    a same-key clash) — a key present on only one machine is never dropped.
+    Byte-exact to BOTH writers (_fileops.locked_write_json and
+    pipeline_write._update_meta): json.dumps(indent=2, ensure_ascii=True)+'\\n'."""
+    a = json.loads(local.decode("utf-8")) if local.strip() else {}
+    b = json.loads(remote.decode("utf-8")) if remote.strip() else {}
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return local if _canon(a) >= _canon(b) else remote
+    win, _lose = _order_by_ts(a, b, "last_updated")
+    out = dict(win)  # winner's key order preserved; derived fields ride along (LWW)
+    ma = a.get("micro_hypothesis_stats") if isinstance(a.get("micro_hypothesis_stats"), dict) else {}
+    mb = b.get("micro_hypothesis_stats") if isinstance(b.get("micro_hypothesis_stats"), dict) else {}
+    if ma or mb:
+        merged_m: Dict[str, object] = {}
+        for k in sorted(set(ma) | set(mb)):
+            va, vb = ma.get(k), mb.get(k)
+            if va is None:
+                merged_m[k] = vb
+            elif vb is None:
+                merged_m[k] = va
+            else:
+                merged_m[k] = va if _canon(va) >= _canon(vb) else vb
+        out["micro_hypothesis_stats"] = merged_m
+    return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+
+
 # --- registration -----------------------------------------------------------
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
@@ -827,6 +1123,17 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "team-state.yaml": merge_team_state,
     # aspiration/goal-id union (records edited in place)
     "aspirations.jsonl": merge_aspirations,
+    # hypothesis pipeline: union by content-derived id + stage-monotonic
+    # field-merge (records edited in place; 7 / rb-2849 — the cc-04
+    # NON-multipart no_clobber freeze, sibling of bdab36ab's multipart fix).
+    # pipeline-archive.jsonl shares the record shape AND the flow (resolve
+    # moves live->archive), so it takes the same handler.
+    "pipeline.jsonl": merge_pipeline,
+    "pipeline-archive.jsonl": merge_pipeline,
+    # spark questions: union by stable text identity (survives candidate ->
+    # question promotion), counter-MAX + derived yield_rate recompute
+    # (rb-2849 — frozen alongside pipeline.jsonl).
+    "spark-questions.jsonl": merge_spark_questions,
     # append-only logs -> LINE-UNION (records immutable; verified append-only
     # per-store by reading each writer, rb-245 / ):
     "evolution-log.jsonl": merge_append_only_jsonl,
@@ -851,6 +1158,10 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # _tree.yaml is a 4th, higher-risk shape carved to ):
     "module-health.yaml": merge_module_health,
     "aspirations-meta.json": merge_aspirations_meta,
+    # pipeline meta: derived counters (LWW, self-correcting via recompute) +
+    # micro_hypothesis_stats per-key union — rewritten by every pipeline
+    # mutation, so it must reconcile for the 7 flow to stay unfrozen.
+    "pipeline-meta.json": merge_pipeline_meta,
 }
 
 

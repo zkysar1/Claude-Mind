@@ -915,13 +915,13 @@ def _load_team_state_cached():
         return _TEAM_STATE_CACHE
     path = WORLD_DIR / "team-state.yaml"
     if not path.exists():
-        _TEAM_STATE_CACHE = {}
+        _TEAM_STATE_CACHE = _compose_rows({})
         return _TEAM_STATE_CACHE
     last_err = None
     for attempt in range(_TEAM_STATE_READ_RETRIES):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                _TEAM_STATE_CACHE = yaml.safe_load(f) or {}
+                _TEAM_STATE_CACHE = _compose_rows(yaml.safe_load(f) or {})
             return _TEAM_STATE_CACHE
         except (OSError, yaml.YAMLError) as e:
             last_err = e
@@ -938,8 +938,22 @@ def _load_team_state_cached():
         f"handoff-liveness + critical-blocker scoring disengaged this run (rb-2429)",
         file=sys.stderr,
     )
-    _TEAM_STATE_CACHE = {}
+    _TEAM_STATE_CACHE = _compose_rows({})
     return _TEAM_STATE_CACHE
+
+
+def _compose_rows(core_doc):
+    """Overlay per-agent row files onto the core team-state doc (
+    sharding — agent_status rows live in world/team-state/agents/*.yaml;
+    rows win newest-wins over core residuals). Fail-open: composition
+    errors return the core doc unchanged (advisory input, rb-2429 spirit)."""
+    try:
+        from _team_state import compose_state
+        return compose_state(core_doc, WORLD_DIR)
+    except Exception as e:  # noqa: BLE001 — advisory input never crashes selection
+        print(f"[goal-selector] WARN: team-state row compose failed "
+              f"({type(e).__name__}: {e}); using core file only", file=sys.stderr)
+        return core_doc
 
 
 PRIORITY_MAP = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}

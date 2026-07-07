@@ -144,7 +144,7 @@ Not mutually exclusive. A single event can spawn all four. See `aspirations-exec
 | Agent watchdog | `core/scripts/agent-watchdog.py`, `agents/<agent>/session/watchdog-prev-state.json`, `core/logs/watchdog-<agent>.jsonl` (periodic probe registry — invoked from iteration-close.sh productivity-check via `--tick`; cross-platform, no daemon, no PID file) |
 | External paths | `agents/<agent>/local-paths.conf`, `core/scripts/_paths.sh`, `core/scripts/_paths.py` |
 | File operations | `core/scripts/_fileops.py` (locking, history, changelog) |
-| Team state | `world/team-state.yaml`, `core/scripts/team-state.py`, `team-state-update.sh`, `team-state-read.sh` |
+| Team state | `world/team-state.yaml` (shared fields) + `world/team-state/agents/<name>.yaml` (per-agent rows, g-328-27 shard), `core/scripts/team-state.py`, `core/scripts/_team_state.py` (routing/compose SSOT), `team-state-update.sh`, `team-state-read.sh` |
 | Execution diary | `agents/<agent>/session/execution-diary.jsonl`, `core/scripts/execution-diary.sh` |
 | Reasoning snapshot | `agents/<agent>/session/reasoning-snapshot.yaml`, `core/scripts/reasoning-snapshot.sh` |
 | Compact recovery | `agents/<agent>/session/compact-checkpoint.yaml`, `core/scripts/compact-restore-slots.sh` |

@@ -118,9 +118,14 @@ def main() -> int:
                 print(f"  {a}: rc={r.returncode} stderr={r.stderr!r}", file=sys.stderr)
             return 1
 
-        # Read final state and verify all rows survived.
+        # Read final COMPOSED state and verify all rows survived. 
+        # sharding: each racer's claim lands in its OWN row file under
+        # world/team-state/agents/ — the original single-file clobber race is
+        # now structurally impossible; the composed view is the contract.
+        from _team_state import compose_state
         with open(TEAM_STATE_PATH, "r", encoding="utf-8") as f:
             final = yaml.safe_load(f) or {}
+        final = compose_state(final, WORLD_DIR)
         agent_status = final.get("agent_status") or {}
 
         missing = []
@@ -143,11 +148,21 @@ def main() -> int:
         print(f"TEST PASS: all {N_RACERS} racers' rows survived")
         return 0
     finally:
-        # Restore.
+        # Restore + remove test-racer row files (: racers write
+        # world/team-state/agents/test-race-N.yaml in the LIVE world).
         if BACKUP_PATH.exists():
             TEAM_STATE_PATH.write_bytes(BACKUP_PATH.read_bytes())
             BACKUP_PATH.unlink()
             print("restored live team-state.yaml")
+        try:
+            from _team_state import row_path
+            for i in range(N_RACERS):
+                p = row_path(WORLD_DIR, f"test-race-{i}")
+                if p.exists():
+                    p.unlink()
+            print("removed test-racer row files")
+        except Exception as e:
+            print(f"WARN: row-file cleanup failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

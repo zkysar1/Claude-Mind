@@ -145,10 +145,16 @@ def _read_team_state(world_dir):
         import yaml
 
         ts_path = Path(world_dir) / "team-state.yaml"
-        if not ts_path.exists():
-            return {}
-        data = yaml.safe_load(ts_path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
+        data = {}
+        if ts_path.exists():
+            data = yaml.safe_load(ts_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+        #  sharding: overlay per-agent row files (rows win
+        # newest-wins) — partners' in_flight claims live in rows now; the
+        # raw core file only carries pre-migration residuals.
+        from _team_state import compose_state
+        return compose_state(data, Path(world_dir))
     except Exception:
         return {}
 

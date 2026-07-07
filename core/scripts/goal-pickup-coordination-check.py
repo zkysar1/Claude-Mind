@@ -390,11 +390,20 @@ def _partner_in_flight():
     if WORLD_DIR is None:
         return None
     ts_path = Path(WORLD_DIR) / "team-state.yaml"
-    if not ts_path.exists():
-        return None
+    data = {}
     try:
-        data = yaml.safe_load(ts_path.read_text(encoding="utf-8")) or {}
+        if ts_path.exists():
+            data = yaml.safe_load(ts_path.read_text(encoding="utf-8")) or {}
     except Exception:
+        data = {}
+    #  sharding: overlay per-agent row files (rows win newest-wins)
+    # so partner in_flight reads the sharded truth.
+    try:
+        from _team_state import compose_state
+        data = compose_state(data, Path(WORLD_DIR))
+    except Exception:
+        pass
+    if not data.get("agent_status"):
         return None
     import os
     me = os.environ.get("MIND_AGENT", "")
@@ -427,11 +436,20 @@ def _read_partners(since_minutes=360):
     if WORLD_DIR is None:
         return []
     ts_path = Path(WORLD_DIR) / "team-state.yaml"
-    if not ts_path.exists():
-        return []
+    data = {}
     try:
-        data = yaml.safe_load(ts_path.read_text(encoding="utf-8")) or {}
+        if ts_path.exists():
+            data = yaml.safe_load(ts_path.read_text(encoding="utf-8")) or {}
     except Exception:
+        data = {}
+    #  sharding: overlay per-agent row files (rows win newest-wins)
+    # so partner liveness reads the sharded truth.
+    try:
+        from _team_state import compose_state
+        data = compose_state(data, Path(WORLD_DIR))
+    except Exception:
+        pass
+    if not data.get("agent_status"):
         return []
     import os
     me = os.environ.get("MIND_AGENT", "")

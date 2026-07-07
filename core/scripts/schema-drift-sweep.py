@@ -336,14 +336,18 @@ def create_fix_goals(all_results: list, aspiration_id: str = "asp-115") -> int:
     self_agent = os.environ.get("MIND_AGENT", "")
     handoff_target = ""
     try:
+        #  sharding: roster = core agent_status keys ∪ row-file stems.
+        names = set()
         ts_path = _paths.WORLD_DIR / "team-state.yaml"
         if ts_path.is_file():
             with open(ts_path, "r", encoding="utf-8") as f:
                 ts = yaml.safe_load(f) or {}
-            peers = sorted(a for a in (ts.get("agent_status") or {}).keys()
-                           if a != self_agent)
-            if peers:
-                handoff_target = peers[0]
+            names.update((ts.get("agent_status") or {}).keys())
+        from _team_state import row_agent_names
+        names.update(row_agent_names(_paths.WORLD_DIR))
+        peers = sorted(a for a in names if a != self_agent)
+        if peers:
+            handoff_target = peers[0]
     except Exception:
         pass  # fail-open to "alpha" — preserves prior behavior on errors
 

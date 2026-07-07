@@ -217,7 +217,16 @@ def section_board(world_path, now, since_hours, max_items):
 
 def section_team_state(world_path, agent, now):
     data = _load_yaml(Path(world_path) / "team-state.yaml") if world_path else None
-    if not isinstance(data, dict):
+    core_present = isinstance(data, dict)
+    if not core_present:
+        data = {}
+    #  sharding: overlay per-agent row files (rows win newest-wins).
+    try:
+        from _team_state import compose_state
+        data = compose_state(data, Path(world_path)) if world_path else data
+    except Exception:
+        pass
+    if not core_present and not (data.get("agent_status") or {}):
         return {"present": False}
     status = data.get("agent_status") or {}
     agents = {}

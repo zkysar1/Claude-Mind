@@ -192,17 +192,16 @@ def _set_nested_scalar(fm_text, parent, child, value, default_indent="  "):
 
 
 def _read_in_flight_goal(agent):
-    """Read team-state.yaml agent_status.<agent>.in_flight.goal_id; '' if absent."""
+    """Read the agent's in_flight.goal_id from its team-state row; '' if absent.
+    g-328-27 sharding: row file first, core-file residual fallback."""
     if not agent:
         return ""
-    ts_path = Path(WORLD_DIR) / "team-state.yaml"
-    if not ts_path.is_file():
-        return ""
     try:
-        ts = yaml.load(ts_path.read_text(encoding="utf-8"), Loader=yaml.CSafeLoader) or {}
-    except (OSError, yaml.YAMLError):
+        from _team_state import read_agent_row
+        info = read_agent_row(Path(WORLD_DIR), agent,
+                              core_path=Path(WORLD_DIR) / "team-state.yaml") or {}
+    except Exception:
         return ""
-    info = (ts.get("agent_status") or {}).get(agent) or {}
     inflight = info.get("in_flight") or {}
     gid = inflight.get("goal_id")
     return str(gid) if gid else ""

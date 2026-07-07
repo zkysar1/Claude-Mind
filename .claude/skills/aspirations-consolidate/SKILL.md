@@ -816,6 +816,16 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
        blockers surfacing in the handoff, and the fact that the loop has
        stopped (user can resume via /start).
 
+     The message MUST be a real multi-line body built via
+     `core/scripts/notify-build-payload.py` (notify-user Step 2). NEVER
+     hand-write the email-send.sh JSON here — the 2026-07-07 delta stop
+     email delivered as title + border + EMPTY body because a Title-only
+     payload was hand-built at the transport: the SendInfoAlert renderer
+     IGNORES InfoMessage whenever Title is present (structured mode renders
+     Body/Sections only). email-send.sh now refuses bodyless payloads
+     (exit 2, empty-body guard); on refusal use the fallback below — do
+     not retry with a thinner payload.
+
      If no matching skill is registered, fall back to a
      `participants: [agent, user]` goal via `aspirations-add-goal.sh`
      titled `"User Notice: Session ended"` with

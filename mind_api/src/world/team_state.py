@@ -20,6 +20,11 @@ try:
 except ImportError as e:  # pragma: no cover
     raise RuntimeError("PyYAML required for team-state endpoint") from e
 
+# Shared sharding helper (core/scripts is on sys.path for daemon workers —
+# same import mechanism as team_state_write's `from _fileops import ...`).
+# Single source of truth for row composition; guard-742 parity by construction.
+from _team_state import compose_state
+
 from ..yaml_cache import cache
 
 
@@ -53,16 +58,19 @@ def _path(ctx):
 
 def _read_state(ctx):
     """Mirror of team-state.py:read_state — returns EMPTY_STATE on miss,
-    backfills any missing top-level key with its EMPTY_STATE default."""
+    backfills any missing top-level key with its EMPTY_STATE default, then
+    composes per-agent row files over the core document (g-328-27 sharding;
+    row files win newest-wins over core residuals)."""
     data = cache().get(_path(ctx))
     if not data:
-        return dict(_EMPTY_STATE_DEFAULTS)
-    # Don't mutate the cached dict — copy first.
-    out = dict(data)
+        out = dict(_EMPTY_STATE_DEFAULTS)
+    else:
+        # Don't mutate the cached dict — copy first.
+        out = dict(data)
     for k, default in _EMPTY_STATE_DEFAULTS.items():
         if k not in out:
             out[k] = default if not isinstance(default, (list, dict)) else type(default)()
-    return out
+    return compose_state(out, ctx.paths.world)
 
 
 def read(ctx) -> "Response":  # type: ignore[name-defined]

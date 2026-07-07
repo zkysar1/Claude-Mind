@@ -517,21 +517,22 @@ def _rb_inject_source_goal(ctx, rec):
     # own-cloud read-path fix (2026-07-02): materialize an S3-only team-state on
     # a fresh box before the exists() gate, else source_goal injection silently
     # no-ops. Best-effort (this whole helper is caller-wins enrichment); no-op on
-    # LocalBackend and for out-of-root paths (keystone).
+    # LocalBackend and for out-of-root paths (keystone).  sharding: the
+    # agent's live status is its ROW file — materialize + read that first, with
+    # core-file residual fallback.
+    try:
+        from _team_state import read_agent_row, row_path as _ts_row_path
+    except ImportError:
+        return
     try:
         from storage_backend import get_backend
         get_backend().ensure_local(path)
+        get_backend().ensure_local(_ts_row_path(ctx.paths.world, agent_name))
     except Exception:
         pass
-    if not path.exists():
-        return
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        goal_id = (data.get("agent_status", {})
-                       .get(agent_name, {})
-                       .get("in_flight", {})
-                       .get("goal_id"))
+        status = read_agent_row(ctx.paths.world, agent_name, core_path=path) or {}
+        goal_id = (status.get("in_flight") or {}).get("goal_id")
         if goal_id:
             if need_source:
                 rec["source_goal"] = goal_id

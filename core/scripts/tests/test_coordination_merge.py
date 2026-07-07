@@ -582,6 +582,275 @@ def test_aspirations_meta_multiround_and_empty():
 
 
 # --- registry ---------------------------------------------------------------
+# --- pipeline (7 / rb-2849 — the cc-04 NON-multipart no_clobber freeze) ---
+def _hyp(rec_id, **kw):
+    base = {"id": rec_id, "title": f"hyp {rec_id}", "stage": "active",
+            "horizon": "short", "type": "calibration", "confidence": 0.5,
+            "position": "YES — a multi-word testable claim here",
+            "formed_date": rec_id[:10], "category": "framework-architecture",
+            "outcome": None, "reflected": False, "surprise": None}
+    base.update(kw)
+    return base
+
+
+def test_pipeline_disjoint_union_commutative():
+    a = _rb([_hyp("2026-07-01_base"), _hyp("2026-07-05_machine-a")])
+    b = _rb([_hyp("2026-07-01_base"), _hyp("2026-07-06_machine-b")])
+    ab, ba = cm.merge_pipeline(a, b), cm.merge_pipeline(b, a)
+    assert ab == ba                                   # byte-identical
+    assert [r["id"] for r in _recs(ab)] == [
+        "2026-07-01_base", "2026-07-05_machine-a", "2026-07-06_machine-b"]
+
+
+def test_pipeline_resolution_never_reverted():
+    # Machine A RESOLVED the hypothesis; machine B concurrently bumped
+    # last_reviewed on its stale ACTIVE copy. The merge must keep the
+    # resolution (stage-monotonic base) AND B's newer review timestamp.
+    a = _rb([_hyp("2026-07-01_x", stage="resolved", outcome="CONFIRMED",
+                  outcome_date="2026-07-05", surprise=3,
+                  last_reviewed="2026-07-05")])
+    b = _rb([_hyp("2026-07-01_x", stage="active",
+                  last_reviewed="2026-07-06")])
+    ab, ba = cm.merge_pipeline(a, b), cm.merge_pipeline(b, a)
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["stage"] == "resolved"                 # never reverted
+    assert rec["outcome"] == "CONFIRMED"
+    assert rec["surprise"] == 3
+    assert rec["last_reviewed"] == "2026-07-06"       # B's newer bump kept
+
+
+def test_pipeline_reflected_flag_monotonic():
+    # reflected=True on either side survives the merge (the reflect flag is
+    # monotonic — this is exactly the frozen-write class from cc-04: the 5
+    # blocked H1 reflected-retries).
+    a = _rb([_hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                  reflected=True)])
+    b = _rb([_hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                  reflected=False, last_reviewed="2026-07-07")])
+    ab, ba = cm.merge_pipeline(a, b), cm.merge_pipeline(b, a)
+    assert ab == ba
+    assert _recs(ab)[0]["reflected"] is True
+
+
+def test_pipeline_side_only_fields_unioned_and_formed_date_older_wins():
+    a = _rb([_hyp("2026-07-01_x", formed_date="2026-07-01",
+                  measurement_channel="efs session logs")])
+    b = _rb([_hyp("2026-07-01_x", formed_date="2026-07-02",
+                  resolves_by="2026-08-01")])
+    ab, ba = cm.merge_pipeline(a, b), cm.merge_pipeline(b, a)
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["measurement_channel"] == "efs session logs"  # side-only kept
+    assert rec["resolves_by"] == "2026-08-01"                # side-only kept
+    assert rec["formed_date"] == "2026-07-01"                # older wins
+
+
+def test_pipeline_multiround_convergence():
+    recA = _hyp("2026-07-05_machine-a")
+    recB = _hyp("2026-07-06_machine-b")
+    base = _hyp("2026-07-01_base")
+    localA, localB = _rb([base, recA]), _rb([base, recB])
+    s3 = cm.merge_pipeline(localA, localB)
+    for _ in range(4):
+        s3_b = cm.merge_pipeline(localB, s3)
+        s3_a = cm.merge_pipeline(localA, s3_b)
+        assert s3_a == s3_b, "not converged: A and B disagree"
+        s3 = s3_a
+    ids = [r["id"] for r in _recs(s3)]
+    assert sorted(ids) == ids and len(ids) == len(set(ids)) == 3
+
+
+def test_pipeline_intra_blob_duplicates_fold_commutatively():
+    # The LIVE pipeline-archive.jsonl carries duplicate-id lines WITHIN one
+    # file (5 byte-identical groups from historical re-appends — 2026-07-07
+    # probe). With a differing copy on the peer side, a naive
+    # encounter-ordered fold would make the merge depend on the
+    # (local, remote) argument order; the content-sorted fold keeps it
+    # commutative AND collapses the identical dup lines for free.
+    dup = _hyp("2026-07-01_x", stage="archived", outcome="EXPIRED")
+    a = _rb([dup, dup, dup])                      # one side: 3 identical copies
+    b = _rb([_hyp("2026-07-01_x", stage="archived", outcome="EXPIRED",
+                  reflected=True, last_reviewed="2026-07-06")])
+    ab, ba = cm.merge_pipeline(a, b), cm.merge_pipeline(b, a)
+    assert ab == ba
+    recs = _recs(ab)
+    assert len(recs) == 1                         # dups collapsed, peer merged
+    assert recs[0]["reflected"] is True
+    assert recs[0]["last_reviewed"] == "2026-07-06"
+
+
+def test_spark_intra_blob_duplicates_fold_commutatively():
+    dup = _sq("sq-001", "Q1?", times_asked=5)
+    a = _rb([dup, dup])
+    b = _rb([_sq("sq-001", "Q1?", times_asked=9)])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    recs = _recs(ab)
+    assert len(recs) == 1 and recs[0]["times_asked"] == 9
+
+
+def test_pipeline_byte_exact_writer_format():
+    # Output records must match the writers' exact per-record bytes
+    # (json.dumps(rec, ensure_ascii=True) + "\n" — pipeline.py locked_*_jsonl
+    # AND pipeline_write._atomic_write_jsonl).
+    rec = _hyp("2026-07-01_x", title="unicode — em-dash")
+    out = cm.merge_pipeline(_rb([rec]), b"")
+    lines = out.decode("utf-8").splitlines()
+    assert lines == [json.dumps(r, ensure_ascii=True) for r in _recs(out)]
+    assert "\\u2014" in out.decode("utf-8")           # ensure_ascii honored
+
+
+def test_pipeline_empty_inputs():
+    assert cm.merge_pipeline(b"", b"") == b""
+    one = _rb([_hyp("2026-07-01_x")])
+    assert cm.merge_pipeline(one, b"") == one
+    assert cm.merge_pipeline(b"", one) == one
+
+
+# --- spark-questions (rb-2849 — frozen alongside pipeline.jsonl) -------------
+def _sq(rec_id, text, **kw):
+    base = {"id": rec_id, "text": text, "times_asked": 0,
+            "sparks_generated": 0, "yield_rate": 0.0, "status": "active",
+            "category": "discovery", "type": "question"}
+    base.update(kw)
+    return base
+
+
+def _sqc(rec_id, text, **kw):
+    base = {"id": rec_id, "text": text, "category": "discovery",
+            "type": "candidate", "proposed_session": 1}
+    base.update(kw)
+    return base
+
+
+def test_spark_disjoint_union_commutative():
+    a = _rb([_sq("sq-001", "Q1?"), _sq("sq-002", "Q2?")])
+    b = _rb([_sq("sq-001", "Q1?"), _sqc("sq-c01", "C1?")])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    assert [r["id"] for r in _recs(ab)] == ["sq-001", "sq-002", "sq-c01"]
+
+
+def test_spark_counter_max_and_yield_recompute():
+    a = _rb([_sq("sq-001", "Q1?", times_asked=1250, sparks_generated=33,
+                 yield_rate=0.0264)])
+    b = _rb([_sq("sq-001", "Q1?", times_asked=1274, sparks_generated=30,
+                 yield_rate=0.0235)])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["times_asked"] == 1274                 # max never regresses
+    assert rec["sparks_generated"] == 33              # max never regresses
+    assert rec["yield_rate"] == round(33 / 1274, 4)   # derived: recomputed
+
+
+def test_spark_promote_collapses_stale_candidate():
+    # Machine A promoted candidate sq-c07 -> question sq-021 (promote rewrites
+    # id + type, resets counters, keeps text). Machine B still holds the stale
+    # candidate. The text-identity union collapses them to ONE question —
+    # the candidate must NOT resurrect as a duplicate.
+    a = _rb([_sq("sq-021", "New question?", times_asked=2)])
+    b = _rb([_sqc("sq-c07", "New question?", proposed_session=42)])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    recs = _recs(ab)
+    assert len(recs) == 1
+    rec = recs[0]
+    assert rec["id"] == "sq-021" and rec["type"] == "question"
+    assert rec["times_asked"] == 2                    # promoted side wholesale
+    assert "proposed_session" not in rec              # candidate fields don't bleed
+
+
+def test_spark_retired_dominates():
+    a = _rb([_sq("sq-001", "Q1?", status="retired")])
+    b = _rb([_sq("sq-001", "Q1?", status="active", times_asked=9)])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["status"] == "retired" and rec["times_asked"] == 9
+
+
+def test_spark_true_id_collision_reids_per_family():
+    # Two DISTINCT texts allocated the same candidate id during a lock
+    # stale-break: both survive; the displaced one is re-id'd within its OWN
+    # family (sq-cNN 2-pad), never into the question sequence.
+    a = _rb([_sqc("sq-c07", "Candidate A?")])
+    b = _rb([_sqc("sq-c07", "Candidate B?")])
+    ab, ba = cm.merge_spark_questions(a, b), cm.merge_spark_questions(b, a)
+    assert ab == ba
+    recs = _recs(ab)
+    ids = sorted(r["id"] for r in recs)
+    assert len(recs) == 2 and ids == ["sq-c07", "sq-c08"]
+    assert {r["text"] for r in recs} == {"Candidate A?", "Candidate B?"}
+
+
+def test_spark_multiround_convergence_and_empty():
+    localA = _rb([_sq("sq-001", "Q1?", times_asked=5)])
+    localB = _rb([_sq("sq-001", "Q1?", times_asked=7), _sqc("sq-c01", "C1?")])
+    s3 = cm.merge_spark_questions(localA, localB)
+    for _ in range(3):
+        s3_b = cm.merge_spark_questions(localB, s3)
+        s3_a = cm.merge_spark_questions(localA, s3_b)
+        assert s3_a == s3_b
+        s3 = s3_a
+    assert [r["id"] for r in _recs(s3)] == ["sq-001", "sq-c01"]
+    assert _recs(s3)[0]["times_asked"] == 7
+    assert cm.merge_spark_questions(b"", b"") == b""
+    one = _rb([_sq("sq-001", "Q1?")])
+    assert cm.merge_spark_questions(one, b"") == one
+
+
+# --- pipeline-meta.json (7 — rewritten by every pipeline mutation) ---
+def _pmeta(last_updated, micro=None, **kw):
+    d = {"last_updated": last_updated,
+         "stage_counts": {"discovered": 1, "active": 2,
+                          "measurement-pending": 0, "resolved": 3,
+                          "archived": 4},
+         "accuracy": {"total_resolved": 3, "confirmed": 2, "corrected": 1,
+                      "accuracy_pct": 66.7}}
+    if micro is not None:
+        d["micro_hypothesis_stats"] = micro
+    d.update(kw)
+    return (json.dumps(d, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+
+
+def test_pipeline_meta_lww_and_micro_stats_union():
+    a = _pmeta("2026-07-05", micro={"batch_a": {"processed": 4}})
+    b = _pmeta("2026-07-06", micro={"batch_b": {"processed": 9}})
+    ab, ba = cm.merge_pipeline_meta(a, b), cm.merge_pipeline_meta(b, a)
+    assert ab == ba
+    out = json.loads(ab.decode("utf-8"))
+    assert out["last_updated"] == "2026-07-06"        # newer snapshot is base
+    assert set(out["micro_hypothesis_stats"]) == {"batch_a", "batch_b"}  # union
+
+
+def test_pipeline_meta_byte_exact_and_same_day_tiebreak():
+    a = _pmeta("2026-07-06", accuracy={"total_resolved": 5})
+    b = _pmeta("2026-07-06")
+    ab, ba = cm.merge_pipeline_meta(a, b), cm.merge_pipeline_meta(b, a)
+    assert ab == ba                                   # same-day: content tiebreak
+    assert ab.endswith(b"\n")                          # writer's trailing newline
+    json.loads(ab.decode("utf-8"))                     # valid indent-2 JSON
+    assert cm.merge_pipeline_meta(a, b"") == cm.merge_pipeline_meta(b"", a)
+
+
+def test_handler_registry_pipeline_spark_basenames():
+    # Lock the 7 / rb-2849 registrations — an accidental removal
+    # re-opens the cc-04 non-multipart both-diverged write-freeze.
+    assert cm.merge_handler_for("world/pipeline.jsonl") is cm.merge_pipeline
+    assert cm.merge_handler_for("world/pipeline-archive.jsonl") is cm.merge_pipeline
+    assert cm.merge_handler_for("world/pipeline-meta.json") is cm.merge_pipeline_meta
+    assert cm.merge_handler_for("meta/spark-questions.jsonl") is cm.merge_spark_questions
+    # pattern-signatures.jsonl is DELIBERATELY unregistered in the 7
+    # pass: its two live writers disagree on serialization (CLI
+    # pattern-signatures.py emits ensure_ascii=False; the daemon store endpoint
+    # emits ensure_ascii=True), so the byte-exact contract cannot be satisfied
+    # until that writer split is reconciled (follow-up filed via BRD notes).
+    # Locking None keeps a future edit from registering it half-verified.
+    assert cm.merge_handler_for("world/pattern-signatures.jsonl") is None
+
+
 def test_handler_registry_by_basename():
     assert cm.merge_handler_for("world/reasoning-bank.jsonl") is cm.merge_reasoning_bank
     assert cm.merge_handler_for("world/guardrails.jsonl") is cm.merge_guardrails

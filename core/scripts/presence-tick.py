@@ -162,18 +162,16 @@ def main() -> int:
     if not agent:
         return 0
 
-    # Step 4: Optional goal_id from team-state.in_flight.<agent>
+    # Step 4: Optional goal_id from the agent's team-state row (
+    # sharding: row file first, core-file residual fallback).
     goal_id = ""
-    team_state = Path(WORLD_DIR) / "team-state.yaml"
-    if team_state.exists():
-        try:
-            import yaml
-            with open(team_state, encoding="utf-8") as f:
-                d = yaml.safe_load(f) or {}
-            in_flight = (((d.get("agent_status") or {}).get(agent) or {}).get("in_flight") or {})
-            goal_id = in_flight.get("goal_id", "") or ""
-        except Exception:
-            pass
+    try:
+        from _team_state import read_agent_row
+        status = read_agent_row(Path(WORLD_DIR), agent,
+                                core_path=Path(WORLD_DIR) / "team-state.yaml") or {}
+        goal_id = (status.get("in_flight") or {}).get("goal_id", "") or ""
+    except Exception:
+        pass
 
     # Step 5: Optional phase from execution-diary tail
     phase = ""

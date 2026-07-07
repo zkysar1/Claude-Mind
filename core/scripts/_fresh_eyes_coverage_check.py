@@ -82,6 +82,27 @@ def parse_own_records(raw, hours, now):
     return records, own_files, in_cooldown
 
 
+def _composed_agent_status(ts_path):
+    """agent_status composed from the core team-state file + per-agent row
+    files (g-328-27 sharding — rows win newest-wins; rows dir is a sibling
+    of ts_path). Fail-open to whatever the core file yields."""
+    core = {}
+    try:
+        import yaml
+        if ts_path and os.path.isfile(ts_path):
+            with open(ts_path, "r", encoding="utf-8") as f:
+                core = (yaml.safe_load(f) or {}).get("agent_status") or {}
+    except Exception:
+        core = {}
+    if not isinstance(core, dict):
+        core = {}
+    try:
+        from _team_state import compose_agent_status, load_rows
+        return compose_agent_status(core, load_rows(os.path.dirname(str(ts_path))))
+    except Exception:
+        return core
+
+
 def parse_self_ts_record(ts_path, self_agent, hours, now):
     """: parse self-agent's team-state.<self>.last_fresh_eyes_run as
     own-side coverage. /fresh-eyes-code Phase 5b writes here but NOT to
@@ -95,13 +116,10 @@ def parse_self_ts_record(ts_path, self_agent, hours, now):
     records = []
     files = set()
     in_cooldown = False
-    if not (ts_path and self_agent and os.path.isfile(ts_path)):
+    if not (ts_path and self_agent):
         return records, files, in_cooldown
     try:
-        import yaml
-        with open(ts_path, "r", encoding="utf-8") as f:
-            ts_data = yaml.safe_load(f) or {}
-        agent_data = (ts_data.get("agent_status") or {}).get(self_agent)
+        agent_data = _composed_agent_status(ts_path).get(self_agent)
         if not isinstance(agent_data, dict):
             return records, files, in_cooldown
         last_run = agent_data.get("last_fresh_eyes_run")
@@ -136,13 +154,10 @@ def parse_peer_records(ts_path, self_agent, hours, now):
     records = []
     peer_files = set()
     in_cooldown = False
-    if not (ts_path and os.path.isfile(ts_path)):
+    if not ts_path:
         return records, peer_files, in_cooldown
     try:
-        import yaml
-        with open(ts_path, "r", encoding="utf-8") as f:
-            ts_data = yaml.safe_load(f) or {}
-        for agent_name, agent_data in (ts_data.get("agent_status") or {}).items():
+        for agent_name, agent_data in _composed_agent_status(ts_path).items():
             if agent_name == self_agent:
                 continue
             if not isinstance(agent_data, dict):
