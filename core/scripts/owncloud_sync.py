@@ -144,6 +144,7 @@ _EXCLUDE_NAMES = {
     "changelog.jsonl",
     ".fallback-stats.jsonl",
     "file-contention-telemetry.jsonl",
+    "write-queue-telemetry.jsonl",
     "history-save-telemetry.jsonl",
     "local-paths.conf",
     "daemon.port", "daemon.pid", "daemon.lock",

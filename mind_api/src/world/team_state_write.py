@@ -32,6 +32,16 @@ from pathlib import Path
 from .team_state import _EMPTY_STATE_DEFAULTS as EMPTY_STATE
 
 from _fileops import locked_modify_yaml, locked_write_yaml  # noqa: E402
+#  sharding: shared routing/composition helper (core/scripts on
+# sys.path). CLI and daemon route through the SAME functions — guard-742
+# parity by construction.
+from _team_state import (  # noqa: E402
+    core_residual,
+    route_field,
+    row_path,
+    rows_dir,
+    stamp_row_metadata,
+)
 
 MAX_RECENT_COMPLETIONS = 50
 
@@ -166,6 +176,39 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
 
     agent = _agent_name(ctx)
 
+    #  sharding: agent_status.<name>[...] writes land in that agent's
+    # OWN row file (world/team-state/agents/<name>.yaml) — heartbeat/focus
+    # stamps from N agents never contend on one object. Mirrors the CLI's
+    # cmd_update routing exactly (shared route_field helper).
+    scope, row_agent, subpath = route_field(field)
+    if scope == "row":
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        if subpath == "" and (operation != "set" or not isinstance(parsed, dict)):
+            return Response.error(
+                400, "invalid_row_write",
+                "agent_status.<name> whole-row supports only operation=set "
+                "with a JSON object value")
+
+        def _row_modifier(row):
+            if not isinstance(row, dict):
+                row = {}
+            if subpath == "":
+                row = dict(parsed)
+            elif operation == "set":
+                _set_nested(row, subpath, parsed)
+            elif operation == "append":
+                _append_nested(row, subpath, parsed)
+            elif operation == "remove":
+                _remove_nested(row, subpath, parsed)
+            return stamp_row_metadata(row, agent, now)
+
+        try:
+            locked_modify_yaml(row_path(ctx.paths.world, row_agent), _row_modifier,
+                               initial=core_residual(_ts_path(ctx), row_agent))
+        except (OSError, ValueError) as e:
+            return Response.error(500, "write_failed", str(e))
+        return Response.json({"ok": True, "field": field, "operation": operation})
+
     def _modifier(state):
         _backfill(state)
         if operation == "set":
@@ -227,28 +270,26 @@ def in_flight(ctx) -> "Response":  # type: ignore[name-defined]
     else:
         _focus = _asp or goal_id
 
-    def _modifier(state):
-        _backfill(state)
-        if "agent_status" not in state or not isinstance(state["agent_status"], dict):
-            state["agent_status"] = {}
-        entry = state["agent_status"].get(target_agent)
-        if not isinstance(entry, dict):
-            entry = {}
-        entry["in_flight"] = {
+    #  sharding: the claim stamp lands in the agent's OWN row file
+    # (mirrors CLI cmd_in_flight).
+    def _row_modifier(row):
+        if not isinstance(row, dict):
+            row = {}
+        row["in_flight"] = {
             "goal_id": goal_id,
             "title": title,
             "claimed_at": now,
             "phase": phase,
         }
-        entry["last_active"] = now
-        entry["current_focus"] = _focus
-        entry["current_focus_updated_at"] = now
-        state["agent_status"][target_agent] = entry
-        return _stamp_metadata(state, agent_author)
+        row["last_active"] = now
+        row["current_focus"] = _focus
+        row["current_focus_updated_at"] = now
+        return stamp_row_metadata(row, agent_author, now)
 
     try:
-        locked_modify_yaml(_ts_path(ctx), _modifier, initial=_empty_state())
-    except OSError as e:
+        locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier,
+                           initial=core_residual(_ts_path(ctx), target_agent))
+    except (OSError, ValueError) as e:
         return Response.error(500, "write_failed", str(e))
 
     return Response.json({"ok": True, "agent": target_agent,
@@ -278,22 +319,25 @@ def clear_in_flight(ctx) -> "Response":  # type: ignore[name-defined]
     agent_author = _agent_name(ctx)
     status = {"cleared": False}
 
-    def _modifier(state):
-        _backfill(state)
-        agent_status = state.get("agent_status") or {}
-        entry = agent_status.get(target_agent) or {}
-        if "in_flight" in entry:
-            entry.pop("in_flight")
-            entry["last_active"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            agent_status[target_agent] = entry
-            state["agent_status"] = agent_status
+    #  sharding: clear operates on the agent's OWN row file. The
+    # core_residual seed lets an un-migrated deployment's in_flight (still
+    # in the core file) be seeded into the row and actually cleared —
+    # newest-wins compose then prefers the freshly-stamped row.
+    def _row_modifier(row):
+        if not isinstance(row, dict):
+            row = {}
+        if "in_flight" in row:
+            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            row.pop("in_flight")
+            row["last_active"] = now
             status["cleared"] = True
-            return _stamp_metadata(state, agent_author)
-        return state
+            return stamp_row_metadata(row, agent_author, now)
+        return row
 
     try:
-        locked_modify_yaml(_ts_path(ctx), _modifier, initial=_empty_state())
-    except OSError as e:
+        locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier,
+                           initial=core_residual(_ts_path(ctx), target_agent))
+    except (OSError, ValueError) as e:
         return Response.error(500, "write_failed", str(e))
 
     return Response.json({"ok": True, "agent": target_agent,
@@ -324,6 +368,15 @@ def init(ctx) -> "Response":  # type: ignore[name-defined]
         get_backend().ensure_local(ts_path)
     except Exception:
         pass
+    #  sharding: always ensure the per-agent rows dir exists
+    # (idempotent) so aged deployments gain the layout on their next init.
+    from ..agent_paths import assert_not_cruft
+    try:
+        rd = rows_dir(ctx.paths.world)
+        assert_not_cruft(rd, "mkdir (team-state rows init)")
+        rd.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # best-effort — row writes mkdir-on-demand via locked_modify_yaml
     if ts_path.exists():
         return Response.json({"ok": True, "created": False,
                               "detail": "team-state.yaml already exists"})

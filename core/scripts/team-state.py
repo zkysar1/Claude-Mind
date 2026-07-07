@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Shared team state for multi-agent situational awareness.
 
-Manages world/team-state.yaml — a single document both agents maintain
-with strategic focus, recent completions, active blockers, and agent status.
-Locked writes via _fileops prevent concurrent modification.
+Manages the composed team state: shared fields live in
+world/team-state.yaml (the core file); each agent's agent_status row lives
+in its OWN file world/team-state/agents/<name>.yaml (g-328-27 sharding —
+no two agents ever write the same object, so heartbeat/claim stamps never
+contend). Reads compose the two; writes route by field via _team_state.
+Locked writes via _fileops prevent concurrent modification per file.
 
 Subcommands:
-  read              — Read the full team state or a specific field
-  update            — Update a specific field (set, append, remove)
-  init              — Create team-state.yaml with empty structure if missing
-  in-flight         — Mark agent as in-flight on a goal (auto-stamps claimed_at)
-  clear-in-flight   — Remove the in_flight block from an agent's status
+  update            — Update a specific field (set, append, remove); routes
+                      agent_status.<name>[...] to that agent's row file
+  init              — Create team-state.yaml + rows dir if missing
+  in-flight         — Mark agent as in-flight on a goal (row file)
+  clear-in-flight   — Remove the in_flight block from an agent's status (row file)
+  migrate-shard     — One-shot cleanup: move core agent_status residuals to rows
 """
 
 import argparse
@@ -29,6 +33,15 @@ import yaml
 
 from _paths import WORLD_DIR
 from _fileops import locked_modify_yaml, locked_write_yaml
+from _team_state import (
+    compose_state,
+    core_residual,
+    route_field,
+    row_path,
+    rows_dir,
+    stamp_row_metadata,
+    _entry_ts,
+)
 
 TEAM_STATE_PATH = WORLD_DIR / "team-state.yaml"
 
@@ -56,18 +69,21 @@ EMPTY_STATE = {
 MAX_RECENT_COMPLETIONS = 50
 
 def read_state():
-    """Read the current team state, returning empty structure if missing."""
+    """Read the composed team state (core file + per-agent row files),
+    returning empty structure if missing. Row files win newest-wins over
+    core residuals — see _team_state module docstring (g-328-27)."""
     if not TEAM_STATE_PATH.exists():
-        return dict(EMPTY_STATE)
-    with open(TEAM_STATE_PATH, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    if not data:
-        return dict(EMPTY_STATE)
+        data = dict(EMPTY_STATE)
+    else:
+        with open(TEAM_STATE_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if not data:
+            data = dict(EMPTY_STATE)
     # Schema migration: backfill any keys added to EMPTY_STATE since file was created
     for key, default in EMPTY_STATE.items():
         if key not in data:
             data[key] = default if not isinstance(default, (list, dict)) else type(default)()
-    return data
+    return compose_state(data, WORLD_DIR)
 
 def _stamp_metadata(data, agent_name):
     """Stamp last_updated + last_updated_by on every write. Called by
@@ -97,6 +113,39 @@ def cmd_update(args):
     except (json.JSONDecodeError, TypeError):
         parsed = value
 
+    #  sharding: agent_status.<name>[...] writes land in that
+    # agent's OWN row file — never the shared core file — so heartbeat /
+    # focus / in-flight stamps from N agents no longer contend on one
+    # object. Everything else keeps the legacy core-file path below.
+    scope, row_agent, subpath = route_field(field)
+    if scope == "row":
+        now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+        def _row_modifier(row):
+            if not isinstance(row, dict):
+                row = {}
+            if subpath == "":
+                # Whole-row set (e.g. consolidate's session-end snapshot).
+                # append/remove make no sense against a whole row.
+                if args.operation != "set":
+                    sys.exit("team-state: agent_status.<name> whole-row "
+                             "supports only --operation set")
+                if not isinstance(parsed, dict):
+                    sys.exit("team-state: whole-row value must be a JSON object")
+                row = dict(parsed)
+            elif args.operation == "set":
+                _set_nested(row, subpath, parsed)
+            elif args.operation == "append":
+                _append_nested(row, subpath, parsed)
+            elif args.operation == "remove":
+                _remove_nested(row, subpath, parsed)
+            return stamp_row_metadata(row, agent, now)
+
+        locked_modify_yaml(row_path(WORLD_DIR, row_agent), _row_modifier,
+                           initial=core_residual(TEAM_STATE_PATH, row_agent))
+        print(f"Updated {field}")
+        return
+
     def _modifier(state):
         # Schema-migration backfill (previously in read_state); we must do
         # it here because locked_modify_yaml reads the raw file without
@@ -119,7 +168,10 @@ def cmd_update(args):
     print(f"Updated {field}")
 
 def cmd_init(args):
-    """Initialize team-state.yaml if it doesn't exist."""
+    """Initialize team-state.yaml if it doesn't exist. Always ensures the
+    per-agent rows directory exists (idempotent), so aged deployments gain
+    the sharded layout on their next init call (g-328-27)."""
+    rows_dir(WORLD_DIR).mkdir(parents=True, exist_ok=True)
     if TEAM_STATE_PATH.exists():
         print("team-state.yaml already exists")
         return
@@ -161,26 +213,23 @@ def cmd_in_flight(args):
     else:
         _focus = _asp or args.goal_id
 
-    def _modifier(state):
-        for key, default in EMPTY_STATE.items():
-            if key not in state:
-                state[key] = default if not isinstance(default, (list, dict)) else type(default)()
-        if "agent_status" not in state or not isinstance(state["agent_status"], dict):
-            state["agent_status"] = {}
-        if target_agent not in state["agent_status"] or not isinstance(state["agent_status"][target_agent], dict):
-            state["agent_status"][target_agent] = {}
-        state["agent_status"][target_agent]["in_flight"] = {
+    #  sharding: the claim stamp lands in the agent's OWN row file.
+    def _row_modifier(row):
+        if not isinstance(row, dict):
+            row = {}
+        row["in_flight"] = {
             "goal_id": args.goal_id,
             "title": args.title,
             "claimed_at": now,
             "phase": args.phase,
         }
-        state["agent_status"][target_agent]["last_active"] = now
-        state["agent_status"][target_agent]["current_focus"] = _focus
-        state["agent_status"][target_agent]["current_focus_updated_at"] = now
-        return _stamp_metadata(state, agent_author)
+        row["last_active"] = now
+        row["current_focus"] = _focus
+        row["current_focus_updated_at"] = now
+        return stamp_row_metadata(row, agent_author, now)
 
-    locked_modify_yaml(TEAM_STATE_PATH, _modifier, initial=dict(EMPTY_STATE))
+    locked_modify_yaml(row_path(WORLD_DIR, target_agent), _row_modifier,
+                       initial=core_residual(TEAM_STATE_PATH, target_agent))
     print(f"in_flight set for {target_agent}: {args.goal_id} phase={args.phase}")
 
 def cmd_clear_in_flight(args):
@@ -199,30 +248,83 @@ def cmd_clear_in_flight(args):
     # doing a second read just to check.
     status = {"cleared": False}
 
-    def _modifier(state):
-        for key, default in EMPTY_STATE.items():
-            if key not in state:
-                state[key] = default if not isinstance(default, (list, dict)) else type(default)()
-        agent_status = state.get("agent_status") or {}
-        entry = agent_status.get(target_agent) or {}
-        if "in_flight" in entry:
-            entry.pop("in_flight")
-            entry["last_active"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            agent_status[target_agent] = entry
-            state["agent_status"] = agent_status
+    #  sharding: clear operates on the agent's OWN row file. The
+    # core_residual seed matters here: an un-migrated deployment whose
+    # in_flight still lives in the core file gets its row seeded from that
+    # residual first, so the pop below actually clears it in the composed
+    # view (newest-wins prefers the freshly-stamped row).
+    def _row_modifier(row):
+        if not isinstance(row, dict):
+            row = {}
+        if "in_flight" in row:
+            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            row.pop("in_flight")
+            row["last_active"] = now
             status["cleared"] = True
-            return _stamp_metadata(state, agent_author)
-        # No in_flight to clear — still write nothing. Return state
-        # unchanged; locked_modify_yaml will still re-write the file
-        # (harmless — yaml round-trip), but we skip the metadata stamp
-        # so "last_updated" doesn't move on a no-op call.
-        return state
+            return stamp_row_metadata(row, agent_author, now)
+        # No in_flight to clear — return unchanged; locked_modify_yaml
+        # still re-writes the row (harmless yaml round-trip), but we skip
+        # the metadata stamp so timestamps don't move on a no-op call.
+        return row
 
-    locked_modify_yaml(TEAM_STATE_PATH, _modifier, initial=dict(EMPTY_STATE))
+    locked_modify_yaml(row_path(WORLD_DIR, target_agent), _row_modifier,
+                       initial=core_residual(TEAM_STATE_PATH, target_agent))
     if status["cleared"]:
         print(f"in_flight cleared for {target_agent}")
     else:
         print(f"in_flight already absent for {target_agent}")
+
+def cmd_migrate_shard(args):
+    """One-shot cleanup: move core-file agent_status residuals into per-agent
+    row files, then empty the core file's agent_status map (g-328-27).
+
+    OPTIONAL — the sharded write path self-seeds each row from its core
+    residual on first write, so correctness never depends on running this.
+    What it buys: a clean core file (no permanently-stale residual rows
+    confusing raw readers of the un-composed file). Idempotent; newest-wins
+    on collision with an already-written row file.
+
+    Durability note (guard-832): on an own-cloud deployment the new row
+    files land on S3 via the next sweep/push — run a sync before treating
+    the migration as fleet-visible.
+    """
+    agent = args.author or _agent_name()
+    state = {}
+    if TEAM_STATE_PATH.exists():
+        with open(TEAM_STATE_PATH, "r", encoding="utf-8") as f:
+            state = yaml.safe_load(f) or {}
+    residuals = state.get("agent_status") or {}
+    if not isinstance(residuals, dict) or not residuals:
+        rows_dir(WORLD_DIR).mkdir(parents=True, exist_ok=True)
+        print("migrate-shard: no core agent_status residuals — nothing to move")
+        return
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    moved = []
+    for name, entry in sorted(residuals.items()):
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            continue
+
+        def _row_modifier(row, _entry=entry):
+            if not isinstance(row, dict) or not row:
+                return dict(_entry)
+            # Row already exists — keep whichever snapshot is newer
+            # (same comparison compose uses), so re-running the migration
+            # can never roll a live row back to the stale residual.
+            return row if _entry_ts(row) >= _entry_ts(_entry) else dict(_entry)
+
+        locked_modify_yaml(row_path(WORLD_DIR, name), _row_modifier,
+                           initial=dict(entry))
+        moved.append(name)
+
+    def _core_modifier(st):
+        st["agent_status"] = {}
+        return _stamp_metadata(st, agent)
+
+    locked_modify_yaml(TEAM_STATE_PATH, _core_modifier, initial=dict(EMPTY_STATE))
+    print(f"migrate-shard: moved {len(moved)} row(s) to {rows_dir(WORLD_DIR)}: "
+          f"{', '.join(moved)}")
+    print("migrate-shard: core agent_status emptied (composed reads now serve rows)")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -333,6 +435,12 @@ def build_parser():
                          help="Agent name to clear (alpha, bravo, ...)")
     clear_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
 
+    # migrate-shard ()
+    migrate_p = sub.add_parser("migrate-shard",
+                               help="One-shot: move core agent_status rows into "
+                                    "per-agent row files (optional cleanup)")
+    migrate_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
+
     return parser
 
 def main():
@@ -343,6 +451,7 @@ def main():
         "init": cmd_init,
         "in-flight": cmd_in_flight,
         "clear-in-flight": cmd_clear_in_flight,
+        "migrate-shard": cmd_migrate_shard,
     }
     dispatch[args.command](args)
 

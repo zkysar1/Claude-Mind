@@ -48,16 +48,13 @@ def _read_in_flight_goal_id():
     agent = os.environ.get("MIND_AGENT")
     if not agent:
         return None
-    path = WORLD_DIR / "team-state.yaml"
-    if not path.exists():
-        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        return (data.get("agent_status", {})
-                    .get(agent, {})
-                    .get("in_flight", {})
-                    .get("goal_id"))
+        # g-328-27 sharding: row-first read (world/team-state/agents/<agent>.yaml)
+        # with core-file residual fallback for un-migrated deployments.
+        from _team_state import read_agent_row
+        status = read_agent_row(WORLD_DIR, agent,
+                                core_path=WORLD_DIR / "team-state.yaml") or {}
+        return (status.get("in_flight") or {}).get("goal_id")
     except Exception:
         return None
 # EXPERIENCE_REF_RE is the experience-store ID regex — single source of truth

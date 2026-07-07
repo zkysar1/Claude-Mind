@@ -565,6 +565,51 @@ Both agents maintain a shared situational awareness document at `world/team-stat
 This provides instant context about what the other agent is doing, what's strategically
 important, and what's blocked — without scanning hundreds of board messages.
 
+### Sharded Storage Layout (g-328-27)
+
+The LOGICAL schema below is unchanged, but the STORAGE is sharded: each
+agent's `agent_status.<name>` row physically lives in its own file
+`world/team-state/agents/<name>.yaml`, written ONLY by that agent's
+sessions. Shared fields (`strategic_focus`, `active_blockers`,
+`recent_completions`, `critical_blockers`, `inbox_alert_backlog`,
+`shared_cadences`, ...) stay in `world/team-state.yaml` (the "core" file).
+Rationale: team-state was the hottest cross-writer file in the fleet —
+every agent bumped its own `last_active`/`in_flight` every iteration, so N
+agents contended on one lock (local) / one CAS-fenced S3 object
+(own-cloud). With one row file per agent, no two writers ever touch the
+same object; contention disappears by construction.
+
+Mechanics (single source of truth: `core/scripts/_team_state.py`, imported
+by BOTH the CLI `team-state.py` and the daemon `team_state{,_write}.py` —
+guard-742 parity by construction):
+
+- **Write routing**: `update --field agent_status.<name>[...]`,
+  `in-flight`, and `clear-in-flight` land in that agent's row file (row
+  writes also stamp `row_updated`/`row_updated_by`). All other fields
+  route to the core file exactly as before.
+- **Composed reads**: `team-state-read.sh` / `GET /v1/team-state/read` /
+  `read_state()` overlay row files onto the core document — per-agent
+  WHOLE-ROW newest-wins (same side-pick semantics as
+  `coordination_merge._merge_agent_status`; rows win ties), and
+  `last_updated`/`last_updated_by` lift to the newest stamp across core +
+  rows. Consumers see the exact pre-shard schema.
+- **Raw readers must compose**: any code reading `agent_status` straight
+  off `team-state.yaml` sees only stale residuals. Use
+  `_team_state.read_agent_row(world, agent, core_path=...)` for one agent
+  (in-flight inference) or `_team_state.compose_state / compose_agent_status`
+  for the full map; roster = core keys ∪ row-file stems
+  (`row_agent_names`, or `_agents.get_active_agents()` which already
+  unions both).
+- **Lazy migration**: the first row write for an agent self-seeds from the
+  core-file residual, so no coordinated migration is required.
+  `team-state.py migrate-shard` is an optional one-shot cleanup that moves
+  residuals into rows and empties the core `agent_status` map.
+- **Own-cloud**: row files are ordinary governed world files (the sweep
+  walks the tree). They are single-writer by construction, so
+  both-diverged conflicts should not occur; they are intentionally NOT
+  merge-registered (safe-freeze is the correct conservative behavior for
+  a violated single-writer invariant).
+
 ### Schema
 
 ```yaml

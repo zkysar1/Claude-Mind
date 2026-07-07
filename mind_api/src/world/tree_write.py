@@ -722,15 +722,12 @@ def _read_in_flight_goal_id(world_path: Path, agent: str):
     try:
         if not agent or world_path is None:
             return None
-        path = world_path / "team-state.yaml"
-        if not path.exists():
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        return (data.get("agent_status", {})
-                    .get(agent, {})
-                    .get("in_flight", {})
-                    .get("goal_id")) or None
+        #  sharding: row-first read (world/team-state/agents/<agent>.yaml)
+        # with core-file residual fallback for un-migrated deployments.
+        from _team_state import read_agent_row
+        status = read_agent_row(world_path, agent,
+                                core_path=world_path / "team-state.yaml") or {}
+        return (status.get("in_flight") or {}).get("goal_id") or None
     except Exception:
         return None
 

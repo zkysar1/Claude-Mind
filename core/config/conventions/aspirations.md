@@ -49,6 +49,53 @@ aspiration's source (`--source world` vs `--source agent`) disambiguates.
    queues and tags each candidate with `source: "world"` or `source: "agent"`.
    Downstream skills propagate `source` per the Source Routing Protocol below.
 
+## ID Allocation (g-328-29 — server-side, in-lock)
+
+**The `id` field on `/v1/aspirations/add` is OPTIONAL.** When absent (or
+`"auto"`/`""`), the daemon mints the next `asp-NNN` INSIDE the write lock:
+max+1 across the target queue's live file ∪ archive, both read under the
+same lock that appends the record. Embedded goal ids are minted in the same
+lock as `g-NNN-01..` in array order (goals carrying explicit ids under auto
+allocation are refused with `auto_id_goal_conflict` — the caller cannot know
+the asp number yet). The response returns `aspiration_id` +
+`id_allocated: true`; callers read the id back instead of pre-computing it.
+Goal ids on `/v1/aspirations/add-goal` were already minted in-lock
+(`_allocate_goal_id`) — this extends the same guarantee to aspiration ids.
+
+**Why option (a) — atomic in-lock allocation.** The alternative shapes were
+(b) optimistic mint + retry-on-collision (client keeps minting, server
+refuses, client increments — leaves the race window and adds a retry loop
+every caller must implement) and (c) a dedicated counter file (a second
+write surface with its own lock ordering and drift-vs-truth reconciliation).
+(a) closes the race at the only place that already serializes queue writes,
+adds zero new files, and keeps explicit ids working for transplant and
+migration callers.
+
+**The incident this closes** (2026-07, BRD "owncloud-fence-freeze"): two
+agents filed aspirations concurrently; both ran the SKILL-layer
+`max(NNN across active ∪ archive) + 1` read OUTSIDE any lock, both computed
+`asp-334`, and the second write landed as a duplicate id (double-mint).
+In-lock minting makes concurrent auto adds serialize and receive distinct
+sequential ids.
+
+**Scope and residual risk.**
+- Uniqueness is per-queue (world and agent queues share the `asp-001`
+  bootstrap id by convention — see Dual-Scope Bootstrap IDs above); the
+  mint scans only the target queue, matching the id-space semantics.
+- Cross-box residual: two machines filing against different local replicas
+  before own-cloud sync converges can still double-mint — the write lock is
+  per-box. Today the merge/CAS layer surfaces such collisions; if the
+  conflict-rate metric (`GET /v1/admin/write-queue`, g-328-28) shows this
+  actually occurring, the documented escalation is a remote-lock-table
+  atomic-counter allocator (conditional add — fleet-global, monotonic,
+  no scan).
+- Format ceiling: `_ASP_ID_RE` (and the CLI's `ASP_ID_RE`) accept exactly
+  3-digit `asp-NNN`. The mint's `:03d` format grows naturally past 999
+  (`asp-1000`), but downstream update paths would reject it — the same
+  ceiling client-side minting had. Expand both regexes to `\d{3,4}`
+  (mirroring the 2026-05-19 g-NNN-NNNN goal-id expansion) before the fleet
+  approaches asp-999.
+
 ## Script-Based Access (Exclusive Data Layer)
 
 The LLM NEVER reads or edits aspiration JSONL files directly. All operations go through scripts.
