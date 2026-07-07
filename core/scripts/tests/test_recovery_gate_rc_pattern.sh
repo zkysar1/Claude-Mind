@@ -2,11 +2,11 @@
 # test_recovery_gate_rc_pattern.sh — 
 #
 # Verifies the rc-pattern fix for stop-requested gates in recovery-gate.sh:
-# _check_state_corruption (Path B, ~L210-216), _check_hung_autocompact
-# (Path C, ~L272-281), and run_gate_for_agent Cond 3 (Path A, ~L362-376).
-# All three sites must mirror Cond 2.5/Cond 4 (rb-762): rc=1 is the ONLY
-# "continue" code; rc=0 (signal exists) AND rc=2+ (script error) both
-# suppress recovery.
+# _check_state_corruption (Path B), _check_hung_autocompact (Path C),
+# _check_wedged_loop (Path D, ), and run_gate_for_agent Cond 3
+# (Path A, extracted to runner-dead-check.sh). All four sites must mirror
+# Cond 2.5/Cond 4 (rb-762): rc=1 is the ONLY "continue" code; rc=0 (signal
+# exists) AND rc=2+ (script error) both suppress recovery.
 #
 # Strategy: probe the rc-pattern idiom in isolation via a simulated wrapper
 # that exits with a configurable rc. Doesn't invoke the full gate (would
@@ -99,18 +99,19 @@ elif [[ ! -f "$RDC_SH" ]]; then
     echo "FAIL: runner-dead-check.sh not found at $RDC_SH (g-115-947 helper)"
     failures=$((failures+1))
 else
-    # Scenario 4: exactly 3 sr_rc sites total across the two files —
+    # Scenario 4: exactly 4 sr_rc sites total across the two files —
     # Path B (recovery-gate.sh:_check_state_corruption), Path C
-    # (recovery-gate.sh:_check_hung_autocompact), and Path A (now in
+    # (recovery-gate.sh:_check_hung_autocompact), Path D
+    # (recovery-gate.sh:_check_wedged_loop, ), and Path A (now in
     # runner-dead-check.sh after the  extraction).
     # `grep -c` returns 1 on zero matches, so pipe to wc -l for a stable count.
     sr_count_rg=$(grep "local sr_rc=" "$RG_SH" 2>/dev/null | wc -l | tr -d '[:space:]')
     sr_count_rdc=$(grep "^[[:space:]]*sr_rc=" "$RDC_SH" 2>/dev/null | wc -l | tr -d '[:space:]')
     sr_count_total=$((sr_count_rg + sr_count_rdc))
-    if [[ "$sr_count_total" == "3" ]]; then
-        echo "PASS: scenario 4 — all 3 stop-requested sites use sr_rc idiom (recovery-gate.sh=$sr_count_rg + runner-dead-check.sh=$sr_count_rdc)"
+    if [[ "$sr_count_total" == "4" ]]; then
+        echo "PASS: scenario 4 — all 4 stop-requested sites use sr_rc idiom (recovery-gate.sh=$sr_count_rg + runner-dead-check.sh=$sr_count_rdc)"
     else
-        echo "FAIL: scenario 4 — expected 3 sr_rc sites total, found $sr_count_total (recovery-gate.sh=$sr_count_rg + runner-dead-check.sh=$sr_count_rdc)"
+        echo "FAIL: scenario 4 — expected 4 sr_rc sites total, found $sr_count_total (recovery-gate.sh=$sr_count_rg + runner-dead-check.sh=$sr_count_rdc)"
         failures=$((failures+1))
     fi
 

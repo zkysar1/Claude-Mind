@@ -318,8 +318,9 @@ stale_sentinel:
 #   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
 #                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
 #                (0.5e.5), felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
-#                health-regression-cadence (0.5h). All are themselves
-#                cadence-gated, so dropping them in tight zones is safe.
+#                health-regression-cadence (0.5h), curriculum-cadence (0.5i).
+#                All are themselves cadence-gated, so dropping them in tight
+#                zones is safe.
 #
 # Always-run sweeps fire 100% of the time regardless of zone or budget. If
 # precheck-drops.jsonl ever shows an always-run drop, that's a bug — raise
@@ -769,6 +770,23 @@ l1_skew_check:
   first_fire_offset: 20         # Stagger first-fire so it doesn't collide with
                                 # fresh-eyes (+5) or felt-sense (+15) on a fresh
                                 # seed event — 20 goals out lands distinctly.
+
+# --- CURRICULUM RE-EVALUATION CADENCE (1) ---
+# Time-based cadence that re-runs curriculum-evaluate for the CURRENT agent so
+# its graduation-gate snapshot never goes stale. The only OTHER /curriculum-gates
+# triggers (session-end consolidation, cadence-gated evolution) can skip a
+# continuously-looping agent for weeks — delta sat at Foundation a full month
+# (eval frozen at 2026-06-01, goals=3/competence=0.0) while its live values
+# already qualified (goals=27/competence=0.589). Consumed by aspirations-precheck
+# Phase 0.5i via curriculum-cadence-check.sh. On a fire the precheck runs
+# curriculum-evaluate.sh, stamps wm_slot, and routes any qualifying promotion
+# through /curriculum-gates (guard-33 email-confirmed) — this cadence NEVER calls
+# curriculum-promote.sh directly. interval_hours (not goal_cadence) because the
+# staleness is wall-clock drift, not a throughput gap.
+curriculum_cadence:
+  enabled: true
+  interval_hours: 24            # Re-evaluate at most once per day per agent
+  wm_slot: last_curriculum_eval
 
 # --- TREE-NODE CLUSTER ARCHIVAL (D2 — , design d2-cluster-archival-design.md) ---
 # LLM-reviewed, cluster-aware archival of STALE LEAF tree nodes. A leaf >180d past
@@ -1580,6 +1598,52 @@ runner_heartbeat:
   # instrumentation. Trade-off: genuine zombie recovery takes ~2x longer.
   # Tunable; raise further if 60 still false-positives.
   stale_minutes: 60
+  # Wedged-loop detection threshold (recovery-gate Path D, ;  fix).
+  # A phase_start left UNCLOSED (phase entered, never exited) longer than this is
+  # a WEDGE: the loop keeps the heartbeat FRESH while diary writes stall behind a
+  # wedged _fileops lock (2026-07-04 own-cloud fleet-wedge,  #4/#5).
+  # INVARIANT (): wedge_stale_minutes MUST be > runner_heartbeat.stale_minutes
+  # (60). WHY: a HEALTHY non-phase-4 phase's local runner-heartbeat ages WITH its
+  # phase_start -- both are stamped near the iteration's Phase -0.5 -> Phase 0
+  # boundary and neither re-ticks mid-phase during active (non-sleeping) work
+  # (heartbeat-stale.sh reads the LOCAL runner-heartbeat mtime, touched only by
+  # heartbeat-tick.sh at Phase -0.5 and interruptible-sleep.sh during sleeps). So
+  # when a healthy phase_start exceeds wedge_stale (>60), its heartbeat is ALSO
+  # >60 -> STALE -> Path D's heartbeat-FRESH gate (recovery-gate.sh L607-608)
+  # fails FIRST and suppresses. ONLY a genuine wedge (heartbeat re-ticked FRESH
+  # while the diary stays frozen) presents phase_start>wedge_stale WITH a fresh
+  # heartbeat. At 45 (< 60) there was a 45-60min window where a long precheck /
+  # state-update false-recovered a HEALTHY agent -- the  defect, found by
+  # fresh-eyes-code self-review of . 65 = 60 + 5min margin eliminates that
+  # window; cost is ~20min slower real-wedge recovery (rare + previously manual).
+  # Raising the threshold is monotonically safe: it can only REDUCE Path D firings.
+  # phase-4-execute is separately protected by the execute-in-flight suppressor
+  # (4h) shared with Paths A/C. Env override: WEDGE_STALE_MINUTES. Guarded by
+  # test_phase_wedge_check.py::test_config_invariant_wedge_exceeds_heartbeat_stale.
+  wedge_stale_minutes: 65
+  # Watchdog STALLED-detection threshold (agent-watchdog.py StalledProbe, ).
+  # The watchdog reports STALLED (not OK) when the runner-heartbeat is FRESH (loop
+  # alive + re-ticking every iteration) but the execution-diary.jsonl mtime is
+  # stale beyond THIS many minutes (no goal-execution progress). That conjunction
+  # is root cause #5 of the 2026-07-04 own-cloud fleet-wedge (): own-cloud
+  # write deadlock froze goal execution for DAYS while the loop kept ticking the
+  # heartbeat, and the watchdog reported OK because HeartbeatProbe only fires on a
+  # STALE heartbeat — a fresh heartbeat masks the wedge.
+  # INVARIANT (same shape as wedge_stale_minutes > stale_minutes): this MUST be >
+  # runner_heartbeat.stale_minutes (60). WHY: deep-close LLM work legitimately
+  # freezes the diary AND ages the heartbeat TOGETHER for 30-45 min (see the
+  # stale_minutes comment above). If this threshold were <= stale_minutes, a diary
+  # stale past it would imply a heartbeat also stale -> classify_stalled's
+  # fresh-heartbeat gate fails first -> the STALLED verdict is INERT. Only a
+  # genuine wedge (heartbeat re-ticked FRESH while the diary stays frozen far
+  # longer) presents fresh-heartbeat WITH diary-stale > this threshold. 180 = 3x
+  # the 60-min heartbeat window, well above the 45-min deep-close gap; distinct
+  # from wedge_stale (65, unclosed-phase detection) because a TOTAL diary freeze
+  # is a longer/rarer condition than a single unclosed phase and this probe is
+  # observability (a log event), not recovery. Env override:
+  # STALLED_DIARY_STALE_MINUTES. Guarded by
+  # test_agent_watchdog_stalled.py::test_config_invariant_diary_stale_exceeds_heartbeat_stale.
+  stalled_diary_stale_minutes: 180
 
 # --- Recovery gate (script-gated crashed-runner auto-recovery) ---
 # core/scripts/recovery-gate.sh fires from the SessionStart hook when ALL FOUR
@@ -1688,7 +1752,12 @@ health_regression:
   #   collect-only      — append ledger records; no detection, no reverts (Phase 1)
   #   detect-and-report — + detection sweep files Investigate goals; no reverts (Phase 2)
   #   full              — + tiered revert pipeline active (Phase 3, post-calibration)
-  mode: collect-only
+  #  (2026-07-06): advanced collect-only -> detect-and-report (agent-judgable
+  # low-risk step; calibration AND-gate satisfied 2026-07-06, alpha composite 0.7497
+  # trend +0.0026 healthy). Detection sweep now files Investigate goals on health
+  # regressions; NO auto-revert (that is the detect-and-report -> full step, which is
+  # user-paced per health-ledger.md §10 — left for the user to advance).
+  mode: detect-and-report
 
   # --- Composite weights (health-ledger §4). Reused signals from
   # world/productivity-snapshots.jsonl — NOT recomputed. Renormalized over

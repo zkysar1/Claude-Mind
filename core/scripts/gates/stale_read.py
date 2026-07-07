@@ -90,9 +90,11 @@ def _agent_last_read(parent_goal_id: str, agent: str,
 
     RETIRED RECEIPT FILE (g-333-02): goal-reads.jsonl has no live writer
     (aspirations.py:_log_goal_read removed at the 2026-05-14 daemon cutover;
-    the daemon read path never logged it). Its 3 stale files (~257k frozen
-    lines) were deleted under g-333-02, so in production this early-returns
-    None at the `if not log.exists()` guard below WITHOUT running the per-goal
+    the daemon read path never logged it). Its stale files (~257k+ frozen
+    lines) were deleted under g-333-02 (3 of 4) and g-115-1796 (alpha's
+    4th straggler, 114667 frozen lines, g-333-02-missed; all 6 agents now
+    clean), so in production this early-returns None at the
+    `if not log.exists()` guard below WITHOUT running the per-goal
     O(n) scan -- the scan is now vestigial. Block 2 in evaluate() is
     intentionally retained (g-115-1572 kept it) for the hypothetical
     manually-restored-receipt case; do NOT resurrect the writer (rejected

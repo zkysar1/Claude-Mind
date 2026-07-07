@@ -5520,6 +5520,27 @@ else:
    Check: pytest test files under core/scripts/tests/ and core/tests/ have no module-level os.environ mutation without capture-restore evidence (Layer 1 of the test-pollution defense).
    Bash: `py -3 -c "import sys,pathlib,re; mut=re.compile(r'^os\.environ\.(pop|setdefault|update)|^os\.environ\['); ev=re.compile(r'_SAVED|_ORIG_|_BOOTSTRAP|autouse|@pytest\.fixture'); viol=[]; [viol.append(f'{f}:{n+1}: {line.strip()[:80]}') for root in ('core/scripts/tests','core/tests') if pathlib.Path(root).exists() for f in pathlib.Path(root).rglob('test_*.py') for text in [f.read_text(encoding='utf-8',errors='replace')] for n,line in enumerate(text.splitlines()) if mut.match(line) and not ev.search(text)]; ok=not viol; print('PASS: no module-level os.environ mutation regressions in pytest files (Layer 1 test-pollution defense intact)') if ok else (print(f'FAIL: module-level os.environ mutation without capture-restore evidence in pytest test files (regression of the test_cmd_set_auto_propagate.py contaminator class — see rb-1096, guard-588, tree node test-pollution-defense, commit 7f05915d): {viol[:10]}') or sys.exit(1))"`
 
+   # Section ODI: Optional-dependency module-level import guard — pytest collection-abort defense (g-115-1775, rb-2780, 2026-07-04)
+   # A DIRECT module-level `import numpy|torch|sentence_transformers` (or `from`
+   # same) in a pytest test file aborts pytest COLLECTION on any box lacking that
+   # dep — exit 2, ZERO tests run — because pytest imports every test module during
+   # collection before running anything. That silently zeroes ALL test signal on
+   # that box: a HIGH-blast-radius regression that forced --continue-on-collection-
+   # errors on every deep-close full-suite run (rb-2766 baseline). The durable fix
+   # is the assignment-form guard `np = pytest.importorskip("numpy")` placed BEFORE
+   # every dep-importing line (direct AND transitive), which converts the collection
+   # ERROR into a clean module SKIP. This check guards RE-introduction: any pytest
+   # test file with an unguarded (no importorskip anywhere in the file) module-level
+   # heavy-dep import FAILs. Mirror of the Section TPD Layer 1 grep above (same
+   # core/scripts/tests scan shape). LIMITATION: catches DIRECT module-level imports
+   # only — the TRANSITIVE case (a test importing a LOCAL module that itself imports
+   # numpy, as test_embedding_retrieval.py did via _embedding_retrieval) is NOT
+   # statically greppable and is out of scope. Module-level = no leading whitespace;
+   # an indented import inside try/except or a def is lazy/guarded and does not
+   # abort collection.
+   Check: pytest test files under core/scripts/tests/ and core/tests/ have no unguarded module-level numpy/torch/sentence_transformers import (importorskip collection-abort defense).
+   Bash: `py -3 -c "import sys,pathlib,re; dep=re.compile(r'^(?:import (?:numpy|torch|sentence_transformers)\b|from (?:numpy|torch|sentence_transformers)(?:\.\w+)* import)'); guard=re.compile(r'importorskip'); viol=[]; [viol.append(f'{f}:{n+1}: {line.strip()[:80]}') for root in ('core/scripts/tests','core/tests') if pathlib.Path(root).exists() for f in pathlib.Path(root).rglob('test_*.py') for text in [f.read_text(encoding='utf-8',errors='replace')] if not guard.search(text) for n,line in enumerate(text.splitlines()) if dep.match(line)]; ok=not viol; print('PASS: no unguarded module-level numpy/torch/sentence_transformers imports in pytest test files (importorskip collection-abort defense intact)') if ok else (print(f'FAIL: module-level optional-dependency import without pytest.importorskip in a pytest test file — this aborts pytest core/scripts/tests COLLECTION (exit 2, ZERO tests run) on any box lacking the dep, silently zeroing all test signal there (g-115-1775, rb-2780): {viol[:10]}') or sys.exit(1))"`
+
    # Section APD: Inlined _APD constants mirror canonical AGENTS_PARENT_DIR (g-115-984, commit 520e9375, 2026-05-19)
    # Four hot-path shell scripts (session-state-get.sh, session-mode-get.sh,
    # session-signal-exists.sh, cleanup-stale-bindings.sh) inline `_APD="agents"`

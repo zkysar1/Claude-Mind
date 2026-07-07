@@ -238,9 +238,15 @@ doubt between framework and domain, pick domain.
 
         Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
         Read agents/<agent>/developmental-stage.yaml → current stage
+        # Curriculum contract gate (g-115-1801): the stricter gate /forge-skill enforces at its
+        # Step 1. Dev-stage >= EXPLOIT (competence axis) can pass while the curriculum contract
+        # (capability-unlock axis) still blocks forging — gate on BOTH so we never queue a forge
+        # goal that /forge-skill will ABORT. Exit 0 = permitted, exit 1 = blocked by curriculum stage.
+        Bash: curriculum-contract-check.sh --action allow_forge_skill
         IF gap.times_encountered >= forge_threshold
            AND gap.estimated_value >= "medium"
-           AND developmental stage >= EXPLOIT (developing+):
+           AND developmental stage >= EXPLOIT (developing+)
+           AND curriculum-contract-check exit code == 0:
             # Verify no pending forge goal already exists for this gap
             Bash: load-aspirations-compact.sh → IF path returned: Read it
             (compact aspirations now in context — search goals for this gap ID)

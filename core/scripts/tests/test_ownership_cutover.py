@@ -40,7 +40,7 @@ if str(SCRIPTS) not in sys.path:
 
 import owncloud_sync as _mod  # noqa: E402 — module under test
 import storage_backend  # noqa: E402 — monkeypatch target for get_backend
-from owncloud_backend import RunnerClaim  # noqa: E402
+from owncloud_backend import RunnerClaim, OwnCloudPermissionError  # noqa: E402
 
 STALE = 900  # OWNERSHIP_STALE_SECONDS under test
 
@@ -176,6 +176,22 @@ def test_ownership_ddb_failure_is_empty_set_not_none(wire):
     assert result == set() and result is not None, (
         "fallback is the empty set, never None/own-all"
     )
+
+
+def test_ownership_permission_gap_fails_loud(wire):
+    # : a PERSISTENT IAM/permission gap (OwnCloudPermissionError from
+    # list_runner_claims' DDB Scan — e.g. the daemon's creds lack dynamodb:Scan)
+    # must NOT conservative-degrade to own-none the way a transient error does.
+    # A permission gap silently owning no dirs is the 2026-07-04 fleet-wedge
+    # (): the fleet synced nothing for days because AccessDenied looked
+    # identical to "owns no agent dirs". It must fail LOUD (re-raise) so the gap
+    # surfaces for remediation. Contrast test_ownership_ddb_failure_owns_none
+    # (transient RuntimeError -> own none, unchanged).
+    failing = _FakeClaimBackend(
+        "machineA", raise_on_list=OwnCloudPermissionError("dynamodb:Scan denied"))
+    wire(failing)
+    with pytest.raises(OwnCloudPermissionError):
+        _mod._owned_agents()
 
 
 def test_ownership_unknown_machine_id_owns_none(wire):

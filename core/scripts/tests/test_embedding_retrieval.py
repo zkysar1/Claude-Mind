@@ -8,8 +8,12 @@ hot suite.
 """
 import json
 
-import numpy as np
 import pytest
+
+# 5: importorskip -> clean module SKIP on a numpy-less box instead of a
+# collection ERROR that aborts the whole `pytest core/scripts/tests` run. Also
+# guards `import _embedding_retrieval` below (it imports numpy transitively).
+np = pytest.importorskip("numpy")
 
 import _embedding_retrieval as er
 

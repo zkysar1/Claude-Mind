@@ -385,6 +385,21 @@ _STOPWORDS = {
     "evaluate", "evaluated", "evaluating",
     "before", "after", "only", "first", "last", "then", "stale",
     "must",
+    # g-115-1791: generic infra terms that leak into keyword matching from
+    # own-cloud write-fence defer_reasons ("own-cloud pipeline writes fenced;
+    # reads work, writes fail; write_conflict") and false-match domain
+    # capability rows. "writes"/"reads" are the plural-leak of the already-
+    # present singular "write"/"read" above; each is a non-discriminative verb
+    # in domain prose (game-session row "NPC memory writes"; PLAY-mode row
+    # "reads Player presence") whose row retains other identifying tokens
+    # (npc/memory/session; play-mode/bridge/player/datamodel). "pipeline" is a
+    # generic infra noun in the same class as the already-present "process"/
+    # "script"/"system" — it collides across the behavioral-analysis row
+    # ("OHS scoring pipeline", which still matches on ohs/scoring/analyze),
+    # the framework hypothesis pipeline, and pipeline-*.sh companion scripts,
+    # i.e. "too general to discriminate". Evidence: g-001-317 spurious Unblock
+    # auto-filed 2026-07-05 when g-001-02 was deferred on the own-cloud fence.
+    "writes", "reads", "pipeline",
 }
 
 
