@@ -30,16 +30,24 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    leaves_json=$(bash core/scripts/tree-read.sh --leaves)
    # Filter to entries where depth >= 2, extract capability_level from each
 
-   Compute average_competence:
+   Compute tree_maturity (knowledge-tree maturity = mean capability_level of tree
+   leaves at depth >= 2). This is EVOLVE's metric — it drives overall_stage +
+   exploration epsilon. It is NOT the curriculum-gate metric: competence-assess.py
+   owns current_assessment.average_competence (4-component evidence formula) that
+   curriculum.yaml gates consume; evolve owns current_assessment.tree_maturity.
+   The two were split (g-115-2028) to end the shared-field last-writer-wins
+   collision that left average_competence with misattributed provenance
+   (producer/assessed_at claiming the script after evolve overwrote it) and a
+   threshold-oscillation risk on worlds where the two values straddle a gate:
      competence_mapping: EXPLORE=0.15, CALIBRATE=0.45, EXPLOIT=0.70, MASTER=0.90
      For each leaf at depth >= 2: map capability_level → numeric value
-     average_competence = mean(all competence values)
-     If no leaves at depth >= 2: average_competence = 0.0
+     tree_maturity = mean(all competence values)
+     If no leaves at depth >= 2: tree_maturity = 0.0
 
    Compute exploration_budget:
-     exploration_budget = max(0.15, min(0.85, 1.0 - average_competence))
+     exploration_budget = max(0.15, min(0.85, 1.0 - tree_maturity))
 
-   Determine stage label from average_competence:
+   Determine stage label from tree_maturity:
      exploring:  avg < 0.30
      developing: 0.30 <= avg < 0.55
      applying:   0.55 <= avg < 0.80
@@ -72,7 +80,11 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        Log as ASSIMILATION in schema_operations.log
 
    Update agents/<agent>/developmental-stage.yaml:
-     overall_stage, average_competence, exploration_budget, evidence
+     overall_stage, tree_maturity, exploration_budget, evidence
+     # evolve writes current_assessment.tree_maturity ONLY. It MUST NOT write
+     # current_assessment.average_competence — competence-assess.py owns that
+     # field for the curriculum gates. Writing both producers to average_competence
+     # was the g-115-2028 collision this split resolved.
 
    Run active forgetting pruning:
      Read core/config/memory-pipeline.yaml forgetting config

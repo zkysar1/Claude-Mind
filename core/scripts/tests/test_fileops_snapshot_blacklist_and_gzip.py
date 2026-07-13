@@ -456,16 +456,19 @@ def _setup_history_dir():
     base_dir. So the fixture now creates an MIND_WORLD sandbox + plants
     the snapshot under <world>/.history/<rel>/<snap-name>.
 
-    Returns (sandbox, target_file, snap_path). Caller cleans up sandbox.
-    The caller is also responsible for env var restoration via the same
-    pattern used by with_sandbox above — here we keep it inline because
-    these three lookup tests need to invoke history._find_snapshot_by_name
-    against a known-good base_dir without going through save_history.
+    Returns (sandbox, target_file, snap_path, meta_dir, prior_env).
+    Caller passes sandbox, meta_dir, and prior_env to
+    _teardown_history_dir, which removes both tmp dirs AND restores the
+    pre-existing MIND_WORLD/MIND_META (capture-restore, matching the
+    with_sandbox wrapper above). The three lookup tests invoke
+    history._find_snapshot_by_name against a known-good base_dir without
+    going through save_history, so they need this dedicated fixture.
     """
+    prior_env = {k: os.environ.get(k) for k in ("MIND_WORLD", "MIND_META")}
     sandbox = Path(tempfile.mkdtemp(prefix="hist_resolve_world_"))
+    meta = Path(tempfile.mkdtemp(prefix="hist_resolve_meta_"))
     os.environ["MIND_WORLD"] = str(sandbox)
-    meta = str(Path(tempfile.mkdtemp(prefix="hist_resolve_meta_")))
-    os.environ.setdefault("MIND_META", meta)
+    os.environ["MIND_META"] = str(meta)
     for mod in list(sys.modules):
         if mod in ("_fileops", "_paths", "history"):
             del sys.modules[mod]
@@ -476,14 +479,22 @@ def _setup_history_dir():
     snap = snap_dir / "2026-05-22T09-15-00_zeta.jsonl.gz"
     with gzip.open(snap, "wb") as f:
         f.write(b'{"hello": "world"}\n')
-    return sandbox, target, snap
+    return sandbox, target, snap, meta, prior_env
 
 
-def _teardown_history_dir(sandbox):
+def _teardown_history_dir(sandbox, meta, prior_env):
     shutil.rmtree(sandbox, ignore_errors=True)
-    os.environ.pop("MIND_WORLD", None)
-    # MIND_META intentionally left — the wrapper above sets it lazily and
-    # subsequent tests via with_sandbox overwrite it.
+    shutil.rmtree(meta, ignore_errors=True)
+    # Capture-restore: return MIND_WORLD/MIND_META to their pre-setup
+    # values. Was pop-not-restore (WORLD) + setdefault-never-restored
+    # (META), which leaked an orphaned tmp MIND_META pointer into the
+    # pytest process so a later local-paths.conf-resolving test read a
+    # dead tmp dir (4).
+    for var, val in prior_env.items():
+        if val is None:
+            os.environ.pop(var, None)
+        else:
+            os.environ[var] = val
 
 
 def test_resolve_version_path_accepts_literal_gz_filename():
@@ -491,18 +502,18 @@ def test_resolve_version_path_accepts_literal_gz_filename():
     # Fixture MUST run before `import history` — _setup_history_dir clears
     # cached _paths/_fileops/history so the next import picks up the fresh
     # MIND_WORLD. Importing history first would bind to a stale module.
-    sandbox, target, snap = _setup_history_dir()
+    sandbox, target, snap, meta, prior = _setup_history_dir()
     try:
         import history
         found = history._find_snapshot_by_name(target, snap.name)
         assert_eq(found, snap, "literal .gz filename should resolve")
     finally:
-        _teardown_history_dir(sandbox)
+        _teardown_history_dir(sandbox, meta, prior)
 
 
 def test_resolve_version_path_accepts_bare_filename_without_gz():
     """User passes 'foo.jsonl' but on-disk is 'foo.jsonl.gz' — must resolve."""
-    sandbox, target, snap = _setup_history_dir()
+    sandbox, target, snap, meta, prior = _setup_history_dir()
     try:
         import history
         bare = snap.name[:-3]  # strip .gz
@@ -510,17 +521,17 @@ def test_resolve_version_path_accepts_bare_filename_without_gz():
         assert_eq(found, snap,
                   "bare filename should resolve to its .gz on-disk form")
     finally:
-        _teardown_history_dir(sandbox)
+        _teardown_history_dir(sandbox, meta, prior)
 
 
 def test_resolve_version_path_returns_none_for_missing():
-    sandbox, target, _ = _setup_history_dir()
+    sandbox, target, _, meta, prior = _setup_history_dir()
     try:
         import history
         found = history._find_snapshot_by_name(target, "does-not-exist.jsonl.gz")
         assert_eq(found, None, "missing version should return None")
     finally:
-        _teardown_history_dir(sandbox)
+        _teardown_history_dir(sandbox, meta, prior)
 
 
 # ---------------------------------------------------------------------------

@@ -506,9 +506,21 @@ def do_swap(dest_root: Path) -> dict:
     if failures:
         return {"moved": moved, "failures": failures}
 
-    # Success — remove staging dir
-    shutil.rmtree(staging, ignore_errors=True)
-    return {"moved": moved, "failures": []}
+    # Success — remove staging dir. FAIL-LOUD (0): the moves already
+    # succeeded, so a staging-dir cleanup error must NOT fail the swap, but it
+    # MUST be surfaced as a NAMED field rather than silently swallowed by
+    # ignore_errors=True — a silent post-move raise on this step was the
+    # hypothesized origin of the v2.1.1 silent-post-swap-death. Try a clean
+    # removal to capture any error, then a best-effort ignore_errors sweep to
+    # remove whatever can still be removed. Never raises (cleanup is best-effort
+    # once the swap itself has landed).
+    result = {"moved": moved, "failures": []}
+    try:
+        shutil.rmtree(staging)
+    except OSError as e:
+        result["staging_cleanup_error"] = f"rmtree({staging}): {e}"
+        shutil.rmtree(staging, ignore_errors=True)
+    return result
 
 
 # ============================================================================
@@ -633,7 +645,7 @@ _ORPHAN_SCAN_SKIP_TOP = {
     "meta",                 # per-deployment strategy state (external path in source)
     ".mind-data",           # in-repo own-cloud world/meta store (ZDS layout since
                             # 2026-06-30). EMERGENCY STOPGAP 2026-07-07 (applied by omni
-                            # with Zachary's explicit direction, all three repos): the
+                            # with user's explicit direction, all three repos): the
                             # sweep unlinked ZDS's entire world+meta because this name
                             # was missing (commit fb3634a transplant; restored from the
                             # dormant OneDrive backup). PROPER FIX (dev-chain): resolve

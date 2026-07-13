@@ -59,10 +59,22 @@ def _path(ctx) -> Path:
     return ctx.paths.meta / "improvement-velocity.yaml"
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
-    """Mirror meta-impk.py:read_yaml (line 31) incl. the NUL-byte guard."""
+def _read_yaml(path: Path, force_fresh: bool = False) -> Dict[str, Any]:
+    """Mirror meta-impk.py:read_yaml (line 31) incl. the NUL-byte guard.
+
+    force_fresh=True force-pulls the latest remote object AND records its ETag
+    as the If-Match fence token (get_backend().refresh), so a locked_rmw retry
+    cycle re-reads the peer's landed write and re-fences on each attempt — the
+    only way to break the per-object stale-IfMatch conflict deadlock (rb-2639).
+    Used by the snapshot() write cycle. Default False keeps the read-only
+    compute() path on the cache-TTL ensure_local (byte-identical, no extra S3
+    GET per read).
+    """
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639: break the per-object stale-IfMatch deadlock so each retry re-applies on the peer's landed write)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -203,44 +215,63 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
 
+    def _cycle():
+        # locked_rmw retries this ENTIRE in-lock body on the backend's
+        # optimistic-concurrency ConflictError (own-cloud If-Match 412), up to
+        # _CONFLICT_RETRY_CAP attempts with backoff. Each retry MUST begin with
+        # a fresh force-pull (_read_yaml force_fresh=True -> get_backend().refresh)
+        # so it re-reads the peer's landed write AND re-fences the If-Match token
+        # — the only way to break the per-object stale-IfMatch deadlock (rb-2639).
+        # On LocalBackend conflict_error is () so this is a transparent single
+        # pass, byte-identical to the prior `with locked(): ...` idiom (the
+        # daemon-safe test suite runs on LocalBackend and is unaffected).
+        vel = _read_yaml(live_path, force_fresh=True)
+        _validate_velocity_structure(vel, "post-read")
+
+        if "entries" not in vel:
+            vel["entries"] = []
+
+        entry: Dict[str, Any] = {
+            "goal_id": goal_id,
+            "date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "learning_value": learning_value,
+        }
+        if category:
+            entry["category"] = category
+        if active_changes:
+            entry["active_meta_changes"] = [
+                c.strip() for c in active_changes.split(",") if c.strip()]
+
+        vel["entries"].append(entry)
+
+        # Recompute rolling averages (meta-impk.py:149-156).
+        entries = vel["entries"]
+        for w in (5, 10, 20):
+            key = f"window_{w}"
+            if len(entries) >= w:
+                avg = sum(e.get("learning_value", 0) for e in entries[-w:]) / w
+                vel.setdefault("rolling_averages", {})[key] = round(avg, 4)
+            else:
+                vel.setdefault("rolling_averages", {})[key] = 0.0
+
+        _validate_velocity_structure(vel, "pre-write")
+        _validate_no_surrogates(vel, live_path)
+        history.snapshot(live_path, base_dir, agent)
+        _atomic_write_yaml(live_path, vel)
+        changelog.append(base_dir, agent, live_path, "edit")
+
     try:
         assert_not_cruft(live_path.parent, "mkdir (meta_impk)")
         live_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_locks.locked(live_path):
-            vel = _read_yaml(live_path)
-            _validate_velocity_structure(vel, "post-read")
-
-            if "entries" not in vel:
-                vel["entries"] = []
-
-            entry: Dict[str, Any] = {
-                "goal_id": goal_id,
-                "date": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-                "learning_value": learning_value,
-            }
-            if category:
-                entry["category"] = category
-            if active_changes:
-                entry["active_meta_changes"] = [
-                    c.strip() for c in active_changes.split(",") if c.strip()]
-
-            vel["entries"].append(entry)
-
-            # Recompute rolling averages (meta-impk.py:149-156).
-            entries = vel["entries"]
-            for w in (5, 10, 20):
-                key = f"window_{w}"
-                if len(entries) >= w:
-                    avg = sum(e.get("learning_value", 0) for e in entries[-w:]) / w
-                    vel.setdefault("rolling_averages", {})[key] = round(avg, 4)
-                else:
-                    vel.setdefault("rolling_averages", {})[key] = 0.0
-
-            _validate_velocity_structure(vel, "pre-write")
-            _validate_no_surrogates(vel, live_path)
-            history.snapshot(live_path, base_dir, agent)
-            _atomic_write_yaml(live_path, vel)
-            changelog.append(base_dir, agent, live_path, "edit")
+        # Route the RMW through the shared retry primitive instead of a bare
+        # `with file_locks.locked(...)`. locked_rmw acquires the same per-path
+        # lock, then runs _cycle under _rmw_with_conflict_retry. A conflict that
+        # survives all retries re-raises ConflictError (NOT an OSError), so it
+        # propagates past this handler to the server's universal 409
+        # "write_conflict" floor — the caller still gets the safe-to-retry 409,
+        # never a false 500. (1: closes the recurring non-fatal
+        # state-update-audit velocity-snapshot failure diagnosed in 0.)
+        file_locks.locked_rmw(live_path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 

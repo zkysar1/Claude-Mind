@@ -14,6 +14,12 @@ This goal completes the fix in two parts:
   2. Data (world/config/capability-routing.yaml): npc-evaluation -> charlie,
      roblox-integration -> delta (the two unambiguous documented-lane keys).
 
+2026-07-07 agent-merge re-key (g-115-1808): charlie + delta were merged into
+foxtrot; the overlay re-keyed both lanes charlie/delta -> foxtrot (audit
+commit 1b0be8b1). The end-to-end cases below pin the CURRENT specialist
+(foxtrot). The monkeypatched unit cases keep charlie/delta as synthetic
+names — they never read live state, so retired names are fine there.
+
 Coverage-helper cases monkeypatch the tables + active-agent set so they are
 independent of the live world overlay (matching test_capability_route.py).
 The end-to-end routability cases DO read the live overlay and skip when it is
@@ -94,30 +100,34 @@ def test_uncovered_active_agents_either_only_route_does_not_cover(monkeypatch):
 
 # ── end-to-end routability after the world-overlay data fix ──
 
-def test_charlie_routable_via_npc_evaluation():
+def test_npc_evaluation_routes_to_specialist():
+    # Was charlie's lane (3); charlie -> foxtrot per the 2026-07-07
+    # agent-merge overlay re-key. A retired-agent route demotes to "either",
+    # so this test breaking on a future roster change is it doing its job:
+    # roster changes must update routing, then this pin.
     if "npc-evaluation" not in cr.CATEGORY_ROUTES:
         pytest.skip("capability-routing overlay absent (fresh deployment)")
     r = cr.evaluate("Evaluate NPC believability gap", category="npc-evaluation")
-    assert r["intended_agent"] == "charlie", r
+    assert r["intended_agent"] == "foxtrot", r
 
 
-def test_delta_routable_via_roblox_integration():
+def test_roblox_integration_routes_to_specialist():
+    # Was delta's lane (3); delta -> foxtrot per the same re-key.
     if "roblox-integration" not in cr.CATEGORY_ROUTES:
         pytest.skip("capability-routing overlay absent (fresh deployment)")
-    # Category-only goal (no strong dev title-prefix to win Tier 1) -> delta.
+    # Category-only goal (no strong dev title-prefix to win Tier 1).
     r = cr.evaluate("NPC in-world reaction polish", category="roblox-integration")
-    assert r["intended_agent"] == "delta", r
+    assert r["intended_agent"] == "foxtrot", r
 
 
-def test_charlie_and_delta_present_in_live_route_tables():
-    # Structural assertion against the live overlay: after the data fix the two
-    # previously-unroutable agents now appear as route targets. Skips on a
-    # fresh deployment where the overlay (and thus all category routes) is empty.
+def test_merged_specialist_present_in_live_route_tables():
+    # Structural assertion against the live overlay: the specialist lanes that
+    # previously named charlie/delta now cover foxtrot. Skips on a fresh
+    # deployment where the overlay (and thus all category routes) is empty.
     if not cr.CATEGORY_ROUTES:
         pytest.skip("capability-routing overlay absent (fresh deployment)")
     covered = cr._route_covered_agents()
-    assert "charlie" in covered, covered
-    assert "delta" in covered, covered
+    assert "foxtrot" in covered, covered
 
 
 # ── regression: pre-existing routes unaffected by the additions ──

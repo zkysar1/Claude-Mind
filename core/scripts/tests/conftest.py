@@ -77,6 +77,19 @@ _set_default_agent()
 # rather than via this env selector, so the pin does not reduce its coverage.
 os.environ["STORAGE_BACKEND"] = "local"
 
+# 5: dormant-pin the own-cloud tempdir tripwire OFF for the whole pytest
+# session. Under pytest ALL backends are hermetic -- get_backend() returns
+# LocalBackend (STORAGE_BACKEND=local above), and the only tests reaching
+# OwnCloudBackend._put construct it directly against a moto-mocked S3 (no real
+# cloud), so their tmp-path PUTs are safe. The _assert_not_tempdir_put tripwire
+# (refuses a PUT under a tempfile/pytest tmp dir) must therefore NOT fire here;
+# it exists to catch NON-pytest runners -- main()-style `python3 test_x.py` and
+# the bash aggregator (run-asp-257-suite.sh) -- where THIS conftest never loads
+# and get_backend() may return a REAL own-cloud backend that would collide on the
+# production S3 key (rb-2983/guard-955). The presence of this env var IS the
+# "am I inside a hermetic pytest session?" signal the tripwire keys off.
+os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = "1"
+
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE
 # _paths is first imported caches AGENT_DIR=None for the whole session.
@@ -101,6 +114,7 @@ _UNSET = object()
 _BOOTSTRAP_MIND_AGENT = os.environ.get("MIND_AGENT", _UNSET)
 _BOOTSTRAP_MIND_WORLD = os.environ.get("MIND_WORLD", _UNSET)
 _BOOTSTRAP_MIND_BACKEND = os.environ.get("STORAGE_BACKEND", _UNSET)
+_BOOTSTRAP_ALLOW_TMP_PUT = os.environ.get("MIND_ALLOW_TMP_OWNCLOUD_PUT", _UNSET)
 
 
 @pytest.fixture(autouse=True)
@@ -133,4 +147,10 @@ def _restore_env_per_test():
         os.environ.pop("STORAGE_BACKEND", None)
     else:
         os.environ["STORAGE_BACKEND"] = _BOOTSTRAP_MIND_BACKEND
+    # 5: keep the own-cloud tempdir-tripwire dormant-pin stable across
+    # tests that mutate it (the tripwire's own regression test toggles it).
+    if _BOOTSTRAP_ALLOW_TMP_PUT is _UNSET:
+        os.environ.pop("MIND_ALLOW_TMP_OWNCLOUD_PUT", None)
+    else:
+        os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = _BOOTSTRAP_ALLOW_TMP_PUT
     yield

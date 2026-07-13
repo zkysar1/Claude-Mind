@@ -400,6 +400,41 @@ _STOPWORDS = {
     # i.e. "too general to discriminate". Evidence: g-001-317 spurious Unblock
     # auto-filed 2026-07-05 when g-001-02 was deferred on the own-cloud fence.
     "writes", "reads", "pipeline",
+    # g-115-2070: "own-cloud" is the same fence-leak class as g-115-1791's
+    # writes/reads/pipeline — a backend-NAME noun that leaks from an own-cloud
+    # write-fence defer ("precondition_unmet: own-cloud ... fenced;
+    # write_conflict"). It survived extraction as a NON-matching token until the
+    # forged skill 'probe-governed-store' (zeta, 2026-07-11) registered trigger
+    # "verify write propagated to own-cloud" — then a legitimately-FENCED
+    # own-cloud defer false-matched that skill on the SOLE token 'own-cloud'
+    # (would_block=True; test_fence_defer_does_not_falsely_block regressed).
+    # Safe per the line-348 rule: 'own-cloud' is non-actionable prose (a backend
+    # identifier, not a verb), and probe-governed-store keeps its discriminating
+    # tokens (governed/store/s3-authoritative/backend-cat/s3/probe/propagated/
+    # sharded/mirror/drift) — recall proven by the adjacent-to-stopword control
+    # in test_capability_gate_fence_stopwords.py (guard-958).
+    "own-cloud",
+    # g-115-1882: tokens that appear ONLY as incidental PROSE or as the
+    # section/category descriptor in capability-routing.md rows -- never as a
+    # capability identifier -- so extracting them only yields prose-collision
+    # false matches (the g-115-1848 defer -> spurious g-115-1881). Safe per the
+    # line-348 rule: none discriminates a real capability. rb-2993.
+    #   - "goal"/"idle": bounded-config row "named in the goal"; game-session
+    #     row "idle Player object".
+    #   - "provisionable"/"agent-provisionable": the "## Agent-Provisionable"
+    #     section descriptor, repeated in row prose ("Agent-provisionable for
+    #     X"). Matching it INVERTS a negated defer_reason -- "the fleet is NOT
+    #     agent-provisionable" was flagged AS matching an agent-provisionable
+    #     capability (the gate ignores the "not"). It never names an action.
+    "goal", "idle", "provisionable", "agent-provisionable",
+    # g-115-1885: boolean literals appear as config-VALUE fragments in row prose
+    # (game-session row "plugin_connected: true") and in defer_reasons naming a
+    # flag ("cross_agent_surfacing.enabled=true" -> the tokenizer splits off
+    # "true"). A boolean literal NEVER names a capability -- it is pure prose/
+    # value. Without this the g-115-1848 fleet defer's "=true" false-matched
+    # "plugin_connected: true" in the RUN-mode game-session row -> spurious
+    # Unblock g-115-1884. Boolean-literal class (closed): true + false. rb-2996.
+    "true", "false",
 }
 
 
@@ -440,6 +475,33 @@ _UNIT_AFTER_START = re.compile(
     r"(first|required|needed|before|until|must)\b"
 )
 
+# g-115-1882: a word that is BOTH a common noun AND an imperative verb
+# (probe, monitor, audit, review, scan) used as a NOUN whose evidence is being
+# REPORTED ("fresh probe 2026-07-09 shows X", "the audit found Y") describes a
+# past observation, not a requested action -- so it must NOT count as a
+# capability-invocation signal. Keyed on a clear past-evidence/reporting verb
+# within 2 words AFTER the keyword. Safe against action requests: "deploy the
+# build" / "needs a fresh deploy" have no following evidence verb, so they still
+# match. Ambiguous verbs (report/return) are deliberately EXCLUDED -- "probe the
+# service and report status" is a genuine action pair, not reported evidence.
+# This extends the g-115-1872 guard (which only SUPPRESSED the Unblock for
+# verbLESS matches; a verb-noun used as a noun kept matching + filing). rb-2993.
+# g-115-1883: INFLECTED report forms ONLY (shows/showed/showing, finds/found,
+# confirms/confirmed, ...) -- NEVER the bare base forms (show/find/confirm/
+# reveal/indicate/demonstrate/suggest), which are IMPERATIVES in compound action
+# requests ("deploy the service. Confirm health", "push and show the team").
+# Matching the bare form there wrongly stripped a genuine provisionable keyword
+# -> false-negative in a safety gate (fresh-eyes review a6e3fd81 confirmed).
+# Evidence-reporting English never writes bare "show" (it writes "shows"/
+# "showed"/"showing"), so the original "probe ... shows ..." incident still
+# matches the inflected "shows". rb-2996, guard-958.
+_EVIDENCE_VERB_AFTER = re.compile(
+    r"^\W*(?:\S+\s+){0,2}"
+    r"(shows|showed|showing|finds|found|reveals|revealed|"
+    r"indicates|indicated|confirms|confirmed|demonstrates|demonstrated|"
+    r"suggests|suggested)\b"
+)
+
 
 def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
     """True if `keyword` has at least one valid-context occurrence.
@@ -466,6 +528,10 @@ def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
         if _COUNT_BEFORE_END.search(pre):
             continue
         if _UNIT_AFTER_START.match(post):
+            continue
+        # g-115-1882: verb-noun used as a reported-evidence subject, not an
+        # action request ("fresh probe 2026-07-09 shows X", "the audit found Y").
+        if kw in _IMPERATIVE_VERBS and _EVIDENCE_VERB_AFTER.search(post):
             continue
 
         return True
@@ -689,6 +755,10 @@ def evaluate(failure_reason: str, *,
     if diagnostic_text:
         text_blob += "\n" + diagnostic_text
 
+    # CRITICAL ORDER: _load_noise_phrases(world_dir) must run BEFORE
+    # _extract_keywords — keyword extraction depends on the WORLD_DIR-scoped
+    # noise-phrase list; reordering silently disables noise disqualification
+    # (g-115-460).
     noise_phrases = _load_noise_phrases(world_dir)
     keywords = _extract_keywords(text_blob, noise_phrases=noise_phrases)
     keywords = _filter_context_disqualified(text_blob, keywords)
@@ -833,32 +903,60 @@ def evaluate(failure_reason: str, *,
                         "cure_for_precondition": first_precon,
                     },
                 }
-            elif keyword_block:
+            elif keyword_block and not (action_verb is None
+                                        and session_req_matches):
+                # (Verbless keyword match WITH session-requirement phrasing
+                # falls through to the session-req branch below — its 'start'
+                # default verb is the right action. The g-115-1872 suppression
+                # inside this branch targets spurious noun-matches only.)
                 top = matches[0]
                 top_kw = top["matched_keyword"]
-                cap_label = top.get("skill") or (top.get("row", "")[:120])
-                cap_source = top.get("source")
-                cap_skill = top.get("skill")
-                cap_row = top.get("row")
-                title_action = action_verb or top_kw
-                unblock_payload = {
-                    "unblock_suggested": True,
-                    "unblock_title": f"Unblock: {title_action}{title_suffix}",
-                    "unblock_description": (
-                        f"Failure reason: {(failure_reason or '')[:160]}. "
-                        f"Capability gate matched '{top_kw}' against "
-                        f"{cap_source}: {cap_label}. "
-                        f"Action required: '{title_action}'. "
-                        f"Invoke the matched capability (or a peer) to perform "
-                        f"'{title_action}' rather than routing to user."
-                    ),
-                    "matched_capability": {
-                        "source": cap_source,
-                        "skill": cap_skill,
-                        "row": cap_row,
-                        "matched_keyword": top_kw,
-                    },
-                }
+                # g-115-1872: the Unblock suggestion must name a genuine ACTION
+                # the agent performs instead of deferring. When failure_reason
+                # carries no imperative verb (action_verb is None) the prior
+                # `action_verb or top_kw` fallback used the matched KEYWORD --
+                # often a bare domain noun (e.g. 'npc' from a tree-restructuring
+                # description token-matched to access-efs-data) -- yielding a
+                # meaningless "Unblock: npc" / "perform npc" HIGH goal that
+                # topped the selector queue (g-115-1868). A verbless match
+                # against a domain-noun token is the spurious-match signature:
+                # suppress the Unblock (would_block still stands, so the improper
+                # defer/user-route is still refused) rather than file a
+                # noun-as-action. rb-574 fixed title=verb-not-keyword; this
+                # closes the deeper no-verb-at-all case.
+                if action_verb is None:
+                    unblock_payload = {
+                        "unblock_suggested": False,
+                        "unblock_suppressed_reason": (
+                            f"no imperative verb in failure_reason; matched "
+                            f"keyword '{top_kw}' is a bare token, not an action "
+                            f"(g-115-1872 noun-as-verb guard)"
+                        ),
+                    }
+                else:
+                    cap_label = top.get("skill") or (top.get("row", "")[:120])
+                    cap_source = top.get("source")
+                    cap_skill = top.get("skill")
+                    cap_row = top.get("row")
+                    title_action = action_verb
+                    unblock_payload = {
+                        "unblock_suggested": True,
+                        "unblock_title": f"Unblock: {title_action}{title_suffix}",
+                        "unblock_description": (
+                            f"Failure reason: {(failure_reason or '')[:160]}. "
+                            f"Capability gate matched '{top_kw}' against "
+                            f"{cap_source}: {cap_label}. "
+                            f"Action required: '{title_action}'. "
+                            f"Invoke the matched capability (or a peer) to perform "
+                            f"'{title_action}' rather than routing to user."
+                        ),
+                        "matched_capability": {
+                            "source": cap_source,
+                            "skill": cap_skill,
+                            "row": cap_row,
+                            "matched_keyword": top_kw,
+                        },
+                    }
             else:
                 session_phrase, captured_x = session_req_matches[0]
                 top_kw = "start-session"

@@ -27,11 +27,16 @@
 # wrapper, or a standalone (NON-imported) CLI cannot change daemon behaviour —
 # the running process is still current. Recycling it then is pure churn.
 #
-# Two callers share THIS one predicate (do NOT inline the pathspec into
-# either — the boundary lives here and only here):
+# Three callers share THIS one predicate (do NOT inline the pathspec into
+# any — the boundary lives here and only here):
 #   - core/githooks/post-commit             BASE = HEAD~1
 #       restart-on-commit trigger (recycle only when the commit touched
 #       daemon code).
+#   - core/githooks/post-merge              BASE = ORIG_HEAD
+#       restart-on-merge trigger (merges bypass post-commit; ORIG_HEAD is the
+#       pre-merge HEAD, so the FULL merged range — including fast-forwards
+#       that move HEAD by N commits with no merge commit — is diffed, which
+#       HEAD~1 would miss). 5.
 #   - core/scripts/_runtime.sh rt_check_staleness   BASE = daemon's running
 #       /v1/admin/health git_head_sha
 #       narrows the  stale-code auto-restart so a docs/world-only

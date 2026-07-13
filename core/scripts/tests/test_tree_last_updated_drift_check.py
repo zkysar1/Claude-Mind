@@ -142,3 +142,38 @@ def test_missing_front_matter_is_skipped_not_crashed():
     da = json.loads(ra.stdout)
     assert da["backfilled"] == 1
     assert da["skipped_errors"].get("no_front_matter") == 1
+
+
+def test_full_emits_complete_lists_beyond_sample_cap():
+    # 0: --full must emit EVERY index_ahead/index_stale entry, not the
+    # capped [:8] sample. Set up 10 index_ahead nodes so the sample (8) and the
+    # full list (10) are distinguishable — the whole point of the flag: a
+    # capped sample cannot prove a property (e.g. "no entry has idx > cutoff")
+    # across the full set, which left a hypothesis structurally unresolvable.
+    tmp = Path(tempfile.mkdtemp(prefix="drift-full-"))
+    specs = {f"ahead-{i:02d}": (f"2026-06-{i + 1:02d}", "2026-01-01")
+             for i in range(10)}   # 10 index_ahead nodes (idx newer than fm)
+    world = _setup_world(tmp, specs)
+
+    # Default (no --full): full keys ABSENT, sample capped at 8, count == 10.
+    r = _run(world, [])
+    assert r.returncode == 0, r.stderr
+    d = json.loads(r.stdout)
+    assert d["index_ahead"] == 10
+    assert len(d["sample_index_ahead"]) == 8            # capped sample
+    assert "index_ahead_full" not in d                  # backward-compat
+    assert "index_stale_full" not in d
+
+    # --full: complete list present, len == count (10) — NOT capped at 8.
+    rf = _run(world, ["--full"])
+    assert rf.returncode == 0, rf.stderr
+    df = json.loads(rf.stdout)
+    assert "index_ahead_full" in df
+    assert len(df["index_ahead_full"]) == df["index_ahead"] == 10
+    assert len(df["index_ahead_full"]) > len(df["sample_index_ahead"])
+    assert all(set(e.keys()) == {"key", "idx", "fm"}
+               for e in df["index_ahead_full"])
+    assert "index_stale_full" in df                     # present even when empty
+
+    # --full does NOT alter the exit contract (exit 0 without --exit-on-ahead).
+    assert rf.returncode == 0

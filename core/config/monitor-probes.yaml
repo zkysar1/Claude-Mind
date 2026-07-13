@@ -25,7 +25,12 @@ enabled_probes: []
 # when it trips; its combined stdout+stderr is captured as the trip evidence.
 # Per-probe schema:
 #   id                    unique probe id (matches the migrated recurring goal where applicable)
-#   script                path to the probe script, relative to PROJECT_ROOT
+#   script                path to the probe script. A path under `world/` or
+#                         `meta/` resolves to the user-configured EXTERNAL path
+#                         (WORLD_DIR / META_DIR), NOT project_root/world -- those
+#                         trees are not under PROJECT_ROOT (E1). Any other
+#                         relative path (e.g. core/scripts/x.sh) resolves under
+#                         PROJECT_ROOT; an absolute path is used as-is.
 #                         (e.g. world/scripts/probe-operator.sh, core/scripts/x.sh)
 #   interval_hours        minimum hours between runs (self-gated via the state file)
 #   on_trip               file_goal | post_finding
@@ -35,6 +40,18 @@ enabled_probes: []
 #   priority              (optional) HIGH|MEDIUM|LOW; default MEDIUM
 #   category              (optional) goal category; default framework-architecture
 #   args                  (optional) list of extra args passed to the probe script
+#   clean_exit_codes      (optional) list[int] of exit codes that mean "clean"
+#                         (default [0]). Lets a probe with a richer exit contract
+#                         (e.g. 0=clean, 2=fail, 3=fail-open) declare which codes
+#                         are non-tripping. Any rc NOT in this list (and not the
+#                         timeout sentinel below) trips (E2).
+#   timeout_is_trip       (optional) bool (default false). When false, a probe
+#                         killed at the timeout boundary (runner sentinel rc=124)
+#                         is a LOGGED ERROR, never a trip -- a slow/hung probe
+#                         cannot manufacture a false finding. Set true only for a
+#                         probe whose whole purpose is "did X finish in time" (E2).
+#   source                (optional) world | agent -- which goal queue the trip
+#                         goal is filed into (default world)
 #   description           (optional) human note for maintainers
 #
 # Example (commented — NOT enabled, since enabled_probes is empty):

@@ -36,6 +36,7 @@ from _fileops import locked_modify_yaml, locked_write_yaml
 from _team_state import (
     compose_state,
     core_residual,
+    retire_agent,
     route_field,
     row_path,
     rows_dir,
@@ -326,6 +327,20 @@ def cmd_migrate_shard(args):
     print("migrate-shard: core agent_status emptied (composed reads now serve rows)")
 
 
+def cmd_retire_agent(args):
+    """Sanctioned removal of an agent's team-state presence (core-file
+    agent_status residual + per-agent shard), gated by archive-before-delete.
+    The REMOVE path g-115-1909 found missing. Delegates to the shared
+    _team_state.retire_agent (guard-742 parity by construction — the daemon
+    endpoint calls the same function). Prints the JSON result."""
+    _validate_agent_name(args.agent, "retire-agent")
+    author = args.author or _agent_name()
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    result = retire_agent(WORLD_DIR, TEAM_STATE_PATH, args.agent, author, now,
+                          source=args.source, dry_run=args.dry_run)
+    print(json.dumps(result, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -441,6 +456,20 @@ def build_parser():
                                     "per-agent row files (optional cleanup)")
     migrate_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
 
+    # retire-agent (5) — the sanctioned REMOVE path
+    retire_p = sub.add_parser("retire-agent",
+                              help="Remove an agent's team-state presence "
+                                   "(core residual + shard), archive-before-delete gated")
+    retire_p.add_argument("--agent", required=True,
+                          help="Agent name to retire (e.g., charlie)")
+    retire_p.add_argument("--source",
+                          help="Free-text provenance recorded in the archive "
+                               "(e.g., goal id / merge event)")
+    retire_p.add_argument("--dry-run", action="store_true",
+                          help="Report what would be removed without archiving "
+                               "or deleting")
+    retire_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
+
     return parser
 
 def main():
@@ -452,6 +481,7 @@ def main():
         "in-flight": cmd_in_flight,
         "clear-in-flight": cmd_clear_in_flight,
         "migrate-shard": cmd_migrate_shard,
+        "retire-agent": cmd_retire_agent,
     }
     dispatch[args.command](args)
 

@@ -40,4 +40,11 @@ if [ -z "$AGENT_NAME" ] && [ -n "$session_id" ]; then
 fi
 
 source "$CORE_ROOT/scripts/_platform.sh"
-exec MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$file_path"
+# `exec env VAR=... cmd` — NOT `exec VAR=... cmd`. Prefix assignments are only
+# parsed at the start of a simple command; after the word `exec` they become
+# exec's FIRST ARGUMENT, so bash tries to run a program literally named
+# "MIND_AGENT=..." and dies rc=127 ("not found"). PostToolUse hook errors are
+# swallowed, so the old form silently disabled read-RECORDING on every Read —
+# the tracker never accumulated entries (found 2026-07-07, twin of the same
+# bug in context-reads-gate.sh).
+exec env MIND_AGENT="${AGENT_NAME:-}" python3 "$CORE_ROOT/scripts/context-reads.py" record $sid_arg "$file_path"

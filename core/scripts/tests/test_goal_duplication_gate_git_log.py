@@ -33,8 +33,16 @@ Cases:
      committed "core/scripts/widget_xyz.py" -> false-positive block.
   C  qualified partial path (trailing segment)    -> BLOCK (passed=False)
      Qualified paths still substring-match either direction.
+  D  completed-Maintain goal, qualified-path overlap -> PASS (passed=True)
+     g-115-1813: a status=completed Maintain goal names files touched by its
+     OWN just-shipped commit within 48h — that overlap IS the completion
+     evidence, not duplication. Mirrors _check_target_state's g-115-836 skip.
+  E  completed NON-Maintain goal, same overlap     -> BLOCK (passed=False)
+     Symmetry guard: the carve-out is Maintain-title-scoped, not a blanket
+     completed-goal exemption.
 
 Filed by g-115-1166 (corpus-size co-signal calibration audit, zeta).
+Cases D/E added by g-115-1813 (git_log completed-Maintain carve-out, alpha).
 """
 
 from __future__ import annotations
@@ -76,7 +84,10 @@ def _build_repo(tmp: Path) -> Path:
 
 
 def _check(repo: Path, file_paths):
-    # _check_git_log ignores the goal dict (uses file_paths + project_root).
+    # A/B/C pass {} as the goal — an empty dict never triggers the 3
+    # completed-Maintain carve-out (status is None), so these cases exercise
+    # the file-path matching path. Cases D/E build explicit goal dicts to test
+    # the carve-out (which now reads goal.status + goal.title).
     return goal_duplication._check_git_log({}, set(file_paths), repo)
 
 
@@ -119,12 +130,50 @@ def main() -> int:
                 f"overlap; got passed={rc.get('passed')} reason={rc.get('reason')!r}"
             )
 
+        # ── D: completed-Maintain goal w/ qualified-path overlap → PASS ────
+        # 3: a status=completed Maintain goal names framework files
+        # touched by its OWN just-shipped commit in the 48h window — that
+        # overlap IS the completion evidence, not duplication. The carve-out
+        # (mirroring _check_target_state's  skip) passes it despite
+        # the identical qualified-path overlap that BLOCKS in case A.
+        maintain_goal = {"status": "completed",
+                         "title": "Maintain: harden widget_xyz.py"}
+        rd = goal_duplication._check_git_log(
+            maintain_goal, {"core/scripts/widget_xyz.py"}, repo)
+        if rd.get("passed") is not True:
+            failures.append(
+                "D: expected PASS (passed=True) on completed-Maintain carve-out "
+                f"despite qualified-path overlap; got passed={rd.get('passed')} "
+                f"reason={rd.get('reason')!r} (g-115-1813 skip missing)"
+            )
+        elif "Maintain" not in (rd.get("reason") or ""):
+            failures.append(
+                "D: carve-out passed but reason does not cite the Maintain "
+                f"skip; got reason={rd.get('reason')!r}"
+            )
+
+        # ── E: completed NON-Maintain goal w/ overlap → BLOCK (symmetry) ───
+        # The carve-out is scoped to Maintain: titles. A completed goal with a
+        # different title prefix must STILL block on the same overlap — proves
+        # the 3 skip is Maintain-scoped, not a blanket completed-goal
+        # exemption (run-full-suite testSymmetry discipline).
+        nonmaintain_goal = {"status": "completed",
+                            "title": "Fix: rewrite widget_xyz.py"}
+        re_ = goal_duplication._check_git_log(
+            nonmaintain_goal, {"core/scripts/widget_xyz.py"}, repo)
+        if re_.get("passed") is not False:
+            failures.append(
+                "E: expected BLOCK (passed=False) on completed NON-Maintain "
+                "goal (carve-out must be Maintain-scoped); got "
+                f"passed={re_.get('passed')}"
+            )
+
     if failures:
         print(f"FAIL ({len(failures)} cases)")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (3/3 cases)")
+    print("PASS (5/5 cases)")
     return 0
 
 

@@ -171,6 +171,22 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 
 # --- Validate / normalize (verbatim from experience.py) -------------------
 
+# Goal-id embedded in an experience id: exp-{goal-id}-{slug}. Verbatim from
+# experience.py derive_goal_id_from_id (7) — the daemon add path builds
+# ids as exp-{goal_id}-{skill_slug}, so a caller-formed cmd_add record can leave
+# the goal_id FIELD null while the id still names the goal. Underscore-prefixed
+# per the daemon's private-helper convention (cf. _normalize_record).
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-\d{3}-\d{2,4})-")
+
+
+def _derive_goal_id_from_id(rec_id):
+    """Return the g-NNN-NN goal-id embedded in an experience id, or None."""
+    if not rec_id:
+        return None
+    m = GOAL_ID_IN_EXP_ID_RE.match(rec_id)
+    return m.group(1) if m else None
+
+
 def _normalize_record(rec: dict) -> dict:
     """experience.py normalize_record — defaults + deep sub-key backfill."""
     for f, default in DEFAULT_FIELDS.items():
@@ -183,6 +199,15 @@ def _normalize_record(rec: dict) -> dict:
             for sub_key, sub_default in default.items():
                 if sub_key not in rec[f]:
                     rec[f][sub_key] = sub_default
+    # Backfill a null goal_id from the id when the id embeds a canonical goal-id
+    # (exp-g-NNN-NN-*). Symmetric with experience.py normalize_record (7)
+    # — without this the LIVE daemon write path leaves goal_id null on caller-formed
+    # cmd_add records, blinding the daemon --goal read filter (rec.get("goal_id")
+    # == goal). NEVER overwrites a present value; slug-only ids stay null.
+    if not rec.get("goal_id"):
+        derived = _derive_goal_id_from_id(rec.get("id"))
+        if derived:
+            rec["goal_id"] = derived
     return rec
 
 

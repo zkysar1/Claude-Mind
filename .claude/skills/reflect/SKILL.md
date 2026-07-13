@@ -253,7 +253,27 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # weaknesses auto-create investigation goals.
      # Only runs during --full-cycle.
 
-     Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: []} if missing)
+     Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: [], signal_baseline: {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}}} if missing)
+
+     # WINDOWED SIGNAL SOURCES (g-115-2002 / sig-27 CONFIRMED): several raw signals
+     # below are MONOTONIC CUMULATIVE counters that never stop firing once they
+     # cross an absolute threshold — they measure lifetime accumulation, not recent
+     # activity, so they are non-discriminating. utilization.times_active is the
+     # worst: Phase 0.5a runs `guardrail-check.sh --context any --phase
+     # pre-selection`, matches_context("any") is unconditionally True, and
+     # matches_phase filters on STATIC rule-text keywords (PHASE_PRE_SELECTION_KEYWORDS)
+     # — NOT the runtime condition. So every guardrail whose text matches those
+     # keywords increments ~once per iteration whether or not it genuinely fired,
+     # making times_active iteration-correlated (top ~3500). backpressure
+     # rollback_history is lifetime-cumulative the same way. THE FIX: snapshot each
+     # signal's value at the END of every pass into weakness_report.signal_baseline;
+     # this pass thresholds on the DELTA since that baseline — and for the guardrail
+     # counter, on the delta ABOVE the iteration-correlated BACKGROUND (median delta),
+     # so a guardrail signals only when it fired MORE than the per-iteration
+     # keyword-match rate. Windowing keeps agent-judgment synthesis unchanged below;
+     # only the signal INPUTS change.
+     baseline = weakness_report.signal_baseline (default {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}})
+     first_pass = (baseline.captured_at is null)  # no history yet → cumulative-counter sources emit nothing; baseline is written at end-of-pass
 
      # Gather signals from multiple sources
      signals = []
@@ -268,7 +288,16 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
              --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
              --field-names "outcome_stats.accuracy,outcome_stats.total"
      Bash: pattern-signatures-read.sh --active
+     # WINDOWED (g-115-2002): accuracy is a ratio (already discriminating), but a
+     # stale low-accuracy signature that has seen NO new outcomes since the last
+     # pass re-fires forever. Require total to have ADVANCED since baseline (the
+     # signature was actually exercised in this window) so we surface patterns
+     # failing NOW, not ones that failed long ago and went dormant. First pass and
+     # brand-new signatures (no baseline entry) pass through on the accuracy gate.
      FOR EACH sig WHERE sig.outcome_stats.accuracy < 0.70 AND sig.outcome_stats.total >= 3:
+         prev_total = baseline.pattern_totals.get(sig.id)  # null if unseen last pass
+         IF (NOT first_pass) AND prev_total is not null AND (sig.outcome_stats.total - prev_total) < 1:
+             continue  # dormant this window — no new outcomes, skip
          signals.append({source: "pattern_signature", id: sig.id, detail: sig})
 
      # 2. Guardrails that fired frequently
@@ -277,8 +306,28 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
              --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
              --field-names "utilization.times_active"
      Bash: guardrails-read.sh --active
-     FOR EACH guard WHERE guard.utilization.times_active >= 3:
-         signals.append({source: "guardrail", id: guard.id, detail: guard})
+     # WINDOWED (g-115-2002 / sig-27): times_active is a monotonic cumulative
+     # counter AND iteration-correlated (header note — the pre-selection keyword
+     # match bumps it ~once/iteration for every guardrail whose rule text matches
+     # PHASE_PRE_SELECTION_KEYWORDS, real trigger or not). An absolute
+     # `times_active >= 3` therefore fires for nearly every guardrail forever, AND
+     # a naive delta fails too once ≥3 iterations elapse between passes (every
+     # keyword-matching guardrail gains +3 from background alone). Window on the
+     # delta since baseline, THEN subtract the iteration-correlated BACKGROUND so
+     # only guardrails that fired MORE than the per-iteration keyword rate survive:
+     #   delta[g]   = times_active_now - baseline.guardrail_times_active[g]  (skip g with no baseline entry — no history to window)
+     #   background = median(delta[g] over all g that HAVE a baseline entry)  (≈ iterations elapsed between passes = the uniform per-iteration bump)
+     #   signal iff (delta[g] - background) >= guardrail_delta_threshold (default 3)
+     # When most guardrails don't match the keywords their delta is 0, background
+     # collapses to 0, and this reduces to a pure `delta >= 3` (the genuinely-fired
+     # ones). When many accumulate background, subtracting the median removes it.
+     # First pass (no baseline) emits no guardrail signal — correct, not a miss.
+     IF NOT first_pass:
+         deltas = {g.id: g.utilization.times_active - baseline.guardrail_times_active[g.id]
+                   FOR EACH active guard WHERE g.id in baseline.guardrail_times_active}
+         background = median(list(deltas.values())) if deltas else 0
+         FOR EACH guard WHERE guard.id in deltas AND (deltas[guard.id] - background) >= 3:
+             signals.append({source: "guardrail", id: guard.id, delta: deltas[guard.id], background: background, detail: guard})
 
      # 3. Experience records with negative relative_advantage clustered by approach
      Bash: experience-read.sh --recent 20
@@ -291,7 +340,15 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 
      # 4. Backpressure rollback patterns
      Bash: meta-backpressure.sh status
-     FOR EACH rollback in result.rollback_history:
+     # WINDOWED (g-115-2002): rollback_history is lifetime-cumulative — a rollback
+     # from months ago otherwise re-appears as a "signal" every pass forever. Only
+     # rollbacks appended SINCE the last snapshot count. rollback_history is
+     # append-ordered, so the new tail is the slice past baseline.rollback_count.
+     # (Prefer a timestamp filter on rollback.at > baseline.captured_at when the
+     # entries carry a timestamp; fall back to the count slice otherwise.) First
+     # pass emits no rollback signal.
+     new_rollbacks = result.rollback_history[baseline.rollback_count:] if (NOT first_pass) else []
+     FOR EACH rollback in new_rollbacks:
          signals.append({source: "backpressure_rollback", id: rollback.meta_change_id, detail: rollback})
 
      # Synthesize weaknesses from signals
@@ -347,6 +404,20 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 
      weakness_report.last_analyzed = now
      weakness_report.analysis_count += 1
+     # Snapshot every windowed signal's CURRENT value so the NEXT pass diffs
+     # against it (g-115-2002). This write is what turns the cumulative counters
+     # above into windowed deltas — without it the delta math has no baseline and
+     # every source degrades to first_pass (emits nothing). Snapshot ALL active
+     # guardrails/patterns (not just the ones that signalled) so a guardrail that
+     # crosses threshold NEXT window is measured from its value NOW. Runs on EVERY
+     # pass — including passes with < 2 signals that skip synthesis — so the window
+     # advances every cycle, never stalls at a stale baseline.
+     weakness_report.signal_baseline = {
+         captured_at: now,
+         guardrail_times_active: {g.id: g.utilization.times_active FOR EACH active guard},
+         rollback_count: len(result.rollback_history),
+         pattern_totals: {sig.id: sig.outcome_stats.total FOR EACH active sig}
+     }
      Edit agents/<agent>/weakness-report.yaml with updated content
 
      Output: "▸ Weakness analysis: {len(signals)} signals, {new_weakness_count} new weakness(es), {goal_count} investigation goal(s)"

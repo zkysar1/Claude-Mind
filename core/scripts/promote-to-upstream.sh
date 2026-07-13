@@ -19,7 +19,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 2; }
 LIB="$SCRIPT_DIR/_release_lib.py"
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
-RELEASES_JSON="$PROJECT_ROOT/RELEASES.json"
+# RELEASES.json check delegated to check-releases-current.sh (role-aware, 1);
+# this script no longer references RELEASES.json directly.
 WORLD="${WORLD_DIR:-${WORLD_PATH:-}}"
 OVERLAY="$WORLD/config/compatibility.yaml"
 FW_COMPAT="$CONFIG_DIR/compatibility.yaml"
@@ -84,33 +85,43 @@ LOCAL="$(grep -E '^__version__' "$INIT_PY" | sed -E 's/.*"([^"]+)".*/\1/' || tru
 [[ -n "$LOCAL" ]] || fail "could not read local __version__"
 say "local version: $LOCAL"
 
-# (a) RELEASES.json has an entry for the current __version__. Capture stderr
-# (2>&1) so an M1 parse-or-fail diagnostic (malformed RELEASES.json) is
-# SURFACED, not masked behind a misleading "newest () != version" message.
-# On success seed-latest prints only the version to stdout; on failure the
-# error text lands in SL_OUT and NRC is non-zero. (review F4)
-set +e; SL_OUT="$(py -3 "$LIB" seed-latest "$RELEASES_JSON" 2>&1)"; NRC=$?; set -e
-if [[ $NRC -ne 0 ]]; then
-  fail "could not read RELEASES.json newest version (exit $NRC): ${SL_OUT:-no detail} — fix RELEASES.json before promoting"
-fi
-NEWEST="$SL_OUT"
-if [[ "$NEWEST" != "$LOCAL" ]]; then
-  fail "RELEASES.json newest ($NEWEST) != __version__ ($LOCAL) — cut a release before promoting"
-fi
+# (a) RELEASES.json is current — DELEGATED to check-releases-current.sh, the
+# single role-aware canonical checker (seed-preflight check #7 also runs it).
+# RELEASES.json is FRONTIER-ONLY provenance: release.sh writes it and only the
+# frontier cuts releases (core/config/compatibility.yaml promotion_chain). A
+# non-frontier role (seed/downstream) legitimately has no RELEASES.json, and
+# check-releases-current.sh PASSes it as N/A (version SSOT __version__ is
+# authoritative) — which is what lets a seed->downstream promote run WITHOUT
+# --force-release. The prior inline `seed-latest` check was a duplicate of
+# check-releases-current.sh that dropped its role-awareness and hard-failed
+# EVERY non-frontier promote (1). Single source of truth now.
+CRC_OUT="$(bash "$SCRIPT_DIR/check-releases-current.sh" 2>&1)" \
+  || fail "RELEASES.json not current: $CRC_OUT (cut a release with release.sh before promoting)"
+say "$CRC_OUT"
 
-# (b) working tree clean + (c) HEAD tagged v$LOCAL  (notes in dry-run)
+# (b) working tree clean — enforced for ALL roles (promoting an uncommitted
+#     tree is wrong regardless of role). (c) HEAD tagged v$LOCAL is frontier-only
+#     (guarded below).
 DIRTY="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null || true)"
 if [[ -n "$DIRTY" ]]; then
   if [[ $DRY -eq 1 ]]; then say "[dry-run] note: working tree dirty (would FAIL a real promote)";
   else fail "working tree is dirty — commit before promoting"; fi
 fi
-if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v$LOCAL" >/dev/null 2>&1; then
-  if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD has no tag v$LOCAL (would FAIL — cut a release with release.sh first)";
-  else fail "no tag v$LOCAL — promote only TAGGED releases (run release.sh first)"; fi
+# (c) HEAD tagged v$LOCAL — FRONTIER-ONLY provenance. release.sh is the sole
+# v-tagger and only runs at the frontier; a non-frontier role (seed/downstream)
+# re-transplants adopted framework and has no v-tag by design, so the tag gate
+# is skipped for it (1, option 2 role-conditional gating).
+if [[ "$SELF_ROLE" == "frontier" ]]; then
+  if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v$LOCAL" >/dev/null 2>&1; then
+    if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD has no tag v$LOCAL (would FAIL — cut a release with release.sh first)";
+    else fail "no tag v$LOCAL — promote only TAGGED releases (run release.sh first)"; fi
+  else
+    HEAD_SHA="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+    TAG_SHA="$(git -C "$PROJECT_ROOT" rev-list -n1 "v$LOCAL")"
+    [[ "$HEAD_SHA" == "$TAG_SHA" ]] || { [[ $DRY -eq 1 ]] && say "[dry-run] note: HEAD is not the v$LOCAL commit (would FAIL)" || fail "HEAD is not the tagged v$LOCAL commit"; }
+  fi
 else
-  HEAD_SHA="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
-  TAG_SHA="$(git -C "$PROJECT_ROOT" rev-list -n1 "v$LOCAL")"
-  [[ "$HEAD_SHA" == "$TAG_SHA" ]] || { [[ $DRY -eq 1 ]] && say "[dry-run] note: HEAD is not the v$LOCAL commit (would FAIL)" || fail "HEAD is not the tagged v$LOCAL commit"; }
+  say "skip tag-check: role '$SELF_ROLE' is non-frontier — v-tags are frontier-only (release.sh); a seed re-transplants adopted framework (g-115-1811)"
 fi
 
 # --- Step 2: frontier-invariant (CW2 — HARD) -------------------------------

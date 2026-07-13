@@ -181,6 +181,98 @@ if [ "$NO_FETCH" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
+# --- Cross-agent-churn self-heal helper (3, per 3) ---------
+# On a dirty-tree merge REFUSAL (git refuses before starting; MERGE_HEAD absent),
+# the deadlock is almost always unstaged cross-agent churn: agents/<other>/*
+# files that owncloud re-materialised and iteration-commit's namespace filter
+# refuses to commit, overlapping the incoming origin merge. The retry-next-
+# iteration path never self-heals because owncloud re-creates the same churn
+# every cycle (observed 2026-07-06: alpha framework commits stranded 2+ iters).
+#
+# This helper narrowly self-heals that ONE shape: if the ENTIRE blocking set
+# (unstaged tracked-dirty + untracked, --exclude-standard so ignored scratch is
+# out) is cross-agent churn, clear ONLY those paths and RETRY the merge once
+# (owncloud re-syncs the sibling's authoritative state next cycle; origin is
+# authoritative). Returns 0 iff cleared+re-merged clean. Returns 1 (DEFER —
+# caller keeps the current behaviour) for EVERY other shape:
+#   - MIND_AGENT unresolved (cannot identify self → cannot scope safely)
+#   - guard-741: ANY staged index entry (a CONCURRENT agent's staged cross-agent
+#     work — NEVER discard it; defer, exactly as the bare merge already does)
+#   - ANY blocking file outside agents/<other>/* (core/, world/, agents/<self>/ —
+#     never clear the agent's own or shared work)
+#   - empty blocking set, or the retry still failing
+# FAIL-SOFT throughout (|| true; iteration-push is soft_exit — a bug here can
+# only DEFER, never wedge the loop or discard staged work).
+_selfheal_cross_agent_churn_remerge() {
+  local self="${MIND_AGENT:-}"
+  if [ -z "$self" ]; then
+    log "self-heal: MIND_AGENT unresolved — cannot scope safely, defer"
+    return 1
+  fi
+
+  # guard-741: the shared multi-agent index can hold a CONCURRENT agent's STAGED
+  # cross-agent files. NEVER discard staged work — if the index has any staged
+  # entry, defer (the bare merge already refuses on staged overlap anyway).
+  if [ -n "$(git -C "$REPO" diff --cached --name-only 2>/dev/null)" ]; then
+    log "self-heal: staged index entries present — guard-741, defer (never discard partner's staged work)"
+    return 1
+  fi
+
+  # Two blocking categories, cleared by different git verbs:
+  #   tracked-dirty (unstaged modify/delete) -> git checkout -- (restore to HEAD)
+  #   untracked (--exclude-standard)          -> git clean -fdq -- (remove)
+  # Keep them SEPARATE so a mixed pathspec can't make `git checkout` abort on an
+  # untracked path and leave the tracked ones un-restored. NUL-delimited reads
+  # for space-safe paths; index is already known clean (staged check above).
+  local dirty=() untracked=() p
+  while IFS= read -r -d '' p; do dirty+=("$p"); done \
+    < <(git -C "$REPO" diff --name-only -z 2>/dev/null)
+  while IFS= read -r -d '' p; do untracked+=("$p"); done \
+    < <(git -C "$REPO" ls-files --others --exclude-standard -z 2>/dev/null)
+
+  local total=$(( ${#dirty[@]} + ${#untracked[@]} ))
+  if [ "$total" -eq 0 ]; then
+    log "self-heal: no unstaged/untracked files — not a dirty-tree churn shape, defer"
+    return 1
+  fi
+
+  # EVERY blocking path (both categories) MUST be under a NON-SELF agent dir.
+  local rel name
+  for rel in "${dirty[@]}" "${untracked[@]}"; do
+    case "$rel" in
+      agents/*)
+        name="${rel#agents/}"; name="${name%%/*}"
+        if [ "$name" = "$self" ]; then
+          log "self-heal: blocking file under SELF agent dir ($rel) — defer (never clear own work)"
+          return 1
+        fi
+        ;;
+      *)
+        log "self-heal: blocking file outside agents/<other>/* ($rel) — defer (never clear core/world/shared work)"
+        return 1
+        ;;
+    esac
+  done
+
+  log "self-heal: clearing ${#dirty[@]} tracked + ${#untracked[@]} untracked cross-agent file(s), retrying merge once (g-115-1843)"
+  [ "${#dirty[@]}" -gt 0 ]     && { git -C "$REPO" checkout -- "${dirty[@]}" 2>/dev/null || true; }
+  [ "${#untracked[@]}" -gt 0 ] && { git -C "$REPO" clean -fdq -- "${untracked[@]}" 2>/dev/null || true; }
+
+  # Retry the merge ONCE. Reassigns the OUTER MERGE_OUT/MERGE_RC (intentional —
+  # the caller's post-helper defer log then reflects the retry outcome).
+  MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
+  MERGE_RC=$?
+  if [ "$MERGE_RC" -eq 0 ]; then
+    return 0
+  fi
+  # Retry still failed — clean up any half-merge state and defer.
+  if [ -f "$GITDIR/MERGE_HEAD" ]; then
+    git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+  fi
+  log "self-heal: merge retry still failed after clearing churn (rc=${MERGE_RC}) — defer"
+  return 1
+}
+
 # --- Integrate (merge origin-ahead commits; never rebase, never force) -------
 # Without this, the first push from a SECOND machine leaves this machine
 # non-fast-forward forever (the 2026-07-03 divergence wedge).
@@ -200,14 +292,23 @@ if [ "$BEHIND" -gt 0 ]; then
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "MERGE CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration."
         log "If this repeats every iteration it is a TRUE cross-machine content conflict: resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
+        soft_exit 1
+      fi
+      # Dirty tree — merge refused before starting (MERGE_HEAD absent). Try the
+      # narrow cross-agent-churn self-heal (3): if the entire blocking
+      # set is unstaged agents/<other>/* churn, clear it and retry the merge
+      # once. Any other shape (staged entries, self/core/world dirty) DEFERS —
+      # exactly the pre-1843 behaviour (log + soft_exit 1).
+      if _selfheal_cross_agent_churn_remerge; then
+        log "integrated ${BEHIND} origin commit(s) into $BRANCH (after cross-agent-churn self-heal, g-115-1843)"
       else
-        # Dirty tree / staged entries — merge refused before starting (safe).
         log "merge DEFERRED (rc=${MERGE_RC}): $(printf '%s' "$MERGE_OUT" | tail -n 1)"
         log "retry next iteration after iteration-commit sweeps the churn"
+        soft_exit 1
       fi
-      soft_exit 1
+    else
+      log "integrated ${BEHIND} origin commit(s) into $BRANCH"
     fi
-    log "integrated ${BEHIND} origin commit(s) into $BRANCH"
   fi
 fi
 

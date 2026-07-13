@@ -146,7 +146,7 @@ IF all_passed == true:
                 # tree encoding is the value-add.
 
         IF promoted == false:
-            Output: "Curriculum: confirmed but promotion blocked -- {reason}"
+            Bash: echo "Curriculum: confirmed but promotion blocked -- {reason}"
         RETURN
 
     IF latest is not None AND latest.status == "awaiting_reply":

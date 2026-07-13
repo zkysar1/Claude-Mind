@@ -573,6 +573,25 @@ def _check_git_log(goal, file_paths, project_root):
             "reason": "skipped (no file paths in goal text)",
             "matches": [],
         }
+    # Completed-Maintain skip (, extended to git_log by 3).
+    # A status=completed Maintain goal names framework files touched by its OWN
+    # just-shipped commit(s) within 48h — that file-path overlap IS the
+    # completion evidence, not duplication. Structural twin of the identical
+    # carve-out in _check_target_state (identifiers-present-is-completion, not
+    # duplication). Without it, every retroactive Maintain record whose
+    # description cites own-session-touched files needs --override-duplication
+    # (canonical: /encode-session 2026-07-07 Lane 2 blocked two completed
+    # Maintain records; 3).
+    if (goal.get("status") == "completed"
+            and (goal.get("title") or "").startswith("Maintain:")):
+        return {
+            "name": "git_log_48h",
+            "passed": True,
+            "reason": ("skipped (status=completed Maintain goal — 48h commit "
+                       "file-path overlap is the completion signal, not "
+                       "duplication; g-115-836 / g-115-1813)"),
+            "matches": [],
+        }
     try:
         out = subprocess.run(
             # git approxidate rejects the bare unit-letter form "48h" (returns
@@ -1130,9 +1149,32 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
         # >= idf_floor (df(k) <= STRUCT_IDF_DF_CEIL) so cluster-common ids
         # (/ referenced across many pending goals) no longer
         # false-strong-block legit follow-ups (canonical: 4 filing).
-        has_specific = bool(hit_paths) or any(
-            re.search(r"[_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
-            for k in hit_kws)
+        # 1: a PROSE-sourced proposal (no verification block) requires
+        # a FILE-PATH co-signal for a HARD structural block — the [_0-9]-keyword
+        # branch alone is demoted to advisory. A prose goal that shares a
+        # structured keyword-identifier (board_write, git_log_48h, )
+        # with a pending goal is DISCUSSING the same topic/incident, not
+        # necessarily duplicating the same WORK: the canonical FP is a follow-up
+        # that RECAPS its parent's incident (alpha's board-write latency-canary
+        # vs its parent , sharing board_write/append_jsonl_record/16ms;
+        # file_path_hits EMPTY) or a meta-goal discussing framework vocabulary
+        # (1 vs 3 on "git_log_48h"). Prose shares TOPIC
+        # identifiers, not work-target files. The [_0-9] co-signal STAYS for
+        # VERIFICATION-sourced proposals: verification.outcomes/checks naming an
+        # identifier IS an authoritative work-target declaration (), so a
+        # shared structured id there is real duplicate evidence. Scoped to
+        # pending_queue only (the already-strictest, larger-corpus check where
+        # every evidenced FP landed); recent_completions is unchanged (G3). A
+        # true prose duplicate that names the same FILE still blocks (P2/P8);
+        # one that shares only a topic identifier is demoted to advisory, still
+        # surfaced, and still caught by Strategy 1 (origin_signal) when it is a
+        # real dup filed under the same symptom key.
+        if source_name == "prose":
+            has_specific = bool(hit_paths)
+        else:
+            has_specific = bool(hit_paths) or any(
+                re.search(r"[_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
+                for k in hit_kws)
         if strong and has_specific:
             structural_matches.append({
                 "source": c["source"],

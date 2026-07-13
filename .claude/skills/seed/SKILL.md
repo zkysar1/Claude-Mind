@@ -54,7 +54,7 @@ for manifest/skill maintenance; copies framework files to destination).
 ```
 Bash: session-mode-get.sh
 IF mode is "reader":
-    Output: "Skill requires assistant mode. Run `/start --mode assistant` to enable."
+    Bash: echo "Skill requires assistant mode. Run /start --mode assistant to enable."
     STOP.
 ```
 

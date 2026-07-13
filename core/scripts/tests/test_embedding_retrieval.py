@@ -31,7 +31,9 @@ def _write(d, arr, ids):
 
 
 class _StubModel:
-    """Stands in for SentenceTransformer — encode() returns a fixed unit vector."""
+    """Stands in for an encoder — encode() returns a fixed unit vector.
+    Exposes only the legacy .encode surface, deliberately: cosine_scores
+    must keep working with encoders lacking encode_query (g-306-82 shim)."""
 
     def __init__(self, vec):
         self._v = np.asarray(vec, dtype="float32")
@@ -58,7 +60,7 @@ def test_cosine_math_with_stub(tmp_path, monkeypatch):
     er.clear_caches()
     # A parallel to the query (score 1), B orthogonal (0), C at cos=0.6.
     _write(tmp_path, [[1, 0, 0, 0], [0, 1, 0, 0], [0.6, 0.8, 0, 0]], ["A", "B", "C"])
-    monkeypatch.setattr(er, "_get_model", lambda: _StubModel([1, 0, 0, 0]))
+    monkeypatch.setattr(er, "_get_model", lambda *a, **k: _StubModel([1, 0, 0, 0]))
     s = er.cosine_scores("q", index_dir=tmp_path)
     assert set(s) == {"A", "B", "C"}
     assert s["A"] == pytest.approx(1.0, abs=1e-2)
@@ -71,26 +73,26 @@ def test_cosine_math_with_stub(tmp_path, monkeypatch):
 def test_index_caching_populates_and_reuses(tmp_path, monkeypatch):
     er.clear_caches()
     _write(tmp_path, [[1, 0, 0, 0]], ["A"])
-    monkeypatch.setattr(er, "_get_model", lambda: _StubModel([1, 0, 0, 0]))
+    monkeypatch.setattr(er, "_get_model", lambda *a, **k: _StubModel([1, 0, 0, 0]))
     assert str(tmp_path) not in er._index_cache
     er.cosine_scores("q", index_dir=tmp_path)
     assert str(tmp_path) in er._index_cache  # cached after first load
-    emb1, ids1 = er._load_index(tmp_path)
-    emb2, ids2 = er._load_index(tmp_path)
+    emb1, ids1, _m1 = er._load_index(tmp_path)
+    emb2, ids2, _m2 = er._load_index(tmp_path)
     assert emb1 is emb2 and ids1 is ids2  # same objects -> served from cache
 
 
 def test_index_cache_invalidates_on_mtime(tmp_path, monkeypatch):
     er.clear_caches()
     _write(tmp_path, [[1, 0, 0, 0]], ["A"])
-    emb1, _ = er._load_index(tmp_path)
+    emb1, _, _m = er._load_index(tmp_path)
     # Rewrite with a different corpus + bump mtime; cache must refresh.
     import os
     st = (tmp_path / "embeddings.npy").stat()
     _write(tmp_path, [[0, 1, 0, 0], [1, 0, 0, 0]], ["B", "C"])
     os.utime(tmp_path / "meta.json", (st.st_atime + 10, st.st_mtime + 10))
     os.utime(tmp_path / "embeddings.npy", (st.st_atime + 10, st.st_mtime + 10))
-    emb2, ids2 = er._load_index(tmp_path)
+    emb2, ids2, _m2 = er._load_index(tmp_path)
     assert ids2 == ["B", "C"]
     assert emb2.shape[0] == 2
 
@@ -99,7 +101,7 @@ def test_desync_truncates_to_shorter(tmp_path, monkeypatch):
     er.clear_caches()
     # 2 embedding rows but 3 ids -> the extra id is dropped, no IndexError.
     _write(tmp_path, [[1, 0], [0, 1]], ["A", "B", "C"])
-    monkeypatch.setattr(er, "_get_model", lambda: _StubModel([1, 0]))
+    monkeypatch.setattr(er, "_get_model", lambda *a, **k: _StubModel([1, 0]))
     s = er.cosine_scores("q", index_dir=tmp_path)
     assert set(s) == {"A", "B"}
 
@@ -108,7 +110,7 @@ def test_model_error_degrades_to_empty(tmp_path, monkeypatch):
     er.clear_caches()
     _write(tmp_path, [[1, 0, 0, 0]], ["A"])
 
-    def _boom():
+    def _boom(*a, **k):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(er, "_get_model", _boom)

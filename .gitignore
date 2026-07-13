@@ -64,6 +64,17 @@ tmp_*
 #     runtime invocation with the wrong CWD/var.
 /sessions/
 /SPAWN_LOG
+# 2026-07-13: /environment_files/ — the ARC-AGI-3 arcengine (arc_agi.Arcade)
+# writes per-game cache dirs (environment_files/<game>/<hash>/{<game>.py,
+# metadata.json}) RELATIVE TO CWD. echo's solver A/B harnesses live in
+# /opt/ARC-AGI-3-Kaggle-Starter/experiments/ but were launched with
+# CWD=/opt/ayoai-mind (the mind repo), so 4.2M / 25 game dirs / 50 files landed
+# here and got swept into an iteration-commit (0489bd4a, g-315-350). The real
+# cache belongs in the ARC repo. This net only STOPS the cruft entering git; the
+# actual fix is CWD discipline — run ARC harnesses with cwd=/opt/ARC-AGI-3-Kaggle-Starter
+# (guard-1026). Anchored with leading / (repo-root only; the arcengine never
+# writes this deeper in the mind tree).
+/environment_files/
 
 # OS files
 .DS_Store

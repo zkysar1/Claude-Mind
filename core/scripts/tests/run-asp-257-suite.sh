@@ -20,6 +20,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../_paths.sh"
 cd "$PROJECT_ROOT"
 
+# INCIDENT rb-2983/guard-955 (2026-07-09): pin the storage backend to local so no
+# suite here can PUT to the production own-cloud S3 store. Suite 6/6 runs the
+# main()-style test_defer_to_unblock_integration.py DIRECTLY (not via pytest —
+# pytest collects 0 from it, so a conftest autouse fixture never protects it);
+# its update-goal subprocess does env=os.environ.copy(), so under a global
+# STORAGE_BACKEND=own-cloud that copy PUT the asp-555 fixture to the production
+# S3 key (MIND_WORLD redirects only the local path + _rel base, NOT the S3 key —
+# customer_prefix+env_id are unchanged), truncating world/aspirations.jsonl from
+# 22 aspirations to 1. Pinning local HERE makes the tests' "production state is
+# never touched" contract true regardless of the caller's global backend.
+export STORAGE_BACKEND=local
+
 PASSES=0
 FAILS=0
 declare -a FAILED_SUITES

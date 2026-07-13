@@ -303,6 +303,7 @@ def main():
                         help="Parent aspiration ID (where child goals will be filed)")
     parser.add_argument("--category", required=True,
                         help="Category for child goals (usually source goal's category)")
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     parser.add_argument("--source", default="world", choices=["world", "agent"],
                         help="Aspiration source for aspirations-add-goal.sh (default: world)")
     parser.add_argument("--is-investigation", action="store_true",

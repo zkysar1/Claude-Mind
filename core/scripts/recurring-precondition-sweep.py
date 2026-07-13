@@ -106,7 +106,37 @@ def _advance_last_achieved_at(goal_id: str, source: str, now_iso: str, dry_run: 
         "--source", source, "update-goal",
         goal_id, "lastAchievedAt", now_iso,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    # guard-879: aspirations.py's own-cloud write-lock resolves its governed
+    # root map from MIND_WORLD/MIND_META (or the *_PATH fallbacks) in the
+    # SUBPROCESS env ONLY (OwnCloudBackend._resolve_root_map). This script runs
+    # as a direct `py` call (aspirations-precheck Phase 0.5c) with NO _paths.sh
+    # preamble, so on env-only own-cloud hosts the inherited env lacks those
+    # vars and the update-goal WRITE aborts BEFORE the lock ("cannot map a
+    # governed path to a root"; 2) — advanced=0 skipped_on_error=1,
+    # silently, every iteration a goal actually needs advancing. The READ side
+    # above already resolved WORLD_DIR/META_DIR via _paths.py's
+    # .mind-data/local-paths.conf fallback, so propagate them under the names
+    # from_env reads. Let an already-set MIND_* win (guard-879 / guard-652);
+    # skip a None-able root (guard-551). Local backend ignores all four.
+    env = os.environ.copy()
+    # Fill each alias on FALSY (unset OR empty-string), not merely-missing:
+    # from_env's `or` treats "" as unset (owncloud_backend.py:427), and guard-879's
+    # idiom is ${MIND_WORLD:-$WORLD_DIR} — so an ambient MIND_WORLD="" must still be
+    # filled (setdefault would leave it empty and the child would still abort). An
+    # already-set TRUTHY value wins (guard-879/652); a None-able root is skipped
+    # (guard-551).
+    for key, root in (
+        ("MIND_WORLD", _paths.WORLD_DIR), ("WORLD_PATH", _paths.WORLD_DIR),
+        ("MIND_META", _paths.META_DIR), ("META_PATH", _paths.META_DIR),
+    ):
+        if root is not None and not env.get(key):
+            # as_posix(), not str(): the value crosses into env consumed by
+            # Path() in the child AND by ${MIND_WORLD:-...} shell idioms —
+            # forward slashes are the conf/env convention on every platform
+            # (local-paths.conf, _transplant_pack.py). On POSIX identical to
+            # str(); on Windows avoids backslash-escape hazards in shell.
+            env[key] = root.as_posix()
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", env=env)
     if r.returncode != 0:
         sys.stderr.write(
             f"recurring-precondition-sweep: update-goal failed for {goal_id}: {r.stderr}"

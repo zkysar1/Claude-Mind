@@ -372,7 +372,20 @@ Bash: MIND_AGENT=<agent> bash -c '
     bash core/scripts/owncloud-flush.sh; frc=$?
   fi
   if [ "$frc" -eq 0 ]; then
-    bash core/scripts/runner-claim.sh release --agent "<agent>" || echo "[runner-claim] WARN: release rc nonzero — claim expires via stale-lock-break (~OWNERSHIP_STALE_SECONDS); proceeding with stop"
+    # D6.8 RELEASE — capture rc so a released=False (rc=5, g-328-31) surfaces a
+    # WARN + handoff note instead of being buried in a clean-looking exit-0.
+    bash core/scripts/runner-claim.sh release --agent "<agent>"; rrc=$?
+    if [ "$rrc" -eq 5 ]; then
+      # released=False: the DDB claim was NOT confirmed RUNNING->IDLE. Under a
+      # wedged daemon this strands a RUNNING self-claim (the g-115-1787 incident);
+      # the /start acquire-before-heartbeat reorder now self-heals the next start,
+      # but surface loudly (stderr) AND drop a durable handoff note so the operator
+      # knows a LIVE-claim release may have been missed.
+      echo "[runner-claim] WARN: DDB release UNCONFIRMED (released=False) — claim may be stranded RUNNING if the daemon was wedged. Next /start reclaims a genuinely-stale claim automatically; verify runner-state if this stop was expected to release a LIVE claim. Proceeding with stop." >&2
+      echo "$(date +%Y-%m-%dT%H:%M:%S) g-328-31: /stop DDB runner-claim release UNCONFIRMED (released=False) — DDB claim not confirmed IDLE. Next /start reclaims a stale self-claim (acquire-before-heartbeat); if a LIVE claim was expected to release, verify DDB runner-state before restart." >> "agents/<agent>/session/runner-release-warning"
+    elif [ "$rrc" -ne 0 ]; then
+      echo "[runner-claim] WARN: release rc=$rrc nonzero — claim expires via stale-lock-break (~OWNERSHIP_STALE_SECONDS); proceeding with stop" >&2
+    fi
   else
     echo "[stop-flush] WARN: flush FAILED twice (rc=$frc) — SKIPPING runner-claim release per design §6 (a failed-flush+release strands incomplete S3 state). Claim stays RUNNING, expires via stale-lock-break; daemon periodic sweep (120s) keeps retrying. Avoid a machine-move until S3 is confirmed current." >&2
   fi

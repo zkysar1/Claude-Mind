@@ -173,6 +173,32 @@ def test_count_findings_array_form():
             os.environ["MIND_AGENT"] = prior
 
 
+def test_count_findings_bare_goal_id_tag_is_goal_linked():
+    # rb-3014 / bravo msg-2962: a finding carrying a BARE goal-id-shaped tag
+    # (e.g. "6", NOT "goal_id:...") IS goal-linked. Before the fix the
+    # drainable detector missed it and over-counted actionable-without-goal,
+    # firing approved_but_drainable on a false set every quiescence cycle.
+    prior = os.environ.get("MIND_AGENT")
+    os.environ["MIND_AGENT"] = "alpha"
+    try:
+        lines = "\n".join([
+            # bare goal-id -> now recognized as goal-linked -> SKIP
+            '{"id":"m1","author":"bravo","tags":["actionable","g-115-1766"]}',
+            # g-prefixed but NOT goal-id shape -> boundary: still COUNT
+            '{"id":"m2","author":"bravo","tags":["actionable","git-sync"]}',
+            # no goal tag at all -> control: COUNT
+            '{"id":"m3","author":"bravo","tags":["actionable"]}',
+        ])
+        _install_rt({"/v1/board/read": lines})
+        # Only m2 + m3 count; m1 is goal-linked via its bare tag. (Pre-fix: 3.)
+        assert qg._count_actionable_findings_without_goal() == 2
+    finally:
+        if prior is None:
+            os.environ.pop("MIND_AGENT", None)
+        else:
+            os.environ["MIND_AGENT"] = prior
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

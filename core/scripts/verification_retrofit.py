@@ -146,6 +146,7 @@ def main(argv):
                       help="Print parsed JSON; do not modify goal (default)")
     mode.add_argument("--apply", action="store_true",
                       help="Write parsed verification into the goal")
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default=None,
                     help="Queue to search (default: both)")
     args = ap.parse_args(argv)

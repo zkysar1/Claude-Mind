@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 import urllib.error
 import urllib.request
@@ -45,7 +46,8 @@ class _Backend:
     """Mock OwnCloudBackend — records calls, drives each method's outcome."""
     def __init__(self, *, acquire_exc=None, heartbeat_exc=None,
                  release_ret=True, release_exc=None,
-                 reclaim_ret=False, reclaim_exc=None, acquire_exc_then_ok=False):
+                 reclaim_ret=False, reclaim_exc=None, acquire_exc_then_ok=False,
+                 runner_state=None):
         self._acquire_exc = acquire_exc
         self._heartbeat_exc = heartbeat_exc
         self._release_ret = release_ret
@@ -55,6 +57,10 @@ class _Backend:
         self._reclaim_ret = reclaim_ret
         self._reclaim_exc = reclaim_exc
         self._acquire_exc_then_ok = acquire_exc_then_ok
+        # Previous-holder row for the stale-break diagnostics (2026-07-07):
+        # the endpoint reads get_runner_state BEFORE reclaiming so a broken
+        # claim reports prev_machine_id + heartbeat age. None = row unreadable.
+        self._runner_state = runner_state
         self._acquire_n = 0
         self.calls: list = []
 
@@ -74,6 +80,10 @@ class _Backend:
         if self._reclaim_exc is not None:
             raise self._reclaim_exc
         return self._reclaim_ret
+
+    def get_runner_state(self, agent):
+        self.calls.append(("runner_state", agent))
+        return self._runner_state
 
     def heartbeat(self, agent, token):
         self.calls.append(("heartbeat", agent, token))
@@ -192,10 +202,35 @@ def test_acquire_reclaims_stale_peer_then_succeeds(running_daemon, monkeypatch):
     assert body["acquired"] is True
     assert body["held"] is False
     assert body["reclaimed_stale"] is True
-    # acquire(held) -> reclaim(True) -> acquire(ok)
+    # runner_state row is None here (unreadable) -> the endpoint's best-effort
+    # guard keeps the diagnostics keys ABSENT rather than emitting nulls.
+    assert "prev_machine_id" not in body
+    assert "prev_heartbeat_age_seconds" not in body
+    # acquire(held) -> runner_state(prev capture) -> reclaim(True) -> acquire(ok)
     assert be.calls == [("acquire", "alpha", "tokB"),
+                        ("runner_state", "alpha"),
                         ("reclaim", "alpha"),
                         ("acquire", "alpha", "tokB")]
+
+
+def test_acquire_stale_break_reports_previous_holder(running_daemon, monkeypatch):
+    """2026-07-07 bravo dual-runner follow-through: a stale-break acquire must
+    report WHO it broke and HOW stale the claim was (prev_machine_id +
+    prev_heartbeat_age_seconds), so /start can never again narrate a
+    stale-break as 'no live peer was detected'."""
+    _, port = running_daemon
+    hb_age = 1320  # the incident gap: a 22-minute max-effort turn
+    be = _Backend(acquire_exc=_RunnerHeld("bravo RUNNING (stale peer)"),
+                  reclaim_ret=True, acquire_exc_then_ok=True,
+                  runner_state={"machine_id": "cc-05",
+                                "heartbeat_at": str(int(time.time()) - hb_age)})
+    _inject(monkeypatch, be)
+    status, body = _post(port, "/v1/admin/runner-acquire?agent=bravo&token=tokB",
+                         agent="bravo")
+    assert status == 200
+    assert body["reclaimed_stale"] is True
+    assert body["prev_machine_id"] == "cc-05"
+    assert hb_age - 10 <= body["prev_heartbeat_age_seconds"] <= hb_age + 60
 
 
 def test_acquire_live_peer_not_reclaimed_stays_held(running_daemon, monkeypatch):
@@ -213,8 +248,10 @@ def test_acquire_live_peer_not_reclaimed_stays_held(running_daemon, monkeypatch)
     assert body["acquired"] is False
     assert body["held"] is True
     assert "reclaimed_stale" not in body
-    # acquire(held) -> reclaim(False) -> NO retry
-    assert be.calls == [("acquire", "alpha", "tokB"), ("reclaim", "alpha")]
+    # acquire(held) -> runner_state(prev capture) -> reclaim(False) -> NO retry
+    assert be.calls == [("acquire", "alpha", "tokB"),
+                        ("runner_state", "alpha"),
+                        ("reclaim", "alpha")]
 
 
 def test_acquire_reclaim_then_retry_races_back_to_held(running_daemon, monkeypatch):
@@ -231,8 +268,9 @@ def test_acquire_reclaim_then_retry_races_back_to_held(running_daemon, monkeypat
     assert body["ok"] is True
     assert body["acquired"] is False
     assert body["held"] is True
-    # acquire(held) -> reclaim(True) -> acquire(held again, raced) -> held
+    # acquire(held) -> runner_state -> reclaim(True) -> acquire(held again, raced) -> held
     assert be.calls == [("acquire", "alpha", "tokB"),
+                        ("runner_state", "alpha"),
                         ("reclaim", "alpha"),
                         ("acquire", "alpha", "tokB")]
 

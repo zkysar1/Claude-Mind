@@ -37,6 +37,7 @@ from _fileops import locked_modify_yaml, locked_write_yaml  # noqa: E402
 # parity by construction.
 from _team_state import (  # noqa: E402
     core_residual,
+    retire_agent as _retire_agent,
     route_field,
     row_path,
     rows_dir,
@@ -394,6 +395,47 @@ def init(ctx) -> "Response":  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
+# POST /v1/team-state/retire-agent  (5 — the sanctioned REMOVE path)
+# ---------------------------------------------------------------------------
+
+def retire_agent(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/team-state/retire-agent?agent=&source=&dry_run=
+
+    Sanctioned removal of an agent's team-state presence (core-file
+    agent_status residual + per-agent shard), archive-before-delete gated.
+    g-115-1909 found this REMOVE path missing (whole-row remove refused;
+    _remove_nested is list-only; no retire subcommand). Delegates to the
+    shared _team_state.retire_agent — the SAME function the CLI
+    cmd_retire_agent calls, so guard-742 parity holds by construction. The
+    archive lands in world/team-state/.graveyard/ (a path the live system
+    never reads); the op refuses to delete on an unverified archive.
+    """
+    from ..server import Response
+
+    err = _require_agent_header(ctx)
+    if err:
+        return err
+
+    target = (ctx.query.get("agent") or "").strip()
+    if not target:
+        return Response.error(400, "missing_param", "query parameter 'agent' required")
+    source = ctx.query.get("source")
+    dry_run = (ctx.query.get("dry_run") or "").strip().lower() in ("1", "true", "yes")
+    author = _agent_name(ctx)
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    try:
+        result = _retire_agent(ctx.paths.world, _ts_path(ctx), target, author,
+                               now, source=source, dry_run=dry_run)
+    except ValueError as e:
+        return Response.error(400, "invalid_agent", str(e))
+    except (RuntimeError, OSError) as e:
+        return Response.error(500, "retire_failed", str(e))
+
+    return Response.json(result)
+
+
+# ---------------------------------------------------------------------------
 # Route registration
 # ---------------------------------------------------------------------------
 
@@ -402,3 +444,4 @@ def register(routes) -> None:
     routes[("POST", "/v1/team-state/in-flight")] = in_flight
     routes[("POST", "/v1/team-state/clear-in-flight")] = clear_in_flight
     routes[("POST", "/v1/team-state/init")] = init
+    routes[("POST", "/v1/team-state/retire-agent")] = retire_agent

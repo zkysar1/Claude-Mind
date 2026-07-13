@@ -162,6 +162,7 @@ def main(argv=None):
                     help="Aspiration id to scan (e.g. asp-115)")
     ap.add_argument("--origin-prefix", required=True,
                     help='origin_signal prefix to match (e.g. "alert-email:")')
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default="world",
                     help="Which aspiration queue (default world)")
     ap.add_argument("--field", default="inbox_alert_backlog",

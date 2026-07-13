@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Sweep discovered-stage hypotheses orphaned past resolves_by (9).
+"""Sweep discovered-stage hypotheses orphaned past their deadline (9;
+formed_date+horizon fallback g-115-1981).
 
 review-hypotheses/SKILL.md Mode 1 Step 1 loads `--stage active` +
 `--stage measurement-pending` ONLY, so hypothesis records orphaned in
@@ -7,6 +8,12 @@ stage=discovered past their resolves_by are never resolved -- invisible to the
 review path, never feed accuracy stats (only resolved records do), silently
 distorting calibration. At filing (2026-06-24): 63 of 193 discovered records
 were overdue, the oldest >2 months stale.
+
+The deadline is resolves_by when present; when ABSENT (the common case -- most
+discovered hypotheses are drafted without one) it falls back to formed_date +
+the horizon's expected resolution window (g-115-1981). Before that fallback,
+resolves_by-absent records were skipped and never swept, accumulating silently
+until a manual pass (g-115-1976 hand-triaged 165 such records) drained them.
 
 This sweep (rb-428 sweep family; sibling of recurring-precondition-sweep.py /
 stranded-claim-sweep.py) classifies each OVERDUE discovered record and acts
@@ -50,8 +57,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -67,6 +75,18 @@ from pipeline import validate_formation_quality  # noqa: E402  (gate mirror)
 DEFAULT_EXPIRE_DAYS_SHORT = 30
 DEFAULT_EXPIRE_DAYS_LONG = 90
 
+# 1: when a discovered record has NO parseable resolves_by, fall back to
+# formed_date + the horizon's expected resolution window to synthesize an
+# effective deadline. Without this fallback, resolves_by-absent records -- the
+# majority, since most discovered hypotheses are drafted without a resolves_by --
+# were skipped entirely and never swept, silently accumulating in the discovered
+# stage (the manual cleanup that motivated this: 6 triaged 165 such
+# records by hand). Windows are "time from formation until the prediction should
+# be settleable": a micro hypothesis resolves within a day, a long one over months.
+HORIZON_WINDOW_DAYS = {"micro": 1, "session": 3, "short": 14, "long": 90}
+
+_ID_DATE_RX = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
 
 def _parse_iso(s):
     """Parse an ISO date/datetime string; None on any failure (e.g. the
@@ -77,6 +97,47 @@ def _parse_iso(s):
         return datetime.fromisoformat(s.replace("Z", "")[:19])
     except (ValueError, TypeError):
         return None
+
+
+def _formed_date(rec):
+    """Formation date of a record: an explicit formed/created field if present,
+    else the ID-date prefix (pipeline IDs are `YYYY-MM-DD_slug`). None if neither
+    is parseable. Used only as the fallback basis when resolves_by is absent."""
+    for k in ("formed_date", "created", "discovered_at", "created_at", "date"):
+        d = _parse_iso(rec.get(k))
+        if d is not None:
+            return d
+    m = _ID_DATE_RX.match(str(rec.get("id") or ""))
+    return _parse_iso(m.group(1)) if m else None
+
+
+def effective_deadline(rec):
+    """The date past which a discovered record counts as overdue.
+
+    resolves_by when present and parseable (unchanged behavior); otherwise, when
+    resolves_by is truly ABSENT, formed_date + the horizon's HORIZON_WINDOW_DAYS
+    window (g-115-1981 fallback). Returns (deadline, basis) with basis in
+    {'resolves_by', 'formed+horizon'}, or (None, None) when no deadline can be
+    derived.
+
+    A resolves_by that is PRESENT but not a parseable date -- the deliberate
+    'session_end' sentinel, or any other non-date marker -- is NOT treated as
+    absent: it stays skipped (pre-g-115-1981 behavior), because it was set on
+    purpose to mean "resolves at session end, not on a calendar date." Only a
+    MISSING / None / empty resolves_by triggers the formed_date+horizon fallback."""
+    raw = rec.get("resolves_by")
+    rb = _parse_iso(raw)
+    if rb is not None:
+        return rb, "resolves_by"
+    if raw is not None and str(raw).strip():
+        # Present-but-non-date sentinel (e.g. 'session_end') -> intentional, skip.
+        return None, None
+    formed = _formed_date(rec)
+    if formed is None:
+        return None, None
+    horizon = (rec.get("horizon") or "short").strip().lower()
+    window = HORIZON_WINDOW_DAYS.get(horizon, HORIZON_WINDOW_DAYS["short"])
+    return formed + timedelta(days=window), "formed+horizon"
 
 
 def passes_active_formation(rec):
@@ -97,8 +158,10 @@ def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
     """Pure classifier. `records`: list of pipeline record dicts (any stage).
 
     Returns {scanned, overdue, expire[], promote[], needs_judgment[]}. Only
-    stage=='discovered' records with a parseable PAST resolves_by are
-    considered overdue; everything else is ignored.
+    stage=='discovered' records with a PAST effective deadline are considered
+    overdue -- resolves_by when present, else formed_date + horizon window
+    (g-115-1981); records with neither a resolves_by nor a parseable formation
+    date are ignored.
     """
     expire, promote, needs = [], [], []
     overdue = 0
@@ -107,11 +170,11 @@ def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
             continue
         if rec.get("stage") != "discovered":
             continue
-        rb = _parse_iso(rec.get("resolves_by"))
-        if rb is None or rb >= now:
-            continue  # no parseable deadline, or not yet overdue
+        deadline, _basis = effective_deadline(rec)
+        if deadline is None or deadline >= now:
+            continue  # no derivable deadline, or not yet overdue
         overdue += 1
-        overdue_days = (now - rb).days
+        overdue_days = (now - deadline).days
         horizon = (rec.get("horizon") or "short").strip().lower()
         # Long-horizon windows are months; everything else (short/session/unset)
         # uses the short threshold.
@@ -194,14 +257,21 @@ def main() -> int:
 
     for rec in c["expire"]:
         rid = rec.get("id")
-        rb = _parse_iso(rec.get("resolves_by"))
-        days = (now - rb).days if rb else "?"
+        deadline, basis = effective_deadline(rec)
+        days = (now - deadline).days if deadline else "?"
+        if basis == "formed+horizon":
+            window_desc = (
+                f"derived deadline (formed_date + {(rec.get('horizon') or 'short')}"
+                f" horizon window; no resolves_by)"
+            )
+        else:
+            window_desc = f"resolves_by {rec.get('resolves_by')}"
         merge = {
             "outcome": "UNRESOLVABLE",
             "outcome_note": (
-                f"discovered-overdue-sweep (g-115-1629): resolves_by "
-                f"{rec.get('resolves_by')} was {days}d past; observation window "
-                f"closed -- prediction can no longer be settled. Swept {now_iso}."
+                f"discovered-overdue-sweep (g-115-1629): {window_desc} was "
+                f"{days}d past; observation window closed -- prediction can no "
+                f"longer be settled. Swept {now_iso}."
             ),
         }
         ok, _ = _move(rid, "archived", merge, args.apply)

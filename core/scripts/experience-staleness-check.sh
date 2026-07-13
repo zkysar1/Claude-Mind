@@ -70,6 +70,25 @@ agent_name = sys.argv[3]
 
 last_ts = None
 last_id = None
+
+# guard-980 / 6: on own-cloud boxes the local experience.jsonl is a
+# write-through cache ONLY on the daemon's own box; on every other box it is a
+# stale git-sync mirror. A raw read makes a false staleness decision (observed
+# 8-day divergence: bravo local 07-02 vs S3 07-10) and false-fires
+# force_experience_archival. Route the read through the backend first: refresh()
+# force-fetches the authoritative copy on OwnCloudBackend and is a No-op on
+# LocalBackend (canonical pattern — mind_api/src/endpoints/experience_write.py
+# _read_jsonl). Fail-open: if the backend can't resolve (bare subprocess without
+# MIND_WORLD/MIND_META) degrade to the raw read rather than skip it — this
+# canary is informational (rb-428) and must never hard-fail the iteration-close
+# hot path.
+try:
+    sys.path.insert(0, os.path.join(os.environ.get("PROJECT_ROOT", ""), "core", "scripts"))
+    from storage_backend import get_backend
+    get_backend().refresh(exp_file)
+except Exception:
+    pass
+
 with open(exp_file, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
         line = line.strip()

@@ -1,6 +1,6 @@
 ---
 name: encode-session
-description: "Runs a structured learning pass on the current chat session: encode reusable insights to the knowledge tree / reasoning bank / guardrails / patterns / experience archive; file Maintain goals for inline completions; re-probe blockers our work may have falsified; surface new aspirations / goals / forge gaps; propose /verify-learning checks for framework changes; check meta-strategy and Self for evolution signals. Invoked explicitly via /encode-session or 'encode this chat session' — does NOT auto-fire on conversational close-out language. Hybrid: user-invocable AND agent-callable."
+description: "Runs a structured learning pass on the current chat session: encode reusable insights to the knowledge tree / reasoning bank / guardrails / patterns / experience archive; file Maintain goals for inline completions; re-probe blockers our work may have falsified; surface new aspirations / goals / forge gaps; propose /verify-learning checks for framework changes; check meta-strategy and Self for evolution signals. Use only when the user explicitly types /encode-session or says 'encode this chat session' — does NOT auto-fire on conversational close-out language. Hybrid: user-invocable AND agent-callable."
 user-invocable: true
 triggers:
   - "/encode-session"

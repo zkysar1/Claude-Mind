@@ -92,6 +92,28 @@ fi
 # below so the guard-343 "new companion script" trigger survives committed scope
 # (a script added in the commit shows as status=A in the range diff, not as
 # untracked).
+#
+# DELTA vs CUMULATIVE (2): mode (1) IS per-goal-delta scoped — the
+# committed range is exactly this goal's landed work — and it is the PRIMARY
+# path (iteration-close.sh runs iteration-commit BEFORE this gate on every deep
+# close, so a deep goal that committed core edits takes committed scope). Mode
+# (2), the fallback, is CUMULATIVE against HEAD: on a box carrying standing
+# working-tree divergence (e.g. an in-flight fleet-sync backlog) it can count
+# pre-existing residue toward this goal's threshold. That residual over-fire is
+# BOUNDED, not eliminated, by three layers — committed scope (mode 1) is the
+# norm; the cross-agent attribution filter (below) drops known-partner residue;
+# and the mode-only exclusion (below) drops zero-content residue, the largest
+# recurring subclass (exec-bit normalization of Windows-authored *.sh on Linux,
+# e.g. 1's 434-file commit). A full iteration-start dirty-set baseline
+# (snapshot at loop entry, subtract at gate time) was evaluated and DEFERRED:
+# the only clean iteration-start capture point is a critical-path script
+# (heartbeat-tick.sh, IRREDUCIBLY LOCAL) or fragile SKILL.md pseudocode, and any
+# baseline-subtraction on a REVIEW gate risks FALSE-NEGATIVES — a missed
+# fresh-eyes review ships unreviewed code, strictly worse than a transient
+# false-positive. The residue condition is a transient sync-backlog artifact,
+# not steady state (a healthy box is clean vs HEAD), so the cumulative fallback
+# is intentionally retained; revisit only if telemetry shows the fallback
+# firing on residue frequently in practice.
 COMMIT_SHA="${COMMIT_SHA:-}"
 COMMIT_SHA_VALID=no
 COMMITTED_NEW_SCRIPTS=""
@@ -189,6 +211,56 @@ if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB
     fi
     rm -f "$ATTRIB_TMP2"
   fi
+fi
+
+# ── Mode-only exclusion (2) ─────────────────────────────────────────
+# A file whose ONLY change is a mode bit (exec-bit normalization, symlink/type
+# flip) carries ZERO reviewable content: `git diff --numstat` reports it as
+# "0<tab>0<tab><path>". Counting it toward core_files — or firing a
+# fresh-eyes-code review on it — is a false positive: there is no code delta to
+# review. The LOC path below already treats mode-only as 0; this makes the
+# FILE-COUNT path consistent, so the gate measures CONTENT deltas, not mode
+# flips. Canonical residue class: 1 normalized 434 Windows-authored
+# *.sh exec bits (100644->100755) in one commit — mode-only, zero content —
+# which would otherwise blow past core_files>=3 on the next deep close.
+#
+# SAFETY (zero false-negative): a file is dropped ONLY when git reports 0
+# insertions AND 0 deletions (no line changed). Dropping it can never miss a
+# real review. --no-renames keeps a renamed file visible as add+delete (nonzero)
+# so a rename is never mis-scored as mode-only. UNTRACKED/new files (new content,
+# absent from numstat vs base) are ALWAYS kept. FAIL-OPEN: when numstat produces
+# no output (git error, or no tracked changes at all → every core file is
+# untracked) we keep the full set — a review gate must bias to over-fire, never
+# silently drop.
+MODE_ONLY_DROPPED=0
+if [ -n "$CORE_FILES" ]; then
+  PRE_MODE_COUNT=$(printf '%s\n' "$CORE_FILES" | sed '/^$/d' | grep -c . || echo 0)
+  # shellcheck disable=SC2086
+  RAW_NUMSTAT=$(git diff --numstat --no-renames $BASE_FOR_LOC 2>/dev/null || true)
+  CONTENT_CHANGED=$(printf '%s\n' "$RAW_NUMSTAT" \
+    | awk -F'\t' 'NF>=3 && !($1=="0" && $2=="0") {print $3}' | sort -u || true)
+  NUMSTAT_NONEMPTY=0
+  [ -n "$RAW_NUMSTAT" ] && NUMSTAT_NONEMPTY=1
+  CORE_FILES=$(CORE_FILES_VAL="$CORE_FILES" CONTENT_VAL="$CONTENT_CHANGED" \
+               UNTRACKED_VAL="$UNTRACKED" NUMSTAT_NONEMPTY="$NUMSTAT_NONEMPTY" \
+               python3 - <<'PYEOF'
+import os
+core = [l.strip() for l in os.environ.get("CORE_FILES_VAL", "").splitlines() if l.strip()]
+if os.environ.get("NUMSTAT_NONEMPTY") != "1":
+    # No tracked changes / numstat error — cannot verify mode-only. Fail-open:
+    # keep the full set (bias to over-fire; never silently drop).
+    print("\n".join(core))
+else:
+    content = set(l.strip() for l in os.environ.get("CONTENT_VAL", "").splitlines() if l.strip())
+    untracked = set(l.strip() for l in os.environ.get("UNTRACKED_VAL", "").splitlines() if l.strip())
+    # Keep a core file iff it has a nonzero content delta OR is an untracked new
+    # file. Drop pure mode-only (0+0) tracked changes.
+    print("\n".join(f for f in core if f in content or f in untracked))
+PYEOF
+)
+  CORE_FILES=$(printf '%s\n' "$CORE_FILES" | sed '/^$/d')
+  POST_MODE_COUNT=$(printf '%s\n' "$CORE_FILES" | sed '/^$/d' | grep -c . || echo 0)
+  MODE_ONLY_DROPPED=$((PRE_MODE_COUNT - POST_MODE_COUNT))
 fi
 
 CORE_COUNT=0
@@ -483,5 +555,10 @@ PYEOF
   fi
   FIRED=true REASON="${REASONS% }" emit_json
 else
-  FIRED=false REASON="below thresholds (core_files=$CORE_COUNT<$CORE_FILE_THRESHOLD, loc=$LOC_CHANGED<$LOC_THRESHOLD, no new script)" emit_json
+  # 2 observability: name the mode-only exclusion when it reduced the
+  # count, so a debugger seeing core_files=0 after an exec-bit-only commit sees
+  # WHY (the fix worked) instead of an unexplained non-fire.
+  MODE_SUFFIX=""
+  [ "${MODE_ONLY_DROPPED:-0}" -gt 0 ] && MODE_SUFFIX=", mode_only_excluded=$MODE_ONLY_DROPPED"
+  FIRED=false REASON="below thresholds (core_files=$CORE_COUNT<$CORE_FILE_THRESHOLD, loc=$LOC_CHANGED<$LOC_THRESHOLD, no new script${MODE_SUFFIX})" emit_json
 fi

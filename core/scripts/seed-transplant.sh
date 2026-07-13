@@ -236,7 +236,32 @@ if d['pending_skip']:
 
 # Step 9: Atomic swap
 echo "[seed-transplant] Swapping staged files into place..."
-SWAP_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" swap --dest "$DEST")"
+# Defensive stderr-capture + explicit rc-check (mirrors the build-plan block
+# above, L173-184). Without it, an engine crash that exits non-zero AFTER the
+# moves land (a post-move cleanup/stat step raising, esp. on Windows) sends its
+# traceback to STDERR — which the stdout-only $(...) capture drops — and the
+# top-of-file `set -e` kills the wrapper SILENTLY before [moved: N] and before
+# --commit. The operator then sees a scary mid-swap death on a tree that is
+# actually fully swapped, with NO diagnostic (0; v2.1.1 prod promotion
+# 2026-07-05). Capture stderr, check rc, fail LOUD with the named diagnostic,
+# and distinguish engine-crash-after-swap (exit 8) from per-file swap failures
+# (exit 6, below).
+SWAP_ERR="$(mktemp 2>/dev/null || echo "/tmp/seed-transplant-swaperr.$$")"
+set +e
+SWAP_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" swap --dest "$DEST" 2>"$SWAP_ERR")"
+SWAP_RC=$?
+set -e
+if [ $SWAP_RC -ne 0 ]; then
+    echo "[seed-transplant] swap ENGINE exited non-zero (rc=$SWAP_RC) after the [Swapping...] step." >&2
+    echo "[seed-transplant] This is an engine-crash-during/after-swap, NOT a per-file swap failure." >&2
+    echo "[seed-transplant] The file moves may have FULLY COMPLETED — do NOT assume corruption; verify:" >&2
+    echo "                  bash \"$SCRIPT_DIR/seed-verify.sh\" \"$DEST\"   (0 FAILS = tree is intact)" >&2
+    echo "[seed-transplant] engine stderr diagnostic follows (names the failing step):" >&2
+    cat "$SWAP_ERR" >&2
+    rm -f "$SWAP_ERR"
+    exit 8
+fi
+rm -f "$SWAP_ERR"
 MOVED="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin)['moved'])")"
 echo "  moved: $MOVED"
 N_FAIL="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(len(json.load(sys.stdin)['failures']))")"
@@ -244,6 +269,14 @@ if [ "$N_FAIL" -gt 0 ]; then
     echo "  FAILURES during swap:"
     echo "$SWAP_JSON" | py -3 -c "import sys,json; [print('   ', f['rel_path'], ':', f['error']) for f in json.load(sys.stdin)['failures']]"
     exit 6
+fi
+# Non-fatal post-move staging-cleanup error (moves already succeeded; only the
+# staging-dir removal hiccupped). Surfaced by the engine as a NAMED field rather
+# than silently swallowed (0 fail-loud). Warn; do not fail the swap.
+STAGING_ERR="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin).get('staging_cleanup_error') or '')" 2>/dev/null)"
+if [ -n "$STAGING_ERR" ]; then
+    echo "  WARN: post-move staging cleanup reported: $STAGING_ERR" >&2
+    echo "        (moves succeeded; the .seed-staging dir may need manual removal)" >&2
 fi
 
 # Step 10: Clean cruft

@@ -46,6 +46,14 @@ import yaml
 # in import-cycle-proof modules (core/scripts/_agents.py) — keep in sync.
 ROWS_SUBDIR = ("team-state", "agents")
 
+# Cold archive for retired agent rows (retire_agent). Deliberately NOT under
+# ROWS_SUBDIR ("team-state/agents") so load_rows()'s shard glob never sees it,
+# and NOT the core file — the live team-state code never reads it. It IS a
+# subpath of the existing "team-state" dir, so the L1 new-top-level-under-world
+# cruft gate allows it (archive-before-delete.md step 3: a location the live
+# system does not read + no retention clock touches).
+GRAVEYARD_SUBDIR = ("team-state", ".graveyard")
+
 # Row-write metadata stamps (row-scoped analog of the core file's
 # last_updated/last_updated_by). Also feed the newest-wins comparison so a
 # row write that does not bump last_active still beats a stale residual.
@@ -56,6 +64,13 @@ ROW_UPDATED_BY_KEY = "row_updated_by"
 def rows_dir(world_dir) -> Path:
     d = Path(world_dir)
     for seg in ROWS_SUBDIR:
+        d = d / seg
+    return d
+
+
+def graveyard_dir(world_dir) -> Path:
+    d = Path(world_dir)
+    for seg in GRAVEYARD_SUBDIR:
         d = d / seg
     return d
 
@@ -214,3 +229,258 @@ def read_agent_row(world_dir, agent: str, core_path=None) -> dict:
     if not row_entry:
         return core_entry
     return core_entry if _entry_ts(core_entry) > _entry_ts(row_entry) else row_entry
+
+
+# ---------------------------------------------------------------------------
+# Agent-row retirement (5) — the sanctioned REMOVE path.
+#
+# Signal gap 9 root-caused: team-state had NO way to remove an
+# agent_status ROW. route_field sends agent_status.<name> to a per-agent
+# SHARD (targeting a non-existent shard for un-sharded legacy agents);
+# the generic --operation remove / _remove_nested only drops items from a
+# LIST (agent_status is a DICT -> no-op); the daemon whole-row path refuses
+# remove. So a user-retired agent's core-residual row could only be removed
+# by forbidden raw-YAML surgery. retire_agent is that missing op — one place,
+# imported by BOTH the CLI (team-state.py) and the daemon (team_state_write.py),
+# so guard-742 parity holds by construction (no second implementation).
+# ---------------------------------------------------------------------------
+
+def enumerate_retire(world_dir, core_path, agent: str) -> dict:
+    """Pure read: what retire_agent WOULD remove for <agent> — the core-file
+    agent_status.<agent> residual and the per-agent shard (path + content).
+    `present` is False when neither exists (retire is then an idempotent
+    no-op). No mutation — the enumeration is also the integrity baseline the
+    archive is verified against (archive-before-delete.md step 1)."""
+    name = (agent or "").strip()
+    core = core_residual(core_path, name) if core_path is not None else {}
+    rp = None
+    row_content = None
+    try:
+        rp = row_path(world_dir, name)
+    except ValueError:
+        rp = None
+    row_exists = rp is not None and rp.exists()
+    if row_exists:
+        try:
+            with open(rp, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+            if isinstance(doc, dict):
+                row_content = doc
+        except Exception:  # noqa: BLE001 — corrupt row still archived as None
+            row_content = None
+    return {
+        "agent": name,
+        "core_residual": core or None,
+        "row_path": str(rp) if rp is not None else None,
+        "row_content": row_content,
+        "present": bool(core) or row_exists,
+    }
+
+
+def enumerate_belief_sweep(world_dir, core_path, retiree: str) -> dict:
+    """Pure read: every live agent (core-resident agent_status row OR per-agent
+    shard) holding a Theory-of-Mind belief whose `about` == retiree. Returns
+    {"core": {holder: [belief, ...]}, "shards": {holder: [belief, ...]}}.
+
+    Beliefs about a retiree are DEAD: the subject produces no further
+    observations, so the holder's own supersede_beliefs hygiene (which fires
+    only on a FRESH observation of the subject) never replaces them.
+    Retirement must sweep them or they linger forever — the echo/zeta
+    about:delta residue that survived the g-115-1965 row removal (g-115-2043,
+    rb-3104 lineage). Enumeration is also the archive baseline
+    (archive-before-delete.md step 1). No mutation."""
+    name = (retiree or "").strip()
+    out = {"core": {}, "shards": {}}
+    if not name:
+        return out
+
+    def _hits(beliefs):
+        return [b for b in (beliefs or [])
+                if isinstance(b, dict) and str(b.get("about", "")).strip() == name]
+
+    # core-resident beliefs (agent_status.<holder>.beliefs — legacy/un-sharded)
+    if core_path is not None:
+        try:
+            with open(core_path, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+            ast = (doc or {}).get("agent_status") or {}
+            for holder, row in ast.items():
+                if holder == name or not isinstance(row, dict):
+                    continue
+                h = _hits(row.get("beliefs"))
+                if h:
+                    out["core"][holder] = h
+        except Exception:  # noqa: BLE001 — a corrupt core file yields no sweep
+            pass
+
+    # shard-resident beliefs (per-agent shard, top-level `beliefs`)
+    rdir = rows_dir(world_dir)
+    if rdir.is_dir():
+        for shard in sorted(rdir.glob("*.yaml")):
+            holder = shard.stem
+            if holder == name:
+                continue
+            try:
+                with open(shard, "r", encoding="utf-8") as f:
+                    doc = yaml.safe_load(f)
+            except Exception:  # noqa: BLE001 — corrupt shard skipped
+                continue
+            if not isinstance(doc, dict):
+                continue
+            h = _hits(doc.get("beliefs"))
+            if h:
+                out["shards"][holder] = h
+    return out
+
+
+def retire_agent(world_dir, core_path, agent, author, now, *,
+                 source=None, dry_run=False) -> dict:
+    """Sanctioned removal of an agent's team-state presence: the core-file
+    agent_status.<agent> residual AND the per-agent shard file, gated by
+    archive-before-delete (.claude/rules/archive-before-delete.md).
+
+    Protocol: ENUMERATE -> ARCHIVE (to world/team-state/.graveyard/, a path
+    the live system never reads) -> VERIFY the archive against the
+    enumeration -> DELETE (pop the core key under lock + unlink the shard)
+    -> RECEIPT (the archive file IS the receipt). NEVER deletes on an
+    unverified archive — raises RuntimeError instead.
+
+    Idempotent: a re-run when the agent is already absent returns
+    removed=False, reason="not_present" without error. dry_run reports the
+    enumeration without writing or deleting. Returns a JSON-serializable
+    result dict."""
+    name = (agent or "").strip()
+    if not name or name in (".", "..") or any(c in name for c in "/\\"):
+        raise ValueError(f"invalid agent name for retire: {agent!r}")
+
+    plan = enumerate_retire(world_dir, core_path, name)
+    # 3: beliefs ABOUT the retiree are held by OTHER agents and persist
+    # independently of the retiree's own row — enumerate them so retirement (or a
+    # re-run after the row is already gone) sweeps the dead beliefs too.
+    sweep = enumerate_belief_sweep(world_dir, core_path, name)
+    has_beliefs = bool(sweep["core"] or sweep["shards"])
+    if not plan["present"] and not has_beliefs:
+        return {"ok": True, "agent": name, "removed": False,
+                "reason": "not_present",
+                "detail": f"{name} has no core residual, no shard, and no "
+                          f"partner-beliefs — nothing to retire"}
+
+    if dry_run:
+        return {"ok": True, "agent": name, "removed": False, "dry_run": True,
+                "would_remove": {
+                    "core_residual": plan["core_residual"] is not None,
+                    "shard": plan["row_content"] is not None,
+                    "beliefs": {
+                        "core": {h: len(bs) for h, bs in sweep["core"].items()},
+                        "shards": {h: len(bs) for h, bs in sweep["shards"].items()}}},
+                "plan": plan}
+
+    # --- ARCHIVE (before any delete) ---------------------------------------
+    payload = {
+        "schema": "team-state-retire-archive/v1",
+        "agent": name,
+        "retired_at": now,
+        "retired_by": author,
+        "source": source,
+        "core_residual": plan["core_residual"],
+        "shard_content": plan["row_content"],
+        "shard_path": plan["row_path"],
+        "swept_beliefs": sweep,
+        "restore": (
+            f"Re-add the core residual via `team-state-update.sh --field "
+            f"agent_status.{name} --value '<core_residual json>' --operation "
+            f"set`; re-create the shard by writing shard_content to "
+            f"{plan['row_path']}. Do NOT restore into a live session's row "
+            f"(archive-before-delete.md — resurrection risk)."),
+    }
+    gyard = graveyard_dir(world_dir)
+    gyard.mkdir(parents=True, exist_ok=True)
+    safe_ts = now.replace(":", "").replace("-", "").replace("T", "-")
+    archive_path = gyard / f"{safe_ts}-{name}.yaml"
+    with open(archive_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+
+    # --- VERIFY the archive (re-read, field-compare) -----------------------
+    with open(archive_path, "r", encoding="utf-8") as f:
+        verify = yaml.safe_load(f)
+    if (not isinstance(verify, dict)
+            or verify.get("agent") != name
+            or verify.get("core_residual") != plan["core_residual"]
+            or verify.get("shard_content") != plan["row_content"]
+            or verify.get("swept_beliefs") != sweep):
+        raise RuntimeError(
+            f"retire {name}: archive verification FAILED at {archive_path} "
+            f"— refusing to delete (archive-before-delete.md)")
+
+    # --- DELETE (only now that the archive is verified) --------------------
+    removed_core = False
+    removed_shard = False
+    beliefs_swept = {"core": {}, "shards": {}}
+    from _fileops import locked_modify_yaml  # lazy: cycle-proof
+
+    # Core file: pop the retiree's own row AND sweep every OTHER core-resident
+    # row's beliefs about the retiree — one locked read-modify-write so the sweep
+    # is atomic with the row removal. The single-writer invariant on
+    # agent_status.<self>.beliefs is a CONCURRENT-write guard; a retiree-belief is
+    # dead (never re-written by its holder, whose supersede fires only on a fresh
+    # observation of a now-gone subject), so this administrative sweep under the
+    # shared core lock is the sanctioned exception — same class as popping the row.
+    if plan["core_residual"] is not None or sweep["core"]:
+        def _modify_core(state):
+            ast = state.get("agent_status")
+            if isinstance(ast, dict):
+                if name in ast:
+                    ast.pop(name)
+                for holder, row in ast.items():
+                    if not isinstance(row, dict):
+                        continue
+                    bl = row.get("beliefs")
+                    if not isinstance(bl, list):
+                        continue
+                    kept = [b for b in bl
+                            if not (isinstance(b, dict)
+                                    and str(b.get("about", "")).strip() == name)]
+                    if len(kept) != len(bl):
+                        row["beliefs"] = kept
+                        beliefs_swept["core"][holder] = len(bl) - len(kept)
+            state["last_updated"] = now
+            state["last_updated_by"] = author
+            return state
+
+        locked_modify_yaml(Path(core_path), _modify_core,
+                           initial={"agent_status": {}})
+        removed_core = plan["core_residual"] is not None
+
+    # Shard files: sweep each holder's top-level beliefs about the retiree under
+    # that shard's own lock (serialized with the holder's live writes).
+    for holder in sweep["shards"]:
+        sp = row_path(world_dir, holder)
+
+        def _modify_shard(state, _name=name, _holder=holder):
+            bl = state.get("beliefs")
+            if isinstance(bl, list):
+                kept = [b for b in bl
+                        if not (isinstance(b, dict)
+                                and str(b.get("about", "")).strip() == _name)]
+                if len(kept) != len(bl):
+                    state["beliefs"] = kept
+                    beliefs_swept["shards"][_holder] = len(bl) - len(kept)
+            return state
+
+        locked_modify_yaml(sp, _modify_shard, initial={})
+
+    # Retiree's own shard unlink (unchanged path).
+    if plan["row_content"] is not None and plan["row_path"]:
+        try:
+            Path(plan["row_path"]).unlink()
+            removed_shard = True
+        except FileNotFoundError:
+            removed_shard = False
+
+    any_removed = (removed_core or removed_shard
+                   or bool(beliefs_swept["core"] or beliefs_swept["shards"]))
+    return {"ok": True, "agent": name, "removed": any_removed,
+            "removed_core_residual": removed_core,
+            "removed_shard": removed_shard,
+            "beliefs_swept": beliefs_swept,
+            "archive": str(archive_path), "source": source}

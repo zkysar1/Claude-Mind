@@ -70,6 +70,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -83,6 +84,18 @@ if hasattr(sys.stderr, "reconfigure"):
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+
+
+# Bare goal-id-shaped tag (e.g. "6"): a finding carrying a bare goal
+# id IS goal-linked, even without the "goal_id:" prefix. The drainable detector
+# (_count_actionable_findings_without_goal) must treat it as has_goal, or it
+# over-counts actionable-without-goal findings and fires approved_but_drainable
+# on a false set every quiescence cycle (rb-3014 / bravo finding msg-2962,
+# empirically confirmed 2026-07-10: 3 of 5 flagged findings were bare-tag
+# goal-linked). Shape per CLAUDE.md ID Formats: g-<aspiration digits>-<goal
+# digits>. Fully anchored so g-prefixed non-goal tags (git-sync, cc-05) do NOT
+# match.
+_GOAL_ID_TAG_RE = re.compile(r"^g-\d+-\d+$")
 
 
 # --- Config ------------------------------------------------------------------
@@ -753,11 +766,12 @@ def _count_unreflected_hypotheses():
 
 
 def _count_actionable_findings_without_goal():
-    """Count findings (board, 7d) tagged 'actionable', NOT tagged goal_id, and
+    """Count findings (board, 7d) tagged 'actionable', NOT goal-linked, and
     not authored by this agent — matching B6.8 Target 3's conversion filter so
     the gate's count agrees with what the orchestrator would actually drain.
-    board-read emits JSONL (one post per line) or a JSON array; tolerate both.
-    0 on any error."""
+    "Goal-linked" = a literal 'goal_id' tag, a 'goal_id:<id>' prefixed tag, OR
+    a bare goal-id-shaped tag (e.g. 'g-115-1766' — rb-3014). board-read emits
+    JSONL (one post per line) or a JSON array; tolerate both. 0 on any error."""
     try:
         agent = os.environ.get("MIND_AGENT", "") or ""
         raw = _rt.rt_call("GET", "/v1/board/read",
@@ -786,7 +800,12 @@ def _count_actionable_findings_without_goal():
                 continue
             tag_strs = [str(t) for t in tags]
             has_actionable = "actionable" in tag_strs
-            has_goal = any(t == "goal_id" or t.startswith("goal_id:") for t in tag_strs)
+            has_goal = any(
+                t == "goal_id"
+                or t.startswith("goal_id:")
+                or _GOAL_ID_TAG_RE.match(t)
+                for t in tag_strs
+            )
             if has_actionable and not has_goal and post.get("author") != agent:
                 count += 1
         return count

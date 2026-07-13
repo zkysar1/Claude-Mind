@@ -251,6 +251,20 @@ _perform_recovery() {
         return 1
     fi
 
+    # DDB runner-claim release with the crashed session's OLD on-disk token
+    # (2026-07-07, bravo dual-runner incident follow-through). A crashed runner
+    # leaves its DDB row RUNNING; local recovery flips only the LOCAL state, so
+    # without this release the next /start on THIS box is held hostage by its
+    # OWN stale row until OWNERSHIP_STALE_SECONDS elapses (~65 min post-
+    # calibration). MUST run BEFORE manifest-clear below — runner-token is
+    # recovery_action:clear, so the old token is gone after it. Token-
+    # conditional and idempotent: if a peer machine already stale-broke and
+    # re-claimed, the old token no longer matches and this is a no-op — it can
+    # never steal a peer's claim. Fail-open: a DDB hiccup must never block
+    # recovery (the acquire path's stale-break remains the fallback).
+    MIND_AGENT="$agent" bash "$SCRIPT_DIR/runner-claim.sh" release --agent "$agent" \
+        2>>"$CORE_ROOT/logs/recovery-gate-stderr.log" || true
+
     # Manifest-driven clear — IDENTICAL to /start --recover Phase 0.7.
     # Single source of truth lives in session-manifest-clear.sh.
     # Runs AFTER state-set IDLE succeeded ( reorder); the cleanup

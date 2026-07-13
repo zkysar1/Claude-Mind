@@ -226,7 +226,10 @@ IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restar
        Key outcomes: {session_summary.key_outcomes}.
        Curriculum: {curriculum_stage_name} ({gates_passed}/{gates_total} gates).
        Last consolidation: {consolidation_meta.triage_tier} ({consolidation_meta.consecutive_lean_sessions} consecutive lean).  ← omit line if consolidation_meta absent
-       First action: {first_action.goal_id} ({first_action.reason}).
+       First action: {first_action.goal_id}{foreign_badge} ({first_action.reason}).
+         (foreign_badge = " [foreign: {cross_world_origin}]" when first_action.goal_id's
+          record in the aspirations data read at sub-step 1 carries a non-null
+          cross_world_origin — g-336-12; empty for native goals so they render unchanged.)
        Meta: imp@k {last_session_imp_k} ({trend}) | {active_variant or 'baseline'} | {meta_changes} changes.
        Resuming aspirations loop."
        (Curriculum line: read from Bash: curriculum-status.sh. If not configured, omit line.)

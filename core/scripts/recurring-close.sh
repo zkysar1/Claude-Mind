@@ -118,6 +118,8 @@ fi
 ORIGINAL_OUTCOME="$OUTCOME"
 
 # ─────────────────────────── recurring check ───────────────────────────
+# WORLD_AGENT_ONLY: cross-agent goals run under an MIND_AGENT env override
+# ( Option 3), so $AGENT_DIR already points at the owning agent.
 if [[ "$SOURCE" == "world" ]]; then
     SRC_FILE="$WORLD_DIR/aspirations.jsonl"
 elif [[ "$SOURCE" == "agent" ]]; then
@@ -150,6 +152,31 @@ then
     echo "recurring-close: goal $GOAL_ID not found or not recurring in $SRC_FILE" >&2
     exit 1
 fi
+
+# ─────────────────── deliverable-file verification (6) ───────────────────
+# rb-428 class: a recurring skill's deliverable-writing step (e.g. /agent-completion-
+# report writing agents/<agent>/COMPLETION-REPORT.md in its Phase 4) is LLM-gated and
+# can drift — a close advances lastAchievedAt WITHOUT the named deliverable being
+# regenerated (canonical , 2026-07-11: lastAchievedAt bumped, no write touched
+# the report). This bash-gated FLAG makes that drift VISIBLE at close time (bash steps
+# do not drift, LLM steps do). deliverable-verify.py reads the goal's deliverable_file
+# + its CURRENT lastAchievedAt (verify has NOT yet bumped it — this block runs before
+# the phases below) and checks mtime > lastAchievedAt. Goals WITHOUT the field verdict
+# "skip" → they close exactly as before. FAIL-OPEN + FLAG-ONLY: never blocks a close (a
+# false-stale mtime — e.g. an own-cloud stale pull, 9 — must not gate real
+# work). {agent} in the path expands to $MIND_AGENT (a shared recurring goal produces
+# a per-agent deliverable — rb-1556). A hard-refuse mode would hook in here.
+DELIV_VERDICT="$(python3 "$SCRIPT_DIR/deliverable-verify.py" \
+    --goal-id "$GOAL_ID" --source-file "$SRC_FILE" \
+    --agent "$MIND_AGENT" --project-root "$PROJECT_ROOT" 2>/dev/null || echo skip)"
+case "$DELIV_VERDICT" in
+    stale)
+        echo "[recurring-close] ⚠ DELIVERABLE NOT REGENERATED: $GOAL_ID is closing (lastAchievedAt about to advance) but its deliverable_file has NOT been modified since the prior close. The skill's deliverable-writing step may have been skipped (rb-428 LLM-abbreviation drift). Close proceeding — this is a FLAG, not a block (g-115-2036)." >&2
+        ;;
+    missing)
+        echo "[recurring-close] ⚠ DELIVERABLE MISSING: $GOAL_ID names a deliverable_file that does not exist on disk — the deliverable was likely never produced. Close proceeding — FLAG only (g-115-2036)." >&2
+        ;;
+esac
 
 # ─────────────────────────── loop_state mutation (Block A/B/C/D) ───────────────────────────
 # Magic Wand #1 (alpha session-60 reflection, 2026-05-07). Single-writer for

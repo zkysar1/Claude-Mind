@@ -39,6 +39,8 @@ SCHEMA = {
     # decomposed child goal.
     "goal_id":          {"required": True,  "type": str, "pattern": r"^g-\d{3}-\d{2,4}(-[a-z])?$"},
     "aspiration_id":    {"required": True,  "type": str, "pattern": r"^asp-\d+$"},
+    # WORLD_AGENT_ONLY: cross-agent goals reach here already translated to
+    # source='agent' + cross_agent_owner (see that field's comment below).
     "source":           {"required": True,  "type": str, "enum": ("world", "agent")},
     "phase":            {"required": True,  "type": str},  # selected, executed, verified, ...
     "selected_at":      {"required": True,  "type": str},  # ISO 8601

@@ -170,3 +170,97 @@ def test_counts_aggregate():
     assert [r["id"] for r in c["promote"]] == ["p1"]
     assert [r["id"] for r in c["needs_judgment"]] == ["n1"]
     assert [r["id"] for r in c["expire"]] == ["e1"]
+
+
+# ---------------------------------------------------------------------------
+# 1: formed_date + horizon fallback when resolves_by is ABSENT.
+# Before this, resolves_by-absent records (the common draft shape) were skipped
+# entirely and never swept; 6 had to hand-triage 165 such records.
+# ---------------------------------------------------------------------------
+
+
+def _no_rb(**over):
+    """A discovered record with NO resolves_by (the common draft shape). Bare
+    (fails active-formation), so a resolves_by-absent record can only EXPIRE or
+    NEEDS_JUDGMENT -- never PROMOTE (active-formation requires resolves_by per
+    guard-798)."""
+    rec = _bare(**over)
+    rec.pop("resolves_by", None)
+    return rec
+
+
+def test_no_resolves_by_old_short_expires_via_id_date():
+    # No resolves_by; id-date 2026-04-15 (~70d before NOW), short horizon.
+    # effective deadline = formed(04-15) + 14 = 04-29 -> 56d overdue > 30 -> EXPIRE.
+    rec = _no_rb(id="2026-04-15_old-short")
+    c = SW.classify_overdue([rec], NOW)
+    assert rec in c["expire"]
+    assert c["overdue"] == 1
+
+
+def test_no_resolves_by_recent_short_not_overdue():
+    # id-date 2026-06-20 (4d before NOW); short window +14 -> 07-04 (future) -> not overdue.
+    rec = _no_rb(id="2026-06-20_recent-short")
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+    assert rec not in c["expire"] and rec not in c["needs_judgment"]
+
+
+def test_no_resolves_by_long_horizon_recent_needs_judgment():
+    # id-date 2026-03-19 + long window 90 = 06-17 -> 7d overdue < 90 long thresh ->
+    # not expired; bare (no resolves_by => fails formation) -> NEEDS_JUDGMENT.
+    # Mirrors the 6 manual call: keep recent long-horizon predictions.
+    rec = _no_rb(id="2026-03-19_old-long", horizon="long")
+    c = SW.classify_overdue([rec], NOW)
+    assert rec in c["needs_judgment"]
+    assert rec not in c["expire"]
+
+
+def test_no_resolves_by_no_parseable_date_skipped():
+    # No resolves_by AND id carries no YYYY-MM-DD prefix AND no formed_date field
+    # -> no derivable deadline -> skipped entirely (not overdue). Fail-safe.
+    rec = _no_rb(id="no-date-prefix-here")
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+    assert rec not in c["expire"] and rec not in c["needs_judgment"]
+
+
+def test_explicit_formed_date_preferred_over_id_date():
+    # formed_date field present -> used even though the id-date would look recent.
+    rec = _no_rb(id="2026-06-20_would-be-recent", formed_date="2026-04-15T00:00:00")
+    c = SW.classify_overdue([rec], NOW)
+    assert rec in c["expire"]  # formed 04-15 + 14 = 04-29 -> 56d overdue > 30
+
+
+def test_resolves_by_present_still_wins_over_formed_date():
+    # Backward-compat: when resolves_by IS present it is used, ignoring formed_date/id.
+    rec = _bare(id="2026-04-15_old", horizon="short", resolves_by=_iso(+10),
+                formed_date="2026-04-15T00:00:00")
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0  # future resolves_by wins -> not overdue
+
+
+def test_effective_deadline_basis():
+    # resolves_by present -> basis 'resolves_by'
+    d, basis = SW.effective_deadline(_bare(resolves_by=_iso(-5)))
+    assert basis == "resolves_by" and d is not None
+    # resolves_by absent + id-date -> basis 'formed+horizon', deadline = formed + window
+    d, basis = SW.effective_deadline(_no_rb(id="2026-04-15_x"))
+    assert basis == "formed+horizon"
+    assert d == datetime(2026, 4, 15) + timedelta(days=14)
+    # resolves_by absent + no parseable date -> (None, None)
+    d, basis = SW.effective_deadline(_no_rb(id="no-date"))
+    assert d is None and basis is None
+
+
+def test_non_date_sentinel_not_fallback_even_when_old():
+    # A PRESENT-but-non-date resolves_by ('session_end') is a deliberate sentinel,
+    # NOT an absent value -- so it must NOT trigger the formed_date+horizon
+    # fallback, even with a stale id-date. Distinguishes intentional-sentinel-skip
+    # from truly-absent-fallback (guards the test_session_end_sentinel_skipped
+    # contract against re-break by 1's fallback).
+    rec = _bare(id="2026-01-01_very-old", horizon="session", resolves_by="session_end")
+    c = SW.classify_overdue([rec], NOW)
+    assert c["overdue"] == 0
+    d, basis = SW.effective_deadline(rec)
+    assert d is None and basis is None

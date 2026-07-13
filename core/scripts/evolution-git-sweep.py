@@ -278,10 +278,24 @@ def classify_path(rel_path):
     # Reject other .claude/ paths
     if len(parts) >= 2 and parts[0] == ".claude":
         return (None, None)
-    # Agent self.md: <agent>/self.md
+    # Agent self.md — BOTH layout eras appear in git history: legacy
+    # <agent>/self.md (pre-2.5.D, 2 parts) AND relocated
+    # <AGENTS_PARENT_DIR>/<agent>/self.md (depth follows _agents_root()).
+    # The 2-part-only form silently zeroed agent_self backfill after the
+    # relocation (fresh-eyes 2026-07-11: stream newest 2026-05-29 while
+    # self.md carried 3 newer revisions).
     if len(parts) == 2 and parts[1] == "self.md":
         if (_agent_dir(parts[0]) / "local-paths.conf").exists():
             return ("agent_self", parts[0])
+    _aprel = _agents_root().relative_to(PROJECT_ROOT).parts
+    if (
+        _aprel
+        and parts[-1] == "self.md"
+        and len(parts) == len(_aprel) + 2
+        and tuple(parts[: len(_aprel)]) == _aprel
+    ):
+        if (_agent_dir(parts[-2]) / "local-paths.conf").exists():
+            return ("agent_self", parts[-2])
     return (None, None)
 
 
@@ -452,7 +466,8 @@ def derive_agent(commit, file_kind, key):
 
 def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verbose):
     """Sweep one file kind. Returns list of entries written (or to-be-written if dry_run)."""
-    commits = list_commits([path_glob], since=since, until=until)
+    globs = path_glob if isinstance(path_glob, list) else [path_glob]
+    commits = list_commits(globs, since=since, until=until)
     if verbose:
         print(f"  [{file_kind}] found {len(commits)} commits matching {path_glob}")
 
@@ -594,10 +609,15 @@ def main():
         kinds_to_run = [args.file_kind]
     do_program = args.file_kind in ("all", "program")
 
+    # agent_self carries BOTH pathspecs so git log surfaces pre-relocation
+    # (<agent>/self.md) AND post-relocation (agents/<agent>/self.md) commits;
+    # the second is derived from _agents_root() so a future rename tracks.
+    _aprel = _agents_root().relative_to(PROJECT_ROOT).as_posix()
     path_globs = {
-        "agent_self": "*/self.md",
-        "skill_edit": ".claude/skills/**/SKILL.md",
-        "rule_edit": ".claude/rules/*.md",
+        "agent_self": ["*/self.md"]
+        + ([f"{_aprel}/*/self.md"] if _aprel != "." else []),
+        "skill_edit": [".claude/skills/**/SKILL.md"],
+        "rule_edit": [".claude/rules/*.md"],
     }
 
     totals = {"written": 0, "skipped": 0}

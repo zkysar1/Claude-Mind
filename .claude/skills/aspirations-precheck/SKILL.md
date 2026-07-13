@@ -59,6 +59,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5b.6 | parent-supersession-sweep | deferrable |
 | 0.5b.7 | unblock-parent-status-sweep | deferrable |
 | 0.5b.8 | routing-audit-target-status-sweep | deferrable |
+| 0.5b.9 | credential-defer-recheck | deferrable |
 | 0.5b.10 | defer-drift-check | deferrable |
 | 0.5c | recurring-precondition-sweep | deferrable |
 | 0.5e | fresh-eyes-cadence | deferrable |
@@ -955,6 +956,7 @@ Rationale (WHY unblock-parent-status sweep): `core/config/rationale/precheck-gat
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check unblock-parent-status-sweep)
 IF decision == "drop": SKIP this phase; continue to Phase 0.5c
 Bash: bash core/scripts/unblock-parent-status-sweep.sh --apply
+# (engine: core/scripts/unblock-parent-status-sweep.py behind the wrapper)
 # Iterates world + agent queues. For each pending "Unblock:" with a
 # parseable parent goal-id whose parent.status is terminal, marks the
 # Unblock status=skipped with outcome_note

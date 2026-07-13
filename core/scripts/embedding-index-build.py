@@ -46,8 +46,26 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 import retrieve as R  # noqa: E402  canonical store readers (read_jsonl / paths)
 
-MODEL_NAME = "all-MiniLM-L6-v2"
+MODEL_NAME = "all-MiniLM-L6-v2"  # fallback when config + --model are absent
 DEFAULT_OUT = SCRIPT_DIR.parent.parent / "mind_api" / "state" / "retrieval-embedding-index"
+
+
+def resolve_model_name(cli_override=None):
+    """ precedence: --model CLI > tree.yaml retrieval:
+    embedding_model_name > MODEL_NAME fallback. The BUILDER is the only
+    config consumer — the query side (_embedding_retrieval) reads the model
+    name from the built index's meta.json, so index and query can never
+    disagree about the model."""
+    if cli_override:
+        return cli_override
+    try:
+        cfg = R._load_retrieval_config()
+        name = (cfg.get("embedding_model_name") or "").strip()
+        if name:
+            return name
+    except Exception:
+        pass
+    return MODEL_NAME
 
 
 def match_text(e):
@@ -80,9 +98,44 @@ def content_hash(text):
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
+def tree_doc_id(node):
+    """Stable index id for a tree node: 'tree:' + tree-root-relative path
+    (no .md). Derived from the node's `file` field — NOT the basename key,
+    which is retrieve.load_tree_nodes' namespace but is neither unique nor
+    stable across moves. Same derivation as retrieve._graph_node_key_
+    candidates' path form (the g-306-45 lesson: a basename-keyed join
+    matched ZERO real records and the PPR blend shipped silently inert).
+    Returns None when the file field doesn't contain the tree marker."""
+    f = str((node or {}).get("file") or "").replace("\\", "/")
+    marker = "knowledge/tree/"
+    i = f.find(marker)
+    if i < 0:
+        return None
+    rel = f[i + len(marker):]
+    if rel.endswith(".md"):
+        rel = rel[:-3]
+    return ("tree:" + rel) if rel else None
+
+
+def tree_doc_text(key, node):
+    """The embedded surface for a tree node: humanized key + summary (the
+    _tree.yaml retrieval surface — no .md body reads; bodies are the LLM's
+    post-triage Read, not the match surface)."""
+    parts = [str(key or "").replace("-", " ")]
+    s = (node or {}).get("summary")
+    if isinstance(s, str) and s:
+        parts.append(s)
+    return " ".join(p for p in parts if p).strip()
+
+
 def load_corpus(limit=None):
-    """Active guardrails + reasoning-bank as [{id, type, text, hash}], skipping
-    empty-text records. Deterministic order (guardrails then rb, file order).
+    """Active guardrails + reasoning-bank + tree nodes as [{id, type, text,
+    hash}], skipping empty-text records. Deterministic order (guardrails,
+    rb, then tree in _tree.yaml order).
+
+    Tree docs (g-306-83) use 'tree:<relpath>' ids — namespace-disjoint from
+    rb-*/guard-* so the supplementary consumers' id joins ignore them and
+    the tree channel's join ignores supplementary rows.
 
     When limit is None, honors EMBED_INDEX_LIMIT (test knob) so build/update/stats
     all see the SAME subset in a test run — otherwise stats/update would load the
@@ -104,6 +157,15 @@ def load_corpus(limit=None):
         t = match_text(e)
         if t and e.get("id"):
             docs.append({"id": e["id"], "type": "rb", "text": t, "hash": content_hash(t)})
+    try:
+        tree = R.read_yaml(R.TREE_PATH) if R.TREE_PATH else {}
+    except Exception:
+        tree = {}
+    for key, node in (tree.get("nodes") or {}).items():
+        did = tree_doc_id(node)
+        t = tree_doc_text(key, node)
+        if did and t:
+            docs.append({"id": did, "type": "tree", "text": t, "hash": content_hash(t)})
     # De-dup by id (defensive — a store should not carry two active same-id rows;
     # keep first). Preserves order.
     seen = set()
@@ -118,22 +180,25 @@ def load_corpus(limit=None):
     return uniq
 
 
-def _load_model():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(MODEL_NAME)
+def _load_encoder(model_name):
+    """: backend-agnostic encoder (fastembed ONNX preferred,
+    sentence-transformers fallback). See _embedding_model.load_encoder."""
+    from _embedding_model import load_encoder
+    return load_encoder(model_name)
 
 
-def _embed(model, texts, batch_size=64):
+def _embed(encoder, texts):
     import numpy as np
     if not texts:
-        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype="float16")
-    arr = model.encode(texts, normalize_embeddings=True, batch_size=batch_size,
-                       show_progress_bar=False)
-    return arr.astype("float16")
+        return np.zeros((0, 384), dtype="float16")
+    return np.asarray(encoder.encode_docs(texts)).astype("float16")
 
 
-def _atomic_write_index(out, embeddings, docs):
-    """Write embeddings.npy + meta.json atomically (tmp + rename)."""
+def _atomic_write_index(out, embeddings, docs, model_name, backend=None):
+    """Write embeddings.npy + meta.json atomically (tmp + rename).
+
+    meta["model"] is the SSOT the query side (_embedding_retrieval) loads
+    its encoder from — index and query can never disagree about the model."""
     import numpy as np
     out.mkdir(parents=True, exist_ok=True)
     emb_tmp = out / "embeddings.npy.tmp"
@@ -142,7 +207,8 @@ def _atomic_write_index(out, embeddings, docs):
     # np.save appends .npy to a path without it; normalize the tmp name it wrote.
     written = emb_tmp if emb_tmp.exists() else Path(str(emb_tmp) + ".npy")
     meta = {
-        "model": MODEL_NAME,
+        "model": model_name,
+        "backend": backend,
         "dim": int(embeddings.shape[1]) if embeddings.shape[0] else 384,
         "count": len(docs),
         "docs": [{"id": d["id"], "type": d["type"], "hash": d["hash"]} for d in docs],
@@ -154,14 +220,16 @@ def _atomic_write_index(out, embeddings, docs):
     return meta
 
 
-def cmd_build(out, limit=None):
+def cmd_build(out, limit=None, model_override=None):
     import numpy as np
     t0 = time.time()
+    model_name = resolve_model_name(model_override)
     docs = load_corpus(limit=limit)
-    model = _load_model()
-    emb = _embed(model, [d["text"] for d in docs])
-    meta = _atomic_write_index(out, emb, docs)
-    print(json.dumps({"op": "build", "count": len(docs), "dim": meta["dim"],
+    encoder, backend = _load_encoder(model_name)
+    emb = _embed(encoder, [d["text"] for d in docs])
+    meta = _atomic_write_index(out, emb, docs, model_name, backend)
+    print(json.dumps({"op": "build", "model": model_name, "backend": backend,
+                      "count": len(docs), "dim": meta["dim"],
                       "seconds": round(time.time() - t0, 1),
                       "bytes": int(emb.nbytes), "out": str(out)}))
 
@@ -176,6 +244,18 @@ def cmd_update(out):
     if not (meta_path.exists() and emb_path.exists()):
         return cmd_build(out)  # no prior index — full build
     old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    # MODEL PINNING (): an incremental update MUST embed with the
+    # model the existing index was built with — mixing two models' vectors
+    # in one matrix silently corrupts every cosine. Config/--model changes
+    # take effect only via an explicit --build (full re-embed).
+    index_model = (old_meta.get("model") or "").strip() or MODEL_NAME
+    configured = resolve_model_name(None)
+    if configured != index_model:
+        print(json.dumps({"op": "update", "note": "model_drift",
+                          "index_model": index_model,
+                          "configured_model": configured,
+                          "action": "updating with index_model; run --build "
+                                    "to switch models"}), file=sys.stderr)
     old_emb = np.load(emb_path)
     old_by_id = {d["id"]: (i, d["hash"]) for i, d in enumerate(old_meta.get("docs", []))}
     cur = load_corpus()
@@ -192,9 +272,10 @@ def cmd_update(out):
             to_embed_texts.append(d["text"])
             to_embed_slots.append(len(rows) - 1)
             to_embed += 1
+    backend = old_meta.get("backend")
     if to_embed_texts:
-        model = _load_model()
-        new_emb = _embed(model, to_embed_texts)
+        encoder, backend = _load_encoder(index_model)
+        new_emb = _embed(encoder, to_embed_texts)
         for slot, vec in zip(to_embed_slots, new_emb):
             rows[slot] = vec
     if rows:
@@ -203,9 +284,10 @@ def cmd_update(out):
         emb = np.zeros((0, old_emb.shape[1] if old_emb.ndim == 2 else 384), dtype="float16")
     cur_ids = {d["id"] for d in cur}
     removed = sum(1 for i in old_by_id if i not in cur_ids)
-    meta = _atomic_write_index(out, emb, cur)
-    print(json.dumps({"op": "update", "count": len(cur), "reused": reused,
-                      "reembedded": to_embed, "removed": removed,
+    meta = _atomic_write_index(out, emb, cur, index_model, backend)
+    print(json.dumps({"op": "update", "model": index_model, "count": len(cur),
+                      "reused": reused, "reembedded": to_embed,
+                      "removed": removed,
                       "seconds": round(time.time() - t0, 1), "out": str(out)}))
 
 
@@ -240,10 +322,15 @@ def main():
     g.add_argument("--stats", action="store_true", help="Report index state + staleness")
     ap.add_argument("--out", type=str, default=str(DEFAULT_OUT), help="Index directory")
     ap.add_argument("--limit", type=int, default=None, help="Cap corpus size (testing)")
+    ap.add_argument("--model", type=str, default=None,
+                    help="Model override for --build (g-306-82; default: "
+                         "tree.yaml retrieval: embedding_model_name, then "
+                         f"{MODEL_NAME}). Ignored by --update, which pins "
+                         "the existing index's model.")
     args = ap.parse_args()
     out = Path(args.out)
     if args.build:
-        cmd_build(out, limit=args.limit)
+        cmd_build(out, limit=args.limit, model_override=args.model)
     elif args.update:
         cmd_update(out)
     else:

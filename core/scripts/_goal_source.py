@@ -48,7 +48,9 @@ def infer(origin_signal):
             "investigate:", "investigation:",
             "idea:", "maintain:",
             "apply:", "brief:",
-            "board_post:")):
+            "board_post:",
+            # fresh-eyes program-review proposals (agent's own review cadence)
+            "program-change-proposal:")):
         return "agent-self"
     return None
 

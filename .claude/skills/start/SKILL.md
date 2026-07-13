@@ -1,6 +1,6 @@
 ---
 name: start
-description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), handling full initialization for new agents (Self, program, paths, aspirations, curriculum) and state transitions for existing ones. USER-ONLY — Claude must NEVER invoke /start. Fires only when the user types /start {agent-name} [--mode {mode}]. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Auto-recovers zombie sessions (state=RUNNING + stale heartbeat + no pending obligations) inline so /start <name> just works after a crash; --recover is reserved for the --force override path."
+description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), handling full initialization for new agents (Self, program, paths, aspirations, curriculum) and state transitions for existing ones. USER-ONLY — Claude must NEVER invoke /start. Fires only when the user types /start {agent-name} [--mode {mode}]. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Auto-recovers zombie sessions (state=RUNNING + stale heartbeat + no pending obligations) inline so /start {name} just works after a crash; --recover is reserved for the --force override path."
 triggers:
   - "/start"
 minimum_mode: any
@@ -163,6 +163,18 @@ recovery block picks it up automatically.
   Output: "ERROR: Failed to set agent-state to IDLE. Manifest-clear was
    SKIPPED to avoid half-recovered zombie. Investigate agents/<agent-name>/session/agent-state
    directly before retrying." DONE.
+
+- Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh release --agent <agent-name> || true`
+  DDB claim release with the crashed session's OLD on-disk runner-token
+  (2026-07-07 bravo dual-runner follow-through). A crashed runner leaves its
+  DDB row RUNNING; local recovery flips only LOCAL state, so without this
+  release the fresh acquire below is held hostage by its OWN stale row for
+  up to OWNERSHIP_STALE_SECONDS (~65 min post-calibration). MUST run BEFORE
+  manifest-clear — `runner-token` is `recovery_action: clear`, so the old
+  token is deleted by the next step. Token-conditional and idempotent: if a
+  peer machine already stale-broke and re-claimed, the old token no longer
+  matches and this is a no-op — it can never steal a peer's claim. Fail-open
+  (`|| true`): a DDB hiccup must never block recovery.
 
 - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-manifest-clear.sh`
   Manifest-driven clear of every session file with `recovery_action: clear`.
@@ -397,6 +409,16 @@ branch and as recovery-gate.sh's `_perform_recovery`.
   python source single-quoted. `py -3` (Bash-tool context — NOT a sourced .sh,
   so the Microsoft-Store-stub rule applies). Only when a crashed SID is present.
   Bash: `RECSID=$(cat "agents/<agent-name>/session/running-session-id" 2>/dev/null | tr -d '\r\n'); [ -n "$RECSID" ] && TSID="$RECSID" TAGENT="<agent-name>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_crash; write_crash(sid=os.environ["TSID"], agent=os.environ["TAGENT"])' >/dev/null 2>&1 || true`
+
+  Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh release --agent <agent-name> || true`
+  DDB claim release with the crashed session's OLD on-disk runner-token —
+  same rationale as Step 0.7 (2026-07-07 bravo dual-runner follow-through):
+  a crashed runner's DDB row stays RUNNING, and without this release the
+  fresh acquire below is blocked by its OWN stale row for up to
+  OWNERSHIP_STALE_SECONDS (~65 min). MUST run BEFORE manifest-clear
+  (`runner-token` is `recovery_action: clear`). Token-conditional +
+  idempotent — a peer's re-claimed row has a different token, so this can
+  never steal a peer's claim. Fail-open.
 
   Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-manifest-clear.sh`
   Runs AFTER state-set IDLE succeeded; cleanup window now shows
@@ -720,18 +742,14 @@ agent-state, agent-mode, persona-active, or running-session-id.
      - On exit 3 (override accepted): proceed; the gate logged an audit entry
        to `world/output-style-overrides.jsonl`.
      - On exit 0: proceed normally.
-   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/heartbeat-tick.sh --bypass-state`
-     (Seeds `runner-heartbeat` mtime AND stamps team-state `last_active` NOW
-     in one call — heartbeat-tick.sh writes both. MUST precede the RUNNING
-     transition to close the observer-probe race (state=RUNNING with a stale
-     heartbeat/last_active from the previous session). Liveness is pure mtime
-     — see `core/config/conventions/compact-recovery.md`. DO NOT add a separate
-     `team-state-update.sh ... last_active ...` line here; it duplicates the
-     write heartbeat-tick just performed. `--bypass-state` is REQUIRED because
-     state is still IDLE at this point — the heartbeat MUST seed before the
-     RUNNING flip per rb-323; the gate in `heartbeat-tick.sh` refuses bare
-     ticks against IDLE state to prevent the `heartbeat_without_running`
-     desync class (alpha incident 2026-05-13 cbb27ab3).)
+   - (DDB-heartbeat ordering, g-328-31: the first `heartbeat-tick.sh` — which
+     under own-cloud ALSO fires the DDB `runner-claim.sh heartbeat` — is
+     deliberately DEFERRED to AFTER the DDB acquire below (and before the RUNNING
+     flip). A DDB heartbeat run BEFORE the acquire, using a leftover runner-token
+     from a prior session whose release did not confirm, refreshes a STALE claim's
+     `heartbeat_at` and defeats the acquire's §5 stale-lock-break — pinning this
+     /start at rc=4 on its own stale claim. See the heartbeat-tick step just
+     before `session-state-set.sh RUNNING` below.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.current_focus" --value "\"\"" || true`
      (Clear stale current_focus from the previous session's shutdown — without this,
      a partner reading team-state.yaml sees the prior session's "session ended" or
@@ -807,6 +825,27 @@ agent-state, agent-mode, persona-active, or running-session-id.
      claim (DDB session-lock); stop the other runner or wait ~OWNERSHIP_STALE_SECONDS."
      Any OTHER non-zero rc (1 = daemon/DDB error) is FAIL-OPEN: log and PROCEED — a
      transient DDB hiccup must not block a legitimate start.)
+   - Bash: `MIND_AGENT=<agent-name> bash core/scripts/heartbeat-tick.sh --bypass-state`
+     (FIRST heartbeat — seeds `runner-heartbeat` mtime AND stamps team-state
+     `last_active` NOW, and under own-cloud ALSO fires the DDB
+     `runner-claim.sh heartbeat`. MOVED here from before the triple-write
+     (g-328-31) so it runs AFTER the DDB acquire above and BEFORE the RUNNING
+     flip below. Ordering rationale: the DDB heartbeat MUST NOT precede the
+     acquire — a heartbeat carrying a leftover token from a prior session
+     refreshes a STALE claim's `heartbeat_at`, defeating the acquire's §5
+     stale-lock-break and pinning the next /start at rc=4 (stale-self-claim).
+     Acquiring first lets §5 reclaim the genuinely-stale claim; THIS heartbeat
+     then refreshes the just-acquired claim with the fresh token from the
+     triple-write. Still precedes the RUNNING transition to close the
+     observer-probe race (state=RUNNING with a stale heartbeat/last_active) per
+     rb-323/guard-403 — both observer-paired signals (heartbeat here, triple-write
+     above) are seeded before the flip. `--bypass-state` is REQUIRED because state
+     is still IDLE here; the gate in `heartbeat-tick.sh` refuses bare ticks against
+     IDLE (the `heartbeat_without_running` desync class, alpha 2026-05-13
+     cbb27ab3). DO NOT add a separate `team-state-update.sh ... last_active` line;
+     it duplicates the write heartbeat-tick just performed. On an acquire HALT
+     (rc=4) above, this heartbeat never runs — a failed acquire leaves no
+     heartbeat side-effect, which is the point.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
      (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment.)
 

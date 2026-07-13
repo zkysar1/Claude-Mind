@@ -44,9 +44,24 @@ run_case() {
   # safety).
   rm -f "$agent_dir/session/.wake-debounce-mtime"
 
-  # Pre-create the wake signal.
+  # Pre-create the wake signal — with mtime stamped 3s in the FUTURE so it
+  # reads as a mid-sleep arrival. Without the stamp, this harness races the
+  #  first-fire stale-signal fix: whenever the epoch second ticks
+  # between file-create and the script's SLEEP_START capture (likelier the
+  # slower the box / the more the script does before its loop), production
+  # CORRECTLY classifies the file as stale (mtime < SLEEP_START → consume,
+  # no wake) and the case flakes rc=0. Pre-fix this suite passed only by
+  # same-second luck (observed 3-7/10 flaky failures, 2026-07-10). The
+  # future mtime is what the cases semantically mean: a live wake event
+  # arriving during the sleep.
+  # +30s (not +3): the stamp must exceed WORST-CASE script startup (bash
+  # spawn + _paths.sh source + the 7 quiescent-mode bg-job python
+  # registration) on a cold/AV-loaded box — at +3s the quiescent cases still
+  # flaked when startup crossed the stamp. Cases exit at i=0/1 regardless,
+  # so the far-future mtime adds zero runtime.
   local signal_path="$agent_dir/session/$signal_file_basename"
   : > "$signal_path"
+  touch -m -d "@$(( $(date +%s) + 30 ))" "$signal_path" 2>/dev/null || true
 
   # Run the sleep with a short duration. With the signal pre-present, the
   # polling loop should hit it on iteration 0 (or 1).
