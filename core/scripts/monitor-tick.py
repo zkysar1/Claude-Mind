@@ -117,16 +117,53 @@ def _due(probe, last_run_iso, now):
     return (now - last) >= dt.timedelta(hours=interval_h)
 
 
-def _subprocess_runner(script_abs, args, timeout=DEFAULT_PROBE_TIMEOUT):
+def _probe_env():
+    """E3 (subprocess-env parity): the env a probe runs under.
+
+    Start from the inherited env -- on the live iteration-close.sh path that
+    already carries MIND_AGENT, MIND_SID, PATH, and any gh/aws auth (the
+    bash-agent-inject prepend exported them into the shell that spawned this
+    Python) -- and GUARANTEE MIND_AGENT even when monitor-tick is invoked
+    OUTSIDE that path (a test, a cron, a bare CLI run), so gh/aws/agent-keyed
+    probes behave identically regardless of how the tick was launched.
+    Fail-open: never raises (a probe must run even if identity resolution errors).
+    """
+    env = os.environ.copy()
+    if not env.get("MIND_AGENT"):
+        try:
+            from _paths import AGENT_NAME
+            if AGENT_NAME:
+                env["MIND_AGENT"] = AGENT_NAME
+        except Exception:
+            pass
+    return env
+
+
+def _subprocess_runner(script_abs, args, timeout=DEFAULT_PROBE_TIMEOUT, project_root=None):
     """Default probe runner: exec the script, return (exit_code, combined_output).
-    A probe exits 0 when clean and non-zero when it trips."""
+    A probe exits 0 when clean and non-zero when it trips.
+
+    E3 (subprocess-env parity): the probe runs with (a) cwd=project_root so a
+    probe that sources .env.local / _paths.sh or uses PROJECT_ROOT-relative
+    paths resolves exactly as the loop's Bash path does, and (b) an env that
+    guarantees MIND_AGENT (via _probe_env), so gh/aws probes behave identically
+    to a hand-run of the same script from the loop.
+    """
     cmd = [str(script_abs)] + list(args or [])
     if str(script_abs).endswith(".sh"):
         cmd = ["bash"] + cmd
     elif str(script_abs).endswith(".py"):
         cmd = [sys.executable] + cmd
+    run_kwargs = {"capture_output": True, "text": True, "timeout": timeout,
+                  "env": _probe_env()}
+    if project_root:
+        try:
+            if Path(project_root).is_dir():
+                run_kwargs["cwd"] = str(project_root)
+        except Exception:
+            pass  # fail-open: bad project_root -> inherit cwd (pre-E3 behavior)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, **run_kwargs)
         out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
         return r.returncode, out.strip()
     except subprocess.TimeoutExpired:
@@ -147,6 +184,36 @@ def _default_on_trip(probe, evidence):
     return mod.convert_finding(probe, evidence, source=source)
 
 
+def _resolve_script_path(script_rel, project_root, world_dir=None, meta_dir=None):
+    """E1: resolve a probe's `script` path to an absolute path.
+
+    A registry `script` beginning with `world/` or `meta/` maps to the
+    user-configured EXTERNAL path (WORLD_DIR / META_DIR), NOT
+    project_root/world -- world/ and meta/ do not live under PROJECT_ROOT (the
+    local repo holds only core/, .claude/, agents/; world/ and meta/ are
+    external). Every other relative path (core/scripts/..., etc.) resolves under
+    project_root as before; an absolute path is returned unchanged. Fail-open:
+    an unset world_dir/meta_dir falls back to project_root/script_rel (the
+    pre-E1 behavior), so a resolution gap only reproduces the old path -- never
+    raises.
+    """
+    sr = (script_rel or "").strip()
+    if not sr:
+        return None
+    p = Path(sr)
+    if p.is_absolute():
+        return p
+    parts = sr.replace("\\", "/").split("/", 1)
+    prefix = parts[0]
+    rest = parts[1] if len(parts) > 1 else ""
+    if rest:
+        if prefix == "world" and world_dir:
+            return Path(world_dir) / rest
+        if prefix == "meta" and meta_dir:
+            return Path(meta_dir) / rest
+    return Path(project_root) / sr
+
+
 def run_tick(registry_path, state_path, *, now=None, project_root=None,
              probe_runner=None, on_trip_fn=None):
     """Run one monitor-tick. Returns a structured result (guard-614).
@@ -157,8 +224,25 @@ def run_tick(registry_path, state_path, *, now=None, project_root=None,
     """
     now = now or dt.datetime.now()
     project_root = Path(project_root) if project_root else SCRIPT_DIR.parent.parent
-    probe_runner = probe_runner or _subprocess_runner
+    # E3: bind the default runner to project_root so probes run with cwd=root +
+    # the agent env (parity with the loop's Bash path). An injected test runner
+    # keeps the 2-arg (script_abs, args) seam untouched.
+    if probe_runner is None:
+        def probe_runner(script_abs, args):
+            return _subprocess_runner(script_abs, args, project_root=project_root)
     on_trip_fn = on_trip_fn or _default_on_trip
+
+    # E1: resolve the world/ and meta/ external base dirs ONCE per tick (a probe
+    # `script` under those prefixes lives at the user-configured external path,
+    # not project_root/world). Fail-open: unavailable _paths -> None ->
+    # _resolve_script_path falls back to project_root/script_rel.
+    world_dir = meta_dir = None
+    try:
+        import _paths
+        world_dir = getattr(_paths, "WORLD_DIR", None)
+        meta_dir = getattr(_paths, "META_DIR", None)
+    except Exception:
+        pass
 
     result = {"inert": False, "due": [], "ran": [], "clean": [], "tripped": [],
               "filed": [], "deduped": [], "skipped_not_due": [], "errors": []}
@@ -187,20 +271,45 @@ def run_tick(registry_path, state_path, *, now=None, project_root=None,
         if not script_rel:
             result["errors"].append({"probe": pid, "error": "no script defined"})
             continue
-        script_abs = (project_root / script_rel)
+        script_abs = _resolve_script_path(script_rel, project_root, world_dir, meta_dir)
         rc, output = probe_runner(script_abs, probe.get("args") or [])
         result["ran"].append(pid)
         # Record last-run regardless of outcome so interval gating advances even
         # when the probe trips (prevents trip-every-tick from re-running each cycle).
         entry = {"last_run": now.replace(microsecond=0).isoformat()}
 
+        # E2 -- declarative exit-contract. A probe may override the default
+        # "0 == clean, anything else == trip" via two optional registry fields:
+        #   clean_exit_codes: list[int]  (default [0]) -- rc values meaning "clean"
+        #   timeout_is_trip:  bool        (default false) -- when false, a probe
+        #     killed at the timeout boundary (runner sentinel rc=124, the
+        #     timeout(1)/curl convention) is a LOGGED ERROR, never a trip, so a
+        #     slow/hung probe cannot manufacture a false finding. Set true only
+        #     for a probe whose whole purpose is "did X finish in time."
+        clean_codes = probe.get("clean_exit_codes")
+        if not isinstance(clean_codes, list) or not clean_codes:
+            clean_codes = [0]
+        try:
+            clean_codes = {int(c) for c in clean_codes}
+        except Exception:
+            clean_codes = {0}
+        timeout_is_trip = bool(probe.get("timeout_is_trip", False))
+
         if rc is None:
             # Launch failure: not a clean pass, not a trip. Log; do not convert.
             entry["last_outcome"] = "launch_error"
             result["errors"].append({"probe": pid, "error": output})
-        elif rc == 0:
+        elif rc in clean_codes:
             entry["last_outcome"] = "clean"
             result["clean"].append(pid)
+        elif rc == 124 and not timeout_is_trip:
+            # Timeout sentinel -- logged error, NOT a trip (goal spec E2). A hung
+            # probe records the outcome (so the interval gate still advances) but
+            # files NOTHING. A probe that voluntarily exits 124 for a non-timeout
+            # reason is treated as a timeout here unless it sets timeout_is_trip
+            # or lists 124 in clean_exit_codes -- 124 is the timeout convention.
+            entry["last_outcome"] = "timeout"
+            result["errors"].append({"probe": pid, "error": output or "probe timed out"})
         else:
             entry["last_outcome"] = "tripped"
             result["tripped"].append(pid)

@@ -256,3 +256,53 @@ def test_ownership_resolves_once_per_call(wire):
     wire(be)
     _mod._owned_agents()
     assert be.calls == 1
+
+
+# ── 2026-07-07 bravo dual-runner incident: staleness calibration + SSOT ──────
+
+def test_config_invariant_ddb_stale_exceeds_local_heartbeat_stale():
+    """The cross-machine DDB runner-lease staleness MUST exceed the LOCAL
+    liveness threshold (runner_heartbeat.stale_minutes in aspirations.yaml) —
+    a peer machine must never stale-break a claim the owner's own machine
+    still considers fresh. The 2026-07-07 bravo dual-runner incident existed
+    ONLY because the DDB lease (900s design placeholder) was 4x TIGHTER than
+    the local contract (60 min, itself calibrated up from 30 in g-115-724
+    because deep LLM work legitimately runs 30-45+ min between heartbeat
+    ticks): any iteration in the 15-60 min band left the claim breakable
+    while the runner was demonstrably alive. Same invariant shape as
+    test_phase_wedge_check's wedge_stale > stale_minutes guard. If a future
+    edit raises stale_minutes past the DDB default, this fails loudly."""
+    import yaml
+    from owncloud_backend import DEFAULT_RUNNER_STALE_SECONDS
+    cfg = SCRIPTS.parent / "config" / "aspirations.yaml"
+    with open(cfg, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    stale_minutes = (data.get("runner_heartbeat") or {}).get("stale_minutes")
+    assert isinstance(stale_minutes, int) and stale_minutes > 0, (
+        "runner_heartbeat.stale_minutes missing from aspirations.yaml")
+    assert DEFAULT_RUNNER_STALE_SECONDS > stale_minutes * 60, (
+        f"DDB runner-lease default ({DEFAULT_RUNNER_STALE_SECONDS}s) must "
+        f"exceed the local heartbeat contract ({stale_minutes} min) — see "
+        "the 2026-07-07 bravo dual-runner incident")
+    # The sync module's stub-only fallback stays fused to the backend SSOT.
+    assert _mod._OWNERSHIP_STALE_SECONDS_DEFAULT == DEFAULT_RUNNER_STALE_SECONDS
+
+
+def test_owned_agents_falls_back_to_backend_stale_value(monkeypatch):
+    """SSOT repair (2026-07-07): with OWNERSHIP_STALE_SECONDS unset, the
+    resolver derives staleness from the LIVE backend's runner_stale_seconds —
+    the SAME value reclaim_if_stale enforces for the lock-break — instead of
+    a private constant, so the sync-ownership filter and the lock-break can
+    no longer disagree about what 'stale' means."""
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    # env deliberately UNSET (autouse fixture cleared it) -> backend attr wins.
+    be = _FakeClaimBackend("machineA", [_claim("alpha", "machineA", age_s=150)])
+    be.runner_stale_seconds = 100
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: be)
+    assert _mod._owned_agents() == set(), (
+        "150s-old heartbeat must be STALE under the backend's 100s value")
+    be2 = _FakeClaimBackend("machineA", [_claim("alpha", "machineA", age_s=150)])
+    be2.runner_stale_seconds = 1000
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: be2)
+    assert _mod._owned_agents() == {"alpha"}, (
+        "150s-old heartbeat must be FRESH under the backend's 1000s value")

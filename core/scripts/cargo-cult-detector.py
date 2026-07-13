@@ -463,11 +463,25 @@ def _propose_new_interval(goal: dict, cfg: dict) -> float | None:
     would have written. Single source of truth — DO NOT hardcode numbers
     here. Returns None if we lack the data to propose.
     """
+    # 9: review-ritual recurring goals (fresh-eyes / felt-sense / l1-skew /
+    # curriculum cadences, strategic-scan) fire at a DELIBERATE cadence — a routine
+    # "nothing to report" close IS their value, not a signal to stretch the interval.
+    # An explicit calibration_exempt flag opts a goal out of auto-extension entirely,
+    # so a review ritual is never batch-extended into irrelevance.
+    if goal.get("calibration_exempt"):
+        return None
     interval_h = goal.get("interval_hours")
     if interval_h is None or interval_h <= 0:
         return None
     multiplier = float(cfg.get("multiplier", 1.5))
     cap_ratio = float(cfg.get("cap_ratio", 3.0))
+    # original_interval_hours is now persisted at the aspirations.py update-goal
+    # chokepoint on EVERY interval_hours write — per-goal, BATCH-CALIBRATE, and
+    # MANUAL apply paths alike (9 anchor-write fix). So the `or interval_h`
+    # fallback below is now only a legacy-goal safety net (goals last extended before
+    # the chokepoint fix), NOT the unbounded-ratchet hole it used to be: fresh
+    # extensions always read a real anchor, so cap = cap_ratio x TRUE original and
+    # can no longer ratchet upward on each batch apply.
     original = float(goal.get("original_interval_hours") or interval_h)
     proposed = min(float(interval_h) * multiplier, original * cap_ratio)
     return proposed if proposed > interval_h else None
@@ -490,9 +504,17 @@ def _recent_audit_all_batch(hours: float) -> bool:
     if hours <= 0:
         return False
     cutoff = datetime.now() - timedelta(hours=hours)
-    for source in ("world", "agent"):
+    # 9: scan world + EVERY agent queue (not just the current agent). The
+    # batch goal files to world () by default, so the world scan already dedups
+    # cross-agent for the common path; enumerating all agent queues via discover_agents()
+    # closes the rare fallback where  is absent and the batch lands in one agent's
+    # queue — mirrors cmd_audit_all's scan_passes so dedup coverage == emission coverage.
+    scan_targets: list[tuple[str, str | None]] = [("world", None)]
+    for ag in discover_agents():
+        scan_targets.append(("agent", ag))
+    for source, agent_override in scan_targets:
         try:
-            p = source_path(source)
+            p = source_path(source, agent_override=agent_override)
         except SourceUnavailable:
             # MIND_AGENT not bound (cmd-line/tests) — agent queue unreachable.
             continue
@@ -945,6 +967,7 @@ def main() -> int:
     ap.add_argument("goal_id", nargs="?", default=None,
                     help="Recurring goal-id to file an extend-interval Idea for "
                          "(omit when using --audit-all)")
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default="world")
     ap.add_argument("--dry-run", action="store_true",
                     help="Show what would be filed; do not write")

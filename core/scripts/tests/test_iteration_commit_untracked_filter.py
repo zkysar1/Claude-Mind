@@ -441,6 +441,72 @@ def test_modified_own_agent_dir_not_filtered_even_if_predating():
             f"Own agent-dir M file missing from staging plan. combined={combined!r}"
 
 
+# ---------------------------------------------------------------------------
+# gitignore exclusion (4 — iteration-commit git-add abort investigation)
+# ---------------------------------------------------------------------------
+# A gitignored file under agents/<agent>/temp/ must NEVER reach staged_files[],
+# so the explicit `git add -A -- "${staged_files[@]}"` (iteration-commit.sh
+# ~L1164) cannot abort on it. Historical failure (bravo 0): git add
+# errored `paths are ignored by one of your .gitignore files ... use -f` (rc!=0),
+# which is NOT an index.lock error, so it fell through to `exit 2` and aborted
+# the whole deep-close commit — leaving the loop's changes uncommitted, silent
+# until a manual commit. Root cause: staged_files is built from
+# `git status --porcelain` (iteration-commit.sh L492), and an untracked-ignored
+# path explicitly named in the add is the only shape git refuses (empirically:
+# `git add -A -- <untracked-ignored-file>` rc!=0, while `git add -A -- <dir>` and
+# a tracked-then-ignored path are both rc=0). Structurally resolved by a9c487af
+# (5: gitignore ALL of temp/ + untrack the previously-tracked
+# temp/drained/*.json), because `git status --porcelain` (no --ignored) does not
+# surface untracked-ignored paths. This test LOCKS that guarantee: if the status
+# source ever gains --ignored, the temp scratch file would appear in the staging
+# plan and this test fails.
+
+def test_gitignored_temp_file_excluded_from_staging_g115_1834():
+    """A gitignored agents/<agent>/temp/ scratch file is excluded from the
+    staging plan (never reaches staged_files[]), while a legitimate own-dir
+    change is still staged. Regression guard for the git-add-abort class."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp, None)  # null claimed_at → filter fail-open
+
+        # .gitignore that ignores all agent temp/ (mirrors real repo, 5).
+        (repo / ".gitignore").write_text("agents/*/temp/\n")
+        subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "gitignore agent temp"], cwd=repo, check=True)
+
+        # An UNTRACKED, gitignored scratch file under alpha's temp/ — the
+        # historical abort trigger. Present in the working tree, must be invisible
+        # to iteration-commit.
+        scratch = repo / "agents" / "alpha" / "temp" / "scratch.log"
+        scratch.parent.mkdir(parents=True, exist_ok=True)
+        scratch.write_text("ephemeral scratch\n")
+        ci = subprocess.run(
+            ["git", "check-ignore", "-q", "agents/alpha/temp/scratch.log"], cwd=repo
+        )
+        assert ci.returncode == 0, "test setup: temp scratch is not actually gitignored"
+
+        # A LEGITIMATE change under alpha's own dir that MUST be staged.
+        legit = repo / "agents" / "alpha" / "journal.jsonl"
+        legit.write_text('{"entry":1}\n')
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-01", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+
+        combined = result.stderr + result.stdout
+        # The gitignored scratch file is excluded by `git status --porcelain`,
+        # so it never appears in iteration-commit's view at all.
+        assert "scratch.log" not in combined, \
+            f"gitignored temp scratch reached iteration-commit (would abort git add). combined={combined!r}"
+        # The legitimate own-dir change IS staged.
+        assert "journal.jsonl" in combined, \
+            f"legitimate own-dir change missing from staging plan. combined={combined!r}"
+
+
 if __name__ == "__main__":
     test_untracked_file_predating_claimed_at_is_filtered()
     test_untracked_file_postdating_claimed_at_is_included()
@@ -450,4 +516,5 @@ if __name__ == "__main__":
     test_modified_file_predating_claimed_at_is_filtered()
     test_modified_file_postdating_claimed_at_is_included()
     test_modified_own_agent_dir_not_filtered_even_if_predating()
-    print("All 8 tests passed.")
+    test_gitignored_temp_file_excluded_from_staging_g115_1834()
+    print("All 9 tests passed.")

@@ -34,10 +34,16 @@ _append_q() { [ -n "$QUERY" ] && QUERY+="&"; QUERY+="$1"; }
 
 _translate() {
     # CLI printed: "Updated {field}" — extract field from daemon JSON response.
+    # Application errors ({"error": ...}) must surface as exit 1, not be
+    # swallowed as transport success (A7: empty-field rejection was invisible
+    # to callers because this path always exited 0).
     # shellcheck disable=SC2086
     printf '%s' "$1" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
+if 'error' in resp:
+    print(resp.get('detail') or resp['error'], file=sys.stderr)
+    sys.exit(1)
 print('Updated ' + resp['field'])
 "
 }
@@ -46,14 +52,14 @@ rc=0
 RESPONSE="$(rt_call POST /v1/team-state/update --query "$QUERY")" || rc=$?
 
 case $rc in
-    0) _translate "$RESPONSE"; exit 0;;
+    0) _translate "$RESPONSE"; exit $?;;
     2) exit 1;;
     3)
         # DAEMON-ONLY (2026-05-29 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
             RESPONSE="$(rt_call POST /v1/team-state/update --query "$QUERY")" || rc=$?
-            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; exit 0; fi
+            if [ "$rc" = "0" ]; then _translate "$RESPONSE"; exit $?; fi
         fi
         rt_no_daemon_error "team-state-update.sh";;
     *) exit $rc;;

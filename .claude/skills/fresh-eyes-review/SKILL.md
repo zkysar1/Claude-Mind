@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-review
-description: "Periodic local self-audit (cadence: every 25 goals). Assembles a portfolio-direction briefing (Self snapshot, aspiration portfolio, evolution signals, partner activity), writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Use whenever the user wants to force a portfolio review on demand (/fresh-eyes-review), or the precheck cadence triggers automatically (--cadence). Distinct from sq-012 (post-goal, narrow) and /priority-review (user-pull, ranking-only)."
+description: "Periodic local self-audit (cadence: every 25 goals). Assembles a portfolio-direction briefing (Self snapshot, aspiration portfolio, evolution signals, partner activity), writes it to agents/{agent}/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Use whenever the user wants to force a portfolio review on demand (/fresh-eyes-review), or the precheck cadence triggers automatically (--cadence). Distinct from sq-012 (post-goal, narrow) and /priority-review (user-pull, ranking-only)."
 user-invocable: true
 triggers:
   - "/fresh-eyes-review"
@@ -240,9 +240,13 @@ state what the evidence shows, do not hedge. If evidence is ambiguous, say
 
 Write the briefing body to `agents/<agent>/temp/fresh-eyes-{YYYY-MM-DDTHH-MM-SS}.md`
 as a staging artifact — its durable findings are encoded to the knowledge tree
-by Phase 5.6, and the file itself is drained by `/drain-temp` (see
-`core/config/conventions/temp-store.md`). Timestamp includes HH-MM-SS so multiple
-same-day invocations (cadence fire + user-forced review) do not collide.
+by Phase 5.6, after which Phase 8 Step 1.5 archives the file to `temp/drained/`.
+The briefing therefore never enters the `/drain-temp` queue as already-encoded
+slush (g-115-1838; the drain would only DISCARD it anyway, so the
+staging→drain→DISCARD round-trip inflates the precheck temp-pressure metric for
+nothing — see `core/config/conventions/temp-store.md`). Timestamp includes
+HH-MM-SS so multiple same-day invocations (cadence fire + user-forced review) do
+not collide.
 
 ```
 Bash: mkdir -p agents/<agent>/temp
@@ -369,6 +373,24 @@ This wrapper reads the current completed-goals count via
 non-null after the write (fails exit 1 on silent write failure). One
 script call, one failure mode — no chaining.
 
+### Step 1.5: Archive the briefing out of the drain queue (g-115-1838)
+
+The briefing's durable value is fully extracted by now — Phase 5.5 routed one
+finding (a Self edit via `act_now` or an Idea goal via `act_later`) and Phase 5.6
+encoded every other observation — so the staging `.md` is a pure archival record.
+Move it into `temp/drained/` so it never inflates the precheck temp-pressure
+metric as already-encoded slush (`/drain-temp` would only DISCARD it). Placing
+this AFTER Phase 5.6 keeps the interruption case no worse than before: if the
+skill dies before this step, the briefing simply stays in `temp/` for the next
+drain, exactly as today.
+
+```
+Bash: mkdir -p agents/<agent>/temp/drained && mv agents/<agent>/temp/fresh-eyes-{the-Phase-4-isotime}.md agents/<agent>/temp/drained/ 2>/dev/null || true
+```
+
+Use the exact filename written in Phase 4. This is a bookkeeping move, NOT the
+terminal action — Step 2's board-post remains the skill's final tool call.
+
 ### Step 2: Post to board (best-effort, must not block)
 
 ```
@@ -396,7 +418,8 @@ the skill does NOT end with text output.
   `<meta>/evolution-log.jsonl`, world aspirations compact,
   `agents/<agent>/session/working-memory.yaml`,
   `world/team-state.yaml` `agent_status.<partner>.beliefs` (Phase 2.6b consumer)
-- **Modifies**: `agents/<agent>/temp/fresh-eyes-*.md` (new staging file),
+- **Modifies**: `agents/<agent>/temp/drained/fresh-eyes-*.md` (briefing, archived
+  there at Phase 8 Step 1.5 after value extraction — never enters the drain queue),
   `agents/<agent>/session/working-memory.yaml` (update last_fresh_eyes_review slot),
   `agents/<agent>/journal.jsonl` (append), board `general` channel (best-effort),
   `world/team-state.yaml` `agent_status.<self>.beliefs` (Phase 2.6c writer, supersede-or-cap),

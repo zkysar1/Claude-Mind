@@ -111,6 +111,24 @@ ELSE:
 SKILL.md references when calling an affected script. A non-cross-agent
 iteration sets it to empty string and the calls behave exactly as before.
 
+**Enforced helper (option A, g-115-1847 — bravo decision msg-20260709-021804-bravo-118).**
+For any NEW cross-agent write site, and for ad-hoc cross-agent writes outside
+this SKILL.md, prefer the enforced wrapper over hand-rolling the prefix:
+```
+bash core/scripts/cross-agent-write.sh "{cross_agent_owner}" <write-script.sh> [args...]
+```
+The owner is passed as a DATA argument, so the `MIND_AGENT=<owner>` prefix is
+applied by code and cannot be forgotten (the fragility option A closes). It is
+the SSOT for the affected/exempt classification the comment above documents:
+the identity/liveness-exempt scripts (`aspirations-claim.sh`, `board-post.sh`,
+`team-state-in-flight.sh`, `team-state-clear-in-flight.sh`, `heartbeat-tick.sh`)
+are REFUSED (exit 2) so an exempt call can't be swapped to the owner; a
+`cross_agent_owner` of `""`/`"-"` is a pure passthrough. The existing
+`${ENV_PREFIX}` call sites below already apply the prefix correctly and remain
+as-is — the helper is the canonical path for callers that would otherwise
+re-derive the prefix by hand. Regression coverage (mechanism + helper):
+`core/scripts/tests/test_cross_agent_write.py`.
+
 ## Phase 4-lw: Lightweight Goal Mode — Trivial-Goal Classifier (g-305-15; design g-305-02)
 
 Runs ONCE at Phase-4 entry (after Setup, before the Cost-Ordered Preamble).

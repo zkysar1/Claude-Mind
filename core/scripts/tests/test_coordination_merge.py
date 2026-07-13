@@ -7,6 +7,7 @@ byte-level symmetry is what makes the two machines converge (each computes the
 merge from its own vantage and reaches the same result, so the fenced-PUT retry
 loop terminates instead of ping-ponging).
 """
+import ast
 import json
 import sys
 from pathlib import Path
@@ -444,6 +445,92 @@ def test_append_only_multiround_convergence():
         s3 = s3_a
     whos = [r.get("who") for r in _recs(s3)]
     assert whos.count("a") == 1 and whos.count("b") == 1     # neither duplicated
+
+
+# --- _HANDLERS registration (6) ------------------------------------
+def test_handler_registration_board_and_override_g115_2006():
+    # The non-default board channels + the Phase 4 bulk-override ledger are
+    # shared append-only stores that were unregistered and wedged on
+    # both-diverged. They MUST now route to merge_append_only_jsonl. Dispatch is
+    # by BASENAME, so the leading board/ path segment is irrelevant.
+    for path in ["board/reasoning.jsonl", "board/directives.jsonl",
+                 "board/events.jsonl", "board/feedback.jsonl",
+                 "override-bypass-ledger.jsonl"]:
+        assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
+            f"{path} not registered to the append-only handler"
+
+
+def test_handler_registration_excludes_pruned_stores_g115_2006():
+    # Regression guard (rb-245): stores that are REWRITTEN/PRUNED (not strictly
+    # append-only) MUST stay unregistered — a line-union handler would resurrect
+    # pruned records. changelog.jsonl is pruned; the evolution streams are
+    # rewritten by evolution-stub-expiry.py; journal.jsonl gets index rewrites.
+    for path in ["changelog.jsonl", "self-evolution.jsonl",
+                 "program-evolution.jsonl", "journal.jsonl"]:
+        assert cm.merge_handler_for(path) is None, \
+            f"{path} is pruned/rewritten and must NOT be append-only-registered"
+
+
+def test_board_reasoning_two_box_concurrent_append_converges_g115_2006():
+    # End-to-end two-box concurrent-append simulation: two boxes each append a
+    # distinct musing to the reasoning channel on top of a shared baseline;
+    # resolve the handler the way OwnCloudBackend._put does (via
+    # merge_handler_for) and confirm the fenced-PUT retry loop CONVERGES
+    # (byte-identical from both vantages) with no wedge and no lost append.
+    handler = cm.merge_handler_for("board/reasoning.jsonl")
+    base = {"id": "m0", "ts": "2026-07-11T09:00:00", "author": "alpha", "text": "baseline"}
+    a = _rb([base, {"id": "mA", "ts": "2026-07-11T10:00:00", "author": "alpha", "text": "A"}])
+    b = _rb([base, {"id": "mB", "ts": "2026-07-11T10:05:00", "author": "bravo", "text": "B"}])
+    ab, ba = handler(a, b), handler(b, a)
+    assert ab == ba                                          # converged, no ping-pong
+    ids = [r["id"] for r in _recs(ab)]
+    assert ids == ["m0", "mA", "mB"]                         # baseline deduped, both kept
+
+
+def test_handler_registration_g115_2009_verified_append_only():
+    # 6 remainder: the lower-churn shared append-only stores, EACH
+    # verified strictly append-only by reading its writer (rb-245). The 9 per-gate
+    # override ledgers + 6 audit/telemetry logs MUST route to the append-only
+    # handler. Dispatch is by basename, so a leading world/ path is irrelevant.
+    for path in ["blocker-gate-overrides.jsonl", "goal-duplication-overrides.jsonl",
+                 "loop-state-merge-overrides.jsonl", "origin-signal-overrides.jsonl",
+                 "output-style-overrides.jsonl", "phase-4-26-overrides.jsonl",
+                 "stale-read-overrides.jsonl", "uncommitted-work-overrides.jsonl",
+                 "missing-artifact-overrides.jsonl", "skill-rejected-edits.jsonl",
+                 "reflection-history.jsonl", "defer-date-extractions.jsonl",
+                 "retrieval-trace.jsonl", "loop-death-detections.jsonl",
+                 "description-length-telemetry.jsonl",
+                 "world/blocker-gate-overrides.jsonl"]:
+        assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
+            f"{path} not registered to the append-only handler (g-115-2009)"
+
+
+def test_handler_registration_g115_2009_excludes_rewritten_stores():
+    # Regression guard (rb-245): the 9 audit DISQUALIFIED these because
+    # their writers REWRITE the whole file — dead-ends via meta-dead-ends.py
+    # write_all() -> locked_write_jsonl; knowledge-graph via knowledge-graph-
+    # build.py rebuild. A line-union handler would resurrect deleted records, so
+    # they MUST stay unregistered (safe-freeze). meta-log/l1-pick-log/scoring-
+    # criterion-audit were DEFERRED (writer not confirmed) — also unregistered.
+    for path in ["dead-ends.jsonl", "knowledge-graph.jsonl", "meta-log.jsonl",
+                 "l1-pick-log.jsonl", "scoring-criterion-audit.jsonl"]:
+        assert cm.merge_handler_for(path) is None, \
+            f"{path} is rewritten/unconfirmed and must NOT be append-only-registered"
+
+
+def test_override_ledger_two_box_concurrent_append_converges_g115_2009():
+    # End-to-end: two boxes each append a distinct override record to
+    # blocker-gate-overrides on a shared baseline; resolve the handler as
+    # OwnCloudBackend._put does (merge_handler_for) and confirm the fenced-PUT
+    # retry loop CONVERGES byte-identically with no wedge and no lost append.
+    handler = cm.merge_handler_for("world/blocker-gate-overrides.jsonl")
+    base = {"timestamp": "2026-07-11T09:00:00", "agent": "alpha", "gate": "blocker_create", "justification": "baseline"}
+    a = _rb([base, {"timestamp": "2026-07-11T10:00:00", "agent": "alpha", "gate": "blocker_create", "justification": "A"}])
+    b = _rb([base, {"timestamp": "2026-07-11T10:05:00", "agent": "bravo", "gate": "blocker_create", "justification": "B"}])
+    ab, ba = handler(a, b), handler(b, a)
+    assert ab == ba                                          # converged, no ping-pong
+    justs = [r["justification"] for r in _recs(ab)]
+    assert justs == ["baseline", "A", "B"]                   # baseline deduped, both appends kept
 
 
 def test_append_only_byte_exact_writer_format():
@@ -884,7 +971,535 @@ def test_handler_registry_field_merge_basenames():
     assert cm.merge_handler_for("world/aspirations-meta.json") is cm.merge_aspirations_meta
     # basename resolution ignores directory + agent-store path
     assert cm.merge_handler_for("agents/alpha/aspirations-meta.json") is cm.merge_aspirations_meta
-    # _tree.yaml is DELIBERATELY unregistered — carved to the higher-risk
-    # follow-up  (1134-node structural tree). Locking None here keeps a
-    # future edit from silently registering it against the wrong (flat) handler.
-    assert cm.merge_handler_for("world/knowledge/tree/_tree.yaml") is None
+    # _tree.yaml is NOW registered — -c wired merge_tree (node reconcile
+    # a/b + top-level assembly c). Lock the binding so an accidental removal
+    # re-opens the ~1140-node tree's both-diverged freeze, and so a future edit
+    # can't silently swap it for the wrong (flat) handler.
+    assert cm.merge_handler_for("world/knowledge/tree/_tree.yaml") is cm.merge_tree
+    assert cm.merge_handler_for("_tree.yaml") is cm.merge_tree  # basename resolution
+
+
+# --- _tree.yaml per-node field reconcile (-a) ----------------------
+# Sub-goal A: the FIELD-CLASSIFICATION map + the three NON-STRUCTURAL merge
+# classes (MAX / NEWER / PROGRESSION). The STRUCTURAL reconcile is -b
+# and the bytes<->bytes merge_tree handler + _HANDLERS registration is
+# -c, so these tests exercise the dict-level helpers directly (there is
+# no merge_tree bytes path yet -- _tree.yaml stays unregistered, asserted above).
+def _tnode(**over):
+    """A minimal tree node dict with one field per non-structural class plus a
+    couple of BASE/STRUCTURAL fields, so a test can diverge exactly what it means."""
+    n = {"summary": "node summary", "file": "path/to/node.md",
+         "growth_state": "stable", "node_type": "leaf", "depth": 3,
+         "parent": "root", "children": [],
+         "retrieval_count": 10, "times_helpful": 4, "times_noise": 1,
+         "last_updated": "2026-07-01T00:00:00",
+         "last_retrieved": "2026-07-01T00:00:00",
+         "confidence": 0.5, "capability_level": "CALIBRATE"}
+    n.update(over)
+    return n
+
+
+# Observed _tree.yaml per-node fields (inventoried from the live ~1140-node tree,
+# -a). The classification map MUST route every one to a known class --
+# that is outcome #1 "field-classification map covers all per-node fields".
+_OBSERVED_TREE_FIELDS = [
+    "children", "retrieval_count", "parent", "node_type", "last_updated",
+    "growth_state", "file", "depth", "capability_level", "article_count",
+    "child_count", "utility_ratio", "summary", "times_noise", "last_retrieved",
+    "times_helpful", "times_inferred_helpful", "backfill_reason", "confidence",
+    "domain_confidence", "sample_size", "accuracy", "poignancy",
+    "last_relevant_at", "valid_to", "valid_from", "domain_class",
+    "origin_goal_id", "maintain_exempt", "last_update_trigger",
+]
+
+
+def test_tree_classify_covers_all_observed_fields():
+    valid = {"MAX", "NEWER", "PROGRESSION", "STRUCTURAL", "BASE"}
+    for f in _OBSERVED_TREE_FIELDS:
+        assert cm._classify_tree_field(f) in valid, f
+    # named classes land where the  spec says
+    assert cm._classify_tree_field("retrieval_count") == "MAX"
+    assert cm._classify_tree_field("times_inferred_helpful") == "MAX"
+    assert cm._classify_tree_field("last_updated") == "NEWER"
+    assert cm._classify_tree_field("last_retrieved") == "NEWER"
+    assert cm._classify_tree_field("confidence") == "PROGRESSION"
+    assert cm._classify_tree_field("capability_level") == "PROGRESSION"
+    assert cm._classify_tree_field("children") == "STRUCTURAL"
+    assert cm._classify_tree_field("parent") == "STRUCTURAL"
+    # a future/unknown field defaults to the safe BASE class (total function)
+    assert cm._classify_tree_field("some_future_field_zzz") == "BASE"
+
+
+def test_tree_max_field_monotonic_and_commutative():
+    a = _tnode(retrieval_count=10, times_helpful=7, times_noise=2)
+    b = _tnode(retrieval_count=13, times_helpful=4, times_noise=5)
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba                                  # commutative
+    assert ab["retrieval_count"] == 13               # MAX -- never lose a count
+    assert ab["times_helpful"] == 7
+    assert ab["times_noise"] == 5
+
+
+def test_tree_newer_timestamp_wins_commutative():
+    a = _tnode(last_retrieved="2026-07-05T09:00:00", last_updated="2026-07-05T09:00:00")
+    b = _tnode(last_retrieved="2026-07-02T09:00:00", last_updated="2026-07-02T09:00:00")
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba
+    assert ab["last_retrieved"] == "2026-07-05T09:00:00"   # strictly-newer wins
+    assert ab["last_updated"] == "2026-07-05T09:00:00"
+
+
+def test_tree_progression_later_last_updated_wins_even_if_lower():
+    # confidence is LWW by last_updated: a LATER downgrade (0.9 -> 0.4) is
+    # PRESERVED, not clobbered by a never-regress MAX. This is the whole reason
+    # confidence is LWW-by-timestamp rather than a blind max.
+    older = _tnode(confidence=0.9, last_updated="2026-07-01T00:00:00")
+    newer = _tnode(confidence=0.4, last_updated="2026-07-06T00:00:00")
+    ab, ba = cm._merge_tree_node(older, newer), cm._merge_tree_node(newer, older)
+    assert ab == ba
+    assert ab["confidence"] == 0.4                   # later edit wins (downgrade kept)
+
+
+def test_tree_progression_never_regress_on_equal_timestamp():
+    # equal last_updated -> ambiguous winner -> never-regress: higher confidence
+    # AND more-mature capability_level win; commutative both directions.
+    ts = "2026-07-04T12:00:00"
+    a = _tnode(confidence=0.3, capability_level="CALIBRATE", last_updated=ts)
+    b = _tnode(confidence=0.8, capability_level="EXPLOIT", last_updated=ts)
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba
+    assert ab["confidence"] == 0.8                   # never regress: higher wins
+    assert ab["capability_level"] == "EXPLOIT"       # EXPLOIT > CALIBRATE on the axis
+
+
+def test_tree_capability_reference_orthogonal_tiebreak_commutative():
+    # REFERENCE is off the maturity axis -> an equal-timestamp tie falls to the
+    # content tiebreak, which must STILL be commutative + deterministic.
+    ts = "2026-07-04T12:00:00"
+    a = _tnode(capability_level="REFERENCE", last_updated=ts)
+    b = _tnode(capability_level="EXPLORE", last_updated=ts)
+    assert cm._merge_tree_node(a, b) == cm._merge_tree_node(b, a)
+
+
+def test_tree_class_field_present_on_one_side_kept():
+    # a MAX/NEWER/PROGRESSION field on ONLY one side is never dropped by the base.
+    a = _tnode()
+    del a["times_helpful"]                            # a lacks this MAX field
+    b = _tnode(times_helpful=9, last_updated="2026-07-09T00:00:00")  # b is the base
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba
+    assert ab["times_helpful"] == 9                   # kept from the only side with it
+
+
+def test_tree_all_classes_diverge_commutative_and_convergent():
+    a = _tnode(retrieval_count=10, last_updated="2026-07-05T00:00:00",
+               last_retrieved="2026-07-05T00:00:00", confidence=0.6,
+               capability_level="EXPLOIT", summary="A-summary")
+    b = _tnode(retrieval_count=14, last_updated="2026-07-02T00:00:00",
+               last_retrieved="2026-07-08T00:00:00", confidence=0.9,
+               capability_level="CALIBRATE", summary="B-summary")
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba                                   # commutative
+    assert ab["retrieval_count"] == 14                # MAX
+    assert ab["last_retrieved"] == "2026-07-08T00:00:00"  # NEWER
+    assert ab["last_updated"] == "2026-07-05T00:00:00"    # NEWER
+    assert ab["confidence"] == 0.6                    # PROGRESSION: a's last_updated newer
+    assert ab["capability_level"] == "EXPLOIT"
+    assert ab["summary"] == "A-summary"               # BASE rides newer-last_updated (a)
+    # multiround fixpoint: re-merging the result with either input is stable
+    assert cm._merge_tree_node(ab, b) == ab
+    assert cm._merge_tree_node(a, ab) == ab
+
+
+def test_tree_field_helpers_are_directly_commutative():
+    # the three named non-structural merge functions, unit-tested in isolation.
+    assert cm._merge_field_max(5, 9) == cm._merge_field_max(9, 5) == 9
+    assert cm._merge_field_max(3, None) == cm._merge_field_max(None, 3) == 3
+    t_old, t_new = "2026-07-01T00:00:00", "2026-07-09T00:00:00"
+    assert cm._merge_field_newer(t_old, t_new) == cm._merge_field_newer(t_new, t_old) == t_new
+    # progression: newer timestamp wins regardless of value or arg order
+    assert cm._merge_field_progression(0.2, t_new, 0.9, t_old) == 0.2
+    assert cm._merge_field_progression(0.9, t_old, 0.2, t_new) == 0.2
+    # progression tie -> never regress (higher), commutative
+    assert cm._merge_field_progression(0.2, t_old, 0.9, t_old) == 0.9
+    assert cm._merge_field_progression(0.9, t_old, 0.2, t_old) == 0.9
+
+
+def test_tree_node_non_dict_inputs_commutative():
+    # -a fresh-eyes fix: the non-dict guard must be commutative too.
+    # The dict side always wins; BOTH-non-dict falls to the content tiebreak so
+    # the result is identical regardless of arg order (the prior guard returned
+    # the first arg unconditionally: merge(3,5)->3 but merge(5,3)->5).
+    node = _tnode()
+    assert cm._merge_tree_node(node, 5) == cm._merge_tree_node(5, node) == node
+    assert cm._merge_tree_node(3, 5) == cm._merge_tree_node(5, 3)   # both non-dict, symmetric
+    assert cm._merge_tree_node(None, node) == cm._merge_tree_node(node, None) == node
+
+
+def test_tree_node_loser_only_base_field_preserved():
+    # -a fresh-eyes fix: a BASE field present ONLY on the loser side
+    # (older last_updated) must survive — authored fields like origin_goal_id are
+    # NOT self-correcting, so dropping them loses data. Commutative both ways.
+    older = _tnode(origin_goal_id="g-115-42", last_updated="2026-07-01T00:00:00")
+    newer = _tnode(last_updated="2026-07-06T00:00:00")   # newer base, no origin_goal_id
+    assert "origin_goal_id" not in newer
+    ab, ba = cm._merge_tree_node(older, newer), cm._merge_tree_node(newer, older)
+    assert ab == ba
+    assert ab["origin_goal_id"] == ""             # loser-only authored field kept
+    assert ab["last_updated"] == "2026-07-06T00:00:00"    # NEWER class still takes the newer
+
+
+# --- _tree.yaml node-MAP structural merge (-b) ---------------------
+# The dedicated adversarial structural-integrity pass. _merge_tree_nodes_map is
+# the parent-authoritative map merge; _tree_structural_integrity is the checker.
+# HIGH-blast-radius (a bug corrupts the ~1140-node tree once -c wires
+# it), so these assert the three invariants directly on both-diverged inputs.
+def _tmap(*nodes):
+    """Build a `nodes:` map from (key, parent, last_updated) tuples. last_updated
+    is stamped so _merge_tree_node's LWW parent reconcile is deterministic."""
+    m = {}
+    for key, parent, lu in nodes:
+        m[key] = {"parent": parent, "last_updated": lu,
+                  "summary": f"{key} sum", "retrieval_count": 1}
+    return m
+
+
+def test_tree_map_union_preserves_node_count():
+    a = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("x", "root", "2026-07-01T00:00:00"),
+              ("a_only", "root", "2026-07-01T00:00:00"))
+    b = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("x", "root", "2026-07-01T00:00:00"),
+              ("b_only", "root", "2026-07-01T00:00:00"))
+    m = cm._merge_tree_nodes_map(a, b)
+    assert set(m) == {"root", "x", "a_only", "b_only"}          # union, zero node loss
+    assert cm._merge_tree_nodes_map(b, a) == m                  # commutative
+    assert cm._tree_structural_integrity(m) == []              # clean
+
+
+def test_tree_map_children_derived_symmetric_no_orphans():
+    # concurrent-add: A adds child p under root, B adds child q under root.
+    a = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("p", "root", "2026-07-02T00:00:00"))
+    b = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("q", "root", "2026-07-02T00:00:00"))
+    ab, ba = cm._merge_tree_nodes_map(a, b), cm._merge_tree_nodes_map(b, a)
+    assert ab == ba
+    assert ab["root"]["children"] == ["p", "q"]                # derived + SORTED
+    assert ab["root"]["child_count"] == 2
+    assert ab["root"]["node_type"] == "interior"
+    assert ab["p"]["node_type"] == "leaf"
+    assert cm._tree_structural_integrity(ab) == []             # symmetry + no orphans
+
+
+def test_tree_map_parent_move_no_symmetry_violation():
+    # THE canonical failure a naive children-union would corrupt: A moves z from p
+    # to n (newer last_updated), B keeps z under p. Parent-authoritative reconcile
+    # -> z.parent = n (LWW), z appears in n.children ONLY, never in p.children.
+    a = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("p", "root", "2026-07-01T00:00:00"),
+              ("n", "root", "2026-07-01T00:00:00"),
+              ("z", "n", "2026-07-05T00:00:00"))     # A: z moved under n (newer)
+    b = _tmap(("root", None, "2026-07-01T00:00:00"),
+              ("p", "root", "2026-07-01T00:00:00"),
+              ("n", "root", "2026-07-01T00:00:00"),
+              ("z", "p", "2026-07-02T00:00:00"))     # B: z still under p (older)
+    ab, ba = cm._merge_tree_nodes_map(a, b), cm._merge_tree_nodes_map(b, a)
+    assert ab == ba                                            # commutative
+    assert ab["z"]["parent"] == "n"                           # LWW: the later move wins
+    assert ab["n"]["children"] == ["z"]                       # z under n only
+    assert ab["p"]["children"] == []                          # NOT double-listed
+    assert cm._tree_structural_integrity(ab) == []            # zero symmetry violations
+
+
+def test_tree_map_depth_follows_reconciled_parent():
+    # depth recomputes from the reconciled parent chain: root keeps its merged
+    # depth, each descendant = parent depth + 1 — so a stale stored depth is
+    # corrected to match the actual structure.
+    a = {"root": {"parent": None, "depth": 1, "last_updated": "2026-07-01T00:00:00"},
+         "mid": {"parent": "root", "depth": 2, "last_updated": "2026-07-01T00:00:00"},
+         "leaf": {"parent": "mid", "depth": 9, "last_updated": "2026-07-01T00:00:00"}}
+    m = cm._merge_tree_nodes_map(a, dict(a))
+    assert m["root"]["depth"] == 1                            # root keeps merged depth
+    assert m["mid"]["depth"] == 2                             # root + 1
+    assert m["leaf"]["depth"] == 3                            # mid + 1 (stale 9 corrected)
+    assert cm._tree_structural_integrity(m) == []
+
+
+def test_tree_structural_integrity_catches_bad_map():
+    # negative test: the checker MUST flag a hand-built inconsistent map.
+    bad = {"n": {"parent": None, "children": ["ghost", "c"]},
+           "c": {"parent": "other", "children": []}}          # ghost missing; c.parent != n
+    issues = cm._tree_structural_integrity(bad)
+    assert any("orphan" in i for i in issues)                 # ghost is an orphan child
+    assert any("asymmetry" in i for i in issues)              # c.parent != n
+    assert cm._tree_structural_integrity({}) == []            # empty map is clean
+
+
+def test_tree_structural_integrity_catches_dangling_parent():
+    #  (fresh-eyes review of -b): a node whose parent points to
+    # a slug ABSENT from the map is a parentless orphan with a broken reference.
+    # Post-rebuild it appears in NO node's children (the parent doesn't exist to
+    # list it), so the orphan- and symmetry-checks in the children loop never see
+    # it. The old `p in keys` guard silently passed this as clean; the dangling-
+    # parent branch now catches it.
+    merged = {"root": {"parent": None, "children": [], "child_count": 0,
+                       "node_type": "leaf", "depth": 1},
+              "widget": {"parent": "DELETED_NODE", "children": [], "child_count": 0,
+                         "node_type": "leaf", "depth": 1}}
+    issues = cm._tree_structural_integrity(merged)
+    assert any("dangling" in i for i in issues)                 # NOW flagged
+    assert any("widget" in i and "DELETED_NODE" in i for i in issues)
+    # the dangling ref is the ONLY violation — no false orphan/asymmetry noise
+    assert not any(i.startswith("orphan:") for i in issues)
+    assert not any(i.startswith("asymmetry:") for i in issues)
+
+
+def test_tree_map_merge_preserves_dangling_input_and_checker_flags():
+    # End-to-end: an already-inconsistent INPUT (B's leaf points to a parent that
+    # B does not have, and A has no such node either) flows through the merge.
+    # Key-union PRESERVES leaf (merge must not silently drop or "fix" it), and the
+    # checker now flags the surviving dangling reference instead of a false-clean.
+    # (This is the only way a dangling parent reaches a merged map — two INTERNALLY
+    # CONSISTENT inputs cannot produce one, since LWW always picks a parent that
+    # existed on its source side and the union preserves it.)
+    a = _tmap(("root", None, "2026-07-01T00:00:00"))
+    b = {"root": {"parent": None, "last_updated": "2026-07-01T00:00:00",
+                  "summary": "r", "retrieval_count": 1},
+         "leaf": {"parent": "vanished", "last_updated": "2026-07-05T00:00:00",
+                  "summary": "l", "retrieval_count": 1}}
+    ab = cm._merge_tree_nodes_map(a, b)
+    ba = cm._merge_tree_nodes_map(b, a)
+    assert ab == ba                                             # still commutative
+    assert "leaf" in ab and ab["leaf"]["parent"] == "vanished"  # node + ref preserved
+    assert "vanished" not in ab                                 # parent genuinely absent
+    issues = cm._tree_structural_integrity(ab)
+    assert any("dangling" in i and "vanished" in i for i in issues)
+
+
+def test_tree_map_multiround_convergence():
+    a = _tmap(("root", None, "2026-07-01T00:00:00"), ("p", "root", "2026-07-02T00:00:00"))
+    b = _tmap(("root", None, "2026-07-01T00:00:00"), ("q", "root", "2026-07-02T00:00:00"))
+    m = cm._merge_tree_nodes_map(a, b)
+    assert cm._merge_tree_nodes_map(m, b) == m                # fixpoint
+    assert cm._merge_tree_nodes_map(a, m) == m
+
+
+# --- _tree.yaml TOP-LEVEL merge_tree handler (-c) -------------------
+# merge_tree assembles the a/b node reconcile with the 7 top-level field merges,
+# emits byte-exact _tree.yaml, and is the registered _HANDLERS entry. These lock
+# commutativity + each top-level rule + CRLF tolerance on the FULL document — the
+# integration-test half of sub-goal C (a real both-diverged _tree.yaml converges).
+def _tree_bytes(nodes=None, growth=None, last_updated="2026-07-01", total_entities=0,
+                unmapped=None, xrefs=None, entity_index=None, maintenance=None):
+    """Build a realistic _tree.yaml doc as bytes via the module's own serializer."""
+    doc = {
+        "last_updated": last_updated,
+        "tree_growth_log": growth if growth is not None else [],
+        "unmapped_categories": unmapped if unmapped is not None else [],
+        "cross_references": xrefs if xrefs is not None else [],
+        "entity_index": entity_index if entity_index is not None else {},
+        "total_entities": total_entities,
+        "nodes": nodes if nodes is not None else {},
+        "maintenance": maintenance if maintenance is not None else {},
+    }
+    return cm._dump_tree_yaml(doc)
+
+
+def test_merge_tree_commutative_full_doc():
+    # THE integration test: a real both-diverged _tree.yaml (divergent nodes +
+    # growth log + top-level fields) converges byte-identically either arg order.
+    a = _tree_bytes(
+        nodes=_tmap(("root", None, "2026-07-01T00:00:00"), ("p", "root", "2026-07-02T00:00:00")),
+        growth=[{"op": "ADD", "node": "p", "date": "2026-07-02", "reason": "a-add"}],
+        last_updated="2026-07-05", total_entities=3, entity_index={"e1": {"v": 1}})
+    b = _tree_bytes(
+        nodes=_tmap(("root", None, "2026-07-01T00:00:00"), ("q", "root", "2026-07-03T00:00:00")),
+        growth=[{"op": "ADD", "node": "q", "date": "2026-07-03", "reason": "b-add"}],
+        last_updated="2026-07-04", total_entities=5, entity_index={"e2": {"v": 2}})
+    ab, ba = cm.merge_tree(a, b), cm.merge_tree(b, a)
+    assert ab == ba                                            # byte-identical (commutative)
+    m = yaml.safe_load(ab.decode())
+    assert set(m["nodes"]) == {"root", "p", "q"}               # node union, zero loss
+    assert m["last_updated"] == "2026-07-05"                   # strictly-newer
+    assert m["total_entities"] == 5                            # MAX
+    assert m["entity_index"] == {"e1": {"v": 1}, "e2": {"v": 2}}  # key union
+    ops = [(e["op"], e["node"], e["date"]) for e in m["tree_growth_log"]]
+    assert ops == [("ADD", "p", "2026-07-02"), ("ADD", "q", "2026-07-03")]  # chronological
+    assert cm._tree_structural_integrity(m["nodes"]) == []     # structurally clean
+
+
+def test_merge_tree_growth_log_dedup_and_chronological_order():
+    # same (op,node,date) identity dedups to ONE; distinct events kept; emitted in
+    # chronological (date,op,node) order regardless of input order.
+    shared = {"op": "DECOMPOSE", "node": "x", "date": "2026-06-01", "reason": "same"}
+    a = _tree_bytes(growth=[{"op": "ADD", "node": "late", "date": "2026-07-01", "reason": "a"}, shared])
+    b = _tree_bytes(growth=[shared, {"op": "ADD", "node": "early", "date": "2026-05-01", "reason": "b"}])
+    ab, ba = cm.merge_tree(a, b), cm.merge_tree(b, a)
+    assert ab == ba
+    log = yaml.safe_load(ab.decode())["tree_growth_log"]
+    keys = [(e["op"], e["node"], e["date"]) for e in log]
+    assert keys == [("ADD", "early", "2026-05-01"),
+                    ("DECOMPOSE", "x", "2026-06-01"),
+                    ("ADD", "late", "2026-07-01")]             # chronological
+    assert keys.count(("DECOMPOSE", "x", "2026-06-01")) == 1   # shared deduped
+
+
+def test_merge_tree_crlf_tolerance_converges_to_lf():
+    a = _tree_bytes(nodes=_tmap(("root", None, "2026-07-01T00:00:00")), last_updated="2026-07-02")
+    a_crlf = a.replace(b"\n", b"\r\n")                         # simulate Windows-written file
+    b = _tree_bytes(nodes=_tmap(("root", None, "2026-07-01T00:00:00")), last_updated="2026-07-01")
+    ab, ba = cm.merge_tree(a_crlf, b), cm.merge_tree(b, a_crlf)
+    assert ab == ba                                           # commutative w/ mixed line endings
+    assert b"\r\n" not in ab                                  # output LF (matches tree.write_tree)
+
+
+def test_merge_tree_idempotent_fixpoint():
+    a = _tree_bytes(nodes=_tmap(("root", None, "2026-07-01T00:00:00"), ("p", "root", "2026-07-02T00:00:00")),
+                    growth=[{"op": "ADD", "node": "p", "date": "2026-07-02", "reason": "a"}], last_updated="2026-07-03")
+    b = _tree_bytes(nodes=_tmap(("root", None, "2026-07-01T00:00:00"), ("q", "root", "2026-07-02T00:00:00")),
+                    growth=[{"op": "ADD", "node": "q", "date": "2026-07-02", "reason": "b"}], last_updated="2026-07-02")
+    m = cm.merge_tree(a, b)
+    assert cm.merge_tree(m, b) == m                           # fixpoint: re-merging loser is a no-op
+    assert cm.merge_tree(a, m) == m
+
+
+def test_merge_tree_maintenance_and_lists():
+    a = _tree_bytes(maintenance={"last_maintain_at": "2026-07-05", "backlog": 10},
+                    unmapped=["cat-a"], xrefs=[{"from": "x", "to": "y"}])
+    b = _tree_bytes(maintenance={"last_maintain_at": "2026-07-03", "backlog": 15},
+                    unmapped=["cat-b"], xrefs=[{"from": "x", "to": "y"}])   # xref dup
+    ab, ba = cm.merge_tree(a, b), cm.merge_tree(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert m["maintenance"]["last_maintain_at"] == "2026-07-05"  # newer ISO via content-larger
+    assert m["maintenance"]["backlog"] == 15                     # numeric MAX
+    assert m["unmapped_categories"] == ["cat-a", "cat-b"]        # sorted union
+    assert len(m["cross_references"]) == 1                       # identical xref deduped
+
+
+def test_merge_tree_non_dict_input_commutative():
+    good = _tree_bytes(nodes=_tmap(("root", None, "2026-07-01T00:00:00")))
+    listy = b"- one\n- two\n"                                  # parses to a list -> non-dict guard
+    ab, ba = cm.merge_tree(good, listy), cm.merge_tree(listy, good)
+    assert ab == ba                                            # guard is commutative
+    # Defect 4 fix: the guard now serializes the content-chosen input through the
+    # canonical path (not raw bytes verbatim), so byte-differing-but-content-equal
+    # non-dicts still converge. `good`'s dict _canon > the list's, so it is chosen;
+    # the output parses back to good's CONTENT (canonicalized), never corrupt.
+    assert yaml.safe_load(ab.decode()) == yaml.safe_load(good.decode())
+
+
+def test_merge_tree_dict_key_order_canonicalized_commutative():
+    # Defect 1 regression (guard-907): two docs with IDENTICAL content but different
+    # dict-key INSERTION order (in a cross_reference list-dict AND an entity_index
+    # value) must merge byte-identically either arg order. Pre-fix, _dump_tree_yaml's
+    # sort_keys=False leaked the _canon-tie dedup survivor's key order arg-order-
+    # dependently. dict literals preserve insertion order (py3.7+), so the two sides
+    # serialize to different bytes before the terminal canonicalization folds them.
+    a = _tree_bytes(xrefs=[{"from": "x", "to": "y"}], entity_index={"e": {"alpha": 1, "beta": 2}})
+    b = _tree_bytes(xrefs=[{"to": "y", "from": "x"}], entity_index={"e": {"beta": 2, "alpha": 1}})
+    assert a != b                                              # confirm key-order perturbation landed in bytes
+    ab, ba = cm.merge_tree(a, b), cm.merge_tree(b, a)
+    assert ab == ba                                            # byte-identical despite key-order divergence
+    m = yaml.safe_load(ab.decode())
+    assert m["cross_references"] == [{"from": "x", "to": "y"}]  # content preserved + deduped
+    assert m["entity_index"]["e"] == {"alpha": 1, "beta": 2}
+
+
+def test_merge_tree_int_float_scalar_canonicalized_commutative():
+    # Defect 2 regression: total_entities 10 (int) vs 10.0 (float) is the same VALUE
+    # but different bytes; max() returns whichever arg came first on a tie, so the
+    # output type was arg-order-dependent. Canonicalization folds integral float->int.
+    a = _tree_bytes(total_entities=10)
+    b = _tree_bytes(total_entities=10.0)
+    ab, ba = cm.merge_tree(a, b), cm.merge_tree(b, a)
+    assert ab == ba                                            # commutative despite int/float split
+    assert yaml.safe_load(ab.decode())["total_entities"] == 10
+    assert b"10.0" not in ab                                   # serialized as int, not float
+
+
+def test_merge_tree_str_vs_date_last_updated_commutative():
+    # Defect 3 regression: last_updated as a quoted str vs an UNQUOTED YAML date
+    # (which safe_load parses to datetime.date). Same calendar date, different type ->
+    # different serialized bytes pre-fix. Canonicalization stringifies date->isoformat.
+    a = _tree_bytes(last_updated="2026-07-01")                # str, _dump quotes it
+    b_date = a.replace(b"last_updated: '2026-07-01'", b"last_updated: 2026-07-01")  # unquoted -> date
+    assert b_date != a                                        # confirm the unquote perturbation landed
+    ab, ba = cm.merge_tree(a, b_date), cm.merge_tree(b_date, a)
+    assert ab == ba                                           # commutative despite str/date type split
+    assert yaml.safe_load(ab.decode())["last_updated"] == "2026-07-01"
+
+
+# --- _HANDLERS registry integrity (3) ------------------------------
+# The _HANDLERS dict literal (coordination_merge.py) is edited from BOTH boxes at
+# every fork reconcile (55+ keys). Python dict literals accept DUPLICATE keys
+# SILENTLY (last value wins), so a merge that duplicates a store key with a
+# DIFFERENT handler would silently misroute that store's both-diverged merge with
+# ZERO runtime signal. This AST-level check (supersedes the ad-hoc re.findall used
+# at the 2 resolution) asserts every registry key is unique in SOURCE --
+# ast preserves duplicates because Python dedups only at dict CONSTRUCTION, not at
+# parse. Complements guard-907 (handlers must be COMMUTATIVE): guard-907 governs
+# each handler's behavior; this governs the registry's key-uniqueness.
+_CM_SOURCE = Path(__file__).resolve().parent.parent / "coordination_merge.py"
+
+
+def _handlers_key_nodes():
+    """Source-order list of _HANDLERS dict-literal keys (duplicates PRESERVED) as
+    (key_string, lineno) tuples, via AST. Handles both the annotated form
+    (`_HANDLERS: Dict[...] = {...}`) and a bare `_HANDLERS = {...}`."""
+    tree = ast.parse(_CM_SOURCE.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        is_handlers = (
+            (isinstance(node, ast.AnnAssign)
+             and isinstance(node.target, ast.Name)
+             and node.target.id == "_HANDLERS")
+            or (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "_HANDLERS"
+                        for t in node.targets))
+        )
+        if is_handlers:
+            assert isinstance(node.value, ast.Dict), \
+                "_HANDLERS is not a dict literal (AST expected ast.Dict)"
+            out = []
+            for k in node.value.keys:
+                # k is None only for `**spread` entries — none exist here, and one
+                # appearing would itself be worth failing on.
+                assert isinstance(k, ast.Constant) and isinstance(k.value, str), \
+                    f"_HANDLERS key is not a string literal: " \
+                    f"{ast.dump(k) if k is not None else 'None (** unpacking)'}"
+                out.append((k.value, k.lineno))
+            return out
+    raise AssertionError(
+        "_HANDLERS assignment not found in coordination_merge.py — the registry "
+        "was renamed or restructured; update this test.")
+
+
+def test_handlers_registry_has_no_duplicate_keys():
+    """3: the _HANDLERS store->handler registry must have NO duplicate
+    keys in source. A dup key with a different handler is a silent last-wins
+    misroute at every fork reconcile (Python dict-literal semantics)."""
+    keys = _handlers_key_nodes()
+    seen = {}
+    dups = []
+    for key, lineno in keys:
+        if key in seen:
+            dups.append((key, seen[key], lineno))
+        else:
+            seen[key] = lineno
+    assert not dups, (
+        "_HANDLERS has duplicate key(s) — Python takes last-wins, silently "
+        "misrouting the store's merge handler: "
+        + "; ".join(f"{k!r} (lines {a} and {b})" for k, a, b in dups)
+    )
+
+
+def test_handlers_registry_is_nonempty_and_ast_findable():
+    """Non-vacuity guard: if the AST extractor silently matched nothing (or the
+    wrong node), the dup-key test above would pass VACUOUSLY on an empty key list.
+    Pin the registry as AST-discoverable AND populated so the guard has teeth."""
+    keys = _handlers_key_nodes()
+    assert len(keys) >= 20, (
+        f"_HANDLERS AST extraction found only {len(keys)} keys — expected the full "
+        f"registry (~55). The extractor likely matched the wrong node; fix it "
+        f"before trusting the dup-key check.")

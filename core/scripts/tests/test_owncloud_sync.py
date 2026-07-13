@@ -571,6 +571,10 @@ def test_pull_one_local_at_baseline_s3_moved_pulls(tmp_path):
                          baseline_md5=_md5(b"old-m2-cache"))
     assert stats["pulled"] == 1
     assert f.read_bytes() == b"new-m1-flush"
+    # read-path stamp: the download records the NEW content as baseline (not the
+    # stale old-m2-cache) -- else the next sweep would mis-classify local as ahead
+    # of an already-reconciled S3 and refuse to pull the next peer flush.
+    assert out == _md5(b"new-m1-flush")
 
 
 def test_pull_one_local_ahead_not_clobbered(tmp_path):
@@ -599,6 +603,9 @@ def test_pull_one_no_baseline_local_present_pulls(tmp_path):
     out = _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
     assert stats["pulled"] == 1
     assert f.read_bytes() == b"s3-truth"
+    # read-path stamp: the no-baseline pull records the downloaded S3 content as
+    # the new baseline, so the immediate re-pull settles to in-sync (idempotent).
+    assert out == _md5(b"s3-truth")
 
 
 def test_pull_one_dry_run_no_write(tmp_path):
@@ -611,9 +618,38 @@ def test_pull_one_dry_run_no_write(tmp_path):
     assert not f.exists()
 
 
+def test_pull_one_download_then_repull_settles_identical(tmp_path):
+    """Read-path stamp idempotence: a download stamps the pulled bytes as the new
+    baseline; feeding that stamp back into a second _pull_one (now local == S3)
+    yields the in-sync verdict -- no second write, the same md5 returned. This is
+    the 'download + identical verdicts' round-trip the machine-move pull relies
+    on: the stamp returned by the pull MUST be exactly what makes the immediate
+    re-pull a no-op, or the sync would oscillate (re-pull every cycle)."""
+    be = FakeBackend([(tmp_path, "agents")])
+    f = tmp_path / "alpha" / "session" / "handoff.yaml"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"old-m2-cache")
+    be.s3[str(f)] = b"new-m1-flush"
+    stats = _new_pull_stats()
+    # First pull: local == baseline, S3 moved -> download + stamp new content.
+    stamp = _mod._pull_one(be, f, dry_run=False, stats=stats,
+                           baseline_md5=_md5(b"old-m2-cache"))
+    assert stats["pulled"] == 1 and stamp == _md5(b"new-m1-flush")
+    assert f.read_bytes() == b"new-m1-flush"
+    # Second pull with the fresh stamp as baseline: local == S3 -> in-sync verdict,
+    # nothing written, the same md5 returned (baseline stays recorded).
+    stats2 = _new_pull_stats()
+    again = _mod._pull_one(be, f, dry_run=False, stats=stats2, baseline_md5=stamp)
+    assert stats2["in_sync"] == 1 and stats2["pulled"] == 0
+    assert again == stamp == _md5(b"new-m1-flush")
+    assert f.read_bytes() == b"new-m1-flush"  # untouched on the idempotent re-pull
+
+
 def test_pull_continuity_end_to_end(tmp_path, monkeypatch):
-    """Drives the 16 continuity names: pulls an absent file + an untouched-cache
-    file whose S3 moved, protects a local-ahead file, and counts S3-absent ones."""
+    """Drives every manifest continuity name: pulls an absent file + an
+    untouched-cache file whose S3 moved, protects a local-ahead file, and counts
+    S3-absent ones. Counts derive from session-manifest.yaml (the SSOT) so
+    registering a new continuity file doesn't rot a literal pin here."""
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)  # read real manifest fresh
     monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
@@ -634,11 +670,14 @@ def test_pull_continuity_end_to_end(tmp_path, monkeypatch):
         "agents/alpha/session/execution-diary.jsonl": {"mtime": 1, "md5": _md5(b"diary-prior")},
     })
     stats = _mod.pull_continuity(be, "alpha")
-    assert stats["scanned"] == 16
+    exact, _globs = _mod._load_session_tiers()
+    n_continuity = sum(1 for t in exact.values() if t == "continuity")
+    assert n_continuity >= 16  # sanity floor: manifest continuity set never shrinks silently
+    assert stats["scanned"] == n_continuity
     assert set(stats["pulled_files"]) == {"handoff.yaml", "working-memory.yaml"}
     assert stats["pulled"] == 2
     assert stats["local_ahead_skipped"] == 1
-    assert stats["s3_absent"] == 13  # the other 13 continuity names absent on S3
+    assert stats["s3_absent"] == n_continuity - 3  # all continuity names absent on S3 except the 3 seeded
     assert (sess / "handoff.yaml").read_bytes() == b"handoff-from-m1"
     assert (sess / "working-memory.yaml").read_bytes() == b"wm-new-m1"
     assert (sess / "execution-diary.jsonl").read_bytes() == b"diary-local-ahead"
@@ -1617,6 +1656,134 @@ def test_pull_bootstrap_no_marker_reruns(tmp_path, monkeypatch):
     stats = _mod.pull_bootstrap(be, only_root="world")
     assert (world / "sources.yaml").exists()                # re-scan pulled it
     assert stats["pulled"] == 1
+
+
+# --- 8: pre-pull .history snapshot ---------------------------------
+# The no-baseline pull branches (_pull_one "S3-authoritative at bind" and
+# _sync_one's  reconcile) are the one shape where a pull can destroy
+# content nothing else holds. These pin: snapshot fires BEFORE the overwrite
+# with the pre-pull bytes, ONLY on those branches, and never blocks the pull.
+
+def _capture_snapshots(monkeypatch):
+    """Recorder for _snapshot_before_pull that captures the ON-DISK bytes at
+    call time — the invariant under test is snapshot-BEFORE-overwrite."""
+    calls = []
+
+    def fake(full):
+        p = Path(full)
+        calls.append((p, p.read_bytes() if p.exists() else None))
+
+    monkeypatch.setattr(_mod, "_snapshot_before_pull", fake)
+    return calls
+
+
+def test_pull_one_nobaseline_snapshots_pre_pull_bytes(tmp_path, monkeypatch):
+    """The 7 incident shape: authored local bytes, no baseline, S3
+    holds a stale object -> the pull proceeds (designed reconcile) but the
+    authored bytes are snapshotted FIRST."""
+    calls = _capture_snapshots(monkeypatch)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "scripts" / "scanner.py"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"authored-local-fix")
+    be.s3[str(f)] = b"stale-s3-object"
+    stats = _new_pull_stats()
+    _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
+    assert stats["pulled"] == 1 and f.read_bytes() == b"stale-s3-object"
+    assert calls == [(f, b"authored-local-fix")], (
+        "snapshot must fire exactly once, BEFORE refresh, with the local bytes")
+
+
+def test_pull_one_baseline_pull_no_snapshot(tmp_path, monkeypatch):
+    """local == baseline (untouched cache) -> pull loses nothing unique -> no
+    snapshot (keeps the .history store free of worthless cache copies)."""
+    calls = _capture_snapshots(monkeypatch)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"old-cache")
+    be.s3[str(f)] = b"peer-flush"
+    stats = _new_pull_stats()
+    _mod._pull_one(be, f, dry_run=False, stats=stats,
+                   baseline_md5=_md5(b"old-cache"))
+    assert stats["pulled"] == 1 and f.read_bytes() == b"peer-flush"
+    assert calls == []
+
+
+def test_pull_one_local_absent_no_snapshot(tmp_path, monkeypatch):
+    calls = _capture_snapshots(monkeypatch)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    be.s3[str(f)] = b"only-copy"
+    stats = _new_pull_stats()
+    _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
+    assert stats["pulled"] == 1 and calls == []
+
+
+def test_pull_one_dry_run_no_snapshot(tmp_path, monkeypatch):
+    """--dry-run must stay side-effect-free: no pull, no snapshot."""
+    calls = _capture_snapshots(monkeypatch)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"authored")
+    be.s3[str(f)] = b"s3"
+    stats = _new_pull_stats()
+    stats["would_pull"] = 0
+    _mod._pull_one(be, f, dry_run=True, stats=stats, baseline_md5=None)
+    assert stats["would_pull"] == 1 and f.read_bytes() == b"authored"
+    assert calls == []
+
+
+def test_sync_one_reconcile_snapshots_pre_pull_bytes(tmp_path, monkeypatch):
+    """ reconcile (periodic-sweep twin of the bind-time pull): same
+    snapshot-first contract."""
+    calls = _capture_snapshots(monkeypatch)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"stale-local-cache")
+    be.s3[str(f)] = b"S3-authoritative"
+    stats = _new_stats()
+    _mod._sync_one(be, f, dry_run=False, stats=stats,
+                   baseline_md5=None, multi_machine=True,
+                   own_cloud_authority=True)
+    assert f.read_bytes() == b"S3-authoritative"
+    assert stats.get("nobaseline_reconciled") == 1
+    assert calls == [(f, b"stale-local-cache")]
+
+
+def test_snapshot_failure_never_blocks_pull(tmp_path, monkeypatch):
+    """Fail-open contract: a raising save_history (real _snapshot_before_pull,
+    lazy-imported seam patched) must not stop the reconcile pull."""
+    import _fileops
+
+    def boom(*a, **k):
+        raise RuntimeError("history store unavailable")
+
+    monkeypatch.setattr(_fileops, "save_history", boom)
+    monkeypatch.setattr(_fileops, "resolve_base_dir", lambda p: tmp_path)
+    be = FakeBackend([(tmp_path, "world")])
+    f = tmp_path / "a.md"
+    f.write_bytes(b"authored")
+    be.s3[str(f)] = b"s3-wins"
+    stats = _new_pull_stats()
+    out = _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
+    assert stats["pulled"] == 1 and f.read_bytes() == b"s3-wins"
+    assert out == _md5(b"s3-wins")
+
+
+def test_snapshot_end_to_end_history_store(tmp_path, monkeypatch):
+    """Real save_history against a tmp base: the pre-pull bytes land in the
+    base's .history/ CAS store (restorable), not just in a recorder."""
+    import _fileops
+
+    monkeypatch.setattr(_fileops, "resolve_base_dir", lambda p: tmp_path)
+    f = tmp_path / "scripts" / "scanner.py"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"authored-local-fix")
+    _mod._snapshot_before_pull(f)
+    hist = tmp_path / ".history"
+    assert hist.is_dir(), ".history store must be created by the snapshot"
+    landed = [p for p in hist.rglob("*") if p.is_file()]
+    assert landed, "snapshot must write at least one artifact into .history/"
 
 
 if __name__ == "__main__":

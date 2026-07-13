@@ -266,12 +266,30 @@ def resolve_agent(project_root, session_id, env_agent):
             pass
     # Legacy fallback: pre-Phase-2.6 .active-agent-<SID>.
     binding = Path(project_root) / f".active-agent-{session_id}"
-    if not binding.exists():
-        return None
+    if binding.exists():
+        try:
+            name = binding.read_text(encoding="utf-8").strip()
+            if name and re.match(r"^[a-z][a-z0-9-]*$", name):
+                return name
+        except Exception:
+            pass
+    # Marker-cache fallback (0): cleanup-stale-bindings.sh reaps the
+    # Phase 2.6 binding dir at mtime>24h even when the session is still ALIVE
+    # (marathon autonomous/assistant sessions), after which both tiers above
+    # miss and D1 capture silently dies for every subsequent edit. The
+    # bash-agent-inject hook survives the same reap via its per-SID marker
+    # (core/logs/bash-inject-resolved/<SID>, rb-2859 addendum "fail SAFE
+    # reuse") — reuse that surface as the last resolution tier.
+    marker = Path(project_root) / "core" / "logs" / "bash-inject-resolved" / session_id
     try:
-        name = binding.read_text(encoding="utf-8").strip()
-        if name and re.match(r"^[a-z][a-z0-9-]*$", name):
-            return name
+        if marker.is_file():
+            name = marker.read_text(encoding="utf-8").strip()
+            if (
+                name
+                and re.match(r"^[a-z][a-z0-9-]*$", name)
+                and (Path(project_root) / "agents" / name / "local-paths.conf").exists()
+            ):
+                return name
     except Exception:
         pass
     return None

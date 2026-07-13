@@ -1694,10 +1694,32 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # would inflate selection_count on every resume/retry of the same
             # in-progress goal (mirror of cmd_update_goal line 2080 invariant).
             old_status = goal.get("status")
+            # 9: capture pre-update interval_hours BEFORE the write so the
+            # anchor-persist cascade below records the ORIGINAL cadence, not the
+            # incoming (possibly already-extended) value. Mirror of cmd_update_goal.
+            _prev_interval_hours = goal.get("interval_hours")
 
             goal[field] = value
             # asp is items[asp_idx] (same dict reference); mutation above
             # already persists. No rebind needed.
+
+            # 9 (unbounded interval-ratchet fix — DAEMON MIRROR of the
+            # aspirations.py cmd_update_goal anchor-persist; guard-742 byte-parallel).
+            # The LIVE batch-calibrate and manual apply paths flow through THIS daemon
+            # endpoint and never persisted original_interval_hours, so cargo-cult-
+            # detector's 3x cap read orig=None, treated the already-extended value as
+            # "original", and ratcheted UNBOUNDED ( root-cause, zeta 2026-07-12).
+            # Persist the anchor here (the single daemon write site) to the PRE-update
+            # cadence when absent; skip a fresh goal's first interval set (_prev None/0);
+            # no-op when the anchor already exists (update_interval_hours wrote it first).
+            if (
+                field == "interval_hours"
+                and goal.get("original_interval_hours") in (None, "")
+                and isinstance(_prev_interval_hours, (int, float))
+                and not isinstance(_prev_interval_hours, bool)
+                and _prev_interval_hours > 0
+            ):
+                goal["original_interval_hours"] = _prev_interval_hours
 
             # === Cascade mutations (PR 7e/3) ===
             # All cascades happen INSIDE the lock so a concurrent read sees
@@ -2803,6 +2825,97 @@ def _audit_cross_lane_claim_inline(ctx, *, goal_id: str,
               file=sys.stderr)
 
 
+def _load_claim_timeout_hours(project_root: Path) -> Optional[float]:
+    """Load multi_agent.claim_timeout_hours from core/config/aspirations.yaml.
+
+    Single source of truth SHARED with goal-selector.py's claim-visibility
+    contract: the selector makes a stale-claimed world goal visible again once
+    claim_age exceeds this value, and claim() must mirror it (else the two
+    disagree and the world queue livelocks — g-115-1841). Fail-open to the
+    historical literal 4.0 on any read/parse error OR a missing key; returns
+    None ONLY when the key is explicitly null (parity with the selector's
+    `claim_timeout_hours is None` legacy branch — no expiry configured -> no
+    take-back). Mirrors the fail-open shape of _load_streak_mult_config.
+    """
+    import yaml
+    cfg_path = project_root / "core" / "config" / "aspirations.yaml"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        ma = cfg.get("multi_agent") or {}
+        if "claim_timeout_hours" not in ma:
+            return 4.0
+        v = ma["claim_timeout_hours"]
+        return None if v is None else float(v)
+    except (OSError, ValueError, TypeError, yaml.YAMLError):
+        return 4.0
+
+
+def _hours_since(iso_ts) -> Optional[float]:
+    """Hours between now and an ISO-8601 LOCAL timestamp; None on missing or
+    unparseable input. Mirrors goal-selector.py hours_since — callers treat a
+    None result as 'age unknown'."""
+    if not iso_ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(iso_ts))
+    except (ValueError, TypeError):
+        return None
+    return (datetime.now() - dt).total_seconds() / 3600.0
+
+
+def _audit_stale_claim_takeback_inline(ctx, *, goal_id: str,
+                                       agent_claiming: str,
+                                       prior_claimer: str,
+                                       claim_age_hours: Optional[float],
+                                       effective_timeout_hours: float,
+                                       category: Optional[str] = None,
+                                       title: Optional[str] = None) -> None:
+    """Log a stale-claim take-back to override-bypass-ledger.jsonl.
+
+    When claim() re-assigns a world goal whose prior claim has expired
+    (claim_age > effective_timeout, mirroring goal-selector.py's visibility
+    contract — g-115-1841), record the steal to the shared audit ledger so
+    claim-contention is debuggable (parity with _audit_cross_lane_claim_inline).
+    A take-back is sanctioned auto-recovery, NOT a guard bypass, so it carries a
+    distinct gate tag ('claim-staleness-takeback') for filtering. Fail-open:
+    a ledger write failure never blocks the claim (warn to stderr only)."""
+    import sys
+    if not goal_id or not prior_claimer:
+        return
+    age_str = "unknown" if claim_age_hours is None else round(claim_age_hours, 2)
+    context = {
+        "goal_id": goal_id,
+        "agent_claiming": agent_claiming,
+        "prior_claimer": prior_claimer,
+        "claim_age_hours": (None if claim_age_hours is None
+                            else round(claim_age_hours, 2)),
+        "effective_timeout_hours": round(effective_timeout_hours, 2),
+    }
+    if category:
+        context["category"] = category
+    if title:
+        context["title"] = title[:200]
+    record = {
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "override_token": None,
+        "justification": (
+            f"stale-claim take-back: prior claim by {prior_claimer} aged "
+            f"{age_str}h > {round(effective_timeout_hours, 2)}h timeout")[:1000],
+        "gate": "claim-staleness-takeback",
+        "agent": agent_claiming or (ctx.paths.agent_name or None),
+        "session_id": None,
+        "context": context,
+    }
+    try:
+        from _fileops import locked_append_jsonl
+        ledger_path = ctx.paths.world / "override-bypass-ledger.jsonl"
+        locked_append_jsonl(str(ledger_path), record)
+    except Exception as e:
+        print(f"[daemon claim] WARN: stale-claim-takeback ledger write "
+              f"failed: {e}", file=sys.stderr)
+
+
 def claim(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/aspirations/claim?id=<goal_id>&agent=<name>[&cross_lane=<reason>]"""
     from ..server import Response
@@ -2882,18 +2995,62 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
                     category=goal.get("category"), title=goal.get("title"))
 
             existing = goal.get("claimed_by")
+            claim_summary = f"claim {goal_id}"
             if existing and existing != agent_name:
-                return Response.error(409, "already_claimed",
-                    f"Goal {goal_id} already claimed by {existing}")
+                # Staleness take-back (1): mirror goal-selector.py's
+                # claim-visibility contract (L1415-1428). The selector makes a
+                # stale-claimed world goal VISIBLE again once its claim expires;
+                # if claim() keeps hard-409ing, selector and endpoint DISAGREE
+                # and the world queue LIVELOCKS (goal offered to the agent, which
+                # then cannot claim it). A claim is stale when
+                # claim_age > effective_timeout, where effective_timeout is
+                # claim_timeout_hours capped at 2x interval_hours for recurring
+                # goals (a short-interval goal must not stay claimed for the full
+                # window). Selector-parity on the edge cases:
+                #   - claim_timeout_hours is None (no expiry configured) -> NEVER
+                #     take back (selector's legacy `continue`).
+                #   - claimed_at missing/unparseable (claim_age is None) -> treat
+                #     as expired and take back (selector falls through to include).
+                #     Safe: claim() ALWAYS stamps claimed_at under this same lock
+                #     (below), so a live in-flight claim always carries a
+                #     parseable timestamp; a timestamp-less claim is legacy/manual
+                #     residue and stealing it is the correct recovery.
+                claim_timeout_hours = _load_claim_timeout_hours(
+                    ctx.paths.project_root)
+                claim_age = None
+                effective_timeout = None
+                if claim_timeout_hours is not None:
+                    effective_timeout = claim_timeout_hours
+                    if goal.get("recurring"):
+                        interval = goal.get("interval_hours")
+                        if not interval:
+                            rd = goal.get("remind_days")
+                            interval = (rd * 24) if rd else 24
+                        effective_timeout = min(claim_timeout_hours, 2 * interval)
+                    claim_age = _hours_since(goal.get("claimed_at"))
+                    stale = (claim_age is None) or (claim_age > effective_timeout)
+                else:
+                    stale = False  # no expiry configured -> keep the claim
+                if not stale:
+                    return Response.error(409, "already_claimed",
+                        f"Goal {goal_id} already claimed by {existing}")
+                # Expired claim -> take it back. Audit the steal to the bypass
+                # ledger (like cross_lane) so claim contention is debuggable.
+                _audit_stale_claim_takeback_inline(
+                    ctx, goal_id=goal_id, agent_claiming=agent_name,
+                    prior_claimer=existing, claim_age_hours=claim_age,
+                    effective_timeout_hours=effective_timeout,
+                    category=goal.get("category"), title=goal.get("title"))
+                claim_summary = f"claim {goal_id} (take-back from {existing})"
 
             goal["claimed_by"] = agent_name
             goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
             history.snapshot(live_path, base_dir, agent,
-                             summary=f"claim {goal_id}")
+                             summary=claim_summary)
             _atomic_write_jsonl(live_path, items)
             changelog.append(base_dir, agent, live_path, "edit",
-                             summary=f"claim {goal_id}",
+                             summary=claim_summary,
                              lines_changed=len(items))
             _jsonl_cache().invalidate(live_path)
     except OSError as e:

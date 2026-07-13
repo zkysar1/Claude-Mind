@@ -90,6 +90,17 @@ age desc, exposure desc):
      real, currently-relevant invariant — the flag fired because --infer
      couldn't classify; agent judgment overrides
 
+   **Reviewed-valid vs provisional KEEP (selects the exemption window below):**
+   a KEEP is *reviewed-valid* (`reviewed_durably_valid=yes` → 90d window) when
+   the agent read the full record AND affirmatively judged it durably-valid via
+   EITHER (a) a grep of CLAUDE.md + .claude/skills + .claude/rules + core/config
+   for the entry ID that found a LIVE doc-reference (guard-707 — doc-referenced
+   entries are load-bearing regardless of counters; EXCLUDE `.history/`), OR
+   (b) content that is a stable framework-engineering invariant certain to stay
+   relevant (an OS/shell gotcha, a parser/subprocess-contract discipline, an
+   architecture principle). A KEEP that is merely "couldn't confidently retire,
+   holding provisionally" is NOT reviewed-valid — it stays at the 14d window.
+
    **REVISE if:**
    - The rule is correct but `trigger_condition` is wrong (too narrow, too
      broad, references retired skill names) — file a Maintain goal and KEEP
@@ -115,9 +126,24 @@ age desc, exposure desc):
 
    **KEEP** (write the exemption window):
    ```
-   # 14-day exemption for zero-evidence (more suspect)
-   # 30-day exemption otherwise (proven, lower priority)
-   exemption_days=$([ "$evidence" = "0" ] && echo 14 || echo 30)
+   # Window tiers (agent selects based on the KEEP decision above):
+   #   90d — a zero-evidence entry the agent CONTENT-REVIEWED and affirmatively
+   #         judged durably-valid (reviewed_durably_valid; see KEEP criteria).
+   #         Rationale: evidence-tracking counts retrieval-session citations, NOT
+   #         the background-reasoning value of framework lessons, so a valid-but-
+   #         uncited entry keeps evidence=0 across hundreds of retrievals forever;
+   #         a 14d re-review is then perpetual low-value churn AND the entry would
+   #         wrongly trip the retrieval>=200 auto-RETIRE default. A reviewed-valid
+   #         KEEP earns the long window. (g-115-2081)
+   #   14d — zero-evidence, PROVISIONAL keep (couldn't fully judge — more suspect)
+   #   30d — positive-evidence (proven, lower priority)
+   if [ "$reviewed_durably_valid" = "yes" ] && [ "$evidence" = "0" ]; then
+       exemption_days=90
+   elif [ "$evidence" = "0" ]; then
+       exemption_days=14
+   else
+       exemption_days=30
+   fi
    eligible_date=$(date -d "+${exemption_days} days" +%Y-%m-%d)
    Bash: bash core/scripts/guardrails-update-field.sh <id> next_review_eligible_at $eligible_date
    ```

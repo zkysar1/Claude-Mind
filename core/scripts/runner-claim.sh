@@ -36,6 +36,9 @@
 #   1  — daemon returned an error (caller decides; all three call sites fail open)
 #   2  — bad usage (unknown op / missing agent / missing token)
 #   4  — acquire only: another machine holds a live claim (held=true) -> refuse
+#   5  — release only: released=False — the release did NOT confirm a RUNNING->IDLE
+#        transition (idempotent no-op, OR a wedged-daemon stranded self-claim).
+#        NOT a hard error; /stop D6.8 surfaces a WARN + handoff note ().
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
@@ -135,9 +138,44 @@ if op == "acquire" and r.get("held"):
     print(f"[runner-claim] acquire: HELD (backend={backend}) — another machine "
           f"owns a live claim for this agent; refuse autonomous start")
     sys.exit(4)
+# acquire via stale-break: the claim was NOT free — a peer's RUNNING claim was
+# broken because its heartbeat exceeded OWNERSHIP_STALE_SECONDS. Surface that
+# LOUDLY: the 2026-07-07 bravo dual-runner incident started exactly here, when
+# this summary printed a plain "acquire: ok" and the /start narration concluded
+# "no live peer was detected" while a live runner on another machine lost its
+# claim mid-iteration. Exit 0 — stale-break IS the designed crash-takeover path
+# — but the operator must see whose claim was broken and how stale it was.
+if op == "acquire" and r.get("reclaimed_stale"):
+    prev_mid = r.get("prev_machine_id") or "unknown-machine"
+    age = r.get("prev_heartbeat_age_seconds")
+    age_s = f"{age}s (~{age // 60}m)" if isinstance(age, int) else "unknown age"
+    print(f"[runner-claim] acquire: ok — BROKE A STALE CLAIM (backend={backend}) "
+          f"previously held by '{prev_mid}', heartbeat age {age_s}. This is the "
+          f"crash-takeover path, NOT a clean 'no peer' acquire. If that machine's "
+          f"runner could still be alive (e.g. a very long LLM turn), verify it is "
+          f"stopped: a live peer that loses its claim keeps running but stops "
+          f"syncing (split-brain).")
+    sys.exit(0)
 if op == "acquire":
     print(f"[runner-claim] acquire: ok (backend={backend} acquired={r.get('acquired')})")
 elif op == "release":
+    # : released=True means THIS call performed the RUNNING->IDLE
+    # transition (clean self-release). released=False is the idempotent no-op —
+    # already IDLE/reclaimed, OR (the danger case) a wedged daemon left this
+    # machine's claim stranded RUNNING and the release did NOT confirm. The
+    # False-return is CORRECT (owncloud_backend.release_runner), but framing it
+    # as "ok" + exit 0 buried the stranded-claim case: /stop D6.8's `|| WARN`
+    # never fired and the next /start hit rc=4 on its own stale claim. SURFACE
+    # released=False loudly and exit 5 ("release unconfirmed", distinct from
+    # 2=hard daemon error) so D6.8 can WARN + drop a handoff note.
+    if r.get("released") is False:
+        print(f"[runner-claim] release: UNCONFIRMED (backend={backend} released=False) "
+              f"— this /stop did NOT transition the DDB claim RUNNING->IDLE (already "
+              f"released/reclaimed, OR the claim is stranded RUNNING if the daemon was "
+              f"wedged). The next /start reclaims a genuinely-stale claim (acquire-before-"
+              f"heartbeat, g-328-31); verify runner-state if a stop was expected to "
+              f"release a LIVE claim.")
+        sys.exit(5)
     print(f"[runner-claim] release: ok (backend={backend} released={r.get('released')})")
 else:
     print(f"[runner-claim] heartbeat: ok (backend={backend} beat={r.get('beat')})")
@@ -149,5 +187,6 @@ case $pyrc in
     0) echo "$SUMMARY"; exit 0;;
     2) echo "$SUMMARY" >&2; exit 1;;          # daemon op-level failure
     4) echo "$SUMMARY" >&2; exit 4;;          # acquire held -> caller refuses
+    5) echo "$SUMMARY" >&2; exit 5;;          # release unconfirmed (released=False) -> D6.8 WARN + handoff note ()
     *) echo "[runner-claim] (raw) $RESPONSE"; exit 0;;  # unparseable: call still ok
 esac

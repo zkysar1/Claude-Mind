@@ -1597,6 +1597,13 @@ runner_heartbeat:
   # triggered. 60 min absorbs that without forcing per-tool-call heartbeat
   # instrumentation. Trade-off: genuine zombie recovery takes ~2x longer.
   # Tunable; raise further if 60 still false-positives.
+  # CROSS-MACHINE TWIN (2026-07-07, bravo dual-runner incident): the DDB
+  # runner-lease staleness (owncloud_backend.DEFAULT_RUNNER_STALE_SECONDS,
+  # 3900s = 65 min; env override OWNERSHIP_STALE_SECONDS) MUST stay ABOVE
+  # this value — a peer machine must never stale-break a claim the owner's
+  # own machine still considers fresh. If you raise stale_minutes, raise the
+  # DDB default too. Guarded by test_ownership_cutover.py::
+  # test_config_invariant_ddb_stale_exceeds_local_heartbeat_stale.
   stale_minutes: 60
   # Wedged-loop detection threshold (recovery-gate Path D, ;  fix).
   # A phase_start left UNCLOSED (phase entered, never exited) longer than this is

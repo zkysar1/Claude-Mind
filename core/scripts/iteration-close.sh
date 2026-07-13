@@ -165,6 +165,8 @@ while [[ $# -gt 0 ]]; do
         --phase)   PHASE="$2"; shift 2 ;;
         --goal)    GOAL_ID="$2"; shift 2 ;;
         --status)  GOAL_STATUS="$2"; shift 2 ;;
+        # WORLD_AGENT_ONLY: cross-agent goals arrive with MIND_AGENT already
+        # overridden to the owner (g-115-978 Option 3); enum stays world|agent.
         --source)  SOURCE="$2"; shift 2 ;;
         --outcome) OUTCOME="$2"; shift 2 ;;
         --summary) SUMMARY="$2"; shift 2 ;;
@@ -1709,6 +1711,19 @@ do_productivity_check() {
     # allowlist (Phase-3 / Apply-3). Fail-open: errors routed to the diagnostic
     # log, never aborts productivity-check. cygpath: Windows-Python file-arg.
     python3 "$(_winpath "$SCRIPT_DIR/monitor-tick.py")" --tick \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
+    # Embedding-index freshness tick (g-306-84) — per-box staleness check for
+    # the retrieval embedding index. Silent no-op while embedding_blend_enabled
+    # is false (one YAML read) or the index is absent (initial build is a
+    # deliberate operator action, never hook-spawned). When the blend is live
+    # and a source store (rb/guardrails) is newer than the index, spawns
+    # `embedding-index-build.py --update` DETACHED (incremental — re-embeds
+    # changed docs only), debounced to one attempt per 6h. Same LOCAL-tick
+    # rationale as agent-watchdog above: the index is per-box daemon cache,
+    # so a world-scoped recurring goal (runs on ONE box per firing) cannot
+    # keep every box fresh. Fail-open: never delays loop continuation.
+    python3 "$(_winpath "$SCRIPT_DIR/embedding-index-freshness.py")" \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Stale-sentinel canary (g-115-717) — defense-in-depth for Cat C sentinels

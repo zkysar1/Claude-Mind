@@ -55,13 +55,13 @@ def sandbox():
                "FILEOPS_HISTORY_USE_NEW_STORE",
                "FILEOPS_HISTORY_KEEP_LEGACY_WRITES")
     prior = {k: os.environ.get(k) for k in tracked}
-    os.environ["MIND_WORLD"] = str(world)
-    os.environ["MIND_META"] = str(meta)
-    # Reload fresh modules so they pick up the new env.
-    for mod in list(sys.modules):
-        if mod in ("_fileops", "_paths", "_history_store", "history"):
-            del sys.modules[mod]
     try:
+        os.environ["MIND_WORLD"] = str(world)
+        os.environ["MIND_META"] = str(meta)
+        # Reload fresh modules so they pick up the new env.
+        for mod in list(sys.modules):
+            if mod in ("_fileops", "_paths", "_history_store", "history"):
+                del sys.modules[mod]
         yield world
     finally:
         shutil.rmtree(world, ignore_errors=True)

@@ -45,6 +45,7 @@ import json
 import logging
 import os
 import random
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -210,6 +211,26 @@ def _assert_ifmatch_supported() -> None:
         raise RuntimeError(_IFMATCH_UPGRADE_MSG)
 
 
+# Cross-machine runner-lease staleness (design §5/§9, guard-594). A RUNNING
+# claim whose heartbeat_at is older than this is treated as a CRASHED peer and
+# becomes reclaimable (reclaim_if_stale). INVARIANT: this MUST exceed the LOCAL
+# liveness threshold, runner_heartbeat.stale_minutes in core/config/
+# aspirations.yaml (60 min) — a peer must never break a claim the owner's own
+# machine still considers fresh. The DDB heartbeat advances on the SAME
+# once-per-iteration heartbeat-tick.sh cadence as the local file mtime, and
+# deep LLM iterations legitimately run 30-45+ min between ticks (the reason
+# stale_minutes was bumped 30->60 on 2026-05-14, g-115-724). Calibrated
+# 2026-07-07 after the bravo dual-runner incident: the original 900s (15 min)
+# design placeholder let a /start on one machine stale-break the claim of a
+# LIVE runner mid-iteration on another (22-min max-effort turn), producing the
+# exact split-brain the lock exists to prevent. 3900 = 60 + 5 min margin,
+# mirroring wedge_stale_minutes (65). Env override: OWNERSHIP_STALE_SECONDS
+# (parsed in from_env; owncloud_sync._owned_agents honors the same env at
+# call time and falls back to the live backend's value). Guarded by
+# test_ownership_cutover.py::test_config_invariant_ddb_stale_exceeds_local_heartbeat_stale.
+DEFAULT_RUNNER_STALE_SECONDS = 3900
+
+
 class OwnCloudBackend:
     """StorageBackend over S3 + DynamoDB. Constructed explicitly (tests) or via
     :meth:`from_env`. Boto3 clients are injectable for testing (moto)."""
@@ -228,7 +249,7 @@ class OwnCloudBackend:
                  root_map=None,
                  cache_ttl: int = 30, machine_id: str = "unknown",
                  region: str = "us-east-2",
-                 runner_stale_seconds: int = 900,
+                 runner_stale_seconds: int = DEFAULT_RUNNER_STALE_SECONDS,
                  aws_access_key_id: str = None, aws_secret_access_key: str = None,
                  s3=None, ddb=None):
         self.env_id = env_id.strip("/")
@@ -369,6 +390,18 @@ class OwnCloudBackend:
                 "other's locks -> concurrent read-modify-write -> data corruption. "
                 "Set MACHINE_ID to a unique per-machine value (the hostname is "
                 "a good default) in .env.local.")
+        # OWNERSHIP_STALE_SECONDS env override (guard-594 calibration knob).
+        # Before 2026-07-07 this env var was documented but only reached the
+        # sync-ownership filter (owncloud_sync._owned_agents) — the actual
+        # lock-break (reclaim_if_stale) always used the constructor default,
+        # so the two consumers could disagree on staleness. Parse it here so
+        # ONE value governs both.
+        _stale_env = os.environ.get("OWNERSHIP_STALE_SECONDS", "").strip()
+        try:
+            runner_stale = (int(_stale_env) if _stale_env
+                            else DEFAULT_RUNNER_STALE_SECONDS)
+        except ValueError:
+            runner_stale = DEFAULT_RUNNER_STALE_SECONDS
         return cls(
             env_id=os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
             bucket=os.environ["STORAGE_S3_BUCKET"],
@@ -378,6 +411,7 @@ class OwnCloudBackend:
             cache_ttl=int(os.environ.get("OWNCLOUD_CACHE_TTL", "30")),
             machine_id=machine_id,
             region=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"),
+            runner_stale_seconds=runner_stale,
             # Scoped least-privilege creds (Zak_first_test), separate from the
             # root AWS_* keys. Both-None is only reached when the operator set
             # MIND_AWS_ALLOW_DEFAULT_CHAIN=1 above -> __init__ default chain.
@@ -484,6 +518,57 @@ class OwnCloudBackend:
         except Exception:
             return False
         return False
+
+    def _assert_not_tempdir_put(self, path: PathLike) -> None:
+        """Refuse (fail loud) an own-cloud S3 PUT whose path resolves under a
+        tempfile/pytest temp dir -- the UNIVERSAL test-isolation net for
+        g-115-1875. _s3_key ignores the local filesystem path (it is
+        customer_prefix + env_id + _rel(path)), so a tmp-world PUT collides on
+        the PRODUCTION S3 key and truncates the real store (rb-2983/guard-955:
+        world/aspirations.jsonl truncated 22 asp -> 1 fixture record on
+        2026-07-09, when a subprocess seeded a tmp world but inherited
+        STORAGE_BACKEND=own-cloud). Fires INSIDE the backend, below every
+        runner, so it catches what conftest's STORAGE_BACKEND=local pin cannot:
+        main()-style test files run directly (`python3 test_x.py` -- conftest
+        never loads) and the bash aggregator (run-asp-257-suite.sh) that ran the
+        truncating test.
+
+        Escape hatch: the pytest conftest (core/scripts/tests/conftest.py) sets
+        MIND_ALLOW_TMP_OWNCLOUD_PUT=1 session-wide, so the tripwire is DORMANT
+        under pytest -- where every backend is hermetic (LocalBackend, or a
+        moto-mocked OwnCloudBackend that never touches real S3). It ARMS for
+        NON-pytest runners (main()-style `python3 test_x.py`, the bash
+        aggregator) where the conftest never loads and a real own-cloud PUT to a
+        tmp world would collide on the production key. The env var's presence IS
+        the "hermetic pytest session" signal. Fail-open on an unresolvable path
+        -- a resolution error must never block a real write."""
+        if os.environ.get("MIND_ALLOW_TMP_OWNCLOUD_PUT") == "1":
+            return
+        try:
+            resolved = Path(path).resolve()
+        except Exception:
+            return  # unresolvable -> fail-open (never block a legitimate write)
+        under_tmp = False
+        try:
+            resolved.relative_to(Path(tempfile.gettempdir()).resolve())
+            under_tmp = True
+        except ValueError:
+            # pytest tmp factories usually nest under gettempdir, but some CI
+            # relocate them (TMPDIR / --basetemp); a 'pytest-' path segment is
+            # the backstop marker.
+            under_tmp = any(seg.startswith("pytest-") for seg in resolved.parts)
+        if under_tmp:
+            raise RuntimeError(
+                "own-cloud PUT REFUSED (g-115-1875 test-isolation tripwire): "
+                f"path {resolved} resolves under a tempfile/pytest temp dir. "
+                "_s3_key ignores the local path, so this tmp PUT would collide "
+                "on the PRODUCTION S3 key and truncate the real store "
+                "(rb-2983/guard-955 -- world/aspirations.jsonl was truncated "
+                "22->1 asp on 2026-07-09 this way). A test's world-write code "
+                "leaked into own-cloud mode: pin STORAGE_BACKEND=local for the "
+                "test/runner (see core/scripts/tests/conftest.py), or set "
+                "MIND_ALLOW_TMP_OWNCLOUD_PUT=1 if this is an intentional "
+                "own-cloud test against a mocked S3.")
 
     # --- reads -------------------------------------------------------------
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
@@ -732,6 +817,15 @@ class OwnCloudBackend:
             local.write_bytes(body)
             return WriteResult(version=str(local.stat().st_mtime_ns),
                                fallback_used=False)
+        # g-115-1875: UNIVERSAL test-isolation tripwire (fires below every
+        # runner). Refuse a PUT whose path resolves under a tempfile/pytest temp
+        # dir -- _s3_key ignores the local path, so a tmp-world PUT collides on
+        # the PRODUCTION S3 key and truncates the real store (rb-2983/guard-955).
+        # This is the net that covers what conftest's STORAGE_BACKEND=local pin
+        # cannot: main()-style test files run directly (`python3 test_x.py`,
+        # conftest never loads) and the bash aggregator that ran the 2026-07-09
+        # truncating test. See _assert_not_tempdir_put for the full rationale.
+        self._assert_not_tempdir_put(path)
         key = self._s3_key(path)
         local = self._local(path)
         local.parent.mkdir(parents=True, exist_ok=True)

@@ -255,10 +255,23 @@ def main():
         approve_no_mutation()
 
     # --- Read local-paths.conf ---
+    # The agent-dir write-surface allowlist + the PROJECT_ROOT cruft checks
+    # below are computable from PROJECT_ROOT + the bound agent ALONE — they do
+    # NOT need WORLD/META from local-paths.conf. So a MISSING conf must NOT
+    # blanket-approve: that silently disables the cruft gate for every agent not
+    # provisioned on THIS box (6 — the L1 allowlist fail-open, where
+    # bravo/echo/zeta/foxtrot had no conf on a secondary box and every cruft
+    # path under their agent dirs silently approved). Fall through with empty
+    # external paths: allowed_roots then holds only PROJECT_ROOT, so the
+    # agent-dir allowlist + PROJECT_ROOT cruft checks still fire, while
+    # genuinely-external (WORLD/META) writes stay fail-open via the conf_present
+    # guard at the final block (an external target cannot be validated against
+    # unknown roots).
     conf_path = os.path.join(_resolve_agent_dir(project_root, agent), "local-paths.conf")
-    if not os.path.isfile(conf_path):
-        approve_no_mutation()
-    paths = read_paths_conf(conf_path)
+    conf_present = os.path.isfile(conf_path)
+    paths = read_paths_conf(conf_path) if conf_present else {
+        "WORLD_PATH": None, "META_PATH": None, "AGENT_WRITE_PATH": None,
+    }
 
     # --- Build allowed roots ---
     # Always allow PROJECT_ROOT (local repo). WORLD/META only if configured.
@@ -514,6 +527,14 @@ def main():
             approve_no_mutation()
 
     # --- Block: target is absolute AND outside all configured roots ---
+    # Conf-missing fail-open (6): when local-paths.conf was absent we
+    # only know PROJECT_ROOT. A target that reached here is outside PROJECT_ROOT
+    # (in-repo targets, incl. the agent dir, were already gated by the
+    # PROJECT_ROOT branch above); it cannot be validated against the unknown
+    # external WORLD/META roots, so preserve the historical fail-open rather
+    # than denying blindly.
+    if not conf_present:
+        approve_no_mutation()
     root_list = "\n".join(f"  {label} = {root}" for label, root in allowed_roots)
     reason = (
         f"Path-resolution hook (L1) blocked {tool_name} to:\n"

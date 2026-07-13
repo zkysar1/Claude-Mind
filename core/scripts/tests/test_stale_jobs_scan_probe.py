@@ -13,6 +13,7 @@ plugin_connected=true.
 
 import io
 import json
+import os
 import sys
 import unittest
 from datetime import datetime, timedelta
@@ -20,17 +21,38 @@ from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2].parent
-WORLD_SCRIPTS = REPO_ROOT / ".." / "Ayoai-World" / "scripts"
-# Fallback: locate via local-paths.conf if the relative path doesn't exist.
-if not WORLD_SCRIPTS.exists():
-    agent_name = (REPO_ROOT / ".active-agent-test").read_text().strip() if (REPO_ROOT / ".active-agent-test").exists() else "zeta"
-    # Phase 2.5.D layout: agent dirs live under agents/ parent.
-    conf = REPO_ROOT / "agents" / agent_name / "local-paths.conf"
-    if conf.exists():
+
+
+def _find_world_scripts():
+    """Locate the domain world/scripts dir that actually contains
+    stale-jobs-scan.py, robustly across boxes (g-115-1807). The prior logic
+    hardcoded agent "zeta" + a .active-agent-test file that exist on no current
+    box, so this regression test silently SKIPPED everywhere and the g-115-1518
+    ForeignRootOrphanScopingTest coverage (3 tests) went dormant. Resolution
+    order: (1) the product-box sibling checkout, (2) the bound agent's world
+    (MIND_AGENT, injected on this box), (3) any agent's local-paths.conf whose
+    WORLD_PATH actually carries the script."""
+    sibling = REPO_ROOT / ".." / "Ayoai-World" / "scripts"
+    if (sibling / "stale-jobs-scan.py").exists():
+        return sibling
+    confs = []
+    bound = os.environ.get("MIND_AGENT")
+    if bound:
+        confs.append(REPO_ROOT / "agents" / bound / "local-paths.conf")
+    confs.extend(sorted((REPO_ROOT / "agents").glob("*/local-paths.conf")))
+    for conf in confs:
+        if not conf.exists():
+            continue
         for line in conf.read_text().splitlines():
             if line.strip().startswith("WORLD_PATH="):
-                WORLD_SCRIPTS = Path(line.split("=", 1)[1].strip().strip('"')) / "scripts"
+                ws = Path(line.split("=", 1)[1].strip().strip('"')) / "scripts"
+                if (ws / "stale-jobs-scan.py").exists():
+                    return ws
                 break
+    return sibling  # not found — the module-level skip below reports this path
+
+
+WORLD_SCRIPTS = _find_world_scripts()
 
 sys.path.insert(0, str(REPO_ROOT / "core" / "scripts"))
 sys.path.insert(0, str(WORLD_SCRIPTS))

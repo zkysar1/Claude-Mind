@@ -6,14 +6,20 @@
 
 # --- FRAMEWORK ---
 
-# Stage labels derived from average domain competence.
-# These are descriptive labels, not gates — competence drives behavior.
+# Stage labels derived from tree_maturity (knowledge-tree competence mean — the
+# mean capability_level of tree leaves at depth >= 2, computed by aspirations-evolve
+# Step 0). tree_maturity is EVOLVE's metric, distinct from
+# current_assessment.average_competence (the 4-component evidence formula owned by
+# competence-assess.py that curriculum.yaml gates consume). Split per 8 to
+# end the shared-field last-writer-wins collision. The band keys below
+# (tree_maturity_min/max) document evolve's stage boundaries; no code reads them.
+# These are descriptive labels, not gates — tree_maturity drives behavior.
 stages:
   exploring:
     description: "Learning through direct interaction — forming hypotheses to see what happens"
     criteria:
-      average_competence_min: 0.00
-      average_competence_max: 0.30
+      tree_maturity_min: 0.00
+      tree_maturity_max: 0.30
     behaviors:
       hypothesis_types: ["calibration", "exploration"]
       max_commitment: "SMALL"
@@ -26,8 +32,8 @@ stages:
   developing:
     description: "Building patterns and categories — can classify and reason about domains"
     criteria:
-      average_competence_min: 0.30
-      average_competence_max: 0.55
+      tree_maturity_min: 0.30
+      tree_maturity_max: 0.55
     behaviors:
       hypothesis_types: ["calibration", "exploration", "high-conviction"]
       max_commitment: "MEDIUM"
@@ -40,8 +46,8 @@ stages:
   applying:
     description: "Applying knowledge systematically — tracks patterns, classifies categories"
     criteria:
-      average_competence_min: 0.55
-      average_competence_max: 0.80
+      tree_maturity_min: 0.55
+      tree_maturity_max: 0.80
     behaviors:
       hypothesis_types: ["calibration", "exploration", "high-conviction", "contrarian"]
       max_commitment: "LARGE"
@@ -54,7 +60,7 @@ stages:
   mastering:
     description: "Abstract thinking — hypothesis testing, meta-cognition, strategy transfer"
     criteria:
-      average_competence_min: 0.80
+      tree_maturity_min: 0.80
     behaviors:
       hypothesis_types: ["all"]
       max_commitment: "LARGE"
@@ -66,17 +72,17 @@ stages:
       pattern: 0.3
       strategic: 0.6
 
-# Exploration budget computed dynamically from average domain competence.
+# Exploration budget computed dynamically from tree_maturity (evolve's metric).
 # No fixed per-stage budgets — continuous adjustment.
 exploration_budget:
-  formula: "max(0.15, min(0.85, 1.0 - average_domain_competence))"
+  formula: "max(0.15, min(0.85, 1.0 - tree_maturity))"
   competence_mapping:
     EXPLORE: 0.15
     CALIBRATE: 0.45
     EXPLOIT: 0.70
     MASTER: 0.90
   description: >
-    Average competence is computed from L2 capability_levels using competence_mapping.
+    tree_maturity is computed from L2 capability_levels using competence_mapping.
     Each L2 node's capability_level maps to a numeric value.
     exploration_budget = max(0.15, min(0.85, 1.0 - average)).
     Higher competence → less exploration, more exploitation.
@@ -98,7 +104,8 @@ initial_state:
   current_assessment:
     stage: "exploring"
     resolved_hypotheses: 0
-    average_competence: 0.0
+    tree_maturity: 0.0        # evolve's metric (knowledge-tree competence mean; drives stage/epsilon)
+    average_competence: 0.0   # competence-assess.py's metric (4-component evidence formula; curriculum gates)
     highest_capability: "EXPLORE"
     lowest_capability: "EXPLORE"
     exploration_budget: 0.85

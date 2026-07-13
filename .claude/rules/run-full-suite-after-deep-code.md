@@ -48,14 +48,45 @@ leave local-only write residue (split-brain). This caused two daemon storms on
 2026-05-31 (the second was an agent running this suite to verify its own deep-code change).
 
 Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
-1. Run the daemon-SAFE full suite:
-   `python -m pytest core/scripts/tests -q -m "not daemon_integration"`.
+1. Run the daemon-SAFE full suite, **prepending `STORAGE_BACKEND=local`** (see
+   the own-cloud S3-key-collision hazard below — this prefix is MANDATORY, not
+   optional, whenever the box runs `STORAGE_BACKEND=own-cloud`):
+   `STORAGE_BACKEND=local python -m pytest core/scripts/tests -q -m "not daemon_integration"`.
    The `daemon_integration` marker (registered in `pytest.ini`) tags the only
    tests that spawn REAL subprocess daemons and/or count system-wide
    `mind_api.src` processes — currently just `test_daemon_orphan_prevention.py`.
    Excluding them, the rest of the suite is hermetic (the in-process
    `_daemon_fixture.py` / `running_daemon` fixtures bind a thread-local daemon
-   in a tmp project root) and is safe to run with a live daemon present.
+   in a tmp project root) and is safe to run with a live daemon present —
+   **but ONLY with `STORAGE_BACKEND=local` prepended (as shown above).** On an
+   own-cloud box (`STORAGE_BACKEND=own-cloud`, this repo's default when a live
+   daemon serves agents) the "hermetic" claim is FALSE: tests that seed a
+   tempfile world and write via a subprocess (e.g.
+   `test_defer_to_unblock_integration.py`) inherit own-cloud (their subprocess
+   spawn does `env = os.environ.copy()`), and `OwnCloudBackend._s3_key` derives
+   the S3 key from `customer_prefix+env_id+`filename — NOT the `MIND_WORLD`
+   tmp-dir override — so the tmp write collides on the PRODUCTION S3 key and
+   truncates the real store. This happened 2026-07-09: `world/aspirations.jsonl`
+   was truncated from 22 aspirations/1366 goals to a lone `asp-555` fixture
+   (recovered from a `.history` snapshot via a fenced re-PUT).
+   `STORAGE_BACKEND=local` forces LocalBackend so every tmp write stays on the
+   tmp filesystem.
+
+   **"Prepend to pytest" is too narrow — pin it for ANY test runner.** The
+   2026-07-09 truncation did NOT come from `pytest core/scripts/tests`:
+   `test_defer_to_unblock_integration.py` is a `main()`-style file with zero
+   `test_` functions, so pytest collects 0 from it and never runs it. The real
+   runner was the bash aggregator `core/scripts/tests/run-asp-257-suite.sh`
+   (suite 6/6 = `python3 …/test_defer_to_unblock_integration.py`), invoked to
+   validate a capability-gate change. So pin `STORAGE_BACKEND=local` for pytest,
+   a bash aggregator, OR a direct `python3 test_*.py`. Bash aggregators that exec
+   `main()`-style world-writing tests MUST pin it themselves
+   (`run-asp-257-suite.sh` now `export`s it at the top) — a conftest autouse
+   fixture (g-115-1875) protects ONLY pytest-collected tests, never
+   `main()`-style files run outside pytest. (~18 pytest-collected world-writers
+   in `core/scripts/tests` do `os.environ.copy()` and are S3-collision-capable
+   under own-cloud; the conftest pin covers those.) See guard-955, rb-2983, and
+   `exp-owncloud-s3-collision-truncation-2026-07-09`.
 2. Defer ONLY the `daemon_integration` subset to a quiescent window (agents
    stopped) or a separate clone / CI:
    `python -m pytest core/scripts/tests -q -m daemon_integration`.
@@ -94,7 +125,7 @@ before you kill a run or file a false "suite hangs" blocker:
    file directly (the Read tool shows partial content mid-run), forcing
    unbuffered flushes so per-test dots land immediately:
    ```
-   PYTHONUNBUFFERED=1 python -u -m pytest core/scripts/tests -m "not daemon_integration" \
+   STORAGE_BACKEND=local PYTHONUNBUFFERED=1 python -u -m pytest core/scripts/tests -m "not daemon_integration" \
      > agents/<agent>/temp/suite.log 2>&1
    ```
    Then Read `agents/<agent>/temp/suite.log` to watch progress (add `-v` for one

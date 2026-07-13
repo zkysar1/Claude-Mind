@@ -243,30 +243,42 @@ def _gitcfg(repo: Path) -> None:
     _git(repo, "config", "tag.gpgsign", "false")
 
 
-def _setup_promote_source(tmp_path: Path, version: str = "1.0.0") -> Path:
-    """Isolated, clean, tagged frontier source repo carrying promote + its libs +
-    stubbed sub-steps. promote anchors PROJECT_ROOT to <src>/core/scripts/../..."""
+def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool = True) -> Path:
+    """Isolated, clean source repo carrying promote + its libs + stubbed sub-steps.
+    promote anchors PROJECT_ROOT to <src>/core/scripts/../..
+
+    frontier=True  -> a frontier source: ships RELEASES.json + a v<version> tag
+                      (the release-provenance a frontier cut produces).
+    frontier=False -> a SEED source (g-115-1811): NO RELEASES.json, NO tag — the
+                      un-bootstrapped-seed condition (claude-mind). promote's
+                      release-provenance gates (Step 1a RELEASES.json + Step 1c
+                      v-tag) must SKIP for it (role-conditional, option 2)."""
     src = tmp_path / "src"
     (src / "core" / "scripts").mkdir(parents=True)
     (src / "core" / "config").mkdir(parents=True)
     (src / "mind_api" / "src").mkdir(parents=True)
-    for name in ("promote-to-upstream.sh", "_paths.sh", "_release_lib.py"):
+    # check-releases-current.sh is REQUIRED here: promote Step 1a delegates the
+    # RELEASES.json check to it (1, single role-aware checker).
+    for name in ("promote-to-upstream.sh", "_paths.sh", "_release_lib.py",
+                 "check-releases-current.sh"):
         shutil.copy(CORE_SCRIPTS / name, src / "core" / "scripts" / name)
     (src / "core" / "scripts" / "seed-preflight.sh").write_text(_STUB_OK, encoding="utf-8")
     (src / "core" / "scripts" / "seed-verify.sh").write_text(_STUB_OK, encoding="utf-8")
     (src / "core" / "scripts" / "seed-transplant.sh").write_text(_STUB_TRANSPLANT, encoding="utf-8")
     (src / "core" / "config" / "compatibility.yaml").write_text(_FW_CHAIN_YAML, encoding="utf-8")
     (src / "mind_api" / "src" / "__init__.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
-    (src / "RELEASES.json").write_text(json.dumps(
-        [L.build_entry(version, None, "2026-06-05", False, False, "s", None, None, None)]),
-        encoding="utf-8")
+    if frontier:
+        (src / "RELEASES.json").write_text(json.dumps(
+            [L.build_entry(version, None, "2026-06-05", False, False, "s", None, None, None)]),
+            encoding="utf-8")
     (src / ".gitignore").write_text("core/scripts/.python-shim/\ncore/.pycache/\n", encoding="utf-8")
     _git(src, "init", "-q")
     _gitcfg(src)
     _git(src, "add", "-A")
     _git(src, "commit", "-q", "-m", "init")
     _git(src, "branch", "-M", "main")
-    _git(src, "tag", "-a", f"v{version}", "-m", f"Release v{version}")  # Step 1c: HEAD == tag
+    if frontier:
+        _git(src, "tag", "-a", f"v{version}", "-m", f"Release v{version}")  # Step 1c: HEAD == tag
     return src
 
 
@@ -537,4 +549,44 @@ def test_shell_dry_run_unpublishable_fails(tmp_path):
     r = _run_promote_dry(src, tgt, world)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "seed-preflight FAILED" in r.stderr
+    assert "[dry-run] OK" not in r.stdout
+
+
+# ===========================================================================
+# 8. promote-to-upstream.sh — role-conditional release gates (1)
+#    seed->downstream promote runs WITHOUT --force-release; frontier stays strict
+# ===========================================================================
+@requires_git
+def test_shell_dry_run_seed_role_skips_release_gates(tmp_path):
+    """1 (option 2): a SEED source (self_role=seed, NO RELEASES.json, NO
+    v-tag — the un-bootstrapped claude-mind condition) promotes downstream in
+    --dry-run WITHOUT --force-release. The RELEASES.json (Step 1a) and v-tag
+    (Step 1c) gates are FRONTIER-ONLY provenance and skip for a non-frontier role.
+    This is the seed->downstream half of the acceptance check '--dry-run passes
+    from BOTH frontier and seed clones'."""
+    src = _setup_promote_source(tmp_path, "1.0.0", frontier=False)  # no RELEASES.json, no tag
+    world = _mk_world(tmp_path, "seed")
+    tgt = _mk_target(tmp_path, "0.5.0")  # downstream below seed 1.0.0 -> invariant OK
+    r = _run_promote_dry(src, tgt, world)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[dry-run] OK" in r.stdout
+    # Step 1a delegated to check-releases-current.sh, which PASSes a non-frontier
+    # source with no RELEASES.json as N/A (version SSOT __version__ authoritative).
+    assert "non-frontier" in r.stdout
+    # Step 1c v-tag check skipped for the non-frontier role.
+    assert "skip tag-check" in r.stdout
+
+
+@requires_git
+def test_shell_dry_run_frontier_missing_releases_still_fails(tmp_path):
+    """SYMMETRY GUARD (no over-relaxation): the role-conditional skip is
+    non-frontier ONLY. A FRONTIER source genuinely missing RELEASES.json MUST
+    still FAIL — check-releases-current.sh FAILs a frontier with no release
+    history. Proves the g-115-1811 relaxation did not weaken the frontier gate."""
+    src = _setup_promote_source(tmp_path, "1.0.0", frontier=False)  # no RELEASES.json
+    world = _mk_world(tmp_path, "frontier")  # ...but the overlay claims frontier
+    tgt = _mk_target(tmp_path, "0.5.0")
+    r = _run_promote_dry(src, tgt, world)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "RELEASES.json" in (r.stdout + r.stderr)
     assert "[dry-run] OK" not in r.stdout

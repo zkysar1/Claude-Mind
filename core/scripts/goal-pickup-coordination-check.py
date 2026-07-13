@@ -529,6 +529,7 @@ def main():
                      "filter misses). Detective only — never mutates, exit 0."),
     )
     ap.add_argument("--goal-id", required=True)
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default="world")
     ap.add_argument("--since-hours", type=float, default=2.0,
                     help="git-log lookback window in hours (default 2).")

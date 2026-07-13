@@ -47,9 +47,15 @@ if [[ -f "$SCRIPT_DIR/_paths.sh" ]]; then
   FORGED="${WORLD_DIR:-}/forged-skills.yaml"
   if [[ -f "$FORGED" ]]; then
     # Skills are YAML keys at 2-space indent under 'skills:' (e.g., "  access-efs-data:")
+    # CRLF-tolerant (g-115-1934, restoring the never-committed g-115-1929 fix): world/
+    # forged-skills.yaml is synced through own-cloud from Windows boxes and carries CRLF
+    # terminators. `s/\r$//` MUST run BEFORE the trailing-colon anchor `s/: *$//`, else the
+    # `\r` sits between the colon and end-of-line so `: *$` never matches — every skill name
+    # extracts as "name:\r", the --exclude-dir args miss the real dirs, and forged skills are
+    # scanned (false leak noise). Verified on cc-04: 15/15 names broken pre-fix, 0 post-fix.
     while IFS= read -r skill_name; do
       [[ -n "$skill_name" ]] && { EXCLUDE_ARGS+=("--exclude-dir=$skill_name"); FORGED_NAMES+=("$skill_name"); }
-    done < <(sed -n '/^skills:/,/^[^ ]/{ /^  [a-z]/{ s/: *$//; s/^ *//; p; } }' "$FORGED")
+    done < <(sed -n '/^skills:/,/^[^ ]/{ /^  [a-z]/{ s/\r$//; s/: *$//; s/^ *//; p; } }' "$FORGED")
   fi
 fi
 

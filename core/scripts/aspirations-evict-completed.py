@@ -79,7 +79,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
 from _goal_census import (  # noqa: E402
     ABANDONED_STATUSES, TERMINAL_STATUSES, CENSUS_KEY, effective_counts,
-    census_completed,
+    census_completed, census_by_status,
 )
 
 # The exact denominators the live consumers use — recomputed before/after each
@@ -138,6 +138,113 @@ def _bump_census(asp: dict, status: str) -> None:
         by_status = {}
         census["by_status"] = by_status
     by_status[status] = int(by_status.get(status, 0) or 0) + 1
+
+
+def _capacity(asp) -> int:
+    """Pigeonhole ceiling for an aspiration's id-space: the max sequence number
+    among live goal ids (+ count of distinct suffixed ids). Ids are minted
+    contiguously from 1, so this is the observable lower bound on how many
+    distinct goal ids the aspiration ever allocated. in_list + census_sum must
+    not exceed it — if it does, archived_census double-counts evicted goals
+    (phantom allocations from evict->resurrect->re-evict cycles). Evicted
+    higher-seq ids are invisible here, so this is a CONSERVATIVE ceiling
+    (maximizes detected excess); g-115-1936's independent completions-delta
+    cross-check confirmed the excess is genuine phantom, not hidden high-seq
+    eviction. (g-115-1951 / g-115-1938 conservation canary)"""
+    prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"   #  -> g-249-
+    max_seq = 0
+    suffixed = 0
+    for g in asp.get("goals", []) or []:
+        gid = str(g.get("id", ""))
+        if not gid.startswith(prefix):
+            continue
+        tail = gid[len(prefix):]
+        num = tail.rstrip("abcdefghijklmnopqrstuvwxyz")
+        if num.isdigit():
+            max_seq = max(max_seq, int(num))
+            if tail != num:            # had an alpha suffix (g-NNN-12a)
+                suffixed += 1
+    return max_seq + suffixed
+
+
+def _audit_violations(items):
+    """Read-only pigeonhole conservation audit (1 / 8).
+    Returns a per-aspiration report where in_list_sequence_goals + census_sum
+    exceeds id capacity — archived_census claiming more evicted goals than the
+    id-space could ever have held. Sorted by excess desc."""
+    out = []
+    for asp in items:
+        goals = asp.get("goals", []) or []
+        prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"
+        in_list = sum(1 for g in goals if str(g.get("id", "")).startswith(prefix))
+        cap = _capacity(asp)
+        census_sum = sum(census_by_status(asp).values())
+        claimed = in_list + census_sum
+        if cap > 0 and claimed > cap:
+            out.append({
+                "id": asp.get("id", "?"),
+                "in_list": in_list,
+                "census_sum": census_sum,
+                "capacity": cap,
+                "excess": claimed - cap,
+                "true_evicted_max": cap - in_list,
+            })
+    out.sort(key=lambda v: -v["excess"])
+    return out
+
+
+def _scale_by_status(bs: dict, old_sum: int, target: int) -> dict:
+    """Scale a {status:count} census down to sum==target, preserving proportions
+    via largest-remainder rounding (hits target EXACTLY, never over/under by
+    rounding). target 0 -> empty. Statuses that round to 0 are dropped."""
+    if old_sum <= 0 or target <= 0:
+        return {}
+    raw = {s: (n * target / old_sum) for s, n in bs.items()}
+    floored = {s: int(v) for s, v in raw.items()}
+    remainder = target - sum(floored.values())
+    # Hand the remaining units to the largest fractional parts first.
+    order = sorted(bs.keys(), key=lambda s: -(raw[s] - floored[s]))
+    for i in range(remainder):
+        floored[order[i % len(order)]] += 1
+    return {s: n for s, n in floored.items() if n > 0}
+
+
+def _make_census_repair(stamp: str):
+    """locked_modify_jsonl modifier: for each aspiration with a pigeonhole
+    violation, shrink archived_census.by_status so census_sum == capacity -
+    in_list (the max conservation-valid evicted count), preserving per-status
+    proportions and stamping a census_note. Non-violating aspirations untouched.
+    Returns the modified items; raises if any violation SURVIVES (post-repair
+    conservation guard — the write aborts rather than land a partial fix)."""
+    def _repair(items):
+        for asp in items:
+            goals = asp.get("goals", []) or []
+            prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"
+            in_list = sum(1 for g in goals if str(g.get("id", "")).startswith(prefix))
+            cap = _capacity(asp)
+            bs = census_by_status(asp)
+            census_sum = sum(bs.values())
+            if cap <= 0 or in_list + census_sum <= cap:
+                continue  # no violation — leave untouched
+            target = max(0, cap - in_list)
+            census = asp.setdefault(CENSUS_KEY, {})
+            if not isinstance(census, dict):
+                census = {}
+                asp[CENSUS_KEY] = census
+            census["by_status"] = _scale_by_status(bs, census_sum, target)
+            census["census_note"] = (
+                f"reconciled g-115-1951 {stamp}: census_sum {census_sum}->{target} "
+                f"(capacity {cap} - in_list {in_list}); per-status proportionally "
+                f"scaled from prior distribution; exact evicted-id status recovery "
+                f"from .history deferred (estimate).")
+        # Post-repair conservation guard: no violation may survive.
+        survivors = _audit_violations(items)
+        if survivors:
+            raise RuntimeError(
+                "census repair left violations — ABORTING write: "
+                f"{[(v['id'], v['excess']) for v in survivors[:5]]}")
+        return items
+    return _repair
 
 
 def _plan(items, cutoff):
@@ -199,6 +306,17 @@ def main():
                          "(default 45 — beyond every record-consumer's window)")
     ap.add_argument("--apply", action="store_true",
                     help="perform the write (default: dry-run, read-only)")
+    ap.add_argument("--audit", action="store_true",
+                    help="read-only pigeonhole conservation audit: report any "
+                         "aspiration whose in_list + archived_census exceeds id "
+                         "capacity (phantom census double-count). Exit 1 on any "
+                         "violation, 0 when clean. (g-115-1951 / g-115-1938)")
+    ap.add_argument("--repair-census", action="store_true",
+                    help="fix pigeonhole violations: shrink each violating "
+                         "aspiration's archived_census to census_sum == capacity "
+                         "- in_list (proportional per-status scaling + census_note). "
+                         "DRY-RUN unless --apply. Post-repair audit must be clean or "
+                         "the write aborts. (g-115-1951)")
     args = ap.parse_args()
 
     base = WORLD_DIR if args.source == "world" else AGENT_DIR
@@ -222,6 +340,71 @@ def main():
         print(f"[evict] (refresh skipped: {e})", file=sys.stderr)
     items = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()
              if ln.strip()]
+
+    # Read-only conservation audit (1 / 8). Reports and exits
+    # BEFORE any eviction plan/write — --audit never mutates.
+    if args.audit:
+        violations = _audit_violations(items)
+        print(f"[audit] source={args.source} path={path}")
+        print(f"[audit] scanned {len(items)} aspirations")
+        if not violations:
+            print("[audit] OK — zero pigeonhole violations "
+                  "(census conserves id-space).")
+            return 0
+        print(f"[audit] {len(violations)} CONSERVATION VIOLATION(S) "
+              "(in_list + census_sum > id capacity):")
+        total_excess = 0
+        for v in violations:
+            total_excess += v["excess"]
+            print(f"         {v['id']:12} in_list={v['in_list']:4} "
+                  f"census={v['census_sum']:4} capacity={v['capacity']:4} "
+                  f"EXCESS={v['excess']:4} (true_evicted_max={v['true_evicted_max']})")
+        print(f"[audit] total phantom excess: {total_excess}")
+        return 1
+
+    # Census repair (1): shrink violating archived_census to
+    # conservation-valid counts. DRY-RUN unless --apply.
+    if args.repair_census:
+        violations = _audit_violations(items)
+        print(f"[repair] source={args.source} path={path}")
+        if not violations:
+            print("[repair] nothing to repair — audit already clean.")
+            return 0
+        print(f"[repair] {len(violations)} violation(s) to reconcile "
+              "(census_sum -> capacity - in_list):")
+        # Per-asp before/after by_status projection (goal outcome 2 evidence).
+        by_id = {str(a.get("id", "")): a for a in items}
+        for v in violations:
+            asp = by_id.get(v["id"], {})
+            before_bs = census_by_status(asp)
+            after_bs = _scale_by_status(before_bs, v["census_sum"], v["true_evicted_max"])
+            print(f"  {v['id']:12} census_sum {v['census_sum']:4} -> "
+                  f"{v['true_evicted_max']:4}  (capacity {v['capacity']}, "
+                  f"in_list {v['in_list']}, excess -{v['excess']})")
+            print(f"               by_status {dict(before_bs)} -> {after_bs}")
+        if not args.apply:
+            print("[repair] DRY-RUN — re-run with --apply to write "
+                  "(prior records recoverable from .history; post-repair audit "
+                  "must be clean or the write aborts).")
+            return 0
+
+        from _fileops import locked_modify_jsonl
+        stamp = datetime.now().strftime("%Y-%m-%d")
+        locked_modify_jsonl(path, _make_census_repair(stamp))
+        try:
+            get_backend().refresh(path)
+        except Exception:
+            pass
+        after_items = [json.loads(ln) for ln in
+                       path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        after_v = _audit_violations(after_items)
+        if after_v:
+            print(f"[repair] WARN: {len(after_v)} violation(s) REMAIN after "
+                  "repair — investigate.", file=sys.stderr)
+            return 1
+        print(f"[repair] APPLIED — {len(violations)} aspiration(s) reconciled; "
+              "audit now clean (zero violations).")
+        return 0
 
     before_bytes = path.stat().st_size
     total_goals_now = sum(len(a.get("goals", []) or []) for a in items)

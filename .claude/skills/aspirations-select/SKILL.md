@@ -67,7 +67,15 @@ IF parsed_output is a JSON object with "all_blocked": true:
     RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)
 
 ranked_goals = parsed_output  # JSON array of scored candidates
-# Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw}
+# Each entry: {goal_id, aspiration_id, title, skill, category, recurring, score, breakdown, raw, cross_world_origin}
+# Foreign-goal display hint (g-336-12): cross_world_origin is non-null
+# "<identity>@<origin-world>" ONLY on goals injected by a cross-world INFLUENCE
+# grant; null for native goals. Whenever a candidate is rendered to a
+# human-visible line — the ALL-BLOCKED list above, the Program-alignment probe,
+# any ▸ Output that names a goal by title — append a " [foreign: {cross_world_origin}]"
+# badge when the field is non-null, so the agent KNOWS it is executing another
+# world's intent and applies appropriate scrutiny (guardrails, review gate).
+# A native goal (null) renders unchanged — no badge, no false positive.
 
 # Partner-claim filter: drop any goal the partner is already in_flight on.
 # This is the live claim-conflict HINT — it avoids wasting decomposition and

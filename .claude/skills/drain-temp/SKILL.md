@@ -1,6 +1,6 @@
 ---
 name: drain-temp
-description: "Drains the agent's temp/ working-doc store into the knowledge tree. Walks every undrained file under agents/<agent>/temp/ (analyses, briefings, audits, design docs, snapshots), classifies each against the learning-routing decision tree, encodes its reusable value into the right store (knowledge tree / reasoning bank / guardrails / experience), then moves the file to temp/drained/ as an audit trail. Also PURGES stale pure-ephemera files (.log/.txt test-suite output, tool dumps) that carry no knowledge — deleting them rather than encoding (Phase 1.5). Use when the user says \"drain temp\", \"encode everything in temp\", \"clear out temp\", or when the aspirations-precheck temp-pressure check flags temp_drain_needed (>= drain threshold of undrained docs + ephemera). Pass --dry-run to list what WOULD drain or purge without encoding, moving, or deleting."
+description: "Drains the agent's temp/ working-doc store into the knowledge tree. Walks every undrained file under agents/{agent}/temp/ (analyses, briefings, audits, design docs, snapshots), classifies each against the learning-routing decision tree, encodes its reusable value into the right store (knowledge tree / reasoning bank / guardrails / experience), then moves the file to temp/drained/ as an audit trail. Also PURGES stale pure-ephemera files (.log/.txt/.py/.sh/.err test-suite output, tool dumps, one-shot scratch scripts) that carry no knowledge — deleting them rather than encoding (Phase 1.5, 120-min age guard). Use when the user says \"drain temp\", \"encode everything in temp\", \"clear out temp\", or when the aspirations-precheck temp-pressure check flags temp_drain_needed (>= drain threshold of undrained docs + ephemera). Pass --dry-run to list what WOULD drain or purge without encoding, moving, or deleting."
 user-invocable: true
 triggers:
   - "/drain-temp"
@@ -78,10 +78,11 @@ Bash: load-conventions.sh temp-store learning-routing
 the documented helper). Never hardcode an agent name and never derive the path
 from world/ or meta/ (see `.claude/rules/path-resolution.md`).
 
-## Phase 1.5: Purge Pure Ephemera (.log/.txt)
+## Phase 1.5: Purge Pure Ephemera (.log/.txt/.py/.sh/.err)
 
 temp/ also collects PURE-EPHEMERA files that carry no knowledge — test-suite
-output (`suite-*.log`) and tool dumps (`leak-check.txt`). These are NOT drainable
+output (`suite-*.log`), tool dumps (`leak-check.txt`), and one-shot scratch
+scripts (`build-*.py`, `orphan-*.py`, `restart-poller.sh`, `gs.err`). These are NOT drainable
 working docs: the framework's own guidance writes them here (see
 `.claude/rules/run-full-suite-after-deep-code.md` — "redirect to
 `agents/<agent>/temp/suite.log`"), but they have nothing to encode. Left alone
@@ -96,21 +97,25 @@ lose). Discard-only: no encode, no `drained/` move.
 ```
 SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 
-# Purge stale ephemera in temp/ ROOT only. `-maxdepth 1 -type f` lists files
-# directly under TEMP_DIR (drained/ is a depth-1 DIR excluded by -type f; its
-# files are depth-2, excluded by -maxdepth 1) — so drained/ is never touched.
-# Age guard (-mmin +120): skip files modified within the last 120 min so an
-# ACTIVELY-WRITTEN suite.log from an in-flight run (the daemon-safe full suite
-# is ~32 min; 120 min clears any realistic active run with wide margin) is never
-# deleted mid-write. A just-completed run's log is caught on a later drain cycle.
-Bash: source core/scripts/_paths.sh; TEMP_DIR="$AGENT_DIR/temp"
-Bash: find "$TEMP_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) -mmin +120
-  → capture the list = ephemera_to_purge (names go in the Phase 4 report)
-IF ephemera_to_purge is empty: purged_count = 0; continue.
-IF --dry-run: record the would-purge list only; DELETE NOTHING; purged_count = 0.
-ELSE:
-    Bash: find "$TEMP_DIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) -mmin +120 -delete
-    purged_count = len(ephemera_to_purge)
+# Purge stale ephemera via the CANONICAL GUARDED helper — NEVER hand-roll an
+# `rm` (or the find/rm inline) here. `temp-drain-purge.sh` asserts the temp dir
+# is set + non-empty, absolute, strictly under PROJECT_ROOT, and basename=='temp'
+# BEFORE any deletion, then uses `find … -maxdepth 1 -type f (ephemera globs)
+# -mmin +120 -delete` (never a per-file `rm` on an interpolated path). It leaves
+# drained/ untouched (a depth-1 subdir) and the 120-min age guard skips an
+# actively-written suite.log from an in-flight run.
+#
+# WHY the helper and NOT an inline rm: hand-rolling an unguarded
+# `rm -f "$TEMP_DIR/$f"` here — when $TEMP_DIR resolves empty — becomes an `rm`
+# on a root-relative path, which Claude Code flags as a dangerous-rm and PROMPTS
+# for confirmation EVEN under --dangerously-skip-permissions. An autonomous agent
+# cannot answer its own dialog, so the loop looks alive (state=RUNNING) but hangs
+# at zero progress until a human taps a button — an agent hung 46+ min this way
+# (g-115-1876). Do NOT reconstruct the find/rm inline; call the helper.
+Bash: bash core/scripts/temp-drain-purge.sh          # add --dry-run when the drain is --dry-run
+  → parse the JSON: purged_count = .purged; ephemera names = .files (for the Phase 4 report)
+IF --dry-run: invoke with --dry-run (purged=0, .would_purge lists what WOULD go); DELETE NOTHING.
+IF .purged == 0 AND .would_purge == 0: nothing to purge; continue.
 ```
 
 Ephemera NEWER than the age guard are left in place (a running suite's log); the

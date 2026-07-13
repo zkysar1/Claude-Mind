@@ -41,7 +41,12 @@ if str(_SD) not in sys.path:
     sys.path.insert(0, str(_SD))
 
 # wm.py asserts an agent at import time () — bind one before import.
-os.environ.setdefault("MIND_AGENT", "alpha")
+# _SAVED_AGENT capture per guard-588/rb-1096 module-level env hygiene: fill
+# only when absent (setdefault semantics); conftest env isolation re-seeds
+# between test modules, so no destructive override needs restoring here.
+_SAVED_AGENT = os.environ.get("MIND_AGENT")
+if _SAVED_AGENT is None:
+    os.environ["MIND_AGENT"] = "alpha"
 
 import wm  # noqa: E402  — core/scripts/wm.py (the module the importers now call)
 from _paths import AGENT_DIR  # noqa: E402

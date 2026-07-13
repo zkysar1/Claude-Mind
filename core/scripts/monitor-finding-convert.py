@@ -202,6 +202,7 @@ def main(argv=None):
     ap.add_argument("--title", default="")
     ap.add_argument("--priority", default="MEDIUM")
     ap.add_argument("--category", default="framework-architecture")
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", default="world", choices=["world", "agent"])
     ap.add_argument("--evidence", default="")
     ap.add_argument("--evidence-file", default="")

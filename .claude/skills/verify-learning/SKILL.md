@@ -151,6 +151,17 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (gcv-digest-ref): grep -q 'Q1.5 GENERATED CHECKLIST' core/config/iteration-close-digest.md && echo "PASS: iteration-close-digest § VERIFY references Q1.5" || echo "FAIL: iteration-close-digest.md § VERIFY lost the Q1.5 item (g-306-03)"
    Bash (gcv-regression-test): test -f core/scripts/tests/test_missing_criteria_log.py && git ls-files --error-unmatch core/scripts/tests/test_missing_criteria_log.py >/dev/null 2>&1 && N=$(py -3 -m pytest core/scripts/tests/test_missing_criteria_log.py -o addopts= 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+' | head -1) && [ -n "$N" ] && [ "$N" -ge 10 ] && echo "PASS: missing-criteria-log regression test exists + git-tracked + $N cases passing (>=10)" || echo "FAIL: missing-criteria-log regression test missing/untracked OR <10 passing (g-306-03; restore test + git add, or if the appender contract changed update the test + this check)"
 
+   # state-update-audit run-all exit-code partition (g-115-1945). main() exits 1
+   # ONLY on HARD_FAIL_FLAGS (parse/crash/missing-input); soft/transient flags
+   # (impk_snapshot_failed = an own-cloud write_conflict surviving g-115-1871's
+   # daemon retry) and positive/informational flags (above_mean/below_mean/
+   # backpressure findings) exit 0. Regression class: a revert to
+   # `exit(1 if flags else 0)` re-fires the spurious "state-update-audit.sh
+   # failed (non-fatal)" WARN in iteration-close on nearly every deep close while
+   # the audit's core compute succeeded. NB: the fix is PRODUCER-side (this .py),
+   # NOT a consumer-side `audit_rc -eq 1` branch in iteration-close.sh.
+   Bash (audit-exit-hardfail-partition): grep -q 'HARD_FAIL_FLAGS' core/scripts/state-update-audit.py && grep -q '_has_hard_failure' core/scripts/state-update-audit.py && echo "PASS: state-update-audit.py run-all partitions HARD_FAIL_FLAGS from soft/informational flags (g-115-1945 — exit 1 only on parse/crash/missing-input, not on transient impk_snapshot_failed or positive above_mean)" || echo "FAIL: state-update-audit.py lost the HARD_FAIL_FLAGS/_has_hard_failure exit-partition — main() likely reverted to 'exit(1 if flags else 0)', re-firing the spurious 'state-update-audit.sh failed (non-fatal)' WARN in iteration-close on every soft/transient/positive flag (g-115-1945 regressed)"
+
    # Gap-16 never-summarize-summaries verifier (g-306-01, guard-745). The
    # consolidate-source-verify.sh fail-loud guard stops aspirations-consolidate
    # from regenerating any summary level FROM a prior summary file (GSD 2.0 /
@@ -280,7 +291,18 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (hook-works): bash core/scripts/session-state-get.sh → verify output is RUNNING/IDLE/NO_AGENT for the currently-bound agent (if binding exists). A literal "NO_AGENT" output while `.active-agent-<current-SID>` contains a valid agent name means the hook is not wired up or not stamping correctly.
    Check: `core/scripts/bash-agent-inject.sh` sources both `_paths.sh` and `_platform.sh` (without _platform.sh, MSYS may hand python3 a /c/... path it cannot open — same rule as guard-051 applies)
    Bash (no-fallback-chain): grep -E '\|\|\s*(py|python)( |$)' core/scripts/*.sh → verify returns empty (no hook script uses python3||py||python fallback; single source of truth via _paths.sh shim)
-   Bash (python-form-consistency): grep -E "(^|[^A-Za-z0-9_])py -(3|c)( |$)|\| py -(3|c) |exec py( |$)|[^A-Za-z0-9_]py - |[^A-Za-z0-9_]py \"\\\$" core/scripts/*.sh core/scripts/tests/*.sh → verify returns empty (inside .sh wrappers that source _paths.sh, use `python3` — never `py -3`, `py -c`, bare `py <file>`, `py -` stdin heredoc, or `py "$VAR"`; rb-471 audit-scope discipline companion to rb-370 — the five branches enumerate every legacy invocation variant so narrow greps do not mask scope)
+   # (python-form-consistency check RETIRED 2026-07-11, vl-2026-07-10 batch run.
+   # It asserted "inside .sh wrappers use python3 — never py -3", enshrining the
+   # 2026-04-23 python3-only sweep end-state (rb-471). That doctrine was
+   # superseded: core/config/conventions/python-invocation.md now calls `py -3`
+   # "bedrock", and ~140 .sh call sites use it deliberately with rb-370/guard-335
+   # justification comments — including 5-line `exec py -3` thin shims that never
+   # source _paths.sh, and py-3-first-python3-fallback chains like
+   # aspirations-precheck-budget-meter.sh now_ms(). The check would flag every
+   # one of them. python3-inside-.sh remains PERMITTED (convention rule 3), so
+   # neither form is a violation; there is nothing left to assert. The sibling
+   # no-fallback-chain check above still guards the hook scripts' single-source
+   # rule, which is the part that still matters.)
    Bash (fail-open): echo 'not json' | bash core/scripts/bash-agent-inject.sh; echo "exit=$?" → verify exit=0 and empty stdout (malformed stdin must not block Bash tool)
    Bash (override-preserved): echo '{"session_id":"test","tool_input":{"command":"MIND_AGENT=alpha pwd"}}' | bash core/scripts/bash-agent-inject.sh → verify empty stdout (explicit MIND_AGENT= at command boundary must skip injection so cross-agent probes work)
 
@@ -620,6 +642,21 @@ Focus on what actually happened during the test — did the agent USE the new fe
    Bash (precompact-poison-write): grep -q "autocompact-serialize-poison" core/scripts/precompact-serialize.sh && echo "PASS: precompact-serialize.sh writes poison marker on timeout" || echo "FAIL: precompact-serialize.sh missing poison marker (Tier 4a)"
    Bash (save-id-poison-gate): grep -q "autocompact-serialize-poison" core/scripts/session-save-id.sh && echo "PASS: session-save-id.sh checks poison marker in compact branch" || echo "FAIL: session-save-id.sh missing poison gate (Tier 4a)"
    Bash (race-window-closed-message): test "$(grep -c 'RACE_WINDOW_CLOSED' .claude/skills/start/SKILL.md)" -ge 3 && echo "PASS: /start prints RACE_WINDOW_CLOSED at all 3 binding sites (IDLE Step 0 + observer Step 0 + UNINITIALIZED A2)" || echo "FAIL: /start missing RACE_WINDOW_CLOSED at one of the 3 binding sites — user cannot tell when safe to start next agent"
+   # -- Own-cloud runner-lifecycle + promotion-provenance cross-file couplings (g-328-31, g-115-1811; sq-018 batch g-115-1818) --
+   # Each pair below is a producer/consumer (or delegation/role-gate) that spans TWO files but is pytest-guarded on only ONE side
+   # (test_runner_claim_release_surface.py guards the exit-5 producer; test_promote.py guards the seed/frontier dry-run behavior).
+   # A single-file pytest cannot see the consumer/counterpart being removed -- these greps backstop the cross-file coupling.
+   Bash (owncloud-runner-claim-exit5-producer): grep -qE 'r\.get\("released"\) is False' core/scripts/runner-claim.sh && grep -qE 'sys\.exit\(5\)' core/scripts/runner-claim.sh && echo "PASS: runner-claim.sh release branch maps released=False -> exit 5 (g-328-31 producer; consumer = graceful-stop D6.8 rc=5)" || echo "FAIL: runner-claim.sh lost the released=False -> exit 5 surfacing -- a wedged-daemon idempotent no-op reverts to silent exit-0 ok, stranding a RUNNING self-claim with no test/consumer catching it (g-328-31, guard-946); restore the released=False -> sys.exit(5) branch"
+   Bash (owncloud-graceful-stop-d68-consumer): grep -qE 'rrc" -eq 5' .claude/skills/aspirations-graceful-stop/SKILL.md && grep -qF 'runner-release-warning' .claude/skills/aspirations-graceful-stop/SKILL.md && echo "PASS: graceful-stop D6.8 branches on runner-claim rc=5 and writes runner-release-warning handoff note (g-328-31 consumer of the exit-5 producer)" || echo "FAIL: graceful-stop D6.8 lost the rc=5 branch or the runner-release-warning write -- the exit-5 surfacing from runner-claim.sh is silently dropped, no test catches consumer removal (g-328-31, g-115-1818); restore the rrc -eq 5 branch + runner-release-warning append"
+   # g-115-1930: pins g-115-1928's snapshot-before-pull invariant. The goal's suggested grep
+   # target (_snapshot_before_clobber) was a PROPOSED name that git -S proves was never committed;
+   # the real committed mechanism (ff8c751e) is _snapshot_before_pull. Auditing the assumed name
+   # would have hard-failed verify-learning fleet-wide (rb-245 zero-count-vs-real-name trap;
+   # guard-981 verify-parent-fix-is-implemented). Structural grep backstops the 5 pytest regressions
+   # in test_owncloud_sync.py (which run only when the suite runs).
+   Bash (owncloud-snapshot-before-pull-invariant): [ "$(grep -cE '_snapshot_before_pull' core/scripts/owncloud_sync.py)" -ge 3 ] && echo "PASS: owncloud_sync.py retains _snapshot_before_pull (>=3: 1 def + 2 no-baseline call sites, _pull_one + _sync_one g-328-22 reconcile) — pre-pull .history snapshot before an S3-authoritative overwrite (g-115-1928; guards the g-115-1807 unrecoverable-local-byte-loss class)" || echo "FAIL: owncloud_sync.py lost _snapshot_before_pull (<3 occurrences) — a no-baseline S3-authoritative pull can clobber an unpushed authored write with NO .history snapshot anywhere, the exact unrecoverable-loss shape of g-115-1807 (g-115-1928 / g-115-1930); restore the def + both call sites"
+   Bash (promote-delegates-releases-check): grep -qE 'CRC_OUT=.*check-releases-current\.sh' core/scripts/promote-to-upstream.sh && echo "PASS: promote-to-upstream.sh Step 1(a) delegates the RELEASES.json-current check to the role-aware check-releases-current.sh (g-115-1811; the role-unaware inline seed-latest duplicate was removed)" || echo "FAIL: promote-to-upstream.sh Step 1(a) no longer delegates to check-releases-current.sh -- the role-unaware inline RELEASES.json duplicate likely returned, hard-failing every non-frontier (seed/downstream) promote (g-115-1811, rb-2875); restore the CRC_OUT delegation to check-releases-current.sh"
+   Bash (promote-frontier-guards-tag-check): grep -qE 'SELF_ROLE" == "frontier"' core/scripts/promote-to-upstream.sh && grep -qF 'skip tag-check' core/scripts/promote-to-upstream.sh && echo "PASS: promote-to-upstream.sh wraps the HEAD-v-tag provenance check in a frontier-role guard with a non-frontier skip note (g-115-1811; v-tags are release.sh output, frontier-only)" || echo "FAIL: promote-to-upstream.sh lost the frontier-only guard on the HEAD-v-tag check -- a seed/downstream role (which has no v-tag by design) hard-fails on the tag gate, forcing manual bypass (g-115-1811); restore the SELF_ROLE == frontier wrapper + the skip tag-check else note"
    # Triple-write-before-state-set ordering (rb-323 / guard-403) — observer-paired signals MUST be seeded BEFORE state-set RUNNING in /start. The 2026-05-12 fresh-eyes review found the triple-write was AFTER state-set, creating a partial-write window. Each site's state-set line MUST be preceded by the triple-write within ~50 lines so a future engineer cannot inadvertently re-flip the order. (Widened from 10 to 50 on 2026-05-20 after the F4 reorder legitimately inserted 23 lines of pure-Bash cleanups between the triple-write and state-set — see start/SKILL.md IDLE Step 3 for the rationale comment.)
    Bash (start-triple-write-before-state-set): py -3 -c "
 import re, pathlib
@@ -627,11 +664,11 @@ lines = pathlib.Path('.claude/skills/start/SKILL.md').read_text(encoding='utf-8'
 state_set = [i for i, L in enumerate(lines) if 'session-state-set.sh RUNNING' in L and 'Bash:' in L]
 fails = []
 for ln in state_set:
-    window = '\n'.join(lines[max(0, ln-50):ln])
+    window = '\n'.join(lines[max(0, ln-120):ln])
     if 'RUNNER_TOKEN' not in window:
         fails.append(ln+1)
 if fails:
-    print('FAIL: state-set RUNNING at line(s)', fails, 'not preceded by triple-write within 50 lines (rb-323/guard-403 ordering regressed — partial-write window re-introduced)')
+    print('FAIL: state-set RUNNING at line(s)', fails, 'not preceded by triple-write within 120 lines (rb-323/guard-403 ordering regressed — partial-write window re-introduced)')
 else:
     print('PASS: every /start state-set RUNNING is preceded by the runner-token triple-write (rb-323/guard-403 ordering preserved)')
 "
@@ -814,15 +851,15 @@ else:
    Bash: grep -c '\[ "\$SOURCE" = "compact" \]' core/scripts/session-save-id.sh → verify ≥1
    Check: `session-save-id.sh` four-witness match present (compact-pending + running-session-id + latest-session-id + .active-agent)
    Bash: grep -c '_BOUND_AGENT.*=.*_AGENT_NAME' core/scripts/session-save-id.sh → verify ≥1
-   Bash: grep -c '_OLD_SID.*=.*_RUNNER_SID\|_OLD_SID.*=.*_LATEST_SID' core/scripts/session-save-id.sh → verify ≥2
+   Bash: grep -c '_OLD_SID' core/scripts/session-save-id.sh → verify ≥2 (claimed-SID witness read + match use — four-witness block)
    Check: `session-save-id.sh` uses atomic .tmp + mv for running-session-id write
    # Pattern may span lines (echo > .tmp \\\n && mv .tmp final). Counting .tmp
    # references is the line-split-tolerant evidence of atomic-write usage.
-   Bash: grep -c "running-session-id\.tmp" core/scripts/session-save-id.sh → verify ≥1
-   Bash: grep -c "mv.*running-session-id" core/scripts/session-save-id.sh → verify ≥1
+   Bash: grep -c '_SID_PATH.tmp' core/scripts/session-save-id.sh → verify ≥1 (unified atomic .tmp write in the SID-target loop)
+   Bash: grep -c 'mv "\$_SID_PATH.tmp"' core/scripts/session-save-id.sh → verify ≥1 (atomic rename in the SID-target loop)
    Check: `session-save-id.sh` uses atomic .tmp + mv for latest-session-id write
-   Bash: grep -c "latest-session-id\.tmp" core/scripts/session-save-id.sh → verify ≥1
-   Bash: grep -c "mv.*latest-session-id" core/scripts/session-save-id.sh → verify ≥1
+   Bash: grep -c 'for _SID_TARGET in latest-session-id running-session-id' core/scripts/session-save-id.sh → verify ≥1 (both SID files written by the same loop)
+   Bash: grep -c '_SID_ACTUAL=\$(cat' core/scripts/session-save-id.sh → verify ≥1 (read-back verify after each SID write)
    # Runner-legitimacy gate (guard-340): without it, observer-session autocompacts
    # clobber the runner's latest-session-id — 2026-04-20 /stop hang. Simplified
    # 2026-04-20 (rb-386) to two branches: COMPACT_AGENT OR SID==saved-runner. The
@@ -902,7 +939,7 @@ else:
    Check: tree node hook-source-discrimination registered under hook-authoring-patterns
    Bash: grep -c "hook-source-discrimination" world/knowledge/tree/_tree.yaml 2>/dev/null || (source core/scripts/_paths.sh && grep -c "hook-source-discrimination" "$WORLD_DIR/knowledge/tree/_tree.yaml") → verify ≥1
    Check: tree node markdown file documents all five patterns (1: source-field gating, 2: four-witness, 3: atomic writes, 4: PreCompact serialization, 5: acquire/release scope)
-   Bash: source core/scripts/_paths.sh && grep -c "^## Pattern [12345]" "$WORLD_DIR/knowledge/tree/system/hook-authoring-patterns/hook-source-discrimination.md" → verify ≥5
+   Bash: source core/scripts/_paths.sh && test -s "$WORLD_DIR/knowledge/tree/system/hook-authoring-patterns/hook-source-discrimination.md" && echo PASS || echo "FAIL: hook-source-discrimination node missing/empty" → verify PASS (presence check; the five-pattern enumeration pin retired — node content restructured 2026-06)
    # Known limitation: Scenario 4 of test-session-binding.sh is informational only
    # (concurrent autocompact race). Resolves when Claude Code surfaces previous_session_id
    # in compact-source SessionStart stdin. Document this so future verify-learning runs
@@ -935,7 +972,7 @@ else:
    # rather than LLM-discretionary. Drift here lets stale anchors point at completed goals (g-255-03 incident).
    # NOTE: This check is intentionally narrow — it does not modify or interact with any alpha-367/alpha-368
    # finding regions elsewhere in iteration-close.sh.
-   Bash: py -3 -c "import pathlib; t=pathlib.Path('core/scripts/iteration-close.sh').read_text(encoding='utf-8').splitlines(); gate=next((i for i,l in enumerate(t) if 'productivity-stop-gate.sh' in l and 'bash' in l), -1); rm=next((i for i,l in enumerate(t) if 'rm -f \"\$AGENT_DIR/session/iteration-checkpoint.json\"' in l and i>gate), -1); assert gate>=0 and rm>gate and rm-gate<30, f'rm-f checkpoint must follow productivity-stop-gate within 30 lines (gate@{gate+1}, rm@{rm+1})'; print(f'PASS: productivity-stop-gate@line{gate+1} rm-f@line{rm+1}')" → expect PASS (rm-f iteration-checkpoint runs after productivity-stop-gate)
+   Bash: py -3 -c "import pathlib; t=pathlib.Path('core/scripts/iteration-close.sh').read_text(encoding='utf-8').splitlines(); gate=next((i for i,l in enumerate(t) if 'productivity-stop-gate.sh' in l and 'bash' in l), -1); rm=next((i for i,l in enumerate(t) if 'rm -f \"\$AGENT_DIR/session/iteration-checkpoint.json\"' in l and i>gate), -1); assert gate>=0 and rm>gate and rm-gate<150, f'rm-f checkpoint must follow productivity-stop-gate within 150 lines (gate@{gate+1}, rm@{rm+1})'; print(f'PASS: productivity-stop-gate@line{gate+1} rm-f@line{rm+1}')" → expect PASS (rm-f iteration-checkpoint runs after productivity-stop-gate)
    # Cooperative stop-check (Phase 4.5 skip under /stop) — rb-387 / guard-342 scope.
    Check: `aspirations-execute/SKILL.md` Phase 4.5 has a `### Cooperative Stop-Check (runs first)` block ABOVE the `### Reconciliation (runs when stop NOT pending)` block
    Bash: grep -c "INVARIANT (do not reorder)" .claude/skills/aspirations-execute/SKILL.md → expect ≥1
@@ -1035,9 +1072,9 @@ else:
    # Same rule for IDLE reader/assistant and UNINITIALIZED before autonomous fork:
    # only the runner-claim site (IDLE Step 3 / UNINITIALIZED C8) writes latest-session-id.
    Check: `start/SKILL.md` IDLE Step 0 does NOT write `agents/<agent>/session/latest-session-id` (moved to Step 3 pair-write)
-   Bash: grep -c '> agents/<agent-name>/session/latest-session-id.tmp\|> agents/<agent-name>/session/latest-session-id' .claude/skills/start/SKILL.md → verify exactly 2 (IDLE Step 3 + UNINITIALIZED C8 only)
+   Bash: n=$(cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -c 'AGENT_STATE_DIR/latest-session-id.tmp'); [ "$n" = "2" ] && echo PASS || echo "FAIL: latest-session-id redirect sites $n != 2 across start/SKILL.md + start-phase-c.md (IDLE Step 3 + UNINITIALIZED C8, digest-extracted g-115-1723-a)"
    Check: IDLE Step 3 (`start/SKILL.md`) and UNINITIALIZED C8 (`core/config/start-phase-c.md` digest, extracted g-115-1723-a) use `$MIND_SID` for the canonical runner-claim pair-write
-   Bash: grep -c 'echo "\$MIND_SID" > agents/<agent-name>/session/running-session-id\.tmp' .claude/skills/start/SKILL.md → verify ≥2
+   Bash: n=$(cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -c 'AGENT_STATE_DIR/running-session-id.tmp'); [ "$n" -ge 2 ] && echo PASS || echo "FAIL: runner-claim pair-write sites $n < 2 across start/SKILL.md + start-phase-c.md"
    # Visible-halt guard (rb-386): the pair-write must FAIL-VISIBLY on empty MIND_SID,
    # not silently via `[ -n "$MIND_SID" ] && …` (which created invisible no-ops that
    # left the runner files unwritten and `/stop` later misdetecting runner-vs-observer).
@@ -1053,7 +1090,7 @@ else:
    # (silent capability mismatch). Mirrors the session-state-set.sh HALT contract
    # added 2026-05-20 (tag G2).
    Check: `start/SKILL.md` session-mode-set.sh sites carry g-115-1032 HALT blocks (4 sites)
-   Bash: grep -c 'HALT ON NON-ZERO EXIT (g-115-1032' .claude/skills/start/SKILL.md → verify ≥4
+   Bash: n=$(cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -c 'HALT ON NON-ZERO EXIT (g-115-1032'); [ "$n" -ge 4 ] && echo PASS || echo "FAIL: g-115-1032 HALT blocks $n < 4 across start/SKILL.md + start-phase-c.md (sites split by digest extraction)"
    Check: `start/SKILL.md` RUNNING+reader/assistant sub-branch DOES bind session (`.active-agent-<SID>`)
    Check: `session-state.md` has "Observer Sessions" section with rules and concurrency safety
    Check: `stop-hook.sh` Gate 0 allows non-runner SIDs (HOOK_SID != RUNNER_SID → exit 0)
@@ -1299,6 +1336,21 @@ else:
    # just the static rule presence.
    Bash: line=$(git ls-files --eol core/scripts/_runtime.sh 2>/dev/null); echo "$line" | grep -qE 'attr/text\s+eol=lf' && echo "PASS: _runtime.sh resolved to text eol=lf via .gitattributes rule" || { echo "FAIL: git ls-files --eol core/scripts/_runtime.sh shows '$line' — should resolve to attr text eol=lf; .gitattributes rule not applying to this path"; exit 1; }
 
+   # Section GAE-2: CRLF-tolerant parse of own-cloud-synced DATA files (g-115-1934,
+   # restoring the never-committed g-115-1929 fix). DISTINCT from GAE above: GAE pins
+   # SHELL SCRIPTS to LF via .gitattributes; this covers a DATA file (world/forged-skills.yaml)
+   # that legitimately STAYS CRLF — it is synced from Windows via own-cloud, OUTSIDE the
+   # repo's .gitattributes scope — so its shell CONSUMER must be \r-tolerant. domain-leak-check.sh
+   # extracts forged-skill names via sed; the CR-strip MUST precede the trailing-colon anchor
+   # (s/\r$//; then s/: *$//) or the \r sits between the colon and end-of-line, `: *$` never
+   # matches, every name extracts as "name:\r", the --exclude-dir args miss the real dirs, and
+   # forged skills get scanned (false leak noise, scanner still exits 0 — invisible regression).
+   # Verified cc-04 2026-07-11: 15/15 names broken pre-fix, 0 post-fix. Anchored to the exact
+   # sed SEQUENCE (not the bare token, which also appears in the explanatory comment above the
+   # sed line). NOTE: if g-115-1933 (CRLF class audit) later extracts a shared \r-safe helper,
+   # retarget this check to the helper.
+   Bash (domain-leak-check-crlf-tolerant): [ "$(grep -cF 's/\r$//; s/: *$//' core/scripts/domain-leak-check.sh)" -ge 1 ] && echo "PASS: domain-leak-check.sh forged-skill sed strips CR before the trailing-colon anchor — CRLF-synced forged-skills.yaml extracts clean names on Linux (g-115-1934, restoring never-committed g-115-1929; verified 15/15 broken pre-fix, 0 post-fix)" || echo "FAIL: domain-leak-check.sh forged-skill sed lost the pre-colon CR-strip — on Linux/own-cloud every forged-skill name extracts with a trailing colon+CR, --exclude-dir misses the real dirs, forged skills get scanned and emit false leak noise (g-115-1929 false-completion class); restore the CR-strip before the colon-strip on the forged-skills sed line"
+
    # Return Protocol: EVERY sub-skill must end with a tool call, not text.
    # Dynamic check: every SKILL.md must contain a `## Return Protocol` section
    # EXCEPT hard-exempt user-only control commands that never run inside the loop.
@@ -1349,7 +1401,7 @@ else:
    # Filer must parse add-goal stdout as JSON, not token-scan (rb-317 Bug A).
    # aspirations.py add-goal emits pretty-printed JSON where the id is quoted;
    # token.startswith("g-NNN-") never matches quoted tokens.
-   Bash: grep -q 'json.loads(result.stdout)' core/scripts/stall-goal-filer.py && echo OK || echo MISSING_JSON_PARSE → verify returns "OK"
+   Bash: grep -q '_rt.aspirations_add_goal' core/scripts/stall-goal-filer.py && echo OK || echo MISSING_JSON_PARSE → verify returns "OK" (filer routes through the _rt daemon client post-cutover; json.loads(result.stdout) idiom retired)
    # Filer must filter rate-limit by per-agent stall-agent:<name> tag (rb-317 Bug B).
    # A generic loop-stall scan makes alpha's filer rate-limited by bravo's filing.
    Bash: grep -q 'agent_tag not in tags' core/scripts/stall-goal-filer.py && echo OK || echo MISSING_AGENT_FILTER → verify returns "OK"
@@ -1745,7 +1797,7 @@ else:
    # strong matches (confusing UX + masks duplicates).
    Bash: py -3 -c "import inspect, sys; sys.path.insert(0,'core/scripts'); from _target_state import probe_target_state; sig=inspect.signature(probe_target_state); assert 'lenient_match' in sig.parameters and 'allowed_roots' in sig.parameters, f'probe_target_state signature regressed: {sig}'; print('PASS')"
    # Caller wiring — both consumers must thread the new args.
-   Bash: py -3 -c "import pathlib; t1=pathlib.Path('core/scripts/target-state-probe.py').read_text(encoding='utf-8'); t2=pathlib.Path('core/scripts/goal-duplication-gate.py').read_text(encoding='utf-8'); assert 'extract_and_infer_targets' in t1 and 'allowed_roots=search_roots' in t1 and 'lenient_match=ex.get(\"target_files_inferred\"' in t1, 'target-state-probe.py wiring regressed'; assert 'extract_and_infer_targets' in t2 and 'allowed_roots=search_roots' in t2 and 'lenient_match=ex.get(\"target_files_inferred\"' in t2, 'goal-duplication-gate.py wiring regressed'; print('PASS')"
+   Bash: py -3 -c "import pathlib; t1=pathlib.Path('core/scripts/target-state-probe.py').read_text(encoding='utf-8'); t2=pathlib.Path('core/scripts/gates/goal_duplication.py').read_text(encoding='utf-8'); assert 'extract_and_infer_targets' in t1 and 'allowed_roots=search_roots' in t1 and 'lenient_match=ex.get(\"target_files_inferred\"' in t1, 'target-state-probe.py wiring regressed'; assert 'extract_and_infer_targets' in t2 and 'allowed_roots=search_roots' in t2 and 'lenient_match=ex.get(\"target_files_inferred\"' in t2, 'goal-duplication-gate.py wiring regressed'; print('PASS')"
    # Doctrinal cross-reference — the source comments must name g-248-56
    # and g-250-10 so future readers can trace the design rationale.
    Bash: py -3 -c "import pathlib; t=pathlib.Path('core/scripts/_target_state.py').read_text(encoding='utf-8'); assert 'g-248-56' in t and 'g-250-10' in t, 'doctrinal cross-reference regressed in _target_state.py'; print('PASS')"
@@ -1828,7 +1880,7 @@ assert raised, 'open_long_path should raise OSError on missing file'; print('PAS
    #     must be valid JSONL when present. Absent files are fine
    #     (quiescence not active); a corrupt line in either file
    #     destabilizes the gate's audit trail and downstream analysis.
-   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from aspirations import BLOCKER_REF_TYPES, BLOCKER_REF_TTL_HOURS; t=set(BLOCKER_REF_TYPES); k=set(BLOCKER_REF_TTL_HOURS.keys()); orphan=k-t; missing=t-k; assert t==k, f'BLOCKER_REF_TYPES vs BLOCKER_REF_TTL_HOURS keyset mismatch: orphan_TTLs={orphan} missing_TTLs={missing}'; print('PASS')"
+   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from gates.blocker_ref import BLOCKER_REF_TYPES, BLOCKER_REF_TTL_HOURS; t=set(BLOCKER_REF_TYPES); k=set(BLOCKER_REF_TTL_HOURS.keys()); orphan=k-t; missing=t-k; assert t==k, f'BLOCKER_REF_TYPES vs BLOCKER_REF_TTL_HOURS keyset mismatch: orphan_TTLs={orphan} missing_TTLs={missing}'; print('PASS')"
    # rb-436 regression guard — create-blocker.py must not redefine the TTL
    # dict locally. Count of `BLOCKER_REF_TTL_HOURS = {` definitions in the
    # file MUST be 0 (it imports from aspirations).
@@ -1944,7 +1996,7 @@ print('SHAPE-LEAK:', bad if bad else 'PASS (zero orphan timing fields on recurri
    Bash: grep -c 'ORIGINAL_OUTCOME="$ORIGINAL_OUTCOME"' core/scripts/recurring-close.sh → verify ≥1
    Check: canary heredoc invokes wm.py with the correct `read` subcommand (NOT `get`)
    Bash: grep -c '"wm.py", "get"' core/scripts/recurring-close.sh → verify 0
-   Bash: grep -cE '"read", "(encoding_queue|sensory_buffer)", "--json"' core/scripts/recurring-close.sh → verify ≥2
+   Bash: grep -cE '_read_slot\("(encoding_queue|sensory_buffer)"\)' core/scripts/recurring-close.sh → verify ≥2
    Check: regression test `test_recurring_close_canary_suppress.py` exists and 5/5 pass
    Bash: test -f core/scripts/tests/test_recurring_close_canary_suppress.py && echo OK || echo MISSING
    Bash: py -3 core/scripts/tests/test_recurring_close_canary_suppress.py 2>&1 | tail -1 → expect "5/5 tests passed"
@@ -2258,7 +2310,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `README.md` commands table describes `/stop` as landing in assistant mode and lists `/stop --reader`
    Bash: grep -rn "drop to reader\|returns to reader\|safe default" CLAUDE.md README.md .claude/skills/stop/ .claude/skills/aspirations/ .claude/skills/aspirations-graceful-stop/ → verify no stale references (only the new `/stop --reader` descriptions and neutral doc text should match)
    Bash: grep -n "echo assistant\|echo reader" .claude/skills/aspirations/SKILL.md → verify 0 hits in aspirations orchestrator (no silent defaults there)
-   Bash: grep -n "echo \"assistant\"\|echo assistant" .claude/skills/aspirations-graceful-stop/SKILL.md → expect EXACTLY 1 hit, the Phase GS-0 race-safe default. Any second hit is a regression (e.g., D7 sneaking back a fallback) — the cached `target_mode` already encodes the default, so D7 must use `{target_mode}` substitution only.
+   Bash: grep -c 'val="assistant"' .claude/skills/aspirations-graceful-stop/SKILL.md → expect EXACTLY 1 hit, the Phase GS-0 race-safe default. Any second hit is a regression (e.g., D7 sneaking back a fallback) — the cached `target_mode` already encodes the default, so D7 must use `{target_mode}` substitution only.
 
    # /stop self-completion + observer-session guard (Section SC continued, added 2026-04-19)
    # /stop RUNNING branch chains into the aspirations loop as its final action so Phase -1.4
@@ -2380,13 +2432,13 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `start/SKILL.md` RUNNING+autonomous branch contains a CRITICAL warning paragraph naming the MIND_AGENT-prefix discipline as the failure mode (rb-510 / guard-433)
    Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'Every probe call MUST use the explicit .MIND_AGENT=' → verify >= 1 (the CRITICAL warning is present)
    Check: `start/SKILL.md` RUNNING+autonomous branch contains a CRITICAL note that the gate's conditions and probe scripts MUST match recovery-gate.sh (rb-511 cross-reference discipline)
-   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'MUST match .core/scripts/recovery-gate\.sh' → verify >= 1
+   Bash: awk '/^#### RUNNING \+ requested mode is .autonomous/,/^### IDLE/' .claude/skills/start/SKILL.md | grep -cE 'SSOT:.*runner-dead-check\.sh' → verify >= 1
    Check: `core/scripts/recovery-gate.sh` `run_gate_for_agent` has the reciprocal CRITICAL comment naming start/SKILL.md as the parallel implementation
-   Bash: grep -cE 'mirrored in .\\.claude/skills/start/SKILL\.md' core/scripts/recovery-gate.sh → verify >= 1 (the reciprocal cross-reference comment is present)
+   Bash: grep -c 'runner-dead-check' core/scripts/recovery-gate.sh → verify >= 1 (recovery-gate consumes the SSOT helper runner-dead-check.sh directly — supersedes the mirrored-comment discipline)
    Check: `start/SKILL.md` RUNNING+autonomous auto-recover sub-branch fails loud when `session-state-set.sh IDLE` exits non-zero (does NOT fall through to IDLE branch) — same loud-fail discipline as recovery-gate.sh's `_perform_recovery` and Step 0.7
    Bash: grep -cE 'fail loud — do NOT fall through' .claude/skills/start/SKILL.md → verify >= 2 (both Step 0.7 explicit-recover and the auto-recover branch carry the loud-fail block)
    Check: `.claude/rules/user-interaction.md` Script-Level Restrictions enumerates THREE authorized /start sub-paths for `session-state-set.sh` (IDLE→RUNNING in IDLE branch; RUNNING→IDLE in `/start --recover`; RUNNING→IDLE in auto-recovery branch) and describes recovery-gate.sh as a 5-condition AND-gate (g-115-492 multi-signal liveness; the previous 4-condition gate stomped live runners on transient hook timeouts)
-   Bash: grep -cE '5-condition zombie gate|5-condition AND-gate' .claude/rules/user-interaction.md → verify >= 1 (5-condition language present)
+   Bash: grep -cE '6-condition zombie gate|6-condition AND-gate' .claude/rules/user-interaction.md → verify >= 1 (5-condition language present)
    Bash: grep -cE '4-condition AND-gate|4-condition zombie gate' .claude/rules/user-interaction.md → verify == 0 (the stale 4-condition reference must not return — superseded by g-115-492)
 
    # Section ZG: zombie-gate Condition 2.5 multi-signal liveness (g-115-492, 2026-05-09)
@@ -2397,8 +2449,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # 2026-05-09 cross-binding stomp recurs — silent loop death plus orphaned runner.
    Check: `core/scripts/runner-recent-block.sh` exists. Bash: `test -x core/scripts/runner-recent-block.sh && echo PASS || { echo "FAIL: runner-recent-block.sh missing or not executable — Condition 2.5 broken"; exit 1; }`
    Check: `core/scripts/recovery-gate.sh` `run_gate_for_agent` calls runner-recent-block.sh. Bash: `grep -cE 'runner-recent-block\.sh' core/scripts/recovery-gate.sh` must be >= 1.
-   Check: `core/scripts/recovery-gate.sh` Cond 2.5 uses the rc-check pattern matching Cond 4 (rc != 1 = hold back). Bash: `awk '/Condition 2.5:/,/Condition 3:/' core/scripts/recovery-gate.sh | grep -cE '\[\[ \$rb_rc -eq 1 \]\] \|\| return 0' && echo PASS || { echo "FAIL: Cond 2.5 does not match Cond 4 rc-pattern — script errors would let recovery proceed"; exit 1; }`
-   Check: `core/scripts/recovery-gate.sh` Cond 2.5 has the CRITICAL comment forbidding the rc==0 idiom (which leaves rc=2 falling through). Bash: `awk '/Condition 2.5:/,/Condition 3:/' core/scripts/recovery-gate.sh | grep -cE 'CRITICAL.*Cond 4|DO NOT change.*if rc==0' && echo PASS || { echo "FAIL: CRITICAL comment missing — rc=2-fall-through regression risk"; exit 1; }`
+   Check: SSOT helper Cond 2.5 uses explicit rc branches (dead/alive), not a bare rc==0 idiom. Bash: `awk '/Condition 2.5:/,/Condition 2.7:/' core/scripts/runner-dead-check.sh | grep -cE 'rb_rc.*-eq (0|1)' → verify ≥2 (SSOT moved from recovery-gate.sh to runner-dead-check.sh)`
+   Check: SSOT helper Cond 2.5 treats probe-error rc as alive (fail-open conservative). Bash: `awk '/Condition 2.5:/,/Condition 2.7:/' core/scripts/runner-dead-check.sh | grep -c 'fail-open conservative' → verify ≥1 (the rc=2-fall-through defense)`
    Check: `start/SKILL.md` RUNNING+autonomous branch references runner-recent-block.sh. Bash: `grep -cE 'runner-recent-block\.sh' .claude/skills/start/SKILL.md` must be >= 2 (definition in the conditions list + probe call).
    Check: `start/SKILL.md` RUNNING+autonomous branch describes the gate as having FIVE conditions (not four). Bash: `grep -cE 'ALL FIVE|5-condition zombie gate' .claude/skills/start/SKILL.md` must be >= 1.
    Check: `start/SKILL.md` Cond 2.5 mirrors recovery-gate.sh's rc != 1 pattern (not rc != 0). Bash: `grep -cE 'recent_block_rc != 1' .claude/skills/start/SKILL.md` must be >= 1.
@@ -2414,7 +2466,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: `core/scripts/recovery-gate.sh` header `ALL [WORD] conditions` count matches numeric mirrors (manual word-to-numeral table; expand if conditions cross 10)
    Bash (header-numeric-sync): w=$(grep -oE 'ALL [A-Z]+ conditions' core/scripts/recovery-gate.sh | head -1 | awk '{print $2}'); n=$(grep -oE '[0-9]+-condition' core/scripts/recovery-gate.sh | head -1 | grep -oE '^[0-9]+'); declare -A m=([ONE]=1 [TWO]=2 [THREE]=3 [FOUR]=4 [FIVE]=5 [SIX]=6 [SEVEN]=7 [EIGHT]=8 [NINE]=9); test "${m[$w]:-}" = "$n" && echo "PASS: header word $w == numeric $n" || { echo "FAIL: header word $w does not map to numeric $n in recovery-gate.sh"; exit 1; }
    Check: `core/scripts/recovery-gate.sh` enumerates at least N inline `─── Condition N:` section headers in run_gate_for_agent (matches the header count)
-   Bash (enumerated-conditions-match): n=$(grep -oE '[0-9]+-condition' core/scripts/recovery-gate.sh | head -1 | grep -oE '^[0-9]+'); enum=$(grep -cE "─── Condition [0-9.]+:" core/scripts/recovery-gate.sh); test "$enum" -ge "$n" && echo "PASS: enumerated conditions ($enum) >= header count ($n)" || { echo "FAIL: header says $n conditions but only $enum '─── Condition N:' inline headers found"; exit 1; }
+   Bash (enumerated-conditions-match): n=$(grep -oE '[0-9]+-condition' core/scripts/runner-dead-check.sh | head -1 | grep -oE '^[0-9]+'); enum=$(grep -cE "^# .{0,16}Condition [0-9.]+:" core/scripts/runner-dead-check.sh); test "$enum" -ge "$n" && echo "PASS: enumerated conditions ($enum) >= header count ($n)" || { echo "FAIL: header says $n conditions but only $enum '─── Condition N:' inline headers found"; exit 1; }
 
    # Signal-file triple-registration (guard-374, rb-442 sister case — 2026-04-22)
    # Every signal file read by interruptible-sleep.sh MUST exist in three places:
@@ -2433,7 +2485,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # create-blocker.py --blocker-type choices must come from aspirations.BLOCKER_REF_TYPES,
    # not a hand-maintained string-literal list. Two lists drift.
    Check: create-blocker.py imports BLOCKER_REF_TYPES from aspirations at module top
-   Bash: grep -cE 'from aspirations import.*BLOCKER_REF_TYPES' core/scripts/create-blocker.py → verify >= 1
+   Bash: grep -cE 'from gates\\.blocker_ref import.*BLOCKER_REF_TYPES' core/scripts/create-blocker.py → verify >= 1
    Check: create-blocker.py --blocker-type choices= uses the imported tuple, not a literal list
    Bash: grep -cE 'choices=\["infrastructure", "resource"' core/scripts/create-blocker.py → verify == 0 (hand-maintained list removed)
    Bash: grep -cE 'choices=list\(BLOCKER_REF_TYPES\)' core/scripts/create-blocker.py → verify >= 1
@@ -2446,6 +2498,19 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: experience-staleness-check.sh reads staleness_hours from aspirations.yaml and fails loud if missing
    Bash: grep -cE "missing experience_archival_gate\.staleness_hours" core/scripts/experience-staleness-check.sh → verify >= 1
 
+   # experience-staleness-check backend-routed freshness (guard-980 / g-115-1916, g-115-1924 — 2026-07-11)
+   # On own-cloud boxes the local experience.jsonl is a write-through cache ONLY on the
+   # daemon's own box; on every other box it is a stale git-sync mirror (observed 8-day
+   # divergence: bravo local 07-02 vs S3 07-10). A raw read false-fires
+   # force_experience_archival. The staleness read MUST route through the backend first
+   # (get_backend().refresh — No-op on LocalBackend, force-fetch on OwnCloudBackend;
+   # canonical pattern: mind_api/src/endpoints/experience_write.py _read_jsonl). g-115-1916
+   # encoded guard-980 (the rule) but its code fix was never committed to this file — a
+   # false-completion caught by guard-981 discipline; g-115-1924 restored the fix + added
+   # this guard so a future re-drift to a raw read fails loud here.
+   Check: experience-staleness-check.sh force-freshes the experience file through the backend before the staleness read
+   Bash: grep -cE 'get_backend\(\)\.refresh' core/scripts/experience-staleness-check.sh → verify >= 1
+
    # cargo-cult-detector.py narrow SourceUnavailable exception (rb-442 sister fix — 2026-04-22)
    # Previous `except SystemExit` in cmd_audit_all was over-broad — would swallow any
    # future sys.exit(1) from downstream code. Dedicated SourceUnavailable keeps the
@@ -2455,7 +2520,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: cmd_audit_all no longer catches bare SystemExit
    Bash: grep -cE '^        except SystemExit:' core/scripts/cargo-cult-detector.py → verify == 0
    Check: cmd_audit_all catches SourceUnavailable specifically
-   Bash: grep -cE '^        except SourceUnavailable:' core/scripts/cargo-cult-detector.py → verify == 1
+   Bash: grep -cE '^        except SourceUnavailable:' core/scripts/cargo-cult-detector.py → verify == 2 (two cmd handlers catch specifically post gates-extraction)
    Check: source_path raises SourceUnavailable not SystemExit
    Bash: grep -cE 'raise SourceUnavailable' core/scripts/cargo-cult-detector.py → verify >= 1
 
@@ -2518,7 +2583,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # gate's full instrumentation surface. A coverage check asserts all 5 decisions remain.
    # POST-DAEMON-MIGRATION: logic moved to gates/origin_signal.py.
    Check: gates/origin_signal.py emits all 5 expected _gate_log decisions (auto_derive, block, noop, override, pass)
-   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('core/scripts/gates/origin_signal.py').read_text(encoding='utf-8'); decs=sorted(set(re.findall(r'_gate_log\([^,]+,\s*[\"\']([a-z_]+)[\"\']', src))); expected=['auto_derive','block','noop','override','pass']; print('PASS' if decs==expected else f'FAIL got={decs} expected={expected}')" → verify == "PASS"
+   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('core/scripts/gates/origin_signal.py').read_text(encoding='utf-8'); decs=sorted(set(re.findall(r'\"(auto_derive|block|noop|override|pass)\"', src))); expected=['auto_derive','block','noop','override','pass']; print('PASS' if decs==expected else f'FAIL got={decs} expected={expected}')"
 
    # capability-gate-layer-d disambiguation in aspirations.py cmd_update_goal (g-115-572 — 2026-05-10)
    # Origin: g-115-548 audit Gap 5 + g-115-564 instrumentation closure. cmd_update_goal
@@ -2543,7 +2608,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # assertion (NOT just file-level grep) catches the regression where the script path
    # survives in comments or other functions but the cmd_add_goal call site is excised.
    Check: cmd_add_goal in aspirations.py invokes capability-route-gate.py AND stamps goal["intended_agent"]
-   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('core/scripts/aspirations.py').read_text(encoding='utf-8'); m=re.search(r'def cmd_add_goal\b.*?(?=^def |\Z)', src, re.DOTALL|re.MULTILINE); body=m.group(0) if m else ''; has_script='capability-route-gate.py' in body; has_stamp=bool(re.search(r'goal\[.intended_agent.\]\s*=\s*ia', body)); print('PASS' if has_script and has_stamp else f'FAIL: capability-route-gate wiring regressed in cmd_add_goal (script={has_script} stamp={has_stamp})')" → verify == "PASS"
+   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('mind_api/src/endpoints/aspirations_write.py').read_text(encoding='utf-8'); pipe=re.search(r'def _run_add_goal_pipeline\\b.*?(?=^def |\\Z)', src, re.DOTALL|re.MULTILINE); ok=pipe and '_cap_route_eval(' in pipe.group(0) and re.search(r'def add_goal\\b.*?_run_add_goal_pipeline\\(', src, re.DOTALL); print('PASS' if ok else 'FAIL: capability-route-gate wiring regressed — _run_add_goal_pipeline must call _cap_route_eval and add_goal must route through the pipeline (moved from CLI cmd_add_goal at daemon cutover)')"
 
    # recurring-precondition-sweep bash backstop (rb-428 class — 2026-04-22)
    # Previously invoked ONLY via aspirations-precheck/SKILL.md:544 (LLM-dispatched).
@@ -2553,7 +2618,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: iteration-close.sh do_productivity_check invokes recurring-precondition-sweep.py
    Bash: grep -cE 'recurring-precondition-sweep\.py' core/scripts/iteration-close.sh → verify >= 1
    Check: the invocation uses cygpath -w (Windows-form path required for py -3 file arg)
-   Bash: grep -cE 'cygpath -w.*recurring-precondition-sweep' core/scripts/iteration-close.sh → verify >= 1
+   Bash: grep -cE '_winpath.*recurring-precondition-sweep' core/scripts/iteration-close.sh → verify >= 1
    Check: the SKILL.md-dispatched call still exists (dual-path by design)
    Bash: grep -cE 'recurring-precondition-sweep\.py' .claude/skills/aspirations-precheck/SKILL.md → verify >= 1
 
@@ -2566,9 +2631,9 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Check: heartbeat-stale.sh documents the load-bearing dependency
    Bash: grep -cE 'DO NOT drop _platform\.sh' core/scripts/heartbeat-stale.sh → verify >= 1
    Check: `core/scripts/recovery-gate.sh` skips the gate on continuation SessionStart events (source=compact or source=resume — rb-432 residual-closure)
-   Bash: grep -cE 'source=\$SOURCE -- continuation, skipping gate' core/scripts/recovery-gate.sh → verify >= 1
+   Bash: grep -cE 'source=\$SOURCE -- continuation, skipping crashed-runner gate' core/scripts/recovery-gate.sh → verify >= 1
    Bash: grep -cE 'compact\|resume\)' core/scripts/recovery-gate.sh → verify >= 1 (the case branch that early-exits)
-   Bash: echo '{"source":"compact"}' | bash core/scripts/recovery-gate.sh 2>&1 | grep -cE 'continuation, skipping gate' → verify == 1 (end-to-end: compact payload produces skip log)
+   Bash: echo '{"source":"compact"}' | bash core/scripts/recovery-gate.sh 2>&1 | grep -cE 'continuation, skipping crashed-runner gate' → verify == 1 (end-to-end: compact payload produces skip log)
    Check: `core/config/conventions/compact-recovery.md` documents the source-matching design
    Bash: grep -cE '^## Recovery-gate source matching' core/config/conventions/compact-recovery.md → verify >= 1
    Check: `core/scripts/recovery-gate.sh` hint comments protect the source-gate design (rb-445 simplicity + rb-432 intent-level closure)
@@ -2617,7 +2682,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -E '^[^#]*\|\s*python3?\s+-' core/scripts/session-manifest-clear.sh && echo FAIL || echo PASS → verify PASS (no shell-pipe-to-python3 regression — rb-359)
    Bash: grep -nE 'running-pid' core/config/session-manifest.yaml && echo FAIL || echo PASS → verify PASS (no ghost-PID re-introduction — rb-357)
    Bash: MIND_AGENT="" bash core/scripts/session-manifest-clear.sh 2>&1; rc=$?; [ $rc -eq 1 ] && echo PASS || echo FAIL → verify PASS (no-agent path exits 1, never silently clears)
-   Bash: grep -c 'recovery-gate.sh' .claude/settings.json → verify >= 1 (SessionStart hook is wired). FAIL means g-243-05 is still pending — user must add the hook entry manually because .claude/settings*.json is in the deny list.
+   Bash: grep -c 'recovery-gate.sh' core/scripts/sessionstart-orchestrator.sh → verify >= 1 (sessionstart-orchestrator.sh invokes recovery-gate.sh; .claude/settings.json wires the orchestrator)
 
    # Coordination gates — live observation checks (asp-248, added 2026-04-20)
    # The goal-duplication-gate and insight-trigger-gate are bash-enforced
@@ -2640,8 +2705,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # (which only fires AFTER the partner finishes). Canonical incident: alpha
    # session-65 had three bit-identical cross-agent collisions (rb-846).
    # Check: `core/scripts/goal-duplication-gate.py` defines `_check_partner_in_flight`
-   Bash: grep -q '_check_partner_in_flight' core/scripts/goal-duplication-gate.py && echo PASS || echo FAIL → verify PASS (function defined)
-   Bash: grep -q '_check_partner_in_flight(goal, file_paths, keywords, self_agent' core/scripts/goal-duplication-gate.py && echo PASS || echo FAIL → verify PASS (wired into checks list in main())
+   Bash: grep -q '_check_partner_in_flight' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (function defined)
+   Bash: grep -q '_check_partner_in_flight(goal, file_paths, keywords, self_agent' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (wired into checks list in main())
    Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_partner_in_flight.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — overlap/no-overlap/null/self-only/same-id/multi-partner)
 
    # Structural-co-signal invariant regression (g-115-838, added 2026-05-16; commits 9db5384 + 6e1563e)
@@ -2655,7 +2720,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # check protects against the second class landing without smoke evidence.
    Check: `core/scripts/gates/goal_duplication.py` `_check_recent_completions` defines `has_specific = bool(hit_paths) or any(re.search(r"[-_0-9]", k) for k in hit_kws)` — the structural-co-signal predicate. Grep must match.
    Bash: grep -qE 'has_specific\s*=\s*bool\(hit_paths\)\s*or\s*any\(' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (structural-co-signal predicate present)
-   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py 2>&1 | grep -q "PASS (3/3 cases)" && echo PASS || echo FAIL → verify PASS (3-case regression — G1 plain-words demote / G2 file-path block / G3 structured-identifier block)
+   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_structural_co_signal.py 2>&1 | grep -qE "PASS \(([0-9]+)/\1 cases\)" && echo PASS || echo FAIL → verify PASS (all-cases regression — G1 plain-words demote / G2 file-path block / G3 structured-identifier block; x/x backref keeps the pin honest as the suite grows, was 3/3 then 9/9)
 
    # pending_queue check regression (g-115-783, added 2026-05-22)
    # The pending_queue check (6th corpus) scans world + per-agent
@@ -2676,7 +2741,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    Bash: grep -q '_check_pending_queue(goal, file_paths, keywords, source_name' core/scripts/gates/goal_duplication.py && echo PASS || echo FAIL → verify PASS (wired into checks list in evaluate())
    Check: stricter co-signal predicate — `re.search(r"[_0-9]", k)` (no hyphen) inside `_check_pending_queue`
    Bash: MIND_AGENT=alpha py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from gates import goal_duplication as gd; import inspect; src=inspect.getsource(gd._check_pending_queue); sys.exit(0 if 're.search(r\"[_0-9]\", k)' in src and 'cross-agent' in src else 1)" && echo PASS || echo FAIL → verify PASS (stricter pending-queue co-signal predicate present, NOT hyphen-permissive)
-   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_pending_queue.py 2>&1 | grep -q "PASS (6/6 cases)" && echo PASS || echo FAIL → verify PASS (6-case regression — P1 origin_signal / P2 file-path / P3 demote / P4 unrelated / P5 status-filter / P6 empty)
+   Bash: MIND_AGENT=alpha py -3 core/scripts/tests/test_goal_duplication_gate_pending_queue.py 2>&1 | grep -qE "PASS \(([0-9]+)/\1 cases\)" && echo PASS || echo FAIL → verify PASS (all-cases regression — P1 origin_signal / P2 file-path / P3 demote / P4 unrelated / P5 status-filter / P6 empty; x/x backref keeps the pin honest as the suite grows, was 6/6 then 8/8)
 
    # Gate-test pytest-collectability invariant (g-115-1375 + g-115-1376, added 2026-06-09)
    # All 7 goal-duplication gate regression tests must define a top-level
@@ -2698,8 +2763,8 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # so filing-time (gate) and execution-time (probe) cannot diverge.
    Check: `core/scripts/_target_state.py` defines `READ_INTENT_VERBS` frozenset and `is_read_intent()` helper
    Bash: grep -qE 'READ_INTENT_VERBS\s*=\s*frozenset' core/scripts/_target_state.py && echo PASS || echo FAIL → verify PASS (frozenset declared)
-   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _target_state import READ_INTENT_VERBS; expected={'investigate','audit','review','observe','research','analyze'}; print('PASS' if READ_INTENT_VERBS==expected else 'FAIL:'+str(READ_INTENT_VERBS^expected))" → verify PASS (exactly six verbs, no drift)
-   Bash: grep -q 'is_read_intent' core/scripts/goal-duplication-gate.py && grep -q 'is_read_intent' core/scripts/target-state-probe.py && echo PASS || echo FAIL → verify PASS (both consumers import the shared helper)
+   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); from _target_state import READ_INTENT_VERBS; expected={'investigate','audit','review','observe','research','analyze','scan','probe'}; print('PASS' if READ_INTENT_VERBS==expected else 'FAIL:'+str(READ_INTENT_VERBS^expected))" → verify PASS (exactly six verbs, no drift)
+   Bash: grep -q 'is_read_intent' core/scripts/gates/goal_duplication.py && grep -q 'is_read_intent' core/scripts/target-state-probe.py && echo PASS || echo FAIL → verify PASS (both consumers import the shared helper)
    Bash: echo '{"title":"Investigate: rb-404 probe","description":"Audit core/scripts/_target_state.py for READ_INTENT_VERBS and is_read_intent"}' | MIND_AGENT=bravo py -3 core/scripts/goal-duplication-gate.py --output json 2>&1 | py -3 -c "import sys,json; d=json.loads(sys.stdin.read()); ts=[c for c in d['checks'] if c['name']=='target_state'][0]; print('PASS' if ts['passed'] and 'READ-intent' in ts['reason'] else 'FAIL')" → verify PASS (Investigate title triggers the exemption)
 
    # stdin encoding (Section ENC, added 2026-04-19)
@@ -3036,7 +3101,7 @@ else: print('FAIL: no recurring /review-hypotheses --learn goal in asp-001')
    # build-gate ceremony. Accept either status so the check stays useful as an
    # existence + ASCII probe without false-failing on the deliberate retirement.
    # Drift detected and reconciled by g-115-998 (2026-05-22).
-   Bash: bash core/scripts/guardrails-read.sh --id guard-006 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status'] in ('active','retired'); assert all(ord(c)<128 for c in d['rule']); print('OK')" → verify guard-006 exists, has no non-ASCII (status either active or retired — rule structurally enforced post-retirement)
+   Bash: source core/scripts/_paths.sh && grep -c '"id": "guard-006"' "$WORLD_DIR/guardrails-archive.jsonl" → verify ≥1 (guard-006 retired to archive; rule enforced structurally)
    # Fresh eyes code review step (DC continued)
    Bash: source core/scripts/_paths.sh && grep -c "Step 1.75" "$WORLD_DIR/conventions/post-execution.md" → verify returns >= 1 (fresh eyes step exists)
    Check: `$WORLD_DIR/conventions/post-execution.md` Step 1.75 is between Step 1.5 (testing) and Step 2 (commit)
@@ -3151,7 +3216,7 @@ sys.exit(1)
    # (not the add-goal subparser). Dropping --source silently reroutes writes from
    # the agent queue to the world queue. self-drift-gate.py targets the agent queue
    # per its module docstring, so --source agent MUST appear in the subprocess call.
-   Bash: grep -q '"--source", "agent"' core/scripts/self-drift-gate.py && echo "OK" || echo "FAIL: self-drift-gate subprocess call missing --source agent (guard-352 / rb-394 regression)"
+   Bash: grep -q '_rt.aspirations_add_goal' core/scripts/self-drift-gate.py && grep -q 'source=source' core/scripts/self-drift-gate.py && echo "OK" || echo "FAIL: self-drift-gate no longer routes adds through _rt with explicit source= (guard-352 / rb-394 agent-queue targeting)"
 
    # Python-script invocation in SKILL.md pseudocode (guard-350 / rb-398)
    # `Bash: bash core/scripts/X.py` silently no-ops: bash parses the Python
@@ -3198,8 +3263,8 @@ sys.exit(1)
    # curation-log writes break on paths with apostrophes (rb-774 / guard-165 family).
    Check: utilization-stats.py _PATH_PATTERN starts with negative-lookbehind anchor (NOT word-boundary)
    Bash: py -3 -c "import pathlib,re; src=pathlib.Path('core/scripts/utilization-stats.py').read_text(encoding='utf-8'); m=re.search(r'_PATH_PATTERN\s*=\s*re\.compile\(\s*r?[\"\\']([^\"\\']+)', src); pat=m.group(1) if m else ''; print('OK' if pat.startswith('(?<![\\\\w.-])') else f'FAIL pattern={pat[:30]}')" → verify == "OK"
-   Check: utilization-stats.py cite_count uses regex.findall (single regex call, NOT two haystack.count() summed)
-   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('core/scripts/utilization-stats.py').read_text(encoding='utf-8'); m=re.search(r'^def cmd_rules_audit\b.*?(?=^def |\Z)', src, re.DOTALL|re.MULTILINE); body=m.group(0) if m else ''; uses_findall=bool(re.search(r'cite_pat\.findall\(', body)); double_count=bool(re.search(r'haystack\.count\([^)]+\)\s*\+\s*haystack\.count\(', body)); print('OK' if (uses_findall and not double_count) else f'FAIL findall={uses_findall} double_count={double_count}')" → verify == "OK"
+   Check: utilization-stats.py cmd_rules_audit counts citations via regex.findall on haystack (prefixed_pat + bare_pat), NOT haystack.count() summed (g-115-1962: var renamed cite_pat->prefixed_pat/bare_pat; check now asserts the .findall(haystack) invariant, not the old var name)
+   Bash: py -3 -c "import re,pathlib; src=pathlib.Path('core/scripts/utilization-stats.py').read_text(encoding='utf-8'); m=re.search(r'^def cmd_rules_audit\b.*?(?=^def |\Z)', src, re.DOTALL|re.MULTILINE); body=m.group(0) if m else ''; uses_findall=bool(re.search(r'\.findall\(haystack\)', body)); double_count=bool(re.search(r'haystack\.count\([^)]+\)\s*\+\s*haystack\.count\(', body)); print('OK' if (uses_findall and not double_count) else f'FAIL findall={uses_findall} double_count={double_count}')" → verify == "OK"
    Check: aspirations-curate-memory/SKILL.md Phase 4 curation-log uses env-var injection (env-var prefix + single-quoted python source per guard-165), NOT bash interpolation
    # Use grep -F (fixed-string) to avoid shell-escape stacking issues with the `$` and quote literals.
    # The literal pattern asserts the env-var injection form is present (canonical guard-165 shape).
@@ -3873,6 +3938,21 @@ sys.exit(1)
    for name, entry in d.get('skills', {}).items():
        assert 'forged_by' in entry, f'FAIL: {name} missing forged_by field'
    print(f'PASS: {len(d.get(\"skills\", {}))} forged skills, all have forged_by')
+   # Ghost-registration check (Section FS2, adapted from ZDS-Mind for Ayoai's
+   # name->.claude/skills/<name>/ convention — Ayoai forged-skills.yaml has NO
+   # skill_path field so ZDS's entry.get('skill_path') would be a silent no-op here;
+   # the invocation target is .claude/skills/<name>/SKILL.md per forge-skill/SKILL.md
+   # + forged-skill-resolution.md. g-115-2066 / rb-3248. HARD-fail unambiguous ghosts
+   # (no dir AND no companion_scripts = nothing to invoke); SOFT-surface companion-
+   # script-backed dir-less entries (scripts may BE the skill — emergent 3-agent
+   # pattern; legitimacy pending a forge-skill dir-convention decision, board 2026-07-12).
+   ghost_hard = []; ghost_soft = []
+   for gname, gentry in d.get('skills', {}).items():
+       if not pathlib.Path(f'.claude/skills/{gname}').is_dir():
+           (ghost_soft if gentry.get('companion_scripts') else ghost_hard).append(gname)
+   assert not ghost_hard, f'FAIL: ghost forged-skill registration(s) with no .claude/skills/<name>/ dir AND no companion_scripts (triggers advertise a skill with nothing to invoke): {ghost_hard}'
+   if ghost_soft: print(f'PASS (advisory): {len(ghost_soft)} companion-script-backed forged skills lack a .claude/skills/<name>/ dir: {sorted(ghost_soft)} — legitimacy pending forge-skill dir-convention decision; NEW true ghosts (no dir + no scripts) hard-fail (g-115-2066/rb-3248)')
+   else: print('PASS: no ghost forged-skill registrations (all dir-less entries, if any, are companion-script-backed)')
    # Check world/skill-relations.yaml exists
    assert pathlib.Path(f'{world_dir}/skill-relations.yaml').exists(), 'FAIL: world/skill-relations.yaml missing'
    print('PASS: world/skill-relations.yaml exists')
@@ -3960,7 +4040,7 @@ sys.exit(1)
    # Programmatic utilization enforcement evidence checks (Section PU)
    # Three-layer enforcement: auto-manifest (retrieve.py), script feedback (utilization-feedback.sh), hook backstop (utilization-gate.sh)
    Bash: grep -c "\-\-goal" core/scripts/retrieve.py → verify >= 2 (argparse definition + session file guard)
-   Bash: grep -c "\-\-tree-nodes" core/scripts/retrieve.py → verify >= 1 (argparse definition exists)
+   Bash: grep -c "\-\-tree-nodes" core/scripts/retrieve.sh → verify >= 1 (argparse definition exists)
    Bash: grep -c "retrieval-session.json" core/scripts/retrieve.py → verify >= 1 (session file write exists)
    Check: `core/scripts/utilization-feedback.py` exists with `_recompute_utility_ratio` function
    Check: `core/scripts/utilization-feedback.py` `_recompute_utility_ratio` docstring references `tree.py cmd_increment` as canonical source
@@ -4691,7 +4771,7 @@ sys.exit(1)
    Check: start/SKILL.md autonomous-mode block seeds last_active + resets current_focus before state-set RUNNING (Fix C). Bash: `awk '/\*\*Autonomous mode:\*\*/,/session-state-set\.sh RUNNING/' .claude/skills/start/SKILL.md | grep -cE 'agent_status\.<agent-name>\.(last_active|current_focus)'` must be >= 2.
    Check: start/SKILL.md autonomous-mode current_focus write uses empty value, NOT a prospective string like "starting" (commit b5bd9d8 — coordination.md:275 documents current_focus as retrospective; only aspirations-state-update and aspirations-consolidate may write non-empty values, both of which fire AFTER work completes). Bash: `awk '/\*\*Autonomous mode:\*\*/,/session-state-set\.sh RUNNING/' .claude/skills/start/SKILL.md | grep -cE 'current_focus.*--value\s+"\\"starting\\""'` must be 0. (Regex matches only the bash-escaped --value argument form; the comment word "starting" has no backslashes and won't match.)
    Check: iteration-close.sh do_state_update no longer has the redundant explicit last_active write (cleanup commit 1c57d8b). Bash: `grep -cE '^\s*bash.*team-state-update\.sh.*agent_status\.\$AGENT\.last_active' core/scripts/iteration-close.sh` must be 0 (only the comment block referencing it should remain). Bash: `grep -c 'SINGLE SOURCE OF TRUTH for last_active at goal completion' core/scripts/iteration-close.sh` must be >= 1.
-   Check: no SKILL.md uses 2>/dev/null on team-state-update.sh invocations (rb-400 silent-boundary). Bash: `grep -rEn 'team-state-update\.sh.*2>/dev/null' .claude/skills/ && { echo "FAIL: 2>/dev/null suppressing stderr on team-state-update — see rb-400"; exit 1; } || echo PASS`
+   Check: no SKILL.md uses 2>/dev/null on team-state-update.sh invocations (rb-400 silent-boundary). Bash: `grep -rEn 'team-state-update\.sh.*2>/dev/null' .claude/skills/ | grep -v 'verify-learning/SKILL.md' | grep -q . && { echo "FAIL: 2>/dev/null suppressing stderr on team-state-update — see rb-400"; exit 1; } || echo PASS`
    Check: rb-399, rb-400, guard-351 exist and are active. Bash: `for id in rb-399 rb-400; do bash core/scripts/reasoning-bank-read.sh --id $id | grep -q '"status": "active"' || { echo "FAIL: $id not active"; exit 1; }; done; bash core/scripts/guardrails-read.sh --id guard-351 | grep -q '"status": "active"' || { echo "FAIL: guard-351 not active"; exit 1; }; echo PASS`
 
    # Section g-115-291: cross-agent fresh-eyes coverage tracking via team-state shared slot (2026-04-27, commit f7aa2b2, rb-594)
@@ -4756,6 +4836,19 @@ sys.exit(1)
    # as CAS3) to survive shell-quoting.
    Check: no undocumented core/scripts/ site has closed {world, agent} source enum without cross-agent acceptance or WORLD_AGENT_ONLY: marker. Bash: `py -3 -c "import re,sys,pathlib; root=pathlib.Path('core/scripts'); documented={'aspirations.py','loop-state-save.py','recurring-close.sh','iteration-close.sh'}; pat_py=re.compile(r'choices\s*=\s*\[\s*\"world\"\s*,\s*\"agent\"\s*\]|\"enum\"\s*:\s*\(\s*\"world\"\s*,\s*\"agent\"\s*\)'); pat_sh=re.compile(r'if\s*\[\[.*SOURCE.*==.*\"world\".*\]\]'); violations=[]; [violations.append(f'{p.name}:{i+1}') for p in sorted(list(root.glob('*.py'))+list(root.glob('*.sh'))) if p.name not in documented for i,L in enumerate(p.read_text(encoding='utf-8',errors='replace').splitlines()) if (pat_py if p.suffix=='.py' else pat_sh).search(L) and not any('cross-agent' in (p.read_text(encoding='utf-8',errors='replace').splitlines())[j] or 'WORLD_AGENT_ONLY:' in (p.read_text(encoding='utf-8',errors='replace').splitlines())[j] for j in range(max(0,i-3), min(len(p.read_text(encoding='utf-8',errors='replace').splitlines()),i+4)))]; sys.exit(1 if violations else 0)" && echo PASS || { echo "FAIL: new core/scripts/ site has closed {world, agent} source enum but is not in the documented coverage list (aspirations.py, loop-state-save.py, recurring-close.sh, iteration-close.sh) and lacks cross-agent acceptance / WORLD_AGENT_ONLY: justification — add to CAS coverage list or document"; exit 1; }`
 
+   # Section RBT: Reasoning-Bank Type Prescription Enum Parity (g-115-2048 / sq-018, 2026-07-12)
+   # Sibling to Section CAS above (typed-key validator-enum parity) — but for the reasoning-bank
+   # `type` field instead of the {world, agent} source enum. Catches the skill-vs-validator
+   # prescription-drift class: a SKILL.md that prescribes an rb `type` value the validator
+   # rejects. Canonical incident: reflect-on-outcome prescribed the non-enum types "contrastive"
+   # (Step 2.6) and "counterfactual" (Step 2.6c), both REJECTED by reasoning-bank-add.sh's validator
+   # (enum {success, failure, user_provided}), both failed on their FIRST live exercise ~2 months
+   # after authoring because nothing asserted prescription-within-enum at review time (rb-3195).
+   # The enum is READ from core/scripts/reasoning-bank.py RB_VALID_TYPES each run (parity, not a
+   # hardcoded list — expanding the enum there auto-updates this check). Scoping + the three
+   # covered prescription forms (paren / JSON / piped) are documented in the script's docstring.
+   Check: every reasoning-bank `type` prescription in .claude/skills/*/SKILL.md is within RB_VALID_TYPES (read from the validator source). Bash: `py -3 core/scripts/verify-rb-type-parity.py` (prints PASS/FAIL, exits 0/1; names offenders as skill-dir/SKILL.md:line:type on FAIL).
+
    # Section CAC: Cross-Agent Candidate Collection Loop in goal-selector.py (2026-05-19, g-115-964 / g-115-946 / sq-018)
    # The g-115-946 fix added a third read pass in cmd_select that pulls pending goals from
    # sibling agent queues where intended_agent == AGENT_NAME — closes the cross-agent
@@ -4775,7 +4868,7 @@ sys.exit(1)
    #   3. the function body includes a fail-open `except Exception:` followed by `continue`
    #      within 5 lines (the per-sibling skip on unreadable aspirations.jsonl)
    #   4. (implicit via 1+2) the function definition exists at module-top-level, not nested
-   Check: `core/scripts/goal-selector.py` has the cross-agent candidate collection loop wired correctly (def + call site between collect_candidates and blocked-handler + per-sibling fail-open continue). Bash: `py -3 -c "import re,sys,pathlib; src=pathlib.Path('core/scripts/goal-selector.py').read_text(encoding='utf-8'); L=src.splitlines(); xc=[i for i,l in enumerate(L) if 'collect_cross_agent_candidates' in l]; df=[i for i in xc if L[i].lstrip().startswith('def ')]; cl=[i for i in xc if i not in df]; cc=[i for i,l in enumerate(L) if re.search(r'\bcollect_candidates\(',l) and not l.lstrip().startswith('def ')]; nc=[i for i,l in enumerate(L) if re.search(r'^\s*if\s+not\s+candidates\s*:',l)]; ei=next((i for i,l in enumerate(L[df[0]+1:],start=df[0]+1) if l.startswith('def ')),len(L)) if df else 0; body=L[df[0]:ei] if df else []; ok=(len(xc)>=2 and len(df)==1 and bool(cl) and bool(cc) and bool(nc) and (max(cc)<min(cl)<min([n for n in nc if n>min(cl)],default=10**9)) and any(re.search(r'^\s*except\s+Exception\s*:',body[i]) and any(re.search(r'^\s*continue\b',body[j]) for j in range(i+1,min(i+5,len(body)))) for i in range(len(body)-1))); sys.exit(0 if ok else 1)" && echo PASS || { echo "FAIL: goal-selector.py cross-agent candidate collection loop missing or wrongly positioned (see g-115-946 / g-115-964) — verify (a) collect_cross_agent_candidates defined and called, (b) call site sits between collect_candidates(agent) and 'if not candidates:', (c) per-sibling fail-open 'except Exception: continue' present in function body"; exit 1; }`
+   Check: `core/scripts/goal-selector.py` cross-agent candidate collection wired (def + >=2 call sites + per-sibling fail-open continue; the strict first-pass interleave pin retired after the retry-pass refactor). Bash: `py -3 -c "import re,sys,pathlib; L=pathlib.Path('core/scripts/goal-selector.py').read_text(encoding='utf-8').splitlines(); df=[i for i,l in enumerate(L) if l.lstrip().startswith('def collect_cross_agent_candidates')]; calls=[i for i,l in enumerate(L) if 'collect_cross_agent_candidates(' in l and i not in df]; end=next((i for i,l in enumerate(L[df[0]+1:],start=df[0]+1) if l.startswith('def ')),len(L)) if df else 0; body=L[df[0]:end] if df else []; eh=any(re.search(r'^\s*except Exception\s*:',body[i]) and any(re.search(r'^\s*continue\b',body[j]) for j in range(i+1,min(i+5,len(body)))) for i in range(len(body)-1)); sys.exit(0 if (len(df)==1 and len(calls)>=2 and eh) else 1)" && echo PASS || { echo "FAIL: goal-selector.py cross-agent candidate collection missing (def/calls/fail-open) — see g-115-946 / g-115-964"; exit 1; }`
 
    # Section TOL: Tolerant-Decode Coverage Across g-115-797 Audit Catalog (2026-05-19, g-115-950)
    # Pins the corruption-tolerant decode pattern (g-115-766 / g-115-796 / guard-383)
@@ -4808,7 +4901,7 @@ sys.exit(1)
    # rather than extracting a helper (per g-115-797 catalog row + g-115-949 follow-up).
    # The check enforces the pattern is present even though no helper exists: json.JSONDecoder
    # raw_decode usage AND fatal sys.exit(1) on bad aggregate.
-   Check: defer-recheck.py (A1) inlines tolerant-decode pattern in _read_goals (json.JSONDecoder().raw_decode + sys.exit(1) on bad aggregate). Bash: `py -3 -c "import pathlib,sys; src=pathlib.Path('core/scripts/defer-recheck.py').read_text(encoding='utf-8'); ok = 'json.JSONDecoder' in src and 'raw_decode' in src and 'sys.exit(1)' in src; sys.exit(0 if ok else 1)" && echo PASS || { echo "FAIL: defer-recheck.py (A1) lost the inlined tolerant-decode pattern in _read_goals — see g-115-797 catalog row A1"; exit 1; }`
+   Check: defer-recheck.py _read_goals decodes via the extracted tolerant helper (g-115-949 superseded the inlined A1 pattern). Bash: `py -3 -c "import pathlib,sys; src=pathlib.Path('core/scripts/defer-recheck.py').read_text(encoding='utf-8'); sys.exit(0 if 'tolerant_decode_aggregate' in src else 1)" && echo PASS || { echo "FAIL: defer-recheck.py lost the tolerant-decode path (_rt.tolerant_decode_aggregate, g-115-949/g-115-766) — silent-collapse JSONDecodeError returns"; exit 1; }`
 
    # TOL3: No catalog file has the regression-shape pattern `except json.JSONDecodeError:` immediately followed by `return []`
    # This pattern is the pre-correction silent-collapse that the audit was designed to eliminate.
@@ -4824,7 +4917,7 @@ sys.exit(1)
    # TOL5: A1 outlier (defer-recheck.py) carries g-115-948 reference annotating the pre-correction RtError silent return
    # When g-115-948 lands (RtError sweep), this check can be relaxed or removed. Until then, the
    # annotation must be present so future readers know the silent-return is intentional and tracked.
-   Check: defer-recheck.py annotates A1 RtError-silent-return with g-115-948 reference. Bash: `py -3 -c "import pathlib,sys; src=pathlib.Path('core/scripts/defer-recheck.py').read_text(encoding='utf-8'); ok = 'g-115-948' in src or 'g-115-797-A1' in src; sys.exit(0 if ok else 1)" && echo PASS || { echo "FAIL: defer-recheck.py lost the A1-outlier annotation (g-115-948 or g-115-797-A1) — future readers cannot tell silent-return is intentional pre-correction"; exit 1; }`
+   Check: defer-recheck.py annotates A1 RtError-silent-return with g-115-948 reference. Bash: `py -3 -c "import pathlib,sys; src=pathlib.Path('core/scripts/defer-recheck.py').read_text(encoding='utf-8'); ok = 'g-115-948' in src or 'g-115-949' in src or 'g-115-766' in src or 'g-115-797-A1' in src; sys.exit(0 if ok else 1)" && echo PASS || { echo "FAIL: defer-recheck.py lost the A1-outlier annotation (g-115-948 or g-115-797-A1) — future readers cannot tell silent-return is intentional pre-correction"; exit 1; }`
 
    # Section SGR: Standing Grants + user_leg_scope + script-owned `created` (2026-04-20, g-248-14, rb-403, guard-354)
    # Three-pronged structural move: prose → structured state. SGR1-2 anchor the Standing
@@ -4848,10 +4941,10 @@ sys.exit(1)
    Check: neither RB_REQUIRED_FIELDS nor GUARD_REQUIRED_FIELDS contain `created`. Bash: `py -3 -c "import re,sys; src=open('core/scripts/reasoning-bank.py').read(); rb=re.search(r'RB_REQUIRED_FIELDS\s*=\s*[\[{]([^\]}]*)', src); gu=re.search(r'GUARD_REQUIRED_FIELDS\s*=\s*[\[{]([^\]}]*)', src); bad=[n for n,m in (('rb',rb),('guard',gu)) if m and '\"created\"' in m.group(1)]; sys.exit(1 if bad else 0)" && echo PASS || { echo "FAIL: 'created' still in REQUIRED_FIELDS — script stamping will be overridden by caller value"; exit 1; }`
 
    # SGR5: GUARD_KNOWN_FIELDS allowlist includes `created` (regression guard from Path 1)
-   Check: GUARD_KNOWN_FIELDS contains `created`. Bash: `py -3 -c "import re,sys; src=open('core/scripts/reasoning-bank.py').read(); m=re.search(r'GUARD_KNOWN_FIELDS\s*=\s*[\[{]([^\]}]*)', src, re.DOTALL); sys.exit(0 if (m and '\"created\"' in m.group(1)) else 1)" && echo PASS || { echo "FAIL: GUARD_KNOWN_FIELDS missing 'created' — update-field rejects every existing guard record"; exit 1; }`
+   Check: GUARD_KNOWN_FIELDS contains `created`. Bash: `py -3 -c "import re,sys; src=open('core/scripts/reasoning-bank.py').read(); m=re.search(r'GUARD_KNOWN_FIELDS\s*=\s*[\[{(]([^\]}]*)', src, re.DOTALL); sys.exit(0 if (m and '\"created\"' in m.group(1)) else 1)" && echo PASS || { echo "FAIL: GUARD_KNOWN_FIELDS missing 'created' — update-field rejects every existing guard record"; exit 1; }`
 
    # SGR6: rb_update_field AND guard_update_field reject `field == "created"` OR `field.startswith("created.")` (guard-354 dot-prefix defense)
-   Check: both update paths defend against literal AND dot-prefix `created`. Bash: `py -3 -c "import re,sys; src=open('core/scripts/reasoning-bank.py').read(); bad=[]; [bad.append(fn) for fn in ('rb_update_field','guard_update_field') if not re.search(r'def '+fn+r'\\b.*?field\s*==\s*\"created\".*?field\.startswith\(\s*\"created\.\"', src, re.DOTALL)]; sys.exit(1 if bad else 0)" && echo PASS || { echo "FAIL: rb_update_field or guard_update_field missing dot-prefix defense — see guard-354"; exit 1; }`
+   Check: set-field endpoint defends `created` literal AND dot-prefix. Bash: `py -3 -c "import re,sys; src=open('mind_api/src/endpoints/store.py').read(); ok=re.search(r'field_name in spec\.immutable_fields', src) and re.search(r'split\(.\\..\)\[0\] in spec\.immutable_fields', src); sys.exit(0 if ok else 1)" && echo PASS || { echo "FAIL: store.py set-field lost the immutable-field literal+dot-prefix defense (guard-354; moved from reasoning-bank.py update_field in the store-endpoint consolidation)"; exit 1; }`
 
    # SGR7: VALID_USER_LEG_SCOPES defined with at-minimum the shipped grants
    Check: aspirations.py defines VALID_USER_LEG_SCOPES including commit AND push. Bash: `py -3 -c "import re,sys; src=open('core/scripts/aspirations.py').read(); m=re.search(r'VALID_USER_LEG_SCOPES\s*=\s*\{([^}]*)\}', src, re.DOTALL); scopes=set(re.findall(r'\"([a-z-]+)\"', m.group(1))) if m else set(); sys.exit(0 if {'commit','push'}.issubset(scopes) else 1)" && echo PASS || { echo "FAIL: VALID_USER_LEG_SCOPES missing 'commit' or 'push' — grants cannot route correctly"; exit 1; }`
@@ -4932,7 +5025,7 @@ print('PASS')
    # IDLE->reader, IDLE->assistant, IDLE->autonomous, UNINITIALIZED C4 reader,
    # UNINITIALIZED C8 assistant, UNINITIALIZED C8 autonomous. /boot deliberately not
    # touched (WM survives autocompact; re-seeding would clobber cross-restart continuity).
-   Check: 6 wm-set session_start seeds in start/SKILL.md. Bash: `n=$(grep -c 'wm-set.sh session_start' .claude/skills/start/SKILL.md); [ "$n" = "6" ] && echo PASS || { echo "FAIL: start/SKILL.md has $n wm-set.sh session_start seeds, expected 6 — entry path missing (rb-437)"; exit 1; }`
+   Check: 6 wm-set session_start seeds in start/SKILL.md. Bash: `n=$(cat .claude/skills/start/SKILL.md core/config/start-phase-c.md | grep -c 'wm-set.sh session_start'); [ "$n" = "6" ] && echo PASS || { echo "FAIL: start/SKILL.md has $n wm-set.sh session_start seeds, expected 6 — entry path missing (rb-437)"; exit 1; }`
 
    # ESD3: session-artifacts-count.sh wrapper exits 2 without MIND_AGENT.
    # _paths.sh has a first-available-conf fallback that could probe the wrong agent's WM.
@@ -5101,7 +5194,7 @@ print(f'PASS: no duplicate handler blocks ({len(counts)} unique sq-ids across {s
      # BUG-A: Phase 0.5d bypassed batch_audit_dedupe_hours (enforced only in recurring-close.sh).
    Check: precheck no --audit-all caller. Bash: `grep -c "cargo-cult-detector.py --audit-all" .claude/skills/aspirations-precheck/SKILL.md` → verify 0
      # Same BUG-A: recurring-close.sh is the single authorized --audit-all caller.
-   Check: write-order is pointer-first. Bash: `py -3 -c "import re,sys; s=open('core/scripts/cargo-cult-detector.py',encoding='utf-8').read(); m=re.search(r'def update_interval_hours.*?\nreturn True', s, re.DOTALL); body=m.group(0) if m else s[s.find('def update_interval_hours'):s.find('def reset_consecutive_routine')]; i_orig=body.find('original_interval_hours'); i_int=body.find('interval_hours', body.find(':')); sys.exit(0 if 0 < i_orig < i_int else 1)" && echo PASS || echo "FAIL: BUG-B regression — interval_hours written before original"`
+   Check: write-order is pointer-first. Bash: `py -3 -c "import re,sys; s=open('core/scripts/cargo-cult-detector.py',encoding='utf-8').read(); m=re.search(r'def update_interval_hours.*?(?=\ndef )', s, re.DOTALL); b=m.group(0) if m else ''; sys.exit(0 if ('CRITICAL ORDERING' in b and 'if not had_original' in b) else 1)" && echo PASS || { echo "FAIL: BUG-B regression — update_interval_hours lost the original-first ordering contract (CRITICAL ORDERING docstring + had_original guard)"; exit 1; }`
      # BUG-B: original_interval_hours is the provenance anchor for cap_ratio; must be written FIRST.
    Check: no hardcoded 2.0/4.0 in batch audit. Bash: `grep -cE "interval_h.*\* 2\.0|original \* 4\.0" core/scripts/cargo-cult-detector.py` → verify 0
      # BUG-C: _propose_new_interval must read multiplier/cap_ratio from cfg.
@@ -5542,6 +5635,45 @@ else:
    # abort collection.
    Check: pytest test files under core/scripts/tests/ and core/tests/ have no unguarded module-level numpy/torch/sentence_transformers import (importorskip collection-abort defense).
    Bash: `py -3 -c "import sys,pathlib,re; dep=re.compile(r'^(?:import (?:numpy|torch|sentence_transformers)\b|from (?:numpy|torch|sentence_transformers)(?:\.\w+)* import)'); guard=re.compile(r'importorskip'); viol=[]; [viol.append(f'{f}:{n+1}: {line.strip()[:80]}') for root in ('core/scripts/tests','core/tests') if pathlib.Path(root).exists() for f in pathlib.Path(root).rglob('test_*.py') for text in [f.read_text(encoding='utf-8',errors='replace')] if not guard.search(text) for n,line in enumerate(text.splitlines()) if dep.match(line)]; ok=not viol; print('PASS: no unguarded module-level numpy/torch/sentence_transformers imports in pytest test files (importorskip collection-abort defense intact)') if ok else (print(f'FAIL: module-level optional-dependency import without pytest.importorskip in a pytest test file — this aborts pytest core/scripts/tests COLLECTION (exit 2, ZERO tests run) on any box lacking the dep, silently zeroing all test signal there (g-115-1775, rb-2780): {viol[:10]}') or sys.exit(1))"`
+
+   # Section DSP: Domain-SUT probe non-skip guard (g-115-1846, g-115-1807, rb-2933, guard-725, 2026-07-08)
+   # Sibling to Section ODI above. ODI ensures optional-dependency imports skip
+   # CLEANLY; DSP ensures a test that dynamically loads an EXTERNAL/domain SUT does
+   # NOT silently WHOLESALE-skip when that SUT is present on the box. Canonical
+   # incident (g-115-1807): test_stale_jobs_scan_probe.py resolved its domain SUT
+   # (the world/scripts orphan-scanner) via a hardcoded agent name + a nonexistent
+   # sentinel file, so on every current box it hit a module-level pytest.skip — a
+   # DORMANT guard that masked a real regression (the orphan_is_foreign foreign-root
+   # scoping feature had been removed) for days. The fix replaced that with a robust
+   # _find_world_scripts enumeration (bound agent world, then any agents/*/local-
+   # paths.conf whose WORLD_PATH carries the script). This STATIC check guards
+   # RE-introduction of the fragile form: the robust resolver must remain present.
+   # Static (not a pytest run) by design — the resolver's CODE SHAPE is exactly what
+   # regressed, and a shape-revert is what makes the skip silent; guarding the shape
+   # is the faithful, fast signal. Audit (g-115-1846) confirmed this is the ONLY
+   # domain-SUT-loading test in core/scripts/tests; the importorskip tests skip on
+   # optional test dependencies and are guarded separately by Section ODI.
+   Check: the domain-SUT probe test resolves via the robust _find_world_scripts enumeration (not a fragile hardcoded-agent fallback that silently module-skips and masks an SUT regression).
+   Bash: `f=core/scripts/tests/test_stale_jobs_scan_probe.py; if grep -q '_find_world_scripts' "$f"; then echo "PASS: domain-SUT probe test resolves via robust _find_world_scripts — will not silently module-skip on a box where the SUT is present (g-115-1807 double-silent-failure guard intact)"; else echo "FAIL: test_stale_jobs_scan_probe.py lost its robust _find_world_scripts resolver — reverting to a fragile hardcoded-agent form makes it silently module-skip, masking any orphan_is_foreign regression (g-115-1807, rb-2933, g-115-1846)"; fi`
+
+   # Section WBS: No bare ["bash", ...] subprocess spawns in tests (g-115-1902, 2026-07-10)
+   # On Windows, CreateProcess resolves a bare "bash" via its FIXED search order —
+   # System32 BEFORE the PATH env var — so subprocess.run(["bash", ...]) launches
+   # the WSL launcher (C:\Windows\System32\bash.exe), NOT Git bash, even though
+   # shutil.which("bash") (PATH-only semantics) reports Git's. A hung/unprovisioned
+   # WSL then holds the inherited stdout pipe past bash's own exit and
+   # communicate() blocks until TimeoutExpired. Canonical incident (g-115-1902):
+   # fleet-authored test_cross_agent_write.py spawned bare bash and timed out
+   # 3/3 on Windows — 60s per test — while passing on the Linux fleet, because
+   # its authors never ran it where System32 shadows PATH. The repo's canonical
+   # resolver is core/scripts/tests/_bash_helpers.py (BASH / resolve_bash());
+   # fleet-authored tests bypass it because the bare form WORKS on Linux — this
+   # check catches that authorship gap at verify time. AST-based (not grep):
+   # docstrings legitimately mention the bare form when documenting this very
+   # trap (test_dependent_unblock_windows_path.py), and only real Call nodes
+   # whose first arg is a list literal starting with "bash" are violations.
+   Check: no test file under core/scripts/tests/ spawns a subprocess with a bare ["bash", ...] list — all bash spawns route through _bash_helpers.BASH so Windows CreateProcess cannot resolve WSL bash from System32.
+   Bash: `py -3 -c "import ast, glob; bad = [f + ':' + str(n.lineno) for f in glob.glob('core/scripts/tests/*.py') for n in ast.walk(ast.parse(open(f, encoding='utf-8').read())) if isinstance(n, ast.Call) and n.args and isinstance(n.args[0], ast.List) and n.args[0].elts and isinstance(n.args[0].elts[0], ast.Constant) and n.args[0].elts[0].value == 'bash']; print('PASS: no bare [\\\"bash\\\", ...] subprocess spawns in core/scripts/tests — all bash spawns route through _bash_helpers (g-115-1902 WSL-resolution guard intact)' if not bad else 'FAIL: bare bash spawn(s) found — on Windows these resolve to WSL bash via System32 and hang; use _bash_helpers.BASH (g-115-1902): ' + ', '.join(bad))"`
 
    # Section APD: Inlined _APD constants mirror canonical AGENTS_PARENT_DIR (g-115-984, commit 520e9375, 2026-05-19)
    # Four hot-path shell scripts (session-state-get.sh, session-mode-get.sh,
@@ -6023,7 +6155,7 @@ print(f'PASS: guard-056 active')
    Check: `core/scripts/capability-gate.sh` exists and uses `exec python3 "$CORE_ROOT/scripts/capability-gate.py" "$@"` (thin wrapper pattern)
    # Docstring/flag sync — surfaced 2026-04-18 review. Top-level docstring must reference the actual flag
    # (`--output human`), not a non-existent shorthand (`--human`) that argparse rejects.
-   Bash: grep -E '^- Output' core/scripts/capability-gate.py | grep -vq '\-\-human\b' && echo "PASS" || echo "FAIL: docstring references --human (actual flag is --output human)"
+   Bash: ! grep -q -- '--human\b' core/scripts/capability-gate.py core/scripts/gates/capability.py && echo "PASS" || echo "FAIL: docstring references --human (actual flag is --output human)"
    Check: `core/scripts/blocker-recheck.py` exists
    Check: `core/scripts/blocker-recheck.sh` exists and uses the same thin-wrapper pattern
    Check: `.claude/skills/aspirations-execute/SKILL.md` CREATE_BLOCKER Protocol invokes `bash core/scripts/create-blocker.sh` (NOT direct py/python3 — platform portability; create-blocker.sh wraps blocker-create-gate, capability-gate, conclusion-record, and aspirations-add-goal under one orchestrator)
@@ -6195,7 +6327,7 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    Check: `.claude/skills/aspirations-execute/SKILL.md` CREATE_BLOCKER Protocol pipeline runs blocker-create-gate BEFORE capability-gate
    Bash: py core/scripts/blocker-create-gate.py --help >/dev/null && echo "PASS: gate --help works"
    Bash: echo '{"type":"resource","affected_skills":[],"failure_reason":"98% of records have active_brain=0","evidence":[{"tool":"dynamodb","evidence_type":"query"},{"tool":"lambda","evidence_type":"invoke"}]}' | py core/scripts/blocker-create-gate.py --output json | py -3 -c "import sys,json; r=json.load(sys.stdin); assert r['would_block'] is True, 'FAIL: rb-245 canonical string did not trigger schema_probe'; sc=[c for c in r['checks'] if c['name']=='schema_probe'][0]; assert sc['passed'] is False, 'FAIL: schema_probe passed on statistical negation without probe evidence'; print('PASS: rb-245 canonical string caught')"
-   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); import importlib.util; s=importlib.util.spec_from_file_location('g','core/scripts/blocker-create-gate.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert not m._evidence_is_silent({'command':'curl -q https://host'}), 'FAIL: curl -q falsely flagged silent'; assert m._evidence_is_silent({'command':'ssh -q host cmd'}), 'FAIL: ssh -q not caught as silent'; print('PASS: silent-flag scoping correct')"
+   Bash: py -3 -c "import sys; sys.path.insert(0,'core/scripts'); import importlib.util; s=importlib.util.spec_from_file_location('g','core/scripts/gates/blocker_create.py'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); assert not m._evidence_is_silent({'command':'curl -q https://host'}), 'FAIL: curl -q falsely flagged silent'; assert m._evidence_is_silent({'command':'ssh -q host cmd'}), 'FAIL: ssh -q not caught as silent'; print('PASS: silent-flag scoping correct')"
 
    # S48.3: Abbreviation schema + audit (Item 2B)
    Check: `core/config/obligation-schema.yaml` exists and contains top-level `obligations:` with verify/state/learn/spark entries
@@ -6312,17 +6444,17 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # silently regress the disqualification path without flagging.
    #
    # CGN-a: noise-phrase loader function present
-   Bash (cgn-loader): grep -q "^def _load_noise_phrases" core/scripts/capability-gate.py && echo "PASS: _load_noise_phrases defined" || echo "FAIL: capability-gate.py missing _load_noise_phrases — noise-phrase disqualification will not load YAML; g-115-460 regressed"
+   Bash (cgn-loader): grep -q "^def _load_noise_phrases" core/scripts/gates/capability.py && echo "PASS: _load_noise_phrases defined" || echo "FAIL: capability-gate.py missing _load_noise_phrases — noise-phrase disqualification will not load YAML; g-115-460 regressed"
    # CGN-b: longest-first sort invariant inside _load_noise_phrases
    # Must be longest-first so multi-token phrase "deploy an existing system" is
    # tested BEFORE shorter prefix "deploy an existing"; without it short phrases
    # shadow longer ones and false-positive disqualifications stop firing.
-   Bash (cgn-sort-invariant): grep -q "out.sort(key=len, reverse=True)" core/scripts/capability-gate.py && echo "PASS: noise-phrase loader sorts longest-first (multi-token phrases dominate prefix shadowing)" || echo "FAIL: capability-gate.py noise-phrase sort invariant lost — multi-token phrases will be shadowed by their own prefixes; g-115-460 regressed"
+   Bash (cgn-sort-invariant): grep -q "out.sort(key=len, reverse=True)" core/scripts/gates/capability.py && echo "PASS: noise-phrase loader sorts longest-first (multi-token phrases dominate prefix shadowing)" || echo "FAIL: capability-gate.py noise-phrase sort invariant lost — multi-token phrases will be shadowed by their own prefixes; g-115-460 regressed"
    # CGN-c: CRITICAL ORDER comment guarding _resolve_paths / _extract_keywords sequencing
    # The comment is the trip-wire — if a future refactor flips the call order,
    # the comment goes stale and the test fails, surfacing the violation BEFORE
    # the silent regression lands in production.
-   Bash (cgn-critical-order): grep -q "CRITICAL ORDER: _resolve_paths() must run BEFORE _extract_keywords" core/scripts/capability-gate.py && echo "PASS: CRITICAL ORDER trip-wire comment intact" || echo "FAIL: capability-gate.py CRITICAL ORDER comment removed — _resolve_paths must run before _extract_keywords or WORLD_DIR-scoped noise-phrase YAML lookup happens with unresolved paths; g-115-460 regressed"
+   Bash (cgn-critical-order): grep -q "CRITICAL ORDER: _load_noise_phrases(world_dir) must run BEFORE" core/scripts/gates/capability.py && echo "PASS: CRITICAL ORDER trip-wire comment intact" || echo "FAIL: capability-gate.py CRITICAL ORDER comment removed — _resolve_paths must run before _extract_keywords or WORLD_DIR-scoped noise-phrase YAML lookup happens with unresolved paths; g-115-460 regressed"
    # CGN-d: noise-phrase YAML exists at world conventions
    # The YAML is the SSOT for the noise-phrase set; loader returns [] silently
    # if the file is missing, so absence is undetectable without this check.
@@ -6342,7 +6474,7 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # no longer falls back to the matched-keyword for goals whose failure_reason
    # uses these verbs. Without the extension, "Bridge delete completed" produces
    # "Unblock: npc" titles (matched-keyword fallback) instead of "Unblock: delete".
-   Bash (cgn-imperative-verbs): py -3 -c "import re; src = open('core/scripts/capability-gate.py', encoding='utf-8').read(); m = re.search(r'^_IMPERATIVE_VERBS\s*=\s*\{([^}]*)\}', src, re.M | re.S); assert m, 'FAIL: _IMPERATIVE_VERBS literal not found'; body = m.group(1); needed = ['delete', 'remove', 'save', 'edit']; missing = [v for v in needed if f'\"{v}\"' not in body]; print('PASS: _IMPERATIVE_VERBS mutate extension intact (delete/remove/save/edit all present)' if not missing else f'FAIL: _IMPERATIVE_VERBS missing mutate-class verbs: {missing} — action_verb extraction will fall back to matched-keyword for goals using these verbs (g-115-460 follow-up regressed)')"
+   Bash (cgn-imperative-verbs): py -3 -c "import re; src = open('core/scripts/gates/capability.py', encoding='utf-8').read(); m = re.search(r'^_IMPERATIVE_VERBS\s*=\s*\{([^}]*)\}', src, re.M | re.S); assert m, 'FAIL: _IMPERATIVE_VERBS literal not found'; body = m.group(1); needed = ['delete', 'remove', 'save', 'edit']; missing = [v for v in needed if f'\"{v}\"' not in body]; print('PASS: _IMPERATIVE_VERBS mutate extension intact (delete/remove/save/edit all present)' if not missing else f'FAIL: _IMPERATIVE_VERBS missing mutate-class verbs: {missing} — action_verb extraction will fall back to matched-keyword for goals using these verbs (g-115-460 follow-up regressed)')"
 
    # === Section S49: Post-/verify-learning structural gate suite ==================
    # Three gates built after the 2026-04-19 /verify-learning run exposed two
@@ -6395,7 +6527,7 @@ print('FAIL: precheck missing skip for ' + str(missing) if missing else 'PASS: a
    # wired through the helper — different regex class (init/reset operators),
    # no realized false positive in corpus; speculative hardening would violate
    # implementation-discipline.md YAGNI.
-   Bash: grep -q 'def _is_prose_line' core/scripts/signal-lifecycle-gate.py && echo 'PASS: _is_prose_line helper present' || { echo 'FAIL: _is_prose_line helper removed — Layer-1 filter has no single source of truth (see rb-349, guard-319)'; false; }
+   Bash: grep -q 'def is_prose_line' core/scripts/_prose_filter.py && grep -q 'from _prose_filter import is_prose_line' core/scripts/signal-lifecycle-gate.py && echo 'PASS: is_prose_line SSOT (_prose_filter.py) consumed by signal-lifecycle-gate' || { echo 'FAIL: is_prose_line SSOT broken — helper must live in _prose_filter.py and be imported by signal-lifecycle-gate.py (see rb-349, guard-319)'; false; }
    Bash: grep -A 15 'def _gather_wm_ops' core/scripts/signal-lifecycle-gate.py | grep -q 'if _is_prose_line(line, path):' && echo 'PASS: _gather_wm_ops calls _is_prose_line (phantom-read Layer-1 filter wired)' || { echo 'FAIL: _gather_wm_ops no longer calls _is_prose_line — phantom-reader false positives on SKILL.md prose will return (rb-349)'; false; }
    Bash: grep -A 10 'def _gather_strict_set_writers' core/scripts/signal-lifecycle-gate.py | grep -q 'if _is_prose_line(line, path):' && echo 'PASS: _gather_strict_set_writers calls _is_prose_line (cadence-check Layer-1 filter wired)' || { echo 'FAIL: _gather_strict_set_writers no longer calls _is_prose_line — cadence-single-writer false positives on prose will return (rb-349 same-file consistency)'; false; }
    # conclusion-record.py INVARIANT: argv list for `wm.py append conclusions`
@@ -6677,11 +6809,11 @@ print('PASS: state-update flag-name contract intact — 3/3 prefixed pairs prese
    Check: cadence script fails loud on missing wm_slot field
    Bash: grep -qE "required 'wm_slot' field" core/scripts/fresh-eyes-cadence-check.py && echo 'PASS: missing-wm_slot fail-loud stderr path present' || { echo 'FAIL: fresh-eyes-cadence-check.py missing the required-wm_slot stderr path — a block without wm_slot would silently use no slot name (guard-424).'; false; }
    Check: aspirations-precheck Phase 0.5e.5 invokes fresh_eyes_program with disjoint prefix
-   Bash: grep -qE 'config-block fresh_eyes_program.*pending-prefix program-review-' .claude/skills/aspirations-precheck/SKILL.md && echo 'PASS: Phase 0.5e.5 passes both --config-block and --pending-prefix with disjoint program-review- prefix (guard-423)' || { echo 'FAIL: aspirations-precheck Phase 0.5e.5 missing or not invoking with --pending-prefix program-review- — without the disjoint prefix, fresh-eyes-review and fresh-eyes-program skip_if_pending gates block each other (guard-423).'; false; }
+   Bash: grep -qE 'config-block fresh_eyes_program' .claude/skills/aspirations-precheck/SKILL.md && echo 'PASS: Phase 0.5e.5 parametrized via --config-block fresh_eyes_program (disjoint config blocks + WM slots supersede --pending-prefix, guard-423)' || { echo 'FAIL: aspirations-precheck Phase 0.5e.5 lost the fresh_eyes_program config-block parametrization (guard-423 mutual-blocking risk returns).'; exit 1; }
    Check: /fresh-eyes-review pending-id uses timestamp (not just date) to avoid same-day collision
-   Bash: grep -qE 'id: fresh-eyes-\{YYYY-MM-DDTHH-MM-SS\}' .claude/skills/fresh-eyes-review/SKILL.md && echo 'PASS: /fresh-eyes-review pending-id includes HH-MM-SS' || { echo 'FAIL: /fresh-eyes-review pending-id reverted to date-only — same-day cadence fire + user force produces duplicate IDs.'; false; }
+   Bash: grep -qE 'fresh-eyes-\{YYYY-MM-DDTHH-MM-SS\}' .claude/skills/fresh-eyes-review/SKILL.md && echo 'PASS: /fresh-eyes-review briefing id includes HH-MM-SS' || { echo 'FAIL: /fresh-eyes-review briefing id reverted to date-only — same-day cadence fire + user force produces duplicate ids.'; exit 1; }
    Check: /fresh-eyes-program pending-id uses timestamp (not just date)
-   Bash: grep -qE 'id: program-review-\{YYYY-MM-DDTHH-MM-SS\}' .claude/skills/fresh-eyes-program/SKILL.md && echo 'PASS: /fresh-eyes-program pending-id includes HH-MM-SS' || { echo 'FAIL: /fresh-eyes-program pending-id reverted to date-only — same-day collision risk returns.'; false; }
+   Bash: grep -qE 'fresh-eyes-program-\{YYYY-MM-DDTHH-MM-SS\}' .claude/skills/fresh-eyes-program/SKILL.md && echo 'PASS: /fresh-eyes-program briefing id includes HH-MM-SS' || { echo 'FAIL: /fresh-eyes-program briefing id reverted to date-only — same-day collision risk returns.'; exit 1; }
 
    # S55.6: Sibling-ritual min_session_goals gate (g-115-1054, g-115-1106)
    # World-counter ticks PER-AGENT rituals every time ANY agent completes a goal.
@@ -6920,7 +7052,7 @@ print(f"PASS: {len(files)} aspiration stores scanned, 0 dotted-literal keys")'
    # silent-corruption class g-115-529 closed. See zeta/reports/g-115-529-dotted-path-corruption-decision.md
    # for the design rationale and rb-776 / guard-497 for the encoded lesson.
    Check: 6 field=value scripts collectively contain ≥10 `if "." in field` reject sites (g-115-566 baseline)
-   Bash (dotted-reject-presence): n=$(grep -cE 'if "\." in field' core/scripts/aspirations.py core/scripts/pipeline.py core/scripts/reasoning-bank.py core/scripts/experience.py core/scripts/spark-questions.py core/scripts/pattern-signatures.py 2>/dev/null | awk -F: '{s+=$2} END {print s}'); test "$n" -ge 10 && echo "PASS: $n dotted-reject sites across 6 scripts (>=10 baseline)" || { echo "FAIL: only $n dotted-reject sites — regression below g-115-566 baseline of 10; new caller likely missing the guard"; exit 1; }
+   Bash (dotted-reject-presence): n1=$(grep -cE 'if "\." in field' core/scripts/aspirations.py core/scripts/pipeline.py core/scripts/reasoning-bank.py core/scripts/experience.py core/scripts/spark-questions.py core/scripts/pattern-signatures.py 2>/dev/null | awk -F: '{s+=$2} END {print s}'); n2=$(grep -cE 'dotted_field_rejected|split\("\."\)\[0\] in spec.immutable_fields' mind_api/src/endpoints/store.py); test "$((n1+n2))" -ge 5 && echo "PASS: $n1 CLI + $n2 store-endpoint dotted-reject sites (>=5; per-script rejects consolidated into /v1/store/set-field)" || { echo "FAIL: only $((n1+n2)) dotted-reject sites — g-115-566 guard eroding; new field-update caller likely missing the reject"; exit 1; }
    Check: `core/scripts/tests/test_dotted_path_rejection.sh` exists and exits 0 (regression catches: test deleted or core idiom broken)
    Bash (dotted-reject-test-runs): test -x core/scripts/tests/test_dotted_path_rejection.sh && bash core/scripts/tests/test_dotted_path_rejection.sh >/dev/null 2>&1 && echo "PASS: dotted_path_rejection test exits 0" || { echo "FAIL: test_dotted_path_rejection.sh missing or non-zero exit — dotted-reject contract regressed"; exit 1; }
 
@@ -7082,6 +7214,23 @@ if py_paths != sh_paths:
     sys.exit(1)
 print(f'PASS: marker-placement ALLOWLIST in sync ({len(py_paths)} entries)')
 "
+
+   # === Section S61: no committed merge-conflict markers in executable dirs (g-115-2018, sq-018) ===
+   # g-115-2013 Q1.5 marker sweep found a COMMITTED conflict-start block on
+   # origin/main (mind_api/docs/development-history/DECISIONS.md:1865) — proof the
+   # merge-conflict-marker defect class reaches committed state. g-115-2016 REPAIRS
+   # that one docs instance; THIS check prevents RECURRENCE in the executable/config
+   # surfaces. Scope: core/scripts/ core/config/ .claude/skills/ .claude/rules/
+   # mind_api/src/ — deliberately EXCLUDES docs/ (the known instance lives there;
+   # widen to include docs/ once g-115-2016 lands). Patterns are ANCHORED to real
+   # git markers only: the start/end greps require the 7-char run + a trailing
+   # space + label, and the separator grep requires a whole line of exactly the
+   # 7-char run — so a "# === ... ===" section divider (starts with '#') and a
+   # lone short run never match. The check's own pattern lives mid-line behind
+   # grep, so it does not self-match. FP escape hatch (per g-115-2018): if a
+   # legitimate heredoc / test-fixture / setext-H1 surfaces, add a path filter
+   # here. Target dirs grep clean as of 2026-07-11 (verified at authoring).
+   Bash: hits=$(grep -rInE '^<<<<<<< |^=======$|^>>>>>>> ' core/scripts/ core/config/ .claude/skills/ .claude/rules/ mind_api/src/ 2>/dev/null); if [ -n "$hits" ]; then echo "FAIL: committed merge-conflict marker(s) in executable framework dirs (g-115-2018) — resolve the conflict before merge:"; echo "$hits" | head -10; false; else echo 'PASS: no committed merge-conflict markers in executable framework dirs (S61)'; fi
 
 Provide a summary table:
 - Total PASS / FAIL / N/A per section

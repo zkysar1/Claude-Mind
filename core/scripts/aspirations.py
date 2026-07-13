@@ -1621,7 +1621,30 @@ def cmd_update_goal(args):
         # in-progress writes. Moving this read below `goal[field] = value` would
         # break the guard and inflate selection_count on every resume/retry.
         old_status = goal.get("status")
+        # 9: capture pre-update interval_hours BEFORE the write so the
+        # anchor-persist cascade below records the ORIGINAL cadence, not the
+        # incoming (possibly already-extended) value.
+        _prev_interval_hours = goal.get("interval_hours")
         goal[field] = value
+
+        # 9 (unbounded interval-ratchet fix): persist the cap anchor here,
+        # at the single write site EVERY interval_hours path funnels through. The
+        # per-goal path (cargo-cult-detector.update_interval_hours) writes the anchor
+        # itself, but the BATCH-CALIBRATE and MANUAL apply paths reach interval_hours
+        # through this generic chokepoint and never persisted original_interval_hours —
+        # so every later auto-extension read orig=None, treated the already-extended
+        # value as "original", and the 3x cap ratcheted UNBOUNDED ( root-cause,
+        # zeta 2026-07-12). Anchor to the PRE-update cadence; skip a fresh goal's first
+        # interval set (_prev None/0) so no spurious anchor is created. When the anchor
+        # already exists (e.g. update_interval_hours wrote it first) this is a no-op.
+        if (
+            field == "interval_hours"
+            and goal.get("original_interval_hours") in (None, "")
+            and isinstance(_prev_interval_hours, (int, float))
+            and not isinstance(_prev_interval_hours, bool)
+            and _prev_interval_hours > 0
+        ):
+            goal["original_interval_hours"] = _prev_interval_hours
 
         # Stamp last_modified on every successful field write (-a, sub-goal of
         #  stale-read gate). Consumed by stale-read-gate.py to detect when a
@@ -1996,6 +2019,8 @@ def cmd_evolution_append(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Aspiration lifecycle engine")
+    # WORLD_AGENT_ONLY: cross-agent execution routes via the MIND_AGENT env
+    # override ( Option 3), never by widening this enum.
     parser.add_argument("--source", choices=["world", "agent"], default="world",
                         help="Which aspiration queue to operate on (default: world)")
     subparsers = parser.add_subparsers(dest="command", required=True)

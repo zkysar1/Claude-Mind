@@ -63,7 +63,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
-from _paths import WORLD_DIR, META_DIR, AGENT_NAME  # noqa: E402
+from _paths import WORLD_DIR, META_DIR, AGENT_NAME, agent_dir  # noqa: E402
 
 # ----------------------------------------------------------------------------
 # Config
@@ -464,7 +464,7 @@ def _invocation_counts():
     NOTE (rb-245): this log is per-window, NOT lifetime — a 0 here means
     'not invoked in the recorded window', which is NOT 'orphaned'."""
     counts = {}
-    inv = PROJECT_ROOT / "agents" / AGENT_NAME / "skill-invocations.jsonl"
+    inv = agent_dir(AGENT_NAME) / "skill-invocations.jsonl"
     if not inv.exists():
         return counts
     try:
