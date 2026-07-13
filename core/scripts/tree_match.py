@@ -45,6 +45,12 @@ CHANNEL_SCORES = {
     "exact_key": 4.0,
     "substring": 3.0,
     "entity_index": 2.5,
+    # g-306-83: semantic eligibility via the persisted embedding index
+    # (retrieve.load_tree_nodes, flag-gated embedding_tree_channel_enabled).
+    # Scored like entity_index: a strong semantic hit is comparable evidence
+    # to an entity-term hit; the cosine BONUS in the scorer differentiates
+    # strong vs marginal semantic matches on top of this base.
+    "embedding": 2.5,
     "concept": 2.0,
     "word_prefix": 1.5,
     "sibling": 1.0,

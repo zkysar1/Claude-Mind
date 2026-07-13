@@ -369,8 +369,9 @@ def main(argv=None):
 
     commits = {}
     if not args.no_commits:
-        agents_root = PROJECT_ROOT / "agents"
-        gmap = build_goal_agent_map(world_dir, agents_root)
+        sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
+        from _paths import agents_root  # noqa: E402 — AGENTS_PARENT_DIR SSOT
+        gmap = build_goal_agent_map(world_dir, agents_root())
         commits = commit_stats(cutoff, gmap)
     team_commits = commits.get("team", {}).get("commits", 0)
 

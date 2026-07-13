@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 from ..stats import collector
 
@@ -239,13 +240,34 @@ def runner_acquire(ctx) -> "Response":  # type: ignore[name-defined]
         # reclaimed (the conditional check fails) so we still answer held=true.
         # reclaim+re-acquire is the same race-safe conditional-CAS pair a peer
         # /start would run (design §5): two machines cannot both win.
+        #
+        # Capture the previous holder BEFORE the reclaim so a successful
+        # stale-break can report WHO it broke and HOW stale the claim was
+        # (prev_machine_id + prev_heartbeat_age_seconds). Without this, the
+        # caller cannot distinguish "row was IDLE, clean acquire" from "broke
+        # a peer's stale claim" — the 2026-07-07 bravo dual-runner incident
+        # was narrated as "no live peer detected" precisely because the
+        # stale-break was invisible. Best-effort: a read failure must never
+        # abort the reclaim path.
+        try:
+            prev = get_backend().get_runner_state(agent)
+        except Exception:  # noqa: BLE001 — diagnostics only, never fatal
+            prev = None
         try:
             reclaimed = get_backend().reclaim_if_stale(agent)
             if reclaimed:
                 get_backend().acquire_runner(agent, token)
-                return Response.json(
-                    {"backend": backend, "ok": True, "acquired": True,
-                     "held": False, "reclaimed_stale": True})
+                resp = {"backend": backend, "ok": True, "acquired": True,
+                        "held": False, "reclaimed_stale": True}
+                if prev:
+                    try:
+                        hb = int(prev.get("heartbeat_at") or 0)
+                        resp["prev_machine_id"] = prev.get("machine_id")
+                        resp["prev_heartbeat_age_seconds"] = max(
+                            0, int(time.time()) - hb)
+                    except (TypeError, ValueError):
+                        pass
+                return Response.json(resp)
         except RunnerHeld:
             pass  # raced: another machine acquired between our reclaim and retry
         except Exception as e:  # noqa: BLE001 — reclaim/retry failure is non-fatal

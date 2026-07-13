@@ -97,6 +97,54 @@ retrieval:
   poignancy_blend_enabled: false                # master flag — false = current behavior
   poignancy_weight_min: 1.0                      # factor at poignancy=1 (and null→neutral)
   poignancy_weight_max: 1.5                      # factor at poignancy=10
+  # Embedding-cosine hybrid for the supplementary stores ( part b2;
+  # validated by the  A/B gate: offline embedding-cosine beat the
+  # token-overlap text-fallback ~5x on hit@3, 67% vs 13%, MRR .512 vs .129).
+  # When enabled AND the persisted index exists (embedding-index-build.py →
+  # mind_api/state/retrieval-embedding-index/), reasoning-bank + guardrail
+  # candidates are (1) WIDENED with entries whose query-cosine >=
+  # embedding_min_cosine even when the token predicate missed them, and
+  # (2) RE-RANKED by cosine desc before the depth cap — relevance decides
+  # cap slots instead of utility. DEFAULT OFF — when false (or the index is
+  # absent, or the model fails) ranking is byte-identical to the token path;
+  # graceful degradation is structural (_embedding_retrieval.cosine_scores
+  # never raises). The daemon caches this config per process — flipping the
+  # flag needs a daemon restart, same as the poignancy blend above.
+  embedding_blend_enabled: false                # master flag — false = current behavior
+  embedding_min_cosine: 0.35                    # widen threshold for non-token-matched entries
+  # : when the blend is ON, this many of the UNIVERSAL_RB_CAP(5)
+  # meta_lessons slots are picked by query-cosine (from universal entries
+  # clearing embedding_min_cosine) instead of utilization order. The top
+  # (5 - N) by utilization remain guaranteed (push floor); unfilled pull
+  # slots backfill by utilization, so the returned count never shrinks.
+  # Motivation: the b2 acceptance A/B showed the universal lane returns the
+  # SAME top-5-by-utilization for ANY query — framework meta-lessons were
+  # query-invisible (9/9 paraphrase targets unranked in both arms).
+  # 0 = disable the split (pure utilization) even with the blend on.
+  universal_relevance_slots: 2
+  # : model the index BUILDER embeds with (embedding-index-build.py
+  # --build; --model CLI overrides). The QUERY side ignores this — it loads
+  # the model named in the built index's meta.json, so a box's query encoder
+  # always matches its own index. --update pins the existing index's model
+  # (mixing models in one matrix corrupts cosines); switching models requires
+  # an explicit --build. Backend auto-selects per box: fastembed (ONNX, no
+  # torch) when installed + model supported, else sentence-transformers.
+  # DEFAULT stays all-MiniLM-L6-v2 because that is the model every fleet box
+  # has HF-cached today — do NOT flip to bge-small here until fastembed +
+  # model files are provisioned fleet-wide (offline posture: an uncached
+  # model cannot download at build time). Boxes with fastembed provisioned
+  # can rebuild with: py -3 core/scripts/embedding-index-build.py --build
+  # --model "BAAI/bge-small-en-v1.5" (the  GO model).
+  embedding_model_name: all-MiniLM-L6-v2
+  # : tree-lane embedding channel. When true AND the index carries
+  # tree docs (embedding-index-build.py now embeds key+summary per node as
+  # 'tree:<relpath>' ids), load_tree_nodes gains a semantic eligibility
+  # channel ('embedding' — nodes above embedding_min_cosine join the match
+  # set even when all four token strategies miss) and _score_weight_limit
+  # swaps its TF-IDF cosine bonus for true embedding cosine. SEPARATE flag
+  # from embedding_blend_enabled (supplementary lane) so each lane enables
+  # on its own A/B evidence. DEFAULT OFF — byte-identical when false.
+  embedding_tree_channel_enabled: false
   # M-4: Rehearsal-weighted decay parameters.
   # Frequently-retrieved nodes get a longer recency TAU, so their recency bonus
   # persists longer. Uses retrieval_count (monotonic, safe) not last_retrieved

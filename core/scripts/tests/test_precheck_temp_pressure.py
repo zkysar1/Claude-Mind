@@ -209,5 +209,46 @@ def test_temp_pressure_ephemera_dedup_existing_goal(tmp_path, monkeypatch):
     assert r["suggested_goal"] is None
 
 
+# ── One-shot scratch-script ephemera (.py/.sh/.err) counting (7) ──
+# Pre-fix, one-shot scratch scripts (build-*.py, orphan-*.py, restart-poller.sh,
+# gs.err) in temp/ root were invisible to BOTH the drain glob and this metric,
+# so scratch-only accumulation emitted NO flag and grew unbounded — the exact
+# 7 gap for a different file class. EPHEMERA_SUFFIXES now includes
+# .py/.sh/.err so they count as ephemera alongside .log/.txt.
+
+def test_temp_pressure_scratch_scripts_counted_as_ephemera(tmp_path, monkeypatch):
+    # 4 scratch scripts (.py/.sh/.err) + 1 legacy .log = 5 ephemera, 0 docs.
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    (temp / "build-fix.py").write_text("x", encoding="utf-8")
+    (temp / "orphan-scan.py").write_text("x", encoding="utf-8")
+    (temp / "restart-poller.sh").write_text("x", encoding="utf-8")
+    (temp / "gs.err").write_text("x", encoding="utf-8")
+    (temp / "suite.log").write_text("x", encoding="utf-8")  # legacy class still counts
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["count"] == 0
+    assert r["ephemera_count"] == 5
+    assert r["pressure_count"] == 5
+    assert r["flags"] == []  # below warn(10)
+
+
+def test_temp_pressure_scratch_scripts_not_conflated_with_docs(tmp_path, monkeypatch):
+    # A .py/.sh/.err in temp/ root is ephemera, NOT a drainable working doc
+    # (.md/.json). The two classes must stay distinct: 2 docs + 3 scratch.
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    (temp / "design.md").write_text("doc", encoding="utf-8")
+    (temp / "plan.json").write_text("{}", encoding="utf-8")
+    (temp / "a.py").write_text("x", encoding="utf-8")
+    (temp / "b.sh").write_text("x", encoding="utf-8")
+    (temp / "c.err").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["count"] == 2           # .md + .json only
+    assert r["ephemera_count"] == 3  # .py + .sh + .err
+    assert r["pressure_count"] == 5
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

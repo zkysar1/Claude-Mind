@@ -15,10 +15,12 @@ pinned by test_goal_source_cycle_detector_prefixes.py:
 
     infer(sig) is not None  ==>  is_valid(sig) is True
 
-(The reverse is intentionally NOT required: a gate-accepted signal may have no
-infer() mapping -- e.g. program-change-proposal: -- which leaves
-goal_source null but does NOT inflate the override rate. That is a separate,
-lesser attribution gap, out of scope for this lock.)
+(The reverse is intentionally NOT required: a gate-accepted signal with no
+infer() mapping leaves goal_source null but does NOT inflate the override
+rate. That is a separate, lesser attribution gap, out of scope for this lock.
+As of 2026-07-10 every ALLOWED_PREFIXES entry happens to have an infer()
+mapping -- program-change-proposal: was the last gap, closed to agent-self --
+but this test does not pin that direction.)
 
 Fixture maintenance: INFER_RECOGNIZED_SIGNALS lists one representative concrete
 signal per branch of _goal_source.infer(). When infer() gains a new recognized
@@ -55,6 +57,7 @@ INFER_RECOGNIZED_SIGNALS = [
     "idle_fallback",
     "decomposition:parent-1",
     "parent_aspiration:asp-115",
+    "program-change-proposal:2026-07-10",
     "unblock:g-115-1357",
     "investigate:g-002-17",
     "investigation:fresh-eyes-code-finding",

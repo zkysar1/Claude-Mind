@@ -39,6 +39,9 @@ CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 GATE_PY = CORE_SCRIPTS / "capability-gate.py"
+# PR 7a/5 extracted the pattern helpers out of the CLI shim into the gates
+# package — import them from there (the shim no longer defines them).
+GATES_CAPABILITY_PY = CORE_SCRIPTS / "gates" / "capability.py"
 
 CASES = [
     # 1. Multi-NPC RUN session — agent-provisionable, must block.
@@ -149,12 +152,14 @@ def _run_gate(failure_reason: str, with_suggest: bool = True,
 
 
 def _import_helpers():
-    """Import session-requirement helpers via importlib (hyphenated filename)."""
+    """Import session-requirement helpers from gates/capability.py (the
+    post-7a/5 home; the hyphenated CLI shim re-exports nothing)."""
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("capability_gate", GATE_PY)
+    spec = importlib.util.spec_from_file_location(
+        "capability_gate", GATES_CAPABILITY_PY)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load spec for {GATE_PY}")
+        raise RuntimeError(f"could not load spec for {GATES_CAPABILITY_PY}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return (

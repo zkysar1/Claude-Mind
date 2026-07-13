@@ -163,14 +163,15 @@ Single source of truth: `VALID_GOAL_SOURCES` in `core/scripts/aspirations.py`.
 
 When `goal_source` is absent at goal-add time, `cmd_add_goal` and `cmd_add`
 infer it from `origin_signal` prefix using the mapping in
-`core/scripts/aspirations.py::_infer_goal_source_from_signal`:
+`core/scripts/_goal_source.py::infer` (the single source of truth, imported
+by both the CLI path and the daemon writer endpoint):
 
 | `origin_signal` prefix | Inferred `goal_source` |
 |------------------------|------------------------|
 | `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*` | `user` |
 | `recurring_cadence:*`, `recurring:*` | `recurring-cycle` |
 | `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*` | `cycle-detector` |
-| `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `idle_fallback` | `agent-self` |
+| `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `program-change-proposal:*`, `idle_fallback` | `agent-self` |
 
 Variant prefixes (`investigation:` vs canonical `investigate:`, `user-directed:`
 vs canonical `user_directive`, etc.) are recognized for backward compatibility
@@ -293,6 +294,7 @@ Weight: `meta/goal-selection-strategy.yaml → cross_aspiration_support`
     type: command_succeeds
     command: "bash world/scripts/probe-<deployment-resource>.sh"
   ```
+- `deliverable_file`: optional string (schema-additive, g-115-2036) — path to the file a recurring goal is expected to REGENERATE on every cycle (e.g. a completion report, a metrics snapshot). When set, `recurring-close.sh` runs `deliverable-verify.py` BEFORE the verify phase bumps `lastAchievedAt`, comparing the file's mtime against the CURRENT (prior-close) `lastAchievedAt`. If the file was NOT modified since the prior close, the close emits a non-blocking `⚠ DELIVERABLE NOT REGENERATED` warning to stderr — catching the rb-428 LLM-abbreviation drift where a close advances `lastAchievedAt` without the skill's deliverable-writing step having run (canonical g-001-04: 2026-07-11 close bumped `lastAchievedAt`, no write touched the report). FLAG-ONLY + fail-open: it never blocks a close (a false-stale mtime, e.g. an own-cloud stale pull, must not gate real work) and goals WITHOUT the field close exactly as before. The literal `{agent}` placeholder expands to the running agent, so a SHARED recurring goal (run by several agents under an `MIND_AGENT` override) can name a per-agent deliverable — e.g. `"agents/{agent}/COMPLETION-REPORT.md"` for the `/agent-completion-report` goal (rb-1556). Relative paths anchor to `PROJECT_ROOT`.
 
 To permanently stop a recurring goal: set `recurring: false` via `aspirations-update-goal.sh <goal-id> recurring false`. The data layer (`cmd_update_goal` in `aspirations.py`) cascading-clears `interval_hours` and `lastAchievedAt` in the same write — preserving `achievedCount` / `currentStreak` / `longestStreak` as historical record. Without the cascade, the orphan timing fields would mislead the goal-selector's "not yet due" filter and require the archive sweep to silently repair.
 

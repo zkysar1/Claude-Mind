@@ -424,6 +424,26 @@ def load_tree_nodes(categories, depth, read_only=False):
                 if new > existing:
                     all_channels[key] = cat_channels[key]
 
+    # g-306-83: flag-gated tree embedding channel — semantic eligibility.
+    # Nodes whose query-cosine clears embedding_min_cosine join the matched
+    # set on the 'embedding' channel even when all four token strategies
+    # missed them. Runs BEFORE sibling/parent inclusion so semantic matches
+    # are first-class (they expand at deep like any other match). The same
+    # score map feeds _score_weight_limit below, replacing the TF-IDF
+    # cosine bonus with true embedding cosine for this request.
+    tree_emb = _tree_embedding_scores(categories, nodes)
+    if tree_emb:
+        try:
+            _min_cos = float(_load_retrieval_config().get(
+                "embedding_min_cosine", 0.35))
+        except (TypeError, ValueError):
+            _min_cos = 0.35
+        for _k, _score in tree_emb.items():
+            if _score >= _min_cos and _k not in all_matched and _k in nodes:
+                all_matched[_k] = nodes[_k]
+                all_channels[_k] = "embedding"
+                all_matched_keys.add(_k)
+
     # Convert to list form for sibling/parent inclusion
     matched = [(k, v) for k, v in all_matched.items()]
 
@@ -448,7 +468,8 @@ def load_tree_nodes(categories, depth, read_only=False):
     # specific matches outrank generic-token parents (NOISY-leaf fix).
     query_text = " ".join(c for c in categories if c)
     scored = _score_weight_limit(matched, all_channels, limit,
-                                 query_text=query_text, all_nodes=nodes)
+                                 query_text=query_text, all_nodes=nodes,
+                                 emb_scores=tree_emb)
 
     # Build results with match metadata (tree bodies never inline — see below).
     # Snapshot match metadata from `node` (the unlocked-read view); the
@@ -674,6 +695,190 @@ def _entry_matches(entry, categories):
         return True
     return _entry_matches_text(entry, categories)
 
+def _embedding_blend(matched, active, categories, exclude=None):
+    """g-306-77 part b2 — flag-gated embedding-cosine hybrid for the
+    supplementary stores (reasoning bank + guardrails; the two corpora
+    embedding-index-build.py persists).
+
+    Fixes the two weaknesses the g-306-77 A/B exposed (delta msg-2771,
+    hit@3 67% vs 13%, MRR .512 vs .129): the token predicate is BINARY
+    (a semantically-relevant entry sharing <2 long tokens never becomes
+    eligible), and the final order is utility, not relevance (a relevant
+    entry loses its cap slot to high-utility off-topic entries).
+
+    Two moves, both flag-gated by `embedding_blend_enabled` (DEFAULT OFF —
+    byte-identical ranking when off, same contract as the poignancy/PPR
+    blends):
+      1. WIDEN — active entries whose cosine >= embedding_min_cosine join
+         the candidate set even when `_entry_matches` said no.
+      2. RE-RANK — candidates sort by cosine desc. Entries absent from the
+         index (added since the last `embedding-index-build.py --update`)
+         sort AT the threshold, keeping their pre-existing utility order
+         among themselves (stable sort; `matched` arrives utility-sorted).
+         They earned eligibility via tokens — never buried below every
+         indexed record, never boosted above real semantic hits.
+
+    The caller applies the depth cap AFTER this returns, so semantic adds
+    compete for cap slots by relevance — and the bump-set == return-set
+    invariant (see load_reasoning_bank docstring) is untouched because the
+    bump code reads the post-cap list exactly as before.
+
+    Graceful degradation is structural: flag off, empty/missing index,
+    model unavailable, or ANY exception from the helper → `matched` is
+    returned unchanged. cosine_scores() itself never raises
+    (_embedding_retrieval.py contract); the try/except here additionally
+    covers the import on a box without numpy.
+
+    `exclude` filters the widen pass (load_reasoning_bank passes
+    is_universal_rb — the universal partition has its own cap and must not
+    be double-returned via the domain list).
+    """
+    cfg = _load_retrieval_config()
+    if not cfg.get("embedding_blend_enabled", False):
+        return matched
+    try:
+        from _embedding_retrieval import cosine_scores
+        query = " ".join(c for c in categories
+                         if isinstance(c, str) and c).strip()
+        scores = cosine_scores(query) if query else {}
+    except Exception:
+        scores = {}
+    if not scores:
+        return matched
+    try:
+        min_cos = float(cfg.get("embedding_min_cosine", 0.35))
+    except (TypeError, ValueError):
+        min_cos = 0.35
+    matched_ids = {r.get("id") for r in matched}
+    widened = list(matched)
+    for r in active:
+        rid = r.get("id")
+        if not rid or rid in matched_ids:
+            continue
+        if exclude is not None and exclude(r):
+            continue
+        if scores.get(rid, 0.0) >= min_cos:
+            widened.append(r)
+    widened.sort(key=lambda r: -scores.get(r.get("id"), min_cos))
+    return widened
+
+def _universal_relevance_split(universal_sorted, categories):
+    """g-306-86 — split the universal-RB cap between the utilization push
+    floor and query-relevance pulls, flag-gated by `embedding_blend_enabled`.
+
+    Motivating finding (g-306-77 b2 acceptance A/B, 2026-07-10): the
+    universal partition returned the SAME top-UNIVERSAL_RB_CAP(5)-by-
+    utilization entries for ANY query — 9/9 direct paraphrases of
+    universal lessons (rb-629 silent-loop-death, rb-2859 archive-before-
+    delete, ...) came back unranked in BOTH A/B arms. Query relevance
+    played no role in the lane where the framework's hard-won meta-lessons
+    live.
+
+    Contract:
+      - Input is the FULL universal list already ordered by
+        sort_universal_rbs (utilization desc) — the caller's pre-cap list.
+      - Flag off / no scores / no qualifying picks → EXACTLY
+        universal_sorted[:UNIVERSAL_RB_CAP], today's behavior.
+      - Flag on: the top (CAP - universal_relevance_slots) by utilization
+        are ALWAYS returned first (the push floor — the "always surface
+        meta-lessons" guarantee, narrowed but never removed). The remaining
+        slots go to the highest-cosine entries from the rest of the
+        universal list that clear embedding_min_cosine, in cosine order.
+        Unfilled pull slots BACKFILL by utilization order, so the total is
+        min(CAP, len(universal_sorted)) in every branch — the cap never
+        shrinks because a query had no semantic relatives.
+      - Bump-set == return-set holds downstream for free: the caller bumps
+        exactly the list this returns.
+      - prime's boot display is NOT this lane — it reads
+        `reasoning-bank-read.sh --universal` (a separate reader); only
+        retrieve's meta_lessons output changes here.
+    """
+    cfg = _load_retrieval_config()
+    if not cfg.get("embedding_blend_enabled", False):
+        return universal_sorted[:UNIVERSAL_RB_CAP]
+    try:
+        slots = int(cfg.get("universal_relevance_slots", 2))
+    except (TypeError, ValueError):
+        slots = 2
+    slots = max(0, min(slots, UNIVERSAL_RB_CAP))
+    if slots == 0:
+        return universal_sorted[:UNIVERSAL_RB_CAP]
+    try:
+        from _embedding_retrieval import cosine_scores
+        query = " ".join(c for c in categories
+                         if isinstance(c, str) and c).strip()
+        scores = cosine_scores(query) if query else {}
+    except Exception:
+        scores = {}
+    if not scores:
+        return universal_sorted[:UNIVERSAL_RB_CAP]
+    try:
+        min_cos = float(cfg.get("embedding_min_cosine", 0.35))
+    except (TypeError, ValueError):
+        min_cos = 0.35
+    floor_n = UNIVERSAL_RB_CAP - slots
+    out = list(universal_sorted[:floor_n])
+    rest = universal_sorted[floor_n:]
+    pulls = [r for r in rest if scores.get(r.get("id"), 0.0) >= min_cos]
+    pulls.sort(key=lambda r: -scores.get(r.get("id"), 0.0))
+    out.extend(pulls[:slots])
+    if len(out) < UNIVERSAL_RB_CAP:
+        picked = {id(r) for r in out}
+        for r in rest:
+            if id(r) not in picked:
+                out.append(r)
+                picked.add(id(r))
+            if len(out) >= UNIVERSAL_RB_CAP:
+                break
+    return out
+
+def _tree_doc_id_for(node):
+    """This node's embedding-index doc id: 'tree:' + tree-root-relative path
+    (no .md), derived from the `file` field. MUST mirror embedding-index-
+    build.py tree_doc_id — the write-side of this join. Basename keys are
+    deliberately NOT the join key (g-306-45: a basename join against a
+    path-keyed store matched zero real records and shipped silently inert)."""
+    f = str((node or {}).get("file") or "").replace("\\", "/")
+    marker = "knowledge/tree/"
+    i = f.find(marker)
+    if i < 0:
+        return None
+    rel = f[i + len(marker):]
+    if rel.endswith(".md"):
+        rel = rel[:-3]
+    return ("tree:" + rel) if rel else None
+
+def _tree_embedding_scores(categories, nodes):
+    """g-306-83 — flag-gated tree-lane cosine scores, joined back to the
+    caller's BASENAME namespace.
+
+    Returns {basename_key: cosine} for every node present in the persisted
+    index, or {} when `embedding_tree_channel_enabled` is off, the index is
+    absent/degraded, or anything fails (structural graceful degradation —
+    same contract as _embedding_blend). The caller uses the map twice:
+    eligibility (nodes above embedding_min_cosine join the matched set on
+    the 'embedding' channel) and ranking (_score_weight_limit swaps the
+    TF-IDF cosine bonus for these scores when present).
+    """
+    cfg = _load_retrieval_config()
+    if not cfg.get("embedding_tree_channel_enabled", False):
+        return {}
+    try:
+        from _embedding_retrieval import cosine_scores
+        query = " ".join(c for c in categories
+                         if isinstance(c, str) and c).strip()
+        raw = cosine_scores(query) if query else {}
+    except Exception:
+        raw = {}
+    if not raw:
+        return {}
+    out = {}
+    for key, node in (nodes or {}).items():
+        did = _tree_doc_id_for(node)
+        if did is not None and did in raw:
+            out[key] = raw[did]
+    return out
+
 def _sort_by_utility(entries):
     """In-place sort by utilization.utilization_score desc, provenance weight
     desc (M-5), then created desc.
@@ -798,9 +1003,22 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     domain = [r for r in active if not is_universal_rb(r)
               and _entry_matches(r, categories)]
     _sort_by_utility(domain)
+    # g-306-77 b2: flag-gated embedding hybrid (widen + cosine re-rank) BEFORE
+    # the cap, so semantic matches compete for slots by relevance. Skipped on
+    # as_of reads — blending a historical view against the current-corpus
+    # index would rank yesterday's records by today's semantics.
+    if as_of_dt is None:
+        domain = _embedding_blend(domain, active, categories,
+                                  exclude=is_universal_rb)
     domain = domain[:cap]
     sort_universal_rbs(universal)
-    universal = universal[:UNIVERSAL_RB_CAP]
+    # g-306-86: flag-gated relevance split of the universal cap. as_of reads
+    # keep the pure utilization slice — same historical-view reasoning as the
+    # domain-lane blend above.
+    if as_of_dt is None:
+        universal = _universal_relevance_split(universal, categories)
+    else:
+        universal = universal[:UNIVERSAL_RB_CAP]
 
     # g-306-36: never bump on a point-in-time (as_of) read — it is observational
     # history, not current usage, and would inflate the counters that rank
@@ -842,6 +1060,9 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
         active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
     _sort_by_utility(filtered)
+    # g-306-77 b2: flag-gated embedding hybrid — see load_reasoning_bank.
+    if as_of_dt is None:
+        filtered = _embedding_blend(filtered, active, categories)
     filtered = filtered[:cap]
 
     if not read_only and as_of_dt is None:
@@ -1191,6 +1412,24 @@ _DEFAULT_RETRIEVAL_CFG = {
     "ppr_weight_min": 1.0,
     "ppr_weight_max": 1.5,
     "ppr_seed_top_n": 5,
+    # Embedding-cosine hybrid for the supplementary stores (g-306-77 part b2;
+    # index built by embedding-index-build.py, queried via _embedding_retrieval).
+    # DEFAULT OFF — mirrors the two blends above: when false, _embedding_blend
+    # returns its input unchanged and ranking is byte-identical to pre-b2.
+    "embedding_blend_enabled": False,
+    "embedding_min_cosine": 0.35,
+    # g-306-86: universal-RB cap slots reassigned from utilization order to
+    # query-cosine order when the blend is ON. 0 disables the split even
+    # with the blend enabled; clamped to [0, UNIVERSAL_RB_CAP].
+    "universal_relevance_slots": 2,
+    # g-306-82: builder-side model choice (embedding-index-build.py). Query
+    # side follows the built index's meta.json, never this key.
+    "embedding_model_name": "all-MiniLM-L6-v2",
+    # g-306-83: tree-lane embedding channel (semantic eligibility in
+    # load_tree_nodes + embedding cosine replacing the TF-IDF bonus in
+    # _score_weight_limit). Separate flag from the supplementary blend so
+    # each lane enables on its own A/B evidence.
+    "embedding_tree_channel_enabled": False,
 }
 
 _RETRIEVAL_CFG_CACHE = None
@@ -1395,7 +1634,7 @@ def _resolve_ppr_key(key, node, ppr_scores):
     return cands[0]
 
 def _score_weight_limit(matched, channels, limit,
-                        query_text="", all_nodes=None):
+                        query_text="", all_nodes=None, emb_scores=None):
     """Score each matched node, apply utility weighting, sort, limit.
     Replaces tree_match._score_and_limit for full retrieval; the shared
     helper stays unchanged for lightweight lookups (/tree find, etc.).
@@ -1406,12 +1645,21 @@ def _score_weight_limit(matched, channels, limit,
     generic-token parents (the audit-driven NOISY-leaf fix). Cosine bonus
     is added to `base` before the utility weight multiplies, so a noisy
     node's low utility_weight still drags down its effective score.
+
+    g-306-83: when `emb_scores` (basename-keyed embedding cosines from
+    _tree_embedding_scores) is non-empty, it REPLACES the TF-IDF bonus —
+    same COSINE_BONUS_WEIGHT, real semantic cosine instead of token IDF,
+    and the tree_idf index build is skipped entirely. Nodes absent from
+    the embedding index contribute 0 bonus (their channel/depth/confidence
+    signals still rank them). Empty/None emb_scores → the TF-IDF path,
+    byte-identical to pre-g-306-83.
     """
     cfg = _load_retrieval_config()
 
+    use_emb = bool(emb_scores)
     idf_index = None
     q_vm = None
-    if query_text and all_nodes:
+    if query_text and all_nodes and not use_emb:
         from tree_idf import build_index, query_vector
         idf_index = build_index(all_nodes)
         q_vm = query_vector(query_text, idf_index["idf"])
@@ -1423,7 +1671,9 @@ def _score_weight_limit(matched, channels, limit,
     for key, node in matched:
         channel = channels.get(key, "parent")
         base = _compute_match_score(key, node, channel)
-        if idf_index is not None:
+        if use_emb:
+            base += COSINE_BONUS_WEIGHT * float(emb_scores.get(key, 0.0))
+        elif idf_index is not None:
             d_vm = idf_index["vectors"].get(key, ({}, 0.0))
             base += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)
         w = _utility_weight(node, cfg)

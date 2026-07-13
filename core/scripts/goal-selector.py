@@ -321,6 +321,38 @@ def _synth_blocker_ref_from_structured_defer(goal):
 
     return None
 
+
+def _synth_block_ref(kind, key):
+    """Synthesize a type=resource blocker_ref for a blocked goal whose branch
+    classified it (kind = infrastructure / precondition / explicit-status / ...) but
+    which reached collect_blocked with blocker_ref=None -- the known_blocker (if any)
+    carried no blocker_ref of its own AND _synth_blocker_ref_from_structured_defer
+    returned None (goal has no defer_reason/deferred_until/rne/blocked_by/string-ref).
+    quiescence-gate C2 (blocker_ref_required) requires a DICT; a None ref makes an
+    all-blocked queue fail C2 on a capability-limited runner -> perpetual B7 backoff
+    churn (300->1800 escalation + idle-tick spin) instead of clean quiescent sleep.
+    Mirrors the not_my_lane synth (collect_blocked branch 7): type=resource (catch-all
+    structural wait, NOT user-only -> normal short quiescent sleep re-checked each
+    wake) + md5(kind:key)[:12] external_id (C4 hysteresis hash stays stable across
+    iters when `key` is stable; `kind` is the external_id prefix -> per-branch hashes
+    stay disjoint + aid debugging) + now+120h rolling expiry (self-healing -- when the
+    block clears the goal leaves the blocked set and the synth vanishes). Coverage
+    lineage: g-115-1792/1794 (structured-defer paths, via the sibling
+    _synth_blocker_ref_from_structured_defer), g-115-1887 (infrastructure branches),
+    g-115-1888 (precondition_unmet + explicit_status branches)."""
+    _now = datetime.now()
+    _h = hashlib.md5(
+        (str(kind) + ":" + str(key)).encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    return {
+        "type": "resource",
+        "external_id": f"{kind}:{_h}",
+        "state_hash": None,
+        "created_at": _now.isoformat(timespec="seconds"),
+        "expires_at": (_now + timedelta(hours=120)).isoformat(timespec="seconds"),
+        "synthesized": True,
+    }
+
 # Collective domain stores (world/)
 WORLD_ASP_PATH = WORLD_DIR / "aspirations.jsonl"
 PIPELINE_PATH = WORLD_DIR / "pipeline.jsonl"
@@ -1270,6 +1302,42 @@ def get_interval_hours(goal):
 # FILTER + COLLECT
 # ---------------------------------------------------------------------------
 
+def _get_idle_agents(reallocation_hours):
+    """Set of agent names whose team-state last_active is older than
+    reallocation_hours (6 gap #4 — intended_agent idle-reallocation).
+
+    An intended_agent-routed goal is normally hidden from every other agent
+    (collect_candidates intended_agent filter). When the routed-to agent has
+    gone idle for longer than reallocation_hours, that routing STRANDS the
+    goal — invisible to the running agent AND absent from collect_blocked (a
+    select-time drop, not a block), so it vanishes from selection entirely
+    (verified 2026-07-08: 15 framework goals routed to a 5.75-day-idle agent
+    vanished from both selectable and blocked outputs -> running agent falsely
+    concluded all-blocked). This set lets the intended_agent filter fall
+    through for an idle target, mirroring the reallocatable+reallocation_hours
+    mechanism but keyed on intended-agent idleness rather than the explicit
+    reallocatable flag.
+
+    Conservative + fail-open (rb-1028 posture): returns an empty set when
+    reallocation is disabled (reallocation_hours is None) or team-state is
+    unavailable, and an agent with a missing/unparseable last_active is NOT
+    treated as idle — the goal stays routed (status quo) rather than being
+    surfaced on absent evidence.
+    """
+    if reallocation_hours is None:
+        return set()
+    ts = _load_team_state_cached() or {}
+    agent_status = ts.get("agent_status") or {}
+    idle = set()
+    for name, row in agent_status.items():
+        if not isinstance(row, dict):
+            continue
+        age = hours_since(row.get("last_active"))
+        if age is not None and age > reallocation_hours:
+            idle.add(name)
+    return idle
+
+
 def collect_candidates(aspirations, known_blockers=None, source="world",
                        global_done_ids=None, claim_timeout_hours=None,
                        reallocation_hours=None,
@@ -1303,6 +1371,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
     # module-wide so cmd_select AND quiescence-gate's candidate check skip
     # locally-unexecutable goals consistently (no call-site threading).
     runner_caps = _get_runner_capabilities()
+    # Agents idle beyond reallocation_hours (6 gap #4) — used below to
+    # reallocate intended_agent-routed goals stranded on an idle target. Derived
+    # once per run (mirrors runner_caps); empty set when reallocation is disabled
+    # (reallocation_hours is None) or team-state is unavailable.
+    idle_agents = _get_idle_agents(reallocation_hours)
 
     # Build set of skills blocked by infrastructure blockers
     blocked_skills = set()
@@ -1564,7 +1637,19 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             if (intended_agent
                     and intended_agent != AGENT_NAME
                     and intended_agent != "either"):
-                continue
+                # Idle-agent reallocation (6 gap #4): when the routed-to
+                # agent has been idle beyond reallocation_hours AND the goal is
+                # unclaimed, fall through so a running capable agent can pick up
+                # otherwise-stranded work. Mirrors the reallocatable path above
+                # but keyed on intended-agent idleness rather than the explicit
+                # reallocatable flag. Conservative: fires only when team-state
+                # POSITIVELY shows the target idle (missing last_active => not
+                # idle => keep routing, status quo). Unclaimed-only so a goal an
+                # active peer already owns is never yanked away.
+                if intended_agent in idle_agents and not goal.get("claimed_by"):
+                    pass  # reallocate — surface to this running agent
+                else:
+                    continue
 
             # Per-runner capability skip (0 Slice 2): drop goals whose
             # EXPLICIT requires_capability this runner cannot satisfy. A per-RUNNER
@@ -1771,6 +1856,14 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             if status == "blocked":
                 entry["block_reason"] = "explicit_status"
                 entry["block_detail"] = goal.get("block_reason", "No reason given")
+                # C2 coverage (8): an explicitly-blocked goal with no defer
+                # fields keeps blocker_ref=None (the L1817 synth found nothing) ->
+                # quiescence C2 fails -> B7 churn. Synth a type=resource ref keyed on
+                # the goal id (mirrors branch 7). Defensive: 4's
+                # all-gap-shapes test only exercised explicit_status WITH a
+                # defer/blocked_by/string-ref (which the L1817 synth already covers).
+                if not isinstance(entry.get("blocker_ref"), dict):
+                    entry["blocker_ref"] = _synth_block_ref("explicit-status", goal_id)
                 blocked.append(entry)
                 continue
 
@@ -1791,6 +1884,14 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 # not the individual goal. create-blocker.py writes this.
                 if b.get("blocker_ref"):
                     entry["blocker_ref"] = b["blocker_ref"]
+                # Residual gap (7, bravo msg-2949): the known_blocker may
+                # carry NO blocker_ref of its own, and the L1817 structured-defer
+                # synth returns None for an infra-blocked goal with no defer fields,
+                # leaving entry.blocker_ref=None -> quiescence C2 never passes ->
+                # perpetual B7 churn. Synth a type=resource ref (mirrors branch 7).
+                if not isinstance(entry.get("blocker_ref"), dict):
+                    entry["blocker_ref"] = _synth_block_ref(
+                        "infrastructure", b.get("blocker_id") or goal_skill)
                 blocked.append(entry)
                 continue
 
@@ -1805,6 +1906,12 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     entry["blocker_id"] = b.get("blocker_id", "")
                     if b.get("blocker_ref"):
                         entry["blocker_ref"] = b["blocker_ref"]
+                    # Same residual gap as the skill-based branch above
+                    # (7): synth a type=resource ref when neither the
+                    # known_blocker nor the structured-defer synth supplied one.
+                    if not isinstance(entry.get("blocker_ref"), dict):
+                        entry["blocker_ref"] = _synth_block_ref(
+                            "infrastructure", b.get("blocker_id") or goal_cat)
                     blocked.append(entry)
                     continue
 
@@ -1921,6 +2028,15 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     entry["block_reason"] = "precondition_unmet"
                     entry["block_detail"] = "Preconditions unmet: " + ", ".join(failed_ids)
                     entry["precondition_unmet"] = failed_ids
+                    # C2 coverage (8, bravo msg-2949): a goal whose
+                    # preconditions fail LIVE here but which carries no defer fields
+                    # keeps blocker_ref=None (the L1817 synth found nothing) ->
+                    # quiescence C2 fails -> B7 churn (//).
+                    # Synth a type=resource ref keyed on the failing predicate set
+                    # (stable while the same preconditions fail; mirrors branch 7).
+                    if not isinstance(entry.get("blocker_ref"), dict):
+                        entry["blocker_ref"] = _synth_block_ref(
+                            "precondition", ",".join(sorted(failed_ids)))
                     blocked.append(entry)
                     continue
 
@@ -2667,6 +2783,11 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "aspiration_id": asp_id,
         "source": source,
         "title": goal.get("title", ""),
+        # : expose cross-world provenance so consumers (aspirations-select
+        # display, boot status) can badge foreign-injected goals as [foreign: <origin>]
+        # instead of rendering them indistinguishably from native goals. None for
+        # native goals -> no false badge.
+        "cross_world_origin": goal.get("cross_world_origin"),
         "skill": goal.get("skill"),
         "category": category,
         "tags": _ensure_list(goal.get("tags")),

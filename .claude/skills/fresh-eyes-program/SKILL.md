@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-program
-description: "Periodic local self-audit of world/program.md (cadence: every 100 goals). Assembles a briefing (The Program body, both agents' Self summaries, cross-agent aspiration portfolio, recent completions, drift signals), writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Sibling to /fresh-eyes-review (per-agent Self, 25 goals). Closes the 'program.md has no systematic evolution path' gap."
+description: "Periodic local self-audit of world/program.md — fires when the every-100-goals precheck cadence trips, or on user demand (/fresh-eyes-program). Assembles a briefing (The Program body, both agents' Self summaries, cross-agent aspiration portfolio, recent completions, drift signals), writes it to agents/{agent}/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate — the user reviews changes via git log and tracked signals at their own pace. Sibling to /fresh-eyes-review (per-agent Self, 25 goals). Closes the 'program.md has no systematic evolution path' gap."
 user-invocable: true
 triggers:
   - "/fresh-eyes-program"
@@ -222,7 +222,8 @@ state what the evidence shows, do not hedge. If evidence is ambiguous, say
 Write the briefing body to
 `agents/<agent>/temp/fresh-eyes-program-{YYYY-MM-DDTHH-MM-SS}.md` as a staging
 artifact — its durable findings are encoded to the knowledge tree by Phase 5.6,
-and the file itself is drained by `/drain-temp` (see
+after which Phase 8 Step 1.5 archives the file to `temp/drained/` (it never enters
+the `/drain-temp` queue as already-encoded slush — g-115-1838; see
 `core/config/conventions/temp-store.md`). Timestamp includes HH-MM-SS so multiple
 same-day invocations (cadence fire + user-forced review) do not collide.
 
@@ -361,6 +362,23 @@ count via `fresh-eyes-cadence-check.sh --print-current` (slot-agnostic),
 writes the slot atomically, and verifies the slot is non-null after the
 write (fails exit 1 on silent write failure). One script call, one failure
 mode — no chaining.
+
+### Step 1.5: Archive the briefing out of the drain queue (g-115-1838)
+
+The briefing's durable value is fully extracted by now (Phase 5.5 routed one
+finding; Phase 5.6 encoded the rest), so the staging `.md` is a pure archival
+record. Move it into `temp/drained/` so it never inflates the precheck
+temp-pressure metric as already-encoded slush (`/drain-temp` would only DISCARD
+it). Placing this AFTER Phase 5.6 keeps the interruption case no worse than
+before: if the skill dies before this step, the briefing stays in `temp/` for
+the next drain, exactly as today.
+
+```
+Bash: mkdir -p agents/<agent>/temp/drained && mv agents/<agent>/temp/fresh-eyes-program-{the-Phase-4-isotime}.md agents/<agent>/temp/drained/ 2>/dev/null || true
+```
+
+Use the exact filename written in Phase 4. This is a bookkeeping move, NOT the
+terminal action — Step 2's board-post remains the skill's final tool call.
 
 ### Step 2: Post to board (best-effort, must not block)
 

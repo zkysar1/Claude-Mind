@@ -703,9 +703,27 @@ def cmd_cycles(args, config, compact):
 
 # Keyword match for Check 4 in SKILL.md:615. Stays in sync with
 # .claude/rules/capability-before-user.md.
+# Matched as a substring against the lowercased goal title (see cmd_user_goals
+# below): a [user]-only goal whose title contains any of these is flagged as
+# agent-provisionable (the agent can self-service it — routing violation).
+# Extended  (2026-07-08): the original 9-verb list was ~53% false-
+# negative vs the 10% threshold (bravo  weekly classifier review) —
+# common fleet close-verbs (sweep/resolve/review/reflect/encode/audit/...) were
+# missed. "verify" -> "verif" so the stem also substring-matches
+# verified/verification/verifying (the single most-common fleet close-verb,
+# previously unmatched because "verify" is not a substring of "verified").
+# NOTE: "form" was in the proposed set but is DELIBERATELY OMITTED — as a bare
+# substring it matches platform/information/performance/format/transform/formal
+# (high false-positive rate); safely adding it requires word-prefix (stem-token)
+# matching instead of substring — deferred as a follow-up (the pending queue
+# already carries matching-related work). The verbs kept below are all
+# distinctive substrings (low FP); "fix" carries a minor prefix/suffix FP
+# accepted as low-harm (this sweep only surfaces candidates).
 AGENT_ACTION_KEYWORDS = [
     "deploy", "commit", "script", "test", "analyze",
-    "run", "check", "verify", "monitor",
+    "run", "check", "verif", "monitor",
+    "sweep", "fix", "resolve", "review", "reflect", "generate",
+    "encode", "replay", "drain", "evict", "audit", "reconcil",
 ]
 
 
@@ -805,16 +823,20 @@ def cmd_temp_pressure(args, config, compact):
     # temp/ holds TWO file classes (core/config/conventions/temp-store.md):
     #   - drainable working docs (.md/.json) -> /drain-temp encodes to the tree
     #     then archives to drained/. Counted as `count`.
-    #   - pure ephemera (.log/.txt: test-suite output, tool dumps like
-    #     leak-check.txt) -> carry NO knowledge; /drain-temp Phase 1.5 PURGES
-    #     them (deletes — gitignored + unencodable). Counted as `ephemera_count`.
+    #   - pure ephemera (.log/.txt/.py/.sh/.err: test-suite output, tool dumps
+    #     like leak-check.txt, and one-shot scratch scripts like build-*.py /
+    #     orphan-*.py / restart-poller.sh / gs.err) -> carry NO knowledge;
+    #     /drain-temp Phase 1.5 PURGES them (deletes — gitignored + unencodable,
+    #     120-min age guard protects in-flight writes). Counted as
+    #     `ephemera_count`. 7 added the scratch-script class (.py/.sh/
+    #     .err); 7 added .log/.txt.
     # Both classes accumulate in temp/ root, so BOTH must feed the pressure
     # signal — else the ephemera slush stays invisible to the drain trigger and
     # grows unbounded (7: 7 .log/.txt survived a full drain because the
     # glob AND this metric both saw only .md/.json). Threshold flags fire on the
     # COMBINED pressure; the two counts stay distinct so the drain goal can name
     # what it drains vs purges.
-    EPHEMERA_SUFFIXES = (".log", ".txt")
+    EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err")
     count = 0
     ephemera_count = 0
     temp_dir = (AGENT_DIR / "temp") if AGENT_DIR is not None else None
@@ -845,7 +867,7 @@ def cmd_temp_pressure(args, config, compact):
     suggested_goal = None
     if pressure_count >= drain_threshold and existing is None:
         flags.append("temp_drain_needed")
-        _purge_clause = (f" + purge {ephemera_count} ephemera .log/.txt file(s)"
+        _purge_clause = (f" + purge {ephemera_count} stale ephemera file(s)"
                          if ephemera_count else "")
         suggested_goal = {
             "title": (f"Maintain: drain {count} accumulated temp/ working docs "
@@ -854,7 +876,7 @@ def cmd_temp_pressure(args, config, compact):
             "participants": ["agent"],
             "description": (
                 f"agents/<agent>/temp/ holds {count} undrained working docs"
-                + (f" and {ephemera_count} pure-ephemera .log/.txt file(s)"
+                + (f" and {ephemera_count} pure-ephemera scratch file(s)"
                    if ephemera_count else "")
                 + f" (combined >= drain threshold {drain_threshold}). Invoke "
                 f"/drain-temp to encode each working doc into the knowledge "
@@ -876,7 +898,7 @@ def cmd_temp_pressure(args, config, compact):
     if pressure_count:
         _breakdown = f"{count} undrained doc(s)"
         if ephemera_count:
-            _breakdown += f" + {ephemera_count} ephemera(.log/.txt)"
+            _breakdown += f" + {ephemera_count} ephemera(.log/.txt/.py/.sh/.err)"
         summary = (
             f"temp-pressure: {_breakdown} "
             f"(warn>={warn_threshold}, drain>={drain_threshold}"

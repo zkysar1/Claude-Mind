@@ -221,8 +221,8 @@ Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
 
 ### Scripted Reflect-Bookkeeping
 
-Steps 2.5b, 2.7, 7.5b (entity normalization), 7.6c (dual classification),
-7.7 (context gap), and 7.7f (utilization deltas) route through
+Steps 2.5b, 2.7, 7.6c (dual classification), 7.7 (context gap), and 7.7f
+(utilization deltas) route through
 `reflect-bookkeeping.sh` subcommands — pure arithmetic, no LLM judgment
 needed. The LLM still owns Steps 2.6 (contrastive extraction), 7.5
 (pattern-signature outcome record), 7.6 (belief registry updates), 7.6b
@@ -236,7 +236,9 @@ Subcommand map:
     and each active guardrail. N = count of semantically similar guardrails. Passing
     `N=0` blindly silently under-fires auto-promotion.
 - Step 2.7:  `reflect-bookkeeping.sh encoding-score --novelty X --outcome-impact Y --surprise Z --goal-relevance W --repetition-count N --precision-items P --domain-class CLS`
-- Step 7.5b: `reflect-bookkeeping.sh entity-normalize` (entities via stdin)
+- Step 7.5b: RETIRED (g-115-2047) — the entity_index write path was permission-dead
+  (superseded by the `embedding` retrieval channel). `entity-normalize` survives only
+  as a normalize-only helper; Step 7.5b itself no longer runs. See Step 7.5b above.
 - Step 7.6c: `reflect-bookkeeping.sh dual-classification --outcome OUT --confidence C`
 - Step 7.7:  `reflect-bookkeeping.sh context-gap --hypothesis-category CAT --consulted-nodes '[...]' --consulted-signatures '[...]' --outcome OUT`
 - Step 7.7f: `reflect-bookkeeping.sh utilization-delta` (deliberation JSON via stdin)
@@ -380,11 +382,13 @@ If both a CONFIRMED and CORRECTED exist in this category AND they haven't been p
         present_in_corrected: true/false
     contrastive_lesson: "In {category}, success correlates with {X} while failure correlates with {Y}"
 
-  Create reasoning bank entry (type: contrastive) via script:
+  Create reasoning bank entry (type: success — a contrastive lesson IS a validated
+  distinguishing factor, i.e. a pattern to repeat; the contrastive nature is carried
+  in tags/content, not the outcome-class `type` field, which is {success|failure|user_provided}) via script:
     echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
     `id` and `created` are auto-set by the script — omit both; capture the
     assigned id from stdout. Fields to supply: title, description, content
-    (contrastive analysis), type ("contrastive"), applies_to (REQUIRED:
+    (contrastive analysis), type ("success"), tags (MUST include "contrastive"), applies_to (REQUIRED:
     `any` | `framework` | `domain` | `specific` based on the lesson's
     scope), confirmed_source, corrected_source, category, tags,
     when_to_use (derived from confirmed conditions), status ("active").
@@ -467,8 +471,10 @@ IF a counterfactual produced a transferable lesson:
     echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
       # `id`/`created` auto-set — omit both; capture id from stdout.
       # Fields: title, content (the delta + lesson, predictions labeled
-      # simulated), type ("counterfactual" — same non-standard-type precedent
-      # as Step 2.6 "contrastive"), applies_to (REQUIRED: any|framework|
+      # simulated), type ("failure" — a counterfactual "what-should-have-happened"
+      # is an outcome-class failure/pitfall; the counterfactual nature is carried in
+      # the REQUIRED tags below, not the `type` field {success|failure|user_provided}),
+      # applies_to (REQUIRED: any|framework|
       # domain|specific), category, source_hypothesis, when_to_use,
       # tags (MUST include "simulated", "counterfactual"),
       # poignancy (typically 4-6 — simulated signal is weaker than an observed
@@ -836,33 +842,28 @@ Bash: pattern-signatures-read.sh --active   (load all active pattern signatures)
      Log: "PATTERN SEPARATION UPDATE: {matched} ≠ {actual} — {distinguishing feature}"
 ```
 
-## Step 7.5b: Entity Extraction and Cross-Linking
+## Step 7.5b: Entity Extraction and Cross-Linking — RETIRED (g-115-2047)
 
-Extract entities mentioned in the ABC chain and update the entity index for cross-link retrieval.
+**RETIRED 2026-07-12.** This step formerly prescribed "Write updated entity_index
+back to _tree.yaml" via a direct Edit — but `_tree.yaml` is script-governed and
+direct edits are permission-DENIED, and no script/daemon endpoint exposes an
+entity_index write (`reflect-bookkeeping.sh entity-normalize` is normalize-only:
+it tokenizes entities to stdout, it does not persist). The write therefore never
+succeeded, and `entity_index` stayed `{}` fleet-wide for ~100+ sessions.
 
-```
-From the ABC chain (Step 2), extract named entities:
-  - People, organizations, concepts, metrics, events mentioned in antecedents
-  - Key terms from behavior.reasoning
-  - Normalize to lowercase-kebab-case (e.g., "Federal Reserve" → "federal-reserve")
+Decision (g-115-2047): **retire, do not implement.** The manual LLM-maintained
+entity-index channel is superseded by the automated `embedding` retrieval channel
+(g-306-83; `CHANNEL_SCORES["embedding"] = 2.5` in `tree_match.py`), which supplies
+semantic / entity-style cross-linking automatically from a persisted embedding
+index — no per-session LLM upkeep. A manual entity_index write path would duplicate
+that capability at higher maintenance cost.
 
-Bash: world-cat.sh knowledge/tree/_tree.yaml  # entity_index (create section if missing)
-
-For each extracted entity:
-  If entity already in index:
-    - Add this hypothesis's resolved record path to articles list (if not already present)
-    - Add relevant tree node IDs to tree_nodes list (from Step 0 context)
-    - Increment mention_count
-  If entity is new:
-    - Read core/config/tree.yaml → entity_index.max_entities
-    - If total_entities < max_entities:
-        Create entry: {articles: [record_path], tree_nodes: [node_ids], mention_count: 1}
-        Increment total_entities
-    - Else: skip (index full)
-
-Write updated entity_index back to _tree.yaml
-Log: "ENTITY INDEX: updated {N} entities from {hypothesis-id}"
-```
+Retrieval-side readers of `entity_index` (`tree_match.py` Strategy 2, `retrieve.py`,
+`tree-accuracy-sync.py`, `build-agent-context.py`, `coordination_merge.py`) all
+default to `tree.get("entity_index", {})` and no-op gracefully on the empty index.
+They are LEFT IN PLACE as harmless, forward-compatible dormant infrastructure: if
+entity cross-linking is ever wanted, add a write endpoint and they light up — no
+reader change needed. **Skip this step; do not attempt an entity_index write.**
 
 ## Step 7.6: Belief Registry Update
 

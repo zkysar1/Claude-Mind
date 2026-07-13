@@ -195,6 +195,7 @@ def main():
                      "ceremony). Conservative AND-gate; fail-to-full; master "
                      "flag default-OFF. Design: g-305-02."))
     ap.add_argument("goal_id", help="Goal id to classify (e.g. g-305-15)")
+    # WORLD_AGENT_ONLY: cross-agent routes via MIND_AGENT env override ()
     ap.add_argument("--source", choices=["world", "agent"], default="world")
     ap.add_argument("--output", choices=["plain", "json"], default="plain",
                     help="plain prints just trivial|full; json adds reasons")

@@ -506,9 +506,21 @@ def do_swap(dest_root: Path) -> dict:
     if failures:
         return {"moved": moved, "failures": failures}
 
-    # Success — remove staging dir
-    shutil.rmtree(staging, ignore_errors=True)
-    return {"moved": moved, "failures": []}
+    # Success — remove staging dir. FAIL-LOUD (0): the moves already
+    # succeeded, so a staging-dir cleanup error must NOT fail the swap, but it
+    # MUST be surfaced as a NAMED field rather than silently swallowed by
+    # ignore_errors=True — a silent post-move raise on this step was the
+    # hypothesized origin of the v2.1.1 silent-post-swap-death. Try a clean
+    # removal to capture any error, then a best-effort ignore_errors sweep to
+    # remove whatever can still be removed. Never raises (cleanup is best-effort
+    # once the swap itself has landed).
+    result = {"moved": moved, "failures": []}
+    try:
+        shutil.rmtree(staging)
+    except OSError as e:
+        result["staging_cleanup_error"] = f"rmtree({staging}): {e}"
+        shutil.rmtree(staging, ignore_errors=True)
+    return result
 
 
 # ============================================================================
@@ -529,6 +541,11 @@ def do_clean_cruft(dest_root: Path, manifest: dict, *,
     removed = []
     skipped_preserved = []
 
+    # In-repo world/meta stores are protected UNCONDITIONALLY (not gated on
+    # --living-prod): a data store must never be cruft-swept in any mode
+    # (2026-07-07 ZDS wipe). Empty set on fresh plants (no agents/ dir).
+    store_tops = _in_repo_store_tops(dest_root)
+
     # Build dest forged-skill protection set (same logic as do_remove_orphans)
     if preserve_deployment_local:
         dest_forged = _dest_forged_skill_names(dest_root)
@@ -542,6 +559,8 @@ def do_clean_cruft(dest_root: Path, manifest: dict, *,
 
     def _should_preserve(rel: str) -> bool:
         """Return True if *rel* must be kept at a living destination."""
+        if rel.split("/", 1)[0] in store_tops:
+            return True
         if not preserve_deployment_local:
             return False
         if _is_preserved_at_dest(rel):
@@ -557,6 +576,9 @@ def do_clean_cruft(dest_root: Path, manifest: dict, *,
             if target.exists() and target.is_dir():
                 rel = _norm(str(target.relative_to(dest_root)))
                 # Check if any file inside the directory tree is preserved
+                if rel.split("/", 1)[0] in store_tops:
+                    skipped_preserved.append(p)
+                    continue
                 if preserve_deployment_local:
                     has_preserved = False
                     for child in target.rglob("*"):
@@ -621,6 +643,15 @@ _ORPHAN_SCAN_SKIP_TOP = {
     "agents",               # per-deployment state (created by /start)
     "world",                # per-deployment domain state (external path in source)
     "meta",                 # per-deployment strategy state (external path in source)
+    ".mind-data",           # in-repo own-cloud world/meta store (ZDS layout since
+                            # 2026-06-30). EMERGENCY STOPGAP 2026-07-07 (applied by omni
+                            # with user's explicit direction, all three repos): the
+                            # sweep unlinked ZDS's entire world+meta because this name
+                            # was missing (commit fb3634a transplant; restored from the
+                            # dormant OneDrive backup). PROPER FIX (dev-chain): resolve
+                            # every dest agents/*/local-paths.conf WORLD_PATH/META_PATH
+                            # and preserve any root inside dest_root — do not rely on
+                            # this hardcoded name surviving future layout renames.
 }
 
 # ── Unified deployment-local preservation (single source of truth) ──
@@ -649,7 +680,9 @@ _OPERATIONAL_DIRS = {
 _ORPHAN_PRESERVE_FILES = _DEPLOYMENT_LOCAL_FILES
 
 
-def _is_preserved_at_dest(rel: str) -> bool:
+def _is_preserved_at_dest(rel: str, extra_tops=frozenset()) -> bool:
+    if rel.split("/", 1)[0] in extra_tops:
+        return True
     if rel in _DEPLOYMENT_LOCAL_FILES:
         return True
     # .seed-backup-<timestamp>/ from prior plants
@@ -665,8 +698,8 @@ def _is_preserved_at_dest(rel: str) -> bool:
     return False
 
 
-def _read_world_path_from_conf(conf: Path):
-    """Extract WORLD_PATH from a local-paths.conf.
+def _read_conf_path_key(conf: Path, want_key: str):
+    """Extract *want_key* (e.g. WORLD_PATH / META_PATH) from a local-paths.conf.
 
     Format: KEY=value lines, `#` comments, optional surrounding quotes.
     Returns the value string, or None if absent/unreadable.
@@ -680,12 +713,55 @@ def _read_world_path_from_conf(conf: Path):
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, val = line.partition("=")
-        if key.strip() == "WORLD_PATH":
+        if key.strip() == want_key:
             val = val.strip()
             if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
                 val = val[1:-1]
             return val or None
     return None
+
+
+def _read_world_path_from_conf(conf: Path):
+    """Extract WORLD_PATH from a local-paths.conf (see _read_conf_path_key)."""
+    return _read_conf_path_key(conf, "WORLD_PATH")
+
+
+def _in_repo_store_tops(dest_root: Path) -> set:
+    """Top-level dir names under *dest_root* that hold an agent world/meta store.
+
+    Resolves every dest agents/*/local-paths.conf WORLD_PATH/META_PATH; any
+    configured root that lives INSIDE dest_root contributes its first path
+    segment. Orphan-removal and cruft sweeps must never walk these — they are
+    per-deployment data stores, not framework files. Dynamic complement to the
+    static ".mind-data" entry in _ORPHAN_SCAN_SKIP_TOP: a renamed or novel
+    in-repo store is protected without a code change (2026-07-07 ZDS incident:
+    the static lists did not know .mind-data and the sweep unlinked the entire
+    world+meta; commit fb3634a era, restored from the dormant OneDrive backup).
+
+    External paths (the normal layout) resolve outside dest_root and are
+    ignored. Unreadable confs and unresolvable paths fail toward EMPTY —
+    the static skip list remains the floor.
+    """
+    tops = set()
+    agents_dir = dest_root / "agents"
+    if not agents_dir.is_dir():
+        return tops
+    try:
+        dest_resolved = dest_root.resolve()
+    except OSError:
+        return tops
+    for conf in sorted(agents_dir.glob("*/local-paths.conf")):
+        for key in ("WORLD_PATH", "META_PATH"):
+            val = _read_conf_path_key(conf, key)
+            if not val:
+                continue
+            try:
+                rel = Path(val).resolve().relative_to(dest_resolved)
+            except (ValueError, OSError):
+                continue
+            if rel.parts:
+                tops.add(rel.parts[0])
+    return tops
 
 
 def _dest_forged_skill_names(dest_root: Path):
@@ -768,7 +844,9 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
     Semantics: destination = mirror of (manifest ∩ source). Files that exist at
     destination but no longer at source (or are now excluded by manifest) are
     deleted. Preserved paths (.git, .env.local, .claude/settings.local.json,
-    .seed-backup-*, agents/, world/, meta/) are never touched. Additionally,
+    .seed-backup-*, agents/, world/, meta/, .mind-data/, plus any in-repo
+    world/meta store root resolved from agents/*/local-paths.conf — see
+    _in_repo_store_tops) are never touched. Additionally,
     destination-owned forged/domain skill dirs (`.claude/skills/<name>/` for
     <name> in the destination's own forged-skills.yaml) are preserved even
     though they are absent from the source include set — see
@@ -790,6 +868,12 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
         f".claude/skills/{n}" for n in dest_forged
     }
 
+    # In-repo world/meta stores (e.g. .mind-data/) — dynamic protection.
+    # The static _ORPHAN_SCAN_SKIP_TOP covers known names; this resolves the
+    # ACTUAL configured roots from every dest agent local-paths.conf so a
+    # renamed store can never be swept (2026-07-07 ZDS wipe, fb3634a era).
+    store_tops = _in_repo_store_tops(dest_root)
+
     removed = []
     preserved = []
 
@@ -801,7 +885,7 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
             rel = str(path.relative_to(dest_root)).replace("\\", "/")
         except ValueError:
             continue
-        if _is_preserved_at_dest(rel):
+        if _is_preserved_at_dest(rel, store_tops):
             preserved.append(rel)
             continue
         if rel in expected:
@@ -829,7 +913,8 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
             except ValueError:
                 continue
             first = rel.split("/", 1)[0]
-            if first in _ORPHAN_SCAN_SKIP_TOP or first.startswith(".seed-backup-"):
+            if (first in _ORPHAN_SCAN_SKIP_TOP or first.startswith(".seed-backup-")
+                    or first in store_tops):
                 continue
             try:
                 if not any(path.iterdir()):

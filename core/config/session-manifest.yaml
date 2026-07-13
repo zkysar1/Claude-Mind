@@ -218,6 +218,14 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: runner-write-attribution
+    purpose: runner write-attribution evidence (runner SID + unix timestamp) stamped by the Phase -1.45 runner-identity gate; a fresher signal than running-session-id, used in the g-305-09/US-09 stale-pointer override (a session whose write-attribution is fresher than ~300s is treated as the confirmed runner, not ejected). Per-machine identity — syncing it cross-machine would manufacture phantom runners, so it must stay machine_local (registered 2026-07-10, g-115-1900, after a machine-move desync warning flagged it as an unregistered signal-shaped orphan)
+    writer: runner-identity-check.sh (Phase -1.45 runner-identity gate)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: true
+
   # ── Persistent agent data (preserve across recoveries) ──────────────
   - file: handoff.yaml
     purpose: cross-session state (consolidation → next boot); consumed at boot
@@ -262,6 +270,14 @@ files:
   - file: execution-diary.jsonl
     purpose: append-only reasoning breadcrumb trail (survives autocompact)
     writer: execution-diary.py append
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  - file: gate-d-telemetry.jsonl
+    purpose: Gate D commons-pattern injection telemetry (append-only; audited by gate-d-validate-telemetry.py)
+    writer: iteration-close.sh (aspirations-execute Step 5e fields)
     recovery_action: preserve
     sync_tier: continuity
     required_when_idle: false
@@ -508,6 +524,14 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: precheck-retrospection-tracker.json
+    purpose: precheck retrospection cadence tracker ({iter, last_retrospection_run_iter}); gates how often aspirations-precheck re-runs its retrospection pass. Per-machine iter space — a fresh machine starts its own trail, so it must NOT be pulled at boot (registered 2026-07-10, g-115-1900, after a desync warning flagged it as an unregistered data orphan)
+    writer: aspirations-precheck-budget-meter.sh
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
   - file: streak-breaks.jsonl
     purpose: streak-break events appended when a routine/productive streak ends
     writer: aspirations.py _append_streak_break_event
@@ -519,6 +543,22 @@ files:
   - file: quiescence-audit.jsonl
     purpose: wake-miss audit records emitted by quiescence-gate.py
     writer: quiescence-gate.py _append_log
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: quiescence-last-cycle.json
+    purpose: quiescence fast-path cycle cache ({blocker_set_hash, blocker_refs[], sleep_seconds, ...}) re-validated by quiescence-cycle-cache.py check on each loop re-entry (Phase -0.5e.0). Per-machine cycle state — a different machine has a different blocker context, so it must NOT be pulled at boot (registered 2026-07-10, g-115-1900, same sweep as the other 3 orphans)
+    writer: quiescence-gate.py / quiescence-cycle-cache.py
+    recovery_action: clear
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: loop-state-bump-failures.jsonl
+    purpose: append-only log of loop-state bump no-op/failure events (e.g. bump_noop_detected → refire) written when loop-state-bump-counters.py detects a counter-advance failure; per-iteration audit trail (registered 2026-07-10, g-115-1900, same sweep as the other 3 orphans)
+    writer: iteration-close.sh (loop-state-bump-counters.py)
     recovery_action: clear
     sync_tier: ephemeral
     required_when_idle: false

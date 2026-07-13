@@ -89,6 +89,24 @@ TERMINAL_GOAL_STATES = {"completed", "skipped", "expired", "decomposed", "supers
 # ---------------------------------------------------------------------------
 
 
+def _refresh(path):
+    """guard-980: force-pull the authoritative backend copy before a raw read.
+
+    findings.jsonl and the world + per-agent aspirations.jsonl are
+    backend-routed stores; on an own-cloud box a raw local read can be a stale
+    git-sync mirror (rb-2855 / guard-980), so this sweep would file/skip goals
+    off drifted data. refresh() force-fetches the S3 copy on OwnCloudBackend
+    and is a no-op on LocalBackend. Fail-open: a bare subprocess without daemon
+    env cannot resolve the backend — degrade to the raw read rather than abort
+    this advisory routing sweep (matches core/scripts/aspirations-evict-completed.py).
+    """
+    try:
+        from storage_backend import get_backend
+        get_backend().refresh(path)
+    except Exception:
+        pass
+
+
 def _parse_ts(ts_str):
     """Parse the timestamp formats observed in findings.jsonl.
 
@@ -108,6 +126,7 @@ def load_triggers():
       - message has `action_type:<verb>` tag
       - message timestamp is within WINDOW_HOURS and older than GRACE_HOURS
     """
+    _refresh(FINDINGS)  # guard-980: avoid a stale git-sync mirror of findings.jsonl
     if not FINDINGS.is_file():
         return []
     now = datetime.now()
@@ -190,6 +209,7 @@ def probe_goal_status(goal_id):
         if d.is_dir() and (d / "local-paths.conf").is_file():
             paths.append(d / "aspirations.jsonl")
     for path in paths:
+        _refresh(path)  # guard-980: avoid a stale git-sync mirror of aspirations.jsonl
         if not path.is_file():
             continue
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -270,6 +290,7 @@ def load_converted_ids():
             paths.append(d / "aspirations.jsonl")
     ids = set()
     for path in paths:
+        _refresh(path)  # guard-980: avoid a stale git-sync mirror of aspirations.jsonl
         if not path.is_file():
             continue
         with open(path, "r", encoding="utf-8") as f:

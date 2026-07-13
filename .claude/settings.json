@@ -42,8 +42,12 @@
   "env": {
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "DISABLE_AUTOUPDATER": "1",
     "GATE_D_ENABLED": "",
     "GATE_D_WORLD": "ayoai",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "DISABLE_AUTOUPDATER": "1",
     "GATE_D_CORPUS_PATH": "<PROJECT_ROOT>\\core\\config\\gate-d-corpus-zds-2026-06-10.jsonl"
   },
   "skillListingBudgetFraction": 0.05,
@@ -283,6 +287,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/owncloud-push-on-write.sh",
+            "timeout": 30
           }
         ]
       },
@@ -313,6 +322,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/owncloud-push-on-write.sh",
+            "timeout": 30
           }
         ]
       },
@@ -343,6 +357,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/evolution-record.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/owncloud-push-on-write.sh",
+            "timeout": 30
           }
         ]
       },

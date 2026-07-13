@@ -245,7 +245,7 @@ rm -f "$WORLD/pattern-signatures.yaml.tmp"
 touch "$WORLD/pipeline.jsonl"
 touch "$WORLD/pipeline-archive.jsonl"
 cat > "$WORLD/pipeline-meta.json" << 'EOF'
-{"last_updated":null,"stage_counts":{"discovered":0,"active":0,"resolved":0,"archived":0},"accuracy":{"total_resolved":0,"confirmed":0,"corrected":0,"accuracy_pct":0.0}}
+{"last_updated":null,"stage_counts":{"discovered":0,"active":0,"measurement-pending":0,"resolved":0,"archived":0},"accuracy":{"total_resolved":0,"confirmed":0,"corrected":0,"accuracy_pct":0.0}}
 EOF
 echo "  Seeded pipeline JSONL files"
 

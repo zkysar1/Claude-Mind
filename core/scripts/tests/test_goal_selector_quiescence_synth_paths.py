@@ -72,12 +72,17 @@ def _future_iso(days_ahead):
 
 
 def _goal(goal_id, *, status="pending", defer_reason=None, set_at_hours_ago=None,
-          blocked_by=None, blocker_ref=None, deferred_until=None):
+          blocked_by=None, blocker_ref=None, deferred_until=None,
+          skill=None, category="framework-architecture", fire_when=None):
     g = {
         "id": goal_id, "title": f"test goal {goal_id}", "status": status,
-        "priority": "MEDIUM", "category": "framework-architecture",
+        "priority": "MEDIUM", "category": category,
         "participants": ["agent"], "recurring": False,
     }
+    if skill is not None:
+        g["skill"] = skill
+    if fire_when is not None:
+        g["fire_when"] = fire_when
     if defer_reason is not None:
         g["defer_reason"] = defer_reason
         ts = _ts(set_at_hours_ago)
@@ -294,3 +299,168 @@ def test_collect_blocked_all_gap_shapes_get_valid_future_refs():
         exp = ref.get("expires_at")
         assert exp and datetime.fromisoformat(str(exp)) > now, \
             f"{gid}: C3 requires a future expiry, got {exp}"
+
+
+# ── INFRASTRUCTURE-blocked synth (7 / bravo msg-2949) ──
+# The residual C2/C3 gap the 4 paths above missed: a goal blocked by an
+# INFRASTRUCTURE known_blocker (goal.skill/category in the blocker's affected set)
+# whose known_blocker carries NO blocker_ref of its own AND which has no
+# structured-defer field (so _synth_blocker_ref_from_structured_defer returns None)
+# reached collect_blocked with blocker_ref=None -> quiescence C2 never passed on a
+# capability-limited runner (no aws/gpu/roblox/efs-key) -> perpetual B7 churn. The
+# fix synths a type=resource ref at collect_blocked checks 2 (skill) + 2b (category),
+# mirroring the not_my_lane synth (branch 7).
+
+def _infra_blocker(blocker_id, *, skills=None, categories=None,
+                   blocker_ref=None, reason="infra down"):
+    b = {"blocker_id": blocker_id, "reason": reason, "resolution": None}
+    if skills is not None:
+        b["affected_skills"] = skills
+    if categories is not None:
+        b["affected_categories"] = categories
+    if blocker_ref is not None:
+        b["blocker_ref"] = blocker_ref
+    return b
+
+
+def _blocked_with(aspirations, known_blockers):
+    done, live = _global_ids(aspirations)
+    blocked = collect_blocked(
+        aspirations, known_blockers=known_blockers,
+        global_done_ids=done, global_live_ids=live,
+        defer_reason_timeout_hours=TTL)
+    return {b["goal_id"]: b for b in blocked}
+
+
+def test_infra_skill_blocked_no_ref_synthed():
+    # THE FIX: goal.skill in a ref-LESS known_blocker's affected_skills, no goal
+    # defer -> entry.blocker_ref was None (C2 miss) -> now a type=resource synth.
+    asps = _asp([_goal("g-infra", skill="run-processor")])
+    blk = _blocked_with(asps, [_infra_blocker("blk-1", skills=["run-processor"])])
+    assert "g-infra" in blk, f"g-infra must be blocked, got {sorted(blk)}"
+    e = blk["g-infra"]
+    assert e["block_reason"] == "infrastructure"
+    ref = e.get("blocker_ref")
+    assert isinstance(ref, dict), f"C2 requires a dict blocker_ref, got {ref!r}"
+    assert ref["type"] == "resource"
+    assert str(ref["external_id"]).startswith("infrastructure:")
+    assert ref["synthesized"] is True
+    assert _is_future(ref), "C3 requires a future expiry"
+
+
+def test_infra_known_blocker_ref_preferred_over_synth():
+    # The known_blocker's OWN blocker_ref is used verbatim when present — the synth
+    # is a fallback, not an override (existing behavior preserved).
+    real = {"type": "user_action", "external_id": "u:infra-real",
+            "expires_at": _future_iso(5), "synthesized": False}
+    asps = _asp([_goal("g-infra2", skill="run-processor")])
+    blk = _blocked_with(
+        asps, [_infra_blocker("blk-2", skills=["run-processor"], blocker_ref=real)])
+    assert blk["g-infra2"]["blocker_ref"] == real
+
+
+def test_infra_category_blocked_no_ref_synthed():
+    # Category fallback (check 2b): skill-less goal whose category is in a ref-less
+    # known_blocker's affected_categories gets the same infra synth.
+    asps = _asp([_goal("g-infra-cat")])  # no skill -> category fallback path
+    blk = _blocked_with(
+        asps, [_infra_blocker("blk-3", categories=["framework-architecture"])])
+    e = blk["g-infra-cat"]
+    assert e["block_reason"] == "infrastructure"
+    ref = e.get("blocker_ref")
+    assert isinstance(ref, dict), f"C2 requires a dict blocker_ref, got {ref!r}"
+    assert str(ref["external_id"]).startswith("infrastructure:")
+    assert _is_future(ref)
+
+
+def test_infra_external_id_stable_per_blocker():
+    # C4 hysteresis: two goals blocked by the SAME blocker_id hash to the SAME
+    # external_id (keyed on blocker_id, not goal id) so the hash stays stable.
+    asps = _asp([_goal("g-i1", skill="run-processor"),
+                 _goal("g-i2", skill="run-processor")])
+    blk = _blocked_with(asps, [_infra_blocker("blk-shared", skills=["run-processor"])])
+    assert (blk["g-i1"]["blocker_ref"]["external_id"]
+            == blk["g-i2"]["blocker_ref"]["external_id"])
+
+
+def test_infra_structured_defer_ref_not_clobbered():
+    # Precedence: an infra-blocked goal that ALSO carries a structured defer keeps
+    # its structured-defer synth ref (a dict from L1817) — the infra synth fires
+    # only when entry.blocker_ref is not already a dict (mirrors not_my_lane).
+    asps = _asp([_goal("g-i-both", skill="run-processor",
+                       defer_reason="precondition_unmet: dep-x", set_at_hours_ago=1)])
+    blk = _blocked_with(asps, [_infra_blocker("blk-4", skills=["run-processor"])])
+    ref = blk["g-i-both"]["blocker_ref"]
+    assert isinstance(ref, dict)
+    assert str(ref["external_id"]).startswith("structured-defer:"), \
+        f"structured-defer ref must be preserved, got {ref['external_id']}"
+
+
+# ── precondition_unmet + explicit_status branch synth (8) ──
+# The remaining two collect_blocked branches that set block_reason without synthing
+# a blocker_ref: check 6 (precondition_unmet — bravo msg-2949 named it as the second
+# residual C2 class after infrastructure) and check 1 (explicit_status — defensive:
+# 4's all-gap-shapes test only covered explicit_status WITH defer fields).
+# Both use the generalized _synth_block_ref(kind, key). rb-3004 "audit the whole
+# branch set" applied.
+
+# A structured precondition that fails deterministically (nonexistent file) — feeds
+# collect_blocked check 6 via the fire_when sugar, no external state needed.
+_FAILING_PC = {"type": "file_check",
+               "path": "/nonexistent/g-115-1888-precondition.does-not-exist",
+               "condition": "exists"}
+
+
+def test_precondition_unmet_no_defer_synthed():
+    # THE bravo-evidenced fix: a goal whose LIVE structured precondition fails
+    # (check 6) but which carries no defer fields kept blocker_ref=None (C2 miss)
+    # -> now a type=resource "precondition:" synth.
+    asps = _asp([_goal("g-pc", fire_when=_FAILING_PC)])
+    blk = _blocked_entries(asps)
+    assert "g-pc" in blk, f"g-pc must be blocked (precondition_unmet), got {sorted(blk)}"
+    e = blk["g-pc"]
+    assert e["block_reason"] == "precondition_unmet"
+    ref = e.get("blocker_ref")
+    assert isinstance(ref, dict), f"C2 requires a dict blocker_ref, got {ref!r}"
+    assert ref["type"] == "resource"
+    assert str(ref["external_id"]).startswith("precondition:")
+    assert ref["synthesized"] is True
+    assert _is_future(ref), "C3 requires a future expiry"
+
+
+def test_precondition_external_id_stable():
+    # C4 hysteresis: the same failing predicate set hashes to the same external_id
+    # across goals (keyed on sorted failed predicate ids, not goal id).
+    asps = _asp([_goal("g-pc1", fire_when=_FAILING_PC),
+                 _goal("g-pc2", fire_when=_FAILING_PC)])
+    blk = _blocked_entries(asps)
+    assert (blk["g-pc1"]["blocker_ref"]["external_id"]
+            == blk["g-pc2"]["blocker_ref"]["external_id"])
+
+
+def test_explicit_status_no_defer_synthed():
+    # Defensive (check 1): a goal explicitly set status="blocked" with no defer
+    # fields kept blocker_ref=None -> now an "explicit-status:" synth.
+    asps = _asp([_goal("g-es", status="blocked")])
+    blk = _blocked_entries(asps)
+    assert "g-es" in blk
+    e = blk["g-es"]
+    assert e["block_reason"] == "explicit_status"
+    ref = e.get("blocker_ref")
+    assert isinstance(ref, dict), f"C2 requires a dict blocker_ref, got {ref!r}"
+    assert str(ref["external_id"]).startswith("explicit-status:")
+    assert ref["synthesized"] is True
+    assert _is_future(ref)
+
+
+def test_explicit_status_with_defer_keeps_structured_ref():
+    # Precedence: an explicit_status goal that ALSO carries a structured defer keeps
+    # its L1817 structured-defer synth ref — the explicit-status synth fires only
+    # when entry.blocker_ref is not already a dict.
+    asps = _asp([_goal("g-es-defer", status="blocked",
+                       defer_reason="precondition_unmet: dep-x", set_at_hours_ago=1)])
+    blk = _blocked_entries(asps)
+    ref = blk["g-es-defer"]["blocker_ref"]
+    assert isinstance(ref, dict)
+    assert str(ref["external_id"]).startswith("structured-defer:"), \
+        f"structured-defer ref must win over explicit-status synth, got {ref['external_id']}"

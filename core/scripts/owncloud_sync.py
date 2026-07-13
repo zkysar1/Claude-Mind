@@ -378,11 +378,19 @@ def _save_manifest(m: dict) -> None:
 # OWNERSHIP_STALE_SECONDS (lodestar §9 / guard-594): a RUNNING claim whose
 # heartbeat_at is older than this is a CRASHED peer, not a live owner — so the
 # sweep stops deferring to its (now-stale) S3 state and the peer-side reclaim
-# (reclaim_if_stale, §5) can flip it to IDLE. Starting value = the architecture-doc
-# H5 15-minute threshold (900s); env-overridable for calibration against observed
-# heartbeat_at deltas (the heartbeat advances once per loop iteration via
-# iteration-close.sh). Read at call-time so calibration needs no process restart.
-_OWNERSHIP_STALE_SECONDS_DEFAULT = 900
+# (reclaim_if_stale, §5) can flip it to IDLE. Calibrated 2026-07-07 (bravo
+# dual-runner incident): the original 900s (15 min) design placeholder was
+# SHORTER than a normal deep iteration's tick gap (the heartbeat advances once
+# per loop iteration; deep LLM work runs 30-45+ min between ticks — see
+# runner_heartbeat.stale_minutes in core/config/aspirations.yaml), so a /start
+# on a peer machine stale-broke a LIVE runner's claim mid-iteration. The value
+# MUST exceed the local stale_minutes (60 min); 3900 = 60 + 5 min margin.
+# SSOT is owncloud_backend.DEFAULT_RUNNER_STALE_SECONDS — _owned_agents falls
+# back to the live backend's runner_stale_seconds so the sync-ownership filter
+# and the lock-break can never disagree; this module constant is only the
+# last-resort default for stub backends lacking the attribute. Env override
+# read at call-time so calibration needs no process restart.
+_OWNERSHIP_STALE_SECONDS_DEFAULT = 3900
 
 
 def _owned_agents(be=None):
@@ -416,11 +424,6 @@ def _owned_agents(be=None):
     # depends on it, so this import cannot fail where get_backend would succeed).
     from owncloud_backend import OwnCloudPermissionError
     try:
-        stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS",
-                                   _OWNERSHIP_STALE_SECONDS_DEFAULT))
-    except (TypeError, ValueError):
-        stale = _OWNERSHIP_STALE_SECONDS_DEFAULT
-    try:
         from storage_backend import get_backend
         be_dyn = get_backend()
         # be_dyn.machine_id is the value acquire_runner stamped onto the claim
@@ -446,6 +449,19 @@ def _owned_agents(be=None):
               "(conservative — never own-all, never clobber a peer).",
               file=sys.stderr)
         return set()
+    # Staleness threshold: env override (call-time, guard-594 calibration) ->
+    # the live backend's runner_stale_seconds (SSOT — the SAME value
+    # reclaim_if_stale enforces for the lock-break, parsed from the same env
+    # in from_env) -> module default for stub backends lacking the attribute.
+    # Before 2026-07-07 this function read the env with its OWN 900 default
+    # while the lock-break ignored the env entirely — the two consumers could
+    # (and did) disagree on what "stale" means.
+    _fallback = getattr(be_dyn, "runner_stale_seconds",
+                        _OWNERSHIP_STALE_SECONDS_DEFAULT)
+    try:
+        stale = int(os.environ.get("OWNERSHIP_STALE_SECONDS", _fallback))
+    except (TypeError, ValueError):
+        stale = _fallback
     now = time.time()
     return {
         c.agent for c in claims
@@ -623,6 +639,10 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                     stats["nobaseline_would_reconcile"] = \
                         stats.get("nobaseline_would_reconcile", 0) + 1
                     return None
+                # g-115-1928: the local bytes may be an unpushed authored write
+                # (no baseline can prove otherwise) — snapshot before adopting
+                # S3 so the reconcile is recoverable instead of lossy.
+                _snapshot_before_pull(full)
                 try:
                     be.refresh(full)  # GET S3 -> local cache (materialize authority)
                 except Exception as e:  # noqa: BLE001
@@ -832,6 +852,45 @@ def sync_file(be, target: Path, *, dry_run) -> int:
     return 1 if stats["errors"] else 0
 
 
+def _snapshot_before_pull(full: Path) -> None:
+    """Best-effort .history snapshot of local bytes about to be clobbered by an
+    S3-authoritative pull (g-115-1928).
+
+    Fires ONLY on the no-baseline + local-differs branches (_pull_one's
+    "S3-authoritative at bind" and _sync_one's g-328-22 reconcile) — the one
+    shape where a pull can destroy content nothing else holds: no manifest
+    baseline proves the local bytes were ever reconciled with S3, so they may
+    be an unpushed authored write. Canonical incident: the g-115-1807
+    world-script fix was pulled over with NO snapshot anywhere, making the
+    loss unrecoverable (re-derived from tests + experience traces,
+    g-115-1923). The local==baseline pull branch does NOT snapshot — those
+    bytes equal the last reconciled content, so nothing unique is lost.
+
+    Cost is bounded: the CAS-delta history store dedups content and
+    _prune_to_cap bounds per-file snapshot counts, and save_history's
+    blacklist already skips high-churn no-restore-value files. A fresh
+    2nd-machine transplant (thousands of no-baseline reconciles of clone
+    defaults) pays one dedup'd snapshot per file once.
+
+    Fail-open by contract: the pull IS the designed reconcile; a snapshot
+    failure prints a WARN and never blocks it. Lazy import keeps _fileops
+    off this module's import path for the common no-pull sweeps, and makes
+    the seam monkeypatchable in tests.
+    """
+    try:
+        from _fileops import resolve_base_dir, save_history
+        base = resolve_base_dir(full)
+        if base is None:
+            return
+        save_history(
+            full, base, "owncloud-sync",
+            summary="pre-pull snapshot: S3-authoritative overwrite of "
+                    "no-baseline local (g-115-1928)")
+    except Exception as e:  # noqa: BLE001 — insurance must never block the pull
+        print(f"[pull] WARN: pre-pull history snapshot failed for {full}: {e}",
+              file=sys.stderr)
+
+
 # --- continuity pull (machine-move resume) ---------------------------------
 def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
     """Inverse of _sync_one — HEAD-compare one continuity file and decide
@@ -871,6 +930,7 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         stats["s3_absent"] += 1
         return None  # nothing on S3 to resume from
 
+    snapshot_first = False  # g-115-1928: set only on the no-baseline pull branch
     if full.exists():
         try:
             local_md5 = hashlib.md5(full.read_bytes()).hexdigest()
@@ -902,11 +962,14 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
             # (the Phase-5 drift detector reconciles genuine surprises).
             print(f"[pull] pulling no-baseline local (S3-authoritative at bind): "
                   f"{full}", file=sys.stderr)
+            snapshot_first = True  # local may be an unpushed authored write
         # else local == baseline, S3 differs -> peer wrote -> fall through to pull
 
     if dry_run:
         stats["would_pull"] += 1
         return None
+    if snapshot_first:
+        _snapshot_before_pull(full)
     try:
         be.refresh(full)  # GET S3 -> local cache (force_fresh; materializes)
     except Exception as e:  # noqa: BLE001

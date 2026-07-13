@@ -1,6 +1,6 @@
 ---
 name: felt-sense-checkin
-description: "Fires whenever the aspirations-precheck cadence hits 75 completed goals — an autonomous structured 7-lane self-audit that converts the user's proven-high-yield diagnostic question into a routine. Sweeps memory hygiene (including insight curation from agents/<agent>/insights.jsonl — distills unprocessed entries into tree/reasoning-bank/guardrails/experience then bulk-marks processed), out-of-cycle completions, unblocks, forward backlog, /verify-learning gaps, meta tuning, and the felt-sense question (where is the pain, what would I change). Writes outputs directly — tree nodes, guardrails, reasoning-bank entries, new goals, verify-learning checks, meta edits. Material Self findings route through the Self-update protocol (guard-380 post-notification); cosmetic findings journal only. Use when the user wants to force the sweep on demand (/felt-sense-checkin) or the precheck cadence triggers automatically. Distinct from fresh-eyes-review (periodic local portfolio self-audit, no email push) and sq-012 (post-goal, narrow) — this is the autonomous structured self-audit that writes directly."
+description: "Fires whenever the aspirations-precheck cadence hits 75 completed goals — an autonomous structured 7-lane self-audit that converts the user's proven-high-yield diagnostic question into a routine. Sweeps memory hygiene (including insight curation from agents/{agent}/insights.jsonl — distills unprocessed entries into tree/reasoning-bank/guardrails/experience then bulk-marks processed), out-of-cycle completions, unblocks, forward backlog, /verify-learning gaps, meta tuning, and the felt-sense question (where is the pain, what would I change). Writes outputs directly — tree nodes, guardrails, reasoning-bank entries, new goals, verify-learning checks, meta edits. Material Self findings route through the Self-update protocol (guard-380 post-notification); cosmetic findings journal only. Use when the user wants to force the sweep on demand (/felt-sense-checkin) or the precheck cadence triggers automatically. Distinct from fresh-eyes-review (periodic local portfolio self-audit, no email push) and sq-012 (post-goal, narrow) — this is the autonomous structured self-audit that writes directly."
 user-invocable: true
 triggers:
   - "/felt-sense-checkin"
@@ -369,12 +369,13 @@ path was silently dropping ticks. g-001-189 reproduces and documents.
 
 ```
 Bash: bash core/scripts/fresh-eyes-record-tick.sh last_felt_sense_checkin
-Write: agents/<agent>/temp/felt-sense-<YYYY-MM-DD>.md  # full 7-lane summary (staging — drained to tree)
+Bash: mkdir -p agents/<agent>/temp/drained
+Write: agents/<agent>/temp/drained/felt-sense-<YYYY-MM-DD>.md  # full 7-lane summary — written STRAIGHT to the drained/ archive (g-115-1838): the 7 lanes already wrote all durable value to the 6 stores + Self DURING the sweep, so this summary is archival-by-design and must NOT enter the /drain-temp queue as already-encoded slush
 Bash: journal-add.sh stdin JSON {journal_file: agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md, key_events: [...], tags: [...]}
   # NOTE: journal-add.sh actual API is stdin-JSON only — no --kind / --summary
   # flags. The .md narrative file is written separately (see journal.md
   # convention). This skill writes both: the 7-lane summary at
-  # agents/<agent>/temp/felt-sense-*.md AND the index entry via journal-add.sh.
+  # agents/<agent>/temp/drained/felt-sense-*.md AND the index entry via journal-add.sh.
 ```
 
 ## Relationship to Existing Mechanisms
@@ -413,7 +414,8 @@ check as one atomic pass.
   `agents/<agent>/insights.jsonl` (bulk `--mark-processed` in Phase 1b —
   flips `processed: true` for all unprocessed entries so the `/prime`
   Phase 4 surface resets),
-  `agents/<agent>/temp/felt-sense-*.md` (new staging file),
+  `agents/<agent>/temp/drained/felt-sense-*.md` (archival summary — value already
+  written to the 6 stores during the sweep; never enters the drain queue),
   `agents/<agent>/journal.jsonl` (append),
   `agents/<agent>/session/working-memory.yaml` (last_felt_sense_checkin slot),
   `meta/*.yaml` (tuning edits), `core/config/verification-checklist.md`

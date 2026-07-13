@@ -3015,3 +3015,9 @@ The tree-encoding-drift-gate increments `goals_since_last_tree_update` every sta
 37. **Static**: `grep -q '"--tree-updated" in sys.argv' core/scripts/tree-encoding-drift-gate.py` — the gate parses the flag in main(). Without parsing, the flag is silently dropped even if iteration-close passes it.
 38. **Static**: `grep -q "short_circuited" core/scripts/tree-encoding-drift-gate.py` AND `grep -q "g-115-282" core/scripts/tree-encoding-drift-gate.py` — the short-circuit branch and traceability tag are present. The branch resets counter to 0 WITHOUT setting `slots["force_tree_encoding"]`; without that asymmetry the flag would behave identically to the threshold-cross path (which DOES set the sentinel).
 
+## BR10. core/scripts Exec-Bit Regression Check (g-115-1901)
+
+This repo was authored on Windows (git stores `*.sh` at mode 100644) but runs on a Linux box, where a 100644 `*.sh` is NOT executable and DIRECT-EXEC chains (`exec "$DIR/foo.sh"`, `./foo.sh`) fail with 'Permission denied'. The gap hid because scripts invoked as `bash foo.sh` are unaffected — it surfaced only when an `exec`-chain hit it (echo boot 2026-07-10: `agent-aspirations-add-goal.sh` line 7 exec'd `aspirations-add-goal.sh`). g-115-1901 chmod'd the full core/scripts `*.sh` population to 100755 (git core.filemode=true records the mode change, which commits + propagates fleet-wide) and added this check so a newly-added `*.sh` at 100644 is caught before it breaks a direct-exec chain. Scope: core/scripts only (git-tracked); world/scripts exec bits are machine-local (external store, no POSIX-perm S3 sync — re-applied per machine).
+
+39. **Runtime**: `bash core/scripts/check-sh-exec-bits.sh` exits 0 — every core/scripts `*.sh` carries the exec bit (100755). Exit 1 lists any file missing it (a Windows-origin `*.sh` committed at 100644). The check script itself carries +x, obeying its own rule.
+

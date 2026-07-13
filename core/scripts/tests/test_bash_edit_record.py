@@ -89,11 +89,18 @@ def _setup_repo(tmp: Path, agents=("alpha", "zeta")) -> Path:
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)
     # Pre-seed .python-shim so _paths.sh skips the Windows Store python3 probe.
+    # The shim MUST exec the real interpreter (sys.executable), NOT `py -3`: on a
+    # host where `py` is itself an `exec python3` wrapper (e.g. this Linux box's
+    # /usr/local/bin/py), a `python3->py -3` shim plus a `py -3->python3` wrapper
+    # form an infinite mutual recursion once the shim dir is on PATH — the record
+    # script hangs and the subprocess times out (6). sys.executable is an
+    # absolute path, so there is no PATH re-resolution and no loop; it is also the
+    # correct working interpreter on Windows (bypasses the Store stub).
     shim_dir = core_scripts / ".python-shim"
     shim_dir.mkdir()
     for name in ("python3", "python"):
         s = shim_dir / name
-        s.write_text("#!/usr/bin/env bash\nexec py -3 \"$@\"\n")
+        s.write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
         s.chmod(0o755)
     return repo
 

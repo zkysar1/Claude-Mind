@@ -49,16 +49,23 @@ def test_l161_stdin_buffer_em_dash():
 
 # ── Unfixed behaviour (demonstrates the bug exists without the fix) ────────
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Windows json.dumps handles surrogates; bug manifests only on POSIX agents")
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows handles surrogates; bug manifests only on POSIX agents")
 def test_l362_without_fix_raises():
-    """Without fix: lone surrogate from cp1252 em-dash causes json.dumps ValueError.
-    POSIX agents (Linux) are the deployment target; Windows CI skips this test.
+    """Without fix: the cp1252 em-dash lone surrogate cannot be UTF-8 encoded —
+    the failure the L362 ingress fix (.encode('utf-8', errors='replace')) prevents.
+
+    NOTE (g-115-1836): the original demonstration asserted json.dumps() raises,
+    but on CPython 3.12 json.dumps(ensure_ascii=True) escapes the lone surrogate
+    to an ASCII \\u escape and does NOT raise. The bug surfaces one step later,
+    at the UTF-8 encode of the diary write. raw.encode('utf-8') is the minimal,
+    version-robust reproduction of that fundamental failure. POSIX agents (Linux)
+    are the deployment target; Windows CI skips this test.
     """
     raw = _posix_environ(b"summary\x97note")
     if "\uDC97" not in raw:
         pytest.skip("no surrogate present on this platform — cannot demonstrate bug")
-    with pytest.raises((ValueError, UnicodeEncodeError)):
-        json.dumps({"content": raw})
+    with pytest.raises(UnicodeEncodeError):
+        raw.encode("utf-8")
 
 
 def test_l161_without_fix_raises():

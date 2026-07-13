@@ -60,7 +60,7 @@ or rehydratable.
 ```
 Bash: session-mode-get.sh
 IF mode is "reader":
-    Output: "Skill requires assistant mode. Run `/start <agent> --mode assistant` to enable."
+    Bash: echo "Skill requires assistant mode. Run /start <agent> --mode assistant to enable."
     STOP.
 ```
 

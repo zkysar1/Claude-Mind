@@ -16,6 +16,7 @@ self-resolve instead of wedging the integrate step.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -286,3 +287,157 @@ def test_real_repo_union_scope_is_evidence_gated():
     for line in r.stdout.strip().splitlines():
         path, _, value = (s.strip() for s in line.split(":", 2))
         assert value == paths[path.replace("\\", "/")], line
+
+
+# --------------------------------------------------------------------------- #
+# cross-agent-churn self-heal for the dirty-tree merge deadlock (3)
+#
+# The deadlock (per 3): origin advances a file that THIS machine has
+# UNSTAGED cross-agent churn on (agents/<other>/* — owncloud re-materialised
+# sibling state the namespace filter refuses to commit). `git merge` refuses
+# BEFORE starting (no MERGE_HEAD), the tree is deferred, and owncloud re-creates
+# the same churn every cycle so it never self-heals. The fix clears ONLY the
+# blocking cross-agent churn and retries the merge once — but NEVER touches
+# staged entries (guard-741: a concurrent agent's in-flight staged work) nor any
+# file outside agents/<other>/* (self/core/world). All-or-nothing: any
+# non-clearable file in the blocking set defers the WHOLE tree untouched.
+# --------------------------------------------------------------------------- #
+def _run_push_env(repo: Path, agent: str, *flags: str) -> subprocess.CompletedProcess:
+    """_run_push with MIND_AGENT set — the script reads it to identify 'self'."""
+    return subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(repo), *flags],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "MIND_AGENT": agent},
+    )
+
+
+def _seed_and_sync(a: Path, b: Path, files: dict) -> None:
+    """Commit tracked files from A, push to origin, pull into B (shared base)."""
+    for rel, content in files.items():
+        _commit_file(a, rel, content, f"seed {rel}")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+
+
+def test_selfheal_dirty_tracked_crossagent_clears_and_merges(tmp_path):
+    """t1: unstaged tracked agents/<other>/* churn overlapping the merge is
+    cleared; the merge retries and succeeds; A's own commit survives; the
+    cross-agent file converges to origin's version."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/state.jsonl": "v1\n"})
+    # B advances the cross-agent file at origin
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _must(b, "push", "-q", "origin", "main")
+    # A has its own framework commit to push
+    _commit_file(a, "core/scripts/foo.sh", "echo hi\n", "A: framework work")
+    # ...plus UNSTAGED cross-agent churn overlapping the incoming merge
+    (a / "agents/bravo/state.jsonl").write_text("dirty-churn\n",
+                                                encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    assert "self-heal: clearing" in r.stderr
+    assert "after cross-agent-churn self-heal" in r.stderr
+    assert "push OK" in r.stderr
+
+    # A fully converged; origin holds BOTH A's commit and B's bravo change
+    _must(a, "fetch", "-q", "origin", "main")
+    counts = _must(a, "rev-list", "--left-right", "--count", "origin/main...main")
+    assert counts.split() == ["0", "0"], f"not converged: {counts}"
+    tree = _must(a, "ls-tree", "-r", "--name-only", "origin/main")
+    assert "core/scripts/foo.sh" in tree and "agents/bravo/state.jsonl" in tree
+    # churn discarded → the file is origin's committed version, tree clean
+    assert (a / "agents/bravo/state.jsonl").read_text() == "v2-from-b\n"
+    assert _must(a, "status", "--porcelain") == ""
+
+
+def test_selfheal_untracked_crossagent_clears_and_merges(tmp_path):
+    """t2: an UNTRACKED agents/<other>/* file that collides with an incoming
+    origin ADD is removed; the merge retries and brings origin's version."""
+    origin, a, b = _clone_pair(tmp_path)
+    # B adds a NEW cross-agent file at origin
+    _commit_file(b, "agents/bravo/new.jsonl", "from-b\n", "B: new bravo file")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/bar.sh", "echo bar\n", "A: framework work")
+    # A has an UNTRACKED file at the same path (collides with the incoming add)
+    (a / "agents" / "bravo").mkdir(parents=True, exist_ok=True)
+    (a / "agents/bravo/new.jsonl").write_text("untracked-local\n",
+                                              encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"stderr: {r.stderr}"
+    assert "self-heal: clearing" in r.stderr
+    assert "push OK" in r.stderr
+    # untracked collision removed → merge brought origin's committed version
+    assert (a / "agents/bravo/new.jsonl").read_text() == "from-b\n"
+    assert _must(a, "status", "--porcelain") == ""
+
+
+def test_selfheal_staged_crossagent_defers_guard741(tmp_path):
+    """t3 (guard-741): a STAGED cross-agent change is a concurrent agent's
+    in-flight work — NEVER discarded. The tree defers, staged work preserved."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/state.jsonl": "v1\n"})
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/baz.sh", "echo baz\n", "A: framework work")
+    # A STAGES a change to the cross-agent file (concurrent-agent staged work)
+    (a / "agents/bravo/state.jsonl").write_text("staged-by-partner\n",
+                                                encoding="utf-8", newline="\n")
+    _must(a, "add", "agents/bravo/state.jsonl")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"should defer, not heal: {r.stderr}"
+    assert "staged index entries present" in r.stderr
+    assert "guard-741" in r.stderr
+    assert "merge DEFERRED" in r.stderr
+    # staged work NEVER discarded — content preserved AND still staged
+    assert (a / "agents/bravo/state.jsonl").read_text() == "staged-by-partner\n"
+    assert "agents/bravo/state.jsonl" in _must(a, "diff", "--cached", "--name-only")
+
+
+def test_selfheal_self_dir_dirty_defers(tmp_path):
+    """t4: dirty churn under the agent's OWN dir (agents/<self>/*) is never
+    cleared — that would discard the agent's own uncommitted work. Defer."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/alpha/state.jsonl": "v1\n"})
+    # origin advances a file under alpha's own dir (hermetic trigger — the
+    # commit author is irrelevant; the point is A has agents/<self>/* dirty)
+    _commit_file(b, "agents/alpha/state.jsonl", "v2-from-b\n", "advance alpha state")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/qux.sh", "echo\n", "A: framework work")
+    (a / "agents/alpha/state.jsonl").write_text("dirty-self\n",
+                                                encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"should defer, not clear own work: {r.stderr}"
+    assert "under SELF agent dir" in r.stderr
+    assert "merge DEFERRED" in r.stderr
+    # own dirty work preserved (not cleared)
+    assert (a / "agents/alpha/state.jsonl").read_text() == "dirty-self\n"
+
+
+def test_selfheal_mixed_blocking_set_defers_all_or_nothing(tmp_path):
+    """t5: a mixed blocking set (one clearable agents/<other>/* + one
+    non-clearable core/) defers the WHOLE tree untouched — the scope guard
+    returns BEFORE clearing anything, so neither file is cleared."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/state.jsonl": "v1\n",
+                          "core/scripts/shared.sh": "c1\n"})
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _commit_file(b, "core/scripts/shared.sh", "c2-from-b\n", "B: shared v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "agents/alpha/note.md", "note\n", "A: own work")
+    # BOTH dirty: cross-agent (clearable) + core (never clearable)
+    (a / "agents/bravo/state.jsonl").write_text("dirty-bravo\n",
+                                                encoding="utf-8", newline="\n")
+    (a / "core/scripts/shared.sh").write_text("dirty-core\n",
+                                              encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, f"mixed set must defer: {r.stderr}"
+    assert "outside agents/<other>/*" in r.stderr
+    assert "merge DEFERRED" in r.stderr
+    # ALL-OR-NOTHING: neither file cleared (defer touches nothing)
+    assert (a / "agents/bravo/state.jsonl").read_text() == "dirty-bravo\n"
+    assert (a / "core/scripts/shared.sh").read_text() == "dirty-core\n"

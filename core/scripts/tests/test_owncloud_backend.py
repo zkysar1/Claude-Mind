@@ -460,6 +460,63 @@ def test_fresh_runner_not_reclaimed(cloud):
         other.acquire_runner("alpha", "tokB")
 
 
+def test_live_long_turn_peer_not_reclaimable_at_incident_age(cloud):
+    """Regression for the 2026-07-07 bravo dual-runner incident. A LIVE peer
+    22 minutes into ONE max-effort LLM turn has a 1320s-old heartbeat (the DDB
+    heartbeat only advances once per loop iteration via heartbeat-tick.sh) —
+    stale under the original 900s design placeholder, which is exactly how a
+    /start on cc-04 stale-broke cc-05's live claim and started a second bravo.
+    Under the calibrated default (DEFAULT_RUNNER_STALE_SECONDS = 3900, i.e.
+    the local runner_heartbeat.stale_minutes contract + margin) that claim is
+    FRESH: reclaim refuses and the second acquire raises RunnerHeld, so
+    /start answers held=true (ACQUIRE_RC=4) and refuses the second runner.
+    A genuinely crashed peer (past the lease) must STILL be recoverable."""
+    from owncloud_backend import DEFAULT_RUNNER_STALE_SECONDS, RunnerHeld
+    live = _backend(cloud, machine_id="cc-05")
+    second = _backend(cloud, machine_id="cc-04")
+    assert live.acquire_runner("bravo", "tokLive") is True
+    _set_heartbeat(cloud, "bravo", time.time() - 22 * 60)  # the incident gap
+    assert second.reclaim_if_stale("bravo") is False, (
+        "a 22-min-old heartbeat is a BUSY runner, not a crashed one — "
+        "reclaim must refuse")
+    with pytest.raises(RunnerHeld):
+        second.acquire_runner("bravo", "tokSecond")
+    # Crash recovery still works: age the heartbeat past the calibrated lease.
+    _set_heartbeat(cloud, "bravo",
+                   time.time() - (DEFAULT_RUNNER_STALE_SECONDS + 60))
+    assert second.reclaim_if_stale("bravo") is True
+    assert second.acquire_runner("bravo", "tokSecond") is True
+
+
+def test_from_env_honors_ownership_stale_seconds(cloud, tmp_path, monkeypatch):
+    """OWNERSHIP_STALE_SECONDS must reach the LOCK-BREAK, not just the sync
+    filter. Before 2026-07-07 from_env never passed runner_stale_seconds, so
+    the documented calibration knob silently governed only _owned_agents while
+    reclaim_if_stale kept its hardcoded default — two consumers, two answers."""
+    from owncloud_backend import DEFAULT_RUNNER_STALE_SECONDS, OwnCloudBackend
+    world, meta, agents = tmp_path / "w", tmp_path / "m", tmp_path / "agents"
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        monkeypatch.setenv(k, "testing")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
+    monkeypatch.setenv("MIND_AWS_ALLOW_DEFAULT_CHAIN", "1")
+    monkeypatch.setenv("STORAGE_S3_BUCKET", BUCKET)
+    monkeypatch.setenv("STORAGE_DDB_LOCK_TABLE", LOCKS)
+    monkeypatch.setenv("STORAGE_DDB_SESSIONS_TABLE", SESSIONS)
+    monkeypatch.setenv("ENVIRONMENT_ID", ENV_ID)
+    monkeypatch.setenv("MIND_WORLD", str(world))
+    monkeypatch.setenv("MIND_META", str(meta))
+    monkeypatch.setenv("AGENTS_ROOT", str(agents))
+    monkeypatch.setenv("OWNERSHIP_STALE_SECONDS", "1234")
+    assert OwnCloudBackend.from_env().runner_stale_seconds == 1234
+    # Unset / garbage -> the calibrated default, never a crash.
+    monkeypatch.delenv("OWNERSHIP_STALE_SECONDS", raising=False)
+    assert (OwnCloudBackend.from_env().runner_stale_seconds
+            == DEFAULT_RUNNER_STALE_SECONDS)
+    monkeypatch.setenv("OWNERSHIP_STALE_SECONDS", "not-a-number")
+    assert (OwnCloudBackend.from_env().runner_stale_seconds
+            == DEFAULT_RUNNER_STALE_SECONDS)
+
+
 def test_heartbeat_refresh_blocks_reclaim(cloud):
     a = _backend(cloud, machine_id="A")
     other = _backend(cloud, machine_id="B")

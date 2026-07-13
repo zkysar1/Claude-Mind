@@ -215,6 +215,28 @@ def validate_record(rec):
     if not content_path.exists():
         raise ValueError(f"content_path file does not exist: {rec['content_path']}")
 
+# Goal-id embedded in an experience id: exp-{goal-id}-{slug}, where goal-id is
+# the canonical g-NNN-NN (2-4 digit tail). cmd_archive_goal builds ids as
+# exp-{goal_id}-{skill_slug}, so the goal-id is present in the id even when a
+# caller-formed cmd_add record leaves the goal_id FIELD null — which blinds the
+# daemon --goal read filter (mind_api/src/endpoints/experience.py: it matches on
+# rec.get("goal_id") == goal, so a null field is invisible). 7.
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-\d{3}-\d{2,4})-")
+
+
+def derive_goal_id_from_id(rec_id):
+    """Return the g-NNN-NN goal-id embedded in an experience id, or None.
+
+    Matches ONLY the canonical exp-{goal-id}-{slug} shape. Slug-only ids
+    (exp-encode-session-*, exp-577-behavioral-*, exp-2026-05-16_ohs-*) return
+    None — those experiences are genuinely goal-less and must stay null so the
+    field keeps meaning "no owning goal" rather than "unknown". (g-115-1917)
+    """
+    if not rec_id:
+        return None
+    m = GOAL_ID_IN_EXP_ID_RE.match(rec_id)
+    return m.group(1) if m else None
+
 def normalize_record(rec):
     """Apply defaults for missing fields. Mutates and returns rec.
 
@@ -235,6 +257,17 @@ def normalize_record(rec):
             for sub_key, sub_default in default.items():
                 if sub_key not in rec[field]:
                     rec[field][sub_key] = sub_default
+    # Backfill a null goal_id from the id when the id embeds a canonical goal-id
+    # (exp-g-NNN-NN-*). Fires on every read/write path that normalizes (cmd_add,
+    # cmd_update_field, cmd_archive_goal), so new records self-heal at write and
+    # existing records backfill on their next core-side touch. NEVER overwrites a
+    # present goal_id; slug-only ids stay null. Persisting the derived value at
+    # write time is what makes the daemon --goal read (which matches the stored
+    # field, not a re-derivation) find the record. (7)
+    if not rec.get("goal_id"):
+        derived = derive_goal_id_from_id(rec.get("id"))
+        if derived:
+            rec["goal_id"] = derived
     return rec
 
 # ---------------------------------------------------------------------------

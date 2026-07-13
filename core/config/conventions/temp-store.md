@@ -65,9 +65,17 @@ temp/<type>-<YYYY-MM-DDTHH-MM-SS>.md
 temp/<type>-<YYYY-MM-DDTHH-MM-SS>.json
 ```
 
-Examples: `temp/fresh-eyes-2026-06-02T14-30-00.md`,
-`temp/felt-sense-2026-06-02.md`,
-`temp/design-notes-2026-06-02T14-30-00.md`.
+Examples: `temp/design-notes-2026-06-02T14-30-00.md`,
+`temp/diag-<subsystem>-2026-06-02T14-30-00.md`,
+`temp/audit-<topic>-2026-06-02.md`.
+
+Cadence-ritual briefings (`fresh-eyes-*.md`, `fresh-eyes-program-*.md`,
+`fresh-eyes-tree-*.md`, `felt-sense-*.md`) are the EXCEPTION: they self-encode
+their durable value at creation (their own Phase 5.6 / lane sweeps write to
+tree/RB/guardrails/Self), so they are archival-by-design and land straight in
+`temp/drained/` — they never enter the drain queue as already-encoded slush
+(g-115-1838). Do not treat a `temp/drained/fresh-eyes-*.md` as an undrained
+working doc.
 
 (NOT temp/: completion reports are the single `COMPLETION-REPORT.md` pointer at
 the agent root — git history is their archive; phase-cost telemetry and the
@@ -125,6 +133,34 @@ in-flight run (the daemon-safe full suite is ~32 min); a just-completed log is
 purged on the next drain cycle. The temp-pressure metric applies NO age guard —
 it counts all ephemera so a recent slush still triggers the drain that will
 later purge it.
+
+### The purge MUST go through the guarded helper — never a hand-rolled `rm`
+
+The Phase 1.5 purge MUST call `core/scripts/temp-drain-purge.sh` — the canonical
+GUARDED purge path. Do NOT hand-roll an `rm` (or reconstruct the find/rm inline)
+on a temp-dir variable. The helper asserts the temp dir is set + non-empty,
+absolute, strictly under `PROJECT_ROOT`, and `basename=='temp'` BEFORE any
+deletion, then deletes via `find … -maxdepth 1 -type f (ephemera globs) -mmin
++120 -delete` — never a per-file `rm` on an interpolated path (and `-maxdepth 1`
+leaves `drained/` untouched).
+
+WHY (g-115-1876): a hand-rolled `rm -f "$TEMP_DIR/$f"` where `$TEMP_DIR` resolves
+empty becomes an `rm` on a root-relative path, which Claude Code flags as a
+dangerous-rm and PROMPTS for confirmation EVEN under
+`--dangerously-skip-permissions` (the fleet launch mode). An autonomous agent
+cannot answer its own dialog, so the loop looks alive (`agent-state=RUNNING`)
+while hanging at zero progress until a human intervenes — an agent hung 46+ min
+this way (observed 2026-07-09, cc-05). The guarded helper eliminates the whole
+hand-rolled-rm class: there is exactly one purge path, and it fails loud
+(non-zero exit, deletes nothing) rather than ever issuing a dangerous rm.
+Regression-guarded by `core/scripts/tests/test_temp_drain_purge.sh` (8 guard
+cases + a dry-run smoke).
+
+**General rule (applies beyond temp):** any framework guidance that has an agent
+construct an `rm` on a variable path MUST guard the variable (set + non-empty +
+expected-shape) first, or route through a helper that does. An unguarded `rm` on
+a possibly-empty variable is an agent-hang hazard, not just a data-loss hazard —
+the dialog it triggers cannot be answered by an autonomous agent.
 
 ## Searching temp/
 

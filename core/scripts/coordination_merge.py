@@ -1114,6 +1114,556 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
+# --- _tree.yaml per-node field reconcile (, carved from ) ---
+# _tree.yaml is the 4th both-diverged freeze shape: a ~966KB / ~1140-node tree
+# where each node dict carries MIXED-semantics fields. This sub-goal (-a)
+# supplies the FIELD-CLASSIFICATION map + the three NON-STRUCTURAL merge classes.
+# The STRUCTURAL reconcile (children/parent/depth/child_count/node_type) is
+# -b, and the top-level merge_tree(bytes->bytes) handler + tree_growth_log
+# order-preserving union + _HANDLERS registration is -c. These helpers are
+# therefore DORMANT until C wires them -- nothing in _HANDLERS calls them yet, so
+# _tree.yaml stays unregistered (merge_handler_for still returns None for it).
+#
+# Field classes (every per-node field is classified -- see _classify_tree_field):
+#   MAX          grow-only utilization counters -> numeric max (never lose a count;
+#                identical convention to _merge_counters / _merge_module).
+#   NEWER        monotonic timestamps -> strictly-newer ISO wins (only advance).
+#   PROGRESSION  confidence / capability_level -> LWW by the node's last_updated
+#                (the later edit reflects the node's CURRENT calibration/maturity,
+#                so a genuine later downgrade -- e.g. a contradiction lowering
+#                confidence -- is PRESERVED, not clobbered), with a NEVER-REGRESS
+#                tiebreak ONLY on an equal/both-missing last_updated: the
+#                more-progressed value wins (higher confidence; more-mature
+#                capability_level per the EXPLORE<CALIBRATE<EXPLOIT<MASTER maturity
+#                axis in core/scripts/tree.py). later-wins is the primary rule;
+#                never-regress is the ambiguity-only refinement.
+#   STRUCTURAL   children/parent/depth/child_count/node_type -> DEFERRED to
+#                -b; here they ride the LWW base unchanged (a naive union
+#                corrupts parent/child symmetry, so B reconciles them adversarially).
+#   BASE         everything else (summary, file, growth_state, derived counts like
+#                article_count/utility_ratio/accuracy, opaque/LWW fields) -> rides
+#                the newer-last_updated base (self-correcting: the next tree-maintain
+#                recomputes derived fields; same precedent as merge_pipeline_meta's
+#                derived LWW fields).
+# Every rule is a symmetric function of (a, b) -> both machines converge (the
+# module-wide commutativity invariant). Verified by the -a unit tests.
+
+# Grow-only utilization counters -> numeric MAX.
+_TREE_MAX_FIELDS = ("retrieval_count", "times_helpful", "times_noise",
+                    "times_inferred_helpful", "sample_size")
+# Monotonic timestamps -> strictly-newer ISO wins.
+_TREE_NEWER_FIELDS = ("last_retrieved", "last_updated", "last_relevant_at")
+# LWW-by-last_updated with never-regress-on-tie.
+_TREE_PROGRESSION_FIELDS = ("confidence", "capability_level", "domain_confidence")
+# Structural -- reconciled in -b; ride the LWW base here.
+_TREE_STRUCTURAL_FIELDS = ("children", "parent", "depth", "child_count", "node_type")
+# capability_level maturity axis (core/scripts/tree.py capability-threshold map:
+# EXPLORE 0.25 < CALIBRATE 0.50 < EXPLOIT 0.75 < MASTER 1.00). Higher rank = more
+# progressed. REFERENCE is orthogonal to the axis (absent -> content tiebreak).
+_CAPABILITY_RANK = {"EXPLORE": 0, "CALIBRATE": 1, "EXPLOIT": 2, "MASTER": 3}
+
+
+def _merge_field_max(va, vb):
+    """MAX class: two grow-only counter values -> the larger. A present numeric
+    beats a missing/non-numeric side; two non-numerics fall to a content tiebreak.
+    Commutative (max and _canon are symmetric)."""
+    na = isinstance(va, (int, float)) and not isinstance(va, bool)
+    nb = isinstance(vb, (int, float)) and not isinstance(vb, bool)
+    if na and nb:
+        return max(va, vb)
+    if na:
+        return va
+    if nb:
+        return vb
+    return va if _canon(va) >= _canon(vb) else vb
+
+
+def _merge_field_newer(va, vb):
+    """NEWER class: two monotonic ISO timestamps -> the strictly-newer (None sorts
+    oldest; equal values are identical either way). Commutative -- returns the
+    newer value regardless of arg order (via _newer)."""
+    return va if (_newer(va, vb) or va == vb) else vb
+
+
+def _progression_rank(v):
+    """Total order for the PROGRESSION never-regress tiebreak. Numbers rank by
+    value; capability_level strings rank by the maturity axis; anything else ranks
+    by canonical JSON (deterministic + machine-independent). The 3-tuple keeps the
+    three kinds separable so a str never numerically-compares against a float."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return (2, float(v), "")
+    if isinstance(v, str) and v in _CAPABILITY_RANK:
+        return (1, float(_CAPABILITY_RANK[v]), "")
+    return (0, 0.0, _canon(v))
+
+
+def _merge_field_progression(va, ta, vb, tb):
+    """PROGRESSION class (confidence / capability_level): LWW keyed on the node's
+    last_updated (ta / tb) -- the later edit reflects the node's CURRENT
+    calibration/maturity, so a genuine later downgrade is kept. On an EQUAL (or
+    both-missing) last_updated the winner is ambiguous, so the NEVER-REGRESS
+    tiebreak picks the more-progressed value (higher confidence / more-mature
+    capability_level), content tiebreak on an equal rank. Commutative: _newer is
+    antisymmetric and the rank/_canon tiebreak is symmetric."""
+    if _newer(ta, tb):
+        return va
+    if _newer(tb, ta):
+        return vb
+    ra, rb = _progression_rank(va), _progression_rank(vb)
+    if ra != rb:
+        return va if ra > rb else vb
+    return va if _canon(va) >= _canon(vb) else vb
+
+
+def _merge_tree_node(a: dict, b: dict) -> dict:
+    """Reconcile two copies of the SAME tree node (same node key) from two
+    machines. Base = the newer-last_updated copy (LWW via _order_by_ts) so every
+    BASE/derived/opaque field AND the STRUCTURAL fields (deferred to g-001-313-b)
+    ride the later edit; then the class fields override:
+      MAX          -> _merge_field_max          (larger counter)
+      NEWER        -> _merge_field_newer         (strictly-newer ISO)
+      PROGRESSION  -> _merge_field_progression   (LWW-by-last_updated, never-regress tie)
+    A class field present on only ONE side is kept (an absent field never clobbers
+    a present one), and loser-only BASE fields are preserved too (authored fields
+    like origin_goal_id / valid_from / domain_class are NOT self-correcting, so a
+    loser-only one must not be dropped). Symmetric in (a, b) -> both machines
+    converge, INCLUDING the non-dict guard below (proven by the g-001-313-a unit
+    tests). NOTE: this returns a merged NODE dict; the byte-exact _tree.yaml
+    serialization + tree_growth_log union + dispatcher wiring are g-001-313-c, so
+    this helper is not yet reachable from _HANDLERS."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        # Non-dict input (never happens for real tree nodes). The dict side wins;
+        # if BOTH are non-dicts fall to the module's content tiebreak so the result
+        # is byte-identical regardless of (a, b) order. (-a fresh-eyes fix
+        # — the prior `return b if isinstance(b, dict) else a` broke commutativity:
+        # merge(3, 5)->3 but merge(5, 3)->5.)
+        if isinstance(a, dict):
+            return a
+        if isinstance(b, dict):
+            return b
+        return a if _canon(a) >= _canon(b) else b
+    base, _lose = _order_by_ts(a, b, "last_updated")
+    out = dict(base)
+    ta, tb = a.get("last_updated"), b.get("last_updated")
+    for f in _TREE_MAX_FIELDS:
+        if f in a and f in b:
+            out[f] = _merge_field_max(a[f], b[f])
+        elif f in a:
+            out[f] = a[f]
+        elif f in b:
+            out[f] = b[f]
+    for f in _TREE_NEWER_FIELDS:
+        if f in a and f in b:
+            out[f] = _merge_field_newer(a[f], b[f])
+        elif f in a:
+            out[f] = a[f]
+        elif f in b:
+            out[f] = b[f]
+    for f in _TREE_PROGRESSION_FIELDS:
+        if f in a and f in b:
+            out[f] = _merge_field_progression(a[f], ta, b[f], tb)
+        elif f in a:
+            out[f] = a[f]
+        elif f in b:
+            out[f] = b[f]
+    # Preserve loser-only fields the base lacks (-a fresh-eyes fix):
+    # authored BASE fields (origin_goal_id / valid_from / domain_class) are NOT
+    # self-correcting, so a loser-only one must not be silently dropped. `_lose`
+    # is content-fixed (symmetric via _order_by_ts) and every class field is
+    # already in `out` from the loops above, so this stays commutative and only
+    # adds base-absent keys. Mirrors the id-keyed handlers' loser-key union.
+    for k, v in _lose.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
+def _classify_tree_field(field: str) -> str:
+    """The FIELD-CLASSIFICATION map as a TOTAL function: every per-node field name
+    -> its merge class ("MAX" | "NEWER" | "PROGRESSION" | "STRUCTURAL" | "BASE").
+    Named classes get a dedicated rule in _merge_tree_node; STRUCTURAL is deferred
+    to g-001-313-b; BASE rides the newer-last_updated LWW base. Total by
+    construction -- an unrecognized (future) field defaults to BASE, the safe
+    self-correcting class -- so the map "covers all per-node fields" by design."""
+    if field in _TREE_MAX_FIELDS:
+        return "MAX"
+    if field in _TREE_NEWER_FIELDS:
+        return "NEWER"
+    if field in _TREE_PROGRESSION_FIELDS:
+        return "PROGRESSION"
+    if field in _TREE_STRUCTURAL_FIELDS:
+        return "STRUCTURAL"
+    return "BASE"
+
+
+# --- _tree.yaml node-MAP structural merge (-b) ----------------------
+# -a reconciles a SINGLE node's non-structural fields. This sub-goal
+# (-b) reconciles the whole `nodes:` map's STRUCTURE -- children /
+# parent / depth / child_count / node_type -- where a naive per-node children
+# UNION corrupts parent/child consistency. Canonical failure: machine A moves
+# node Z from parent P to parent N (Z.parent=N, Z in N.children, Z NOT in
+# P.children); machine B keeps Z under P. A naive children-union leaves Z in BOTH
+# N.children and P.children while Z.parent is only one of them -- a symmetry
+# violation that, once wired (-c) onto the live ~1140-node tree, corrupts
+# it.
+#
+# The robust reconcile is PARENT-AUTHORITATIVE: `parent` is the single source of
+# truth (reconciled LWW-by-last_updated inside _merge_tree_node -- the later
+# edit's parent wins), and children / depth / child_count / node_type are DERIVED
+# from the reconciled parents AFTER the per-node merge. Deriving children from
+# parent GUARANTEES parent/child symmetry AND no orphaned children by
+# construction: a node appears in exactly the children list of the parent it
+# actually points to, and that list only ever names keys that exist. Every
+# derived list is SORTED, so the result is byte-identical regardless of (a, b)
+# order (the module-wide commutativity invariant). These helpers are still
+# DORMANT: -c wraps _merge_tree_nodes_map in the bytes->bytes merge_tree
+# handler (parse YAML -> merge nodes map + tree_growth_log union -> serialize),
+# adds CRLF handling, and registers it in _HANDLERS.
+
+
+def _rebuild_tree_structure(merged: Dict[str, dict]) -> None:
+    """IN-PLACE structural rebuild of a merged node map: derive children /
+    child_count / node_type / depth from each node's reconciled `parent`, so the
+    structure is internally consistent (parent/child symmetry + no orphaned
+    children) no matter how the two sides diverged. Deterministic (children
+    SORTED); depends only on `merged`, so the whole map merge stays commutative.
+    Mutates only the freshly-merged node dicts (never the caller's inputs)."""
+    # 1. children: derive from parent. children[P] = the keys whose parent == P.
+    children_of: Dict[str, list] = {k: [] for k in merged}
+    for k in merged:
+        p = merged[k].get("parent")
+        if p is not None and p in children_of:
+            children_of[p].append(k)
+    for k, node in merged.items():
+        kids = sorted(children_of[k])              # SORTED -> byte-deterministic
+        node["children"] = kids
+        node["child_count"] = len(kids)
+        # node_type is leaf/interior, fully derived from whether the node has
+        # children (verified: _tree.yaml node_type is only ever leaf|interior).
+        node["node_type"] = "interior" if kids else "leaf"
+    # 2. depth: recompute as (parent depth + 1); a root (no parent, or a parent
+    # outside the merged map) keeps its merged depth. Memoized + cycle-guarded so
+    # a pathological parent cycle can never infinite-loop. A parent-move therefore
+    # re-derives the moved subtree's depth to match its NEW parent.
+    memo: Dict[str, int] = {}
+
+    def _depth(key: str, visiting: frozenset) -> int:
+        if key in memo:
+            return memo[key]
+        node = merged.get(key) or {}
+        p = node.get("parent")
+        if p is None or p not in merged or key in visiting:
+            d = node.get("depth", 0)               # root / dangling parent / cycle
+            d = d if isinstance(d, int) and not isinstance(d, bool) else 0
+        else:
+            d = _depth(p, visiting | {key}) + 1
+        memo[key] = d
+        return d
+
+    for k in merged:
+        merged[k]["depth"] = _depth(k, frozenset())
+
+
+def _merge_tree_nodes_map(nodes_a: Dict[str, dict],
+                          nodes_b: Dict[str, dict]) -> Dict[str, dict]:
+    """Reconcile two `nodes:` maps ({node_key: node_dict}) from two machines.
+    Node keys are UNIONED (a node on either side survives -> node count is
+    preserved); a key on BOTH sides is field-merged via _merge_tree_node
+    (g-001-313-a) and then the whole map's STRUCTURE is rebuilt from the
+    reconciled parents (g-001-313-b). Emitted key order is SORTED so the bytes
+    are identical regardless of (a, b) order (commutativity invariant). Returns
+    a NEW map of NEW node dicts (inputs untouched); the bytes<->bytes merge_tree
+    wrapper + tree_growth_log union + _HANDLERS registration are g-001-313-c."""
+    if not isinstance(nodes_a, dict) or not isinstance(nodes_b, dict):
+        # Degenerate guard (never happens for a real `nodes:` map) — content
+        # tiebreak so the result is identical regardless of (a, b) order.
+        if isinstance(nodes_a, dict):
+            return nodes_a
+        if isinstance(nodes_b, dict):
+            return nodes_b
+        return nodes_a if _canon(nodes_a) >= _canon(nodes_b) else nodes_b
+    merged: Dict[str, dict] = {}
+    for key in sorted(set(nodes_a) | set(nodes_b)):
+        na, nb = nodes_a.get(key), nodes_b.get(key)
+        if na is None:
+            merged[key] = dict(nb) if isinstance(nb, dict) else nb
+        elif nb is None:
+            merged[key] = dict(na) if isinstance(na, dict) else na
+        else:
+            merged[key] = _merge_tree_node(na, nb)
+    # Parent-authoritative structural rebuild -> parent/child symmetry + no
+    # orphaned children by construction (the whole reason -b is split from -a).
+    _rebuild_tree_structure(merged)
+    return merged
+
+
+def _tree_structural_integrity(merged: Dict[str, dict]) -> List[str]:
+    """Return the list of structural-integrity VIOLATIONS in a merged node map
+    (empty == clean). Checks the invariants g-001-313-b guarantees: (1) no
+    orphaned children (every child key exists as a node), (2) parent/child
+    symmetry both directions (child in P.children <=> child.parent == P),
+    (3) no dangling parent references (every non-null parent key exists as a
+    node — added g-001-324 after fresh-eyes caught the `p in keys` false
+    negative). Node count is the caller's check (compare len(merged) against
+    the input key union). Drives the adversarial test pass; also usable as a
+    post-merge assertion. NOTE: parent CYCLES (self-parent, a<->b) are
+    semantic validity, out of this checker's structural scope — the depth
+    walk in _rebuild_tree_structure cycle-guards them, and a dedicated
+    acyclicity check is a separate future concern."""
+    issues: List[str] = []
+    keys = set(merged)
+    for k in sorted(merged):
+        node = merged[k]
+        for c in node.get("children", []) or []:
+            if c not in keys:
+                issues.append(f"orphan: {k}.children references missing node {c}")
+            elif merged[c].get("parent") != k:
+                issues.append(
+                    f"asymmetry: {k}.children has {c} but {c}.parent="
+                    f"{merged[c].get('parent')!r}")
+        p = node.get("parent")
+        if p is not None:
+            if p not in keys:
+                # Dangling parent: the node references a parent slug that is
+                # absent from the merged map (e.g. the parent was removed on
+                # one machine before the merge). The node is a parentless
+                # orphan with a broken reference — no existing node lists it
+                # as a child, so the symmetry check below would never see it.
+                # The old `p in keys` guard silently passed this as clean
+                # (, fresh-eyes review of -b).
+                issues.append(f"dangling: {k}.parent={p!r} references missing node")
+            elif k not in (merged[p].get("children") or []):
+                issues.append(f"asymmetry: {k}.parent={p!r} but {p}.children lacks {k}")
+    return issues
+
+
+# --- _tree.yaml TOP-LEVEL assembly + dispatcher handler (-c) ---------
+# The a/b helpers above reconcile the `nodes:` map (per-node field merge +
+# parent-authoritative structural rebuild). This sub-goal (C) assembles the full
+# document: it merges the SEVEN non-node top-level keys and wires merge_tree into
+# _HANDLERS so _tree.yaml is finally a registered both-diverged freeze shape.
+# Every top-level rule is a symmetric function of (a, b) -> commutative, same as
+# the node reconcile. Symmetry of the RULES is necessary but not sufficient for
+# byte-identity: a value can survive a _canon-tie dedup carrying the LOSER's
+# dict-key insertion order (or a scalar's int-vs-float / str-vs-date form), which
+# sort_keys=False would then serialize arg-order-dependently. merge_tree therefore
+# applies a terminal _canonicalize_for_merge pass so the output bytes are a pure
+# function of CONTENT -> merge_tree(a, b) is byte-identical to merge_tree(b, a).
+
+
+def _dump_tree_yaml(data) -> bytes:
+    """Byte-exact serializer for _tree.yaml: matches tree.write_tree
+    (core/scripts/tree.py) -- yaml.dump with default_flow_style=None (NOT False,
+    unlike module-health -- None renders all-scalar leaf lists like `children` in
+    flow style and nested structures in block), sort_keys=False (preserve the
+    winner's key order), allow_unicode=True, width=200. yaml.dump emits LF on both
+    OSes, so a CRLF-written (Windows) input converges to LF output either arg order
+    (the CRLF tolerance is automatic: PyYAML normalizes CRLF->LF on PARSE)."""
+    return yaml.dump(data, default_flow_style=None, sort_keys=False,
+                     allow_unicode=True, width=200).encode("utf-8")
+
+
+def _canonicalize_for_merge(obj):
+    """Deep-canonicalize a merged _tree.yaml value so the serialized bytes are a
+    pure function of CONTENT, independent of argument order (guard-907). Three
+    normalizations, applied recursively BEFORE _dump_tree_yaml:
+      1. dict keys SORTED — closes the sort_keys=False key-order commutativity gap:
+         a value whose keys differ only in insertion order serialized differently
+         depending on which arg's object survived a _canon-tie dedup (Defect 1 —
+         top-level, node-level, entity_index values, cross_references list-dicts,
+         tree_growth_log entries, maintenance nested dicts all shared this).
+      2. integral float -> int (10.0 -> 10) — a count-like field carries the same
+         VALUE but different bytes as int vs float (Defect 2). A real tree.write_tree
+         file only ever has int counts (len(nodes)), so this is a no-op on canonical
+         input; it defends against a non-standard writer / hand-edit. Non-integral
+         floats (0.72 confidence) and bool (not a float) pass through untouched;
+         nan/inf raise on int() and are left as-is.
+      3. date/datetime -> isoformat str (Defect 3) — an UNQUOTED YAML date parses to
+         datetime.date while the quoted form parses to str; both stringify to the
+         same ISO text. tree.write_tree always quotes (str), so also a no-op on
+         canonical input. `hasattr(.,'isoformat')` uniquely tags date/datetime (str
+         lacks it, so an ISO string stays a str and matches the stringified date).
+    Applied ONCE at merge_tree's return, this makes the WHOLE output tree canonical,
+    so node-level dicts + scalars (b's helpers) are normalized without re-touching
+    them. List ORDER is preserved (only dict keys sort) — tree_growth_log stays
+    chronological. Idempotent: canonicalize(canonical) == canonical."""
+    if isinstance(obj, dict):
+        return {k: _canonicalize_for_merge(obj[k]) for k in sorted(obj)}
+    if isinstance(obj, list):
+        return [_canonicalize_for_merge(v) for v in obj]
+    if isinstance(obj, float):
+        try:
+            if obj == int(obj):
+                return int(obj)
+        except (ValueError, OverflowError):
+            pass  # nan / inf -> leave as-is
+        return obj
+    if hasattr(obj, "isoformat"):  # datetime.date / datetime.datetime
+        return obj.isoformat()
+    return obj
+
+
+def _tree_growth_log_union(a_log, b_log):
+    """Order-preserving union of two tree_growth_log lists. Entries are append-only
+    chronological events {op, node, children, date, reason}; identity is
+    (op, node, date). A naive _canon-sort of the whole entry would scramble history,
+    so the union is emitted in CHRONOLOGICAL (date, op, node) order -- a total,
+    arg-order-independent order (commutative) that PRESERVES the log's meaning. On an
+    identity clash (same op/node/date, differing children/reason) the content-larger
+    canonical entry wins (deterministic). Non-dict entries key by their canonical
+    form so they dedup with themselves and sort deterministically."""
+    a_log = a_log if isinstance(a_log, list) else []
+    b_log = b_log if isinstance(b_log, list) else []
+    by_id: Dict[tuple, object] = {}
+    for entry in list(a_log) + list(b_log):
+        if isinstance(entry, dict):
+            key = ("d", str(entry.get("op", "")), str(entry.get("node", "")),
+                   str(entry.get("date", "")))
+        else:
+            key = ("x", _canon(entry), "", "")
+        prev = by_id.get(key)
+        if prev is None or _canon(entry) > _canon(prev):
+            by_id[key] = entry
+
+    def _sort_key(entry):
+        if isinstance(entry, dict):
+            return (str(entry.get("date", "")), str(entry.get("op", "")),
+                    str(entry.get("node", "")), _canon(entry))
+        return ("", "", "", _canon(entry))
+
+    return sorted(by_id.values(), key=_sort_key)
+
+
+def _sorted_list_union(la, lb):
+    """Set-union of two lists, deduped + sorted by canonical form (deterministic,
+    arg-order-independent). Handles unhashable elements (dicts) via _canon. Used for
+    unmapped_categories / cross_references (both currently empty but structurally
+    lists that only ever grow)."""
+    seen: Dict[str, object] = {}
+    for item in list(la) + list(lb):
+        seen[_canon(item)] = item
+    return [seen[k] for k in sorted(seen)]
+
+
+def _dict_key_union(ea, eb):
+    """Per-key union of two dicts (content-larger canonical wins a same-key clash;
+    a key on ONE side is kept). Keys emitted SORTED for byte-stability. Used for
+    entity_index."""
+    merged: Dict[str, object] = {}
+    for k in sorted(set(ea) | set(eb)):
+        va, vb = ea.get(k), eb.get(k)
+        if va is None:
+            merged[k] = vb
+        elif vb is None:
+            merged[k] = va
+        else:
+            merged[k] = va if _canon(va) >= _canon(vb) else vb
+    return merged
+
+
+def _merge_tree_maintenance(ma, mb):
+    """Reconcile the top-level maintenance cadence block. Per-key: numeric -> MAX
+    (grow-only cadence counters), else content-larger canonical. For the fixed-width
+    ISO timestamps the block carries, content-larger canonical IS the strictly-newer
+    value (lexical compare == chronological, per _newer's own contract), so no
+    separate ISO detection is needed. Commutative + deterministic; a key on ONE side
+    is kept. Keys emitted SORTED for byte-stability."""
+    if not isinstance(ma, dict):
+        ma = {}
+    if not isinstance(mb, dict):
+        mb = {}
+    merged: Dict[str, object] = {}
+    for k in sorted(set(ma) | set(mb)):
+        va, vb = ma.get(k), mb.get(k)
+        if va is None:
+            merged[k] = vb
+        elif vb is None:
+            merged[k] = va
+        elif (isinstance(va, (int, float)) and not isinstance(va, bool)
+              and isinstance(vb, (int, float)) and not isinstance(vb, bool)):
+            merged[k] = max(va, vb)
+        else:
+            merged[k] = va if _canon(va) >= _canon(vb) else vb
+    return merged
+
+
+def merge_tree(local: bytes, remote: bytes) -> bytes:
+    """Field-level reconcile of two _tree.yaml documents — the 4th and highest-
+    blast-radius both-diverged freeze shape (g-001-313; ~966KB / ~1140-node tree).
+    Base = the newer top-level `last_updated` snapshot (LWW so any opaque/future
+    top-level key rides along), then each field below overrides with its natural
+    merge:
+      - nodes               : _merge_tree_nodes_map (a per-node field merge + b
+                              parent-authoritative structural rebuild)
+      - tree_growth_log     : order-preserving union by (op, node, date) identity,
+                              emitted in chronological (date, op, node) order
+      - last_updated        : strictly-newer wins (monotonic index stamp)
+      - total_entities      : numeric MAX (grow-only entity count)
+      - unmapped_categories : sorted set-union
+      - cross_references    : sorted set-union
+      - entity_index        : per-key union (content-larger on a same-key clash)
+      - maintenance         : per-key cadence merge (MAX numeric / newer ISO)
+    CRLF tolerance is automatic (PyYAML normalizes CRLF->LF on parse; yaml.dump
+    emits LF), so a Windows-written CRLF file converges either arg order. Output is
+    CANONICAL — _canonicalize_for_merge deep-sorts dict keys, folds integral floats
+    to int, and stringifies dates before _dump_tree_yaml — so the bytes are a pure
+    function of CONTENT. This is a deliberate divergence from tree.write_tree's
+    insertion-order format, REQUIRED for commutativity per guard-907 (a value
+    differing only in key order or scalar type must serialize identically regardless
+    of arg order). YAML key order is semantic-free: safe_load round-trips the
+    canonical form identically and the next tree.write_tree preserves it. Commutative:
+    every rule is a symmetric function of (a, b) — merge_tree(a, b) == merge_tree(b, a)
+    byte-for-byte."""
+    a = yaml.safe_load(local.decode("utf-8")) or {}
+    b = yaml.safe_load(remote.decode("utf-8")) or {}
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        # Degenerate (a valid _tree.yaml is always a dict). Serialize the
+        # content-chosen value through the canonical path rather than returning
+        # raw input bytes, so two byte-differing-but-content-equal non-dicts
+        # still converge either arg order (Defect 4).
+        chosen = a if _canon(a) >= _canon(b) else b
+        return _dump_tree_yaml(_canonicalize_for_merge(chosen))
+    win, _lose = _order_by_ts(a, b, "last_updated")
+    out = dict(win)  # LWW base — winner's key order + opaque top-level keys ride along
+    # nodes: a/b per-node + structural reconcile
+    na = a.get("nodes") if isinstance(a.get("nodes"), dict) else {}
+    nb = b.get("nodes") if isinstance(b.get("nodes"), dict) else {}
+    out["nodes"] = _merge_tree_nodes_map(na, nb)
+    # tree_growth_log: order-preserving chronological union
+    out["tree_growth_log"] = _tree_growth_log_union(
+        a.get("tree_growth_log"), b.get("tree_growth_log"))
+    # last_updated: strictly-newer (win already holds it, but state it explicitly)
+    lua, lub = a.get("last_updated"), b.get("last_updated")
+    if lua is not None or lub is not None:
+        out["last_updated"] = lua if (_newer(lua, lub) or lua == lub) else lub
+    # total_entities: grow-only MAX
+    te = [v for v in (a.get("total_entities"), b.get("total_entities"))
+          if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if te:
+        out["total_entities"] = max(te)
+    # unmapped_categories / cross_references: sorted set-union
+    for f in ("unmapped_categories", "cross_references"):
+        la = a.get(f) if isinstance(a.get(f), list) else []
+        lb = b.get(f) if isinstance(b.get(f), list) else []
+        if la or lb:
+            out[f] = _sorted_list_union(la, lb)
+    # entity_index: per-key union
+    ea = a.get("entity_index") if isinstance(a.get("entity_index"), dict) else {}
+    eb = b.get("entity_index") if isinstance(b.get("entity_index"), dict) else {}
+    if ea or eb:
+        out["entity_index"] = _dict_key_union(ea, eb)
+    # maintenance: per-key cadence merge (only when either side has one)
+    if isinstance(a.get("maintenance"), dict) or isinstance(b.get("maintenance"), dict):
+        out["maintenance"] = _merge_tree_maintenance(
+            a.get("maintenance"), b.get("maintenance"))
+    # Terminal canonicalization (guard-907): make the serialized bytes a pure
+    # function of CONTENT so merge_tree(a,b) == merge_tree(b,a) byte-for-byte even
+    # when a value differs only in dict-key insertion order (survived a _canon-tie
+    # dedup) or scalar TYPE. One pass normalizes the whole tree incl. node-level
+    # dicts + scalars from a/b's helpers, so those need no per-site sort.
+    return _dump_tree_yaml(_canonicalize_for_merge(out))
+
+
 # --- registration -----------------------------------------------------------
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
@@ -1146,6 +1696,27 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "general.jsonl": merge_append_only_jsonl,
     "findings.jsonl": merge_append_only_jsonl,
     "decisions.jsonl": merge_append_only_jsonl,
+    # non-default board channels (6): same board_write.py append path +
+    # same append-only contract as the canonical 4, but absent from
+    # DEFAULT_CHANNELS so they were left unregistered and wedged on both-diverged.
+    # The merge_append_only_jsonl docstring already claims to cover "the board
+    # channels" -- this closes the gap. CORRECTION (0): an earlier
+    # revision of this comment claimed these non-default channels have "NO
+    # archive/prune writer" and are "strictly safer" than the canonical 4 --
+    # that was FALSE. store-hygiene.yaml rotates the GLOB `world/board/*.jsonl`
+    # (enabled, mode:rotate, max_lines:5000, owner ), which matches ALL
+    # eight channels -- reasoning/directives/events/feedback included -- exactly
+    # as it matches coordination.jsonl. So all 8 carry the SAME accepted
+    # rotate+line-union tradeoff, NOT a safer one: a both-diverged merge unions
+    # a rotated-out record back into the live window; the next sweep re-archives
+    # it -> at most a DUPLICATE record in <channel>-archive.jsonl. Bounded + no
+    # data loss (board.py reads the LIVE file only, never the archive -- see
+    # store-hygiene.yaml G11 note), so the registration STANDS on the accepted
+    # tradeoff -- the same basis as the canonical 4, which are likewise rotated.
+    "reasoning.jsonl": merge_append_only_jsonl,
+    "directives.jsonl": merge_append_only_jsonl,
+    "events.jsonl": merge_append_only_jsonl,
+    "feedback.jsonl": merge_append_only_jsonl,
     # sweep/recheck telemetry metrics (all via _fileops.locked_append_jsonl):
     "defer-recheck-metrics.jsonl": merge_append_only_jsonl,
     "credential-defer-recheck-metrics.jsonl": merge_append_only_jsonl,
@@ -1153,15 +1724,68 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "parent-supersession-sweep-metrics.jsonl": merge_append_only_jsonl,
     "unblock-parent-status-sweep-metrics.jsonl": merge_append_only_jsonl,
     "routing-audit-target-status-sweep-metrics.jsonl": merge_append_only_jsonl,
+    # Phase 4 bulk-override audit ledger (6): multi-agent append-only
+    # via _override_helpers.locked_append_jsonl (no rewrite writer). A shared
+    # world store where concurrent overrides from two boxes can both-diverge and
+    # wedge without a handler; strictly append-only (immutable audit records).
+    "override-bypass-ledger.jsonl": merge_append_only_jsonl,
+    # 9 (6 remainder): the lower-churn shared append-only
+    # stores that could still wedge on both-diverged. EACH verified strictly
+    # append-only by reading its writer (rb-245 / rb-3153): merge_append_only_jsonl
+    # is a commutative LINE-UNION, so a both-diverged merge RESURRECTS any
+    # locally-deleted record -- a store with a rewrite/prune/rebuild writer must
+    # NOT be registered. The 9 per-gate override ledgers (all write via
+    # _fileops.locked_append_jsonl OR open(...,'a')/'>>' -- no rewrite writer):
+    "blocker-gate-overrides.jsonl": merge_append_only_jsonl,
+    "goal-duplication-overrides.jsonl": merge_append_only_jsonl,
+    "loop-state-merge-overrides.jsonl": merge_append_only_jsonl,
+    "origin-signal-overrides.jsonl": merge_append_only_jsonl,
+    "output-style-overrides.jsonl": merge_append_only_jsonl,
+    "phase-4-26-overrides.jsonl": merge_append_only_jsonl,
+    "stale-read-overrides.jsonl": merge_append_only_jsonl,
+    "uncommitted-work-overrides.jsonl": merge_append_only_jsonl,
+    "missing-artifact-overrides.jsonl": merge_append_only_jsonl,
+    # audit/telemetry append-only logs (writer verified: locked_append_jsonl or
+    # open(...,'a')): skill_edit_gate (skill-rejected-edits), reflection-cadence-
+    # stamp (reflection-history), aspirations.py _log_defer_extraction
+    # (defer-date-extractions), retrieve.py _write_trace (retrieval-trace),
+    # stop-hook-analyze (loop-death-detections), description-length gate.
+    "skill-rejected-edits.jsonl": merge_append_only_jsonl,
+    "reflection-history.jsonl": merge_append_only_jsonl,
+    "defer-date-extractions.jsonl": merge_append_only_jsonl,
+    "retrieval-trace.jsonl": merge_append_only_jsonl,
+    "loop-death-detections.jsonl": merge_append_only_jsonl,
+    "description-length-telemetry.jsonl": merge_append_only_jsonl,
+    # DELIBERATELY NOT REGISTERED (rb-245 disqualified -- the audit's whole point):
+    #   dead-ends.jsonl        -> meta-dead-ends.py write_all() does
+    #                             locked_write_jsonl(DE_PATH, records) = full-file
+    #                             REWRITE (read-modify-write). Line-union would
+    #                             resurrect deleted dead-ends. Stays safe-freeze.
+    #   knowledge-graph.jsonl  -> knowledge-graph-build.py REBUILDS the triple
+    #                             store via locked_write_jsonl. A rebuild is a
+    #                             rewrite; line-union would resurrect stale edges.
+    # DEFERRED (writer not yet confirmed strictly append-only -- left unregistered
+    # = safe-freeze, the conservative default; needs per-writer read before adding):
+    #   meta-log.jsonl (meta-yaml.py has an open('r') read-modify path),
+    #   l1-pick-log.jsonl, scoring-criterion-audit.jsonl, and the
+    #   file-contention/gate-d/history-save/history-shadow/write-queue-telemetry
+    #   family (variable-path writers not resolved in the 9 pass).
     # field-level YAML/JSON reconcile (records MUTATED IN PLACE -> per-field
-    # reconcile; verified per-store by reading each writer, rb-245 / .
-    # _tree.yaml is a 4th, higher-risk shape carved to ):
+    # reconcile; verified per-store by reading each writer, rb-245 / ):
     "module-health.yaml": merge_module_health,
     "aspirations-meta.json": merge_aspirations_meta,
     # pipeline meta: derived counters (LWW, self-correcting via recompute) +
     # micro_hypothesis_stats per-key union — rewritten by every pipeline
     # mutation, so it must reconcile for the 7 flow to stay unfrozen.
     "pipeline-meta.json": merge_pipeline_meta,
+    # _tree.yaml: the 4th, highest-blast-radius freeze shape (~1140-node tree with
+    # structural children/parent fields + a chronological growth log + CRLF). Node
+    # reconcile a/b + top-level assembly c ->  COMPLETE. A running daemon
+    # picks this up on its next normal restart; until then it keeps the prior
+    # no-handler safe-freeze behavior. The merge is strictly better than that
+    # whole-file default (it never drops a side's tree edits), so a mixed-fleet
+    # activation window cannot corrupt worse than the status quo.
+    "_tree.yaml": merge_tree,
 }
 
 

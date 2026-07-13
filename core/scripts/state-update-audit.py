@@ -452,6 +452,38 @@ DISPATCH = {
 }
 
 
+# Flags that mean the audit could NOT complete — only these drive a non-zero exit
+# (iteration-close.sh WARNs on rc!=0). Every OTHER flag is an informational finding
+# (above_mean/below_mean, backpressure events — often positive) or a best-effort/
+# transient telemetry-write failure: impk_snapshot_failed = a write_conflict that
+# survived the daemon's own RMW retry (meta_impk.locked_rmw, 1) — a
+# "safe-to-retry 409" (rb-2639) that records on a later, less-contended close;
+# board_post_failed and impk_snapshot_skipped_no_goal are likewise non-fatal.
+# Pre-partition, `exit(1 if flags else 0)` fired a spurious "state-update-audit.sh
+# failed (non-fatal)" WARN inside iteration-close on nearly every deep close — any
+# goal above/below its category mean, or any transient snapshot write_conflict —
+# while the audit's core computation succeeded (5; the read/exit-side
+# complement to 1's write-side retry). Do NOT add a client-side snapshot
+# retry here: conflict-retry is owned by the daemon endpoint (single writer).
+HARD_FAIL_FLAGS = {
+    "check_failed",                # a sub-check raised / returned non-zero
+    "bad_output",                  # a sub-check's stdout was unparseable
+    "bad_experience_json",         # temporal-credit could not parse the experience record
+    "meta_dir_missing",            # relative-advantage has no meta dir to read
+    "velocity_yaml_parse_failed",  # improvement-velocity.yaml is corrupt
+}
+
+
+def _has_hard_failure(flags):
+    """True if any flag names a condition that PREVENTED the audit from completing.
+    Flags are '<sub>:<name>' at the run-all level and bare '<name>' when a
+    subcommand runs standalone — compare the suffix so both forms match."""
+    for f in flags or []:
+        if f.rsplit(":", 1)[-1] in HARD_FAIL_FLAGS:
+            return True
+    return False
+
+
 def main():
     p = argparse.ArgumentParser(description="State-update audit (Tier 1a)")
     p.add_argument("subcommand", choices=list(DISPATCH.keys()))
@@ -481,7 +513,7 @@ def main():
         "flags": result.get("flags", []),
     })
     print(json.dumps(result, ensure_ascii=False, default=str))
-    sys.exit(1 if result.get("flags") else 0)
+    sys.exit(1 if _has_hard_failure(result.get("flags")) else 0)
 
 
 if __name__ == "__main__":

@@ -182,6 +182,65 @@ handle_wake_signal() {
   exit 2
 }
 
+# ─── Quiescence bg-job registration (7, 2026-07-10) ──────────────
+# WHY: during RUNNING quiescence troughs the loop launches THIS script as a
+# harness background task and ends its turn (quiescence-cycle-cache.py:193
+# directive; all-blocked B7.2 same shape). stop-hook.sh fires on that
+# turn-end and BLOCKs unless an ALLOW gate matches; its Gate 2.6 allows when
+# `background-jobs.sh has-pending` is true. The bare bg-sleep was never
+# registered in that ledger, so the carve-out never fired and the loop
+# fast-spun troughs (~100x idle turns — rb-2541, charlie's 8-iteration
+# confirmation; guard-967 pre-fix wording). Registering the sleep as a
+# Tier-A background job fires the carve-out: the turn-end is ALLOWed, the
+# sleep paces its full duration, and the harness bg-completion notification
+# re-invokes the loop (Skill(aspirations) per the cache-HIT directive).
+# SAFETY RAILS (per the 7 spec):
+#   - Scoped to QUIESCENCE_SLEEP=1 — hot-path backoff sleeps (5s) never pay
+#     the two python spawns (IRREDUCIBLY LOCAL budget preserved; the spawns
+#     amortize over an 1800s quiescence sleep).
+#   - No orphaned-row hazard: has-pending counts a row ONLY while its PID is
+#     alive (background-jobs.py cmd_has_pending strictness, 2026-05-14
+#     incidents) — a SIGKILLed sleep leaves a dead-PID row that gates
+#     NOTHING; the EXIT/TERM/INT/HUP traps deregister on every catchable
+#     exit path (natural end, stop-signal exit 0, wake exit 2, TERM kill).
+#   - /stop responsiveness unchanged: stop-loop / stop-requested are polled
+#     every 1s by the loop below; detection exits 0 → EXIT trap deregisters
+#     → the pending row clears within ~1-2s of a /stop. No orphaned rows.
+#   - PID namespace ( class, probed 2026-07-10): on Git Bash/MSYS,
+#     $$ is an MSYS pid that Windows python's pid_alive CANNOT see (probe:
+#     pid_alive(msys $$)=False while alive; pid_alive(winpid)=True) — so
+#     register /proc/$$/winpid when it exists, else $$ (Linux fleet boxes).
+#   - completion_check "true" is honest semantics: the job IS the process —
+#     PID dead means the sleep finished (exit 0 = completed) — and satisfies
+#     has-pending's completion-mechanism requirement. No --output-artifacts:
+#     the sleep has no downstream file consumers (guard-333 N/A).
+#   - Registration failure fails OPEN to pre-fix behavior (sleep runs
+#     unregistered; that one cycle spins as before). stderr NOT suppressed
+#     (rb-400); stdout silenced only to keep the bg task output clean.
+_QS_BGJOBS_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/background-jobs.sh"
+_QS_JOB_ID=""
+_qs_deregister() {
+  if [ -n "$_QS_JOB_ID" ]; then
+    bash "$_QS_BGJOBS_SCRIPT" deregister --id "$_QS_JOB_ID" >/dev/null || true
+    _QS_JOB_ID=""
+  fi
+}
+if [ "${QUIESCENCE_SLEEP:-0}" = "1" ]; then
+  # Traps BEFORE register so no catchable-signal window exists where a
+  # registered row outlives the process. Deregistering an unregistered id
+  # is a harmless no-op ("not found").
+  trap _qs_deregister EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  _QS_PID="$(cat "/proc/$$/winpid" 2>/dev/null || echo "$$")"
+  if bash "$_QS_BGJOBS_SCRIPT" register \
+        --id "quiescence-sleep-$$" --type quiescence-sleep --pid "$_QS_PID" \
+        --completion-check "true" >/dev/null; then
+    _QS_JOB_ID="quiescence-sleep-$$"
+  fi
+fi
+
 for (( i=0; i<SECONDS_TO_SLEEP; i++ )); do
   [ -f "$STOP_FILE" ] && exit 0
   [ -f "$STOP_REQ_FILE" ] && exit 0

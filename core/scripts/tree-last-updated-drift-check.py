@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tree _tree.yaml `last_updated` index / front-matter drift check + backfill.
 
-g-115-1683 (promotes the g-115-1612 read-only audit prototype from
-agents/zeta/temp/tree-drift-audit.py to a framework script). The node .md
+g-115-1683 (promotes the g-115-1612 read-only audit prototype — a zeta
+session temp scratch script, gitignored — to a framework script). The node .md
 front-matter `last_updated` is the single source of truth (g-001-67). The
 _tree.yaml per-node index `last_updated` can drift from it in two directions:
 
@@ -19,7 +19,10 @@ Modes:
   --audit (default): READ-ONLY. Classify synced / index_ahead / index_stale and
     print a JSON summary. `--exit-on-ahead` makes it exit 2 when index_ahead > 0
     so an asp-115 Layer-D recurring goal can detect ongoing drift and file an
-    Investigate.
+    Investigate. `--full` additionally emits the COMPLETE index_ahead[]/
+    index_stale[] lists (every {key, idx, fm}) instead of only the capped
+    samples, so a hypothesis resolution_method can evaluate every entry
+    against the full set, not a sample (g-115-1820).
   --apply: BACKFILL. For every desynced node set the index last_updated = that
     node's .md fm last_updated, atomically via locked_modify_yaml(TREE_PATH)
     (guard-366 / g-115-417 -- a single locked read-modify-write, NOT a
@@ -115,7 +118,7 @@ def _classify(nodes):
     }
 
 
-def cmd_audit(exit_on_ahead):
+def cmd_audit(exit_on_ahead, full=False):
     data = yaml.safe_load(Path(TREE_PATH).read_text(encoding="utf-8")) or {}
     nodes = data.get("nodes") or {}
     r = _classify(nodes)
@@ -133,6 +136,13 @@ def cmd_audit(exit_on_ahead):
         "sample_index_ahead": sorted(r["index_ahead"], key=lambda x: x["fm"])[:8],
         "sample_index_stale": sorted(r["index_stale"], key=lambda x: x["idx"])[:8],
     }
+    if full:
+        # 0: emit the COMPLETE lists (not just the capped [:8] samples)
+        # so a hypothesis resolution_method can evaluate every entry against the
+        # full set. The full sets are already computed by _classify; this only
+        # changes what is serialized at output.
+        summary["index_ahead_full"] = sorted(r["index_ahead"], key=lambda x: x["fm"])
+        summary["index_stale_full"] = sorted(r["index_stale"], key=lambda x: x["idx"])
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     # index_ahead is the dangerous direction (over-reports freshness); a
     # recurring Layer-D goal greps this exit code to file an Investigate.
@@ -197,10 +207,15 @@ def main():
     ap.add_argument("--exit-on-ahead", action="store_true",
                     help="(audit mode) exit 2 when index_ahead > 0, for "
                          "recurring-goal drift detection.")
+    ap.add_argument("--full", action="store_true",
+                    help="(audit mode) emit the COMPLETE index_ahead[]/"
+                         "index_stale[] lists (every {key, idx, fm}), not just "
+                         "the capped samples -- to evaluate a hypothesis against "
+                         "the full set (g-115-1820).")
     args = ap.parse_args()
     if args.apply:
         sys.exit(cmd_apply())
-    sys.exit(cmd_audit(args.exit_on_ahead))
+    sys.exit(cmd_audit(args.exit_on_ahead, args.full))
 
 
 if __name__ == "__main__":

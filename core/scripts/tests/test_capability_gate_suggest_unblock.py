@@ -153,6 +153,40 @@ def main() -> int:
     print(f"  [{'PASS' if d.get('unblock_suggested') is False and 'unblock_title' not in d else 'FAIL'}] "
           f"no-match-no-fields: unblock_suggested={d.get('unblock_suggested')!r}")
 
+    # Case 5: 2 noun-as-verb guard. A verbless failure_reason that
+    # matches a capability ONLY via a domain-noun token (the 8 shape:
+    # 'npc' from a tree-restructuring desc token-matched to an NPC capability)
+    # would_blocks but carries NO imperative verb → the Unblock is SUPPRESSED
+    # (unblock_suggested=False) rather than filing a meaningless "Unblock: npc"
+    # HIGH goal that tops the selector. The block itself (would_block) still
+    # stands, so the improper defer/user-route is still refused. Contrast Case 1
+    # ("deploy needs human"): "deploy" IS an imperative verb, so that Unblock is
+    # still emitted with title "deploy".
+    cases_run += 1
+    rc, d = _run_gate("npc memory hierarchy node", suggest_unblock=True,
+                      for_goal_id="g-115-1789")
+    if not d.get("would_block"):
+        failures.append(
+            f"case5: expected would_block=True (domain-noun 'npc' token-matches "
+            f"an NPC capability), got {d.get('would_block')}"
+        )
+    if d.get("unblock_suggested") is not False:
+        failures.append(
+            f"case5 noun-as-verb guard: expected unblock_suggested=False for a "
+            f"verbless failure_reason, got {d.get('unblock_suggested')!r} "
+            f"(title={d.get('unblock_title')!r})"
+        )
+    for not_expected in ("unblock_title", "unblock_description", "matched_capability"):
+        if not_expected in d:
+            failures.append(
+                f"case5: {not_expected} should NOT be present when the "
+                f"noun-as-verb guard suppresses the Unblock, found "
+                f"{d.get(not_expected)!r}"
+            )
+    print(f"  [{'PASS' if d.get('unblock_suggested') is False and 'unblock_title' not in d else 'FAIL'}] "
+          f"noun-as-verb-guard (g-115-1872): would_block={d.get('would_block')} "
+          f"unblock_suggested={d.get('unblock_suggested')!r}")
+
     if failures:
         print(f"\n{len(failures)} failure(s):")
         for f in failures:

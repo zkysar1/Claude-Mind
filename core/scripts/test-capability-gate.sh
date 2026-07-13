@@ -20,6 +20,15 @@ GATE="$SCRIPT_DIR/capability-gate.py"
 
 [[ -f "$GATE" ]] || { echo "ERROR: $GATE missing" >&2; exit 2; }
 
+# Source _paths.sh UNCONDITIONALLY so `python3` resolves cross-platform (native
+# on Linux; the Microsoft-Store-stub-avoiding shim / py launcher on Windows —
+# see _paths.sh python3 detection) AND $PROJECT_ROOT/$AGENTS_PARENT_DIR are set
+# for the auto-bind glob below. (: previously sourced only inside the
+# MIND_AGENT-unset branch, so the bound case — the normal path — ran without
+# the python3 PATH setup and `command -v python` failed on cc-04.)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_paths.sh"
+
 # Test-fixture: capability-gate reads world/conventions/capability-routing.md
 # resolved through MIND_AGENT → local-paths.conf → WORLD_DIR. With no agent
 # bound, the gate fail-opens by design (rb-347: one fail-open boundary), so
@@ -41,8 +50,8 @@ if [[ -z "${MIND_AGENT:-}" ]]; then
     # silently defeating the auto-bind this block exists for. Sourcing _paths.sh
     # is safe with MIND_AGENT unset (it falls through to the first agent, never
     # hard-fails) and mirrors session-save-id.sh's $PROJECT_ROOT/$AGENTS_PARENT_DIR glob.
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/_paths.sh"
+    # _paths.sh already sourced unconditionally at the top of this script, so
+    # $PROJECT_ROOT/$AGENTS_PARENT_DIR are in scope here ().
     AUTO_BOUND=""
     for conf in "$PROJECT_ROOT/$AGENTS_PARENT_DIR"/*/local-paths.conf; do
         [[ -f "$conf" ]] || continue
@@ -56,13 +65,15 @@ if [[ -z "${MIND_AGENT:-}" ]]; then
     echo "test-capability-gate: auto-bound MIND_AGENT=$AUTO_BOUND for capability-routing.md resolution" >&2
 fi
 
-# bash-agent-inject.sh + _paths.sh PATH-prepend guarantee `python` resolves
-# to the shim (core/scripts/.python-shim/python → py -3). One resolver,
-# one behavior — no fallback chain (rb-347: one fail-open boundary).
-command -v python >/dev/null 2>&1 || { echo "ERROR: no python on PATH — _paths.sh shim not active" >&2; exit 2; }
+# _paths.sh (sourced above) guarantees `python3` resolves cross-platform:
+# native on Linux, or the Microsoft-Store-stub-avoiding shim / py launcher on
+# Windows. Use python3, never bare `python` (absent on Linux; a Store stub on
+# Windows) — per CLAUDE.md "Use python3 only inside .sh scripts that source
+# _paths.sh". One resolver, one behavior — no fallback chain (rb-347).
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: no python3 on PATH — _paths.sh shim not active" >&2; exit 2; }
 
 # All assertion logic in Python for reliability.
-python -u - "$GATE" <<'PYEOF'
+python3 -u - "$GATE" <<'PYEOF'
 import json, subprocess, sys
 
 gate = sys.argv[1]

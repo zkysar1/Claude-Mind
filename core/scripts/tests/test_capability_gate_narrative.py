@@ -101,23 +101,18 @@ def _run_gate(failure_reason: str) -> tuple[int, dict]:
 
 
 def _import_match_narrative_patterns():
-    """Import via importlib because capability-gate.py contains a hyphen.
+    """Import _match_narrative_patterns from the gates.capability module.
 
-    Standard `import capability-gate` is invalid Python; the file is run as
-    a script in production and imported here for regression-test access to
-    the helper function. SourceFileLoader + module_from_spec is the standard
-    workaround.
+    The function moved out of the capability-gate.py CLI wrapper into the
+    gates/capability.py module during the gates/ refactor (g-115-1872 era),
+    so the old importlib load of GATE_PY (the hyphenated CLI wrapper) raised
+    `AttributeError: module 'capability_gate' has no attribute
+    '_match_narrative_patterns'`. core/scripts is on sys.path (line 41) and
+    gates/capability.py has no hyphen, so a normal package import is the
+    correct access path — no importlib workaround needed. (g-001-334)
     """
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location(
-        "capability_gate", GATE_PY
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load spec for {GATE_PY}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod._match_narrative_patterns
+    from gates.capability import _match_narrative_patterns
+    return _match_narrative_patterns
 
 
 def main() -> int:

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# post-merge — recycle the runtime daemon ONLY when the merge that just
+# completed brought daemon-code changes (mind_api/src/** or the imported
+# core/scripts modules). Sibling to post-commit.
+#
+# WHY a SEPARATE hook from post-commit: git does NOT run post-commit for a
+# merge. A true merge creates a merge commit via the merge machinery (no
+# post-commit), and a fast-forward merge moves HEAD without creating any commit
+# at all — so post-commit never sees it. Result before this hook: a
+# `git merge`/`git pull` that changes daemon code left the running daemon
+# serving PRE-merge code until an explicit mind-api-start.sh --restart
+# (g-115-2045; observed live during g-115-2025 inv-3: merge 294763df brought
+# _team_state.py +138/-19 while /v1/admin/health kept serving the pre-merge
+# sha — the rb-915 dead-code state).
+#
+# WHY ORIG_HEAD, not HEAD~1 (the base post-commit uses): git sets ORIG_HEAD to
+# the pre-merge HEAD before it starts the merge. A fast-forward merge advances
+# HEAD by N commits WITHOUT a merge commit, so HEAD~1 would diff only the LAST
+# of those N (missing daemon changes in the earlier N-1). ORIG_HEAD..HEAD
+# captures the FULL merged range for BOTH the fast-forward and the true-merge
+# case. post-merge's positional $1 (1 = squash merge, 0 otherwise) does not
+# affect the code-surface diff, so it is intentionally ignored — a squash
+# merge still leaves ORIG_HEAD at the pre-merge HEAD.
+#
+# SINGLE SOURCE OF TRUTH for "is this a daemon-code change?":
+# core/scripts/mind-api-code-changed.sh (BASE = ORIG_HEAD here). Do NOT inline
+# the pathspec — the boundary lives in that script and only there.
+#
+# Tracked + propagated via core.hooksPath=core/githooks (install-git-hooks.sh,
+# auto-installed by sessionstart-orchestrator.sh Step 0.5) — the SAME mechanism
+# that already makes post-commit / pre-commit / pre-push fire. No copy step:
+# git reads core/githooks/ directly.
+#
+# Fail-open: a merge must NEVER fail because the daemon could not be recycled.
+# Every path exits 0.
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+[ -n "$ROOT" ] || exit 0
+
+# Did the merge (ORIG_HEAD..HEAD) change daemon code? mind-api-code-changed.sh
+# exits 0 = changed, 1 = unchanged, and fails toward 0 (restart) on any git
+# error — including an unresolvable ORIG_HEAD (e.g. the rare case where it was
+# never set). "Never serve stale daemon code" is the correctness guarantee; a
+# spurious restart is cheap (guard-559, rb-711, rb-936).
+if bash "$ROOT/core/scripts/mind-api-code-changed.sh" "ORIG_HEAD" >/dev/null 2>&1; then
+    # Fully detach so `git merge`/`git pull` returns immediately: mind-api-start.sh
+    # does a kill + respawn + up-to-10s readiness wait, which must NOT block the
+    # merge. The ( ... & ) subshell orphans the job; </dev/null guards the
+    # Git-for-Windows console-handle-inheritance hang. --restart is required
+    # because plain mind-api-start.sh is health-only idempotent (guard-559).
+    # (Byte-identical to post-commit's restart spawn — the proven path.)
+    ( bash "$ROOT/core/scripts/mind-api-start.sh" --restart >/dev/null 2>&1 </dev/null & ) >/dev/null 2>&1 </dev/null
+fi
+exit 0

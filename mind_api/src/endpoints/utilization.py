@@ -277,7 +277,10 @@ def _gather_citation_haystack(ctx) -> str:
             sub_dir = agent / sub
             if sub_dir.exists():
                 sources.extend(sorted(sub_dir.glob("*.md")))
-        agents_root = project_root / "agents"
+        # ctx.paths.agents_root tracks AGENTS_PARENT_DIR (was a literal
+        # project_root / "agents" hardcode — the ⚠ row in CLAUDE.md's
+        # glob-consumer table since the 5 audit).
+        agents_root = ctx.paths.agents_root
         for sib in sorted(agents_root.glob("*/local-paths.conf")):
             agent_d = sib.parent
             if agent_d == agent:

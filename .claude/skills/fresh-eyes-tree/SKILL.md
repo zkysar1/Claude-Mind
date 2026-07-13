@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-tree
-description: "Periodic local self-audit of the knowledge tree's top-level taxonomy (cadence: every 200 goals). Assembles a briefing covering L1 distribution skew (S1), L1 pick-rate trends (S9), candidate L2 promotions, candidate L1 retirements, and SPROUT/REPARENT history, writes it to agents/<agent>/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate. The user can invoke l1-domain-add.sh / l1-domain-rename.sh manually if taxonomy changes are desired. Closes the 'tree has no taxonomy-level review' gap."
+description: "Periodic local self-audit of the knowledge tree's top-level taxonomy — fires when the every-200-goals precheck cadence trips, or on user demand (/fresh-eyes-tree). Assembles a briefing covering L1 distribution skew (S1), L1 pick-rate trends (S9), candidate L2 promotions, candidate L1 retirements, and SPROUT/REPARENT history, writes it to agents/{agent}/temp/ (a staging file drained to the knowledge tree), and posts a one-line summary to the coordination board. No email push, no user-approval gate. The user can invoke l1-domain-add.sh / l1-domain-rename.sh manually if taxonomy changes are desired. Closes the 'tree has no taxonomy-level review' gap."
 user-invocable: true
 triggers:
   - "/fresh-eyes-tree"
@@ -310,8 +310,16 @@ the skill's final tool call.
 # Step 1: Record stamp (LOAD-BEARING — same g-240-60 lesson as the sibling rituals)
 Bash: bash core/scripts/fresh-eyes-record-tick.sh last_fresh_eyes_tree_review
 
+# Step 1.5: Archive the briefing out of the drain queue (g-115-1838). The
+# encode-non-routed-observations step already wrote the briefing's durable
+# findings to the durable stores, so the staging .md is a pure archival record.
+# Move it to temp/drained/ so it never inflates the precheck temp-pressure metric
+# as already-encoded slush (/drain-temp would only DISCARD it). Placing this
+# AFTER the encode step keeps the interruption case no worse than today.
+Bash: mkdir -p agents/<agent>/temp/drained && mv agents/<agent>/temp/fresh-eyes-tree-{the-Phase-4-isotime}.md agents/<agent>/temp/drained/ 2>/dev/null || true
+
 # Step 2: Board post (best-effort)
-Bash: echo "Fresh-eyes TREE review completed; briefing staged at agents/<agent>/temp/fresh-eyes-tree-{today-isotime}.md." | bash core/scripts/board-post.sh --channel general --type status --tags fresh-eyes-tree || true
+Bash: echo "Fresh-eyes TREE review completed; briefing archived to agents/<agent>/temp/drained/fresh-eyes-tree-{today-isotime}.md." | bash core/scripts/board-post.sh --channel general --type status --tags fresh-eyes-tree || true
 ```
 
 The board-post is the terminal action — per Return Protocol requirements,
