@@ -26,11 +26,20 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     CORE_ROOT="$(cygpath -m "$CORE_ROOT")"
     CONFIG_DIR="$(cygpath -m "$CONFIG_DIR")"
     # AGENT_DIR may be empty (no agent bound); META_DIR and WORLD_DIR are always set
+    # _paths.sh exports ALIASES of these values (WORLD_PATH/MIND_WORLD,
+    # META_PATH/MIND_META) at source time, i.e. still in MSYS /c/... form.
+    # They are value-copies, so converting META_DIR/WORLD_DIR alone leaves the
+    # aliases unconverted — and _paths.py prefers MIND_WORLD/MIND_META, so
+    # python resolves /c/... rooted on the current drive (C:\c\... mangle;
+    # broke every FORCE_FALLBACK tree.py scan, found 2026-07-14). Re-export
+    # the aliases from the converted value.
     if [ -n "$META_DIR" ]; then
         META_DIR="$(cygpath -m "$META_DIR")"
+        export META_PATH="$META_DIR" MIND_META="$META_DIR"
     fi
     if [ -n "$WORLD_DIR" ]; then
         WORLD_DIR="$(cygpath -m "$WORLD_DIR")"
+        export WORLD_PATH="$WORLD_DIR" MIND_WORLD="$WORLD_DIR"
     fi
     if [ -n "$AGENT_DIR" ]; then
         AGENT_DIR="$(cygpath -m "$AGENT_DIR")"
