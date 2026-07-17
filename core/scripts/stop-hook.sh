@@ -68,15 +68,42 @@ unset _RFILE _RSIZE _RTMP
 # --- Read stdin ONCE (sole Stop hook — no stdin sharing, no race) ---
 STDIN_JSON=$(cat)
 
+# --- Resolve a working Python launcher ONCE (g-115-2205, rb-370/guard-335) ---
+# Every $PY site below (SID extraction first, then insight capture, body-manifest,
+# trailing-text detector, decision payload, timing) used a BARE `py -3`. On any
+# Linux host with NO `py` shim (foxtrot 2026-07-14: WSL/Ubuntu, no shim installed)
+# that is command-not-found; the trailing `2>/dev/null || echo ""` swallowed it,
+# HOOK_SID came back empty, the hook logged `ALLOW gate=no-sid` and the stop hook
+# — the loop's life support — silently became a no-op, so the loop died on its
+# first text-death and STAYED dead with no alarm. Resolve py-3-then-python3 ONCE
+# here (test-execute, so a present-but-broken `py` still falls through), then use
+# "$PY" at every site. The python3 fallback is what makes a fresh Linux deploy
+# (WSL, new container, seed plant, transplant land) boot with a LIVE stop hook.
+# Placed before the SID extraction, which fires on EVERY hook invocation ahead of
+# any gate — so the resolver is never wasted on an early-exit ALLOW path.
+# (Promoted from Ayoai g-115-2205 per g-030-15; ZDS keeps its MIND_AGENT binding.)
+PY=""
+if command -v py >/dev/null 2>&1 && py -3 -c "pass" >/dev/null 2>&1; then PY="py -3"
+elif command -v python3 >/dev/null 2>&1 && python3 -c "pass" >/dev/null 2>&1; then PY="python3"
+fi
+
 # --- Resolve agent for THIS session (not from shared files) ---
 # .active-agent-$SID is the only per-session binding; written by /start.
 # No shared-file fallback exists — that path was retired with the bridge file
 # (rb-386). Use the per-session binding directly.
-HOOK_SID=$(printf '%s' "$STDIN_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
+HOOK_SID=$(printf '%s' "$STDIN_JSON" | $PY -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
 
 # Can't identify this session — don't risk blocking the wrong window
 if [ -z "$HOOK_SID" ]; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-sid" >> "$LOG" 2>/dev/null || true
+    # LOUD degradation signal (g-115-2204). gate=no-sid = the SID could not be
+    # extracted, so the stop hook (the loop's life support) is a NO-OP this fire
+    # and CANNOT force the Skill(aspirations) re-entry — the loop dies silently on
+    # its next text-only turn-end (foxtrot 2026-07-14 ran dead for HOURS this way).
+    # Emit to STDERR so it surfaces in the pane immediately. Does NOT change the
+    # fail-open ALLOW (blocking the wrong window is the worse hazard — HARD
+    # CONSTRAINT of g-115-2204); it only makes the silent degradation loud.
+    echo "[stop-hook] DEGRADED gate=no-sid: session_id could not be extracted from the Stop event — the stop hook is a NO-OP this fire and CANNOT keep the autonomous loop alive; the loop will die on its next text-only turn-end with no other alarm. Likely cause: no Python launcher (py/python3) resolvable in the hook env, or malformed Stop-event JSON. Fix the launcher / hook env (see g-115-2205, g-115-2204)." >&2
     exit 0
 fi
 
@@ -179,7 +206,7 @@ if [ -f "$HOOK_AGENT_DIR/session/runner-token" ]; then
 fi
 
 # --- Insight capture (non-critical — must not affect blocking decision) ---
-printf '%s' "$STDIN_JSON" | MIND_AGENT="$HOOK_AGENT" py -3 "$CORE_ROOT/scripts/capture-insights.py" 2>/dev/null || true
+printf '%s' "$STDIN_JSON" | MIND_AGENT="$HOOK_AGENT" $PY "$CORE_ROOT/scripts/capture-insights.py" 2>/dev/null || true
 _T_AFTER_INSIGHTS=$(date +%s%3N)
 
 # --- Housekeeping: stale session files + legacy artifacts ---
@@ -224,7 +251,7 @@ if [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNER_SID" ]; then
     _BODY_WM="$HOOK_AGENT_DIR/sessions/$HOOK_SID/working-memory.yaml"
     _CLOSE_SENTINEL="$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-closing"
     if [ -f "$_BODY_WM" ] && [ -f "$_CLOSE_SENTINEL" ]; then
-        _CLOSE_RESULT=$(py -3 "$CORE_ROOT/scripts/body-manifest.py" close-body-on-genuine --sid "$HOOK_SID" --agent "$HOOK_AGENT" 2>/dev/null || echo "")
+        _CLOSE_RESULT=$($PY "$CORE_ROOT/scripts/body-manifest.py" close-body-on-genuine --sid "$HOOK_SID" --agent "$HOOK_AGENT" 2>/dev/null || echo "")
         echo "$(date +%Y-%m-%dT%H:%M:%S) BODY-CLOSE sid=$HOOK_SID agent=$HOOK_AGENT genuine-close result=$_CLOSE_RESULT" >> "$LOG" 2>/dev/null || true
         unset _CLOSE_RESULT
     fi
@@ -298,11 +325,11 @@ if [ -f "$TTD_DETECTOR" ]; then
     # Stop event never resolves and the loop dies a different way. SIGTERM at
     # 2s; SIGKILL 1s later if SIGTERM didn't take. timeout exit=124 → empty
     # TTD_RESULT → fail-open (no marker emitted, BLOCK still fires correctly).
-    TTD_RESULT=$(printf '%s' "$STDIN_JSON" | timeout --kill-after=1 2 py -3 "$TTD_DETECTOR" --stop-hook 2>/dev/null || true)
+    TTD_RESULT=$(printf '%s' "$STDIN_JSON" | timeout --kill-after=1 2 $PY "$TTD_DETECTOR" --stop-hook 2>/dev/null || true)
     if [ -n "$TTD_RESULT" ]; then
-        TTD_MARKER=$(printf '%s' "$TTD_RESULT" | py -3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('marker') or '')" 2>/dev/null || echo "")
-        TTD_SEVERITY=$(printf '%s' "$TTD_RESULT" | py -3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('severity') or '')" 2>/dev/null || echo "")
-        TTD_EVIDENCE=$(printf '%s' "$TTD_RESULT" | py -3 -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('evidence') or '')" 2>/dev/null || echo "")
+        TTD_MARKER=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('marker') or '')" 2>/dev/null || echo "")
+        TTD_SEVERITY=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('severity') or '')" 2>/dev/null || echo "")
+        TTD_EVIDENCE=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('evidence') or '')" 2>/dev/null || echo "")
     fi
 fi
 
@@ -318,7 +345,7 @@ if [ "$TTD_SEVERITY" = "high" ] && [ -n "$TTD_MARKER" ]; then
     TTD_NOW="$TTD_NOW" TTD_AGENT="$HOOK_AGENT" TTD_SID="$HOOK_SID" \
     TTD_LOG="$WORLD_DIR/loop-death-detections.jsonl" \
     TTD_CORE_SCRIPTS="$PROJECT_ROOT/core/scripts" \
-    py -3 -c "
+    $PY -c "
 import json, os, sys
 sys.path.insert(0, os.environ['TTD_CORE_SCRIPTS'])
 from _fileops import locked_append_jsonl
@@ -354,7 +381,7 @@ _T_AFTER_TTD=$(date +%s%3N)
 # IDs, phase values) cannot corrupt the decision payload via shell escaping.
 HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" \
 TTD_MARKER="$TTD_MARKER" TTD_SEVERITY="$TTD_SEVERITY" \
-py -3 - <<'PYEOF'
+$PY - <<'PYEOF'
 import json, os, pathlib
 
 agent_dir = pathlib.Path(os.environ["HOOK_AGENT_DIR"])
@@ -418,7 +445,7 @@ T0="$_T0" T_AI="${_T_AFTER_INSIGHTS:-0}" T_AH="${_T_AFTER_HOUSEKEEPING:-0}" \
 T_AG="${_T_AFTER_GATES:-0}" T_AT="${_T_AFTER_TTD:-0}" T_END="$_T_END" \
 TIMING_LOG="$TIMING_LOG" HOOK_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" \
 TTD_SEVERITY="${TTD_SEVERITY:-}" TTD_MARKER="${TTD_MARKER:-}" \
-py -3 -c "
+$PY -c "
 import json, os, datetime
 def _i(k):
     try: return int(os.environ.get(k,'0') or 0)
