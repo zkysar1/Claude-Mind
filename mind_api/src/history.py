@@ -1,25 +1,29 @@
 """`.history/` snapshots for the daemon's write path.
 
-Mirrors `_fileops.save_history` exactly so daemon-written history snapshots
-are interchangeable with fallback-path snapshots — same filename format,
-same skip-on-missing semantics.
+DELEGATES to `_fileops.save_history` — the single snapshot writer — so daemon
+writes get the same defenses as every other write path (g-115-2410):
 
-Snapshot location:
-    <base_dir>/.history/<relative-path>/<timestamp>_<agent><ext>
+  - CAS-delta store (Stage 2 authoritative): gzip'd content-addressed blobs +
+    delta chains under `<base_dir>/.history/{blobs,patches,snapshots}/`,
+    deduped on identical content.
+  - `_SNAPSHOT_BLACKLIST`: high-churn no-restore-value files skip snapshots.
+  - Per-file snapshot caps (`_PER_FILE_SNAPSHOT_CAP`) on the legacy tree.
+  - JSONL parse-validation (guard-600): refuses to snapshot a non-empty
+    source with zero parseable records (raises CorruptSourceError so the
+    endpoint write fails loud instead of destroying the last-good snapshot).
 
-Where:
-    base_dir       = WORLD_DIR or META_DIR (resolved per-request, not global)
-    relative-path  = path.relative_to(base_dir)
-    timestamp      = local time, "%Y-%m-%dT%H-%M-%S" (hyphens — Windows
-                     filenames can't contain colons)
-    agent          = X-Mind-Agent header value
-    ext            = path.suffix (.jsonl, .yaml, .md, ...)
+HISTORY: this module previously re-implemented the Stage-0 snapshot format
+(uncompressed full copy via shutil.copy2, no cap, no blacklist) and claimed
+to "mirror _fileops.save_history exactly" — a claim that went three
+generations stale as _fileops gained gzip (2026-05-22), then caps+blacklist,
+then the CAS-delta store. Since the 2026-05-14 daemon-only cutover, that
+meant EVERY daemon store write full-copied multi-MB JSONLs uncompressed:
+measured 13.9GB of `.history/` growth in 4 days on one box (cc-04 disk
+emergency, 2026-07-16). Delegation makes divergence structurally impossible.
 """
 from __future__ import annotations
 
-import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -27,42 +31,28 @@ _SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "core" / "scripts
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from .agent_paths import assert_not_cruft  # noqa: E402
+# Daemon-safe: save_history takes explicit paths; importing _fileops here is
+# the same pattern file_locks.py already uses (see its import note).
+from _fileops import save_history as _save_history  # noqa: E402
 
 
 def snapshot(path: Path, base_dir: Path, agent_name: str,
              summary: str = "") -> Optional[Path]:
-    """Save a copy of `path` to `<base_dir>/.history/...` before overwriting.
+    """Save a pre-write snapshot of `path` via `_fileops.save_history`.
 
-    Returns the snapshot path on success, None when `path` does not yet
-    exist (new file — nothing to version).
+    Same call signature as before the g-115-2410 unification; none of the
+    46 daemon call sites use the return value, so this now always returns
+    None (save_history writes the CAS store and returns nothing).
 
-    CRITICAL: identical byte-format and filename to `_fileops.save_history`.
-    A reader looking at .history/ should not be able to tell which writer
-    (daemon or fallback) produced any given snapshot.
+    Skip-on-missing semantics preserved: a new file (path does not exist)
+    is a no-op inside save_history.
 
-    Pure path operations + shutil.copy2. No locks here — callers MUST
-    already hold the file lock via `file_locks.locked(path)`.
+    Raises CorruptSourceError (from _fileops) when a non-empty JSONL source
+    parses to zero records — intended guard-600 fail-loud: the endpoint's
+    write is refused rather than snapshotting corrupt state.
+
+    Callers MUST already hold the file lock via `file_locks.locked(path)` —
+    unchanged; save_history assumes the same.
     """
-    path = Path(path).resolve()
-    base_dir = Path(base_dir).resolve()
-    if not path.exists():
-        return None
-
-    rel = path.relative_to(base_dir)
-    history_dir = base_dir / ".history" / str(rel)
-    assert_not_cruft(history_dir, "mkdir (history snapshot)")
-    history_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-    ext = path.suffix
-    snapshot_path = history_dir / f"{timestamp}_{agent_name}{ext}"
-    shutil.copy2(str(path), str(snapshot_path))
-
-    if summary:
-        meta_file = snapshot_path.with_suffix(snapshot_path.suffix + ".meta")
-        # Trailing newline matches _fileops.save_history byte-for-byte —
-        # see CRITICAL note in module docstring. Do not strip.
-        meta_file.write_text(summary + "\n", encoding="utf-8")
-
-    return snapshot_path
+    _save_history(path, base_dir, agent_name, summary=summary)
+    return None

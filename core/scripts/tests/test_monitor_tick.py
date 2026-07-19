@@ -388,3 +388,43 @@ def test_subprocess_runner_missing_script_not_clean(tmp_path):
     rc, out = TICK._subprocess_runner(str(tmp_path / "nonexistent.sh"), [],
                                       project_root=tmp_path)
     assert rc != 0
+
+
+# ---- FW-1b.2 win32 stdin-detach fix (6) ---------------------------
+
+def test_subprocess_runner_detaches_stdin(monkeypatch):
+    """The runner must pass stdin=DEVNULL: MSYS bash on win32 blocks on the
+    inherited stdin handle under capture_output, riding every .sh probe to the
+    60s timeout (ZDS isolation-proof, g-115-2576)."""
+    import subprocess as sp
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs, cmd=cmd)
+
+        class R:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+        return R()
+
+    monkeypatch.setattr(TICK.subprocess, "run", fake_run)
+    rc, out = TICK._subprocess_runner("/tmp/x.sh", [])
+    assert rc == 0 and out == "ok"
+    assert captured.get("stdin") == sp.DEVNULL
+    assert captured.get("capture_output") is True
+    assert captured["cmd"][0] == "bash"
+
+
+def test_subprocess_runner_live_echo_probe(tmp_path):
+    """A trivial echo probe returns clean fast — the 6 acceptance
+    check (on win32 this is THE acceptance test; on POSIX it proves the
+    stdin=DEVNULL change is behavior-preserving)."""
+    import time
+    probe = tmp_path / "echo-probe.sh"
+    probe.write_text("echo ok\nexit 0\n", encoding="utf-8")
+    t0 = time.monotonic()
+    rc, out = TICK._subprocess_runner(str(probe), [])
+    assert rc == 0
+    assert out == "ok"
+    assert time.monotonic() - t0 < 5

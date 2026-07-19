@@ -43,8 +43,24 @@ last_modified == the in-progress-transition moment; the diary check carries
 the primary detection weight regardless. A no-claim stranded goal has
 nothing to release (no claim) and no team-state in_flight to clear
 (in_flight is written at claim time): the operative action is the
-status->pending flip that returns it to the selectable pool. World goals
-always claim, so the no-claim shape is agent-source-only.
+status->pending flip that returns it to the selectable pool.
+
+Third shape (g-115-2417): the no-claim scan originally covered ONLY the
+agent source, on the premise "world goals always claim". Falsified
+2026-07-16: felt-sense Phase 2 found 3 WORLD goals (g-115-2156, g-115-2243,
+g-350-14) stuck status=in-progress with claimed_by=null and no live
+activity — frozen for selection (the selector skips in-progress) yet
+invisible to both scans above. Producing mechanisms: a release path strips
+claimed_by/claimed_at without resetting status, or a session dies between
+the two writes. The no-claim scan therefore runs for BOTH sources. The
+world queue is shared, so the world pass carries one extra guard the
+agent pass does not need: if ANY agent's team-state in_flight names the
+goal, it is kept (a peer is live on it even though the claim record is
+missing — flip would yank a goal mid-execution). Cross-box TZ skew
+(g-115-2418: peer UTC stamps read up to 4h in the FUTURE on an EDT box)
+makes age negative for fresh peer writes — negative age < stale threshold
+lands on the KEEP side, the safe direction; a same-TZ box's sweep flips
+the genuinely stale ones.
 
 Exit codes:
   0 — sweep ran (dry-run or apply). Output is JSON.
@@ -190,23 +206,86 @@ def _diary_has_entry_after(agent: str, goal_id: str, since_iso: str) -> bool:
     return False
 
 
+def _has_pending_background_work(agent: str) -> bool:
+    """True iff ``agent`` has pending background work — mirrors stop-hook
+    Gate 2.5, which checks BOTH ``pending-agents.sh has-pending`` (Claude
+    sub-agents) AND ``background-jobs.sh has-pending`` (long-running OS jobs).
+    g-115-1925.
+
+    Used to SKIP releasing a claim that LOOKS stranded (no post-claim diary
+    marker + age >= stale threshold) but is legitimately paused across a turn
+    boundary awaiting REGISTERED background work. This is the complement to
+    rb-1533's phase-4 diary-marker defense: rb-1533 keeps a claim whose Phase 4
+    wrote a ``phase-4-execute --goal <id>`` diary entry (which covers the
+    harness ``run_in_background`` Bash-task case, detected by
+    ``_diary_has_entry_after``); THIS check covers the registered-bg-work case
+    where no fresh diary marker exists but the agent is genuinely busy.
+
+    Fail-SAFE toward RELEASING: on ANY error (wrapper missing, subprocess
+    failure, timeout) returns False, so a probe failure never SUPPRESSES a
+    legitimate release (that would strand the sweep itself). The diary-marker
+    check remains the primary keep-signal.
+    """
+    core = Path(__file__).resolve().parent
+    env = {**os.environ, "MIND_AGENT": agent}
+    # Invoke the .py backends via sys.executable (Python on Python, never
+    # through bash). The .sh wrappers just `exec python3 <the .py> "$@"`, and a
+    # Python->bash subprocess fails/hangs on Windows (rb-225/rb-247, guard-580,
+    # guard-581; see the module docstring). This mirrors _clear_team_in_flight's
+    # sys.executable invocation and hits the identical canonical has-pending
+    # logic the .sh wrappers exec.
+    for backend in ("pending-agents.py", "background-jobs.py"):
+        script = core / backend
+        if not script.exists():
+            continue
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script), "has-pending"],
+                capture_output=True,
+                timeout=15,
+                env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue  # probe failure -> "not pending" (fail toward release)
+        if proc.returncode == 0:
+            return True
+    return False
+
+
+def _decode_team_state_field(raw: str) -> Any:
+    """Decode a /v1/team-state/read field response (fresh-eyes 7).
+
+    The daemon serializes dict-valued fields as YAML and IGNORES a
+    format=json query param (live-probed 2026-07-17; the .sh wrapper's
+    --json output is a wrapper-side conversion, not a daemon behavior).
+    Scalar/absent fields come back as plain text / empty. Try JSON first
+    (cheap, covers null/scalars), then YAML. Returns None on any failure.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "null":
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    try:
+        import yaml  # deferred — only dict-valued reads pay the import
+        return yaml.safe_load(raw)
+    except Exception:
+        return None
+
+
 def _read_team_in_flight(agent: str) -> Optional[Dict[str, Any]]:
     """Daemon: GET /v1/team-state/read — return agent's in_flight block or None."""
     try:
         raw = _rt.rt_call(
             "GET",
             "/v1/team-state/read",
-            query={"field": f"agent_status.{agent}.in_flight", "format": "json"},
+            query={"field": f"agent_status.{agent}.in_flight"},
         )
     except _rt.RtError:
         return None
-    raw = (raw or "").strip()
-    if not raw or raw == "null":
-        return None
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
+    data = _decode_team_state_field(raw)
     return data if isinstance(data, dict) else None
 
 
@@ -277,19 +356,23 @@ def _clear_team_in_flight(agent: str, goal_id: str) -> Dict[str, Any]:
     return {"cleared": True, "reason": "matched and cleared"}
 
 
-def _query_inprogress_no_claim(agent: str) -> List[Dict[str, Any]]:
-    """1: agent-source in-progress goals with NO claimed_by.
+def _query_inprogress_no_claim(agent: str, source: str = "agent") -> List[Dict[str, Any]]:
+    """1 (+ 7): in-progress goals with NO claimed_by.
 
     The claimed-by query path (_query_claimed_goals) cannot see these:
-    agent-source goals skip aspirations-claim.sh (the only claimed_by writer),
-    so they sit status=in-progress with claimed_by unset and never match the
-    claimed_by==agent filter. Read the agent-source active aggregate directly
-    and surface in-progress goals with no claim, carrying last_modified as the
-    stale-age basis (no claimed_at exists). Fail-open: any read/decode error
-    yields an empty list (the sweep degrades to claimed-only, never crashes).
+    aspirations-claim.sh is the only claimed_by writer, so a goal that went
+    in-progress without a (surviving) claim never matches the
+    claimed_by==agent filter. Agent-source goals skip the claim wrapper by
+    design (g-115-1691); world-source goals reach this state through broken
+    flows — a release that strips the claim without resetting status, or a
+    session dying between the two writes (g-115-2417, 3 observed). Read the
+    source's active aggregate directly and surface in-progress goals with no
+    claim, carrying last_modified as the stale-age basis (no claimed_at
+    exists). Fail-open: any read/decode error yields an empty list (the
+    sweep degrades gracefully, never crashes).
     """
     try:
-        raw = _rt.aspirations_read(source="agent", active=True)
+        raw = _rt.aspirations_read(source=source, active=True)
     except _rt.RtError:
         return []
     try:
@@ -308,10 +391,44 @@ def _query_inprogress_no_claim(agent: str) -> List[Dict[str, Any]]:
             out.append({
                 "goal_id": g.get("id", ""),
                 "asp_id": asp_id,
-                "source": "agent",
+                "source": source,
                 "title": g.get("title", ""),
                 "last_modified": g.get("last_modified"),
             })
+    return out
+
+
+def _read_all_in_flight_goal_ids() -> set:
+    """Goal-ids ANY agent's team-state in_flight currently names (7).
+
+    Guard for the world-source no-claim scan: the world queue is shared, so a
+    claim-less in-progress world goal MIGHT still be live on a peer whose
+    claim record was lost (partial release). in_flight is written at claim
+    time and cleared at verify — a live peer usually still carries it. Keep
+    such goals instead of flipping them out from under the peer.
+
+    Fail-open toward the scan (empty set on any error): an unreadable
+    team-state must not suppress legitimate flips — the flip is recoverable
+    (a live peer's next status write or re-claim restores it), a permanently
+    frozen goal is not. Mirrors _has_pending_background_work's fail direction.
+    """
+    try:
+        raw = _rt.rt_call(
+            "GET",
+            "/v1/team-state/read",
+            query={"field": "agent_status"},
+        )
+    except _rt.RtError:
+        return set()
+    data = _decode_team_state_field(raw)
+    if not isinstance(data, dict):
+        return set()
+    out = set()
+    for st in data.values():
+        if isinstance(st, dict):
+            infl = st.get("in_flight")
+            if isinstance(infl, dict) and infl.get("goal_id"):
+                out.add(infl["goal_id"])
     return out
 
 
@@ -373,7 +490,13 @@ def main() -> int:
         "stranded": [],
         "kept": 0,
         "released": 0,
+        "skipped_bg": 0,
     }
+
+    # 5: lazily computed on the first would-be release/flip so the
+    # has-pending subprocess cost is paid only when a release is actually about
+    # to happen (never on the common scanned=0 / all-kept path).
+    bg_pending: Optional[bool] = None
 
     for entry in claimed:
         goal_id = entry.get("goal_id", "")
@@ -432,6 +555,23 @@ def main() -> int:
             "reason": "no diary entry after claimed_at AND age >= stale threshold",
         }
 
+        # 5: bg-pending guard (mirrors stop-hook Gate 2.5). A claim
+        # that looks stranded may be legitimately paused awaiting REGISTERED
+        # background work (OS jobs / Claude sub-agents). Skip the release; the
+        # next sweep after the bg work completes re-evaluates. rb-1533's
+        # phase-4 diary marker covers the harness-bg-task case separately.
+        if bg_pending is None:
+            bg_pending = _has_pending_background_work(agent)
+        if bg_pending:
+            record["verdict"] = "kept"
+            record["reason"] = ("stranded-skip-bg: agent has pending background "
+                                "work (pending-agents/background-jobs "
+                                "has-pending) — g-115-1925")
+            summary["kept"] += 1
+            summary["skipped_bg"] += 1
+            summary["stranded"].append(record)
+            continue
+
         if args.apply:
             rel = _release_goal(goal_id, source)
             record["release_result"] = rel
@@ -446,10 +586,18 @@ def main() -> int:
 
         summary["stranded"].append(record)
 
-    # 1: second shape — agent-source in-progress goals with NO
-    # claimed_by (structurally invisible to the claimed_by==agent query above).
-    no_claim = _query_inprogress_no_claim(agent)
+    # 1: second shape — in-progress goals with NO claimed_by
+    # (structurally invisible to the claimed_by==agent query above).
+    # 7: third shape — the same scan over the WORLD source (a
+    # release-without-status-reset or a death between the two writes leaves
+    # world orphans too; 3 observed 2026-07-16). World entries carry one
+    # extra guard: a goal named by ANY agent's team-state in_flight is kept.
+    no_claim = _query_inprogress_no_claim(agent, "agent") \
+        + _query_inprogress_no_claim(agent, "world")
     summary["scanned_no_claim"] = len(no_claim)
+    # Lazily fetched on the first world-source candidate (cheap single read;
+    # skipped entirely when no world orphans exist).
+    live_in_flight: Optional[set] = None
     for entry in no_claim:
         goal_id = entry.get("goal_id", "")
         asp_id = entry.get("asp_id", "")
@@ -487,6 +635,8 @@ def main() -> int:
             continue  # work is happening — not stranded
 
         if age < stale_threshold:
+            # Also covers a NEGATIVE age from a cross-box future stamp
+            # (8 TZ skew) — keep is the safe direction there.
             summary["kept"] += 1
             continue  # too fresh — race / mid-transition window
 
@@ -499,6 +649,36 @@ def main() -> int:
             "reason": "in-progress with no claimed_by, no diary entry after "
                       "last_modified AND age >= stale threshold",
         }
+
+        # 7: shared-queue guard — a world goal a peer is live on
+        # (in_flight names it) is kept even though its claim record is gone;
+        # flipping would yank the goal mid-execution. Agent-source goals are
+        # private (no peer can be live on them) — guard skipped.
+        if source == "world":
+            if live_in_flight is None:
+                live_in_flight = _read_all_in_flight_goal_ids()
+            if goal_id in live_in_flight:
+                record["verdict"] = "kept"
+                record["reason"] = ("no-claim but a live team-state in_flight "
+                                    "names this goal — peer mid-execution, "
+                                    "claim record lost (g-115-2417)")
+                summary["kept"] += 1
+                summary["stranded"].append(record)
+                continue
+
+        # 5: bg-pending guard (mirrors the claimed-path guard above /
+        # stop-hook Gate 2.5). A no-claim in-progress goal can be bg-paused too.
+        if bg_pending is None:
+            bg_pending = _has_pending_background_work(agent)
+        if bg_pending:
+            record["verdict"] = "kept"
+            record["reason"] = ("stranded-skip-bg: agent has pending background "
+                                "work (pending-agents/background-jobs "
+                                "has-pending) — g-115-1925")
+            summary["kept"] += 1
+            summary["skipped_bg"] += 1
+            summary["stranded"].append(record)
+            continue
 
         if args.apply:
             res = _flip_pending_no_claim(goal_id, source)

@@ -1,8 +1,14 @@
 """Phase 3 — Historical audit backfill (Track E, §9.7) + §14.11 P3 extension.
 
 Walks git log for all 4 tracked file_kinds and writes retroactive event-stream
-entries to the appropriate JSONL stream. Idempotent: skips commits whose
-revision_id already exists in the target stream.
+entries to the appropriate JSONL stream. Idempotent two ways: skips commits
+whose revision_id already exists in the target stream (sweep-vs-sweep), AND —
+by default — commits whose (file_path, after_hash) already appears on ANY
+existing entry (live-vs-sweep: a live-captured edit that was then committed
+would otherwise re-enter as a sweep entry, since live revision_ids are random
+and can never collide with the deterministic sweep ids — g-115-2566/g-115-2567).
+With live-dedup on, the "N new entries" backfill count measures REAL capture
+misses. `--no-live-dedup` restores the old behavior for forensic re-sweeps.
 
 Tracked path patterns:
   - <agent>/self.md             (agent_self)        — git-tracked
@@ -32,6 +38,7 @@ CLI:
   --file-kind <kind>     — limit to single kind (default: all)
   --dry-run              — report what would be written; no JSONL writes
   --apply                — actually write entries
+  --no-live-dedup        — disable the (file_path, after_hash) skip (forensic re-sweeps)
   --verbose              — per-commit progress
 
 Per world/conventions/self-program-evolution.md
@@ -366,6 +373,70 @@ def load_existing_revision_ids(world_dir):
     return out
 
 
+def _norm_path(p):
+    """Normalize a file_path for dedup joins: posix separators only.
+
+    Both live (evolution-record) and sweep entries currently write
+    repo-relative posix paths (probed 2439/2439 on 2026-07-18), but a future
+    Windows writer drifting to backslashes must not silently break the join.
+    """
+    return (p or "").replace("\\", "/")
+
+
+def load_existing_after_hashes(world_dir):
+    """Return dict[file_kind] -> dict[(file_path, after_hash) -> revision_id].
+
+    Covers entries of ANY signal_source (live D1, git-sweep, guard-380, ...):
+    the live-dedup question is "is this content-state for this file already
+    recorded in the stream?", not "who recorded it?". Last-seen entry wins so
+    a skip chains previous_revision_id to the most recent matching record.
+    Entries with a null after_hash are excluded (never matchable).
+    """
+    out = {kind: {} for kind in _STREAM_FILENAME}
+    for kind, fname in _STREAM_FILENAME.items():
+        path = Path(world_dir) / fname
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ah = e.get("after_hash")
+                    rid = e.get("revision_id")
+                    if ah and rid:
+                        out[kind][(_norm_path(e.get("file_path")), ah)] = rid
+        except Exception:
+            continue
+    return out
+
+
+def live_dedup_match(rel_path, after_blob, pair_to_rid):
+    """Return the existing revision_id whose (file_path, after_hash) matches
+    this commit's post-state, or None.
+
+    body_hash normalizes front matter, CRLF, and trailing whitespace, so a
+    live capture and the committed blob of the same edit hash identically.
+    Deliberate scope choices:
+    - None-hash blobs (file deleted at the commit) never match.
+    - A revert commit restoring an OLD content-state matches the old entry
+      and is skipped — the content-state is already recorded, so it is not a
+      capture MISS; the chain points at the matched entry.
+    - Only PRE-EXISTING stream entries participate: entries built earlier in
+      the same sweep run are not added to the map, so a fresh-world
+      full-history sweep still reconstructs complete edit chains.
+    """
+    ah = body_hash(after_blob)
+    if ah is None:
+        return None
+    return pair_to_rid.get((_norm_path(rel_path), ah))
+
+
 # ---------------------------------------------------------------------------
 # Build retroactive entry
 # ---------------------------------------------------------------------------
@@ -464,14 +535,16 @@ def derive_agent(commit, file_kind, key):
 # Main sweep
 # ---------------------------------------------------------------------------
 
-def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verbose):
-    """Sweep one file kind. Returns list of entries written (or to-be-written if dry_run)."""
+def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verbose,
+                    live_dedup=True):
+    """Sweep one file kind. Returns (new_entries, skipped, skipped_live)."""
     globs = path_glob if isinstance(path_glob, list) else [path_glob]
     commits = list_commits(globs, since=since, until=until)
     if verbose:
         print(f"  [{file_kind}] found {len(commits)} commits matching {path_glob}")
 
     existing_ids = load_existing_revision_ids(world_dir).get(file_kind, set())
+    pair_to_rid = load_existing_after_hashes(world_dir).get(file_kind, {}) if live_dedup else {}
 
     # Group commits by file → chain previous_revision_id correctly per file
     by_file = {}
@@ -484,6 +557,7 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
 
     new_entries = []
     skipped = 0
+    skipped_live = 0
     for rel_path, commit_list in by_file.items():
         # Sort by commit timestamp ascending (oldest first → chain naturally)
         commit_list.sort(key=lambda ck: ck[0]["ts"])
@@ -504,6 +578,17 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
             parent = get_parent(commit["hash"])
             before_blob = get_blob(parent, rel_path) if parent else None
             after_blob = get_blob(commit["hash"], rel_path)
+
+            live_rid = live_dedup_match(rel_path, after_blob, pair_to_rid)
+            if live_rid is not None:
+                if verbose:
+                    print(f"    SKIP live-captured: {revision_id} (after_hash matches {live_rid})")
+                # Chain the next entry to the matched existing record so
+                # previous_revision_id stays meaningful across the skip.
+                prev_rid_for_this_file = live_rid
+                skipped_live += 1
+                continue
+
             diff_text = get_diff_unified(commit["hash"], rel_path)
 
             entry = build_entry(commit, rel_path, file_kind, key, parent,
@@ -513,7 +598,8 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
             prev_rid_for_this_file = revision_id
 
     if verbose:
-        print(f"  [{file_kind}] would write {len(new_entries)} new entries, skipping {skipped}")
+        print(f"  [{file_kind}] would write {len(new_entries)} new entries, "
+              f"skipping {skipped} (existing) + {skipped_live} (live-captured)")
 
     if new_entries and not dry_run:
         # Append all entries in one atomic batch via _fileops.locked_append_jsonl
@@ -522,7 +608,7 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
         for e in new_entries:
             locked_append_jsonl(stream_path, e)
 
-    return new_entries, skipped
+    return new_entries, skipped, skipped_live
 
 
 def sweep_program(world_dir, dry_run, verbose):
@@ -588,6 +674,9 @@ def main():
                         help="Limit to one file kind (default: all)")
     parser.add_argument("--dry-run", action="store_true", help="Report without writing")
     parser.add_argument("--apply", action="store_true", help="Write entries")
+    parser.add_argument("--no-live-dedup", action="store_true",
+                        help="Disable the (file_path, after_hash) live-entry skip "
+                             "(forensic re-sweeps; restores pre-g-115-2567 behavior)")
     parser.add_argument("--verbose", action="store_true", help="Per-commit progress")
     args = parser.parse_args()
 
@@ -620,16 +709,19 @@ def main():
         "rule_edit": [".claude/rules/*.md"],
     }
 
-    totals = {"written": 0, "skipped": 0}
+    totals = {"written": 0, "skipped": 0, "skipped_live": 0}
     for kind in kinds_to_run:
         glob = path_globs[kind]
         print(f"\n=== {kind} ({glob}) ===")
-        new, skipped = sweep_file_kind(kind, glob, args.since, args.until, world_dir,
-                                        args.dry_run, args.verbose)
+        new, skipped, skipped_live = sweep_file_kind(
+            kind, glob, args.since, args.until, world_dir,
+            args.dry_run, args.verbose, live_dedup=not args.no_live_dedup)
         totals["written"] += len(new)
         totals["skipped"] += skipped
+        totals["skipped_live"] += skipped_live
         if not args.verbose:
-            print(f"  {len(new)} new entries, {skipped} skipped (existing)")
+            print(f"  {len(new)} new entries, {skipped} skipped (existing), "
+                  f"{skipped_live} skipped (live-captured)")
 
     if do_program:
         print(f"\n=== program (special-case bootstrap) ===")
@@ -640,7 +732,7 @@ def main():
 
     print()
     print(f"Total: {totals['written']} new entries {'(dry-run, not written)' if args.dry_run else 'written'}, "
-          f"{totals['skipped']} skipped")
+          f"{totals['skipped']} skipped (existing), {totals['skipped_live']} skipped (live-captured)")
 
     return 0
 

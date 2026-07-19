@@ -380,6 +380,34 @@ rt_spawn() {
     echo "[$stamp] rt_spawn — attempting daemon start" >> "$RT_SPAWN_LOG"
 
     (
+        # 8: canonicalize the daemon environment at the wrapper
+        # auto-respawn chokepoint. The daemon otherwise inherits the POKING
+        # process's env verbatim — observed 2026-07-16: a background pytest
+        # suite's wrapper call respawned the production daemon carrying
+        # STORAGE_BACKEND=local + MIND_ALLOW_TMP_OWNCLOUD_PUT=1 +
+        # PYTEST_CURRENT_TEST (~6min LocalBackend split-brain, tempdir
+        # tripwire dormant). mind_api's _load_env_local uses setdefault
+        # ("explicit launch env wins"), so an inherited var BLOCKS the
+        # .env.local value. Scrub, inside this subshell only:
+        #   - test markers (PYTEST_*, MOTO_*) + the tripwire escape hatch —
+        #     no daemon should ever carry a test session's flags;
+        #   - every storage/config key the daemon self-resolves from
+        #     .env.local / the environment registry (_N3_ALLOWED_EXACT in
+        #     mind_api/src/__main__.py, minus RUNTIME_DIR) — .env.local
+        #     becomes the single source of truth on this path.
+        # RUNTIME_DIR is deliberately KEPT: it is the sanctioned per-test
+        # daemon-isolation override (lifecycle.runtime_dir). Deliberate
+        # env-shaping for DIRECT launches (python3 -m mind_api.src,
+        # mind-api-start.sh, daemon_integration fixtures) is untouched —
+        # those do not pass through rt_spawn, and there the launcher is a
+        # deliberate operator, not an accidental parent.
+        local _v
+        for _v in $(compgen -e); do
+            case "$_v" in
+                PYTEST_*|MOTO_*) unset "$_v" ;;
+                MIND_ALLOW_TMP_OWNCLOUD_PUT|STORAGE_BACKEND|STORAGE_S3_BUCKET|STORAGE_DDB_SESSIONS_TABLE|STORAGE_DDB_LOCK_TABLE|ENVIRONMENT_ID|MACHINE_ID|MACHINE_MULTI|OWNCLOUD_SYNC_INTERVAL|OWNCLOUD_CACHE_TTL|MIND_API_TOKEN|MIND_API_BIND) unset "$_v" ;;
+            esac
+        done
         cd "$PROJECT_ROOT" && \
         $py_cmd -m mind_api.src >> "$RT_SPAWN_LOG" 2>&1 &
         disown $! 2>/dev/null || true
@@ -772,8 +800,17 @@ rt_curl() {
 
     local result curl_rc
     if [ -n "$body_string" ]; then
+        # --data-raw, NOT -d: curl interprets a leading "@" in a -d value as
+        # "read body from this file" — a body like "@alpha — ..." (any board
+        # post addressed to an agent) becomes a nonexistent-filename hard error
+        # BEFORE any request is sent. With stderr swallowed below, that instant
+        # rc=2 surfaces as return 3 and gets misdiagnosed as a slow daemon
+        # timeout by the caller's recovery diagnostics (observed 2026-07-13,
+        # : 4 consecutive "@alpha" board posts "timed out" at 60-180s
+        # while every non-@ post landed instantly). --data-raw is byte-identical
+        # to -d except it never file-expands @ (curl >= 7.43).
         result=$(curl -s --max-time "$RT_CURL_TIMEOUT" -X "$method" "${headers[@]}" \
-            -d "$body_string" -w "${RT_MARKER}%{http_code}" "$url" 2>/dev/null) || curl_rc=$?
+            --data-raw "$body_string" -w "${RT_MARKER}%{http_code}" "$url" 2>/dev/null) || curl_rc=$?
         curl_rc=${curl_rc:-0}
     else
         result=$(curl -s --max-time "$RT_CURL_TIMEOUT" -X "$method" "${headers[@]}" \
@@ -827,8 +864,16 @@ rt_curl() {
 # function call that returns nonzero would trip `set -e`. We guard the
 # inner rt_curl calls with `|| true` so we can read $? without exiting.
 rt_call() {
-    local rc=0
-    rt_curl "$@" || rc=$?
+    local rc=0 out
+    # Buffer the first response instead of streaming it: the staleness branch
+    # below may retry rt_curl after a recycle, and a streamed first body would
+    # CONCATENATE with the retry body on the caller's $() capture (rt_curl
+    # emits no trailing newline) — observed 2026-07-18 as a doubled goal-id
+    # ("11") that made claim-liveness-check INDETERMINATE
+    # and fail-opened the guard-1151 restart gate. rt_curl prints nothing to
+    # stdout on rc 2/3, so buffering + printf '%s' is byte-identical for every
+    # non-retry path.
+    out=$(rt_curl "$@") || rc=$?
     if [ "$rc" -ne 3 ]; then
         # Daemon answered. If it's running stale code, rt_check_staleness
         # warns AND arms the auto-restart sentinel ( Change 1).
@@ -852,9 +897,11 @@ rt_call() {
            [ "${RT_NO_AUTOSPAWN:-0}" != "1" ]; then
             if rt_ensure_running; then
                 rc=0
-                rt_curl "$@" || rc=$?
+                # REPLACE the stale first body — never emit both (doubled-id bug).
+                out=$(rt_curl "$@") || rc=$?
             fi
         fi
+        printf '%s' "$out"
         return "$rc"
     fi
     # rc==3: connection refused, no port, OR a routing-layer 404 escalated by

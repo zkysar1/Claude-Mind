@@ -76,7 +76,7 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 - All memory tree nodes registered in `world/knowledge/tree/_tree.yaml`
 - Skills read `_tree.yaml` to navigate — never hardcode category→path mappings
 - `growth_state` values: `stable`, `growing`, `ready_to_split`, `ready_to_decompose`
-- K_max=4 is a soft limit at all levels (can exceed when justified, log reason to tree_growth_log)
+- K_max is a soft limit at all levels — current value in `core/config/tree.yaml` (raised 4→40, 2026-07-14 user directive; count-based regroup pressure retired, regroup on semantic incoherence only); can exceed when justified, log reason to tree_growth_log
 
 ### Growth Operations
 - DECOMPOSE: `.md` body > `decompose_threshold (80)` lines AND `depth < D_max` → break monolith into 2-4 child nodes

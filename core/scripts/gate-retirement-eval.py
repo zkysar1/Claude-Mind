@@ -64,6 +64,26 @@ MIN_RATE_SAMPLES gates `block + override` (tighten). Both default to
                  → Gate threw an exception at least once. Look at the
                    recorded gate_error and fix.
 
+  inert_candidate  (post-scoring transform, g-115-2108) an action
+                 recommendation (retire/tighten/widen) whose gate had ZERO
+                 firings in the recent window AND whose implementation
+                 (wrapper script or gates/ module) was git-modified AFTER
+                 the gate's last recorded firing. Every data point behind
+                 the recommendation predates the current implementation, so
+                 prescribing tighten/widen from it re-flags already-fixed
+                 gates forever (canonical: stale-read-gate — g-115-1796
+                 neutered it 2026-07-06, firings end 2026-06-22, yet the
+                 06-14..06-22 override rate kept re-recommending tighten;
+                 spawned duplicate goals g-115-1796 → g-115-2106). The
+                 recency suppressions above cannot catch this: they
+                 suppress only on POSITIVE recent evidence, and an inert
+                 gate has no recent samples at all. Consumer action: verify
+                 live behavior; honest disposition is usually retirement or
+                 telemetry re-enable, never the preserved recommendation.
+                 evidence.inert_prior_recommendation carries the converted
+                 value. Fail-open: git unavailable / paths missing → no
+                 transform (original recommendation stands).
+
   keep           None of the above; gate behaving within expected envelope.
 
   insufficient_data   total firings < MIN_TOTAL_FIRINGS
@@ -78,9 +98,11 @@ A missing gates.yaml is fatal (exit 2).
 
 import argparse
 import json
+import subprocess
 import sys
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -93,7 +115,7 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-from _paths import META_DIR, CONFIG_DIR
+from _paths import META_DIR, CONFIG_DIR, PROJECT_ROOT
 # Decision enum — single source of truth in _gate_log.py. Importing (not
 # redeclaring) means any future change to the taxonomy lands in one place;
 # mismatches between writer and reader become impossible by construction.
@@ -198,6 +220,178 @@ def _load_firings(since):
     if skipped:
         print(f"[gate-retirement-eval] WARN: skipped {skipped} malformed "
               f"firing record(s)", file=sys.stderr)
+
+
+def _gate_impl_paths(script_str):
+    """Return existing implementation paths for a gate's `script:` value.
+
+    Covers BOTH layers of the wrapper/engine split: the gates.yaml `script:`
+    wrapper (e.g. core/scripts/stale-read-gate.py) AND the gates/ module the
+    wrapper delegates to (core/scripts/gates/stale_read.py — derived by
+    stripping a trailing `-gate` from the stem and swapping hyphens for
+    underscores; only included when it exists on disk). The engine module is
+    where behavior changes usually land (g-115-1796 touched gates/stale_read.py,
+    not the wrapper), so watching the wrapper alone would miss most fixes.
+    """
+    paths = []
+    p = (PROJECT_ROOT / script_str).resolve() if not Path(script_str).is_absolute() \
+        else Path(script_str)
+    if p.is_file():
+        paths.append(p)
+    stem = Path(script_str).stem
+    if stem.endswith("-gate"):
+        stem = stem[: -len("-gate")]
+    module = PROJECT_ROOT / "core" / "scripts" / "gates" / (stem.replace("-", "_") + ".py")
+    if module.is_file() and module not in paths:
+        paths.append(module)
+    return paths
+
+
+def _gate_modified_epoch(script_str):
+    """Latest git commit epoch across a gate's implementation paths.
+
+    Returns (epoch:int, iso:str) of the newest commit touching any impl path,
+    or (None, None) when git is unavailable, the paths have no history, or
+    anything else goes wrong — fail-open, so the inert transform simply does
+    not fire and the original recommendation stands.
+    """
+    best_epoch, best_iso = None, None
+    for p in _gate_impl_paths(script_str):
+        try:
+            out = subprocess.run(
+                ["git", "log", "-1", "--format=%ct %cI", "--", str(p)],
+                cwd=str(PROJECT_ROOT), capture_output=True, text=True,
+                timeout=15)
+            line = (out.stdout or "").strip()
+            if out.returncode != 0 or not line:
+                continue
+            epoch_s, iso = line.split(" ", 1)
+            epoch = int(epoch_s)
+            if best_epoch is None or epoch > best_epoch:
+                best_epoch, best_iso = epoch, iso
+        except Exception:
+            continue
+    return best_epoch, best_iso
+
+
+# Recommendations the inert transform may convert. investigate is excluded:
+# a recent-window fail_open is itself recency-gated, and a historical-only
+# fail_open already falls through to the asymmetry rules.
+_INERT_CONVERTIBLE = ("retire", "tighten", "widen")
+
+# Cost-rank map for the all-noop cost-asymmetry downgrade (5).
+# Unknown / missing values rank None → the cost side contributes no downgrade
+# (fail toward pre-existing behavior; taxonomy drift adds a rank here, it
+# never silently flips a recommendation).
+_COST_RANK = {"low": 0, "medium": 1, "high": 2}
+
+# Minimum gate age before ACTION recommendations are trusted (5).
+# An embedded per-goal-write classifier reaches MIN_TOTAL_FIRINGS in days —
+# volume is not maturity. Gates younger than min(--days, this) get their
+# action recommendation replaced by insufficient_data via
+# _apply_min_age_transform (post-score, lazy git probe — same shape as the
+# inert transform below).
+MIN_GATE_AGE_DAYS = 14
+
+# Recommendations the min-age transform may convert — the action set.
+# investigate is excluded on purpose: a YOUNG gate that is fail_open'ing
+# (raising exceptions) still needs investigation NOW, and an all-noop
+# FN-costly young gate routed to investigate is a cheap look, not a deletion.
+_MIN_AGE_CONVERTIBLE = ("retire", "tighten", "widen")
+
+
+def _gate_registry_first_epoch(gid):
+    """Epoch of the commit that INTRODUCED `id: <gid>` into gates.yaml.
+
+    Registry presence is the preferred age source while the firings ledger
+    carries the g-115-2294 month-hole (missing older records make a gate's
+    first ledger ts too RECENT, understating age exactly when the min-age
+    rule needs it). Returns int epoch or None — fail-open: no git, no match,
+    or any error → None and the caller falls back to the ledger bound.
+    """
+    try:
+        out = subprocess.run(
+            ["git", "log", "-S", f"id: {gid}", "--format=%ct", "--reverse",
+             "--", "core/config/gates.yaml"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=20)
+        first = (out.stdout or "").strip().splitlines()
+        if out.returncode != 0 or not first:
+            return None
+        return int(first[0])
+    except Exception:
+        return None
+
+
+def _apply_min_age_transform(scored, gate_age_days, window_days):
+    """Replace an action recommendation on a too-young gate (5).
+
+    Pure function (no I/O) so the self-test can exercise it synthetically.
+    `gate_age_days` None → age unknown (git + ledger both failed) → no
+    transform (fail-open, original recommendation stands). Threshold is
+    min(window_days, MIN_GATE_AGE_DAYS): a deliberately short --days window
+    should not be blocked by the default age floor.
+    """
+    if scored.get("recommendation") not in _MIN_AGE_CONVERTIBLE:
+        return scored
+    if gate_age_days is None:
+        return scored
+    threshold = min(window_days, MIN_GATE_AGE_DAYS) if window_days \
+        else MIN_GATE_AGE_DAYS
+    evidence = scored.setdefault("evidence", {})
+    evidence["gate_age_days"] = round(gate_age_days, 1)
+    evidence["gate_age_threshold_days"] = threshold
+    if gate_age_days >= threshold:
+        return scored
+    original = scored["recommendation"]
+    evidence["pre_min_age_recommendation"] = original
+    scored["recommendation"] = "insufficient_data"
+    scored["reason"] = (
+        f"Gate is {gate_age_days:.1f}d old (< {threshold}d min age) — "
+        f"volume is not maturity (an embedded per-goal-write classifier "
+        f"reaches MIN_TOTAL_FIRINGS in days). Withholding the "
+        f"'{original}' recommendation until the gate has aged; re-eval "
+        f"after {threshold}d. (g-115-2295)")
+    return scored
+
+
+def _apply_inert_transform(scored, recent_total,
+                           last_firing_epoch, last_firing_ts,
+                           modified_epoch, modified_ts):
+    """Convert a stale action recommendation to inert_candidate (8).
+
+    Pure function (no I/O) so the self-test can exercise it synthetically.
+    Converts ONLY when ALL hold:
+      - recommendation is retire/tighten/widen (action derived from firings)
+      - recent_total == 0 (the gate produced NO firings of any decision in
+        the recent window — nothing current backs the recommendation)
+      - both timestamps known (fail-open on missing git data)
+      - the implementation was modified STRICTLY AFTER the last firing
+        (every data point predates the current implementation)
+    Anything else returns `scored` unchanged.
+    """
+    if scored.get("recommendation") not in _INERT_CONVERTIBLE:
+        return scored
+    if recent_total != 0:
+        return scored
+    if last_firing_epoch is None or modified_epoch is None:
+        return scored
+    if modified_epoch <= last_firing_epoch:
+        return scored
+    prior = scored["recommendation"]
+    ev = scored.setdefault("evidence", {})
+    ev["inert_prior_recommendation"] = prior
+    ev["last_firing_ts"] = last_firing_ts
+    ev["gate_impl_modified_ts"] = modified_ts
+    scored["recommendation"] = "inert_candidate"
+    scored["reason"] = (
+        f"Prior recommendation '{prior}' rests entirely on pre-modification "
+        f"data: zero firings in the recent window, last firing "
+        f"{last_firing_ts}, but the gate implementation was modified after it "
+        f"({modified_ts}). Prescribing '{prior}' from stale telemetry re-flags "
+        f"an already-changed gate (g-115-2108; canonical: stale-read-gate). "
+        f"Verify live behavior — honest disposition is usually retirement or "
+        f"telemetry re-enable, not '{prior}'.")
+    return scored
 
 
 def _score_gate(gate, counts, min_fires,
@@ -351,15 +545,35 @@ def _score_gate(gate, counts, min_fires,
         # event (keep) or mis-wired (widen/fix). Without this, the retire rule
         # preempts the widen path (unreachable when meaningful==0) and deletes a
         # guard that never had a chance to fire.
-        if dominant_risk == "FN":
+        #
+        # Cost-asymmetry key (5): dominant_risk is a LIKELIHOOD label
+        # (which error mode is more probable), not a cost label — gates.yaml
+        # registers e.g. removal-intent-verbs as FP because the strict matcher
+        # over-matches, while its COST shape (fn_cost=medium > fp_cost=low) is
+        # the same as the canonical FN gate. Keying the downgrade only on
+        # dominant_risk==FN retire-recommended that gate (1). Fire the
+        # downgrade when EITHER key says the quiet side is the expensive side:
+        # dominant_risk==FN OR fn_cost outranks fp_cost (rank low<medium<high;
+        # unknown/missing ranks → no cost-side downgrade, taxonomy-drift-proof).
+        fp_rank = _COST_RANK.get(str(gate.get("fp_cost", "")).lower())
+        fn_rank = _COST_RANK.get(str(gate.get("fn_cost", "")).lower())
+        fn_outranks_fp = (fp_rank is not None and fn_rank is not None
+                          and fn_rank > fp_rank)
+        evidence["fp_cost"] = gate.get("fp_cost")
+        evidence["fn_cost"] = gate.get("fn_cost")
+        if dominant_risk == "FN" or fn_outranks_fp:
+            key_desc = ("dominant_risk=FN" if dominant_risk == "FN"
+                        else f"fn_cost={gate.get('fn_cost')} outranks "
+                             f"fp_cost={gate.get('fp_cost')}")
             return {"recommendation": "investigate",
                     "reason": f"Gate fired {total} times over window, all noops, "
-                              f"but dominant_risk=FN. An all-noop FN-dominant gate "
-                              f"is typically a working preventive guard whose rare "
-                              f"guarded condition didn't occur in-window, NOT a dead "
-                              f"gate. Investigate whether it is correctly scoped for "
-                              f"a rare event (keep) or mis-wired (widen/fix) before "
-                              f"retiring.",
+                              f"but {key_desc}. An all-noop gate whose false-"
+                              f"negative side is the expensive side is typically "
+                              f"a working preventive guard whose rare guarded "
+                              f"condition didn't occur in-window, NOT a dead "
+                              f"gate. Investigate whether it is correctly scoped "
+                              f"for a rare event (keep) or mis-wired (widen/fix) "
+                              f"before retiring.",
                     "evidence": evidence}
         return {"recommendation": "retire",
                 "reason": f"Gate fired {total} times over window, all noops "
@@ -489,8 +703,8 @@ def _human_table(rows):
     lines.append("=== Gate Retirement Recommendations ===")
     lines.append(f"Total gates evaluated: {len(rows)}")
     lines.append("Distribution:")
-    for rec in ("retire", "tighten", "widen", "investigate", "keep",
-                "insufficient_data", "uninstrumented"):
+    for rec in ("retire", "tighten", "widen", "investigate", "inert_candidate",
+                "keep", "insufficient_data", "uninstrumented"):
         if by_rec.get(rec):
             lines.append(f"  {by_rec[rec]:3d}  {rec}")
     lines.append("")
@@ -507,7 +721,7 @@ def _human_table(rows):
     # Surface the action items first.
     lines.append("Action items (anything not 'keep' / 'insufficient_data' / 'uninstrumented'):")
     actions = [r for r in rows if r["recommendation"] in
-               ("retire", "tighten", "widen", "investigate")]
+               ("retire", "tighten", "widen", "investigate", "inert_candidate")]
     if not actions:
         lines.append("  (none — all gates within expected envelope)")
     for r in actions:
@@ -556,6 +770,33 @@ def _self_test():
           "keyword_bias": "balanced", "dominant_risk": "FN"},
          Counter({"noop": 15}),
          "investigate"),
+        # Cost-asymmetry key (5, canonical gate removal-intent-verbs):
+        # dominant_risk=FP is a LIKELIHOOD label; the COST shape
+        # (fn_cost=medium > fp_cost=low) says the quiet side is the expensive
+        # side. The downgrade must fire on cost asymmetry independent of the
+        # dominant_risk label — this pins the exact 1 miss.
+        ("fp-labeled-fn-costly-all-noop-investigate-not-retire",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "strict", "dominant_risk": "FP",
+          "fp_cost": "low", "fn_cost": "medium"},
+         Counter({"noop": 15}),
+         "investigate"),
+        # Equal costs + FP label → the cost key must NOT over-fire; plain
+        # retire behavior preserved for genuinely-cheap-both-ways gates.
+        ("fp-labeled-equal-costs-all-noop-still-retire",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "balanced", "dominant_risk": "FP",
+          "fp_cost": "low", "fn_cost": "low"},
+         Counter({"noop": 15}),
+         "retire"),
+        # Unknown cost vocab (taxonomy drift) → rank None → no cost-side
+        # downgrade; original retire stands (fail toward existing behavior).
+        ("unknown-cost-values-no-downgrade",
+         {"id": "_test", "instrumented": True, "retirement_eligible": True,
+          "keyword_bias": "balanced", "dominant_risk": "FP",
+          "fp_cost": "trivial", "fn_cost": "catastrophic"},
+         Counter({"noop": 15}),
+         "retire"),
         ("retire-suppressed-by-low-volume",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "balanced"},
@@ -700,6 +941,41 @@ def _self_test():
          Counter({"noop": 99}),
          "uninstrumented"),
     ]
+    # ── Inert-transform cases (8) ────────────────────────────────
+    # Pure-function tests for _apply_inert_transform — no git, no telemetry.
+    # Tuples: (label, scored-dict, recent_total, last_epoch, mod_epoch, expected).
+    T0, T1 = 1000.0, 2000.0  # T1 strictly after T0
+    inert_cases = [
+        # Action rec + zero recent + impl modified AFTER last firing → convert.
+        ("inert-converts-stale-tighten",
+         {"recommendation": "tighten", "reason": "x", "evidence": {}},
+         0, T0, T1, "inert_candidate"),
+        ("inert-converts-stale-retire",
+         {"recommendation": "retire", "reason": "x", "evidence": {}},
+         0, T0, T1, "inert_candidate"),
+        # Impl modified BEFORE last firing → data post-dates the change →
+        # the recommendation reflects the CURRENT implementation. Preserved.
+        ("inert-preserved-modified-before-last-firing",
+         {"recommendation": "tighten", "reason": "x", "evidence": {}},
+         0, T1, T0, "tighten"),
+        # Recent firings exist → gate is live → recency suppressions own the
+        # staleness question. Preserved.
+        ("inert-preserved-recent-firings-exist",
+         {"recommendation": "tighten", "reason": "x", "evidence": {}},
+         3, T0, T1, "tighten"),
+        # Missing git data → fail-open, preserved.
+        ("inert-preserved-no-git-data",
+         {"recommendation": "widen", "reason": "x", "evidence": {}},
+         0, T0, None, "widen"),
+        # Non-action recommendations never convert.
+        ("inert-ignores-keep",
+         {"recommendation": "keep", "reason": "x", "evidence": {}},
+         0, T0, T1, "keep"),
+        ("inert-ignores-investigate",
+         {"recommendation": "investigate", "reason": "x", "evidence": {}},
+         0, T0, T1, "investigate"),
+    ]
+
     failures = 0
     for case in cases:
         # Cases are positional tuples:
@@ -727,11 +1003,67 @@ def _self_test():
             failures += 1
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] {label}: expected={expected!r} actual={actual!r}")
+    for label, scored, recent_total, last_epoch, mod_epoch, expected in inert_cases:
+        result = _apply_inert_transform(
+            dict(scored, evidence=dict(scored.get("evidence", {}))),
+            recent_total, last_epoch, "2026-01-01T00:00:00",
+            mod_epoch, "2026-01-02T00:00:00+00:00")
+        actual = result["recommendation"]
+        ok = actual == expected
+        # Converted rows must preserve the prior recommendation in evidence.
+        if ok and expected == "inert_candidate":
+            ok = (result["evidence"].get("inert_prior_recommendation")
+                  == scored["recommendation"])
+        if not ok:
+            failures += 1
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] {label}: expected={expected!r} actual={actual!r}")
+    # Min-age transform cases (5): pure-function checks mirroring the
+    # inert_cases pattern. (label, scored, gate_age_days, window_days, expected)
+    min_age_cases = [
+        # 2.1d-old retire (the exact 1 shape) → insufficient_data.
+        ("min-age-young-retire-to-insufficient",
+         {"recommendation": "retire", "reason": "r", "evidence": {}},
+         2.1, 30, "insufficient_data"),
+        # Old gate → action recommendation untouched.
+        ("min-age-old-gate-retire-stands",
+         {"recommendation": "retire", "reason": "r", "evidence": {}},
+         45.0, 30, "retire"),
+        # Age unknown (git + ledger both failed) → fail-open, untouched.
+        ("min-age-unknown-age-fail-open",
+         {"recommendation": "retire", "reason": "r", "evidence": {}},
+         None, 30, "retire"),
+        # investigate is NOT in the convertible set — young fail_open'ing
+        # gates still get investigated now.
+        ("min-age-investigate-not-converted",
+         {"recommendation": "investigate", "reason": "r", "evidence": {}},
+         2.1, 30, "investigate"),
+        # Short --days window lowers the threshold: 5d-old gate with a 3d
+        # window is PAST min(3, 14) → recommendation stands.
+        ("min-age-short-window-lowers-threshold",
+         {"recommendation": "tighten", "reason": "r", "evidence": {}},
+         5.0, 3, "tighten"),
+    ]
+    for label, scored, age_days, window_days, expected in min_age_cases:
+        result = _apply_min_age_transform(
+            dict(scored, evidence=dict(scored.get("evidence", {}))),
+            age_days, window_days)
+        actual = result["recommendation"]
+        ok = actual == expected
+        # Converted rows must preserve the prior recommendation in evidence.
+        if ok and expected == "insufficient_data":
+            ok = (result["evidence"].get("pre_min_age_recommendation")
+                  == scored["recommendation"])
+        if not ok:
+            failures += 1
+        status = "PASS" if ok else "FAIL"
+        print(f"  [{status}] {label}: expected={expected!r} actual={actual!r}")
+    total_cases = len(cases) + len(inert_cases) + len(min_age_cases)
     print()
     if failures:
-        print(f"FAILED: {failures} of {len(cases)} self-test case(s) failed.")
+        print(f"FAILED: {failures} of {total_cases} self-test case(s) failed.")
         return 1
-    print(f"OK: all {len(cases)} self-test case(s) passed.")
+    print(f"OK: all {total_cases} self-test case(s) passed.")
     return 0
 
 
@@ -791,6 +1123,14 @@ def main(argv=None):
     latest_fail_open_ts_per_gate = {}   # ISO ts of the most recent fail_open
     recent_counts_per_gate = {}         # block/override within TIGHTEN_RECENCY_DAYS
     recent_counts_widen_per_gate = {}   # ALL decisions within WIDEN_RECENCY_DAYS
+    latest_ts_per_gate = {}             # ISO ts of the most recent firing (any
+                                        # decision) — inert transform input
+                                        # (8); ISO sorts lexically
+    first_ts_per_gate = {}              # ISO ts of the EARLIEST in-window firing
+                                        # — min-age transform's ledger fallback
+                                        # bound (5); a LOWER bound on
+                                        # true age (window + 4 month-
+                                        # hole both truncate history)
     for rec in _load_firings(since):
         gid = rec.get("gate_id")
         if not gid:
@@ -807,6 +1147,12 @@ def main(argv=None):
         # so a string max IS the latest fail_open.
         ts_raw = rec["ts"]
         ts = datetime.strptime(ts_raw, "%Y-%m-%dT%H:%M:%S")
+        prev_latest = latest_ts_per_gate.get(gid)
+        if prev_latest is None or ts_raw > prev_latest:
+            latest_ts_per_gate[gid] = ts_raw
+        prev_first = first_ts_per_gate.get(gid)
+        if prev_first is None or ts_raw < prev_first:
+            first_ts_per_gate[gid] = ts_raw
         # Tighten recency bucketing (9): count block/override within
         # the tighten recency window. Only those two decisions feed the
         # override-rate suppression; noop/pass/fail_open are irrelevant to it.
@@ -840,11 +1186,54 @@ def main(argv=None):
             recent_counts=recent_counts_per_gate.get(gid, Counter()),
             recent_counts_widen=recent_counts_widen_per_gate.get(gid, Counter()))
         scored["gate_id"] = gid
+        # Min-age transform (5): lazy — the registry git probe runs
+        # ONLY for gates that scored an action recommendation (typically 0-3
+        # per run), and BEFORE the inert transform (a too-young gate should
+        # not reach inert conversion either). Age source preference: registry
+        # introduction commit (git -S on gates.yaml) — the firings ledger
+        # carries the 4 month-hole, so its first ts understates age
+        # exactly when this rule needs it. Ledger first-in-window ts is the
+        # fail-open fallback bound when git is unavailable.
+        if scored["recommendation"] in _MIN_AGE_CONVERTIBLE:
+            age_days = None
+            reg_epoch = _gate_registry_first_epoch(gid)
+            if reg_epoch is not None:
+                age_days = (datetime.now().timestamp() - reg_epoch) / 86400.0
+                scored.setdefault("evidence", {})["gate_age_source"] = \
+                    "registry-introduction-commit"
+            else:
+                first_ts = first_ts_per_gate.get(gid)
+                if first_ts:
+                    age_days = (datetime.now()
+                                - datetime.strptime(
+                                    first_ts, "%Y-%m-%dT%H:%M:%S")
+                                ).total_seconds() / 86400.0
+                    scored.setdefault("evidence", {})["gate_age_source"] = \
+                        "ledger-first-in-window-firing (lower bound; " \
+                        "g-115-2294 month-hole caveat)"
+            scored = _apply_min_age_transform(scored, age_days, args.days)
+        # Inert transform (8): lazy — the git probe runs ONLY for
+        # gates that scored an action recommendation with zero recent-window
+        # firings (typically 0-2 per run). recent_counts_widen already counts
+        # ALL decisions in the recent window, so its sum is the recent total.
+        if scored["recommendation"] in _INERT_CONVERTIBLE:
+            recent_total = sum(recent_counts_widen_per_gate.get(gid, Counter()).values())
+            if recent_total == 0:
+                last_ts = latest_ts_per_gate.get(gid)
+                last_epoch = None
+                if last_ts:
+                    last_epoch = datetime.strptime(
+                        last_ts, "%Y-%m-%dT%H:%M:%S").timestamp()
+                mod_epoch, mod_iso = _gate_modified_epoch(gate.get("script", ""))
+                scored = _apply_inert_transform(
+                    scored, recent_total, last_epoch, last_ts,
+                    mod_epoch, mod_iso)
         rows.append(scored)
 
     # Sort: action items first, then keep / insufficient / uninstrumented.
     rec_order = {"retire": 0, "tighten": 1, "widen": 2, "investigate": 3,
-                 "keep": 4, "insufficient_data": 5, "uninstrumented": 6}
+                 "inert_candidate": 4, "keep": 5, "insufficient_data": 6,
+                 "uninstrumented": 7}
     rows.sort(key=lambda r: (rec_order.get(r["recommendation"], 99),
                              -r["evidence"]["total_firings"]))
 

@@ -107,10 +107,18 @@ def test_detection_preserved_for_real_domain_capability():
 
 
 # 0 recall control (guard-958): stopwording own-cloud must NOT suppress
-# an ADJACENT genuine probe-governed-store token. The single surviving keyword
-# (backend-cat) is the SOLE matcher, sitting right beside the newly-stopworded
-# own-cloud — so a multi-keyword happy path cannot mask a recall regression.
-_GOVERNED_STORE_RECALL_DEFER = "blocked: own-cloud backend-cat step must run first"
+# an ADJACENT genuine capability token. The single surviving keyword is the SOLE
+# matcher, sitting right beside the newly-stopworded own-cloud — so a
+# multi-keyword happy path cannot mask a recall regression.
+# Re-pointed from backend-cat/probe-governed-store to analyze-npc-behavior
+# (3): probe-governed-store was NEVER forged — 7 was
+# mis-premised (skill + backend-cat.sh absent on disk and from
+# forged-skills.yaml; re-scoped in place to a design+forge goal, still
+# pending), so the original fixture asserted recall of a PHANTOM registration
+# and could not pass on any box. analyze-npc-behavior is a real registered
+# forged skill whose name-token is its own discriminator — same adversarial
+# single-surviving-keyword shape.
+_ADJACENT_RECALL_DEFER = "blocked: own-cloud analyze-npc-behavior step must run first"
 
 
 def test_own_cloud_stopworded_no_longer_matches_forged_skill():
@@ -131,25 +139,26 @@ def test_own_cloud_stopworded_no_longer_matches_forged_skill():
     )
 
 
-def test_governed_store_recall_preserved_adjacent_to_stopword():
+def test_recall_preserved_adjacent_to_stopword():
     """0 / guard-958 adversarial recall control: stopwording own-cloud
-    did NOT break probe-governed-store detection. A genuine defer whose SOLE
-    surviving keyword is backend-cat (own-cloud stopworded right beside it) must
-    still route to the agent via that skill — proving no collateral recall loss
-    and no multi-keyword masking."""
-    _, d = _run_gate(_GOVERNED_STORE_RECALL_DEFER)
+    must not break detection of an adjacent genuine capability token. A defer
+    whose SOLE surviving keyword is analyze-npc-behavior (own-cloud stopworded
+    right beside it) must still route to the agent via that skill — proving no
+    collateral recall loss and no multi-keyword masking. (Re-pointed from the
+    never-forged probe-governed-store — see _ADJACENT_RECALL_DEFER note.)"""
+    _, d = _run_gate(_ADJACENT_RECALL_DEFER)
     kws = set(d.get("keywords_extracted") or [])
     assert "own-cloud" not in kws, f"own-cloud not stopworded: {sorted(kws)}"
-    assert "backend-cat" in kws, (
-        f"recall token backend-cat lost from extraction: {sorted(kws)}"
+    assert "analyze-npc-behavior" in kws, (
+        f"recall token analyze-npc-behavior lost from extraction: {sorted(kws)}"
     )
     assert d.get("would_block"), (
-        f"probe-governed-store recall broken; keywords={sorted(kws)} "
+        f"adjacent-token recall broken; keywords={sorted(kws)} "
         f"matches={d.get('matches')}"
     )
     match_skills = {m.get("skill") for m in (d.get("matches") or [])}
-    assert "probe-governed-store" in match_skills, (
-        f"backend-cat no longer routes to probe-governed-store: "
+    assert "analyze-npc-behavior" in match_skills, (
+        f"analyze-npc-behavior no longer routes to its skill: "
         f"{sorted(m for m in match_skills if m)}"
     )
 

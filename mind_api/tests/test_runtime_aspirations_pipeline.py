@@ -3,7 +3,7 @@
 Covers the 4 gates + 2 advisories + 2 mutators added in PR 7c:
   Advisories:  user_leg_scope, description_length
   Mutators:    category-suggest, work_class, capability-route
-  Blockers:    stale-read, scaffolded-exploration
+  Blockers:    scaffolded-exploration
 
 Plus origin-signal Layer-D auto-derive ordering: capability-route runs AFTER
 origin-signal so it can see the patched origin_signal field.
@@ -127,6 +127,9 @@ def test_recurring_goal_skips_description_warning(running_daemon):
         "description": "x",  # short, but recurring
         "recurring": True,
         "interval_hours": 24,
+        # Recurring goals must carry offload_decision (operator-offload-gate,
+        # 1be14521f) — orthogonal to this test's description-warning assertion.
+        "offload_decision": "stays on LLM loop — health check needs contextual judgment, not an operator cron",
     }
     code, body = _add_goal(port, goal)
     assert code == 200
@@ -257,83 +260,6 @@ def test_route_to_header_forwarded(running_daemon, aspirations_write_module,
 
 
 # ---------------------------------------------------------------------------
-# stale-read blocker (only fires when parent_goal cited)
-# ---------------------------------------------------------------------------
-
-def test_stale_read_does_not_fire_without_parent_goal(running_daemon,
-                                                     aspirations_write_module,
-                                                     monkeypatch):
-    """Goal without parent_goal → stale-read gate is not invoked at all."""
-    _, port = running_daemon
-    called = {"n": 0}
-
-    def _track(*a, **kw):
-        called["n"] += 1
-        return {"would_block": False, "reason": "test"}
-
-    monkeypatch.setattr(aspirations_write_module,
-                        "_stale_read_eval", _track)
-
-    goal = {"title": "No parent", "status": "pending",
-            "origin_signal": "user_directive"}
-    code, _ = _add_goal(port, goal)
-    assert code == 200
-    assert called["n"] == 0
-
-
-def test_stale_read_blocks_on_gate_decision(running_daemon,
-                                            aspirations_write_module,
-                                            monkeypatch):
-    """Force the stale-read gate to block; daemon must return 400."""
-    _, port = running_daemon
-    fake = {
-        "would_block": True,
-        "reason": "synthetic stale read",
-        "parent_goal": "g-001-99",
-        "parent_last_modified": "2026-05-13T10:00:00",
-        "agent_last_read": "2026-05-13T09:00:00",
-        "override_applied": None,
-        "_fail_open": False,
-    }
-    monkeypatch.setattr(aspirations_write_module,
-                        "_stale_read_eval", lambda *a, **kw: fake)
-
-    goal = {"title": "Has parent", "status": "pending",
-            "origin_signal": "user_directive",
-            "parent_goal": "g-001-99"}
-    code, body = _add_goal(port, goal)
-    assert code == 400
-    err = json.loads(body)
-    assert err["error"] == "stale_read_blocked"
-    assert err["gate"] == "stale-read-gate"
-    # The daemon-only _fail_open key must NOT leak to the response
-    assert "_fail_open" not in err["gate_output"]
-
-
-def test_stale_read_override_header_forwarded(running_daemon,
-                                              aspirations_write_module,
-                                              monkeypatch):
-    _, port = running_daemon
-    captured = {}
-
-    def _capture(payload, **kw):
-        captured.update(kw)
-        return {"would_block": False, "reason": "override applied",
-                "_fail_open": False}
-
-    monkeypatch.setattr(aspirations_write_module,
-                        "_stale_read_eval", _capture)
-
-    goal = {"title": "Override stale", "status": "pending",
-            "origin_signal": "user_directive",
-            "parent_goal": "g-001-99"}
-    code, _ = _add_goal(port, goal,
-                       headers={"X-Mind-Override-Stale-Read": "irrelevant edit"})
-    assert code == 200
-    assert captured.get("override") == "irrelevant edit"
-
-
-# ---------------------------------------------------------------------------
 # scaffolded-exploration blocker
 # ---------------------------------------------------------------------------
 
@@ -393,7 +319,7 @@ def test_origin_signal_auto_derive_visible_to_later_gates(running_daemon):
     to 'unblock:<slug>'. Verify the persisted record reflects the patch.
 
     Also implicitly tests that pipeline order is correct: the goal must
-    survive all subsequent blockers (goal-duplication, stale-read,
+    survive all subsequent blockers (goal-duplication,
     scaffolded-exploration) and land in the file with the patched value.
     """
     project_root, port = running_daemon

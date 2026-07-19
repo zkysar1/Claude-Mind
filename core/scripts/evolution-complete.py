@@ -227,6 +227,32 @@ def _post_board_decision(entry):
     env = os.environ.copy()
     if agent:
         env["MIND_AGENT"] = agent
+    # Governed-root forwarding (0). board.py WRITES a governed store,
+    # so on own-cloud it needs WORLD_PATH/META_PATH in its env — without one,
+    # OwnCloudBackend.from_env() raises and the child exits 1 on its first write.
+    #
+    # Do NOT "fix" that by making from_env fall back to _paths: the raise is
+    # LOAD-BEARING. _fileops._lock_backend() catches it to detect a genuinely
+    # bare subprocess and select the LocalBackend local-lock fail-soft (),
+    # and three tests pin that contract (test_from_env_requires_a_world_or_meta_root,
+    # test_lock_backend_helper_returns_local_when_governed_root_absent,
+    # test_fallback_warns_once_per_process). Removing the raise silently disables
+    # the fail-soft — tried it, broke all three, reverted.
+    #
+    # This child is not a bare subprocess: it is our own helper invoked with our
+    # already-resolved roots, exactly as a sourced wrapper would be. Forward them.
+    # setdefault, not assignment — an inherited env value must keep winning.
+    #
+    # Without this, the post died behind ONE WARN on stderr and board_post_id was
+    # stamped null: 41 of 44 material Self edits never reached the decisions board
+    # (alpha 0/14, bravo 0/14, echo 0/2, delta 0/1, zeta 2/10).
+    try:
+        from _paths import WORLD_DIR, META_DIR
+        env.setdefault("WORLD_PATH", str(WORLD_DIR))
+        env.setdefault("META_PATH", str(META_DIR))
+    except Exception as _pe:  # resolution failure -> let board.py fail loudly
+        print(f"WARN: could not resolve governed roots for board-post child: {_pe!r}",
+              file=sys.stderr)
     try:
         result = subprocess.run(cmd, input=body, capture_output=True, text=True,
                                 env=env, timeout=20)
@@ -299,6 +325,8 @@ def _email_user(entry, event):
         "Title": subject,
         "InfoMessage": subject,
         "Body": body,
+        # Provenance stamp — email-send.sh refuses payloads without it (6).
+        "XPayloadProvenance": "evolution-complete/v1",
     }
     # email-send.sh lives at world/scripts/email-send.sh in the externally-mounted
     # world dir. Resolve via _paths.WORLD_DIR to honor MIND_WORLD env override.

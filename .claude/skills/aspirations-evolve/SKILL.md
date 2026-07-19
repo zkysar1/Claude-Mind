@@ -27,44 +27,36 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    ```
    Read core/config/developmental-stage.yaml (stage definitions, competence_mapping)
    Read agents/<agent>/developmental-stage.yaml (current assessment, epsilon, schema log)
-   leaves_json=$(bash core/scripts/tree-read.sh --leaves)
-   # Filter to entries where depth >= 2, extract capability_level from each
+   old_stage = agents/<agent>/developmental-stage.yaml.overall_stage
+   old_highest = agents/<agent>/developmental-stage.yaml.current_assessment.highest_capability
 
-   Compute tree_maturity (knowledge-tree maturity = mean capability_level of tree
-   leaves at depth >= 2). This is EVOLVE's metric — it drives overall_stage +
-   exploration epsilon. It is NOT the curriculum-gate metric: competence-assess.py
-   owns current_assessment.average_competence (4-component evidence formula) that
-   curriculum.yaml gates consume; evolve owns current_assessment.tree_maturity.
-   The two were split (g-115-2028) to end the shared-field last-writer-wins
-   collision that left average_competence with misattributed provenance
-   (producer/assessed_at claiming the script after evolve overwrote it) and a
-   threshold-oscillation risk on worlds where the two values straddle a gate:
-     competence_mapping: EXPLORE=0.15, CALIBRATE=0.45, EXPLOIT=0.70, MASTER=0.90
-     For each leaf at depth >= 2: map capability_level → numeric value
-     tree_maturity = mean(all competence values)
-     If no leaves at depth >= 2: tree_maturity = 0.0
+   # Stage-block computation is SCRIPT-ENFORCED (g-115-2624). The former inline
+   # formula here (tree-leaf capability mean at depth >= 2, competence_mapping
+   # EXPLORE=0.15/CALIBRATE=0.45/EXPLOIT=0.70/MASTER=0.90, stage bands
+   # 0.30/0.55/0.80, exploration_budget = clamp(1 - tree_maturity, 0.15, 0.85))
+   # now lives in core/scripts/_competence.py::assess_stage — the SAME math,
+   # deterministic and refreshed at every curriculum-evaluate chokepoint too.
+   # WHY: LLM-discretionary producers drift silent (rb-3171); this exact block
+   # fired once in 2 months on zeta, pinning ZDS agents at 'exploring' with
+   # forge gated and resolved_hypotheses contradicting its own sibling
+   # evidence (ZDS omni code-read 2026-07-18). The one call below computes AND
+   # writes: overall_stage, current_assessment.{stage,tree_maturity,
+   # highest_capability,lowest_capability,exploration_budget,
+   # resolved_hypotheses(=pipeline_resolved),average_competence,components,
+   # evidence,producer,assessed_at}, exploration.epsilon. Do NOT re-inline the
+   # math here.
+   Bash: py -3 core/scripts/competence-assess.py
+   Parse JSON stdout → stage_assessment.{stage, tree_maturity, highest_capability, exploration_budget}
 
-   Compute exploration_budget:
-     exploration_budget = max(0.15, min(0.85, 1.0 - tree_maturity))
+   If stage_assessment.highest_capability != old_highest:
+     Log: "DEVELOPMENTAL UPDATE: highest_capability → {stage_assessment.highest_capability}"
 
-   Determine stage label from tree_maturity:
-     exploring:  avg < 0.30
-     developing: 0.30 <= avg < 0.55
-     applying:   0.55 <= avg < 0.80
-     mastering:  avg >= 0.80
-
-   Also update highest_capability and lowest_capability:
-     # Use same leaves_json from above (already has all depth >= 2 nodes)
-     highest = max(leaf.capability_level for all leaves at depth >= 2)
-     lowest = min(leaf.capability_level for all leaves at depth >= 2)
-     If highest != agents/<agent>/developmental-stage.yaml.highest_capability:
-       Update highest_capability
-       Log: "DEVELOPMENTAL UPDATE: highest_capability → {highest}"
-
-   If stage has CHANGED since last check:
-     Update exploration_budget (epsilon)
+   If stage_assessment.stage != old_stage:
+     # Numbers are already written by the script; the LLM applies the
+     # stage-definition SIDE EFFECTS (behavioral envelope from
+     # core/config/developmental-stage.yaml stages.<stage>.behaviors):
      Update allowed hypothesis_types and max_commitment (per stage definition)
-     Log: "DEVELOPMENTAL TRANSITION: {old} → {new}"
+     Log: "DEVELOPMENTAL TRANSITION: {old_stage} → {stage_assessment.stage}"
 
    Metacognitive self-check (every 5th goal via sq-010):
      "Based on my knowledge, accuracy, and experience — what capability level am I at?
@@ -80,11 +72,13 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        Log as ASSIMILATION in schema_operations.log
 
    Update agents/<agent>/developmental-stage.yaml:
-     overall_stage, tree_maturity, exploration_budget, evidence
-     # evolve writes current_assessment.tree_maturity ONLY. It MUST NOT write
-     # current_assessment.average_competence — competence-assess.py owns that
-     # field for the curriculum gates. Writing both producers to average_competence
-     # was the g-115-2028 collision this split resolved.
+     schema_operations.log + equilibration_state ONLY (from the two blocks above).
+     # ALL numeric assessment fields (overall_stage, current_assessment.*,
+     # exploration.epsilon) are script-written by competence-assess.py — the
+     # single producer since g-115-2624. Evolve MUST NOT hand-write any of
+     # them; hand-writing re-creates the g-115-2028 last-writer-wins collision
+     # AND the rb-3171 silent-drift class this delegation eliminated. Evolve's
+     # write surface here is the schema_operations narrative alone.
 
    Run active forgetting pruning:
      Read core/config/memory-pipeline.yaml forgetting config
@@ -135,7 +129,9 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # elsewhere (S1 board posts, S9 l1-pick-log).
    #
    # Trigger conditions for filing a pending-question:
-   #   - The latest l1-skew-check board post had a flagged ratio > 10x
+   #   - The latest l1-skew-check board post carries a flagged finding
+   #     (flag_reason: dominance / share_creep / empty_l1 — g-115-2455
+   #     recalibration; ratio rides along as evidence, not the gate)
    #     AND no l1-taxonomy-* pending-question is currently open
    #   - OR the l1-pick-log shows the same NEW node-cluster going to one
    #     L1 repeatedly while not fitting siblings (signal for ADD)
@@ -181,8 +177,14 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    Bash: meta-read.sh encoding-strategy.yaml
    Bash: meta-cat.sh improvement-instructions.md
    Bash: meta-read.sh improvement-velocity.yaml  # last 20 entries
-   Bash: meta-impk.sh compute --window 10 --metric pipeline_accuracy
-   Bash: meta-impk.sh compute --window 10 --metric goal_completion_rate
+   # ONE call — the store holds a single per-goal learning_value series; the
+   # old two-metric form (--metric pipeline_accuracy / goal_completion_rate)
+   # returned identical output because --metric was decorative (g-115-2441).
+   # NOISE CAVEAT: entries before 2026-07-17 include false 0.0s from unflagged
+   # deep closes (the producer now SKIPS unmeasured closes instead of writing
+   # 0.0) — a "declining" direction whose window spans that era is suspect
+   # until ~20 measured closes flush it.
+   Bash: meta-impk.sh compute --window 10
 
    # AutoContext-inspired pre-evaluation checks
    # 1. Backpressure cooldown check — don't modify recently-rolled-back fields
@@ -211,7 +213,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        # Active HIGH weaknesses should inform meta-strategy changes
 
    # Evaluate: Are current meta-strategies working?
-   IF imp@k is declining (direction == "declining") for ANY tracked metric:
+   IF imp@k is declining (direction == "declining") on the learning_value series:
        Log: "META ALERT: improvement velocity declining — review needed"
        # Diagnose: Which strategy area is underperforming?
        # Cross-reference meta-log signals with velocity segments.
@@ -259,6 +261,10 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    velocity_window = plateau_detection.velocity_window (default 5)
    plateau_threshold = plateau_detection.plateau_threshold (default 0.2)
    diminishing_returns_window = plateau_detection.diminishing_returns_window (default 5)
+   # Maintenance queues (recurring-upkeep aspirations) carry plateau_exempt: true on
+   # their record — the trajectory compiler suppresses both flags for them (g-115-2387),
+   # so a trajectory.plateau_exempt==true never enters the branches below. Zero learning
+   # velocity is a maintenance queue's normal operating point, not a stalled direction.
 
    qualifying_asp_ids = [asp.id for asp in active_aspirations
                          where completed_goals >= velocity_window]
@@ -596,17 +602,41 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      so gate on BOTH. (Mirrors the `allow_meta_edits` contract check already used at Step 2's META
      EVAL above.) Log one line: `"FORGE CHECK: curriculum blocks allow_forge_skill at {stage_name} — skipping forge-ready loop"`.
    - **Forge-ready gap → goal creation**: Read `meta/skill-gaps.yaml`. For EACH gap where `status != "forged"`:
+     - **Registry cross-check (g-326-09 incident, 2026-07-16)**: before trusting `gap.status`,
+       grep `world/forged-skills.yaml` for `gap_ref: {gap.id}`. If a forged skill already
+       references this gap, the gap's `status: registered` is STALE (another agent forged it;
+       the local meta mirror served an old copy — observed 11 days stale for gap-006 despite a
+       daemon-routed read). SKIP the gap — do not file a forge goal. forged-skills.yaml is the
+       authoritative cross-agent registry; skill-gaps.yaml status is per-store and can lag.
+       (guard-1163 family: never act on a single possibly-stale read when the authoritative
+       registry is one grep away.)
      - Read `core/config/skill-gaps.yaml` → `forge_threshold` (default: 2)
      - Read `agents/<agent>/developmental-stage.yaml` → current stage
      - IF `gap.times_encountered >= forge_threshold`
           AND `gap.estimated_value >= "medium"`
           AND developmental stage >= EXPLOIT (developing+):
-       - Bash: load-aspirations-compact.sh → IF path returned: Read it (search compact data for this gap's ID)
-       - IF no pending forge goal exists:
+       - **Live-store dedup (g-115-2284 — replaces compact-search)**: the in-context compact is
+         doubly stale (context-read dedup serves an hours-old copy, and the compact renders from
+         the box's local mirror). Probe the live store instead:
+         - `Bash: aspirations-query.sh --goal-field origin_signal "idea:forge-ready-{gap.id}"`
+         - `Bash: aspirations-query.sh --title-contains "Forge skill: {gap.procedure_name}"`
+           (catches legacy datestamped origin_signal variants)
+         - IF either probe returns a pending/in-progress goal: SKIP this gap — duplicate exists.
+         - IF either probe ERRORS (non-zero exit or unparseable output): WARN loudly + SKIP this
+           gap — suppression gates fail CLOSED (guard-487). A missed filing re-detects next
+           evolve pass; a cross-box duplicate does not self-heal.
+       - IF both probes returned clean-empty (`[]`):
          - Route to target aspiration (current → matching category → `/create-aspiration from-self`)
          - Build goal: title `"Forge skill: {gap.procedure_name}"`,
-           skill `"/forge-skill"`, args `"skill {gap.id}"`, priority `"MEDIUM"`
+           skill `"/forge-skill"`, args `"skill {gap.id}"`, priority `"MEDIUM"`,
+           origin_signal EXACTLY `"idea:forge-ready-{gap.id}"` — canonical form, NO datestamp
+           suffix (a datestamped variant defeats the duplication-gate's Strategy-1 exact match
+           against the canonical form; g-115-2284 incident g-115-2279-vs-g-307-54)
          - Add via `aspirations-add-goal.sh` (goal JSON on stdin; asp-id as arg)
+         - **Post-filing read-back**: re-run the origin_signal probe above; only log
+           "forge goal filed" when the goal reads back (own-cloud can silently swallow the write
+           while echoing success — insight msg-20260714-213836-echo-3288). IF read-back empty:
+           WARN + retry the add once, then file-or-fail loudly.
          - Log: `echo '{"date":"...","event":"forge-ready","details":"Gap {gap.id} met criteria in evolve Phase 9.2","trigger_reason":"evolve-forge-check"}' | bash core/scripts/evolution-log-append.sh`
 
 ### Skill Curation (Step 9.5 — after forge check)
@@ -670,7 +700,10 @@ sources," which is an UPPER BOUND on real silence — under-logging (skill
 fires but neither skill-quality.yaml, co_invocation_log, nor journal.jsonl
 captures the call) is indistinguishable from genuine silence. The
 triage_hints emitted by the script already direct the agent to rule out
-under-logging in step 1; this is by design.
+under-logging in step 1; this is by design. For utility-type wrapper skills
+the under-logging is STRUCTURAL, not incidental — see the type-aware triage
+branch below and `meta/skill-discovery-strategy.yaml` → `type_triage` +
+`known_blind_spots` (g-115-2289).
 
 ```
 Bash: skill-discovery.sh flagged --action-required-only
@@ -695,6 +728,18 @@ FOR EACH skill in flagged.skills:
        (pending, in-progress, blocked) AND title contains any of
        ("silent", "discovery", "cold", "declining"):
         Log: "DISCOVERY AUDIT: {skill.skill} already has active follow-up — skipping"
+        continue
+
+    # Type-aware triage (g-115-2289, 2026-07-16): utility-type wrapper skills
+    # are exercised via direct Bash calls to their companion scripts — a usage
+    # mode invisible to ALL invocation sources including the skill-invocations
+    # ledger (the Skill tool never fires for a bash call). Zero counts are
+    # WEAK evidence for this type; do NOT file on measurement absence alone.
+    # Capability loss at the script layer is caught elsewhere (infra-health,
+    # loud failures in consuming goals). Policy + full blind-spot catalog:
+    # meta/skill-discovery-strategy.yaml → type_triage.utility, known_blind_spots.
+    IF skill.type == "utility" AND strategy.type_triage.utility.downgrade_action_required:
+        Log: "DISCOVERY AUDIT: {skill.skill} type=utility — flag downgraded to advisory (wrapper-mediated blind spot, g-115-2289); no goal filed on measurement absence. Verify companion-script health via infra-health / consuming goals if in doubt."
         continue
 
     # Map status → primitive + title. Primitives are encoded by title prefix
@@ -773,10 +818,11 @@ Signature Calibration above. Reads `meta/gate-firings.jsonl` +
 `core/config/gates.yaml` and produces per-gate recommendations.
 
 `bash core/scripts/gate-retirement-eval.sh --output json` → JSON with
-per-gate recommendation in {retire | tighten | widen | investigate | keep |
-insufficient_data | uninstrumented} plus the raw counts that justify it.
+per-gate recommendation in {retire | tighten | widen | investigate |
+inert_candidate | keep | insufficient_data | uninstrumented} plus the raw
+counts that justify it.
 
-For each `recommendation` in {retire, tighten, widen, investigate}:
+For each `recommendation` in {retire, tighten, widen, investigate, inert_candidate}:
 1. Append the full record to `meta/gate-eval-recommendations.jsonl`
    (append-only journal — preserves the recommendation lineage so trends
    over evolutions are visible). Append via:
@@ -791,6 +837,18 @@ For each `recommendation` in {retire, tighten, widen, investigate}:
    escaping.
 5. For `investigate`: file a HIGH-priority Investigate goal — fail_open
    means the gate code itself has a bug.
+6. For `inert_candidate`: file an Investigate goal to verify the gate is
+   truly inert and route it to retirement or telemetry re-enable. The
+   evaluator emits this when a prior retire/tighten/widen recommendation
+   rests on ZERO recent-window firings AND the gate's implementation was
+   modified after its last firing (see `evidence.inert_prior_recommendation`,
+   `evidence.last_firing_ts`, `evidence.gate_impl_modified_ts`) — the stale
+   recommendation describes a gate that no longer exists in that form. Do
+   NOT file the prior recommendation's goal type; quote the evidence fields
+   in the description. Goal title:
+   `"Investigate: gate {gate_id} appears inert — stale {prior_rec} recommendation"`.
+   (Canonical incident: stale-read-gate re-spawned duplicate tighten goals
+   g-115-1796 → g-115-2106 across evolutions after its firing lane went quiet.)
 
 Bounded: only one goal per gate per evolution pass. If a goal already
 exists for `{gate_id}` from a prior evolution, skip — wait for that goal

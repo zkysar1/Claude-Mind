@@ -16,6 +16,20 @@ Retirement signal: count(decision != "noop") in window.
 FP signal:         count(override) / (count(block) + count(override)).
 
 Contract: log() never raises. Telemetry must not break gates.
+
+Pytest suppression (g-248-102): log() is a silent no-op when
+PYTEST_CURRENT_TEST is set (pytest exports it for the duration of each test)
+UNLESS GATE_LOG_ALLOW_PYTEST is also set. Without this guard, any test that
+imports a gate module and exercises a classifier writes SYNTHETIC firings into
+the production gate-firings.jsonl, contaminating the noop/pass ratios the
+retirement evaluator scores (observed: test_target_state_check_positional.py
+leaked ~16 read-intent-verbs records per suite run since 2026-05-17; the first
+run of test_target_state_removal_intent.py wrote 17 removal-intent-verbs
+records — g-248-101 discovery). Tests that POSITIVELY assert on firing records
+(test_layer_d_telemetry.py) opt out via GATE_LOG_ALLOW_PYTEST=1 with their
+destination redirected to a tmp meta dir. The env guard covers in-process
+imports and subprocess children (both inherit pytest's environment); hermetic
+daemon fixtures are covered separately by their tmp project-root isolation.
 """
 
 import datetime as _dt
@@ -31,6 +45,24 @@ from _fileops import locked_append_jsonl
 
 _SCHEMA_VERSION = 1
 _VALID_DECISIONS = ("noop", "pass", "block", "override", "fail_open")
+
+# Own-cloud spool lane (5). Under STORAGE_BACKEND=own-cloud a direct
+# locked_append_jsonl on gate-firings.jsonl is a whole-object S3
+# read-modify-write — measured 3.8-10.1s per append at 38-40MB/~118k records,
+# paid by EVERY instrumented gate on EVERY decision including noop. The spool
+# makes the hot path O(1): append one line to a machine-local spool file
+# (lockless O_APPEND, same idiom as _fileops._record_fallback_hit — sub-4KB
+# single-line writes; a torn line is harmless, the flusher skips it), and
+# gate-firings-flush.py (iteration-close maintenance tick) batches the spool
+# into the shared store with ONE locked RMW per flush. The spool basename is
+# in owncloud_sync._EXCLUDE_NAMES — never synced, never refresh-clobbered.
+# Local/other backends keep the direct locked append: it is a cheap raw local
+# append there, and tests (GATE_LOG_ALLOW_PYTEST) assert on the store file.
+_SPOOL_NAME = "gate-firings.spool.jsonl"
+
+
+def _spool_active():
+    return _os.environ.get("STORAGE_BACKEND", "").strip().lower() == "own-cloud"
 
 
 def _hash_payload(payload):
@@ -88,6 +120,12 @@ def log(
                   daemon. Omit elsewhere.
     """
     try:
+        # Pytest suppression () — see module docstring. Checked inside
+        # the try so the never-raises contract stays airtight.
+        if (_os.environ.get("PYTEST_CURRENT_TEST")
+                and not _os.environ.get("GATE_LOG_ALLOW_PYTEST")):
+            return
+
         if decision not in _VALID_DECISIONS:
             extra = dict(extra or {})
             extra["_invalid_decision_received"] = str(decision)
@@ -115,7 +153,13 @@ def log(
             record["extra"] = extra
 
         dest = (meta_dir if meta_dir is not None else META_DIR)
-        locked_append_jsonl(dest / "gate-firings.jsonl", record)
+        if _spool_active():
+            # O(1) hot path: one lockless local append; the flush tick
+            # batches records into the shared store (see _SPOOL_NAME note).
+            with open(dest / _SPOOL_NAME, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(record, ensure_ascii=True) + "\n")
+        else:
+            locked_append_jsonl(dest / "gate-firings.jsonl", record)
     except Exception:
         return
 

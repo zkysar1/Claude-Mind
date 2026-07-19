@@ -68,6 +68,23 @@ exp_file = sys.argv[1]
 threshold_h = float(sys.argv[2])
 agent_name = sys.argv[3]
 
+# 6: route the freshness read through the storage backend. On
+# own-cloud boxes the authoritative store is S3 and the local file is only
+# write-through-current on the box whose daemon last appended — a lagging
+# mirror yields phantom staleness (observed 8-day divergence -> false
+# force_experience_archival sentinel). refresh() pulls the latest remote
+# state before the read; no-op on LocalBackend. Fail-open: any backend
+# error falls back to the raw local read (pre-fix behavior).
+try:
+    _pr = os.environ.get("PROJECT_ROOT", "").rstrip("/")
+    if _pr:
+        sys.path.insert(0, os.path.join(_pr, "core", "scripts"))
+    from pathlib import Path as _Path
+    from storage_backend import get_backend
+    get_backend().refresh(_Path(exp_file))
+except Exception:
+    pass
+
 last_ts = None
 last_id = None
 

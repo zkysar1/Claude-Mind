@@ -12,8 +12,13 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import boto3
 import pytest
+
+# Optional deps: on boxes without the AWS test stack, skip this module instead
+# of interrupting collection for the entire mind_api suite (a bare
+# ModuleNotFoundError at import time aborts pytest collection wholesale).
+boto3 = pytest.importorskip("boto3", reason="boto3 not installed")
+moto = pytest.importorskip("moto", reason="moto (AWS mock) not installed")
 from botocore.exceptions import ClientError
 from moto import mock_aws
 

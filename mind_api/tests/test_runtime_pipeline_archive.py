@@ -144,15 +144,34 @@ def test_archive_sweep_single(archive_daemon):
     resp = json.loads(body)
     assert resp["archived_count"] == 1
 
-    # Removed from live
+    # 6: stays in live as a stage=archived tombstone with a prune
+    # clock (the own-cloud union-by-id merge cannot express a cross-file
+    # removal, so the stage flip converges fleet-wide before the prune).
     live_items = _read_jsonl(live)
-    assert len(live_items) == 0
+    assert len(live_items) == 1
+    assert live_items[0]["stage"] == "archived"
+    assert live_items[0]["archived_date"] == date.today().isoformat()
 
     # Appended to archive
     archive_items = _read_jsonl(archive)
     assert len(archive_items) == 1
     assert archive_items[0]["id"] == "2026-05-01_sweep-test"
     assert archive_items[0]["stage"] == "archived"
+
+    # Age the tombstone past PRUNE_GRACE_DAYS (14) and re-sweep: the live
+    # copy is physically pruned; the archive copy is untouched.
+    aged = dict(live_items[0])
+    aged["archived_date"] = (date.today() - timedelta(days=15)).isoformat()
+    live.write_text(json.dumps(aged) + "\n", encoding="utf-8")
+
+    status, body = _post(port, "/v1/pipeline/archive-sweep")
+    assert status == 200
+    resp = json.loads(body)
+    assert resp["archived_count"] == 0
+    assert resp["pruned_count"] == 1
+    assert _read_jsonl(live) == []
+    archive_items = _read_jsonl(archive)
+    assert len(archive_items) == 1  # still exactly one deduped copy
 
 
 # ---------------------------------------------------------------------------
@@ -178,17 +197,21 @@ def test_archive_sweep_mixed(archive_daemon):
     resp = json.loads(body)
     assert resp["archived_count"] == 2
 
+    # 6: swept records stay in live as stage=archived tombstones;
+    # ineligible records keep their stage.
     live_items = _read_jsonl(live)
-    live_ids = {r["id"] for r in live_items}
-    assert "2026-05-10_recent" in live_ids
-    assert "2026-05-10_active" in live_ids
-    assert "2026-04-01_old-one" not in live_ids
-    assert "2026-04-02_old-two" not in live_ids
+    by_id = {r["id"]: r for r in live_items}
+    assert by_id["2026-05-10_recent"]["stage"] == "resolved"
+    assert by_id["2026-05-10_active"]["stage"] == "active"
+    assert by_id["2026-04-01_old-one"]["stage"] == "archived"
+    assert by_id["2026-04-02_old-two"]["stage"] == "archived"
 
     archive_items = _read_jsonl(archive)
     archive_ids = {r["id"] for r in archive_items}
     assert "2026-04-01_old-one" in archive_ids
     assert "2026-04-02_old-two" in archive_ids
+    assert "2026-05-10_recent" not in archive_ids
+    assert "2026-05-10_active" not in archive_ids
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +264,7 @@ def test_archive_sweep_idempotent(archive_daemon):
 def test_archive_sweep_history_created(archive_daemon):
     project_root, port = archive_daemon
     live = project_root / "world" / "pipeline.jsonl"
-    history_dir = project_root / "world" / ".history" / "pipeline.jsonl"
+    history_dir = project_root / "world" / ".history" / "snapshots" / "pipeline.jsonl"
 
     rec = _valid_rec(outcome_date=_old_date())
     live.write_text(json.dumps(rec) + "\n", encoding="utf-8")

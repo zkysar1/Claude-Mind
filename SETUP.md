@@ -17,7 +17,7 @@ proceed if anything is missing — but it's friendlier to install them up front.
 
 | What | Why | How |
 |------|-----|-----|
-| **Python 3.8 or newer** | The framework's scripts and the local helper daemon are Python. | https://www.python.org/downloads/ (on Windows, check "Add to PATH" during install) |
+| **Python 3.10 or newer** | The framework's scripts and the local helper daemon are Python (they use PEP 604 union-type annotations, which require 3.10+). | https://www.python.org/downloads/ (on Windows, check "Add to PATH" during install) |
 | **PyYAML** | Reads the framework's config files. | `pip install pyyaml` (or `py -3 -m pip install pyyaml` on Windows) |
 | **bash 4 or newer** | Shell scripts. Already present on macOS and Linux. | On Windows: install **Git for Windows** (which bundles bash 5.x). Same install gives you git, which is optional but helpful. |
 | **Claude Code** | The UI you'll type slash-commands into. | https://claude.ai/code or the desktop app |

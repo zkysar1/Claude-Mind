@@ -5,19 +5,22 @@ agent edits an IN-SCOPE file it has NOT Read in the current session.
 
 The gate delegates its read/scope/session decision to
 `context-reads.py check-file`, which is the single source of truth for which
-path classes are tracked (is_in_scope: core/config, .claude/skills,
-world/knowledge/tree, world/conventions, aspirations-compact.json). The
-advisory therefore fires ONLY for in-scope files — editing an out-of-scope
-file (core/scripts, .claude/rules, self.md, product code) stays silent so
-the banner never cries wolf on reads the manifest can't track.
+path classes are advisory-tracked (is_in_scope_advisory: core/config,
+.claude/skills, world/knowledge/tree, world/conventions,
+aspirations-compact.json, AND core/scripts framework code — g-115-2210). The
+advisory therefore fires ONLY for in-scope files — editing a still-out-of-scope
+file (.claude/rules, self.md, product code) stays silent so the banner never
+cries wolf on reads the manifest can't track.
 
 Tests:
   - Always exits 0 (never blocks, never denies)
   - Never emits stdout (would be read as a deny payload by Claude Code)
   - Graceful on missing/empty/malformed stdin
-  - IN-SCOPE + unread  -> stderr advisory fires
-  - IN-SCOPE + read     -> silent (manifest has the path)
-  - OUT-OF-SCOPE        -> silent (scope-aware; the regression this guards)
+  - IN-SCOPE + unread   -> stderr advisory fires
+  - IN-SCOPE + read      -> silent (manifest has the path)
+  - core/scripts + unread -> advisory fires (advisory scope, g-115-2210)
+  - core/scripts + read   -> silent (symmetry)
+  - OUT-OF-SCOPE (.claude/rules) -> silent (scope-aware; the regression this guards)
 
 Run: py -3 -m pytest core/scripts/tests/test_pre_edit_context_gate.py -v
   or: py -3 core/scripts/tests/test_pre_edit_context_gate.py
@@ -46,7 +49,10 @@ from _bash_helpers import BASH  # noqa: E402
 
 # Real in-scope / out-of-scope files in this repo (used by scope tests).
 IN_SCOPE_FILE = PROJECT_ROOT / ".claude" / "skills" / "respond" / "SKILL.md"
-OUT_OF_SCOPE_FILE = SCRIPT_DIR / "iteration-close.sh"
+# core/scripts is advisory-tracked since 0 (framework-code edit surface).
+CORE_SCRIPTS_FILE = SCRIPT_DIR / "iteration-close.sh"
+# Genuinely still-out-of-scope: .claude/rules stays silent-by-design (Rule 4).
+OUT_OF_SCOPE_FILE = PROJECT_ROOT / ".claude" / "rules" / "read-before-edit.md"
 
 # A throwaway agent name that no real session uses. Created under the real
 # PROJECT_ROOT so _paths.sh fully resolves (real core/ tree present), torn
@@ -163,16 +169,37 @@ def test_silent_when_in_scope_file_already_read():
 
 
 def test_silent_when_out_of_scope_file():
-    """Out-of-scope file (core/scripts/*.sh) -> silent even when unread.
+    """Out-of-scope file (.claude/rules/*.md) -> silent even when unread.
 
     This is the regression guard: the manifest never records reads of
     out-of-scope files, so warning there would be a guaranteed false
-    positive. The gate must stay silent."""
+    positive. The gate must stay silent. (.claude/rules is the still-silent
+    surface after g-115-2210 moved core/scripts into advisory scope.)"""
     with _throwaway_agent(manifest_paths=[]) as env:
         rc, stdout, stderr = _run_gate(_make_hook_json(str(OUT_OF_SCOPE_FILE)), env=env)
     assert rc == 0
     assert "ADVISORY" not in stderr, (
         f"Out-of-scope file must be silent (scope-aware). stderr={stderr!r}")
+
+
+def test_advisory_when_core_scripts_unread():
+    """core/scripts framework code IS advisory-tracked since 0 — an
+    unread script edit MUST fire the advisory (the whole point of the goal)."""
+    with _throwaway_agent(manifest_paths=[]) as env:
+        rc, stdout, stderr = _run_gate(_make_hook_json(str(CORE_SCRIPTS_FILE)), env=env)
+    assert rc == 0
+    assert "ADVISORY" in stderr, (
+        f"core/scripts edit must fire advisory (g-115-2210). stderr={stderr!r}")
+    assert "has not been Read" in stderr
+
+
+def test_silent_when_core_scripts_already_read():
+    """core/scripts file present in manifest -> no advisory (symmetry check)."""
+    with _throwaway_agent(manifest_paths=[CORE_SCRIPTS_FILE]) as env:
+        rc, stdout, stderr = _run_gate(_make_hook_json(str(CORE_SCRIPTS_FILE)), env=env)
+    assert rc == 0
+    assert "ADVISORY" not in stderr, (
+        f"core/scripts already read must be silent. stderr={stderr!r}")
 
 
 def test_advisory_when_session_mismatch():
@@ -197,6 +224,8 @@ if __name__ == "__main__":
         ("advisory_when_in_scope_file_unread", test_advisory_when_in_scope_file_unread),
         ("silent_when_in_scope_file_already_read", test_silent_when_in_scope_file_already_read),
         ("silent_when_out_of_scope_file", test_silent_when_out_of_scope_file),
+        ("advisory_when_core_scripts_unread", test_advisory_when_core_scripts_unread),
+        ("silent_when_core_scripts_already_read", test_silent_when_core_scripts_already_read),
         ("advisory_when_session_mismatch", test_advisory_when_session_mismatch),
     ]
     failures = 0

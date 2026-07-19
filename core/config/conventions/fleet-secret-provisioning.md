@@ -92,6 +92,55 @@ distinct home). The provisioner (`.env.local`) and the clone-home step (framewor
 + agent repo) together stand up a complete node from the single bootstrap secret.
 Encoded as `guard-131` (clone-home-repo).
 
+## GitHub write-access lane (`provision-github-from-vault.sh`)
+
+The `.env.local` lane above self-services a container's daemon credentials. A
+second secret-bearing prerequisite is **git push access**: a fleet container that
+runs an agent must be able to push that agent's state to the fleet repo. Before
+this lane, that write access was granted by a human (the prod operator) holding
+repo-admin and registering each container's deploy key by hand — a single point
+of failure (no new container can get write access while that operator is absent
+or de-authed). The GitHub lane makes write access self-serviced from the SAME
+bootstrap vault, exactly as `.env.local` is.
+
+Mechanism (per agent, at container bring-up — the same five-step shape as the
+`.env.local` lane, retargeted at a GitHub deploy key):
+
+1. **Read one token in-memory** — the provisioner reaches the vault via the same
+   bootstrap-key path and reads a single dedicated entry,
+   `<PREFIX>_FLEET_GH_DEPLOYKEY_ADMIN_TOKEN` (a fine-grained credential scoped to
+   `Administration:read/write` on ONLY the fleet repos — never a broad personal
+   token). The token stays in a shell variable, is passed to `curl` via
+   `--config` stdin (never argv/proc), and never touches disk.
+2. **Generate the agent's own keypair** — an `ed25519` pair at
+   `<SSH_KEY_DIR>/<agent>_deploy` (private key mode 600) if absent. Per-agent keys
+   preserve attribution + independent revocability.
+3. **Self-register as a WRITE deploy key** — `GET /repos/<repo>/keys` then
+   `POST` with `read_only:false` via the raw REST API (no `gh` install needed on
+   containers). Idempotent: skip when our key MATERIAL is already registered.
+   GitHub's `read_only` flag is authoritative for write-status (never a
+   key-name heuristic — guard-133); a pre-existing READ-ONLY registration of the
+   same material is a clear WARN + non-zero (deleting a deploy key is a
+   destructive, operator-gated op left to the operator — guard-1021,
+   archive-before-delete), not an auto-delete.
+4. **Route ssh** — ensure `<SSH_KEY_DIR>/config` sends `Host github.com` through
+   the deploy key (`IdentitiesOnly yes`), appended exactly once.
+5. **Verify values-blind** — print the deploy-key title + registration state,
+   NEVER the token, NEVER the private key.
+
+**Dormant-but-ready.** The production PAT is minted (GitHub web UI, human-only)
+and seeded into the vault ZDS-side by the prod operator + user — out of scope
+for the framework. The provisioner ships READY: when the vault has no token entry
+it prints a clear skip and exits 0, so bring-up never breaks; it activates the
+moment the entry appears. This preserves invariant 1 (single pre-seeded secret):
+the bootstrap key remains the only manual per-container secret; the deploy-key
+admin token lives once in the shared vault, not per-container.
+
+All seven invariants above apply unchanged (in-memory only, never print values,
+mode 600, FROM-state guard via the pubkey-already-registered idempotency check,
+values-blind verify). The env-prefix mapping contract (invariant 7) governs the
+vault key name.
+
 ## Secrets hygiene (non-negotiable)
 
 This capability handles credentials; every rule in
@@ -114,12 +163,14 @@ Fleet-node bring-up composes three framework pieces:
 |------|-------------------|------------------|
 | Plant the mind | `core/scripts/seed-transplant.sh` (`/seed plant`) | framework code + seeded state onto the destination |
 | Clone the home repo | guard-131 clone-home principle | the hosting agent's private repo |
-| **Provision secrets** | **this capability** (the provisioner script) | the mode-600 `.env.local` from one bootstrap key |
+| **Provision secrets** | **this capability** (`provision-from-vault.sh`) | the mode-600 `.env.local` from one bootstrap key |
+| **Provision GitHub write** | **the GitHub lane** (`provision-github-from-vault.sh`) | a per-agent WRITE deploy key so the container can `git push` — no agent holding repo-admin |
 
 The provisioner is the credential-bootstrap step — orthogonal to seed-plant (which
 carries no secrets) and to clone-home (which carries code). Run order on a cold
-node: provision secrets → (framework/home present) → daemon boots with a complete
-env.
+node: seed-transplant → clone-home → **provision-from-vault** (`.env.local`) →
+**provision-github-from-vault** (write deploy key) → daemon boots with a complete
+env AND push access.
 
 ## Domain routing (why this file is domain-free and the script is not)
 

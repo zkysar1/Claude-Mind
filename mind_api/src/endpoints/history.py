@@ -23,9 +23,10 @@ DAEMON-SAFE (base_dir is a parameter): _history_store.{restore,_read_manifest}.
 byte_compat:
   - list/diff: read-only; body == CLI STDOUT.
   - restore: the RESTORED file gets the exact snapshot bytes. Side-effects: a
-    before-restore snapshot via mind_api.src.history.snapshot (LEGACY format —
-    pre-existing divergence from the CLI's CAS-delta save_history, inherited by
-    ALL daemon write side-effects, NOT introduced here) + changelog.append
+    before-restore snapshot via mind_api.src.history.snapshot (CAS-delta
+    format since g-115-2407 — mind_api.src.history now delegates to
+    _fileops.save_history, closing the legacy-format divergence that
+    previously applied to ALL daemon write side-effects) + changelog.append
     action='restore'. Lock uses stale_seconds=10 (restore-specific override).
     Agent attribution falls back to 'restore' (NOT 'system') to match the CLI's
     os.environ.get('MIND_AGENT', 'restore'). Header is CONDITIONAL: required

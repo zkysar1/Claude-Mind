@@ -145,6 +145,87 @@ def test_missing_env_local_fast_exits(tmp_path):
     assert "would push" not in r.stdout
 
 
+# --- 7: environment-registry backend gate ----------------------------
+# Env-config deployments set ONLY ENVIRONMENT_ID in .env.local; the daemon
+# derives STORAGE_BACKEND from core/config/environments/<id>.yaml. The shim's
+# old gate grepped .env.local alone, so it silently fast-exited on every such
+# box (proven cc-02 2026-07-16) — every governed write waited for the ~120s
+# sweep, breeding both-moved conflict freezes. These tests pin the fallback
+# chain against the COMMITTED registry files (deterministic, no S3/creds).
+
+
+def _run_shim_env_id(tmp_path, *, env_lines, file_path, world):
+    """Like _run_shim but with arbitrary .env.local content (no STORAGE_BACKEND)."""
+    env_local = tmp_path / "env.local"
+    env_local.write_text(env_lines, encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("STORAGE_BACKEND", None)
+    env["OWNCLOUD_PUSH_HOOK_ENV_LOCAL"] = str(env_local)
+    env["OWNCLOUD_PUSH_HOOK_DRYRUN"] = "1"
+    env["MIND_WORLD"] = str(world)
+    payload = json.dumps({"tool_input": {"file_path": file_path}})
+    return subprocess.run(
+        [BASH, str(SHIM)], input=payload, capture_output=True, text=True,
+        env=env, timeout=60, cwd=str(PROJECT_ROOT))
+
+
+def test_environment_id_owncloud_registry_gates_open(tmp_path):
+    """ENVIRONMENT_ID → registry backend: own-cloud → push-eligible."""
+    world = tmp_path / "world"
+    world.mkdir()
+    target = world / "x.md"
+    target.write_text("x\n", encoding="utf-8")
+    r = _run_shim_env_id(
+        tmp_path, env_lines="ENVIRONMENT_ID=ayoai-mind\n",
+        file_path=str(target), world=world)
+    assert r.returncode == 0
+    assert "would push" in r.stdout, (
+        f"env-config own-cloud deployment must be push-eligible; "
+        f"stdout={r.stdout!r} stderr={r.stderr!r}")
+
+
+def test_environment_id_local_registry_fast_exits(tmp_path):
+    """ENVIRONMENT_ID → registry backend: local → fast-exit."""
+    world = tmp_path / "world"
+    world.mkdir()
+    target = world / "x.md"
+    target.write_text("x\n", encoding="utf-8")
+    r = _run_shim_env_id(
+        tmp_path, env_lines="ENVIRONMENT_ID=local\n",
+        file_path=str(target), world=world)
+    assert r.returncode == 0
+    assert "would push" not in r.stdout
+
+
+def test_explicit_backend_wins_over_environment_id(tmp_path):
+    """Legacy explicit STORAGE_BACKEND=local beats an own-cloud registry entry
+    (setdefault precedence, mirroring _apply_environment_registry)."""
+    world = tmp_path / "world"
+    world.mkdir()
+    target = world / "x.md"
+    target.write_text("x\n", encoding="utf-8")
+    r = _run_shim_env_id(
+        tmp_path,
+        env_lines="STORAGE_BACKEND=local\nENVIRONMENT_ID=ayoai-mind\n",
+        file_path=str(target), world=world)
+    assert r.returncode == 0
+    assert "would push" not in r.stdout
+
+
+def test_unknown_environment_id_fast_exits(tmp_path):
+    """ENVIRONMENT_ID with no matching registry file → no backend → fast-exit
+    (fail-open, guard-141: never block the edit on a config gap)."""
+    world = tmp_path / "world"
+    world.mkdir()
+    target = world / "x.md"
+    target.write_text("x\n", encoding="utf-8")
+    r = _run_shim_env_id(
+        tmp_path, env_lines="ENVIRONMENT_ID=no-such-env-zzz\n",
+        file_path=str(target), world=world)
+    assert r.returncode == 0
+    assert "would push" not in r.stdout
+
+
 # --- 7: PostToolUse hook-ordering invariant --------------------------
 # Restores the coverage the 3 merge dropped when it retired
 # test_sync_governed_write.py — the ONLY prior test of the wiring-order

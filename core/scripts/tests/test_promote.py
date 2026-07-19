@@ -158,6 +158,30 @@ def test_shell_target_not_a_dir_exit1(tmp_path):
     assert r.returncode == 1
 
 
+def _release_chain_divergent() -> bool:
+    """True when this box's RELEASES.json newest entry != __version__ — the
+    promote preflight refuses with 'RELEASES.json not current' BEFORE reaching
+    the error paths the two live-repo shell tests below assert (unsynced
+    satellite box, merge deferred; g-115-1940). Fail-open on read errors."""
+    try:
+        nv = L.newest_version(L.load_releases(str(PROJECT_ROOT / "RELEASES.json")))
+        txt = (PROJECT_ROOT / "mind_api" / "src" / "__init__.py").read_text(encoding="utf-8")
+        ver = next((ln.split('"')[1] for ln in txt.splitlines()
+                    if ln.startswith("__version__") and '"' in ln), None)
+        return bool(nv and ver and nv != ver)
+    except Exception:
+        return False
+
+
+_live_release_chain_synced = pytest.mark.skipif(
+    _release_chain_divergent(),
+    reason="release chain anchor divergent on this box (RELEASES.json newest "
+           "!= __version__) — promote preflight fails before the tested "
+           "behavior; sync/merge the box to re-enable (g-115-1940)",
+)
+
+
+@_live_release_chain_synced
 def test_shell_target_missing_init_exit1(tmp_path):
     bare = tmp_path / "bare"; bare.mkdir()
     r = run_promote("--target", str(bare), "--dry-run")
@@ -165,6 +189,7 @@ def test_shell_target_missing_init_exit1(tmp_path):
     assert "__init__.py" in r.stderr
 
 
+@_live_release_chain_synced
 def test_shell_invariant_violation_higher_target_exit1(tmp_path):
     """CW2: cannot promote BACKWARDS — target ahead of local is refused."""
     tgt = _mk_target(tmp_path, "99.0.0")
@@ -259,8 +284,13 @@ def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool
     (src / "mind_api" / "src").mkdir(parents=True)
     # check-releases-current.sh is REQUIRED here: promote Step 1a delegates the
     # RELEASES.json check to it (1, single role-aware checker).
+    # promotion-preflight.{sh,py} are REQUIRED since 9 wired the
+    # reconcile-not-mirror drift gate into promote Step 3b (real gate, no stub
+    # — the fixture source/target are framework-path subsets so it runs CLEAN,
+    # and its weights-contract check self-skips: no goal-selector.py in the copy).
     for name in ("promote-to-upstream.sh", "_paths.sh", "_release_lib.py",
-                 "check-releases-current.sh"):
+                 "check-releases-current.sh", "promotion-preflight.sh",
+                 "promotion-preflight.py"):
         shutil.copy(CORE_SCRIPTS / name, src / "core" / "scripts" / name)
     (src / "core" / "scripts" / "seed-preflight.sh").write_text(_STUB_OK, encoding="utf-8")
     (src / "core" / "scripts" / "seed-verify.sh").write_text(_STUB_OK, encoding="utf-8")
@@ -515,6 +545,9 @@ def test_shell_dry_run_lower_target_ok(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "[dry-run] OK" in r.stdout
     assert "would: seed-transplant.sh" in r.stdout  # would, not did
+    # 1: pin that the Step 3b reconcile-not-mirror drift gate RAN on the
+    # happy path — removing the promotion-preflight invocation must fail here.
+    assert "promotion-preflight: CLEAN" in r.stdout
     # The target was NOT mutated by the dry-run.
     assert (tgt / "mind_api" / "src" / "__init__.py").read_text(encoding="utf-8").strip() \
         == f'__version__ = "{below}"'

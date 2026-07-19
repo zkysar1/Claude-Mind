@@ -9,15 +9,17 @@
 #
 # Scope: delegates the read/scope/session decision to
 #   context-reads.py check-file
-# which is the SINGLE SOURCE OF TRUTH for (a) what path classes are tracked
-# (is_in_scope: core/config, .claude/skills, world/knowledge/tree,
-# world/conventions, aspirations-compact.json) and (b) session-scoped
-# tracked-set membership. The advisory therefore fires ONLY for files the
-# context-reads manifest can actually have signal about — editing an
-# out-of-scope file (core/scripts, .claude/rules, self.md, product code)
-# stays SILENT rather than crying wolf (a read of those is never recorded,
-# so a "has not been Read" warning there would be a guaranteed false
-# positive that desensitizes the agent to the banner).
+# which is the SINGLE SOURCE OF TRUTH for (a) what path classes are advisory-
+# tracked (is_in_scope_advisory: core/config, .claude/skills,
+# world/knowledge/tree, world/conventions, aspirations-compact.json, AND
+# core/scripts framework code — 0) and (b) session-scoped tracked-set
+# membership. The advisory therefore fires ONLY for files the context-reads
+# manifest can actually have signal about — editing a still-out-of-scope file
+# (.claude/rules, self.md, product code) stays SILENT rather than crying wolf
+# (a read of those is never recorded, so a "has not been Read" warning there
+# would be a guaranteed false positive that desensitizes the agent to the
+# banner). core/scripts reads ARE recorded (advisory scope) but are never
+# re-read-BLOCKED — the blocking dedup gate keeps the narrow is_in_scope.
 #
 # check-file prints the target path to STDOUT iff it is in-scope AND not
 # yet read this session — exactly the warn condition. We CAPTURE that stdout

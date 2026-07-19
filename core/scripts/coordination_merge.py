@@ -50,7 +50,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Callable, Dict, List, Optional
+import sys
+from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -110,10 +111,31 @@ def _dump_jsonl(records: List[dict]) -> bytes:
                     for r in records)).encode("utf-8")
 
 
+def _commutative_key_order(a: dict, b: dict, out: dict) -> dict:
+    """Make a field-merged record's KEY ORDER side-independent when the two
+    sides' key sequences diverged (g-115-2341). ``out = dict(a)`` + appended
+    b-only keys inherits a's insertion order, so when a and b carry DIFFERENT
+    key sequences — one side added a new field, or their on-disk orders already
+    differ — merge(a, b) and merge(b, a) emit identical VALUES in different
+    ORDER. _dump_jsonl serializes insertion order, so the bytes never settle
+    and the fenced-PUT loop ping-pongs (guard-907 byte-commutativity violated
+    in this corner; no data loss, pure churn). Diverged records are emitted in
+    sorted-key order — side-independent AND self-healing: the next round sees
+    identical key sequences on both sides and takes the order-preserving path.
+    Records whose key sequences already MATCH keep their on-disk order, so
+    untouched records never re-order (no blanket-sort churn — the reason
+    _dump_jsonl must NOT pass sort_keys)."""
+    if list(a.keys()) == list(b.keys()):
+        return out
+    return {k: out[k] for k in sorted(out)}
+
+
 def _merge_counters(a: dict, b: dict) -> dict:
     """Merge two utilization-counter dicts: union keys, MAX on numeric values
     (a counter only grows — max never loses an increment), content tiebreak
-    otherwise. Commutative."""
+    otherwise. Commutative (nested key order canonicalized on divergence —
+    these dicts serialize inside their parent record, so their insertion
+    order reaches the bytes too)."""
     out = dict(a)
     for k, vb in b.items():
         if k not in out:
@@ -125,7 +147,7 @@ def _merge_counters(a: dict, b: dict) -> dict:
                 out[k] = max(va, vb)
             elif va != vb:
                 out[k] = va if _canon(va) >= _canon(vb) else vb
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def _merge_rb_record(a: dict, b: dict) -> dict:
@@ -134,7 +156,9 @@ def _merge_rb_record(a: dict, b: dict) -> dict:
       - status:      a retire is a deliberate, monotonic action -> retired-dominates
       - utilization: per-counter MAX (see _merge_counters)
       - valid_to:    a set retirement bound dominates a null; else newer wins
-      - everything else: deterministic content tiebreak (larger canon)."""
+      - everything else: deterministic content tiebreak (larger canon)
+      - key order:   canonicalized when the sides' key sequences diverged
+        (_commutative_key_order — byte-commutativity on distinct-key adds)."""
     out = dict(a)
     for k, vb in b.items():
         if k not in out:
@@ -157,7 +181,7 @@ def _merge_rb_record(a: dict, b: dict) -> dict:
                 out[k] = va if _newer(va, vb) or (va == vb) else vb
         else:
             out[k] = va if _canon(va) >= _canon(vb) else vb
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
@@ -206,16 +230,44 @@ def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
             groups[ident] = {"rec": dict(rec), "ids": {rec.get("id")}}
             order.append(ident)
         else:
-            g["rec"] = record_merge_fn(g["rec"], rec)
+            prev = g["rec"]
+            merged = record_merge_fn(prev, rec)
+            # Displacement tombstone is STICKY through the field-merge
+            # (7, mirrors _merge_goal): the per-store merge fn's LWW
+            # base may be the stale pre-displacement copy lacking the field.
+            # Union symmetrically (both-set -> lexicographic min) and
+            # re-canonicalize key order when the field had to be re-added —
+            # the per-store fn already emitted sorted keys for diverged sides
+            # (_commutative_key_order), and an append would break that.
+            da, db = prev.get("displaced_from"), rec.get("displaced_from")
+            tomb = (min(da, db) if isinstance(da, str) and isinstance(db, str)
+                    else da if isinstance(da, str) else db)
+            if isinstance(tomb, str) and merged.get("displaced_from") != tomb:
+                merged = dict(merged)
+                merged["displaced_from"] = tomb
+                merged = {k: merged[k] for k in sorted(merged)}
+            g["rec"] = merged
             g["ids"].add(rec.get("id"))
 
     # 2. Each logical record's preferred id = the SMALLEST numeric id it was seen
-    #    under (a re-id'd record settles back to its lowest id; deterministic).
+    #    under (a re-id'd record settles back to its lowest id; deterministic) —
+    #    UNLESS the record carries a displacement tombstone (7, mirrors
+    #    _merge_goals): then its LATEST settled displacement slot is preferred,
+    #    so a stale replica replaying the pre-collision copy cannot drag it back
+    #    into the contested bucket and re-displace it to a pair-dependent id.
+    #    Pure function of merged group content -> commutative (guard-907).
     by_pref: Dict[object, List[dict]] = {}
     for ident in order:
         g = groups[ident]
         nums = [i for i in (_int_id(x) for x in g["ids"]) if i is not None]
-        by_pref.setdefault(min(nums) if nums else None, []).append(g["rec"])
+        home = _int_id(g["rec"].get("displaced_from")) if isinstance(
+            g["rec"].get("displaced_from"), str) else None
+        non_home = [n for n in nums if n != home]
+        if home is not None and non_home:
+            pref = max(non_home)
+        else:
+            pref = min(nums) if nums else None
+        by_pref.setdefault(pref, []).append(g["rec"])
 
     # 3. Assign final ids. Where two DISTINCT records prefer the same id (a true
     #    concurrent-allocation collision), the earlier-``created`` keeps it and
@@ -240,7 +292,21 @@ def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
         while next_free in taken:
             next_free += 1
         rec = dict(rec)
-        rec["id"] = id_format(next_free)
+        # Displacement tombstone (7, mirrors _merge_goals): record the
+        # contested id this record LOST, once (first home wins on chained
+        # displacement), and emit sorted-key at the moment the record gains the
+        # key — so a later re-merge against a stale tombstone-less copy
+        # canonicalizes to exactly these bytes (fixpoint) instead of leaving
+        # stamped-append order the replay's sort can never reproduce.
+        if not rec.get("displaced_from") and isinstance(rec.get("id"), str) \
+                and rec.get("id"):
+            rec["displaced_from"] = rec.get("id")
+            rec["id"] = id_format(next_free)
+            rec = {k: rec[k] for k in sorted(rec)}
+        else:
+            # id-less fragment (pid=None lane) or already-tombstoned: no new
+            # key gained -> keep on-disk key order (no blanket-sort churn).
+            rec["id"] = id_format(next_free)
         keepers.append((next_free, rec))
         taken.add(next_free)
         next_free += 1
@@ -329,7 +395,7 @@ def _merge_guard_record(a: dict, b: dict) -> dict:
             out[k] = max(va, vb)
         else:
             out[k] = va if _canon(va) >= _canon(vb) else vb
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def merge_guardrails(local: bytes, remote: bytes) -> bytes:
@@ -350,6 +416,106 @@ def merge_guardrails(local: bytes, remote: bytes) -> bytes:
     return _merge_id_keyed_jsonl(
         local, remote, id_prefix="guard-", identity_fn=_guard_identity,
         record_merge_fn=_merge_guard_record, id_format=lambda n: f"guard-{n:03d}")
+
+
+# --- pattern-signatures.jsonl : union by id (id-keyed shape, 3) -----
+def _sig_identity(rec: dict):
+    """Stable cross-machine identity of a pattern-signature record:
+    (created, name). ``created`` is DATE-only (coarser than rb's
+    second-precision, but two DISTINCT signatures minted the same day with the
+    same human-authored name is implausible) and both fields are stable under
+    later edits (record-outcome counter bumps, set-status retire). Mirrors
+    _rb_identity / _guard_identity."""
+    return (str(rec.get("created") or ""), str(rec.get("name") or ""))
+
+
+def _merge_sig_record(a: dict, b: dict) -> dict:
+    """Field-merge two pattern-signature records sharing identity (created +
+    name) — the SAME signature edited on both machines. Commutative. Same rules
+    as _merge_rb_record (status retired-dominates, utilization per-counter MAX,
+    everything else content tiebreak) PLUS:
+      - outcome_stats: confirmed/total per-counter MAX, then ``accuracy``
+        RECOMPUTED from the merged counters with the writer's exact rounding
+        (pattern_signatures_write.record_outcome: round(c/t, 4)). A content
+        tiebreak here would keep a stale ratio inconsistent with the merged
+        counters.
+      - last_matched: monotonic date stamp — newer wins.
+      - sample_size: monotonic evidence count — numeric MAX (a bare content
+        tiebreak lexically prefers "9" over "26", regressing the count — the
+        same hazard _GUARD_MONOTONIC_FIELDS exists for)."""
+    out = dict(a)
+    for k, vb in b.items():
+        if k not in out:
+            out[k] = vb
+            continue
+        va = out[k]
+        if va == vb:
+            continue
+        if k == "status":
+            out[k] = "retired" if "retired" in (va, vb) \
+                else (va if _canon(va) >= _canon(vb) else vb)
+        elif k == "utilization" and isinstance(va, dict) and isinstance(vb, dict):
+            out[k] = _merge_counters(va, vb)
+        elif k == "outcome_stats" and isinstance(va, dict) and isinstance(vb, dict):
+            merged = _merge_counters(va, vb)
+            total = merged.get("total")
+            confirmed = merged.get("confirmed")
+            if isinstance(total, (int, float)) and not isinstance(total, bool) \
+                    and isinstance(confirmed, (int, float)) \
+                    and not isinstance(confirmed, bool):
+                merged["accuracy"] = (round(confirmed / total, 4)
+                                      if total > 0 else 0.0)
+            out[k] = merged
+        elif k == "last_matched":
+            out[k] = va if _newer(va, vb) or (va == vb) else vb
+        elif k == "sample_size" \
+                and isinstance(va, (int, float)) and isinstance(vb, (int, float)) \
+                and not isinstance(va, bool) and not isinstance(vb, bool):
+            out[k] = max(va, vb)
+        else:
+            out[k] = va if _canon(va) >= _canon(vb) else vb
+    return _commutative_key_order(a, b, out)
+
+
+def merge_pattern_signatures(local: bytes, remote: bytes) -> bytes:
+    """Union two pattern-signatures.jsonl blobs, keyed by STABLE
+    content-identity (created + name) — see ``_merge_id_keyed_jsonl`` for the
+    union / collision-reid / convergence algorithm. Same-record edits reconcile
+    via ``_merge_sig_record`` (retired-dominates status, counter-MAX
+    outcome_stats with accuracy recompute, newer last_matched).
+
+    The store's on-disk ids are MIXED-format — the original allocator 3-padded
+    (``sig-001``..``sig-007``) and the current one is unpadded (``sig-8``+) —
+    so no pure ``id_format(n)`` reproduces every id byte-for-byte (the generic
+    helper's contract). The formatter therefore PRESERVES the form each id was
+    OBSERVED under in either input (built symmetrically from both blobs:
+    longer/padded form wins a same-int form clash, then lexicographic — a
+    deterministic, commutative preference), and falls back to the current
+    allocator's unpadded ``sig-{n}`` only for FRESH ids minted by the
+    collision-displacement path (always > max existing, so never legacy-padded).
+    Re-stamping legacy ids to a uniform width instead would rename records out
+    from under external references (guard-575 and skill text cite ``sig-003``;
+    weakness-report signal_baseline keys on sig ids).
+
+    Closes the last unadjudicated g-115-2319 store: writers mutate records in
+    place (record-outcome counter bumps), so an unregistered both-diverged 412
+    froze the file fleet-wide (rb-3150 class) — line-union would instead
+    resurrect retired signatures. g-115-2333."""
+    observed: Dict[int, str] = {}
+    for rec in _parse_jsonl(local) + _parse_jsonl(remote):
+        rid = rec.get("id")
+        if isinstance(rid, str) and rid.startswith("sig-") and rid[4:].isdigit():
+            n = int(rid[4:])
+            prev = observed.get(n)
+            if prev is None or (len(rid), rid) > (len(prev), prev):
+                observed[n] = rid
+
+    def _sig_id_format(n: int) -> str:
+        return observed.get(n, f"sig-{n}")
+
+    return _merge_id_keyed_jsonl(
+        local, remote, id_prefix="sig-", identity_fn=_sig_identity,
+        record_merge_fn=_merge_sig_record, id_format=_sig_id_format)
 
 
 # --- team-state.yaml : per-field last-writer-wins + list union --------------
@@ -478,7 +644,43 @@ def merge_team_state(local: bytes, remote: bytes) -> bytes:
         key_fields=("id", "goal_id"))
     out["recent_completions"] = _merge_recent_completions(
         a.get("recent_completions") or [], b.get("recent_completions") or [])
-    return _dump_yaml(out)
+    # Singleton-doc key order side-independent on divergence (0: the
+    # exact-equal-canon tiebreak returns the FIRST arg, so identical content in
+    # different serialization order ping-pongs; same helper as 1).
+    return _dump_yaml(_commutative_key_order(a, b, out))
+
+
+def merge_team_state_shard(local: bytes, remote: bytes) -> bytes:
+    """Commutative merge of two divergent versions of a SINGLE per-agent
+    team-state shard (``world/team-state/agents/<name>.yaml``, the g-328-27
+    split).
+
+    Each shard is a FLAT single-agent status document (last_active,
+    current_focus, live_phase, session_goals_completed, row_updated, ...) —
+    normally only the OWNING agent writes it, so a both-diverged clash
+    reconciles by whole-snapshot last-writer-wins on ``last_active`` (mirrors
+    ``_merge_agent_status``'s per-agent rule: a partial field-merge could
+    stitch an inconsistent in_flight/current_focus/live_phase triple, and the
+    per-session ``session_goals_completed`` counter resets so it is NOT a
+    monotonic-max field — the newer whole snapshot is authoritative). Winner
+    is re-dumped (not returned raw) so both machines emit byte-identical output
+    regardless of input YAML formatting.
+
+    This gives per-agent shards the SAME both-diverged self-heal the composite
+    ``team-state.yaml`` already had, closing the rb-3150 peer-shard freeze: the
+    basename-keyed _HANDLERS never registered the dynamic shard basenames, so
+    ``merge_handler_for`` returned None and the backend froze peer shards on the
+    both-diverged 412 -> every box saw fresh-SELF + stale-PEERS. Dispatched by
+    the path-pattern branch in ``merge_handler_for`` (g-115-2133)."""
+    a = yaml.safe_load(local.decode("utf-8")) or {}
+    b = yaml.safe_load(remote.decode("utf-8")) or {}
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        # Non-mapping content is unexpected for a shard; fall back to the
+        # content-larger blob so the result stays deterministic + commutative.
+        return local if _canon(a) >= _canon(b) else remote
+    win, _ = _order_by_ts(a, b, "last_active")
+    # Key order side-independent on divergence (0; see merge_team_state).
+    return _dump_yaml(_commutative_key_order(a, b, dict(win)))
 
 
 # --- aspirations.jsonl : union aspirations by id, union goals by id ----------
@@ -518,6 +720,29 @@ def _merge_goal(a: dict, b: dict) -> dict:
         so status rides the LWW base; NON-recurring terminal statuses
         (completed/skipped/expired) DOMINATE a non-terminal (fixes the both-
         diverged 'completed reverted to in-progress' clobber, delta 2026-07-03).
+      - claimed_by/claimed_at : live claims by DIFFERENT agents -> first-claim-
+        wins on claimed_at (stamped beats timestamp-less; full tie ->
+        lexicographic-smaller claimed_by); the pair moves as a UNIT. ONE-side-
+        null -> KEEP the non-null claim UNLESS the null side is PROVABLY NEWER
+        (its last_modified strictly postdates the claim's claimed_at) (g-115-2547).
+        Neither claim() nor release() stamps last_modified, so claimed_at (not the
+        claim side's pre-claim last_modified) is the claim's recency signal: a null
+        side newer than claimed_at is a genuine release-then-edit and clears the
+        claim; a null side older-or-equal (incl. the observed both-lack-
+        last_modified tie) is a stale PRE-claim snapshot and the claim is kept.
+        Preserving the claim is asymmetric-safe -- a dropped LIVE claim means two
+        agents both own the goal (double-claim), while a resurrected pure-RELEASE
+        claim (last_modified never advanced) self-heals via the stale-claim
+        take-back. Merged NON-recurring terminal status still clears the pair
+        (write-path claim-clearing mirror, aspirations.py cmd_update_goal Rule 3)
+        -- so a genuine completion clears the claim regardless of this rule.
+        Fixes the second-claimer steal: claim() does not stamp last_modified, so
+        concurrent claims tie on the LWW base and fell to the _canon content
+        tiebreak (g-115-1918 / rb-3043).
+      - key order: canonicalized when the sides' key sequences diverged
+        (_commutative_key_order, g-115-2355 — the _order_by_ts full-content-tie
+        otherwise picks the FIRST ARG between value-identical order-divergent
+        copies, and dict(win) key order reaches the bytes).
     Every rule is a symmetric function of (a, b) -> both machines converge."""
     win, _lose = _order_by_ts(a, b, "last_modified")
     out = dict(win)
@@ -541,6 +766,19 @@ def _merge_goal(a: dict, b: dict) -> dict:
         out["created_at"] = ca
     elif cb is not None:
         out["created_at"] = cb
+    # Displacement tombstone is STICKY (7): the LWW base may be the
+    # stale pre-displacement copy (which lacks the field) — a tombstone present
+    # on either side survives the field-merge, or _merge_goals' anchor cannot
+    # recognize the settled displacement on re-merge. Both-set-and-different
+    # (divergent displacement histories) picks the lexicographic min —
+    # symmetric in (a, b).
+    da, db = a.get("displaced_from"), b.get("displaced_from")
+    if isinstance(da, str) and isinstance(db, str):
+        out["displaced_from"] = min(da, db)
+    elif isinstance(da, str):
+        out["displaced_from"] = da
+    elif isinstance(db, str):
+        out["displaced_from"] = db
     # Status: recurring cycles (base LWW status stands); non-recurring
     # terminal-dominates so a completed goal is never reverted to in-progress.
     if not (bool(a.get("recurring")) or bool(b.get("recurring"))):
@@ -553,43 +791,395 @@ def _merge_goal(a: dict, b: dict) -> dict:
         elif ta and tb and sa != sb:
             out["status"] = sa if _canon(sa) >= _canon(sb) else sb
         # else: both terminal-equal OR both non-terminal -> base LWW status stands
-    return out
+    # Claim pair: first-claim-wins for LIVE claims by DIFFERENT agents
+    # (8 / rb-3043 second-claimer steal). Symmetric in (a, b):
+    # comparisons are on field VALUES, never argument order.
+    ca_by, cb_by = a.get("claimed_by"), b.get("claimed_by")
+    if ca_by and cb_by and ca_by != cb_by:
+        ca_at, cb_at = a.get("claimed_at"), b.get("claimed_at")
+        if ca_at and cb_at:
+            if ca_at != cb_at:
+                first = a if ca_at < cb_at else b   # older claim stands
+            else:
+                first = a if ca_by < cb_by else b   # full tie -> lexicographic
+        elif ca_at or cb_at:
+            first = a if ca_at else b               # stamped beats timestamp-less
+        else:
+            first = a if ca_by < cb_by else b       # both unstamped -> lexicographic
+        out["claimed_by"] = first.get("claimed_by")
+        if first.get("claimed_at") is not None:
+            out["claimed_at"] = first["claimed_at"]
+        else:
+            out.pop("claimed_at", None)             # pair moves as a unit
+    elif bool(ca_by) != bool(cb_by):
+        # Exactly ONE side carries a live claim; the other is null. Keep the
+        # claim UNLESS the null side is PROVABLY NEWER than the claim -- i.e. its
+        # last_modified strictly postdates the claim's claimed_at, which marks a
+        # genuine RELEASE followed by a later edit (or other supersession).
+        # Otherwise the null side is a stale PRE-claim snapshot and dropping the
+        # claim is the 7 double-claim hazard (two agents both believe
+        # they own the goal).
+        #
+        # Why claimed_at, not the claim side's last_modified: neither claim() nor
+        # release() stamps last_modified (aspirations_write.py claim ~L3454,
+        # release ~L3106), so the claim side's last_modified is its PRE-claim
+        # value -- useless as a claim-recency signal. claimed_at IS the claim's
+        # recency. The observed live bug is exactly the "both sides lack
+        # last_modified" tie where the content tiebreak dropped the claim: there
+        # null_lm is None and _newer(None, claimed_at) is False -> not provably
+        # newer -> the claim is kept (the fix).
+        #
+        # Asymmetric-safe by design: keeping a stale claim self-heals (the
+        # stale-claim take-back clears it after effective_timeout); dropping a
+        # live claim does not (it double-claims). A pure release that never got a
+        # later edit is resurrected here (its last_modified was never advanced) --
+        # accepted, because that too self-heals via timeout. A genuine completion
+        # is STILL cleared by the terminal-status block below regardless of this
+        # branch. Byte-commutative: claim_side/null_side are chosen by field value
+        # (which side is non-null), never argument order; the _newer comparison is
+        # on those field values; the pair moves as a unit.
+        claim_side = a if ca_by else b
+        null_side = b if ca_by else a
+        claimed_at = claim_side.get("claimed_at")
+        if _newer(null_side.get("last_modified"), claimed_at):
+            # Null side provably newer -> genuine release/supersession -> clear.
+            out.pop("claimed_by", None)
+            out.pop("claimed_at", None)
+        else:
+            # Stale pre-claim snapshot -> keep the claim (double-claim guard).
+            out["claimed_by"] = claim_side.get("claimed_by")
+            if claimed_at is not None:
+                out["claimed_at"] = claimed_at
+            else:
+                out.pop("claimed_at", None)         # pair moves as a unit
+    # Merged NON-recurring terminal status clears the claim pair (merge-layer
+    # mirror of the write-path claim-clearing invariant). Recurring goals
+    # cycle completed -> pending, so their claims are left to the LWW base.
+    if (not (bool(a.get("recurring")) or bool(b.get("recurring")))
+            and out.get("status") in _TERMINAL_STATUSES):
+        out.pop("claimed_by", None)
+        out.pop("claimed_at", None)
+    return _commutative_key_order(a, b, out)
 
 
-def _goal_key(g):
-    """Stable identity of a goal record: its ``id`` (goals always carry one).
-    A pathological id-less/non-dict entry falls back to a content key so it is
-    NEVER collapsed with a distinct entry (zero data loss)."""
-    if isinstance(g, dict) and g.get("id"):
-        return ("id", g["id"])
+def _goal_identity(g):
+    """Stable cross-machine identity of a goal, invariant under re-id — the basis
+    of the collision-tolerant goal union (the nested-array analogue of
+    ``_rb_identity``). A NEWLY-allocated goal always carries BOTH ``created_at``
+    and ``title`` (set together at allocation, aspirations.py), so
+    ``(created_at, title)`` identifies it even after a peer re-ids it — the
+    property that makes the collision path CONVERGE across the fenced-PUT loop.
+    Goals missing either (legacy pre-``created_at`` goals, id-less fragments)
+    fall back to id-identity — the pre-fix behaviour — so they field-merge by id
+    exactly as before and this change is a no-op for them (they are already
+    allocated and never NEWLY collide). A non-dict entry falls back to content so
+    it is never collapsed with a distinct entry (zero data loss)."""
+    if isinstance(g, dict):
+        ct, ti = g.get("created_at"), g.get("title")
+        if ct and ti:
+            return ("ct", ct, ti)
+        gid = g.get("id")
+        if gid:
+            return ("id", gid)
     return ("_canon", _canon(g))
+
+
+def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> list:
+    """Collision-tolerant union of two goals arrays for the SAME aspiration — the
+    nested-array analogue of ``_merge_id_keyed_jsonl`` (the rb/guardrail keep-both
+    algorithm), which aspirations could not use directly because goals live nested
+    inside an aspiration record, not as flat top-level jsonl lines.
+
+    - same content-identity (the SAME logical goal edited on both machines)
+      -> field-merged via ``_merge_goal``
+    - two DISTINCT goals that collided on a PURE-sequential id ``g-{asp}-{seq}``
+      (the decentralized max+1 allocation race — aspirations.py ~L1165, two boxes
+      pick the same next id in one eventual-consistency window) -> the
+      earlier-``created_at`` keeps the id, the rest are re-assigned the next free
+      ``g-{asp}-{seq}``. ZERO content loss — this REPLACES the old id-keyed union
+      that field-interleaved the two distinct goals into one franken-record and
+      dropped a writer's content (g-115-2147; observed live g-335-34 add-loss,
+      g-335-32 update-loss).
+
+    Variant ids (``g-{asp}-{seq}-{letter}``), foreign-aspiration ids, and id-less
+    fragments are OUTSIDE this aspiration's sequential space, so they never
+    collide — grouped by identity and passed through with their exact id.
+
+    ``evicted_ids`` (g-115-2430) is the union of both sides'
+    ``archived_census.evicted_ids`` — the eviction TOMBSTONE set. A goal whose id
+    is in it was removed by aspirations-evict-completed and is already counted in
+    the census; a live copy arriving from a stale replica is a RESURRECTION
+    (guard-1072 slow lane of the g-115-2401 phantom producer: union re-adds it,
+    the next evict re-bumps the census, counts inflate). Drop such copies at
+    entry. Safe against id REUSE because the mint sites (aspirations.py /
+    aspirations_write.py) allocate max+1 over live ∪ evicted ids, so a new goal
+    can never legitimately carry an evicted id. Evicted seqs are also excluded
+    from displacement re-allocation below for the same reason.
+
+    Symmetric in (a, b): the id-assignment tiebreak is a pure function of content
+    (earlier created_at, then canonical-JSON order), and the output is id-sorted,
+    so both machines converge byte-identically (the fenced-PUT invariant)."""
+    def _seq(gid):
+        # The PURE sequential seq of THIS aspiration: g-{asp_num}-{digits}, no
+        # trailing -letter variant, not a foreign aspiration. Else None.
+        if not isinstance(gid, str):
+            return None
+        parts = gid.split("-")
+        if (len(parts) == 3 and parts[0] == "g"
+                and parts[1] == asp_num and parts[2].isdigit()):
+            return int(parts[2])
+        return None
+
+    def _fmt(n):
+        return f"g-{asp_num}-{n:02d}"   # byte-exact to aspirations.py allocation
+
+    combined = [g for g in list(goals_a) + list(goals_b)
+                if not (isinstance(g, dict) and g.get("id") in evicted_ids)]
+
+    # 1. Collapse by content identity; field-merge same-identity copies; record
+    #    every id each logical goal was seen under (old id + any peer re-id).
+    groups: Dict[tuple, dict] = {}
+    order: List[tuple] = []
+    for g in combined:
+        ident = _goal_identity(g)
+        grp = groups.get(ident)
+        if grp is None:
+            groups[ident] = {"rec": g,
+                             "ids": {g.get("id") if isinstance(g, dict) else None}}
+            order.append(ident)
+        else:
+            cur = grp["rec"]
+            if isinstance(cur, dict) and isinstance(g, dict):
+                grp["rec"] = _merge_goal(cur, g)
+            else:
+                grp["rec"] = cur if _canon(cur) >= _canon(g) else g
+            grp["ids"].add(g.get("id") if isinstance(g, dict) else None)
+
+    # 2. Sequential-id goals enter collision resolution at their SMALLEST seq;
+    #    everything else (variant / foreign / id-less) passes through unchanged.
+    by_pref: Dict[int, List[dict]] = {}
+    passthrough: List[dict] = []
+    for ident in order:
+        grp = groups[ident]
+        seqs = sorted({s for s in (_seq(i) for i in grp["ids"]) if s is not None})
+        if seqs:
+            rec = grp["rec"]
+            # A goal seen under MULTIPLE sequential ids (its original id + a peer's
+            # re-id of the SAME goal) has a field-merged rec whose `id` is LWW-chosen
+            # and may be ANY of those ids -- including one HIGHER than its home (min)
+            # seq. If that foreign-seq id rides into the min-seq bucket, the keeper
+            # carries an id belonging to a DIFFERENT bucket and collides with THAT
+            # bucket's keeper -- two distinct goals sharing one id in a single pass
+            # (7 fresh-eyes finding). Anchor a multi-seq group to its home id
+            # so every keeper's id matches its bucket. Single-seq groups are left
+            # verbatim -- no churn of legacy non-canonical g-N-N ids.
+            if len(seqs) >= 2 and isinstance(rec, dict):
+                rec = dict(rec)
+                # Anchor choice (7 associativity hardening): when the
+                # group carries a displacement tombstone whose home seq is one
+                # of the seen ids, the OTHER (higher) id is this goal's SETTLED
+                # displacement slot — anchor there so a stale replica replaying
+                # the pre-collision copy does not drag the goal back into the
+                # contested home bucket and re-displace it to a pair-dependent
+                # next-free id (merge(merge(a,b),a) now == merge(a,b) for the
+                # collision path). Without a tombstone the higher id is drift
+                # of unknown provenance (e.g. a peer's LWW edit) — anchor home
+                # (min) exactly as before, so a same-goal id drift can never
+                # steal a DISTINCT goal's settled slot (7 fixture).
+                # Pure function of merged group content -> commutative
+                # (guard-907).
+                home = _seq(rec.get("displaced_from")) if isinstance(
+                    rec.get("displaced_from"), str) else None
+                non_home = [s for s in seqs if s != home]
+                if home is not None and non_home:
+                    # Tombstoned: anchor the LATEST settled displacement slot.
+                    # Applies whether or not the home seq is still among the
+                    # seen ids — a CHAIN-displaced goal (lost its first slot to
+                    # an earlier-created contender) has home outside seqs, and
+                    # anchoring min would re-fight a bucket it already lost,
+                    # relying on vacated-slot dynamics to land back (fresh-eyes
+                    # 2026-07-16 second pass: fragile, breaks with two chained
+                    # replays or an adjacent allocation).
+                    anchor = max(non_home)
+                else:
+                    anchor = seqs[0]
+                rec["id"] = _fmt(anchor)
+                by_pref.setdefault(anchor, []).append(rec)
+            else:
+                by_pref.setdefault(seqs[0], []).append(rec)
+        else:
+            passthrough.append(grp["rec"])
+
+    # 3. Resolve id collisions: earlier-created_at keeps the id, the rest are
+    #    displaced to fresh sequential ids (symmetric => convergent).
+    keepers: List[dict] = []
+    displaced: List[dict] = []
+    for pid in by_pref:
+        recs = by_pref[pid]
+        recs.sort(key=lambda r: (str(r.get("created_at") or ""), _canon(r)))
+        # Winner keeps its EXISTING id verbatim (byte-faithful): for a real
+        # canonical id g-{asp}-{seq:02d} this already equals _fmt(pid), and for a
+        # legacy/non-canonical id it avoids churning a stable id. Only a
+        # DISPLACED goal — which genuinely needs a fresh id — gets canonical _fmt.
+        keepers.append(dict(recs[0]))
+        displaced.extend(recs[1:])
+    taken = {s for s in (_seq(k.get("id")) for k in keepers) if s is not None}
+    # Evicted seqs are allocated-forever: a displaced goal re-id'd onto one
+    # would be tombstone-dropped by the NEXT merge (0).
+    taken |= {s for s in (_seq(i) for i in evicted_ids) if s is not None}
+    displaced.sort(key=lambda r: (str(r.get("created_at") or ""), _canon(r)))
+    next_free = (max(taken) + 1) if taken else 1
+    for rec in displaced:
+        while next_free in taken:
+            next_free += 1
+        rec = dict(rec)
+        # Displacement tombstone (7): record the contested id this goal
+        # LOST, once (first home wins — never overwritten on chained
+        # displacement). Step 2's anchor reads it to recognize a prior
+        # displacement on re-merge, so a stale replica replaying the
+        # pre-collision copy cannot re-fight the bucket and shuffle the goal to
+        # a different next-free id (collision re-id was commutative but
+        # NON-ASSOCIATIVE without it). Also the audit trail for external
+        # references (claims, discovered_by, origin_signal dedup) that still
+        # point at the lost id.
+        if not rec.get("displaced_from"):
+            rec["displaced_from"] = rec.get("id")
+        rec["id"] = _fmt(next_free)
+        # Sorted-key emission at the moment the record gains a new key — the
+        # same self-healing convention as _commutative_key_order, so a later
+        # re-merge against a stale (tombstone-less) copy canonicalizes to
+        # exactly these bytes (fixpoint), instead of leaving the settled bytes
+        # in stamped-append order that the replay's sort can never reproduce.
+        rec = {k: rec[k] for k in sorted(rec)}
+        keepers.append(rec)
+        taken.add(next_free)
+        next_free += 1
+
+    # 4. Deterministic id-then-content order for the byte-identical result.
+    result = keepers + passthrough
+    result.sort(key=lambda g: (str(g.get("id") if isinstance(g, dict) else "") or "",
+                               _canon(g)))
+    return result
+
+
+def _merge_archived_census(a_census, b_census):
+    """Merge two ``archived_census`` dicts with per-field semantics (0 —
+    the fix for the g-115-2401 census phantom producer, guard-1153: counters in
+    record-merge handlers need EXPLICIT merge semantics, never the opaque-LWW
+    default; the old LWW-by-``last_selected`` ride-along reverted census repairs
+    within ~81min on hot aspirations because ``last_selected`` is bumped by
+    SELECTION, uncorrelated with census mutation).
+
+      - ``evicted_ids`` : per-status goal-id SET UNION (commutative, idempotent,
+        associative; sorted deduped lists for the byte-identical result). Ids
+        are the post-cutover census ground truth AND the resurrection tombstone
+        consumed by _merge_goals.
+      - ``by_status``   : the FROZEN legacy count baseline. Per-status MIN when
+        both sides carry the key (post-cutover only census REPAIRS mutate it,
+        and repairs SHRINK — min converges to the most-repaired value, so a
+        repair survives a stale peer instead of reverting). A key on one side
+        only is kept verbatim (absent = no opinion, NOT zero — else any merge
+        against a pre-census copy would zero the baseline). Mixed-fleet
+        old-code increments get min'd away: a bounded, conservation-safe
+        undercount, accepted by design.
+      - other keys (``census_note``...) : deterministic canonical-max pick.
+
+    Returns None when neither side has a census (key stays absent). Output keys
+    sorted for byte determinism."""
+    a = a_census if isinstance(a_census, dict) else None
+    b = b_census if isinstance(b_census, dict) else None
+    if a is None and b is None:
+        return None
+    if a is None or b is None:
+        out = dict(a if a is not None else b)
+        ids = out.get("evicted_ids")
+        if isinstance(ids, dict):   # normalize shape even on the one-sided path
+            out["evicted_ids"] = {
+                s: sorted({str(x) for x in v})
+                for s, v in sorted(ids.items()) if isinstance(v, list) and v}
+        return {k: out[k] for k in sorted(out)}
+    out = {}
+    ids_a = a.get("evicted_ids") if isinstance(a.get("evicted_ids"), dict) else {}
+    ids_b = b.get("evicted_ids") if isinstance(b.get("evicted_ids"), dict) else {}
+    merged_ids = {}
+    for s in set(ids_a) | set(ids_b):
+        va = ids_a.get(s) if isinstance(ids_a.get(s), list) else []
+        vb = ids_b.get(s) if isinstance(ids_b.get(s), list) else []
+        u = sorted({str(x) for x in va} | {str(x) for x in vb})
+        if u:
+            merged_ids[s] = u
+    if merged_ids:
+        out["evicted_ids"] = {s: merged_ids[s] for s in sorted(merged_ids)}
+    bs_a = a.get("by_status") if isinstance(a.get("by_status"), dict) else {}
+    bs_b = b.get("by_status") if isinstance(b.get("by_status"), dict) else {}
+    merged_bs = {}
+    for s in set(bs_a) | set(bs_b):
+        vals = []
+        for src in (bs_a, bs_b):
+            if s in src:
+                try:
+                    vals.append(max(0, int(src[s])))
+                except (TypeError, ValueError):
+                    continue
+        if vals:
+            merged_bs[s] = min(vals)
+    if merged_bs or "by_status" in a or "by_status" in b:
+        out["by_status"] = {s: merged_bs[s] for s in sorted(merged_bs)}
+    for k in sorted(set(a) | set(b)):
+        if k in ("evicted_ids", "by_status"):
+            continue
+        va, vb = a.get(k), b.get(k)
+        if va is None:
+            out[k] = vb
+        elif vb is None:
+            out[k] = va
+        else:
+            out[k] = va if _canon(va) >= _canon(vb) else vb
+    return {k: out[k] for k in sorted(out)}
 
 
 def _merge_aspiration_record(a: dict, b: dict) -> dict:
     """Merge two records of the SAME aspiration id. Base = newer-``last_selected``
     snapshot (LWW for opaque aspiration-level fields), then:
-      - goals             : union by goal id (_merge_goal on same-id clashes)
+      - archived_census   : explicit per-field semantics — evicted_ids UNION,
+        legacy by_status MIN, never LWW (_merge_archived_census, g-115-2430).
+        Also fixes the latent lose-side loss lane: a census present only on the
+        LWW-losing side previously vanished entirely.
+      - goals             : union by goal id (_merge_goal on same-id clashes),
+        minus both sides' evicted_ids (resurrection tombstone)
       - selection_count / sessions_active : numeric MAX (monotonic)
+      - key order         : canonicalized when the sides' key sequences
+        diverged (_commutative_key_order, g-115-2355 full-tie corner)
     Goals sorted by identity for the byte-identical result commutativity needs."""
     win, _lose = _order_by_ts(a, b, "last_selected")
     out = dict(win)
-    merged: Dict[object, object] = {}
-    for g in list(a.get("goals") or []) + list(b.get("goals") or []):
-        k = _goal_key(g)
-        cur = merged.get(k)
-        if cur is None:
-            merged[k] = g
-        elif isinstance(cur, dict) and isinstance(g, dict) and k[0] == "id":
-            merged[k] = _merge_goal(cur, g)
-        else:
-            merged[k] = cur if _canon(cur) >= _canon(g) else g
-    out["goals"] = [merged[k] for k in sorted(merged, key=lambda t: (t[0], _canon(t[1])))]
+    census = _merge_archived_census(a.get("archived_census"),
+                                    b.get("archived_census"))
+    if census is not None:
+        out["archived_census"] = census
+    # Garbage-tolerant: a one-sided census passes through with its shape only
+    # normalized when well-formed, so a hand-corrupted evicted_ids (non-dict,
+    # or non-list bucket) must degrade to "no tombstones", never crash the
+    # store merge (fresh-eyes-code 0 finding).
+    _ids = (census or {}).get("evicted_ids")
+    evicted = frozenset(
+        str(gid)
+        for vals in (_ids.values() if isinstance(_ids, dict) else ())
+        if isinstance(vals, list)
+        for gid in vals)
+    # Goals unioned with concurrent-allocation collision tolerance: two DISTINCT
+    # goals that raced to the same g-{asp}-{seq} id are BOTH kept (loser re-id'd),
+    # not field-interleaved into one franken-record (7). asp_num scopes
+    # the re-id sequence to this aspiration.
+    asp_num = str(out.get("id", "")).replace("asp-", "")
+    out["goals"] = _merge_goals(a.get("goals") or [], b.get("goals") or [],
+                                asp_num, evicted_ids=evicted)
     for f in ("selection_count", "sessions_active"):
         nums = [v for v in (a.get(f), b.get(f))
                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if nums:
             out[f] = max(nums)
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def merge_aspirations(local: bytes, remote: bytes) -> bytes:
@@ -653,6 +1243,11 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
       - reflected: True dominates (the reflect flag is monotonic)
       - last_reviewed / outcome_date / reflected_date: strictly-newer wins
       - formed_date: OLDER wins (stable formation timestamp)
+      - key order: canonicalized when the sides' key sequences diverged
+        (_commutative_key_order, g-115-2355 — the equal-rank canon tiebreak
+        otherwise picks the FIRST ARG between value-identical order-divergent
+        copies, which a 3-participant merge-order asymmetry can manufacture
+        from two concurrent distinct-field adds).
     Every rule is a symmetric function of (a, b) -> both machines converge."""
     ra = _PIPELINE_STAGE_RANK.get(a.get("stage"), -1)
     rb = _PIPELINE_STAGE_RANK.get(b.get("stage"), -1)
@@ -677,7 +1272,7 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
     fa, fb = a.get("formed_date"), b.get("formed_date")
     if fa is not None and fb is not None:
         out["formed_date"] = fb if _newer(fa, fb) else fa
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def merge_pipeline(local: bytes, remote: bytes) -> bytes:
@@ -755,7 +1350,11 @@ def _merge_spark_record(a: dict, b: dict) -> dict:
         (grow-only); yield_rate is DERIVED -> recomputed from the merged
         counters (matches cmd_increment — a blind MAX would overstate it);
         status: retired dominates (a retire is deliberate + monotonic);
-        everything else: content-tiebreak base + side-only field union."""
+        everything else: content-tiebreak base + side-only field union;
+        key order canonicalized on diverged key sequences
+        (_commutative_key_order, g-115-2355 full-tie corner). The wholesale
+        early returns need no routing — they emit ONE side's dict chosen by
+        CONTENT (type / canon), identical from either arg order."""
     ta, tb = a.get("type"), b.get("type")
     if ta != tb:
         if ta == "question":
@@ -778,7 +1377,7 @@ def _merge_spark_record(a: dict, b: dict) -> dict:
     if out.get("type") == "question" and "yield_rate" in out:
         out["yield_rate"] = round(
             out.get("sparks_generated", 0) / max(out.get("times_asked", 0), 1), 4)
-    return out
+    return _commutative_key_order(a, b, out)
 
 
 def _spark_family(rec: dict):
@@ -909,6 +1508,56 @@ def _log_ts(rec) -> str:
     return ""
 
 
+def _parse_jsonl_lossy(data: bytes) -> Tuple[List[dict], List[str]]:
+    """Torn-line-tolerant parse for APPEND-ONLY logs ONLY (5).
+
+    A torn half-line (a truncated append — the write was interrupted mid-line)
+    is unrecoverable half-data for an append-only log: the complete record
+    either synced to the other side before the tear (the union keeps it) or
+    never fully landed anywhere (nothing complete exists to preserve). The
+    strict ``_parse_jsonl`` raises on such a line, which wedges the union lane
+    forever (``_merge_reconcile_put`` wraps the handler raise in ConflictError
+    and every sweep retries into the same torn bytes — the cc-04 franken-local
+    wedge, healed manually under g-115-2297 by pre-filtering parseable lines).
+    This variant skips unparseable lines and RETURNS them so the caller can
+    surface the drop loudly.
+
+    Scope guard: id-keyed / field-merge handlers MUST keep the strict parse —
+    there a parse failure can mean real corruption of an editable record and
+    the safe response is the freeze, not a silent skip. Only
+    ``merge_append_only_jsonl`` may call this.
+    """
+    records: List[dict] = []
+    torn: List[str] = []
+    # errors="replace": a tear can cut mid-UTF-8-sequence; strict decode would
+    # raise before line-splitting ever happens. Valid lines decode identically.
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except (json.JSONDecodeError, ValueError):
+            torn.append(line)
+    return records, torn
+
+
+def _warn_torn_lines(torn: List[str], side: str) -> None:
+    """Loud, bounded stderr surface for dropped torn lines (5).
+
+    The full torn content (capped) is echoed so the daemon log / sweep output
+    preserves the forensic bytes even after the merged write-back replaces the
+    on-disk original — the in-band half of preserve-before-drop (the on-disk
+    half is the caller-side .history snapshot in owncloud_sync._try_merge_put).
+    """
+    shown = torn[:5]
+    body = " | ".join(t[:200] for t in shown)
+    more = f" (+{len(torn) - len(shown)} more)" if len(torn) > len(shown) else ""
+    print(f"[coordination-merge] WARN: dropped {len(torn)} torn line(s) from "
+          f"{side} side of append-log union{more}: {body[:2000]}",
+          file=sys.stderr)
+
+
 def merge_append_only_jsonl(local: bytes, remote: bytes) -> bytes:
     """Commutative LINE-UNION merge for append-only JSONL logs (evolution-log,
     productivity-snapshots, gate-firings, the board channels, trigger-firings,
@@ -930,8 +1579,22 @@ def merge_append_only_jsonl(local: bytes, remote: bytes) -> bytes:
     so two non-identical lines are distinct events (contrast _merge_id_keyed_jsonl,
     where two records CAN be two edits of one logical record). Byte-exact:
     _dump_jsonl matches every writer's ``json.dumps(rec, ensure_ascii=True) + "\\n"``.
+
+    Torn-line tolerance (g-115-2325): parses BOTH sides via _parse_jsonl_lossy —
+    symmetric on the two args, so commutativity (guard-907) is preserved: the
+    dropped set is a function of content, never of the local-vs-remote role. A
+    torn half-line from a truncated append no longer wedges the lane (see
+    _parse_jsonl_lossy docstring); it is dropped LOUDLY (stderr carries the
+    bytes) and the sync-side caller snapshots the pre-merge local to .history
+    first. Append-only ONLY — id-keyed/field-merge handlers keep strict parsing.
     """
-    combined = _parse_jsonl(local) + _parse_jsonl(remote)
+    local_recs, local_torn = _parse_jsonl_lossy(local)
+    remote_recs, remote_torn = _parse_jsonl_lossy(remote)
+    if local_torn:
+        _warn_torn_lines(local_torn, "first")
+    if remote_torn:
+        _warn_torn_lines(remote_torn, "second")
+    combined = local_recs + remote_recs
     by_line: Dict[str, dict] = {}   # serialized line -> record (identical collapse)
     for rec in combined:
         by_line[json.dumps(rec, ensure_ascii=True)] = rec
@@ -1012,10 +1675,15 @@ def merge_module_health(local: bytes, remote: bytes) -> bytes:
     merged: Dict[str, object] = {}
     for mid in sorted(set(am) | set(bm)):
         ra, rb = am.get(mid), bm.get(mid)
+        # One-sided modules self-normalize via _merge_module(r, r) (MAX is
+        # idempotent; derived success_rate recomputed) so the merged doc is
+        # canonical-form regardless of which path a module took — otherwise
+        # merge(m, m) rewrites bytes once more when a formerly-one-sided
+        # module meets the both-sided normalizer (0 idempotency).
         if ra is None:
-            merged[mid] = rb
+            merged[mid] = _merge_module(rb, rb) if isinstance(rb, dict) else rb
         elif rb is None:
-            merged[mid] = ra
+            merged[mid] = _merge_module(ra, ra) if isinstance(ra, dict) else ra
         elif isinstance(ra, dict) and isinstance(rb, dict):
             merged[mid] = _merge_module(ra, rb)
         else:
@@ -1024,7 +1692,184 @@ def merge_module_health(local: bytes, remote: bytes) -> bytes:
     # deterministically (today 'modules' is the only top-level key).
     out = dict(a) if _canon(a) >= _canon(b) else dict(b)
     out["modules"] = merged
-    return _dump_yaml_default(out)
+    # Key order side-independent on divergence (0; see merge_team_state).
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
+
+
+# --- forged-skills.yaml : keyed dict union (skills registry) ----------------
+# 5 — CURE for the stale-base full-file clobber lane (8
+# check-production-health row + 9 probe-governed-store /
+# reconcile-fleet-fork rows, 07-12/07-13 window). The registry basename had NO
+# handler, so concurrent writers fell into the diverged/LWW lanes and a
+# stale-base writer deleted peer rows.
+
+
+def _merge_forged_skill(a: dict, b: dict) -> dict:
+    """Reconcile two records of the SAME skill name. A skill record is
+    authored as a unit (one forge event writes all fields), so the winner is
+    WHOLE-RECORD — field-blending would stitch two authored versions'
+    triggers/companion_scripts. Winner: newer ``forged_date`` (ISO string,
+    lexicographic; missing sorts oldest) -> more fields (richer side, the
+    _merge_module convention) -> ``_canon`` content tiebreak. Symmetric in
+    (a, b) -> both machines converge; merge(r, r) == r (idempotent)."""
+    # str() coercion: an UNQUOTED YAML date parses as datetime.date (the
+    # merge_tree str-vs-date bug class); str(date) is ISO so it compares
+    # lexicographically with the quoted-string form.
+    da = str(a.get("forged_date")) if a.get("forged_date") is not None else ""
+    db = str(b.get("forged_date")) if b.get("forged_date") is not None else ""
+    if da != db:
+        return a if da > db else b
+    if len(a) != len(b):
+        return a if len(a) > len(b) else b
+    return a if _canon(a) >= _canon(b) else b
+
+
+def merge_forged_skills(local: bytes, remote: bytes) -> bytes:
+    """Keyed union of the forged-skills registry: {skills: {name: record}}.
+    Rows are append-mostly (a forge event ADDS a row; retirement is an
+    explicit status field, never deletion — /forge-skill has no delete path),
+    so key-set UNION is safe: a row present on EITHER side survives, turning
+    the concurrent-writer clobber into a union. Same-name divergence resolves
+    whole-record via _merge_forged_skill. Non-``skills`` top-level keys (none
+    today) ride the content-larger base so a future schema addition cannot
+    wedge the handler. Skills emitted SORTED by name — bytes identical
+    regardless of arg order (the fenced-PUT commutativity property; same
+    discipline as merge_module_health, this handler's template)."""
+    a = yaml.safe_load(local.decode("utf-8")) or {}
+    b = yaml.safe_load(remote.decode("utf-8")) or {}
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return local if _canon(a) >= _canon(b) else remote
+    am = a.get("skills") if isinstance(a.get("skills"), dict) else {}
+    bm = b.get("skills") if isinstance(b.get("skills"), dict) else {}
+    merged: Dict[str, object] = {}
+    for name in sorted(set(am) | set(bm)):
+        ra, rb = am.get(name), bm.get(name)
+        if ra is None:
+            merged[name] = rb
+        elif rb is None:
+            merged[name] = ra
+        elif isinstance(ra, dict) and isinstance(rb, dict):
+            merged[name] = _merge_forged_skill(ra, rb)
+        else:
+            merged[name] = ra if _canon(ra) >= _canon(rb) else rb
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+    out["skills"] = merged
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
+
+
+# --- skill-relations.yaml : list-union relation graph (6) ----------
+# The sibling shared registry to forged-skills.yaml — same clobber lane
+# (no handler -> diverged/LWW -> stale-base full-file write deletes peer
+# entries). Writer inventory (rb-245, verified 2026-07-17): cmd_add appends
+# with a (source,target,type) duplicate check and NEVER deletes;
+# skill-coinvocation-discovery --apply is an idempotent RMW appender;
+# cmd_co_invoke APPENDS then TAIL-CAPS the log at co_invocation_log_cap —
+# the one legitimate delete path, so the merged log must re-apply the same
+# cap or a union would resurrect capped-out entries and grow unboundedly.
+
+
+def _co_invocation_log_cap() -> int:
+    """co_invocation_log_cap from core/config/skill-relations.yaml — the same
+    SSOT cmd_co_invoke enforces (skill-relations.py:211). Fail-open 200."""
+    try:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "config", "skill-relations.yaml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return int((cfg.get("config") or {}).get("co_invocation_log_cap", 200))
+    except Exception:
+        return 200
+
+
+def _merge_skill_relation(a: dict, b: dict) -> dict:
+    """Reconcile two records of the SAME (source, target, type) edge. No date
+    field exists on relation records, so: more fields (richer side — e.g.
+    confidence+evidence vs bare edge) -> _canon content tiebreak. Symmetric
+    and idempotent (mirrors _merge_forged_skill minus the date leg)."""
+    if len(a) != len(b):
+        return a if len(a) > len(b) else b
+    return a if _canon(a) >= _canon(b) else b
+
+
+def merge_skill_relations(local: bytes, remote: bytes) -> bytes:
+    """Union merge for world/skill-relations.yaml (3 top-level keys):
+
+    - forged_relations: LIST unioned by the (source, target, type) identity
+      cmd_add's duplicate check defines; same-edge divergence resolves via
+      _merge_skill_relation. Emitted SORTED by identity — bytes identical
+      regardless of arg order.
+    - co_invocation_log: append-mostly entries unioned by FULL-record content,
+      sorted by (date, content) ascending, then TAIL-CAPPED at the writers'
+      own co_invocation_log_cap so the merge cannot resurrect capped-out
+      entries or outgrow the cap. Unquoted YAML dates (datetime objects)
+      are str()-coerced for the sort key (the merge_tree str-vs-date class).
+    - last_updated: max non-null (write_yaml never stamps it today — the
+      live value is null — but a future stamper must not be rolled back).
+
+    Keys are only emitted when present on at least one side, so a
+    non-registry doc that happens to share the basename (core/config/
+    skill-relations.yaml — never synced, but defensively) passes through
+    without invented keys."""
+    a = yaml.safe_load(local.decode("utf-8")) or {}
+    b = yaml.safe_load(remote.decode("utf-8")) or {}
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return local if _canon(a) >= _canon(b) else remote
+
+    out = dict(a) if _canon(a) >= _canon(b) else dict(b)
+
+    def _list_of(doc, key):
+        v = doc.get(key)
+        return v if isinstance(v, list) else []
+
+    if "forged_relations" in a or "forged_relations" in b:
+        by_id: Dict[tuple, dict] = {}
+        raw_rels: List[object] = []
+        for r in _list_of(a, "forged_relations") + _list_of(b, "forged_relations"):
+            if not isinstance(r, dict):
+                raw_rels.append(r)
+                continue
+            k = (str(r.get("source")), str(r.get("target")), str(r.get("type")))
+            if k in by_id:
+                by_id[k] = _merge_skill_relation(by_id[k], r)
+            else:
+                by_id[k] = r
+        merged_rels = [by_id[k] for k in sorted(by_id)]
+        # Non-dict cruft entries survive dedup'd by content, sorted last —
+        # never silently dropped (the union promise), never crash the sort.
+        merged_rels += sorted({_canon(r): r for r in raw_rels}.values(),
+                              key=_canon)
+        out["forged_relations"] = merged_rels
+
+    if "co_invocation_log" in a or "co_invocation_log" in b:
+        seen: Dict[str, object] = {}
+        for e in _list_of(a, "co_invocation_log") + _list_of(b, "co_invocation_log"):
+            seen.setdefault(_canon(e), e)
+
+        def _log_key(e):
+            d = e.get("date") if isinstance(e, dict) else None
+            # str(datetime) uses a space where ISO strings use 'T' — without
+            # normalization a datetime-typed entry sorts BEFORE a string-typed
+            # entry of the same second (space < 'T'), skewing cap eviction.
+            return (str(d).replace(" ", "T") if d is not None else "",
+                    _canon(e))
+
+        merged_log = sorted(seen.values(), key=_log_key)
+        cap = _co_invocation_log_cap()
+        if len(merged_log) > cap:
+            merged_log = merged_log[-cap:]
+        out["co_invocation_log"] = merged_log
+
+    lu_a, lu_b = a.get("last_updated"), b.get("last_updated")
+    if lu_a is not None or lu_b is not None:
+        # Winner by T-normalized comparison (str(datetime) space vs ISO 'T' —
+        # fresh-eyes P1: a chronologically NEWER unquoted datetime otherwise
+        # loses to an older quoted string). _canon second key: a normalized
+        # TIE (same instant, datetime vs string type) must not resolve by arg
+        # order or merge(a,b) != merge(b,a) at the byte level.
+        candidates = [v for v in (lu_a, lu_b) if v is not None]
+        out["last_updated"] = max(
+            candidates, key=lambda v: (str(v).replace(" ", "T"), _canon(v)))
+    return _dump_yaml_default(_commutative_key_order(a, b, out))
 
 
 _META_MAX_FIELDS = ("session_count", "annecs_solved")
@@ -1074,6 +1919,8 @@ def merge_aspirations_meta(local: bytes, remote: bytes) -> bytes:
             else:
                 merged_g[k] = va2 if _canon(va2) >= _canon(vb2) else vb2
         out["readiness_gates"] = merged_g
+    # Key order side-independent on divergence (0; see merge_team_state).
+    out = _commutative_key_order(a, b, out)
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
@@ -1108,9 +1955,34 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
                 merged_m[k] = vb
             elif vb is None:
                 merged_m[k] = va
+            elif (isinstance(va, (int, float)) and not isinstance(va, bool)
+                    and isinstance(vb, (int, float)) and not isinstance(vb, bool)):
+                # 3 (guard-1153 sweep): confirmed_all_time /
+                # corrected_all_time are grow-only counters — numeric MAX.
+                # The previous _canon content-compare ordered lexicographically
+                # ("10" < "9"), so a counter could go BACKWARD on a same-key
+                # clash between two boxes that both batch-processed micros.
+                merged_m[k] = max(va, vb)
             else:
+                # Non-numeric values (last_session_stats snapshot dict, notes):
+                # content-larger stays — a whole-snapshot display blob where
+                # either side is a valid session record; deterministic beats
+                # date-parsing a cosmetic field.
                 merged_m[k] = va if _canon(va) >= _canon(vb) else vb
+        # accuracy_all_time is DERIVED from the two counters — recompute after
+        # the MAX-merge so one side's ratio is never paired with the other
+        # side's counters (same discipline as _merge_module.success_rate and
+        # _merge_spark_record.yield_rate). round(3) matches the batch-micro
+        # writer's precision.
+        conf = merged_m.get("confirmed_all_time")
+        corr = merged_m.get("corrected_all_time")
+        if (isinstance(conf, (int, float)) and not isinstance(conf, bool)
+                and isinstance(corr, (int, float)) and not isinstance(corr, bool)
+                and (conf + corr) > 0 and "accuracy_all_time" in merged_m):
+            merged_m["accuracy_all_time"] = round(conf / (conf + corr), 3)
         out["micro_hypothesis_stats"] = merged_m
+    # Key order side-independent on divergence (0; see merge_team_state).
+    out = _commutative_key_order(a, b, out)
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
@@ -1120,9 +1992,11 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
 # supplies the FIELD-CLASSIFICATION map + the three NON-STRUCTURAL merge classes.
 # The STRUCTURAL reconcile (children/parent/depth/child_count/node_type) is
 # -b, and the top-level merge_tree(bytes->bytes) handler + tree_growth_log
-# order-preserving union + _HANDLERS registration is -c. These helpers are
-# therefore DORMANT until C wires them -- nothing in _HANDLERS calls them yet, so
-# _tree.yaml stays unregistered (merge_handler_for still returns None for it).
+# order-preserving union + _HANDLERS registration is -c. C LANDED
+# (cccf0345 + 2292ac9b): merge_tree is LIVE, registered as "_tree.yaml" in
+# _HANDLERS (see the registration map below), verified reconciling the frozen
+# ~1140-node both-diverged tree post-restart with zero node loss
+# (2026-07-09_tree-yaml-freeze-restart-reconciles-without-clobber, CONFIRMED).
 #
 # Field classes (every per-node field is classified -- see _classify_tree_field):
 #   MAX          grow-only utilization counters -> numeric max (never lose a count;
@@ -1151,8 +2025,14 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
 # Grow-only utilization counters -> numeric MAX.
 _TREE_MAX_FIELDS = ("retrieval_count", "times_helpful", "times_noise",
                     "times_inferred_helpful", "sample_size")
-# Monotonic timestamps -> strictly-newer ISO wins.
-_TREE_NEWER_FIELDS = ("last_retrieved", "last_updated", "last_relevant_at")
+# Monotonic timestamps -> strictly-newer ISO wins. progression_updated_at
+# (5) is the dedicated PROGRESSION-field calibration stamp: writers of
+# confidence/capability_level/domain_confidence bump it on edit, and the
+# PROGRESSION merge keys on it (see _merge_tree_node) instead of last_updated,
+# which 3 deliberately leaves un-bumped on a field poke. It merges NEWER
+# so the winning side's stamp is preserved.
+_TREE_NEWER_FIELDS = ("last_retrieved", "last_updated", "last_relevant_at",
+                      "progression_updated_at")
 # LWW-by-last_updated with never-regress-on-tie.
 _TREE_PROGRESSION_FIELDS = ("confidence", "capability_level", "domain_confidence")
 # Structural -- reconciled in -b; ride the LWW base here.
@@ -1229,8 +2109,8 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
     loser-only one must not be dropped). Symmetric in (a, b) -> both machines
     converge, INCLUDING the non-dict guard below (proven by the g-001-313-a unit
     tests). NOTE: this returns a merged NODE dict; the byte-exact _tree.yaml
-    serialization + tree_growth_log union + dispatcher wiring are g-001-313-c, so
-    this helper is not yet reachable from _HANDLERS."""
+    serialization + tree_growth_log union + dispatcher wiring are g-001-313-c
+    (LANDED — reachable via the merge_tree handler registered in _HANDLERS)."""
     if not isinstance(a, dict) or not isinstance(b, dict):
         # Non-dict input (never happens for real tree nodes). The dict side wins;
         # if BOTH are non-dicts fall to the module's content tiebreak so the result
@@ -1259,9 +2139,22 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
             out[f] = a[f]
         elif f in b:
             out[f] = b[f]
+    # PROGRESSION merges key on the DEDICATED progression_updated_at stamp
+    # (bumped by writers on any confidence/capability_level/domain_confidence
+    # edit), falling back to last_updated for un-migrated nodes. 3
+    # deliberately does NOT bump last_updated on a field poke (it tracks .md
+    # article freshness, SSOT ), so keying PROGRESSION on last_updated
+    # made every confidence merge see equal stamps and hit the never-regress
+    # tiebreak, silently reverting data-derived DOWNGRADES to the stale-higher
+    # value (4; rb-3823, guard-1170). The fallback keeps behavior
+    # byte-identical for nodes not yet re-written with the stamp (backfill-safe).
+    # Commutative: pa/pb are each side's own value passed in (a, b) order and
+    # _merge_field_progression is symmetric under (va, pa)<->(vb, pb) swap.
+    pa = a.get("progression_updated_at", ta)
+    pb = b.get("progression_updated_at", tb)
     for f in _TREE_PROGRESSION_FIELDS:
         if f in a and f in b:
-            out[f] = _merge_field_progression(a[f], ta, b[f], tb)
+            out[f] = _merge_field_progression(a[f], pa, b[f], pb)
         elif f in a:
             out[f] = a[f]
         elif f in b:
@@ -1315,10 +2208,10 @@ def _classify_tree_field(field: str) -> str:
 # construction: a node appears in exactly the children list of the parent it
 # actually points to, and that list only ever names keys that exist. Every
 # derived list is SORTED, so the result is byte-identical regardless of (a, b)
-# order (the module-wide commutativity invariant). These helpers are still
-# DORMANT: -c wraps _merge_tree_nodes_map in the bytes->bytes merge_tree
-# handler (parse YAML -> merge nodes map + tree_growth_log union -> serialize),
-# adds CRLF handling, and registers it in _HANDLERS.
+# order (the module-wide commutativity invariant). -c LANDED: the
+# bytes->bytes merge_tree handler (parse YAML -> merge nodes map +
+# tree_growth_log union -> serialize, with CRLF handling) wraps these helpers
+# and is registered in _HANDLERS ("_tree.yaml": merge_tree).
 
 
 def _rebuild_tree_structure(merged: Dict[str, dict]) -> None:
@@ -1664,11 +2557,226 @@ def merge_tree(local: bytes, remote: bytes) -> bytes:
     return _dump_tree_yaml(_canonicalize_for_merge(out))
 
 
+# byte-deterministic without matching the domain writer's dump style.
+def merge_outcome_metrics(local: bytes, remote: bytes) -> bytes:
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 — unparseable side -> content tiebreak
+        a = b = None
+    if isinstance(a, dict) and isinstance(b, dict):
+        ta, tb = a.get("updated_at"), b.get("updated_at")
+        if _newer(ta, tb):
+            return local
+        if _newer(tb, ta):
+            return remote
+    # Equal / missing / unparseable timestamps: content tiebreak on the raw
+    # bytes (deterministic, arg-order-independent).
+    return local if local >= remote else remote
+
+
+# --- evolution event streams : revision_id-keyed, status-monotonic ----------
+# (1, from the 2026-07-18 12-file both-diverged repair 8.)
+# The four evolution streams ({self,skill,rule,script}-evolution.jsonl) were
+# proposed as plain line-union, but the rb-245 writer read DISPROVED
+# append-only: evolution-record.py APPENDS stubs (status=awaiting_completion),
+# then evolution-complete.py rewrite_stream() REWRITES the stub line in place
+# (status -> final, reasoning filled) and evolution-stub-expiry.py
+# locked_modify_jsonl REWRITES it to expired. A line-union would RESURRECT the
+# awaiting_completion version beside its finalized/expired twin, false-firing
+# the force_evolution_finalize precheck gate (evolution-stub-pending-check
+# counts pending stubs) forever. So: union keyed by revision_id, same-id
+# copies merged STATUS-MONOTONICALLY — the more terminal status wins
+# (awaiting_completion < awaiting_acks < expired < final; a real completion
+# beats the honest-fallback expiry). Deterministic output order by (ts,
+# revision_id, canon) -> byte-commutative (guard-907).
+_EVO_STATUS_RANK = {"awaiting_completion": 0, "awaiting_acks": 1,
+                    "expired": 2, "final": 3}
+
+
+def _merge_evolution_record(a: dict, b: dict) -> dict:
+    ra = _EVO_STATUS_RANK.get(str(a.get("status")), 0)
+    rb_ = _EVO_STATUS_RANK.get(str(b.get("status")), 0)
+    if ra != rb_:
+        return a if ra > rb_ else b
+    # Same status: newer ts wins; equal/missing -> content tiebreak.
+    w, _l = _order_by_ts(a, b, "ts")
+    # Canon tie = identical parsed content, but key ORDER may have diverged —
+    # _order_by_ts then returns its first arg, which is side-dependent. Emit
+    # sorted-key order on divergence (1 pattern) so bytes stay
+    # side-independent (guard-907).
+    if _canon(a) == _canon(b):
+        return _commutative_key_order(a, b, w)
+    return w
+
+
+def merge_evolution_stream(local: bytes, remote: bytes) -> bytes:
+    """Commutative merge for the evolution event streams. Records keyed by
+    revision_id (defensive fallback: whole-record canonical identity for any
+    malformed line without one); same-key copies resolved status-monotonically
+    via _merge_evolution_record. Output sorted by (ts, revision_id, canon) —
+    a pure function of the merged content set (guard-907)."""
+    merged: Dict[object, dict] = {}
+    for rec in _parse_jsonl(local) + _parse_jsonl(remote):
+        rid = rec.get("revision_id")
+        key = ("rev", str(rid)) if rid else ("canon", _canon(rec))
+        merged[key] = (_merge_evolution_record(merged[key], rec)
+                       if key in merged else rec)
+    out = sorted(merged.values(),
+                 key=lambda r: (str(r.get("ts") or ""),
+                                str(r.get("revision_id") or ""), _canon(r)))
+    return _dump_jsonl(out)
+
+
+# --- infra-health.yaml : per-component newest-activity-wins ------------------
+# (1.) Writer: infra-health.py via locked_modify_yaml — per-component
+# in-place mutation of {last_success, last_failure, consecutive_failures,
+# streak_started_at, ...}. A component's fields are internally consistent
+# (streak math), so the reconcile unit is the WHOLE component record, won by
+# the side with the newest activity timestamp (max of last_success /
+# last_failure) — never a field-mix. Component keys union (a component probed
+# on only one box survives). Top-level non-component keys (none today,
+# defensive) union with per-key canon tiebreak.
+def _infra_component_ts(c) -> str:
+    if not isinstance(c, dict):
+        return ""
+    return max(str(c.get("last_success") or ""),
+               str(c.get("last_failure") or ""))
+
+
+def merge_infra_health(local: bytes, remote: bytes) -> bytes:
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001 — unparseable side -> byte tiebreak
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+    ca = a.get("components") if isinstance(a.get("components"), dict) else {}
+    cb = b.get("components") if isinstance(b.get("components"), dict) else {}
+    comps: Dict[str, object] = {}
+    for name in sorted(set(ca) | set(cb)):
+        xa, xb = ca.get(name), cb.get(name)
+        if xa is None or xb is None:
+            comps[name] = xa if xb is None else xb
+            continue
+        ta, tb = _infra_component_ts(xa), _infra_component_ts(xb)
+        if ta != tb:
+            comps[name] = xa if ta > tb else xb
+        elif _canon(xa) != _canon(xb):
+            comps[name] = xa if _canon(xa) > _canon(xb) else xb
+        elif isinstance(xa, dict) and isinstance(xb, dict):
+            # Canon tie: identical content, possibly diverged key order —
+            # side-independent order via 1 pattern (guard-907).
+            comps[name] = _commutative_key_order(xa, xb, xa)
+        else:
+            comps[name] = xa
+    out: Dict[str, object] = {"components": comps}
+    for k in sorted((set(a) | set(b)) - {"components"}):
+        va, vb = a.get(k), b.get(k)
+        if va is None or vb is None:
+            out[k] = va if vb is None else vb
+        elif _canon(va) != _canon(vb):
+            out[k] = va if _canon(va) > _canon(vb) else vb
+        elif isinstance(va, dict) and isinstance(vb, dict):
+            out[k] = _commutative_key_order(va, vb, va)
+        else:
+            out[k] = va
+    return _dump_yaml(out)
+
+
+# --- goal-selection-strategy.yaml : version-winner + applications_log union --
+# (1.) Versioned meta-strategy: writers are whole-file/field RMW
+# (meta-yaml.py set, meta-init.py seed, goal-selector.py applications_log
+# append via locked_modify_yaml). Reconcile: the side with the HIGHER version
+# wins the strategy body (tie -> newer last_updated -> canon); the
+# applications_log telemetry list is entry-UNIONED from both sides (dedup by
+# full canonical identity, chronological (ts, canon) order) then RE-CAPPED at
+# the writer's own FIFO cap of 200 (goal-selector._APPLICATIONS_LOG_CAP —
+# the cap is a legitimate delete path a naive union would resurrect; same
+# re-cap pattern as merge_skill_relations' co_invocation_log).
+_GSS_APPLICATIONS_LOG_CAP = 200
+
+
+def merge_goal_selection_strategy(local: bytes, remote: bytes) -> bytes:
+    try:
+        a = yaml.safe_load(local.decode("utf-8")) or {}
+        b = yaml.safe_load(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+
+    def _ver(d):
+        v = d.get("version")
+        return v if isinstance(v, (int, float)) else -1
+
+    if _ver(a) != _ver(b):
+        w = a if _ver(a) > _ver(b) else b
+    elif str(a.get("last_updated") or "") != str(b.get("last_updated") or ""):
+        w = a if str(a.get("last_updated") or "") > str(b.get("last_updated") or "") else b
+    elif _canon(a) != _canon(b):
+        w = a if _canon(a) > _canon(b) else b
+    else:
+        # Canon tie: identical content, possibly diverged key order — a bare
+        # "pick a" is side-dependent and breaks byte-commutativity
+        # (guard-907; caught by test_serialization_order_commutative).
+        # Sorted-key order on divergence per the 1 pattern.
+        w = _commutative_key_order(a, b, a)
+    out = dict(w)
+    la = a.get("applications_log") if isinstance(a.get("applications_log"), list) else []
+    lb = b.get("applications_log") if isinstance(b.get("applications_log"), list) else []
+    seen: Dict[str, dict] = {}
+    for e in la + lb:
+        seen.setdefault(_canon(e), e)
+    log = sorted(seen.values(),
+                 key=lambda e: (str((e or {}).get("ts") if isinstance(e, dict) else "") or "",
+                                _canon(e)))
+    if len(log) > _GSS_APPLICATIONS_LOG_CAP:
+        log = log[-_GSS_APPLICATIONS_LOG_CAP:]
+    out["applications_log"] = log
+    return _dump_yaml(out)
+
+
+# --- hypothesis-category-bindings.json : key-union on a derived map ----------
+# (1.) Writer: tree-accuracy-sync.py — full-file rewrite of a FLAT
+# {category: node-key} string map DERIVED from tree state (rebuildable; the
+# next sync run recomputes authoritative values). Keys union; a same-key value
+# conflict has no per-key timestamp to arbitrate, so the canonical-larger
+# value wins deterministically — safe because the store is derived and
+# self-corrects on the next tree-accuracy-sync pass. sort_keys serialization
+# matches the writer's own dump style (indent=2, sort_keys=True).
+def merge_hypothesis_category_bindings(local: bytes, remote: bytes) -> bytes:
+    try:
+        a = json.loads(local.decode("utf-8")) or {}
+        b = json.loads(remote.decode("utf-8")) or {}
+    except Exception:  # noqa: BLE001
+        return local if local >= remote else remote
+    if not (isinstance(a, dict) and isinstance(b, dict)):
+        return local if local >= remote else remote
+    out: Dict[str, object] = {}
+    for k in sorted(set(a) | set(b)):
+        va, vb = a.get(k), b.get(k)
+        if va is None or vb is None:
+            out[k] = va if vb is None else vb
+        else:
+            out[k] = va if _canon(va) >= _canon(vb) else vb
+    # No trailing newline — byte-matches tree-accuracy-sync.py's own dump so a
+    # merge that changes nothing semantically converges instead of re-diverging.
+    return json.dumps(out, indent=2, sort_keys=True).encode("utf-8")
+
+
 # --- registration -----------------------------------------------------------
 _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
     "reasoning-bank.jsonl": merge_reasoning_bank,
     "guardrails.jsonl": merge_guardrails,
+    # pattern signatures (3): in-place-mutating writers (record-outcome
+    # counter bumps, set-status retire) -> id-keyed field-merge, NOT line-union
+    # (which would resurrect retired signatures). Mixed-format on-disk ids
+    # (sig-001 legacy pad / sig-8+ unpadded) are preserved via the observed-form
+    # id formatter — see merge_pattern_signatures.
+    "pattern-signatures.jsonl": merge_pattern_signatures,
     # field-level YAML reconcile
     "team-state.yaml": merge_team_state,
     # aspiration/goal-id union (records edited in place)
@@ -1680,6 +2788,64 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # moves live->archive), so it takes the same handler.
     "pipeline.jsonl": merge_pipeline,
     "pipeline-archive.jsonl": merge_pipeline,
+    # aspirations-archive shares the record shape AND flow with aspirations
+    # (complete/complete_intent/retire APPEND whole-aspiration records;
+    # archive_sweep REWRITES normalizing via _normalize_terminal_goals_in) —
+    # same handler. Writer inventory read per rb-245 (). Ported from
+    # cc-02 9 registry expansion at the 2 unwedge merge.
+    "aspirations-archive.jsonl": merge_aspirations,
+    # outcome metrics: whole-file derived snapshot -> LWW by updated_at
+    # (6; box-relative counter wart tracked in 8).
+    "outcome-metrics.yaml": merge_outcome_metrics,
+    # forged-skills registry (5): keyed dict union under skills: —
+    # append-mostly rows (retirement = status field, never deletion), so a
+    # row on either side survives; same-name divergence -> whole-record
+    # newer-forged_date/richer/_canon winner. CURE for the 8 +
+    # 9 stale-base row-clobber incidents.
+    "forged-skills.yaml": merge_forged_skills,
+    # skill-relations graph (6): sibling registry to forged-skills —
+    # forged_relations list unioned by (source,target,type), co_invocation_log
+    # entry-unioned then re-capped at the writers' own cap (cmd_co_invoke's
+    # tail-cap is a legitimate delete path a naive union would resurrect).
+    "skill-relations.yaml": merge_skill_relations,
+    # tree-debt telemetry (): verified append-only by reading BOTH
+    # writers (rb-245) — CLI tree.py + daemon tree_write.py, zero rewriters.
+    "tree-debt.jsonl": merge_append_only_jsonl,
+    # goal-selector anomaly telemetry: append-only.
+    "goal-selector-anomalies.jsonl": merge_append_only_jsonl,
+    # board read-cursors: append-only per-agent read receipts.
+    "coordination-reads.jsonl": merge_append_only_jsonl,
+    "decisions-reads.jsonl": merge_append_only_jsonl,
+    # store-hygiene archive sinks (7): jsonl_hygiene compact/rotate
+    # APPENDS moved retired/superseded records archive-FIRST via
+    # locked_modify_jsonl and NOTHING deletes from an archive (bounded-by-
+    # design, the hygiene glob explicitly never matches *-archive*). Two boxes
+    # compacting independently diverge these — line-union matches the writers'
+    # documented at-least-once tolerance ("a crash leaves the moved records in
+    # BOTH files — recoverable archive dup, never a live loss"). Caveat: the
+    # same id archived on two boxes after divergent utilization increments
+    # keeps BOTH lines (distinct bytes = distinct events); restore flows read
+    # by id and pick the newest — union-over-collapse is deliberate here.
+    "guardrails-archive.jsonl": merge_append_only_jsonl,
+    "reasoning-bank-archive.jsonl": merge_append_only_jsonl,
+    "pattern-signatures-archive.jsonl": merge_append_only_jsonl,
+    # Triaged NOT-registered (7 audit, dispositions on record):
+    #   world/journal.jsonl — 12-byte "placeholder" seed artifact, zero
+    #     writers found (agents journal into agents/<name>/journal.jsonl);
+    #     freeze is a no-op on a file nothing writes.
+    #   world/sources.yaml — reflect-on-outcome LLM read-modify-write
+    #     reliability registry (keyed by source id, low write frequency);
+    #     freeze acceptable until divergence is ever observed — the fix then
+    #     is a keyed union à la merge_forged_skills with counter-max fields.
+    #   Remaining world-root telemetry logs (curation-log, precheck-eval-log,
+    #     *-sweep-metrics, etc.) — single-writer flows; registration deferred
+    #     until a second writer or observed divergence justifies it.
+    "findings-reads.jsonl": merge_append_only_jsonl,
+    "general-reads.jsonl": merge_append_only_jsonl,
+    # 5th board read-cursor (1 — froze at streak 5 in the 2026-07-18
+    # both-diverged backlog): same board.py mark-read locked_append_jsonl
+    # writer as the four registered above.
+    "reasoning-reads.jsonl": merge_append_only_jsonl,
     # spark questions: union by stable text identity (survives candidate ->
     # question promotion), counter-MAX + derived yield_rate recompute
     # (rb-2849 — frozen alongside pipeline.jsonl).
@@ -1756,6 +2922,60 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "retrieval-trace.jsonl": merge_append_only_jsonl,
     "loop-death-detections.jsonl": merge_append_only_jsonl,
     "description-length-telemetry.jsonl": merge_append_only_jsonl,
+    # changelog.jsonl + its rotation target changelog-archive.jsonl (3,
+    # ports cc-02 7b6801e1; SUPERSEDES the 6 "pruned -> exclude" call).
+    # changelog.jsonl IS rotated by store-hygiene.yaml, but the rotation MOVES
+    # lines into changelog-archive.jsonl -- it is NOT a rewrite/rebuild that drops
+    # records -- so the pair carries the SAME bounded rotate+line-union tradeoff
+    # already accepted for the board channels above: a both-diverged merge unions
+    # the live file (at most RESURRECTING a just-rotated line as a bounded
+    # duplicate, reconciled on the next rotation) and unions the archive (capturing
+    # every rotated line). Dispatch is by basename, so these two entries cover ALL
+    # six changelog stores at once -- world/, meta/, and agents/<name>/. Leaving
+    # them unregistered froze the fleet's ENTIRE write-audit trail out of S3 for 5
+    # weeks (2026-06-06 -> 2026-07-14) across all six stores -- the same freeze
+    # class as rb-3150 (team-state peer shards), and why partner liveness read
+    # days-stale. STEP-3 verification confirms live INTERSECT archive == 0 after
+    # the reconcile; a non-zero overlap would mean guard-1005 resurrection bit and
+    # the pair wants a paired-archive-aware handler instead of the plain line-union.
+    "changelog.jsonl": merge_append_only_jsonl,
+    "changelog-archive.jsonl": merge_append_only_jsonl,
+    # 1 (2026-07-18 12-file both-diverged repair, 8 cure):
+    # evolution event streams — NOT line-union (rb-245 read disproved
+    # append-only: evolution-complete/stub-expiry REWRITE stub records in
+    # place); revision_id-keyed status-monotonic merge instead. Dispatch by
+    # basename covers all four streams' world/ paths.
+    "self-evolution.jsonl": merge_evolution_stream,
+    "skill-evolution.jsonl": merge_evolution_stream,
+    "rule-evolution.jsonl": merge_evolution_stream,
+    "script-evolution.jsonl": merge_evolution_stream,
+    # program-evolution.jsonl: the 5th sibling stream — not in the 2026-07-18
+    # freeze backlog but IDENTICAL writer set (evolution-record append /
+    # evolution-complete rewrite incl. the program-only awaiting_acks status /
+    # stub-expiry rewrite), so it takes the same handler rather than staying
+    # the lone freeze-prone sibling.
+    "program-evolution.jsonl": merge_evolution_stream,
+    # meta/l1-pick-log.jsonl (1): NOW writer-verified append-only —
+    # _l1_pick.py open('a') + l1-domain-rename.py (self-documented "append");
+    # leaves the DEFERRED list below.
+    "l1-pick-log.jsonl": merge_append_only_jsonl,
+    # meta/meta-log.jsonl (1): NOW writer-verified append-only —
+    # meta-yaml.py append_log() opens 'a' (the open('r') the old DEFERRED note
+    # flagged is only mc-NNN ID ALLOCATION, not a rewrite; daemon twin
+    # meta_yaml.py mirrors it). Accepted tradeoff: concurrent cross-box
+    # allocation can collide mc-NNN ids and the union keeps both lines —
+    # bounded duplicate-ID tolerance (next_meta_change_id takes max, so
+    # allocation self-heals), same class as the archive-sink duplicates above.
+    "meta-log.jsonl": merge_append_only_jsonl,
+    # world/auto-fix-evidence-sweep-metrics.jsonl (1): writer RETIRED
+    # (zero code references fleet-wide; last record 2026-06-23) — immutable
+    # historical run_summary log, so line-union reconciles the residual
+    # divergence and nothing can violate append-only going forward.
+    "auto-fix-evidence-sweep-metrics.jsonl": merge_append_only_jsonl,
+    # 1 structured trio (per-file decisions on record in each handler):
+    "infra-health.yaml": merge_infra_health,
+    "goal-selection-strategy.yaml": merge_goal_selection_strategy,
+    "hypothesis-category-bindings.json": merge_hypothesis_category_bindings,
     # DELIBERATELY NOT REGISTERED (rb-245 disqualified -- the audit's whole point):
     #   dead-ends.jsonl        -> meta-dead-ends.py write_all() does
     #                             locked_write_jsonl(DE_PATH, records) = full-file
@@ -1766,10 +2986,17 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #                             rewrite; line-union would resurrect stale edges.
     # DEFERRED (writer not yet confirmed strictly append-only -- left unregistered
     # = safe-freeze, the conservative default; needs per-writer read before adding):
-    #   meta-log.jsonl (meta-yaml.py has an open('r') read-modify path),
-    #   l1-pick-log.jsonl, scoring-criterion-audit.jsonl, and the
+    #   scoring-criterion-audit.jsonl, and the
     #   file-contention/gate-d/history-save/history-shadow/write-queue-telemetry
     #   family (variable-path writers not resolved in the 9 pass).
+    #   (pattern-signatures.jsonl left this list 2026-07-16 — registered above
+    #   with merge_pattern_signatures, 3. meta-log.jsonl +
+    #   l1-pick-log.jsonl left it 2026-07-18 — writer-verified and registered
+    #   above, 1.)
+    #   world/conventions/deploy-secrets.md (1 disposition) ->
+    #   hand-edited markdown with NO code writer; prose has no commutative
+    #   merge unit, so it stays safe-freeze + hand-union on conflict (the
+    #   2026-07-18 repair pushed LOCAL, which carried the  correction).
     # field-level YAML/JSON reconcile (records MUTATED IN PLACE -> per-field
     # reconcile; verified per-store by reading each writer, rb-245 / ):
     "module-health.yaml": merge_module_health,
@@ -1790,7 +3017,21 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
 
 
 def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
-    """Return the commutative merge handler for ``path`` by its basename, or
-    None when the store is not merge-registered (the backend then keeps its
-    safe-freeze behavior for that path)."""
+    """Return the commutative merge handler for ``path``, or None when the
+    store is not merge-registered (the backend then keeps its safe-freeze
+    behavior for that path).
+
+    Dispatch is by basename EXCEPT for per-agent team-state shards
+    (``.../team-state/agents/<name>.yaml``), whose basenames are dynamic
+    (alpha.yaml/bravo.yaml/...) and so cannot be enumerated in _HANDLERS. Those
+    match by PATH PATTERN (parent dir ``agents`` under ``team-state``) so new
+    agents are covered automatically without touching this registry. Without
+    the branch, shard basenames returned None and the backend froze peer shards
+    on the both-diverged 412 -> fresh-SELF + stale-PEERS on every box (rb-3150;
+    fixed g-115-2133). The composite ``team-state.yaml`` is NOT under
+    ``team-state/agents/`` so it still routes by basename to merge_team_state."""
+    parts = str(path).replace("\\", "/").split("/")
+    if (len(parts) >= 3 and parts[-3] == "team-state"
+            and parts[-2] == "agents" and parts[-1].endswith(".yaml")):
+        return merge_team_state_shard
     return _HANDLERS.get(os.path.basename(str(path)))

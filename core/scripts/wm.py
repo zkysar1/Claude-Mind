@@ -165,6 +165,18 @@ CADENCE_TRACKER_PATTERNS = (
     re.compile(r"^last_.*_fire$"),
 )
 
+# Slots that survive cmd_reset BY NAME: their writer and reader sit on opposite
+# sides of the aspirations-consolidate Step-5 wm-reset boundary (Step 0.65
+# writes journal_cluster_summaries pre-reset; Step 9 consumes it one-shot
+# post-reset for handoff key_outcomes, then clears it). Content payloads, not
+# timestamps — CADENCE_TRACKER_PATTERNS cannot cover them. Staleness
+# self-heals: the next consolidation's Step 0.65 overwrites the slot, and
+# cmd_maintain's evict path cleans a crashed-consolidation leftover.
+# MIRRORED in mind_api/src/endpoints/wm_write.py (the LIVE runtime path —
+# wm-reset.sh routes to POST /v1/wm/reset, not to cmd_reset). Keep both in
+# sync; parity asserted by test_wm_reset_cadence.py. (2)
+RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
+
 def _is_cadence_tracker(slot_name):
     """True if slot name matches a cadence-tracker pattern — do not evict."""
     return any(p.match(slot_name) for p in CADENCE_TRACKER_PATTERNS)
@@ -178,19 +190,31 @@ def now_iso():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 def read_yaml(path):
-    """Read a YAML file, return parsed dict. Returns {} if missing."""
+    """Read a YAML file, return parsed dict. Returns {} if missing.
+
+    Detective layer (g-001-44): a non-empty file whose bytes are all 0x00 is
+    the NTFS metadata-journaled-but-data-not-flushed crash signature — return
+    empty with a stderr WARN instead of feeding null bytes to the YAML parser.
+    """
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    raw = path.read_bytes()
+    if raw and not raw.strip(b"\x00"):
+        print(f"[wm] WARN: {path} is all-null content ({len(raw)} bytes) — "
+              f"post-crash corruption signature (g-001-44); treating as empty. "
+              f"Rebuild via wm-init.sh if slots are expected.", file=sys.stderr)
+        return {}
+    data = yaml.safe_load(raw.decode("utf-8", errors="replace"))
     return data if data is not None else {}
 
 def write_yaml(path, data):
-    """Atomically write data as YAML."""
+    """Atomically write data as YAML (fsync before rename — )."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
 
 def read_wm():
@@ -832,15 +856,19 @@ def cmd_reset(args):
         # the _is_cadence_tracker check in cmd_maintain). Iterates existing
         # slots (not slot_types) because cadence-trackers are typically
         # added dynamically and may not appear in slot_types config.
+        # RESET_SURVIVING_SLOTS members survive the same way — their reader
+        # runs AFTER this reset by design (2).
         existing_slots = existing.get("slots", {})
         existing_meta = existing.get("slot_meta", {})
         cadence_preserved = []
+        surviving_preserved = []
         for slot_name, slot_val in existing_slots.items():
-            if _is_cadence_tracker(slot_name) and slot_val is not None:
+            is_cadence = _is_cadence_tracker(slot_name)
+            if (is_cadence or slot_name in RESET_SURVIVING_SLOTS) and slot_val is not None:
                 data["slots"][slot_name] = slot_val
                 if slot_name in existing_meta:
                     data["slot_meta"][slot_name] = existing_meta[slot_name]
-                cadence_preserved.append(slot_name)
+                (cadence_preserved if is_cadence else surviving_preserved).append(slot_name)
 
         write_wm(data)
     status_parts = []
@@ -848,6 +876,8 @@ def cmd_reset(args):
         status_parts.append(", ".join(sorted(preserved)))
     if cadence_preserved:
         status_parts.append(f"{len(cadence_preserved)} cadence trackers")
+    if surviving_preserved:
+        status_parts.append("reset-surviving: " + ", ".join(sorted(surviving_preserved)))
     if status_parts:
         print(f"Working memory reset to template state ({len(slot_types)} slots; preserved: {'; '.join(status_parts)}).")
     else:

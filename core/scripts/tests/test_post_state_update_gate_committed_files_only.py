@@ -119,15 +119,19 @@ def _setup_repo(tmp: Path) -> tuple[Path, str]:
     return repo, sha
 
 
-def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None) -> dict:
+def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None,
+              goal_id: str | None = None) -> dict:
     """Run the REAL gate with cwd=repo; return parsed JSON output."""
     env = dict(os.environ)
     env["MIND_AGENT"] = "zeta"           # self — WM write (if any) goes to own slot
     env["MIND_WORLD"] = _to_bash_path(world)  # empty temp world → deterministic filter/peer-read
     env["MIND_META"] = _to_bash_path(meta)
     env.pop("COMMIT_SHA", None)
+    env.pop("GOAL_ID", None)
     if commit_sha is not None:
         env["COMMIT_SHA"] = commit_sha
+    if goal_id is not None:
+        env["GOAL_ID"] = goal_id
     result = subprocess.run(
         [GIT_BASH, _to_bash_path(GATE_SH), "deep"],
         cwd=str(repo),
@@ -272,6 +276,81 @@ def test_invalid_commit_sha_falls_back_to_working_tree():
         for cf in COMMITTED:
             assert cf not in files, \
                 f"committed file must NOT appear under invalid-sha fallback: {cf} in {files}"
+
+
+def _setup_repo_multicommit(tmp: Path) -> tuple[Path, str]:
+    """Two goal commits stamped '(9)': a mid-Phase-4 CODE commit (3
+    core files, one new .py) followed by a close-time DOCS-ONLY commit. Returns
+    (repo, close_sha) — the docs commit is what iteration-close passes as
+    COMMIT_SHA (the g-115-2026 leak shape)."""
+    repo = tmp / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, timeout=10)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+    (repo / "core" / "scripts").mkdir(parents=True)
+    (repo / "core" / "scripts" / ".gitkeep").write_text("")
+    (repo / "agents" / "zeta").mkdir(parents=True)
+    (repo / "agents" / "zeta" / "journal.md").write_text("init\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    # Mid-Phase-4 code commit (e.g. committed early for a daemon restart).
+    for rel in COMMITTED:
+        (repo / rel).write_text(f"# {rel}\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fix(g-115-9999): wire the thing"], cwd=repo, check=True)
+
+    # Close-time commit: docs/state only — zero core files.
+    (repo / "agents" / "zeta" / "journal.md").write_text("init\ngoal closed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "docs(g-115-9999): journal + state"], cwd=repo, check=True)
+    close_sha = _git(repo, "rev-parse", "HEAD")
+    return repo, close_sha
+
+
+def test_goal_id_unions_midgoal_commits():
+    """0: GOAL_ID unions every '(goal-id)'-stamped commit into the
+    committed scope, so a mid-Phase-4 code commit is detected even when the
+    close-time COMMIT_SHA carries only docs."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo, close_sha = _setup_repo_multicommit(tmp)
+        world = tmp / "world"; world.mkdir()
+        meta = tmp / "meta"; meta.mkdir()
+
+        out = _run_gate(repo, world, meta, commit_sha=close_sha, goal_id="g-115-9999")
+
+        assert out["fired"] is True, f"expected fire via goal-commit union: {out}"
+        assert out.get("commits_scanned") == 2, \
+            f"expected both goal commits scanned: {out}"
+        files = set(out.get("files", []))
+        assert set(COMMITTED) <= files, \
+            f"mid-goal code commit's files missing from union: {files}"
+        assert out.get("new_script") in COMMITTED, \
+            f"new-script trigger lost in multi-commit union: {out.get('new_script')!r}"
+
+
+def test_goal_id_absent_preserves_single_sha_leak_shape():
+    """Backward-compat pin: WITHOUT GOAL_ID the docs-only close commit stays
+    below thresholds (the documented pre-g-115-2030 limitation — this assert
+    is the regression contract for the single-sha path, not an endorsement)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo, close_sha = _setup_repo_multicommit(tmp)
+        world = tmp / "world"; world.mkdir()
+        meta = tmp / "meta"; meta.mkdir()
+
+        out = _run_gate(repo, world, meta, commit_sha=close_sha, goal_id=None)
+
+        assert out["fired"] is False, \
+            f"single-sha docs-only commit must not fire (below thresholds): {out}"
+        assert out.get("commits_scanned") == 1, f"expected exactly the close sha: {out}"
 
 
 if __name__ == "__main__":

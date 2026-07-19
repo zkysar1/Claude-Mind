@@ -12,6 +12,9 @@ Predicate types:
   metric_threshold     — allowlisted script emits count/int; compared against min/max
   after_time           — wall-clock anchor + delay_seconds elapsed (Monitor goals)
   vcs_commits_since    — repo has >= min_count commits since a cutoff (event-gate)
+  pr_merged            — GitHub PR is MERGED (branch-per-goal estates: gates a
+                         stacked goal on its foundation PR reaching main, not
+                         just the foundation GOAL completing — g-115-2593/rb-3995)
 
 Unknown types, malformed predicates, and evaluator errors all fail closed for
 the offending predicate but NEVER crash the caller. The selector/caller
@@ -519,6 +522,124 @@ def _eval_vcs_commits_since(p: dict) -> PredicateResult:
     )
 
 
+def _pr_cache_path() -> Optional[Path]:
+    """Per-agent session cache for pr_merged probes. None when no agent bound
+    (predicate still evaluates live — just uncached)."""
+    agent = os.environ.get("MIND_AGENT", "").strip()
+    if not agent:
+        return None
+    d = _agent_dir(agent) / "session"
+    return d / "pr-merge-state-cache.json" if d.is_dir() else None
+
+
+def _pr_cache_load(path: Optional[Path]) -> dict:
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _pr_cache_store(path: Optional[Path], cache: dict) -> None:
+    if path is None:
+        return
+    try:
+        path.write_text(json.dumps(cache, indent=1), encoding="utf-8")
+    except OSError:
+        pass  # cache is an optimization — never fail the predicate over it
+
+
+def _eval_pr_merged(p: dict) -> PredicateResult:
+    """Pass when GitHub PR `pr` in `repo` (owner/name) is MERGED.
+
+    Branch-per-goal estates (g-115-2593 / rb-3995): a foundation goal is
+    marked completed when its code lands on its OWN branch, so plain
+    blocked_by-on-completion reads the dependency as satisfied while the
+    substrate is still off-main. Stacked goals carry this predicate (WITHOUT
+    selector_skip) so the selector keeps them out of candidates until the
+    foundation PR actually merges; precondition-defer-recheck + the pre-claim
+    re-check then resurface them automatically post-merge.
+
+    States: MERGED -> pass (cached terminally). OPEN -> fail, re-probed after
+    `cache_ttl_minutes` (default 30). CLOSED-unmerged -> fail with an
+    abandoned-foundation warning (cached 24h — long enough to stop probe spam,
+    short enough that a reopened PR recovers within a day).
+
+    Probe: `gh pr view <pr> --repo <repo> --json state` (15s timeout). On
+    probe failure a stale cache entry is trusted (grace); with no cache the
+    predicate fails closed per library convention — the goal stays gated
+    until a gh-capable evaluation observes the merge.
+    """
+    pid = p.get("id")
+    repo = p.get("repo")
+    pr = p.get("pr")
+    if not isinstance(repo, str) or "/" not in repo:
+        return PredicateResult(False, "pr_merged", pid,
+                               reason="missing/invalid repo (need owner/name)")
+    if not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0:
+        return PredicateResult(False, "pr_merged", pid,
+                               reason="missing/invalid pr (need positive int)")
+    ttl_open = float(p.get("cache_ttl_minutes", 30)) * 60
+    ttl_closed = 24 * 3600
+    key = f"{repo}#{pr}"
+    now = datetime.now()
+
+    cache_path = _pr_cache_path()
+    cache = _pr_cache_load(cache_path)
+    entry = cache.get(key)
+
+    def _verdict(state: str, source: str) -> PredicateResult:
+        if state == "MERGED":
+            return PredicateResult(True, "pr_merged", pid,
+                                   observed_value={"state": state, "source": source},
+                                   reason="ok")
+        if state == "CLOSED":
+            return PredicateResult(False, "pr_merged", pid,
+                                   observed_value={"state": state, "source": source},
+                                   reason=(f"PR {key} CLOSED without merge — foundation "
+                                           "abandoned; re-plan the dependency"))
+        return PredicateResult(False, "pr_merged", pid,
+                               observed_value={"state": state, "source": source},
+                               reason=f"PR {key} still {state} (not merged)")
+
+    if isinstance(entry, dict) and entry.get("state") in ("MERGED", "OPEN", "CLOSED"):
+        state = entry["state"]
+        try:
+            age = (now - datetime.fromisoformat(str(entry.get("checked_at")))).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        fresh = (state == "MERGED"
+                 or (age is not None and state == "OPEN" and age <= ttl_open)
+                 or (age is not None and state == "CLOSED" and age <= ttl_closed))
+        if fresh:
+            return _verdict(state, "cache")
+
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if out.returncode != 0:
+            raise OSError(f"gh rc={out.returncode}: {out.stderr.strip()[:120]}")
+        state = str(json.loads(out.stdout).get("state", "")).upper()
+        if state not in ("MERGED", "OPEN", "CLOSED"):
+            raise ValueError(f"unexpected PR state {state!r}")
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
+        if isinstance(entry, dict) and entry.get("state") in ("MERGED", "OPEN", "CLOSED"):
+            # Stale-cache grace: a failed probe trusts the last observation
+            # rather than flapping. Direction is safe either way — worst case
+            # the goal stays gated (OPEN) or surfaces (MERGED) one TTL late.
+            return _verdict(entry["state"], "stale-cache")
+        return PredicateResult(False, "pr_merged", pid,
+                               reason=f"gh probe failed, no cache: {type(e).__name__}: {e}")
+
+    cache[key] = {"state": state, "checked_at": now.strftime("%Y-%m-%dT%H:%M:%S")}
+    _pr_cache_store(cache_path, cache)
+    return _verdict(state, "probe")
+
+
 PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "file_exists_after":    _eval_file_exists_after,
     "command_succeeds":     _eval_command_succeeds,
@@ -527,6 +648,7 @@ PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
     "metric_threshold":     _eval_metric_threshold,
     "after_time":           _eval_after_time,
     "vcs_commits_since":    _eval_vcs_commits_since,
+    "pr_merged":            _eval_pr_merged,
 }
 
 

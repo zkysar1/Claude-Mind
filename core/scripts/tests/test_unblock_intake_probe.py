@@ -152,6 +152,27 @@ def test_force_flag_bypasses_gates(tmp_path):
 
 # ── Artifact extraction + probing ────────────────────────────────────────
 
+def _fixture_commit_present() -> bool:
+    """The test below pins a REAL commit from this repo's history (fe56cbc2).
+    On a divergent/behind clone that commit may not exist locally, so the
+    ancestor probe can only return 'inconclusive' — box-state, not a probe
+    regression (g-115-1940). Fail-open: probe errors return True (run it)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(Path(__file__).resolve().parents[3]),
+             "rev-parse", "--verify", "--quiet", "fe56cbc2^{commit}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return True
+
+
+@pytest.mark.skipif(
+    not _fixture_commit_present(),
+    reason="fixture commit fe56cbc2 not in this clone's history — the "
+           "ancestor verdict is untestable on a divergent/behind box (g-115-1940)",
+)
 def test_commit_hash_ancestor_fires_fix_landed(tmp_path):
     """Unblock failure_reason naming a commit hash that IS reachable from HEAD
     should produce probable-fix-landed verdict."""

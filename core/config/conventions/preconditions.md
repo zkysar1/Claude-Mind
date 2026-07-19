@@ -176,6 +176,48 @@ list (`shell=False`), so `repo`/`paths`/`author`/`grep` cannot inject. Non-git
 `repo`, git errors, unresolvable cutoffs, and missing cutoff source all fail
 closed (predicate fails, never crashes).
 
+### `pr_merged`
+
+Passes when a GitHub PR is **MERGED**. The branch-per-goal estate gate
+(g-115-2593 / rb-3995): in estates where each Apply goal ships on its own
+branch, a foundation goal is marked `completed` when its code lands on its OWN
+branch — but its PR can stay open, so the substrate is off-main and plain
+`blocked_by`-on-completion falsely reads the dependency as satisfied. Stacked
+goals carry this predicate (WITHOUT `selector_skip`) so the selector keeps them
+out of candidates until the foundation PR actually merges; the pre-claim
+re-check and `precondition-defer-recheck` (Phase 0.5b.3) resurface them
+automatically once it does. Scaling note: per-TTL probe cost grows with the
+number of DISTINCT concurrently-OPEN gated PRs (one 15s-timeout `gh` probe per
+PR per TTL expiry — many goals gating on ONE PR share one cache entry). If an
+estate accumulates many distinct open-PR gates, set `selector_skip: true` on
+the long-tail entries (they then gate at pre-claim re-check / Phase 0.5b.3
+instead) and keep selector-time gating for the near-frontier ones.
+
+```yaml
+- type: pr_merged
+  id: pr89-merged
+  repo: "owner/name"        # GitHub slug — the REMOTE owner/name, NOT the local
+                            # directory name (probe `git remote get-url origin`
+                            # when unsure; the two diverged in the first live use)
+  pr: 89                    # positive int
+  cache_ttl_minutes: 30     # optional; re-probe interval while the PR is OPEN
+```
+
+**States:** `MERGED` → pass (cached terminally — merges never un-happen).
+`OPEN` → fail, re-probed after `cache_ttl_minutes`. `CLOSED`-unmerged → fail
+with an abandoned-foundation warning (cached 24h, so a reopened PR recovers
+within a day).
+
+**Cache:** per-agent, at `agents/<agent>/session/pr-merge-state-cache.json`,
+keyed `owner/name#pr`. Bounds `gh` network calls to ≤1 per PR per TTL per
+agent even though the selector evaluates every iteration. No bound agent → no
+cache (evaluates live).
+
+**Failure posture:** probe errors (no `gh`, network, auth) trust a stale cache
+entry when one exists (grace — the last observation beats flapping); with no
+cache they fail closed per library convention, keeping the goal gated until a
+`gh`-capable evaluation observes the merge.
+
 ## `after_ref` Grammar
 
 Shared by `file_exists_after` and `goal_completed_after`:

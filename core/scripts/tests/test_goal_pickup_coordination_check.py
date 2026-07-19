@@ -270,3 +270,443 @@ def test_classify_uncommitted_stem_carries_no_boilerplate():
     assert kw == set()
     uncommitted = ["core/scripts/status.py"]
     assert M.classify_uncommitted_overlap(affected, kw, uncommitted) == []
+
+
+# ── classify_board_mentions ( board probe) ─────────────────────────
+
+def _msg(mid, author, mtype, text, tags=None, ts="2026-07-09T15:50:08"):
+    return {"id": mid, "author": author, "timestamp": ts, "type": mtype,
+            "text": text, "tags": tags or []}
+
+
+def test_board_claim_by_type():
+    # 1 contract: a type=claim post is claim-kind for the id it
+    # STRUCTURALLY claims — extracted from goal-id-shaped tags (the ceremony
+    # always tags the claimed id) or a "claim:/Claiming <id>" text prefix.
+    msgs = [_msg("m1", "alpha", "claim", "picked up g-115-1876",
+                 tags=["g-115-1876", "alpha"])]
+    hits = M.classify_board_mentions("g-115-1876", "bravo", msgs)
+    assert len(hits) == 1 and hits[0]["kind"] == "claim"
+
+
+def test_board_claim_by_type_body_mention_only_dropped():
+    # 1: a claim post with NO parseable claimed id (no goal-shaped
+    # tag, no claim prefix) does NOT become claim-kind via a body mention —
+    # body mentions are citations, dropped like any bare mention.
+    msgs = [_msg("m1", "alpha", "claim", "picked up g-115-1876")]
+    assert M.classify_board_mentions("g-115-1876", "bravo", msgs) == []
+
+
+def test_board_claim_prefix_text_form_extracts_id():
+    # The 3 atomic-announce text shape, tags absent: the claimed id
+    # comes from the "claim: <id> — <title>" prefix.
+    msgs = [_msg("m1", "alpha", "claim", "claim: g-115-1876 — fix the gate")]
+    hits = M.classify_board_mentions("g-115-1876", "bravo", msgs)
+    assert len(hits) == 1 and hits[0]["kind"] == "claim"
+
+
+def test_board_claim_post_citing_another_goal_dropped():
+    # Live FP specimen msg-20260713-171224-alpha-5101 (1): alpha's
+    # atomic claim-announce FOR 4 cites 4-c in its body
+    # ("clears 4-c Layer 3 suite-green gate"). Probing 4-c
+    # must NOT see a claim (the pre-fix type-only leg did, and the digest
+    # branch would have wrongly yielded); probing 4 must.
+    text = ("claim: g-115-2104 — make test_compact_restore_preserves_live_"
+            "loop_state daemon-agnostic (direct WM-file read like test 2/4); "
+            "clears g-115-2084-c Layer 3 suite-green gate. rb-3331.")
+    msgs = [_msg("m1", "alpha", "claim", text,
+                 tags=["g-115-2104", "alpha", "framework"])]
+    assert M.classify_board_mentions("g-115-2084-c", "bravo", msgs) == []
+    hits = M.classify_board_mentions("g-115-2104", "bravo", msgs)
+    assert len(hits) == 1 and hits[0]["kind"] == "claim"
+
+
+def test_board_claim_by_text_prefix():
+    # The Phase-4 ceremony shape: type=status but text "Claiming <id> ...".
+    msgs = [_msg("m1", "alpha", "status", "Claiming g-115-1876 for the fix",
+                 tags=["claim", "g-115-1876"])]
+    hits = M.classify_board_mentions("g-115-1876", "bravo", msgs)
+    assert len(hits) == 1 and hits[0]["kind"] == "claim"
+
+
+def test_board_complete_by_text_prefix():
+    # The canonical 2026-07-09 contentless completion post shape.
+    msgs = [_msg("m1", "bravo", "status", "Completed: g-115-1876 [g-115-1876]")]
+    hits = M.classify_board_mentions("g-115-1876", "alpha", msgs)
+    assert len(hits) == 1 and hits[0]["kind"] == "complete"
+
+
+def test_board_own_author_excluded():
+    msgs = [_msg("m1", "bravo", "claim", "Claiming g-115-1876")]
+    assert M.classify_board_mentions("g-115-1876", "bravo", msgs) == []
+
+
+def test_board_bare_mention_dropped():
+    # Findings/insight posts cite goal ids topically — must NOT flip race_risk.
+    msgs = [_msg("m1", "alpha", "finding",
+                 "the claim collision on g-115-1876 was informative",
+                 tags=["affects:g-115-1876"])]
+    assert M.classify_board_mentions("g-115-1876", "bravo", msgs) == []
+
+
+def test_board_claim_for_other_goal_dropped():
+    # A partner's claim post for a DIFFERENT goal that merely mentions this
+    # goal-id in its narrative is a mention, not a claim on THIS goal.
+    msgs = [_msg("m1", "alpha", "status",
+                 "Claiming g-001-311 re the claim collision on g-115-1876",
+                 tags=["claim", "g-001-311"])]
+    assert M.classify_board_mentions("g-115-1876", "bravo", msgs) == []
+
+
+def test_board_recurring_skips_completions_keeps_claims():
+    msgs = [
+        _msg("m1", "alpha", "status", "Completed: g-115-151 bitnet probe"),
+        _msg("m2", "alpha", "claim", "working g-115-151 now",
+             tags=["g-115-151", "alpha"]),
+    ]
+    hits = M.classify_board_mentions("g-115-151", "bravo", msgs,
+                                     goal_recurring=True)
+    assert [h["id"] for h in hits] == ["m2"]
+
+
+def test_board_empty_me_returns_nothing():
+    # MIND_AGENT injection is fail-open and can drop (bravo-fec 2026-07-13):
+    # with me="" every author passes the partner filter, so the agent's OWN
+    # claim post would flag as a partner claim on an autocompact re-claim
+    # probe. Falsy me must yield [] (no-hits is the advisory-safe direction).
+    msgs = [_msg("m1", "alpha", "claim", "Claiming g-115-1876")]
+    assert M.classify_board_mentions("g-115-1876", "", msgs) == []
+    assert M.classify_board_mentions("g-115-1876", None, msgs) == []
+
+
+# ── _git_log_commits (stale-clone fetch, 6) ─────────────────────────
+# The  miss: the race scan ran on a clone whose last pull predated 20h
+# of upstream commits, so the REAL overlap (partner's pushed fix) was invisible
+# to a HEAD-only `git log`. The fix fetches remote-tracking refs first and
+# scans --all. These fixture tests exercise the impure helper against real tmp
+# repos (no daemon, no shared state).
+
+import subprocess as _sp
+
+
+def _run_git(args, cwd):
+    _sp.run(["git", "-c", "user.email=test@test", "-c", "user.name=test",
+             *args], cwd=str(cwd), check=True,
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
+
+def test_git_log_commits_sees_origin_only_commit(tmp_path, monkeypatch):
+    # partner clone: seed history, then a bare origin both boxes share.
+    partner = tmp_path / "partner"
+    partner.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], partner)
+    (partner / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _run_git(["add", "."], partner)
+    _run_git(["commit", "-q", "-m", "chore(seed): base"], partner)
+    origin = tmp_path / "origin.git"
+    _run_git(["clone", "-q", "--bare", str(partner), str(origin)], tmp_path)
+    _run_git(["remote", "add", "origin", str(origin)], partner)
+    # "my box" clones BEFORE the partner ships the overlap commit.
+    mine = tmp_path / "mine"
+    _run_git(["clone", "-q", str(origin), str(mine)], tmp_path)
+    # partner ships the overlap commit and pushes; mine never pulls.
+    sub = partner / "core" / "scripts"
+    sub.mkdir(parents=True)
+    (sub / "target-surface.py").write_text("x = 1\n", encoding="utf-8")
+    _run_git(["add", "."], partner)
+    _run_git(["commit", "-q", "-m",
+              "feat(g-999-01): rework target-surface race scan"], partner)
+    _run_git(["push", "-q", "origin", "main"], partner)
+    # Scan from the stale clone: the commit exists ONLY on origin.
+    monkeypatch.setattr(M, "PROJECT_ROOT", mine)
+    commits = M._git_log_commits(2.0)
+    subjects = [c["subject"] for c in commits]
+    assert any("target-surface" in s for s in subjects), subjects
+    # And the classifier flags it on path overlap (end-to-end for the fix).
+    race, overlapping = M.classify_overlap(
+        {"core/scripts/target-surface.py"}, set(), commits, "g-115-0000")
+    assert race and overlapping[0]["committed_goal_id"] == "g-999-01"
+
+
+def test_git_log_commits_no_remote_fail_open(tmp_path, monkeypatch):
+    # A repo with NO remote (fresh world, test fixture): the fetch fails
+    # silently and the scan still returns local commits — the pre-fix
+    # behavior, no regression (fail-open contract).
+    solo = tmp_path / "solo"
+    solo.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], solo)
+    (solo / "a.txt").write_text("a\n", encoding="utf-8")
+    _run_git(["add", "."], solo)
+    _run_git(["commit", "-q", "-m", "feat(g-999-02): local-only work"], solo)
+    monkeypatch.setattr(M, "PROJECT_ROOT", solo)
+    commits = M._git_log_commits(2.0)
+    assert any("local-only" in c["subject"] for c in commits)
+
+
+# ── 8: product-repo surface extension ───────────────────────────────
+# The check was blind to AGENT_WRITE_PATH product repos — the 6 shape
+# (deliverable PR shipped ~24h before claim, only a sibling mind commit
+# flagged). These tests pin the pure detection/classification contract plus
+# the impure scan end-to-end on synthetic repos.
+
+# detect_product_surfaces (pure) ----------------------------------------------
+
+# 'acme' (brand-like prefix) appears in 7/8 names -> frequency-suppressed;
+# 'operator' in 2/8 -> distinctive; full names always match.
+_REPO_NAMES = [
+    "acme-operator-api", "deploy-acme-operator", "acme-widget-service",
+    "acme-billing-core", "acme-ingest-core", "acme-notify-core",
+    "acme-portal-site", "standalone-tooling",
+]
+
+
+def test_detect_full_repo_name_matches():
+    labels, matched = M.detect_product_surfaces(
+        "Fix the session pool in acme-widget-service before the release",
+        _REPO_NAMES)
+    assert "acme-widget-service" in labels
+    assert matched == ["acme-widget-service"]
+
+
+def test_detect_distinctive_token_selects_repo_family():
+    # Goal prose says just 'operator' (no full repo name) — the 8
+    # trigger list names exactly this case. The token is distinctive (2/8
+    # names < thresh 3) so it selects the operator-family repos.
+    labels, matched = M.detect_product_surfaces(
+        "Add the start-session endpoint to the operator API", _REPO_NAMES)
+    assert "operator" in labels
+    assert set(matched) == {"acme-operator-api", "deploy-acme-operator"}
+
+
+def test_detect_full_name_ordered_before_token_family():
+    # The bounded network budget spends on matched[:3] — a full-name match is
+    # the strongest statement of WHICH repo the goal means, so it must come
+    # FIRST (live 2026-07-17 replay: a leaked token family burned all 3 slots
+    # on alphabetically-early repos and the deliverable repo got no PR search).
+    labels, matched = M.detect_product_surfaces(
+        "Author the deploy-acme-operator PR for the operator start-session",
+        _REPO_NAMES)
+    assert matched[0] == "deploy-acme-operator"
+    assert set(matched) == {"acme-operator-api", "deploy-acme-operator"}
+
+
+def test_detect_brand_prefix_frequency_suppressed():
+    # 'acme' appears in 7/8 repo names — an org/brand prefix is
+    # non-distinctive BY FREQUENCY (no hardcoded vocabulary; domain-free).
+    labels, matched = M.detect_product_surfaces(
+        "General acme work on the loop", _REPO_NAMES)
+    assert labels == set() and matched == []
+
+
+def test_detect_brand_prefix_suppressed_at_fleet_scale():
+    # The live off-by-one (2026-07-17): 13 brand-prefixed names at a 56-name
+    # fleet slipped a 25% threshold (14). The 12.5% threshold catches it.
+    fleet = [f"brandx-svc-{i:02d}" for i in range(13)] + [
+        f"tool-{c}" for c in "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopq"[:43]]
+    assert len(fleet) == 56
+    labels, matched = M.detect_product_surfaces(
+        "General brandx maintenance", fleet)
+    assert matched == []  # 13 owners >= max(3, ceil(56/8)=7) -> suppressed
+
+
+def test_detect_generic_tokens_never_trigger():
+    # server/status/api/... are generic surface tokens; framework goals say
+    # them constantly and must not trigger a product scan.
+    labels, matched = M.detect_product_surfaces(
+        "Restart the server and check status of the api gateway",
+        _REPO_NAMES)
+    assert labels == set() and matched == []
+
+
+def test_detect_write_path_literal_adds_label_only():
+    labels, matched = M.detect_product_surfaces(
+        "Commit the fix under /opt/work/acme and push",
+        _REPO_NAMES, write_path_entries=("/opt/work/acme",))
+    assert "acme" in labels
+    assert matched == []  # path match triggers the scan, no network focus
+
+
+def test_detect_empty_inputs():
+    assert M.detect_product_surfaces("", _REPO_NAMES) == (set(), [])
+    assert M.detect_product_surfaces("operator work", []) == (set(), [])
+
+
+# classify_product_overlap (pure) ---------------------------------------------
+
+def test_product_overlap_force_includes_own_goal_id():
+    # THE 6 shape: the shipped product commit carries the CLAIMING
+    # goal's id. classify_overlap would exclude it as own-WIP; the product
+    # variant force-includes it as the strongest already-shipped evidence.
+    commits = [_commit("p1", "feat(g-115-2156): add start-session endpoint",
+                       ["src/gateway/session.py"])]
+    hits = M.classify_product_overlap(set(), set(), commits, "g-115-2156")
+    assert len(hits) == 1
+    assert hits[0]["matched_goal_id"] is True
+    assert hits[0]["committed_goal_id"] == "g-115-2156"
+
+
+def test_product_overlap_recurring_skips_force_include():
+    # A recurring goal legitimately ships product commits under its own id
+    # every cycle — the force-include would self-flag forever.
+    commits = [_commit("p1", "feat(g-115-151): nightly probe artifacts", [])]
+    hits = M.classify_product_overlap(set(), set(), commits, "g-115-151",
+                                      goal_recurring=True)
+    assert hits == []
+
+
+def test_product_overlap_keyword_match_annotated_not_goal_id():
+    commits = [_commit("p2",
+                       "feat(g-777-01): start-session endpoint for gateway",
+                       [])]
+    kw = M.extract_keywords("Ship the start-session endpoint gateway change")
+    hits = M.classify_product_overlap(set(), kw, commits, "g-115-2428")
+    assert len(hits) == 1
+    assert hits[0]["matched_goal_id"] is False
+    assert len(hits[0]["matched_keywords"]) >= 2
+
+
+# _parse_write_path_conf ------------------------------------------------------
+
+def test_parse_write_path_conf_quoted_semicolon(tmp_path):
+    conf = tmp_path / "local-paths.conf"
+    conf.write_text(
+        "# comment\n"
+        "WORLD_PATH=/somewhere/world\n"
+        'AGENT_WRITE_PATH="/opt/work/acme;/opt/work/beta"\n'
+        "AGENT_WRITE_PATH_EXTRA=/must/not/be/parsed\n",  # exact-key only
+        encoding="utf-8")
+    assert M._parse_write_path_conf(conf) == [
+        "/opt/work/acme", "/opt/work/beta"]
+
+
+def test_detect_short_names_never_trigger():
+    # Convention-file name extraction is regex-loose; a short backticked
+    # token (table header word) must not become a full-name scan trigger.
+    labels, matched = M.detect_product_surfaces(
+        "Tier work on the loop", ["Tier", "acme-widget-service"])
+    assert labels == set() and matched == []
+
+
+def test_parse_write_path_conf_absent_is_silent():
+    # Verification check: "absent conf is silent" — no exception, empty list.
+    assert M._parse_write_path_conf("/nonexistent/nowhere.conf") == []
+
+
+# _agent_write_repos ----------------------------------------------------------
+
+def test_agent_write_repos_direct_and_container(tmp_path):
+    # A direct repo entry contributes itself; a CONTAINER entry (plain dir of
+    # independent clones) contributes its depth-1 git children only.
+    direct = tmp_path / "solo-repo"
+    (direct / ".git").mkdir(parents=True)
+    container = tmp_path / "work"
+    (container / "repo-a" / ".git").mkdir(parents=True)
+    (container / "repo-b" / ".git").mkdir(parents=True)
+    (container / "not-a-repo").mkdir()
+    repos = M._agent_write_repos([str(direct), str(container),
+                                  str(tmp_path / "missing")])
+    assert [(n, p.name) for n, p in repos] == [
+        ("solo-repo", "solo-repo"), ("repo-a", "repo-a"),
+        ("repo-b", "repo-b")]
+
+
+# _scan_product_repos (impure, end-to-end) ------------------------------------
+
+def _isolate_scan(monkeypatch, entries):
+    """Pin the scan's environment seams: synthetic conf entries, no domain
+    convention read, no gh network."""
+    monkeypatch.setenv("MIND_AGENT", "test-agent")
+    monkeypatch.setattr(M, "_parse_write_path_conf", lambda _p: entries)
+    monkeypatch.setattr(M, "_convention_repo_names", lambda: set())
+    monkeypatch.setattr(M, "_gh_available", lambda **kw: False)
+
+
+def test_scan_synthetic_product_repo_reported(tmp_path, monkeypatch):
+    # Verification outcome: a matching commit in a synthetic product repo is
+    # reported as an overlapping-commit entry WITH repo attribution.
+    container = tmp_path / "work"
+    repo = container / "widget-service"
+    repo.mkdir(parents=True)
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], repo)
+    (repo / "session.py").write_text("x = 1\n", encoding="utf-8")
+    _run_git(["add", "."], repo)
+    _run_git(["commit", "-q", "-m",
+              "feat(g-115-2156): add start-session endpoint to widget gateway"],
+             repo)
+    _isolate_scan(monkeypatch, [str(container)])
+    text = "Ship the start-session endpoint in widget-service gateway"
+    result = M._scan_product_repos(
+        "g-115-2156", text, set(), M.extract_keywords(text), 48.0, 2)
+    # labels may also carry the distinctive token ('widget' bounded-matches
+    # inside 'widget-service') — membership is the contract, not exact set.
+    assert "widget-service" in result["surfaces"]
+    assert result["repos_scanned"] == ["widget-service"]
+    assert len(result["commits"]) == 1
+    hit = result["commits"][0]
+    assert hit["repo"] == "widget-service"          # repo attribution
+    assert hit["matched_goal_id"] is True
+    assert hit["committed_goal_id"] == "g-115-2156"
+
+
+def test_scan_absent_conf_is_silent(monkeypatch):
+    # Verification check: absent conf (parser returns []) -> empty verdict,
+    # no exception, nothing scanned — even when the prose names a surface.
+    _isolate_scan(monkeypatch, [])
+    result = M._scan_product_repos(
+        "g-115-2428", "work on the operator API", set(), set(), 48.0, 2)
+    assert result == {"surfaces": [], "repos_scanned": [], "commits": [],
+                      "branch_hits": [], "pr_hits": []}
+
+
+def test_since_arg_integer_minutes():
+    # git approxidate silently mishandles FLOAT hour strings (git 2.43,
+    # observed live 2026-07-17): "2.0 hours ago" parses as NO filter
+    # (full-history scan -> 6-day-old commits flagged as 2h races) while
+    # "48.0 hours ago" parses as an EMPTY window (0 commits). Integer
+    # minutes are unambiguous and preserve fractional hours.
+    assert M._since_arg(2.0) == "--since=120 minutes ago"
+    assert M._since_arg(48.0) == "--since=2880 minutes ago"
+    assert M._since_arg(0.5) == "--since=30 minutes ago"
+    assert M._since_arg(0.001) == "--since=1 minutes ago"  # floor of 1
+
+
+def test_git_log_commits_float_window_excludes_old(tmp_path, monkeypatch):
+    # Behavioral pin for the float--since bug: an OLD commit (3h ago) must
+    # NOT surface under since_hours=2.0. Pre-fix, the float string disabled
+    # the filter entirely and the old commit leaked into the race scan.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(["-c", "init.defaultBranch=main", "init", "-q"], repo)
+    import datetime as _dt
+    old = (_dt.datetime.now().astimezone()
+           - _dt.timedelta(hours=3)).isoformat(timespec="seconds")
+    (repo / "old.txt").write_text("old\n", encoding="utf-8")
+    _run_git(["add", "."], repo)
+    _sp.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-q", "-m", "feat(g-999-03): old work"],
+            cwd=str(repo), check=True, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            env={**os.environ, "GIT_COMMITTER_DATE": old,
+                 "GIT_AUTHOR_DATE": old})
+    (repo / "new.txt").write_text("new\n", encoding="utf-8")
+    _run_git(["add", "."], repo)
+    _run_git(["commit", "-q", "-m", "feat(g-999-04): fresh work"], repo)
+    monkeypatch.setattr(M, "PROJECT_ROOT", repo)
+    subjects = [c["subject"] for c in M._git_log_commits(2.0)]
+    assert any("fresh work" in s for s in subjects), subjects
+    assert not any("old work" in s for s in subjects), subjects
+
+
+import os  # noqa: E402  (used by the float-window fixture above)
+
+
+def test_scan_skips_when_no_surface_named(tmp_path, monkeypatch):
+    # Gating: repos exist, but the goal prose names no product surface ->
+    # zero git work (repos_scanned stays empty). Ordinary framework goals
+    # pay ~nothing.
+    container = tmp_path / "work"
+    (container / "widget-service" / ".git").mkdir(parents=True)
+    _isolate_scan(monkeypatch, [str(container)])
+    result = M._scan_product_repos(
+        "g-115-2428", "Fix the learning-gate stub condition in the loop",
+        set(), set(), 48.0, 2)
+    assert result["surfaces"] == [] and result["repos_scanned"] == []

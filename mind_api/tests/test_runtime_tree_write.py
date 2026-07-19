@@ -216,7 +216,15 @@ def test_set_field_roundtrip(running_daemon):
     assert status == 200, body
     tree = _read_tree(world)
     assert tree["nodes"]["alpha-test-node"]["summary"] == "updated summary text"
-    assert tree["nodes"]["alpha-test-node"].get("last_updated")
+    # 3 Option B (ported to the daemon in 2): a metadata set
+    # must NOT auto-bump per-node last_updated — node .md front matter is the
+    # source of truth and the index syncs to it only via
+    # tree-front-matter-sync.py. The baseline node carries no last_updated, so
+    # after a summary set it must still be absent. (This assertion previously
+    # pinned the retired auto-bump behavior.)
+    assert "last_updated" not in tree["nodes"]["alpha-test-node"]
+    # The index-level stamp IS retained.
+    assert tree.get("last_updated")
 
 
 def test_set_confidence_propagates(running_daemon):

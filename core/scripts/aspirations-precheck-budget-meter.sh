@@ -18,17 +18,22 @@
 # Sweep tier table (single source of truth — keep in sync with
 # core/config/aspirations.yaml `precheck:` doc-block):
 #
-#   always-run:  tree-debt-gate, experience-archival-gate, fresh-eyes-code-gate,
-#                inbox-alert-age-check, handoff-aging-check (the two
-#                notification-age safety gates — escalate aged unclaimed work to
-#                external parties, so they fire reliably; 6)
+#   always-run:  tree-debt-gate, experience-archival-gate, evolution-finalize-gate,
+#                fresh-eyes-code-gate, inbox-alert-age-check, handoff-aging-check
+#                (the last two are the notification-age safety gates — escalate
+#                aged unclaimed work to external parties, so they fire reliably;
+#                6. evolution-finalize-gate carries the guard-380
+#                user-notification promise on material Self/Program edits — a
+#                dropped sweep there means the user is never told their agent's
+#                identity changed, so it can never be droppable; 0)
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
 #                parent-supersession-sweep, unblock-parent-status-sweep,
+#                defer-drift-check, reason-less-blocked-check,
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
 #                felt-sense-cadence, health-regression-cadence,
-#                curriculum-cadence
+#                curriculum-cadence, evolution-cadence
 #
 # Unknown sweep names default to medium tier (conservative — less likely to
 # get dropped). Add new sweeps here when introducing them.
@@ -80,11 +85,11 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|fresh-eyes-code-gate|inbox-alert-age-check|handoff-aging-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|inbox-alert-age-check|handoff-aging-check)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration

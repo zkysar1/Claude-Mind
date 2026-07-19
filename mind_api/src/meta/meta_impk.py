@@ -136,9 +136,12 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
-    metric = ctx.query.get("metric")
-    if not metric:
-        return Response.error(400, "missing_param", "query parameter 'metric' required")
+    # 1: `metric` is OPTIONAL (default learning_value). The store
+    # holds exactly ONE series — per-goal learning_value snapshots — so the
+    # old required param was decorative: any name produced identical output,
+    # misleading the evolve Step 0.7 caller into believing pipeline_accuracy
+    # and goal_completion_rate were independently tracked series.
+    metric = ctx.query.get("metric") or "learning_value"
     window_raw = ctx.query.get("window")
     if window_raw is None or window_raw == "":
         return Response.error(400, "missing_param", "query parameter 'window' required")
@@ -152,7 +155,7 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
 
     if len(entries) < window:
         result: Dict[str, Any] = {
-            "metric": metric,
+            "series": "learning_value",
             "window": window,
             "imp_at_k": 0.0,
             "direction": "insufficient_data",
@@ -175,12 +178,20 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
         direction = ("improving" if imp > 0.001
                      else ("declining" if imp < -0.001 else "stable"))
         result = {
-            "metric": metric,
+            "series": "learning_value",
             "window": window,
             "imp_at_k": round(imp, 6),
             "direction": direction,
             "recent_avg": round(recent_avg, 4),
         }
+
+    # Non-default label: echo it but state plainly the computation ignored it
+    # (pre-1 output echoed the label as "metric", implying per-metric
+    # series that never existed).
+    if metric != "learning_value":
+        result["metric_label"] = metric
+        result["note"] = ("metric is a caller label; computation always runs "
+                          "over the single learning_value series")
 
     return Response.text(json.dumps(result, ensure_ascii=False) + "\n",
                          content_type="application/json")

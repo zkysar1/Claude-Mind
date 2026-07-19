@@ -128,7 +128,15 @@ ALSO read <partner_agent>/session/pending-questions.yaml if accessible
 # signal 2.6 never reads. Same omission rb-1279 caught for fresh-eyes-review
 # (self_evolution_signals_count=0 while a self-drift finding sat unread);
 # fresh-eyes-review closed it in Phase 2.3b — this is the program-scope sibling.
-Bash: board-read.sh --channel findings --since 60d --json
+# --unread-only (g-115-2490, parity with g-115-2486's fresh-eyes-review fix):
+# count only UNACTIONED drift signals. A signal ACTIONED via `board.py mark-read`
+# (consumed into concrete work, or retired with a resolution note) drops out so
+# it stops re-counting as net-divergent residue every review within the 60d
+# window. Orthogonal to the deliberate no-agent-scoping below (SCOPE note):
+# --unread-only filters by the REVIEWING agent's read-state, NOT by who the
+# signal is about — program-wide drift is still read program-wide, it just stops
+# counting once the reviewing agent has actioned (marked-read) it.
+Bash: board-read.sh --channel findings --since 60d --unread-only --json
   → filter to findings WHERE tags intersect
     {'program_drift', 'program-drift', 'self_evolution', 'self-drift'}
   → call these board_signals
@@ -250,7 +258,9 @@ ack/reject → finalize) is **DESIGNED BUT NOT IMPLEMENTED** (g-115-1619 verifie
 2026-06-23: `program-change-propose.py` + `program-ack-sweep.py` were never
 built). Do NOT assume an `act_now` Program edit sits in `awaiting_acks` — it is
 live the moment `evolution-complete.sh` finalizes it. The LLM applies the Edit;
-`evolution-complete.py` finalizes + posts to the board.
+`evolution-complete.py` finalizes ONLY — it does NOT auto-post. The LLM then
+posts the `program-change` entry to the decisions board itself (verified live
+2026-07-10, g-115-1904: FINALIZED output carried no board post).
 
 Extract signals from the Phase 3 briefing synthesis (scored 0..1 unless
 noted) and pass to the helper. Note `partner_alignment_score` is REQUIRED

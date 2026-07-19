@@ -107,9 +107,152 @@ def test_rb_multiround_collision_converges():
 
 def test_rb_empty_inputs():
     assert cm.merge_reasoning_bank(b"", b"") == b""
+
+
+def test_rb_collision_reid_stamps_tombstone():
+    # 7 (flat-record mirror of the 7 goals-array fix): the
+    # displaced loser carries displaced_from = the contested id it lost.
+    recA = {"id": "rb-2", "created": "2026-07-02T10:00:00", "title": "machineA"}
+    recB = {"id": "rb-2", "created": "2026-07-02T11:00:00", "title": "machineB"}
+    out = _recs(cm.merge_reasoning_bank(_rb([recA]), _rb([recB])))
+    moved = next(r for r in out if r["title"] == "machineB")
+    assert moved["id"] == "rb-3" and moved["displaced_from"] == "rb-2"
+    keep = next(r for r in out if r["title"] == "machineA")
+    assert "displaced_from" not in keep                    # winner untouched
+
+
+def test_rb_collision_reid_associative_stale_replay():
+    # Stale replay from EITHER pre-collision side must be a byte fixpoint —
+    # settled re-id records never reshuffle when a stale replica rejoins.
+    base = [{"id": f"rb-{n}", "created": f"2026-07-01T0{n}:00:00",
+             "title": f"filler-{n}"} for n in range(3, 8)]
+    recA = {"id": "rb-2", "created": "2026-07-02T10:00:00", "title": "machineA"}
+    recB = {"id": "rb-2", "created": "2026-07-02T11:00:00", "title": "machineB"}
+    a, b = _rb([recA] + base), _rb([recB])
+    settled = cm.merge_reasoning_bank(a, b)
+    moved = next(r for r in _recs(settled) if r["title"] == "machineB")
+    assert moved["id"] == "rb-8"                           # displaced past fillers
+    assert cm.merge_reasoning_bank(settled, a) == settled
+    assert cm.merge_reasoning_bank(settled, b) == settled
+    assert cm.merge_reasoning_bank(a, settled) == cm.merge_reasoning_bank(settled, a)
+
+
+def test_rb_chained_displacement_stale_replay_no_refight():
+    # Chain-displaced record (lost its first displacement slot to an
+    # earlier-created contender; tombstone home outside its seen ids on stale
+    # replay) must anchor its LATEST settled slot directly — never re-fight.
+    recX = {"id": "rb-2", "created": "2026-07-02T09:00:00", "title": "X"}
+    recY = {"id": "rb-2", "created": "2026-07-02T10:00:00", "title": "Y"}
+    s1 = cm.merge_reasoning_bank(_rb([recX]), _rb([recY]))
+    y1 = next(r for r in _recs(s1) if r["title"] == "Y")
+    assert y1["id"] == "rb-3" and y1["displaced_from"] == "rb-2"
+    recZ = {"id": "rb-3", "created": "2026-07-02T09:30:00", "title": "Z"}
+    s2 = cm.merge_reasoning_bank(s1, _rb([recZ]))
+    y2 = next(r for r in _recs(s2) if r["title"] == "Y")
+    assert y2["id"] == "rb-4"                              # chained displacement
+    assert y2["displaced_from"] == "rb-2"                  # first home preserved
+    stale = _rb([dict(y1)])
+    assert cm.merge_reasoning_bank(s2, stale) == s2, \
+        "chained-displacement stale replay must be a byte fixpoint"
+    assert cm.merge_reasoning_bank(stale, s2) == cm.merge_reasoning_bank(s2, stale)
+
+
+def test_guard_collision_reid_tombstone_zero_pad():
+    # The tombstone lane must respect each store's id_format byte-exactness
+    # (guard ids are 3-pad): displaced guard carries displaced_from and settles
+    # at a 3-pad id; stale replay is a fixpoint.
+    gA = {"id": "guard-002", "created": "2026-07-02T10:00:00", "rule": "A",
+          "status": "active"}
+    gB = {"id": "guard-002", "created": "2026-07-02T11:00:00", "rule": "B",
+          "status": "active"}
+    settled = cm.merge_guardrails(_rb([gA]), _rb([gB]))
+    moved = next(r for r in _recs(settled) if r["rule"] == "B")
+    assert moved["id"] == "guard-003" and moved["displaced_from"] == "guard-002"
+    assert cm.merge_guardrails(settled, _rb([gB])) == settled
     one = _rb([{"id": "rb-1", "created": "t"}])
     assert cm.merge_reasoning_bank(one, b"") == one
     assert cm.merge_reasoning_bank(b"", one) == one
+
+
+# --- key-order byte-commutativity (1) -------------------------------
+
+def test_rb_distinct_new_keys_byte_commutative():
+    """Same record, each side adds a DIFFERENT new key. out=dict(a)+b-extras
+    inherits a's key order, so pre-fix merge(a,b) != merge(b,a) at the byte
+    level (identical values, different key order) — fenced-PUT ping-pong
+    (bravo-fec-idkeyed-keyorder-noncommut-202607161052)."""
+    base = {"id": "rb-5", "created": "2026-07-02T10:00:00", "title": "t",
+            "status": "active"}
+    ra = dict(base); ra["last_probe"] = "2026-07-15"
+    rb_ = dict(base); rb_["sample_note"] = "n=9"
+    ab = cm.merge_reasoning_bank(_rb([ra]), _rb([rb_]))
+    ba = cm.merge_reasoning_bank(_rb([rb_]), _rb([ra]))
+    assert ab == ba, "distinct-key adds must stay byte-commutative (guard-907)"
+    rec = _recs(ab)[0]
+    assert rec["last_probe"] == "2026-07-15" and rec["sample_note"] == "n=9"
+
+
+def test_rb_distinct_new_keys_multiround_settles():
+    """The diverged record settles: once both sides hold the merged result, a
+    re-merge against either stale local is a byte no-op (loop terminates)."""
+    base = {"id": "rb-5", "created": "2026-07-02T10:00:00", "title": "t"}
+    ra = dict(base); ra["last_probe"] = "x"
+    rb_ = dict(base); rb_["sample_note"] = "y"
+    m = cm.merge_reasoning_bank(_rb([ra]), _rb([rb_]))
+    assert cm.merge_reasoning_bank(m, m) == m
+    assert cm.merge_reasoning_bank(m, _rb([rb_])) == m
+    assert cm.merge_reasoning_bank(_rb([ra]), m) == m
+
+
+def test_rb_same_keyset_order_divergence_heals():
+    """Pre-existing on-disk order divergence (same keys, same values, different
+    insertion order — e.g. left behind by pre-fix merges) must also emit
+    side-independent bytes, not preserve each side's own order forever."""
+    r1 = {"id": "rb-6", "created": "2026-07-02T10:00:00", "title": "t",
+          "k1": 1, "k2": 2}
+    r2 = {"id": "rb-6", "created": "2026-07-02T10:00:00", "title": "t",
+          "k2": 2, "k1": 1}
+    ab = cm.merge_reasoning_bank(_rb([r1]), _rb([r2]))
+    ba = cm.merge_reasoning_bank(_rb([r2]), _rb([r1]))
+    assert ab == ba
+
+
+def test_rb_nested_counter_key_divergence_byte_commutative():
+    """utilization sub-dict key order reaches the bytes too — divergent counter
+    keys (one side bumps a counter the other doesn't carry) must merge to
+    byte-identical output in both directions."""
+    base = {"id": "rb-7", "created": "2026-07-02T10:00:00", "title": "t"}
+    ca = dict(base); ca["utilization"] = {"times_helpful": 1, "times_probed": 3}
+    cb = dict(base); cb["utilization"] = {"times_helpful": 2, "times_active": 1}
+    ab = cm.merge_reasoning_bank(_rb([ca]), _rb([cb]))
+    ba = cm.merge_reasoning_bank(_rb([cb]), _rb([ca]))
+    assert ab == ba
+    util = _recs(ab)[0]["utilization"]
+    assert util == {"times_helpful": 2, "times_probed": 3, "times_active": 1}
+
+
+def test_rb_matching_key_order_is_preserved_not_sorted():
+    """No blanket re-order churn: records whose key sequences MATCH keep their
+    on-disk (deliberately unsorted) order byte-for-byte — the reason the fix
+    lives in the record merge, not as sort_keys in _dump_jsonl."""
+    u = {"id": "rb-8", "created": "2026-07-02T10:00:00", "title": "t",
+         "zeta_field": 1, "alpha_field": 2}
+    blob = _rb([u])
+    assert cm.merge_reasoning_bank(blob, blob) == blob
+
+
+def test_guard_distinct_new_keys_byte_commutative():
+    """merge_guardrails shares the chassis — same distinct-key-add shape must
+    stay byte-commutative (values verbatim, order side-independent)."""
+    base = {"id": "guard-005", "created": "2026-07-01T09:00:00", "rule": "r",
+            "status": "active"}
+    ga = dict(base); ga["action_hint"] = "probe first"
+    gb = dict(base); gb["times_triggered"] = 4
+    ab = cm.merge_guardrails(_rb([ga]), _rb([gb]))
+    ba = cm.merge_guardrails(_rb([gb]), _rb([ga]))
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["action_hint"] == "probe first" and rec["times_triggered"] == 4
 
 
 # --- team-state -------------------------------------------------------------
@@ -193,6 +336,77 @@ def test_ts_active_blockers_union_dedup_by_id():
                              {"id": "blk-2", "note": "y"}])
     m = yaml.safe_load(cm.merge_team_state(a, b).decode())
     assert sorted(x["id"] for x in m["active_blockers"]) == ["blk-1", "blk-2"]
+
+
+# --- team-state per-agent shards (3 / rb-3150) ---------------------
+# The  split moved per-agent liveness into world/team-state/agents/
+# <name>.yaml. Those shard basenames are dynamic (alpha.yaml/bravo.yaml/...) so
+# the basename-keyed _HANDLERS never registered them -> merge_handler_for
+# returned None -> the backend froze peer shards on the both-diverged 412 ->
+# every box saw fresh-SELF + stale-PEERS. The fix: a path-pattern dispatch
+# branch + a whole-snapshot-LWW shard handler giving shards the same
+# both-diverged self-heal the composite team-state.yaml already had.
+
+def _shard(**fields):
+    """Build a flat per-agent team-state shard (agents/<name>.yaml) as bytes."""
+    return yaml.dump(fields, default_flow_style=False, sort_keys=False).encode()
+
+
+def test_shard_dispatch_by_path_pattern():
+    # Dynamic shard basenames route by PATH pattern (parent agents/ under
+    # team-state/) so a NEW agent is covered without editing _HANDLERS.
+    for p in ("world/team-state/agents/alpha.yaml",
+              "team-state/agents/bravo.yaml",
+              r"C:\mind\world\team-state\agents\zeta.yaml"):
+        assert cm.merge_handler_for(p) is cm.merge_team_state_shard, p
+    # The composite still routes by basename to the composite handler.
+    assert cm.merge_handler_for("world/team-state.yaml") is cm.merge_team_state
+    # Negatives: unregistered, a lookalike dir, and a non-yaml file under the
+    # shard dir must NOT match the shard branch.
+    assert cm.merge_handler_for("world/random.yaml") is None
+    assert cm.merge_handler_for("world/myteam-state/agents/x.yaml") is None
+    assert cm.merge_handler_for("world/team-state/agents/notes.txt") is None
+
+
+def test_shard_newer_last_active_wins_and_commutative():
+    # The peer-shard freeze case: local STALE, remote FRESH -> fresh wins, so a
+    # box adopts the peer's current shard instead of freezing on both-diverged.
+    stale = _shard(last_active="2026-07-07T22:17:09", current_focus="",
+                   session_goals_completed=0, row_updated_by="bravo")
+    fresh = _shard(last_active="2026-07-13T23:27:00", current_focus="asp-318",
+                   session_goals_completed=5, row_updated_by="bravo")
+    m = yaml.safe_load(cm.merge_team_state_shard(stale, fresh).decode())
+    assert m["last_active"] == "2026-07-13T23:27:00"
+    assert m["current_focus"] == "asp-318"
+    assert m["session_goals_completed"] == 5     # whole-snapshot LWW, not max
+    # COMMUTATIVITY: byte-identical regardless of local/remote order.
+    assert (cm.merge_team_state_shard(stale, fresh)
+            == cm.merge_team_state_shard(fresh, stale))
+
+
+def test_shard_whole_snapshot_lww_no_field_stitch():
+    # A partial field-merge could stitch an inconsistent focus/live_phase/
+    # in_flight triple. Whole-snapshot LWW takes ALL of the winner's fields and
+    # NONE of the loser's — the winner cleared in_flight, so it stays cleared.
+    old = _shard(last_active="2026-07-13T10:00:00", live_phase="phase-4-execute",
+                 current_focus="oldgoal", in_flight={"goal_id": "g-old"})
+    new = _shard(last_active="2026-07-13T11:00:00", live_phase="between-phases",
+                 current_focus="newgoal")   # in_flight intentionally absent
+    m = yaml.safe_load(cm.merge_team_state_shard(old, new).decode())
+    assert m["live_phase"] == "between-phases"
+    assert m["current_focus"] == "newgoal"
+    assert "in_flight" not in m            # not stitched from the loser
+
+
+def test_shard_non_mapping_fallback_deterministic():
+    # Valid YAML that parses to a non-dict (list/scalar) hits the deterministic
+    # content-larger fallback rather than raising, and stays symmetric.
+    a = b"[1, 2, 3]"
+    b = b"just a scalar string that is clearly the larger content blob"
+    fb1 = cm.merge_team_state_shard(a, b)
+    fb2 = cm.merge_team_state_shard(b, a)
+    assert isinstance(fb1, bytes) and isinstance(fb2, bytes)
+    assert fb1 == fb2
 
 
 # --- aspirations.jsonl (1 follow-up) -------------------------------
@@ -287,6 +501,193 @@ def test_aspirations_multiround_convergence():
     m1 = cm.merge_aspirations(a, b)
     assert cm.merge_aspirations(m1, b) == m1
     assert cm.merge_aspirations(a, m1) == m1
+
+
+def test_aspirations_fulltie_order_divergence_heals():
+    """5: VALUE-identical order-divergent copies (canon-blind corner —
+    _canon sorts keys) tie on both last_modified/last_selected AND canon, so
+    the pre-fix _order_by_ts full-tie picked the FIRST ARG and dict(win) key
+    order reached the bytes: merge(a,b) != merge(b,a), permanent ping-pong.
+    Both the GOAL dict and the ASPIRATION record are permuted here to pin the
+    _merge_goal AND _merge_aspiration_record routings."""
+    g1 = {"id": "g-9-1", "title": "t", "status": "pending",
+          "last_modified": "2026-07-03T10:00:00", "xf": 1, "yf": 2}
+    g2 = {"id": "g-9-1", "status": "pending", "yf": 2, "xf": 1,
+          "last_modified": "2026-07-03T10:00:00", "title": "t"}
+    a1 = {"id": "asp-9", "status": "active", "last_selected": "2026-07-03T09:00:00",
+          "goals": [g1]}
+    a2 = {"id": "asp-9", "last_selected": "2026-07-03T09:00:00", "status": "active",
+          "goals": [g2]}
+    ab, ba = cm.merge_aspirations(_rb([a1]), _rb([a2])), \
+        cm.merge_aspirations(_rb([a2]), _rb([a1]))
+    assert ab == ba, "full-tie order divergence must canonicalize (guard-907)"
+    m = cm.merge_aspirations(ab, _rb([a1]))
+    assert m == ab, "post-heal re-merge against a stale side must be a fixpoint"
+
+
+def test_aspirations_concurrent_add_same_id_keeps_both():
+    # 7: two boxes each add a DISTINCT new goal to the same aspiration
+    # and both decentralized max+1 allocate the SAME id (same eventual-consistency
+    # window). The merge must keep BOTH (loser re-id'd), never field-interleave
+    # them into one franken-record (the old id-keyed union dropped a writer —
+    # observed live  add-loss /  update-loss).
+    base = _goal("g-115-01", title="base", created_at="2026-07-14T09:00:00")
+    boxA = _goal("g-115-02", title="alpha work", created_at="2026-07-14T10:00:00",
+                 description="ALPHA-CONTENT")
+    boxB = _goal("g-115-02", title="bravo work", created_at="2026-07-14T10:00:05",
+                 description="BRAVO-CONTENT")
+    a = _rb([_asp("asp-115", [base, boxA])])
+    b = _rb([_asp("asp-115", [base, boxB])])
+    ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
+    assert ab == ba                                        # commutative / byte-identical
+    assert sorted(_goal_ids(ab)) == ["", "", ""]  # loser re-id'd, none lost
+    descs = {g.get("description") for asp in _recs(ab) for g in asp["goals"]}
+    assert {"ALPHA-CONTENT", "BRAVO-CONTENT"} <= descs     # zero content loss
+    keep = _find_goal(ab, "g-115-02")
+    assert keep["description"] == "ALPHA-CONTENT"          # earlier-created keeps the id
+    moved = _find_goal(ab, "g-115-03")
+    assert moved["description"] == "BRAVO-CONTENT"         # later displaced forward
+
+
+def test_aspirations_concurrent_add_converges_multiround():
+    # The re-id must CONVERGE across the multi-round fenced-PUT loop (mirror of
+    # test_rb_multiround_collision_converges): a goal one box re-id'd is
+    # recognized by its (created_at, title) identity when it returns under its old
+    # id, so it is NOT re-duplicated each round.
+    base = _goal("g-115-01", title="base", created_at="2026-07-14T09:00:00")
+    gA = _goal("g-115-02", title="alpha", created_at="2026-07-14T10:00:00")
+    gB = _goal("g-115-02", title="bravo", created_at="2026-07-14T10:00:05")
+    localA = _rb([_asp("asp-115", [base, gA])])
+    localB = _rb([_asp("asp-115", [base, gB])])
+    s3 = cm.merge_aspirations(localA, localB)              # A pushes
+    for _ in range(4):                                     # B, A, B, A re-merge stale local
+        s3_b = cm.merge_aspirations(localB, s3)
+        s3_a = cm.merge_aspirations(localA, s3_b)
+        assert s3_a == s3_b, "not converged: A and B disagree"
+        s3 = s3_a
+    titles = sorted(g["title"] for asp in _recs(s3) for g in asp["goals"])
+    assert titles == ["alpha", "base", "bravo"]            # exactly one of each, no dupes
+
+
+def test_aspirations_variant_id_not_reallocated():
+    # A -letter variant id (1-a) is OUTSIDE the sequential space and must
+    # pass through unchanged — never displaced into the g-115-{seq} sequence.
+    a = _rb([_asp("asp-115", [_goal("g-115-1991-a", title="variant",
+                                    created_at="2026-07-14T10:00:00")])])
+    b = _rb([_asp("asp-115", [_goal("g-115-05", title="seq",
+                                    created_at="2026-07-14T10:00:00")])])
+    ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
+    assert ab == ba
+    assert _goal_ids(ab) == {"1-a", ""}   # variant kept verbatim
+
+
+def test_aspirations_reid_winner_no_duplicate_id():
+    # 7 fresh-eyes finding: the SAME goal seen under two seq ids (its
+    # original id + a peer's re-id) where _merge_goal's LWW picks the HIGHER-seq
+    # id must NOT let the keeper carry that higher id into its (lower) home bucket
+    # and collide with the DISTINCT goal legitimately at the higher seq. All output
+    # ids must be distinct in ONE pass (not self-healed a round later). _goal_ids()
+    # is a SET (dedups) so it cannot see the dup -- assert on the RAW list via _recs.
+    shared_a = _goal("g-115-02", title="shared", created_at="2026-07-14T10:00:00",
+                     last_modified="2026-07-14T10:00:00")
+    other    = _goal("g-115-03", title="other", created_at="2026-07-14T10:30:00",
+                     last_modified="2026-07-14T10:30:00")
+    shared_b = _goal("g-115-03", title="shared", created_at="2026-07-14T10:00:00",
+                     last_modified="2026-07-14T11:00:00")   # newer -> LWW picks id 
+    a = _rb([_asp("asp-115", [shared_a, other])])
+    b = _rb([_asp("asp-115", [shared_b])])
+    ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
+    assert ab == ba                                          # commutative
+    raw_ids = [g["id"] for asp in _recs(ab) for g in asp.get("goals", [])]
+    assert len(raw_ids) == len(set(raw_ids)), f"duplicate id in one pass: {raw_ids}"
+    titles = {g["title"] for asp in _recs(ab) for g in asp.get("goals", [])}
+    assert {"shared", "other"} <= titles                     # both distinct goals survive
+
+
+def test_aspirations_collision_reid_stamps_tombstone():
+    # 7: the displaced loser carries displaced_from = the contested id
+    # it lost, so external references (claims, discovered_by, origin_signal
+    # dedup) can be traced and re-merges recognize the settled displacement.
+    gA = _goal("g-115-02", title="alpha work", created_at="2026-07-14T10:00:00")
+    gB = _goal("g-115-02", title="bravo work", created_at="2026-07-14T10:00:05")
+    ab = cm.merge_aspirations(_rb([_asp("asp-115", [gA])]),
+                              _rb([_asp("asp-115", [gB])]))
+    moved = _find_goal(ab, "g-115-03")
+    assert moved is not None and moved["title"] == "bravo work"
+    assert moved.get("displaced_from") == ""         # tombstone stamped
+    keep = _find_goal(ab, "g-115-02")
+    assert "displaced_from" not in keep                      # winner untouched
+
+
+def test_aspirations_collision_reid_associative_stale_replay():
+    # 7 core property: replaying a STALE pre-collision side against the
+    # settled result must be a FIXPOINT — merge(merge(a,b), a) == merge(a,b) on
+    # the collision path. Pre-tombstone, the settled displaced goal was dragged
+    # back into its home bucket and re-displaced to a pair-dependent next-free
+    # id (proven on the 2026-07-16 healed x clobbered pair: settled ids
+    # reshuffled by a very stale replica rejoin).
+    base = [_goal(f"g-115-{n:02d}", title=f"filler-{n}",
+                  created_at=f"2026-07-10T0{n}:00:00") for n in range(3, 8)]
+    gA = _goal("g-115-02", title="alpha work", created_at="2026-07-14T10:00:00")
+    gB = _goal("g-115-02", title="bravo work", created_at="2026-07-14T10:00:05")
+    a = _rb([_asp("asp-115", [gA] + base)])
+    b = _rb([_asp("asp-115", [gB])])
+    settled = cm.merge_aspirations(a, b)
+    # bravo work displaced past the filler block (next free after 02..07 = 08)
+    moved = _find_goal(settled, "g-115-08")
+    assert moved is not None and moved["title"] == "bravo work"
+    # Stale replays from EITHER side are fixpoints — settled ids never reshuffle.
+    assert cm.merge_aspirations(settled, a) == settled
+    assert cm.merge_aspirations(settled, b) == settled
+    assert cm.merge_aspirations(a, settled) == cm.merge_aspirations(settled, a)
+
+
+def test_aspirations_chained_displacement_stale_replay_no_refight():
+    # 7 second-pass hardening: a CHAIN-displaced goal (displaced 50->67,
+    # then lost 67 to an earlier-created contender -> 68; tombstone stays 50) has
+    # home OUTSIDE its seen-id set on stale replay {67, 68}. It must anchor its
+    # LATEST settled slot (68) directly — never re-fight bucket 67 it already
+    # lost and rely on vacated-slot dynamics to land back.
+    X = _goal("g-115-50", title="X", created_at="2026-07-14T09:00:00")
+    Y = _goal("g-115-50", title="Y", created_at="2026-07-14T10:00:00")
+    fill = [_goal(f"g-115-{n}", title=f"f{n}",
+                  created_at=f"2026-07-13T00:{n}:00") for n in range(51, 67)]
+    s1 = cm.merge_aspirations(_rb([_asp("asp-115", [X] + fill)]),
+                              _rb([_asp("asp-115", [Y])]))
+    y1 = next(g for a in _recs(s1) for g in a["goals"] if g["title"] == "Y")
+    assert y1["id"] == "g-115-67" and y1["displaced_from"] == "g-115-50"
+    # Z allocated Y's slot on another box, created EARLIER -> wins the bucket.
+    Z = _goal("g-115-67", title="Z", created_at="2026-07-14T09:30:00")
+    s2 = cm.merge_aspirations(s1, _rb([_asp("asp-115", [Z])]))
+    y2 = next(g for a in _recs(s2) for g in a["goals"] if g["title"] == "Y")
+    assert y2["id"] == ""                       # chained displacement
+    assert y2["displaced_from"] == ""           # first home preserved
+    # Stale replica still holding Y at its FIRST displacement slot rejoins.
+    stale = _rb([_asp("asp-115", [dict(y1)])])
+    s3 = cm.merge_aspirations(s2, stale)
+    assert s3 == s2, "chained-displacement stale replay must be a byte fixpoint"
+    assert cm.merge_aspirations(stale, s2) == cm.merge_aspirations(s2, stale)
+
+
+def test_aspirations_divergent_displacement_converges():
+    # Two histories displaced the SAME goal to DIFFERENT ids (their pair
+    # id-spaces differed). The exchange must converge commutatively to ONE id
+    # and stay a fixpoint on further stale replay.
+    gA = _goal("g-115-02", title="alpha work", created_at="2026-07-14T10:00:00")
+    gB = _goal("g-115-02", title="bravo work", created_at="2026-07-14T10:00:05")
+    h1 = cm.merge_aspirations(_rb([_asp("asp-115", [gA])]),
+                              _rb([_asp("asp-115", [gB])]))       # bravo -> 
+    filler = _goal("g-115-03", title="filler", created_at="2026-07-10T03:00:00")
+    h2 = cm.merge_aspirations(_rb([_asp("asp-115", [gA, filler])]),
+                              _rb([_asp("asp-115", [gB])]))       # bravo -> 
+    ab, ba = cm.merge_aspirations(h1, h2), cm.merge_aspirations(h2, h1)
+    assert ab == ba                                          # commutative exchange
+    raw_ids = [g["id"] for asp in _recs(ab) for g in asp.get("goals", [])]
+    assert len(raw_ids) == len(set(raw_ids)), f"duplicate id: {raw_ids}"
+    titles = {g["title"] for asp in _recs(ab) for g in asp.get("goals", [])}
+    assert {"alpha work", "bravo work", "filler"} <= titles  # zero loss
+    assert cm.merge_aspirations(ab, h1) == ab                # fixpoint after exchange
+    assert cm.merge_aspirations(ab, h2) == ab
 
 
 # --- guardrails (id-keyed like reasoning-bank; 3-pad ids + times_triggered) --
@@ -447,6 +848,72 @@ def test_append_only_multiround_convergence():
     assert whos.count("a") == 1 and whos.count("b") == 1     # neither duplicated
 
 
+# --- torn-line tolerance (5) ----------------------------------------
+def _torn_tail(records, cut=38):
+    """A franken blob: valid records + a truncated final append (the cc-04
+    wedge shape — the writer died mid-line, leaving a torn half-line tail).
+    cut=38 slices {"ts": "2026-07-03T12:00:00", "torn": "yes"} mid-value —
+    past the "torn" key (so tests can assert the fragment surfaced) but
+    before the closing brace (so the line stays unparseable)."""
+    full = _rb(records)
+    extra = json.dumps(_log("2026-07-03T12:00:00", torn="yes"),
+                       ensure_ascii=True).encode()
+    return full + extra[:cut]                                # no trailing \n
+
+
+def test_append_only_torn_local_no_longer_wedges(capsys):
+    # THE 5 behavior: a torn half-line on one side must NOT raise
+    # (pre-fix: json.loads raised -> _merge_reconcile_put wrapped it in
+    # ConflictError -> the union lane wedged forever on the franken local).
+    base = _log("2026-07-03T09:00:00", n=1)
+    torn_local = _torn_tail([base, _log("2026-07-03T10:00:00", n=2)])
+    clean_remote = _rb([base, _log("2026-07-03T11:00:00", n=3)])
+    out = _recs(cm.merge_append_only_jsonl(torn_local, clean_remote))
+    assert [r["n"] for r in out] == [1, 2, 3]                # all parseable kept
+    err = capsys.readouterr().err
+    assert "dropped 1 torn line(s)" in err                   # loud, not silent
+    assert '"torn"' in err                                   # bytes preserved in-band
+
+
+def test_append_only_torn_commutative_and_convergent(capsys):
+    # guard-907: tolerance is symmetric — the dropped set is a function of
+    # content, never of the local-vs-remote role. Byte-identical both ways,
+    # and re-merging the torn side against the merged result is a fixpoint
+    # (the fenced-PUT retry loop still terminates).
+    base = _log("2026-07-03T09:00:00", n=1)
+    torn = _torn_tail([base, _log("2026-07-03T10:00:00", n=2)])
+    clean = _rb([base, _log("2026-07-03T11:00:00", n=3)])
+    ab = cm.merge_append_only_jsonl(torn, clean)
+    ba = cm.merge_append_only_jsonl(clean, torn)
+    assert ab == ba                                          # byte-identical
+    assert cm.merge_append_only_jsonl(torn, ab) == ab        # fixpoint
+    capsys.readouterr()                                      # drain warnings
+
+
+def test_append_only_torn_both_sides_and_mid_utf8_cut(capsys):
+    # A tear can cut mid-UTF-8-sequence — strict decode would raise before
+    # line-splitting. Both sides torn simultaneously must still union cleanly.
+    base = _log("2026-07-03T09:00:00", n=1)
+    a = _rb([base]) + '{"ts": "2026-07-03T10:00:00", "s": "café'.encode()[:-1]
+    b = _torn_tail([base, _log("2026-07-03T10:30:00", n=2)])
+    out = _recs(cm.merge_append_only_jsonl(a, b))
+    assert [r["n"] for r in out] == [1, 2]
+    err = capsys.readouterr().err
+    assert err.count("dropped 1 torn line(s)") == 2          # one per side
+
+
+def test_torn_tolerance_does_not_leak_to_id_keyed_handlers():
+    # Scope boundary (5): id-keyed stores keep the STRICT parse — a
+    # parse failure there can mean real corruption of an editable record and
+    # must freeze (ConflictError at the caller), never silently skip.
+    torn = _rb([{"id": "rb-1", "created": "2026-07-02T10:00:00",
+                 "title": "base"}])[:-10]                    # truncate a record
+    clean = _rb([{"id": "rb-2", "created": "2026-07-02T11:00:00",
+                  "title": "other"}])
+    with pytest.raises(Exception):
+        cm.merge_reasoning_bank(torn, clean)
+
+
 # --- _HANDLERS registration (6) ------------------------------------
 def test_handler_registration_board_and_override_g115_2006():
     # The non-default board channels + the Phase 4 bulk-override ledger are
@@ -462,13 +929,68 @@ def test_handler_registration_board_and_override_g115_2006():
 
 def test_handler_registration_excludes_pruned_stores_g115_2006():
     # Regression guard (rb-245): stores that are REWRITTEN/PRUNED (not strictly
-    # append-only) MUST stay unregistered — a line-union handler would resurrect
-    # pruned records. changelog.jsonl is pruned; the evolution streams are
-    # rewritten by evolution-stub-expiry.py; journal.jsonl gets index rewrites.
-    for path in ["changelog.jsonl", "self-evolution.jsonl",
-                 "program-evolution.jsonl", "journal.jsonl"]:
-        assert cm.merge_handler_for(path) is None, \
-            f"{path} is pruned/rewritten and must NOT be append-only-registered"
+    # append-only) MUST NOT take the LINE-UNION handler — it would resurrect
+    # pruned/superseded records. journal.jsonl gets index rewrites and stays
+    # fully unregistered. The evolution streams (rewritten in place by
+    # evolution-complete/stub-expiry) left this exclusion 2026-07-18
+    # (1): they are now registered with merge_evolution_stream — a
+    # revision_id-keyed STATUS-MONOTONIC merge that handles the rewrite
+    # correctly — but must NEVER regress to merge_append_only_jsonl.
+    # (changelog.jsonl lived here until 3 — it is ROTATED into
+    # changelog-archive.jsonl, a MOVE not a record-dropping rewrite, so the
+    # pair is append-only-registered; see
+    # test_handler_registration_changelog_g115_2173 below.)
+    assert cm.merge_handler_for("journal.jsonl") is None, \
+        "journal.jsonl is rewritten and must stay unregistered"
+    for path in ["self-evolution.jsonl", "skill-evolution.jsonl",
+                 "rule-evolution.jsonl", "script-evolution.jsonl",
+                 "program-evolution.jsonl"]:
+        h = cm.merge_handler_for(path)
+        assert h is cm.merge_evolution_stream, \
+            f"{path} must use the status-monotonic evolution handler"
+        assert h is not cm.merge_append_only_jsonl, \
+            f"{path} is rewritten in place — line-union would resurrect stubs"
+
+
+def test_handler_registration_changelog_g115_2173():
+    # 3 (ports cc-02 7b6801e1): changelog.jsonl is ROTATED into
+    # changelog-archive.jsonl by store-hygiene.yaml — a MOVE, not a record-dropping
+    # rewrite — so the pair carries the SAME bounded rotate+line-union tradeoff
+    # already accepted for the board channels, and BOTH must route to the
+    # append-only handler. Leaving them unregistered froze the fleet's entire
+    # write-audit trail out of S3 for 5 weeks across all six changelog stores
+    # (rb-3150 freeze class). Dispatch is by basename, so a leading world/ or
+    # agents/<name>/ path segment is irrelevant.
+    for path in ["changelog.jsonl", "changelog-archive.jsonl",
+                 "world/changelog.jsonl", "agents/alpha/changelog.jsonl"]:
+        assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
+            f"{path} not registered to the append-only handler (g-115-2173)"
+
+
+def test_changelog_two_box_concurrent_append_converges_g115_2173():
+    # End-to-end two-box concurrent-append with the REAL changelog record shape
+    # (timestamp/agent/file/action/summary/lines_changed): two boxes each append a
+    # distinct audit record on top of a shared baseline; resolve the handler the
+    # way OwnCloudBackend._put does (merge_handler_for) and confirm the fenced-PUT
+    # retry loop CONVERGES (byte-identical from both vantages) with no wedge and no
+    # lost append. Regression lock for the 5-week freeze: before 3,
+    # merge_handler_for("changelog.jsonl") returned None and the backend safe-froze
+    # the store out of S3. Sort is by `timestamp` (a _log_ts field).
+    handler = cm.merge_handler_for("agents/alpha/changelog.jsonl")
+    assert handler is cm.merge_append_only_jsonl
+    base = {"timestamp": "2026-07-14T09:00:00", "agent": "alpha",
+            "file": "world/aspirations.jsonl", "action": "edit",
+            "summary": "baseline", "lines_changed": 1}
+    a = _rb([base, {"timestamp": "2026-07-14T10:00:00", "agent": "alpha",
+                    "file": "world/pipeline.jsonl", "action": "append",
+                    "summary": "A", "lines_changed": 1}])
+    b = _rb([base, {"timestamp": "2026-07-14T10:05:00", "agent": "zeta",
+                    "file": "world/guardrails.jsonl", "action": "append",
+                    "summary": "B", "lines_changed": 1}])
+    ab, ba = handler(a, b), handler(b, a)
+    assert ab == ba                                          # converged, no ping-pong
+    summaries = [r["summary"] for r in _recs(ab)]
+    assert summaries == ["baseline", "A", "B"]               # baseline deduped, both kept, chronological
 
 
 def test_board_reasoning_two_box_concurrent_append_converges_g115_2006():
@@ -512,10 +1034,17 @@ def test_handler_registration_g115_2009_excludes_rewritten_stores():
     # build.py rebuild. A line-union handler would resurrect deleted records, so
     # they MUST stay unregistered (safe-freeze). meta-log/l1-pick-log/scoring-
     # criterion-audit were DEFERRED (writer not confirmed) — also unregistered.
-    for path in ["dead-ends.jsonl", "knowledge-graph.jsonl", "meta-log.jsonl",
-                 "l1-pick-log.jsonl", "scoring-criterion-audit.jsonl"]:
+    # meta-log.jsonl + l1-pick-log.jsonl left the DEFERRED list 2026-07-18
+    # (1): writers read and verified append-only (meta-yaml.py
+    # append_log open('a') — its open('r') is only mc-NNN allocation;
+    # _l1_pick.py open('a') + l1-domain-rename.py append), now registered.
+    for path in ["dead-ends.jsonl", "knowledge-graph.jsonl",
+                 "scoring-criterion-audit.jsonl"]:
         assert cm.merge_handler_for(path) is None, \
             f"{path} is rewritten/unconfirmed and must NOT be append-only-registered"
+    for path in ["meta-log.jsonl", "l1-pick-log.jsonl"]:
+        assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
+            f"{path} writer-verified append-only (g-115-2551) and must stay registered"
 
 
 def test_override_ledger_two_box_concurrent_append_converges_g115_2009():
@@ -748,6 +1277,47 @@ def test_pipeline_multiround_convergence():
     assert sorted(ids) == ids and len(ids) == len(set(ids)) == 3
 
 
+def test_pipeline_fulltie_order_divergence_heals():
+    """5: two VALUE-identical copies whose key sequences diverged tie
+    on stage rank AND canon (_canon sorts keys — blind to order); the pre-fix
+    tiebreak picked the FIRST ARG, so merge(a,b) != merge(b,a) bytes and the
+    fenced-PUT loop ping-ponged forever. Post-fix the diverged sequences
+    canonicalize (sorted) and settle."""
+    r1 = {"id": "2026-07-01_x", "title": "hyp", "stage": "active",
+          "alpha_f": 1, "beta_f": 2}
+    r2 = {"id": "2026-07-01_x", "stage": "active", "beta_f": 2,
+          "alpha_f": 1, "title": "hyp"}
+    ab, ba = cm.merge_pipeline(_rb([r1]), _rb([r2])), \
+        cm.merge_pipeline(_rb([r2]), _rb([r1]))
+    assert ab == ba
+    assert cm.merge_pipeline(ab, _rb([r2])) == ab       # settles
+
+
+def test_pipeline_three_box_manufacture_converges():
+    """The reachability proof for the full-tie corner: THREE participants, two
+    concurrent distinct-field adds, DIFFERENT merge encounter orders. Pre-fix
+    this manufactures value-identical order-divergent copies (...,x,y vs
+    ...,y,x) that then full-tie ping-pong forever. Post-fix every diverged
+    merge emits sorted keys, so all encounter orders converge byte-identically."""
+    base = {"id": "2026-07-01_h", "title": "hyp", "stage": "active"}
+    rx = dict(base); rx["xf"] = 1
+    ry = dict(base); ry["yf"] = 2
+    box_a = cm.merge_pipeline(_rb([rx]), _rb([ry]))          # A: meets y first
+    b1 = cm.merge_pipeline(_rb([ry]), _rb([base]))           # B: stale base first
+    box_b = cm.merge_pipeline(b1, _rb([rx]))                 # ...then x
+    assert box_a == box_b, "3-box encounter orders must converge (g-115-2355)"
+    assert cm.merge_pipeline(box_a, box_b) == box_a          # fixpoint
+
+
+def test_pipeline_matching_key_order_preserved_not_sorted():
+    """No blanket churn: when both sides carry the SAME key sequence, on-disk
+    order is preserved even if unsorted (self-merge is byte-identity)."""
+    rec = {"id": "2026-07-02_y", "title": "keep order", "stage": "active",
+           "zeta_f": 1, "alpha_f": 2}
+    blob = _rb([rec])
+    assert cm.merge_pipeline(blob, blob) == blob
+
+
 def test_pipeline_intra_blob_duplicates_fold_commutatively():
     # The LIVE pipeline-archive.jsonl carries duplicate-id lines WITHIN one
     # file (5 byte-identical groups from historical re-appends — 2026-07-07
@@ -888,6 +1458,19 @@ def test_spark_multiround_convergence_and_empty():
     assert cm.merge_spark_questions(one, b"") == one
 
 
+def test_spark_fulltie_order_divergence_heals():
+    """5: same-type union path — VALUE-identical order-divergent
+    copies tie on canon and pre-fix fell to first-arg-wins key order."""
+    s1 = {"id": "sq-001", "type": "question", "text": "Q1?",
+          "times_asked": 5, "mf": 1, "nf": 2}
+    s2 = {"id": "sq-001", "type": "question", "text": "Q1?",
+          "nf": 2, "mf": 1, "times_asked": 5}
+    ab, ba = cm.merge_spark_questions(_rb([s1]), _rb([s2])), \
+        cm.merge_spark_questions(_rb([s2]), _rb([s1]))
+    assert ab == ba
+    assert cm.merge_spark_questions(ab, _rb([s2])) == ab    # settles
+
+
 # --- pipeline-meta.json (7 — rewritten by every pipeline mutation) ---
 def _pmeta(last_updated, micro=None, **kw):
     d = {"last_updated": last_updated,
@@ -922,6 +1505,31 @@ def test_pipeline_meta_byte_exact_and_same_day_tiebreak():
     assert cm.merge_pipeline_meta(a, b"") == cm.merge_pipeline_meta(b"", a)
 
 
+def test_pipeline_meta_micro_counters_numeric_max_not_lexicographic():
+    # 3 (guard-1153 sweep): confirmed_all_time/corrected_all_time are
+    # grow-only counters. The pre-fix per-key _canon compare ordered
+    # lexicographically ("10" < "9"), so the higher count LOST on a same-key
+    # clash — a counter went backward on merge. Pin numeric MAX + the derived
+    # accuracy_all_time recompute, both arg orders.
+    a = _pmeta("2026-07-06", micro={"confirmed_all_time": 10,
+                                    "corrected_all_time": 2,
+                                    "accuracy_all_time": 0.833})
+    b = _pmeta("2026-07-05", micro={"confirmed_all_time": 9,
+                                    "corrected_all_time": 3,
+                                    "accuracy_all_time": 0.75})
+    ab, ba = cm.merge_pipeline_meta(a, b), cm.merge_pipeline_meta(b, a)
+    assert ab == ba
+    m = json.loads(ab.decode("utf-8"))["micro_hypothesis_stats"]
+    assert m["confirmed_all_time"] == 10               # numeric MAX (not "10"<"9")
+    assert m["corrected_all_time"] == 3                # per-key MAX, not one side
+    assert m["accuracy_all_time"] == round(10 / 13, 3)  # recomputed from merged
+    # Non-numeric values keep the deterministic content-compare fallback.
+    c = _pmeta("2026-07-06", micro={"last_session_stats": {"date": "2026-07-11", "total": 3}})
+    d = _pmeta("2026-07-05", micro={"last_session_stats": {"date": "2026-07-10", "total": 5}})
+    cd, dc = cm.merge_pipeline_meta(c, d), cm.merge_pipeline_meta(d, c)
+    assert cd == dc                                    # commutative either way
+
+
 def test_handler_registry_pipeline_spark_basenames():
     # Lock the 7 / rb-2849 registrations — an accidental removal
     # re-opens the cc-04 non-multipart both-diverged write-freeze.
@@ -929,13 +1537,19 @@ def test_handler_registry_pipeline_spark_basenames():
     assert cm.merge_handler_for("world/pipeline-archive.jsonl") is cm.merge_pipeline
     assert cm.merge_handler_for("world/pipeline-meta.json") is cm.merge_pipeline_meta
     assert cm.merge_handler_for("meta/spark-questions.jsonl") is cm.merge_spark_questions
-    # pattern-signatures.jsonl is DELIBERATELY unregistered in the 7
-    # pass: its two live writers disagree on serialization (CLI
-    # pattern-signatures.py emits ensure_ascii=False; the daemon store endpoint
-    # emits ensure_ascii=True), so the byte-exact contract cannot be satisfied
-    # until that writer split is reconciled (follow-up filed via BRD notes).
-    # Locking None keeps a future edit from registering it half-verified.
-    assert cm.merge_handler_for("world/pattern-signatures.jsonl") is None
+    # pattern-signatures.jsonl REGISTERED (3, 2026-07-16) — the
+    # 7-era None-lock's premise ("two live writers disagree on
+    # serialization") was re-verified STALE: the H2 Wave 3 migration gutted the
+    # CLI CRUD writers to the daemon generic store endpoint (ensure_ascii=True,
+    # store.py), the bespoke record-outcome daemon endpoint emits True, and the
+    # CLI record-outcome path routes through _fileops.locked_modify_jsonl
+    # (True at every write site). The one remaining ensure_ascii=False emitter
+    # is cmd_migrate_yaml — the one-time fresh-world bootstrap seeder, not a
+    # steady-state writer (and the live store is ASCII-only, so even that form
+    # is byte-identical). Full verification trail in merge_pattern_signatures'
+    # docstring + test_pattern_signatures_merge.py.
+    assert cm.merge_handler_for("world/pattern-signatures.jsonl") \
+        is cm.merge_pattern_signatures
 
 
 def test_handler_registry_by_basename():
@@ -1070,6 +1684,34 @@ def test_tree_progression_never_regress_on_equal_timestamp():
     assert ab == ba
     assert ab["confidence"] == 0.8                   # never regress: higher wins
     assert ab["capability_level"] == "EXPLOIT"       # EXPLOIT > CALIBRATE on the axis
+
+
+def test_tree_progression_stamp_preserves_downgrade_on_equal_last_updated_g_115_2495():
+    # 5: a data-derived confidence DOWNGRADE must survive an own-cloud
+    # merge even when last_updated is EQUAL on both sides (the 4 bug:
+    # accuracy-sync lowers confidence WITHOUT bumping last_updated, per the
+    # 3 decoupling). progression_updated_at is the dedicated LWW key,
+    # so the side that recalibrated (fresher stamp) wins and the downgrade holds.
+    lu = "2026-07-01T00:00:00"                        # SAME article last_updated
+    a = _tnode(confidence=0.5, last_updated=lu, progression_updated_at="2026-07-17")
+    b = _tnode(confidence=0.7, last_updated=lu, progression_updated_at="2026-07-14")
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba                                  # commutative
+    assert ab["confidence"] == 0.5                   # DOWNGRADE SURVIVES (the fix)
+    assert ab["progression_updated_at"] == "2026-07-17"  # newer stamp kept (NEWER)
+
+
+def test_tree_progression_stamp_absent_is_backfill_safe_g_115_2495():
+    # Backfill-safe: with NO progression_updated_at on either side the merge
+    # falls back to last_updated -> behavior IDENTICAL to pre-fix (equal
+    # last_updated -> never-regress keeps the higher value; stamp not fabricated).
+    lu = "2026-07-01T00:00:00"
+    a = _tnode(confidence=0.5, last_updated=lu)
+    b = _tnode(confidence=0.7, last_updated=lu)
+    ab, ba = cm._merge_tree_node(a, b), cm._merge_tree_node(b, a)
+    assert ab == ba
+    assert ab["confidence"] == 0.7                   # unchanged: never-regress on equal ts
+    assert "progression_updated_at" not in ab        # not fabricated
 
 
 def test_tree_capability_reference_orthogonal_tiebreak_commutative():
@@ -1503,3 +2145,381 @@ def test_handlers_registry_is_nonempty_and_ast_findable():
         f"_HANDLERS AST extraction found only {len(keys)} keys — expected the full "
         f"registry (~55). The extractor likely matched the wrong node; fix it "
         f"before trusting the dup-key check.")
+
+
+# ---------------------------------------------------------------------------
+# forged-skills.yaml — keyed dict union (5; CURE for the 8 +
+# 9 stale-base row-clobber incidents)
+# ---------------------------------------------------------------------------
+
+def _fs(skills: dict) -> bytes:
+    return yaml.dump({"skills": skills}, default_flow_style=False,
+                     sort_keys=False).encode()
+
+
+def test_fs_disjoint_union_byte_commutative():
+    a = _fs({"skill-a": {"parent": "p", "forged_date": "2026-07-01",
+                         "forged_by": "alpha", "triggers": ["ta"]}})
+    b = _fs({"skill-b": {"parent": "p", "forged_date": "2026-07-02",
+                         "forged_by": "echo", "triggers": ["tb"]}})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert sorted(m["skills"]) == ["skill-a", "skill-b"]   # both rows survive
+
+
+def test_fs_same_skill_newer_forged_date_wins():
+    old = {"parent": "p", "forged_date": "2026-07-01", "triggers": ["old"]}
+    new = {"parent": "p", "forged_date": "2026-07-10", "triggers": ["new"]}
+    a, b = _fs({"skill-x": old}), _fs({"skill-x": new})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert m["skills"]["skill-x"]["triggers"] == ["new"]
+    # Whole-record winner — the losing side's fields do NOT blend in.
+    assert m["skills"]["skill-x"]["forged_date"] == "2026-07-10"
+
+
+def test_fs_date_tie_richer_side_wins():
+    lean = {"parent": "p", "forged_date": "2026-07-01"}
+    rich = {"parent": "p", "forged_date": "2026-07-01",
+            "gap_ref": "gap-9", "companion_scripts": ["s.sh"]}
+    a, b = _fs({"skill-y": lean}), _fs({"skill-y": rich})
+    ab, ba = cm.merge_forged_skills(a, b), cm.merge_forged_skills(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["skills"]["skill-y"].get("gap_ref") == "gap-9"
+
+
+def test_fs_retired_status_row_survives_union():
+    # Retirement is an explicit status field, never deletion — a retired row
+    # present on ONE side must survive the merge (union semantics), so a
+    # stale-base peer can never clobber it away.
+    a = _fs({"skill-live": {"parent": "p", "forged_date": "2026-07-01"}})
+    b = _fs({"skill-live": {"parent": "p", "forged_date": "2026-07-01"},
+             "skill-retired": {"parent": "p", "forged_date": "2026-06-01",
+                               "status": "retired"}})
+    m = yaml.safe_load(cm.merge_forged_skills(a, b).decode())
+    assert m["skills"]["skill-retired"]["status"] == "retired"
+    assert cm.merge_forged_skills(a, b) == cm.merge_forged_skills(b, a)
+
+
+def test_fs_multiround_settle_idempotent():
+    a = _fs({"skill-a": {"forged_date": "2026-07-01", "parent": "p"}})
+    b = _fs({"skill-a": {"forged_date": "2026-07-02", "parent": "p"},
+             "skill-b": {"forged_date": "2026-07-01", "parent": "q"}})
+    m1 = cm.merge_forged_skills(a, b)
+    m2 = cm.merge_forged_skills(m1, m1)
+    assert m1 == m2                        # fixpoint after one merge
+    assert cm.merge_forged_skills(m1, b) == m1   # stale replay settles
+
+
+def test_fs_degenerate_inputs_commutative():
+    good = _fs({"skill-a": {"forged_date": "2026-07-01"}})
+    for bad in (b"", b"- just\n- a list\n", b"scalar\n"):
+        ab = cm.merge_forged_skills(good, bad)
+        ba = cm.merge_forged_skills(bad, good)
+        assert ab == ba
+        assert b"skill-a" in ab            # parseable dict side preferred
+
+
+def test_fs_unquoted_yaml_date_newer_side_wins():
+    # Unquoted YAML dates parse as datetime.date (merge_tree str-vs-date bug
+    # class); str() coercion must let a date-typed NEWER side win against a
+    # quoted-string older side, byte-commutatively.
+    a = b'skills:\n  skill-x:\n    forged_date: 2026-07-10\n    parent: p\n'
+    b_ = b'skills:\n  skill-x:\n    forged_date: "2026-07-01"\n    parent: q\n'
+    ab, ba = cm.merge_forged_skills(a, b_), cm.merge_forged_skills(b_, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["skills"]["skill-x"]["parent"] == "p"
+
+
+# --- skill-relations.yaml handler (6) -------------------------------
+
+
+def _sr(rels=None, log=None, last_updated=None, extra=None) -> bytes:
+    doc = {"last_updated": last_updated}
+    if rels is not None:
+        doc["forged_relations"] = rels
+    if log is not None:
+        doc["co_invocation_log"] = log
+    if extra:
+        doc.update(extra)
+    return yaml.dump(doc, default_flow_style=False, sort_keys=False).encode()
+
+
+def _rel(src, tgt, typ="compose_with", **kw):
+    r = {"source": src, "target": tgt, "type": typ}
+    r.update(kw)
+    return r
+
+
+def _logent(goal, skills, date):
+    return {"goal_id": goal, "skills": list(skills), "date": date}
+
+
+def test_sr_disjoint_union_byte_commutative():
+    a = _sr(rels=[_rel("s1", "t1")], log=[_logent("g-1", ["x", "y"], "2026-07-01T10:00:00")])
+    b = _sr(rels=[_rel("s2", "t2")], log=[_logent("g-2", ["p", "q"], "2026-07-02T10:00:00")])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert len(m["forged_relations"]) == 2 and len(m["co_invocation_log"]) == 2
+
+
+def test_sr_stale_base_clobber_recovered():
+    # The incident lane this handler closes: a stale-base full-file writer
+    # (remote) lacks local's newest relation + log entry — union restores both.
+    fresh = _sr(rels=[_rel("s1", "t1"), _rel("s2", "t2", confidence=0.9)],
+                log=[_logent("g-1", ["a", "b"], "2026-07-01T10:00:00"),
+                     _logent("g-2", ["c", "d"], "2026-07-02T10:00:00")])
+    stale = _sr(rels=[_rel("s1", "t1")],
+                log=[_logent("g-1", ["a", "b"], "2026-07-01T10:00:00")])
+    for first, second in ((fresh, stale), (stale, fresh)):
+        m = yaml.safe_load(cm.merge_skill_relations(first, second).decode())
+        assert len(m["forged_relations"]) == 2
+        assert len(m["co_invocation_log"]) == 2
+
+
+def test_sr_same_edge_richer_side_wins():
+    bare = _rel("s1", "t1")
+    rich = _rel("s1", "t1", confidence=0.9, evidence="probe log")
+    a, b = _sr(rels=[bare]), _sr(rels=[rich])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert len(m["forged_relations"]) == 1
+    assert m["forged_relations"][0].get("confidence") == 0.9
+
+
+def test_sr_log_union_respects_cap():
+    # cmd_co_invoke tail-caps at co_invocation_log_cap (200) — the union must
+    # re-apply it, keeping the NEWEST entries, byte-commutatively.
+    cap = cm._co_invocation_log_cap()
+    n = cap + 5
+    ents = [_logent("g-%04d" % i, ["a", "b"], "2026-01-01T00:%02d:%02d" % (i // 60, i % 60))
+            for i in range(n)]
+    a = _sr(log=ents[: n // 2 + 3])          # overlapping halves
+    b = _sr(log=ents[n // 2 - 3:])
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    m = yaml.safe_load(ab.decode())
+    assert len(m["co_invocation_log"]) == cap
+    kept = {e["goal_id"] for e in m["co_invocation_log"]}
+    assert "g-%04d" % (n - 1) in kept        # newest survives
+    assert "g-0000" not in kept              # oldest capped out (5 dropped)
+
+
+def test_sr_multiround_settle_idempotent():
+    a = _sr(rels=[_rel("s1", "t1")], log=[_logent("g-1", ["a", "b"], "2026-07-01T10:00:00")])
+    b = _sr(rels=[_rel("s2", "t2")], log=[_logent("g-2", ["c", "d"], "2026-07-02T10:00:00")])
+    m1 = cm.merge_skill_relations(a, b)
+    assert cm.merge_skill_relations(m1, m1) == m1
+    assert cm.merge_skill_relations(m1, b) == m1
+
+
+def test_sr_degenerate_inputs_commutative():
+    good = _sr(rels=[_rel("s1", "t1")])
+    for bad in (b"", b"- just\n- a list\n", b"scalar\n"):
+        ab = cm.merge_skill_relations(good, bad)
+        ba = cm.merge_skill_relations(bad, good)
+        assert ab == ba
+        assert b"s1" in ab
+
+
+def test_sr_unquoted_date_entries_deterministic():
+    # Unquoted YAML timestamps parse as datetime — str() coercion in the sort
+    # key must keep the merge crash-free and byte-commutative.
+    a = b"co_invocation_log:\n- goal_id: g-1\n  skills: [a, b]\n  date: 2026-07-01T10:00:00\n"
+    b_ = b"co_invocation_log:\n- goal_id: g-2\n  skills: [c, d]\n  date: '2026-07-02T10:00:00'\n"
+    ab, ba = cm.merge_skill_relations(a, b_), cm.merge_skill_relations(b_, a)
+    assert ab == ba
+    assert len(yaml.safe_load(ab.decode())["co_invocation_log"]) == 2
+
+
+def test_sr_last_updated_max_nonnull():
+    a = _sr(rels=[], last_updated=None)
+    b = _sr(rels=[], last_updated="2026-07-01T00:00:00")
+    ab, ba = cm.merge_skill_relations(a, b), cm.merge_skill_relations(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["last_updated"] == "2026-07-01T00:00:00"
+    both_null = cm.merge_skill_relations(_sr(rels=[]), _sr(rels=[]))
+    assert yaml.safe_load(both_null.decode())["last_updated"] is None
+
+
+def test_sr_config_shaped_doc_passthrough():
+    # A doc sharing the basename but NOT the registry shape (core/config/
+    # skill-relations.yaml — never synced, defensive) must not gain invented
+    # forged_relations / co_invocation_log keys.
+    cfg = yaml.dump({"config": {"co_invocation_log_cap": 200}},
+                    default_flow_style=False, sort_keys=False).encode()
+    m = yaml.safe_load(cm.merge_skill_relations(cfg, cfg).decode())
+    assert "forged_relations" not in m and "co_invocation_log" not in m
+
+
+def test_sr_unquoted_datetime_last_updated_newer_wins():
+    # Fresh-eyes P1 (2026-07-17): str(datetime) uses a space where ISO strings
+    # use 'T' — un-normalized, a chronologically NEWER unquoted datetime lost
+    # to an older quoted string. Also pins the normalized-TIE case (same
+    # instant, different types) to a deterministic arg-order-free winner.
+    newer_dt = b"last_updated: 2026-07-17T05:00:00\nforged_relations: []\n"
+    older_str = b"last_updated: '2026-07-17T04:00:00'\nforged_relations: []\n"
+    ab = cm.merge_skill_relations(newer_dt, older_str)
+    ba = cm.merge_skill_relations(older_str, newer_dt)
+    assert ab == ba
+    won = yaml.safe_load(ab.decode())["last_updated"]
+    assert str(won).replace(" ", "T") == "2026-07-17T05:00:00"
+    same_dt = b"last_updated: 2026-07-17T05:00:00\nforged_relations: []\n"
+    same_str = b"last_updated: '2026-07-17T05:00:00'\nforged_relations: []\n"
+    assert (cm.merge_skill_relations(same_dt, same_str)
+            == cm.merge_skill_relations(same_str, same_dt))
+
+
+# --- evolution event streams (1) -----------------------------------
+def _evo(recs):
+    return _rb(recs)
+
+
+def test_evo_stub_vs_final_final_wins_both_orders():
+    # Box A finalized the stub; box B still holds awaiting_completion.
+    # Line-union would keep BOTH lines (the bug this handler exists to avoid);
+    # the keyed merge must emit exactly one record, status=final.
+    stub = {"revision_id": "self-x-0001", "ts": "2026-07-18T00:00:00",
+            "status": "awaiting_completion", "reasoning": None}
+    final = {"revision_id": "self-x-0001", "ts": "2026-07-18T00:00:00",
+             "status": "final", "reasoning": "did the thing because reasons"}
+    a, b = _evo([stub]), _evo([final])
+    ab, ba = cm.merge_evolution_stream(a, b), cm.merge_evolution_stream(b, a)
+    assert ab == ba
+    recs = _recs(ab)
+    assert len(recs) == 1 and recs[0]["status"] == "final"
+
+
+def test_evo_final_beats_expired():
+    # Box A expired the stub (24h honest fallback); box B completed it with a
+    # real rationale. The completion carries the WHY — it must win.
+    exp = {"revision_id": "skill-y-0002", "ts": "2026-07-17T09:00:00",
+           "status": "expired"}
+    fin = {"revision_id": "skill-y-0002", "ts": "2026-07-17T09:00:00",
+           "status": "final", "reasoning": "reconstructed from journal"}
+    ab = cm.merge_evolution_stream(_evo([exp]), _evo([fin]))
+    ba = cm.merge_evolution_stream(_evo([fin]), _evo([exp]))
+    assert ab == ba
+    recs = _recs(ab)
+    assert len(recs) == 1 and recs[0]["status"] == "final"
+
+
+def test_evo_disjoint_union_sorted_and_idempotent():
+    r1 = {"revision_id": "rule-a-0001", "ts": "2026-07-16T10:00:00", "status": "final"}
+    r2 = {"revision_id": "rule-b-0001", "ts": "2026-07-17T10:00:00", "status": "awaiting_completion"}
+    ab = cm.merge_evolution_stream(_evo([r1]), _evo([r2]))
+    ba = cm.merge_evolution_stream(_evo([r2]), _evo([r1]))
+    assert ab == ba
+    assert [r["revision_id"] for r in _recs(ab)] == ["rule-a-0001", "rule-b-0001"]
+    # idempotent: merging the merged result with either side is a fixed point
+    assert cm.merge_evolution_stream(ab, _evo([r1])) == ab
+    assert cm.merge_evolution_stream(ab, ab) == ab
+
+
+def test_evo_malformed_record_without_revision_id_survives():
+    good = {"revision_id": "self-z-0003", "ts": "2026-07-18T01:00:00", "status": "final"}
+    stray = {"note": "malformed line without revision_id"}
+    ab = cm.merge_evolution_stream(_evo([good, stray]), _evo([good]))
+    ba = cm.merge_evolution_stream(_evo([good]), _evo([good, stray]))
+    assert ab == ba
+    assert len(_recs(ab)) == 2
+
+
+# --- infra-health.yaml (1) -----------------------------------------
+def _ih(components):
+    return yaml.dump({"components": components}).encode()
+
+
+def test_ih_component_newest_activity_wins_whole_record():
+    # Box A probed efs-ssh later (success); box B holds an older failure streak.
+    # The WHOLE newer component record must win — no field-mixing.
+    a = _ih({"efs-ssh": {"last_success": "2026-07-18T01:00:00", "last_failure": None,
+                          "consecutive_failures": 0}})
+    b = _ih({"efs-ssh": {"last_success": "2026-07-16T00:00:00",
+                          "last_failure": "2026-07-17T00:00:00",
+                          "consecutive_failures": 3}})
+    ab, ba = cm.merge_infra_health(a, b), cm.merge_infra_health(b, a)
+    assert ab == ba
+    comp = yaml.safe_load(ab.decode())["components"]["efs-ssh"]
+    assert comp["consecutive_failures"] == 0 and comp["last_failure"] is None
+
+
+def test_ih_component_key_union_both_survive():
+    a = _ih({"only-a": {"last_success": "2026-07-18T00:00:00"}})
+    b = _ih({"only-b": {"last_failure": "2026-07-18T00:30:00"}})
+    ab, ba = cm.merge_infra_health(a, b), cm.merge_infra_health(b, a)
+    assert ab == ba
+    comps = yaml.safe_load(ab.decode())["components"]
+    assert set(comps) == {"only-a", "only-b"}
+
+
+def test_ih_unparseable_side_byte_tiebreak_commutative():
+    good = _ih({"x": {"last_success": "2026-07-18T00:00:00"}})
+    bad = b": not yaml : ["
+    assert cm.merge_infra_health(good, bad) == cm.merge_infra_health(bad, good)
+
+
+# --- goal-selection-strategy.yaml (1) ------------------------------
+def _gss(version, last_updated, weights, log):
+    return yaml.dump({"version": version, "last_updated": last_updated,
+                      "weights": weights, "applications_log": log}).encode()
+
+
+def test_gss_higher_version_wins_body_log_unions():
+    a = _gss(5, "2026-06-14", {"priority": 1.0},
+             [{"ts": "2026-07-01T00:00:00", "agent": "alpha", "summary": "a"}])
+    b = _gss(6, "2026-07-10", {"priority": 1.0, "opportunity_boost": 0.4},
+             [{"ts": "2026-07-11T00:00:00", "agent": "bravo", "summary": "b"}])
+    ab, ba = cm.merge_goal_selection_strategy(a, b), cm.merge_goal_selection_strategy(b, a)
+    assert ab == ba
+    d = yaml.safe_load(ab.decode())
+    assert d["version"] == 6 and "opportunity_boost" in d["weights"]
+    # applications_log entry-union from BOTH sides, chronological
+    assert [e["agent"] for e in d["applications_log"]] == ["alpha", "bravo"]
+
+
+def test_gss_log_union_respects_writer_cap():
+    log_a = [{"ts": f"2026-07-01T00:{i:02d}:00", "agent": "a", "summary": str(i)}
+             for i in range(0, 60)]
+    log_b = [{"ts": f"2026-07-02T00:{i:02d}:00", "agent": "b", "summary": str(i)}
+             for i in range(0, 55)]
+    filler = [{"ts": f"2026-06-30T{h:02d}:{i:02d}:00", "agent": "f", "summary": "x"}
+              for h in range(3) for i in range(40)]
+    a = _gss(5, "2026-06-14", {}, filler + log_a)
+    b = _gss(5, "2026-06-14", {}, filler + log_b)
+    ab, ba = cm.merge_goal_selection_strategy(a, b), cm.merge_goal_selection_strategy(b, a)
+    assert ab == ba
+    log = yaml.safe_load(ab.decode())["applications_log"]
+    assert len(log) == cm._GSS_APPLICATIONS_LOG_CAP  # re-capped, newest kept
+    assert log[-1]["agent"] == "b"
+
+
+def test_gss_version_tie_newer_last_updated_wins():
+    a = _gss(5, "2026-06-14", {"priority": 1.0}, [])
+    b = _gss(5, "2026-07-01", {"priority": 2.0}, [])
+    ab, ba = cm.merge_goal_selection_strategy(a, b), cm.merge_goal_selection_strategy(b, a)
+    assert ab == ba
+    assert yaml.safe_load(ab.decode())["weights"]["priority"] == 2.0
+
+
+# --- hypothesis-category-bindings.json (1) --------------------------
+def test_hcb_key_union_and_deterministic_value_conflict():
+    a = json.dumps({"arc": "node-1", "only-a": "x"}).encode()
+    b = json.dumps({"arc": "node-2", "only-b": "y"}).encode()
+    ab, ba = (cm.merge_hypothesis_category_bindings(a, b),
+              cm.merge_hypothesis_category_bindings(b, a))
+    assert ab == ba
+    d = json.loads(ab.decode())
+    assert set(d) == {"arc", "only-a", "only-b"}
+    assert d["arc"] in ("node-1", "node-2")  # deterministic canon winner
+
+
+def test_hcb_output_matches_writer_dump_style():
+    # tree-accuracy-sync.py dumps indent=2, sort_keys=True, NO trailing newline
+    # — byte-matching it means a semantically-null merge converges.
+    a = json.dumps({"k": "v"}, indent=2, sort_keys=True).encode()
+    assert cm.merge_hypothesis_category_bindings(a, a) == a

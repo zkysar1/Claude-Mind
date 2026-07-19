@@ -738,7 +738,21 @@ def cmd_failing_streak(args):
         if last_failure:
             try:
                 lf_dt = datetime.fromisoformat(last_failure)
-                if (now - lf_dt) > window:
+                # Cross-machine clock/TZ skew (g-115-2425, class from
+                # g-115-1850): a component probed on a box whose local
+                # wall-clock is ahead writes a future-dated last_failure,
+                # (now - lf_dt) goes negative, and a signed comparison is
+                # never > window — the stamp sits inside EVERY window until
+                # wall-clock passes it (CASE 3 of the streak test goes red
+                # on live skewed data). The docstring's contract is "within
+                # window_hours of now", which is a DISTANCE: use abs().
+                # (A max(0, delta) clamp — the literal g-115-1850 pattern —
+                # is a no-op here: clamped 0 is still never > window.)
+                # A future stamp within the window (skew < window) still
+                # alerts — the failure is real and recent; age-out is
+                # delayed by up to the skew (≤4h fleet-wide), accepted in
+                # g-115-2425's spec.
+                if abs(now - lf_dt) > window:
                     continue
             except (ValueError, TypeError):
                 pass
@@ -749,6 +763,15 @@ def cmd_failing_streak(args):
             "last_failure_reason": entry.get("last_failure_reason"),
             "streak_started_at": entry.get("streak_started_at"),
             "human_gated": bool(entry.get("human_gated")),
+            # g-249-24: per-agent notify blocklist for box-locality false
+            # positives. A component whose probe is an environment-reachability
+            # gate on a given box (localhost-port / product-box-software /
+            # GPU-required) reports "down" on every box that cannot HOST it
+            # (rb-2908, guard-1045). Listing an agent here means that box's
+            # infra-streak-notify --notify SUPPRESSES the user email for this
+            # component (the streak is still tracked). The hosting box, absent
+            # from the list, still notifies. Default [] = notify everywhere.
+            "notify_suppressed_agents": entry.get("notify_suppressed_agents") or [],
         })
 
     output = {
@@ -779,6 +802,71 @@ def cmd_failing_streak(args):
 
     if alerts:
         sys.exit(1)
+
+
+def cmd_probe_freshness(args):
+    """Report whether the accumulated probe store is fresh enough to trust.
+
+    streak-alert (cmd_failing_streak) filters to components whose last_failure is
+    within window_hours of now. If the WHOLE store is stale -- the NEWEST probe
+    across every component is older than window_hours -- that recency filter has
+    no in-window data, so a 0-alert result is a false-healthy artifact of
+    staleness, NOT a confirmed-healthy state (rb-4013 / g-249-06: the 2026-07-18
+    12:08 run reported alert_count=0 while CI had been failing 10 days because no
+    check-all had refreshed the store within the window; the 15:00 run WITH a
+    fresh check-all first surfaced 5 streaks).
+
+    Reuses _component_staleness (the max-of-last_success/last_failure per-component
+    "last recorded a real result" logic) and _load_streak_config's window_hours, so
+    the freshness threshold tracks the SAME window streak-alert uses (single source
+    of truth). Local YAML read only -- no external probes -- so a caller can gate on
+    freshness without paying the check-all cost.
+
+    Prints JSON {newest_probe, newest_age_hours, window_hours, stale,
+    components_considered}. stale=True when no component has recorded a result
+    within window_hours (including an empty store). Always exits 0 -- the `stale`
+    field is the signal a caller reads, not the exit code.
+    """
+    _threshold, window_hours = _load_streak_config()
+    if getattr(args, "window_hours", None) is not None:
+        window_hours = args.window_hours
+    data = load_health()
+    components = data.get("components", {}) or {}
+    now = datetime.now()
+    newest_dt = None
+    considered = 0
+    for entry in components.values():
+        # _component_staleness returns the newest recorded result (last_check_iso)
+        # as its 2nd element; None when the component never recorded one (a
+        # never-probed component is neither fresh nor stale evidence -- skip it).
+        _is_stale, last_check_iso, _hours_ago = _component_staleness(entry, window_hours, now)
+        if not last_check_iso:
+            continue
+        try:
+            dt = datetime.fromisoformat(last_check_iso)
+        except (ValueError, TypeError):
+            continue  # guard-514: malformed persisted timestamp -> skip
+        considered += 1
+        if newest_dt is None or dt > newest_dt:
+            newest_dt = dt
+    if newest_dt is None:
+        output = {
+            "newest_probe": None,
+            "newest_age_hours": None,
+            "window_hours": window_hours,
+            "stale": True,
+            "components_considered": 0,
+        }
+    else:
+        age_hours = round((now - newest_dt).total_seconds() / 3600, 1)
+        output = {
+            "newest_probe": newest_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            "newest_age_hours": age_hours,
+            "window_hours": window_hours,
+            "stale": age_hours > window_hours,
+            "components_considered": considered,
+        }
+    print(json.dumps(output, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -812,6 +900,9 @@ def build_parser():
     p_streak.add_argument("--alert-file", type=str, default=None, help="Optional: append alerting components as JSONL for downstream notify-user dedup")
     p_streak.add_argument("--no-sync-blockers", action="store_true", help="Skip per-agent WM known_blocker sync (g-115-360). Use when running ad-hoc / outside an agent context.")
 
+    p_fresh = sub.add_parser("probe-freshness", help="Report whether the probe store is fresh enough to trust a streak-alert result (stale=true means a 0-alert result may be false-healthy)")
+    p_fresh.add_argument("--window-hours", type=float, default=None, help="Override recency window (default: aspirations.yaml infra_health.window_hours, fallback 6)")
+
     return parser
 
 
@@ -823,6 +914,7 @@ DISPATCH = {
     "list": cmd_list,
     "record": cmd_record,
     "streak-alert": cmd_failing_streak,
+    "probe-freshness": cmd_probe_freshness,
 }
 
 

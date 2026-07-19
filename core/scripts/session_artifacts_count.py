@@ -133,6 +133,12 @@ def count_jsonl(path, field, cutoff, predicate=None):
 # still count (backward-compat — today most edits omit the field). Extend
 # cautiously: expanding this list in the count-less direction makes the gate
 # stricter; never add a trigger here that represents real learning.
+# 9: tree nodes whose YAML front matter would not parse. Populated by
+# count_tree_writes, surfaced in the JSON as `fm_parse_errors` so a consumer can
+# tell "you encoded nothing" apart from "I could not read N nodes". A non-empty
+# list means the returned counts are a LOWER BOUND, not a measurement.
+_FM_PARSE_ERRORS: list = []
+
 _MAINTENANCE_TRIGGERS = frozenset({
     "typo-fix", "typo",
     "formatting", "format", "whitespace",
@@ -242,7 +248,33 @@ def count_tree_writes(tree_root, cutoff):
                 if line.strip() == "---":
                     break
                 fm_lines.append(line)
-        fm = yaml.safe_load("".join(fm_lines)) or {}
+        try:
+            fm = yaml.safe_load("".join(fm_lines)) or {}
+        except yaml.YAMLError as e:
+            # 9: a malformed front matter on ONE node used to raise here
+            # and kill the whole count. The comment above says data-format errors
+            # "should still propagate" — but NOTHING usefully catches them:
+            # productivity-stop-gate.sh converts the nonzero exit into raw_total=0,
+            # so the fail-loud intent was silently converted into
+            # `encoding_ratio=0.00` — a FALSE MEASUREMENT THAT READS AS REAL. An
+            # agent that encoded 4 artifacts is told it encoded none, the 0.3-weight
+            # encoding term is zeroed for the whole session, and (worst) the agent
+            # may "correct" behavior that was never wrong. Blast radius is the whole
+            # fleet: world/knowledge/tree is shared, so one bad node blinds every
+            # agent's encoding signal.
+            #
+            # So: do NOT propagate (the caller launders it into a lie) and do NOT
+            # silently skip (that trades one silent hole for another). Attribute it
+            # LOUDLY by path, skip the one bad node, keep counting the rest, and
+            # report the degradation in the JSON (`fm_parse_errors`) so a consumer
+            # can distinguish "you encoded nothing" from "I could not read N nodes".
+            # Narrow except (yaml.YAMLError only) — an OSError still means something
+            # different and is handled above; a non-YAML bug still propagates.
+            _FM_PARSE_ERRORS.append(str(md))
+            print(f"[session-artifacts] UNPARSEABLE front matter, node SKIPPED "
+                  f"(encoding count is now DEGRADED): {md}: "
+                  f"{str(e).splitlines()[0]}", file=sys.stderr)
+            continue
         val = _iso(fm.get("last_updated"))
         if not (val and val >= cutoff):
             continue
@@ -392,6 +424,10 @@ def main():
         "structural_progress": structural_progress,
         "total": total,
         "session_start": cutoff,
+        # 9: non-empty => the counts above are a LOWER BOUND. One or more
+        # tree nodes had unparseable front matter and were skipped. Consumers MUST
+        # NOT report a resulting low encoding_ratio as a clean measurement.
+        "fm_parse_errors": _FM_PARSE_ERRORS,
     }))
 
 

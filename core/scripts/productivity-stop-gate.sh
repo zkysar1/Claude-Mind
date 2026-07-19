@@ -219,11 +219,29 @@ if ar.stderr:
     sys.stderr.write(ar.stderr)
 counts = {k: 0 for k in ARTIFACT_KEYS}
 total_artifacts = 0  # unweighted sum, kept for logging
+# 9: a counter FAILURE is not a measurement of ZERO. Previously, a
+# nonzero exit (e.g. ONE tree node with malformed YAML front matter — the whole
+# shared tree is one bad node away from this) left `counts` all-zero and the gate
+# went on to print `encoding_ratio=0.00` as if it had measured something. That is
+# a FALSE MEASUREMENT THAT READS AS REAL: it tells an agent it encoded nothing
+# when it encoded plenty, and because encoding_ratio carries weight 0.3, it can
+# drag a healthy score below stop_threshold and FALSELY STOP THE AGENT. Track the
+# degradation explicitly and refuse to stop on it (see the stop branch below).
+encoding_degraded = ""
 if ar.returncode == 0 and ar.stdout.strip():
     payload = json.loads(ar.stdout.strip())
     for k in ARTIFACT_KEYS:
         counts[k] = int(payload.get(k, 0))
     total_artifacts = int(payload.get("total", sum(counts.values())))
+    _bad = payload.get("fm_parse_errors") or []
+    if _bad:
+        # Counts are a LOWER BOUND — some tree nodes could not be read.
+        encoding_degraded = (f"{len(_bad)} tree node(s) have unparseable front "
+                             f"matter (counts are a LOWER BOUND): "
+                             f"{', '.join(str(b) for b in _bad[:3])}")
+else:
+    encoding_degraded = (f"session_artifacts_count.py FAILED (rc={ar.returncode}) "
+                         f"— the encoding term is UNKNOWN, not zero")
 
 # Weighted sum — tree_writes dominates, hyp_* / experience half-weighted.
 # See header comment for the value hierarchy and bravo session-56 calibration.
@@ -252,6 +270,13 @@ print(f"[productivity-gate] score={score:.2f} routine_ratio={routine_ratio:.2f} 
       f"encoding_ratio={encoding_ratio:.2f} "
       f"(weighted={weighted_artifacts:.2f}, raw_total={total_artifacts}, {breakdown}) "
       f"deep_ratio={deep_ratio:.2f} goals={goals_completed} threshold={stop_threshold}")
+if encoding_degraded:
+    # Loud + ATTRIBUTED. The prior failure mode printed a bare `encoding_ratio=0.00`
+    # next to an unattributed YAML traceback, which reads as "you encoded nothing"
+    # rather than "I could not count". Never let a broken counter masquerade as a
+    # measurement (9 / guard-1090).
+    print(f"[productivity-gate] *** ENCODING SIGNAL DEGRADED — encoding_ratio above is "
+          f"NOT a measurement *** {encoding_degraded}", file=sys.stderr)
 
 # --- Routine-streak surface ( / US-08) -------------------------------
 # Make the auto-deep flip counter visible at iteration close so the agent
@@ -431,6 +456,19 @@ if score >= stop_threshold:
     if current_streak > 0:
         if _persist_loop_state(0):
             print(f"[productivity-gate] streak reset 0 (was {current_streak}) — score recovered")
+    sys.exit(0)
+
+# 9: below threshold — but is the score TRUSTWORTHY? encoding_ratio carries
+# weight 0.3, so a failed/degraded counter can subtract up to 0.30 from the score and
+# push a genuinely-productive agent under stop_threshold. Stopping an agent because a
+# YAML parse error in ONE shared tree node blinded the counter is a catastrophic
+# false positive. Fail OPEN: never stop on an untrustworthy signal. The DEGRADED
+# banner above already names the cause loudly so it gets fixed rather than tolerated.
+if encoding_degraded:
+    print(f"[productivity-gate] STOP SUPPRESSED — score={score:.2f} is below "
+          f"threshold={stop_threshold} but the encoding term is DEGRADED, so the "
+          f"score is not trustworthy. Fix the cause, do not tolerate it: "
+          f"{encoding_degraded}", file=sys.stderr)
     sys.exit(0)
 
 # Below threshold. If the streak has not yet saturated the ladder, sleep

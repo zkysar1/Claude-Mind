@@ -109,6 +109,83 @@ def test_temp_pressure_dedup_existing_drain_goal(tmp_path, monkeypatch):
     assert r["suggested_goal"] is None
 
 
+def test_temp_pressure_other_agent_drain_goal_not_deduped(tmp_path, monkeypatch):
+    # 7: the undrained-doc COUNT is scoped to AGENT_DIR/temp (the bound
+    # agent's store), so the existing-drain-goal DEDUP must ALSO be agent-scoped.
+    # World-queue drain goals appear in every agent's compact — a drain goal filed
+    # by ANOTHER agent must NOT suppress this agent's suggestion, else while any ONE
+    # agent has an open drain goal, every OTHER agent's temp/ grows unbounded
+    # (temp_drain_pending with no goal ever filed). filed_by_agent != AGENT_DIR.name
+    # (== tmp_path.name here) => not ours => still temp_drain_needed + a suggestion.
+    goals = [{"id": "g-001-88", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs",
+              "filed_by_agent": "some-other-agent"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["count"] == 25
+    assert r["flags"] == ["temp_drain_needed"]         # NOT temp_drain_pending
+    assert r["existing_drain_goal"] is None             # other agent's goal is not ours
+    assert r["suggested_goal"] is not None
+
+
+def test_temp_pressure_own_agent_drain_goal_deduped(tmp_path, monkeypatch):
+    # Companion to the cross-agent test: this agent's OWN open drain goal
+    # (filed_by_agent == the bound agent, i.e. AGENT_DIR.name == tmp_path.name)
+    # still dedups -> temp_drain_pending, no duplicate goal filed. Proves the
+    # 7 scoping did not break same-agent dedup.
+    goals = [{"id": "g-001-77", "status": "pending",
+              "title": "Maintain: drain accumulated temp/ working docs",
+              "filed_by_agent": tmp_path.name}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["count"] == 25
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["existing_drain_goal"] == "g-001-77"
+    assert r["suggested_goal"] is None
+
+
+def test_temp_pressure_investigate_goal_not_treated_as_drain_goal(tmp_path, monkeypatch):
+    # 0 regression: an ANALYSIS goal (Investigate:) whose title happens to
+    # contain "drain"+"temp" must NOT satisfy the action-goal dedup — else it falsely
+    # counts as the open drain goal and permanently suppresses the real "Maintain:
+    # drain..." goal from ever filing (temp/ grows unbounded). At the drain threshold
+    # with ONLY an Investigate goal present, we must still emit temp_drain_needed +
+    # a suggested_goal, with no false existing_drain_goal.
+    goals = [{"id": "g-115-1780", "status": "pending",
+              "title": "Investigate: temp-drain goal not auto-surfaced by goal-selector"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["count"] == 25
+    assert r["flags"] == ["temp_drain_needed"]
+    assert r["existing_drain_goal"] is None
+    assert r["suggested_goal"] is not None
+    assert "drain" in r["suggested_goal"]["title"].lower()
+
+
+def test_temp_pressure_idea_goal_not_treated_as_drain_goal(tmp_path, monkeypatch):
+    # Companion to the Investigate case: an Idea: goal about the temp drain is also
+    # analysis, not an action goal, and must not trip the dedup (0).
+    goals = [{"id": "g-115-9001", "status": "pending",
+              "title": "Idea: pressure-boost the temp drain goal's selector score"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_needed"]
+    assert r["existing_drain_goal"] is None
+
+
+def test_temp_pressure_real_drain_goal_found_despite_analysis_goal(tmp_path, monkeypatch):
+    # No over-correction (0): when BOTH an analysis goal AND a real Maintain
+    # drain goal are open, the dedup must SKIP the analysis goal and still find the
+    # real action goal — so an existing drain goal is correctly deduped even when an
+    # Investigate goal precedes it in iteration order.
+    goals = [
+        {"id": "g-115-1780", "status": "pending",
+         "title": "Investigate: temp-drain goal not auto-surfaced"},
+        {"id": "g-001-99", "status": "pending",
+         "title": "Maintain: drain accumulated temp/ working docs"},
+    ]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["existing_drain_goal"] == "g-001-99"
+    assert r["suggested_goal"] is None
+
+
 def test_temp_pressure_warn_range_ignores_existing_drain_goal(tmp_path, monkeypatch):
     # In the warn range (10-19) an existing drain goal is irrelevant — dedup only
     # gates the drain-threshold goal-filing, so this still emits temp_pressure_warn

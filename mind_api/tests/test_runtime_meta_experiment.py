@@ -197,7 +197,7 @@ class TestByteCompat:
         assert _norm(dmn_yaml) == _norm(cli_yaml)
         # First create: file was new -> NO history snapshot (matches CLI
         # save_history), but a changelog entry IS appended.
-        assert not (dmn_meta / ".history" / "experiments" / "active-experiments.yaml").exists()
+        assert not (dmn_meta / ".history" / "snapshots" / "experiments" / "active-experiments.yaml").exists()
         assert (dmn_meta / "changelog.jsonl").exists()
 
     def test_create_409(self, tmp_path):
@@ -262,7 +262,7 @@ class TestByteCompat:
             dmn_y = (dmn_meta / "experiments" / fname).read_text(encoding="utf-8")
             assert _norm(dmn_y) == _norm(cli_y), fname
         # active-experiments.yaml pre-existed -> resolve DOES snapshot it.
-        assert (dmn_meta / ".history" / "experiments" / "active-experiments.yaml").exists()
+        assert (dmn_meta / ".history" / "snapshots" / "experiments" / "active-experiments.yaml").exists()
         assert (dmn_meta / "changelog.jsonl").exists()
 
     def test_resolve_not_found_404(self, tmp_path):

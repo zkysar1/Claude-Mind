@@ -141,14 +141,19 @@ def test_snapshot_then_compute(running_daemon):
     assert "imp_at_k" in json.loads(body)
 
 
-def test_compute_missing_metric_400(running_daemon):
+def test_compute_missing_metric_defaults_ok(running_daemon):
+    """1: `metric` is OPTIONAL — it defaults to the single
+    learning_value series, so a MISSING metric is NOT a 400. The evolve
+    Step 0.7 caller relies on this (aspirations-evolve/SKILL.md invokes
+    `meta-impk.sh compute --window 10` with no --metric). A missing metric
+    computes normally and emits no caller-label note (metric == default)."""
     _, port = running_daemon
-    try:
-        _http(port, "GET", "/v1/meta/impk/compute", {"window": "5"})
-    except urllib.error.HTTPError as e:
-        assert e.code == 400
-    else:
-        raise AssertionError("expected 400 for missing metric")
+    status, body = _http(port, "GET", "/v1/meta/impk/compute", {"window": "5"})
+    assert status == 200
+    result = json.loads(body)
+    assert result["series"] == "learning_value"
+    assert "metric_label" not in result
+    assert "note" not in result
 
 
 def test_compute_invalid_window_400(running_daemon):

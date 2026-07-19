@@ -68,6 +68,30 @@ represents work the agent JUST DID inline and needs proper encoding for.
 Without a Maintain goal, the work lives only in ephemeral context — the
 experience archive, spark, and tree-encoding pipeline never fire on it.
 
+**Shared-surface collision check (BEFORE starting the inline fix — g-115-2616)**:
+when the fix touches a SHARED framework surface (`core/`, `.claude/`,
+`mind_api/` — anything sibling agents also patch), the filing-time duplication
+gate cannot protect you: completed-Maintain filings are dedup-exempt by design
+(g-115-836), and a concurrent partner fix is invisible inside the cross-box
+sync horizon (pending-queue mirror lag, unpushed partner commits, laggy
+team-state — all three gate anchor stores are box-local views; rb-3296). The
+2026-07-18 double-implementation (g-115-2609/2610 vs g-115-2611: same rollback
+fix built twice in a 5-minute window, 5-file merge conflict) happened entirely
+inside that horizon. The interception point must come BEFORE the work, on the
+one partition-surviving channel:
+
+1. Read the coordination board for a matching in-flight fix:
+   `board-read.sh --channel coordination --since 90m` — scan for
+   `inline-fix-start` (or claim/status) posts naming the same file or symptom.
+2. On match: coordinate instead of duplicating — reply to the post, split the
+   work, or stand down.
+3. On no-match: post the one-liner BEFORE editing:
+   `echo "inline-fix-start: <file-or-surface> — <symptom>" | board-post.sh
+   --channel coordination --type status --tags "inline-fix-start,<surface-slug>"`
+
+Cost is ~2 board calls. Box-local fixes (own agent dir, non-shared data) skip
+this check.
+
 File the Maintain goal BEFORE moving on, with `status: completed` already
 set and `started` / `completed_date` timestamps matching the inline work.
 The standard post-execution pipeline then encodes the learning properly.

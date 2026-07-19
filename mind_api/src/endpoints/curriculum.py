@@ -52,6 +52,8 @@ import yaml
 
 from ..agent_paths import assert_not_cruft
 
+from _competence import refresh_competence_for_gates  # noqa: E402  # SSOT, 6
+
 
 # ---------------------------------------------------------------------------
 # Agent-header gate (all 5 commands are agent-scoped)
@@ -395,6 +397,12 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
             "gates": [],
         }, indent=None)
 
+    # Refresh the competence metric BEFORE evaluating (producer wiring,
+    # 6) — mirrors core/scripts/curriculum.py cmd_evaluate. Fail-open:
+    # on refresh failure the stored value is used (pre-wiring behavior).
+    competence_refresh = refresh_competence_for_gates(
+        gates, Path(ctx.paths.world), agent_dir)
+
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     gate_results = []
     all_passed = True
@@ -417,6 +425,15 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
     state["stages"][current_idx] = current
     _write_yaml(curriculum_path, state)
 
+    # next_stage = the promotion target (next stage by list order), independent
+    # of whether gates pass. Emitted for parity with the `status` endpoint
+    # (which computes it the same way) — the omission here caused 3's
+    # misdiagnosis (curriculum-evaluate showed no next_stage, misread as a
+    # broken promotion path, when the path via status()+promote() was intact).
+    next_stage = (
+        stages[current_idx + 1].get("id")
+        if current_idx + 1 < len(stages) else None)
+
     return _json_out({
         "configured": True,
         "current_stage": current_id,
@@ -424,6 +441,8 @@ def evaluate(ctx) -> "Response":  # type: ignore[name-defined]
         "all_passed": all_passed,
         "gates_total": len(gate_results),
         "gates_passed_count": sum(1 for g in gate_results if g["passed"]),
+        "competence_refresh": competence_refresh,
+        "next_stage": next_stage,
         "gates": gate_results,
     }, indent=2)
 

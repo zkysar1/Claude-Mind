@@ -176,6 +176,15 @@ class StorageBackend(Protocol):
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes: ...
     def read_text(self, path: PathLike, encoding: str = "utf-8",
                   *, force_fresh: bool = False) -> str: ...
+    # Pure read of the STORE's current content, straight to memory — never
+    # mutates the local mirror (no download-into-cache, no fence/cache-stamp
+    # updates) and never falls back to local bytes when local and store have
+    # both diverged. This is the diagnostic-read primitive: read_* with
+    # force_fresh routes through the cache-refresh path, which on a remote
+    # backend WRITES the fetched object into the local cache (the rb-3128
+    # read-side clobber) and in the both-diverged no_clobber state returns
+    # the LOCAL content. Raises FileNotFoundError when absent in the store.
+    def read_authoritative_bytes(self, path: PathLike) -> bytes: ...
     def exists(self, path: PathLike) -> bool: ...
     def stat(self, path: PathLike) -> Optional[FileStat]: ...
     def list_dir(self, path: PathLike) -> List[str]: ...
@@ -271,6 +280,11 @@ class LocalBackend:
     def read_text(self, path: PathLike, encoding: str = "utf-8",
                   *, force_fresh: bool = False) -> str:
         return Path(path).read_text(encoding=encoding)
+
+    def read_authoritative_bytes(self, path: PathLike) -> bytes:
+        # The local file IS the store — a plain read is already authoritative
+        # and mutation-free.
+        return Path(path).read_bytes()
 
     def exists(self, path: PathLike) -> bool:
         return Path(path).exists()
@@ -462,6 +476,74 @@ class LocalBackend:
 _ACTIVE_BACKEND: Optional[StorageBackend] = None
 
 
+def _bootstrap_env_defaults(root: Optional[Path] = None) -> None:
+    """Best-effort env self-resolution for BARE subprocesses (7).
+
+    A hook- or shell-spawned Python that reaches ``get_backend()`` without the
+    box's sourced environment degrades in one of two silent lanes:
+
+      A. ``STORAGE_BACKEND`` absent  -> LocalBackend -> local-only appends that
+         S3 never sees (the cc-02 gate-firings franken-copy: a month of
+         local-tail rot behind the authoritative store).
+      B. ``STORAGE_BACKEND=own-cloud`` ambient but bucket/roots/creds absent ->
+         ``OwnCloudBackend.from_env()`` raises -> never-raises callers
+         (``_gate_log.log``) swallow -> the record is DROPPED entirely.
+
+    Both lanes are configuration-presence failures on a box whose canonical
+    config already exists at ``PROJECT_ROOT/.env.local``. Fill the gaps from
+    that file via ``os.environ.setdefault`` — EXPLICIT env always wins, so the
+    guard-955 ``STORAGE_BACKEND=local`` test-runner pin and any deliberate
+    override are untouched — then default the governed-root vars from
+    ``_paths`` so ``_resolve_root_map()`` can build the world/meta map.
+
+    Best-effort by design: every step is wrapped; a missing .env.local (fresh
+    local-only clone) or an unresolvable ``_paths`` leaves env exactly as it
+    was and ``get_backend()`` behaves as before. ``from_env()``'s fail-closed
+    guards still apply to whatever env results — this fills gaps, it never
+    weakens validation. Skipped under pytest (tests monkeypatch env and must
+    not inherit production config) unless ``ENV_BOOTSTRAP_ALLOW_PYTEST`` is
+    set. The pytest signal is ``pytest in sys.modules``, NOT just
+    PYTEST_CURRENT_TEST: the env var is absent during COLLECTION, and a
+    collection-time (module-import) ``get_backend()`` call that bootstrapped
+    would side-load production bucket/creds into the suite process env — after
+    which any test monkeypatching only ``STORAGE_BACKEND=own-cloud`` builds a
+    REAL production backend instead of getting from_env()'s expected raise,
+    and the cached instance poisons later tests (observed 2026-07-16: one
+    leaked backend broke 3 unrelated tests in the full-suite run while the
+    baseline was clean). ``root`` parameter is a test seam only.
+    """
+    if ("pytest" in sys.modules or os.environ.get("PYTEST_CURRENT_TEST")) \
+            and not os.environ.get("ENV_BOOTSTRAP_ALLOW_PYTEST"):
+        return
+    try:
+        import re
+        env_local = (root or Path(__file__).resolve().parents[2]) / ".env.local"
+        if env_local.exists():
+            key_re = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+            for line in env_local.read_text(
+                    encoding="utf-8", errors="replace").splitlines():
+                m = key_re.match(line.strip())
+                if not m:
+                    continue
+                k, v = m.group(1), m.group(2).strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                os.environ.setdefault(k, v)
+    except Exception:
+        pass
+    try:
+        # Governed roots for _resolve_root_map (not in .env.local — resolved
+        # per-agent by _paths from local-paths.conf). Lazy import: only when a
+        # root var is actually missing, so pure-local processes never pay it.
+        if not (os.environ.get("MIND_WORLD") or os.environ.get("WORLD_PATH")) \
+                or not (os.environ.get("MIND_META") or os.environ.get("META_PATH")):
+            from _paths import META_DIR, WORLD_DIR
+            os.environ.setdefault("MIND_WORLD", str(WORLD_DIR))
+            os.environ.setdefault("MIND_META", str(META_DIR))
+    except Exception:
+        pass
+
+
 def get_backend() -> StorageBackend:
     """Return the process-wide active storage backend.
 
@@ -472,6 +554,7 @@ def get_backend() -> StorageBackend:
     """
     global _ACTIVE_BACKEND
     if _ACTIVE_BACKEND is None:
+        _bootstrap_env_defaults()  # 7: bare-subprocess env self-heal
         kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
         if kind in ("", "local", "local-files"):
             _ACTIVE_BACKEND = LocalBackend()

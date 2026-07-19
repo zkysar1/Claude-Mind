@@ -125,6 +125,14 @@ class _FakePaths:
         self.meta = meta
         self.project_root = project_root
 
+    @property
+    def agents_root(self):
+        # Mirrors AgentPaths.agents_root (5 glob-routing fix consumed
+        # at utilization.py:283). The fake agent dir's parent plays the agents/
+        # parent; sibling enumeration finds no local-paths.conf there, matching
+        # the single-agent behavior these byte-compat tests pin.
+        return self.agent.parent if self.agent is not None else REPO_ROOT / "agents"
+
 
 class _FakeCtx:
     def __init__(self, world=None, agent=None, meta=None, project_root=REPO_ROOT,

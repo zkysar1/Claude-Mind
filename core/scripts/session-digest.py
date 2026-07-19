@@ -144,6 +144,16 @@ def section_handoff(agent_path):
         out["known_blockers_active"] = len(kb)
     elif kb not in (None, ""):
         out["known_blockers_active"] = kb
+    # pending_deploys: unverified deploy obligations rolled into the handoff at
+    # graceful stop (SG-c, 8-c). Surfacing the count here gives the
+    # cross-session visibility mirror a real consumer (9, fresh-eyes
+    # SG-c Finding 1); the persisting pending-deploys.yaml store stays the
+    # source of truth re-probed by SG-b's all-sweep.
+    pd = data.get("pending_deploys")
+    if isinstance(pd, list):
+        out["pending_deploys"] = len(pd)
+    elif pd not in (None, ""):
+        out["pending_deploys"] = pd
     return out
 
 
@@ -305,6 +315,8 @@ def render_text(d):
             bits.append(f"next={h.get('next_action') or h.get('first_action')}")
         if "known_blockers_active" in h:
             bits.append(f"blockers={h['known_blockers_active']}")
+        if h.get("pending_deploys"):
+            bits.append(f"pending_deploys={h['pending_deploys']}")
         L.append("handoff: " + ("; ".join(str(b) for b in bits) if bits else "present"))
     else:
         L.append("handoff: (none)")

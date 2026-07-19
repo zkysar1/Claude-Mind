@@ -67,9 +67,46 @@ def _pin_team_state(monkeypatch, statuses):
     monkeypatch.setattr(gs, "_load_team_state_cached", lambda: doc)
 
 
+def _pin_runner_identity(monkeypatch):
+    """Pin the runner identity PER-TEST (3). The import-time env
+    setdefault above does NOT pin on agent boxes: bash-agent-inject pre-sets
+    MIND_AGENT into every Bash call, so on bravo's box the module imported
+    with AGENT_NAME="bravo" — flipping self-routed vs other-routed semantics
+    (g-self intended="alpha" became other-routed and hidden; g-active-routed
+    intended="bravo" became self-routed and surfaced) — the cc-05 2F. The
+    intended_agent filter reads the module global, so patch it."""
+    monkeypatch.setattr(gs, "AGENT_NAME", "alpha")
+
+
 def _collect(monkeypatch, goals, reallocation_hours=8):
-    """Collect world candidates with the capability filter neutralized."""
+    """Collect world candidates with the capability filter neutralized.
+
+    Pins _liveness_confirms_dormant -> True (g-115-2315): these tests exercise
+    the REALLOCATION mechanics for a genuinely-dormant target, so the liveness
+    cross-check is simulated as confirming dormancy. The cross-check itself is
+    tested separately below with the real function + a pinned fresh-signal."""
+    _pin_runner_identity(monkeypatch)
     monkeypatch.setattr(gs, "_get_runner_capabilities", lambda: set())
+    monkeypatch.setattr(gs, "_liveness_confirms_dormant", lambda *a: True)
+    return {c["goal"]["id"] for c in gs.collect_candidates(
+        _asps(goals), source="world", reallocation_hours=reallocation_hours)}
+
+
+def _collect_real_liveness(monkeypatch, goals, fresh_iso_or_exc,
+                           reallocation_hours=8):
+    """Collect with the REAL _liveness_confirms_dormant, the fresh-signal
+    fetch pinned to a value (or an exception), and the memo cache cleared."""
+    import liveness_check as lc
+    _pin_runner_identity(monkeypatch)
+    monkeypatch.setattr(gs, "_get_runner_capabilities", lambda: set())
+    monkeypatch.setattr(gs, "_LIVENESS_DORMANT_CACHE", {})
+    if isinstance(fresh_iso_or_exc, Exception):
+        def _boom(*a, **k):
+            raise fresh_iso_or_exc
+        monkeypatch.setattr(lc, "fetch_fresh_signal", _boom)
+    else:
+        monkeypatch.setattr(lc, "fetch_fresh_signal",
+                            lambda *a, **k: fresh_iso_or_exc)
     return {c["goal"]["id"] for c in gs.collect_candidates(
         _asps(goals), source="world", reallocation_hours=reallocation_hours)}
 
@@ -106,7 +143,15 @@ def test_missing_last_active_not_idle(monkeypatch):
 
 def test_either_and_self_routed_unaffected(monkeypatch):
     """'either' and self-routed goals surface regardless of team-state (the
-    intended_agent filter never dropped these; the fix must not change that)."""
+    intended_agent filter never dropped these; the fix must not change that).
+
+    Identity note: the same box-dependence was found independently twice —
+    echo/cc-03 (g-115-2315, fixed via a live gs.AGENT_NAME fixture) and
+    cc-05 (g-115-2313, fixed via a per-test AGENT_NAME pin in _collect).
+    The pin supersedes the live-fixture form: _collect forces
+    AGENT_NAME="alpha" for the duration of the call, so the fixture must
+    name the PINNED identity (a live gs.AGENT_NAME read here captures the
+    import-time value BEFORE the pin applies and goes stale)."""
     _pin_team_state(monkeypatch, {"zeta": 200})
     ids = _collect(monkeypatch, [_goal("g-either", intended="either"),
                                  _goal("g-self", intended="alpha")])
@@ -123,3 +168,70 @@ def test_mixed_only_idle_routed_surfaces(monkeypatch):
         _goal("g-open", intended="either"),          # open -> surface
     ])
     assert ids == {"g-idle-routed", "g-open"}, ids
+
+
+# ── 5: liveness cross-check on the idle verdict ──────────────────
+# A stale LOCAL-mirror last_active alone must not surface another agent's
+# routed goals; the authoritative-store fresh signal decides. Root incident
+# (2026-07-16, echo/cc-03): foxtrot last_active 27.5h stale locally while its
+# shard hit the authoritative store 4 minutes earlier — its alert goal leaked
+# to echo. These tests run the REAL _liveness_confirms_dormant with the
+# fresh-signal fetch pinned.
+
+def test_stale_mirror_fresh_shard_not_idle(monkeypatch):
+    """last_active stale (200h) but authoritative shard push FRESH (4m ago)
+    -> verdict alive -> NOT idle -> goal stays routed (the root incident)."""
+    _pin_team_state(monkeypatch, {"foxtrot": 200})
+    fresh = (datetime.now() - timedelta(minutes=4)).isoformat(timespec="seconds")
+    ids = _collect_real_liveness(
+        monkeypatch, [_goal("g-leak", intended="foxtrot")], fresh)
+    assert "g-leak" not in ids, \
+        "fresh authoritative shard must veto the stale-mirror idle verdict"
+
+
+def test_both_signals_stale_is_idle(monkeypatch):
+    """last_active stale AND authoritative shard stale -> dormant is a
+    supported conclusion -> goal reallocates (the g-115-1766 fix preserved)."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    stale = (datetime.now() - timedelta(hours=200)).isoformat(timespec="seconds")
+    ids = _collect_real_liveness(
+        monkeypatch, [_goal("g-stranded", intended="zeta")], stale)
+    assert "g-stranded" in ids, \
+        "both-signals-stale (dormant) must still reallocate stranded goals"
+
+
+def test_fresh_signal_unavailable_not_idle(monkeypatch):
+    """Fresh signal unreadable (fetch returns None -> verdict unknown)
+    -> NOT idle: never conclude dormant on absent evidence."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    ids = _collect_real_liveness(
+        monkeypatch, [_goal("g-routed", intended="zeta")], None)
+    assert "g-routed" not in ids, \
+        "unknown liveness (no fresh signal) must NOT trigger reallocation"
+
+
+def test_probe_error_not_idle(monkeypatch):
+    """Probe raising entirely -> fail-safe NOT idle (goals stay routed)."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    ids = _collect_real_liveness(
+        monkeypatch, [_goal("g-routed", intended="zeta")],
+        RuntimeError("boto3 exploded"))
+    assert "g-routed" not in ids, \
+        "a probe error must degrade toward goals-stay-routed, not false-idle"
+
+
+def test_liveness_probe_memoized_per_agent(monkeypatch):
+    """The fresh-signal fetch fires once per stale agent per process even
+    across repeated collect calls (world + agent queues share the memo)."""
+    import liveness_check as lc
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    monkeypatch.setattr(gs, "_get_runner_capabilities", lambda: set())
+    monkeypatch.setattr(gs, "_LIVENESS_DORMANT_CACHE", {})
+    calls = []
+    stale = (datetime.now() - timedelta(hours=200)).isoformat(timespec="seconds")
+    monkeypatch.setattr(lc, "fetch_fresh_signal",
+                        lambda *a, **k: calls.append(1) or stale)
+    for _ in range(3):
+        gs.collect_candidates(_asps([_goal("g-x", intended="zeta")]),
+                              source="world", reallocation_hours=8)
+    assert len(calls) == 1, f"expected 1 memoized probe, saw {len(calls)}"

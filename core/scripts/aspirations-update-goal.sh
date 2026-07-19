@@ -39,6 +39,7 @@ OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 BLOCKER_REF=""
 FORCE_UNSTRUCTURED_DEFER=""
+CROSS_LANE=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
 declare -a POSITIONALS=()
@@ -57,6 +58,12 @@ while [[ $# -gt 0 ]]; do
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-uncommitted)
             OVERRIDE_UNCOMMITTED="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --cross-lane)
+            # 4: bypass the cross-lane TAKEOVER guard
+            # (status->in-progress / claimed_by on another agent's goal).
+            CROSS_LANE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-missing-artifact)
@@ -132,6 +139,7 @@ declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_MISSING_ARTIFACT" ] && HEADER_ARGS+=(--header "X-Mind-Override-Missing-Artifact: $OVERRIDE_MISSING_ARTIFACT")
 [ -n "$BLOCKER_REF" ] && HEADER_ARGS+=(--header "X-Mind-Blocker-Ref: $BLOCKER_REF")
 [ -n "$FORCE_UNSTRUCTURED_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Unstructured-Defer: $FORCE_UNSTRUCTURED_DEFER")
+[ -n "$CROSS_LANE" ] && HEADER_ARGS+=(--header "X-Mind-Cross-Lane: $CROSS_LANE")
 
 rc=0
 COMBINED="$(rt_call POST /v1/aspirations/update-goal \

@@ -175,6 +175,16 @@ These are small, always relevant, and not category-specific. Load unconditionall
      live snapshot — see coordination.md "Single source of truth".
    IF file missing: skip silently
 
+5.55. Bash: bash core/scripts/mirror-health.sh
+   → Own-cloud mirror-wedge visibility (g-115-2549, display-only). Exit 0
+     (healthy): stash nothing. Exit 1 (WEDGED): stash the printed file list
+     and surface a warning line in Phase 4 output — this box is serving
+     stale world reads for those files until the g-115-2548
+     /reconcile-owncloud-conflicts repair runs (the watchdog MirrorWedgeProbe
+     files the Investigate goal; /prime only displays). Exit 2 (unknown —
+     sweep not running / not own-cloud): stash the one-line reason, display
+     at most one dim note. Advisory: never block priming on any exit code.
+
 5.5a. Bash: board-read.sh --channel coordination --type encoding --since 30m --json --mark-read
    → E11: Cross-agent pending encodings. Output is JSONL (one object per
      line), each carrying keys: {id, author, timestamp, channel, type,

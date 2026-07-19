@@ -166,7 +166,14 @@ def is_read_intent(title, _caller="unknown"):
                       payload=title[:200],
                       extra={"position": "final-prefix-word"})
             return True
-    for word in prefix.split():
+    # Verb-matching ( finding 4): a COLON title matches any pre-colon
+    # (label-segment) word; a NO-COLON title matches the LEADING word only — a
+    # read verb in a subordinate clause of a colon-less title ("Refactor and
+    # review the API") is not the primary action and must not over-exempt the
+    # check. The check-positional rule above is SEPARATE and stays whole-title
+    # (test_strategic_vision_check_no_colon pins "Strategic vision check" True).
+    verb_words = prefix.split() if ":" in title else prefix.split()[:1]
+    for word in verb_words:
         w = word.lower()
         if w.endswith("'s"):
             w = w[:-2]
@@ -182,6 +189,188 @@ def is_read_intent(title, _caller="unknown"):
             return True
     # "noop" = no verb match → caller proceeds with default (non-exempted) behavior.
     _gate_log("read-intent-verbs", "noop",
+              caller=_caller,
+              trigger_matched=None,
+              payload=title[:200])
+    return False
+
+
+# REMOVAL-intent goal title detector (, sibling of READ_INTENT_VERBS).
+#
+# Removal goals (retire / remove / delete / deprecate / strip / drop / purge)
+# invert the target_state semantic the same way READ goals do, from the other
+# side: the named identifiers are present in the target files BECAUSE THEY ARE
+# THE REMOVAL TARGET. Presence means the work is NOT done; absence would mean
+# it is. Without this carve-out every retirement goal trips hit_ratio=1.0 and
+# needs a manual --override-duplication (3 FP overrides in session 104 alone:
+# , 7, 8 — the canonical shape is 7
+# "Apply: retire stale-read-gate", where the full removal scope list IS the
+# identifier set).
+#
+# Match rule differs from READ-intent in ONE position: removal verbs are
+# ACTION verbs, not prefix LABELS. Observed removal titles carry a generic
+# label prefix ("Apply:", "Maintain:", "Unblock:") with the removal verb as
+# the FIRST word after the colon — the position that names the goal's primary
+# action. So is_removal_intent matches:
+#   (a) any word in the pre-colon segment (mirrors is_read_intent — covers
+#       "Retire stale-read-gate" / "Remove X: scope"), OR
+#   (b) the FIRST word immediately after the first colon (covers
+#       "Apply: retire stale-read-gate", "Maintain: remove dead flag").
+# Deliberately NOT any-word-after-colon: "Fix: review then remove the flag"
+# keeps the check (primary intent is the leading verb, not a later clause) —
+# same conservatism as is_read_intent's "Fix: review the retry logic" example.
+# Retirement work is a first-class lane (learning-philosophy rule 5); this
+# keeps it filing-friction-free without loosening the gate for mixed intent.
+
+REMOVAL_INTENT_VERBS = frozenset({
+    "retire", "remove", "delete", "deprecate", "strip", "drop", "purge",
+})
+
+
+def _normalize_title_word(word):
+    """Lowercase + strip possessive suffixes and trailing punctuation."""
+    w = word.lower().strip(",.;:!?—–-")
+    if w.endswith("'s"):
+        w = w[:-2]
+    elif w.endswith("'"):
+        w = w[:-1]
+    return w
+
+
+def is_removal_intent(title, _caller="unknown"):
+    """Return True if the goal title's primary action is a REMOVAL verb.
+
+    Matches a removal verb (a) anywhere in the pre-colon segment, or (b) as
+    the first word after the first colon. See block comment above for why
+    position (b) exists (removal verbs are action verbs behind generic
+    label prefixes, unlike READ verbs which ARE the label).
+
+    `_caller` is a callsite label for telemetry (gate firing log), same
+    contract as is_read_intent.
+    """
+    if not title:
+        return False
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        candidates = [(_normalize_title_word(w), "pre-colon") for w in prefix.split()]
+        rest_words = rest.split()
+        if rest_words:
+            candidates.append((_normalize_title_word(rest_words[0]),
+                               "leading-post-colon"))
+            # Adverb-prefixed removal (): an adverbial modifier can
+            # delay the removal verb into the SECOND post-colon slot
+            # ("Apply: fully retire X", "Maintain: safely delete Y" — sq-016
+            # surfaced this FP class re-opening). Admit the 2nd word as a
+            # candidate ONLY when the 1st post-colon word is an adverbial
+            # modifier (ends in "ly"). Gating on -ly is deliberately narrower
+            # than the blanket "first-two-post-colon-words" widen the goal
+            # proposed: the blanket form over-exempts noun-phrase IMPLEMENTATION
+            # titles where a removal verb is the second word of a compound noun
+            # — "Add: soft delete support", "Fix: hard delete perf" ("soft" /
+            # "hard" are adjectives, not -ly adverbs) — which are genuine
+            # target_state goals, not removals. (guard-958: prefer a surgical
+            # context-disqualifier over a broad widen; verify precision with an
+            # adversarial control — test_add_soft_delete_not_removal below.)
+            if len(rest_words) >= 2 and _normalize_title_word(rest_words[0]).endswith("ly"):
+                candidates.append((_normalize_title_word(rest_words[1]),
+                                   "adverb-delayed-post-colon"))
+    else:
+        # No colon ( fresh-eyes finding 4, board msg-3199/3200): a
+        # removal verb ANYWHERE in a colon-less title is a subordinate clause,
+        # not the primary action — matching any word over-exempts the check
+        # ("Scan and remove orphaned rows" is a scan-and-fix goal, not a
+        # removal). The primary action of a colon-less title is its LEADING
+        # word only, mirroring the finding-4 fix applied to is_read_intent.
+        words = title.split()
+        candidates = ([(_normalize_title_word(words[0]), "no-colon-first-word")]
+                      if words else [])
+    for w, position in candidates:
+        if w in REMOVAL_INTENT_VERBS:
+            # "pass" = removal-intent detected → caller exempts the dup check.
+            _gate_log("removal-intent-verbs", "pass",
+                      caller=_caller,
+                      trigger_matched=w,
+                      payload=title[:200],
+                      extra={"position": position})
+            return True
+    # "noop" = no removal verb in matched positions → default behavior.
+    _gate_log("removal-intent-verbs", "noop",
+              caller=_caller,
+              trigger_matched=None,
+              payload=title[:200])
+    return False
+
+
+# MODIFY-intent goal title detector (5, sibling of REMOVAL_INTENT_VERBS).
+#
+# Modify goals (fix / extend / wire / harden / consolidate / refactor / ...)
+# NAME the existing symbols they change — those identifiers are the modification
+# SUBJECT, present in the target file BEFORE the work (that IS what is being
+# changed), not a completion signal. echo's 6 quantification: 71%
+# (37/52) of target_state SOLO-block overrides since 2026-07-04 were
+# subject-not-deliverable FPs on modify-verb goals (citation-shape 16,
+# modification-surface 11, test-absence 6, union-masks-miss 4).
+#
+# CRITICAL DIFFERENCE from read/removal intent — the caller DEMOTES, not skips.
+# Read/removal presence INVERTS the completion semantic (identifiers present
+# means the work is NOT done), so a full skip is safe. Modify-presence is
+# AMBIGUOUS: the symbol is present both before AND after the modification, so
+# presence proves neither duplication NOR completion. _check_target_state
+# therefore demotes the target_state BLOCK to a visible advisory for
+# modify-intent (keeps the match visible, drops the hard --override requirement)
+# rather than skipping the probe like is_read_intent / is_removal_intent do.
+#
+# Match rule mirrors is_removal_intent (modify verbs are ACTION verbs behind
+# generic label prefixes like Apply:/Maintain:): matches (a) any word in the
+# pre-colon segment, (b) the first word after the first colon, or (c) an
+# adverb-delayed verb in the second post-colon slot.
+
+MODIFY_INTENT_VERBS = frozenset({
+    "fix", "extend", "wire", "harden", "consolidate", "serialize", "repair",
+    "persist", "tune", "migrate", "refactor", "integrate", "rewire",
+})
+
+
+def is_modify_intent(title, _caller="unknown"):
+    """Return True if the goal title's primary action is a MODIFY verb.
+
+    Matches a modify verb (a) anywhere in the pre-colon segment, (b) as the
+    first word after the first colon, or (c) an adverb-delayed verb in the
+    second post-colon slot. Same position contract + normalization as
+    is_removal_intent (single source of truth in _target_state). The caller
+    DEMOTES the target_state block to a visible advisory rather than skipping,
+    because modify-presence is ambiguous (pre- vs post-modification); g-115-2565.
+
+    `_caller` is a callsite label for telemetry (gate firing log), same
+    contract as is_read_intent / is_removal_intent.
+    """
+    if not title:
+        return False
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        candidates = [(_normalize_title_word(w), "pre-colon") for w in prefix.split()]
+        rest_words = rest.split()
+        if rest_words:
+            candidates.append((_normalize_title_word(rest_words[0]),
+                               "leading-post-colon"))
+            if len(rest_words) >= 2 and _normalize_title_word(rest_words[0]).endswith("ly"):
+                candidates.append((_normalize_title_word(rest_words[1]),
+                                   "adverb-delayed-post-colon"))
+    else:
+        words = title.split()
+        candidates = ([(_normalize_title_word(words[0]), "no-colon-first-word")]
+                      if words else [])
+    for w, position in candidates:
+        if w in MODIFY_INTENT_VERBS:
+            # "pass" = modify-intent detected → caller DEMOTES the dup block to advisory.
+            _gate_log("modify-intent-verbs", "pass",
+                      caller=_caller,
+                      trigger_matched=w,
+                      payload=title[:200],
+                      extra={"position": position})
+            return True
+    # "noop" = no modify verb in matched positions → default behavior.
+    _gate_log("modify-intent-verbs", "noop",
               caller=_caller,
               trigger_matched=None,
               payload=title[:200])

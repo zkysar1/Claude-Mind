@@ -169,6 +169,9 @@ def _run_gate(goal: dict, tmp_world: Path, self_agent: str = "bravo") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = self_agent
     env["MIND_WORLD"] = str(tmp_world)
+    # Hermetic agent-queue scan (5): keep live agent queues out
+    # of the wrapper's pending_queue check (rb-3784 corpus coupling).
+    env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),

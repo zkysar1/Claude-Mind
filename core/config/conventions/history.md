@@ -85,9 +85,19 @@ Policy: `DEFAULT_SNAPSHOT_CAP = 500` for any file not in
 | world | `pipeline.jsonl`           | 100 |
 | world | `team-state.yaml`          | 100 |
 | world | `aspirations-meta.json`    |  50 |
+| world | `board/coordination.jsonl` | 100 |
+| world | `board/findings.jsonl`     | 100 |
+| world | `board/general.jsonl`      | 100 |
+| world | `board/decisions.jsonl`    | 100 |
 | meta  | `changelog.jsonl`          | 100 |
 | meta  | `improvement-velocity.yaml`|  50 |
 | meta  | `goal-selection-strategy.yaml`| 50 |
+| meta  | `spark-questions.jsonl`    | 100 |
+
+(Board channels + spark-questions added g-115-2410 after measuring 827 / 877
+snapshots in 4 days on cc-04. Note the caps bound the LEGACY per-file tree
+only — the Stage-2 CAS-delta store dedups content and is GC'd by
+`_history_store.vacuum`, so it needs no count cap.)
 
 Enforcement: `save_history()` calls `_prune_to_cap()` immediately after
 writing a new snapshot, dropping the oldest non-`.meta` files by parsed
@@ -114,6 +124,15 @@ The cap is the steady-state bound. Existing surplus snapshots are trimmed
 naturally over the next N writes (where N = current_count - cap).
 
 ## How It Works
+
+There is ONE snapshot writer: `_fileops.save_history`. Direct-python write
+scripts call it via the `_fileops.py` locked write functions; the daemon's
+write path (`mind_api/src/history.py::snapshot`) DELEGATES to it since
+g-115-2410 (2026-07-16). Before that unification the daemon re-implemented
+the Stage-0 format (uncompressed full copy, no cap, no blacklist) and grew
+one box's `.history/` by 13.9GB in 4 days — the docstring's "mirrors
+_fileops exactly" claim had gone three generations stale. Delegation makes
+that divergence class structurally impossible.
 
 All write scripts delegate to `_fileops.py` locked write functions. These automatically:
 1. Acquire a file lock

@@ -101,6 +101,13 @@ obligations:
 # without evidence, the learning-gate audit treats the claim as suspect.
 abbreviation_audit:
   journal_line_format: "OBLIGATION ABBREVIATED: {phase} — {condition}"
+  # TARGET: the abbreviation line goes in the NARRATIVE daily journal
+  # (agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md — plain text, where the
+  # audit script parses it). NEVER append it to journal.jsonl: that file is
+  # a JSON-per-line INDEX and one raw text line 500s every subsequent
+  # daemon journal append (2026-07-16 line-309 incident, repaired via
+  # fenced S3 re-PUT).
+  journal_line_target: "narrative daily .md (agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md), NEVER journal.jsonl"
   must_include:
     - phase_name_from_obligations_above
     - one_of_the_abbreviated_allowed_when_conditions

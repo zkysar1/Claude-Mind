@@ -54,7 +54,12 @@ if has_recurring and functionally_complete:
     # Guard: only fire once per aspiration (prevent repeated triggering)
     IF asp.functionally_complete_at is not null:
         RETURN (should_archive = false, goals_added = 0)  # already processed
-    Bash: aspirations-meta-update.sh --source {source} {asp.id} functionally_complete_at $(date +%Y-%m-%dT%H:%M:%S)
+    # ASPIRATION-FIELD setter, NOT aspirations-meta-update.sh (g-115-2592):
+    # meta-update takes exactly <key> <value> — passing {asp.id} as a positional
+    # made it write a spurious meta key `{asp.id}: functionally_complete_at` and
+    # silently DROP the timestamp, so the field was never set and precheck-eval
+    # re-flagged the aspiration as an all_terminal zombie every iteration.
+    Bash: aspirations-update.sh --source {source} {asp.id} functionally_complete_at "$(date +%Y-%m-%dT%H:%M:%S)"
 
     Output: "▸ Functionally complete: {asp.id} '{asp.title}' — all non-recurring goals done, {recurring_count} recurring continue"
     run_aspiration_spark(goal.aspiration)

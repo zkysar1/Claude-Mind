@@ -231,6 +231,64 @@ def test_no_fetch_skips_integrate(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# push-race recovery (9 — the rb-3970 phantom-window shape)
+# --------------------------------------------------------------------------- #
+def test_pushrace_recovery_lands_same_invocation(tmp_path):
+    """THE 2026-07-18 phantom shape: A's pre-push fetch is THROTTLED, so the
+    integrate step compares against a stale tracking ref (BEHIND=0, merge
+    skipped) while B has already pushed — A's push rejects non-fast-forward.
+    Pre-fix the script deferred and the next iteration re-failed identically
+    under the same throttle. Post-fix the in-invocation recovery (unthrottled
+    fetch + merge + one retry push) lands the commit in the SAME run."""
+    origin, a, b = _clone_pair(tmp_path)
+    # Prime A's FETCH_HEAD so a 60-min throttle suppresses the pre-push fetch.
+    _must(a, "fetch", "origin", "main")
+    # B pushes AFTER A's fetch — A's tracking ref is now stale.
+    _commit_file(b, "from_b.txt", "b\n", "B: change")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "from_a.txt", "a\n", "A: change")
+
+    r = _run_push(a, "--min-commits", "1", "--fetch-interval-min", "60",
+                  "--strict")
+    assert r.returncode == 0, f"recovery should land the push: {r.stderr}"
+    assert "fetch throttled" in r.stderr          # the stale-ref precondition
+    assert "push rejected (race shape)" in r.stderr
+    assert "push-race recovery OK" in r.stderr
+    # origin holds BOTH machines' commits; A fully converged
+    _must(a, "fetch", "-q", "origin", "main")
+    counts = _must(a, "rev-list", "--left-right", "--count",
+                   "origin/main...main")
+    assert counts.split() == ["0", "0"], f"not converged: {counts}"
+    files = _must(a, "ls-tree", "-r", "--name-only", "origin/main")
+    assert "from_a.txt" in files and "from_b.txt" in files
+
+
+def test_pushrace_recovery_conflict_defers_cleanly(tmp_path):
+    """Race recovery hits a TRUE content conflict on the recovery merge: it
+    aborts cleanly (no MERGE_HEAD debris), defers fail-soft, and never
+    forces — same safety contract as the primary integrate step."""
+    origin, a, b = _clone_pair(tmp_path)
+    _must(a, "fetch", "origin", "main")           # throttle precondition
+    _commit_file(b, "base.txt", "B version\n", "B: rewrite base")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "base.txt", "A version\n", "A: rewrite base")
+    a_tip_before = _tip(a)
+
+    r = _run_push(a, "--min-commits", "1", "--fetch-interval-min", "60",
+                  "--strict")
+    assert r.returncode == 1, f"true conflict must defer: {r.stderr}"
+    assert "push rejected (race shape)" in r.stderr
+    assert "recovery merge CONFLICT" in r.stderr
+    # clean abort: no mid-merge state, local commit intact, tree pristine
+    assert not (a / ".git" / "MERGE_HEAD").exists()
+    assert _tip(a) == a_tip_before
+    assert _must(a, "status", "--porcelain") == ""
+    # origin untouched (B's tip) — never forced
+    _must(a, "fetch", "-q", "origin", "main")
+    assert _must(a, "rev-parse", "origin/main") == _tip(b)
+
+
+# --------------------------------------------------------------------------- #
 # merge=union lane for append-only agent ledgers
 # --------------------------------------------------------------------------- #
 def test_union_merge_selfresolves_appendonly(tmp_path):
@@ -267,6 +325,32 @@ def test_union_merge_selfresolves_appendonly(tmp_path):
     assert '{"n":"from-a"}' in merged and '{"n":"from-b"}' in merged
 
 
+def _union_attrs_pre_merge() -> bool:
+    """True when origin/main's .gitattributes carries the union entries but
+    the local checkout does not yet (behind box, merge deferred) — check-attr
+    then reports 'unspecified' for box-state reasons, not regression
+    (g-115-1940). Both-missing returns False so a REAL regression (entry
+    removed everywhere) still fails the test."""
+    try:
+        needle = "skill-invocations.jsonl merge=union"
+        ga = PROJECT_ROOT / ".gitattributes"
+        if ga.is_file() and needle in ga.read_text(encoding="utf-8"):
+            return False
+        r = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "show", "origin/main:.gitattributes"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return r.returncode == 0 and needle in r.stdout
+    except Exception:
+        return False
+
+
+@pytest.mark.skipif(
+    _union_attrs_pre_merge(),
+    reason="origin/main has the union .gitattributes entries but this checkout "
+           "pre-dates the merge — heals when iteration-push integrates origin "
+           "(g-115-1940)",
+)
 def test_real_repo_union_scope_is_evidence_gated():
     """Read-only probe of the REAL .gitattributes: union ONLY where append-only
     was proven (zero historical deleted lines); RMW stores stay unspecified."""
@@ -290,17 +374,21 @@ def test_real_repo_union_scope_is_evidence_gated():
 
 
 # --------------------------------------------------------------------------- #
-# cross-agent-churn self-heal for the dirty-tree merge deadlock (3)
+# churn self-heal for the dirty-tree merge deadlock (3 + 9)
 #
 # The deadlock (per 3): origin advances a file that THIS machine has
-# UNSTAGED cross-agent churn on (agents/<other>/* — owncloud re-materialised
-# sibling state the namespace filter refuses to commit). `git merge` refuses
-# BEFORE starting (no MERGE_HEAD), the tree is deferred, and owncloud re-creates
-# the same churn every cycle so it never self-heals. The fix clears ONLY the
-# blocking cross-agent churn and retries the merge once — but NEVER touches
-# staged entries (guard-741: a concurrent agent's in-flight staged work) nor any
-# file outside agents/<other>/* (self/core/world). All-or-nothing: any
-# non-clearable file in the blocking set defers the WHOLE tree untouched.
+# UNSTAGED churn on. `git merge` refuses BEFORE starting (no MERGE_HEAD), the
+# tree is deferred, and the churn re-creates every cycle so it never
+# self-heals. Two healable namespaces (all-or-nothing scan first):
+#   - agents/<other>/* (owncloud re-materialised sibling state): CLEARED —
+#     origin is authoritative, owncloud re-syncs next cycle (3).
+#   - agents/<self>/* (own ledgers; changelog re-appends on EVERY write, so
+#     pre-2249 the defer wedged a behind box forever — cc-05
+#     15-ahead/53-behind): COMMITTED pathspec-limited, then merged + pushed
+#     (9).
+# NEVER touches staged entries (guard-741: a concurrent agent's in-flight
+# staged work) nor any file outside agents/* (core/world). Any such file in
+# the blocking set defers the WHOLE tree untouched.
 # --------------------------------------------------------------------------- #
 def _run_push_env(repo: Path, agent: str, *flags: str) -> subprocess.CompletedProcess:
     """_run_push with MIND_AGENT set — the script reads it to identify 'self'."""
@@ -337,7 +425,7 @@ def test_selfheal_dirty_tracked_crossagent_clears_and_merges(tmp_path):
     r = _run_push_env(a, "alpha", *_default_flags("--strict"))
     assert r.returncode == 0, f"stderr: {r.stderr}"
     assert "self-heal: clearing" in r.stderr
-    assert "after cross-agent-churn self-heal" in r.stderr
+    assert "after churn self-heal" in r.stderr
     assert "push OK" in r.stderr
 
     # A fully converged; origin holds BOTH A's commit and B's bravo change
@@ -396,13 +484,57 @@ def test_selfheal_staged_crossagent_defers_guard741(tmp_path):
     assert "agents/bravo/state.jsonl" in _must(a, "diff", "--cached", "--name-only")
 
 
-def test_selfheal_self_dir_dirty_defers(tmp_path):
-    """t4: dirty churn under the agent's OWN dir (agents/<self>/*) is never
-    cleared — that would discard the agent's own uncommitted work. Defer."""
+def test_selfheal_self_dir_dirty_commits_and_merges(tmp_path):
+    """t4 (9): the TRUE cc-05 wedge shape — a union-attributed self
+    ledger (health/*.jsonl) advanced at origin while THIS box holds an
+    UNCOMMITTED append to the same ledger. git refuses the merge
+    (checkout-over-dirty) even though content-level merge is clean
+    (merge=union). The self churn is COMMITTED (pathspec-limited), the merge
+    retries, union keeps BOTH appends, and the push converges. Pre-2249 this
+    shape DEFERRED forever (own ledgers re-dirty every write — the cc-05
+    15-ahead/53-behind wedge)."""
+    origin, a, b = _clone_pair(tmp_path)
+    # hermetic copy of the real repo's union rules (same as the union test)
+    _commit_file(a, ".gitattributes",
+                 "agents/*/skill-invocations.jsonl merge=union\n"
+                 "agents/*/health/*.jsonl merge=union\n",
+                 "attrs")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    _seed_and_sync(a, b, {"agents/alpha/health/day.jsonl": "base\n"})
+    # origin appends to alpha's ledger (another box merged alpha's history)
+    _commit_file(b, "agents/alpha/health/day.jsonl", "base\nfrom-b\n",
+                 "advance alpha ledger")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/qux.sh", "echo\n", "A: framework work")
+    # THIS box's uncommitted append to its own ledger (re-appears every write)
+    (a / "agents/alpha/health/day.jsonl").write_text("base\nlocal-append\n",
+                                                     encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"should commit self churn and heal: {r.stderr}"
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr
+    assert "push OK" in r.stderr
+    # union kept BOTH sides' appends; tree fully converged and clean
+    merged = (a / "agents/alpha/health/day.jsonl").read_text()
+    assert "local-append" in merged and "from-b" in merged
+    _must(a, "fetch", "-q", "origin", "main")
+    counts = _must(a, "rev-list", "--left-right", "--count", "origin/main...main")
+    assert counts.split() == ["0", "0"], f"not converged: {counts}"
+    assert _must(a, "status", "--porcelain") == ""
+    # the self-churn commit is attributed + traceable
+    subjects = _must(a, "log", "--format=%s", "-8")
+    assert "chore(alpha): pre-merge self-namespace churn" in subjects
+
+
+def test_selfheal_self_dir_both_diverged_surfaces_conflict(tmp_path):
+    """t4b (9 rare shape): self file diverged on BOTH sides (origin
+    advanced it AND local dirty). The self churn is committed (preserved in
+    history), the merge then hits a TRUE content conflict which is aborted
+    cleanly and surfaced LOUDLY — strictly better than the pre-2249 silent
+    defer-forever: the local bytes are recoverable from the commit."""
     origin, a, b = _clone_pair(tmp_path)
     _seed_and_sync(a, b, {"agents/alpha/state.jsonl": "v1\n"})
-    # origin advances a file under alpha's own dir (hermetic trigger — the
-    # commit author is irrelevant; the point is A has agents/<self>/* dirty)
     _commit_file(b, "agents/alpha/state.jsonl", "v2-from-b\n", "advance alpha state")
     _must(b, "push", "-q", "origin", "main")
     _commit_file(a, "core/scripts/qux.sh", "echo\n", "A: framework work")
@@ -410,11 +542,38 @@ def test_selfheal_self_dir_dirty_defers(tmp_path):
                                                 encoding="utf-8", newline="\n")
 
     r = _run_push_env(a, "alpha", *_default_flags("--strict"))
-    assert r.returncode == 1, f"should defer, not clear own work: {r.stderr}"
-    assert "under SELF agent dir" in r.stderr
-    assert "merge DEFERRED" in r.stderr
-    # own dirty work preserved (not cleared)
-    assert (a / "agents/alpha/state.jsonl").read_text() == "dirty-self\n"
+    assert r.returncode == 1, f"true divergence must surface, not push: {r.stderr}"
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr
+    # the retry hit a real conflict; no mid-merge state left behind
+    assert not (a / ".git" / "MERGE_HEAD").exists()
+    # own bytes preserved in the pre-merge commit (recoverable)
+    assert _must(a, "show", "HEAD:agents/alpha/state.jsonl") == "dirty-self"
+
+
+def test_selfheal_mixed_self_and_crossagent_heals_both(tmp_path):
+    """t6 (9): blocking set spans BOTH namespaces — self churn is
+    committed, cross-agent churn is cleared, merge retries and the push
+    converges."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/alpha/state.jsonl": "v1\n",
+                          "agents/bravo/state.jsonl": "v1\n"})
+    _commit_file(b, "agents/bravo/state.jsonl", "v2-from-b\n", "B: bravo v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/quux.sh", "echo\n", "A: framework work")
+    (a / "agents/alpha/state.jsonl").write_text("dirty-self\n",
+                                                encoding="utf-8", newline="\n")
+    (a / "agents/bravo/state.jsonl").write_text("dirty-bravo\n",
+                                                encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, f"mixed self+cross should heal both: {r.stderr}"
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr
+    assert "clearing 1 tracked + 0 untracked cross-agent file(s)" in r.stderr
+    assert "push OK" in r.stderr
+    # self churn committed; cross churn converged to origin's version
+    assert _must(a, "show", "HEAD:agents/alpha/state.jsonl") == "dirty-self"
+    assert (a / "agents/bravo/state.jsonl").read_text() == "v2-from-b\n"
+    assert _must(a, "status", "--porcelain") == ""
 
 
 def test_selfheal_mixed_blocking_set_defers_all_or_nothing(tmp_path):
@@ -436,7 +595,7 @@ def test_selfheal_mixed_blocking_set_defers_all_or_nothing(tmp_path):
 
     r = _run_push_env(a, "alpha", *_default_flags("--strict"))
     assert r.returncode == 1, f"mixed set must defer: {r.stderr}"
-    assert "outside agents/<other>/*" in r.stderr
+    assert "outside agents/*" in r.stderr
     assert "merge DEFERRED" in r.stderr
     # ALL-OR-NOTHING: neither file cleared (defer touches nothing)
     assert (a / "agents/bravo/state.jsonl").read_text() == "dirty-bravo\n"

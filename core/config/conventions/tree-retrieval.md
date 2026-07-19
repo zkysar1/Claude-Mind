@@ -171,8 +171,9 @@ staying all-null, which would otherwise leave the blend above a permanent no-op)
 - **Tree node (`/tree add`, at creation)**: include `"poignancy": N` in the
   add-child child JSON — `cmd_add_child` (and the batch add-child) now copy it at
   creation so the INDEX value (the one `retrieve` scores) is set AT WRITE TIME.
-  Also write `poignancy: N` in the node `.md` front matter (readability copy —
-  keep identical to the index). To retrofit an EXISTING node, set the index via
+  (Do NOT also write `poignancy: N` to the node `.md` front matter — it is a
+  vestigial dead mirror; `_tree.yaml` is the SSOT and the only value `retrieve`
+  reads. g-336-38.) To retrofit an EXISTING node, set the index via
   `bash core/scripts/tree-update.sh <key> poignancy N` (`cmd_set` generic setter).
 - **Rubric (1-10, LLM-rated at write)**: 1-3 routine/expected · 4-6 useful ·
   7-8 pivotal/surprising · 9-10 mission-altering. Rate how durable + impactful

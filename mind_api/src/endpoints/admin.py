@@ -164,6 +164,74 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"backend": backend, "ok": ok, **stats})
 
 
+def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/admin/owncloud-sync-file?path=<file>[&dry_run=1] — push ONE
+    governed file to S3 with baseline stamping, using the daemon's creds.
+
+    The per-file complement of owncloud-flush: the PostToolUse push shim
+    (core/scripts/owncloud-push-on-write.sh) calls this so a governed Write/
+    Edit propagates in seconds instead of waiting for the ~120s periodic
+    sweep — the wait window that breeds both-moved conflict freezes
+    (g-115-2447; backlog forensics in g-115-2446). Also the manual push path
+    for reconcile-owncloud-conflicts Step 5 on environment-config
+    deployments, where the bare-CLI fallback lacks the daemon-only creds.
+
+    SSOT: invokes the SAME `owncloud_sync.sync_file()` the CLI `--file` mode
+    runs (multi_machine=False → local IS authoritative → baseline-stamping
+    push). Safe against arbitrary paths: sync_file's own governed-root /
+    machine-local / peer-agent filters decide skips; this endpoint reports
+    the skip reason rather than second-guessing them. `dry_run=1` maps to
+    the shim's OWNCLOUD_PUSH_HOOK_DRYRUN liveness probe. No-op under the
+    local backend; import/sync errors return 500-with-reason, never a raise
+    (the shim is guard-141 fail-open and must be able to warn-and-proceed).
+    """
+    from ..server import Response
+    from pathlib import Path
+    raw_path = (ctx.query.get("path") or "").strip()
+    if not raw_path:
+        return Response.json(
+            {"ok": False, "error": "path query param required"}, status=400)
+    backend = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
+    if backend != "own-cloud":
+        return Response.json({
+            "backend": backend, "ok": True, "pushed": 0,
+            "reason": "non-own-cloud backend — local files are the store",
+        })
+    target = Path(raw_path)
+    if not target.is_absolute():
+        target = ctx.paths.project_root / target
+    scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    try:
+        import owncloud_sync
+        from storage_backend import get_backend
+    except Exception as e:  # noqa: BLE001
+        return Response.json(
+            {"backend": backend, "ok": False,
+             "error": f"import failed: {e}"}, status=500)
+    dry_run = (ctx.query.get("dry_run") or "").strip() in ("1", "true", "yes")
+    stats: dict = {}
+    try:
+        rc = owncloud_sync.sync_file(
+            get_backend(), target, dry_run=dry_run, stats_out=stats)
+    except Exception as e:  # noqa: BLE001
+        return Response.json(
+            {"backend": backend, "ok": False, "path": str(target),
+             "error": f"sync failed: {e}"}, status=500)
+    return Response.json({
+        "backend": backend, "ok": rc == 0, "path": str(target),
+        "dry_run": dry_run,
+        "pushed": stats.get("pushed", 0),
+        "would_push": stats.get("would_push", 0),
+        "in_sync": stats.get("in_sync", 0),
+        "conflicts": stats.get("conflicts", 0),
+        "diverged_skipped": stats.get("diverged_skipped", 0),
+        "errors": stats.get("errors", 0),
+        **({"reason": stats["reason"]} if "reason" in stats else {}),
+    })
+
+
 def _runner_preamble(ctx, *, need_token: bool = True):
     """Shared front-half for the three runner-claim endpoints (design §4):
     validate query params, short-circuit non-own-cloud backends, ensure
@@ -396,6 +464,7 @@ def register(routes) -> None:
     routes[("GET", "/v1/admin/stats")] = stats
     routes[("POST", "/v1/admin/owncloud-flush")] = owncloud_flush
     routes[("POST", "/v1/admin/owncloud-pull")] = owncloud_pull
+    routes[("POST", "/v1/admin/owncloud-sync-file")] = owncloud_sync_file
     routes[("POST", "/v1/admin/runner-acquire")] = runner_acquire
     routes[("POST", "/v1/admin/runner-heartbeat")] = runner_heartbeat
     routes[("POST", "/v1/admin/runner-release")] = runner_release

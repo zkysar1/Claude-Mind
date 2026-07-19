@@ -226,7 +226,8 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
     """
     from _fileops import (acquire_lock, release_lock, save_history,
                           append_changelog, resolve_base_dir, _agent_name,
-                          _validate_no_surrogates, _atomic_write_with_fallback)
+                          _validate_no_surrogates, _atomic_write_with_fallback,
+                          _rmw_with_conflict_retry)
     p = Path(path)
     # s4: materialize from the backend before the pre-lock existence check so
     # own-cloud does not skip the bump for a file that exists in S3 but is not
@@ -239,60 +240,89 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
     lock_path = p.with_suffix(".lock")
     acquire_lock(lock_path)
     try:
-        # s4: force-fresh the local cache from the backend AFTER acquiring the
-        # lock and BEFORE the read — own-cloud lost-update prevention (fix #2)
-        # and records the If-Match fence etag for the atomic_write below.
-        # No-op on LocalBackend. Mirrors _fileops.locked_modify_jsonl.
-        get_backend().refresh(p)
-        # Read inside the lock — captures the post-writer state, not whatever
-        # was on disk before another agent's locked append landed.
-        records = []
-        with open(p, "r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
-                if stripped:
-                    records.append(json.loads(stripped))
+        # Stash of the most recent in-cycle read, for the degraded return path
+        # below (g-115-2301): index 0 holds the last records list _cycle read.
+        last_read = [[]]
 
-        today = today_str()
-        modified = False
-        for rec in records:
-            if not should_bump_fn(rec):
-                continue
-            # Walk counter_path / timestamp_path setting intermediate dicts.
-            # setdefault chain mirrors the pre-lock pattern (`util = rec.setdefault("utilization", {})`).
-            target = rec
-            for k in counter_path[:-1]:
-                target = target.setdefault(k, {})
-            target[counter_path[-1]] = target.get(counter_path[-1], 0) + 1
-            target = rec
-            for k in timestamp_path[:-1]:
-                target = target.setdefault(k, {})
-            target[timestamp_path[-1]] = today
-            modified = True
+        def _cycle():
+            # s4: force-fresh the local cache from the backend AFTER acquiring
+            # the lock and BEFORE the read — own-cloud lost-update prevention
+            # (fix #2) and records the If-Match fence etag for the atomic_write
+            # below. No-op on LocalBackend. Mirrors _fileops.locked_modify_jsonl.
+            # Re-runs on every conflict retry so each attempt re-fences on the
+            # latest remote state (g-115-2301).
+            get_backend().refresh(p)
+            # Read inside the lock — captures the post-writer state, not
+            # whatever was on disk before another agent's locked append landed.
+            records = []
+            with open(p, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped:
+                        records.append(json.loads(stripped))
+            last_read[0] = records
 
-        if not modified:
+            today = today_str()
+            modified = False
+            for rec in records:
+                if not should_bump_fn(rec):
+                    continue
+                # Walk counter_path / timestamp_path setting intermediate dicts.
+                # setdefault chain mirrors the pre-lock pattern (`util = rec.setdefault("utilization", {})`).
+                target = rec
+                for k in counter_path[:-1]:
+                    target = target.setdefault(k, {})
+                target[counter_path[-1]] = target.get(counter_path[-1], 0) + 1
+                target = rec
+                for k in timestamp_path[:-1]:
+                    target = target.setdefault(k, {})
+                target[timestamp_path[-1]] = today
+                modified = True
+
+            if not modified:
+                return records
+
+            # g-276-03 mirror: validate post-modify, pre-write. The walk is cheap
+            # and short-circuits on the kill-switch. Aligns retrieve.py writes
+            # with the surrogate-gate discipline the rest of _fileops uses.
+            for item in records:
+                _validate_no_surrogates(item, p)
+
+            agent = _agent_name()
+            if base_dir:
+                save_history(p, base_dir, agent)
+
+            def _write(handle):
+                for item in records:
+                    handle.write(json.dumps(item, ensure_ascii=True) + "\n")
+            _atomic_write_with_fallback(
+                p, _write, fallback_counter_key="retrieve_locked_bump_jsonl")
+
+            if base_dir:
+                append_changelog(base_dir, agent, p, "edit",
+                                 lines_changed=len(records))
             return records
 
-        # g-276-03 mirror: validate post-modify, pre-write. The walk is cheap
-        # and short-circuits on the kill-switch. Aligns retrieve.py writes
-        # with the surrogate-gate discipline the rest of _fileops uses.
-        for item in records:
-            _validate_no_surrogates(item, p)
-
-        agent = _agent_name()
-        if base_dir:
-            save_history(p, base_dir, agent)
-
-        def _write(handle):
-            for item in records:
-                handle.write(json.dumps(item, ensure_ascii=True) + "\n")
-        _atomic_write_with_fallback(
-            p, _write, fallback_counter_key="retrieve_locked_bump_jsonl")
-
-        if base_dir:
-            append_changelog(base_dir, agent, p, "edit",
-                             lines_changed=len(records))
-        return records
+        # g-115-2301: the bump was a SINGLE-SHOT fenced write — on own-cloud,
+        # hot shared stores (world/reasoning-bank.jsonl etc., written by every
+        # agent's spark/increment paths) advance the fence between refresh and
+        # PUT often enough that whole retrievals 409'd on a telemetry write
+        # (observed cc-05 2026-07-16: 4 conflicts across 2 windows; sibling
+        # writers via locked_rmw/locked_modify_yaml already retry). Wrap the
+        # cycle in the same bounded retry, and on exhaustion DEGRADE instead of
+        # raising: counter telemetry is subordinate to retrieval availability —
+        # a persistent per-object fence wedge (rb-2639/rb-3080 class) must not
+        # make retrieval unavailable. Returns the last-read records (bumps not
+        # persisted). conflict_error is () on LocalBackend, so this except arm
+        # is unreachable there (empty-tuple except catches nothing).
+        try:
+            return _rmw_with_conflict_retry(p, _cycle)
+        except get_backend().conflict_error:
+            print(f"[retrieve] counter-bump on {p.name} dropped after "
+                  f"conflict retries exhausted — returning records un-bumped "
+                  f"(telemetry lost for this call only; g-115-2301)",
+                  file=sys.stderr)
+            return last_read[0]
     finally:
         release_lock(lock_path)
 

@@ -15,13 +15,41 @@ violation too -- 9/9 green doesn't falsify a guard miss.
 This gate is the post-hoc -> pre-hoc move: shift the consult-before-edit
 discipline from after-the-fact audit to before-the-fact directive.
 
-Trigger conditions (ALL three required):
-  1. goal.handoff_from is set AND != $MIND_AGENT (cross-agent Apply)
-  2. goal title or description references a framework-file path:
+Trigger conditions (g-115-2201 — WIDENED; see below for what changed and why):
+  1. goal title or description references a framework-file path:
      core/scripts/, core/config/, mind_api/src/, core/githooks/,
      core/logs/, .claude/skills/, .claude/rules/, .claude/settings,
      world/conventions/, SKILL.md, CLAUDE.md
+  2. no retrieval has ALREADY been recorded for this goal
+     (retrieval-session.json -- the same artifact the learning gate audits)
   3. agent + goal record can be resolved
+
+  `handoff_from` is NO LONGER a trigger condition. It is now an ESCALATOR: an
+  inherited spec makes the banner louder (it carries the extra rb-987 hazard that
+  a test suite pinning the spec pins its violation too), but an OWN-AUTHORED
+  framework goal fires the gate just the same.
+
+WHAT CHANGED AND WHY (g-115-2201)
+  This gate used to `return 0` unless the goal was an inherited cross-agent spec.
+  That scoped it to its originating incident and left the COMMON case entirely
+  uncovered: an agent skipping the consult on its OWN framework goals.
+
+  Measured (zeta, 2026-07-14): FOUR consecutive deep framework goals closed with
+  `retrieval-summary: performed=false` (g-115-2194, g-115-2195, g-115-2179,
+  g-115-2202). All four had handoff_from=None, so this gate was SILENT on every
+  one of them. The 4/4 miss rate was never evidence that "an advisory doesn't
+  work" -- the advisory never ran.
+
+  Cost of the gap, measured: guard-1077 was written at 17:25 and the very incident
+  it describes was then re-derived from scratch by an hour of git archaeology at
+  20:42; a duplicate guardrail (guard-1089) was created and had to be retired,
+  because the Phase-6.5 anti-duplication check ALSO depends on retrieving first.
+  A guardrail only works if it is RETRIEVED.
+
+  The suppression in (2) is what keeps the widening from becoming banner-fatigue:
+  a gate that fires even when satisfied is one the agent learns to ignore -- the
+  same habituation that let 8 red tests be waved through for days (guard-1090).
+  A gate must be silent when satisfied, or it stops being a signal.
 
 Posture: ADVISORY-LOUD (large banner to stdout) but NOT loop-blocking
 (always exits 0). Fail-open on parse/path/env errors with a stderr note.
@@ -68,6 +96,16 @@ FRAMEWORK_FILE_NEEDLES = (
     "skill.md",
     "claude.md",
 )
+
+# Structured second trigger (1). The needle scan above reads goal PROSE and
+# therefore misses any goal that names its files bare rather than by full path --
+# 2 ("session_artifacts_count.py", "productivity-stop-gate.sh") did exactly
+# that and slipped through. `category` is a field on the goal record, so it holds
+# regardless of how the author phrased the description.
+FRAMEWORK_CATEGORIES = frozenset({
+    "framework-maintenance",
+    "framework-architecture",
+})
 
 
 def _read_local_paths_conf(agent_name: str) -> dict:
@@ -134,6 +172,39 @@ def _detect_framework_refs(title: str, description: str):
     return hits
 
 
+def _consult_already_done(agent: str, goal_id: str) -> bool:
+    """True when a retrieval was already recorded FOR THIS GOAL (1).
+
+    `retrieval-session.json` is the same artifact iteration-close.sh's learning gate
+    reads to emit `retrieval-summary: performed=<bool>` — so the gate that ASKS for the
+    consult and the audit that MEASURES it now agree on one source of truth, instead of
+    drifting apart.
+
+    Fail-open: any error -> False -> the banner fires. An extra banner costs a 5-second
+    retrieve.sh; a missed one costs an hour of re-deriving a lesson you already wrote
+    (measured, g-115-2179).
+    """
+    try:
+        p = _agent_dir(agent) / "session" / "retrieval-session.json"
+        d = json.loads(p.read_text(encoding="utf-8"))
+        if d.get("goal_id") != goal_id:
+            return False
+        # `retrieval_performed` is NOT set to True by the real retrieve.sh path --
+        # a genuine `retrieve.sh --goal <id>` records goal_id + counts and leaves this
+        # field ABSENT (None). Only iteration-close.sh's no-retrieval STUB writes it
+        # explicitly as False. So `bool(retrieval_performed)` -- the obvious check --
+        # rejects every real consultation and accepts none: the banner would keep
+        # nagging an agent that had just obeyed it, which is precisely the
+        # banner-fatigue this suppression exists to prevent (guard-1090).
+        #
+        # Credit on goal_id match (the same signal iteration-close.sh:1398 uses), and
+        # exclude ONLY the explicit-False stub. A real consult that happened to match
+        # nothing still counts -- the agent DID consult; the store was just empty.
+        return d.get("retrieval_performed") is not False
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Pre-apply consult gate (advisory, fail-open).",
@@ -178,16 +249,54 @@ def main(argv=None) -> int:
         # already landed the record, so this case is rare.
         return 0
 
+    # 1 — WIDENED. This used to `return 0` unless the goal was an INHERITED
+    # cross-agent spec (handoff_from set and != agent). That scoped the gate to its
+    # originating incident (, an Apply of another agent's spec) and left the
+    # COMMON case completely uncovered: an agent skipping the consult on its OWN
+    # framework goals.
+    #
+    # Measured (zeta, 2026-07-14): FOUR consecutive deep framework goals closed with
+    # `retrieval-summary: performed=false` — 4, 5, 9,
+    # 2. All four have handoff_from=None, so this gate was SILENT on every
+    # one. The 4/4 miss rate was never evidence that "the advisory doesn't work"; the
+    # advisory never ran. Cost of the gap, measured: guard-1077 was written at 17:25
+    # and the exact incident it describes was then re-derived from scratch by an hour
+    # of git archaeology at 20:42, plus a duplicate guardrail (guard-1089) that had to
+    # be retired — because the Phase-6.5 anti-duplication check ALSO depends on
+    # retrieving first.
+    #
+    # The hazard does not care who authored the spec. Self-authored is arguably WORSE:
+    # there is no second pair of eyes anywhere in the loop. So handoff is now an
+    # ESCALATOR (it makes the banner louder), never a GATE.
     handoff_from = (goal.get("handoff_from") or "").strip()
-    if not handoff_from or handoff_from == agent:
-        # Own-authored or no handoff -- gate does not fire.
-        return 0
+    inherited = bool(handoff_from) and handoff_from != agent
 
     title = (goal.get("title") or "").strip()
     description = (goal.get("description") or "").strip()
     hits = _detect_framework_refs(title, description)
+
+    # 1 — the needle scan reads the goal's PROSE, which is fragile: a goal
+    # that names its files bare ("session_artifacts_count.py", "productivity-stop-
+    # gate.sh") rather than by full path matches NOTHING. That is not hypothetical --
+    # 2 was written exactly that way and slipped through the widened gate on
+    # its first positive-control run. `category` is a STRUCTURED field on the goal
+    # record, so it does not depend on how the author happened to phrase the prose.
+    category = (goal.get("category") or "").strip().lower()
+    if category in FRAMEWORK_CATEGORIES and "category" not in hits:
+        hits = hits + [f"category:{category}"]
+
     if not hits:
-        # Cross-agent handoff but no framework-file reference -- gate does not fire.
+        # No framework-file reference and not a framework category -- the consult is
+        # not required. This is the condition that keeps the gate from becoming a tax
+        # on every goal.
+        return 0
+
+    # Suppress if the consult ALREADY happened for THIS goal. Without this, the gate
+    # would fire on every framework goal even when the agent did the right thing, and
+    # a banner that fires unconditionally is one the agent learns to ignore — the
+    # exact habituation dynamic that let 8 red tests be dismissed for days
+    # (guard-1090). A gate must be silent when satisfied, or it stops being a signal.
+    if _consult_already_done(agent, goal_id):
         return 0
 
     one_line = title.split("\n")[0]
@@ -201,7 +310,16 @@ def main(argv=None) -> int:
     out.write("=== PRE-APPLY CONSULT GATE ===========================================\n")
     out.write(f"Goal:        {goal_id}\n")
     out.write(f"Title:       {one_line}\n")
-    out.write(f"Inherited:   handoff_from={handoff_from} (current agent: {agent})\n")
+    if inherited:
+        # Escalator, not a gate (1). An inherited spec carries the extra
+        # hazard of rb-987: a test suite that pins the spec pins its violation too.
+        out.write(f"INHERITED:   handoff_from={handoff_from} (current agent: {agent})\n")
+        out.write("             ^ an inherited spec may CONTRADICT a guardrail you\n")
+        out.write("               already hold. This is the rb-987 / g-115-796 shape.\n")
+    else:
+        out.write(f"Authored by: {agent} (own goal — the consult is NOT optional here;\n")
+        out.write("             a self-authored framework fix has no second reader\n")
+        out.write("             anywhere in the loop, so retrieval IS the review)\n")
     out.write(f"Refs:        {refs}\n")
     out.write("\n")
     out.write("Per .claude/rules/code-review-protocol.md step 4 + rb-987 (g-115-796\n")
@@ -211,7 +329,16 @@ def main(argv=None) -> int:
     out.write("NOT falsify a guard violation.\n")
     out.write("\n")
     out.write("Recommended invocation:\n")
-    out.write(f'  bash core/scripts/retrieve.sh --category "{one_line[:80]}" --depth shallow\n')
+    # --goal is LOAD-BEARING (1). Without it, retrieve.sh does the retrieval
+    # but never records it against THIS goal, so:
+    #   * iteration-close.sh:1398 (which credits on goal_id match) writes a
+    #     `performed=false` stub -- the consult you actually did is logged as a MISS;
+    #   * this gate's own suppression never fires, so it nags you again next time;
+    #   * any measurement of the consult miss-rate counts every consult as a failure.
+    # The gate would have been recommending a command that could not satisfy the audit
+    # measuring it. Keep --goal.
+    out.write(f'  bash core/scripts/retrieve.sh --category "{one_line[:80]}" \\\n')
+    out.write(f'       --goal {goal_id} --depth shallow\n')
     out.write("\n")
     out.write("Then read returned reasoning_bank + guardrails. If any CONTRADICTS the\n")
     out.write("intended fix: STOP -- re-evaluate. Apply the entry's pattern instead,\n")

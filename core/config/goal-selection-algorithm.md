@@ -17,7 +17,10 @@ The LLM reads ranked output and applies Phase 2.5 metacognitive assessment.
    - if deferred_until set: now >= deferred_until
    - if not agent-eligible by participants: skip (user-only OR other-agent goals)
 
-3. SCORE (17 deterministic + 1 stochastic):
+3. SCORE (26 deterministic + 1 stochastic):
+   # Canonical criteria list = the `weights:` keys in meta/goal-selection-strategy.yaml
+   # (SSOT, loaded by goal-selector.py load_weights()). Keep this enumeration in
+   # sync with that file when criteria are added/removed (last resync: g-115-2538).
    priority_score:       HIGH=3, MEDIUM=2, LOW=1            (weight: 1.0)
    deadline_urgency:     +3/+2/+1 for 1/3/7 day deadlines   (weight: 1.0)
    agent_executable:     +2 if current agent eligible         (weight: 0.8)
@@ -36,6 +39,15 @@ The LLM reads ranked output and applies Phase 2.5 metacognitive assessment.
    context_coherence:    +2.0 if same category (non-tight)     (weight: 1.0)
    skill_affinity:       quality-weighted skill preference      (weight: 0.4)
    directive_boost:      cross-agent priority from directives   (weight: 1.5)
+   opportunity_boost:    1.0 discovery_type=opportunity, 0.5 idea-class (weight: 0.5; g-115-2525)
+   critical_blocker_surface: surface a high-downstream-unlock bottleneck goal (weight: 1.2; g-305-07)
+   user_signal_boost:    user-signal detection (e.g. silent_48h) boost        (weight: 1.2)
+   handoff_bonus:        cross-agent handoff routing (raw value IS the bonus)  (weight: 1.0)
+   role_affinity:        per-agent work_class preference                       (weight: 1.0)
+   class_balance_bonus:  pull under-represented work_class up                  (weight: 0.8)
+   per_goal_saturation:  penalty when the SAME goal_id fires rapidly           (weight: 0.8)
+   cross_aspiration_support: support for goals that aid other aspirations      (weight: 0.5)
+   co_invest_alignment:  pair-iteration co-investment bias (disabled by default) (weight: 0.0; g-115-563)
    exploration_noise:    random(0,1) * epsilon * noise_scale    (weight: varies)
 
    TOTAL = sum(score * weight) + exploration_noise

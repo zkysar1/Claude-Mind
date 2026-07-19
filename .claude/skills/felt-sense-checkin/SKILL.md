@@ -174,10 +174,17 @@ partner work mid-execution, NOT orphan state. Before any mutation:
    $MIND_AGENT`, the goal is partner work — SKIP it. Do NOT reset to
    pending. Do NOT mark completed.
 2. **Cross-reference `world/changelog.jsonl`** when `in_flight` is ambiguous
-   (e.g., null but the goal status looks suspicious). The changelog is the
-   single source of truth for "who wrote what when" — `in_flight` is a
-   snapshot that clears at iter-close and re-sets at phase-4, so it can be
-   null even when the partner is actively writing.
+   (e.g., null but the goal status looks suspicious). The changelog records
+   "who wrote what when" for THIS BOX only — `in_flight` is a snapshot that
+   clears at iter-close and re-sets at phase-4, so it can be null even when
+   the partner is actively writing. **Own-cloud caveat (g-115-2427)**:
+   `changelog.jsonl` is machine-local BY DESIGN (`owncloud_sync.py`
+   `_EXCLUDE_NAMES`; B15 per-machine aggregation deferred), so on a
+   multi-box fleet a local changelog scan can prove a partner-write HAPPENED
+   but can NEVER establish that no cross-box writer exists. For absence
+   claims, use the coordination board + team-state (partition-surviving
+   surfaces) instead — echo's g-115-2351 forensics derived an invalid
+   "no cross-box writer" conclusion from exactly this scan.
 3. **Only mutate** when `claimed_by == $MIND_AGENT` OR `claimed_by` is null
    AND no recent changelog activity from a partner on this goal-id.
 

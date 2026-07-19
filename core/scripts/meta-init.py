@@ -3,8 +3,15 @@
 
 Reads the initial_state section and writes each key to its corresponding file.
 Key name mapping: underscores in key → hyphens in filename.
+
+--missing-only (g-115-2524 backfill mode): write ONLY targets that do not
+already exist — never overwrite an evolved live strategy file. Under
+STORAGE_BACKEND=own-cloud, a locally-missing target is additionally probed
+against the store of record via _init_seed_probe (local absence is not
+authoritative under the read-through cache; guard-980 class).
 """
 
+import os
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -45,6 +52,7 @@ FILE_MAP = {
 
 
 def main():
+    missing_only = "--missing-only" in sys.argv[1:]
     config_path = CONFIG_DIR / "meta.yaml"
     if not config_path.exists():
         print(f"ERROR: {config_path} not found", file=sys.stderr)
@@ -65,6 +73,21 @@ def main():
 
         filename = FILE_MAP[key]
         target = META_DIR / filename
+
+        if missing_only:
+            # Additive backfill (4): never overwrite an existing
+            # (potentially agent-evolved) strategy file.
+            if target.exists():
+                continue
+            if os.environ.get("STORAGE_BACKEND") == "own-cloud":
+                # Local absence is not authoritative under the read-through
+                # cache — consult the store of record (safe direction on
+                # probe failure is DO NOT SEED).
+                from _init_seed_probe import probe_path
+                verdict = probe_path(target)
+                if verdict != "seed":
+                    print(f"  backfill: {filename} {verdict} — not seeding")
+                    continue
 
         # Ensure parent directory exists
         target.parent.mkdir(parents=True, exist_ok=True)

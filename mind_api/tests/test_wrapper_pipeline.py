@@ -165,9 +165,13 @@ def test_wrapper_move_to_archived(pipeline_daemon):
                           ["2026-05-12_test-resolved", "archived"])
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
+    # 6 tombstone-in-live archival: the record stays in live as a
+    # stage=archived tombstone; the archive gains one deduped copy.
     live_items = _read_jsonl(live)
     archive_items = _read_jsonl(archive)
-    assert not any(r["id"] == "2026-05-12_test-resolved" for r in live_items)
+    tomb = next(r for r in live_items if r["id"] == "2026-05-12_test-resolved")
+    assert tomb["stage"] == "archived"
+    assert tomb.get("archived_date")
     assert any(r["id"] == "2026-05-12_test-resolved" for r in archive_items)
 
 

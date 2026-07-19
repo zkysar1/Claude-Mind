@@ -384,15 +384,18 @@ If both a CONFIRMED and CORRECTED exist in this category AND they haven't been p
 
   Create reasoning bank entry (type: success — a contrastive lesson IS a validated
   distinguishing factor, i.e. a pattern to repeat; the contrastive nature is carried
-  in tags/content, not the outcome-class `type` field, which is {success|failure|user_provided}) via script:
+  in tags/content, not the outcome-class `type` field) via script:
     echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
     `id` and `created` are auto-set by the script — omit both; capture the
     assigned id from stdout. Fields to supply: title, description, content
-    (contrastive analysis), type ("success"), tags (MUST include "contrastive"), applies_to (REQUIRED:
-    `any` | `framework` | `domain` | `specific` based on the lesson's
-    scope), confirmed_source, corrected_source, category, tags,
-    when_to_use (derived from confirmed conditions), status ("active").
-    Utilization is auto-initialized.
+    (contrastive analysis), type ("success" — the validator enum is
+    {success, failure, user_provided}; a bare type "contrastive" is
+    REJECTED (validation_failed, observed live 2026-07-12 g-001-08).
+    tags MUST include "contrastive" — the tag carries the semantics),
+    applies_to (REQUIRED: `any` | `framework` | `domain` | `specific`
+    based on the lesson's scope), confirmed_source, corrected_source,
+    category, tags, when_to_use (derived from confirmed conditions),
+    status ("active"). Utilization is auto-initialized.
 
   Log: "CONTRASTIVE EXTRACTION: {category} — CONFIRMED {confirmed_id} vs CORRECTED {corrected_id}"
 
@@ -419,7 +422,11 @@ Experience JSON:
     summary: "Reflection on {hypothesis_id}: {key insight}"
     hypothesis_id: "{hypothesis_id}"
     tree_nodes_related: [nodes updated during reflection]
-    verbatim_anchors: [key quotes from ABC chain, exact strategy text]
+    verbatim_anchors: [{key: "{kebab-slug}", content: "{exact quote from ABC chain / strategy text}"}]
+      # DICT shape REQUIRED — experience-add.sh validator rejects bare strings
+      # ("Each verbatim_anchor must have 'key' and 'content' fields"; observed
+      # live 2026-07-17 g-001-08 — two records bounced on the string form this
+      # line previously showed)
     content_path: "agents/<agent>/experience/{experience_id}.md"
 ```
 
@@ -471,12 +478,16 @@ IF a counterfactual produced a transferable lesson:
     echo '<JSON>' | bash core/scripts/reasoning-bank-add.sh
       # `id`/`created` auto-set — omit both; capture id from stdout.
       # Fields: title, content (the delta + lesson, predictions labeled
-      # simulated), type ("failure" — a counterfactual "what-should-have-happened"
-      # is an outcome-class failure/pitfall; the counterfactual nature is carried in
-      # the REQUIRED tags below, not the `type` field {success|failure|user_provided}),
-      # applies_to (REQUIRED: any|framework|
-      # domain|specific), category, source_hypothesis, when_to_use,
-      # tags (MUST include "simulated", "counterfactual"),
+      # simulated), type ("failure" for the typical what-should-have-happened
+      # pitfall shape — the g-306-23 failure→counterfactual extraction pairing;
+      # use "success" ONLY when the rollout VALIDATES the taken path against a
+      # worse simulated alternative. The validator enum is {success, failure,
+      # user_provided}; a bare type "counterfactual" is REJECTED
+      # (validation_failed, observed live 2026-07-12 g-001-08), same class as
+      # Step 2.6 "contrastive". The MANDATORY tags below carry the semantics),
+      # applies_to (REQUIRED: any|framework|domain|specific), category,
+      # source_hypothesis, when_to_use, tags (MUST include "simulated",
+      # "counterfactual"),
       # poignancy (typically 4-6 — simulated signal is weaker than an observed
       # outcome; do NOT over-rate a counterfactual above a real resolution).
     Log: "COUNTERFACTUAL ROLLOUT: {N} simulated alternative(s) for {hypothesis_id} (gate: {high_surprise|high_cost})"
@@ -905,8 +916,15 @@ from outcome + original confidence (no step-attribution dependency):
 
     process_quality = confidence if CONFIRMED else (1.0 - confidence)
 
-    Bash: pipeline-update-field.sh {id} process_score.dual_classification {dual_classification}
-    Bash: pipeline-update-field.sh {id} process_score.process_quality {process_quality}
+    # FLAT top-level fields — pipeline-update-field.sh REJECTS dotted paths
+    # (dotted_field_rejected, observed live 2026-07-12 g-001-08), and
+    # /review-hypotheses Step 4.1 already writes these FLAT at resolution
+    # time. If the record already carries dual_classification +
+    # process_quality (the normal case for records resolved via
+    # /review-hypotheses), SKIP these writes — do not invent a second
+    # nested location for the same data.
+    Bash: pipeline-update-field.sh {id} dual_classification {dual_classification}
+    Bash: pipeline-update-field.sh {id} process_quality {process_quality}
 
 ## Step 7.7: Context Gap Analysis (Context Manifest Review)
 
@@ -1657,12 +1675,20 @@ For each promoted micro-hypothesis:
 ## Step 4: Update Aggregate Stats
 
 ```
-# Append batch stats to pipeline metadata for accuracy reporting
+# Append batch stats to pipeline metadata for accuracy reporting.
+# Use the stats_delta block emitted by reflect-bookkeeping.sh batch-micro —
+# do NOT recompute the deltas by hand (g-115-2439).
 Bash: pipeline-read.sh --meta  → get current micro_hypothesis_stats
 Update micro_hypothesis_stats:
-  total_all_time: += total
-  confirmed_all_time: += confirmed
-  corrected_all_time: += corrected
+  confirmed_all_time: += stats_delta.confirmed_delta
+  corrected_all_time: += stats_delta.corrected_delta
+  total_all_time: confirmed_all_time + corrected_all_time + stats_delta.pending_now
+      # DERIVED — never `+= total` (g-115-2439): a carried pending micro
+      # re-batches every pass, so the old increment counted it once per pass
+      # (drifted 30 vs 9 resolved by 2026-07-16). The derived form counts each
+      # settled micro exactly once (settled micros are PRUNED below) + each
+      # pending micro once while it pends, and self-heals any historical
+      # inflation on every write.
   accuracy_all_time: confirmed_all_time / (confirmed_all_time + corrected_all_time)
   sessions_with_micros: += 1
   last_session_stats:
@@ -1674,10 +1700,20 @@ Update micro_hypothesis_stats:
     by_category: {category breakdown}
 Bash: pipeline-meta-update.sh micro_hypothesis_stats '<JSON>'
 
-# Count toward developmental stage resolved_hypotheses total
-Read agents/<agent>/developmental-stage.yaml
-Update: resolved_hypotheses += (confirmed + corrected)  # only resolved micros count
-Write agents/<agent>/developmental-stage.yaml
+# PRUNE settled micros (the counted-once guarantee): write back ONLY the
+# still-pending micros. The script emits exactly this pruned array as
+# micro_hypotheses_writeback — settled micros were counted into the all-time
+# counters above and their surprises promoted in Step 3; carrying them would
+# re-count them on the next batch pass (g-115-2439).
+Bash: echo '<micro_hypotheses_writeback JSON>' | wm-set.sh micro_hypotheses
+
+# (RETIRED g-115-2624) The former "resolved_hypotheses += confirmed+corrected"
+# hand-increment of developmental-stage.yaml is REMOVED. That LLM-discretionary
+# writer never fired in practice (counters sat at 0 beside their own fresh
+# evidence.pipeline_resolved sibling — ZDS omni code-read 2026-07-18);
+# current_assessment.resolved_hypotheses is now script-written by
+# competence-assess.py as evidence.pipeline_resolved (single source). Do NOT
+# hand-write developmental-stage.yaml here.
 ```
 
 ## Step 5: Journal Entry

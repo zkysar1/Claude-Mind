@@ -420,7 +420,13 @@ def graduate(ctx) -> "Response":  # type: ignore[name-defined]
     monitors = data.get("active_monitors", [])
     found = False
     for mon in monitors:
-        if mon["meta_change_id"] == change_id:
+        # active_monitors mixes weight-monitors (meta_change_id) with evolution
+        # monitors (monitor_kind/revision_id, NO meta_change_id). .get() skips
+        # the latter, mirroring check()'s EVOLUTION_KINDS skip (7);
+        # graduate was the sibling that fix missed — an unguarded subscript
+        # KeyError'd the whole endpoint on any co-resident evolution monitor,
+        # breaking graduate fleet-wide (7).
+        if mon.get("meta_change_id") == change_id:
             mon["status"] = "graduated"
             found = True
             break
@@ -603,7 +609,9 @@ def _email_rollback(ctx, rollback_entry):
     if os.environ.get("MIND_EVOLUTION_NOTIFY_DRYRUN", "").strip() in ("1", "true", "yes"):
         return "dry-run:rollback:{}".format(revision_id)
     payload = {"InfoType": "Self-Program-Evolution-Rollback", "Title": subject,
-               "InfoMessage": subject, "Body": body}
+               "InfoMessage": subject, "Body": body,
+               # Provenance stamp — email-send.sh refuses payloads without it (6).
+               "XPayloadProvenance": "meta-backpressure-daemon/v1"}
     email_script = (ctx.paths.world / "scripts" / "email-send.sh").as_posix()
     env = os.environ.copy()
     if agent:

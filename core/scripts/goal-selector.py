@@ -128,6 +128,30 @@ def _get_runner_capabilities():
 _HUMAN_BLOCKED_PREFIX = "human_blocked:"
 
 
+def _parse_rne_dt(rne):
+    """Parse resolves_no_earlier_than into a datetime, or None on failure.
+
+    The field arrives in TWO shapes: date-only ("2026-07-20") from older
+    records, and full datetime ("2026-07-20T00:00:00") from the sq-009
+    hypothesis template. date.fromisoformat RAISES on the datetime shape
+    (verified Python 3.12.3), so the prior per-site try/except silently
+    no-opped the hypothesis time gate for every template-filed goal —
+    g-115-2507 incident: a 3-days-future hypothesis goal top-ranked at 8.57.
+    Same inert-gate class as rb-3830/rb-3834 (swallowed-parse gates).
+    """
+    if not rne:
+        return None
+    s = str(rne)
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.fromisoformat(f"{s}T00:00:00")
+    except (ValueError, TypeError):
+        return None
+
+
 def _synth_blocker_ref_from_structured_defer(goal):
     """For quiescence-gate compatibility (, extended 4): when a
     goal is structurally deferred/blocked but lacks a valid typed blocker_ref,
@@ -162,6 +186,30 @@ def _synth_blocker_ref_from_structured_defer(goal):
     unchanged if present, a synthesized dict for (f/b/a/c/d/e), else None."""
     existing = goal.get("blocker_ref")
     if isinstance(existing, dict):
+        # C3 roll-forward for a STORED typed dict ref whose expires_at has
+        # lapsed (3 sibling): a long-lived user_action / infrastructure
+        # ref on a user-gated recurring monitor (e.g.  game-session,
+        #  npc-deploy) keeps its stored typed ref for months, but its
+        # original short TTL (created_at + N days) expired long ago — tripping
+        # quiescence C3 (future-expiry) into false denial + B7 churn while the
+        # underlying blocker is still genuinely active (Phase 0.5b re-probes it
+        # independently — blocker-recheck cleared 0, confirming still-active).
+        # expires_at is a fail-open RE-CHECK window, NOT a hard deadline, so roll
+        # a lapsed window forward to now+120h, preserving type/external_id/
+        # created_at. Mirrors path (a) roll-forward (below) + 0 /
+        # 4 rolling-expiry idiom. A future expires_at is returned
+        # unchanged (no behavior change for already-fresh stored refs).
+        try:
+            _exp = existing.get("expires_at")
+            if _exp and datetime.fromisoformat(str(_exp)) <= datetime.now():
+                _rolled = dict(existing)
+                _rolled["expires_at"] = (
+                    datetime.now() + timedelta(hours=120)
+                ).isoformat(timespec="seconds")
+                _rolled["expiry_rolled_forward"] = True
+                return _rolled
+        except (ValueError, TypeError):
+            pass
         return existing
     # Path (f): legacy BARE-STRING blocker_ref (4). A plain-string
     # blocker_ref (e.g. "worldbuilders-apikey-missing" from an older write path)
@@ -248,9 +296,10 @@ def _synth_blocker_ref_from_structured_defer(goal):
     rne = goal.get("resolves_no_earlier_than")
     if rne:
         try:
-            # rne is a date (YYYY-MM-DD), not full timestamp — promote to midnight
-            expires_dt = datetime.fromisoformat(f"{rne}T00:00:00")
-            if expires_dt > datetime.now():
+            # Handles BOTH date-only and datetime forms (7 — the old
+            # f"{rne}T00:00:00" promotion raised on datetime-form values).
+            expires_dt = _parse_rne_dt(rne)
+            if expires_dt is not None and expires_dt > datetime.now():
                 created_str = goal.get("created_at") or goal.get("started")
                 try:
                     created = datetime.fromisoformat(str(created_str)) if created_str else datetime.now()
@@ -416,12 +465,74 @@ def _record_strategy_application(strategy_path, summary):
               file=sys.stderr)
 
 
+# Code-side contract manifest: every criterion key score_goal() computes into
+# `raw`, EXCLUDING exploration_noise (dynamic weight = epsilon * noise_scale,
+# never in the meta weights dict — see META_GOAL_SELECTION note above).
+# 5: load_weights() filters meta keys against this set so an orphaned
+# weight (meta names a criterion the code no longer computes — the rb-498-era
+# promotion-clobber class that killed selection fleet-wide in prod via KeyError
+# at the weighted sum) degrades to a loud stderr warning + opt-out instead.
+# promote-preflight cross-checks seed weights against this same set (single
+# contract, parsed via AST). When ADDING a criterion to score_goal, add its
+# key here in the same change — test_goal_selector_weights_contract.py pins
+# the two lists equal.
+KNOWN_CRITERIA = frozenset({
+    "priority", "deadline_urgency", "agent_executable", "variety_bonus",
+    "streak_momentum", "novelty_bonus", "recurring_urgency",
+    "recurring_saturation", "per_goal_saturation", "user_signal_boost",
+    "class_balance_bonus", "role_affinity", "reward_history",
+    "completion_pressure", "tail_bonus", "depth_bonus",
+    "cross_aspiration_support", "evidence_backing", "deferred_readiness",
+    "context_coherence", "skill_affinity", "directive_boost",
+    "handoff_bonus", "co_invest_alignment", "critical_blocker_surface",
+    "opportunity_boost",
+})
+
+
 def load_weights():
-    """Load goal selection weights from meta/goal-selection-strategy.yaml."""
+    """Load goal selection weights from meta/goal-selection-strategy.yaml.
+
+    g-115-2525 hardening: weight keys with no matching criterion in
+    KNOWN_CRITERIA are DROPPED with a loud stderr warning instead of
+    reaching the weighted sum, where they raise KeyError and kill selection
+    for every agent on the box (the orphaned-weight class: a promotion
+    replaces selector code while the external meta/ file keeps a weight the
+    new code never computes). No value fallback in the other direction —
+    a criterion missing from meta simply opts out of scoring (rb-215).
+    """
     with open(META_GOAL_SELECTION, encoding="utf-8") as f:
         meta = yaml.safe_load(f)
     raw = meta["weights"]
-    return {k: max(0.0, min(3.0, float(v))) for k, v in raw.items()}
+    unknown = sorted(set(raw) - KNOWN_CRITERIA)
+    if unknown:
+        print(
+            f"[goal-selector] WARNING: meta weights name {len(unknown)} "
+            f"criteria this selector does not compute: {', '.join(unknown)} "
+            f"— ignoring them (meta/code contract drift, g-115-2525). "
+            f"Fix meta/goal-selection-strategy.yaml or restore the criteria.",
+            file=sys.stderr,
+        )
+    # Non-numeric values (YAML null from an add-key backpressure rollback, or
+    # a stray string like "None" — mc-081 2026-07-18 crashed selection for
+    # every agent on the box) opt the criterion OUT of scoring, same as an
+    # absent key (rb-215). Loud skip, never a crash: a corrupt meta value must
+    # degrade one criterion, not kill fleet-wide goal selection.
+    non_numeric = sorted(
+        k for k, v in raw.items()
+        if k in KNOWN_CRITERIA and not isinstance(v, (int, float))
+    )
+    if non_numeric:
+        print(
+            f"[goal-selector] WARNING: meta weights carry non-numeric values "
+            f"for: {', '.join(non_numeric)} — treating as opted-out (rb-215). "
+            f"Fix meta/goal-selection-strategy.yaml.",
+            file=sys.stderr,
+        )
+    return {
+        k: max(0.0, min(3.0, float(v)))
+        for k, v in raw.items()
+        if k in KNOWN_CRITERIA and isinstance(v, (int, float))
+    }
 
 
 WEIGHTS = load_weights()
@@ -484,20 +595,21 @@ RECURRING_CONFIG = load_recurring_config()
 def load_cross_agent_surfacing_enabled():
     """Whether the selector surfaces sibling-queue goals routed via intended_agent.
 
-    Gated OFF by default (2026-07-04, g-115-1764 follow-up). g-115-946 built
-    cross-agent SURFACING (collect_cross_agent_candidates) but no endpoint ever
-    wired the cross-agent EXECUTION path (claim/update/complete sibling
-    resolution). The claim endpoint (aspirations_write.py claim()) resolves only
-    world + the caller's own-agent queue, so a surfaced sibling-queue goal 404s
-    at claim -> hard selector livelock (g-115-1766). Surfacing was inert (path
-    bug) until g-115-1764 fixed it; that exposed the missing execution half.
-    Until the execution path is wired, surfacing un-actionable cross-agent work
-    is worse than not surfacing it, so the call sites are gated here rather than
-    reverting the (correct) path fix. Flip aspirations.yaml
-    cross_agent_surfacing.enabled -> true once claim/update resolve sibling
-    queues. Empirical (alpha 2026-07-04): selector surfaced g-001-282
-    (intended_agent=alpha, in bravo's queue), then aspirations-claim.sh
-    g-001-282 -> 404 goal_not_found.
+    ENABLED 2026-07-15 (g-115-1848, part iii of g-115-1844). History: g-115-946
+    built cross-agent SURFACING (collect_cross_agent_candidates); it was gated OFF
+    2026-07-04 (g-115-1764 follow-up) because the EXECUTION path was unwired — the
+    claim endpoint (aspirations_write.py claim()) resolves only world + the
+    caller's own-agent queue, so a surfaced sibling-queue goal 404'd at claim ->
+    hard selector livelock (g-115-1766; empirical: selector surfaced g-001-282
+    intended_agent=alpha in bravo's queue, then aspirations-claim.sh -> 404).
+    The execution path is now wired: collect_cross_agent_candidates stamps
+    source='cross-agent:<owner>'; aspirations-select Phase 2.95 splits it into
+    (effective_source='agent', cross_agent_owner); aspirations-execute Phase 4
+    env-prefixes MIND_AGENT=<owner> on the claim so it resolves the OWNER's queue
+    under the owner's identity — no 404. Prereq g-115-1847 (cross-agent-write.sh
+    write-back helper) landed; wiring proven by test_goal_selector_cross_agent_pull.py
+    + test_loop_state_save_cross_agent_owner.py + test_cross_agent_write.py.
+    Reversible: set aspirations.yaml cross_agent_surfacing.enabled=false to gate off.
     """
     try:
         import importlib.util
@@ -1323,6 +1435,20 @@ def _get_idle_agents(reallocation_hours):
     unavailable, and an agent with a missing/unparseable last_active is NOT
     treated as idle — the goal stays routed (status quo) rather than being
     surfaced on absent evidence.
+
+    g-115-2315: a stale last_active alone is NOT sufficient evidence of
+    idleness — it is the LOCAL MIRROR of the peer's pushed snapshot, and a
+    lagged pull path freezes it for every peer while they actively push
+    (the g-115-2149 read-side lie; observed 2026-07-16: foxtrot last_active
+    27.5h stale on this box while its shard hit the authoritative store 4
+    minutes earlier, so its alert goal leaked to echo). Before declaring an
+    agent idle, cross-check the inherently-fresh signal (the agent's
+    team-state shard write time read from the AUTHORITATIVE store) via
+    liveness_check: idle ONLY on a "dormant" verdict (both signals stale);
+    "alive" and "unknown" (fresh signal unreadable) keep the agent NOT idle,
+    honoring the never-on-absent-evidence promise above. Probe results are
+    memoized per process — one authoritative-store HEAD per stale agent per
+    selector run, not per goal.
     """
     if reallocation_hours is None:
         return set()
@@ -1334,8 +1460,42 @@ def _get_idle_agents(reallocation_hours):
             continue
         age = hours_since(row.get("last_active"))
         if age is not None and age > reallocation_hours:
-            idle.add(name)
+            if _liveness_confirms_dormant(name, row.get("last_active"),
+                                          reallocation_hours):
+                idle.add(name)
     return idle
+
+
+_LIVENESS_DORMANT_CACHE = {}
+
+
+def _liveness_confirms_dormant(name, last_active_iso, threshold_hours):
+    """True only when liveness_check upholds the dormant conclusion for
+    ``name`` (g-115-2315 — see _get_idle_agents docstring).
+
+    Dispatches to liveness_check.fetch_fresh_signal (authoritative-store
+    shard write time: S3 LastModified on own-cloud, shard mtime on local)
+    and the pure decide_liveness verdict. Memoized per process so repeated
+    collect_candidates calls (world + agent queues) probe each stale agent
+    once. Fail-safe: any import/probe error returns False (NOT idle) — the
+    same direction as decide_liveness's "unknown" verdict, degrading toward
+    goals-stay-routed (slow but never wrongly leaked) rather than reviving
+    the false-idle defect this check exists to fix.
+    """
+    if name in _LIVENESS_DORMANT_CACHE:
+        return _LIVENESS_DORMANT_CACHE[name]
+    try:
+        import liveness_check as _lc
+        fresh_iso = _lc.fetch_fresh_signal(
+            name, str(WORLD_DIR), os.environ.get("STORAGE_BACKEND", "local"))
+        verdict = _lc.decide_liveness(
+            last_active_iso, fresh_iso, threshold_hours=threshold_hours,
+            now=datetime.now())["verdict"]
+        dormant = (verdict == "dormant")
+    except Exception:  # noqa: BLE001 — fail-safe toward NOT idle
+        dormant = False
+    _LIVENESS_DORMANT_CACHE[name] = dormant
+    return dormant
 
 
 def collect_candidates(aspirations, known_blockers=None, source="world",
@@ -1515,14 +1675,10 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     if la is not None and la < interval:
                         continue
 
-            # Hypothesis time gate
-            rne = goal.get("resolves_no_earlier_than")
-            if rne:
-                try:
-                    if today < date.fromisoformat(str(rne)):
-                        continue
-                except (ValueError, TypeError):
-                    pass
+            # Hypothesis time gate (datetime-form safe — 7, _parse_rne_dt)
+            rne_dt = _parse_rne_dt(goal.get("resolves_no_earlier_than"))
+            if rne_dt is not None and datetime.now() < rne_dt:
+                continue
 
             # Defer reason: textual deferral blocks the goal.
             # Expiry: defer_reason without deferred_until expires after defer_reason_timeout_hours.
@@ -1996,17 +2152,14 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                         continue
                 # else: has deferred_until — handled by time gate at L864-877
 
-            # 5. Hypothesis time gate
+            # 5. Hypothesis time gate (datetime-form safe — 7, _parse_rne_dt)
             rne = goal.get("resolves_no_earlier_than")
-            if rne:
-                try:
-                    if today < date.fromisoformat(str(rne)):
-                        entry["block_reason"] = "hypothesis_gate"
-                        entry["block_detail"] = "Not before {date}".format(date=rne)
-                        blocked.append(entry)
-                        continue
-                except (ValueError, TypeError):
-                    pass
+            rne_dt = _parse_rne_dt(rne)
+            if rne_dt is not None and datetime.now() < rne_dt:
+                entry["block_reason"] = "hypothesis_gate"
+                entry["block_detail"] = "Not before {date}".format(date=rne)
+                blocked.append(entry)
+                continue
 
             # 6. Structured preconditions unmet (SYMMETRY with collect_candidates).
             # NOTE: `goal.get("verification") or {}` defends against goals with
@@ -2760,6 +2913,25 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
             cbs_cfg["downstream_cap"],
         )
 
+    # 13f. opportunity_boost (5 restore): scoring teeth for the
+    # standing pursue-opportunities user directive (ZDS meta-log 2026-06-18,
+    #  signal). The original criterion was implemented prod-side in
+    # ZDS-Mind and clobbered by the rb-498-era promotion — framework code
+    # flows dev→prod, so prod-only code loses on every promote (guard-97/98
+    # now forbid prod-side framework dev; this restores the criterion at the
+    # dev origin). Opportunity-shaped goals: explicit sq-013
+    # `discovery_type: opportunity` gets the full boost; Idea-primitive goals
+    # (origin_signal `idea:` / title `Idea:` — CLAUDE.md defines Idea as
+    # "creative insight, improvement opportunity") get half. Weight lives in
+    # meta like every criterion; deployments tune it (ZDS ran 3.0, the
+    # largest in its file; the dev seed default is deliberately modest).
+    raw["opportunity_boost"] = 0.0
+    if goal.get("discovery_type") == "opportunity":
+        raw["opportunity_boost"] = 1.0
+    elif (str(goal.get("origin_signal") or "").startswith("idea:")
+          or str(goal.get("title") or "").startswith("Idea:")):
+        raw["opportunity_boost"] = 0.5
+
     # 14. exploration_noise (random value scaled by developmental epsilon)
     raw["exploration_noise"] = random.random()
 
@@ -2775,7 +2947,10 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         total = iaus_score(raw, WEIGHTS, IAUS_CONFIG)["score"]
         total += raw["exploration_noise"] * noise_weight
     else:
-        total = sum(raw[k] * WEIGHTS[k] for k in WEIGHTS)
+        # raw.get backstop (5): load_weights() already filters
+        # unknown keys, but a KNOWN criterion skipped by a future early-exit
+        # path must degrade to 0-contribution, never KeyError selection dead.
+        total = sum(raw.get(k, 0.0) * WEIGHTS[k] for k in WEIGHTS)
         total += raw["exploration_noise"] * noise_weight
 
     return {
@@ -2795,7 +2970,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         "recurring_overdue_ratio": round(overdue_ratio, 3),
         "score": round(total, 2),
         "breakdown": {
-            **{k: round(raw[k] * WEIGHTS[k], 2) for k in WEIGHTS},
+            **{k: round(raw.get(k, 0.0) * WEIGHTS[k], 2) for k in WEIGHTS},
             "exploration_noise": round(raw["exploration_noise"] * noise_weight, 2),
         },
         "raw": {k: round(v, 2) if isinstance(v, float) else v for k, v in raw.items()},
@@ -3112,9 +3287,10 @@ def cmd_select(args):
     # landed in the FILER's private queue and were invisible to the TARGET.
     # Strict-match contract: only intended_agent == AGENT_NAME pulls; "either"
     # and unset stay in their owner's queue. Fail-open per sibling.
-    # Gated OFF by default until the cross-agent EXECUTION path is wired
-    # (4 follow-up). See load_cross_agent_surfacing_enabled() — a
-    # surfaced sibling-queue goal currently 404s at claim (livelock, 6).
+    # Gated by cross_agent_surfacing.enabled (ENABLED 2026-07-15, 8).
+    # See load_cross_agent_surfacing_enabled() — the execution path is wired
+    # (select Phase 2.95 split + execute Phase 4 owner env-prefix), so a surfaced
+    # sibling-queue goal claims under the owner's identity, no 404 (6 resolved).
     if AGENT_DIR is not None and CROSS_AGENT_SURFACING_ENABLED:
         candidates += collect_cross_agent_candidates(
             AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,

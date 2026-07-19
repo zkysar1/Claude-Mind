@@ -16,10 +16,9 @@ byte-for-byte matching `cmd_query`'s stdout. Always reads BOTH world and agent
 queues (the CLI ignores --source for query — see aspirations.py:879 comment).
 
 What this endpoint does NOT do (Phase B scope-cut, same as aspirations/read):
-  - Call `_log_goal_read` for each returned goal. The CLI logs reads to power
-    the stale-read gate; the daemon path defers this until we extract a
-    daemon-safe goal-read writer. Out-of-band observability gap, documented
-    in mind_api/docs/development-history/DECISIONS.md.
+  - Call `_log_goal_read` for each returned goal. The CLI logged reads to power
+    the stale-read gate, which was retired g-115-2107 — so this logging is not
+    coming back. Historical context: mind_api/docs/development-history/DECISIONS.md.
 
 INVARIANT: VALID_GOAL_STATUSES mirrors aspirations.py:37. Mirroring keeps the
 endpoint independent of aspirations.py's import side effects (utf-8 reconfigure,

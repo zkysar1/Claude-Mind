@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from datetime import date, datetime
 from pathlib import Path
@@ -547,19 +548,22 @@ def cmd_archive_goal(args):
         print(f"Duplicate error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Move trace file into canonical position — must happen BEFORE
+    # COPY trace file into canonical position — must happen BEFORE
     # validate_record, because validate_record enforces that content_path
-    # resolves to an existing file. Any schema-validation failure after this
-    # point leaves an orphan .md at canonical; the user must manually rm
-    # and re-run. This is an accepted tradeoff with validate_record's
-    # contract — do NOT move os.replace past validate_record without also
-    # splitting the validator into schema-only and filesystem-only phases.
+    # resolves to an existing file (do NOT reorder past validate_record
+    # without splitting the validator into schema-only and filesystem-only
+    # phases). 5: copy-not-move — the old os.replace consumed the
+    # caller's trace on a post-move validation failure, stranding an orphan
+    # .md and making the retry non-idempotent. The source is deleted only
+    # after the record lands; the validation-failure path removes the copy.
+    copied_from = None
     if trace_src.resolve() != canonical.resolve():
         if canonical.exists():
             print(f"Error: canonical content_path already exists: {canonical}. "
                   f"Refusing to overwrite.", file=sys.stderr)
             sys.exit(1)
-        os.replace(str(trace_src), str(canonical))
+        shutil.copy2(str(trace_src), str(canonical))
+        copied_from = trace_src
 
     # Assemble record — defaults from DEFAULT_FIELDS fill in via normalize_record.
     # Uses _stamp_now() for single-source-of-truth stamping (shared with cmd_add).
@@ -586,11 +590,26 @@ def cmd_archive_goal(args):
     try:
         validate_record(rec)
     except ValueError as e:
+        # 5: remove the copy so the failed attempt leaves no orphan
+        # .md and the caller's trace_src survives for an idempotent retry.
+        if copied_from is not None:
+            try:
+                canonical.unlink()
+            except OSError:
+                pass
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
     append_jsonl(LIVE_PATH, rec)
     _update_meta()
+
+    # Record landed — consume the source now (completes the move semantics).
+    if copied_from is not None:
+        try:
+            copied_from.unlink()
+        except OSError as e:
+            print(f"WARN: trace source cleanup failed: {copied_from} ({e})",
+                  file=sys.stderr)
 
     print(json.dumps(rec, indent=2, ensure_ascii=False))
 

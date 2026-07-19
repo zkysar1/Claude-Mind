@@ -168,12 +168,215 @@ def main() -> int:
                 f"passed={re_.get('passed')}"
             )
 
+    # ── F-I: git_log lineage exemption (2) ────────────────────────
+    # A follow-up filed from a just-closed goal matches the parent's OWN
+    # tagged commit — 5th lineage false-positive shape, observed live when
+    # filing 1 against parent 6's commit e6032338. Build a
+    # second repo whose commit carries the conventional tag.
+    with tempfile.TemporaryDirectory() as td:
+        repo2 = Path(td) / "repo2"
+        repo2.mkdir()
+        _git(repo2, "init", "-q")
+        _git(repo2, "config", "user.email", "test@example.com")
+        _git(repo2, "config", "user.name", "git-log-test")
+        target = repo2 / "core" / "scripts" / "widget_xyz.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("# widget\n", encoding="utf-8")
+        _git(repo2, "add", "-A")
+        _git(repo2, "commit", "-q", "-m", "feat(g-888-77): harden widget_xyz")
+
+        # F: discovered_by == the commit's tag -> PASS with lineage advisory
+        rf = goal_duplication._check_git_log(
+            {"discovered_by": "g-888-77"},
+            {"core/scripts/widget_xyz.py"}, repo2)
+        if rf.get("passed") is not True:
+            failures.append(
+                "F: expected PASS on discovered_by-parent commit tag; got "
+                f"passed={rf.get('passed')} reason={rf.get('reason')!r}")
+        elif not any(a.get("lineage_exempt") for a in rf.get("advisories", [])):
+            failures.append(
+                "F: passed but no lineage_exempt advisory recorded; "
+                f"advisories={rf.get('advisories')}")
+
+        # G: UNRELATED discovered_by -> the same tagged commit still BLOCKS
+        rg = goal_duplication._check_git_log(
+            {"discovered_by": "g-888-78"},
+            {"core/scripts/widget_xyz.py"}, repo2)
+        if rg.get("passed") is not False:
+            failures.append(
+                "G: expected BLOCK when discovered_by does not match the "
+                f"commit tag; got passed={rg.get('passed')}")
+
+        # H: origin_signal-embedded parent id -> PASS with lineage advisory
+        rh = goal_duplication._check_git_log(
+            {"origin_signal": "idea:g-888-77-follow-up-hardening"},
+            {"core/scripts/widget_xyz.py"}, repo2)
+        if rh.get("passed") is not True:
+            failures.append(
+                "H: expected PASS on origin_signal-embedded parent id; got "
+                f"passed={rh.get('passed')} reason={rh.get('reason')!r}")
+
+        # I: PREFIX guard — discovered_by  must NOT exempt the
+        #  tag (shorter-id-inside-longer-id class, fresh-eyes F1 of
+        # 6); the block must hold.
+        ri = goal_duplication._check_git_log(
+            {"discovered_by": "g-888-7"},
+            {"core/scripts/widget_xyz.py"}, repo2)
+        if ri.get("passed") is not False:
+            failures.append(
+                "I: expected BLOCK — prefix id g-888-7 must not exempt tag "
+                f"g-888-77; got passed={ri.get('passed')}")
+
+    # ── J-O: git_log self-completion demotion (5) ─────────────────
+    # A commit whose tag maps to a goal the FILING agent itself completed
+    # (per team-state recent_completions) demotes to a visible advisory;
+    # partner-completed tags and untagged commits still hard-block. Basis:
+    # 4 telemetry (19 solo git_log attempts / 9 overridden all
+    # verified-FP / 0 demonstrated TPs).
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        repo3 = base / "repo3"
+        repo3.mkdir()
+        _git(repo3, "init", "-q")
+        _git(repo3, "config", "user.email", "test@example.com")
+        _git(repo3, "config", "user.name", "git-log-test")
+        target = repo3 / "core" / "scripts" / "widget_xyz.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("# widget\n", encoding="utf-8")
+        _git(repo3, "add", "-A")
+        _git(repo3, "commit", "-q", "-m", "feat(g-888-90): ship widget_xyz")
+
+        world = base / "world"
+        world.mkdir()
+        (world / "team-state.yaml").write_text(
+            "recent_completions:\n"
+            "  - goal_id: g-888-90\n"
+            "    completed_by: zeta-test\n"
+            "  - goal_id: g-888-92\n"
+            "    completed_by: other-agent\n",
+            encoding="utf-8",
+        )
+        fp = {"core/scripts/widget_xyz.py"}
+
+        # J: self-completed tag -> PASS with self_completion_exempt advisory
+        rj = goal_duplication._check_git_log(
+            {}, fp, repo3, self_agent="zeta-test", world_dir=world)
+        if rj.get("passed") is not True:
+            failures.append(
+                "J: expected PASS on self-completed commit tag; got "
+                f"passed={rj.get('passed')} reason={rj.get('reason')!r}")
+        elif not any(a.get("self_completion_exempt")
+                     for a in rj.get("advisories", [])):
+            failures.append(
+                "J: passed but no self_completion_exempt advisory recorded; "
+                f"advisories={rj.get('advisories')}")
+
+        # K: same commit, DIFFERENT filing agent (tag completed by
+        # zeta-test, filer is other-agent) -> BLOCK (partner-completed tag;
+        # N-agent invariant's cross-agent detection intact)
+        rk = goal_duplication._check_git_log(
+            {}, fp, repo3, self_agent="other-agent", world_dir=world)
+        if rk.get("passed") is not False:
+            failures.append(
+                "K: expected BLOCK when the tagged goal was completed by a "
+                f"DIFFERENT agent; got passed={rk.get('passed')}")
+
+        # N: tag present but goal-id absent from recent_completions -> BLOCK
+        # ( is other-agent's; the commit tag  IS in
+        # recent_completions — so use a fresh world with neither id)
+        world2 = base / "world2"
+        world2.mkdir()
+        (world2 / "team-state.yaml").write_text(
+            "recent_completions:\n"
+            "  - goal_id: g-777-01\n"
+            "    completed_by: zeta-test\n",
+            encoding="utf-8",
+        )
+        rn = goal_duplication._check_git_log(
+            {}, fp, repo3, self_agent="zeta-test", world_dir=world2)
+        if rn.get("passed") is not False:
+            failures.append(
+                "N: expected BLOCK when commit tag maps to no self "
+                f"recent_completion; got passed={rn.get('passed')}")
+
+        # L: untagged self commit -> BLOCK (no tag = no attribution = no
+        # demotion, fail-conservative)
+        repo4 = base / "repo4"
+        repo4.mkdir()
+        _git(repo4, "init", "-q")
+        _git(repo4, "config", "user.email", "test@example.com")
+        _git(repo4, "config", "user.name", "git-log-test")
+        t4 = repo4 / "core" / "scripts" / "widget_xyz.py"
+        t4.parent.mkdir(parents=True)
+        t4.write_text("# widget\n", encoding="utf-8")
+        _git(repo4, "add", "-A")
+        _git(repo4, "commit", "-q", "-m", "ship widget_xyz untagged")
+        rl = goal_duplication._check_git_log(
+            {}, fp, repo4, self_agent="zeta-test", world_dir=world)
+        if rl.get("passed") is not False:
+            failures.append(
+                "L: expected BLOCK on untagged commit despite self_agent + "
+                f"world args; got passed={rl.get('passed')}")
+
+        # M: mixed self-tagged + partner-tagged commits -> BLOCK overall,
+        # self match demoted to advisory, partner match in matches
+        t4b = repo3 / "core" / "scripts" / "widget_xyz.py"
+        t4b.write_text("# widget v2\n", encoding="utf-8")
+        _git(repo3, "add", "-A")
+        _git(repo3, "commit", "-q", "-m", "feat(g-888-92): rework widget_xyz")
+        rm_ = goal_duplication._check_git_log(
+            {}, fp, repo3, self_agent="zeta-test", world_dir=world)
+        if rm_.get("passed") is not False:
+            failures.append(
+                "M: expected BLOCK on mixed self+partner tagged commits; got "
+                f"passed={rm_.get('passed')}")
+        else:
+            if not any(a.get("self_completion_exempt")
+                       for a in rm_.get("advisories", [])):
+                failures.append(
+                    "M: blocked but the self-completed match was not demoted "
+                    f"to an advisory; advisories={rm_.get('advisories')}")
+            if not any("g-888-92" in (m.get("commit") or "")
+                       for m in rm_.get("matches", [])):
+                failures.append(
+                    "M: blocking matches must contain the partner-tagged "
+                    f"commit; matches={rm_.get('matches')}")
+
+        # O: parent-lineage demotion unaffected when new args are passed —
+        # discovered_by parent tag still demotes even with self_agent +
+        # world_dir supplied (and priority order lineage-before-self holds:
+        #  is BOTH lineage parent and self-completed; it must carry
+        # the lineage attribution)
+        repo5 = base / "repo5"
+        repo5.mkdir()
+        _git(repo5, "init", "-q")
+        _git(repo5, "config", "user.email", "test@example.com")
+        _git(repo5, "config", "user.name", "git-log-test")
+        t5 = repo5 / "core" / "scripts" / "widget_xyz.py"
+        t5.parent.mkdir(parents=True)
+        t5.write_text("# widget\n", encoding="utf-8")
+        _git(repo5, "add", "-A")
+        _git(repo5, "commit", "-q", "-m", "feat(g-888-90): ship widget_xyz")
+        ro = goal_duplication._check_git_log(
+            {"discovered_by": "g-888-90"}, fp, repo5,
+            self_agent="zeta-test", world_dir=world)
+        if ro.get("passed") is not True:
+            failures.append(
+                "O: expected PASS via lineage demotion with new args present; "
+                f"got passed={ro.get('passed')} reason={ro.get('reason')!r}")
+        elif not any(a.get("lineage_exempt")
+                     for a in ro.get("advisories", [])):
+            failures.append(
+                "O: lineage attribution must win over self-completion when "
+                "the tag is both (most-specific-first); "
+                f"advisories={ro.get('advisories')}")
+
     if failures:
         print(f"FAIL ({len(failures)} cases)")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (5/5 cases)")
+    print("PASS (15/15 cases)")
     return 0
 
 

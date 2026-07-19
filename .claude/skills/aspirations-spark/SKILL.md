@@ -21,7 +21,10 @@ Invoked after every goal completion as Phase 6 (spark check) and Phase 6.5 (imme
 Mandatory writes for this obligation: see `core/config/obligation-schema.yaml`
 → `obligations.spark`. Spark has no mandatory writes — it's discretionary
 by design — but abbreviation is explicitly permitted when
-`outcome_class == routine`. When skipping, log one line in the journal:
+`outcome_class == routine`. When skipping, log one line in the NARRATIVE
+daily journal (`agents/<agent>/journal/YYYY/MM/YYYY-MM-DD.md` — plain text;
+NEVER `journal.jsonl`, a JSON-per-line index that one raw text line corrupts —
+2026-07-16 line-309 incident, every subsequent daemon append 500'd):
 `OBLIGATION ABBREVIATED: spark — {condition}`. The learning-gate audit
 (Phase 9.5d) verifies the claimed condition was true at iteration time.
 
@@ -235,6 +238,13 @@ doubt between framework and domain, pick domain.
         # Check forge criteria immediately
         # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
         IF gap.status == "forged": skip forge criteria check
+        # Registry cross-check (g-326-09 incident; mirrors evolve Step 9): before trusting
+        # gap.status, grep world/forged-skills.yaml for `gap_ref: {gap.id}`. If a forged skill
+        # already references this gap, the local skill-gaps.yaml status is STALE (observed 11
+        # days stale for gap-006 despite a daemon-routed read) — SKIP the gap.
+        # forged-skills.yaml is the authoritative cross-agent registry; it is low-write-frequency
+        # and far less divergence-prone than skill-gaps.yaml (guard-1163 family).
+        Bash: grep -q "gap_ref: {gap.id}" "$WORLD_DIR/forged-skills.yaml" && SKIP this gap (already forged by another agent)
 
         Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
         Read agents/<agent>/developmental-stage.yaml → current stage
@@ -247,14 +257,29 @@ doubt between framework and domain, pick domain.
            AND gap.estimated_value >= "medium"
            AND developmental stage >= EXPLOIT (developing+)
            AND curriculum-contract-check exit code == 0:
-            # Verify no pending forge goal already exists for this gap
-            Bash: load-aspirations-compact.sh → IF path returned: Read it
-            (compact aspirations now in context — search goals for this gap ID)
-            IF no existing forge goal:
+            # Live-store dedup (g-115-2284 — replaces compact-search; the in-context compact is
+            # doubly stale: context-read dedup + local-mirror render):
+            Bash: aspirations-query.sh --goal-field origin_signal "idea:forge-ready-{gap.id}"
+            Bash: aspirations-query.sh --title-contains "Forge skill: {gap.procedure_name}"
+            #   (second probe catches legacy datestamped origin_signal variants)
+            IF either probe returns a pending/in-progress goal: SKIP — duplicate exists.
+            IF either probe ERRORS (non-zero exit or unparseable output): WARN loudly + SKIP —
+                suppression gates fail CLOSED (guard-487); a missed filing re-detects on the
+                next encounter, a cross-box duplicate does not self-heal.
+            IF both probes returned clean-empty ([]):
                 Route to target aspiration (current → matching category → /create-aspiration)
                 Build goal: title "Forge skill: {gap.procedure_name}",
-                  skill "/forge-skill", args "skill {gap.id}", priority "MEDIUM"
-                Add via aspirations-update.sh --source {source}
+                  skill "/forge-skill", args "skill {gap.id}", priority "MEDIUM",
+                  origin_signal EXACTLY "idea:forge-ready-{gap.id}" — canonical form, NO
+                  datestamp suffix (a datestamped variant defeats the duplication-gate's
+                  Strategy-1 exact match; g-115-2284 incident g-115-2279-vs-g-307-54)
+                Add via aspirations-add-goal.sh --source {source} {asp.id} (goal JSON on stdin —
+                  the canonical gated single-goal writer; replaces aspirations-update.sh here so
+                  the goal-duplication-gate baseline fires at this site too, matching Step 9)
+                Post-filing read-back: re-run the origin_signal probe; only log "forge goal
+                  filed" when the goal reads back (own-cloud can silently swallow the write while
+                  echoing success — insight msg-20260714-213836-echo-3288). IF read-back empty:
+                  WARN + retry the add once, then file-or-fail loudly.
                 Log in journal: "Forge-ready gap detected during execution: {gap.id}"
                 Log: echo '{"date":"...","event":"forge-ready","details":"Gap {gap.id} detected in Phase 6.5 from {goal.id}","trigger_reason":"immediate-learning-forge"}' | bash core/scripts/evolution-log-append.sh
 
@@ -493,9 +518,36 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
      b. "The code/system might actually handle this because: ___"
      c. If (b) identifies a plausible mechanism the code already handles it,
         reduce confidence by 0.15 (the "well-engineered codebase" prior).
-     d. Record the pre-mortem in the experience archive (Step 2.5 content).
+     d. Scope-quantifier decomposition (g-115-2576; runs at ANY proposed
+        confidence, not just > 0.65 — the 2026-07-18 replay found the failure
+        band at 0.5-0.68): if the claim contains a scope quantifier — "single
+        cause", "all N", "every", "systemic", "complete", "fleet-wide",
+        "none", "pure" — decompose it per-conjunct / per-member (rb-2572) and
+        price confidence off the WEAKEST conjunct, or NARROW the claim to the
+        members actually evidenced. 5 of 10 replayed CORRECTED hypotheses
+        shared exactly this shape: single-cause→multi-mechanism, systemic→
+        isolated, all-N→1-of-N, fleet-wide→one-box-over. A quantified claim
+        is a conjunction; its confidence is bounded by its weakest member.
+     e. Discriminating-power check (rb-4133; g-001-51, 2026-07-19) — the
+        mirror of (d): where (d) guards OVER-claiming breadth (CORRECTED-prone),
+        this guards a criterion with ZERO discriminating power (CONFIRMED-prone,
+        and therefore useless). If the prediction claims an intervention CHANGED
+        something, ask "could this criterion have come out the OTHER way?" The
+        criterion MUST then be a rate, mix, or before/after comparison — NEVER an
+        existence test, because the thing being tested is a DIFFERENCE and an
+        existence test has no difference in it. Cheap tell: if the criterion is
+        satisfiable WITHOUT the intervention existing (baseline behavior already
+        produces it), it measures the baseline, not the intervention — replace
+        it. Second tell: skipping a rate/mix measurement in favor of a binary
+        one on "sharpness" grounds trades power for comfort — the mix
+        measurement is the one that can embarrass you, which is exactly why it
+        is the informative one. Unambiguity is not discriminating power.
+     f. Record the pre-mortem in the experience archive (Step 2.5 content).
      SKIP this step only if the prediction is about external systems
-     (AWS behavior, third-party APIs) rather than project code quality.
+     (AWS behavior, third-party APIs) rather than project code quality —
+     and even then, clause (d) still applies to the claim's own quantifiers,
+     and clause (e) still applies to any claim that an intervention changed
+     something.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
 2. Add goal to aspiration: read current aspiration via `aspirations-read.sh --id <asp-id>`,
    add new goal with hypothesis fields, then pipe updated aspiration JSON to
@@ -540,6 +592,7 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
             created: "{ISO timestamp}"
             category: "{hypothesis category}"
             summary: "Hypothesis: {claim} (confidence: {N})"
+            goal_id: "{goal.id}"   # CANONICAL join key (experience.md schema). The recurring-close 4.25 canary and experience-read --goal match on THIS field — omitting it made template-written entries invisible to both (g-115-2511: writers drifted to source_goal by analogy with the rb/guardrail stores, false-firing force_experience_archival on deep closes)
             hypothesis_id: "{hypothesis_id}"
             tree_nodes_related: [nodes from context manifest]
             verbatim_anchors: [key evidence excerpts that informed the prediction]
@@ -775,7 +828,12 @@ When sq-018 fires after goal completion:
 
    # origin_signal MUST come from the canonical list enforced by
    # core/scripts/origin-signal-gate.py. Bare "sq-018" is rejected — use the
-   # "maintain:" prefix form with a short tag.
+   # "maintain:" prefix form with a short tag. The tag MUST be UNIQUE per
+   # goal (e.g. "maintain:sq-018-<what-the-check-covers>") — the
+   # goal-duplication gate's origin_signal strategy exact-matches, so a
+   # fixed literal here makes every later sq-018 goal false-block against
+   # every earlier one (observed 2026-07-11: marker-check goal blocked
+   # against the unrelated g-115-1993 evolution-capture checks).
    # aspirations-add-goal.sh reads JSON from STDIN (BODY="$(cat)" at line 103);
    # positional JSON args are silently discarded.
    echo '{"title":"Maintain: add verify-learning check for <file>",
@@ -784,7 +842,7 @@ When sq-018 fires after goal completion:
       "participants":["agent"],
       "discovered_by":"<goal.id>",
       "discovery_type":"capability_gap",
-      "origin_signal":"maintain:sq-018-verify-learning"}' \
+      "origin_signal":"maintain:sq-018-<distinct-tag-for-this-check>"}' \
      | bash core/scripts/aspirations-add-goal.sh --source world asp-115
 
 4. Log: `echo '{"event":"spark","details":"sq-018: Goal <goal-id> proposed verify-learning check for <file>","date":"<today>"}' | bash core/scripts/evolution-log-append.sh`

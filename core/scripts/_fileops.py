@@ -22,7 +22,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from _paths import WORLD_DIR, META_DIR, AGENT_DIR, PROJECT_ROOT
+from _paths import WORLD_DIR, META_DIR, AGENT_DIR, PROJECT_ROOT, agents_root
 from _path_helpers import looks_like_cruft
 # Lodestar cutover (s2): the raw lock / atomic-write primitives now live behind
 # a pluggable storage backend so the same _fileops orchestration (history,
@@ -240,9 +240,18 @@ def _classify_base(base_dir):
                 return "meta"
         except (ValueError, OSError):
             pass
-    if AGENT_DIR:
+    # Cross-agent (b34a169b port / 9): classify ANY agent dir under
+    # agents_root() as "agent", not only the bound AGENT_DIR — mirrors
+    # resolve_base_dir so the snapshot blacklist routes to the right store for
+    # every agent's files. A base is an agent dir iff it is a direct child of
+    # agents_root() (agents_root/<name>); agents_root() itself is not.
+    try:
+        ar = agents_root().resolve()
+    except (ValueError, OSError, TypeError):
+        ar = None
+    if ar:
         try:
-            if bd == AGENT_DIR.resolve():
+            if bd != ar and bd.parent == ar:
                 return "agent"
         except (ValueError, OSError):
             pass
@@ -297,11 +306,19 @@ _PER_FILE_SNAPSHOT_CAP = {
         "pipeline.jsonl":           100,
         "team-state.yaml":          100,  # cross-agent liveness signal — high churn
         "aspirations-meta.json":    50,
+        # Board channels — proven high-churn (827 coordination snapshots in
+        # 4 days on cc-04, 0). Exact rel-path match, one entry per
+        # fixed channel file.
+        "board/coordination.jsonl": 100,
+        "board/findings.jsonl":     100,
+        "board/general.jsonl":      100,
+        "board/decisions.jsonl":    100,
     },
     "meta": {
         "changelog.jsonl":          100,
         "improvement-velocity.yaml": 50,
         "goal-selection-strategy.yaml": 50,
+        "spark-questions.jsonl":    100,  # 877 snapshots in 4 days on cc-04 (0)
     },
 }
 
@@ -682,8 +699,14 @@ def resolve_base_dir(path):
     """Determine which base directory (WORLD_DIR, META_DIR, AGENT_DIR, or PROJECT_ROOT/.claude/) a path belongs to.
 
     Returns the base dir Path, or None if the path doesn't match any
-    configured directory. Order: WORLD_DIR > META_DIR > AGENT_DIR > .claude/.
-    AGENT_DIR is None when no agent is bound (MIND_AGENT unset) — that branch is skipped.
+    configured directory. Order: WORLD_DIR > META_DIR > agent dir (ANY agent
+    under agents_root()) > .claude/.
+
+    Cross-agent resolution (g-115-2169 / b34a169b port, Defect A fix): resolves
+    ANY agents_root()/<name> dir, not only the MIND_AGENT-bound one, so the
+    own-cloud sweep (which syncs ALL agent dirs) snapshots every agent's files
+    before a pull instead of silently skipping non-bound agents. agents_root()
+    itself and out-of-root paths → None.
 
     Phase 1 G1 patch (world/conventions/self-program-evolution.md): AGENT_DIR added
     so save_history(), append_changelog(), and the locked_write_* family
@@ -710,10 +733,26 @@ def resolve_base_dir(path):
                 return META_DIR.resolve()
         except (ValueError, OSError):
             pass
-    if AGENT_DIR:
+    # Cross-agent dir resolution (b34a169b port / 9, Defect A fix):
+    # resolve ANY agent dir under agents_root(), not only the MIND_AGENT-bound
+    # AGENT_DIR. The own-cloud sweep syncs ALL agent dirs; before this a
+    # NON-bound agent path returned None here, so owncloud_sync._snapshot_before_pull's
+    # fail-open guard ("if base is None: return") silently skipped the pre-pull
+    # .history snapshot and the sweep clobbered every non-bound agent's files with
+    # no backup. Returning the specific agent subdir (agents_root/<name>) restores
+    # the snapshot for every agent. Subsumes the old AGENT_DIR-only branch —
+    # AGENT_DIR == agents_root()/<bound-name>, so a bound-agent path resolves
+    # identically. agents_root() itself and out-of-root paths fall through to None.
+    try:
+        ar = agents_root().resolve()
+    except (ValueError, OSError, TypeError):
+        ar = None
+    if ar:
         try:
-            if path.is_relative_to(AGENT_DIR.resolve()):
-                return AGENT_DIR.resolve()
+            if path != ar and path.is_relative_to(ar):
+                rel = path.relative_to(ar)
+                if rel.parts:
+                    return (ar / rel.parts[0]).resolve()
         except (ValueError, OSError):
             pass
     claude_dir = (PROJECT_ROOT / ".claude").resolve()
@@ -1488,6 +1527,22 @@ def _slot_update_count(wm, slot):
         return int(sm.get("update_count", 0))
     except (TypeError, ValueError):
         return 0
+
+
+def durable_write_text(tmp_path, text, encoding="utf-8"):
+    """Write text to tmp_path and fsync BEFORE the caller's atomic rename.
+
+    A bare write_text() + os.replace() survives a crash in metadata only:
+    NTFS journals the rename while the data blocks are still unflushed, so
+    the renamed file can come back as all-0x00 content (canonical incident:
+    charlie session d600a945 working-memory.yaml, 8140 null bytes after a
+    60+ min autocompact hang — g-001-44). flush+fsync pins the data to disk
+    before the rename can make it the live file.
+    """
+    with open(tmp_path, "w", encoding=encoding) as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def loop_state_cas_retry(read_fn, mutate_fn, write_fn, *,

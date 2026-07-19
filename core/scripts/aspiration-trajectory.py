@@ -411,8 +411,20 @@ def build_trajectory(asp_id, shared=None):
     velocity_window = config.get("velocity_window", 5)
     current_velocity = compute_learning_velocity(goal_artifacts, velocity_window)
     inflection_points = detect_inflection_points(goal_artifacts)
-    is_plateau = detect_plateau(goal_artifacts, config)
-    is_diminishing = detect_diminishing_returns(goal_artifacts, config)
+    # Record-level exemption (7): maintenance-scope queues (recurring
+    # upkeep aspirations) legitimately run at ~0 learning velocity — that is
+    # their normal operating point, not a stalled learning direction. An
+    # aspiration carrying plateau_exempt: true suppresses BOTH flags so evolve
+    # Step 1.5 stops re-making the same skip-judgment every cadence pass.
+    # Velocity is still computed and reported (informative); only the flags
+    # are suppressed. Set via: aspirations-update.sh <asp-id> plateau_exempt true
+    # Strict-boolean contract (fresh-eyes finding 2026-07-16): only a real JSON
+    # boolean true exempts. A truthy STRING ("False", "no", string-typed "true")
+    # keeps detection ON — fail-safe: malformed values stay visible via the
+    # flag rather than silently suppressing detection.
+    plateau_exempt = asp.get("plateau_exempt") is True
+    is_plateau = (not plateau_exempt) and detect_plateau(goal_artifacts, config)
+    is_diminishing = (not plateau_exempt) and detect_diminishing_returns(goal_artifacts, config)
 
     # Determine primary category (most common across goals)
     cat_counts = {}
@@ -452,6 +464,7 @@ def build_trajectory(asp_id, shared=None):
         "velocity_window": velocity_window,
         "plateau_detected": is_plateau,
         "diminishing_returns": is_diminishing,
+        "plateau_exempt": plateau_exempt,
         "config": config,
     }
 

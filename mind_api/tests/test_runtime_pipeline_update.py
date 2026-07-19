@@ -247,21 +247,12 @@ def test_update_formation_quality_failed(pipeline_daemon):
     assert "validation_failed" in body
 
 
-def test_update_does_not_search_archive(pipeline_daemon):
-    """Update searches live file only — archived records are not found."""
-    project_root, port = pipeline_daemon
-    archive = project_root / "world" / "pipeline-archive.jsonl"
-    archived_rec = _rec(id="2026-01-01_archived-only", stage="archived",
-                        outcome="CONFIRMED")
-    archive.write_text(json.dumps(archived_rec) + "\n", encoding="utf-8")
-
-    replacement = _rec(id="2026-01-01_archived-only")
-    status, body = _post_expect_error(
-        port, "/v1/pipeline/update",
-        {"id": "2026-01-01_archived-only"},
-        json.dumps(replacement).encode("utf-8"))
-    assert status == 404
-    assert "record_not_found" in body
+# NOTE (5 / rb-2239): update() now probes the ARCHIVE when the id is
+# absent from live, so multi-field-corrupt archived records have an atomic
+# whole-record repair path. The former `test_update_does_not_search_archive`
+# (404 on archive-only ids) asserted the retired live-only contract and was
+# removed. The current contract is pinned in test_runtime_pipeline_writers.py::
+# test_update_reaches_archive and ::test_update_not_found_in_either.
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +262,7 @@ def test_update_does_not_search_archive(pipeline_daemon):
 def test_update_history_snapshot_created(pipeline_daemon):
     """History snapshot is created on update."""
     project_root, port = pipeline_daemon
-    history_dir = project_root / "world" / ".history" / "pipeline.jsonl"
+    history_dir = project_root / "world" / ".history" / "snapshots" / "pipeline.jsonl"
     assert not history_dir.exists()
 
     replacement = _rec(id="2026-05-12_test-active", stage="active")

@@ -256,6 +256,7 @@ Goals that re-fire on a schedule use these fields:
 
 - `recurring`: `true`/`false` — whether the goal repeats. Set to `false` to permanently stop.
 - `interval_hours`: positive number — hours between executions (e.g., 0.25, 4, 8, 24). Default: 24.
+- `offload_decision`: string — **REQUIRED at add time when `recurring: true` or `interval_hours` is present** (operator-offload gate, gh-005 in `meta/aspiration-generation-strategy.yaml`). One line stating why this work stays on the LLM loop instead of becoming an Ayoai-Operator scheduled job: `"stays-mind: judgement/retrieval-heavy (<what>)"`, `"stays-mind: mind-box-local state (<what>)"`, `"stays-mind: web research"`, or `"operator-pull: reads <JobName> audit rows"`. Enforced at both daemon add sites in `mind_api/src/endpoints/aspirations_write.py`; bypass with `--override-offload "<reason>"`. Rationale: a recurring goal burns a full LLM iteration every cycle — deterministic + clocked + checkable work belongs on the operator (`/build-operator-job`, `world/conventions/operator-ramp.md`, rb-3281). Goals predating 2026-07-13 have no field (gate fires only on ADD, never retroactively).
 - `remind_days`: DEPRECATED — converted to `interval_hours * 24` for backward compatibility. Use `interval_hours` for new goals.
 - `lastAchievedAt`: `YYYY-MM-DDTHH:MM:SS` — full ISO 8601 timestamp of last completion. Legacy `YYYY-MM-DD` format is accepted (assumes start of day).
 - `achievedCount`: integer — total times completed

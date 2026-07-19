@@ -240,6 +240,41 @@ def _extract_dep_ids(text: str) -> list[str]:
     return out
 
 
+def _classify_time_gated_dep(g: dict, by_id: dict) -> dict | None:
+    """Recognize-only (g-115-2098): deferred_until goal whose defer_reason
+    names dependency goal-ids that have ALL completed.
+
+    deferred_until stays authoritative (g-001-193) — this NEVER clears.
+    But when the cited deps complete EARLY (before the gate date), the goal
+    is an early-completion candidate the LLM should review: estimate-only
+    gates ("resolve after g-X completes", date = outer-bound guess) can be
+    acted on now; observation windows (resolves_no_earlier_than semantics,
+    where elapsed TIME is the point) must stand. Auto-clearing cannot
+    distinguish the two — a surfaced classification can (canonical case:
+    g-115-2052 sat gated to 07-16 while its census dep g-115-2051 completed
+    07-13 and fully resolved the underlying hypothesis; only manual
+    grooming caught it). Mirrors the precon_timegate recognize-only
+    precedent.
+    """
+    reason = g.get("defer_reason") or ""
+    if not reason:
+        return None
+    dep_ids = _extract_dep_ids(reason)
+    if not dep_ids:
+        return None
+    statuses = {did: (by_id.get(did) or {}).get("status") for did in dep_ids}
+    if not all(s == "completed" for s in statuses.values()):
+        return None
+    return {"goal_id": g.get("id"), "action": "skipped",
+            "pattern": "deps_complete_time_gated",
+            "dep_ids": dep_ids,
+            "reason": (f"all cited deps completed ({', '.join(dep_ids)}) but "
+                       f"deferred_until={g.get('deferred_until')} holds the goal — "
+                       f"early-completion candidate: review whether the time gate is "
+                       f"still load-bearing (estimate-only gates can resolve now; "
+                       f"observation windows must stand). Never auto-cleared.")}
+
+
 def _try_precon_elapsed(reason: str, by_id: dict) -> dict | None:
     """Pattern (a) — precondition_unmet: NNh_elapsed_since_g-XXX-YY_<event>.
 
@@ -707,6 +742,7 @@ def main():
     cleared = 0
     would_clear = []
     details = []
+    time_gated_early = []  # g-115-2098: deps-complete-but-time-gated goal ids
 
     for g in all_goals:
         scanned += 1
@@ -723,7 +759,14 @@ def main():
         # a structured gate; when one IS present, defer_reason is parallel
         # narrative and clearing it would not change selection behavior.
         # See g-001-193 investigation (2026-04-27) and docstring above.
+        # g-115-2098: before skipping, surface (recognize-only, never clear)
+        # the early-completion case — all cited deps completed but the time
+        # gate still holds. See _classify_time_gated_dep.
         if g.get("deferred_until"):
+            tg = _classify_time_gated_dep(g, by_id)
+            if tg is not None:
+                time_gated_early.append(tg["goal_id"])
+                details.append(tg)
             continue
         age_h = _age_hours(g.get("defer_reason_set_at") or g.get("started") or g.get("created_at"))
         if age_h is None or age_h < args.max_age_hours:
@@ -844,6 +887,7 @@ def main():
         "eligible": eligible,
         "cleared": cleared,
         "would_clear": would_clear,
+        "time_gated_early_candidates": time_gated_early,
         "details": details,
         "apply": args.apply,
         "metrics_log": str(metrics_path) if metrics_path else None,

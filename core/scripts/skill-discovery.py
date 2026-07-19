@@ -124,12 +124,12 @@ def days_between(d1, d2):
 
 
 def collect_invocation_dates(skill_name, quality_data, relations_data,
-                              journal_dates, companion_dates):
-    """Collect all invocation timestamps for a skill from four data sources.
+                              journal_dates, companion_dates, ledger_dates):
+    """Collect all invocation timestamps for a skill from five data sources.
 
-    Four independent sources provide multi-signal corroboration (rule 1 of
+    Five independent sources provide multi-signal corroboration (rule 1 of
     .claude/rules/verify-before-assuming.md). A skill flagged silent across
-    all four is high-confidence; a skill present in any one is downgraded
+    all five is high-confidence; a skill present in any one is downgraded
     out of silently_undertriggering.
 
     1. skill-quality.yaml evaluations — scored executions (subset of all
@@ -146,6 +146,12 @@ def collect_invocation_dates(skill_name, quality_data, relations_data,
        access-roblox-studio (26 companion invocations / 30d) appear
        silently_undertriggering. See zeta/reports/g-115-798-investigate-
        skill-discovery-silent-flags.md and g-115-879.
+    5. agents/<name>/skill-invocations.jsonl ledger — the PRIMARY per-model-
+       invocation record (one line per Skill-tool fire, `skill` + `ts`
+       fields). Was MISSING until g-115-2280 (2026-07-16): the audit flagged
+       notify-user cold_after_use(110d) while the ledger held 80 fires, the
+       latest the previous day — the reported ages were age-since-forge
+       artifacts of seeing zero invocations, not real silence.
 
     Returns (dates, sources) where dates is the deduplicated sorted list
     used for invocation arithmetic, and sources is a per-source raw count
@@ -156,7 +162,7 @@ def collect_invocation_dates(skill_name, quality_data, relations_data,
     """
     dates = []
     sources = {"quality": 0, "co_invocation": 0, "journal": 0,
-               "companion_script": 0}
+               "companion_script": 0, "ledger": 0}
 
     skills = quality_data.get("skills", {}) or {}
     skill_info = skills.get(skill_name, {})
@@ -187,7 +193,49 @@ def collect_invocation_dates(skill_name, quality_data, relations_data,
         dates.append(dt)
         sources["companion_script"] += 1
 
+    for dt in ledger_dates.get(skill_name, []):
+        dates.append(dt)
+        sources["ledger"] += 1
+
     return sorted(set(dates)), sources
+
+
+def collect_ledger_skill_dates(skill_names):
+    """Scan all agents/<name>/skill-invocations.jsonl ledgers once.
+
+    The ledger is the PRIMARY invocation record: the Skill-tool tracking
+    path appends {"ts", "skill", "agent", "sid", "invocation_source"} on
+    every model invocation. Exact match on the `skill` field (no regex —
+    the field is already the bare skill name). Same tolerance contract as
+    the journal scanner: half-written tails skipped via JSONDecodeError.
+
+    AGENTS-ROOT GLOB (g-115-1405 class): use the _paths SSOT agents_root()
+    — NEVER PROJECT_ROOT.glob("*/...") (depth-1 matches nothing post-
+    relocation; see the CLAUDE.md cross-agent glob-consumer table).
+    """
+    out = {name: [] for name in skill_names}
+    if not skill_names:
+        return out
+    wanted = set(skill_names)
+    for ledger_path in agents_root().glob("*/skill-invocations.jsonl"):
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                name = rec.get("skill")
+                if name not in wanted:
+                    continue
+                dt = parse_iso(rec.get("ts") or rec.get("timestamp"))
+                if dt:
+                    out[name].append(dt)
+    return out
 
 
 def collect_journal_skill_dates(skill_names):
@@ -356,14 +404,14 @@ def collect_companion_script_dates(skill_names, forged_skills):
 
 
 def classify(skill_name, forged_info, quality_data, relations_data,
-             journal_dates, companion_dates, strategy, now):
+             journal_dates, companion_dates, ledger_dates, strategy, now):
     """Compute discovery metrics + classification for one forged skill."""
     forged_date = parse_iso(forged_info.get("forged_date"))
     days_since_forge = days_between(forged_date, now)
 
     invocations, sources = collect_invocation_dates(
         skill_name, quality_data, relations_data, journal_dates,
-        companion_dates,
+        companion_dates, ledger_dates,
     )
     total_invocations = len(invocations)
     sources_with_data = sum(1 for v in sources.values() if v > 0)
@@ -486,6 +534,7 @@ def build_report(now=None):
     skill_names = sorted(forged.keys())
     journal_dates = collect_journal_skill_dates(skill_names)
     companion_dates = collect_companion_script_dates(skill_names, forged)
+    ledger_dates = collect_ledger_skill_dates(skill_names)
 
     skills_out = []
     counts = {}
@@ -494,7 +543,7 @@ def build_report(now=None):
         if not isinstance(info, dict):
             continue
         record = classify(name, info, quality, relations, journal_dates,
-                          companion_dates, strategy, now)
+                          companion_dates, ledger_dates, strategy, now)
         skills_out.append(record)
         counts[record["status"]] = counts.get(record["status"], 0) + 1
 

@@ -98,7 +98,16 @@ cases = [
         "need user trust confirmation for credential rotation",
         set(),  # no specific skill required, just policy expectations
         {"add-npc-task"},  # but stopwords shouldn't trigger false matches
-        True,  # capability-routing.md row on credentials triggers block
+        # Flipped True→False (3 triage, 2026-07-16): the comment
+        # "capability-routing.md row on credentials triggers block" was never
+        # true — the only credentials row is Genuinely-Human-Only ("Must be
+        # created in AWS IAM by user"). The block actually rode a sole
+        # generic-token match ('rotation' → the SSH-to- row's "host-key
+        # rotation" prose), which the  precision rule (2026-07-13)
+        # correctly suppresses. Trust-confirmation for credential rotation is
+        # a genuine security-trust user-leg — NOT blocking user-routing here
+        # is the correct policy.
+        False,
     ),
     (
         "d_stopwords_dont_match_alone",

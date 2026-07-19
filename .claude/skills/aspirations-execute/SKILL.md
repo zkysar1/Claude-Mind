@@ -266,13 +266,18 @@ Guard: the probe is fail-open. A crash, a missing `aspirations-read.sh`,
 unreadable target files, or an extraction yielding zero identifiers all
 produce `verdict="unknown"` and a no-op — never a false block on real work.
 
-## Phase 3.9: Pre-Execution Domain Steps — lightweight: SKIP if trivial_mode (already conditional)
+## Phase 3.9: Pre-Execution Domain Steps — lightweight: trivial_mode runs ONLY the repo-sync step
 
 ```
 Bash: load-conventions.sh pre-execution → IF path returned: Read it
 # Procedural convention — gate on file EXISTENCE, not load status.
 Bash: test -f "$WORLD_DIR/conventions/pre-execution.md"
-IF exists: follow each step; any step returning SKIP → mark goal skipped, GOTO Phase 7.
+IF exists AND NOT trivial_mode: follow each step; any step returning SKIP → mark goal skipped, GOTO Phase 7.
+IF exists AND trivial_mode: run ONLY the repo-sync step (pre-execution.md
+  "Pull Latest") when the goal touches a shared git checkout; skip the rest.
+  # A trivial edit against a stale checkout is still a wrong edit
+  # (user directive 2026-07-19: religious pull-before / push-after on
+  # every shared checkout — read-only goals included).
 ```
 
 ## Phase 3.95: Depth Estimate — lightweight: SKIP if trivial_mode
