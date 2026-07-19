@@ -34,6 +34,13 @@ spec = importlib.util.spec_from_file_location("_target_state", TS_PATH)
 ts_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ts_mod)
 
+# Neutralize gate telemetry for test invocations — defense-in-depth alongside
+# the PYTEST_CURRENT_TEST guard inside _gate_log.log() (). Before that
+# guard existed, every run of this file appended ~16 synthetic read-intent-verbs
+# firings (caller="unknown") to the PRODUCTION meta/gate-firings.jsonl — leaked
+# since 2026-05-17, discovered during .
+ts_mod._gate_log = lambda *args, **kwargs: None
+
 is_read_intent = ts_mod.is_read_intent
 
 
@@ -106,6 +113,27 @@ def test_empty_title():
     """Empty/None title short-circuit unchanged."""
     assert is_read_intent("") is False
     assert is_read_intent(None) is False
+
+
+# ───  finding 4: no-colon read-verb in a subordinate clause ────
+# A READ verb that is NOT the leading word of a COLON-LESS title is a
+# subordinate clause, not the primary action. Before the finding-4 fix the
+# verb loop iterated every prefix word and 'review' here matched → True (FP).
+# The colon path is UNCHANGED (any pre-colon word still matches).
+
+def test_no_colon_read_verb_mid_clause_not_read():
+    """'review' is mid-clause; leading word 'Refactor' is not a read verb."""
+    assert is_read_intent("Refactor and review the API") is False
+
+
+def test_no_colon_leading_read_verb_still_matches():
+    """The finding-4 fix must NOT regress a colon-less leading read verb."""
+    assert is_read_intent("Investigate the pipeline stall") is True
+
+
+def test_colon_pre_colon_read_verb_not_first_still_matches():
+    """Colon path unchanged: any pre-colon word matches, not just the first."""
+    assert is_read_intent("Deep audit: schema drift") is True
 
 
 # ─── Regression cases: existing READ_INTENT_VERBS still work ────────────

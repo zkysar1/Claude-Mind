@@ -16,7 +16,7 @@
 #   2 — one or more required prerequisites missing
 #
 # What's required vs warned:
-#   REQUIRED: Python 3.8+, PyYAML (`yaml` importable), bash 4+
+#   REQUIRED: Python 3.10+, PyYAML (`yaml` importable), bash 4+
 #   REQUIRED (own-cloud only): boto3 — checked ONLY when STORAGE_BACKEND=own-cloud
 #     (the S3/DynamoDB backend imports it lazily; local installs never need it).
 #     Missing boto3 on an own-cloud machine otherwise surfaces only as a dead
@@ -57,7 +57,7 @@ fi
 
 # --- Python presence + version ---
 if [[ -z "$PY" ]]; then
-    REQUIRED_MISSING+=("Python 3.8+ (not found on PATH)")
+    REQUIRED_MISSING+=("Python 3.10+ (not found on PATH)")
     DETAILS+=("  Install from https://www.python.org/downloads/ (check 'Add to PATH' on Windows)")
 else
     # Extract version. eval is safe here — PY is one of three known tokens.
@@ -66,8 +66,8 @@ else
     PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
     if [[ -z "$PY_MAJOR" || -z "$PY_MINOR" ]] \
        || (( PY_MAJOR < 3 )) \
-       || (( PY_MAJOR == 3 && PY_MINOR < 8 )); then
-        REQUIRED_MISSING+=("Python 3.8+ (found: $PY_VERSION via '$PY')")
+       || (( PY_MAJOR == 3 && PY_MINOR < 10 )); then
+        REQUIRED_MISSING+=("Python 3.10+ (found: $PY_VERSION via '$PY')")
         DETAILS+=("  Upgrade Python from https://www.python.org/downloads/")
     fi
 fi

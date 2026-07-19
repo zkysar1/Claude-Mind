@@ -6,7 +6,7 @@
 # --- FRAMEWORK ---
 
 config:
-  K_max: 4
+  K_max: 40   # raised 4→40 by user directive 2026-07-14 (supersedes g-306-13's K=4). Observed max fan-out was 26 (system-constraints-loop) and the fleet never enforced K=4 (all structural ops skipped); retrieve.sh flat-scores nodes so hub width does not degrade recall, and wide-shallow shapes shorten paths (Windows MAXPATH). Leaf cap K_max^(D_retrieval-1) derives to 64,000 — count-based DECOMPOSE/REGROUP pressure is effectively retired; regroup on SEMANTIC incoherence only.
   D_max: 20
   D_retrieval: 4
   split_threshold: 3
@@ -25,6 +25,12 @@ pruning:
   distill_min_retrievals: 5               # minimum retrievals before DISTILL eligible
   distill_line_threshold: 50              # line count threshold for large-but-mediocre nodes
   distill_line_utility_threshold: 0.5     # utility threshold for line-count-based DISTILL
+  # 7: sparse-feedback + stale-signal filters for the UTILITY triggers
+  # (crit1/crit2 only — crit3 is structural and unaffected). One noise vote made
+  # utility_ratio=0 look meaningful, flagging 525 of 817 leaves as a STANDING
+  # false-positive pool that polluted the tree-debt metric (692 vs threshold 40).
+  distill_min_feedback_votes: 3           # (times_helpful + times_noise) below this = utility signal is noise, not evidence
+  distill_recency_days: 45                # last_retrieved older than this = utility signal too stale to act on (missing = stale)
   # crit3 (0): proactive trigger for append-grown recurring-sweep nodes.
   # Fires DISTILL before a node trips the Read ~25k-token cap (which forces a
   # read-before-edit re-read on every sweep), reusing the rb-2085 procedure.
@@ -224,7 +230,7 @@ domain_health:
 
 # Bounds for self-tuning. Each 'default' MUST match the actual config value above.
 modifiable:
-  K_max: {min: 3, max: 6, default: 4}
+  K_max: {min: 3, max: 40, default: 40}   # bounds widened with the 2026-07-14 user directive; default matches config value above
   D_max: {min: 4, max: 20, default: 20}
   D_retrieval: {min: 3, max: 20, default: 4}
   split_threshold: {min: 3, max: 10, default: 3}

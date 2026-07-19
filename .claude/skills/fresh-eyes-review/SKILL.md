@@ -93,7 +93,16 @@ Read agents/<agent>/session/pending-questions.yaml
 # (2026-05-24): a no_change verdict landed with self_evolution_signals_count=0
 # while alpha self-drift finding msg-20260523-091626-alpha-1586 sat unread on
 # the findings board (later actioned by hand as g-115-1213). See rb-1279.
-Bash: board-read.sh --channel findings --since 30d --json
+# --unread-only (g-115-2486): count only UNACTIONED signals. A signal ACTIONED
+# via `board.py mark-read` (consumed into concrete work, or explicitly retired
+# with a resolution note) drops out of the count so it stops re-counting as
+# net-divergent residue every review within the 30d window (the stale-signal
+# treadmill g-115-2486 fixed: echo ARC-frontier 06-27 + retired-charlie sq-012
+# 07-04 re-counted every fresh-eyes review until marked read). Aligned with the
+# g-115-1214 intent — an unread finding IS exactly an unactioned one, so
+# genuinely-pending signals are still caught (line below already documented "the
+# unread finding(s)"); this only aligns the board-read call with that intent.
+Bash: board-read.sh --channel findings --since 30d --unread-only --json
   → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
     AND directed at this agent (tags include MIND_AGENT, OR text/author names
     this agent, OR the finding carries no agent tag = applies to all)

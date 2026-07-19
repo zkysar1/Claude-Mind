@@ -70,7 +70,7 @@ def stress_world(tmp_path: Path):
     """Tmp world dir with the structure _fileops expects."""
     pr = tmp_path / "repo"
     pr.mkdir()
-    (pr / "agents" / "alpha").mkdir()
+    (pr / "agents" / "alpha").mkdir(parents=True)
     (pr / "agents" / "alpha" / "session").mkdir()
     world = pr / "world"
     world.mkdir()

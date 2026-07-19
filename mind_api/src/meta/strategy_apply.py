@@ -41,11 +41,15 @@ from typing import Any, Dict, List
 
 import yaml
 
-import _gate_log  # noqa: E402 — module-level log(); daemon passes meta_dir explicitly
-
 from .. import file_locks, history, changelog
 from ..agent_paths import assert_not_cruft
 
+# core/scripts imports MUST follow the relative imports above — file_locks
+# installs core/scripts on sys.path at module load (sibling-module pattern,
+# e.g. meta_backpressure). _gate_log ahead of them ModuleNotFoundError'd on
+# any isolated import (tests); the real daemon only worked because another
+# module happened to load first (0).
+import _gate_log  # noqa: E402 — module-level log(); daemon passes meta_dir explicitly
 from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noqa: E402
 
 

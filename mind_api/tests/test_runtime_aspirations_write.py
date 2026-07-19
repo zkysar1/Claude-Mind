@@ -87,9 +87,15 @@ def test_add_goal_honors_caller_provided_id(running_daemon):
 
 
 def test_add_goal_history_snapshot_created(running_daemon):
+    # 0: history.snapshot delegates to _fileops.save_history, whose
+    # Stage-2 authoritative store is the CAS-delta layout — assert a manifest
+    # lands under .history/snapshots/<rel>/ instead of the legacy per-file
+    # uncompressed tree (which is no longer written by default).
     project_root, port = running_daemon
-    history_dir = project_root / "world" / ".history" / "aspirations.jsonl"
-    assert not history_dir.exists()
+    manifest_dir = (project_root / "world" / ".history" / "snapshots"
+                    / "aspirations.jsonl")
+    legacy_dir = project_root / "world" / ".history" / "aspirations.jsonl"
+    assert not manifest_dir.exists()
 
     status, _ = _post(
         port, "/v1/aspirations/add-goal",
@@ -98,17 +104,16 @@ def test_add_goal_history_snapshot_created(running_daemon):
         agent="alpha",
     )
     assert status == 200
-    assert history_dir.exists()
-    # Filter to the .jsonl snapshot itself; the .meta sidecar carries the
-    # summary string and is expected when history.snapshot is given one.
-    snapshots = [p for p in history_dir.iterdir() if p.suffix == ".jsonl"]
-    assert len(snapshots) == 1
-    name = snapshots[0].name
-    assert name.endswith("_alpha.jsonl")
-    # And the sidecar exists with summary text:
-    metas = [p for p in history_dir.iterdir() if p.suffix == ".meta"]
-    assert len(metas) == 1
-    assert "add-goal" in metas[0].read_text(encoding="utf-8")
+    assert manifest_dir.exists()
+    manifests = [p for p in manifest_dir.iterdir() if p.suffix == ".yaml"]
+    assert len(manifests) == 1
+    name = manifests[0].name
+    assert name.endswith("_alpha.yaml")
+    # The manifest carries the summary inline (no .meta sidecar in the CAS store).
+    assert "add-goal" in manifests[0].read_text(encoding="utf-8")
+    # And the legacy uncompressed tree is NOT re-created (the 13.9G/4days
+    # growth shape this unification killed).
+    assert not legacy_dir.exists()
 
 
 def test_add_goal_changelog_appended(running_daemon):

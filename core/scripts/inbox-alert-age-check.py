@@ -328,6 +328,8 @@ def _send_email(goal: dict, severity: str, age_hours: float, no_email: bool) -> 
         # only). Without Body these escalations delivered as title + empty body.
         "Body": "\n".join(body_lines),
         "InfoMessage": "\n".join(body_lines),
+        # Provenance stamp — email-send.sh refuses payloads without it (6).
+        "XPayloadProvenance": "inbox-alert-age-check/v1",
     }
     if no_email:
         return True, "no_email"

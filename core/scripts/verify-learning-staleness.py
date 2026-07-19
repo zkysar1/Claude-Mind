@@ -102,21 +102,29 @@ _GREP_TARGET_RE = re.compile(
 )
 
 # L4: Bash: <script>.sh|<script>.py invocation extraction.
-# Matches `Bash: <runner>? <full-script-path>.{sh,py} <args-until-shell-meta-or-paren>`.
-# Captures the full path and the args-tail. The args capture STOPS at the
-# first shell metacharacter (`|`, `&`, `;`, `>`, `<`) OR opening paren `(`
+# Matches `Bash: <var=$(>? <runner>? <full-script-path>.{sh,py} <args-until-shell-meta-or-paren>`.
+# Captures the full path and the args-tail. An OPTIONAL command-substitution
+# assignment prefix (`var=$(`) is consumed BEFORE the runner so the very common
+# dedup-guard form `Bash: existing=$(bash <script> --flag ...)` is scanned —
+# without it the whole line was skipped and stale flags on the highest-stakes
+# call sites (dedup guards whose false-empty result fails open into filing a
+# DUPLICATE goal) were never checked (6). The args capture STILL STOPS
+# at the first shell metacharacter (`|`, `&`, `;`, `>`, `<`) OR opening paren `(`
 # so flags belonging to (a) a downstream piped command (e.g., `grep -q`
 # after `script.sh ... |`) or (b) parenthesized prose comments (e.g.,
 # `wm-read.sh encoding_queue --json  (if --selective mode)`) are NOT
-# mis-attributed to the script. Quoted scripts (`'foo.sh'`) are not
-# matched — pseudocode rarely uses them; a known limitation. Quote-aware
-# arg parsing is also out of scope (a regex pattern with `(` inside `"..."`
-# would be truncated; rare enough to accept).
+# mis-attributed to the script. Widening the PREFIX must never weaken this TAIL
+# guard (rb-3437 / guard-1081 — a raise/guard is an interface; grep for what
+# depends on current behavior before loosening). Quoted scripts (`'foo.sh'`)
+# and backtick command substitution are not matched — pseudocode rarely uses
+# them; a known limitation. Quote-aware arg parsing is also out of scope (a
+# regex pattern with `(` inside `"..."` would be truncated; rare enough to accept).
 _BASH_SCRIPT_RE = re.compile(
     r"^\s*-?\s*Bash:\s+"
-    r"(?:bash\s+|py\s+-3\s+|python\d?\s+)?"   # optional runner prefix
+    r"(?:[A-Za-z_]\w*=\$\(\s*)?"               # optional command-sub prefix: var=$(
+    r"(?:bash\s+|py\s+-3\s+|python\d?\s+)?"    # optional runner prefix
     r"(\S+\.(?:sh|py))\b"                      # full script path (capture 1)
-    r"(\s[^|&;<>(\n]*)?"                       # args tail, stops at shell meta or `(`
+    r"(\s[^|&;<>(\n]*)?"                        # args tail, stops at shell meta or `(`
 )
 
 # L4: literal flag tokens. Matches `--name` or `-x` not preceded by `<`,

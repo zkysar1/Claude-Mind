@@ -109,10 +109,10 @@ def _load_strategy(ctx):
 
 
 def _collect_invocation_dates(skill_name, quality_data, relations_data,
-                              journal_dates, companion_dates):
+                              journal_dates, companion_dates, ledger_dates):
     dates = []
     sources = {"quality": 0, "co_invocation": 0, "journal": 0,
-               "companion_script": 0}
+               "companion_script": 0, "ledger": 0}
     skills = quality_data.get("skills", {}) or {}
     skill_info = skills.get(skill_name, {})
     if isinstance(skill_info, dict):
@@ -138,6 +138,9 @@ def _collect_invocation_dates(skill_name, quality_data, relations_data,
     for dt in companion_dates.get(skill_name, []):
         dates.append(dt)
         sources["companion_script"] += 1
+    for dt in ledger_dates.get(skill_name, []):
+        dates.append(dt)
+        sources["ledger"] += 1
     return sorted(set(dates)), sources
 
 
@@ -176,6 +179,44 @@ def _collect_journal_skill_dates(ctx, skill_names):
                     continue
                 for m in matches:
                     out[m].append(dt)
+    return out
+
+
+def _collect_ledger_skill_dates(ctx, skill_names):
+    """Scan agents/<name>/skill-invocations.jsonl ledgers across all agents.
+
+    The ledger is the PRIMARY invocation record: the Skill-tool tracking hook
+    appends {"ts", "skill", "agent", "sid", "invocation_source"} on every
+    model-side Skill invocation. Before this source existed the audit
+    false-flagged actively-used skills (g-115-2280: notify-user flagged
+    cold_after_use(110d) while its ledger held 80 fires, latest <1d old).
+    Uses ctx.paths.agents_root (matching the CLI's _paths agents_root() SSOT)
+    — NEVER ctx.paths.project_root.glob("*/...") (the agents/ glob-drift bug
+    class: depth-1 silently matched nothing post-relocation, g-115-1405)."""
+    out = {name: [] for name in skill_names}
+    if not skill_names:
+        return out
+    wanted = set(skill_names)
+    for ledger_path in ctx.paths.agents_root.glob("*/skill-invocations.jsonl"):
+        from storage_backend import get_backend
+        get_backend().ensure_local(ledger_path)  # own-cloud read-path fix: materialize per-agent ledger before local read
+        with open(ledger_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                name = rec.get("skill")
+                if name not in wanted:
+                    continue
+                dt = _parse_iso(rec.get("ts") or rec.get("timestamp"))
+                if dt:
+                    out[name].append(dt)
     return out
 
 
@@ -235,12 +276,13 @@ def _collect_companion_script_dates(ctx, skill_names, forged_skills):
 
 
 def _classify(skill_name, forged_info, quality_data, relations_data,
-              journal_dates, companion_dates, strategy, now):
+              journal_dates, companion_dates, ledger_dates, strategy, now):
     forged_date = _parse_iso(forged_info.get("forged_date"))
     days_since_forge = _days_between(forged_date, now)
 
     invocations, sources = _collect_invocation_dates(
-        skill_name, quality_data, relations_data, journal_dates, companion_dates)
+        skill_name, quality_data, relations_data, journal_dates,
+        companion_dates, ledger_dates)
     total_invocations = len(invocations)
     sources_with_data = sum(1 for v in sources.values() if v > 0)
     last_invocation = invocations[-1] if invocations else None
@@ -342,6 +384,7 @@ def build_report(ctx, now: datetime) -> Dict[str, Any]:
     skill_names = sorted(forged.keys())
     journal_dates = _collect_journal_skill_dates(ctx, skill_names)
     companion_dates = _collect_companion_script_dates(ctx, skill_names, forged)
+    ledger_dates = _collect_ledger_skill_dates(ctx, skill_names)
 
     skills_out = []
     counts = {}
@@ -350,7 +393,7 @@ def build_report(ctx, now: datetime) -> Dict[str, Any]:
         if not isinstance(info, dict):
             continue
         record = _classify(name, info, quality, relations, journal_dates,
-                            companion_dates, strategy, now)
+                            companion_dates, ledger_dates, strategy, now)
         skills_out.append(record)
         counts[record["status"]] = counts.get(record["status"], 0) + 1
 

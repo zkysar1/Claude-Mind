@@ -143,11 +143,33 @@ def test_path_f_bare_string_blocker_ref_coerced():
 
 
 def test_path_f_dict_blocker_ref_returned_unchanged():
-    # A real dict ref must pass through untouched (path f only coerces non-dicts).
+    # A FRESH real dict ref (future expires_at) passes through untouched — path f
+    # coerces non-dicts, and the stale-dict roll-forward below only fires on a
+    # LAPSED expiry, so a future-expiry dict is returned verbatim.
     real = {"type": "user_action", "external_id": "u:xyz",
             "expires_at": _future_iso(5), "synthesized": False}
     g = _goal("g-dict", blocker_ref=real)
     assert synth_ref(g) == real
+
+
+def test_path_f_stale_dict_blocker_ref_rolled_forward():
+    # A STORED typed dict ref whose expires_at has LAPSED is rolled forward to a
+    # future expiry (C3 self-heal, 3 sibling) rather than returned stale
+    # — the  /  case (user_action refs created 2026-05-03,
+    # expired 2026-05-08, still-active blocker) that tripped quiescence C3 into
+    # false denial + B7 churn. type/external_id/created_at are preserved so the
+    # C4 hysteresis hash stays stable; only expires_at advances.
+    stale = {"type": "user_action", "external_id": "user-initiated-game-session",
+             "created_at": "2026-05-03T21:28:50", "expires_at": "2026-05-08T21:28:50",
+             "synthesized": False}
+    g = _goal("g-stale-dict", blocker_ref=stale)
+    ref = synth_ref(g)
+    assert isinstance(ref, dict)
+    assert _is_future(ref), "C3: a lapsed stored dict ref must be rolled to a future expiry"
+    assert ref["external_id"] == "user-initiated-game-session", "C4: external_id preserved"
+    assert ref["type"] == "user_action", "type preserved"
+    assert ref["created_at"] == "2026-05-03T21:28:50", "created_at preserved"
+    assert ref.get("expiry_rolled_forward") is True
 
 
 def test_path_f_bare_string_external_id_stable():

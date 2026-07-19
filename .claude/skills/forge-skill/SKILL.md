@@ -57,7 +57,7 @@ evaluations). `/forge-skill` layers THIS agent's domain on top:
 - Gap detection via `meta/skill-gaps.yaml` (encounter counts, value estimates)
 - Curriculum and developmental gates (CALIBRATE+ / EXPLOIT+ thresholds)
 - Companion-script generation for restricted operations (SSH, API scopes)
-- Registration in `world/forged-skills.yaml` + `.gitignore`
+- Registration in `world/forged-skills.yaml` + git-commit of the skill body (fleet distribution)
 - Message-board announcement and aspirations-loop validation goal
 
 If you're not sure how to write the body of a skill, read skill-creator first,
@@ -120,8 +120,15 @@ then come back here for the integration requirements.
      - The forged SKILL.md MUST reference companion scripts for restricted
        operations and MUST say "MUST use companion scripts, never raw [tool]"
      - Script naming: `{resource}-{verb}.sh` (e.g., `data-list.sh`, `data-download.sh`)
-     - Scripts go in `world/scripts/` — shared across all agents in the domain.
-       The forge process creates the directory: `mkdir -p "$WORLD_DIR/scripts/"`
+     - Placement fork (framework/domain split, g-115-1982): scripts that touch
+       DOMAIN resources (named services, product APIs, SSH targets, branded
+       workflows) go in `world/scripts/` — shared across all agents in the
+       domain. The forge process creates the directory:
+       `mkdir -p "$WORLD_DIR/scripts/"`. Scripts that are pure FRAMEWORK
+       helpers (storage backend, session state, governed-store plumbing —
+       domain-free by the `domain-leak-check.sh` test) go in `core/scripts/`
+       instead: git-tracked, portable, and they ride the repo's commit flow.
+       Precedent: `core/scripts/backend-cat.sh` (probe-governed-store).
      - PID files live alongside scripts in `world/scripts/` (single-writer, `kill -0` liveness checks)
      - Mark scripts executable: `chmod +x "$WORLD_DIR/scripts/"*.sh`
 
@@ -215,9 +222,48 @@ then come back here for the integration requirements.
    in `core/config/gates.yaml` (`eval-harness-forge-accept`); every verdict is
    telemetered to `meta/gate-firings.jsonl` via `_gate_log`.
 
-4. **Register in Forged Skills** (`world/forged-skills.yaml` + `.gitignore`):
+3.6. **Companion-script dogfood gate** (correctness-critical forges only; g-115-2665):
+   Step 3.5 scores the SKILL.md TEXT, not whether the companion script produces
+   CORRECT OUTPUT — a script can score `good` on all five dims and still emit the
+   wrong verdict. For a gap whose companion script carries correctness-critical
+   logic — a **verifier** (emits a pass/fail verdict), a **computation** (derives a
+   value other code trusts), or a **state-mutating** op (writes/restores files,
+   moves records) — dogfood the script on synthetic fixtures BEFORE registration:
+
+   - Build the smallest PASS fixture, FAIL fixture, and (if the script has an edge
+     mode) one EDGE fixture that should each drive a distinct verdict.
+   - Run the script on each; assert the emitted verdict/value matches the expected
+     one, AND for state-mutating scripts that the side-effect landed and any
+     restore left no residue (byte-verify against a backup).
+   - A script returning the SAME verdict on the PASS and FAIL fixtures is VACUOUS
+     (no discriminating power — mirrors guard-1220's two-way proof + rb-4133); do
+     NOT register it. Fix, re-run, register only when PASS→pass / FAIL→fail and
+     side-effects verify.
+
+   For a verifier / state-mutating script the `mutation-proof-regression-test`
+   forged skill (`core/scripts/mutation-proof-test.sh`) IS this harness — invoke it
+   on one of the script's guarded targets; for a pure computation script a
+   3-fixture inline assertion suffices. SCOPE: verification / computation /
+   state-mutating gaps ONLY — thin API-wrapper forges (shell one documented command,
+   no correctness-critical branch) are EXEMPT; note the exemption in the forge log
+   and proceed to Step 4. (guard-1220, rb-4004, rb-4124 — done manually for gap-019,
+   now required by the process.)
+
+4. **Register in Forged Skills** (`world/forged-skills.yaml` + git-commit the body):
    - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
-   - Add `.claude/skills/{new-skill-name}/` to `.gitignore` under the forged skills section
+   - **Git-commit the skill body for fleet distribution** (g-115-2373, 2026-07-16):
+     `git add .claude/skills/{new-skill-name}/` — the iteration close-commit sweeps
+     it to origin, and every fleet box picks it up on its next `iteration-push`
+     pull. Rationale: the registry syncs fleet-wide through the governed store and
+     advertises triggers on every box, but `.claude/` is NOT an own-cloud governed
+     root — a gitignored body existed ONLY on its birth box, so trigger resolution
+     dispatched to un-invokable skills on 4/5 boxes (found by g-115-2358 validation).
+     Do NOT write a nested `.claude/skills/{name}/.gitignore` and do NOT add a
+     ROOT `.gitignore` line — both ignore forms are retired (the g-115-2272
+     parallel-forge collision was the shared root-.gitignore FILE; disjoint new
+     skill DIRS cannot conflict). Promotion-seed purity is unaffected:
+     `_seed_engine.py` auto-derives seed exclusions from the registry (g-306-88),
+     so a committed forged body still never leaks into the domain-free seed.
    - Do NOT touch `_tree.yaml` or `_triggers.yaml` — those are static framework files
 
 5. **Update Skill Gaps** (`meta/skill-gaps.yaml`):
@@ -270,8 +316,17 @@ then come back here for the integration requirements.
 Run structural integrity checks across all system registries:
 
 1. **Forged skills audit** (`world/forged-skills.yaml`):
-   - Every entry has a matching SKILL.md in `.claude/skills/{name}/`
-   - Every entry has a matching `.claude/skills/{name}/` line in `.gitignore`
+   - Every entry has a matching SKILL.md in `.claude/skills/{name}/` — a missing
+     dir on THIS box means the birth box has not yet committed the body
+     (pre-g-115-2373 forge) or the pull hasn't landed; check `git log --all --
+     .claude/skills/{name}/` before concluding the body is lost fleet-wide.
+   - Every LOCALLY-PRESENT entry is git-TRACKED (`git ls-files
+     .claude/skills/{name}/` non-empty) and NOT ignored (`git check-ignore
+     .claude/skills/{name}/SKILL.md` exits 1). Forged bodies ride the fleet git
+     channel as of 2026-07-16 (g-115-2373); both ignore forms (nested
+     per-skill `.gitignore`, root-`.gitignore` lines) are retired. The
+     regression this audit catches is a present-but-ignored or
+     present-but-untracked forge — invisible to the fleet, birth-box-only.
    - Every entry has a `forged_by` field
    - No orphaned `.claude/skills/` directories missing from the registry
 
@@ -452,7 +507,7 @@ forge becomes a zombie skill that undertriggers forever.
 ### Validation
 - [ ] A test goal is queued to exercise the skill 3 times before it is trusted
 - [ ] Entry added to `world/forged-skills.yaml` with `forged_by`, `gap_ref`, `triggers`
-- [ ] `.claude/skills/{new-skill-name}/` added to `.gitignore` under forged skills
+- [ ] Skill body staged for the fleet: `git add .claude/skills/{new-skill-name}/` ran clean, `git check-ignore .claude/skills/{new-skill-name}/SKILL.md` exits 1, and NO nested `.gitignore` was written (ignore forms retired — bodies are git-distributed; g-115-2373)
 
 If any item is FAIL, the forge is not ready — fix it first or abort and
 re-queue the gap with updated notes. Forging a skill that never fires does not

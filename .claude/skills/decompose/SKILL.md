@@ -54,6 +54,12 @@ a prior session. Re-decomposing would duplicate work.
 IF goal.status == "decomposed" OR (goal.decomposed_into is a non-empty list):
     # Verify at least one child is still live.
     Bash: aspirations-read.sh --active  (locate children by ID)
+    # --active filters to status==active aspirations (g-115-2604 parity fix) —
+    # a child parked in a PAUSED aspiration is invisible to this dump. Before
+    # concluding a child is gone, fall back to a per-id read of its parent
+    # aspiration (derive asp-id from the goal-id prefix: g-336-04 -> asp-336):
+    #   Bash: aspirations-read.sh --id <asp-id>  (finds paused/any-status parents)
+    # Only children found in NEITHER read count as missing/terminal.
     live_children = [c for c in children if c.status in {pending, in-progress, blocked}]
     IF live_children is non-empty:
         # No-op — prior decomposition is intact and children are actionable.
@@ -358,12 +364,30 @@ If yes, create a companion hypothesis goal alongside the sub-goals:
 
 ```
 1. File each sub-goal under the aspiration — one call per sub-goal. The daemon
-   appends to the goals array AND recomputes progress.total_goals automatically:
-   echo '<sub-goal-json>' | bash core/scripts/aspirations-add-goal.sh <aspiration-id>
+   appends to the goals array AND recomputes progress.total_goals automatically.
+   Pass --override-duplication on EACH child. WHY: decomposition children
+   legitimately overlap their parent AND their already-filed siblings (all share
+   the parent's vocabulary + the "decomposition:<parent>" origin_signal). The
+   goal-duplication gate's Strategy-1 (origin_signal exact-match) already exempts
+   them, and _lineage_relation demotes a child-vs-PARENT structural overlap — but
+   Strategy-2 (structural keyword/file overlap) still HARD-BLOCKS a child against
+   its already-filed SIBLINGS (g-115-1446 deliberately keeps Strategy-2 firing on
+   siblings as the only backstop against a decompose emitting two IDENTICAL
+   children; _lineage_relation has no decomposition-sibling case). So the 2nd+
+   child of every multi-child decomposition trips structural_overlap and needs the
+   override (observed: g-115-2688-a/b/c each needed it — g-115-2702; note the
+   symptom reads "overlap with pending PARENT" but the real blocker is the
+   siblings). Passing it consciously here IS the review g-115-1446 intends —
+   /decompose KNOWS these are distinct deliverables of one parent — and the
+   override is audit-logged to world/goal-duplication-overrides.jsonl with the
+   justification, so a genuinely-duplicate child still surfaces there for review:
+   echo '<sub-goal-json>' | bash core/scripts/aspirations-add-goal.sh <aspiration-id> --source {goal.source} --override-duplication "decomposition child of <parent-goal-id> — distinct deliverable that legitimately shares parent+sibling vocabulary; structural_overlap expected (g-115-1446 backstop preserved via this audit-logged override; g-115-2702)"
 2. Mark the parent goal decomposed (goal-level field-merge):
-   Bash: aspirations-update-goal.sh <parent-goal-id> status decomposed
+   Bash: aspirations-update-goal.sh <parent-goal-id> status decomposed --source {goal.source}
 3. Record the children on the parent goal:
-   Bash: aspirations-update-goal.sh <parent-goal-id> decomposed_into '[<sub-goal-ids>]'
+   Bash: aspirations-update-goal.sh <parent-goal-id> decomposed_into '[<sub-goal-ids>]' --source {goal.source}
+   # --source = the parent goal's queue from selector output (Source Routing
+   # Protocol rules 1-2: propagate to every call; children go to the parent's queue)
 4. Update _index files if needed
 5. Notify the user about the decomposition.
    (Check world/forged-skills.yaml for a skill whose triggers match

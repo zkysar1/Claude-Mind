@@ -164,7 +164,7 @@ def test_add_defaults_stage_to_discovered(pipeline_daemon):
 
 def test_add_history_snapshot_created(pipeline_daemon):
     project_root, port = pipeline_daemon
-    history_dir = project_root / "world" / ".history" / "pipeline.jsonl"
+    history_dir = project_root / "world" / ".history" / "snapshots" / "pipeline.jsonl"
     assert not history_dir.exists()
 
     status, _ = _post(
@@ -191,7 +191,7 @@ def test_move_changes_stage(pipeline_daemon):
     project_root, port = pipeline_daemon
     live = project_root / "world" / "pipeline.jsonl"
 
-    # The conftest seeds "2026-05-12_test-active" at stage=active.
+    # The pipeline_daemon fixture seeds "2026-05-12_test-active" at stage=active.
     status, body = _post(
         port, "/v1/pipeline/move",
         {"id": "2026-05-12_test-active", "stage": "resolved"},
@@ -199,6 +199,9 @@ def test_move_changes_stage(pipeline_daemon):
             "outcome": "CONFIRMED",
             "claim": "This is a sufficiently long claim field for validation",
             "rationale": "Test resolution rationale for this hypothesis",
+            # : CONFIRMED/CORRECTED moves must carry >=1 verifiable
+            # evidence pointer (file:line shape satisfies the gate).
+            "outcome_detail": "verified by mind_api/tests/test_runtime_pipeline_writers.py:1",
         }).encode("utf-8"))
     assert status == 200
     resp = json.loads(body)
@@ -212,26 +215,60 @@ def test_move_changes_stage(pipeline_daemon):
     assert rec["stage"] == "resolved"
 
 
-def test_move_to_archived_transfers_record(pipeline_daemon):
+def test_move_to_resolved_requires_evidence(pipeline_daemon):
+    """: a CONFIRMED/CORRECTED move with no evidence pointer in any
+    resolution field (and no experience_ref / evidence_for / evidence_override)
+    is refused, so the calibration number stays independently auditable."""
+    _, port = pipeline_daemon
+    status, body = _post_expect_error(
+        port, "/v1/pipeline/move",
+        {"id": "2026-05-12_test-active", "stage": "resolved"},
+        json.dumps({
+            "outcome": "CONFIRMED",
+            "claim": "This is a sufficiently long claim field for validation",
+            "rationale": "Test resolution rationale for this hypothesis",
+        }).encode("utf-8"))
+    assert status == 400
+    assert "resolution_evidence_required" in body
+
+
+def test_move_to_archived_tombstones_record(pipeline_daemon):
+    """6 tombstone-in-live archival: the record STAYS in live as a
+    stage=archived tombstone (the own-cloud union-by-id merge cannot express
+    a cross-file removal), the archive gains exactly one deduped copy, and
+    archive_sweep prunes the tombstone after PRUNE_GRACE_DAYS."""
     project_root, port = pipeline_daemon
     live = project_root / "world" / "pipeline.jsonl"
     archive = project_root / "world" / "pipeline-archive.jsonl"
 
     before_live = len(_read_jsonl(live))
-    before_archive = len(_read_jsonl(archive))
 
-    # Move the resolved record (seeded by conftest) to archived.
+    # Move the resolved record (fixture-seeded) to archived.
     status, body = _post(
         port, "/v1/pipeline/move",
         {"id": "2026-05-12_test-resolved", "stage": "archived"})
     assert status == 200
 
+    # Live keeps the record as a stage=archived tombstone with a prune clock.
     after_live = _read_jsonl(live)
-    after_archive = _read_jsonl(archive)
-    assert len(after_live) == before_live - 1
-    assert len(after_archive) == before_archive + 1
-    assert not any(r["id"] == "2026-05-12_test-resolved" for r in after_live)
-    assert any(r["id"] == "2026-05-12_test-resolved" for r in after_archive)
+    assert len(after_live) == before_live
+    tomb = next(r for r in after_live if r["id"] == "2026-05-12_test-resolved")
+    assert tomb["stage"] == "archived"
+    assert tomb.get("archived_date")
+
+    def _archive_copies():
+        return [r for r in _read_jsonl(archive)
+                if r["id"] == "2026-05-12_test-resolved"]
+
+    # Archive holds exactly one copy.
+    assert len(_archive_copies()) == 1
+
+    # Re-moving the tombstone is dedup-safe: still exactly one archive copy.
+    status, _ = _post(
+        port, "/v1/pipeline/move",
+        {"id": "2026-05-12_test-resolved", "stage": "archived"})
+    assert status == 200
+    assert len(_archive_copies()) == 1
 
 
 def test_move_not_found(pipeline_daemon):
@@ -269,7 +306,7 @@ def test_move_merges_data(pipeline_daemon):
 
 def test_move_history_and_changelog(pipeline_daemon):
     project_root, port = pipeline_daemon
-    history_dir = project_root / "world" / ".history" / "pipeline.jsonl"
+    history_dir = project_root / "world" / ".history" / "snapshots" / "pipeline.jsonl"
     cl = project_root / "world" / "changelog.jsonl"
 
     _post(port, "/v1/pipeline/move",

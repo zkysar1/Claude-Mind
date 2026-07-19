@@ -193,6 +193,13 @@ def main():
                    help="JSON object for statistical negations")
     p.add_argument("--infra-health-check", type=str, default=None,
                    help="JSON object for infrastructure blockers")
+    p.add_argument("--credential-source-enumeration", type=str, default=None,
+                   help="JSON array for credentials-required blockers: one "
+                        "{source, identity, probed, denied} per credential source "
+                        "the runtime could resolve (env pair, default chain, stored "
+                        "profile, instance role). Required by blocker-create-gate "
+                        "check 5 (guard-1160) — >=2 distinct sources, each "
+                        "action-probed and denied.")
     p.add_argument("--diagnostic-context", type=str, default="{}",
                    help="JSON object for blocker record")
     p.add_argument("--intended-participants", default="agent",
@@ -295,6 +302,12 @@ def main():
     if args.infra_health_check:
         try:
             blocker_json["infra_health_check"] = json.loads(args.infra_health_check)
+        except json.JSONDecodeError:
+            pass
+    if args.credential_source_enumeration:
+        try:
+            blocker_json["credential_source_enumeration"] = json.loads(
+                args.credential_source_enumeration)
         except json.JSONDecodeError:
             pass
 

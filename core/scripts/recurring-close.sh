@@ -837,7 +837,12 @@ if exp_path.exists():
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if e.get("goal_id") != gid:
+            # Match canonical goal_id OR legacy source_goal (1): 90 of
+            # 476 store entries carry only source_goal (writer templates drifted
+            # by analogy with the rb/guardrail stores where source_goal IS
+            # canonical). Without the fallback the canary false-fires
+            # force_experience_archival on deep closes whose entry exists.
+            if gid not in (e.get("goal_id"), e.get("source_goal")):
                 continue
             cdate_s = e.get("created") or ""
             try:

@@ -213,16 +213,26 @@ def test_append_rejects_missing_agent_header(running_daemon):
 
 def test_append_history_and_changelog(running_daemon):
     """journal.jsonl is agent-rooted; resolve_base_dir G1 patch routes
-    history+changelog under the AGENT dir."""
+    history+changelog under the AGENT dir.
+
+    g-115-2410: history.snapshot delegates to _fileops.save_history — assert
+    the CAS-delta manifest shape under .history/snapshots/<rel>/, and that
+    the legacy per-file uncompressed tree is NOT re-created."""
     project_root, port = running_daemon
-    hist = project_root / "agents" / "alpha" / ".history" / "journal.jsonl"
-    cl = project_root / "agents" / "alpha" / "changelog.jsonl"
-    assert not hist.exists()
+    agent_dir = project_root / "agents" / "alpha"
+    manifest_dir = agent_dir / ".history" / "snapshots" / "journal.jsonl"
+    legacy_dir = agent_dir / ".history" / "journal.jsonl"
+    cl = agent_dir / "changelog.jsonl"
+    assert not manifest_dir.exists()
 
     _post(port, "/v1/store/append", {"store": "journal"},
           json.dumps(_rec()).encode("utf-8"))
 
-    assert hist.exists()
+    assert manifest_dir.exists()
+    manifests = [p for p in manifest_dir.iterdir() if p.suffix == ".yaml"]
+    assert len(manifests) == 1
+    assert manifests[0].name.endswith("_alpha.yaml")
+    assert not legacy_dir.exists()
     entries = _read_jsonl(cl)
     assert any("store-append journal" in (e.get("summary", "") or "")
                for e in entries)

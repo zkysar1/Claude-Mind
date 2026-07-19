@@ -181,9 +181,17 @@ All data comes from framework scripts — no direct JSONL reads.
         #   delta_summary: str  — one-line human description for the report
         # Never error if a key is missing from outcome_prior or outcome_now —
         # the source shape is domain-specific and may change.
-        git_delta       = compute_source_delta(outcome_prior.get("git", {}),      outcome_now.get("git", {}))
-        ci_delta        = compute_source_delta(outcome_prior.get("ci", {}),       outcome_now.get("ci", {}))
-        operator_delta  = compute_source_delta(outcome_prior.get("operator", {}), outcome_now.get("operator", {}))
+        # Sources nest under the top-level `sources:` key in outcome-metrics.yaml
+        # (header written by outcome-metrics-collect.sh). A top-level .get("git")
+        # returns {} for BOTH sides, every source reads moved=false, and the
+        # divergence warning fires FALSELY on any >=5-goal window (observed
+        # 2026-07-16 g-001-04 run — caught by reading the raw file before trusting
+        # the empty delta).
+        prior_src = outcome_prior.get("sources", {}) or {}
+        now_src   = outcome_now.get("sources", {}) or {}
+        git_delta       = compute_source_delta(prior_src.get("git", {}),      now_src.get("git", {}))
+        ci_delta        = compute_source_delta(prior_src.get("ci", {}),       now_src.get("ci", {}))
+        operator_delta  = compute_source_delta(prior_src.get("operator", {}), now_src.get("operator", {}))
         # Process-vs-outcome divergence flag:
         # IF goals_completed_count >= 5 AND no source moved → divergence.
         # This is the exact signal that caught "77 goals done and nothing

@@ -6,9 +6,10 @@ for the override discipline added in Phase 4 of the gate audit/retirement plan.
 ## The Problem It Solves
 
 Filing a single goal can hit 4+ gates (origin-signal, duplication, capability,
-blocker-create depending on path). Each historically had its own bypass flag
-name (`--override-signal`, `--override-duplication`, `--override-agent-match`,
-`--override-blocker-gate`, plus the bare `--override` on standalone gates).
+operator-offload, blocker-create depending on path). Each historically had its
+own bypass flag name (`--override-signal`, `--override-duplication`,
+`--override-agent-match`, `--override-blocker-gate`, `--override-offload`,
+plus the bare `--override` on standalone gates).
 Remembering five different flag names per goal is the cognitive load tax the
 agent's Session-56 audit named explicitly.
 

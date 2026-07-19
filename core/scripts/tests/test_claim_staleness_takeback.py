@@ -50,7 +50,7 @@ def _ago(hours: float) -> str:
 
 
 def _make_world(tmp: Path, *, claimed_by=None, claimed_at=None,
-                recurring=False, interval_hours=None) -> Path:
+                recurring=False, interval_hours=None, started=None) -> Path:
     """Tempdir world with asp-200:  claimed per the args.
 
     The bound (claiming) agent is alpha; the prior claimer is bravo. Only the
@@ -72,6 +72,8 @@ def _make_world(tmp: Path, *, claimed_by=None, claimed_at=None,
         goal["recurring"] = True
     if interval_hours is not None:
         goal["interval_hours"] = interval_hours
+    if started is not None:
+        goal["started"] = started
     asp = {
         "id": "asp-200", "title": "claim staleness take-back regression",
         "motivation": "Test claim() take-back parity with goal-selector",
@@ -226,6 +228,91 @@ def test_takeback_ledger_context_shape():
             assert ctx.get("effective_timeout_hours") == 4.0
 
 
+# --- `started` attempt-marker at claim (7-t / 5) ---------
+# The daemon claim chokepoint stamps `started` via setdefault(), so it is the
+# FIRST-attempt time: set once when a never-attempted goal is claimed, and
+# preserved across every later re-claim or stale take-back. cmd_cycles reads
+# `started` to tell a genuine attempted-then-failed skip from a withdrawn
+# (never-claimed, dedup) skip; clobbering it would corrupt that signal. These
+# lock the setdefault (not assignment) choice against regression.
+
+
+def test_claim_stamps_started_when_absent():
+    """No `started` + claimed -> started == claimed_at (attempt marker stamped)."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))  # unclaimed, no started
+        with DaemonFixture(world, agent="alpha") as df:
+            status, out = _claim(df.port, "g-200-01", "alpha")
+            assert status == 200, f"expected fresh claim 200; got {status}; {out!r}"
+            g = _find_goal(world, "g-200-01")
+            assert g.get("claimed_by") == "alpha"
+            assert g.get("started") is not None, "claim must stamp the attempt marker"
+            assert g.get("started") == g.get("claimed_at"), (
+                f"started must equal the claim timestamp on first claim; "
+                f"started={g.get('started')!r} claimed_at={g.get('claimed_at')!r}")
+
+
+def test_stale_takeback_preserves_started():
+    """Has `started` + STALE take-back -> started UNCHANGED (first-attempt
+    semantics). This is the load-bearing setdefault-vs-assignment lock: an
+    assignment would reset the attempt time to the take-back moment."""
+    original_started = _ago(24)  # attempted a day before the take-back
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), claimed_by="bravo", claimed_at=_ago(10),
+                            started=original_started)
+        with DaemonFixture(world, agent="alpha") as df:
+            status, out = _claim(df.port, "g-200-01", "alpha")
+            assert status == 200, f"expected take-back 200; got {status}; {out!r}"
+            g = _find_goal(world, "g-200-01")
+            assert g.get("claimed_by") == "alpha", "stale claim must be taken back"
+            assert g.get("started") == original_started, (
+                f"take-back must PRESERVE the original attempt marker; "
+                f"started={g.get('started')!r} expected={original_started!r}")
+            # claimed_at IS overwritten (assignment), started is NOT (setdefault):
+            # proves the two fields carry deliberately different write semantics.
+            assert g.get("claimed_at") != original_started
+
+
+def test_own_reclaim_preserves_started():
+    """Has `started` + idempotent same-agent re-claim -> started UNCHANGED
+    (setdefault no-ops when present; survives an autocompact-driven re-claim)."""
+    original_started = _ago(2)
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), claimed_by="alpha", claimed_at=_ago(0.1),
+                            started=original_started)
+        with DaemonFixture(world, agent="alpha") as df:
+            status, out = _claim(df.port, "g-200-01", "alpha")
+            assert status == 200, f"expected own-reclaim 200; got {status}; {out!r}"
+            g = _find_goal(world, "g-200-01")
+            assert g.get("started") == original_started, (
+                f"own re-claim must preserve started; got {g.get('started')!r}")
+
+
+def test_reclaim_after_release_preserves_started():
+    """Has `started` + claimed_by CLEARED (released) + re-claim -> started
+    UNCHANGED. g-115-2192 criterion (2) verbatim: `started` is the FIRST-attempt
+    marker and must survive the release -> re-claim lifecycle (a goal released by
+    aspirations-release.sh, then re-selected + claimed). release does not touch
+    started (only claim's setdefault does), so the re-claim preserves the existing
+    value. Distinct seed from test_own_reclaim_preserves_started (claimed_by
+    present): here claimed_by is None — the exact RELEASED state."""
+    original_started = _ago(6)  # attempted 6h ago, then released back to pending
+    with tempfile.TemporaryDirectory() as tmpd:
+        # Released state: no claimer, but the first-attempt marker survives release.
+        world = _make_world(Path(tmpd), claimed_by=None, claimed_at=None,
+                            started=original_started)
+        with DaemonFixture(world, agent="alpha") as df:
+            status, out = _claim(df.port, "g-200-01", "alpha")
+            assert status == 200, f"expected re-claim 200; got {status}; {out!r}"
+            g = _find_goal(world, "g-200-01")
+            assert g.get("claimed_by") == "alpha", "released goal must be claimable"
+            assert g.get("started") == original_started, (
+                f"re-claim after release must PRESERVE the first-attempt marker; "
+                f"started={g.get('started')!r} expected={original_started!r}")
+            # A fresh claimed_at is stamped (new claim); started is the ORIGINAL.
+            assert g.get("claimed_at") != original_started
+
+
 if __name__ == "__main__":
     test_fresh_claim_by_other_agent_409s()
     test_stale_claim_taken_back()
@@ -234,4 +321,8 @@ if __name__ == "__main__":
     test_recurring_within_cap_still_409s()
     test_own_reclaim_no_ledger()
     test_takeback_ledger_context_shape()
+    test_claim_stamps_started_when_absent()
+    test_stale_takeback_preserves_started()
+    test_own_reclaim_preserves_started()
+    test_reclaim_after_release_preserves_started()
     print("ok")

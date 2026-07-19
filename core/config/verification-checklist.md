@@ -2193,8 +2193,8 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 
 ### BE1. Script Infrastructure
 
-1. `core/scripts/aspirations.py` has `COMPACT_GOAL_KEEP` set and `compact_aspiration()` helper
-2. `core/scripts/aspirations.py` `--active-compact` CLI flag in read mutually exclusive group
+1. `mind_api/src/endpoints/aspirations.py` has `_COMPACT_GOAL_KEEP` set (compact-projection SSOT since g-115-2499 — the CLI `COMPACT_GOAL_KEEP` copy and `compact_aspiration()` helper are retired; `core/scripts/aspirations.py` keeps only a breadcrumb comment)
+2. `aspirations-read.sh --active-compact` routes to the daemon (no CLI read path — daemon-only cutover)
 3. `aspirations-read.sh --active-compact` output has `id`, `title`, `status` but NOT `description`, NOT `verification`
 4. `core/scripts/load-aspirations-compact.sh` exists, follows `load-tree-summary.sh` pattern (staleness check, atomic write, invalidate, check-file)
 5. `core/scripts/load-aspirations-compact.sh` sources `_platform.sh` (MSYS path fix)
@@ -2234,7 +2234,7 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 24. `aspirations-query.sh --goal-status in-progress` returns flat JSON array with `goal_id`, `asp_id`, `source`, `title`, `status` fields
 25. `aspirations-query.sh` searches BOTH world and agent queues (ignores `--source` flag)
 26. `aspirations-query.sh` with no filter flags exits with error (at least one filter required)
-27. `COMPACT_GOAL_KEEP` does NOT include `claimed_by` — comment documents this is intentional (use `aspirations-query.sh` for claim lookups)
+27. `_COMPACT_GOAL_KEEP` (daemon SSOT, `mind_api/src/endpoints/aspirations.py`) does NOT include `claimed_by` — comment documents this is intentional (use `aspirations-query.sh` for claim lookups)
 28. `core/config/conventions/aspirations.md` script table includes all three `aspirations-query.sh` modes
 29. `stop/SKILL.md` Step 3 uses `aspirations-query.sh --goal-status in-progress` (NOT `load-aspirations-compact.sh`)
 30. `aspirations-consolidate/SKILL.md` Step 8.9 uses `aspirations-query.sh --goal-field claimed_by` (NOT `aspirations-read.sh --active-compact`)
@@ -2692,7 +2692,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 5. `core/config/conventions/goal-schemas.md` `blocked_since` entry mentions `cmd_add`, `cmd_add_goal`, and `cmd_update_goal` as auto-setters
 
 ### BO3. Auto-Management (aspirations.py)
-6. `core/scripts/aspirations.py` `COMPACT_GOAL_KEEP` set includes `"blocked_since"`
+6. `mind_api/src/endpoints/aspirations.py` `_COMPACT_GOAL_KEEP` set (daemon SSOT since g-115-2499) includes `"blocked_since"`
 7. `core/scripts/aspirations.py` `cmd_update_goal()` — after `goal[field] = value`, if `field == "blocked_by"` and value is truthy, sets `blocked_since` if not already set
 8. `core/scripts/aspirations.py` `cmd_update_goal()` — if `field == "blocked_by"` and value is falsy, clears `blocked_since` to `None`
 9. `core/scripts/aspirations.py` `cmd_add_goal()` — before lock, if goal has `blocked_by` and no `blocked_since`, auto-sets it
@@ -3021,3 +3021,39 @@ This repo was authored on Windows (git stores `*.sh` at mode 100644) but runs on
 
 39. **Runtime**: `bash core/scripts/check-sh-exec-bits.sh` exits 0 — every core/scripts `*.sh` carries the exec bit (100755). Exit 1 lists any file missing it (a Windows-origin `*.sh` committed at 100644). The check script itself carries +x, obeying its own rule.
 
+## BR11. Gate-Firings Spool Sync-Exclusion Contract (g-115-2405)
+
+Under `STORAGE_BACKEND=own-cloud`, `_gate_log.log()` appends each firing to a machine-local spool (`meta/gate-firings.spool.jsonl`) instead of paying a whole-object S3 RMW per record (measured 3.8–10.1s/append at ~40MB store); `gate-firings-flush.py` (iteration-close maintenance tick) drains it in one batched locked RMW. The lane is safe ONLY because the spool artifacts never sync: they are per-box buffers, and `owncloud_sync` pushing one box's spool to the shared S3 meta prefix would clobber peers' spools (the franken-copy class the spool exists to avoid). The flush lock (`gate-firings.spool.flush.lock`) rides the pre-existing `*.lock` glob. Removing any exclusion entry silently re-arms cross-box clobber. Source: g-115-2405 (spool lane), rb-3732 (spool+flush pattern).
+
+40. **Static**: `grep -c "gate-firings.spool" core/scripts/owncloud_sync.py` returns ≥3 — the three exact-name exclusions (`gate-firings.spool.jsonl`, `gate-firings.spool.flushing.jsonl`, `gate-firings.spool.last-flush`) are present in `_EXCLUDE_NAMES`. AND `grep -q '"\*.lock"' core/scripts/owncloud_sync.py` — the glob covering the flush lock survives.
+41. **Static**: `grep -q "_SPOOL_NAME" core/scripts/_gate_log.py` AND `grep -q "gate-firings.spool.jsonl" core/scripts/gate-firings-flush.py` — writer and flusher agree on the spool basename. A rename on one side only strands records in a file the other side never reads.
+42. **Static**: `grep -q "gate-firings-flush.py" core/scripts/iteration-close.sh` — the flush tick is wired into do_productivity_check. Without a consumer, spooled firings accumulate unbounded and never reach the shared store (the g-115-280 writer-without-consumer class, applied to telemetry).
+
+## BR12. Daemon History-Snapshot Delegation Contract (g-115-2407 / g-115-2410)
+
+`mind_api/src/history.py::snapshot()` MUST delegate to `_fileops.save_history`
+(the CAS-delta store) — it must NOT carry its own copy body. The pre-fix drift
+(a private `shutil.copy2` body claiming byte-parity) went undetected from the
+2026-05-22 CAS cutover until 2026-07-16, writing uncompressed, uncapped,
+blacklist-free legacy copies (13.9G/4days on one box; filled another box's root
+fs). Suite-level pin: `mind_api/tests/test_daemon_history_cas.py` (5 delegation
+tests). These static checks catch the re-inline drift without needing pytest.
+Source: g-115-2407 (echo) / g-115-2410 (alpha, fix-of-record).
+
+43. **Static**: `py -3 -c "import ast; tree=ast.parse(open('mind_api/src/history.py').read()); calls=[n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and n.attr in ('copy2','copyfile')]; imports=[n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module=='_fileops']; assert not calls, 're-inlined copy body'; assert imports, 'missing _fileops delegation import'; print('PASS')"` — the daemon writer delegates (imports from `_fileops`) and carries no private copy path IN CODE. AST-based, not substring: the module docstring's HISTORY narrative legitimately mentions `shutil.copy2` when describing the pre-fix drift, so a whole-file substring grep false-positives (caught at authoring time, 2026-07-16).
+44. **Runtime**: `STORAGE_BACKEND=local python3 -m pytest mind_api/tests/test_daemon_history_cas.py -q` exits 0 — the delegation contract (CAS manifest + blob, dedup, restore-by-name, guard-600 corrupt-refusal, missing-source no-op) holds end-to-end.
+
+## BR13. Changelog Machine-Local Sync Exclusion (g-115-2385)
+
+`world/changelog.jsonl` is a per-machine append log: every box's `_fileops` locked
+write appends to its OWN copy, and the multi-machine per-machine-suffix +
+aggregation design is deferred (lodestar-bug-master-list B15). The
+`owncloud_sync._EXCLUDE_NAMES` entry is what keeps the per-box copies from
+last-writer-wins clobbering each other through the shared S3 key — and the
+backend's `_machine_local()` consults the same policy, so the exclusion also
+short-circuits `_refresh` before any S3 contact (lane W2-iii of the g-115-2385
+read-lane enumeration). A ~33MB pre-exclusion relic object exists at the S3 key;
+it is dead (never pulled, never updated) and is NOT evidence the file syncs.
+Removing the exclusion entry silently re-arms cross-box changelog clobber.
+
+45. **Static**: `grep -q '"changelog.jsonl"' core/scripts/owncloud_sync.py` — the exact-basename exclusion survives in `_EXCLUDE_NAMES`. Verified by g-115-2385.

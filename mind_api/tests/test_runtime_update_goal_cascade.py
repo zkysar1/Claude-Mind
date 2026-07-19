@@ -67,6 +67,15 @@ def _seed_goal(port, **fields):
         "description": "x" * 100,
     }
     goal.update(fields)
+    # mc-066 (0): the Phase E.5 operator-offload gate 400s any
+    # recurring-shaped seed (recurring=True OR interval_hours present) that
+    # lacks an offload_decision. Inject the fixture decision unless the test
+    # supplies its own — the gate-shape pin test seeds via raw _post
+    # precisely to exercise the 400.
+    if (goal.get("recurring") is True
+            or goal.get("interval_hours") is not None) \
+            and "offload_decision" not in goal:
+        goal["offload_decision"] = "stays-mind: test fixture"
     body = json.dumps(goal).encode("utf-8")
     code, resp_body = _post(port, "/v1/aspirations/add-goal",
                             {"asp_id": "asp-001", "source": "world"}, body)
@@ -918,6 +927,13 @@ def test_layer_d_emits_gate_firing_telemetry(running_daemon,
     calling agent's gate-firings.jsonl. Tests the new _gate_log meta_dir
     override path."""
     project_root, port = running_daemon
+    #  made _gate_log.log() a silent no-op under PYTEST_CURRENT_TEST
+    # unless GATE_LOG_ALLOW_PYTEST is set (synthetic-firing pollution guard).
+    # This test POSITIVELY asserts on the firing record and its destination is
+    # already the hermetic fixture repo (ctx.paths.meta), so opt in — the
+    # in-process daemon shares this env (0; twin of the opt-in
+    #  itself added to test_layer_d_telemetry.py).
+    monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
     g = _seed_goal(port)
 
     def _stub_cap(value, **kw):
@@ -1016,3 +1032,37 @@ def test_defer_date_no_extraction_no_audit_log_entry(running_daemon,
     assert code == 200
     post_size = audit_path.stat().st_size if audit_path.exists() else 0
     assert post_size == pre_size  # No append
+
+
+def test_recurring_seed_without_offload_decision_blocked(running_daemon):
+    """mc-066 gate-shape pin (0 companion): a recurring goal filed
+    WITHOUT an offload_decision must 400 with operator_offload_blocked.
+
+    Seeds via raw _post — deliberately bypassing _seed_goal's fixture
+    injection — so this test breaks loudly if the Phase E.5 gate is ever
+    removed/renamed (the _seed_goal injection would then be dead weight) or
+    if its error contract changes shape.
+    """
+    project_root, port = running_daemon
+    goal = {
+        "title": "Recurring seed missing offload decision",
+        "status": "pending",
+        "origin_signal": "user_directive",
+        "description": "x" * 100,
+        "recurring": True,
+        "interval_hours": 24,
+    }
+    code, resp_body = _post(port, "/v1/aspirations/add-goal",
+                            {"asp_id": "asp-001", "source": "world"},
+                            json.dumps(goal).encode("utf-8"))
+    assert code == 400, resp_body
+    err = json.loads(resp_body)
+    assert err["error"] == "operator_offload_blocked"
+    assert err["gate"] == "operator-offload-gate"
+    assert err["gate_output"]["would_block"] is True
+    # ...and the SAME goal WITH a decision passes the gate:
+    goal["offload_decision"] = "stays-mind: test fixture"
+    code, resp_body = _post(port, "/v1/aspirations/add-goal",
+                            {"asp_id": "asp-001", "source": "world"},
+                            json.dumps(goal).encode("utf-8"))
+    assert code == 200, resp_body

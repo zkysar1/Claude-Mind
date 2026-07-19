@@ -24,6 +24,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from _paths import AGENT_DIR, AGENT_NAME, CONFIG_DIR, CORE_ROOT, PROJECT_ROOT, WORLD_DIR, assert_agent_dir
+from _competence import refresh_competence_for_gates
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "curriculum.yaml"` TypeError class the next line would otherwise raise.
@@ -400,6 +401,12 @@ def cmd_evaluate(args):
         }))
         return
 
+    # Refresh the competence metric BEFORE evaluating (producer wiring,
+    # 6): script-enforced at the evaluate chokepoint so the
+    # stale-metric class (1) cannot recur. Fail-open — on refresh
+    # failure the stored value is used, exactly the pre-wiring behavior.
+    competence_refresh = refresh_competence_for_gates(gates, WORLD_DIR, AGENT_DIR)
+
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     gate_results = []
     all_passed = True
@@ -423,6 +430,13 @@ def cmd_evaluate(args):
     state["stages"][current_idx] = current
     write_yaml(CURRICULUM_PATH, state)
 
+    # next_stage = the promotion target (next stage by list order), independent
+    # of whether gates pass. Emitted for parity with the `status` endpoint and
+    # the daemon evaluate() — the omission caused 3's misdiagnosis.
+    next_stage = (
+        stages[current_idx + 1].get("id")
+        if current_idx + 1 < len(stages) else None)
+
     print(json.dumps({
         "configured": True,
         "current_stage": current_id,
@@ -430,6 +444,8 @@ def cmd_evaluate(args):
         "all_passed": all_passed,
         "gates_total": len(gate_results),
         "gates_passed_count": sum(1 for g in gate_results if g["passed"]),
+        "competence_refresh": competence_refresh,
+        "next_stage": next_stage,
         "gates": gate_results,
     }, indent=2))
 

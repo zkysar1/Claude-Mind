@@ -92,6 +92,40 @@ not a failure mode. Narrative defers without `blocker_ref` are rejected at write
 (see `core/config/conventions/goal-schemas.md` → "Blocker Reference Schema"), so
 quiescence cannot be gamed by fabricating narrative blocks.
 
+## Governed-Store Write-Freeze: Infra-Blocked ≠ Idle
+
+An optimistic-concurrency CAS write-freeze (a stale-ETag-fence, rb-2728/rb-2748)
+can freeze the heavily-written governed stores (`_tree.yaml`, world
+`aspirations.jsonl`, the board, the imp@k velocity store) with `write_conflict`
+while lightly-written stores (team-state, AGENT `aspirations.jsonl`, working
+memory) and git-tracked framework files stay writable -- CAS contention is
+per-file, so the fence lands on whatever the session has been hammering. The
+queue is NOT structurally blocked (goals remain selectable) -- the loop is
+**infra-blocked, not idle**. This is distinct from quiescence: there is no
+`blocker_ref` to earn honest silence, so the quiescence-gate does not apply.
+
+Response once a canonical re-probe confirms the freeze (>=2 `write_conflict`
+signals on the same store):
+
+1. **Do the writable work that exists.** Agent-local + git-tracked surfaces stay
+   writable: agent-queue goals, temp-drain hygiene, framework-doc edits. Creating
+   and closing writable work IS the No-Terminal-State response to a blocked
+   pipeline -- not idling.
+2. **Defer world-queue framework fixes** (daemon-hot-path or daemon-imported
+   code) until the world queue unfreezes, so they land tracked + full-suite-
+   tested rather than untracked under storm-stress. A frozen world
+   `aspirations.jsonl` blocks a clean claim/close -- that messiness is the signal
+   to wait, not to force the change untracked.
+3. **Do NOT spin-retry** the frozen writes (rb-2748). One canonical re-probe per
+   iteration is the diagnostic; more only feeds the contention.
+4. **To pace re-probes, use a turn-HOLDING sleep as the LAST tool call, with NO
+   trailing text.** A `run_in_background` sleep DETACHES and ends the turn -> the
+   Stop hook tight-re-invokes, defeating the pace; trailing prose after ANY
+   terminal tool call ends the turn the same way (rb-629 / return-protocol.md). A
+   foreground `interruptible-sleep.sh <sec>` (auto-backgrounded, bound to the
+   turn) holds the turn for the interval. The fence typically clears on a daemon
+   sync reconciliation.
+
 ## Autonomous Loop Rules
 
 - NEVER ask the user a question during RUNNING state -- not by any means.

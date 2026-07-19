@@ -47,7 +47,8 @@ class _FakeRt:
         self.calls: List[Dict[str, Any]] = []
         self.responses: Dict[str, Any] = {}
         # The script also calls _rt.aspirations_read (helper, not rt_call).
-        self._active_payload: Any = []
+        # Per-source payloads (7: the no-claim scan reads both).
+        self._active_payloads: Dict[str, Any] = {}
         # And _rt.tolerant_decode_aggregate (decoder).
         # We pass through dicts unchanged.
 
@@ -55,16 +56,42 @@ class _FakeRt:
         """The /v1/aspirations/query result for in-progress + claimed_by."""
         self.responses["query"] = json.dumps(goals)
 
-    def set_active_aspirations(self, aspirations: List[Dict[str, Any]]) -> None:
-        """The aspirations_read(active=True) payload."""
-        self._active_payload = {"aspirations": aspirations}
+    def set_active_aspirations(self, aspirations: List[Dict[str, Any]],
+                               source: str = "both") -> None:
+        """The aspirations_read(active=True) payload, per source.
+
+        g-115-2417: the no-claim scan now reads BOTH sources, so payloads are
+        stored per source. Default "both" mirrors the old single-payload fake
+        for the claimed-path tests (their claimed_at lookups read the entry's
+        own source, and their payload goals carry no status so the no-claim
+        scan never counts them). No-claim tests pass an explicit source so
+        scanned_no_claim counts exactly one scan.
+        """
+        payload = {"aspirations": aspirations}
+        if source == "both":
+            self._active_payloads["agent"] = payload
+            self._active_payloads["world"] = payload
+        else:
+            self._active_payloads[source] = payload
 
     def set_team_in_flight(self, in_flight: Optional[Dict[str, Any]]) -> None:
-        """The /v1/team-state/read response for agent_status.<agent>.in_flight."""
+        """The /v1/team-state/read response for agent_status.<agent>.in_flight.
+
+        Dict-valued fields come back as YAML from the real daemon (it ignores
+        any format param — fresh-eyes g-115-2417 live probe); the fake emits
+        YAML so the script's decoder is exercised on the real shape.
+        """
         if in_flight is None:
             self.responses["team_state"] = "null"
         else:
-            self.responses["team_state"] = json.dumps(in_flight)
+            import yaml
+            self.responses["team_state"] = yaml.safe_dump(in_flight)
+
+    def set_all_agent_status(self, agent_status: Dict[str, Any]) -> None:
+        """The /v1/team-state/read response for field=agent_status
+        (g-115-2417 world-orphan in_flight guard). YAML — see above."""
+        import yaml
+        self.responses["team_state_all"] = yaml.safe_dump(agent_status)
 
     def rt_call(self, method: str, path: str, query=None, body=None, headers=None):
         self.calls.append({
@@ -74,6 +101,8 @@ class _FakeRt:
         if path == "/v1/aspirations/query":
             return self.responses.get("query", "[]")
         if path == "/v1/team-state/read":
+            if query and query.get("field") == "agent_status":
+                return self.responses.get("team_state_all", "{}")
             return self.responses.get("team_state", "null")
         if path == "/v1/aspirations/release":
             if self.responses.get("release_fail"):
@@ -86,7 +115,7 @@ class _FakeRt:
         return ""
 
     def aspirations_read(self, source="world", active=False, **kwargs):
-        return json.dumps(self._active_payload)
+        return json.dumps(self._active_payloads.get(source, {"aspirations": []}))
 
     def tolerant_decode_aggregate(self, source, raw):
         if isinstance(raw, (str, bytes)):
@@ -151,6 +180,15 @@ def _write_diary_entry(diary: Path, goal_id: str, timestamp: str,
 def _patch_agent_dir(monkeypatch, mod, agent_dir: Path) -> None:
     """The script imports `agent_dir` from _paths; route it to our tmp."""
     monkeypatch.setattr(mod, "agent_dir", lambda name: agent_dir)
+
+
+def _patch_no_bg(monkeypatch, mod) -> None:
+    """Default the 5 bg-pending probe to False so the pre-existing
+    keep/release/flip tests exercise the stale+no-diary logic WITHOUT the
+    bg-skip guard, and independent of any real `has-pending` subprocess (which
+    is otherwise reachable — and, when subprocess.run is stubbed to
+    returncode=0 as in the release tests, would misread as 'pending')."""
+    monkeypatch.setattr(mod, "_has_pending_background_work", lambda agent: False)
 
 
 def _run_main(mod, argv: List[str], capsys) -> Dict[str, Any]:
@@ -242,6 +280,7 @@ def test_strands_old_claim_no_diary_dry_run(tmp_agent, monkeypatch, capsys):
     agent_name, agent_dir, diary = tmp_agent
     mod, fake = _import_and_patch_rt(monkeypatch)
     _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
 
     claimed_at = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
 
@@ -274,6 +313,7 @@ def test_apply_releases_stranded(tmp_agent, monkeypatch, capsys):
     agent_name, agent_dir, diary = tmp_agent
     mod, fake = _import_and_patch_rt(monkeypatch)
     _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
 
     claimed_at = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
 
@@ -354,6 +394,7 @@ def test_release_failure_keeps_goal(tmp_agent, monkeypatch, capsys):
     agent_name, agent_dir, diary = tmp_agent
     mod, fake = _import_and_patch_rt(monkeypatch)
     _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
 
     claimed_at = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
 
@@ -399,13 +440,14 @@ def test_strands_no_claim_old_inprogress_dry_run(tmp_agent, monkeypatch, capsys)
     agent_name, agent_dir, diary = tmp_agent
     mod, fake = _import_and_patch_rt(monkeypatch)
     _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
 
     last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
     fake.set_query_response([])  # no claimed goals — exercise the no-claim path only
     fake.set_active_aspirations([{
         "id": "asp-001",
         "goals": [_no_claim_goal("g-001-02", last_modified.isoformat())],
-    }])
+    }], source="agent")
 
     summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
 
@@ -432,7 +474,7 @@ def test_keeps_fresh_no_claim(tmp_agent, monkeypatch, capsys):
     fake.set_active_aspirations([{
         "id": "asp-001",
         "goals": [_no_claim_goal("g-001-09", last_modified.isoformat())],
-    }])
+    }], source="agent")
 
     summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
 
@@ -456,7 +498,7 @@ def test_keeps_no_claim_with_recent_diary(tmp_agent, monkeypatch, capsys):
     fake.set_active_aspirations([{
         "id": "asp-001",
         "goals": [_no_claim_goal("g-001-10", last_modified.isoformat())],
-    }])
+    }], source="agent")
 
     summary = _run_main(mod, ["--stale-minutes", "5"], capsys)
 
@@ -471,13 +513,14 @@ def test_apply_flips_no_claim_to_pending(tmp_agent, monkeypatch, capsys):
     agent_name, agent_dir, diary = tmp_agent
     mod, fake = _import_and_patch_rt(monkeypatch)
     _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
 
     last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
     fake.set_query_response([])
     fake.set_active_aspirations([{
         "id": "asp-001",
         "goals": [_no_claim_goal("g-001-02", last_modified.isoformat())],
-    }])
+    }], source="agent")
 
     summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
 
@@ -494,6 +537,111 @@ def test_apply_flips_no_claim_to_pending(tmp_agent, monkeypatch, capsys):
     assert update_calls[0]["query"]["field"] == "status"
     assert json.loads(update_calls[0]["body"]) == "pending"
     assert release_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 5: bg-pending guard — mirror of stop-hook Gate 2.5. A claim that
+# meets the stale+no-diary criteria may be legitimately paused across a turn
+# boundary awaiting REGISTERED background work (OS jobs via background-jobs.sh,
+# Claude sub-agents via pending-agents.sh). The sweep skips the release/flip
+# and records verdict=kept, reason=stranded-skip-bg, summary.skipped_bg += 1.
+# (rb-1533's phase-4 diary marker separately covers the harness-bg-task case.)
+# ---------------------------------------------------------------------------
+
+
+def test_skips_release_when_bg_pending(tmp_agent, monkeypatch, capsys):
+    """Claimed path: stale+no-diary claim is KEPT (not released) when the agent
+    has pending background work; no /v1/aspirations/release call is made."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    monkeypatch.setattr(mod, "_has_pending_background_work", lambda agent: True)
+
+    claimed_at = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([{
+        "goal_id": "g-test-bg1", "asp_id": "asp-test", "source": "world",
+        "title": "Bg-paused", "status": "in-progress",
+    }])
+    fake.set_active_aspirations([{
+        "id": "asp-test",
+        "goals": [{"id": "g-test-bg1", "claimed_at": claimed_at.isoformat()}],
+    }])
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["scanned"] == 1
+    assert summary["released"] == 0
+    assert summary["kept"] == 1
+    assert summary["skipped_bg"] == 1
+    rec = summary["stranded"][0]
+    assert rec["verdict"] == "kept"
+    assert "stranded-skip-bg" in rec["reason"]
+    release_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/release"]
+    assert release_calls == []
+
+
+def test_skips_flip_when_bg_pending(tmp_agent, monkeypatch, capsys):
+    """No-claim path: a stranded-looking no-claim in-progress goal is KEPT (not
+    flipped to pending) when bg work is pending; no update-goal call is made."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    monkeypatch.setattr(mod, "_has_pending_background_work", lambda agent: True)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-bg2", last_modified.isoformat())],
+    }], source="agent")
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["released"] == 0
+    assert summary["kept"] == 1
+    assert summary["skipped_bg"] == 1
+    rec = [r for r in summary["stranded"] if r.get("shape") == "no-claim"][0]
+    assert rec["verdict"] == "kept"
+    assert "stranded-skip-bg" in rec["reason"]
+    update_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/update-goal"]
+    assert update_calls == []
+
+
+def test_has_pending_background_work_probe(tmp_agent, monkeypatch):
+    """The probe returns True iff EITHER has-pending wrapper exits 0 (short-
+    circuiting on the first), and is fail-SAFE toward release (False) when the
+    subprocess raises."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, _fake = _import_and_patch_rt(monkeypatch)
+
+    class _Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+            self.stdout = b""
+            self.stderr = b""
+
+    # Case A: first wrapper exits 0 → pending → True, short-circuits (1 call).
+    calls: List[Any] = []
+
+    def _run_a(cmd, **kw):
+        calls.append(cmd)
+        return _Proc(0)
+
+    monkeypatch.setattr(mod.subprocess, "run", _run_a)
+    assert mod._has_pending_background_work(agent_name) is True
+    assert len(calls) == 1
+
+    # Case B: both wrappers exit 1 → not pending → False.
+    monkeypatch.setattr(mod.subprocess, "run", lambda cmd, **kw: _Proc(1))
+    assert mod._has_pending_background_work(agent_name) is False
+
+    # Case C: subprocess raises → caught → False (never suppress a release).
+    def _run_c(cmd, **kw):
+        raise OSError("boom")
+
+    monkeypatch.setattr(mod.subprocess, "run", _run_c)
+    assert mod._has_pending_background_work(agent_name) is False
 
 
 # ---------------------------------------------------------------------------
@@ -553,3 +701,120 @@ def test_digest_writes_phase_start_after_claim():
         "so a paused-but-claimed goal carries a diary marker post-dating "
         "claimed_at (rb-1533); found phase-start at block-line "
         f"{start_idxs[0]} and claim at block-line {claim_idxs[0]}")
+
+
+# ---------------------------------------------------------------------------
+# 7: world-source no-claim orphans. The no-claim scan originally
+# covered only the agent source ("world goals always claim") — falsified by
+# 3 observed world goals stuck in-progress with claimed_by=null. The scan
+# now runs for BOTH sources; world entries carry one extra guard: a goal
+# named by ANY agent's team-state in_flight is kept (peer mid-execution
+# whose claim record was lost).
+# ---------------------------------------------------------------------------
+
+
+def test_apply_flips_world_no_claim_to_pending(tmp_agent, monkeypatch, capsys):
+    """WORLD-source stale no-claim orphan → flipped to pending with --apply,
+    source=world on the write; no release call."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-115",
+        "goals": [_no_claim_goal("g-115-w1", last_modified.isoformat())],
+    }], source="world")
+    fake.set_all_agent_status({})  # nobody in_flight on it
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["released"] == 1
+    rec = [r for r in summary["stranded"] if r.get("shape") == "no-claim"][0]
+    assert rec["verdict"] == "released"
+    assert rec["source"] == "world"
+    update_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/update-goal"]
+    release_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/release"]
+    assert len(update_calls) == 1
+    assert update_calls[0]["query"]["source"] == "world"
+    assert json.loads(update_calls[0]["body"]) == "pending"
+    assert release_calls == []
+
+
+def test_keeps_world_no_claim_when_peer_in_flight(tmp_agent, monkeypatch, capsys):
+    """WORLD-source stale no-claim orphan named by a PEER's team-state
+    in_flight → KEPT (peer mid-execution, claim record lost); no write."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-115",
+        "goals": [_no_claim_goal("g-115-w2", last_modified.isoformat())],
+    }], source="world")
+    fake.set_all_agent_status({
+        "some-peer": {"in_flight": {"goal_id": "g-115-w2", "phase": "4"}},
+    })
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["released"] == 0
+    rec = [r for r in summary["stranded"] if r.get("shape") == "no-claim"][0]
+    assert rec["verdict"] == "kept"
+    assert "in_flight" in rec["reason"]
+    update_calls = [c for c in fake.calls if c["path"] == "/v1/aspirations/update-goal"]
+    assert update_calls == []
+
+
+def test_agent_no_claim_skips_in_flight_guard(tmp_agent, monkeypatch, capsys):
+    """AGENT-source no-claim orphans never trigger the team-state
+    agent_status read (private queue — no peer can be live on them)."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+
+    last_modified = (dt.datetime.now() - dt.timedelta(minutes=30)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-001",
+        "goals": [_no_claim_goal("g-001-a1", last_modified.isoformat())],
+    }], source="agent")
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["released"] == 1
+    all_status_reads = [c for c in fake.calls
+                        if c["path"] == "/v1/team-state/read"
+                        and c["query"] and c["query"].get("field") == "agent_status"]
+    assert all_status_reads == []
+
+
+def test_world_no_claim_fresh_kept(tmp_agent, monkeypatch, capsys):
+    """WORLD-source no-claim orphan inside the stale window → KEPT (also the
+    landing side for negative ages from cross-box future stamps, g-115-2418)."""
+    agent_name, agent_dir, diary = tmp_agent
+    mod, fake = _import_and_patch_rt(monkeypatch)
+    _patch_agent_dir(monkeypatch, mod, agent_dir)
+    _patch_no_bg(monkeypatch, mod)
+
+    # Future stamp — a UTC peer's write read on an EDT box (age negative).
+    last_modified = (dt.datetime.now() + dt.timedelta(minutes=90)).replace(microsecond=0)
+    fake.set_query_response([])
+    fake.set_active_aspirations([{
+        "id": "asp-115",
+        "goals": [_no_claim_goal("g-115-w3", last_modified.isoformat())],
+    }], source="world")
+
+    summary = _run_main(mod, ["--apply", "--stale-minutes", "5"], capsys)
+
+    assert summary["scanned_no_claim"] == 1
+    assert summary["released"] == 0
+    assert summary["kept"] == 1

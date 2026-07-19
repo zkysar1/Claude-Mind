@@ -279,7 +279,7 @@ def main():
                 "reason": f"{len(failed)}/{len(pc_results)} structured predicates still failing",
                 "struct_pc_count": len(struct_pcs),
                 "failing_predicates": [
-                    {"type": r.predicate_type,
+                    {"type": r.type,
                      "id": r.predicate_id,
                      "reason": r.reason}
                     for r in failed

@@ -147,6 +147,35 @@ if ! bash "$SCRIPT_DIR/seed-preflight.sh" --quiet; then
 fi
 say "seed-preflight: PUBLISHABLE"
 
+# --- Step 3b: promotion-preflight (reconcile-not-mirror drift gate) --------
+# 9: the gate existed since its authoring but had ZERO callers — the
+# target-drift audit (and the 5 weights-contract cross-check) only
+# fired on manual invocation, which is exactly how the rb-498-era promotion
+# clobbered prod-side content. seed-preflight answers "is the SOURCE
+# publishable?"; promotion-preflight answers "does the TARGET lead on anything
+# a mirror would clobber?" — both must pass. Runs for dry-run too (before the
+# dry-run stop). Exit 2 = DRIFT: hard-fail per the gate's contract; conscious
+# acceptance via PROMOTE_ALLOW_DRIFT=1 (loud warning, e.g. a first wired run
+# over known pre-existing divergence being reconciled separately).
+say "running promotion-preflight (reconcile-not-mirror drift gate)..."
+set +e
+bash "$SCRIPT_DIR/promotion-preflight.sh" --source "$PROJECT_ROOT" --target "$TARGET"
+PF_RC=$?
+set -e
+if [[ $PF_RC -eq 0 ]]; then
+  say "promotion-preflight: CLEAN"
+elif [[ $PF_RC -eq 2 ]]; then
+  if [[ "${PROMOTE_ALLOW_DRIFT:-0}" == "1" ]]; then
+    say "WARNING: promotion-preflight detected DRIFT — proceeding because PROMOTE_ALLOW_DRIFT=1 (drift consciously accepted; reconcile after)"
+  elif [[ $DRY -eq 1 ]]; then
+    say "[dry-run] note: promotion-preflight detected DRIFT (would FAIL a real promote — back-port/reconcile first, or PROMOTE_ALLOW_DRIFT=1 to consciously accept)"
+  else
+    fail "promotion-preflight DRIFT — target leads on framework content or carries orphaned meta-strategy weights; back-port/reconcile before promoting (or PROMOTE_ALLOW_DRIFT=1 to consciously accept)"
+  fi
+else
+  fail "promotion-preflight errored (exit $PF_RC) — cannot audit target drift; fix the gate invocation before promoting"
+fi
+
 [[ -z "$BRANCH" ]] && BRANCH="promote/v$LOCAL"
 
 # --- Dry-run stops here (no mutation of the target) ------------------------

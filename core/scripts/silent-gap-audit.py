@@ -126,6 +126,20 @@ SITUATIONAL_SKILL_BASE = (
     "access", "analyze", "monitor", "health",
 )
 
+# Time-windowed completed-goal dedup (6). Dedup-against-open-goals alone
+# lets a gap that was investigated-and-CLOSED re-fire every ~4h strategic scan —
+# the SAME sparse-by-design gap was DEEP-investigated twice before catch. So the
+# dedup corpus ALSO includes goals COMPLETED within this many days: a re-detected
+# gap matching a recent completion is noise → suppress. A match against only an
+# OLDER completion (outside the window) still fires — that is a legitimate
+# regression, and catching the tail/next-regression is the audit's whole point,
+# so dedup-against-all-completed-FOREVER would break it. 14d suppresses the
+# hours-to-days re-fire storm ~84x while keeping regression latency bounded.
+# (For a STRUCTURALLY-permanent sub-threshold gap this still re-fires once per
+# window; the heavier per-target "investigated-and-expected" suppression ledger
+# is the documented alt if that residual proves noisy.)
+COMPLETED_DEDUP_WINDOW_DAYS = 14
+
 
 def load_domain_specs(world_dir=WORLD_DIR):
     """Load deployment-specific detector specs from the optional domain config
@@ -204,6 +218,35 @@ def open_goal_corpus(all_goals):
     corpus = []
     for g in all_goals:
         if g.get("status") not in ("pending", "in-progress"):
+            continue
+        text = " ".join([
+            str(g.get("title") or ""),
+            str(g.get("description") or ""),
+            str(g.get("origin_signal") or ""),
+        ]).lower()
+        corpus.append((g.get("id"), text))
+    return corpus
+
+
+def recent_completed_corpus(all_goals, window_days=COMPLETED_DEDUP_WINDOW_DAYS, now=None):
+    """Build a dedup corpus of goals COMPLETED within the last `window_days`
+    (title + description + origin_signal, lowercased) — the time-windowed
+    completed-goal half of the dedup (g-115-2236). Emits the SAME (id, text)
+    blob shape as open_goal_corpus so is_covered treats it identically. A
+    completed goal with no parseable timestamp is SKIPPED (cannot window it →
+    let the gap fire, the regression-safe direction); a completion OLDER than
+    the window is likewise skipped, so a gap matching only an old completion
+    still fires (legitimate regression — the audit's tail-detection purpose).
+    Pure (takes goals + now) so it is unit-testable."""
+    if now is None:
+        now = _now()
+    cutoff = now - dt.timedelta(days=window_days)
+    corpus = []
+    for g in all_goals:
+        if g.get("status") != "completed":
+            continue
+        ts = _parse_iso(g.get("completed_at") or g.get("completed_date"))
+        if ts is None or ts < cutoff:
             continue
         text = " ".join([
             str(g.get("title") or ""),
@@ -629,6 +672,16 @@ def main():
     agent_goals = _read_goals("agent")
     all_goals = world_goals + agent_goals
     corpus = open_goal_corpus(all_goals)
+    open_corpus_count = len(corpus)
+
+    # Time-windowed completed-goal dedup (6): extend the dedup corpus
+    # with goals COMPLETED within COMPLETED_DEDUP_WINDOW_DAYS so a gap that was
+    # investigated-and-closed does not re-fire every ~4h scan. all_goals already
+    # spans mixed status — the active-aspiration read returns completed goals too
+    # (open_goal_corpus filters them out; this ADDS the recent ones back for
+    # dedup). is_covered treats both corpora identically (same (id, text) blob).
+    completed_corpus = recent_completed_corpus(all_goals, COMPLETED_DEDUP_WINDOW_DAYS)
+    corpus = corpus + completed_corpus
 
     # Deployment-specific detector specs come from the domain config (core stays
     # domain-agnostic — see load_domain_specs / domain-free-examples.md).
@@ -636,7 +689,11 @@ def main():
     situational_re = build_situational_re(situational_extra)
 
     detectors_out = []
-    scanned = {"open_goals": len(corpus)}
+    scanned = {
+        "open_goals": open_corpus_count,
+        "completed_goals_in_dedup_window": len(completed_corpus),
+        "completed_dedup_window_days": COMPLETED_DEDUP_WINDOW_DAYS,
+    }
     if "written-never-read" in want:
         blob, fcount = build_reader_blob()
         d = detect_written_never_read(reader_blob=blob)

@@ -13,6 +13,14 @@
 # --active-content) and the legacy --find shorthand go direct to python —
 # they run cross-file logic that isn't yet daemon-safe, or have a
 # dedicated endpoint (tree-find-node.sh for --find).
+#
+# NOTE (authoritative-store-blind limitation): --validate checks the LOCAL
+# mirror (os.path.exists) only, so on a remote-synced backend it is blind to
+# index->authoritative-store-absent bodies — both index-body desync and the
+# never-pushed-at-risk class. The authoritative-store-aware complement is
+# core/scripts/tree-body-presence-audit.py (remote-backend-only; backend.stat
+# HEAD), run on cadence via recurring goal 8. See rb-4089 for the
+# single-box coverage asymmetry.
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"

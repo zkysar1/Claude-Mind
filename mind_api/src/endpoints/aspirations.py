@@ -22,7 +22,8 @@ stdout must come back in the response body.
 
 What this endpoint does NOT do (Phase A scope-cut, see mind_api/docs/development-history/DECISIONS.md):
   - Call `_log_goal_read` on --id reads (low-value observability side effect;
-    re-enable in Phase B once we extract a daemon-safe stale-read writer).
+    the stale-read gate that would have consumed it was retired g-115-2107,
+    so this logging is not coming back).
   - Honour `WORLD_ONLY_COMMANDS` — `read` is never in that set, so safe.
 """
 from __future__ import annotations
@@ -35,11 +36,16 @@ from ..jsonl_cache import cache
 
 # --- Output shaping --------------------------------------------------------
 
-# Mirrors aspirations.py COMPACT_GOAL_KEEP at the time of writing. Duplicated
-# rather than imported to keep the endpoint independent of aspirations.py's
-# import side effects (utf-8 stdio reconfigure, _gate_log import chain).
-# When COMPACT_GOAL_KEEP gains/loses fields upstream, mirror here. This is
-# annoying but Phase B will refactor the upstream into a daemon-safe helper.
+# SSOT for the compact goal projection (9). The CLI copy
+# (core/scripts/aspirations.py COMPACT_GOAL_KEEP) was retired — it had been
+# orphaned since the daemon-only cutover removed the CLI read path. Kept
+# local (not imported) to stay independent of aspirations.py's import side
+# effects (utf-8 stdio reconfigure, _gate_log import chain). Field
+# provenance: filed_by_agent 7 (temp-pressure drain-goal dedup);
+# work_class 2 (cmd_cycles all-product suppression, rb-3820);
+# blocker_ref + defer_reason_set_at ride with defer_reason so
+# goal-selector collect_blocked() and the quiescence gate need no second
+# store read. claimed_by intentionally excluded — use aspirations-query.sh.
 _COMPACT_GOAL_KEEP = {
     "id", "title", "status", "priority", "category", "skill",
     "recurring", "interval_hours", "lastAchievedAt", "achievedCount",
@@ -47,7 +53,19 @@ _COMPACT_GOAL_KEEP = {
     "participants", "blocked_by", "blocked_since", "deferred_until", "defer_reason",
     "defer_reason_set_at", "blocker_ref",
     "args", "parent_goal", "discovered_by", "started",
-    "depends_on", "abstained_by",
+    "depends_on", "abstained_by", "filed_by_agent",
+    # filed_by_agent (7): needed by precheck-eval cmd_temp_pressure to
+    # agent-scope the drain-goal dedup — the undrained-doc COUNT targets the
+    # BOUND agent's temp/, so the dedup must match. Without it in the compact, a
+    # world-queue drain goal filed by ANY agent suppressed EVERY other agent's
+    # drain suggestion (temp/ grew unbounded fleet-wide but for one agent).
+    "work_class",
+    # work_class (2): needed by precheck-eval cmd_cycles to suppress
+    # zero_learning_velocity on all-product windows — product-repo commits are
+    # invisible to compute_learning_velocity's five counters (rb-3820), so a
+    # stretch of product Fix-closes false-positives without this field. A
+    # cycles-side check on a field absent from this projection would be a dead
+    # branch (1 class).
 }
 
 
@@ -130,6 +148,11 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if _flag(q, "active"):
         items = jc.get(live_path)
+        # Parity with the active_compact branch above: --active means
+        # status == "active", not "everything still in the live file".
+        # Retired-but-unarchived records (e.g. fixture tombstones) must not
+        # surface here (4; found via the 1 rb-3382 check).
+        items = [a for a in items if a.get("status") == "active"]
         return Response.text(
             json.dumps(items, indent=2, ensure_ascii=False),
             content_type="application/json",
@@ -185,9 +208,19 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             # live, so its `goals` list under-counts. Fold archived_census back
             # in for an accurate stepping-stone tally (read inline — see
             # core/scripts/_goal_census.py; display-only, no import coupling).
-            _bs = ((asp.get("archived_census") or {}).get("by_status") or {})
+            # Effective count = legacy by_status baseline + evicted_ids id-set
+            # lengths (0 merge-correct census).
+            _census = asp.get("archived_census") or {}
+            _bs = _census.get("by_status") or {}
+            _ids = _census.get("evicted_ids") if isinstance(
+                _census.get("evicted_ids"), dict) else {}
             _evicted_total = sum(v for v in _bs.values() if isinstance(v, int))
             _evicted_completed = _bs.get("completed", 0) if isinstance(_bs.get("completed"), int) else 0
+            for _st, _v in _ids.items():
+                if isinstance(_v, list):
+                    _evicted_total += len(_v)
+                    if _st == "completed":
+                        _evicted_completed += len(_v)
             stones.append({
                 "id": asp["id"],
                 "title": asp["title"],

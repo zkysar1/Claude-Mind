@@ -356,6 +356,69 @@ def main() -> int:
             f"fresh-eyes-cadence-check: block={args.config_block} slot={slot_name} "
             f"current={current} last={last_count} diff={diff} cadence={goal_cadence}"
         )
+    # Negative-diff self-heal (6): a DOWNWARD count-basis correction
+    # (census double-count repair, store surgery, count-basis change) leaves
+    # the stamped slot ABOVE the live count. Without this branch, diff stays
+    # negative and the ritual silently starves until the count regrows past
+    # the stale stamp (~months for a large repair — e.g. the  census
+    # carries +872 phantom completions; repairing it drops every agent's
+    # count basis at once). Re-stamp the slot to the current count (preserving
+    # the last real fire timestamp) and noop — cadence resumes from the
+    # corrected basis. Fires at most once per correction; upward jumps and
+    # the last_count==0 first-fire path are unaffected (diff >= 0 there).
+    if diff < 0:
+        # ZERO-GUARD (guard-1091; fresh-eyes-code F-001, 2026-07-14). A FAILED
+        # measurement is not a measurement of ZERO. count_completed_goals()
+        # returns 0 as a SILENT FAILURE SENTINEL: every candidate file missing
+        # (`if not p.exists(): continue`) or unreadable (`except OSError:
+        # continue`) leaves total=0. The world store is S3-backed on an
+        # own-cloud deployment, so a mid-sync read miss is routine.
+        #
+        # Re-baselining on that 0 would PERSIST the transient error as the new
+        # basis and SPURIOUSLY FIRE next iteration (last_count==0 first-fire
+        # path). BEFORE this heal existed a transient 0 was HARMLESS — diff<0
+        # => noop => NO WRITE => self-recovering. The heal must not convert a
+        # self-recovering error into permanent state corruption. Noop WITHOUT
+        # re-stamping; the next check retries.
+        #
+        # `current == 0` inside `diff < 0` already implies `last_count > 0`, so
+        # this cannot mask a legitimate basis: a real count never falls to zero
+        # (folds in archives + census_completed; eviction-invariant). A
+        # genuinely empty store self-heals the moment ONE goal completes.
+        if current == 0:
+            print(
+                f"fresh-eyes-cadence-check: negative diff ({diff}) with current=0 "
+                f"vs last={last_count} — FAILED MEASUREMENT, not a real basis "
+                f"(count_completed_goals returns 0 on read failure); noop WITHOUT "
+                f"re-stamp — retries next check",
+                file=sys.stderr,
+            )
+            return 1
+        rebase_payload = json.dumps({
+            "timestamp": last.get("timestamp", "0000-00-00T00:00:00"),
+            "goals_count_at_last_fire": current,
+            "rebaselined_from": last_count,
+        })
+        try:
+            subprocess.run(
+                [sys.executable, str(HERE / "wm.py"), "set", slot_name],
+                input=rebase_payload,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            print(
+                f"fresh-eyes-cadence-check: negative diff ({diff}) — count basis "
+                f"moved backward (last={last_count} > current={current}); "
+                f"re-baselined {slot_name} to {current} — noop this iter"
+            )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            print(
+                f"fresh-eyes-cadence-check: negative-diff re-baseline write "
+                f"failed ({exc!r}) — noop without re-stamp; retries next check",
+                file=sys.stderr,
+            )
+        return 1
     if diff >= goal_cadence:
         # 8 team-aware gate: shared-resource rituals (tree, program)
         # have ONE time series, but the per-agent WM slot above never sees a
@@ -372,6 +435,15 @@ def main() -> int:
         # reached when the per-agent cadence already crossed) until the world
         # count elapses past the team stamp. Fail-open: missing file, missing
         # stamp, missing field, or parse error → per-agent behavior.
+        # KNOWN RESIDUAL (9, rb-2876): the world-only diff STILL
+        # crosses when a single fleet S3 sync imports > cadence completed
+        # goals in one window (a transient fresh-box bring-up artifact --
+        # steady-state syncs are incremental < cadence). Harm is
+        # efficiency-only (a wasted ritual re-run, caught manually via subject
+        # mtime + re-stamp). Deliberately NOT closed with a 3rd count-scoping
+        # gate: bounded + transient does not warrant new hot-path complexity
+        # (implementation-discipline + elegance-is-subtraction). Revisit only
+        # on evidenced steady-state harm.
         if fe.get("team_aware"):
             team = team_stamp_value(slot_name)
             team_world = (team or {}).get("world_goals_count_at_last_fire")
@@ -383,6 +455,75 @@ def main() -> int:
             if team_world is not None:
                 current_world = count_completed_goals(world_only=True)
                 team_diff = current_world - team_world
+                # Team-layer negative-diff self-heal (1, sibling of
+                # the 6 per-agent guard above): a DOWNWARD world-count
+                # correction (census repair) leaves the shared stamp ABOVE the
+                # live world count, and only a FIRE re-stamps
+                # shared_cadences.<slot> (fresh-eyes-record-tick.sh) — which
+                # this gate's noop prevents, so team_aware rituals starve until
+                # the world count regrows past the stale stamp. Re-stamp the
+                # shared cadence to the current world count (preserve the last
+                # fire's timestamp/fired_by; mark rebaselined_from) and noop
+                # once. Fail-open: a write error noops without re-stamp and
+                # retries on the next check. In-process daemon call (_rt) —
+                # no bash subprocess from Python (rb-225/rb-247).
+                if team_diff < 0 and current_world == 0:
+                    # ZERO-GUARD (guard-1091; fresh-eyes-code F-001, 2026-07-14)
+                    # — the SHARED-STATE case, and the worst of the four. This
+                    # branch writes world/team-state.yaml shared_cadences, so a
+                    # re-baseline on a failure sentinel corrupts the cadence
+                    # basis for the WHOLE FLEET, not just this agent.
+                    # count_completed_goals(world_only=True) is the SAME function
+                    # as the per-agent path above and returns 0 on the same silent
+                    # read failures. Noop WITHOUT re-stamping; retries next check.
+                    # (team_diff < 0 with current_world == 0 already implies
+                    # team_world > 0 — a real world count never falls to zero.)
+                    print(
+                        f"fresh-eyes-cadence-check: team negative diff ({team_diff}) "
+                        f"with current_world=0 vs team stamp {team_world} — FAILED "
+                        f"MEASUREMENT, not a real basis; refusing to re-stamp the "
+                        f"SHARED cadence (would corrupt every agent's basis) — "
+                        f"retries next check",
+                        file=sys.stderr,
+                    )
+                    # Explicit noop. Falling through would ALSO noop (team_diff<0
+                    # is always < goal_cadence), but only emergently — and it would
+                    # print the "healthy team-aware gate" message below, disguising
+                    # a failed measurement as a normal not-yet-due skip. That
+                    # disguise is the exact class of bug this guard exists to kill.
+                    return 1
+                elif team_diff < 0:
+                    rebase_stamp = json.dumps({
+                        "timestamp": (team or {}).get(
+                            "timestamp", "0000-00-00T00:00:00"),
+                        "world_goals_count_at_last_fire": current_world,
+                        "fired_by": (team or {}).get("fired_by", "unknown"),
+                        "rebaselined_from": team_world,
+                    })
+                    try:
+                        _rt.rt_call(
+                            "POST", "/v1/team-state/update",
+                            query={
+                                "field": f"shared_cadences.{slot_name}",
+                                "value": rebase_stamp,
+                                "operation": "set",
+                            },
+                        )
+                        print(
+                            f"fresh-eyes-cadence-check: negative TEAM diff "
+                            f"({team_diff}) — world count basis moved backward "
+                            f"(team stamp {team_world} > current_world "
+                            f"{current_world}); re-baselined shared_cadences."
+                            f"{slot_name} to {current_world} — noop this iter"
+                        )
+                    except _rt.RtError as exc:
+                        print(
+                            f"fresh-eyes-cadence-check: team-stamp re-baseline "
+                            f"write failed ({exc}) — noop without re-stamp; "
+                            f"retries next check",
+                            file=sys.stderr,
+                        )
+                    return 1
                 if team_diff < goal_cadence:
                     if not args.verbose:
                         print(

@@ -26,9 +26,13 @@ and this test's expectations.
 
 Pattern mirrors test_path_resolution_virtual_prefix_cruft.py: subprocess
 invocation of the real hook with a synthetic Write payload, parse stdout for
-hookSpecificOutput.permissionDecision. Uses agent "bravo" (exists on disk with
-a local-paths.conf). Disk existence of the target is irrelevant — the allowlist
-check is pure first-segment membership, so no on-disk fixture is needed.
+hookSpecificOutput.permissionDecision. Uses the first agent on THIS box that
+has a local-paths.conf (the hook resolves external roots from the bound
+agent's conf and FAILS OPEN when it is absent — hardcoding "bravo" held on the
+dev box but silently approved everything on satellite boxes where bravo's
+per-machine gitignored conf does not exist; g-115-1940). Disk existence of the
+target is irrelevant — the allowlist check is pure first-segment membership,
+so no on-disk fixture is needed.
 """
 
 from __future__ import annotations
@@ -45,7 +49,30 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 HOOK_PY = CORE_SCRIPTS / "path-resolution-hook.py"
-AGENT = "bravo"
+
+
+def _pick_agent_with_conf():
+    """First agent dir carrying a local-paths.conf on this box, or None.
+
+    The hook exits fail-open (approve) at its conf gate when the bound agent
+    has no local-paths.conf, so the deny contract is only testable against an
+    agent that has one HERE. local-paths.conf is per-machine and gitignored —
+    which agent qualifies varies by box (g-115-1940).
+    """
+    agents_root = PROJECT_ROOT / "agents"
+    if agents_root.is_dir():
+        for p in sorted(agents_root.iterdir()):
+            if (p / "local-paths.conf").is_file():
+                return p.name
+    return None
+
+
+AGENT = _pick_agent_with_conf()
+pytestmark = pytest.mark.skipif(
+    AGENT is None,
+    reason="no agent with local-paths.conf on this box — the L1 hook fails "
+           "open without one, so the allowlist deny contract is untestable here",
+)
 
 
 def invoke_hook(rel_path: str) -> dict:

@@ -28,6 +28,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -133,9 +134,13 @@ class TestCrit3GetDistillCandidates(unittest.TestCase):
         # The complement: a low-utility node (crit1) WITH the distill exemption is
         # NOT a candidate -- the over-flag fix. No oversized body, so only crit1
         # could fire, and the exemption clears it.
+        # 7: votes + fresh last_retrieved keep crit1 otherwise-live so
+        # the exemption is provably what clears it.
         tree = {"nodes": {"niche-node": self._node(
             file="", retrieval_count=10, utility_ratio=0.1,
-            times_helpful=1, times_noise=0, maintain_exempt=["distill"])}}
+            times_helpful=3, times_noise=0,
+            last_retrieved=date.today().isoformat(),
+            maintain_exempt=["distill"])}}
         cands = {c["key"]: c for c in tree_engine.get_distill_candidates(tree)}
         self.assertNotIn("niche-node", cands)
 
@@ -165,8 +170,11 @@ class TestCrit3GetDistillCandidates(unittest.TestCase):
         tree = {"nodes": {
             "oversized": self._node(file=big, retrieval_count=50,
                                     utility_ratio=0.95, times_helpful=10),
+            # crit1, file="" (size N/A). 7: crit1 now needs
+            # >= distill_min_feedback_votes (3) + a fresh last_retrieved.
             "low-util": self._node(retrieval_count=10, utility_ratio=0.1,
-                                   times_helpful=2),  # crit1, file="" (size N/A)
+                                   times_helpful=3,
+                                   last_retrieved=date.today().isoformat()),
         }}
         ranked = tree_engine.get_distill_candidates(tree)
         self.assertEqual(ranked[0]["key"], "oversized")

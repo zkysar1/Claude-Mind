@@ -45,6 +45,7 @@ emit_json() {
   REASON="${REASON:-}" \
   FIRED="${FIRED:-false}" \
   CORE_FILES="${CORE_FILES:-}" \
+  COMMITS_SCANNED="${COMMITS_SCANNED:-0}" \
   python3 - <<'PYEOF'
 import json, os
 fired = os.environ.get("FIRED") == "true"
@@ -55,6 +56,11 @@ reason = os.environ.get("REASON") or ""
 files_raw = os.environ.get("CORE_FILES") or ""
 files = [l.strip() for l in files_raw.splitlines() if l.strip()][:20]
 out = {"fired": fired, "core_count": cc, "loc_changed": loc, "reason": reason}
+# Multi-commit committed scope (0): how many goal commits were unioned.
+# 0 = working-tree scope. Additive field — consumers key on fired/files/reason.
+scanned = int(os.environ.get("COMMITS_SCANNED", "0") or "0")
+if scanned:
+    out["commits_scanned"] = scanned
 if fired:
     out["files"] = files
     if ns:
@@ -115,28 +121,74 @@ fi
 # is intentionally retained; revisit only if telemetry shows the fallback
 # firing on residue frequently in practice.
 COMMIT_SHA="${COMMIT_SHA:-}"
+GOAL_ID="${GOAL_ID:-}"
 COMMIT_SHA_VALID=no
 COMMITTED_NEW_SCRIPTS=""
-if [ -n "$COMMIT_SHA" ] \
-   && git rev-parse --verify --quiet "${COMMIT_SHA}^{commit}" >/dev/null 2>&1 \
-   && git rev-parse --verify --quiet "${COMMIT_SHA}~1" >/dev/null 2>&1; then
-  # Valid = resolves to a commit AND has a parent (so ${SHA}~1..${SHA} is a real
-  # range). A root commit (no parent) fails the ~1 probe and falls through to
-  # working-tree scope rather than crashing the range diff.
+
+# ── Multi-commit committed scope (0) ────────────────────────────────
+# A deep goal may land MORE than one commit: the sanctioned mid-Phase-4
+# iteration-commit (e.g. committing daemon code early so the post-commit hook
+# restarts the daemon for live verification) plus the close-time commit. The
+# close-time COMMIT_SHA alone missed the mid-goal commit entirely (canonical:
+# 6 — new core script + 3 core files in e7cb064e evaded the gate
+# because close commit 191a772b carried only docs). Fix: when the caller passes
+# GOAL_ID, union in every commit whose message carries "(GOAL_ID)" —
+# iteration-commit.sh stamps the goal id into every subject it composes
+# (`type(goal-id): title`), so git history IS the per-goal commit ledger; no
+# new state file needed. Bounds: 48h window + 50 commits (goals do not span
+# longer; a reopened goal id re-matching already-reviewed commits over-fires,
+# which the content_signatures cooldown then suppresses — a review gate biases
+# to over-fire, never silently drop). Plain `git commit` calls without the
+# goal-id stamp remain invisible — the sanctioned mid-goal path is
+# iteration-commit.sh (reconcile-fleet-fork Phase 1.2).
+SHA_LIST="$COMMIT_SHA"
+if [ -n "$GOAL_ID" ]; then
+  # Colon anchor (fresh-eyes msg-3119): match the stamp format
+  # `type(goal-id): title` exactly — a prose CITATION of a goal id in a later
+  # commit's body ("closes the gap (2)") lacks the colon and no
+  # longer cross-unions into that goal's scope. Zero recall loss: every
+  # iteration-commit subject carries "(<goal-id>):".
+  GOAL_SHAS=$(git log --fixed-strings --grep "(${GOAL_ID}):" --format=%H -n 50 --since=48.hours 2>/dev/null || true)
+  SHA_LIST=$(printf '%s\n%s\n' "$SHA_LIST" "$GOAL_SHAS" | sed '/^$/d' | sort -u)
+fi
+
+# Valid = resolves to a commit AND has a parent (so ${SHA}~1..${SHA} is a real
+# range). A root commit (no parent) fails the ~1 probe and is skipped rather
+# than crashing the range diff.
+VALID_SHAS=""
+if [ -n "$SHA_LIST" ]; then
+  while IFS= read -r _s; do
+    [ -z "$_s" ] && continue
+    if git rev-parse --verify --quiet "${_s}^{commit}" >/dev/null 2>&1 \
+       && git rev-parse --verify --quiet "${_s}~1" >/dev/null 2>&1; then
+      VALID_SHAS=$(printf '%s\n%s\n' "$VALID_SHAS" "$_s" | sed '/^$/d')
+    fi
+  done <<< "$SHA_LIST"
+fi
+COMMITS_SCANNED=0
+if [ -n "$VALID_SHAS" ]; then
   COMMIT_SHA_VALID=yes
+  COMMITS_SCANNED=$(printf '%s\n' "$VALID_SHAS" | grep -c . || echo 0)
 fi
 
 if [ "$COMMIT_SHA_VALID" = "yes" ]; then
-  CHANGED=$(git diff --name-only "${COMMIT_SHA}~1" "${COMMIT_SHA}" 2>/dev/null | sed '/^$/d' | sort -u || true)
+  # Union CHANGED + new-scripts across every valid range; RANGES feeds the
+  # numstat consumers below (mode-only exclusion + LOC), replacing the former
+  # single BASE_FOR_LOC string.
+  CHANGED=""
+  RANGES=""
   UNTRACKED=""  # committed scope — untracked detection skipped (8)
-  BASE_FOR_LOC="${COMMIT_SHA}~1..${COMMIT_SHA}"
-  # Preserve guard-343's new-script trigger under committed scope: a newly added
-  # core/scripts/*.{sh,py} appears as status=A in the range diff (once committed
-  # it is tracked, so `git ls-files --others` no longer sees it).
-  COMMITTED_NEW_SCRIPTS=$(git diff --name-status "${COMMIT_SHA}~1" "${COMMIT_SHA}" 2>/dev/null \
-    | awk '$1 ~ /^A/ {print $2}' | sed '/^$/d' | sort -u || true)
+  while IFS= read -r _s; do
+    [ -z "$_s" ] && continue
+    RANGES=$(printf '%s\n%s\n' "$RANGES" "${_s}~1..${_s}" | sed '/^$/d')
+    CHANGED=$(printf '%s\n%s\n' "$CHANGED" "$(git diff --name-only "${_s}~1" "${_s}" 2>/dev/null || true)" | sed '/^$/d' | sort -u)
+    # Preserve guard-343's new-script trigger under committed scope: a newly
+    # added core/scripts/*.{sh,py} appears as status=A in the range diff (once
+    # committed it is tracked, so `git ls-files --others` no longer sees it).
+    COMMITTED_NEW_SCRIPTS=$(printf '%s\n%s\n' "$COMMITTED_NEW_SCRIPTS" "$(git diff --name-status "${_s}~1" "${_s}" 2>/dev/null | awk '$1 ~ /^A/ {print $2}' || true)" | sed '/^$/d' | sort -u)
+  done <<< "$VALID_SHAS"
   if [ -z "$CHANGED" ]; then
-    FIRED=false REASON="no changed files in commit ${COMMIT_SHA} (committed scope, g-115-1178)" emit_json
+    FIRED=false REASON="no changed files in ${COMMITS_SCANNED} scanned commit(s) (committed scope, g-115-1178/g-115-2030)" emit_json
   fi
 else
   # git diff --name-only HEAD captures working-tree + staged changes vs HEAD.
@@ -167,6 +219,9 @@ else
     CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | sed '/^$/d' | sort -u || true)
     BASE_FOR_LOC="HEAD~1..HEAD"
   fi
+  # Working-tree scope is single-range; RANGES unifies the numstat consumers
+  # below with the multi-range committed scope (0).
+  RANGES="$BASE_FOR_LOC"
 
   if [ -z "$CHANGED" ]; then
     FIRED=false REASON="no changed files detected (clean working tree + empty HEAD~1 diff)" emit_json
@@ -235,8 +290,15 @@ fi
 MODE_ONLY_DROPPED=0
 if [ -n "$CORE_FILES" ]; then
   PRE_MODE_COUNT=$(printf '%s\n' "$CORE_FILES" | sed '/^$/d' | grep -c . || echo 0)
-  # shellcheck disable=SC2086
-  RAW_NUMSTAT=$(git diff --numstat --no-renames $BASE_FOR_LOC 2>/dev/null || true)
+  # Concatenate numstat across all ranges (0 multi-commit scope). The
+  # CONTENT_CHANGED filter below admits a file when ANY range shows a nonzero
+  # delta — correct union semantics (mode-only in one commit + content in
+  # another = content).
+  RAW_NUMSTAT=$(while IFS= read -r _r; do
+    [ -z "$_r" ] && continue
+    # shellcheck disable=SC2086
+    git diff --numstat --no-renames $_r 2>/dev/null || true
+  done <<< "$RANGES")
   CONTENT_CHANGED=$(printf '%s\n' "$RAW_NUMSTAT" \
     | awk -F'\t' 'NF>=3 && !($1=="0" && $2=="0") {print $3}' | sort -u || true)
   NUMSTAT_NONEMPTY=0
@@ -276,8 +338,14 @@ LOC_CHANGED=0
 if [ -n "$CORE_SCRIPTS" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    # shellcheck disable=SC2086
-    n=$(git diff --numstat $BASE_FOR_LOC -- "$f" 2>/dev/null | awk 'NF>=2 {print $1+$2; exit}' || echo 0)
+    # Sum the file's delta across all ranges (multi-commit scope, 0).
+    # awk's string→number coercion keeps binary-file "-" columns at 0, matching
+    # the prior single-range behavior.
+    n=$(while IFS= read -r _r; do
+      [ -z "$_r" ] && continue
+      # shellcheck disable=SC2086
+      git diff --numstat $_r -- "$f" 2>/dev/null || true
+    done <<< "$RANGES" | awk 'NF>=2 {s+=$1+$2} END {print s+0}')
     [ -z "$n" ] && n=0
     LOC_CHANGED=$((LOC_CHANGED + n))
   done <<< "$CORE_SCRIPTS"

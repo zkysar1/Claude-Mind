@@ -20,12 +20,14 @@ try:
 except ImportError as e:  # pragma: no cover
     raise RuntimeError("PyYAML required for team-state endpoint") from e
 
-# Shared sharding helper (core/scripts is on sys.path for daemon workers —
-# same import mechanism as team_state_write's `from _fileops import ...`).
-# Single source of truth for row composition; guard-742 parity by construction.
-from _team_state import compose_state
-
+from .. import file_locks  # noqa: F401 — installs core/scripts on sys.path at module load (rb-3868)
 from ..yaml_cache import cache
+
+# Shared sharding helper (core/scripts lands on sys.path via the file_locks
+# import above — the ordering is load-bearing; isolated import breaks without
+# it (rb-3868 / 7). Single source of truth for row composition;
+# guard-742 parity by construction.
+from _team_state import compose_state  # noqa: E402
 
 
 # Mirrored from team-state.py EMPTY_STATE. When that schema gains a key,

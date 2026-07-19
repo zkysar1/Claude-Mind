@@ -86,7 +86,9 @@ PROTECTED_SITES = [
     ("mind_api/src/endpoints/aspirations_write.py", "meta_update"),
     ("mind_api/src/endpoints/board.py",              "board reads sidecar"),
     ("mind_api/src/endpoints/store.py",              "store._atomic_write_jsonl"),
-    ("mind_api/src/history.py",                      "history snapshot"),
+    # mind_api/src/history.py removed 0: it no longer mkdirs anything —
+    # snapshot() delegates to _fileops.save_history, whose _cruft_tripwire
+    # covers the history-snapshot path (see _fileops.py save_history).
     ("mind_api/src/lifecycle.py",                    "runtime_dir"),
     ("mind_api/src/lifecycle.py",                    "_atomic_write_text"),
     ("mind_api/src/world/pipeline_write.py",         "pipeline_write._atomic_write_jsonl"),

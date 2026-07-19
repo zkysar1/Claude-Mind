@@ -8,6 +8,17 @@ after consolidate Step 5 wm-reset (the same gap appeared overdue twice).
 This test verifies the fix: cadence-tracker slots (matching the patterns in
 CADENCE_TRACKER_PATTERNS) survive cmd_reset; non-cadence slots are nulled.
 
+Also covers RESET_SURVIVING_SLOTS (g-115-1992): journal_cluster_summaries is
+written by aspirations-consolidate Step 0.65 BEFORE the Step-5 wm-reset and
+consumed one-shot by Step 9 AFTER it — cmd_reset must preserve it (value +
+slot_meta) or Step 9 silently degrades to the linear key_outcomes fallback
+every full-path session.
+
+And the CLI↔daemon mirror (g-115-2042): wm_write.py (the LIVE wm-reset.sh
+path) hand-inlines six wm.py constants; the parity test pins all six in sync
+and the endpoint test exercises the daemon reset() loop end-to-end via an
+in-process daemon.
+
 Runs against an isolated temp-dir WM file via module-level path patching.
 Does NOT touch live agent working memory.
 
@@ -69,9 +80,17 @@ def main() -> int:
                 "test_canary": "this_should_disappear",
                 "test_marker_a": "remove_me",
             }
+            # RESET_SURVIVING_SLOTS member — content payload (not a timestamp),
+            # written pre-reset and consumed post-reset (2).
+            surviving_slots = {
+                "journal_cluster_summaries": [
+                    {"label": "asp-115", "summary": "framework fixes cluster"},
+                    {"label": "asp-001", "summary": "recurring upkeep cluster"},
+                ],
+            }
 
             data = wm.read_wm()
-            for k, v in {**cadence_slots, **non_cadence_slots}.items():
+            for k, v in {**cadence_slots, **non_cadence_slots, **surviving_slots}.items():
                 data["slots"][k] = v
                 data["slot_meta"][k] = {
                     "updated_at": "2026-04-30T01:00:00",
@@ -125,6 +144,20 @@ def main() -> int:
                     f"IDENTITY FAIL: session_start should be preserved, got {after.get('session_start')!r}"
                 )
 
+            # 7. Verify RESET_SURVIVING_SLOTS members survived with value + meta
+            #    (2 — journal_cluster_summaries crosses the reset boundary)
+            for k, expected in surviving_slots.items():
+                actual = after["slots"].get(k)
+                if actual != expected:
+                    failures.append(
+                        f"SURVIVE FAIL: reset-surviving slot {k} expected {expected!r}, got {actual!r}"
+                    )
+                meta = after.get("slot_meta", {}).get(k)
+                if not meta or meta.get("update_count") != 1:
+                    failures.append(
+                        f"SURVIVE FAIL: reset-surviving slot_meta {k} not preserved (got {meta!r})"
+                    )
+
         finally:
             if original_body is None:
                 os.environ.pop("BODY_WM_PATH", None)
@@ -137,7 +170,7 @@ def main() -> int:
             print(f"  - {f}")
         return 1
 
-    print("[test] PASS — cmd_reset preserves cadence-tracker slots and session_start; nulls non-cadence slots")
+    print("[test] PASS — cmd_reset preserves cadence-tracker slots, reset-surviving slots, and session_start; nulls other slots")
     return 0
 
 
@@ -148,6 +181,155 @@ def test_wm_reset_cadence_preservation():
     collected 0 tests from it and the regression went un-run in CI. (g-115-1626)
     """
     assert main() == 0
+
+
+# Constants wm_write.py hand-mirrors from wm.py. A one-sided edit to ANY of
+# them silently diverges CLI-vs-daemon reset/maintain behavior (rb-915 class;
+# 2 hit RESET_SURVIVING_SLOTS, 2 pins the other five).
+SHARED_WM_CONSTANTS = (
+    "SESSION_IDENTITY_FIELDS",
+    "DEFAULT_SLOT_TYPES",
+    "ARRAY_SLOTS",
+    "MAP_SLOTS",
+    "CADENCE_TRACKER_PATTERNS",
+    "RESET_SURVIVING_SLOTS",
+)
+
+
+def _extract_daemon_constants(daemon_src: str) -> dict:
+    """AST-extract SHARED_WM_CONSTANTS values from the daemon source.
+
+    literal_eval covers plain literals; CADENCE_TRACKER_PATTERNS is a tuple of
+    re.compile(...) calls, extracted as its tuple of pattern STRINGS. Pass
+    node.value (the RHS), never the Assign node itself.
+    """
+    import ast
+
+    def value_of(vnode):
+        try:
+            return ast.literal_eval(vnode)
+        except (ValueError, SyntaxError, TypeError):
+            if isinstance(vnode, ast.Tuple):
+                vals = []
+                for elt in vnode.elts:
+                    if (isinstance(elt, ast.Call)
+                            and getattr(elt.func, "attr", "") == "compile"
+                            and elt.args and isinstance(elt.args[0], ast.Constant)):
+                        vals.append(elt.args[0].value)
+                    else:
+                        return None
+                return tuple(vals)
+            return None
+
+    out = {}
+    for node in ast.walk(ast.parse(daemon_src)):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in SHARED_WM_CONSTANTS):
+            out[node.targets[0].id] = value_of(node.value)
+    return out
+
+
+def test_shared_wm_constants_parity_with_daemon():
+    """The daemon endpoint module (mind_api/src/endpoints/wm_write.py) is the
+    LIVE runtime path for wm-reset.sh (POST /v1/wm/reset) and inlines its own
+    copies of six wm.py constants (package-relative imports prevent importing
+    wm.py there). Asserts ALL six stay in sync AND that the daemon's reset()
+    actually consults RESET_SURVIVING_SLOTS — a wm.py-only edit silently does
+    nothing at runtime, which is how the g-115-1992 bug class re-enters.
+    AST-parses the daemon source instead of importing it (relative imports
+    make a standalone module load fail). (g-115-1992 + g-115-2042)
+    """
+    daemon_path = CORE_ROOT.parent / "mind_api" / "src" / "endpoints" / "wm_write.py"
+    daemon_src = daemon_path.read_text(encoding="utf-8")
+    daemon_vals = _extract_daemon_constants(daemon_src)
+
+    for name in SHARED_WM_CONSTANTS:
+        cli_val = getattr(wm, name, None)
+        assert cli_val is not None, f"wm.py lost constant {name}"
+        if name == "CADENCE_TRACKER_PATTERNS":
+            cli_val = tuple(p.pattern for p in cli_val)
+        daemon_val = daemon_vals.get(name)
+        assert daemon_val is not None, (
+            f"daemon wm_write.py lost its {name} mirror (or its shape became "
+            f"un-extractable — update _extract_daemon_constants)"
+        )
+        assert daemon_val == cli_val, (
+            f"{name} drift: wm.py={cli_val!r} daemon={daemon_val!r} — the two "
+            f"copies MUST be edited together (rb-915 / g-115-1992)"
+        )
+
+    # Use-site check: RESET_SURVIVING_SLOTS must be consulted INSIDE reset(),
+    # not just defined at module top.
+    reset_body = daemon_src.split("def reset(", 1)[1].split("\ndef ", 1)[0]
+    assert "RESET_SURVIVING_SLOTS" in reset_body, \
+        "daemon reset() no longer consults RESET_SURVIVING_SLOTS (g-115-1992)"
+
+
+def test_daemon_reset_endpoint_preserves_surviving_slot():
+    """2 (2): actual endpoint invocation. POST /v1/wm/reset against an
+    in-process daemon (thread-local, tmp project root — hermetic, no
+    daemon_integration marker needed) must preserve journal_cluster_summaries
+    value + slot_meta AND a cadence tracker, null a canary slot, keep
+    session_start, and report preserved_surviving in the response. Complements
+    the AST parity test above: this exercises the daemon reset() LOOP, not
+    just its constants.
+    """
+    import json
+    import tempfile
+    import urllib.request
+
+    import yaml
+
+    from _daemon_fixture import DaemonFixture
+
+    with tempfile.TemporaryDirectory() as tmpd:
+        tmp = Path(tmpd)
+        world = tmp / "world"
+        world.mkdir()
+        with DaemonFixture(world, agent="alpha") as df:
+            wm_path = (df.project_root / "agents" / "alpha" / "session"
+                       / "working-memory.yaml")
+            clusters = [{"label": "asp-1", "summary": "framework cluster"}]
+            meta = {"updated_at": "2026-07-12T01:00:00",
+                    "accessed_at": "2026-07-12T01:00:00", "update_count": 1}
+            seeded = {
+                "session_start": "2026-07-12T00:00:00",
+                "slots": {
+                    "journal_cluster_summaries": clusters,
+                    "last_test_tick": "2026-07-12T01:00:00",
+                    "reset_canary": "wipe_me",
+                },
+                "slot_meta": {
+                    "journal_cluster_summaries": dict(meta),
+                    "last_test_tick": dict(meta),
+                    "reset_canary": dict(meta),
+                },
+            }
+            wm_path.write_text(yaml.safe_dump(seeded), encoding="utf-8")
+
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{df.port}/v1/wm/reset", method="POST")
+            req.add_header("X-Mind-Agent", "alpha")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+
+            assert body.get("ok") is True, f"reset endpoint failed: {body!r}"
+            assert body.get("preserved_surviving") == ["journal_cluster_summaries"], (
+                f"response missing/wrong preserved_surviving: {body!r}"
+            )
+
+            after = yaml.safe_load(wm_path.read_text(encoding="utf-8"))
+            assert after["slots"]["journal_cluster_summaries"] == clusters, \
+                "surviving slot value lost across daemon reset"
+            assert after["slot_meta"]["journal_cluster_summaries"]["update_count"] == 1, \
+                "surviving slot_meta lost across daemon reset"
+            assert after["slots"]["last_test_tick"] == "2026-07-12T01:00:00", \
+                "cadence tracker lost across daemon reset"
+            assert after["slots"].get("reset_canary") is None, \
+                "non-preserved slot should be nulled by reset"
+            assert after.get("session_start") == "2026-07-12T00:00:00", \
+                "session identity lost across daemon reset"
 
 
 if __name__ == "__main__":

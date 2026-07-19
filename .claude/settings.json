@@ -40,6 +40,9 @@
     ]
   },
   "env": {
+    "TZ": "UTC",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "DISABLE_AUTOUPDATER": "1",
     "PYTHONUTF8": "1",
     "PYTHONIOENCODING": "utf-8",
     "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
@@ -377,6 +380,11 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-edit-record.sh",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/deploy-detect-hook.sh",
+            "timeout": 10
           }
         ]
       },

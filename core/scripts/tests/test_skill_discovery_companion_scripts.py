@@ -278,6 +278,7 @@ def test_same_second_events_dedup_upstream():
                 relations_data={},
                 journal_dates={"access-aws-services": []},
                 companion_dates=companion_dates,
+                ledger_dates={"access-aws-services": []},
             )
 
         assert "companion_script" in sources, (

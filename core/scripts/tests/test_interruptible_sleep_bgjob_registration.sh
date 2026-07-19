@@ -185,7 +185,36 @@ case5() {
   fi
 }
 
-case1; case2; case3; case4; case5
+# ── Case 6: EXTERNAL_WAIT (mid-goal external wait, 8) registers ──
+# Mirrors case1 but for the external-wait-sleep job type. Self-contained row
+# checks (the shared helpers grep the quiescence-sleep- prefix) so cases 1-5
+# are untouched.
+case6() {
+  local agent="_qsbg-test-$RANDOM"
+  local adir; adir="$(_test_agent_dir "$agent")"
+  mkdir -p "$adir/session"
+  local yaml="$adir/session/background-jobs.yaml"
+  local rc=0
+  MIND_AGENT="$agent" EXTERNAL_WAIT=1 bash "$INT_SLEEP" 8 >/dev/null 2>&1 &
+  local spid=$!
+  local seen="no" i
+  for (( i=0; i<12; i++ )); do
+    grep -q "external-wait-sleep-" "$yaml" 2>/dev/null && { seen="yes"; break; }
+    sleep 0.5
+  done
+  local pending_mid; pending_mid="$(_has_pending_rc "$agent")"
+  wait "$spid" || rc=$?
+  local row_after="absent"; grep -q "external-wait-sleep-" "$yaml" 2>/dev/null && row_after="present"
+  local pending_after; pending_after="$(_has_pending_rc "$agent")"
+  rm -rf "$adir"
+  if [ "$seen" = "yes" ] && [ "$pending_mid" = "0" ] && [ "$rc" = "0" ] && [ "$row_after" = "absent" ] && [ "$pending_after" = "1" ]; then
+    _pass "case6 external-wait-registers: row seen, mid has-pending=0, exit rc=0, row cleared, after has-pending=1"
+  else
+    _fail "case6: seen=$seen (want yes) pending_mid=$pending_mid (want 0) rc=$rc (want 0) row_after=$row_after (want absent) pending_after=$pending_after (want 1)"
+  fi
+}
+
+case1; case2; case3; case4; case5; case6
 
 echo ""
 if [ "$FAIL_COUNT" -gt 0 ]; then
@@ -194,5 +223,5 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
   echo "$FAIL_COUNT/$((PASS_COUNT + FAIL_COUNT)) test(s) failed"
   exit 1
 fi
-echo "All $PASS_COUNT bg-job registration cases verified (register/natural-clear, default-scoping, stop-interrupt, TERM-trap, SIGKILL-inert)."
+echo "All $PASS_COUNT bg-job registration cases verified (register/natural-clear, default-scoping, stop-interrupt, TERM-trap, SIGKILL-inert, external-wait-registers)."
 exit 0

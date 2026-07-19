@@ -143,6 +143,26 @@ def test_list_dir_env_scoped(cloud):
     assert b.list_dir(cloud["root"] / "world") == ["a.txt", "b.txt", "sub"]
 
 
+def test_list_objects_flat_recursive_with_etags(cloud):
+    """8: list_objects returns EVERY descendant object as
+    (rel_posix, etag, size) in one flat paginated pass — the pull sweep's
+    cheap enumeration. ETags match content md5 for single-part PUTs; deep
+    keys keep their full rel path; other roots never leak in."""
+    import hashlib as _hl
+    b = _backend(cloud)
+    b.write_text(cloud["root"] / "world" / "a.txt", "1")
+    b.write_text(cloud["root"] / "world" / "sub" / "deep" / "c.txt", "333")
+    b.write_text(cloud["root"] / "meta" / "m.yaml", "meta")   # other root
+    out = b.list_objects(cloud["root"] / "world")
+    rels = [r for r, _e, _s in out]
+    assert sorted(rels) == ["a.txt", "sub/deep/c.txt"]
+    etags = {r: e.strip('"') for r, e, _s in out}
+    assert etags["a.txt"] == _hl.md5(b"1").hexdigest()
+    assert etags["sub/deep/c.txt"] == _hl.md5(b"333").hexdigest()
+    sizes = {r: s for r, _e, s in out}
+    assert sizes["sub/deep/c.txt"] == 3
+
+
 # --- caching + force_fresh (fix #2) -----------------------------------------
 def test_read_caches_and_force_fresh_bypasses(cloud):
     b = _backend(cloud)
@@ -1180,6 +1200,83 @@ def test_both_diverged_unregistered_file_preserves_safe_freeze(cloud, tmp_path):
     assert b._get_remote_raw(key)[0] == base + b"remoteB\n"  # peer intact, not clobbered
 
 
+# --- 0: fence-on-miss (W1 — unfenced first-write-per-key post-restart)
+# The in-process _etags fence cache is empty after every daemon restart (and
+# stays unpopulated for writes whose base read never touched S3). _put must
+# never issue an UNCONDITIONAL PutObject to a non-machine-local key: existing
+# unregistered keys get head_object fence-adoption, existing registered keys
+# route to merge-reconcile (head-fencing alone would pass a stale-derived body
+# — the W1∘W2 clobber composition, 2026-07-16 aspirations.jsonl incident), and
+# absent keys become conditional creates (IfNoneMatch="*").
+def test_fresh_instance_put_existing_unregistered_key_carries_ifmatch(cloud, tmp_path):
+    """0 (W1): a fresh backend (empty _etags — every daemon restart)
+    writing to an EXISTING unregistered key must NOT issue an unconditional
+    PUT: it head_objects the key and fences on the CURRENT etag."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "w1-unregistered.txt"
+    key = b._s3_key(p)
+    b.write_text(p, "v1")                        # key exists on S3
+    cur = cloud["s3"].head_object(Bucket=BUCKET, Key=key)["ETag"]
+    b2 = _backend(cloud)                         # restart: empty fence cache
+    assert key not in b2._etags
+    calls = []
+    orig = cloud["s3"].put_object
+    cloud["s3"].put_object = lambda **kw: (calls.append(kw), orig(**kw))[1]
+    try:
+        b2.write_text(p, "v2")
+    finally:
+        cloud["s3"].put_object = orig
+    puts = [c for c in calls if c.get("Key") == key]
+    assert puts, "no put_object reached S3 for the key"
+    assert puts[0].get("IfMatch") == cur         # fenced on current etag, not unconditional
+    assert b2.read_text(p, force_fresh=True) == "v2"
+
+
+def test_fresh_instance_stale_body_to_registered_key_merges_not_clobbers(cloud, tmp_path):
+    """0 incident pin (2026-07-16 aspirations.jsonl clobber): a fresh
+    backend whose outgoing body derives from a STALE local read (missing the
+    peer's record already on S3) must MERGE with the current remote. PUT-time
+    head-fencing alone would pass (the fence IS current) and still erase the
+    peer's write — the W1∘W2 composition."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "reasoning-bank.jsonl"   # registered handler
+    key = b._s3_key(p)
+    recA = b'{"id":"rb-1","title":"machineA","valid_from":0}\n'
+    recB = b'{"id":"rb-2","title":"machineB","valid_from":0}\n'
+    cloud["s3"].put_object(Bucket=BUCKET, Key=key, Body=recA + recB)  # head: A+B
+    b2 = _backend(cloud)                         # restart: empty fence cache
+    assert key not in b2._etags
+    # Stale-derived outgoing body: the writer's base read predates the peer's
+    # rb-2 (only A visible) and it appends rb-3. Old behavior (unconditional
+    # PUT) — and head-fenced PUT — would both erase rb-2 from the head.
+    recC = b'{"id":"rb-3","title":"machineC","valid_from":0}\n'
+    b2.write_text(p, (recA + recC).decode())
+    merged = b2.read_text(p, force_fresh=True)
+    titles = {json.loads(l).get("title") for l in merged.splitlines()}
+    assert {"machineA", "machineB", "machineC"} <= titles  # peer rb-2 survived
+
+
+def test_fresh_instance_put_absent_key_uses_conditional_create(cloud):
+    """0: fence-miss + key absent on S3 = a true create — carries
+    IfNoneMatch='*' (a concurrent peer create 412s into the conflict lane
+    instead of last-writer-wins) and never IfMatch."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "w1-brand-new.txt"
+    key = b._s3_key(p)
+    calls = []
+    orig = cloud["s3"].put_object
+    cloud["s3"].put_object = lambda **kw: (calls.append(kw), orig(**kw))[1]
+    try:
+        b.write_text(p, "first")
+    finally:
+        cloud["s3"].put_object = orig
+    puts = [c for c in calls if c.get("Key") == key]
+    assert puts, "no put_object reached S3 for the key"
+    assert puts[0].get("IfNoneMatch") == "*"
+    assert "IfMatch" not in puts[0]
+    assert b.read_text(p, force_fresh=True) == "first"
+
+
 def _hyp_line(rec_id, **kw):
     """One pipeline.jsonl record line (writer byte format: ensure_ascii=True)."""
     rec = {"id": rec_id, "title": f"hyp {rec_id}", "stage": "active",
@@ -1596,3 +1693,112 @@ def test_non_permission_client_error_not_masked(cloud, monkeypatch):
     with pytest.raises(ClientError) as ei:
         b.list_runner_claims()
     assert ei.value.response["Error"]["Code"] == "ThrottlingException"
+
+
+# --- 8: _overwrite_decision fails CLOSED on a baseline-read FAILURE ---
+# (the own-cloud read-stale-clobber fix; rb-3422 "a data-protection guard whose
+# failure mode is OVERWRITE is not a guard"). The PRE-fix code fell through to
+# "download" -- silently overwriting local -- whenever the baseline-read RAISED:
+# a manifest-read exception (route 2) or an owncloud_sync import failure
+# (route 3). A record clobbered before its first git commit has NO trace in git,
+# S3, or .history, so on a genuine read FAILURE the guard must PRESERVE local
+# ("no_clobber") + log loudly instead of downloading.
+# SCOPE: a baseline that is merely ABSENT (no manifest entry -- the common
+# pre-sweep state, since the backend's own write path does NOT populate
+# owncloud_sync's persistent manifest) is NOT a read failure -- it stays the
+# DELIBERATE S3-authoritative "download" (test_refresh_no_baseline_pulls_s3_
+# authoritative; force_fresh cache-coherence). Failing THAT closed broke
+# peer-update visibility. Multipart (freeze-avoidance, 2026-07-02) also stays
+# "download". Both non-failure-close paths are pinned below.
+def _put_and_local(cloud, b, rel_under_root, s3_body, local_body):
+    """Seed S3 with `s3_body`, then write a DIFFERENT `local_body` (so the object
+    is neither byte-identical nor a fresh pull). Returns (path, single-part etag)."""
+    p = cloud["root"] / rel_under_root
+    p.parent.mkdir(parents=True, exist_ok=True)
+    resp = cloud["s3"].put_object(Bucket=BUCKET, Key=b._s3_key(p), Body=s3_body)
+    p.write_bytes(local_body)
+    etag = resp["ETag"]  # moto simple-PUT etag is single-part (md5, no '-')
+    assert "-" not in etag.strip('"'), "test needs a single-part etag"
+    return p, etag
+
+
+def test_g115_2178_import_failure_fails_closed(cloud, monkeypatch):
+    """Route 3: the lazy `from owncloud_sync import ...` raises -> we cannot load
+    the manifest/ETag helpers at all -> FAIL CLOSED ('no_clobber'). Poison
+    sys.modules['owncloud_sync'] = None so the in-function import raises."""
+    b = _backend(cloud)
+    p, etag = _put_and_local(cloud, b, "world/store.jsonl",
+                             b'{"stale":"from-s3"}\n', b'{"unpushed":"local"}\n')
+    monkeypatch.setitem(sys.modules, "owncloud_sync", None)  # import -> ImportError
+    assert b._overwrite_decision(p, p, etag) == "no_clobber"
+
+
+def test_g115_2178_no_baseline_absent_still_downloads(cloud):
+    """SCOPE guard: a baseline that is merely ABSENT (no manifest entry -- the
+    common pre-sweep state) is NOT a read failure -> stays 'download'
+    (S3-authoritative first pull, matching _pull_one). Only a baseline-read
+    EXCEPTION fails closed. Failing absence closed broke force_fresh peer-update
+    visibility (test_refresh_no_baseline_pulls_s3_authoritative); this pins the
+    scope at the _overwrite_decision level."""
+    b = _backend(cloud)
+    p, etag = _put_and_local(cloud, b, "world/store.jsonl",
+                             b'{"stale":"from-s3"}\n', b'{"unpushed":"local"}\n')
+    # manifest empty (no _write_sync_manifest) -> baseline ABSENT, not a read error
+    assert b._overwrite_decision(p, p, etag) == "download"
+
+
+def test_g115_2178_manifest_read_error_fails_closed(cloud, monkeypatch):
+    """Route 2: the manifest read raises -> baseline_md5=None via the except ->
+    FAIL CLOSED ('no_clobber'). Monkeypatch owncloud_sync._load_manifest to raise;
+    the lazy `from owncloud_sync import _load_manifest` re-binds the patched name
+    at call time."""
+    import owncloud_sync
+
+    def _boom():
+        raise RuntimeError("simulated manifest corruption")
+
+    monkeypatch.setattr(owncloud_sync, "_load_manifest", _boom)
+    b = _backend(cloud)
+    p, etag = _put_and_local(cloud, b, "world/store.jsonl",
+                             b'{"stale":"from-s3"}\n', b'{"unpushed":"local"}\n')
+    assert b._overwrite_decision(p, p, etag) == "no_clobber"
+
+
+def test_g115_2178_multipart_no_baseline_still_downloads(cloud):
+    """The ONE deliberate fail-OPEN preserved: a MULTIPART S3 etag with no baseline
+    still returns 'download' (freeze-avoidance, 2026-07-02). Failing THIS closed
+    would re-introduce the fleet-wide IfMatch write freeze. Multipart etags are the
+    large S3-authoritative shared stores, not the small agent-dir pre-commit writes
+    the fail-closed change protects. _overwrite_decision takes etag as an arg, so a
+    synthetic '<hex>-N' multipart etag is passed directly."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "big.jsonl"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b'{"local":"content"}\n')  # manifest empty -> no baseline
+    multipart_etag = '"d41d8cd98f00b204e9800998ecf8427e-3"'
+    assert b._overwrite_decision(p, p, multipart_etag) == "download"
+
+
+def test_g115_2178_local_equals_baseline_still_downloads(cloud, tmp_path):
+    """GUARD against over-fail-closing: when the manifest baseline md5 EQUALS the
+    local md5 (local has NO unpushed writes) and S3 moved, the decision MUST stay
+    'download' -- local==baseline is verified, so S3 is authoritative. The
+    fail-closed change must not break this legitimate peer-wrote-newer pull."""
+    b = _backend(cloud)
+    local_body = b'{"in":"sync-with-baseline"}\n'
+    p, etag = _put_and_local(cloud, b, "world/store.jsonl",
+                             b'{"peer":"wrote-newer-to-s3"}\n', local_body)
+    local_md5 = hashlib.md5(local_body).hexdigest()
+    _write_sync_manifest(tmp_path, {b._rel(p): {"mtime": 1, "md5": local_md5}})
+    assert b._overwrite_decision(p, p, etag) == "download"
+
+
+def test_g115_2178_unpushed_local_still_no_clobber(cloud, tmp_path):
+    """Unchanged rb-2096 property (baseline PRESENT, local diverged from it): keep
+    local. Pins that the fail-closed change preserves the ORIGINAL no-clobber path,
+    not just the new baseline-None one."""
+    b = _backend(cloud)
+    p, etag = _put_and_local(cloud, b, "world/store.jsonl",
+                             b'{"peer":"s3"}\n', b'{"unpushed":"local-newer"}\n')
+    _write_sync_manifest(tmp_path, {b._rel(p): {"mtime": 1, "md5": "0" * 32}})
+    assert b._overwrite_decision(p, p, etag) == "no_clobber"

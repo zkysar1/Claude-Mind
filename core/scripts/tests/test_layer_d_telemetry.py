@@ -106,6 +106,11 @@ def _run_update_goal(tmp_world: Path, tmp_meta: Path, goal_id: str,
     env = os.environ.copy()
     env["MIND_WORLD"] = str(tmp_world)
     env["MIND_META"] = str(tmp_meta)
+    # This test POSITIVELY asserts on gate-firings records, and the writes are
+    # redirected to the tmp meta dir above — opt out of the _gate_log pytest
+    # suppression guard (), which would otherwise silently no-op log()
+    # in this subprocess (PYTEST_CURRENT_TEST propagates via os.environ.copy()).
+    env["GATE_LOG_ALLOW_PYTEST"] = "1"
     cmd = [sys.executable, str(ASP_PY), "update-goal", goal_id, field, value, *extra]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45, env=env)
     return proc.returncode, proc.stdout, proc.stderr
@@ -166,7 +171,7 @@ def main() -> int:
         tmp_meta.mkdir()
         _build_fixture(tmp_world)
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, tmp_meta, "g-test-01", "defer_reason", "deploy needs human"
+            tmp_world, tmp_meta, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes"
         )
         items = _read_world_aspirations(tmp_world)
         unblocks = _unblocks_in_asp001(items)
@@ -275,7 +280,7 @@ def main() -> int:
             "external_id": "case3-override-justification",
         })
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, tmp_meta, "g-test-01", "defer_reason", "deploy needs human",
+            tmp_world, tmp_meta, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes",
             "--force-defer", "test override case3",
             "--blocker-ref", blocker_ref,
         )

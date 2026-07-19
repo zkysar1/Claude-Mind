@@ -217,7 +217,7 @@ Runs 8-check verification on an existing destination. No copy.
 
 **Step 6**: Framework bootability.
   `Bash: bash <dest>/core/scripts/check-prerequisites.sh`
-  Confirms Python 3.8+, PyYAML, bash 4+ at destination.
+  Confirms Python 3.10+, PyYAML, bash 4+ at destination.
 
 **Step 7**: Path self-reference scan.
   `Bash: grep -rn "Ayoai-Mind\|ZakNoCloud\|Zachary" <dest>/.claude/settings.json <dest>/CLAUDE.md <dest>/README.md`

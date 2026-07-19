@@ -499,12 +499,31 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                 except ValueError as e:
                     return Response.error(400, "resolution_evidence_required",
                                           str(e))
+                # Stamp the resolution clock at the single move-INTO-resolved
+                # chokepoint (3): archive_sweep ages resolved records
+                # on outcome_date, but nothing on this path set it — 31 live
+                # records resolved date-less and never archived. Mirrors the
+                # archived_date stamp below; an explicit caller value wins.
+                if not rec.get("outcome_date"):
+                    rec["outcome_date"] = date.today().isoformat()
 
             if target_stage == "archived":
-                _append_to_archive(archive_path, rec)
-                items.pop(idx)
-            else:
-                items[idx] = rec
+                # Tombstone-in-live archival (6): keep the record in
+                # live as a stage=archived tombstone — the own-cloud merge
+                # (coordination_merge.merge_pipeline) is a per-file union-by-id
+                # that cannot express a cross-file removal, so popping here let
+                # a pre-removal remote copy resurrect archived records at their
+                # old stage. The monotonic stage rank converges the in-place
+                # flip fleet-wide; archive_sweep prunes the tombstone after
+                # PRUNE_GRACE_DAYS. Archive-append is deduped by id so a
+                # tombstone re-move (or resurrection residue) never duplicates
+                # the archive copy.
+                if not rec.get("archived_date"):
+                    rec["archived_date"] = date.today().isoformat()
+                if not any(r.get("id") == rec_id
+                           for r in _read_jsonl(archive_path)):
+                    _append_to_archive(archive_path, rec)
+            items[idx] = rec
 
             written_rec.update(rec)
 
@@ -786,6 +805,14 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
 # Duplicated from pipeline.py — same Decision #3 rationale.
 ARCHIVE_AGE_DAYS = 3
 
+# Tombstone-in-live archival (6): a record moved to archived STAYS in
+# pipeline.jsonl as a stage=archived tombstone for this many days before
+# archive_sweep physically prunes it. The grace window lets the stage flip
+# converge fleet-wide through the own-cloud union merge (which cannot express
+# a cross-file removal — a pre-removal remote copy resurrected 94 archived
+# records at their old stage, 2026-07-11) before the live copy disappears.
+PRUNE_GRACE_DAYS = 14
+
 
 def _empty_meta() -> Dict[str, Any]:
     return {
@@ -817,7 +844,19 @@ def _empty_meta() -> Dict[str, Any]:
 def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
     """Recompute meta from all records. Mirrors pipeline.py compute_meta."""
     meta = _empty_meta()
-    all_items = live_items + archive_items
+    # Dedup by id across live+archive (6; mirrors pipeline.py
+    # compute_meta): a tombstoned id is present in BOTH files by design —
+    # count each hypothesis once (archive copy wins) so accuracy denominators
+    # never double-count.
+    _by_id: Dict[str, Dict] = {}
+    _no_id: List[Dict] = []
+    for rec in live_items + archive_items:
+        rid = rec.get("id")
+        if rid is None:
+            _no_id.append(rec)
+        else:
+            _by_id[rid] = rec  # archive iterates second -> archive copy wins
+    all_items = list(_by_id.values()) + _no_id
 
     for rec in live_items:
         stage = rec.get("stage", "discovered")
@@ -986,13 +1025,39 @@ def _update_meta(live_path: Path, archive_path: Path, meta_path: Path) -> None:
 # archive-sweep handler
 # ---------------------------------------------------------------------------
 
+def _is_stale_unactivated(rec: Dict[str, Any], today: date) -> bool:
+    """archive_sweep auto-expiry predicate ().
+
+    True iff a never-activated discovered / measurement-pending hypothesis is
+    past its resolves_by deadline with no recorded outcome and no formation
+    trace (experience_ref). Any failing clause — not-yet-due, already-outcomed,
+    carries an experience_ref, absent/unparseable resolves_by, or any other
+    stage — returns False so the record is left untouched (no premature expiry).
+    """
+    if rec.get("stage") not in ("discovered", "measurement-pending"):
+        return False
+    if rec.get("outcome") is not None or rec.get("experience_ref") is not None:
+        return False
+    resolves_by = rec.get("resolves_by")
+    if not resolves_by:
+        return False
+    try:
+        rb = date.fromisoformat(str(resolves_by)[:10])
+    except (ValueError, TypeError):
+        return False
+    return rb < today
+
+
 def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/pipeline/archive-sweep
 
     Batch operation: sweep all resolved records whose outcome_date is older
-    than ARCHIVE_AGE_DAYS, set their stage to 'archived', validate, and
-    append to pipeline-archive.jsonl. Recomputes pipeline-meta.json
-    afterwards. Mirrors pipeline.py cmd_archive_sweep exactly.
+    than ARCHIVE_AGE_DAYS, flip their stage to 'archived' IN PLACE (they stay
+    in live as tombstones — g-115-1986; see PRUNE_GRACE_DAYS), validate, and
+    append to pipeline-archive.jsonl (deduped by id). Also maintains existing
+    live tombstones: stamps a missing archived_date, prunes tombstones whose
+    archived_date is older than PRUNE_GRACE_DAYS. Recomputes
+    pipeline-meta.json afterwards.
     """
     from ..server import Response
 
@@ -1002,46 +1067,140 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     today = date.today()
 
     archived_count = 0
+    pruned_count = 0
+    # Per-record validation failures are collected here rather than aborting
+    # the whole batch (7): one corrupt record must not wedge all
+    # archival. Invalid records stay in live (un-flipped, visible) and are
+    # reported as skipped_invalid in the response.
+    skipped_invalid: List[Dict[str, Any]] = []
 
     try:
         with file_locks.locked(live_path):
             items = _read_jsonl(live_path)
+            archive_ids = {r.get("id") for r in _read_jsonl(archive_path)}
             to_archive: List[Dict[str, Any]] = []
             remaining: List[Dict[str, Any]] = []
+            stamped_count = 0
 
             for rec in items:
+                if rec.get("stage") == "archived":
+                    # Live tombstone maintenance (6): stamp a missing
+                    # prune clock, prune aged tombstones (the archive copy
+                    # already holds the record), keep young ones so the stage
+                    # flip has time to converge fleet-wide via the union merge.
+                    archived_date = rec.get("archived_date")
+                    if not archived_date:
+                        rec["archived_date"] = today.isoformat()
+                        stamped_count += 1
+                        remaining.append(rec)
+                        continue
+                    try:
+                        age = (today - date.fromisoformat(
+                            str(archived_date)[:10])).days
+                    except ValueError:
+                        remaining.append(rec)  # unparseable clock — keep
+                        continue
+                    if age >= PRUNE_GRACE_DAYS:
+                        pruned_count += 1
+                        continue  # physically pruned; archive copy remains
+                    remaining.append(rec)
+                    continue
                 if rec.get("stage") == "resolved":
-                    outcome_date = rec.get("outcome_date")
+                    # Effective resolution clock (3): 33/73 live
+                    # resolved records were sweep-invisible — 31 carried only
+                    # resolution_date_actual/reflected_date (no writer stamped
+                    # outcome_date on the move-to-resolved path), 2 carried
+                    # datetime-format outcome_date that bare fromisoformat
+                    # rejects. Fallbacks are >= the resolution date, so they
+                    # only ever DELAY archival; [:10] matches the tombstone
+                    # idiom above.
+                    outcome_date = (rec.get("outcome_date")
+                                    or rec.get("resolution_date_actual")
+                                    or rec.get("reflected_date"))
                     if outcome_date:
                         try:
-                            od = date.fromisoformat(outcome_date)
+                            od = date.fromisoformat(str(outcome_date)[:10])
                             if (today - od).days >= ARCHIVE_AGE_DAYS:
-                                rec["stage"] = "archived"
+                                # Validate a candidate copy BEFORE mutating the
+                                # live record so a single invalid record is
+                                # skipped-and-reported, not fatal to the batch
+                                # (7).
+                                candidate = dict(rec)
+                                candidate["stage"] = "archived"
+                                candidate["archived_date"] = today.isoformat()
                                 try:
-                                    _validate_record(rec)
+                                    _validate_record(candidate)
                                 except ValueError as e:
-                                    return Response.error(
-                                        400, "validation_failed",
-                                        f"Validation error on archive-sweep "
-                                        f"({rec.get('id', '?')}): {e}")
+                                    skipped_invalid.append({
+                                        "id": rec.get("id", "?"),
+                                        "reason": str(e),
+                                        "branch": "resolved-archive",
+                                    })
+                                    remaining.append(rec)  # keep in live, un-flipped
+                                    continue
+                                rec["stage"] = "archived"
+                                rec["archived_date"] = today.isoformat()
                                 to_archive.append(rec)
+                                remaining.append(rec)  # keep as tombstone
                                 continue
                         except ValueError:
                             # date.fromisoformat parse failure — keep in live
                             pass
+                elif _is_stale_unactivated(rec, today):
+                    # : expire never-activated discovered /
+                    # measurement-pending records past resolves_by (predicate
+                    # above). archive_sweep previously archived ONLY
+                    # stage==resolved by age, so these accumulated indefinitely
+                    # past resolves_by — the measurement-pending ->
+                    # archived-at-resolves_by transition documented at the
+                    # pipeline.py module header was never wired here. EXPIRED
+                    # lands in archived (never resolved), so it is excluded from
+                    # accuracy stats and never reflected. _validate_record (NOT
+                    # _validate_formation_quality) runs here, so claim-less
+                    # discovered records validate cleanly.
+                    # Validate a candidate copy BEFORE mutating the live record
+                    # so a single invalid record is skipped-and-reported, not
+                    # fatal to the batch (7).
+                    candidate = dict(rec)
+                    candidate["outcome"] = "EXPIRED"
+                    candidate["outcome_date"] = today.isoformat()
+                    candidate["stage"] = "archived"
+                    candidate["archived_date"] = today.isoformat()
+                    try:
+                        _validate_record(candidate)
+                    except ValueError as e:
+                        skipped_invalid.append({
+                            "id": rec.get("id", "?"),
+                            "reason": str(e),
+                            "branch": "expiry",
+                        })
+                        remaining.append(rec)  # keep in live, un-flipped
+                        continue
+                    rec["outcome"] = "EXPIRED"
+                    rec["outcome_date"] = today.isoformat()
+                    rec["stage"] = "archived"
+                    rec["archived_date"] = today.isoformat()
+                    to_archive.append(rec)
+                    remaining.append(rec)  # keep as tombstone
+                    continue
                 remaining.append(rec)
 
-            if not to_archive:
+            archived_count = len(to_archive)
+
+            if not to_archive and pruned_count == 0 and stamped_count == 0:
                 return Response.json({
                     "ok": True,
                     "archived_count": 0,
+                    "pruned_count": 0,
+                    "skipped_invalid": skipped_invalid,
                 })
 
-            # Append each archived record to the archive file.
+            # Append each newly-flipped record to the archive file — once.
+            # Ids already archived (tombstone re-sweeps, resurrection residue)
+            # are skipped so the archive never grows duplicate groups.
             for rec in to_archive:
-                _append_to_archive(archive_path, rec)
-
-            archived_count = len(to_archive)
+                if rec.get("id") not in archive_ids:
+                    _append_to_archive(archive_path, rec)
 
             history.snapshot(live_path, base_dir, agent,
                              summary=f"pipeline-archive-sweep ({archived_count} records)")
@@ -1064,6 +1223,8 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({
         "ok": True,
         "archived_count": archived_count,
+        "pruned_count": pruned_count,
+        "skipped_invalid": skipped_invalid,
     })
 
 

@@ -13,8 +13,15 @@ AGENT="${2:?Usage: history-save.sh <file> <agent> [summary]}"
 SUMMARY="${3:-}"
 
 # Pass args via sys.argv to avoid shell injection from quotes in SUMMARY
-python3 -c "
-import sys
+# CORE_SCRIPTS env prepend (8): _fileops.py lives in $CORE_ROOT/scripts,
+# but `python3 -c` puts cwd (PROJECT_ROOT) on sys.path, not core/scripts — so a
+# bare `from _fileops import` fails on linux/cc-05 (worked on Windows via the shim).
+# Same fix pattern as iteration-close.sh (L551/L1283) + stop-hook.sh (L320): pass
+# the dir via env (guard-165 — NOT interpolated into the python source) and
+# sys.path.insert it before the import.
+CORE_SCRIPTS="$CORE_ROOT/scripts" python3 -c "
+import os, sys
+sys.path.insert(0, os.environ['CORE_SCRIPTS'])
 from _fileops import save_history, resolve_base_dir
 
 base = resolve_base_dir(sys.argv[1])

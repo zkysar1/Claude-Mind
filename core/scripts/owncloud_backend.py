@@ -125,6 +125,14 @@ def _coordination_merge_handler(path):
         return None
 
 
+# g-001-41: serialize _stamp_manifest_baseline's load+mutate+save. Per-path
+# daemon locks do not cover the SHARED manifest, so two in-process backend
+# threads stamping DIFFERENT paths could last-writer-wins-drop each other's
+# entry. In-process only — the cross-PROCESS sweep collision is already accepted
+# by contract (see the _stamp_manifest_baseline docstring). Restored g-115-2179.
+_MANIFEST_STAMP_LOCK = threading.Lock()
+
+
 class ConflictError(Exception):
     """An ``If-Match`` conditional PUT was rejected (the object changed since the
     in-lock read). The caller MUST re-run the whole read-modify-write; the
@@ -596,8 +604,14 @@ class OwnCloudBackend:
         except ValueError:
             return self._local(path)
         # Reset the both-diverged flag; only the no_clobber verdict below re-adds
-        # it. Every other outcome (identical / download / unchanged / absent /
-        # cache-fresh) means this key is NOT in a both-diverged state right now.
+        # it. Outcomes that re-checked S3 (identical / download / unchanged /
+        # absent) genuinely prove the key is not both-diverged right now. The
+        # warm-cache early-return below proves NOTHING (no S3 contact), so this
+        # discard CAN drop a still-true flag there — benign by redundancy: the
+        # flag is a proactive-merge optimization only, and _put's 412 path
+        # dispatches _merge_reconcile_put "regardless of _diverged_keys state"
+        # (g-115-1741), while unregistered stores keep freeze-on-conflict either
+        # way. Verified during the g-115-2385 W2 read-lane enumeration.
         self._diverged_keys.discard(key)
         local = self._local(path)
         now = time.monotonic()
@@ -631,8 +645,11 @@ class OwnCloudBackend:
             if decision == "identical":
                 # local already byte-identical to S3; the empty post-restart
                 # cache only made it look stale. Adopt the ETag as the fence
-                # token and skip the needless re-download.
+                # token and skip the needless re-download. Byte-identity proves
+                # any local delta vs the old baseline is already ON S3 --
+                # nothing unpushed to mask, so re-stamp the baseline too.
                 self._etags[key] = etag
+                self._stamp_manifest_baseline(path, local.read_bytes())
                 return local
             if decision == "no_clobber":
                 # local is authoritative: it holds unpushed writes (local != the
@@ -656,7 +673,58 @@ class OwnCloudBackend:
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(body)
         self._etags[key] = etag
+        # Reaching this line requires verdict=="download" or local-absent --
+        # both mean S3 is authoritative and the mirror now byte-equals S3,
+        # which is precisely the state the baseline exists to record.
+        self._stamp_manifest_baseline(path, body)
         return local
+
+    def _stamp_manifest_baseline(self, path: PathLike, body: bytes) -> None:
+        """Stamp the persistent sync-manifest baseline for a just-pushed key
+        (g-115-1946 — root fix for the cross-box lost-update lanes).
+
+        _put/_merge success previously advanced only the IN-PROCESS fence
+        (self._etags); the PERSISTENT baseline was stamped only by the periodic
+        owncloud_sync sweep (default 120s), so every post-write window falsely
+        presented as "unpushed local writes" to _overwrite_decision's no_clobber
+        gate and to the sweep's authority ladder — the state that let concurrent
+        boxes read stale local inside the write lock, mint duplicate goal ids,
+        and clobber each other. Stamping {mtime, md5} here makes
+        local == baseline == S3 immediately after every backend write.
+
+        Fail-open by contract: a stamp failure WARNs and never fails the PUT
+        (the stale-baseline window then simply persists until the next sweep —
+        exactly the pre-fix behavior). Concurrency: _save_manifest is atomic
+        (tmp + os.replace) and the manifest is a machine-local skip-cache, never
+        the SSOT; a concurrent sweep save can drop this stamp (whole-file
+        last-writer-wins), which only re-opens the window until that sweep's own
+        stamp — never worse than pre-fix. Two in-process backend threads
+        stamping DIFFERENT paths are serialized by _MANIFEST_STAMP_LOCK
+        (g-001-41) around the load+mutate+save, so a same-process interleave can
+        no longer drop a peer thread's baseline; only the cross-PROCESS sweep
+        collision remains accepted. Lazy import mirrors _overwrite_decision
+        (keeps owncloud_sync off the backend's import path).
+
+        RESTORED 2026-07-14 (g-115-2179). Deleted as collateral by the c5814933
+        origin-checkout — see stranded-checkout-check.sh."""
+        try:
+            from owncloud_sync import _load_manifest, _save_manifest
+            local = self._local(path)
+            # g-001-41: serialize load+mutate+save so a concurrent backend
+            # thread stamping a DIFFERENT path cannot last-writer-wins-drop
+            # this entry (per-path daemon locks do not cover the shared
+            # manifest). In-process lock; see _MANIFEST_STAMP_LOCK above.
+            with _MANIFEST_STAMP_LOCK:
+                m = _load_manifest()
+                m[self._rel(path)] = {
+                    "mtime": local.stat().st_mtime_ns,
+                    "md5": hashlib.md5(body).hexdigest(),
+                }
+                _save_manifest(m)
+        except Exception as e:  # noqa: BLE001 — fail-open by contract
+            _LOG.warning(
+                "manifest baseline stamp failed for %s: %s (stale-baseline "
+                "window persists until next sweep)", path, e)
 
     def _overwrite_decision(self, path: PathLike, local: Path, etag: str) -> str:
         """Classify whether _refresh may overwrite an EXISTING local file with
@@ -666,22 +734,41 @@ class OwnCloudBackend:
 
           "identical"  local is byte-identical to S3 -> skip the download; the
                        caller adopts the ETag as the fence token.
-          "no_clobber" local diverged from the PERSISTENT sync-manifest baseline
-                       (unpushed local writes -> local is authoritative) -> keep
-                       local, do NOT download.
-          "download"   safe to pull S3 over local: local == baseline and S3 moved
-                       (a peer/other machine wrote), there is no baseline
-                       (S3-authoritative, matching _pull_one's no-baseline branch),
-                       OR the S3 ETag is multipart (uncomparable by md5, but local
-                       == baseline is guaranteed here since the unpushed-writes
-                       gate above already returned, so S3 is authoritative -- and
-                       pulling refreshes the fence, without which multipart-stored
-                       files freeze on IfMatch forever; 2026-07-02 fix).
+          "no_clobber" local MAY hold unpushed writes -> keep local, do NOT
+                       download. Two cases: (a) local diverged from the PERSISTENT
+                       sync-manifest baseline (local is authoritative), or (b)
+                       g-115-2178 FAIL-CLOSED -- the baseline could not be READ
+                       (owncloud_sync import raised, or the manifest read raised),
+                       so local == baseline cannot be verified and a download risks
+                       PERMANENT loss of an unpushed-not-yet-committed record. Both
+                       surfaced loudly via _LOG.warning; the caller (L637) flags the
+                       key diverged so a following _put reconciles.
+          "download"   safe (or freeze-avoiding) to pull S3 over local: local ==
+                       baseline and S3 moved (a peer/other machine wrote), there is
+                       no manifest baseline (ABSENT, not a read failure -- the
+                       DELIBERATE S3-authoritative first-pull policy, matching
+                       _pull_one's no-baseline branch and preserving force_fresh
+                       cache-coherence; the backend's own write path does NOT
+                       populate owncloud_sync's persistent manifest, so absence is
+                       the common pre-sweep state), OR the S3 ETag is multipart
+                       (uncomparable by md5 -- for the large S3-authoritative shared
+                       stores a fleet-wide freeze is worse than a rare stale-keep,
+                       so a multipart object pulls to refresh the fence even without
+                       a baseline; 2026-07-02 fix, without which IfMatch froze).
 
-        Fail-open: an unreadable local, or unavailable owncloud_sync helpers,
-        degrade to "download" (the pre-fix behavior for that single call) so a
-        manifest/import hiccup never wedges a read. _load_manifest is itself
-        fail-open (returns {} on any error -> no baseline -> "download")."""
+        FAIL-CLOSED (g-115-2178, rb-3422): a data-protection guard whose failure
+        mode is OVERWRITE is not a guard. When the baseline cannot be READ (import
+        or manifest-read EXCEPTION), this returns "no_clobber" + logs loudly rather
+        than silently downloading over a possibly-unpushed local (the write ->
+        first-commit exposure window: a record clobbered before its first git
+        commit has NO trace in git, S3, or .history). SCOPE: only a baseline-read
+        FAILURE (exception) fails closed; a baseline that is merely ABSENT (no
+        manifest entry) is NOT a failure -- it is the tested S3-authoritative
+        first-pull path above (over-failing THAT closed broke peer-update
+        visibility -- test_refresh_no_baseline_pulls_s3_authoritative). The other
+        deliberate fail-OPENs: an UNREADABLE local (OSError) -> "download" (a local
+        we cannot read cannot be preserved; S3 is the only recovery source), and
+        multipart (freeze-avoidance) -> "download"."""
         try:
             local_md5 = hashlib.md5(local.read_bytes()).hexdigest()
         except OSError:
@@ -694,20 +781,40 @@ class OwnCloudBackend:
             from owncloud_sync import (_load_manifest, _manifest_entry,
                                        _etag_matches, _etag_is_multipart)
         except Exception:
-            return "download"
+            # (g-115-2178) FAIL CLOSED: without the manifest/ETag helpers we
+            # cannot verify local == baseline, so we cannot prove an S3 pull is
+            # safe. Overwriting an unverifiable local can PERMANENTLY lose an
+            # unpushed-not-yet-committed record (rb-3422). Keep local + surface
+            # loudly; the caller (L637) flags the key diverged so _put reconciles.
+            _LOG.warning(
+                "owncloud _overwrite_decision FAIL-CLOSED: owncloud_sync import "
+                "failed for %s -- keeping local, refusing S3 overwrite "
+                "(g-115-2178/rb-3422)", self._rel(path))
+            return "no_clobber"
         if _etag_matches(etag, local_md5):
             return "identical"
+        # baseline_read_failed distinguishes a baseline-read EXCEPTION (the
+        # manifest read raised -> NO trustworthy baseline -> FAIL CLOSED below)
+        # from a baseline that is simply ABSENT (no manifest entry -> the
+        # DELIBERATE S3-authoritative first-pull policy). Only the former is a
+        # "read failure" (g-115-2178); absence is the common pre-sweep state
+        # (the backend's own write path does not populate owncloud_sync's
+        # persistent manifest) and MUST stay "download" -- failing it closed
+        # broke force_fresh peer-update visibility
+        # (test_refresh_no_baseline_pulls_s3_authoritative).
+        baseline_read_failed = False
         try:
             _mtime, baseline_md5 = _manifest_entry(
                 _load_manifest().get(self._rel(path)))
         except Exception:
             baseline_md5 = None
+            baseline_read_failed = True  # route 2: the manifest read RAISED
         if baseline_md5 is not None and local_md5 != baseline_md5:
             return "no_clobber"  # unpushed local writes -> local is authoritative
         if _etag_is_multipart(etag):
             # (2026-07-02 fleet-wide-freeze fix) A multipart S3 ETag is
             # uncomparable to a local md5, but reaching HERE guarantees local ==
-            # baseline: the L499 gate already returned "no_clobber" for
+            # baseline: the gate above already returned "no_clobber" for
             # local != baseline (unpushed local writes -> rb-2096 protection).
             # So S3 is authoritative and safe to pull -- identical to the
             # no-baseline "download" policy on the next line. The prior
@@ -716,10 +823,35 @@ class OwnCloudBackend:
             # so _put kept sending IfMatch(stale) and every write to a
             # multipart-stored file (e.g. the ~8MB world/aspirations.jsonl)
             # 412'd DETERMINISTICALLY forever. "download" pulls S3 and adopts the
-            # current ETag as the fence (L456), curing the freeze; the L499
-            # baseline gate still protects unpushed local writes (rb-2096 intact).
+            # current ETag as the fence, curing the freeze; the baseline gate
+            # above still protects unpushed local writes (rb-2096 intact).
             return "download"
-        return "download"
+        if baseline_read_failed:
+            # (g-115-2178) FAIL CLOSED on a baseline-read FAILURE -- the manifest
+            # read RAISED (or, above, owncloud_sync failed to import). We have NO
+            # trustworthy baseline, so we cannot prove local == baseline and a
+            # download could silently overwrite a possibly-unpushed local. A
+            # record clobbered before its first git commit is PERMANENTLY lost
+            # (no git/S3/.history trace -- the write->first-commit exposure
+            # window). A data-protection guard's failure mode must be PRESERVE,
+            # not overwrite (rb-3422): keep local; the caller (L637) flags the key
+            # diverged so a following _put reconciles. Surface loudly so a genuine
+            # manifest fault is seen, not silently disarmed.
+            # SCOPE (g-115-2178): a baseline that is merely ABSENT (no manifest
+            # entry) is NOT a read failure -- it falls through to the
+            # S3-authoritative "download" below, the DELIBERATE policy that
+            # test_refresh_no_baseline_pulls_s3_authoritative pins and that
+            # force_fresh cache-coherence relies on. Only a genuine read EXCEPTION
+            # fails closed here.
+            _LOG.warning(
+                "owncloud _overwrite_decision FAIL-CLOSED: manifest-read failure "
+                "for %s (local_md5=%s) -- keeping local, refusing S3 overwrite to "
+                "protect possibly-unpushed writes (g-115-2178/rb-3422)",
+                self._rel(path), local_md5)
+            return "no_clobber"
+        return "download"  # local == baseline and S3 moved (peer wrote), OR no
+                           # baseline (ABSENT: S3-authoritative first pull, matching
+                           # _pull_one) -> safe to adopt S3
 
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes:
         local = self._refresh(path, force_fresh)
@@ -729,6 +861,44 @@ class OwnCloudBackend:
                   *, force_fresh: bool = False) -> str:
         local = self._refresh(path, force_fresh)
         return local.read_text(encoding=encoding)
+
+    def read_authoritative_bytes(self, path: PathLike) -> bytes:
+        """Pure read of the S3 object, straight to memory (g-115-1987).
+
+        Unlike read_bytes/read_text(force_fresh=True) -> _refresh, this NEVER
+        touches the local mirror: no download-into-cache (the rb-3128
+        read-side clobber), no _etags/_cache_check mutation, and no
+        no_clobber fallback -- in the both-diverged state _refresh returns
+        the LOCAL path, so a "fresh" read_text serves the non-authoritative
+        local content exactly when a diagnostic most needs S3 truth.
+        Machine-local and out-of-root (git-shipped) paths are never on S3 --
+        plain local read, mirroring _refresh's no-op branches. Raises
+        FileNotFoundError when absent (matches LocalBackend semantics).
+
+        RESTORED 2026-07-14 (g-115-2179). Deleted as collateral by the
+        c5814933 origin-checkout (see stranded-checkout-check.sh). It is the
+        ONLY StorageBackend protocol method OwnCloudBackend was missing --
+        LocalBackend and the test FakeBackend both implement it, so its
+        absence was invisible to the suite and live ONLY on own-cloud (the
+        production backend). _merge_reconcile_sweep cannot be correct without
+        it: in the diverged state that is the merge's only trigger,
+        read_bytes(force_fresh=True) returns LOCAL bytes, so a merge built on
+        it would merge local-against-local and emit garbage."""
+        if self._machine_local(path):
+            return self._local(path).read_bytes()
+        try:
+            key = self._s3_key(path)
+        except ValueError:
+            return self._local(path).read_bytes()
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                raise FileNotFoundError(
+                    f"absent in S3 store: s3://{self.bucket}/{key}") from e
+            _reraise_access_denied(e, "read_authoritative_bytes GetObject")
+            raise
+        return obj["Body"].read()
 
     def exists(self, path: PathLike) -> bool:
         try:
@@ -749,6 +919,44 @@ class OwnCloudBackend:
         # mtime_ns=0: S3 has no nanosecond mtime; callers that special-case mtime
         # must tolerate 0 (FileStat contract). version is the ETag.
         return FileStat(version=h["ETag"], size=int(h["ContentLength"]), mtime_ns=0)
+
+    def head_last_modified(self, path: PathLike) -> Optional[float]:
+        """S3 LastModified as epoch seconds, or None when the key is absent.
+        Companion to delete_object's caller-side newer-than guards; kept
+        separate from stat() because FileStat's mtime_ns=0 contract is
+        load-bearing for existing callers."""
+        try:
+            h = self.s3.head_object(Bucket=self.bucket, Key=self._s3_key(path))
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None
+            raise
+        lm = h.get("LastModified")
+        return lm.timestamp() if lm is not None else None
+
+    def delete_object(self, path: PathLike) -> bool:
+        """Delete ONE S3 object. No local-mirror side effects — the caller owns
+        any local twin. Deliberately the sync layer's only delete primitive
+        (g-115-2122 part 2 move-propagation); every caller must satisfy
+        archive-before-delete (e.g. sweep deletes a temp/ root key only when
+        its drained/ twin exists — the drained copy IS the archive). The
+        bucket is versioned, so this writes a delete marker; noncurrent
+        versions remain until lifecycle expiry. Returns True when the delete
+        was accepted, False when the key was already absent. Requires
+        s3:DeleteObject (lodestar-own-cloud policy, granted 2026-07-17)."""
+        key = self._s3_key(path)
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return False
+            raise
+        try:
+            self.s3.delete_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            _reraise_access_denied(e, "delete_object DeleteObject")
+            raise
+        return True
 
     def list_dir(self, path: PathLike) -> List[str]:
         prefix = self._s3_key(path)
@@ -790,6 +998,44 @@ class OwnCloudBackend:
                 break
         names.discard("")
         return sorted(names)
+
+    def list_objects(self, path: PathLike) -> List[tuple]:
+        """Flat recursive paginated list under `path`: [(rel_posix, etag, size)].
+
+        The cheap enumeration the pull sweep (owncloud_sync.pull_sweep,
+        g-115-2268 Gap A) needs: one ListObjectsV2 page per 1000 objects with
+        NO Delimiter, returning every descendant object's key + ETag in ~3-7
+        requests per governed root — vs one HEAD per file. rel paths are
+        POSIX-relative to `path`. Same customer/env scope assert as list_dir."""
+        prefix = self._s3_key(path)
+        if prefix.endswith("/."):
+            prefix = prefix[:-1]
+        if not prefix.endswith("/"):
+            prefix += "/"
+        expected = self._customer_prefix() + self.env_id + "/"
+        assert prefix.startswith(expected), (
+            f"list_objects prefix {prefix!r} escapes customer/env scope "
+            f"{expected!r} — IAM ListBucket is prefix-conditioned on it")
+        out = []
+        token = None
+        while True:
+            kw = dict(Bucket=self.bucket, Prefix=prefix)
+            if token:
+                kw["ContinuationToken"] = token
+            try:
+                resp = self.s3.list_objects_v2(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "list_objects ListObjectsV2")
+                raise
+            for c in resp.get("Contents", []):
+                rel = c["Key"][len(prefix):]
+                if rel:
+                    out.append((rel, c["ETag"], int(c["Size"])))
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+            else:
+                break
+        return out
 
     def ensure_local(self, path: PathLike) -> Path:
         return self._refresh(path, force_fresh=False)
@@ -841,6 +1087,44 @@ class OwnCloudBackend:
                 return self._merge_reconcile_put(path, key, local, body, handler)
         kw = dict(Bucket=self.bucket, Key=key, Body=body)
         fence = self._etags.get(key)
+        if fence is None:
+            # W1 fix (g-115-2370, from the g-115-2360 RCA of the 2026-07-16
+            # aspirations.jsonl clobber): the in-process fence cache is EMPTY
+            # after every daemon restart, and stays unpopulated for any write
+            # whose base read never touched S3 (warm-cache early-return,
+            # head_object-404 return-local). The previous behavior — an
+            # UNCONDITIONAL PutObject — could replace an S3 head this process
+            # never read (composed with a stale-local read = silent multi-goal
+            # data loss). Resolve against S3 NOW, before the PUT:
+            #   - key absent  -> conditional CREATE (IfNoneMatch="*"): a peer
+            #     creating concurrently 412s us into the conflict lane below
+            #     instead of last-writer-wins.
+            #   - key exists + registered merge handler -> merge-reconcile.
+            #     PUT-time head-fencing is NOT sufficient for these: a body
+            #     derived from a stale local read would pass a fence fetched at
+            #     write time and still clobber the head (the W1∘W2 composition),
+            #     so union with the current remote on a fresh fence instead —
+            #     the same safe degradation as the stale-fence 412 path below
+            #     (g-115-1741).
+            #   - key exists + unregistered -> adopt the CURRENT etag as the
+            #     fence. Single-writer per-agent files are the population here;
+            #     plain-PUT-over-own-history is their intended semantic, and the
+            #     fence closes the concurrent-writer race window without
+            #     introducing a post-restart freeze class (rb-3636 fence-wedge).
+            try:
+                head = self.s3.head_object(Bucket=self.bucket, Key=key)
+            except ClientError as e:
+                if e.response["Error"]["Code"] not in _NOT_FOUND:
+                    raise
+                head = None
+            if head is None:
+                kw["IfNoneMatch"] = "*"
+            else:
+                handler = _coordination_merge_handler(path)
+                if handler is not None:
+                    return self._merge_reconcile_put(path, key, local, body,
+                                                     handler)
+                fence = head["ETag"]
         if fence is not None:
             kw["IfMatch"] = fence  # fix #3: only overwrite the version we read
         # G2 (machine-2 gate): the boto3 client carries
@@ -856,8 +1140,10 @@ class OwnCloudBackend:
         # the last good S3 version — no local-ahead divergence to lose. (This
         # reverses the prior "local first" order, which seeded exactly that
         # divergence; do NOT move the local write back above the PUT.)
-        if fence is not None:
-            self._cas_writes += 1  # g-328-21: CAS (fenced) write — conflict-rate denominator
+        if fence is not None or "IfNoneMatch" in kw:
+            # g-328-21: conditional (IfMatch or IfNoneMatch) write — both can
+            # 412, so both count in the conflict-rate denominator.
+            self._cas_writes += 1
         try:
             r = self.s3.put_object(**kw)
         except ParamValidationError as e:
@@ -867,7 +1153,7 @@ class OwnCloudBackend:
             # bypassing __init__) can never silently drop the write. Only remap
             # when IfMatch was actually in play; an unrelated param error surfaces
             # as-is. Do NOT retry without IfMatch — that would drop compare-and-swap.
-            if "IfMatch" in kw:
+            if "IfMatch" in kw or "IfNoneMatch" in kw:
                 raise RuntimeError(
                     _IFMATCH_UPGRADE_MSG + f"\n(original client-side error: {e})")
             raise
@@ -908,6 +1194,7 @@ class OwnCloudBackend:
         self._etags[key] = r["ETag"]
         self._cache_check[str(local)] = time.monotonic()
         self._diverged_keys.discard(key)  # this write resolved any divergence
+        self._stamp_manifest_baseline(path, body)
         return WriteResult(version=r["ETag"], fallback_used=False)
 
     def _get_remote_raw(self, key: str):
@@ -968,6 +1255,7 @@ class OwnCloudBackend:
             self._etags[key] = r["ETag"]
             self._cache_check[str(local)] = time.monotonic()
             self._diverged_keys.discard(key)
+            self._stamp_manifest_baseline(path, merged)
             if saw_conflict:
                 self._cas_conflicts_resolved += 1  # g-328-21: retry recovered
                 _LOG.info(
@@ -1042,6 +1330,37 @@ class OwnCloudBackend:
         else:
             self._etags.pop(key, None)            # new object — unconditional PUT
         return self._put(path, content)
+
+    def merge_put(self, path: PathLike, content: bytes) -> Optional[WriteResult]:
+        """Union-merge push for a merge-REGISTERED store (g-115-2297): GET the
+        current remote bytes, MERGE with ``content`` via the store's commutative
+        handler (coordination_merge), and PUT fenced on the remote ETag — the
+        bounded CAS loop in ``_merge_reconcile_put``. Returns ``None`` when the
+        store has no registered handler or the path is machine-local; the
+        caller then falls back to its default action (e.g. ``mirror_put``).
+        On success the merged bytes land on BOTH S3 and the local cache, so
+        both sides converge to the union.
+
+        Sibling of ``mirror_put`` for the sync sweep. A whole-object PUT of an
+        append-only log CLOBBERS whenever S3 holds records local lacks — the
+        If-Match fence cannot catch it because it fences on the just-observed
+        CURRENT etag, so a stale-TAIL local (appends degraded to LocalBackend
+        while peers appended to S3) replaces the newer head and the fence
+        passes (observed 2026-07-16T03:09:14 on meta/gate-firings.jsonl).
+        Registered stores therefore never take the blind PUT from the sync
+        path; the union is a superset of the push, so local-only records still
+        land. Not on the StorageBackend Protocol: own-cloud-only, like
+        ``mirror_put``."""
+        if self._machine_local(path):
+            return None
+        handler = _coordination_merge_handler(path)
+        if handler is None:
+            return None
+        self._assert_not_tempdir_put(path)  # guard-955 parity with _put
+        key = self._s3_key(path)
+        local = self._local(path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        return self._merge_reconcile_put(path, key, local, content, handler)
 
     # --- record-level JSONL ------------------------------------------------
     def read_jsonl(self, path: PathLike) -> List[dict]:

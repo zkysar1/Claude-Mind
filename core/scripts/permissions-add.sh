@@ -55,7 +55,7 @@ fi
 
 if [ -z "$PY" ]; then
     echo "ERROR: neither 'py -3' nor 'python3' nor 'python' (3.x) found on PATH." >&2
-    echo "  Install Python 3.8+ — see core/scripts/check-prerequisites.sh." >&2
+    echo "  Install Python 3.10+ — see core/scripts/check-prerequisites.sh." >&2
     exit 4
 fi
 

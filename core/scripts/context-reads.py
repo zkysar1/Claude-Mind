@@ -97,6 +97,26 @@ TRACKED_FILES = [
     str(AGENT_DIR / "session" / "aspirations-compact.json")
 ] if AGENT_DIR else []
 
+# Advisory-ONLY extension prefixes (0). The read-before-edit ADVISORY
+# (pre-edit-context-gate.sh -> check-file) plus the RECORDER should cover
+# framework-CODE edits, which concentrate in core/scripts/ — the surface where
+# the loop self-evolves the framework and where stale-context edits after an
+# autocompact are most costly. But the BLOCKING re-read dedup gate (cmd_gate,
+# exit 2) MUST NOT extend here: blocking a whole-file re-read of a script the
+# agent just edited would collide with verify-before-assuming.md's mandated
+# "re-verify after linter/user notification" (a required whole-file re-read
+# would be refused as "already in context"). So these prefixes widen ONLY the
+# recorder + advisory scope; cmd_gate keeps the narrow TRACKED_PREFIXES. Net:
+# core/scripts reads ARE recorded (giving the advisory signal) but are NEVER
+# dedup-blocked, and — because invalidate leaves them recorded across the agent's
+# own edits — a consecutive follow-up edit does NOT mis-fire a false advisory.
+# (.claude/rules/** is a deliberate future candidate — also framework-text and
+# currently silent per read-before-edit.md Rule 4 — added here only if the same
+# stale-context miss pattern is observed there; scoped out of 0.)
+ADVISORY_EXTRA_PREFIXES = [
+    str(PROJECT_ROOT / "core" / "scripts"),
+]
+
 
 def normalize_path(file_path):
     """Resolve a file path to an absolute, normalized string."""
@@ -106,13 +126,34 @@ def normalize_path(file_path):
 
 
 def is_in_scope(normalized):
-    """Check if a normalized path falls within tracked prefixes or is a tracked file."""
+    """Check if a normalized path falls within tracked prefixes or is a tracked file.
+
+    This is the NARROW scope — used by the BLOCKING re-read dedup gate
+    (cmd_gate). Widening it would start blocking whole-file re-reads of the
+    added prefix; see ADVISORY_EXTRA_PREFIXES for why core/scripts must NOT be
+    dedup-blocked. Recorder + advisory use is_in_scope_advisory (wider) instead.
+    """
     for tf in TRACKED_FILES:
         if normalized == tf.replace("\\", "/"):
             return True
     for prefix in TRACKED_PREFIXES:
         norm_prefix = prefix.replace("\\", "/")
         if normalized.startswith(norm_prefix):
+            return True
+    return False
+
+
+def is_in_scope_advisory(normalized):
+    """WIDER scope for the RECORDER (cmd_record) + read-before-edit ADVISORY
+    (cmd_check_file) ONLY. Superset of is_in_scope: adds ADVISORY_EXTRA_PREFIXES
+    (core/scripts) so the advisory fires on framework-CODE edits. The BLOCKING
+    dedup gate (cmd_gate) deliberately does NOT call this — see the
+    ADVISORY_EXTRA_PREFIXES comment (g-115-2210) for the re-read-block rationale.
+    """
+    if is_in_scope(normalized):
+        return True
+    for prefix in ADVISORY_EXTRA_PREFIXES:
+        if normalized.startswith(prefix.replace("\\", "/")):
             return True
     return False
 
@@ -200,6 +241,10 @@ def cmd_gate(args):
     # read_tracker MUST run before is_in_scope — it clears stale cross-session trackers
     tracked = read_tracker(session_id=args.session_id)
 
+    # NARROW is_in_scope is load-bearing here — do NOT switch this to
+    # is_in_scope_advisory. The block gate must never refuse a core/scripts
+    # whole-file re-read (verify-before-assuming.md re-verify mandate); that
+    # prefix is advisory-only (0).
     if not is_in_scope(normalized):
         sys.exit(0)  # Not tracked, always allow
 
@@ -226,8 +271,8 @@ def cmd_record(args):
     # read_tracker MUST run before is_in_scope — it clears stale cross-session trackers
     tracked = read_tracker(session_id=args.session_id)
 
-    if not is_in_scope(normalized):
-        return  # Not tracked
+    if not is_in_scope_advisory(normalized):
+        return  # Not tracked (recorder uses the WIDER advisory scope — 0)
 
     if normalized in tracked:
         return  # Already recorded
@@ -327,7 +372,9 @@ def cmd_check_file(args):
 
     for fp in args.file_paths:
         normalized = normalize_path(fp)
-        if is_in_scope(normalized) and normalized not in tracked:
+        # WIDER advisory scope (0): the read-before-edit advisory covers
+        # core/scripts framework-code edits, which the narrow is_in_scope omits.
+        if is_in_scope_advisory(normalized) and normalized not in tracked:
             print(normalized)
 
 

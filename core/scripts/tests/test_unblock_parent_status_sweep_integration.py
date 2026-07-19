@@ -51,7 +51,9 @@ from _daemon_fixture import DaemonFixture  # noqa: E402
 
 
 def _make_world_with_pair(tmp: Path, *, parent_status: str = "skipped",
-                          unblock_outcome_note: str | None = None
+                          unblock_outcome_note: str | None = None,
+                          parent_extra: dict | None = None,
+                          unblock_extra: dict | None = None
                           ) -> tuple[Path, Path]:
     """Build tempdir world + agent dir with one Unblock + one parent goal.
 
@@ -62,6 +64,10 @@ def _make_world_with_pair(tmp: Path, *, parent_status: str = "skipped",
     unblock_outcome_note: pre-seed outcome_note on the Unblock. For the
     idempotency test, set this to the canonical sweep phrase so
     _is_already_swept returns True.
+
+    parent_extra / unblock_extra: field overrides merged LAST onto the base
+    goal dicts (g-115-2536 — lets the rb-3887 provenance fixture reshape the
+    Unblock's parent-link fields without a parallel builder).
     """
     world = tmp / "world"
     world.mkdir()
@@ -95,6 +101,10 @@ def _make_world_with_pair(tmp: Path, *, parent_status: str = "skipped",
     }
     if unblock_outcome_note is not None:
         unblock["outcome_note"] = unblock_outcome_note
+    if parent_extra:
+        parent.update(parent_extra)
+    if unblock_extra:
+        unblock.update(unblock_extra)
 
     asp = {
         "id": "asp-700",
@@ -246,3 +256,57 @@ def test_parent_pending_not_applied():
             assert unblock is not None
             assert unblock["status"] == "pending"
             assert "outcome_note" not in unblock or not unblock["outcome_note"]
+
+
+def test_provenance_guard_fires_through_main():
+    """rb-3887 guard-FIRING branch through main() (6).
+
+    Fixture: discovered_by-only parent link (origin_signal carries no goal-id,
+    title has no "for <g-id>" form) on an Unblock created AFTER its parent's
+    completed_at, parent terminal. That is the provenance shape — the
+    completed parent's audit DISCOVERED this work; the Unblock never waited
+    on it. The guard must veto the sweep: candidates empty, applied=0, the
+    details[] entry cites rb-3887, and the goal is untouched on disk
+    (the g-115-2530/2531 auto-skip FP this guard exists to prevent).
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_with_pair(
+            Path(tmpd),
+            parent_status="completed",
+            parent_extra={"completed_at": "2026-05-01T00:00:00"},
+            unblock_extra={
+                # No goal-id in origin_signal -> priority-1 no match
+                "origin_signal": "unblock:stranded-forged-body",
+                # No "for g-NNN-NN" in title -> priority-2 no match
+                "title": "Unblock: commit+push stranded SKILL.md body "
+                         "(registered but absent from git)",
+                # Priority-3 provenance link
+                "discovered_by": "g-700-69",
+                # Created AFTER parent completion -> guard must fire
+                "created_at": "2026-05-02T00:00:00",
+            })
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep rc={rc}; stderr={err!r}; stdout={out!r}"
+            result = json.loads(out)
+            assert result["applied"] == 0, (
+                f"provenance-linked Unblock must NOT be swept; "
+                f"got applied={result['applied']}")
+            assert len(result["candidates"]) == 0, (
+                f"guard-vetoed Unblock must not surface as candidate; "
+                f"got {result['candidates']}")
+            fired = [d for d in result.get("details", [])
+                     if d.get("goal_id") == "g-700-73"
+                     and "rb-3887" in (d.get("reason") or "")]
+            assert fired, (
+                f"details[] must record the rb-3887 guard veto for g-700-73; "
+                f"details={result.get('details')}")
+
+            # On-disk: goal untouched (status pending, no outcome_note)
+            unblock = _read_goal(world, "g-700-73")
+            assert unblock is not None
+            assert unblock["status"] == "pending", (
+                f"guard-vetoed Unblock must stay pending; got {unblock['status']!r}")
+            assert not unblock.get("outcome_note"), (
+                f"guard-vetoed Unblock must have no outcome_note; "
+                f"got {unblock.get('outcome_note')!r}")

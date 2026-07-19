@@ -230,6 +230,161 @@ def test_status_index_builder():
                    "g-3": "skipped", "g-4": None}
 
 
+def test_rb3887_provenance_created_after_parent_completion_guarded():
+    """rb-3887 / 4 canonical FP: an Unblock whose ONLY parent link
+    is discovered_by (sq-013 provenance) and whose created_at POSTDATES the
+    parent's completion must be guarded — it was never waiting on that
+    parent (g-115-2530/2531 shape: auto-skipped within one iteration)."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-115-2530",
+        "title": "Unblock: commit+push perception-verticle-scaffolding SKILL.md",
+        "status": "pending",
+        "discovered_by": "g-307-62",
+        "created_at": "2026-07-17T20:00:00",
+    }
+    ts_idx = {"": "2026-07-17T18:00:00"}  # parent completed FIRST
+    assert mod._parse_parent_id(g) == "g-307-62"
+    reason = mod._provenance_fp_guard(g, "g-307-62", ts_idx)
+    assert reason is not None and "rb-3887" in reason
+
+
+def test_rb3887_legacy_wait_created_before_parent_completion_sweeps():
+    """guard-958 recall control (legacy population): a discovered_by-only
+    Unblock created BEFORE the parent completed is a genuine wait — the
+    guard must return None so the sweep still covers it."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-250-90",
+        "title": "Unblock: restore access",  # no 'for <g-id>' form
+        "status": "pending",
+        "discovered_by": "g-250-69",
+        "created_at": "2026-05-13T09:00:00",
+    }
+    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed AFTER
+    assert mod._provenance_fp_guard(g, "g-250-69", ts_idx) is None
+
+
+def test_rb3887_missing_timestamps_conservative_guard():
+    """Missing/unparseable timestamps cannot PROVE a genuine wait — the
+    guard fires (conservative: the FP direction auto-skips live work; the
+    miss direction is benign). Covers absent parent entry (archived-parent
+    default) and absent created_at."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-1",
+        "title": "Unblock: restore access",
+        "discovered_by": "g-2",
+        "created_at": "2026-07-17T20:00:00",
+    }
+    assert mod._provenance_fp_guard(g, "g-2", {}) is not None  # no parent ts
+    g_no_created = {
+        "id": "g-1",
+        "title": "Unblock: restore access",
+        "discovered_by": "g-2",
+    }
+    ts_idx = {"g-2": "2026-07-17T18:00:00"}
+    assert mod._provenance_fp_guard(g_no_created, "g-2", ts_idx) is not None
+
+
+def test_g115_2674_origin_signal_form_guarded_when_created_after_parent():
+    """REVERSED by 4 (2026-07-19). This test previously asserted the
+    OPPOSITE — that a priority-1/2 link is NEVER provenance-guarded, on the
+    premise that "Layer D emits those at defer time by construction".
+
+    That premise is false. `origin_signal: unblock:<parent>` is also the
+    DOCUMENTED convention for filing a follow-up Unblock BY HAND, so the
+    field cannot distinguish a Layer-D auto-conversion from an
+    agent-authored follow-up. The exemption was a hole and it fired: 7 live
+    goals auto-skipped fleet-wide, including two HIGH goals killed within
+    minutes of filing (g-312-09, g-318-63) and a HIGH heartbeat-writer fix
+    (g-115-2182) that sat dead 5 days.
+
+    The timestamp test alone separates the two shapes, so the guard now
+    applies at ALL link priorities. See the companion test below for the
+    Layer-D no-regression proof."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-250-73",
+        "title": "Unblock: behavior for g-250-69",
+        "origin_signal": "unblock:g-250-69",
+        "discovered_by": "g-250-69",
+        "created_at": "2026-05-14T00:00:00",
+    }
+    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed BEFORE
+    assert "rb-3887" in mod._provenance_fp_guard(g, "g-250-69", ts_idx)
+    # Same for the title 'for <g-id>' form without origin_signal:
+    g_title = {
+        "id": "g-250-74",
+        "title": "Unblock: behavior for g-250-69",
+        "discovered_by": "g-250-69",
+        "created_at": "2026-05-14T00:00:00",
+    }
+    assert "rb-3887" in mod._provenance_fp_guard(g_title, "g-250-69", ts_idx)
+
+
+def test_g115_2674_layer_d_defer_time_unblock_still_sweeps():
+    """No-regression proof for the 4 widening: a GENUINE Layer-D
+    Unblock is emitted at DEFER time, while its parent is still pending, so
+    it is created BEFORE the parent ever completes. `created < done` holds,
+    the guard returns None, and the sweep proceeds exactly as it did before
+    the widening. Widening therefore costs real Layer-D goals nothing — it
+    only closes the created-at-or-after-completion hole."""
+    mod = _import_sweep()
+    layer_d = {
+        "id": "g-250-80",
+        "title": "Unblock: deploy for g-250-69",
+        "origin_signal": "unblock:g-250-69",
+        "discovered_by": "g-250-69",
+        "created_at": "2026-05-10T08:00:00",   # filed at defer time
+    }
+    ts_idx = {"": "2026-05-13T09:46:25"}  # parent completed LATER
+    assert mod._provenance_fp_guard(layer_d, "g-250-69", ts_idx) is None
+
+
+def test_rb3887_aware_offset_timestamp_normalized_no_crash():
+    """Fresh-eyes-code finding (4 dispatch): an offset-aware stamp
+    (+00:00 — the fleet is TZ-split, rb-3741) meeting a naive one at the
+    `created < done` comparison raised TypeError and crashed the whole
+    sweep. _parse_ts must normalize to naive-local (guard-982 pattern).
+    Margins ≥38h so assertions hold under ANY box timezone (±14h max)."""
+    mod = _import_sweep()
+    # Normalization invariant: parsed aware stamp comes back naive.
+    parsed = mod._parse_ts("2026-07-17T20:00:00+00:00")
+    assert parsed is not None and parsed.tzinfo is None
+    assert mod._parse_ts("2026-07-17T20:00:00Z").tzinfo is None
+    assert mod._parse_ts("2026-07-17T20:00:00").tzinfo is None
+    base = {"id": "g-1", "title": "Unblock: restore access",
+            "discovered_by": "g-2"}
+    ts_idx = {"g-2": "2026-07-17T18:00:00"}  # naive parent completion
+    # Aware created FAR BEFORE naive done → genuine wait, sweeps (None).
+    g_before = dict(base, created_at="2026-07-15T00:00:00+00:00")
+    assert mod._provenance_fp_guard(g_before, "g-2", ts_idx) is None
+    # Aware created FAR AFTER naive done → provenance, guarded.
+    g_after = dict(base, created_at="2026-07-19T00:00:00+00:00")
+    assert "rb-3887" in mod._provenance_fp_guard(g_after, "g-2", ts_idx)
+    # Aware DONE vs naive created (the mirror mix) → no crash either.
+    aware_idx = {"g-2": "2026-07-17T18:00:00+00:00"}
+    g_naive = dict(base, created_at="2026-07-15T00:00:00")
+    assert mod._provenance_fp_guard(g_naive, "g-2", aware_idx) is None
+
+
+def test_completed_ts_index_builder():
+    """_build_completed_ts_index maps goal_id → completed_at, falling back
+    to completed_date, None when neither present."""
+    mod = _import_sweep()
+    all_asps = [
+        ({"id": "asp-1", "goals": [
+            {"id": "g-1", "completed_at": "2026-07-17T18:00:00"},
+            {"id": "g-2", "completed_date": "2026-07-16"},
+            {"id": "g-3"},
+        ]}, "world"),
+    ]
+    idx = mod._build_completed_ts_index(all_asps)
+    assert idx == {"g-1": "2026-07-17T18:00:00",
+                   "g-2": "2026-07-16", "g-3": None}
+
+
 if __name__ == "__main__":
     test_parent_id_from_origin_signal_canonical_shape()
     test_parent_id_from_title_for_pattern()
@@ -243,4 +398,71 @@ if __name__ == "__main__":
     test_terminal_states_set()
     test_canonical_incident_g_250_73_shape_recognized()
     test_status_index_builder()
-    print("All 12 tests passed.")
+    test_rb3887_provenance_created_after_parent_completion_guarded()
+    test_rb3887_legacy_wait_created_before_parent_completion_sweeps()
+    test_rb3887_missing_timestamps_conservative_guard()
+    test_rb3887_origin_signal_form_never_guarded()
+    test_rb3887_aware_offset_timestamp_normalized_no_crash()
+    test_completed_ts_index_builder()
+    print("All 18 tests passed.")
+
+
+def test_g115_2681_close_sequence_window_guards_followup_filed_during_parent_close():
+    """1 (2026-07-19) — boundary fix for the 4 guard.
+
+    g-115-2674 tested `created < parent_completed` and treated ANY earlier
+    creation as a "genuine wait". Wrong at the margin: an Unblock filed
+    DURING its parent's close sequence (Phase 4 surfaces a finding -> agent
+    files the follow-up -> verify/state-update/learning-gate then stamp the
+    parent terminal) is created SECONDS before the parent completes and is a
+    FOLLOW-UP, not a wait.
+
+    Measured FPs that the bare test re-swept even AFTER g-115-2674 landed —
+    each description literally opens "MEASURED during <parent>":
+      g-318-63   28s lead   (2 declared ohs-trend fields never populated, 0/32)
+      g-350-21   93s lead   (client deploy leg; server leg already shipped)
+      g-115-2533 97s lead   (commit+push a re-materialized, still-gitignored SKILL.md)
+    """
+    mod = _import_sweep()
+    # 28s lead — the tightest observed real FP.
+    g = {
+        "id": "g-318-63",
+        "title": "Unblock: ohs-trend fields never populated",
+        "origin_signal": "unblock:g-318-62",
+        "discovered_by": "g-318-62",
+        "created_at": "2026-07-19T09:13:45",
+    }
+    ts_idx = {"g-318-62": "2026-07-19T09:14:13"}
+    reason = mod._provenance_fp_guard(g, "g-318-62", ts_idx)
+    assert reason is not None, "follow-up filed 28s before parent close must be guarded"
+    assert "close-sequence window" in reason
+
+
+def test_g115_2681_genuine_wait_outside_window_still_sweeps():
+    """REACH-PRESERVED proof — the assertion that matters for this fix.
+
+    The risk of a tolerance window is over-guarding the sweep into a no-op.
+    A genuine Layer-D Unblock is filed at DEFER time while the parent is
+    still pending — typically hours-to-days ahead, far outside the window —
+    so it must STILL sweep. This pins that the window closed only the
+    close-sequence margin, not the sweep itself."""
+    mod = _import_sweep()
+    g = {
+        "id": "g-999-01",
+        "title": "Unblock: deploy for g-999-00",
+        "origin_signal": "unblock:g-999-00",
+        "discovered_by": "g-999-00",
+        "created_at": "2026-07-01T00:00:00",
+    }
+    # Parent completed 3 days later — a real wait, nowhere near the window.
+    ts_idx = {"g-999-00": "2026-07-04T00:00:00"}
+    assert mod._provenance_fp_guard(g, "g-999-00", ts_idx) is None
+
+    # Boundary: just OUTSIDE the 900s window (901s lead) must still sweep.
+    g_edge = dict(g, created_at="2026-07-01T00:00:00")
+    ts_edge = {"g-999-00": "2026-07-01T00:15:01"}
+    assert mod._provenance_fp_guard(g_edge, "g-999-00", ts_edge) is None
+
+    # Boundary: just INSIDE (899s lead) must be guarded.
+    ts_in = {"g-999-00": "2026-07-01T00:14:59"}
+    assert mod._provenance_fp_guard(g_edge, "g-999-00", ts_in) is not None

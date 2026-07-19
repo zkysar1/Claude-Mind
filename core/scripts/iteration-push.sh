@@ -23,10 +23,12 @@
 #     files the way a bare `git commit` can — guard-741/guard-836 hazard does
 #     not apply), and refuses rather than overwrites dirty working-tree files.
 #     Any merge failure (dirty tree, staged entries, true conflict) is aborted
-#     cleanly (merge --abort if MERGE_HEAD exists), logged LOUDLY, and retried
-#     next iteration after iteration-commit has swept the churn. A REPEATED
-#     conflict log means a true cross-machine content conflict — surface it,
-#     do not silence it.
+#     cleanly (merge --abort if MERGE_HEAD exists) and logged LOUDLY. Dirty-tree
+#     refusals self-heal in-run (agents/<self>/* churn is COMMITTED pathspec-
+#     limited, 9; agents/<other>/* churn is CLEARED, 3) and
+#     the merge retries once; remaining shapes (staged partner work, dirty
+#     core/world files) defer to next iteration. A REPEATED conflict log means
+#     a true cross-machine content conflict — surface it, do not silence it.
 #   - Rate-limit (batch): push only when local is ahead of origin by
 #     >= MIN_COMMITS, OR the OLDEST unpushed commit is >= MAX_AGE_MIN minutes old
 #     (a freshness floor so a lone commit does not sit unpushed for hours).
@@ -41,6 +43,14 @@
 #   - Fail-soft: ANY failure (auth, network, fetch, merge) logs to stderr and
 #     exits 0 — a sync failure MUST NEVER block or abort the loop. Next iteration
 #     retries. Never forced.
+#   - Push-race recovery (9): a race-shaped push rejection
+#     (non-fast-forward / fetch-first / cannot-lock-ref) triggers ONE bounded
+#     in-invocation recovery — unthrottled fetch + merge + one retry push —
+#     before deferring. Without it, the fetch throttle makes the next
+#     iteration's retry re-fail against the same stale tracking ref for up to
+#     FETCH_INTERVAL_MIN while a deep-close commit sits stranded local-only
+#     (the rb-3970 completed-but-not-on-origin phantom window). Auth/network
+#     failures do not match the race signature and defer directly.
 #   - Headless-safe: GIT_TERMINAL_PROMPT=0 turns a would-be credential PROMPT into
 #     an immediate failure instead of a hang.
 #   - Auth via the repo's configured credential helper (GCM `manager` over HTTPS);
@@ -189,18 +199,27 @@ fi
 # iteration path never self-heals because owncloud re-creates the same churn
 # every cycle (observed 2026-07-06: alpha framework commits stranded 2+ iters).
 #
-# This helper narrowly self-heals that ONE shape: if the ENTIRE blocking set
-# (unstaged tracked-dirty + untracked, --exclude-standard so ignored scratch is
-# out) is cross-agent churn, clear ONLY those paths and RETRY the merge once
-# (owncloud re-syncs the sibling's authoritative state next cycle; origin is
-# authoritative). Returns 0 iff cleared+re-merged clean. Returns 1 (DEFER —
-# caller keeps the current behaviour) for EVERY other shape:
+# This helper narrowly self-heals TWO shapes (all-or-nothing scan first):
+#   - agents/<other>/* churn (unstaged tracked-dirty + untracked,
+#     --exclude-standard so ignored scratch is out): CLEAR those paths
+#     (owncloud re-syncs the sibling's authoritative state next cycle; origin
+#     is authoritative).
+#   - agents/<self>/* churn: COMMIT it via an index-clean + explicit-pathspec
+#     + pathspec-limited commit (9). Own agent-dir ledgers
+#     (changelog.jsonl re-appends on EVERY write) re-dirty between
+#     iteration-commit and this merge — and iteration-commit only runs on
+#     deep closes at all — so the pre-2249 defer wedged a behind box
+#     INDEFINITELY (cc-05: 15-ahead/53-behind, stable, never resolving).
+#     Never cleared (that would discard own work); committed work is
+#     preserved in history and pushed.
+# Then RETRY the merge once. Returns 0 iff healed+re-merged clean. Returns 1
+# (DEFER — caller keeps the current behaviour) for EVERY other shape:
 #   - MIND_AGENT unresolved (cannot identify self → cannot scope safely)
 #   - guard-741: ANY staged index entry (a CONCURRENT agent's staged cross-agent
 #     work — NEVER discard it; defer, exactly as the bare merge already does)
-#   - ANY blocking file outside agents/<other>/* (core/, world/, agents/<self>/ —
-#     never clear the agent's own or shared work)
-#   - empty blocking set, or the retry still failing
+#   - ANY blocking file outside agents/* (core/, world/ — never clear or
+#     commit shared work from the push path)
+#   - empty blocking set, self-commit failure, or the retry still failing
 # FAIL-SOFT throughout (|| true; iteration-push is soft_exit — a bug here can
 # only DEFER, never wedge the loop or discard staged work).
 _selfheal_cross_agent_churn_remerge() {
@@ -236,27 +255,65 @@ _selfheal_cross_agent_churn_remerge() {
     return 1
   fi
 
-  # EVERY blocking path (both categories) MUST be under a NON-SELF agent dir.
+  # Classify EVERY blocking path FIRST (all-or-nothing): agents/<self>/* is
+  # committed, agents/<other>/* is cleared, ANY path outside agents/* defers
+  # the whole tree untouched (never clear or commit core/world/shared work
+  # from the push path).
   local rel name
-  for rel in "${dirty[@]}" "${untracked[@]}"; do
+  local self_paths=() cross_dirty=() cross_untracked=()
+  for rel in "${dirty[@]}"; do
     case "$rel" in
       agents/*)
         name="${rel#agents/}"; name="${name%%/*}"
-        if [ "$name" = "$self" ]; then
-          log "self-heal: blocking file under SELF agent dir ($rel) — defer (never clear own work)"
-          return 1
-        fi
+        if [ "$name" = "$self" ]; then self_paths+=("$rel"); else cross_dirty+=("$rel"); fi
         ;;
       *)
-        log "self-heal: blocking file outside agents/<other>/* ($rel) — defer (never clear core/world/shared work)"
+        log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+        return 1
+        ;;
+    esac
+  done
+  for rel in "${untracked[@]}"; do
+    case "$rel" in
+      agents/*)
+        name="${rel#agents/}"; name="${name%%/*}"
+        if [ "$name" = "$self" ]; then self_paths+=("$rel"); else cross_untracked+=("$rel"); fi
+        ;;
+      *)
+        log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
         return 1
         ;;
     esac
   done
 
-  log "self-heal: clearing ${#dirty[@]} tracked + ${#untracked[@]} untracked cross-agent file(s), retrying merge once (g-115-1843)"
-  [ "${#dirty[@]}" -gt 0 ]     && { git -C "$REPO" checkout -- "${dirty[@]}" 2>/dev/null || true; }
-  [ "${#untracked[@]}" -gt 0 ] && { git -C "$REPO" clean -fdq -- "${untracked[@]}" 2>/dev/null || true; }
+  # SELF-namespace churn: COMMIT it, never clear, never defer on it
+  # (9). guard-741/836-safe here because (a) the staged-index check
+  # above proved the shared index holds ZERO staged entries, (b) staging is by
+  # EXPLICIT self-namespace paths only, and (c) the commit is pathspec-limited
+  # to agents/<self>/ — a partner's stage racing in between (a) and the commit
+  # is excluded from it. Same namespace scope iteration-commit.sh's filter
+  # enforces — NOT a bare `git commit` (which would absorb anything staged).
+  if [ "${#self_paths[@]}" -gt 0 ]; then
+    log "self-heal: committing ${#self_paths[@]} SELF-namespace file(s) pre-merge (g-115-2249)"
+    if ! git -C "$REPO" add -- "${self_paths[@]}" 2>/dev/null; then
+      log "self-heal: git add of self-namespace churn failed — defer"
+      return 1
+    fi
+    if ! git -C "$REPO" commit -q \
+         -m "chore($self): pre-merge self-namespace churn (iteration-push self-heal, g-115-2249)" \
+         -- "agents/$self/" 2>/dev/null; then
+      # Unstage what we staged so a failed heal leaves the index as found.
+      git -C "$REPO" reset -q -- "agents/$self/" 2>/dev/null || true
+      log "self-heal: pathspec-limited commit of self-namespace churn failed — defer"
+      return 1
+    fi
+  fi
+
+  if [ $(( ${#cross_dirty[@]} + ${#cross_untracked[@]} )) -gt 0 ]; then
+    log "self-heal: clearing ${#cross_dirty[@]} tracked + ${#cross_untracked[@]} untracked cross-agent file(s), retrying merge once (g-115-1843)"
+    [ "${#cross_dirty[@]}" -gt 0 ]     && { git -C "$REPO" checkout -- "${cross_dirty[@]}" 2>/dev/null || true; }
+    [ "${#cross_untracked[@]}" -gt 0 ] && { git -C "$REPO" clean -fdq -- "${cross_untracked[@]}" 2>/dev/null || true; }
+  fi
 
   # Retry the merge ONCE. Reassigns the OUTER MERGE_OUT/MERGE_RC (intentional —
   # the caller's post-helper defer log then reflects the retry outcome).
@@ -291,7 +348,7 @@ if [ "$BEHIND" -gt 0 ]; then
       if [ -f "$GITDIR/MERGE_HEAD" ]; then
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "MERGE CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration."
-        log "If this repeats every iteration it is a TRUE cross-machine content conflict: resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
+        log "If this repeats every iteration it is a TRUE cross-machine content conflict (MERGE_HEAD was created — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
         soft_exit 1
       fi
       # Dirty tree — merge refused before starting (MERGE_HEAD absent). Try the
@@ -300,10 +357,10 @@ if [ "$BEHIND" -gt 0 ]; then
       # once. Any other shape (staged entries, self/core/world dirty) DEFERS —
       # exactly the pre-1843 behaviour (log + soft_exit 1).
       if _selfheal_cross_agent_churn_remerge; then
-        log "integrated ${BEHIND} origin commit(s) into $BRANCH (after cross-agent-churn self-heal, g-115-1843)"
+        log "integrated ${BEHIND} origin commit(s) into $BRANCH (after churn self-heal, g-115-1843/g-115-2249)"
       else
         log "merge DEFERRED (rc=${MERGE_RC}): $(printf '%s' "$MERGE_OUT" | tail -n 1)"
-        log "retry next iteration after iteration-commit sweeps the churn"
+        log "remaining defer shapes: a partner's staged index entries (guard-741) or dirty core/world/shared files — NOT self churn (auto-committed) or cross-agent churn (auto-cleared); retry next iteration"
         soft_exit 1
       fi
     else
@@ -317,6 +374,21 @@ AHEAD="$(git -C "$REPO" rev-list --count "$UPSTREAM..$BRANCH" 2>/dev/null || ech
 case "$AHEAD" in ''|*[!0-9]*) AHEAD=0;; esac   # force numeric
 if [ "$AHEAD" -eq 0 ]; then
   log "origin/$BRANCH up to date (0 ahead) — nothing to push"; soft_exit 0
+fi
+
+# Stranded-depth alarm (8 user correction). A push-blocked window
+# (read-only deploy key rb-3236/guard-1021, disabled push, repeated fail-soft)
+# lets AHEAD grow silently — 121 (8) then 281 by 2026-07-16, and the
+# eventual bulk unwedge push carried a stale store base that transiently
+# regressed world/aspirations.jsonl by ~184 goals (2). Once depth
+# crosses the cap, bang the drum EVERY iteration until it drains: the banner
+# lands in iteration-close stdout where the loop LLM must act on it (fix the
+# push pipe or notify the user — never let depth keep growing). Alarm only;
+# never blocks or defers the push itself.
+BULK_ALARM="${ITERATION_PUSH_BULK_ALARM:-25}"
+case "$BULK_ALARM" in ''|*[!0-9]*) BULK_ALARM=25;; esac
+if [ "$AHEAD" -ge "$BULK_ALARM" ]; then
+  log "⚠ STRANDED-DEPTH ALARM: ${AHEAD} unpushed commit(s) >= ${BULK_ALARM} on ${BRANCH} — bulk-push side-effect risk (stale store bases, g-115-2362 class). ACT NOW: if pushes are failing, fix the credential/remote (rb-3236/guard-1021); if push is deliberately disabled, notify the user of the growing backlog. Do NOT let depth grow to another 281-commit unwedge (g-115-2398)."
 fi
 
 # Age (minutes) of the OLDEST unpushed commit — freshness floor.
@@ -347,8 +419,57 @@ PUSH_RC=$?
 if [ "$PUSH_RC" -eq 0 ]; then
   log "push OK: origin/${BRANCH} now at $(git -C "$REPO" rev-parse --short "$UPSTREAM" 2>/dev/null || echo '?')"
   soft_exit 0
-else
-  # Auth / network / non-fast-forward. Fail-soft; retry next iteration. NEVER force.
-  log "push FAILED (rc=${PUSH_RC}) — fail-soft, will retry next iteration: $(printf '%s' "$PUSH_OUT" | tail -n 1)"
+fi
+
+# --- Push-race recovery (9, rb-3970 phantom window) -----------------
+# A race-shaped rejection here means origin advanced AFTER the fetch/merge
+# above — or the THROTTLED fetch used a stale tracking ref, so the integrate
+# step saw BEHIND=0 and skipped the merge entirely. "Retry next iteration"
+# COMPOUNDS under the throttle: the next run finds FETCH_HEAD fresh, throttles
+# again, computes BEHIND against the SAME stale ref, skips the merge, and
+# fails the identical push — up to FETCH_INTERVAL_MIN of repeated failures
+# while a deep-close commit sits stranded local-only (the goal-status-vs-origin
+# phantom window; both 2026-07-18 phantoms rode this shape, and 3
+# landed first-try via exactly this unthrottled fetch+merge+push sequence).
+# Recover ONCE in-invocation: unthrottled fetch -> merge (same safety as the
+# integrate step: abort on MERGE_HEAD, defer on refusal — churn was already
+# self-healed moments ago, so a NEW refusal defers) -> one retry push. Bounded
+# (no loop), fail-soft, never forced. Skipped under --no-fetch (recovery needs
+# its own fetch). Auth/network failures do NOT match the race signature — an
+# immediate retry cannot fix those, so they keep the plain defer below.
+if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forward|fetch first|cannot lock ref|\[rejected\]'; then
+  log "push rejected (race shape) — in-invocation recovery: unthrottled fetch + merge + one retry (g-115-2599)"
+  RFETCH_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" fetch origin "$BRANCH" 2>&1)"
+  RFETCH_RC=$?
+  if [ "$RFETCH_RC" -ne 0 ]; then
+    log "recovery fetch FAILED (rc=${RFETCH_RC}) — fail-soft, will retry next iteration: $(printf '%s' "$RFETCH_OUT" | tail -n 1)"
+    soft_exit 1
+  fi
+  RBEHIND="$(git -C "$REPO" rev-list --count "$BRANCH..$UPSTREAM" 2>/dev/null || echo 0)"
+  case "$RBEHIND" in ''|*[!0-9]*) RBEHIND=0;; esac
+  if [ "$RBEHIND" -gt 0 ]; then
+    RMERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
+    RMERGE_RC=$?
+    if [ "$RMERGE_RC" -ne 0 ]; then
+      if [ -f "$GITDIR/MERGE_HEAD" ]; then
+        git -C "$REPO" merge --abort >/dev/null 2>&1 || true
+        log "recovery merge CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration"
+      else
+        log "recovery merge refused (rc=${RMERGE_RC}) — will retry next iteration: $(printf '%s' "$RMERGE_OUT" | tail -n 1)"
+      fi
+      soft_exit 1
+    fi
+  fi
+  RPUSH_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" push origin "$BRANCH" 2>&1)"
+  RPUSH_RC=$?
+  if [ "$RPUSH_RC" -eq 0 ]; then
+    log "push-race recovery OK: origin/${BRANCH} now at $(git -C "$REPO" rev-parse --short "$UPSTREAM" 2>/dev/null || echo '?') (${RBEHIND} origin commit(s) integrated in-recovery)"
+    soft_exit 0
+  fi
+  log "push-race recovery FAILED (rc=${RPUSH_RC}) — fail-soft, will retry next iteration: $(printf '%s' "$RPUSH_OUT" | tail -n 1)"
   soft_exit 1
 fi
+
+# Auth / network / non-race shapes. Fail-soft; retry next iteration. NEVER force.
+log "push FAILED (rc=${PUSH_RC}) — fail-soft, will retry next iteration: $(printf '%s' "$PUSH_OUT" | tail -n 1)"
+soft_exit 1

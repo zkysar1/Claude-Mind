@@ -98,7 +98,9 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                   "resolved": 0, "archived": len(archive)}
         for r in items:
             stg = r.get("stage", "discovered")
-            if stg in counts:
+            # Live stage=archived tombstones (6) are counted by their
+            # archive-file copy already — skip them here or the count doubles.
+            if stg in counts and stg != "archived":
                 counts[stg] += 1
         return json_response_pretty(counts)
 
@@ -123,7 +125,15 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
     if flag(q, "replay_candidates"):
         items = jc.get(_live_path(ctx))
         archive = jc.get(_archive_path(ctx))
-        all_resolved = [r for r in list(items) + list(archive)
+        # Dedup by id, preferring the archive copy (6): a tombstoned
+        # id is present in BOTH files by design — without this, every archived
+        # hypothesis would surface twice as a replay candidate.
+        _by_id: dict = {}
+        for r in list(items) + list(archive):
+            rid = r.get("id")
+            if rid is not None:
+                _by_id[rid] = r  # archive iterates second → archive copy wins
+        all_resolved = [r for r in _by_id.values()
                         if r.get("stage") in ("resolved", "archived")]
         candidates = []
         today = date.today()
@@ -140,10 +150,24 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             # also applies LLM-side — script-enforced > LLM-gated.
             if replay.get("encoded_via_chronic") is True:
                 continue
+            # 9: rc>=5 records have exhausted the spaced-repetition
+            # ladder (Replay Step 1's cap). For already-archived records the
+            # LLM-side remedy (pipeline-move to archived) is a no-op, so
+            # without this source-level exclusion they resurface every cycle.
+            # replay_count is a string on some records — coerce; unparseable
+            # values fall through to include (fail-open).
+            try:
+                if int(replay.get("replay_count") or 0) >= 5:
+                    continue
+            except (TypeError, ValueError):
+                pass
             next_review = replay.get("next_review_date")
             if next_review:
                 try:
-                    review_date = date.fromisoformat(next_review)
+                    # [:10] tolerates datetime-form strings ("YYYY-MM-DDTHH:MM:SS")
+                    # — bare fromisoformat(date) rejects them and the swallowed
+                    # ValueError would silently defeat the 7-day exclusion.
+                    review_date = date.fromisoformat(str(next_review)[:10])
                     if review_date > today:
                         continue
                 except ValueError:

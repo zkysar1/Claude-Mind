@@ -263,6 +263,13 @@ files:
     purpose: short-term working memory slots
     writer: wm-*.sh scripts
     recovery_action: preserve
+    # Corruption detective (): an all-0x00 file (NTFS crash signature —
+    # rename journaled, data never flushed) is detected by wm.py read_yaml,
+    # which WARNs on stderr and reads as empty. Recovery then rides the loop's
+    # existing Phase -1 path: all-slots-null -> wm-init.sh re-seeds the
+    # template. Writers fsync before rename (_fileops.durable_write_text /
+    # wm.py write_yaml) so the class should no longer occur; the detective is
+    # the belt to that suspender. No special /start --recover handling needed.
     sync_tier: continuity
     required_when_idle: false
     required_when_running: false
@@ -416,7 +423,7 @@ files:
     required_when_running: false
 
   - file: goal-reads.jsonl
-    purpose: RETIRED (g-333-02). Was an append-only log of cmd_read/cmd_query goal returns for the g-115-410-b stale-read gate. Writer dead since the 2026-05-14 daemon cutover (daemon read path does not log goal reads); 3 stale files (~257k frozen lines) deleted g-333-02. No truncation ever existed (the prior "truncates to last 1000" claim was false). stale_read.py _agent_last_read early-returns on the now-absent file, so the gate O(n) receipt scan is vestigial (Block 2 retained per g-115-1572 but unreachable in production).
+    purpose: RETIRED (g-333-02). Was an append-only log of cmd_read/cmd_query goal returns for the g-115-410-b stale-read gate. Writer dead since the 2026-05-14 daemon cutover (daemon read path does not log goal reads); 3 stale files (~257k frozen lines) deleted g-333-02. No truncation ever existed (the prior "truncates to last 1000" claim was false). stale_read.py _agent_last_read early-returned on the now-absent file, so the gate O(n) receipt scan was vestigial (Block 2 retained per g-115-1572 but unreachable in production). g-115-2107 (2026-07-13) retired and removed the whole stale-read gate + stale_read.py module -- this ledger is now orphaned history (preserved, no writer).
     writer: none (retired -- aspirations.py:_log_goal_read removed at 2026-05-14 daemon cutover)
     recovery_action: clear
     sync_tier: continuity
@@ -714,6 +721,54 @@ files:
   - file: gate-c-eval.md
     purpose: Gate C (Pearl Plan Step 2.3) value-spine measurement report — verdict + test outputs + prerequisite analysis; produced by g-004-03
     writer: aspirations-execute (g-004-03 Pearl Plan Gate C harness goal)
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  # ── Orphans registered 2026-07-10 (0) ──────────────────────
+  # Surfaced by session-desync-check.sh on every boot (echo boot 2026-07-10,
+  # Phase -1.5 advisory). Both have confirmed framework writers, missing only
+  # their manifest entries. Both are this-machine state (cadence / runner
+  # attribution) — machine_local, so the own-cloud sweep stops mirroring the
+  # tracker to S3 (it was never in the continuity pull-set) and never syncs the
+  # runner-attribution signal (cross-machine sync would produce phantom
+  # attribution).
+  - file: precheck-retrospection-tracker.json
+    purpose: precheck retrospection cadence tracker ({iter, last_retrospection_run_iter}) — gates the periodic precheck-retrospection run; this-machine cadence, resets harmlessly on machine-move
+    writer: aspirations-precheck-budget-meter.sh
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  # (runner-write-attribution was registered above with the other 0
+  # signal-shaped orphans — a duplicate entry here crashed session-manifest-clear.sh
+  # mid-clear on 2026-07-16: first unlink succeeded, second hit FileNotFoundError,
+  # skipping the rb-671 team-state in_flight clear. Removed 2026-07-16.)
+
+  # Two more of the same class surfaced on bravo during 0 verification
+  # (2026-07-10) — registered here to leave the desync check fully clean rather
+  # than defer identical trivial work to a follow-up.
+  - file: loop-state-bump-failures.jsonl
+    purpose: append-only loop-state bump-noop/refire diagnostic log (counter-integrity events); accumulates across sessions for trend analysis
+    writer: iteration-close.sh
+    recovery_action: preserve
+    sync_tier: ephemeral
+    required_when_idle: false
+    required_when_running: false
+
+  - file: quiescence-last-cycle.json
+    purpose: last gate-approved quiescence cycle snapshot (blocker_set_hash, blocker_refs, sleep_seconds, cycle_count, wake_outcome) — read by quiescence-cycle-cache fast-path + quiescence-gate wake-verify; this-machine quiescence state
+    writer: quiescence-cycle-cache.py (also quiescence-gate.py)
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
+  - file: dry-idle-last-cycle.json
+    purpose: last dry-idle cycle baseline snapshot (goal_count, earliest_wake_at, sleep_seconds, streak, cycle_count) — written by dry-idle-tick.py write_baseline_cache(), read by dry-idle-cycle-cache.py short-circuit fast-path; this-machine dry-idle state, resets harmlessly on machine-move (registered 2026-07-16 after a boot desync advisory flagged it as an unregistered orphan — sibling of quiescence-last-cycle.json)
+    writer: dry-idle-tick.py (read by dry-idle-cycle-cache.py)
     recovery_action: preserve
     sync_tier: machine_local
     required_when_idle: false

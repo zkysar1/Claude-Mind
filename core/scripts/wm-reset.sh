@@ -34,11 +34,14 @@ import json, sys
 resp = json.load(sys.stdin)
 identity = resp.get('preserved_identity', [])
 cadence = resp.get('preserved_cadence', 0)
+surviving = resp.get('preserved_surviving', [])
 parts = []
 if identity:
     parts.append(', '.join(identity))
 if cadence:
     parts.append(f'{cadence} cadence trackers')
+if surviving:
+    parts.append('reset-surviving: ' + ', '.join(surviving))
 if parts:
     print(f\"Working memory reset to template state (preserved: {'; '.join(parts)}).\")
 else:

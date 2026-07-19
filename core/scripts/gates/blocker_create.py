@@ -1,8 +1,9 @@
 """Blocker-create gate logic — daemon-safe extraction (PR 7a/3).
 
-Hard checks BEFORE writing a new blocker. Catches the four canonical
+Hard checks BEFORE writing a new blocker. Catches the five canonical
 false-positive failure modes (non-canonical probe / single-signal / unverified
-statistical claim / infra blocker without infra-health probe). See the CLI
+statistical claim / infra blocker without infra-health probe / credentials-required
+without per-source identity enumeration). See the CLI
 wrapper docstring for the full failure-mode catalog and the rb-NNN crosslinks.
 
 Public API:
@@ -272,6 +273,144 @@ def _check_infra_health(blocker: dict) -> dict:
             "reason": "infra_health_check present"}
 
 
+def _check_credential_enumeration(blocker: dict) -> dict:
+    """Check 5: credentials-required blockers must enumerate per-source identities.
+
+    Motivated by pq-s3-deleteobject (86h human-gated for a self-serviceable
+    grant — the root credential was already in the default CLI chain, but no
+    enumeration was ever required, so the untested source was never checked).
+    Check 1 (_check_canonical_probe) fails OPEN for human-only types, so
+    credentials-required blockers previously bypassed every self-service
+    verification. This check restores one for exactly that class.
+
+    Requires blocker.credential_source_enumeration: a list of
+    {source, identity, probed, denied} — one per credential source the runtime
+    could resolve (e.g. an env pair, the default chain, a stored profile, an
+    instance role). `probed` records that the source's identity + action were
+    actually tested; `denied` records that the resolved identity CANNOT perform
+    the action; `identity` is the resolved caller identity (null when the source
+    is absent). Refuses when:
+      (b1) fewer than 2 distinct sources are enumerated — one source cannot
+           establish that no OTHER source holds the grant;
+      (b2) any listed source is un-probed (`probed` != true) — an untested
+           source is an untested self-service path;
+      (c)  any source is NOT denied (`denied` != true) — that identity CAN
+           perform the action, so the work is self-serviceable, not human-only
+           (the pq-s3 failure mode; guard-1160);
+      (a)  two sources resolve to the SAME non-null identity
+           (pseudo-independence) — two labels for one identity is one source,
+           and the agent may already hold the grant under the other label.
+    Skipped for every non-credentials-required type. Domain-agnostic: the source
+    labels are supplied by the caller, not enumerated here.
+    """
+    if (blocker.get("type") or "") != "credentials-required":
+        return {"name": "credential_enumeration", "passed": True,
+                "reason": "not a credentials-required blocker; check skipped"}
+
+    enum = blocker.get("credential_source_enumeration")
+    if not isinstance(enum, list) or not enum:
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                "credentials-required blocker without credential_source_enumeration: "
+                "list each credential source as {source, identity, probed, denied} — "
+                "its resolved identity (sts/whoami), whether it was actually probed, "
+                "and whether that identity is denied the action. The pq-s3-deleteobject "
+                "grant sat human-gated 86h while the root credential in the default CLI "
+                "chain could already perform it — guard-1160 / g-248-111."
+            ),
+        }
+
+    probed_sources = set()
+    identities: dict = {}
+    unprobed = []
+    can_perform = []
+    malformed = []
+    for e in enum:
+        if (not isinstance(e, dict) or not e.get("source")
+                or "probed" not in e or "denied" not in e):
+            malformed.append(e)
+            continue
+        src = str(e["source"])
+        probed_sources.add(src)
+        if not e.get("probed"):
+            unprobed.append(src)
+        if not e.get("denied"):
+            can_perform.append(src)
+        ident = e.get("identity")
+        if ident:
+            identities.setdefault(str(ident), []).append(src)
+
+    if malformed:
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                f"credential_source_enumeration has {len(malformed)} malformed "
+                "entry(ies); each must be an object with 'source', 'probed', and "
+                "'denied' ('identity' may be null when the source is absent)."
+            ),
+        }
+
+    if len(probed_sources) < 2:
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                f"only {len(probed_sources)} credential source enumerated; need >=2 "
+                "distinct sources — one source cannot establish that no OTHER source "
+                "holds the grant (g-248-111)."
+            ),
+        }
+
+    if unprobed:
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                f"un-probed credential source(s): {unprobed}. Every enumerated source "
+                "must set probed:true (its sts/whoami + action attempt was actually "
+                "run) — an un-probed source is an untested self-service path."
+            ),
+        }
+
+    if can_perform:
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                f"self-serviceable credential source(s): {can_perform} are NOT denied "
+                "— that identity CAN perform the action, so this is agent-provisionable, "
+                "not human-only. Route participants:[agent], do not file a "
+                "credentials-required blocker (the pq-s3 failure mode; guard-1160)."
+            ),
+        }
+
+    collisions = {ident: srcs for ident, srcs in identities.items() if len(srcs) >= 2}
+    if collisions:
+        ident, srcs = next(iter(collisions.items()))
+        return {
+            "name": "credential_enumeration",
+            "passed": False,
+            "reason": (
+                f"pseudo-independent credential sources: {srcs} both resolve to "
+                f"identity '{ident}'. Two labels for one identity is ONE source, not "
+                "two — the agent may already hold the grant under the other label. "
+                "Confirm the grant is genuinely absent before blocking (g-248-111)."
+            ),
+        }
+
+    return {
+        "name": "credential_enumeration",
+        "passed": True,
+        "reason": (
+            f"{len(probed_sources)} credential sources enumerated, all probed, all "
+            "denied, no pseudo-independence"
+        ),
+    }
+
+
 def _log_override(world_dir: Optional[Path], agent_name: str,
                   blocker: dict, justification: str,
                   failing_checks: list) -> Optional[str]:
@@ -305,7 +444,7 @@ def evaluate(blocker: dict, *, probe_command: Optional[str] = None,
              override_blocker_gate: Optional[str] = None,
              world_dir: Optional[Path] = None,
              agent_name: str = "") -> dict:
-    """Run all four checks. See module docstring for return shape + side effects.
+    """Run all five checks. See module docstring for return shape + side effects.
 
     Args:
         blocker: parsed blocker JSON dict (type, affected_skills,
@@ -323,6 +462,7 @@ def evaluate(blocker: dict, *, probe_command: Optional[str] = None,
         _check_multi_signal(blocker),
         _check_schema_probe(blocker),
         _check_infra_health(blocker),
+        _check_credential_enumeration(blocker),
     ]
     failing = [c for c in checks if not c.get("passed")]
     would_block = bool(failing) and not override_blocker_gate

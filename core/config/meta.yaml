@@ -189,6 +189,14 @@ initial_state:
       directive_boost: 1.5           # cross-agent priority influence from board directives
       tail_bonus: 0.8                # surface frontier goals as aspiration nears completion
       handoff_bonus: 1.0             # prioritize cross-agent handoff goals
+      opportunity_boost: 0.5         # pursue-opportunities directive (g-115-2525 restore; deployments tune — ZDS ran 3.0)
+      per_goal_saturation: 0.8       # dampen re-selecting the same goal repeatedly
+      user_signal_boost: 1.2         # surface goals touched by inbox/directive/pending-question signals
+      class_balance_bonus: 0.8       # nudge toward the agent's under-served work_class targets
+      role_affinity: 1.0             # weight goals matching the agent's role multipliers
+      cross_aspiration_support: 0.5  # favor goals that unblock work in other aspirations
+      co_invest_alignment: 0.0       # off by default — cross-agent co-investment alignment
+      critical_blocker_surface: 1.2  # surface goals that unblock high-downstream critical blockers
     custom_criteria: []
     selection_heuristics: []
 

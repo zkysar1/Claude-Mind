@@ -44,9 +44,31 @@ if [ -z "$REC_ID" ] || [ -z "$STAGE" ]; then
 fi
 
 # Read stdin (optional merge data) BEFORE invoking the daemon.
+# Guarded (1, guard-664 bash twin): non-tty stdin does NOT guarantee
+# EOF — a backgrounded Bash task inherits an open, never-closing stdin, and a
+# bare `cat` wedges the wrapper forever (4 zombie process trees found
+# 2026-07-16; killed with exit 144, their stage moves never landed). Probe the
+# FIRST line with a bounded timeout: real piped callers (`echo '<json>' | ...`)
+# have data in the pipe buffer at exec so the timeout never fires for them; an
+# idle inherited descriptor times out and degrades to no-merge-data with a
+# loud stderr note. `|| [ -n "$first_chunk" ]` keeps single-line input that
+# lacks a trailing newline (read exits nonzero on EOF but fills the var).
 BODY=""
 if ! [ -t 0 ]; then
-    BODY="$(cat)"
+    first_chunk=""
+    rc_read=0
+    IFS= read -r -t 2 first_chunk || rc_read=$?
+    if [ "$rc_read" -eq 0 ] || [ -n "$first_chunk" ]; then
+        rest="$(cat)"
+        if [ -n "$rest" ]; then
+            BODY="$first_chunk"$'\n'"$rest"
+        else
+            BODY="$first_chunk"
+        fi
+    elif [ "$rc_read" -gt 128 ]; then
+        echo "pipeline-move.sh: stdin open but idle after 2s — proceeding without merge data (backgrounded-task guard, g-115-2291)" >&2
+    fi
+    # rc_read == 1 with empty var (immediate EOF, e.g. </dev/null): silent, no merge data.
 fi
 
 # --- Daemon path ----------------------------------------------------------

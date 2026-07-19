@@ -64,9 +64,12 @@ mapping:
   failure-to-aspiration-pipeline: framework
   audit-2026-04-scanners: framework
   self-program-evolution-historical-audit: framework  # g-115-1241: was unmapped -> unclassified -> role_affinity 0.0 -> 82.8h streak-break (g-115-760)
+  framework-guardrails-and-gates: framework  # g-115-2438: was unmapped -> stamped unclassified -> consult-streak reset never fired on g-115-2416's consulted close
+  framework-testing: framework               # g-115-2438 audit: sibling gap, same class as line above
 
   # ---- hygiene (ops plumbing — universal patterns) ----
   infrastructure: hygiene
+  own-cloud-infrastructure: hygiene  # g-115-2438 audit: storage-layer ops plumbing, was unmapped
   infrastructure-monitoring: hygiene
   observability: hygiene
   data-integrity: hygiene

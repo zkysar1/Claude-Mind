@@ -143,6 +143,19 @@ before you kill a run or file a false "suite hangs" blocker:
    negative conclusion). Foreground-in-one-turn is also fine (the Bash tool
    auto-backgrounds >2min commands but keeps them bound to the turn).
 
+4. **Sanctioned pacing for an in-turn wait: `EXTERNAL_WAIT=1` (g-115-2678).**
+   The PRIMARY path is to background the suite (`run_in_background`) and END the
+   turn — the harness auto-notifies on completion, so no polling and no sleep is
+   needed (guard-1230). But if you deliberately pace with a bounded in-turn
+   sleep, use the sanctioned flag: `EXTERNAL_WAIT=1 bash
+   core/scripts/interruptible-sleep.sh <seconds>`. A BARE interruptible-sleep
+   registers no background job, so `background-jobs.sh has-pending` returns rc=1,
+   stop-hook Gate 2.6 BLOCKs the turn-end, and the loop busy-spins (~20 turns
+   over a 32min wait — the incident that motivated the flag). `EXTERNAL_WAIT=1`
+   registers a Tier-A `external-wait-sleep` job so Gate 2.6 ALLOWs the turn-end
+   and the sleep paces its full duration. Never pace a mid-goal external wait
+   with a bare sleep.
+
 The hang itself is now bounded by `faulthandler_timeout = 600` +
 `faulthandler_exit_on_timeout = true` in `pytest.ini` (g-115-1496): any single
 test exceeding 600s (10min — well past the 139.61s slowest legit test) dumps
@@ -156,6 +169,8 @@ stack pointing at the stall instead of buffering forever.
 | Path touched | Full-suite command | Pass criterion |
 |---|---|---|
 | `core/scripts/*.py` (non-test) | `cd PROJECT_ROOT && python -m pytest core/scripts/tests -q` | exit code 0, all collected tests pass |
+| `core/scripts/gates/capability.py`, `capability-gate.py`, or the defer→Unblock path in `aspirations.py` | ALSO run `bash core/scripts/tests/run-asp-257-suite.sh` — 4 of its 6 suites are `main()`-style files pytest collects 0 tests from, so pytest-green says NOTHING about them (they sat red 3 days undetected, masking a real NameError — g-115-2343 / rb-3678) | aggregator prints `6/6 suites passed` |
+| Any change whose test coverage lives in a `main()`-style file (69 of the `test_*.py` files here — enumerate with `bash core/scripts/tests/run-invisible-suites.sh --list`) | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner over every pytest-invisible file; known-reds are quarantined inline with their tracking goal IDs (g-115-2349 baseline sweep found 9 silent reds) | runner exits 0 (`60/60 files passed, N quarantined`) |
 | `mind_api/src/*.py` | `python -m pytest core/scripts/tests -q` (runtime is exercised by daemon-aware wrappers in core/scripts/tests) | exit 0 |
 | `core/scripts/*.sh` (production wrapper) | Whatever the wrapper's daemon endpoint suite covers — typically `python -m pytest core/scripts/tests -q -k <endpoint>` | exit 0 |
 | `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. (Do NOT use `skill-evaluate.sh` here. A bare `skill-evaluate.sh <skill-name>` errors `unknown subcommand`: it needs a subcommand (read/report/underperforming/score), and `score --skill <s> --goal <g>` rates RUNTIME skill-on-goal performance, not a static SKILL.md edit.) | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed |

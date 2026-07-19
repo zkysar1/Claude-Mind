@@ -54,6 +54,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -64,11 +65,14 @@ import yaml  # type: ignore
 
 from _fileops import locked_append_jsonl  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
+from _paths import agents_root as _agents_root  # type: ignore
 from _target_state import (  # type: ignore
     _FILE_PATH_RE,
     _resolve_search_roots,
     extract_and_infer_targets,
+    is_modify_intent,
     is_read_intent,
+    is_removal_intent,
     probe_target_state,
 )
 from gates.origin_signal import ALLOWED_PREFIXES  # type: ignore
@@ -112,6 +116,44 @@ _STOPWORDS = {
     "cause", "caused", "causes", "confirm", "confirmed", "confirms",
     "every", "harden", "hardened", "hardening", "rerun", "re-run",
     "finding", "findings",
+    # : verification-SCHEMA vocabulary. _extract_signals pulls the
+    # proposed goal's keywords from its verification block (outcomes + checks)
+    # when present — so a check dict's `type` VALUE (command_check, file_check,
+    # …) and its `condition`/`command` KEY names become "keywords". These recur
+    # in EVERY goal's verification block, making them zero-discriminant duplicate
+    # signals. Worse: the `*_check` / `*_suite` type-values and `python3` carry
+    # an underscore/digit, so they satisfy the has_specific structured-identifier
+    # co-signal ([_0-9] in pending_queue, [-_0-9] in recent_completions) — turning
+    # a schema-token-ONLY overlap into a HARD block instead of a demoted advisory.
+    # The IDF floor does NOT catch them: the IDF corpus is candidate
+    # title+description PROSE (not verification blocks), where schema tokens are
+    # rare → high IDF → they look like rare identifiers. Evidence 2026-07-10 (echo
+    # session 101): FOUR unrelated adds blocked in one day on keyword_hits
+    # {check, command, command_check, condition, python3, scripts, block},
+    # file_path_hits empty every time (recurring goals with rich verification
+    # blocks structurally match every other such goal; the 4th block fired on the
+    # very Idea goal describing this bug —  ×3,  ×1). Demoting
+    # this vocabulary removes both the inflation AND the false co-signal in BOTH
+    # checks (recent_completions + pending_queue) — a genuine duplicate still needs
+    # a real content token or a file-path / non-schema [-_0-9] identifier co-signal.
+    # The check-`type` VALUES are enumerated from the live queue (file_check ×41,
+    # command_check ×14, code_check ×7, test_suite ×6, command_succeeds ×3,
+    # manual_review ×2, manual_check/grep_check/doc_check/eval_check/board_post ×1).
+    # DECISION (, 2026-07-13): manual expansion STAYS — there is no
+    # registry to derive from. Verified: verification check-`type` values are
+    # free-form strings validated NOWHERE (the VALID_TYPES enums in pipeline.py,
+    # reasoning-bank.py, experience.py cover RECORD types — high-conviction,
+    # success/failure, etc. — NOT verification checks). Deriving this list from a
+    # registry would require FIRST building an enum + imposing type-validation on
+    # every goal author — a larger constraint than this small, slowly-changing
+    # list. The superior lighter fix — a suffix pattern (*_check|*_suite|
+    # *_succeeds|*_review) that auto-demotes NEW schema-token types WITHOUT manual
+    # expansion — is filed as . Until that lands, add new check-type
+    # values to the list below by hand.
+    "check", "command", "command_check", "condition", "python3", "scripts",
+    "block", "file_check", "code_check", "test_suite", "command_succeeds",
+    "manual_review", "manual_check", "grep_check", "doc_check", "eval_check",
+    "board_post",
 }
 
 
@@ -190,6 +232,76 @@ def _verification_text(goal: dict) -> str:
     return " ".join(chunks)
 
 
+# 7: a file-path named ONLY in a NEGATIVE / exclusion context
+# ("feature-path-excluded for retrieve.sh", "audit ... other than tree-read.sh")
+# asserts the OPPOSITE of aboutness. Counting it as a duplicate co-signal
+# false-blocks distinct work — canonical incident 6: 's
+# "feature-path-excluded for tree-read.sh/retrieve.sh" HARD-blocked an unrelated
+# Maintain goal via file_path_hits=['retrieve.sh'] (weighted 7.53). The fix is a
+# surgical context-disqualifier at the single extraction point (guard-958:
+# prefer context-disqualifiers over a matcher rewrite; verify RECALL with a
+# genuine-positive control). CONSERVATIVE marker set — only unambiguous
+# exclusion vocabulary, to avoid dropping a genuinely-about path that merely
+# sits near code-discussion words like "skip"/"ignore"/"except:" (recall loss
+# is the failure mode guard-958 warns against).
+_EXCLUSION_MARKER_RE = re.compile(
+    r"\b(?:exclud\w*|except\s+for|other\s+than|aside\s+from|apart\s+from)\b",
+    re.IGNORECASE,
+)
+# : contrast markers. A goal-id preceded (within its clause) by one of
+# these disclaims duplication rather than asserting it ("distinct from
+# ", "complements ", "unlike 5"). Scanned by
+# _path_in_exclusion_context(marker_re=...) so a cited-in-contrast goal-id is
+# dropped from the co-signal keyword set while a neutral / shared-work goal-id
+# is KEPT (preserves the structural-co-signal tests G3/G9). Look-BACK only,
+# matching the exclusion-context precedent; "g-XXX ... is a distinct sweep"
+# (marker-AFTER) is a known gap deliberately left for a follow-up.
+_CONTRAST_MARKER_RE = re.compile(
+    r"\b(?:distinct(?:\s+from|\s+work)?|complements?|complementary(?:\s+to)?|"
+    r"unlike|not\s+a\s+dup\w*|separate\s+from|as\s+opposed\s+to|rather\s+than|"
+    r"in\s+contrast(?:\s+to)?|differs?\s+from|different\s+from|vs\.?|versus)\b",
+    re.IGNORECASE,
+)
+# Clause boundary for scoping the exclusion look-back: a sentence end (". ") or
+# ";" / newline. A BARE "." is deliberately NOT a boundary — file extensions
+# (.sh/.py/.md) and paths (a/b.sh) carry non-boundary dots that would otherwise
+# truncate the exclusion context and mask the marker.
+_CLAUSE_DELIM_RE = re.compile(r"(?:\.\s)|[;\n]")
+
+
+def _path_in_exclusion_context(text_lower: str, path_lower: str,
+                               window: int = 80, marker_re=None) -> bool:
+    """True IFF `path_lower` occurs in `text_lower` AND every occurrence is
+    preceded — within its own clause, capped at `window` chars back — by a
+    context marker. Any positive/aboutness occurrence returns False so the
+    token is KEPT (recall preservation, guard-958). No occurrence at all → False
+    (nothing to disqualify).
+
+    marker_re defaults to _EXCLUSION_MARKER_RE (path exclusion — "except for
+    X"). g-248-113 passes _CONTRAST_MARKER_RE to reuse this clause-scoped
+    look-back for goal-id contrast citations ("distinct from g-XXX")."""
+    marker = marker_re if marker_re is not None else _EXCLUSION_MARKER_RE
+    start = 0
+    saw_any = False
+    while True:
+        idx = text_lower.find(path_lower, start)
+        if idx == -1:
+            break
+        saw_any = True
+        ctx = text_lower[max(0, idx - window):idx]
+        # Trim to the current clause: keep only text after the last boundary,
+        # so an exclusion marker from a PRIOR sentence never taints this path.
+        last = None
+        for m in _CLAUSE_DELIM_RE.finditer(ctx):
+            last = m
+        if last is not None:
+            ctx = ctx[last.end():]
+        if not marker.search(ctx):
+            return False  # positive-context occurrence → keep the token
+        start = idx + len(path_lower)
+    return saw_any
+
+
 def _extract_signals(goal: dict):
     """Extract file-paths and keyword-stems from the goal's most authoritative
     text source. Returns (file_paths, keywords, source_name).
@@ -209,13 +321,40 @@ def _extract_signals(goal: dict):
     else:
         text = (goal.get("title") or "") + " " + (goal.get("description") or "")
         source_name = "prose"
-    file_paths = set(_FILE_PATH_RE.findall(text))
+    file_paths_all = set(_FILE_PATH_RE.findall(text))
 
+    # Strip ALL detected paths (incl. exclusion-context ones) from the text
+    # before keyword extraction so a path like retrieve.sh never leaks its stem
+    # ("retrieve") into keywords — the exclusion filter below must remove the
+    # path's aboutness signal ENTIRELY, not shift it from file-path to keyword.
     cleaned = text
-    for fp in file_paths:
+    for fp in file_paths_all:
         cleaned = cleaned.replace(fp, " ")
     words = re.findall(r"[a-zA-Z][\w-]{4,}", cleaned.lower())
-    keywords = {w for w in words if w not in _STOPWORDS}
+    text_lower = text.lower()
+    # : a goal-id cited in a CONTRAST clause ("distinct from
+    # ", "complements ", "unlike 5") disclaims
+    # duplication, yet its [-_0-9] shape otherwise makes it a false
+    # "structural co-signal" that inflates overlap — a recurring slice of the
+    # 3252 override-ledger entries. Drop a goal-id from keywords ONLY when
+    # every occurrence sits in such a contrast context; a goal-id in NEUTRAL or
+    # shared-work context is KEPT (it can be genuine duplicate evidence when
+    # paired with a topical token — tests G3/G9). Genuine goal-id RELATIONSHIPS
+    # stay handled by _lineage_relation + Strategy 1. Mirrors the
+    # exclusion-context path drop below; _GOAL_ID_RE is defined with the
+    # pending-queue lineage block. fullmatch keeps it precise (only an exact
+    # goal-id token qualifies).
+    keywords = {
+        w for w in words
+        if w not in _STOPWORDS
+        and not (_GOAL_ID_RE.fullmatch(w)
+                 and _path_in_exclusion_context(text_lower, w,
+                                                marker_re=_CONTRAST_MARKER_RE))
+    }
+
+    # 7: drop exclusion-context-only paths from the co-signal set.
+    file_paths = {fp for fp in file_paths_all
+                  if not _path_in_exclusion_context(text_lower, fp.lower())}
     return file_paths, keywords, source_name
 
 
@@ -286,6 +425,61 @@ def _is_expected_path(fp: str, expected_paths) -> bool:
     return False
 
 
+def _recurring_goal_ids(world_dir):
+    """Goal ids of RECURRING goals across the world + every per-agent queue.
+
+    A recurring/reflection goal's COMPLETION in recent_completions is a keyword
+    vacuum: a generic sweep/reflection key_finding with EMPTY file_path_hits that
+    trips `has_specific` via hyphenated compounds (env-server, end-to-end) — a
+    structural false positive, NOT duplicate-work evidence (g-248-114; the
+    g-335-103/104/105 new-capability goals were HARD-blocked by g-115-23
+    "Recurring: Product world model refresh sweep" + g-001-09 learn-pass
+    reflection, file_path_hits empty every time — omni msg-20260717-213111).
+
+    Recurring goals never archive (they re-fire on cadence and persist in the
+    live queue at any status), so an active-queue scan across world + agents is
+    complete for the class — no writer-side marker migration needed. Both false-
+    block classes ("recurring" sweeps and "reflection"/learn-pass goals) carry
+    `recurring: true`, so this single predicate covers both. Fail-open: any read
+    error yields an empty set (the exemption simply does not fire, preserving the
+    pre-fix hard-block behavior). Mirrors the world+agents path enumeration in
+    _check_pending_queue (MIND_AGENTS_ROOT override → _agents_root())."""
+    ids = set()
+    paths = []
+    if world_dir is not None:
+        paths.append(world_dir / "aspirations.jsonl")
+    try:
+        env_root = os.environ.get("MIND_AGENTS_ROOT", "").strip()
+        agents_root = Path(env_root) if env_root else _agents_root()
+        if agents_root.is_dir():
+            for agent_dir in sorted(agents_root.iterdir()):
+                if agent_dir.is_dir():
+                    paths.append(agent_dir / "aspirations.jsonl")
+    except Exception:
+        pass
+    for jp in paths:
+        try:
+            if not jp.exists():
+                continue
+            with open(jp, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        asp = json.loads(line)
+                    except Exception:
+                        continue
+                    for g in asp.get("goals", []) or []:
+                        if isinstance(g, dict) and g.get("recurring") is True:
+                            gid = g.get("id")
+                            if gid:
+                                ids.add(gid)
+        except Exception:
+            continue
+    return ids
+
+
 def _check_recent_completions(goal, file_paths, keywords, self_agent,
                               source_name, world_dir, expected_paths=None):
     """N-agent correct: filters `completed_by != self_agent`. Scales to any
@@ -304,6 +498,25 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
             "reason": ("skipped (directive/handoff-routing goal — description "
                        "recaps target-agent domain work; completed-overlap is a "
                        "structural false positive, g-115-1674)"),
+            "matches": [],
+        }
+    # Completed-Maintain skip (6) — completes carve-out parity with the
+    # other fuzzy-overlap checks (partner_in_flight 7, git_log
+    # /1813, target_state, insight_triggers 5). A
+    # status=completed Maintain filing RECORDS work that already happened;
+    # keyword/path overlap with a partner's recent completion is a completion
+    # coincidence, not a NEW duplicate — blocking only prevents the record (and
+    # its encoding) from landing. Placed before the team-state read so the skip
+    # also saves it. Exact-duplicate RECORDS are still caught by pending_queue
+    # Strategy 1 (which RESTRICTS rather than fully skips).
+    if (goal.get("status") == "completed"
+            and (goal.get("title") or "").startswith("Maintain:")):
+        return {
+            "name": "recent_completions",
+            "passed": True,
+            "reason": ("skipped (status=completed Maintain goal — recent-completion "
+                       "overlap is completion coincidence, not duplication; "
+                       "g-115-2686 / g-115-2477 family)"),
             "matches": [],
         }
     if world_dir is None:
@@ -343,6 +556,11 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
 
     expected = expected_paths or set()
 
+    # : recurring/reflection goal ids — their COMPLETIONS are keyword
+    # vacuums (empty file_path_hits, generic hyphenated compounds) and must not
+    # HARD-block a new-capability goal. Computed once; empty on any read error.
+    recurring_ids = _recurring_goal_ids(world_dir)
+
     matches = []
     advisories = []
     for entry in entries:
@@ -381,7 +599,15 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
         has_specific = bool(hit_paths) or any(
             re.search(r"[-_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
             for k in hit_kws)
-        if strong and has_specific:
+        # : a recurring/reflection COMPLETION matched on KEYWORDS ONLY
+        # (empty hit_paths) is a keyword vacuum — has_specific tripped on a
+        # generic hyphenated compound (env-server, end-to-end), not duplicate
+        # work. DEMOTE to advisory (stays visible, never HARD-blocks). Scoped to
+        # the vacuum case: a recurring completion that shares a real FILE PATH
+        # (hit_paths non-empty) still HARD-blocks — that is genuine shared-work
+        # evidence, not a vacuum.
+        recurring_vacuum = (goal_id in recurring_ids) and not hit_paths
+        if strong and has_specific and not recurring_vacuum:
             matches.append({
                 "goal_id": goal_id,
                 "completed_by": completed_by,
@@ -391,6 +617,16 @@ def _check_recent_completions(goal, file_paths, keywords, self_agent,
                 "weighted_score": round(weighted, 2),
                 "unique_hits": unique_hits,
                 "key_finding_excerpt": (entry.get("key_finding") or "")[:150],
+            })
+        elif strong and has_specific:
+            # recurring/reflection keyword-vacuum completion — demoted, not blocked.
+            advisories.append({
+                "goal_id": goal_id,
+                "completed_by": completed_by,
+                "unique_hits": unique_hits,
+                "weighted_score": round(weighted, 2),
+                "keyword_hits": hit_kws[:5],
+                "recurring_vacuum_exempt": True,
             })
         elif strong:
             # strong overlap on plain words only -> advisory, never a block
@@ -455,6 +691,24 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
             "reason": "skipped (no WORLD_PATH — cannot resolve team-state.yaml)",
             "matches": [],
         }
+    # Completed-Maintain skip (7, extending  / 3).
+    # A status=completed Maintain filing records work that ALREADY happened —
+    # it cannot race a partner's live in_flight goal, so scope overlap with
+    # live work is vocabulary coincidence, not a claim conflict (canonical FPs:
+    # 6 + 7's own filing, both blocked on generic tokens vs
+    # foxtrot's stranded-claim scan within one precheck). Placed before the
+    # team-state read so the skip also saves the authoritative S3 shard reads.
+    # Exact-duplicate RECORDS are still caught by pending_queue Strategy 1.
+    if (goal.get("status") == "completed"
+            and (goal.get("title") or "").startswith("Maintain:")):
+        return {
+            "name": "partner_in_flight",
+            "passed": True,
+            "reason": ("skipped (status=completed Maintain goal — completed "
+                       "records cannot race live partner work; g-115-2477 / "
+                       "g-115-836 family)"),
+            "matches": [],
+        }
     ts_path = world_dir / "team-state.yaml"
     try:
         state = {}
@@ -463,9 +717,14 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
                 state = yaml.safe_load(f) or {}
         #  sharding: overlay per-agent row files (rows win
         # newest-wins) so partner in_flight reads the sharded truth.
-        from _team_state import compose_agent_status, load_rows
+        # 8 / guard-980: on the own-cloud backend read each peer shard
+        # FRESH from the authoritative store (S3), not the conflict-skipped
+        # LOCAL mirror — else partner_in_flight is permanently blind to peers
+        # (frozen/absent local shards) and cannot prevent a double-claim.
+        # Fail-open to the local read; only this consumer pays the S3 cost.
+        from _team_state import compose_agent_status, load_rows_authoritative
         agent_status = compose_agent_status(
-            state.get("agent_status") or {}, load_rows(world_dir))
+            state.get("agent_status") or {}, load_rows_authoritative(world_dir))
     except Exception as e:
         return {
             "name": "partner_in_flight",
@@ -559,12 +818,71 @@ def _check_partner_in_flight(goal, file_paths, keywords, self_agent,
 
 # --- Check 3: git_log_48h ----------------------------------------------------
 
-def _check_git_log(goal, file_paths, project_root):
+# Conventional commit tag: `type(g-NNN-NN): subject` (the shape
+# iteration-commit.sh writes). Strict `):` anchor — only the commit's OWN
+# goal tag exempts, never an incidental mid-subject id mention.
+_COMMIT_TAG_RE = re.compile(r"\((g-\d+-\d+)\):")
+
+
+def _lineage_parent_ids(goal):
+    """Goal ids that are the proposal's lineage parents: a goal-id-shaped
+    ``discovered_by`` plus any ids embedded in ``origin_signal``. Uses the
+    greedy _GOAL_ID_RE (defined with the pending-queue lineage block below),
+    so a shorter id can never be extracted from inside a longer one (the
+    g-315-39-in-g-315-390 prefix class). Used by the git_log_48h lineage
+    exemption (g-115-2462 — 5th observed lineage false-positive shape: a
+    follow-up filed minutes after its parent closed matches the parent's
+    OWN commit, since sq-013/sq-018 follow-ups routinely name files the
+    parent just committed)."""
+    ids = set()
+    disc = (goal.get("discovered_by") or "").strip()
+    if disc and _GOAL_ID_RE.fullmatch(disc):
+        ids.add(disc)
+    for m in _GOAL_ID_RE.finditer(goal.get("origin_signal") or ""):
+        ids.add(m.group(0))
+    return ids
+
+
+def _self_completed_ids(world_dir, self_agent):
+    """Goal ids from team-state recent_completions completed by the FILING
+    agent itself. Consumed by the git_log_48h self-completion demotion
+    (g-115-2555): a commit tagged with a goal the filer THEMSELVES completed
+    carries no duplicate-information the filer lacks, so the match demotes to
+    a visible advisory naming the commit. Partner-completed tags and untagged
+    commits are NOT included — they keep hard-blocking, preserving the
+    N-agent invariant's cross-agent dup-of-done-work detection. Fail-open to
+    empty set (= no demotion) on any read error."""
+    if world_dir is None or not self_agent:
+        return set()
+    try:
+        with open(world_dir / "team-state.yaml", "r", encoding="utf-8") as f:
+            state = yaml.safe_load(f) or {}
+        entries = state.get("recent_completions") or []
+    except Exception:
+        return set()
+    if not isinstance(entries, list):
+        return set()
+    return {e.get("goal_id") for e in entries
+            if isinstance(e, dict) and e.get("completed_by") == self_agent
+            and e.get("goal_id")}
+
+
+def _check_git_log(goal, file_paths, project_root, self_agent="", world_dir=None):
     """Intersect proposed file-paths against all 48h git commits (any author).
 
-    N-AGENT INVARIANT — DO NOT ADD AUTHOR FILTERING. Scanning all commits
-    is correct: it catches overlap with every concurrent contributor AND
-    catches self-recent-work.
+    N-AGENT INVARIANT — DO NOT ADD AUTHOR FILTERING to the git SCAN. Scanning
+    all commits is correct: it catches overlap with every concurrent
+    contributor AND catches self-recent-work (all agents share one git
+    identity, so --author filtering would be a no-op anyway). The g-115-2555
+    self-completion demotion below does NOT violate this: the scan stays
+    author-blind; only match CLASSIFICATION consults completion attribution
+    (team-state recent_completions via _self_completed_ids), demoting a match
+    to a visible advisory when its commit tag maps to a goal the FILING agent
+    itself completed — the filer already knows what they just did, so the
+    match carries no duplicate-information (basis: 14-day telemetry, 19 solo
+    git_log filing attempts, 9 overridden ALL verified-FP, 0 demonstrated
+    TPs; g-115-2554 board msg-20260718-012141). Partner-completed tags and
+    untagged commits still hard-block.
     """
     if not file_paths:
         return {
@@ -653,11 +971,59 @@ def _check_git_log(goal, file_paths, project_root):
             uniq.append(m)
 
     if uniq:
+        # Lineage exemption (2): a commit whose conventional goal
+        # tag IS one of the proposal's lineage parents (discovered_by /
+        # origin_signal-embedded id) is expected file-path overlap — a
+        # follow-up filed from a just-closed goal names files that goal just
+        # committed. Demote those matches to visible advisories; every other
+        # commit match still blocks.
+        parent_ids = _lineage_parent_ids(goal)
+        self_ids = _self_completed_ids(world_dir, self_agent)
+        blocking, lineage, self_done = [], [], []
+        for m in uniq:
+            tag = _COMMIT_TAG_RE.search(m.get("commit") or "")
+            if parent_ids and tag and tag.group(1) in parent_ids:
+                lineage.append(dict(m, lineage_exempt=True,
+                                    lineage="commit-of-lineage-parent"))
+            elif self_ids and tag and tag.group(1) in self_ids:
+                # 5: tag maps to a goal the FILING agent completed —
+                # demote (see docstring). Checked AFTER lineage so attribution
+                # stays most-specific-first.
+                self_done.append(dict(m, self_completion_exempt=True,
+                                      lineage="commit-of-self-completed-goal"))
+            else:
+                blocking.append(m)
+        demoted = lineage + self_done
+        if blocking:
+            reason = ("file-path overlap with " + str(len(blocking))
+                      + " recent commit touch(es) in 48h")
+            if lineage:
+                reason += (" (+" + str(len(lineage))
+                           + " lineage-parent commit match(es) demoted)")
+            if self_done:
+                reason += (" (+" + str(len(self_done))
+                           + " self-completed-goal commit match(es) demoted)")
+            return {
+                "name": "git_log_48h",
+                "passed": False,
+                "reason": reason,
+                "matches": blocking[:10],
+                "advisories": demoted[:5],
+            }
+        parts = []
+        if lineage:
+            parts.append(str(len(lineage)) + " lineage-exempt (own lineage "
+                         "parent's commits; g-115-2462)")
+        if self_done:
+            parts.append(str(len(self_done)) + " self-completion-exempt "
+                         "(commits of goals this agent completed; g-115-2555)")
         return {
             "name": "git_log_48h",
-            "passed": False,
-            "reason": "file-path overlap with " + str(len(uniq)) + " recent commit touch(es) in 48h",
-            "matches": uniq[:10],
+            "passed": True,
+            "reason": ("passed with all commit match(es) demoted: "
+                       + " + ".join(parts)),
+            "matches": [],
+            "advisories": demoted[:5],
         }
     return {
         "name": "git_log_48h",
@@ -686,6 +1052,23 @@ def _check_insight_triggers(goal, file_paths, self_agent, world_dir,
             "name": "insight_triggers",
             "passed": True,
             "reason": "skipped (no WORLD_PATH)",
+            "matches": [],
+        }
+    # Completed-Maintain skip (5) — matches the 4 sibling checks
+    # (partner_in_flight 7, git_log /3, target_state,
+    # pending_queue). A status=completed Maintain filing RECORDS work that
+    # already happened; file overlap with an active insight_trigger is a
+    # completion/vocabulary coincidence, not a NEW duplicate. Placed before the
+    # findings.jsonl read so the skip also saves it. Exact-duplicate RECORDS are
+    # still caught by pending_queue Strategy 1.
+    if (goal.get("status") == "completed"
+            and (goal.get("title") or "").startswith("Maintain:")):
+        return {
+            "name": "insight_triggers",
+            "passed": True,
+            "reason": ("skipped (status=completed Maintain goal — active "
+                       "insight_trigger file overlap is completion coincidence, "
+                       "not duplication; g-115-2685 / g-115-2477 family)"),
             "matches": [],
         }
     findings_path = world_dir / "board" / "findings.jsonl"
@@ -874,6 +1257,22 @@ def _check_target_state(goal: dict, agent_name: str, project_root: Path):
             ),
             "matches": [],
         }
+    # REMOVAL-intent skip () — the mirror inversion of READ-intent:
+    # for a retire/remove/delete goal, identifiers present in target files
+    # means the removal has NOT happened yet (they ARE the removal target),
+    # so presence must not read as duplication. Same shared-classifier
+    # contract as is_read_intent (single source of truth in _target_state).
+    if is_removal_intent(goal.get("title"), _caller="goal-duplication-gate.py"):
+        return {
+            "name": "target_state",
+            "passed": True,
+            "reason": (
+                "skipped (REMOVAL-intent goal title — identifiers present "
+                "in target files ARE the removal target, not completion "
+                "evidence; see _target_state.REMOVAL_INTENT_VERBS / g-248-101)"
+            ),
+            "matches": [],
+        }
     # Completed-Maintain skip (). When a status=completed Maintain
     # goal records just-shipped framework code, all identifiers from the
     # description are already present in the target file — that IS the
@@ -937,6 +1336,43 @@ def _check_target_state(goal: dict, agent_name: str, project_root: Path):
         }
 
     if pr["verdict"] == "already_present":
+        # MODIFY-intent DEMOTE (5, echo 6). The named
+        # identifiers are the modification SUBJECT — present in the target file
+        # both BEFORE and AFTER the change — so a solo target_state block on a
+        # modify-verb goal is a subject-not-deliverable FP (71% / 37 of 52 solo
+        # overrides since 2026-07-04). Unlike is_read_intent / is_removal_intent
+        # (which SKIP because identifier presence INVERTS the completion
+        # semantic), modify-presence is AMBIGUOUS, so we DEMOTE rather than skip:
+        # keep the match visible (passed=True + matches[].demoted marker) but drop
+        # the hard --override-duplication requirement. Placed at the block branch
+        # (not an early skip) precisely so the probe runs and the match stays
+        # visible as an advisory.
+        if is_modify_intent(goal.get("title"), _caller="goal-duplication-gate.py"):
+            return {
+                "name": "target_state",
+                "passed": True,
+                "reason": ("advisory-demoted (MODIFY-intent goal — named "
+                           "identifiers are the modification SUBJECT, present "
+                           "pre- and post-change, not duplication evidence; "
+                           "match kept visible but not a hard block; "
+                           "_target_state.MODIFY_INTENT_VERBS / g-115-2565): "
+                           "target file(s) contain " + str(pr["total_hits"]) +
+                           "/" + str(pr["total_identifiers"]) +
+                           " identifiers (hit_ratio=" +
+                           str(pr.get("hit_ratio", 0.0)) + ")"),
+                "matches": [{
+                    "verdict": pr["verdict"],
+                    "target_files": ex["target_files"],
+                    "identifiers": ex["identifiers"],
+                    "hit_ratio": pr.get("hit_ratio"),
+                    "demoted": "modify-intent",
+                    "per_file_hits": [
+                        {"file": pf["file"], "hits": pf["hits"][:5],
+                         "miss_count": len(pf["misses"])}
+                        for pf in pr["per_file"]
+                    ],
+                }],
+            }
         return {
             "name": "target_state",
             "passed": False,
@@ -998,6 +1434,77 @@ def _iter_pending_goals_from_jsonl(jsonl_path: Path, proposed_id: str):
         return
 
 
+# Goal ids carry 2-4 digit suffixes (g-NNN-NN..g-NNN-NNNN), so bare substring
+# tests prefix-collide across the live corpus ( matches inside
+# "idea:1-slug"). Boundary rule: the id must not be followed by
+# another digit.
+_GOAL_ID_RE = re.compile(r"g-\d+-\d+")
+
+
+def _id_boundary_match(goal_id, text):
+    if not goal_id or not text:
+        return False
+    return re.search(re.escape(goal_id) + r"(?!\d)", text) is not None
+
+
+def _lineage_relation(goal, candidate):
+    """Return a short label when the pending-queue match `candidate` is the
+    proposed goal's own LINEAGE — its discoverer, a declared precondition
+    dependency, a same-discoverer sibling, or the goal named inside the
+    proposal's origin_signal — else None.
+
+    Lineage goals NECESSARILY share identifiers/keywords with the proposal
+    (the description cites the parent by id; the precondition names the
+    dependency by design), so a structural overlap against them is expected
+    self-reference, not duplicate evidence. Observed false-blocks
+    (g-115-2456): three in one echo session — g-315-389 vs its own
+    discoverer g-315-388, g-315-391 vs its declared prerequisite g-315-390,
+    g-115-2452 vs same-discoverer lane siblings — plus the zeta shape
+    g-335-85 vs g-335-73 (the in-progress goal named in its origin_signal).
+    Exempt matches are DEMOTED to advisories (still visible), never hidden.
+    Strategy 1 (origin_signal EXACT equality) is deliberately unaffected:
+    two goals carrying the same symptom key are true duplicates even inside
+    a lineage chain.
+    """
+    cand_id = candidate.get("goal_id") or ""
+    if not cand_id:
+        return None
+    if (goal.get("discovered_by") or "") == cand_id:
+        return "discovered_by-parent"
+    # Declared dependency: candidate named in verification preconditions
+    # (goal_completed_after / goal_id keys, or a bare string mention).
+    ver = goal.get("verification")
+    if isinstance(ver, dict):
+        pres = ver.get("preconditions")
+        if isinstance(pres, list):
+            for p in pres:
+                if isinstance(p, dict):
+                    vals = [str(v) for k, v in p.items()
+                            if k in ("goal_id", "goal_completed_after")]
+                    if any(cand_id == v or _id_boundary_match(cand_id, v)
+                           for v in vals):
+                        return "precondition-dependency"
+                elif isinstance(p, str) and _id_boundary_match(cand_id, p):
+                    return "precondition-dependency"
+    # Same-discoverer siblings carrying DISTINCT symptom keys: both spawned
+    # by one discovery pass, necessarily sharing its vocabulary. Guarded to
+    # goal-id-shaped discoverers — free-form values ("user", a pipeline name)
+    # would exempt unrelated filings that merely share a producer label.
+    disc = goal.get("discovered_by") or ""
+    if (disc and _GOAL_ID_RE.fullmatch(disc)
+            and disc == candidate.get("discovered_by")):
+        po = (goal.get("origin_signal") or "").strip()
+        co = (candidate.get("origin_signal") or "").strip()
+        if po and co and po != co:
+            return "same-discoverer-sibling"
+    # Origin-signal-embedded parent: the proposal's origin_signal names the
+    # candidate goal id (convention embeds the source goal id, e.g.
+    # "idea:-posix-identity-alignment" filed FROM ).
+    if _id_boundary_match(cand_id, goal.get("origin_signal") or ""):
+        return "origin-signal-lineage"
+    return None
+
+
 def _check_pending_queue(goal, file_paths, keywords, source_name,
                         world_dir, project_root):
     """Scan world + per-agent aspirations.jsonl for pending/in-progress
@@ -1019,8 +1526,11 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
 
     Sources scanned:
       - world_dir/aspirations.jsonl (world queue)
-      - project_root/agents/*/aspirations.jsonl (per-agent queues — ALL
-        agents; pending dups are equally bad in any queue).
+      - <agents-root>/*/aspirations.jsonl (per-agent queues — ALL agents;
+        pending dups are equally bad in any queue). Agents root =
+        MIND_AGENTS_ROOT env override (test hermeticity, g-115-2461) else
+        _paths.agents_root() (tracks AGENTS_PARENT_DIR — CLAUDE.md
+        "Agent-dir Resolution").
 
     Skip-paths:
       - world_dir and project_root both None → skip (no sources)
@@ -1037,13 +1547,22 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
 
     proposed_origin = (goal.get("origin_signal") or "").strip()
     proposed_id = goal.get("id") or ""
+    # 7: completed-Maintain filings restrict this check to EXACT
+    # duplicate-record detection (Strategy 1 + exact title) — see below.
+    completed_maintain = (goal.get("status") == "completed"
+                          and (goal.get("title") or "").startswith("Maintain:"))
 
     # Collect source paths. Sorted iteration for deterministic ordering.
     source_paths = []
     if world_dir is not None:
         source_paths.append(("world", world_dir / "aspirations.jsonl"))
     if project_root is not None:
-        agents_root = project_root / "agents"
+        # MIND_AGENTS_ROOT: sibling of the MIND_WORLD redirect — without it
+        # tmp-world test runs swept LIVE agent queues (1). Default
+        # routes through _paths.agents_root() instead of hardcoding the
+        # literal "agents" segment.
+        env_root = os.environ.get("MIND_AGENTS_ROOT", "").strip()
+        agents_root = Path(env_root) if env_root else _agents_root()
         if agents_root.is_dir():
             for agent_dir in sorted(agents_root.iterdir()):
                 if not agent_dir.is_dir():
@@ -1066,6 +1585,7 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
                 "title": title,
                 "description": description,
                 "origin_signal": (g.get("origin_signal") or "").strip(),
+                "discovered_by": (g.get("discovered_by") or "").strip(),
                 "text": (title + " " + description).lower(),
             })
 
@@ -1100,6 +1620,55 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
                     "origin_signal": c["origin_signal"],
                     "match_strategy": "origin_signal",
                 })
+
+    # Completed-Maintain restriction (7, extending  /
+    # 3). A status=completed Maintain record documents work that
+    # already happened; the only real duplicate risk is an exact-duplicate
+    # RECORD, not shared vocabulary with pending work (canonical FPs:
+    # 6 + 7's own filing + 3, all blocked by
+    # structural_overlap on generic tokens / boilerplate / citation
+    # identifiers within 24h). Restrict to exact origin_signal (Strategy 1
+    # above) + exact-normalized-title match; skip Strategy 2 structural
+    # scanning entirely for these filings.
+    if completed_maintain:
+        norm_title = " ".join((goal.get("title") or "").split()).lower()
+        title_matches = []
+        for c in candidates:
+            if " ".join(c["title"].split()).lower() == norm_title:
+                title_matches.append({
+                    "source": c["source"],
+                    "asp_id": c["asp_id"],
+                    "goal_id": c["goal_id"],
+                    "title": c["title"][:120],
+                    "origin_signal": c["origin_signal"],
+                    "match_strategy": "title_exact",
+                })
+        exact_matches = origin_matches + title_matches
+        if exact_matches:
+            strategy_summary = ", ".join(sorted(set(
+                m["match_strategy"] for m in exact_matches)))
+            return {
+                "name": "pending_queue",
+                "passed": False,
+                "reason": ("exact-duplicate completed-Maintain record: " +
+                           str(len(exact_matches)) + " match(es) [strategies=" +
+                           strategy_summary + ", scanned=" +
+                           str(len(candidates)) + "; g-115-2477 carve-out "
+                           "restricts completed-Maintain to exact matching]"),
+                "matches": exact_matches,
+                "advisories": [],
+            }
+        return {
+            "name": "pending_queue",
+            "passed": True,
+            "reason": ("no exact duplicate (status=completed Maintain goal — "
+                       "restricted to exact origin_signal/title match; "
+                       "structural strategies skipped: completed records "
+                       "cannot race pending work; g-115-2477 / g-115-836 "
+                       "family, scanned=" + str(len(candidates)) + ")"),
+            "matches": [],
+            "advisories": [],
+        }
 
     # Strategy 2: structural overlap mirroring _check_recent_completions.
     # IDF computed over the candidate text corpus so common queue vocab
@@ -1169,13 +1738,40 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
         # one that shares only a topic identifier is demoted to advisory, still
         # surfaced, and still caught by Strategy 1 (origin_signal) when it is a
         # real dup filed under the same symptom key.
+        # Bare-basename specificity floor (3, mirroring the git_log
+        # 6 floor): a filename with no directory component (SKILL.md,
+        # README.md, CLAUDE.md, retrieve.sh) is shared VOCABULARY, not a
+        # work-target path — many topically-unrelated goals mention it, so it
+        # over-fires as a file-path co-signal (canonical FPs: 6 pending goals
+        # matched on "SKILL.md"; 3's own filing false-blocked on
+        # "retrieve.sh"). Only a directory-QUALIFIED path (contains "/") is
+        # specific enough to be the has_specific co-signal for a HARD block.
+        # Bare-filename-only overlap demotes to a visible advisory (still
+        # surfaced; a real dup is still caught by Strategy 1 origin_signal + by
+        # qualified-path / [_0-9]-identifier co-signals). Bare names still count
+        # toward strong (unique_hits/weighted) — only their HARD-BLOCK power is
+        # removed.
+        qualified_hit_paths = [fp for fp in hit_paths if "/" in fp]
         if source_name == "prose":
-            has_specific = bool(hit_paths)
+            has_specific = bool(qualified_hit_paths)
         else:
-            has_specific = bool(hit_paths) or any(
+            has_specific = bool(qualified_hit_paths) or any(
                 re.search(r"[_0-9]", k) and idf.get(k, idf_floor) >= idf_floor
                 for k in hit_kws)
         if strong and has_specific:
+            # 6: the candidate's own lineage necessarily shares its
+            # vocabulary — demote to a visible advisory instead of blocking.
+            lineage = _lineage_relation(goal, c)
+            if lineage:
+                advisories.append({
+                    "source": c["source"],
+                    "goal_id": c["goal_id"],
+                    "unique_hits": unique_hits,
+                    "weighted_score": round(weighted, 2),
+                    "keyword_hits": hit_kws[:5],
+                    "lineage_exempt": lineage,
+                })
+                continue
             structural_matches.append({
                 "source": c["source"],
                 "asp_id": c["asp_id"],
@@ -1206,7 +1802,8 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
             })
 
     matches = origin_matches + structural_matches
-    advisories.sort(key=lambda a: (not a.get("strong_keyword_only"),
+    advisories.sort(key=lambda a: (not a.get("lineage_exempt"),
+                                    not a.get("strong_keyword_only"),
                                     -a.get("weighted_score", 0.0)))
     strong_only = sum(1 for a in advisories if a.get("strong_keyword_only"))
 
@@ -1302,7 +1899,7 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
                                   source_name, world_dir, expected_paths),
         _check_partner_in_flight(goal, file_paths, keywords, self_agent,
                                  source_name, world_dir),
-        _check_git_log(goal, file_paths, project_root),
+        _check_git_log(goal, file_paths, project_root, self_agent, world_dir),
         _check_insight_triggers(goal, file_paths, self_agent, world_dir,
                                 expected_paths),
         _check_target_state(goal, self_agent, project_root),

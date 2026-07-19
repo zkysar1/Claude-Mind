@@ -235,6 +235,7 @@ surface; check it on rename:
 | `core/scripts/skill-coinvocation-discovery.py` | `*/skill-invocations.jsonl` ledger mining (co-invocation candidates) | ✓ routed (`read_ledger` base defaults to `agents_root()`; the `root=` param is a test-only override). Regression-guarded by the `/verify-learning` `skill-coinvocation-glob-routing` check + the `--apply` RMW tests in `test_skill_coinvocation_discovery.py` (g-304-24). |
 | `core/scripts/evolution-git-sweep.py` | `agent_self` git pathspecs (`*/self.md` + `agents/*/self.md`) + both-era path classifier | ✓ routed (second pathspec + classifier depth derive from `_agents_root()`; the legacy 2-part form is kept deliberately — git HISTORY contains pre-relocation commits). Was depth-1-only until 2026-07-11 (commit 973f9d52) — the drift zeroed `agent_self` backfill for ~6 weeks while LIVE D1 capture was also silent, leaving self.md revisions with no stream entries at all; 87-entry backfill applied on fix. |
 | `mind_api/src/endpoints/utilization.py` (~L280) | `*/local-paths.conf` enumeration | ✓ routed (`ctx.paths.agents_root`, fixed 2026-07-11 — was the table's last ⚠ LATENT `project_root / "agents"` hardcode, surfaced by the g-115-1405 audit). |
+| `core/scripts/gates/goal_duplication.py` (`_check_pending_queue`) | `*/aspirations.jsonl` per-agent pending-queue scan | ✓ routed (`_agents_root()`, fixed 2026-07-17 g-115-2461 — was a `project_root / "agents"` hardcode). `MIND_AGENTS_ROOT` env override exists for TEST hermeticity only (before it, tmp-world gate tests silently depended on live agent queues for their IDF corpus — every structural case scored 0.0 once hermetic). Regression-guarded by `test_goal_duplication_gate_pending_queue.py` P16 (two-root proof). |
 
 Helper API (available after sourcing `_paths.sh` or importing from `_paths`):
 - `agents_root()` — parent directory containing all agent dirs
@@ -263,7 +264,13 @@ output: agent name).
 
 Writer: `core/scripts/session-binding-write.{py,sh}` — called by /start at
 each of its 4 binding sites with `--retire-legacy` to delete any stale
-`.active-agent-<SID>` from a prior run.
+`.active-agent-<SID>` from a prior run AND (g-115-1814) retire any OTHER
+agent's stale `sessions/<SID>/binding.yaml` for the same SID. A re-bound SID
+(`/start A` → `/stop A` → `/start B` in one terminal) otherwise leaves A's
+`binding.yaml` behind, which can shadow B's live one in `resolve_binding`'s
+`iterdir()`-order scan — injecting the wrong agent (observed: alpha SID
+resolving to bravo=IDLE). The retirement guarantees exactly one `binding.yaml`
+per SID, so the resolver's iterdir order is irrelevant.
 
 Per-session dir semantics:
 - Created by /start; dir name IS the SID
@@ -349,7 +356,7 @@ guardrails, reasoning bank, knowledge tree, forged skills (`world/forged-skills.
 
 ### Naming Rules
 - All filenames: **lowercase, kebab-case** (hyphens, no spaces, no underscores except pipeline/experience record IDs)
-- ISO 8601 dates everywhere. Timestamps: ALWAYS local system time (never UTC). Use `$(date +%Y-%m-%dT%H:%M:%S)`.
+- ISO 8601 dates everywhere. Timestamps: naive format (no zone suffix) via `$(date +%Y-%m-%dT%H:%M:%S)`, in **UTC wall time on every box** — enforced by `.claude/settings.json` env `TZ=UTC` (all boxes) plus box TZ=Etc/UTC where the OS allows (Linux). "Local system time" and UTC converged by fiat 2026-07 (g-115-2546): a multi-box fleet comparing naive stamps (board `--since`, `last_active` staleness, LWW merges) needs one shared wall clock, and mixed domains silently corrupt every comparison. Long-lived processes keep the TZ env they started with — after changing TZ posture, restart daemons or stamps stay in the old zone.
 
 ### ID Formats
 - Aspirations: `asp-NNN` | Goals: `g-NNN-NN` (supports 2-4 digit: `g-NNN-NNNN`; expanded 2026-05-19 after asp-115 hit g-115-999) | Prep tasks: `pt-NNN`

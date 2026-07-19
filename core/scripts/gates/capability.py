@@ -435,6 +435,41 @@ _STOPWORDS = {
     # "plugin_connected: true" in the RUN-mode game-session row -> spurious
     # Unblock g-115-1884. Boolean-literal class (closed): true + false. rb-2996.
     "true", "false",
+    # g-115-1987: "own-cloud" is the STORAGE-LAYER name — an infrastructure
+    # noun in the same class as the already-present "process"/"system"/
+    # "pipeline", never an action. It appears in nearly every CAS-fence /
+    # write_conflict / sync defer_reason (the g-115-1791 fence narrative
+    # itself contains it) AND, since the probe-governed-store forge
+    # (g-115-1982, 2026-07-11), in that skill's trigger "verify write
+    # propagated to own-cloud" — so the token alone false-matched a READ
+    # probe skill as the "cure" for a WRITE fence (a probe cannot cure a
+    # fence). The skill's rows retain discriminating tokens (backend-cat,
+    # governed, s3, mirror, drift, sharded, authoritative), so legitimate
+    # detection is preserved.
+    "own-cloud",
+    # g-115-2336: markdown-table STRUCTURAL vocabulary + prose function words
+    # that appear in capability-routing.md row TEXT only incidentally — never
+    # as a capability identifier — yet co-occur in defer_reasons often enough
+    # to form 2+-token overlaps that BYPASS the g-248-105 sole-token
+    # distinctiveness rule (multi-token matches always survive by design; the
+    # rule assumed each shared token carries signal, which structural/function
+    # words do not). Two junk auto-Unblocks in one day (2026-07-16): echo's
+    # g-115-2269 defer ("registry entry must exist...") matched 'row'/'entry'
+    # against the PLAY-mode and bounded-config-tune rows -> skipped g-115-2329;
+    # foxtrot's g-350-21 same shape. Live repro: 'because'+'row'+'play-mode'
+    # survived as a 3-token match on text referencing no capability.
+    #   - "row"/"entry"/"table": table-structure words ("see Genuinely
+    #     Human-Only row", "agent-provisionable table above", "registry entry").
+    #   - "because": conjunction, quoted inside the PLAY-mode row's log message.
+    #   - "verified"/"evidence": verification-note prose ("Verified g-273-02
+    #     spike", "explicit empirical evidence"). Distinct tokens from the
+    #     imperative "verify" (_IMPERATIVE_VERBS), which stays matchable —
+    #     inflected narration is not a capability request (rb-2996).
+    # Safe per the line-348 rule: every colliding row retains its true
+    # discriminators (roblox-studio.sh/start-session/play-mode/player;
+    # bounded-config/tune compounds) — recall proven by the adjacent-to-
+    # stopword control in test_capability_gate_table_token_noise.py (guard-958).
+    "row", "entry", "table", "because", "verified", "evidence",
 }
 
 
@@ -456,6 +491,49 @@ _IMPERATIVE_VERBS = {
     "delete", "remove", "save", "edit", "modify", "load", "restore",
     "create", "add", "set", "unset",
 }
+
+
+# g-115-2583 / rb-3955: a small curated set of tokens that are BOTH in
+# _IMPERATIVE_VERBS AND commonly used as an ADJECTIVE modifying a following
+# noun ("clean session" = a fresh/idle session, NOT "clean the session"). When
+# such a token is used adjectivally it is not the requested action verb, so the
+# action-verb extractor in evaluate() must skip it. Kept intentionally MINIMAL
+# and evidence-driven (only what a documented incident showed): a general
+# "verb directly followed by a noun is adjectival" rule is WRONG -- it would
+# reject genuine verb+object requests like "deploy production" / "restart
+# service" / "push origin". Add a member only when a real incident shows that
+# token mis-parsing. Origin: g-250-192 filed a spurious "Unblock: clean for
+# g-X" from "clean session".
+_ADJECTIVE_VERBS = {"clean"}
+
+# Function words that, when they immediately FOLLOW an _ADJECTIVE_VERBS token,
+# signal genuine VERB use ("clean the cache", "clean up the logs") rather than
+# adjectival use ("clean session"). A following bare noun (not in this set)
+# signals adjectival use.
+_ADJ_VERB_FOLLOW_FUNCWORDS = {
+    "the", "a", "an", "this", "that", "these", "those", "it", "them", "us",
+    "up", "out", "off", "away", "all", "and", "or", "then", "before", "after",
+    "until", "via", "again", "now", "everything",
+}
+
+
+def _is_adjectival_use(text: str, match) -> bool:
+    """True if the _ADJECTIVE_VERBS token at `match` is used adjectivally
+    (directly modifying a following noun) rather than as an imperative verb.
+
+    Heuristic: look at the word immediately following the token. If it is a
+    function word (article/particle/conjunction) the token reads as a VERB
+    ("clean the session" / "clean up") -> return False (keep as action verb).
+    If it is a bare noun the token reads as an ADJECTIVE ("clean session")
+    -> return True (reject as action verb). Fails toward KEEPING the verb
+    (returns False) when nothing follows -- conservative, matching the gate's
+    fail-open bias (guard-958). g-115-2583 / rb-3955.
+    """
+    tail = text[match.end():]
+    nxt = _TOKEN_RE.search(tail)
+    if not nxt:
+        return False  # nothing after -> treat as verb
+    return nxt.group(0).lower() not in _ADJ_VERB_FOLLOW_FUNCWORDS
 
 
 # --- Context-aware keyword disqualification ---------------------------------
@@ -502,6 +580,46 @@ _EVIDENCE_VERB_AFTER = re.compile(
     r"suggests|suggested)\b"
 )
 
+# g-115-2583 / rb-3955: causal-relevance disqualifiers. An INCIDENTAL keyword
+# whose surrounding narrative asserts the referent is AVAILABLE / not-the-block
+# (the defer says the capability was probed-fine and is NOT the actual blocker),
+# or merely names it as the LOCATION where some OTHER thing is absent, is not a
+# capability-invocation signal. These are false-negative-SAFE by construction:
+# a genuine block asserts the OPPOSITE state (unreachable / down / cannot-access
+# / "is not available"), which these patterns do NOT match -- so they can never
+# strip a real "X is the blocker" match (the guard-958 concern). Both are scoped
+# to the immediate window around the keyword and only skip THAT occurrence
+# (fail-open across occurrences, like the checks above).
+#
+# _AVAILABILITY_AFTER: keyword FOLLOWED by an availability assertion. The
+# leading (is|was|probed|...)? optional group deliberately does NOT include
+# "not", so "efs is not available" / "efs is not reachable" fall THROUGH (the
+# alternation never matches "not ...") and remain genuine matches.
+_AVAILABILITY_AFTER = re.compile(
+    r"^\W*(?:is|was|are|were|been|remains?|stays?|still|now|probed|tested|"
+    r"verified|confirmed)?\s*(?:as\s+|been\s+)?"
+    r"(available|reachable|healthy|online|accessible|"
+    r"operational|responsive|up\s+and\s+running|"
+    r"not\s+the\s+(?:block|blocker|issue|problem|cause|bottleneck))\b"
+    # g-115-2583 fresh-eyes (self-review): 'mounted'/'connected' deliberately
+    # EXCLUDED — they are ambiguous ("efs mounted read-only, cannot write" /
+    # "efs connected to the wrong endpoint" describe a limited/misconfigured
+    # state that CAN be the genuine blocker). guard-958: when a disqualifier
+    # member is ambiguous, fail toward matching. The unambiguous members above
+    # fully cover the rb-3955 "probed available" case.
+)
+# _ABSENCE_LOCATION_BEFORE: an ABSENCE word + a location preposition immediately
+# PRECEDE the keyword ("config absent on efs", "file deleted from efs") -- the
+# keyword is the healthy container, the absent thing is elsewhere. Requiring
+# BOTH an absence word AND a trailing location preposition keeps genuine
+# requests safe: "cannot access efs" / "unable to mount efs" / "fetch from efs"
+# have no absence word before a location prep, so they still match.
+_ABSENCE_LOCATION_BEFORE = re.compile(
+    r"\b(absent|missing|not\s+found|gone|removed|deleted|empty|"
+    r"no\s+longer\s+(?:present|there|available))\b"
+    r"[^.!?\n]{0,20}\b(?:on|in|at|under|from|inside)\s*$"
+)
+
 
 def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
     """True if `keyword` has at least one valid-context occurrence.
@@ -532,6 +650,14 @@ def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
         # g-115-1882: verb-noun used as a reported-evidence subject, not an
         # action request ("fresh probe 2026-07-09 shows X", "the audit found Y").
         if kw in _IMPERATIVE_VERBS and _EVIDENCE_VERB_AFTER.search(post):
+            continue
+        # g-115-2583: incidental keyword whose narrative asserts the referent is
+        # available / not-the-blocker, or names it as the location of some OTHER
+        # absent thing. False-negative-safe (genuine blocks assert the opposite
+        # state; see the pattern comments). rb-3955.
+        if _AVAILABILITY_AFTER.match(post):
+            continue
+        if _ABSENCE_LOCATION_BEFORE.search(pre):
             continue
 
         return True
@@ -698,16 +824,67 @@ def _log_evidence_approval(world_dir, agent_name: str, failure_reason: str,
         return None
 
 
+def _identifier_parts(entry: dict) -> set:
+    """Hyphen/underscore parts of the entry's SKILL NAME — and only the name.
+    "access-efs-data" -> {access, efs, data}. The name is what the skill's
+    author chose as its identity, so a prose keyword equal to a name part is a
+    deliberate reference, not incidental vocabulary (g-248-105). Companion
+    SCRIPT names are deliberately EXCLUDED: roblox-bridge.py would make
+    "bridge" an identifier part of access-roblox-studio, reintroducing the
+    exact observed FP (prose "bridge" -> that skill) this fix closes. Trigger/
+    row prose is likewise excluded (it IS the vocabulary being demoted)."""
+    parts = set()
+    if entry.get("skill"):
+        for frag in re.split(r"[-_./\s]+", str(entry["skill"]).lower()):
+            if frag:
+                parts.add(frag)
+    return parts
+
+
+def _single_token_qualifies(tok: str, entry: dict) -> bool:
+    """g-248-105: is a SOLE shared token discriminative enough to match?
+
+    True when the token is structurally compound (hyphen/underscore/digit —
+    "backend-cat", "s3", "zeta_deploy": such tokens exist only where someone
+    named a real thing) OR it is an imperative capability VERB
+    (_IMPERATIVE_VERBS — "commit the hotfix" / "push and show the team" name
+    a deliberate provisionable ACTION; dropping those re-opened the
+    g-115-1883 recall regressions) OR it is an identifier part of THIS
+    entry's skill NAME ("efs" in access-efs-data, "roblox" in
+    access-roblox-studio; companion scripts excluded — see _identifier_parts).
+    Plain common-prose tokens shared only via trigger/row VOCABULARY ("bridge",
+    "analysis", "reachable" — none imperative verbs) fail — the sig-30
+    hardcoded-list-under-coverage FPs this closes (each forced an --override
+    3x in one session). NOT more stopwords by design: extraction is
+    untouched, so these tokens still count inside multi-token overlaps —
+    zero recall loss for any 2+-token match."""
+    if "-" in tok or "_" in tok or any(c.isdigit() for c in tok):
+        return True
+    if tok in _IMPERATIVE_VERBS:
+        return True
+    return tok in _identifier_parts(entry)
+
+
 def _find_matches(keywords: set, entries: list) -> list:
     """INVARIANT: whole-token set intersection, NOT substring matching.
     Substring matching would let "port" match "report" and "exe" match
-    "execute". Synthetic test suite locks this in."""
+    "execute". Synthetic test suite locks this in.
+
+    Single-token precision (g-248-105): a match carried by ONE shared token
+    survives only when that token is distinctive (_single_token_qualifies).
+    Multi-token overlaps (>=2) always survive. SAFETY DIRECTION: dropping a
+    match LOOSENS the gate (fewer refusals of user-routing), which risks the
+    g-115-792 anti-pattern — hence the narrow predicate + the both-ways test
+    matrix (FPs stop; genuine single-token matches like "cannot access EFS"
+    -> efs -> access-efs-data still fire via identifier parts)."""
     matches = []
     for entry in entries:
         entry_toks = _entry_tokens(entry)
         hits = sorted(keywords & entry_toks)
         if not hits:
             continue
+        if len(hits) == 1 and not _single_token_qualifies(hits[0], entry):
+            continue  # sole generic-prose token — vocabulary, not a reference
         m = dict(entry)
         m["matched_keyword"] = hits[0]
         m["all_matched_keywords"] = hits
@@ -863,6 +1040,15 @@ def evaluate(failure_reason: str, *,
             for m in _TOKEN_RE.finditer(failure_reason or ""):
                 tok = m.group(0).lower()
                 if tok in _IMPERATIVE_VERBS:
+                    # g-115-2583 / rb-3955: an ambiguous verb-adjective used
+                    # ADJECTIVALLY ("clean" in "clean session") is not the
+                    # requested action -- skip it and keep scanning for a real
+                    # verb. When none follows, action_verb stays None and the
+                    # g-115-1872 verbless-suppression below correctly withholds
+                    # the Unblock (rather than filing "Unblock: clean for g-X").
+                    if tok in _ADJECTIVE_VERBS and _is_adjectival_use(
+                            failure_reason or "", m):
+                        continue
                     action_verb = tok
                     break
             if cure_action:

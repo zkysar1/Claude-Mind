@@ -134,5 +134,65 @@ def test_future_next_review_filter_intact(tmp_path):
     assert "not-due" not in ids
 
 
+def test_replay_count_cap_excluded_from_both_stages(tmp_path):
+    # 9: rc>=5 records are source-excluded — the LLM-side archive
+    # remedy is a no-op for already-archived records, which cycled forever.
+    ids = _read_candidates(
+        tmp_path,
+        live=[
+            _rec("live-rc4", "resolved", replay_count=4),        # IN  (below cap)
+            _rec("live-rc5", "resolved", replay_count=5),        # OUT (at cap)
+        ],
+        archive=[
+            _rec("arch-rc5", "archived", replay_count=5),        # OUT (canonical case)
+            _rec("arch-rc6", "archived", replay_count=6),        # OUT (above cap)
+        ],
+    )
+    assert "live-rc4" in ids
+    assert "live-rc5" not in ids
+    assert "arch-rc5" not in ids
+    assert "arch-rc6" not in ids
+
+
+def test_replay_count_string_coerced(tmp_path):
+    # replay_count is a string on some records — "5" must still exclude.
+    ids = _read_candidates(
+        tmp_path,
+        live=[
+            _rec("string-rc5", "resolved", replay_count="5"),    # OUT (coerced)
+            _rec("string-rc2", "resolved", replay_count="2"),    # IN
+        ],
+        archive=[],
+    )
+    assert "string-rc5" not in ids
+    assert "string-rc2" in ids
+
+
+def test_replay_count_unparseable_falls_through(tmp_path):
+    # Fail-open: an unparseable replay_count must not exclude the record.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("bad-rc", "resolved", replay_count="not-a-number")],
+        archive=[],
+    )
+    assert "bad-rc" in ids
+
+
+def test_next_review_datetime_form_tolerated(tmp_path):
+    # 9 bundled hardening: a datetime-form next_review_date must not
+    # silently defeat the 7-day exclusion (bare date.fromisoformat raises on
+    # "YYYY-MM-DDTHH:MM:SS" and the swallowed ValueError meant INCLUDE).
+    ids = _read_candidates(
+        tmp_path,
+        live=[
+            _rec("dt-not-due", "resolved", next_review="2999-01-01T09:30:00"),  # OUT (future)
+            _rec("dt-due", "resolved", next_review="2000-01-01T09:30:00"),      # IN  (past)
+        ],
+        archive=[],
+    )
+    assert "dt-not-due" not in ids
+    assert "dt-due" in ids
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

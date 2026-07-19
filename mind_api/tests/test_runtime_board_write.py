@@ -188,6 +188,64 @@ def test_channels_lists(running_daemon):
     assert names["general"]["last_timestamp"] == "2026-05-12T10:01:00"
 
 
+def test_post_findings_citation_increments(running_daemon):
+    """ attribution end-to-end through the daemon, including the
+    g-115-2351 regex regression: a 4-digit ID (rb-3742) must attribute —
+    the pre-fix _CITE_RE \\d{3} silently excluded every ID past 999.
+    Non-findings channels must not attribute (channel gate)."""
+    project_root, port = running_daemon
+    world = project_root / "world"
+
+    # Seed one 3-digit guard and one 4-digit rb through the canonical
+    # store append (validated, cache-coherent).
+    guard_rec = {"id": "guard-901", "rule": "test citation target",
+                 "category": "test-cite", "trigger_condition": "never",
+                 "source": "citation-test", "when_to_use": "never",
+                 "tags": ["cite-test"]}
+    rb_rec = {"id": "rb-3742", "title": "test citation target",
+              "type": "success", "category": "test-cite",
+              "content": "citation regression fixture",
+              "applies_to": "framework", "tags": ["cite-test"]}
+    status, _ = _post_raw(port, "/v1/store/append", {"store": "guardrails"},
+                          json.dumps(guard_rec))
+    assert status == 200
+    status, _ = _post_raw(port, "/v1/store/append", {"store": "reasoning-bank"},
+                          json.dumps(rb_rec))
+    assert status == 200
+
+    def _tih(fname, rec_id):
+        recs = [json.loads(ln) for ln in
+                (world / fname).read_text(encoding="utf-8").splitlines()
+                if ln.strip()]
+        rec = next(r for r in recs if r.get("id") == rec_id)
+        return rec["utilization"]["times_inferred_helpful"], \
+            rec["utilization"]["utilization_score"]
+
+    # Findings post citing both — each gets exactly one increment.
+    status, _ = _post_raw(
+        port, "/v1/board/post",
+        {"channel": "findings",
+         "tags": "fresh-eyes-code,guard-901,rb-3742,severity:constrains"},
+        "citation attribution end-to-end")
+    assert status == 200
+    g_tih, g_score = _tih("guardrails.jsonl", "guard-901")
+    r_tih, r_score = _tih("reasoning-bank.jsonl", "rb-3742")
+    assert g_tih == 1, f"guard-901 tih expected 1, got {g_tih}"
+    assert r_tih == 1, f"rb-3742 (4-digit) tih expected 1, got {r_tih} " \
+                       "— \\d{3}-only regex regression"
+    # Smoothed 9 score: (th + 0.5*tih)/(max(rc, th+tih)+1)
+    # = (0 + 0.5)/(max(0, 1)+1) = 0.25 on a fresh record.
+    assert g_score == 0.25 and r_score == 0.25, (g_score, r_score)
+
+    # Non-findings channel with the same tags: counters unchanged.
+    status, _ = _post_raw(port, "/v1/board/post",
+                          {"channel": "general", "tags": "guard-901,rb-3742"},
+                          "general post must not attribute")
+    assert status == 200
+    assert _tih("guardrails.jsonl", "guard-901")[0] == 1
+    assert _tih("reasoning-bank.jsonl", "rb-3742")[0] == 1
+
+
 # ---------------------------------------------------------------------------
 # Byte-compat: daemon handler output == real CLI output
 # ---------------------------------------------------------------------------

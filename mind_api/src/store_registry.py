@@ -373,11 +373,19 @@ def _recompute_utilization_score(rec):
     rc = util["retrieval_count"]
     th = util["times_helpful"]
     tih = util["times_inferred_helpful"]
-    util["utilization_score"] = round((th + 0.5 * tih) / max(rc, 1), 4)
     ta = util.get("times_active", 0)
     tc = util.get("times_cited", 0)
+    # Denominator = max(retrievals, credited usages) + 1 (9) —
+    # verbatim twin of reasoning-bank.py recompute_utilization_score; see the
+    # full WHY comment there (context-carried helpful bumps make th>rc
+    # legitimate for rb/guardrails; old max(rc,1) let untested entries outrank
+    # scan-tested ones in sort_universal_rbs). Tree-node utility_ratio
+    # deliberately keeps max(rc,1) — its th<=rc precondition holds.
+    usage_v1 = th + tih
+    util["utilization_score"] = round((th + 0.5 * tih) / (max(rc, usage_v1) + 1), 4)
+    usage_v2 = th + tih + ta + tc
     util["utilization_score_v2"] = round(
-        (th + 0.5 * tih + 0.25 * ta + 1.0 * tc) / max(rc + 1, 1), 4
+        (th + 0.5 * tih + 0.25 * ta + 1.0 * tc) / (max(rc, usage_v2) + 1), 4
     )
 
 

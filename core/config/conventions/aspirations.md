@@ -118,7 +118,7 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-add.sh` | Validate + append new world aspiration | JSON |
 | `aspirations-update.sh <asp-id>` | Validate + replace world aspiration | JSON |
 | `aspirations-update-goal.sh <goal-id> <field> <value>` | Update single goal field in world queue. **Clearing a field**: pass the literal `null` as `<value>` (parsed to JSON null; `true`/`false`/`[]` likewise parse to JSON forms). An empty-string value is REJECTED by the wrapper's required-positional check — `""` is not the clear form. Clearing `defer_reason` with `null` passes the probe-before-defer gate (fires only on non-null defer writes); on a blocked goal the daemon flips status back to `pending`. Same semantics in `agent-aspirations-update-goal.sh`. | — |
-| `aspirations-add-goal.sh <asp-id>` | Validate + append goal to world aspiration (auto-assigns ID) | JSON |
+| `aspirations-add-goal.sh <asp-id>` | Validate + append goal to world aspiration (auto-assigns ID). Gated add pipeline: origin-signal, goal-duplication, **operator-offload** (recurring goals must carry `offload_decision` — see `goal-schemas.md` Recurring Goal Fields; bypass `--override-offload`), stale-read. `--override-all "<reason>"` bulk-bypasses (audited to `world/override-bypass-ledger.jsonl`). | JSON |
 | `aspirations-complete.sh <asp-id>` | Mark world aspiration completed + archive | — |
 | `aspirations-complete-intent.sh <asp-id>` | Close world aspiration via intent-satisfaction pathway (evidence-gated) | JSON |
 | `aspirations-retire.sh <asp-id>` | Mark world aspiration retired + archive | — |

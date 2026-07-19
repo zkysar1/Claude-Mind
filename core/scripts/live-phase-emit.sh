@@ -32,8 +32,12 @@ if et == "phase_end":
     print("between-phases")
 elif et == "phase_start":
     print(f"{phase} {gid}".strip())
-elif et == "finding":
-    print(f"finding {gid}".strip())
+elif et in ("finding", "decision", "failure", "approach_change",
+            "observation", "state_update"):
+    # All remaining VALID_ENTRY_TYPES (execution-diary.py) — a legitimate
+    # non-phase tail row must not kill the mirror. Truly unknown values
+    # still crash below (the fresh-eyes no-masking invariant).
+    print(f"{et} {gid}".strip())
 else:
     sys.exit(f"live-phase-emit: unhandled entry_type {et!r}")
 ')

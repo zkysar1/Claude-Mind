@@ -58,9 +58,11 @@ def main():
                 known_excluded_children.add(child)
 
     # ── 7b: forged-skills registry cross-reference () ──────────────
-    # exclude_children mirrors world/forged-skills.yaml by hand with no sync, so
-    # a forged skill registered there but absent here LEAKS into the
-    # domain-agnostic seed. Query the registry (source-of-truth) and diff. Reuse
+    # exclude_children hand-mirrors world/forged-skills.yaml. As of  the
+    # seed engine AUTO-DERIVES forged exclusions from the registry at seed-create
+    # (union onto the static list), so a forged skill absent from the static list
+    # no longer leaks -- this cross-reference is now an advisory manifest-hygiene
+    # check, not a leak guard. Query the registry (source-of-truth) and diff. Reuse
     # the seed engine's resolver (read local world/ else WORLD_PATH from
     # agents/*/local-paths.conf) rather than duplicating it -- duplication is the
     # rot class this audit fixes. Fail-safe: any import/read failure leaves
@@ -74,13 +76,21 @@ def main():
         forged_names = None
     leaking = forged_not_excluded(forged_names, known_excluded_children)
     if leaking:
-        print(f"  ROT (7b): {len(leaking)} forged skill(s) in forged-skills.yaml "
-              f"NOT in seed-manifest exclude_children -- WILL LEAK into the seed:")
+        # As of  the seed engine (_seed_engine.walk_include_entry) AUTO-
+        # DERIVES forged exclusions from world/forged-skills.yaml at seed-create,
+        # UNIONing them onto the static exclude_children. A forged skill absent
+        # from the static list therefore no longer LEAKS -- this is advisory
+        # manifest hygiene, not a promote-blocker. The static list stays the
+        # fail-safe floor for when the registry is unlocatable.
+        print(f"  ADVISORY (7b): {len(leaking)} forged skill(s) in forged-skills.yaml "
+              f"NOT in the seed-manifest exclude_children STATIC list. The engine "
+              f"auto-derives forged exclusions at seed-create (g-306-88), so these do "
+              f"NOT leak; optionally add for manifest documentation:")
         for name in leaking:
-            print(f"    - {name}   [add to seed-manifest.yaml exclude_children]")
+            print(f"    - {name}   [optional: add to seed-manifest.yaml exclude_children]")
     elif forged_names is not None:
         print(f"  OK (7b): all {len(forged_names)} registered forged skills are "
-              f"in exclude_children")
+              f"in the static exclude_children list (engine also auto-derives, g-306-88)")
 
     # New skills
     skills_dir = project_root / ".claude" / "skills"

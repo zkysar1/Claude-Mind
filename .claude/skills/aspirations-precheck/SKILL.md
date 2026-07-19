@@ -46,6 +46,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 |---|---|---|
 | 0-pre | tree-debt-gate | always-run |
 | 0-pre2 | experience-archival-gate | always-run |
+| 0-pre2.5 | evolution-finalize-gate | always-run |
 | 0-pre3 | fresh-eyes-code-gate | always-run |
 | 0 (Recurring Safety Net) | aspirations-recover-recurring | medium |
 | 0 (Monitor Stale) | monitor-stale-check | medium |
@@ -61,6 +62,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5b.8 | routing-audit-target-status-sweep | deferrable |
 | 0.5b.9 | credential-defer-recheck | deferrable |
 | 0.5b.10 | defer-drift-check | deferrable |
+| 0.5b.11 | reason-less-blocked-check | deferrable |
 | 0.5c | recurring-precondition-sweep | deferrable |
 | 0.5e | fresh-eyes-cadence | deferrable |
 | 0.5e.5 | fresh-eyes-program-cadence | deferrable |
@@ -69,6 +71,7 @@ SKILL.md (after Phase 1) call `meter end` to write the summary record.
 | 0.5g | l1-skew-cadence | deferrable |
 | 0.5h | health-regression-cadence | deferrable |
 | 0.5i | curriculum-cadence | deferrable |
+| 0.5j | evolution-cadence | deferrable |
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -225,6 +228,31 @@ IF output is non-empty:
 # ELSE: clean — emit nothing (quiet on the common empty case).
 ```
 
+## Phase 0-pre.0d: Sentinel Battery (g-115-2303 — ONE call replaces the six per-phase wm-reads)
+
+The six force-gate/pending sentinel gates below (Phases 0-pre..0-pre6) are
+enumerated by ONE script call. The script owns the slot list
+(`core/scripts/_sentinel_registry.py` — shared with `stale-sentinel-canary.py`,
+single source of truth), so a phase can never silently fall out of the protocol:
+post-autocompact, "run the battery" is the only line that must survive
+summarization; the output re-derives the full battery. (Origin g-115-2302: a
+reconstructed protocol carried 3 of 6 phases and a set sentinel sat unread for
+3 iterations.) Adding a new sentinel gate = one registry entry + its consumer
+phase section below.
+
+```
+Bash: bash core/scripts/precheck-sentinel-battery.sh
+IF output says "all N registered sentinels null — no gates to dispatch":
+    SKIP directly past Phases 0-pre..0-pre6 (no per-phase wm-reads needed).
+FOR EACH "▸ SENTINEL: <slot> (phase <phase>) payload=<json> → dispatch: <section>" line:
+    Handle it via the NAMED phase section below. The payload is on the line —
+    do NOT re-run wm-read for that slot. The phase bodies keep ownership of
+    action + dispatch-stamp + clear (the battery is READ-ONLY).
+IF output reports wrapper_failed or error=...:
+    Fall back to the per-phase wm-read preambles below (each phase section
+    still documents its slot). The battery must never block the loop.
+```
+
 ## Phase 0-pre: Tree-Debt Critical Gate (g-115-81, source-dispatch g-115-721)
 
 Runs BEFORE Phase 0 completion checks. Consumes the `force_tree_maintain` WM
@@ -244,7 +272,8 @@ Prevents the LLM-abbreviation drift that grew backlog 85→151 over sessions
 INFO line that gets skipped under context pressure.
 
 ```
-Bash: wm-read.sh force_tree_maintain --json
+signal = Phase 0-pre.0d battery payload for force_tree_maintain
+         (fallback only if battery errored: Bash: wm-read.sh force_tree_maintain --json)
 IF signal is not null:
     source = signal.get("source", "tree-debt-critical")
     IF source == "encoding-drift":
@@ -289,7 +318,8 @@ action → wm-set 'null'. One-shot retry: if composition fails, the sentinel
 persists and the gate fires again next iteration until the LLM succeeds.
 
 ```
-Bash: wm-read.sh force_experience_archival
+signal = Phase 0-pre.0d battery payload for force_experience_archival
+         (fallback only if battery errored: Bash: wm-read.sh force_experience_archival)
 IF signal is not null:
     Output: "▸ EXPERIENCE-ARCHIVAL GATE: force_experience_archival set (last entry {last_entry_id}, {age_hours}h stale)"
     # Compose the missed experience record per Phase 4.25 instructions
@@ -301,6 +331,17 @@ IF signal is not null:
     # If no deep goal is reconstructible (e.g., routine-only streak), write a
     # minimal placeholder record with a short `note` explaining the gap, AND
     # clear the sentinel — do not loop.
+    # FORCED-FLIP GUARD (g-xw-20260717T220413-01): a "deep" close whose
+    # last_outcome_origin is forced (Block C anti-drift streak flip) carries
+    # ROUTINE content — its deep label is streak mechanics, not substance.
+    # Treat forced-flip closes like routine for THIS gate: if every deep close
+    # since the last experience entry was a forced flip, do NOT compose a full
+    # experience record from its routine content (that manufactures a
+    # contentless filler entry). Take the placeholder path instead (note:
+    # "window contained only forced-flip deep closes — no genuine deep content
+    # to archive") and clear the sentinel. Genuineness check: the goal record's
+    # last_outcome_origin field ("genuine" vs "forced"), or the close output's
+    # outcome_in=routine/outcome_out=deep line.
     <compose experience-add.sh JSON payload>
     echo '<payload-json>' | Bash: experience-add.sh
     # Clear signal after successful write (one-shot).
@@ -311,6 +352,75 @@ IF signal is not null:
 The gate does NOT write `stop-requested` or `stop-loop` — it blocks goal
 selection via the precheck pattern (LLM sees sentinel, acts, clears it) rather
 than terminating the loop.
+
+## Phase 0-pre2.5: Evolution-Stub Finalize Gate (g-115-2180, rb-428 family)
+
+Runs AFTER the experience-archival gate, BEFORE the fresh-eyes-code gate.
+Consumes the `force_evolution_finalize` WM sentinel set by
+`evolution-stub-pending-check.sh` (wired into `iteration-close.sh`'s
+productivity-check maintenance tick, beside `evolution-stub-expiry.py`).
+
+**Why this gate exists.** `evolution-record.py` writes an `awaiting_completion`
+stub on every `self.md` / `program.md` edit. The LLM is then supposed to call
+`evolution-complete.sh`, which records the WHY and — for a MATERIAL `agent_self`
+change — fires the **guard-380 user notification**. *Nothing ever prompted that
+call.* 24h later `evolution-stub-expiry.py` honestly transitions the stub to
+`expired` (it refuses to fabricate a rationale, which is correct — see its
+docstring). Measured 2026-07-14: of 65 material Self edits fleet-wide only
+**11 (17%)** ever reached the user; **22 EXPIRED unnotified** — the agent's
+identity changed and the user was never told. On 2026-04-22 the user explicitly
+traded "ask first" for "notify after, revert if wrong"; the notify-after half was
+silently not executing, which made the autonomy unearned. This gate is the
+missing PROMPT; the expiry sweep remains the honest fallback.
+
+Every sibling obligation in the rb-428 family (tree-debt 0-pre, experience-archival
+0-pre2, fresh-eyes-code 0-pre3, metric-encoding 0-pre4) already had a forcing
+consumer. Self-evolution finalization was the one that did not.
+
+Pattern mirrors Phase 0-pre2 verbatim — wm-read → if non-null → action → clear.
+One-shot with retry: the producer re-fires the sentinel every iteration until the
+stub is finalized, so a failed completion is never lost.
+
+```
+Bash: wm-read.sh force_evolution_finalize --json
+IF signal is not null AND signal.count > 0:
+    Output: "▸ EVOLUTION-FINALIZE GATE: {signal.count} awaiting_completion stub(s) ({signal.material_count} MATERIAL) past {signal.threshold_minutes}min — finalizing before goal selection"
+    FOR EACH stub in signal.stubs:
+        # Reconstruct the WHY from the session's own record — the journal entry,
+        # the goal that motivated the edit, the .history snapshot named in the
+        # stub, or the diff_excerpt carried on the stub itself.
+        #
+        # NEVER FABRICATE. If the rationale genuinely cannot be reconstructed
+        # (e.g. the edit was made by a prior session whose context is gone), do
+        # NOT invent one — leave the stub and let evolution-stub-expiry.py record
+        # `expired` honestly at 24h. A fabricated reasoning string is worse than
+        # an absent one (verify-before-assuming.md; and it is exactly what the
+        # expiry script's docstring refuses to do). Log the skip and move on.
+        Bash: bash core/scripts/evolution-complete.sh \
+                --revision-id {stub.revision_id} \
+                --reasoning "<>=80-char rationale, reconstructed from real evidence>" \
+                --signal-source {sq-012 | fresh-eyes-review | user-directive | ...} \
+                --signal-evidence '[{"type":"goal","id":"<goal-id>"}, ...]'
+        # For change_class=material + file_kind=agent_self, evolution-complete's
+        # Phase 5 AUTO-posts the decisions board AND AUTO-emails the user
+        # (guard-380). No manual notification call is needed here.
+    # Clear after the pass. If a completion failed, the producer re-sets the
+    # sentinel next iteration — do not hand-retry in a loop here.
+    Bash: `echo 'null' | wm-set.sh force_evolution_finalize`
+    # Continue to Phase 0-pre3.
+```
+
+The gate does NOT write `stop-requested` or `stop-loop` — same precheck pattern
+as its siblings. Reversibility: raise `--threshold-minutes` in `iteration-close.sh`
+to an unreachable value (or remove the one-line call) to stop sentinel writes
+without touching this consumer.
+
+**Scope note.** The producer covers the `self` + `program` streams ONLY — the two
+carrying the guard-380 promise. It deliberately does NOT cover script/skill/rule:
+`script-evolution.jsonl` measured 152 pending / 1992 expired vs 23 final (a **99%
+expiry rate**) on 2026-07-14, so widening the gate there would fire every iteration
+forever and train the agent to ignore the sentinel. That backlog is a separate
+finding with its own goal.
 
 ## Phase 0-pre3: Fresh-Eyes-Code Dispatch Gate (g-115-281)
 
@@ -330,7 +440,9 @@ so the dispatcher has the file list + reason without re-running the gate.
 Rationale (WHY fresh_eyes_last_dispatch stamp): `core/config/rationale/precheck-gates.md`
 
 ```
-Bash: wm-read.sh fresh_eyes_dispatch_pending --json
+signal = Phase 0-pre.0d battery payload for fresh_eyes_dispatch_pending
+         (battery omits fired!=true payloads — a printed line IS actionable;
+          fallback only if battery errored: Bash: wm-read.sh fresh_eyes_dispatch_pending --json)
 IF signal is not null AND signal.fired == true:
     Output: "▸ FRESH-EYES-CODE GATE: fresh_eyes_dispatch_pending set ({signal.core_count} core files, {signal.loc_changed} LOC, reason={signal.reason}) — invoking /fresh-eyes-code before goal selection"
     invoke /fresh-eyes-code with files = signal.files
@@ -368,7 +480,9 @@ so the LLM has the extracted findings + recommended target node without
 re-running the gate or re-scanning prose.
 
 ```
-Bash: wm-read.sh force_metric_encoding_pending --json
+signal = Phase 0-pre.0d battery payload for force_metric_encoding_pending
+         (battery omits fired!=true payloads;
+          fallback only if battery errored: Bash: wm-read.sh force_metric_encoding_pending --json)
 IF signal is not null AND signal.fired == true:
     Output: "▸ METRIC-ENCODING GATE: force_metric_encoding_pending set ({signal.distinct_count} distinct findings, target node={signal.candidate_node_key}, reason={signal.reason}) — encoding into tree before goal selection"
     # LLM action: encode the extracted findings as Verified Values into the
@@ -423,7 +537,9 @@ Pattern mirrors Phase 0-pre/0-pre2/0-pre3/0-pre4 verbatim — wm-read -> if non-
 reconcile fails so the next iteration retries.
 
 ```
-Bash: wm-read.sh pipeline_reconcile_pending --json
+signal = Phase 0-pre.0d battery payload for pipeline_reconcile_pending
+         (battery omits fired!=true payloads;
+          fallback only if battery errored: Bash: wm-read.sh pipeline_reconcile_pending --json)
 IF signal is not null AND signal.fired == true:
     skill = signal.skill            # domain-named consumer; core stays agnostic
     goals = signal.goals            # the just-closed pipeline-affecting goal id(s)
@@ -441,6 +557,60 @@ as the sibling sentinel gates. Reversibility: the domain gate's
 `PIPELINE_HOOK_ENABLED=0` stops sentinel writes upstream; removing or renaming
 `$WORLD_DIR/scripts/pipeline-reconcile-gate.sh` makes the core seam a no-op.
 Either disables the feature without touching this consumer.
+
+## Phase 0-pre6: Pre-Apply-Consult Drift Gate (g-115-2201)
+
+Runs AFTER the pipeline-reconcile gate, BEFORE Phase 0 completion checks.
+Consumes the `force_pre_apply_consult` WM sentinel set by
+`iteration-close.sh do_learning_gate` (via `pre-apply-consult-drift-gate.py`)
+when N consecutive framework-touching **deep** closes logged
+`retrieval-summary: performed=false` (default N=2, `--threshold`).
+`.claude/rules/code-review-protocol.md` step 4 — the pre-apply consultation
+(`retrieve.sh` before editing any framework file) — is honor-system and drifted
+to a 100% miss rate on framework deep goals (g-115-2194 / g-115-2195 / g-115-2179,
+2026-07-14; measured cost ~1h re-deriving a guardrail one `retrieve.sh` would
+have surfaced). An advisory cannot fix a 3/3 miss — advisory is what step 4
+already is — so this ENFORCES it. Complementary to the per-goal advisory
+`pre-apply-consult-gate.py` (g-115-826), which fires only on cross-agent Applies;
+this one keys on `work_class == framework` (any authorship), closing the
+own-authored gap those three misses fell through.
+
+Pattern mirrors the sibling gates verbatim — wm-read → if non-null → action →
+wm-set 'null'. Dormant unless the sentinel is set (only on actual drift), so it
+is NOT a tax on every close. Does NOT hard-block the Edit tool (a fail-closed
+per-edit gate can wedge the loop, spec WORK item 3) — same non-wedging precheck
+pattern as 0-pre..0-pre5.
+
+```
+signal = Phase 0-pre.0d battery payload for force_pre_apply_consult
+         (fallback only if battery errored: Bash: wm-read.sh force_pre_apply_consult --json)
+IF signal is not null:
+    Output: "▸ PRE-APPLY-CONSULT DRIFT GATE: force_pre_apply_consult set ({signal.streak} consecutive framework-deep closes with retrieval performed=false, last={signal.goal_id}) — code-review-protocol step 4 skipped {signal.streak}× on framework work."
+    # ACT before goal selection — satisfy ONE branch:
+    #  (a) DEFAULT: run the pre-apply consult NOW to re-ground in the discipline
+    #      and surface guardrails / reasoning-bank entries that constrain
+    #      framework edits (this IS the step the drift skipped):
+    #        Bash: retrieve.sh --category "code-review-protocol pre-apply consultation framework edit guardrails" --depth shallow
+    #      Read the returned reasoning_bank + guardrails. THEN, when THIS
+    #      iteration's selected goal touches a framework file (core/, .claude/,
+    #      core/config/, world/conventions/), run retrieve.sh again scoped to
+    #      that specific fix BEFORE the first Edit (code-review-protocol step 4).
+    #  (b) If this iteration's work provably touches NO framework file, log one
+    #      line in the journal instead: "PRE-APPLY-CONSULT GATE: not applicable —
+    #      no framework edit this iteration" (the ACCEPTANCE "explicitly logging
+    #      why it is not applicable" branch).
+    # Clear the sentinel after acting (one-shot; iteration-close re-sets it on
+    # continued drift — a single framework-deep close that DID consult resets
+    # the streak upstream so it never re-fires).
+    echo 'null' | Bash: wm-set.sh force_pre_apply_consult
+    # Continue to Phase 0.
+```
+
+The gate does NOT write `stop-requested` or `stop-loop` — same precheck pattern
+as the sibling sentinel gates. Reversibility: raise the drift threshold at the
+`pre-apply-consult-drift-gate.py` call site in `iteration-close.sh`
+do_learning_gate (`--threshold`, default 2) to an unreachable value to stop
+sentinel writes without touching this consumer.
 
 ## Phase 0: Automated Completion Checks
 
@@ -700,8 +870,15 @@ IF known_blockers is non-empty:
         FOR EACH blocker WHERE resolution is null:
             age_hours = hours_since(blocker.detected_at)
             IF age_hours >= config.proactive_escalation.blocker_age_hours:
-                last_escalation = find entry in proactive_escalation_log where blocker_id == blocker.blocker_id
-                IF last_escalation is null OR hours_since(last_escalation.sent_at) >= config.proactive_escalation.blocker_age_hours:
+                # Re-send cooldown uses re_escalation_hours (default 24), NOT blocker_age_hours
+                # (first-fire age only). Before g-115-2400 blocker_age_hours served both roles,
+                # so the protocol letter demanded a repeat email every 2h (effective 1h with the
+                # meta override) for a standing human-gated blocker — a cadence no session obeyed,
+                # producing the silent-skip-judgment pattern instead. Coverage entries appended by
+                # /notify-user Step 3 (any outbound notification naming the blocker_id, e.g. a
+                # completion-report digest) count as escalations here — newest sent_at wins.
+                last_escalation = newest entry in proactive_escalation_log where blocker_id == blocker.blocker_id
+                IF last_escalation is null OR hours_since(last_escalation.sent_at) >= config.proactive_escalation.re_escalation_hours:
                     Notify the user:
                         category: blocker
                         subject: "Blocker persisting {age_hours:.0f}h: {blocker.reason}"
@@ -986,6 +1163,33 @@ Bash: bash core/scripts/routing-audit-target-status-sweep.sh --apply
 # Metrics log: <WORLD_PATH>/routing-audit-target-status-sweep-metrics.jsonl
 ```
 
+## Phase 0.5b.8.5: Sweep-Mutation Visibility Surface (g-115-2676)
+
+The three sweeps above (0.5b.6/7/8) mutate a goal's status to a TERMINAL value
+but nothing surfaces it — a swept goal leaves BOTH the selector candidate list
+AND its blocked list (rb-4149), so the filer never notices. Canonical incident
+(2026-07-19): 7 goals silently skipped for days, one a heartbeat-writer fix whose
+absence had already produced a live near-miss. This consumer reads the EXISTING
+per-sweep metrics logs (no sweep edits — decoupled, single-source-of-truth) and
+surfaces apply-mutations newer than a per-agent watermark. ALWAYS-RUN (no budget
+meter): a visibility surface must never be dropped, else the invisibility bug
+returns. Cheap (3 tail reads + a watermark r/w); quiet on the common empty case.
+Fail-open — never blocks the loop.
+
+```
+# --announce posts ONE findings-board message per NEW own-applied mutation
+# (own-only: with per-agent watermarks, un-filtered every agent would re-announce
+# the same mutation → N board posts). The stdout header line surfaces ALL new
+# mutations to THIS agent (that IS the cross-agent visibility); the board post is
+# the single cross-agent notification, made once by the applier.
+Bash: py -3 core/scripts/sweep-mutation-surface.py --announce
+IF stdout contains "SWEEP AUTO-CLOSE":
+    Surface the line in the iteration header. If a surfaced goal is one YOU filed
+    and you did NOT intend it closed, re-open it
+    (aspirations-update-goal.sh <id> status pending). Otherwise informational.
+# ELSE: quiet — no new sweep mutations since last surface.
+```
+
 ## Phase 0.5b.9: Credential Defer Auto-Clear (g-115-1709)
 
 Rationale (WHY credential-defer conservative guard): `core/config/rationale/precheck-gates.md`
@@ -1018,27 +1222,81 @@ Rationale (WHY defer-drift detective): `core/config/rationale/precheck-gates.md`
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check defer-drift-check)
-IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+IF decision == "drop": SKIP this phase; continue to Phase 0.5b.11
 Bash: bash core/scripts/defer-drift-check.sh --output json
 Parse drift_count + drifted[].
 IF drift_count == 0:
-    continue silently to Phase 0.5c   # the clean, common case
+    continue silently to Phase 0.5b.11   # the clean, common case
 ELSE:
     Output: "▸ ⚠ DEFER-DRIFT: {drift_count} goal(s) with a PAST deferred_until + structured-defer marker (deferred_readiness pollution risk)"
     FOR EACH d in drifted[:5]:
         Output: "    {d.goal_id} ({d.source}): deferred_until={d.deferred_until} {d.hours_past}h past | {d.defer_prefix} | pc={d.precondition_status}"
     # File ONE deduplicated Investigate so the drift gets re-gated by judgment.
-    # Dedup: skip if an open Investigate with origin_signal/title naming
-    # "defer-drift" already exists (a single open re-gate pass covers all
-    # current drift — mirrors the rb-428 sweep family's idempotency posture).
-    Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress --contains "defer-drift")
+    # Dedup: skip if an open Investigate with origin_signal
+    # "investigate:defer-drift-audit" already exists (a single open re-gate pass
+    # covers all current drift — mirrors the rb-428 sweep family's idempotency
+    # posture). Uses --goal-field origin_signal (EXACT match on the stable dedup
+    # key), NOT --title-contains: the title is prose while the machine key lives
+    # in origin_signal, so a title-substring search would be VACUOUS and fail
+    # open into a duplicate (g-115-2196 — the exact bug class this call site had
+    # with the old nonexistent --status/--contains flags).
+    # The key MUST carry the "investigate:" prefix: origin-signal-gate
+    # ALLOWED_PREFIXES has no bare "defer-drift-audit" form, so an unprefixed
+    # key gets Layer-D auto-derive REWRITTEN to investigate:<title-slug> at
+    # filing time and the exact-match dedup here goes vacuous — the sweep then
+    # re-files a duplicate every iteration the drift persists (observed
+    # 2026-07-17, g-115-2475; second instance of the g-115-2196 vacuous-dedup
+    # class, this time on the VALUE not the flag).
+    Bash: existing=$(bash core/scripts/aspirations-query.sh --goal-status pending,in-progress --goal-field origin_signal "investigate:defer-drift-audit")
     IF existing is empty:
         Compose an Investigate listing each drifted goal + its precondition_status
         (prose -> re-gate deferred_until to the correct future date from the
         defer_reason; ready -> the gate is merely stale, clear the defer;
         still_unmet -> re-gate). File via aspirations-add-goal.sh into asp-115
         (participants: [agent], category framework-architecture, priority MEDIUM,
-        origin_signal "defer-drift-audit").
+        origin_signal "investigate:defer-drift-audit").
+```
+
+## Phase 0.5b.11: Reason-Less-Blocked Sweep (g-115-2595, g-115-2591 lineage)
+
+Rationale (WHY reason-less-blocked sweep): a `status=blocked` goal with an EMPTY
+Blocker Reference Schema — `blocker_ref` None, `blocked_by` [], `defer_reason`
+None — escapes EVERY existing guard. `gates/blocker_ref.py` validates a
+blocker_ref's structure only when it is paired with a defer_reason;
+`blocker-create-gate.py` fires at CREATE time (these goals flip to blocked LATER
+via a direct status update); `blocker-recheck.py` only re-probes goals that HAVE
+a blocker. So when a peer-dependency blocker completes, nothing auto-unblocks the
+dependent — it strands invisibly (canonical: g-115-2198-b / g-115-2200 stranded
+~2 days until felt-sense RAW-read the queue; surfaced by g-115-2591).
+
+SELF-CONTAINED --apply (rb-428 family — NOT the defer-drift detective pattern of
+0.5b.10). The SCRIPT files ONE deduplicated reconcile Investigate itself (dedup
+by the SAME active read that finds the blocked goals — guard-487 fail-closed,
+guard-383 fatal-on-read-error so it can never file blindly) when reason-less
+goals exist and no open audit does. The LLM's ONLY job here is to surface the
+WARN — do NOT compose or file the Investigate (the `--apply` flag already did,
+bash-side). This is deliberate: the exact failure g-115-2595 fixes is
+LLM-discretionary steps drifting (guard-616/rb-616), so the filing must be
+bash-enforced, not left to LLM memory.
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check reason-less-blocked-check)
+IF decision == "drop": SKIP this phase; continue to Phase 0.5c
+Bash: bash core/scripts/reason-less-blocked-check.sh --apply --output json
+Parse reason_less_count + reason_less[] + investigate_filed + open_audit_goal_id.
+IF reason_less_count == 0:
+    continue silently to Phase 0.5c   # the clean, common case
+ELSE:
+    Output: "▸ ⚠ REASON-LESS-BLOCKED: {reason_less_count} status=blocked goal(s) with an EMPTY Blocker Reference Schema (no blocker_ref / blocked_by / defer_reason) — invisible to selection, blocker-recheck, AND quiescence"
+    FOR EACH e in reason_less[:5]:
+        Output: "    {e.goal_id} ({e.source}) [{e.aspiration_id}] intended={e.intended_agent}: {e.title}"
+    IF investigate_filed:
+        Output: "    → filed reconcile Investigate {investigate_filed} (asp-115) — reconstruct each real blocker into blocked_by/blocker_ref, OR unblock to pending if the premise is gone (route lane-owned goals to their owner, do NOT appropriate)"
+    ELIF open_audit_goal_id:
+        Output: "    → open reconcile Investigate {open_audit_goal_id} already covers these (dedup — no duplicate filed)"
+    # No LLM filing here — the --apply flag already filed-or-deduped bash-side
+    # (drift-proof, the whole point of g-115-2595). Continue to Phase 0.5c.
 ```
 
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep
@@ -1210,8 +1468,11 @@ room to feel earned rather than ritual. See
 Periodic passive observability check. Every 50 completed goals (configured
 in `core/config/aspirations.yaml` → `l1_skew_check.goal_cadence`), compute
 per-L1 distribution (structural mass, retrieval volume, mature capability
-mass) and post a coordination-board `findings` message when any ratio
-exceeds the threshold (default 5x).
+mass) and post a coordination-board `findings` message on a taxonomy-shape
+defect: dominance (one L1 >= 90% of a metric's mass), share_creep (dominant
+L1 grew >= 3pp since last fire), or empty_l1. Max/min ratios ride along as
+evidence but no longer gate the post (g-115-2455 — a tiny-but-healthy
+min-denominator L1 made the ratio unsatisfiable by any taxonomy action).
 
 NOT a user-facing ritual — no email, no pending-question. The board post
 gives partner agents and /fresh-eyes-tree (S5) cross-session visibility
@@ -1284,12 +1545,20 @@ Parse verdict JSON.
 # the edge never re-fires; the dedup query (incl. completed) makes it team-wide
 # idempotent — the first agent to calibrate files the single goal.
 IF verdict.calibration_just_completed == true:
-    Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress,completed --contains "<verdict.calibration_dedup_key>")
+    # --goal-field origin_signal (EXACT match on the FIXED team-wide key), NOT
+    # --title-contains (title is prose; a substring search on the hyphenated key
+    # would be VACUOUS and re-file per agent). Includes completed so a finished
+    # calibration goal still dedups — "the first agent to calibrate files the
+    # single goal" (g-115-2196). Proven: this query matches the live g-001-318.
+    Bash: existing=$(bash core/scripts/aspirations-query.sh --goal-status pending,in-progress,completed --goal-field origin_signal "idea:health-ledger-calibration-complete")
     IF existing is empty:
         # Goal fields go in the JSON body via stdin -- NOT as CLI flags.
         # aspirations-add-goal.sh hard-rejects --title/--priority/--participants/
         # --category/--status/--description with exit 2 (script lines 97-105).
-        Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001
+        # --source agent: asp-001 here is the AGENT maintenance queue; the world
+        # queue ALSO has an asp-001 ("Explore and Learn") — omitting --source
+        # mis-files this per-agent health goal there (g-115-2304).
+        Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001 --source agent
         {
           "title": "health-ledger calibration complete -- advance health_regression.mode when ready",
           "priority": "MEDIUM",
@@ -1306,7 +1575,13 @@ IF verdict.tripped != true:
     continue to Phase 1
 
 # TRIPPED (only reachable in detect-and-report / full mode). Dedup, then file.
-Bash: existing=$(bash core/scripts/aspirations-query.sh --status pending,in-progress --contains "<verdict.dedup_key>")
+# --goal-field origin_signal (EXACT match on the per-signal key), NOT
+# --title-contains: the dedup_key (health-regression:<signal>:<date>) lives in
+# the DESCRIPTION and the title is prose, so a title-substring search would be
+# VACUOUS and fail open into a duplicate Investigate per trip (g-115-2196).
+# origin_signal dedups per-signal regardless of date — the intended posture
+# ("an open Investigate for this regression already exists").
+Bash: existing=$(bash core/scripts/aspirations-query.sh --goal-status pending,in-progress --goal-field origin_signal "investigate:health-regression-<verdict.signal>")
 IF existing is non-empty:
     # An open Investigate for this regression already exists — do not double-file.
     continue to Phase 1
@@ -1323,7 +1598,9 @@ Compose the Investigate description from the verdict:
 
 # Goal fields go in the JSON body via stdin -- NOT as CLI flags (script rejects
 # --title/--priority/--participants/--category/--description with exit 2).
-Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001
+# --source agent: per-agent health goal belongs in the AGENT asp-001, not the
+# world queue's identically-numbered "Explore and Learn" (g-115-2304).
+Bash: cat <<'JSON' | bash core/scripts/aspirations-add-goal.sh asp-001 --source agent
 {
   "title": "Investigate: health regression on <verdict.signal>",
   "priority": "MEDIUM",
@@ -1407,6 +1684,49 @@ ELSE:
     Output: "▸ CURRICULUM CADENCE: re-evaluated {stage_name} ({current_stage}) — {gates_passed_count}/{gates_total} gates pass (not yet promotable); snapshot refreshed"
     continue to Phase 1
 ```
+
+## Phase 0.5j: Evolution Cadence Safety-Net (g-115-2240)
+
+Precheck-side evolution cadence tick. The Phase 8.8 evolution cadence check
+(aspirations loop digest) fires ONLY on the non-recurring close path —
+recurring-close.sh wraps just the 4 iteration-close phases then emits the
+terminal imperative, so the next iteration re-enters at Phase -1.5 and Phase
+8.7/8.8/9/11 never run. On recurring-heavy sessions (the common bravo/fleet
+pattern) Phase 8.8 never fires and evolution STARVES (observed 2026-07-15: last
+fired ~99h prior vs the 12h cadence). This sweep is the safety net — it fires
+regardless of close path, exactly like the sibling cadence sweeps above
+(fresh-eyes 0.5e, felt-sense 0.5f, health-regression 0.5h, curriculum 0.5i)
+which all run in precheck. Idempotent with Phase 8.8 via the shared
+`last_evolution_at_time` stamp: whichever fires first stamps it (via
+aspirations-evolve's mandatory final write), the other sees a fresh stamp and
+no-ops.
+
+Deferrable tier: the budget meter drops it in the tight zone, honoring
+`maintenance_cadence.evolution.tight_zone_skip=true` — so the check script does
+NOT check the zone itself. Fail-open (exit 1 on any error) and fail-loud
+(guard-424: errors to stderr).
+
+```
+# Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check evolution-cadence)
+IF decision == "drop": SKIP this phase; continue to Phase 1
+Bash: core/scripts/evolution-cadence-check.sh
+IF exit 0 (fire):
+    Output: "▸ Evolution cadence crossed (recurring-close bypasses Phase 8.8) — firing /aspirations-evolve"
+    Invoke /aspirations-evolve
+    # aspirations-evolve's MANDATORY final write stamps last_evolution_at_time +
+    # bumps evolutions_this_session (loop-state-bump-counters --evolution-fired),
+    # keeping this sweep idempotent with Phase 8.8 and respecting the per-session
+    # cap (global.max_evolutions_per_session).
+IF exit 1 (noop):
+    # Cadence not crossed, session cap reached, or read error — continue silently.
+    continue
+```
+
+Distinct from Phase 8.8 (non-recurring close path). This is the precheck-side
+net that survives recurring-heavy sessions. See g-115-2240 for the 3-signal
+diagnosis (recurring-close.sh lines 5-8 wrap the 4 phases; lines 955-972 emit the
+terminal imperative; `last_evolution_at_time` was ~99h stale).
 
 ## Phase 1: Recurring Goal Check
 

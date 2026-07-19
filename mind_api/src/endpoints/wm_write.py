@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -69,6 +71,12 @@ CADENCE_TRACKER_PATTERNS = (
     re.compile(r"^last_.*_scan$"),
     re.compile(r"^last_.*_fire$"),
 )
+# Mirror of core/scripts/wm.py RESET_SURVIVING_SLOTS — keep in sync (parity
+# asserted by test_wm_reset_cadence.py). Slots whose writer and reader sit on
+# opposite sides of the aspirations-consolidate Step-5 wm-reset boundary
+# (Step 0.65 writes journal_cluster_summaries; Step 9 consumes it one-shot for
+# handoff key_outcomes). (2)
+RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
 
 
 def _is_cadence_tracker(slot_name: str) -> bool:
@@ -111,10 +119,19 @@ def _require_agent_header(ctx):
 # --- YAML I/O (verbatim from wm.py read_yaml / write_yaml) -----------------
 
 def _read_yaml(path: Path) -> dict:
+    """Mirror of wm.py read_yaml, incl. the  all-null detective:
+    a non-empty file of pure 0x00 bytes is the NTFS
+    metadata-journaled-but-data-not-flushed crash signature — WARN and read
+    as empty (the loop's Phase -1 all-slots-null wm-init path self-heals)."""
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+    raw = path.read_bytes()
+    if raw and not raw.strip(b"\x00"):
+        print(f"[wm_write] WARN: {path} is all-null content ({len(raw)} bytes) — "
+              f"post-crash corruption signature (g-001-44); treating as empty.",
+              file=sys.stderr)
+        return {}
+    data = yaml.safe_load(raw.decode("utf-8", errors="replace"))
     return data if data is not None else {}
 
 
@@ -148,6 +165,11 @@ def _write_wm(path: Path, data: dict) -> None:
     tmp = path.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        # : fsync before rename — a bare tmp.replace survives a crash
+        # in metadata only (NTFS all-0x00 signature). Local durability concern;
+        # the raw-local-write rationale above is unaffected.
+        f.flush()
+        os.fsync(f.fileno())
     tmp.replace(path)
 
 
@@ -691,17 +713,20 @@ def reset(ctx) -> "Response":  # type: ignore[name-defined]
             existing_slots = existing.get("slots", {})
             existing_meta = existing.get("slot_meta", {})
             cadence_preserved = []
+            surviving_preserved = []
             for slot_name, slot_val in existing_slots.items():
-                if _is_cadence_tracker(slot_name) and slot_val is not None:
+                is_cadence = _is_cadence_tracker(slot_name)
+                if (is_cadence or slot_name in RESET_SURVIVING_SLOTS) and slot_val is not None:
                     data["slots"][slot_name] = slot_val
                     if slot_name in existing_meta:
                         data["slot_meta"][slot_name] = existing_meta[slot_name]
-                    cadence_preserved.append(slot_name)
+                    (cadence_preserved if is_cadence else surviving_preserved).append(slot_name)
             _write_wm(_wm_path(ctx), data)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
     return Response.json({"ok": True, "preserved_identity": sorted(preserved),
-                          "preserved_cadence": len(cadence_preserved)})
+                          "preserved_cadence": len(cadence_preserved),
+                          "preserved_surviving": sorted(surviving_preserved)})
 
 
 # ---------------------------------------------------------------------------

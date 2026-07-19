@@ -94,7 +94,7 @@ A0. **Prerequisites Check** — verify the runtime environment BEFORE writing an
 
    Bash: `bash core/scripts/check-prerequisites.sh`
 
-   The script verifies Python 3.8+, PyYAML, bash 4+ (required) and warns
+   The script verifies Python 3.10+, PyYAML, bash 4+ (required) and warns
    on missing git or psutil (optional — framework still works). On failure
    it prints one consolidated friendly error block with copy-pasteable fix
    commands and exits 2.

@@ -172,15 +172,27 @@ def test_rb_append_defaults_applied(running_daemon):
 
 
 def test_rb_append_history_and_changelog(running_daemon):
+    # 0: history.snapshot delegates to _fileops.save_history, whose
+    # Stage-2 authoritative store is the CAS-delta layout — assert a manifest
+    # lands under .history/snapshots/<rel>/ instead of the legacy per-file
+    # uncompressed tree (which is no longer written by default).
     project_root, port = running_daemon
-    hist = project_root / "world" / ".history" / "reasoning-bank.jsonl"
+    manifest_dir = (project_root / "world" / ".history" / "snapshots"
+                    / "reasoning-bank.jsonl")
+    legacy_dir = project_root / "world" / ".history" / "reasoning-bank.jsonl"
     cl = project_root / "world" / "changelog.jsonl"
-    assert not hist.exists()
+    assert not manifest_dir.exists()
 
     _post(port, "/v1/store/append", {"store": "reasoning-bank"},
           json.dumps(_rb_rec()).encode("utf-8"))
 
-    assert hist.exists()
+    assert manifest_dir.exists()
+    manifests = [p for p in manifest_dir.iterdir() if p.suffix == ".yaml"]
+    assert len(manifests) == 1
+    assert manifests[0].name.endswith("_alpha.yaml")
+    # The legacy uncompressed tree must NOT be re-created (the 13.9G/4days
+    # growth shape the 0 unification killed).
+    assert not legacy_dir.exists()
     entries = _read_jsonl(cl)
     assert any("store-append reasoning-bank" in (e.get("summary", "") or "")
                for e in entries)
@@ -267,8 +279,8 @@ def test_rb_set_field_recomputes_on_utilization(running_daemon):
                           "value": util})
     assert status == 200
     rec = json.loads(body)["record"]
-    # (5 + 0.5*2) / max(10,1) = 6.0 / 10 = 0.6
-    assert rec["utilization"]["utilization_score"] == pytest.approx(0.6)
+    # 9 smoothed formula: (5 + 0.5*2) / (max(10, 5+2) + 1) = 6/11 = 0.5455
+    assert rec["utilization"]["utilization_score"] == pytest.approx(0.5455)
 
 
 # ===========================================================================
@@ -285,8 +297,8 @@ def test_rb_increment_counter(running_daemon):
     assert status == 200
     rec = json.loads(body)["record"]
     assert rec["utilization"]["times_helpful"] == 4
-    # (4 + 0.5*0) / max(5,1) = 4/5 = 0.8
-    assert rec["utilization"]["utilization_score"] == pytest.approx(0.8)
+    # 9 smoothed formula: (4 + 0.5*0) / (max(5, 4) + 1) = 4/6 = 0.6667
+    assert rec["utilization"]["utilization_score"] == pytest.approx(0.6667)
 
     on_disk = next(r for r in _read_jsonl(_rb_path(project_root))
                    if r["id"] == "rb-002")
@@ -396,15 +408,23 @@ def test_guard_append_defaults_applied(running_daemon):
 
 
 def test_guard_append_history_and_changelog(running_daemon):
+    # 0: CAS-delta manifest shape, not the legacy per-file tree —
+    # see test_rb_append_history_and_changelog for the full rationale.
     project_root, port = running_daemon
-    hist = project_root / "world" / ".history" / "guardrails.jsonl"
+    manifest_dir = (project_root / "world" / ".history" / "snapshots"
+                    / "guardrails.jsonl")
+    legacy_dir = project_root / "world" / ".history" / "guardrails.jsonl"
     cl = project_root / "world" / "changelog.jsonl"
-    assert not hist.exists()
+    assert not manifest_dir.exists()
 
     _post(port, "/v1/store/append", {"store": "guardrails"},
           json.dumps(_guard_rec()).encode("utf-8"))
 
-    assert hist.exists()
+    assert manifest_dir.exists()
+    manifests = [p for p in manifest_dir.iterdir() if p.suffix == ".yaml"]
+    assert len(manifests) == 1
+    assert manifests[0].name.endswith("_alpha.yaml")
+    assert not legacy_dir.exists()
     entries = _read_jsonl(cl)
     assert any("store-append guardrails" in (e.get("summary", "") or "")
                for e in entries)
@@ -480,8 +500,8 @@ def test_guard_increment_counter(running_daemon):
     assert status == 200
     rec = json.loads(body)["record"]
     assert rec["utilization"]["times_helpful"] == 1
-    # (1 + 0.5*0) / max(0,1) = 1/1 = 1.0
-    assert rec["utilization"]["utilization_score"] == pytest.approx(1.0)
+    # 9 smoothed formula: (1 + 0.5*0) / (max(0, 1) + 1) = 1/2 = 0.5
+    assert rec["utilization"]["utilization_score"] == pytest.approx(0.5)
 
     on_disk = next(r for r in _read_jsonl(_guard_path(project_root))
                    if r["id"] == "guard-200")

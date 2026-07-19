@@ -50,7 +50,17 @@ CASES = [
             "decision before we land the unit-file change"
         ),
         "expected_narrative_substr": "user approves",
-        "should_block": True,
+        # Flipped True→False (3 triage, 2026-07-16): the block relied
+        # on the sole generic-prose token 'always' (from "Restart=always")
+        # accidentally matching the bridge-server capability row — semantically
+        # unrelated vocabulary, exactly the class the  sole-token
+        # precision rule (2026-07-13) suppresses. No systemd/unit-file
+        # capability exists in the routing table, so per the  design
+        # documented above ("narrative-pattern matches alone do NOT block"),
+        # the correct current behavior is pass+log. The genuine-recall control
+        # for narrative+capability blocking is  below (commit/push
+        # imperative verbs still qualify as sole tokens).
+        "should_block": False,
     },
     {
         "id": "g-226-57",

@@ -136,7 +136,13 @@ class TestByteCompat:
         (m.parent / "agents" / "alpha").mkdir(parents=True, exist_ok=True)
         return m
 
-    def test_match_increment(self, tmp_path):
+    def test_match_increment(self, tmp_path, monkeypatch):
+        # These two tests POSITIVELY assert on gate-firings.jsonl byte-compat,
+        # so they opt back in past the  pytest suppression in
+        # _gate_log.log (the documented GATE_LOG_ALLOW_PYTEST escape). The
+        # setenv covers both legs: the in-process daemon call reads os.environ
+        # at log() time, and _run_cli's subprocess env is dict(os.environ).
+        monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
         from mind_api.src.meta import strategy_apply
         cm = self._meta(tmp_path, "cmi")
         dm = self._meta(tmp_path, "dmi")
@@ -158,7 +164,8 @@ class TestByteCompat:
         assert rec["gate_id"] == "strategy-apply" and rec["decision"] == "pass"
         assert rec["trigger_matched"] == "sh-1" and rec["agent"] == "alpha"
 
-    def test_match_no_match_noop(self, tmp_path):
+    def test_match_no_match_noop(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")  # see test_match_increment
         from mind_api.src.meta import strategy_apply
         cm = self._meta(tmp_path, "cnm")
         dm = self._meta(tmp_path, "dnm")

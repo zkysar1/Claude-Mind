@@ -3,7 +3,9 @@
 # Usage: bash core/scripts/domain-leak-check.sh [--verbose] [--core-only]
 #
 # Reads terms from core/config/domain-term-blocklist.txt (case-sensitive).
-# Excludes forged skills (from world/forged-skills.yaml). Scans all if unavailable.
+# Excludes forged skills: world/forged-skills.yaml --exclude-dir, PLUS a
+# `forged: true` front-matter fallback for forged skills absent from that list
+# (g-115-2109). Scans all if the registry is unavailable.
 # Exit code: 0 = clean, 1 = leaks found.
 
 set -euo pipefail
@@ -99,10 +101,12 @@ if [[ "$STAGED" == true ]]; then
 
   if [[ ${#STAGED_FILES[@]} -eq 0 ]]; then
     echo "CLEAN: No in-scope staged files to check (--staged mode)."
-    bash "$SCRIPT_DIR/gate-log.sh" domain-leak-check noop \
-      --caller "domain-leak-check.sh:staged-empty" \
-      --trigger "no-staged-files" \
-      --extra-json '{"decision_path":"staged-empty"}' 2>/dev/null || true
+    # No noop firing here (g-115-2404): on own-cloud boxes one gate-firings
+    # append is a whole-object S3 read-modify-write (measured 4.7-10s at 38MB /
+    # 117k records) — 50x the cost of the check itself, paid on EVERY loop
+    # commit (agent-state commits stage no in-scope files). The invocation
+    # denominator for staged mode is the git commit count; only block/leak
+    # firings carry signal. Full-tree runs keep their noop at exit-clean.
     exit 0
   fi
 fi
@@ -157,7 +161,18 @@ while IFS= read -r term; do
         hits=$(echo "$hits" | while IFS= read -r line; do
           f="${line%%:*}"
           [[ -f "$f" ]] || { echo "$line"; continue; }
-          grep -q "domain-leak-exempt:" "$f" || echo "$line"
+          # Skip files carrying the domain-leak-exempt: marker OR a forged: true
+          # YAML front-matter key. Forged skills are exempt per
+          # domain-free-examples.md Scope, but the forged-skills.yaml
+          # --exclude-dir list above only covers skills registered there — a
+          # skill tagged `forged: true` by seed-preflight yet absent from that
+          # list (e.g. build-operator-job, tagged by 90a2961c) slips through.
+          # The column-0 anchor on `^forged: true$` matches the YAML
+          # front-matter key without over-suppressing prose mentions. (g-115-2109)
+          if grep -q "domain-leak-exempt:" "$f" || grep -qE '^forged:[[:space:]]*true[[:space:]]*$' "$f"; then
+            continue
+          fi
+          echo "$line"
         done)
       fi
     fi
@@ -283,14 +298,20 @@ fi
 
 if [[ $FOUND -eq 0 ]]; then
   echo "CLEAN: No domain terms found in framework files."
-  # Telemetry: clean-pass noop firing (g-248-80). Counts toward invocation
-  # totals so retirement-evaluator can compute fire-rate against total
-  # runs.
-  bash "$SCRIPT_DIR/gate-log.sh" domain-leak-check noop \
-    --caller "domain-leak-check.sh:exit-clean" \
-    --trigger "no-leaks" \
-    --extra-json '{"decision_path":"all-clean"}' \
-    2>/dev/null || true
+  # Telemetry: clean-pass noop firing (g-248-80) — FULL-TREE runs only
+  # (g-115-2404). In --staged mode this fired on every clean framework
+  # commit, and on own-cloud boxes one gate-firings append is a whole-object
+  # S3 read-modify-write (measured 4.7-10s at 38MB) — it dominated the entire
+  # pre-commit suite's latency. Staged-mode denominator = git commit count;
+  # full-tree runs (/verify-learning, manual, CI) are rare and keep the noop
+  # so the retirement evaluator retains invocation totals for deliberate audits.
+  if [[ "$STAGED" == false ]]; then
+    bash "$SCRIPT_DIR/gate-log.sh" domain-leak-check noop \
+      --caller "domain-leak-check.sh:exit-clean" \
+      --trigger "no-leaks" \
+      --extra-json '{"decision_path":"all-clean"}' \
+      2>/dev/null || true
+  fi
   exit 0
 else
   echo

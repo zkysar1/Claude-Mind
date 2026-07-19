@@ -149,6 +149,13 @@ def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
+    # Hermetic agent-queue scan (5): keep live agent queues out
+    # of the wrapper's pending_queue check (rb-3784 corpus coupling).
+    env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
+    # 8: pin local backend so load_rows_authoritative delegates to
+    # load_rows deterministically (no S3), independent of the ambient
+    # STORAGE_BACKEND on an own-cloud box (guard-955).
+    env["STORAGE_BACKEND"] = "local"
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),

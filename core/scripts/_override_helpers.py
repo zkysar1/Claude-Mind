@@ -51,10 +51,10 @@ from _fileops import locked_append_jsonl
 SLOT_TO_GATE_ID = {
     "override_signal": "origin-signal-gate",
     "override_duplication": "goal-duplication-gate",
-    "override_stale_read": "stale-read-gate",
     "override_uncommitted": "uncommitted-work-gate",
     "override_blocker_gate": "blocker-create-gate",
     "override_agent_match": "capability-gate",
+    "override_offload": "operator-offload-gate",
 }
 
 

@@ -164,7 +164,11 @@ def cmd_append(args):
     # makes the allow-list authoritative at write time, matching the defence-in-depth
     # verify-learning lint at .claude/skills/verify-learning/SKILL.md Section 308.
     etype = entry.get("entry_type", "")
-    if etype and etype not in VALID_ENTRY_TYPES:
+    if etype not in VALID_ENTRY_TYPES:
+        # Missing entry_type fails too (1-adjacent, 2026-07-17): an
+        # entry keyed "type" instead of "entry_type" previously passed this
+        # gate and crashed live-phase-emit.sh on every heartbeat tick until
+        # the tail advanced.
         print(f"ERROR: Unknown entry_type '{etype}' — valid types: {', '.join(sorted(VALID_ENTRY_TYPES))}",
               file=sys.stderr)
         sys.exit(1)

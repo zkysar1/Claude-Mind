@@ -67,21 +67,51 @@ def _run(argv, input_text=None, timeout=30):
 # ─────────────────────────── Step 8.8 velocity ───────────────────────────
 
 def compute_learning_value(tree_updated, artifacts_count, encoding_score, findings_count):
-    """4-component weighted learning_value per SKILL.md line 561."""
+    """4-component weighted learning_value per SKILL.md line 561.
+
+    None inputs (measurement sentinels, g-115-2441) coerce to 0 for the
+    weighted sum — callers decide separately whether the goal was MEASURED
+    at all (see cmd_velocity unmeasured-skip)."""
     tree_v = 1.0 if tree_updated else 0.0
-    artifacts_v = min(1.0, artifacts_count * 0.2)
+    artifacts_v = min(1.0, (artifacts_count or 0) * 0.2)
     enc_v = float(encoding_score or 0.0)
-    findings_v = min(1.0, findings_count * 0.25)
+    findings_v = min(1.0, (findings_count or 0) * 0.25)
     return round(
         tree_v * 0.3 + artifacts_v * 0.3 + enc_v * 0.2 + findings_v * 0.2, 4,
     )
 
 
 def cmd_velocity(args):
+    # 1: UNMEASURED closes must not poison the imp@k series. When the
+    # caller passed NO quality input at all (no --tree-updated, and all three
+    # value args at their None sentinels), the close was never measured —
+    # recording learning_value=0.0 injects a false zero that drags every
+    # rolling window down (observed: 0.0 for unambiguously deep goals
+    # 2/8 beside flagged siblings at 0.6-0.79; pre-fix
+    # history was 206/206 dead-zero). Skip the snapshot instead — a gap is
+    # honest, a fabricated zero is not. An EXPLICIT `--encoding-score 0.0`
+    # (ritual outcome) still records a real zero.
+    measured = bool(args.tree_updated) or any(
+        v is not None for v in (
+            args.artifacts_count, args.encoding_score, args.findings_count,
+        )
+    )
     lv = compute_learning_value(
         args.tree_updated, args.artifacts_count,
         args.encoding_score, args.findings_count,
     )
+    if not measured:
+        return {
+            "subcommand": "velocity",
+            "summary": ("velocity: UNMEASURED (no quality flags passed) — "
+                        "imp@k snapshot skipped; pass the § STATE-UPDATE "
+                        "quality flags to record learning_value (g-115-2441)"),
+            "flags": ["velocity_unmeasured_skipped"],
+            "learning_value": None,
+            "active_change_ids": "",
+            "impk_rc": None,
+            "impk_stderr": "",
+        }
     # Read active backpressure monitors for credit assignment tags
     bp_stdout, _e, bp_rc = _run(["meta-backpressure.sh", "status"])
     active_change_ids = ""
@@ -161,9 +191,36 @@ def cmd_backpressure(args):
     rollbacks_applied = []
     for action in bp.get("rollback_actions", []):
         reason = action.get("reason", "regression detected")
+        # rollback_to is None when the monitored change ADDED the key from an
+        # absent state (old_value null). Reverting an add-from-absent = opt the
+        # criterion back out — but the applied value MUST stay type-safe.
+        # Lineage of this line:
+        #   str(None) -> the literal STRING "None" (mc-081, 2026-07-18:
+        #     weights.opportunity_boost "None" crashed goal-selector
+        #     load_weights float() fleet-wide on this box).
+        #   "null"   -> a real YAML null: no crash, but load_weights emits a
+        #     loud non-numeric WARNING every selection AND the key stays
+        #     present, so the restore->re-null thrash recurs (mc-081/083 = 2
+        #     rollbacks = dead-end; rb-4159 / zeta 2).
+        #   "0.0"    -> a NUMERIC floor (this fix, 7). load_weights
+        #     KEEPS 0.0 (isinstance int/float) and the weighted sum adds
+        #     raw*0.0 = 0, so the criterion opts out IDENTICALLY to an absent
+        #     key (the sum iterates `for k in WEIGHTS`) — but with NO warning,
+        #     and every future monitor now records a numeric old_value, never
+        #     None again: the thrash is broken at the root. This is the
+        #     "numeric-floor" arm of zeta's "delete-key/numeric-floor" fix;
+        #     delete-key is unavailable (meta-set is daemon-only, no delete op).
+        rollback_to = action.get("rollback_to")
+        # ALSO map the literal strings "None"/"null": monitors created while
+        # the bug was live (e.g. mc-082's, old_value "None") already carry the
+        # corrupt string and would round-trip it forever.
+        if rollback_to is None or rollback_to in ("None", "null"):
+            rollback_arg = "0.0"
+        else:
+            rollback_arg = str(rollback_to)
         _out, _err, rc = _run([
             "meta-set.sh", action.get("strategy_file", ""),
-            action.get("field", ""), str(action.get("rollback_to", "")),
+            action.get("field", ""), rollback_arg,
             "--reason", f"BACKPRESSURE ROLLBACK: {reason}",
         ])
         if rc == 0:
@@ -418,6 +475,20 @@ def cmd_run_all(args):
             "flags": [],
         }
     r1 = cmd_velocity(args)
+    if "velocity_unmeasured_skipped" in r1.get("flags", []):
+        # 1: no quality inputs → no measurement. Backpressure,
+        # temporal-credit, and relative-advantage all consume the measured
+        # learning_value; feeding them a fabricated 0.0 recreates the same
+        # false-zero poison one layer down (backpressure could trip rollback
+        # monitors on a phantom velocity collapse). Skip the whole cascade.
+        return {
+            "subcommand": "run-all",
+            "summary": ("run-all: UNMEASURED (no quality flags) — velocity "
+                        "cascade skipped; pass § STATE-UPDATE quality flags "
+                        "(g-115-2441)"),
+            "flags": ["velocity:velocity_unmeasured_skipped"],
+            "results": {"velocity": r1},
+        }
     lv = r1.get("learning_value", 0.0)
     bp_args = argparse.Namespace(learning_value=lv)
     r2 = cmd_backpressure(bp_args)
@@ -492,9 +563,13 @@ def main():
     p.add_argument("--category", type=str, default="uncategorized")
     p.add_argument("--experience-id", type=str, default=None)
     p.add_argument("--tree-updated", action="store_true")
-    p.add_argument("--artifacts-count", type=int, default=0)
-    p.add_argument("--encoding-score", type=float, default=0.0)
-    p.add_argument("--findings-count", type=int, default=0)
+    # None defaults are MEASUREMENT sentinels (1): cmd_velocity treats
+    # "no quality input passed at all" as UNMEASURED and skips the imp@k
+    # snapshot instead of recording a false learning_value=0.0. An explicit
+    # `--encoding-score 0.0` (ritual outcome) still records a real zero.
+    p.add_argument("--artifacts-count", type=int, default=None)
+    p.add_argument("--encoding-score", type=float, default=None)
+    p.add_argument("--findings-count", type=int, default=None)
     p.add_argument("--exploration", action="store_true")
     p.add_argument("--learning-value", type=float, default=0.0,
                    help="For backpressure/temporal-credit when called standalone")

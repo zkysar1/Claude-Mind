@@ -131,6 +131,30 @@ IF the goal produced code changes in the primary workspace:
     git -C <repo> push origin main
     Log: "Committed and pushed to <repo>: <commit-hash> (pre-push build verified)"
 
+    **2b.2: Post-Push Deploy Verification (MANDATORY when the push triggers a deploy)**
+
+    A push only places code on the remote. If pushing triggers a CI/CD
+    pipeline that deploys to a live environment, the pipeline run — not the
+    push — is what actually deploys. Verify the triggered run reached success
+    BEFORE treating the deploy as done and moving on.
+
+    IF the repo's push triggers a deploy pipeline (its CLAUDE.md or CI config
+    defines one):
+      Verify the run triggered by THIS push finished successfully, using the
+      domain-specified deploy-verification mechanism (a companion script or
+      pipeline-status query named in the domain post-execution convention).
+      IF the run FAILED (or is still failing): the latest code is on the
+        remote but NOT deployed. Do NOT proceed to Step 2c or Phase 5 verify —
+        create an Unblock goal:
+          "Unblock: <repo> deploy pipeline failed after push — <run/failure ref>"
+      IF the run SUCCEEDED: Log "Deploy verified for <repo>: <run ref>" and
+        proceed.
+    ELSE (push does not trigger a deploy pipeline): skip — nothing to verify.
+
+    This is NOT redundant with 2b.1: the pre-push build gate proves the code
+    builds locally; this gate proves the remote pipeline actually deployed it.
+    A green local build with a red deploy run leaves prod on the OLD code.
+
   **IF pre-conditions NOT met:**
     Log which pre-condition failed and why.
     Do NOT hold silently — create an Unblock goal:
@@ -143,10 +167,11 @@ IF the goal produced code changes in the primary workspace:
 ## Fail-Open Policy
 
 A failed Step 1 (infra-health record) logs and continues. Failed test
-circuits, failed fresh-eyes findings, and failed pre-push build gates
-hold the goal in `pending` and create an Unblock goal — they do NOT silently
-proceed to Phase 5 verify. Phase 4.2 returns with whatever
-`external_changes` and `behavioral_observations` were collected.
+circuits, failed fresh-eyes findings, failed pre-push build gates, and
+failed post-push deploy verification hold the goal in `pending` and create
+an Unblock goal — they do NOT silently proceed to Phase 5 verify. Phase 4.2
+returns with whatever `external_changes` and `behavioral_observations` were
+collected.
 
 ## Downstream Consumers
 

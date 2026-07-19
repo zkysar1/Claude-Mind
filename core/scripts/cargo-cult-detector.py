@@ -84,10 +84,38 @@ ARTIFACT_PRODUCING_KEYWORDS = (
     "inventory",
     "flush",
     "archive",
+    #  (classifier-staleness review , 2026-07-08): the 5 below
+    # are recurring goal shapes that produce a durable artifact EVERY fire yet
+    # missed all 7 original keywords — a ~15-25% FN that wrongly flagged
+    # legitimate artifact-producers as cargo-cult (a routine close on them is
+    # normal, not going-through-motions). Each verb is UNAMBIGUOUS — it never
+    # conflates produce-with-detect — so it is safe in the keyword list.
+    "reflect",   # "Reflect and journal" -> journal + reasoning-bank entries
+    "replay",    # "Hippocampal replay" -> reconsolidation / rb records
+    "drain",     # "Drained temp" -> temp-store cleanup artifacts
+    "evict",     # "evict-aged-terminal" -> aspirations state mutation
+    "reap",      # "session-telemetry-reap" -> telemetry records
+    #  (classifier-accuracy scan , 2026-07-15): the hypothesis
+    # NOUN reliably signals a durable pipeline-record producer. Empirical blast-
+    # radius scan of every recurring goal across all queues found 9 net-new
+    # True-flips — 8 clear producers ("Review and resolve hypotheses" x5 agents,
+    # "Learn from resolved hypotheses", "Generate hypotheses from recent work")
+    # + 1 audit-trail producer ( Tree contradiction audit, which emits
+    # an inspection trail every fire); 0 harmful FP. Matches the NOUN, not the
+    # ambiguous "resolve"/"review" verbs. Prior sibling fix:  (the 5
+    # verbs above). Low FP: a recurring goal naming hypotheses reliably touches
+    # the pipeline store; a rare pure-monitor exception opts out via the flag.
+    "hypothes",  # "Generate/Review/Resolve hypotheses" -> pipeline records
     # "analyze"/"analysis" intentionally NOT here — they conflate
     # artifact-producing ("analyze + emit report") with detection ("analyze
     # health"). Genuinely artifact-producing analyze-titled goals must opt in
-    # via the explicit `artifact_producing: true` flag (see L91-93).
+    # via the explicit `artifact_producing: true` flag (see L91-93). The SAME
+    # exclusion (conflates produce-vs-check) applies to the VERBS "resolve"/
+    # "detect"/"monitor": recurring goals under those verbs that genuinely
+    # produce artifacts should set the explicit flag rather than widen this list
+    # with an ambiguous verb. ("hypothesis" was formerly excluded here too, but
+    #  promoted it to a keyword above — as a NOUN it reliably signals a
+    # pipeline producer, unlike those verbs; see the dated note.)
 )
 
 
@@ -262,6 +290,8 @@ def _load_contract_config() -> dict:
         "deep_streak_contract_threshold": 3,
         "deep_streak_contract_divisor": 1.5,
         "contract_floor_ratio": 0.33,
+        "contract_suppress_window": 5,
+        "contract_suppress_min_samples": 3,
     }
     cfg_path = _paths.CONFIG_DIR / "aspirations.yaml"
     if not cfg_path.exists():
@@ -282,7 +312,182 @@ def _load_contract_config() -> dict:
         "contract_floor_ratio": float(block.get(
             "contract_floor_ratio",
             defaults["contract_floor_ratio"])),
+        "contract_suppress_window": int(block.get(
+            "contract_suppress_window",
+            defaults["contract_suppress_window"])),
+        "contract_suppress_min_samples": int(block.get(
+            "contract_suppress_min_samples",
+            defaults["contract_suppress_min_samples"])),
     }
+
+
+def _load_streak_mult() -> float:
+    """Load recurring.streak_mult from core/config/aspirations.yaml.
+
+    Same shared knob as streak-break-reflector.py::_load_streak_mult and
+    aspirations_write.py cmd_complete_by (g-115-929 consolidation): the
+    multiplier that DEFINES a streak-break also defines "actual cadence far
+    exceeds interval" for the contract-suppression predicate below. Fail-open:
+    any read/parse error falls back to 2.0 (the historical literal).
+    """
+    cfg_path = _paths.CONFIG_DIR / "aspirations.yaml"
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        v = (cfg.get("recurring") or {}).get("streak_mult")
+        if v is None:
+            return 2.0
+        return float(v)
+    except Exception:
+        return 2.0
+
+
+def _recent_actual_cadence(goal_id: str, window: int, min_samples: int,
+                           log_path: Path | None = None
+                           ) -> tuple[float | None, str, int]:
+    """Median of the last `window` actual_elapsed_hours for goal_id from
+    <agent>/session/streak-breaks.jsonl (written by aspirations_write
+    cmd_complete_by on every late fire).
+
+    Returns (median, status, samples):
+      status "ok"           — median computed over `samples` entries
+      status "insufficient" — fewer than min_samples entries (median None).
+                              Absence of break records is a MEANINGFUL
+                              negative: the goal fires on time, so
+                              contraction is legitimate. NOT an error.
+      status "no-agent"     — MIND_AGENT unbound (median None; same as
+                              insufficient for the caller)
+      status "unreadable"   — the file exists but could not be READ at all
+                              (median None). guard-487: a suppression gate
+                              whose input cannot be parsed fails CLOSED —
+                              the caller must treat this as suppress, not
+                              as "no lateness evidence".
+
+    Per-line corruption in the append-only JSONL is skipped with a loud
+    stderr WARN (standard JSONL posture) — only whole-file read failure
+    escalates to "unreadable". The log_path param is a test-only override;
+    production always derives from _paths.AGENT_DIR.
+    """
+    import statistics
+
+    if log_path is None:
+        if _paths.AGENT_DIR is None:
+            return None, "no-agent", 0
+        log_path = _paths.AGENT_DIR / "session" / "streak-breaks.jsonl"
+    if not log_path.exists():
+        return None, "insufficient", 0
+    values: list[float] = []
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    sys.stderr.write(
+                        "cargo-cult-detector: WARN skipping corrupt "
+                        "streak-breaks.jsonl line\n")
+                    continue
+                if rec.get("goal_id") != goal_id:
+                    continue
+                v = rec.get("actual_elapsed_hours")
+                if isinstance(v, (int, float)) and v > 0:
+                    values.append(float(v))
+    except OSError as e:
+        sys.stderr.write(
+            f"cargo-cult-detector: WARN streak-breaks.jsonl unreadable "
+            f"({e}) — treating contract-suppression input as unknown "
+            f"(guard-487 fail-CLOSED)\n")
+        return None, "unreadable", 0
+    recent = values[-window:]
+    if len(recent) < min_samples:
+        return None, "insufficient", len(recent)
+    return statistics.median(recent), "ok", len(recent)
+
+
+# Floor-hit Idea title (pre-existing escalation) — the rebase-UP dedup must
+# also honor a pending one of these so the two escalation shapes never stack
+# on the same goal.
+FLOOR_HIT_TITLE_FMT = "Idea: Rebase original interval for {goal_id}"
+REBASE_UP_TITLE_FMT = "Idea: Rebase interval UP for {goal_id} (selection-gated)"
+
+
+def _file_rebase_up_idea(asp: dict, asp_id: str, source: str, goal_id: str,
+                         title: str, interval_hours: float,
+                         actual_median: float, samples: int,
+                         consecutive_deep: int, streak_mult: float,
+                         dry_run: bool) -> int:
+    """File/refresh ONE deduped rebase-UP Idea for a suppression-suppressed
+    contraction (regime-c selection-gated goal). Dedups against BOTH the
+    rebase-UP title and the pre-existing floor-hit title.
+    """
+    dedup_title = REBASE_UP_TITLE_FMT.format(goal_id=goal_id)
+    floor_title = FLOOR_HIT_TITLE_FMT.format(goal_id=goal_id)
+    existing = already_filed(asp, dedup_title) or already_filed(asp, floor_title)
+    if existing:
+        print(
+            f"[cargo-cult-contract] dedup hit — rebase Idea {existing} already "
+            f"pending for {goal_id} on {asp_id}; skipping"
+        )
+        return 0
+
+    idea = {
+        "title": dedup_title,
+        "status": "pending",
+        "priority": DEFAULT_PRIORITY,
+        "skill": None,
+        "participants": ["agent"],
+        "category": DEFAULT_CATEGORY,
+        "description": (
+            f"Auto-filed by cargo-cult-detector contract-suppression: recurring "
+            f"goal {goal_id} ({title}) reached the deep-streak contract "
+            f"threshold (consecutive_deep={consecutive_deep}), but its recent "
+            f"ACTUAL firing cadence (median {actual_median:.2f}h over the last "
+            f"{samples} recorded streak-breaks) far exceeds interval_hours "
+            f"({interval_hours}h x streak_mult {streak_mult:g} = "
+            f"{streak_mult * float(interval_hours):.2f}h boundary). This is the "
+            f"regime-c selection-gated shape (rb-1558/rb-2475): the goal fires "
+            f"when the selector serves it, not when the timer elapses, so "
+            f"CONTRACTING the interval cannot raise the firing rate — it only "
+            f"manufactures streak-break noise and floor-hit escalations.\n\n"
+            f"Proposal: rebase interval_hours (and original_interval_hours) UP "
+            f"toward the actual cadence (~{actual_median:.1f}h), then reset the "
+            f"streak state. Per guard-1015, any interval_hours write outside "
+            f"cargo-cult-detector's update_interval_hours() MUST persist "
+            f"original_interval_hours in the same write when absent. "
+            f"Discriminator context: recurring-cadence-mechanics tree node "
+            f"(three floor-hit regimes; this is regime c: actual>>interval + "
+            f"genuine deeps -> rebase UP)."
+        ),
+        "verification": {
+            "outcomes": [
+                "interval_hours (+ original_interval_hours anchor) rebased "
+                "toward actual cadence, or a decision recorded not to",
+            ],
+            "checks": [], "preconditions": [],
+        },
+        "blocked_by": [],
+        "origin_signal": f"investigate:contract-suppressed:{goal_id}",
+        "tags": ["cargo-cult", "auto-filed", "regime-c",
+                 f"source-goal:{goal_id}"],
+        "created_at": datetime.now().replace(microsecond=0).isoformat(),
+    }
+
+    if dry_run:
+        print(f"[cargo-cult-contract] DRY-RUN — would file rebase-UP Idea on {asp_id}:")
+        print(json.dumps(idea, indent=2))
+        return 0
+
+    new_id = file_idea(asp_id, source, idea)
+    if not new_id:
+        return 1
+    print(
+        f"[cargo-cult-contract] filed {new_id} on {asp_id}: '{dedup_title}' "
+        f"(actual median {actual_median:.2f}h vs interval {interval_hours}h)"
+    )
+    return 0
 
 
 def update_interval_hours(goal_id: str, source: str,
@@ -870,6 +1075,62 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
     proposed = round(float(interval_hours) / divisor, 2)
     floor = original * floor_ratio
     above_floor = proposed >= floor
+
+    # Cadence-aware contract suppression (0, regime-c detector fix).
+    # For selection-gated goals on a busy loop, the ACTUAL firing cadence is
+    # set by selector competition, not the timer — contracting interval_hours
+    # cannot raise the firing rate (inert) and only manufactures streak-break
+    # noise + floor-hit "rebase original" treadmills (: 25/25 fires
+    # "broke"; 15+ rebase Ideas fleet-wide). Before contracting, compare the
+    # recent actual cadence against streak_mult x interval; when actual far
+    # exceeds interval, SKIP contraction and file/refresh ONE deduped
+    # rebase-UP Idea instead. Runs BEFORE the floor branch on purpose: a
+    # floor-pinned selection-gated goal must get the rebase-UP framing, not
+    # the floor-hit "rebase original DOWN / retire" framing.
+    streak_mult = _load_streak_mult()
+    actual_median, cadence_status, cadence_samples = _recent_actual_cadence(
+        args.goal_id,
+        window=int(contract_cfg["contract_suppress_window"]),
+        min_samples=int(contract_cfg["contract_suppress_min_samples"]),
+    )
+    if cadence_status == "unreadable":
+        # guard-487: suppression-gate input unparseable -> fail CLOSED
+        # (treat as suppressed). Do NOT reset consecutive_deep — a transient
+        # IO error retries on the next close via the persistent counter.
+        print(
+            f"[cargo-cult-contract] SUPPRESSED (input unreadable): "
+            f"streak-breaks.jsonl could not be read — treating as suppressed "
+            f"per guard-487; will retry next close"
+        )
+        return 0
+    if actual_median is not None and actual_median > streak_mult * float(interval_hours):
+        print(
+            f"[cargo-cult-contract] SUPPRESSED: actual cadence "
+            f"{actual_median:.2f}h >> interval {interval_hours}h "
+            f"(> {streak_mult:g}x streak_mult, {cadence_samples} recent "
+            f"breaks) — contraction inert, regime-c selection-gated"
+        )
+        if args.dry_run:
+            print(
+                f"[cargo-cult-contract] DRY-RUN — would file rebase-UP Idea "
+                f"for {args.goal_id} and reset consecutive_deep"
+            )
+            return 0
+        rc = _file_rebase_up_idea(
+            asp, asp_id, args.source, args.goal_id, title,
+            float(interval_hours), actual_median, cadence_samples,
+            consecutive_deep, streak_mult, args.dry_run,
+        )
+        # Reset regardless of filing outcome mirrors the floor-hit dedup
+        # path: leaving the counter >= threshold would re-trigger this
+        # (deduped) path on every subsequent deep close — the exact
+        # treadmill this predicate removes.
+        if not reset_consecutive_deep(args.goal_id, args.source):
+            sys.stderr.write(
+                f"cargo-cult-detector: suppression fired but "
+                f"consecutive_deep reset failed for {args.goal_id}\n"
+            )
+        return rc
 
     if above_floor:
         if args.dry_run:

@@ -334,7 +334,7 @@ def check_no_duplicate_id(items, rec_id):
 # ---------------------------------------------------------------------------
 
 def recompute_utilization_score(rec):
-    """Recompute utilization_score = (times_helpful + 0.5*times_inferred_helpful) / max(retrieval_count, 1).
+    """Recompute utilization_score = (times_helpful + 0.5*times_inferred_helpful) / (max(retrieval_count, times_helpful + times_inferred_helpful) + 1).
 
     times_inferred_helpful is half-weighted because it is produced by token-overlap
     inference (utilization-feedback.py --infer) rather than explicit attestation
@@ -345,7 +345,8 @@ def recompute_utilization_score(rec):
     and times_cited in addition to helpful/inferred, with weights matching the
     composite evidence formula in utilization-stats.py:
 
-        v2 = (helpful + 0.5*inferred + 0.25*active + 1.0*cited) / max(retrieval+1, 1)
+        v2 = (helpful + 0.5*inferred + 0.25*active + 1.0*cited)
+             / (max(retrieval, helpful + inferred + active + cited) + 1)
 
     Why parallel: reflect-maintain Step 1b currently filters on `utilization_score`;
     flipping it to v2 would shift the candidate-list ranking overnight. Run both
@@ -360,13 +361,28 @@ def recompute_utilization_score(rec):
     rc = util["retrieval_count"]
     th = util["times_helpful"]
     tih = util["times_inferred_helpful"]
-    util["utilization_score"] = round((th + 0.5 * tih) / max(rc, 1), 4)
-    # DO NOT INLINE this formula — must match tree.py and utilization-feedback.py.
-    # See utilization-stats.py module docstring for the canonical statement.
     ta = util.get("times_active", 0)
     tc = util.get("times_cited", 0)
+    # Denominator = max(retrievals, credited usages) + 1 (g-115-1959). rb and
+    # guardrail entries take DIRECT helpful bumps for context-carried citations
+    # (spark strengthen-existing, code-review consultation credit) that never
+    # pass a tracked retrieve.sh scan, so th can legitimately exceed rc — under
+    # the old max(rc, 1) denominator an untested h=5/rc=0 entry scored 5.0 and
+    # permanently outranked every scan-tested entry in sort_universal_rbs
+    # (221 rb + 1 guardrail entries live on 2026-07-11). Counting each credited
+    # usage as an implied opportunity caps context-only entries at <1.0 with an
+    # n-confidence gradient (h=1 -> 0.5, h=9 -> 0.9); the +1 prior shrinks
+    # low-n scores. Order-preserving where rc dominates (uniform +1 shift).
+    # This DIVERGES from the tree-node utility_ratio formula (tree.py /
+    # utilization-feedback.py / tree_write.py keep max(rc, 1)) BY DESIGN: the
+    # retrieval engine stamps tree rc on every return, so th<=rc holds there
+    # (0 violations across 1175 nodes probed 2026-07-11) and the shared-formula
+    # doctrine's precondition is intact for trees only.
+    usage_v1 = th + tih
+    util["utilization_score"] = round((th + 0.5 * tih) / (max(rc, usage_v1) + 1), 4)
+    usage_v2 = th + tih + ta + tc
     util["utilization_score_v2"] = round(
-        (th + 0.5 * tih + 0.25 * ta + 1.0 * tc) / max(rc + 1, 1), 4
+        (th + 0.5 * tih + 0.25 * ta + 1.0 * tc) / (max(rc, usage_v2) + 1), 4
     )
 
 # ---------------------------------------------------------------------------

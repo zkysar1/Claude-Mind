@@ -21,6 +21,7 @@ reconfigure_stdio()
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT, CONFIG_DIR
 from _gate_log import log as _gate_log
 from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
+from _goal_census import all_evicted_ids as _all_evicted_ids  # 0 mint-site tombstone awareness
 
 # Default paths point to world/ (collective task queue).
 # Overridden to agent/ at runtime when --source agent is passed.
@@ -162,6 +163,14 @@ from _goal_source import VALID_GOAL_SOURCES, apply_default as _apply_goal_source
 # selection loop-wide (same over-deletion class as 54529fb tree.py-read
 # / 92d9265 pure-CLI wrappers).
 from gates.defer_classifier import STRUCTURED_DEFER_PREFIXES  # noqa: E402,F401
+# BLOCKER_REF_TYPES is interpolated into the structured-defer refusal
+# messages below (cmd_update_goal, ~L1583/L1635). It was referenced without
+# an import — the refusal branch crashed with NameError instead of printing
+# the educational message + filing the atomic Unblock (refuse-without-queue,
+# surfaced by test_defer_to_unblock_integration.py cases 1/5/7; found during
+# 6). gates.blocker_ref is the single source of truth, same import
+# create-blocker.py uses.
+from gates.blocker_ref import BLOCKER_REF_TYPES  # noqa: E402
 
 
 def _warn_missing_user_leg_scope(goal_id, participants, user_leg_scope):
@@ -646,18 +655,11 @@ def check_no_duplicate_id(items, asp_id):
 # Subcommands
 # ---------------------------------------------------------------------------
 
-COMPACT_GOAL_KEEP = {
-    "id", "title", "status", "priority", "category", "skill",
-    "recurring", "interval_hours", "lastAchievedAt", "achievedCount",
-    "currentStreak", "longestStreak",
-    "participants", "blocked_by", "blocked_since", "deferred_until", "defer_reason",
-    "defer_reason_set_at", "blocker_ref",
-    "args", "parent_goal", "discovered_by", "started",
-    "depends_on", "abstained_by",
-}   # claimed_by intentionally excluded — use aspirations-query.sh to find claimed goals
-# blocker_ref + defer_reason_set_at travel together with defer_reason into the
-# compact projection so goal-selector's collect_blocked() can surface them
-# without a second store read. Quiescence gate (Change 2) depends on this.
+# The compact goal projection lives in the daemon:
+# mind_api/src/endpoints/aspirations.py `_COMPACT_GOAL_KEEP` (SSOT). The CLI
+# `COMPACT_GOAL_KEEP` copy that lived here was retired in 9 — it had
+# zero consumers since the daemon-only cutover removed the CLI read path
+# (`--active-compact` routes to the daemon via aspirations-read.sh).
 
 def recompute_progress(asp):
     """Derive progress from goals — recurring goals excluded from completion counts.
@@ -1155,8 +1157,11 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
 
     asp_num = target_asp_id.replace("asp-", "")
     max_seq = 0
-    for g in target_asp.get("goals", []):
-        gid = g.get("id", "")
+    # Evicted ids count toward max+1 (0): re-minting an evicted seq
+    # would collide with the merge-layer resurrection tombstone, which drops
+    # any goal carrying an evicted id.
+    live_ids = [g.get("id", "") for g in target_asp.get("goals", [])]
+    for gid in live_ids + _all_evicted_ids(target_asp):
         match = re.match(r"^g-\d{3}-(\d{2,4})", gid)
         if match:
             max_seq = max(max_seq, int(match.group(1)))
@@ -1257,6 +1262,54 @@ def cmd_update_goal(args):
         # (post-update state) plus the goal's current user_leg_scope.
         if field == "participants":
             _warn_missing_user_leg_scope(goal_id, value, goal.get("user_leg_scope"))
+
+        # Cross-lane TAKEOVER guard (4) — MIRROR of the daemon guard
+        # in mind_api/src/endpoints/aspirations_write.py update_goal() (the
+        # `=== PR 7i in-lock status guards ===` block). guard-742: this logic
+        # lives on BOTH sides. The daemon is the LIVE path for
+        # aspirations-update-goal.sh (daemon-only wrapper), but this CLI entry
+        # is NOT dead code — the rb-428 sweeps (precondition-defer-recheck,
+        # credential-defer-recheck) invoke `aspirations.py update-goal`
+        # DIRECTLY as a Python subprocess, bypassing the wrapper. Keep both in
+        # sync or the guard is half-applied.
+        #
+        # claim()/release() enforce intended_agent ownership; update_goal did
+        # not — so claiming a foreign goal was refused while
+        # `update-goal <foreign> status in-progress` silently took it over.
+        #
+        # SCOPE IS DELIBERATELY NARROW — takeover only (status->in-progress,
+        # claimed_by). Do NOT widen to all status writes: the rb-428 sweeps
+        # mutate foreign-lane goals BY DESIGN, writing skipped / completed /
+        # defer_reason / lastAchievedAt. A blanket cross-lane refusal breaks
+        # every one of them (the  over-fix trap). Verified 2026-07-14:
+        # the only writer of status->in-progress is aspirations-execute Phase 4
+        # (on an already-claimed goal, so already past claim()'s same check),
+        # and nothing writes claimed_by through update-goal at all.
+        if ((field == "status" and value == "in-progress")
+                or field == "claimed_by"):
+            _intended = goal.get("intended_agent")
+            _caller = os.environ.get("MIND_AGENT", "").strip() or "unknown"
+            if _intended and _intended != _caller and _intended != "either":
+                _xl = (getattr(args, "cross_lane", None) or "").strip() or None
+                if not _xl:
+                    print(f"BLOCKED: Goal {goal_id} is routed to "
+                          f"'{_intended}' but the caller is '{_caller}'. "
+                          f"Refusing the TAKEOVER write (field={field}). Pass "
+                          f"--cross-lane <justification> to override (logged "
+                          f"to override-bypass-ledger.jsonl). Non-takeover "
+                          f"cross-lane writes (skipped / completed / "
+                          f"defer_reason) are unaffected.",
+                          file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    from _override_helpers import audit_cross_lane_claim
+                    audit_cross_lane_claim(
+                        goal_id, _caller, _intended, _xl,
+                        category=goal.get("category"),
+                        title=goal.get("title"))
+                except Exception as _ae:  # ledger failure must not lose the write
+                    print(f"WARN: cross-lane override audit failed: {_ae!r}",
+                          file=sys.stderr)
 
         # Guard: recurring goals must never reach status=completed (LLM drift protection)
         if field == "status" and value == "completed" and goal.get("recurring"):
@@ -1646,9 +1699,9 @@ def cmd_update_goal(args):
         ):
             goal["original_interval_hours"] = _prev_interval_hours
 
-        # Stamp last_modified on every successful field write (-a, sub-goal of
-        #  stale-read gate). Consumed by stale-read-gate.py to detect when a
-        # caller's reads outpaced their writes. Single timestamp per cmd_update_goal call
+        # Stamp last_modified on every successful field write. A general
+        # last-touched timestamp (originally -a for the stale-read gate,
+        # retired 7). Single timestamp per cmd_update_goal call
         # — auto-managed cascades below (defer_reason_set_at, blocked_since, blocker_ref,
         # deferred_until) are side-effects of THIS write and share its modification moment.
         # Local system time, no microseconds, matching blocked_since/defer_reason_set_at
@@ -2048,6 +2101,21 @@ def main():
                            "names an agent-provisionable capability. Required to "
                            "bypass the defer-time capability gate. Echoed to stderr "
                            "for auditability. See .claude/rules/probe-before-defer.md.")
+    # --cross-lane is the takeover-time analogue of --force-defer (4).
+    # Required to bypass the cross-lane TAKEOVER guard when the write is
+    # status->in-progress or claimed_by on a goal whose intended_agent names a
+    # DIFFERENT agent. Logged to world/override-bypass-ledger.jsonl via
+    # _override_helpers.audit_cross_lane_claim — the same ledger + schema
+    # claim() writes, so cross-lane takeovers and cross-lane claims are one
+    # analyzable stream. Non-takeover cross-lane writes (skipped / completed /
+    # defer_reason) are NOT gated and need no flag — the rb-428 maintenance
+    # sweeps depend on that.
+    p_ug.add_argument("--cross-lane", dest="cross_lane", default=None,
+                      help="Justification for taking over a goal routed to a "
+                           "different agent (status->in-progress or "
+                           "claimed_by). Required to bypass the cross-lane "
+                           "takeover guard. Logged to override-bypass-ledger"
+                           ".jsonl.")
     # --override-uncommitted is the close-time analogue of --force-defer.
     # Required to bypass the pre-completion uncommitted-work gate when
     # framework-code files are dirty in the working tree at status=completed.

@@ -28,6 +28,11 @@ Inputs (all flags; one of --message / --message-file is required):
 
 Output:
   JSON payload to stdout. Pipe to world/scripts/email-send.sh.
+  NOTE: --category blocker emits the SendErrorAlert shape (ErrorMessage/
+  ErrorFrom); all other categories emit the SendInfoAlert shape.
+  email-send.sh auto-routes by shape (g-115-2434), so --error is optional —
+  but the shape split is load-bearing: SendInfoAlert refuses a payload with
+  only ErrorMessage/ErrorFrom keys as empty-content.
 
 Exit codes:
   0  — payload valid, emitted to stdout
@@ -48,6 +53,7 @@ import argparse
 import json
 import os
 import re
+import subprocess  # finding-disproof gate (4)
 import sys
 from pathlib import Path
 
@@ -188,6 +194,22 @@ def main():
         default=None,
         help="Override PROJECT_ROOT (test only). Default: derived from script location.",
     )
+    # --- finding-disproof gate (4) -------------------------------
+    # Fires for `blocker` and `decision-needed` only — the two categories that
+    # carry FINDINGS to the user (info/completion/update are status reports).
+    # See finding-disproof-gate.py for the incident: a blocker email told the
+    # user the fleet's storage layer was broken on every box. It was false, and
+    # the disproof was ten seconds away inside the evidence being cited.
+    parser.add_argument("--disproof-probe", default="",
+                        help="The command that would FALSIFY this finding's central claim.")
+    parser.add_argument("--disproof-result", default="",
+                        help="What that command actually printed (a probe with no result "
+                             "is a plan, not evidence).")
+    parser.add_argument("--disproof-waived", default="",
+                        help="Ship a universal/causal claim WITHOUT a disproof probe. "
+                             "Justification required; echoed to stderr for audit. Use only "
+                             "when the alert is genuinely time-critical and unfalsifiable-"
+                             "by-command — never to route around the question.")
     args = parser.parse_args()
 
     agent = args.agent or os.environ.get("MIND_AGENT")
@@ -223,6 +245,45 @@ def main():
         )
         sys.exit(2)
 
+    # --- finding-disproof gate (4, 2026-07-14) --------------------
+    # Enforced HERE, not in notify-user/SKILL.md, because the incident email
+    # BYPASSED the skill entirely — the agent called this script directly. A
+    # gate in a SKILL.md is honor-system; the script is the real chokepoint,
+    # and honor-system is precisely what already failed (guard-1065 + rb-3408 +
+    # rb-3410 + rb-3419 all said "mechanism is not case" and did not stop it).
+    #
+    # Fail-OPEN on any gate error (rc=2 / missing gate / exception): a bug here
+    # must never silence a real alert. Fail-CLOSED only on a matched claim with
+    # no disproof — that refusal IS the feature.
+    if args.category in ("blocker", "decision-needed"):
+        if args.disproof_waived.strip():
+            print("[notify] disproof-gate WAIVED: {r}".format(r=args.disproof_waived.strip()),
+                  file=sys.stderr)
+        else:
+            gate = Path(__file__).resolve().parent / "finding-disproof-gate.py"
+            if gate.exists():
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(gate),
+                         "--claim", subject + "\n" + message,
+                         "--disproof-probe", args.disproof_probe,
+                         "--disproof-result", args.disproof_result],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    if proc.stderr:
+                        print(proc.stderr.rstrip(), file=sys.stderr)
+                    if proc.returncode == 1:
+                        print("\n[notify] REFUSED to build payload — see the disproof gate "
+                              "above. Run the falsifying command, then re-invoke with "
+                              "--disproof-probe/--disproof-result. If the claim is genuinely "
+                              "unfalsifiable-by-command AND time-critical, use "
+                              "--disproof-waived \"<why>\".", file=sys.stderr)
+                        sys.exit(4)
+                    # rc 0 (pass / not gated) and rc 2 (gate input error) both proceed.
+                except Exception as exc:  # noqa: BLE001 — fail-open, never block a real alert
+                    print("[notify] disproof-gate error (failing open): {e!r}".format(e=exc),
+                          file=sys.stderr)
+
     sections = parse_json_array("--sections-json", args.sections_json)
     next_steps = parse_json_array("--next-steps-json", args.next_steps_json)
 
@@ -243,6 +304,10 @@ def main():
             "Sections": sections,
             "NextSteps": next_steps,
         }
+
+    # Provenance stamp — email-send.sh refuses payloads without it (6)
+    # and pops it before the transport sees the payload.
+    payload["XPayloadProvenance"] = "notify-build-payload/v1"
 
     # ensure_ascii=False so em-dashes and other unicode in self.md don't
     # become escape sequences in the email body. The downstream transport accepts UTF-8.

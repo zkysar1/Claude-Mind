@@ -22,7 +22,6 @@ import importlib.util
 import json
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 from io import StringIO
@@ -30,7 +29,6 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
-PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 try:
@@ -185,32 +183,43 @@ def _scenario_allow_leaf_removal(tree_path: Path) -> bool:
 def _scenario_batch_refuses(tree_path: Path) -> bool:
     """cmd_batch's remove-child must apply the same gate.
     State on entry: root → mid → [leaf-b] (leaf-a removed in scenario 2).
-    Submit a batch trying to remove 'mid' (still has leaf-b as descendant)."""
+    Submit a batch trying to remove 'mid' (still has leaf-b as descendant).
+
+    In-process call (g-115-2353, 2026-07-16): the prior form piped the batch
+    through `tree-update.sh --batch` in a subprocess with MIND_WORLD=_TMP,
+    but that wrapper is daemon-routed — the daemon resolves the PRODUCTION
+    world from the bound agent's local-paths.conf per-request context and
+    ignores the caller's env override, so the batch ran against the live
+    tree (no root→mid there) and returned rc=0 while the gate itself was
+    intact. Calling cmd_batch in-process (like scenarios 1-2) tests the
+    gate, not the transport. cmd_batch reads its payload from stdin."""
     batch_payload = {
         "operations": [
             {"op": "remove-child", "key": "root", "child_key": "mid"},
         ],
     }
-    from _bash_helpers import BASH as bash  # rb-1472: bin-first, clean-PATH-safe
-    env = os.environ.copy()
-    env["MIND_WORLD"] = _TMP
-    env.pop("MIND_AGENT", None)
-    update_rel = (CORE_SCRIPTS / "tree-update.sh").relative_to(PROJECT_ROOT).as_posix()
-    result = subprocess.run(
-        [bash, update_rel, "--batch"],
-        input=json.dumps(batch_payload),
-        capture_output=True, text=True, env=env,
-        cwd=str(PROJECT_ROOT), timeout=15,
-    )
-    if result.returncode != 2:
-        print(f"FAIL[scenario 3]: batch should exit 2, got rc={result.returncode}",
+    saved_stdin = sys.stdin
+    saved_stderr = sys.stderr
+    sys.stdin = StringIO(json.dumps(batch_payload))
+    sys.stderr = capture = StringIO()
+    rc_seen = None
+    try:
+        _tree_mod.cmd_batch(_Args(batch=True))
+    except SystemExit as e:
+        rc_seen = e.code
+    finally:
+        sys.stdin = saved_stdin
+        sys.stderr = saved_stderr
+
+    err = capture.getvalue()
+    if rc_seen != 2:
+        print(f"FAIL[scenario 3]: batch should exit 2, got rc={rc_seen}",
               file=sys.stderr)
-        print(f"stdout={result.stdout}", file=sys.stderr)
-        print(f"stderr={result.stderr}", file=sys.stderr)
+        print(f"stderr={err}", file=sys.stderr)
         return False
-    if "leaf-b" not in result.stderr:
+    if "leaf-b" not in err:
         print(f"FAIL[scenario 3]: batch stderr should name descendants; "
-              f"got: {result.stderr}", file=sys.stderr)
+              f"got: {err}", file=sys.stderr)
         return False
 
     # Verify nothing changed on disk (atomic refuse)

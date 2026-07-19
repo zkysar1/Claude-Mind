@@ -216,6 +216,14 @@ IF agents/<agent>/session/handoff.yaml EXISTS (auto-continuation / inline restar
             Output: "  Cause: {primary_blocker.cause}"
             IF top_bottlenecks length > 1:
                 Output: "  Also blocking: {b.title} ({b.downstream_count} downstream)" for each additional bottleneck
+    4d. Pending-Deploys Carry-Over (SG-c, g-115-2688-c / g-115-2719):
+        IF handoff.pending_deploys exists and is a non-empty list:
+            Output: "PENDING DEPLOYS: {count} unverified deploy(s) carried over from last session — {repo}@{sha[:7]} (goal {goal_id}) for each entry"
+            # Awareness surface only — no action needed here. The persisting
+            # agents/<agent>/session/pending-deploys.yaml store (NOT deleted with
+            # handoff.yaml at step 5) stays the source of truth: SG-b's all-sweep
+            # (iteration-close do_productivity_check) re-probes each entry on the
+            # first iteration and clears/re-files Unblocks as verdicts resolve.
     5. Delete handoff.yaml (consumed)
     6. Bash: `session-signal-clear.sh loop-active` (cleanup from previous cycle)
     6d. Bash: `session-signal-clear.sh stop-loop` (stale stop signal cleanup)
