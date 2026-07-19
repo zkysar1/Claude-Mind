@@ -204,16 +204,20 @@ def main() -> int:
     cases_run = 0
 
     # ---- Case 1: Hit + auto-file --------------------------------------------
-    # defer_reason="deploy needs human" — "human" matches an NPC capability,
-    # so the gate fires; "deploy" is the first action verb so the Unblock
-    # title contains "deploy". Expect exit 1, new Unblock in asp-001, AND
-    # the original goal's defer_reason still null (write was refused).
+    # defer_reason="deploy blocked until npc behavior analysis completes" —
+    # npc/behavior are identifier-parts of NPC-capability skill names, so the
+    # match survives the  sole-token precision rule (the previous
+    # fixture "deploy needs human" matched only via the generic-prose token
+    # 'human', which that rule now correctly suppresses — 3 triage).
+    # "deploy" is the first action verb so the Unblock title contains
+    # "deploy". Expect exit 1, new Unblock in asp-001, AND the original
+    # goal's defer_reason still null (write was refused).
     cases_run += 1
     with tempfile.TemporaryDirectory() as tmp:
         tmp_world = Path(tmp)
         _build_fixture(tmp_world)
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, "g-test-01", "defer_reason", "deploy needs human"
+            tmp_world, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes"
         )
         items = _read_world_aspirations(tmp_world)
         unblocks = _unblocks_in_asp001(items)
@@ -263,7 +267,7 @@ def main() -> int:
             "external_id": "manual-test-justification",
         })
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, "g-test-01", "defer_reason", "deploy needs human",
+            tmp_world, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes",
             "--force-defer", "test override case2",
             "--blocker-ref", blocker_ref,
         )
@@ -281,13 +285,13 @@ def main() -> int:
                 f"case2: expected 0 Unblocks (override bypasses filing), "
                 f"got {len(unblocks)}"
             )
-        if orig is None or orig.get("defer_reason") != "deploy needs human":
+        if orig is None or orig.get("defer_reason") != "deploy blocked until npc behavior analysis completes":
             failures.append(
                 f"case2: defer_reason should be applied, got "
                 f"{orig.get('defer_reason') if orig else None!r}"
             )
         ok2 = (rc == 0 and not unblocks and orig
-               and orig.get("defer_reason") == "deploy needs human")
+               and orig.get("defer_reason") == "deploy blocked until npc behavior analysis completes")
         print(f"  [{'PASS' if ok2 else 'FAIL'}] hit+opt-out: rc={rc} "
               f"unblocks={len(unblocks)} "
               f"defer_applied={orig.get('defer_reason') if orig else None!r}")
@@ -386,7 +390,7 @@ def main() -> int:
         pre_count = len(_unblocks_in_asp001(_read_world_aspirations(tmp_world)))
 
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, "g-test-01", "defer_reason", "deploy needs human"
+            tmp_world, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes"
         )
         items = _read_world_aspirations(tmp_world)
         unblocks = _unblocks_in_asp001(items)
@@ -428,7 +432,7 @@ def main() -> int:
         tmp_world = Path(tmp)
         _build_fixture(tmp_world)
         _rc, _stdout, _stderr = _run_update_goal(
-            tmp_world, "g-test-01", "defer_reason", "deploy needs human"
+            tmp_world, "g-test-01", "defer_reason", "deploy blocked until npc behavior analysis completes"
         )
         items = _read_world_aspirations(tmp_world)
         unblocks = _unblocks_in_asp001(items)
@@ -506,7 +510,7 @@ def main() -> int:
                 f.write(json.dumps(a) + "\n")
 
         rc, _stdout, stderr = _run_update_goal(
-            tmp_world, "g-555-01", "defer_reason", "deploy needs human"
+            tmp_world, "g-555-01", "defer_reason", "deploy blocked until npc behavior analysis completes"
         )
         items = _read_world_aspirations(tmp_world)
         asp_555 = next((a for a in items if a.get("id") == "asp-555"), None)

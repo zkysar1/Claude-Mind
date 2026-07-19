@@ -22,8 +22,17 @@ g-115-1211 audit. History:
 integration test: it sources the LIVE keep-set from the daemon endpoint and
 runs cmd_cycles on a projection-shaped compact, not hand-injected dicts.
 
+3. Skipped goals with NO attempt marker (`started`) are excluded (g-115-2175):
+   a failure requires an attempt, but 96.5% of live skips are WITHDRAWN work
+   (dedup/superseded/obsolete) skipped straight from pending, never claimed.
+   `started` is stamped at goal-CLAIM time (aspirations_write.py) and survives
+   the compact projection. A naive filter on `started` alone was reverted under
+   g-115-2171 (genuine failures lacked it too, pre-writer) — making it truthful
+   at claim time is the prerequisite. test_never_attempted_skips_no_cycle pins it.
+
 Refs: g-115-1211 (audit + removal), g-115-615 (the dead synthetic exclusion),
 g-001-220 (the live Unblock: exclusion), g-002-23 (migration FP discovery),
+g-115-2175 (never-attempted exclusion + claim-time attempt marker),
 rb-1320 (repeated_failure is advisory noise).
 """
 
@@ -104,7 +113,11 @@ def test_all_unblock_skips_no_cycle():
 def test_genuine_repeated_failure_still_detected():
     """3 skipped non-Unblock goals → repeated_failure cycle fires."""
     goals = [
+        # 5: a GENUINE repeated failure was ATTEMPTED then skipped, so it
+        # carries the claim-time `started` marker. A skip WITHOUT `started` is
+        # WITHDRAWN work (test_never_attempted_skips_no_cycle), not failure.
         {"id": f"g-test-{i}", "status": "skipped", "title": f"Apply: something {i}",
+         "started": "2026-07-14T10:00:00",
          "tags": ["apply"], "category": "npc-cognition"}
         for i in range(3)
     ]
@@ -118,6 +131,33 @@ def test_genuine_repeated_failure_still_detected():
     print("PASS: 3 Apply: skips → repeated_failure (signal NOT suppressed)")
 
 
+def test_never_attempted_skips_no_cycle():
+    """5: 3 skipped NON-Unblock goals with NO `started` marker (never
+    attempted — WITHDRAWN: duplicate/superseded/obsolete) → NO repeated_failure.
+
+    Regression lock for the g-115-2175 fix: a failure requires an attempt, and
+    96.5% of live skips are withdrawn work skipped straight from pending (never
+    claimed → no `started`). Before the fix these tripped phantom repeated_failure
+    (it hit asp-335). Contrast test_genuine_repeated_failure_still_detected, whose
+    skips carry `started` (attempted-then-failed) and DO fire — the ONLY
+    difference is the attempt marker, not the title.
+    """
+    goals = [
+        # NO `started` → never attempted → withdrawn, not failure.
+        {"id": f"g-test-{i}", "status": "skipped", "title": f"Apply: dedup {i}",
+         "tags": ["apply"], "category": "npc-cognition"}
+        for i in range(3)
+    ]
+    compact = _build_compact(goals)
+    result = _run_cycles(compact)
+    reasons = [c.get("reason") for c in result.get("cycles", [])]
+    assert "repeated_failure" not in reasons, (
+        f"never-attempted skips (no `started`) must NOT trip repeated_failure "
+        f"(g-115-2175 withdrawn-vs-failed): {result}"
+    )
+    print("PASS: never-attempted skips (no `started`) → no repeated_failure (g-115-2175)")
+
+
 def test_synthetic_skips_fire_post_removal():
     """1: synthetic-tagged skips are NO LONGER specially excluded.
 
@@ -128,6 +168,9 @@ def test_synthetic_skips_fire_post_removal():
     """
     goals = [
         {"id": f"g-test-{i}", "status": "skipped", "title": f"Wire test {i}",
+         # 5: attempted-then-skipped carries `started` (this test's point
+         # is that `tags` don't exclude — not the never-attempted rule).
+         "started": "2026-07-14T10:00:00",
          "tags": ["synthetic", "wire-test"], "category": "framework-self-improvement"}
         for i in range(3)
     ]
@@ -155,6 +198,16 @@ def test_cmd_cycles_through_real_projection():
     )
     assert "outcome_note" not in keep, "outcome_note unexpectedly in keep-set (g-115-1211 assumed stripped)"
     assert "title" in keep, "title must survive projection for the Unblock: exclusion to be live"
+    assert "started" in keep, (
+        "started must survive projection for the g-115-2175 never-attempted "
+        "exclusion to be live — cmd_cycles reads it from the compact to tell "
+        "WITHDRAWN skips from genuine attempted-then-failed work"
+    )
+    assert "work_class" in keep, (
+        "work_class must survive projection for the g-115-2492 all-product "
+        "zero_learning_velocity suppression to be live — a check on a "
+        "projection-stripped field is a dead branch (g-115-1211 class)"
+    )
 
     # A synthetic-tagged skip loses its tags through the REAL projection.
     raw = {"id": "g-syn", "status": "skipped", "title": "Wire test",
@@ -206,11 +259,91 @@ def test_near_complete_same_category_no_velocity_cycle():
     print("PASS: 5/5 complete aspiration in same category -> no zero_learning_velocity (g-001-12)")
 
 
+def _with_zero_velocity_probe(fn):
+    """Run fn with the trajectory probe forced to velocity-0 and the temp-report
+    suppression forced off, so the zero_learning_velocity branch is REACHABLE in
+    a hermetic fixture (the real probe fails open on a nonexistent aspiration,
+    making fire vs suppress indistinguishable — both yield no cycle)."""
+    orig_run, orig_reports = pe._run_script, pe._has_recent_reports
+    pe._run_script = lambda cmd, timeout=60: ('{"current_velocity": 0}', "", 0)
+    pe._has_recent_reports = lambda *a, **k: False
+    try:
+        return fn()
+    finally:
+        pe._run_script, pe._has_recent_reports = orig_run, orig_reports
+
+
+def _velocity_fixture(work_classes):
+    """3 completed same-category Fix goals (work_class per element; None omits
+    the field) + 2 pending pads keeping completion_ratio 3/5 = 0.6 < 0.8 so the
+    g-001-12 gate does not mask the g-115-2492 branch under test."""
+    goals = []
+    for i, wc in enumerate(work_classes):
+        g = {"id": f"g-test-{i}", "status": "completed", "title": f"Fix: thing {i}",
+             "category": "product-parity"}
+        if wc is not None:
+            g["work_class"] = wc
+        goals.append(g)
+    goals += [
+        {"id": f"g-test-p{i}", "status": "pending", "title": f"Fix: pending {i}",
+         "category": "product-parity"}
+        for i in range(2)
+    ]
+    return _build_compact(goals)
+
+
+def test_all_product_window_no_velocity_cycle():
+    """2 (rb-3820): 3 completed work_class=product goals, velocity 0
+    → NO zero_learning_velocity. Product deliverables are sibling-repo commits,
+    invisible to all five velocity counters — the zero is expected, not a stall.
+    Canonical: asp-335 flagged during Vinheim/Lodestar Fix-close stretches."""
+    result = _with_zero_velocity_probe(
+        lambda: _run_cycles(_velocity_fixture(["product", "product", "product"]))
+    )
+    reasons = [c.get("reason") for c in result.get("cycles", [])]
+    assert "zero_learning_velocity" not in reasons, (
+        f"all-product window must suppress zero_learning_velocity (g-115-2492): {result}"
+    )
+    print("PASS: all-product window -> no zero_learning_velocity (g-115-2492)")
+
+
+def test_mixed_class_window_velocity_cycle_fires():
+    """Control for 2: a MIXED window (2 product + 1 framework) with
+    velocity 0 still fires — strict all() keeps the detector live, and this
+    proves the monkeypatched probe actually reaches the firing branch (making
+    the all-product no-fire above meaningful, not a fixture artifact)."""
+    result = _with_zero_velocity_probe(
+        lambda: _run_cycles(_velocity_fixture(["product", "product", "framework"]))
+    )
+    reasons = [c.get("reason") for c in result.get("cycles", [])]
+    assert "zero_learning_velocity" in reasons, (
+        f"mixed-class window must still fire zero_learning_velocity: {result}"
+    )
+    print("PASS: mixed product/framework window -> zero_learning_velocity still fires")
+
+
+def test_missing_work_class_velocity_cycle_fires():
+    """Legacy goals without work_class fail the == 'product' equality → behavior
+    unchanged (safe-cutover semantics per g-115-2187-t): velocity 0 still fires."""
+    result = _with_zero_velocity_probe(
+        lambda: _run_cycles(_velocity_fixture([None, None, None]))
+    )
+    reasons = [c.get("reason") for c in result.get("cycles", [])]
+    assert "zero_learning_velocity" in reasons, (
+        f"work_class-less legacy window must keep firing (safe cutover): {result}"
+    )
+    print("PASS: missing work_class -> zero_learning_velocity unchanged (legacy safe)")
+
+
 if __name__ == "__main__":
     test_all_unblock_skips_no_cycle()
     test_genuine_repeated_failure_still_detected()
+    test_never_attempted_skips_no_cycle()
     test_synthetic_skips_fire_post_removal()
     test_cmd_cycles_through_real_projection()
     test_near_complete_same_category_no_velocity_cycle()
+    test_all_product_window_no_velocity_cycle()
+    test_mixed_class_window_velocity_cycle_fires()
+    test_missing_work_class_velocity_cycle_fires()
     print()
     print("ALL cmd_cycles FILTER TESTS PASS")

@@ -127,7 +127,24 @@ re-introduces the clobber class g-115-1561 fixed.
               IF goal is None:
                   Bash: execution-diary.sh phase-end phase-2-select
                   /create-aspiration from-self --plan; fallback /research-topic + /reflect
-                  LOOP_CONTINUE
+                  # Dry-idle terminal (g-115-2084-c): if generation produced nothing
+                  # executable, do NOT hot re-enter — the synchronous Skill re-entry
+                  # beats the deadman 600s wakeup every cycle and IS the dry spin
+                  # (g-115-2084). Re-check, then sleep on the Layer-2 curve.
+                  Bash: goal-selector.sh   # re-check post-generation
+                  IF selector returns all_blocked: LOOP_CONTINUE   # route to the
+                      # B-ladder next iteration — B6.5 quiescence must get first
+                      # refusal on a blocked (non-empty) queue; dry is only for
+                      # the EMPTY queue (na = gate cannot run without blockers).
+                  IF selector still returns an empty candidate list:
+                      Bash: tick=$(py -3 core/scripts/dry-idle-tick.py --executable-count 0 --quiescence-decision na)
+                      IF tick.dry == true:
+                          wake_at = now + tick.sleep_seconds; echo '"{wake_at}"' | Bash: wm-set.sh blocked_sleep_until
+                          Bash: DRY_SLEEP=1 bash core/scripts/interruptible-sleep.sh {tick.sleep_seconds} (run_in_background=true)
+                          RETURN   # yield contract (guard-153): the registered bg sleep
+                                   # (guard-967 Tier-A) IS the terminal; harness re-invokes
+                                   # on completion/wake. No ScheduleWakeup, no Skill.
+                  LOOP_CONTINUE   # new work exists (or tick fail-open) — normal re-entry
               Bash: execution-diary.sh phase-end phase-2-select --goal {goal.id}
   Phase 3.    IF compound: /decompose goal.id; if status==decomposed → LOOP_CONTINUE
   Phase 4.    Claim-conflict gate (live partner snapshot — see coordination.md
@@ -141,17 +158,29 @@ re-introduces the clobber class g-115-1561 fixed.
               # catches a partner CURRENTLY claiming this goal; it does NOT catch a
               # partner who already SHIPPED overlapping work and released (canonical
               # 2026-05-13 race — zeta shipped g-115-697, alpha claimed same-surface
-              # g-115-696 4h later). Before claiming, run the two-probe advisory
-              # check (git log --since=2h over the goal's surface + partner last_active):
+              # g-115-696 4h later). Before claiming, run the advisory check
+              # (git log --since=2h over the goal's surface + partner last_active +
+              # coordination-board partner claim/completion posts naming this goal-id
+              # — the board is the one surface that survives cross-box store
+              # partitions; g-001-311, guard-997, rb-3296):
               Bash: bash core/scripts/goal-pickup-coordination-check.sh --goal-id {goal.id} --source {source} --output json
-              IF race_risk == true: read the named overlapping commit(s). IF the goal's
-              outcome is already shipped → mark it completed (superseded) via
-              aspirations-update-goal.sh + journal the supersession, and LOOP_CONTINUE
-              (do NOT claim). ELSE (surface overlaps but the goal is genuinely still
-              open) proceed to claim — the probe is ADVISORY, never a hard gate
-              (fail-open, exit 0; heuristic affected-paths inference must not freeze work).
-              IF source==world: aspirations-claim.sh
-              (conflict → journal abort + LOOP_CONTINUE; no phase-end — phase-start not yet written).
+              IF race_risk == true:
+                IF board_partner_activity has a "claim" entry → a partner's claim is
+                live on another box even though the shared store shows unclaimed
+                (the 2026-07-09 g-115-1876 collision shape) — YIELD: journal the
+                abort + LOOP_CONTINUE (do NOT claim).
+                ELSE read the named overlapping commit(s) / board completion. IF the
+                goal's outcome is already shipped → mark it completed (superseded) via
+                aspirations-update-goal.sh + journal the supersession, and LOOP_CONTINUE
+                (do NOT claim). ELSE (surface overlaps but the goal is genuinely still
+                open) proceed to claim — the probe is ADVISORY, never a hard gate
+                (fail-open, exit 0; heuristic affected-paths inference must not freeze work).
+              IF source==world: aspirations-claim.sh — its OWN Bash call, output
+              VISIBLE (NEVER `>/dev/null 2>&1`, never newline-batched with the
+              phase-4 markers below: g-115-2345 — a silenced 409 let echo execute
+              zeta's claimed goal for a full phase; guard-1007). Parse the JSON:
+              any `error` field OR claimed_by != self → journal abort +
+              LOOP_CONTINUE (no phase-end — phase-start not yet written).
               # phase-start AFTER the claim (g-115-1371 / rb-1533): the phase-4-execute marker
               # MUST post-date claimed_at so the Phase -0.5c.1 stranded-claim sweep's "diary
               # entry after claimed_at" in-flight signal survives a long post-claim pause
@@ -165,7 +194,11 @@ re-introduces the clobber class g-115-1561 fixed.
               Bash: execution-diary.sh phase-start phase-4-execute --goal {goal.id}
               Bash: team-state-in-flight.sh --agent <self> --goal-id {goal.id}
               --title "{goal.title}" --phase 4   # live snapshot for partner
-              Bash: aspirations-update-goal.sh status in-progress; started today.
+              # `started` is NOT set here — the daemon claim chokepoint owns it
+              # (aspirations_write.py setdefault at claim time; single-writer rule,
+              # g-115-2175/g-115-2187-t). An LLM `started today` write would clobber
+              # the precise claim-time first-attempt timestamp with a coarse date.
+              Bash: aspirations-update-goal.sh status in-progress.
               board-post.sh claim.
               Bash: load-execute-protocol.sh → Read; follow inline.
               IF infrastructure_failure: aspirations-release.sh;

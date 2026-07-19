@@ -364,50 +364,73 @@ def main():
     #                    observer detection, /start Step 0 binding). See
     #                    guard-341 / rb-386. DO NOT make MIND_SID conditional —
     #                    it is the single source of truth for the current SID.
-    #   MIND_AGENT    → CONDITIONAL. Skipped when (a) caller wrote an explicit
-    #                    `MIND_AGENT=` at a command boundary (override — caller
-    #                    chose the agent context), or (b) no `.active-agent-$SID`
-    #                    binding exists yet (first Bash call of /start Step 0).
+    #   MIND_AGENT    → injected whenever the SID binding resolves; absent only
+    #                    when no binding exists yet (first Bash call of /start
+    #                    Step 0). Caller overrides compose through SHELL SCOPING,
+    #                    not through an injection skip (8): a head
+    #                    `export MIND_AGENT=other; ...` re-exports AFTER the
+    #                    hook's clause and wins for the whole compound; a
+    #                    per-statement `MIND_AGENT=other cmd` shadows the export
+    #                    for that ONE statement only — exactly the documented
+    #                    one-off cross-agent probe semantics. The pre-fix logic
+    #                    skipped injection entirely when `MIND_AGENT=` appeared
+    #                    ANYWHERE in the command, so a single per-statement
+    #                    override left every OTHER statement of a compound
+    #                    unbound — 28/28 real injection failures in the cc-02
+    #                    2026-07-18 census were this shape, several planted by
+    #                    skill pseudocode that prescribes the per-statement form
+    #                    (e.g. `MIND_AGENT=<agent> py -3 ... verify-wake`).
     agent_clause = ""
-    if not re.search(r"(^|[\s;&|(])MIND_AGENT=", command):
-        project_root = SCRIPT_DIR.parent.parent
-        binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
-        # Transient I/O (OneDrive latency / AV scan / handle contention) can make
-        # resolve spuriously return None for a SID whose binding is fine. Retry --
-        # re-reading the actual binding yields the CORRECT current agent (no
-        # staleness), unlike the memo fallback below. 6 hazard.
-        if binding is None or not getattr(binding, "agent", ""):
-            for _retry in range(2):
-                binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
-                if binding is not None and binding.agent:
-                    break
-        if binding is not None and binding.agent:
-            agent_clause = f"export MIND_AGENT={binding.agent}; "
-            # Record that this SID resolved at least once. A later miss can then
-            # be classified as mid-session-disappeared rather than expected
-            # first-call-before-/start. See _mark_binding_resolved (7).
-            _mark_binding_resolved(sid, project_root, binding.agent)
+    project_root = SCRIPT_DIR.parent.parent
+    binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
+    # Transient I/O (OneDrive latency / AV scan / handle contention) can make
+    # resolve spuriously return None for a SID whose binding is fine. Retry --
+    # re-reading the actual binding yields the CORRECT current agent (no
+    # staleness), unlike the memo fallback below. 6 hazard.
+    if binding is None or not getattr(binding, "agent", ""):
+        for _retry in range(2):
+            binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
+            if binding is not None and binding.agent:
+                break
+    if binding is not None and binding.agent:
+        agent_clause = f"export MIND_AGENT={binding.agent}; "
+        # Record that this SID resolved at least once. A later miss can then
+        # be classified as mid-session-disappeared rather than expected
+        # first-call-before-/start. See _mark_binding_resolved (7).
+        _mark_binding_resolved(sid, project_root, binding.agent)
+    elif not re.search(r"(^|[\s;&|(])MIND_AGENT=", command):
+        # Defense-in-depth: surface SIDs that ran without a binding so the
+        # silent-no-injection failure class becomes greppable instead of
+        # invisible. The hook still fails open — no exception path here can
+        # block the Bash call. See _log_binding_miss_once for the rationale.
+        # The override-presence guard is kept HERE (miss-log suppression
+        # only, per _log_binding_miss_once's contract): an unbound session
+        # whose caller supplied an explicit MIND_AGENT= is handled, not a
+        # miss worth logging. It no longer gates injection itself.
+        #
+        # Mid-session-disappeared upgrade (7): a "binding-yaml-missing"
+        # miss AFTER a prior successful resolve for this SID is the canonical
+        # 6 bug (injection worked, then stopped) — promote the reason
+        # so it greps distinctly from the expected first-Bash-before-/start miss.
+        last = _last_resolved_agent(sid, project_root)
+        if last:
+            # Fail SAFE: transient resolve failure for a SID that resolved
+            # earlier this session -- reuse its (immutable) bound agent rather
+            # than fall through to the first agent. 6 hazard.
+            agent_clause = f"export MIND_AGENT={last}; "
+            _log_binding_miss_once(sid, project_root, "binding-resolve-transient-failsafe")
         else:
-            # Defense-in-depth: surface SIDs that ran without a binding so the
-            # silent-no-injection failure class becomes greppable instead of
-            # invisible. The hook still fails open — no exception path here can
-            # block the Bash call. See _log_binding_miss_once for the rationale.
-            #
-            # Mid-session-disappeared upgrade (7): a "binding-yaml-missing"
-            # miss AFTER a prior successful resolve for this SID is the canonical
-            # 6 bug (injection worked, then stopped) — promote the reason
-            # so it greps distinctly from the expected first-Bash-before-/start miss.
-            last = _last_resolved_agent(sid, project_root)
-            if last:
-                # Fail SAFE: transient resolve failure for a SID that resolved
-                # earlier this session -- reuse its (immutable) bound agent rather
-                # than fall through to the first agent. 6 hazard.
-                agent_clause = f"export MIND_AGENT={last}; "
-                _log_binding_miss_once(sid, project_root, "binding-resolve-transient-failsafe")
-            else:
-                if fail_reason == "binding-yaml-missing" and _binding_was_resolved(sid, project_root):
-                    fail_reason = "binding-yaml-mid-session-disappeared"
-                _log_binding_miss_once(sid, project_root, fail_reason)
+            if fail_reason == "binding-yaml-missing" and _binding_was_resolved(sid, project_root):
+                fail_reason = "binding-yaml-mid-session-disappeared"
+            _log_binding_miss_once(sid, project_root, fail_reason)
+    else:
+        # No binding resolvable but the caller wrote an explicit
+        # MIND_AGENT= — treat as a handled cross-agent/one-off probe.
+        # Failsafe memo reuse still applies so sibling statements without
+        # the caller's per-statement prefix stay bound when possible.
+        last = _last_resolved_agent(sid, project_root)
+        if last:
+            agent_clause = f"export MIND_AGENT={last}; "
 
     # Phase 1A () + reducer-aware routing (): per-Body WM routing
     # env. Inject BODY_WM_PATH when the bound session has a forked body-WM-FILE

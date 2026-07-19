@@ -8,9 +8,12 @@ unchanged (no unblock_* fields appear in the JSON).
 Design notes (mirrors g-257-02 decomposition rationale):
 - Title uses the first-in-source-order action verb from failure_reason
   (the thing the agent must DO), NOT the matched-capability keyword.
-  When failure_reason = "deploy needs human" the gate may match "human"
-  against an NPC capability, but the agent's required action is "deploy"
-  — the title reflects that.
+  When failure_reason = "deploy blocked until npc behavior analysis
+  completes" the gate matches npc/behavior against an NPC capability
+  (identifier-part tokens survive the g-248-105 sole-token precision rule;
+  the original fixture "deploy needs human" matched only via the generic-
+  prose token 'human', now correctly suppressed — g-115-2343 triage), but
+  the agent's required action is "deploy" — the title reflects that.
 - matched_capability carries the gate's match info verbatim (source,
   skill, matched_keyword) so callers needing the gate's signal can use
   it independently of the title's action verb.
@@ -63,12 +66,14 @@ def main() -> int:
     cases_run = 0
 
     # Case 1: canonical verification test from  outcome 4.
-    # failure_reason "deploy needs human" → unblock_title must contain "deploy".
-    # In this codebase "deploy" doesn't itself match any capability row, but
-    # "human" matches analyze-npc-behavior. The title uses "deploy" because
-    # it's the first action verb in source-text order (action-verb design).
+    # failure_reason → unblock_title must contain "deploy". In this codebase
+    # "deploy" doesn't itself match any capability row, but npc/behavior
+    # match NPC-capability skills via identifier-part tokens (-
+    # surviving; see module docstring for the fixture-text history). The
+    # title uses "deploy" because it's the first action verb in source-text
+    # order (action-verb design).
     cases_run += 1
-    rc, d = _run_gate("deploy needs human", suggest_unblock=True)
+    rc, d = _run_gate("deploy blocked until npc behavior analysis completes", suggest_unblock=True)
     title = d.get("unblock_title") or ""
     if not d.get("would_block"):
         failures.append(
@@ -96,7 +101,7 @@ def main() -> int:
 
     # Case 2: --for-goal-id is interpolated into the title.
     cases_run += 1
-    rc, d = _run_gate("deploy needs human", suggest_unblock=True, for_goal_id="g-115-149")
+    rc, d = _run_gate("deploy blocked until npc behavior analysis completes", suggest_unblock=True, for_goal_id="g-115-149")
     title2 = d.get("unblock_title") or ""
     if "deploy" not in title2 or "g-115-149" not in title2:
         failures.append(
@@ -109,7 +114,7 @@ def main() -> int:
     # new fields appear. This is verification outcome 3 (). A future
     # editor that defaults --suggest-unblock to True would break this assertion.
     cases_run += 1
-    rc, d = _run_gate("deploy needs human", suggest_unblock=False)
+    rc, d = _run_gate("deploy blocked until npc behavior analysis completes", suggest_unblock=False)
     extra_fields = [k for k in
                     ("unblock_suggested", "unblock_title",
                      "unblock_description", "matched_capability")
@@ -160,7 +165,7 @@ def main() -> int:
     # (unblock_suggested=False) rather than filing a meaningless "Unblock: npc"
     # HIGH goal that tops the selector. The block itself (would_block) still
     # stands, so the improper defer/user-route is still refused. Contrast Case 1
-    # ("deploy needs human"): "deploy" IS an imperative verb, so that Unblock is
+    # ("deploy blocked until npc behavior analysis completes"): "deploy" IS an imperative verb, so that Unblock is
     # still emitted with title "deploy".
     cases_run += 1
     rc, d = _run_gate("npc memory hierarchy node", suggest_unblock=True,

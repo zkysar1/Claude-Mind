@@ -83,23 +83,23 @@ def save_history_refuses_corrupt_jsonl_source(sandbox, _fileops):
     raise AssertionError("save_history should have raised CorruptSourceError")
 
 
-def _snapshots_with_ext(history_dir, base_ext):
-    """Return snapshots whose underlying ext matches base_ext (e.g. ".jsonl").
+def _cas_snapshot_records(sandbox, rel_name):
+    """Return snapshot RECORD files for rel_name in the Stage-2 CAS-delta store.
 
-    Format-agnostic — handles both legacy uncompressed (foo.jsonl) and the
-    current gzip default (foo.jsonl.gz). Filters out .meta sidecars.
-    Updated 2026-05-22 (fix-ballooning-history) to be compression-agnostic.
+    Stage 2 (2026-05-22, fix-ballooning-history) moved the authoritative
+    snapshot store to <base_dir>/.history/{blobs,patches,snapshots}/ — one
+    .yaml record per snapshot under snapshots/<rel-path>/, content addressed
+    into blobs/. The legacy per-file gzip tree (.history/<rel-path>/<ts>.gz)
+    is read-side fallback only and no longer written by default, so counting
+    snapshots there reports 0 for writes that succeeded (g-115-2353 triage:
+    the three allow-branch cases below failed on the legacy count while
+    save_history demonstrably worked — snapshot present in snapshots/,
+    blob in blobs/, legacy dir never created).
     """
-    if not history_dir.exists():
+    snap_dir = sandbox / ".history" / "snapshots" / rel_name
+    if not snap_dir.exists():
         return []
-    out = []
-    for s in history_dir.iterdir():
-        if s.name.endswith(".meta"):
-            continue
-        name = s.name[:-3] if s.name.endswith(".gz") else s.name
-        if name.endswith(base_ext):
-            out.append(s)
-    return out
+    return [s for s in snap_dir.iterdir() if s.suffix == ".yaml"]
 
 
 @with_sandbox
@@ -113,8 +113,7 @@ def save_history_allows_healthy_jsonl_source(sandbox, _fileops):
     )
     _fileops.save_history(str(target), str(sandbox), "test-agent",
                           summary="healthy write")
-    history_dir = sandbox / ".history" / "aspirations.jsonl"
-    snaps = _snapshots_with_ext(history_dir, ".jsonl")
+    snaps = _cas_snapshot_records(sandbox, "aspirations.jsonl")
     assert_true(len(snaps) == 1,
                 f"expected 1 snapshot, got {len(snaps)}: {snaps}")
 
@@ -126,8 +125,7 @@ def save_history_allows_legitimately_empty_jsonl(sandbox, _fileops):
     target.write_bytes(b"")
     _fileops.save_history(str(target), str(sandbox), "test-agent",
                           summary="empty write")
-    history_dir = sandbox / ".history" / "aspirations.jsonl"
-    snaps = _snapshots_with_ext(history_dir, ".jsonl")
+    snaps = _cas_snapshot_records(sandbox, "aspirations.jsonl")
     assert_true(len(snaps) == 1,
                 f"expected 1 snapshot for empty file, got {len(snaps)}")
 
@@ -140,8 +138,7 @@ def save_history_skips_validation_for_non_jsonl(sandbox, _fileops):
     target.write_bytes(b"\x00" * 256)
     _fileops.save_history(str(target), str(sandbox), "test-agent",
                           summary="non-jsonl write")
-    history_dir = sandbox / ".history" / "team-state.yaml"
-    snaps = _snapshots_with_ext(history_dir, ".yaml")
+    snaps = _cas_snapshot_records(sandbox, "team-state.yaml")
     assert_true(len(snaps) == 1,
                 f"expected 1 snapshot for .yaml file, got {len(snaps)}")
 

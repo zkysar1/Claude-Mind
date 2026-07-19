@@ -217,6 +217,10 @@ Read core/config/memory-pipeline.yaml (replay_priority_order)
    # WM slot. Step 9 reads this slot and makes each cluster.summary one
    # key_outcomes entry in the handoff, so the per-cluster summaries survive to
    # the next session (boot reads handoff.yaml) — they remain retrievable.
+   # The slot crosses the Step-5 wm-reset boundary BY DESIGN: wm.py
+   # RESET_SURVIVING_SLOTS exempts it (g-115-1992 — reset previously wiped it,
+   # so Step 9 always read null on the full path and silently fell back to the
+   # linear summary).
    Bash: echo '<json array of {label, summary} per cluster>' | bash core/scripts/wm-set.sh journal_cluster_summaries
    # Retrieval-not-degraded (verification outcome 3): every entry is still
    # represented, now under a topical label — per-cluster summaries are strictly
@@ -525,6 +529,8 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    Archive working memory to journal entry (summary only).
    This captures any remaining WM state before it is destroyed by reset.
 5. Bash: wm-reset.sh
+   # journal_cluster_summaries survives this reset (wm.py RESET_SURVIVING_SLOTS,
+   # g-115-1992) — Step 9 consumes it one-shot and clears it.
 
 5.5. Presence file truncation (g-115-411 — cross-agent presence). For each
    `world/presence/<agent>.jsonl`, keep the last 1000 entries via locked
@@ -719,11 +725,14 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    handoff.yaml atomically via `locked_write_yaml`.
 
    `key_outcomes` sourcing (BRD Gap 1d, g-306-09): read the
-   `journal_cluster_summaries` WM slot written by Step 0.65. Each cluster's
-   `summary` becomes one `key_outcomes` entry (prefixed with its `label`), so the
-   handoff carries the PER-CLUSTER journal summaries — topical and granular —
-   rather than one linear blob. IF the slot is null/empty (lean session, or < 4
-   journal entries so Step 0.65 produced a single "session" cluster), fall back
+   `journal_cluster_summaries` WM slot written by Step 0.65. The slot survives
+   Step 5's wm-reset by design (wm.py RESET_SURVIVING_SLOTS, g-115-1992), so a
+   null read here means Step 0.65 genuinely didn't run — not the reset wiping
+   it. Each cluster's `summary` becomes one `key_outcomes` entry (prefixed with
+   its `label`), so the handoff carries the PER-CLUSTER journal summaries —
+   topical and granular — rather than one linear blob. IF the slot is
+   null/empty (lean session — the lean fast path skips Step 0.65; on the full
+   path even a < 4-entry session writes a single "session" cluster), fall back
    to the prior single linear key_outcomes list. Clear the slot after reading
    (one-shot; next session's Step 0.65 re-populates it).
 

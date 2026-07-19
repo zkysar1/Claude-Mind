@@ -79,6 +79,47 @@ fi
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# --- Claim-announce board post (3) -------------------------------
+# After a SUCCESSFUL claim, atomically announce it on the coordination board —
+# the ONLY surface that survives cross-box store partitions (: on
+# 07-09 alpha's aspirations/team-state writes never left cc-04, but its board
+# posts did; the read-side  fix can only see claims that were POSTED).
+# This folds the honor-system Phase-4 board-post.sh step into the claim itself
+# so a claim can never land un-announced. Invariants:
+#   - FAIL-OPEN: a post failure MUST NEVER fail the claim (the claim already
+#     committed in the daemon) — log to stderr, return 0.
+#   - Only the rc=0 SUCCESS paths call this; conflict/rejection (rc 2/1) never
+#     reach here, so they post nothing.
+#   - Agent-queue goals carry NO claim (claimed_by unset in the response) -> skip
+#     the announce (single-agent access needs no coordination signal).
+_announce_claim() {
+    local goal_id="$1" agent="$2" response="$3"
+    local extracted claimed_by title
+    # Extract claimed_by + title[:60] from the claim response, tab-separated.
+    # Fail-open on any parse error (empty -> skip).
+    extracted="$(printf '%s' "$response" | $(rt_python_launcher) -c "
+import json, sys
+try:
+    resp, _ = json.JSONDecoder().raw_decode(sys.stdin.read())
+    g = resp.get('goal') or {}
+    cb = (g.get('claimed_by') or '').strip()
+    t = (g.get('title') or '').replace(chr(9), ' ').replace(chr(10), ' ')[:60]
+    print(cb + chr(9) + t)
+except Exception:
+    print(chr(9))
+" 2>/dev/null)" || true
+    claimed_by="${extracted%%$'\t'*}"
+    title="${extracted#*$'\t'}"
+    # Only announce a REAL claim. Agent-queue no-claim (empty claimed_by) -> skip.
+    [ -z "${claimed_by:-}" ] && return 0
+    printf '%s' "Claiming ${goal_id}: ${title}" \
+        | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/board-post.sh" \
+            --channel coordination --type claim --tags "claim,${goal_id},${agent}" \
+            >/dev/null 2>&1 \
+        || echo "[aspirations-claim] WARN: claim-announce board post failed for ${goal_id} (claim still succeeded)" >&2
+    return 0
+}
+
 QUERY="id=${GOAL_ID}&agent=${AGENT}"
 if [ -n "$CROSS_LANE" ]; then
     ENCODED_CL="$(rt_url_encode "$CROSS_LANE")"
@@ -105,6 +146,7 @@ goal = resp.get('goal')
 if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 "
+        _announce_claim "$GOAL_ID" "$AGENT" "$RESPONSE"
         exit 0;;
     2)
         # T2.2: parity with CLI cmd_claim exit code. cross_lane_refused -> exit 2.
@@ -136,6 +178,7 @@ goal = resp.get('goal')
 if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
 "
+                _announce_claim "$GOAL_ID" "$AGENT" "$RESPONSE"
                 exit 0
             fi
         fi

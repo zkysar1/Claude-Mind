@@ -57,6 +57,7 @@ from _target_state import (  # noqa: E402
     extract_and_infer_targets,
     extract_targets,
     is_read_intent,
+    is_removal_intent,
     probe_target_state,
 )
 
@@ -119,6 +120,11 @@ def _human_summary(ex, pr):
     if pr.get("verdict") == "skipped_read_intent":
         return ("READ-intent goal title — target_state check skipped "
                 "(identifiers in target files are a precondition, not a "
+                "duplication signal)")
+    if pr.get("verdict") == "skipped_removal_intent":
+        return ("REMOVAL-intent goal title — target_state check skipped "
+                "(identifiers in target files are the removal TARGET, so "
+                "their presence means the work is NOT done, not a "
                 "duplication signal)")
     if ex["confidence"] == "none":
         return "no target files extracted from goal — probe is no-op"
@@ -216,6 +222,20 @@ def main(argv=None):
               "total_hits": 0, "total_identifiers": 0,
               "hit_ratio": 0.0, "line_hint_verifications": [],
               "reason": "READ-intent goal title — target_state check inverted"}
+    # REMOVAL-intent short-circuit () — mirror inversion of the
+    # READ-intent skip above: for retire/remove/delete goals the named
+    # identifiers are present BECAUSE they are the removal target, so an
+    # "already present" advisory would be exactly backwards. Shared
+    # classifier (_target_state.is_removal_intent) — both consumers cannot
+    # diverge. Same two-layer contract as skipped_read_intent: boundary
+    # verdict at main() level, confidence enum untouched.
+    elif is_removal_intent(goal.get("title"), _caller="target-state-probe.py"):
+        ex = {"target_files": [], "identifiers": [],
+              "line_hints": {}, "confidence": "none"}
+        pr = {"verdict": "skipped_removal_intent", "per_file": [],
+              "total_hits": 0, "total_identifiers": 0,
+              "hit_ratio": 0.0, "line_hint_verifications": [],
+              "reason": "REMOVAL-intent goal title — identifier presence is the removal target, not completion"}
     else:
         # : pass search_roots so the inference fallback can walk
         # PROJECT_ROOT + AGENT_WRITE_PATH for class-shaped identifiers when

@@ -33,9 +33,6 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-import _rt  # canonical Python -> daemon client (post-cutover)
 
 
 def with_sandbox(test_fn):
@@ -96,19 +93,6 @@ def run_wm_set(slot, value_json):
     if r.returncode != 0:
         raise RuntimeError(f"wm.py set {slot} failed: {r.stderr}")
     return r.stdout
-
-
-def run_wm_read(slot, json_mode=False):
-    """Read a WM slot via the daemon (_rt.wm_read).
-
-    The wm.py read CLI subcommand was deleted in the 2026-05-14 daemon
-    cutover; _rt.wm_read is the canonical Python->daemon replacement.
-    """
-    try:
-        body = _rt.wm_read(slot=slot, as_json=json_mode)
-    except _rt.RtError as e:
-        raise RuntimeError(f"wm_read({slot}) failed: {e}") from e
-    return body.strip()
 
 
 def write_compact_checkpoint(agent_dir, all_slots, slot_meta=None):
@@ -234,9 +218,17 @@ def test_compact_restore_preserves_live_loop_state(sandbox, agent_dir):
         f"Expected 'skipped' mention of loop_state in stdout, got: {r.stdout}"
     )
 
-    # Post-restore: loop_state must still be the live X (NOT the stale Y)
-    restored = run_wm_read("loop_state", json_mode=True)
-    restored_obj = json.loads(restored)
+    # Post-restore: loop_state must still be the live X (NOT the stale Y).
+    # Read the WM file DIRECTLY (daemon-agnostic — mirrors Test 2/4's file read)
+    # rather than via _rt.wm_read. On a box with a LIVE daemon present, _rt
+    # connects to that daemon (which has no state for the sandbox's fake agent)
+    # and returns {} even though the subprocess wm.py-set wrote the sandbox
+    # LocalBackend file — the read/write split that made this test
+    # environment-fragile (rb-3331). The file read is the ground truth
+    # compact-restore actually mutated.
+    import yaml
+    wm_path = agent_dir / "session" / "working-memory.yaml"
+    restored_obj = yaml.safe_load(wm_path.read_text(encoding="utf-8"))["slots"]["loop_state"]
     assert restored_obj == live_state, (
         f"compact-restore-slots clobbered live loop_state with stale "
         f"checkpoint snapshot. Expected live state:\n{live_state}\n"
@@ -244,11 +236,80 @@ def test_compact_restore_preserves_live_loop_state(sandbox, agent_dir):
     )
 
 
+# ---------------------------------------------------------------------------
+# Test 4: signals.dry_idle dynamic sub-slot survives compaction (4-a)
+# ---------------------------------------------------------------------------
+
+@with_sandbox
+def test_compact_restore_preserves_dry_idle_signals(sandbox, agent_dir):
+    """4-a: the dynamic signals.dry_idle counter (streak, last_dry_at,
+    sleep_total_s, session_start_at, cap_cycles) must survive compaction. Because
+    loop_state is in SKIP_SLOTS, a live loop_state carrying signals.dry_idle is
+    preserved verbatim across compact-restore — a stale (pre-feature) checkpoint
+    must NOT clobber the dry-idle counter, which would reset the backoff streak
+    and re-spin the loop. This pins the sub-schema against a future refactor that
+    drops loop_state from SKIP_SLOTS or reshapes the signals dict.
+    """
+    subprocess.run([sys.executable, str(SCRIPT_DIR / "wm.py"), "init"],
+                   capture_output=True, env=os.environ.copy(), check=True)
+
+    # Live state carrying the full dry_idle sub-schema.
+    live_state = {
+        "goals_completed": 12,
+        "productive_goals": 9,
+        "signals": {
+            "routine_streak_global": 0,
+            "productive_streak": 2,
+            "dry_idle": {
+                "streak": 4,
+                "last_dry_at": "2026-07-13T16:00:00",
+                "sleep_total_s": 1800,
+                "session_start_at": "2026-07-13T13:00:00",
+                "cap_cycles": 0,
+            },
+        },
+        "touched": ["asp-115"],
+    }
+    run_wm_set("loop_state", json.dumps(live_state))
+
+    # Stale checkpoint WITHOUT dry_idle (a pre-feature snapshot) must not clobber.
+    stale_state = {
+        "goals_completed": 5,
+        "productive_goals": 3,
+        "signals": {"routine_streak_global": 1, "productive_streak": 0},
+        "touched": ["asp-115"],
+    }
+    write_compact_checkpoint(agent_dir, all_slots={"loop_state": stale_state})
+
+    r = run_compact_restore()
+    assert r.returncode == 0, f"compact-restore-slots.py failed: {r.stderr}"
+
+    # Read the WM file DIRECTLY (daemon-agnostic — mirrors Test 2's file read)
+    # rather than via _rt.wm_read. On a box with a LIVE daemon present, _rt
+    # connects to that daemon (which has no state for the sandbox's fake agent)
+    # and returns {} even though the subprocess wm.py-set wrote the sandbox
+    # LocalBackend file — the read/write split that makes the _rt-based Test 3
+    # environment-fragile. The file read is the ground truth compact-restore
+    # actually mutated.
+    import yaml
+    wm_path = agent_dir / "session" / "working-memory.yaml"
+    restored = yaml.safe_load(wm_path.read_text(encoding="utf-8"))["slots"]["loop_state"]
+    assert restored == live_state, (
+        f"compact-restore clobbered live loop_state carrying signals.dry_idle.\n"
+        f"Expected:\n{live_state}\nGot:\n{restored}"
+    )
+    dry = restored["signals"]["dry_idle"]
+    for field in ("streak", "last_dry_at", "sleep_total_s", "session_start_at", "cap_cycles"):
+        assert field in dry, f"signals.dry_idle missing field {field!r} after restore: {dry}"
+    assert dry["streak"] == 4, f"dry_idle.streak not preserved across compaction: {dry}"
+
+
 def main():
     tests = [
         test_loop_state_in_skip_slots,
         test_two_writers_produce_byte_equal_serialization,
         test_compact_restore_preserves_live_loop_state,
+        test_compact_restore_preserves_dry_idle_signals,
     ]
     print(f"# g-283-03: compact-restore loop_state shape invariance — {len(tests)} tests")
     failures = 0

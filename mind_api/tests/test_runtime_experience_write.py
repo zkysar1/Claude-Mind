@@ -435,3 +435,72 @@ def test_byte_compat_recompute_index(tmp_path):
     cli = (cli_agent / "experiential-index.yaml").read_bytes()
     dae = (dae_agent / "experiential-index.yaml").read_bytes()
     assert dae == cli
+
+
+# ---------------------------------------------------------------------------
+# 5 / 7 regression tests (experience-pipeline triple defect)
+# ---------------------------------------------------------------------------
+
+def test_archive_goal_recurring_rerun_uniquifies(running_daemon):
+    """5: re-archiving the same goal+skill_slug must PERSIST a fresh
+    record with an auto-suffixed id (-YYYYMMDD, then -2), never 409 and lose
+    the trace (the pre-fix behavior orphaned the .md on every recurring
+    re-run)."""
+    import re as _re
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    base = "exp-g-8-8-review-hypotheses"
+
+    ids = []
+    for i in range(3):
+        src = project_root / "agents" / "alpha" / "session" / f"rerun-{i}.md"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text("recurring re-run trace body with enough content\n" * 5,
+                       encoding="utf-8")
+        body = {"goal": "g-8-8", "skill_slug": "review-hypotheses",
+                "category": "framework",
+                "summary": "recurring re-run trace archived cleanly",
+                "trace_file": f"agents/alpha/session/rerun-{i}.md"}
+        status, resp = _post_json(port, "/v1/experience/archive-goal", {}, body)
+        assert status == 200, f"call {i} refused: {resp}"
+        rec = json.loads(resp)["record"]
+        ids.append(rec["id"])
+        canonical = agent_dir / "experience" / f"{rec['id']}.md"
+        assert canonical.exists(), f"call {i}: canonical .md missing"
+
+    assert len(set(ids)) == 3, f"ids not unique: {ids}"
+    assert ids[0] == base
+    assert _re.match(rf"^{_re.escape(base)}-\d{{8}}$", ids[1]), ids[1]
+    assert _re.match(rf"^{_re.escape(base)}-\d{{8}}-2$", ids[2]), ids[2]
+    live_ids = [r["id"] for r in _live_records(agent_dir)]
+    for rid in ids:
+        assert rid in live_ids, f"{rid} not persisted to experience.jsonl"
+
+
+def test_add_derives_goal_id_from_id(running_daemon):
+    """7: add without goal_id derives it from the canonical
+    exp-{goal-id}-{suffix} id shape so --goal queries can find the record;
+    non-goal-shaped ids stay null (conservative)."""
+    project_root, port = running_daemon
+
+    cp1 = _make_trace(project_root, "agents/alpha/experience/derive-1.md")
+    rec1 = {"id": "exp-g-7-7-s99", "type": "research", "category": "c",
+            "summary": "derive goal id from record id", "content_path": cp1}
+    status, resp = _post_json(port, "/v1/experience/add", {}, rec1)
+    assert status == 200, resp
+    assert json.loads(resp)["record"]["goal_id"] == "g-7-7"
+
+    cp2 = _make_trace(project_root, "agents/alpha/experience/derive-2.md")
+    rec2 = {"id": "exp-nogoal-shape", "type": "research", "category": "c",
+            "summary": "non goal shaped id stays null", "content_path": cp2}
+    status, resp = _post_json(port, "/v1/experience/add", {}, rec2)
+    assert status == 200, resp
+    assert json.loads(resp)["record"]["goal_id"] is None
+
+    cp3 = _make_trace(project_root, "agents/alpha/experience/derive-3.md")
+    rec3 = {"id": "exp-g-6-6-explicit", "type": "research", "category": "c",
+            "summary": "explicit goal_id is never overwritten",
+            "content_path": cp3, "goal_id": "g-999-999"}
+    status, resp = _post_json(port, "/v1/experience/add", {}, rec3)
+    assert status == 200, resp
+    assert json.loads(resp)["record"]["goal_id"] == "g-999-999"

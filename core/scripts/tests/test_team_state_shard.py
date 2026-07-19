@@ -309,6 +309,117 @@ def test_parallel_five_agent_bumps_all_land_zero_conflicts():
                     == f"2026-07-07T13:00:0{i}")
 
 
+# --- backend sibling-row overlay (9 / 0) -------------------
+# The push-only own-cloud mirror never lands sibling shards locally, so a
+# local-only reader composes clone-era fossils for every partner (the
+# 2026-07-11 fleet-wide last_active split-brain). These cases pin the fix:
+# load_rows must OVERLAY the backend's view of the rows dir. The fake backend
+# models the bug shape exactly — a shard the local dir lacks.
+
+class _FakeBackend:
+    def __init__(self, rows):
+        self._rows = rows  # {filename: yaml-text}
+
+    def list_dir(self, path):
+        return list(self._rows)
+
+    def read_text(self, path, encoding="utf-8", *, force_fresh=False):
+        return self._rows[Path(path).name]
+
+
+class _BoomBackend:
+    def list_dir(self, path):
+        raise RuntimeError("backend unavailable")
+
+
+def _patched_backend(fake):
+    """Manual patch (no pytest fixture — keeps the bare __main__ runner
+    working). Returns a restore callable."""
+    import storage_backend
+    import _team_state
+    orig = storage_backend.get_backend
+    storage_backend.get_backend = lambda: fake
+    _team_state._backend_rows_cache.clear()
+
+    def restore():
+        storage_backend.get_backend = orig
+        _team_state._backend_rows_cache.clear()
+    return restore
+
+
+def test_load_rows_overlays_backend_siblings():
+    restore = _patched_backend(_FakeBackend({
+        # older than local -> local (newest) wins
+        "zeta.yaml": "last_active: '2026-07-11T09:00:00'\n",
+        # absent locally -> overlay must surface it (the 9 bug shape)
+        "alpha.yaml": "last_active: '2026-07-11T11:00:00'\n",
+    }))
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            world = Path(tmpd)
+            d = rows_dir(world)
+            d.mkdir(parents=True)
+            (d / "zeta.yaml").write_text(
+                "last_active: '2026-07-11T10:00:00'\n", encoding="utf-8")
+            rows = load_rows(world)
+            assert set(rows) == {"zeta", "alpha"}, rows
+            assert rows["zeta"]["last_active"] == "2026-07-11T10:00:00"
+            assert rows["alpha"]["last_active"] == "2026-07-11T11:00:00"
+            assert set(row_agent_names(world)) == {"alpha", "zeta"}
+    finally:
+        restore()
+
+
+def test_load_rows_backend_newer_wins_over_local():
+    restore = _patched_backend(_FakeBackend({
+        "zeta.yaml": "last_active: '2026-07-11T12:00:00'\n",
+    }))
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            world = Path(tmpd)
+            d = rows_dir(world)
+            d.mkdir(parents=True)
+            (d / "zeta.yaml").write_text(
+                "last_active: '2026-07-11T10:00:00'\n", encoding="utf-8")
+            rows = load_rows(world)
+            assert rows["zeta"]["last_active"] == "2026-07-11T12:00:00"
+    finally:
+        restore()
+
+
+def test_load_rows_fail_open_on_backend_error():
+    restore = _patched_backend(_BoomBackend())
+    try:
+        with tempfile.TemporaryDirectory() as tmpd:
+            world = Path(tmpd)
+            d = rows_dir(world)
+            d.mkdir(parents=True)
+            (d / "zeta.yaml").write_text(
+                "last_active: '2026-07-11T10:00:00'\n", encoding="utf-8")
+            rows = load_rows(world)  # must not raise — pre-fix behavior
+            assert set(rows) == {"zeta"}
+    finally:
+        restore()
+
+
+def test_compose_drops_retired_and_revives_on_newer_heartbeat():
+    # Tombstone semantics (s3:DeleteObject is IAM-denied fleet-wide):
+    # retired row hidden; a heartbeat NEWER than retired_at self-revives.
+    retired = {"retired": True, "retired_at": "2026-07-11T13:00:00",
+               "last_active": "2026-07-07T11:00:00"}
+    revived = {"retired": True, "retired_at": "2026-07-11T13:00:00",
+               "last_active": "2026-07-12T09:00:00"}
+    live = {"last_active": "2026-07-11T12:00:00"}
+    out = compose_agent_status({}, {"fox": retired, "phoenix": revived,
+                                    "alpha": live})
+    assert "fox" not in out
+    assert out["phoenix"]["last_active"] == "2026-07-12T09:00:00"
+    assert out["alpha"]["last_active"] == "2026-07-11T12:00:00"
+    # Retired residual in the CORE file is dropped too (charlie/delta class).
+    out2 = compose_agent_status({"ghost": dict(retired)}, {})
+    assert "ghost" not in out2
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

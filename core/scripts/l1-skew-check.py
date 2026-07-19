@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """L1 distribution skew detector (S1).
 
-Reads `tree-read.sh --stats --by-l1`, computes max/min ratios across L1s
-for structural mass, retrieval volume, and mature capability mass, and
-reports skew above a configurable threshold (default 5x).
+Reads `tree-read.sh --stats --by-l1` and flags TAXONOMY-shape defects a real
+taxonomy action could fix (g-115-2455 recalibration):
+
+  - dominance:   one L1 holds >= dominance_threshold (default 90%) of a
+                 metric's total mass — a hoover bucket; satisfiable by a split.
+  - share_creep: the dominant L1's share grew >= share_creep_pp (default 3.0
+                 percentage points) since the last cadence fire while already
+                 majority (>= 50%) — degradation trend; cadence mode only.
+  - empty_l1:    a real L1 has zero nodes — dead weight; satisfiable by
+                 populate-or-retire. (total_nodes metric only: derived metrics
+                 like mature capability are legitimately 0 on young L1s.)
+
+Max/min ratios are still computed and carried in every finding as EVIDENCE,
+but they no longer gate flagging: a tiny-but-healthy L1 (e.g. a deliberate
+low-mass strategic bet) makes the min-denominator unsatisfiable by any
+realistic action — measured 2026-07-17: 53.6x with the best available split
+still leaving 29.5x, producing ~5 board posts/24h of permanent alarm noise.
 
 Output is JSON by default — a minimal verdict carrying the ratios and the
 flagged metrics. Pass --post-board to ALSO post a coordination-channel
@@ -76,64 +90,100 @@ def _mature_capability_count(bucket):
     return int(cm.get("EXPLOIT", 0)) + int(cm.get("MASTER", 0))
 
 
-def compute_skew(by_l1, threshold):
-    """Compute max/min ratios per metric. Return list of findings.
+def _build_finding(metric, label, unit, values, dominance_threshold,
+                   prev_shares, creep_pp, l1_count, allow_empty_flag):
+    """Build one finding dict from sorted (l1, value) pairs.
 
-    Each finding: {metric, label, max_l1, max_value, min_l1, min_value, ratio, flagged}.
-    Excludes `_orphan` bucket from ratio math (it shouldn't be a target).
+    Flag reasons (first match wins):
+      dominance   — max share >= dominance_threshold (needs >= 2 L1s AND a
+                    metric total >= 10: shares over tiny totals are
+                    quantization noise — a young tree's 3 matured nodes all
+                    landing in one L1 is not a taxonomy defect)
+      share_creep — share grew >= creep_pp percentage points vs the prior
+                    cadence-fire baseline while already majority (>= 0.5)
+      empty_l1    — a real L1 has value 0 (total_nodes metric only)
+
+    Ratio fields are evidence-only — they never set `flagged` (g-115-2455).
+    """
+    min_l1, min_v = values[0]
+    max_l1, max_v = values[-1]
+    metric_total = sum(v for _, v in values)
+    share = (max_v / metric_total) if metric_total > 0 else 0.0
+    if min_v <= 0:
+        ratio = float("inf") if max_v > 0 else 1.0
+    else:
+        ratio = max_v / min_v
+
+    flag_reason = None
+    if l1_count >= 2 and metric_total >= 10 and share >= dominance_threshold:
+        flag_reason = "dominance"
+    elif isinstance(prev_shares, dict) and metric in prev_shares:
+        try:
+            prev = float(prev_shares[metric])
+        except (TypeError, ValueError):
+            prev = None
+        # Growth requires a POSITIVE delta — with creep_pp=0 a bare `>=`
+        # would flag an unchanged share as "creep" (fresh-eyes F2).
+        delta_pp = ((share - prev) * 100.0) if prev is not None else 0.0
+        if prev is not None and share >= 0.5 and delta_pp > 0 \
+                and delta_pp >= creep_pp:
+            flag_reason = "share_creep"
+    if flag_reason is None and allow_empty_flag and l1_count >= 2 and min_v == 0:
+        flag_reason = "empty_l1"
+
+    return {
+        "metric": metric,
+        "label": label,
+        "unit": unit,
+        "max_l1": max_l1,
+        "max_value": max_v,
+        "min_l1": min_l1,
+        "min_value": min_v,
+        "share": round(share, 4),
+        "ratio": round(ratio, 2) if ratio != float("inf") else None,
+        "ratio_infinite": ratio == float("inf"),
+        "flag_reason": flag_reason,
+        "flagged": flag_reason is not None,
+    }
+
+
+def compute_skew(by_l1, threshold, dominance_threshold=0.90,
+                 prev_shares=None, creep_pp=3.0):
+    """Compute per-metric findings. Return list of findings.
+
+    Each finding: {metric, label, max_l1, max_value, min_l1, min_value,
+    share, ratio, flag_reason, flagged}. Excludes `_orphan` bucket (it
+    shouldn't be a target). `threshold` is retained for payload/API
+    compatibility (ratio evidence context) but no longer gates flagging.
     """
     real_buckets = {k: v for k, v in by_l1.items() if k != "_orphan"}
     findings = []
     if not real_buckets:
         return findings
+    l1_count = len(real_buckets)
     for key, label, unit in METRICS:
         values = [(l1, int(b.get(key, 0))) for l1, b in real_buckets.items()]
         values.sort(key=lambda x: x[1])
         if not values:
             continue
-        min_l1, min_v = values[0]
-        max_l1, max_v = values[-1]
-        if min_v <= 0:
-            # Use a sentinel: ratio undefined, but if max is non-zero this is
-            # an extreme imbalance worth flagging.
-            ratio = float("inf") if max_v > 0 else 1.0
-        else:
-            ratio = max_v / min_v
-        findings.append({
-            "metric": key,
-            "label": label,
-            "unit": unit,
-            "max_l1": max_l1,
-            "max_value": max_v,
-            "min_l1": min_l1,
-            "min_value": min_v,
-            "ratio": round(ratio, 2) if ratio != float("inf") else None,
-            "ratio_infinite": ratio == float("inf"),
-            "flagged": (ratio == float("inf")) or (ratio >= threshold),
-        })
+        findings.append(_build_finding(
+            key, label, unit, values, dominance_threshold, prev_shares,
+            creep_pp, l1_count,
+            allow_empty_flag=(key == "total_nodes")))
     # Also track mature-capability mass — a thin L1 with no MASTER/EXPLOIT
     # is structurally different from a thin L1 that's just early-stage.
+    # allow_empty_flag=False: a young-but-legitimate L1 has 0 matured nodes
+    # for weeks; flagging that was part of the pre-recalibration noise.
     cap_values = [
         (l1, _mature_capability_count(b)) for l1, b in real_buckets.items()
     ]
     cap_values.sort(key=lambda x: x[1])
     if cap_values:
-        min_l1, min_v = cap_values[0]
-        max_l1, max_v = cap_values[-1]
-        ratio = float("inf") if min_v == 0 and max_v > 0 else (
-            max_v / min_v if min_v > 0 else 1.0)
-        findings.append({
-            "metric": "mature_capability_mass",
-            "label": "mature capability mass (EXPLOIT+MASTER)",
-            "unit": "matured nodes",
-            "max_l1": max_l1,
-            "max_value": max_v,
-            "min_l1": min_l1,
-            "min_value": min_v,
-            "ratio": round(ratio, 2) if ratio != float("inf") else None,
-            "ratio_infinite": ratio == float("inf"),
-            "flagged": (ratio == float("inf")) or (ratio >= threshold),
-        })
+        findings.append(_build_finding(
+            "mature_capability_mass",
+            "mature capability mass (EXPLOIT+MASTER)",
+            "matured nodes", cap_values, dominance_threshold, prev_shares,
+            creep_pp, l1_count, allow_empty_flag=False))
     return findings
 
 
@@ -141,20 +191,21 @@ def render_markdown(verdict):
     """Human-readable table for terminal / board posts."""
     lines = []
     lines.append("## L1 distribution skew check — {}".format(verdict["ts"]))
-    lines.append("Threshold: {}x. Status: {}".format(
-        verdict["threshold"],
+    lines.append("Dominance ceiling: {:.0f}%. Status: {}".format(
+        100.0 * verdict.get("dominance_threshold", 0.90),
         "FLAGGED — review L1 boundaries" if verdict["any_flagged"]
         else "balanced",
     ))
     lines.append("")
-    lines.append("| Metric | Max L1 | Min L1 | Max | Min | Ratio | Flagged |")
-    lines.append("|---|---|---|---:|---:|---:|:--:|")
+    lines.append("| Metric | Max L1 | Min L1 | Max | Min | Share | Ratio | Flagged |")
+    lines.append("|---|---|---|---:|---:|---:|---:|:--:|")
     for f in verdict["findings"]:
         ratio = "inf" if f["ratio_infinite"] else str(f["ratio"])
-        flag = "YES" if f["flagged"] else " "
-        lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+        flag = f.get("flag_reason") or " "
+        share_pct = "{:.1f}%".format(100.0 * f.get("share", 0.0))
+        lines.append("| {} | {} | {} | {} | {} | {} | {} | {} |".format(
             f["label"], f["max_l1"], f["min_l1"],
-            f["max_value"], f["min_value"], ratio, flag,
+            f["max_value"], f["min_value"], share_pct, ratio, flag,
         ))
     if verdict.get("notes"):
         lines.append("")
@@ -186,14 +237,16 @@ def _post_board(verdict):
             continue
         ratio = "inf" if f["ratio_infinite"] else str(f["ratio"])
         body_lines.append(
-            "  - {}: {}={} vs {}={} (ratio {})".format(
-                f["label"], f["max_l1"], f["max_value"],
+            "  - {} [{}]: {}={} ({:.1f}% share) vs {}={} (ratio {})".format(
+                f["label"], f.get("flag_reason", "?"),
+                f["max_l1"], f["max_value"], 100.0 * f.get("share", 0.0),
                 f["min_l1"], f["min_value"], ratio,
             )
         )
     body_lines.append(
-        "Threshold: {}x. Review L1 boundaries via /fresh-eyes-tree.".format(
-            verdict["threshold"]))
+        "Flag basis: dominance >= {:.0f}% share / share_creep / empty_l1 "
+        "(g-115-2455). Review L1 boundaries via /fresh-eyes-tree.".format(
+            100.0 * verdict.get("dominance_threshold", 0.90)))
     body = "\n".join(body_lines)
     board_py = str(Path(CORE_ROOT) / "scripts" / "board.py")
     try:
@@ -215,8 +268,10 @@ def _post_board(verdict):
 def _load_cadence_config():
     """Load l1_skew_check config block from aspirations.yaml.
 
-    Returns dict with goal_cadence and wm_slot, or None on read error.
-    Defaults: goal_cadence=50, wm_slot='last_l1_skew_check'.
+    Returns dict with goal_cadence, wm_slot, dominance_threshold, and
+    share_creep_pp, or None on read error. Defaults: goal_cadence=50,
+    wm_slot='last_l1_skew_check', dominance_threshold=0.90,
+    share_creep_pp=3.0.
     """
     try:
         import yaml
@@ -229,6 +284,9 @@ def _load_cadence_config():
         return {
             "goal_cadence": int(block.get("goal_cadence", 50)),
             "wm_slot": str(block.get("wm_slot", "last_l1_skew_check")),
+            "dominance_threshold": float(
+                block.get("dominance_threshold", 0.90)),
+            "share_creep_pp": float(block.get("share_creep_pp", 3.0)),
         }
     except Exception as e:
         print("[l1-skew-check] cadence config read failed: " + str(e),
@@ -283,7 +341,10 @@ def _wm_set(slot, value):
 
 
 def _cadence_gate():
-    """Return True if cadence is crossed and we should fire.
+    """Return (fire, current, cfg, last_slot). fire=True when cadence crossed.
+
+    last_slot is the prior WM slot dict ({} when unset) — carried out so the
+    caller can use its `shares` baseline for share_creep (g-115-2455).
 
     Reads l1_skew_check.goal_cadence and last-fire counter from WM. On first
     fire (slot unset) the diff is capped at the cadence so the ritual reads
@@ -292,7 +353,7 @@ def _cadence_gate():
     """
     cfg = _load_cadence_config()
     if cfg is None:
-        return False, None, None
+        return False, None, None, {}
     current = _count_completed_goals()
     last = _wm_read(cfg["wm_slot"]) or {}
     # Defensive: a legacy/restored slot may hold a bare timestamp string (the
@@ -310,15 +371,91 @@ def _cadence_gate():
     diff = current - last_count
     if last_count == 0:
         diff = min(diff, cfg["goal_cadence"])
+    # Negative-diff self-heal (6 pattern, ported here by 4).
+    # A DOWNWARD count-basis correction (census double-count repair, store
+    # surgery, archival) leaves the stamped slot ABOVE the live count. Without
+    # this branch diff stays negative, `fire` is permanently False, and the
+    # ritual SILENTLY STARVES until the count regrows past the stale stamp.
+    #
+    # The type-guard above (rb-810) fixed a DIFFERENT permanent-disable of this
+    # same ritual — a legacy slot shape that crashed the gate. This is the third
+    # way the same gate can go quietly dead, and it presents identically to a
+    # healthy "cadence not crossed": no crash, no warning, just silence. A gate
+    # that cannot distinguish "not due" from "never again" is not a gate.
+    #
+    # fresh-eyes-cadence-check.py got this heal (6 per-agent,
+    # 1 team-layer); its two siblings (this file, felt-sense-cadence-
+    # check.py) never did. Measured 2026-07-14: felt-sense sat at diff=-335 and
+    # needed 410 more completed goals before it could fire again.
+    #
+    # Re-stamp to the current count and DO NOT fire. Firing here would trade a
+    # starved ritual for one that fires on every basis correction (banner
+    # fatigue, guard-1090). Preserve the last REAL fire timestamp — a
+    # re-baseline is not a fire and must not masquerade as one. _wm_set already
+    # fails safe (logs to stderr, never raises), so a write failure just means
+    # the heal retries on the next cadence check.
+    if diff < 0:
+        # ZERO-GUARD (guard-1091; fresh-eyes-code F-001, 2026-07-14). A FAILED
+        # measurement is not a measurement of ZERO. _count_completed_goals()
+        # returns 0 as a SILENT FAILURE SENTINEL on EVERY error path it has:
+        # subprocess rc != 0, a 10s TimeoutExpired, OSError, and unparseable
+        # stdout ALL `return 0`. That is four routine ways to get a fake zero.
+        #
+        # Re-baselining on it would PERSIST the transient failure as the new
+        # basis (goals_count_at_last_fire=0) and then SPURIOUSLY FIRE next
+        # iteration via the last_count==0 first-fire path. Note the asymmetry:
+        # BEFORE this heal existed a transient 0 was HARMLESS — diff<0 =>
+        # fire=False => noop => NO WRITE => self-recovering. The heal must not
+        # convert a self-recovering error into permanent state corruption.
+        # Noop WITHOUT re-stamping; the next cadence check retries.
+        #
+        # `current == 0` inside `diff < 0` already implies `last_count > 0`, so
+        # this cannot mask a legitimate basis: a real count never falls to zero
+        # (it folds in archives + census and is eviction-invariant). A genuinely
+        # empty store self-heals the moment ONE goal completes (current >= 1
+        # takes the re-baseline below).
+        if current == 0:
+            print(
+                f"[l1-skew-check] negative diff ({diff}) with current=0 vs "
+                f"last={last_count} — FAILED MEASUREMENT, not a real basis "
+                f"(_count_completed_goals returns 0 on subprocess failure/timeout); "
+                f"noop WITHOUT re-stamp — retries next check",
+                file=sys.stderr,
+            )
+            return False, current, cfg, last
+        rebase = {
+            "timestamp": last.get("timestamp", "0000-00-00T00:00:00"),
+            "goals_count_at_last_fire": current,
+            "rebaselined_from": last_count,
+        }
+        # Preserve the share baseline across a re-baseline — a count-basis
+        # correction says nothing about tree shape, and dropping the shares
+        # would blind the next fire's share_creep comparison (5).
+        if isinstance(last.get("shares"), dict):
+            rebase["shares"] = last["shares"]
+        _wm_set(cfg["wm_slot"], rebase)
+        print(
+            f"[l1-skew-check] negative diff ({diff}) — count basis moved backward "
+            f"(last={last_count} > current={current}); re-baselined "
+            f"{cfg['wm_slot']} to {current} — noop this iter"
+        )
+        return False, current, cfg, last
     fire = diff >= cfg["goal_cadence"]
-    return fire, current, cfg
+    return fire, current, cfg, last
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--threshold", type=float, default=5.0,
-                    help="Skew ratio threshold (default: 5.0)")
+                    help="Ratio evidence context carried in the payload "
+                         "(no longer gates flagging — g-115-2455)")
+    ap.add_argument("--dominance-threshold", type=float, default=None,
+                    help="Max L1 share-of-total that flags dominance "
+                         "(default: config or 0.90)")
+    ap.add_argument("--share-creep-pp", type=float, default=None,
+                    help="Percentage-point share growth vs last cadence fire "
+                         "that flags share_creep (default: config or 3.0)")
     ap.add_argument("--post-board", action="store_true",
                     help="Post to coordination channel when any metric flagged")
     ap.add_argument("--markdown", action="store_true",
@@ -331,28 +468,49 @@ def main():
     args = ap.parse_args()
 
     # Cadence gate: check BEFORE doing the read, so the noop path is cheap.
+    prev_slot = {}
+    cfg = None
     if args.cadence:
-        fire, current, cfg = _cadence_gate()
+        fire, current, cfg, prev_slot = _cadence_gate()
         if not fire:
             # Silent noop — periodic callers expect quiet on no-fire.
             sys.exit(1)
         # Fall through to normal flow; record fire AFTER successful stats read.
+
+    # Resolve flag thresholds: CLI > config (cadence mode) > defaults.
+    dominance_threshold = args.dominance_threshold
+    if dominance_threshold is None:
+        dominance_threshold = (cfg or {}).get("dominance_threshold", 0.90)
+    creep_pp = args.share_creep_pp
+    if creep_pp is None:
+        creep_pp = (cfg or {}).get("share_creep_pp", 3.0)
+    # share_creep baseline exists only across cadence fires (the WM slot).
+    prev_shares = prev_slot.get("shares") if isinstance(prev_slot, dict) else None
+    if not isinstance(prev_shares, dict):
+        prev_shares = None
 
     stats = _read_stats()
     if not stats:
         verdict = {
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "threshold": args.threshold,
+            "dominance_threshold": dominance_threshold,
+            "share_creep_pp": creep_pp,
             "findings": [],
             "any_flagged": False,
             "notes": "stats read failed — no skew computation",
         }
     else:
         by_l1 = stats.get("by_l1") or {}
-        findings = compute_skew(by_l1, args.threshold)
+        findings = compute_skew(by_l1, args.threshold,
+                                dominance_threshold=dominance_threshold,
+                                prev_shares=prev_shares,
+                                creep_pp=creep_pp)
         verdict = {
             "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "threshold": args.threshold,
+            "dominance_threshold": dominance_threshold,
+            "share_creep_pp": creep_pp,
             "l1_count": len([k for k in by_l1 if k != "_orphan"]),
             "total_nodes": stats.get("total_nodes", 0),
             "findings": findings,
@@ -380,6 +538,9 @@ def main():
             "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "goals_count_at_last_fire": current,
             "any_flagged": verdict.get("any_flagged", False),
+            # share_creep baseline for the NEXT fire (5)
+            "shares": {f["metric"]: f.get("share", 0.0)
+                       for f in verdict.get("findings", [])},
         }
         _wm_set(cfg["wm_slot"], slot_value)
 

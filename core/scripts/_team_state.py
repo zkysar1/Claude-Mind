@@ -37,6 +37,7 @@ core file.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -85,16 +86,67 @@ def row_path(world_dir, agent: str) -> Path:
     return rows_dir(world_dir) / f"{name}.yaml"
 
 
+# Sibling-row backend overlay (9, 2026-07-11). Each agent's shard is
+# written ONLY on its own box; the own-cloud mirror sweep is PUSH-ONLY, so
+# sibling shards never land in this box's local rows dir. A local-only iterdir
+# therefore composes clone-era fossils for every partner (fleet-wide
+# last_active split-brain: every box read its OWN row fresh and all partners
+# frozen at box-setup values, while S3 held every shard fresh). Fix: overlay
+# the storage backend's view of the rows dir — S3-fresh under OwnCloudBackend,
+# plain local re-reads under LocalBackend (harmless no-op). TTL-cached
+# in-process: the long-lived daemon amortizes to one LIST + N GETs per
+# _BACKEND_ROWS_TTL_S; short-lived CLI imports pay one pull per process. TTL
+# must stay well under the 5-minute cross-agent freshness acceptance bound.
+# Fail-open: any backend error returns {} and compose falls back to local rows
+# + core residuals (the pre-fix behavior). Cache keyed by rows-dir so tests
+# composing multiple tmp worlds in one process never cross-contaminate.
+_BACKEND_ROWS_TTL_S = 120
+_backend_rows_cache: dict = {}  # {rows_dir_str: (monotonic_at, rows_dict)}
+
+
+def _backend_rows(world_dir) -> dict:
+    import time
+    d = rows_dir(world_dir)
+    key = str(d)
+    hit = _backend_rows_cache.get(key)
+    now = time.monotonic()
+    if hit is not None and (now - hit[0]) < _BACKEND_ROWS_TTL_S:
+        return hit[1]
+    rows: dict = {}
+    try:
+        from storage_backend import get_backend  # lazy — import-cycle-proof
+        b = get_backend()
+        for name in b.list_dir(d):
+            if not name.endswith(".yaml"):
+                continue
+            try:
+                doc = yaml.safe_load(b.read_text(d / name, force_fresh=True))
+            except Exception as e:  # noqa: BLE001 — one bad row must not break compose
+                print(f"[_team_state] WARN: unreadable backend row {name}: {e}",
+                      file=sys.stderr)
+                continue
+            if isinstance(doc, dict) and doc:
+                rows[name[:-5]] = doc
+    except Exception as e:  # noqa: BLE001 — overlay is additive, never breaks compose
+        print(f"[_team_state] WARN: backend row overlay unavailable: {e}",
+              file=sys.stderr)
+        return {}
+    _backend_rows_cache[key] = (now, rows)
+    return rows
+
+
 def load_rows(world_dir) -> dict:
     """All row files as {agent_name: row_dict}. Unreadable/non-dict rows are
     skipped loudly on stderr (a corrupt row must not take down every
-    composed read — the owning agent's next stamp rewrites it)."""
+    composed read — the owning agent's next stamp rewrites it). Local rows
+    are overlaid with the backend's (S3-authoritative) sibling rows,
+    per-agent newest-wins — see _backend_rows (g-115-1979)."""
     out: dict = {}
     d = rows_dir(world_dir)
     try:
         entries = sorted(d.iterdir())
     except OSError:
-        return out
+        entries = []
     for p in entries:
         if p.suffix != ".yaml" or not p.is_file():
             continue
@@ -106,17 +158,91 @@ def load_rows(world_dir) -> dict:
             continue
         if isinstance(doc, dict) and doc:
             out[p.stem] = doc
+    for name, row in _backend_rows(world_dir).items():
+        cur = out.get(name)
+        if cur is None or _entry_ts(row) > _entry_ts(cur):
+            out[name] = row
+    return out
+
+
+def _is_owncloud_backend() -> bool:
+    """True when STORAGE_BACKEND names the own-cloud/S3 backend. Mirrors the
+    dispatch in liveness_check.py so both authoritative-read paths agree."""
+    return str(os.environ.get("STORAGE_BACKEND", "local")).strip().lower() in (
+        "own-cloud", "owncloud", "s3")
+
+
+def load_rows_authoritative(world_dir) -> dict:
+    """Row files as {agent: row}, but on the own-cloud backend each peer shard
+    is read FRESH from the authoritative store (S3) rather than the read-through
+    LOCAL mirror.
+
+    Why (g-115-2188 / guard-980; sanctioned pattern cf. liveness_check.py
+    g-115-2149): own-cloud's local shard mirror is conflict-skipped/frozen for
+    PEER shards — a reader never writes a peer's shard, and the local-mirror sync
+    CONFLICT-SKIPS divergent files (g-115-2163) — so plain ``load_rows`` returns
+    stale OR ABSENT peer rows (observed 2026-07-14 on cc-04: bravo/foxtrot local
+    shards 7 days stale; echo/zeta shards absent locally but present + fresh on
+    S3). Any consumer that decides coordination from that (the partner_in_flight
+    double-claim guard) goes permanently blind. This is the SANCTIONED surgical
+    per-consumer authoritative read — the same shape liveness_check.py uses for
+    the liveness verdict, here for the in_flight CONTENT. Only opt-in consumers
+    pay the S3 cost; the hot ``load_rows``/``compose_state`` path is untouched.
+
+    Fail-open at EVERY layer — local backend, backend-init error, S3-list error,
+    or a per-shard read error each degrade to the corresponding ``load_rows``
+    row, so the result is never worse than today's local read.
+    """
+    local = load_rows(world_dir)
+    if not _is_owncloud_backend():
+        return local
+    try:
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from owncloud_backend import OwnCloudBackend
+        be = OwnCloudBackend.from_env()
+    except Exception as e:  # noqa: BLE001 — fail-open to the local mirror
+        print(f"[_team_state] authoritative read unavailable "
+              f"({type(e).__name__}); using local mirror", file=sys.stderr)
+        return local
+    d = rows_dir(world_dir)
+    # Roster from S3 unioned with local: discovers peers whose shard the local
+    # mirror never pulled (echo/zeta on cc-04) which load_rows cannot see.
+    names = set(local)
+    try:
+        for n in be.list_dir(str(d)):
+            n = str(n)
+            if n.endswith(".yaml"):
+                names.add(n[:-5])
+    except Exception as e:  # noqa: BLE001 — S3 list failed; local roster stands
+        print(f"[_team_state] authoritative roster list failed "
+              f"({type(e).__name__}); local roster only", file=sys.stderr)
+    out = dict(local)
+    for name in sorted(names):
+        try:
+            doc = yaml.safe_load(be.read_text(str(d / f"{name}.yaml"),
+                                              force_fresh=True))
+        except Exception as e:  # noqa: BLE001 — keep the local row for this shard
+            print(f"[_team_state] authoritative read of row {name!r} failed "
+                  f"({type(e).__name__}); keeping local row", file=sys.stderr)
+            continue
+        if isinstance(doc, dict) and doc:
+            out[name] = doc
     return out
 
 
 def row_agent_names(world_dir) -> tuple:
-    """Row-file stems only (no YAML parse) — cheap roster source."""
+    """Row-file stems, local ∪ backend (9: local-only stems miss every
+    sibling on push-only-mirror boxes). Backend piece rides the _backend_rows
+    TTL cache, so the parse cost is shared with load_rows."""
     d = rows_dir(world_dir)
     try:
-        return tuple(sorted(p.stem for p in d.iterdir()
-                            if p.suffix == ".yaml" and p.is_file()))
+        local = {p.stem for p in d.iterdir()
+                 if p.suffix == ".yaml" and p.is_file()}
     except OSError:
-        return ()
+        local = set()
+    return tuple(sorted(local | set(_backend_rows(world_dir))))
 
 
 def _entry_ts(entry) -> str:
@@ -129,22 +255,41 @@ def _entry_ts(entry) -> str:
     return max(vals) if vals else ""
 
 
+def _is_retired(entry) -> bool:
+    """Retirement tombstone check (9). A retired row (an agent whose
+    container/identity was decommissioned, e.g. the charlie+delta→foxtrot
+    merge leftovers) is dropped from the composed roster INSTEAD of deleted —
+    shard deletion needs s3:DeleteObject rights fleet boxes don't hold, and a
+    tombstone preserves the audit trail. Self-healing revival: a heartbeat
+    NEWER than retired_at wins (a revived agent's first stamp re-enters the
+    roster without anyone having to clear the sticky retired flag)."""
+    if not isinstance(entry, dict) or not entry.get("retired"):
+        return False
+    retired_at = str(entry.get("retired_at") or "")
+    last_active = str(entry.get("last_active") or "")
+    return not (last_active and retired_at and last_active > retired_at)
+
+
 def compose_agent_status(core_status: dict, rows: dict) -> dict:
     """Merge core-file residual rows with row-file rows: per-agent WHOLE-ROW
     newest-wins, row file winning ties (mirrors
-    coordination_merge._merge_agent_status side-pick semantics). Keys sorted
-    for deterministic output."""
+    coordination_merge._merge_agent_status side-pick semantics). Retired rows
+    (see _is_retired) are dropped from the composed view. Keys sorted for
+    deterministic output."""
     core_status = core_status if isinstance(core_status, dict) else {}
     out: dict = {}
     for name in sorted(set(core_status) | set(rows)):
         core_entry = core_status.get(name)
         row_entry = rows.get(name)
         if row_entry is None:
-            out[name] = core_entry
+            pick = core_entry
         elif core_entry is None:
-            out[name] = row_entry
+            pick = row_entry
         else:
-            out[name] = core_entry if _entry_ts(core_entry) > _entry_ts(row_entry) else row_entry
+            pick = core_entry if _entry_ts(core_entry) > _entry_ts(row_entry) else row_entry
+        if _is_retired(pick):
+            continue
+        out[name] = pick
     return out
 
 

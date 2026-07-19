@@ -92,11 +92,14 @@ SCOPE:
   world/tree-maintenance-log.jsonl via _fileops.locked_append_jsonl (the same
   byte-compatible path the CLI uses).
 
+L1-pick-log telemetry IMPLEMENTED as of g-115-1943 (2026-07-12): add-child,
+batch add-child (per op), and reparent all append via the _l1_pick.py SSOT
+(shared with CLI tree.py) using ctx.paths.meta — fail-open, separate file, no
+_tree.yaml byte impact. The deferral (2026-05-28..2026-07-12) silenced the S9
+pick-rate signal for ~6 weeks while tree writes flowed through this module.
+
 DELIBERATELY NOT YET IMPLEMENTED (tracked in mycelium-api-impl.md risk register):
-  - reparent's L1-pick-log append (_log_l1_pick_for_key, fail-open telemetry to
-    a separate file — does not affect _tree.yaml byte-compat).
-  - L1-pick-log append (fail-open telemetry) and the post-remove dangling-ref
-    sweep (CLI-side cleanup).
+  - the post-remove dangling-ref sweep (CLI-side cleanup).
   - _validate_no_surrogates pre-write check.
   - Multi-tenant commons topology (this writes ctx.paths.world only).
 """
@@ -115,6 +118,7 @@ from .. import file_locks, history, changelog
 from ..agent_paths import assert_not_cruft
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
+from _l1_pick import log_l1_pick  # noqa: E402  # S9 SSOT, 3
 
 
 VALID_OPS = {"add-child", "set", "increment", "remove-child",
@@ -351,6 +355,24 @@ def _merged_config(ctx) -> Dict[str, Any]:
 def _config_d_max(ctx) -> int:
     """Mirror of tree.py:96-98. D_max from tree.yaml + meta overlay."""
     return _merged_config(ctx)["config"]["D_max"]
+
+
+def _config_k_max(ctx) -> int:
+    """Mirror of tree.py:101-107. K_max — max children per node (the Zhong K=4
+    fan-out cap). Raises on missing key (rb-215/rb-275 anti-drift)."""
+    return _merged_config(ctx)["config"]["K_max"]
+
+
+def _config_leaf_cap(ctx) -> int:
+    """Mirror of tree.py:120-133. Per-retrieval-subtree leaf cap, derived from
+    K_max and D_retrieval (K_max^(D_retrieval-1) = 4^3 = 64 at defaults) unless
+    an explicit config.leaf_cap overrides. DERIVED (not a 4th knob) so it can
+    never drift from K_max / D_retrieval — single source of truth (rb-215)."""
+    cfg = _merged_config(ctx)["config"]
+    explicit = cfg.get("leaf_cap")
+    if explicit is not None:
+        return explicit
+    return cfg["K_max"] ** (cfg["D_retrieval"] - 1)
 
 
 def _graduate_node_level(node: Dict[str, Any], competence: Dict[str, Any]):
@@ -795,6 +817,21 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     return child_node
 
 
+# --- PROGRESSION calibration stamp (5; mirror of tree.py) ------------
+# MUST match tree.py._PROGRESSION_STAMP_FIELDS / _stamp_progression byte-for-byte
+# (the byte-compat parity tests enforce CLI<->daemon equality). See tree.py for
+# the full rationale: PROGRESSION-field writers stamp progression_updated_at so
+# the own-cloud _tree.yaml merge keys the PROGRESSION LWW on a signal that
+# advances on a calibration edit (last_updated deliberately does not, 3).
+_PROGRESSION_STAMP_FIELDS = ("confidence", "capability_level", "domain_confidence")
+
+
+def _stamp_progression(node: Dict[str, Any]) -> None:
+    """Bump the PROGRESSION calibration stamp (5). Date-granular to
+    match tree.py._stamp_progression exactly (byte-compat parity)."""
+    node["progression_updated_at"] = date.today().isoformat()
+
+
 def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
                world_path: Path) -> Dict[str, Any]:
     """Non-confidence field set. Confidence is rejected upstream (handler)."""
@@ -804,8 +841,22 @@ def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
     if field == "file" and isinstance(v, str):
         v = _normalize_virtual_path(v, world_path)
     node[field] = v
-    if field != "last_updated":
-        node["last_updated"] = date.today().isoformat()
+    # 5: stamp the PROGRESSION calibration signal (mirror tree.py
+    # cmd_set) so an own-cloud reconcile preserves a data-derived downgrade
+    # instead of reverting it via _merge_field_progression's never-regress tie.
+    if field in _PROGRESSION_STAMP_FIELDS:
+        _stamp_progression(node)
+    # 3 (Option B): do NOT auto-bump per-node last_updated on a
+    # metadata set. node .md front matter is the single source of truth
+    # (); the _tree.yaml index last_updated is synced to it ONLY by
+    # tree-front-matter-sync.py and at node creation. The old auto-bump here
+    # marched the index AHEAD of the .md fm (the index-ahead drift class,
+    # 2 audit). The CLI (tree.py cmd_set) dropped its stamp
+    # 2026-06-28; this daemon path kept it for 19 days — the live write path,
+    # so the Option B fix never actually shipped until the byte-compat parity
+    # tests flagged the divergence (2). Explicit
+    # `set <k> last_updated <d>` still lands via node[field]=v above; the
+    # index-level tree["last_updated"] below is intentionally retained.
     nodes[key] = node
     tree["nodes"] = nodes
     tree["last_updated"] = date.today().isoformat()
@@ -951,6 +1002,57 @@ def _qualifies_for_decomposition(abs_path: str):
     return True, None
 
 
+def _subtree_leaf_counts(nodes):
+    """Verbatim mirror of tree.py:917-954. Map every node key -> number of leaf
+    descendants in its subtree. A leaf counts as 1 (itself); an interior node's
+    count is the sum of its children's counts. Memoized post-order; cycle- and
+    dangling-child-safe (a missing child contributes 0, a back-edge resolves to
+    0 without raising). Drives the K=D=4 retrieval-locality decompose check
+    (g-306-13)."""
+    counts = {}
+    visiting = set()
+
+    def _count(key):
+        if key in counts:
+            return counts[key]
+        node = nodes.get(key)
+        if node is None:
+            return 0
+        children = node.get("children", [])
+        if not children:
+            counts[key] = 1
+            return 1
+        if key in visiting:
+            return 0  # cycle back-edge — contribute 0, let the outer frame finish
+        visiting.add(key)
+        total = 0
+        for child in children:
+            total += _count(child)
+        visiting.discard(key)
+        counts[key] = total
+        return total
+
+    for k in nodes:
+        _count(k)
+    return counts
+
+
+def _node_maintain_exempt(node):
+    """Verbatim mirror of tree.py:974-990. Return the set of maintenance actions
+    a node is durably exempted from via its optional per-node `maintain_exempt`
+    field (g-115-1648). Accepts a list/tuple/set (canonical), a bare string
+    (single action), or absent/None (no exemption). Permissive — an unknown or
+    malformed value yields no exemption (the detector simply never matches)."""
+    raw = node.get("maintain_exempt")
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        return {raw}
+    if isinstance(raw, (list, tuple, set)):
+        return set(raw)
+    return set()
+
+
 def _get_distill_candidates(ctx, tree, include_skipped=False):
     """ctx-aware mirror of tree.py:561-633. Reads pruning thresholds from the
     RAW core/config/tree.yaml (no meta overlay — matches the CLI) and node .md
@@ -1012,61 +1114,68 @@ def _get_distill_candidates(ctx, tree, include_skipped=False):
     return candidates
 
 
-def _get_decompose_candidates(ctx, tree, threshold=50, include_skipped=False):
-    """ctx-aware mirror of tree.py:750-804. Leaf .md files over `threshold`
-    lines, depth < D_max, passing the semantic-structure gate."""
-    d_max = _config_d_max(ctx)
-    leaves = _get_all_leaves(tree)
+def _get_decompose_candidates(ctx, tree, include_skipped=False):
+    """ctx-aware mirror of tree.py:993-1050. STRUCTURAL trigger (): a
+    non-root node is a decompose candidate when its retrieval-subtree leaf count
+    exceeds the leaf cap (K_max^(D_retrieval-1)) — NOT when its .md body exceeds
+    a line count. The line-count trigger is retired per g-306-13 outcome 3
+    (board decision msg-20260619-075228-bravo-086). Root (depth 0) is excluded.
+    Honors maintain_exempt (g-115-1648). Skip-reason enum: is_root,
+    decompose_exempt, within_leaf_cap.
+
+    Ported to the daemon 2026-07-17 (g-115-2481): the g-306-13 migration landed
+    CLI-only and this LIVE production write-path mirror kept the retired
+    line-count logic (reading node .md files, reporting file_not_found/no_file),
+    diverging the record-maintenance run-record's candidates_pre_filter block —
+    the byte-compat parity failure test_byte_compat_record_maintenance_with_run_record
+    caught. Same bug class as g-115-1683/g-115-2422. Structural = no .md read, so
+    file_not_found/read_error are structurally impossible here (cf. tree.py:656)."""
+    leaf_cap = _config_leaf_cap(ctx)
+    nodes = tree.get("nodes", {})
+    leaf_counts = _subtree_leaf_counts(nodes)
     candidates = []
     skipped = []
-    for leaf in leaves:
-        file_path = leaf.get("file", "")
-        depth = leaf.get("depth", 0)
-        key = leaf["key"]
-        if not file_path:
+    for key, node in nodes.items():
+        depth = node.get("depth", 0)
+        if depth < 1:
             if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "no_file"})
+                skipped.append({"node_key": key, "skip_reason": "is_root"})
             continue
-        if depth >= d_max:
+        if "decompose" in _node_maintain_exempt(node):
             if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
+                skipped.append({"node_key": key, "skip_reason": "decompose_exempt"})
             continue
-        abs_path = _resolve_candidate_path(ctx, file_path)
-        if not os.path.exists(abs_path):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
-            continue
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
-        except (OSError, UnicodeDecodeError):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "read_error"})
-            continue
-        if line_count > threshold:
-            qualifies, skip_reason = _qualifies_for_decomposition(abs_path)
-            if qualifies:
-                candidates.append({
-                    "key": key,
-                    "file": file_path,
-                    "line_count": line_count,
-                    "depth": depth,
-                    "growth_state": leaf.get("growth_state", "stable"),
-                })
-            elif include_skipped:
-                skipped.append({"node_key": key, "skip_reason": skip_reason})
+        subtree_leaves = leaf_counts.get(key, 0)
+        if subtree_leaves > leaf_cap:
+            candidates.append({
+                "key": key,
+                "file": node.get("file", ""),
+                "depth": depth,
+                "child_count": len(node.get("children", [])),
+                "subtree_leaves": subtree_leaves,
+                "leaf_cap": leaf_cap,
+                "reason": "leaf_overflow",
+                "recommended_action": "decompose",
+                "growth_state": node.get("growth_state", "stable"),
+            })
         elif include_skipped:
-            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
-    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+            skipped.append({"node_key": key, "skip_reason": "within_leaf_cap"})
+    candidates.sort(key=lambda c: c["subtree_leaves"], reverse=True)
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
 
 
-def _get_redistribute_candidates(ctx, tree, threshold=50, include_skipped=False):
-    """ctx-aware mirror of tree.py:807-865. Interior nodes whose .md body
-    exceeds `threshold` lines and depth < D_max."""
-    d_max = _config_d_max(ctx)
+def _get_redistribute_candidates(ctx, tree, include_skipped=False):
+    """ctx-aware mirror of tree.py:1053-1106. STRUCTURAL trigger (): an
+    interior node is a regroup candidate when it has more than K_max children
+    (the Zhong K=4 fan-out cap) — NOT when its .md body exceeds a line count
+    (retired per g-306-13 outcome 3). Honors maintain_exempt (g-115-1648).
+    Skip-reason enum: no_children, redistribute_exempt, within_k_max.
+
+    Ported to the daemon 2026-07-17 (g-115-2481) — see _get_decompose_candidates
+    for the CLI-only-migration incident. Structural = no .md read."""
+    k_max = _config_k_max(ctx)
     nodes = tree.get("nodes", {})
     candidates = []
     skipped = []
@@ -1075,42 +1184,26 @@ def _get_redistribute_candidates(ctx, tree, threshold=50, include_skipped=False)
         if not children:
             if include_skipped:
                 skipped.append({"node_key": key, "skip_reason": "no_children"})
-            continue
-        file_path = node.get("file", "")
-        depth = node.get("depth", 0)
-        if not file_path:
+            continue  # leaves handled by _get_decompose_candidates
+        if "redistribute" in _node_maintain_exempt(node):
             if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "no_file"})
+                skipped.append({"node_key": key, "skip_reason": "redistribute_exempt"})
             continue
-        if depth >= d_max:
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "depth_at_dmax"})
-            continue
-        abs_path = _resolve_candidate_path(ctx, file_path)
-        if not os.path.exists(abs_path):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "file_not_found"})
-            continue
-        try:
-            with open(abs_path, "r", encoding="utf-8") as f:
-                line_count = sum(1 for _ in f)
-        except (OSError, UnicodeDecodeError):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "read_error"})
-            continue
-        if line_count > threshold:
+        if len(children) > k_max:
             candidates.append({
                 "key": key,
-                "file": file_path,
-                "line_count": line_count,
-                "depth": depth,
+                "file": node.get("file", ""),
+                "depth": node.get("depth", 0),
                 "child_count": len(children),
                 "children": children,
+                "k_max": k_max,
+                "reason": "k_overflow",
+                "recommended_action": "regroup",
                 "growth_state": node.get("growth_state", "stable"),
             })
         elif include_skipped:
-            skipped.append({"node_key": key, "skip_reason": "below_line_threshold"})
-    candidates.sort(key=lambda c: c["line_count"], reverse=True)
+            skipped.append({"node_key": key, "skip_reason": "within_k_max"})
+    candidates.sort(key=lambda c: c["child_count"], reverse=True)
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
     return candidates
@@ -1231,6 +1324,19 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
 
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-add-child {child_key} -> {parent_key}")
+                # S9 pick-log (3): restores the telemetry the tree
+                # daemonization deferred. Fail-open; separate file, no
+                # _tree.yaml byte impact. `nodes` is post-add (child present),
+                # so the L1 walk resolves the fresh node. Path() is guarded:
+                # a None meta (parity-test ctx, misconfigured env) must reach
+                # log_l1_pick's own swallow-to-WARN interior instead of
+                # raising TypeError at the call site — telemetry must never
+                # crash the write path (2).
+                _meta = ctx.paths.meta
+                log_l1_pick(nodes, Path(_meta) if _meta else None,
+                            child_key, "add-child",
+                            source=req.get("encoding_source"),
+                            reason=req.get("encoding_reason"), agent=agent)
                 out = _apply_defaults(child_node)
                 out["key"] = child_key
                 return Response.json({"ok": True, "op": op, "key": child_key,
@@ -1364,8 +1470,9 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
             # two chains can share ancestors and the second pass reads
             # confidences the first pass wrote; order is part of byte-compat.
             # Physical .md moves are NOT performed: reported in `file_moves` for
-            # the caller. The L1-pick-log telemetry (cmd_reparent S9) is
-            # DEFERRED — separate file, no _tree.yaml byte impact.
+            # the caller. The L1-pick-log telemetry (cmd_reparent S9) appends
+            # after the write (3) — separate file, no _tree.yaml byte
+            # impact.
             if op == "reparent":
                 node_key = (req.get("key") or req.get("node") or "").strip()
                 new_parent_key = (req.get("new_parent") or "").strip()
@@ -1483,6 +1590,16 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 _write_tree_locked(
                     path, tree, base_dir, agent,
                     summary=f"tree-reparent {node_key} -> {new_parent_key}")
+                # S9 pick-log (3): the formerly-DEFERRED reparent
+                # telemetry — cross-L1 reparents are the highest-signal
+                # entries. `nodes` is post-reparent, so the walk resolves the
+                # NEW L1 (mirrors the CLI's fresh-read semantics). Fail-open;
+                # None-meta guarded at the call site (2).
+                _meta = ctx.paths.meta
+                log_l1_pick(nodes, Path(_meta) if _meta else None,
+                            node_key, "reparent",
+                            source=req.get("encoding_source"),
+                            reason=req.get("encoding_reason"), agent=agent)
                 return Response.json({
                     "ok": True, "op": op,
                     "reparented": node_key,
@@ -1570,6 +1687,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                      else mutation_ops).append(o)
 
                 updated_keys = set()
+                batch_added_child_keys: List[str] = []  # S9 pick-log, 3
                 propagate_results: List[Dict[str, Any]] = []
                 try:
                     # ---- Phase 1: mutations in order ----
@@ -1611,6 +1729,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                             _apply_add_child(tree, key, child, world_path, agent)
                             updated_keys.add(child_key)
                             updated_keys.add(key)
+                            batch_added_child_keys.append(child_key)
                         elif op_type == "remove-child":
                             child_key = o["child_key"]
                             descendants = _apply_remove_child(
@@ -1648,6 +1767,15 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 tree["last_updated"] = date.today().isoformat()
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-batch ({len(operations)} ops)")
+                # S9 pick-log per add-child in this batch (3; mirrors
+                # cmd_batch's per-op logging). Fail-open; None-meta guarded at
+                # the call site (2).
+                _meta = ctx.paths.meta
+                for _ck in batch_added_child_keys:
+                    log_l1_pick(nodes, Path(_meta) if _meta else None, _ck,
+                                "batch-add-child",
+                                source=req.get("encoding_source"),
+                                reason=req.get("encoding_reason"), agent=agent)
                 updated_nodes: List[Dict[str, Any]] = []
                 for k in updated_keys:
                     if k in tree["nodes"]:
@@ -1708,15 +1836,15 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     distill_detail = _get_distill_candidates(
                         ctx, tree, include_skipped=True)
                     decompose_detail = _get_decompose_candidates(
-                        ctx, tree, _config_threshold(ctx), include_skipped=True)
+                        ctx, tree, include_skipped=True)
                     redistribute_detail = _get_redistribute_candidates(
-                        ctx, tree, _config_threshold(ctx), include_skipped=True)
+                        ctx, tree, include_skipped=True)
                     distill_count = len(distill_detail["candidates"])
                     decompose_count = len(decompose_detail["candidates"])
                 else:
                     distill_count = len(_get_distill_candidates(ctx, tree))
                     decompose_count = len(
-                        _get_decompose_candidates(ctx, tree, _config_threshold(ctx)))
+                        _get_decompose_candidates(ctx, tree))
 
                 post_debt = distill_count + decompose_count
                 if post_debt <= debt_threshold:

@@ -365,3 +365,13 @@ class TestEdgeCases:
             capture_output=True, text=True, timeout=30,
         )
         assert r.returncode == 1
+
+
+if __name__ == "__main__":
+    import pytest
+    # Script-mode entry (run-invisible-suites.sh executes `python3 <file>`).
+    # Without this block the file defined its test classes and exited 0 having
+    # run NOTHING — a vacuous pass in every invisible-suite sweep (2).
+    # SystemExit propagates pytest's exit code (mirrors
+    # test_recurring_close_outcome_origin).
+    raise SystemExit(pytest.main([__file__, "-v"]))

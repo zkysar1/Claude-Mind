@@ -668,6 +668,7 @@ def main() -> int:
     skipped_count = 0
     gap_suppressed_count = 0
     contention_suppressed_count = 0
+    basis_suppressed_count = 0
     session_gap_threshold_h = _load_session_gap_threshold()
     contention_suppress = _load_contention_suppress()
 
@@ -690,6 +691,26 @@ def main() -> int:
             entry["processed"] = True
             entry["dedup_skipped"] = True
             skipped_count += 1
+            continue
+
+        # Emission-side basis classification (0, 0 item b).
+        # canary=False marks an INFORMATIONAL break: the writer
+        # (aspirations_write._streak_break_canary_fields) judged the source
+        # signal-gated (fire_when — vestigial interval) or chronic-late by
+        # its own recent actual cadence (rb-1391 class: interval_hours <<
+        # selector-driven effective cadence, break on nearly every fire).
+        # The record still exists — cargo-cult contract-suppression reads
+        # actual_elapsed_hours from every record — but no Investigate files.
+        # Legacy records without the field (entry.get("canary") is None)
+        # file exactly as before.
+        if entry.get("canary") is False:
+            entry["processed"] = True
+            entry["informational_break"] = True
+            basis_suppressed_count += 1
+            print(f"[streak-break-reflector] basis-suppressed canary for "
+                  f"{goal_id} ({entry.get('basis_reason')}, basis="
+                  f"{entry.get('canary_basis_hours')}h vs interval "
+                  f"{entry.get('expected_interval_hours')}h)")
             continue
 
         # Option A filing gate — session-gap canary suppression (9).
@@ -810,6 +831,7 @@ def main() -> int:
           f"{skipped_count} dedup-skipped, "
           f"{gap_suppressed_count} session-gap-suppressed, "
           f"{contention_suppressed_count} contention-suppressed, "
+          f"{basis_suppressed_count} basis-suppressed, "
           f"{resolved_count} auto-resolved")
     return 0
 

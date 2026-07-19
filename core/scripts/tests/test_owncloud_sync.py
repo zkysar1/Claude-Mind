@@ -96,6 +96,19 @@ class FakeBackend:
         """Write raw bytes to fake S3 for a key (ownership-claim path)."""
         self.s3[str(key)] = data
 
+    def list_objects(self, path):
+        """Flat recursive [(rel_posix, etag, size)] under `path` — models the
+        real backend's paginated ListObjectsV2 WITHOUT Delimiter
+        (owncloud_backend.list_objects, g-115-2268). Walks the S3-SIDE dict,
+        never the local filesystem (guard-919)."""
+        prefix = str(path).replace("\\", "/").rstrip("/") + "/"
+        out = []
+        for k, b in self.s3.items():
+            kk = str(k).replace("\\", "/")
+            if kk.startswith(prefix):
+                out.append((kk[len(prefix):], '"' + _md5(b) + '"', len(b)))
+        return sorted(out)
+
 
 # --- _is_machine_local policy ----------------------------------------------
 @pytest.mark.parametrize("name,prefix,excluded", [
@@ -937,22 +950,62 @@ def test_sync_one_multipart_singlemachine_pushes(tmp_path):
     assert stats["pushed"] == 1 and be.s3[str(f)] == b"local"
 
 
-def test_pull_one_multipart_etag_defers_no_clobber(tmp_path):
-    """PULL-side mirror of the multipart defer: an S3 ETag that is multipart
-    (uncomparable to a content md5) must NOT be classified vs baseline and
-    pulled — that could clobber a local file whose S3 ETag merely became
-    multipart (server-side copy/replication, bytes maybe unchanged). Defer."""
+def test_pull_one_multipart_local_at_baseline_pulls(tmp_path):
+    """1: local == baseline but the S3 ETag is multipart (uncomparable)
+    and S3 moved -> PULL. local==baseline proves nothing unpushed is masked, so the
+    multipart object is S3-authoritative and safe to adopt -- the read-path twin of
+    the 2026-07-02 _overwrite_decision freeze-avoidance fix (owncloud_backend.py
+    L814-828). Before the baseline-gate-first reorder this DEFERRED unconditionally
+    at bind, freezing the file behind a stale cache until the next force_fresh read
+    healed it via _overwrite_decision. Supersedes the prior
+    test_pull_one_multipart_etag_defers_no_clobber, whose local==baseline defer was
+    exactly the over-conservatism this goal removes."""
     be = _MultipartBackend([(tmp_path, "agents")])
     f = tmp_path / "alpha" / "session" / "handoff.yaml"
     f.parent.mkdir(parents=True)
-    f.write_bytes(b"local-v1")
-    be.s3[str(f)] = b"s3-v2"                       # present, multipart etag
+    f.write_bytes(b"old-m2-cache")           # local == baseline (untouched cache)
+    be.s3[str(f)] = b"new-m1-multipart"      # S3 moved; stat() reports it multipart
     stats = _new_pull_stats()
     out = _mod._pull_one(be, f, dry_run=False, stats=stats,
-                         baseline_md5=_md5(b"local-v1"))
-    assert out is None
-    assert stats["multipart_deferred"] == 1 and stats["pulled"] == 0
-    assert f.read_bytes() == b"local-v1"            # local NOT clobbered
+                         baseline_md5=_md5(b"old-m2-cache"))
+    assert stats["pulled"] == 1 and stats["multipart_deferred"] == 0
+    assert f.read_bytes() == b"new-m1-multipart"   # S3 adopted, not deferred
+    assert out == _md5(b"new-m1-multipart")        # new content stamped as baseline
+
+
+def test_pull_one_multipart_no_baseline_pulls(tmp_path):
+    """1 companion: no baseline + local present + S3 multipart ->
+    S3-authoritative at bind -> PULL (matches _overwrite_decision L852-854). Before
+    the reorder the unconditional multipart defer ran first and skipped it."""
+    be = _MultipartBackend([(tmp_path, "agents")])
+    f = tmp_path / "alpha" / "session" / "handoff.yaml"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"leftover")
+    be.s3[str(f)] = b"s3-multipart-truth"
+    stats = _new_pull_stats()
+    out = _mod._pull_one(be, f, dry_run=False, stats=stats, baseline_md5=None)
+    assert stats["pulled"] == 1 and stats["multipart_deferred"] == 0
+    assert f.read_bytes() == b"s3-multipart-truth"
+    assert out == _md5(b"s3-multipart-truth")
+
+
+def test_pull_one_multipart_local_ahead_still_deferred(tmp_path):
+    """1 invariant: multipart is deferred ONLY when local != baseline.
+    Local diverged from baseline (unpushed writes) AND S3 is multipart
+    (uncomparable) -> cannot classify AND must not clobber -> DEFER, local intact.
+    The reorder preserves this rb-2096 protection (the sole surviving bind-time
+    multipart defer -- what the retired defers-no-clobber test guarded, now scoped
+    to the case where deferring is genuinely correct)."""
+    be = _MultipartBackend([(tmp_path, "agents")])
+    f = tmp_path / "alpha" / "session" / "handoff.yaml"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"local-unpushed-edit")    # local != baseline
+    be.s3[str(f)] = b"s3-multipart"
+    stats = _new_pull_stats()
+    out = _mod._pull_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(b"prior-baseline"))
+    assert out is None and stats["multipart_deferred"] == 1 and stats["pulled"] == 0
+    assert f.read_bytes() == b"local-unpushed-edit"   # NOT clobbered
 
 
 # --- sweep --full clobber prevention (the money tests) ---------------------
@@ -1320,6 +1373,49 @@ def test_pull_temp_drained_subdir_pulled(tmp_path):
     assert stats["pulled"] == 2
     assert set(stats["pulled_files"]) == {"temp/live.md", "temp/drained/2026-05-old.md"}
     assert drained.read_bytes() == b"already-drained doc"
+
+
+def test_pull_temp_drained_twin_root_skipped(tmp_path):
+    """1: a root key temp/<name> whose drained twin temp/drained/<name>
+    also exists on S3 is a STALE pre-drain leftover (the sync layer has no
+    move/delete propagation). pull_temp must SKIP the root twin — pulling it would
+    RESURRECT the drained file at the root on every /start (the drain treadmill).
+    The drained copy IS still pulled (archive survives) and a genuine non-twinned
+    root file still pulls (no over-veto)."""
+    agents_root = tmp_path / "agents"
+    be = FakeBackend([(agents_root, "agents")])
+    temp = agents_root / "alpha" / "temp"
+    root_twin = temp / "felt-sense-2026-07-08.md"                 # stale root leftover
+    drained_twin = temp / "drained" / "felt-sense-2026-07-08.md"  # live archive
+    genuine = temp / "fresh-brief.md"                             # real cross-box doc
+    be.s3[str(root_twin)] = b"stale pre-drain body"
+    be.s3[str(drained_twin)] = b"drained archive body"
+    be.s3[str(genuine)] = b"genuine cross-box doc"
+    stats = _mod.pull_temp(be, "alpha", _manifest={}, _new_manifest={})
+    assert stats["skipped_drained_twins"] == 1
+    assert not root_twin.exists(), "stale root twin must NOT be resurrected"
+    assert drained_twin.read_bytes() == b"drained archive body"
+    assert genuine.read_bytes() == b"genuine cross-box doc"
+    assert set(stats["pulled_files"]) == {
+        "temp/drained/felt-sense-2026-07-08.md", "temp/fresh-brief.md"}
+
+
+def test_pull_temp_local_drained_twin_vetoes_root(tmp_path):
+    """The drain->remote-push window: a file drained LOCALLY
+    (temp/drained/<name> exists on disk) but not yet pushed to the remote
+    drained/ prefix, while the remote root twin temp/<name> still exists. The
+    LOCAL drained twin must veto the root pull so the just-drained file is not
+    resurrected before its drained copy reaches S3."""
+    agents_root = tmp_path / "agents"
+    be = FakeBackend([(agents_root, "agents")])
+    temp = agents_root / "alpha" / "temp"
+    (temp / "drained").mkdir(parents=True)
+    (temp / "drained" / "note.md").write_bytes(b"locally drained")  # local only
+    be.s3[str(temp / "note.md")] = b"stale remote root twin"        # remote root
+    stats = _mod.pull_temp(be, "alpha", _manifest={}, _new_manifest={})
+    assert stats["skipped_drained_twins"] == 1
+    assert stats["pulled"] == 0
+    assert not (temp / "note.md").exists(), "local drained twin must veto root pull"
 
 
 def test_pull_temp_empty_no_error(tmp_path):
@@ -1784,6 +1880,208 @@ def test_snapshot_end_to_end_history_store(tmp_path, monkeypatch):
     assert hist.is_dir(), ".history store must be created by the snapshot"
     landed = [p for p in hist.rglob("*") if p.is_file()]
     assert landed, "snapshot must write at least one artifact into .history/"
+
+
+# --- 8: pull sweep (Gap A) + stale-pull (Gap B) + conflict streaks (Gap C)
+def _prime_baselines(be, monkeypatch, tmp_path):
+    """Initial full sweep to establish manifest baselines for the local tree."""
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=True)
+    be.puts.clear()
+
+
+def test_pull_sweep_materializes_peer_created_file(tmp_path, monkeypatch):
+    """Gap A2: a file that exists ONLY in S3 (peer-created, never pulled here)
+    is invisible to the local-walk push sweep forever; pull_sweep materializes
+    it and registers a manifest baseline."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    peer = tmp_path / "world" / "knowledge" / "peer-node.md"
+    be.s3[str(peer)] = b"peer wrote this on another box"
+    stats = _mod.pull_sweep(be)
+    assert peer.read_bytes() == b"peer wrote this on another box"
+    assert stats["pulled"] == 1
+    assert "world/knowledge/peer-node.md" in stats["pulled_files"]
+    manifest = _mod._load_manifest()
+    entry = manifest.get("world/knowledge/peer-node.md")
+    assert entry and entry["md5"] == _md5(b"peer wrote this on another box")
+
+
+def test_pull_sweep_heals_local_mtime_unchanged_s3_moved(tmp_path, monkeypatch):
+    """The goal's NAMED regression case (Gap A1): local file untouched (mtime
+    manifest-skips it on the push sweep) while a peer moved S3 — the push
+    sweep alone never re-examines it; pull_sweep pulls the peer bytes and
+    advances the baseline."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    node = tmp_path / "world" / "knowledge" / "node.md"
+    be.s3[str(node)] = b"peer-advanced body"          # S3 moved; local untouched
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    # Push sweep proves Gap A1: mtime unchanged -> skipped, stale bytes stay.
+    push_stats = _mod.sweep(be, only_root=None, dry_run=False,
+                            use_manifest=True, full=False)
+    assert push_stats["skipped_unchanged"] >= 1
+    assert node.read_bytes() == b"node body"          # still stale
+    # Pull sweep heals it.
+    stats = _mod.pull_sweep(be)
+    assert node.read_bytes() == b"peer-advanced body"
+    assert stats["pulled"] == 1
+    manifest = _mod._load_manifest()
+    assert manifest["world/knowledge/node.md"]["md5"] == _md5(b"peer-advanced body")
+    # Idempotent: second pull is pure in-sync (ETag pre-filter, no re-pull).
+    stats2 = _mod.pull_sweep(be)
+    assert stats2["pulled"] == 0 and stats2["in_sync"] >= 1
+
+
+def test_pull_sweep_never_clobbers_local_ahead(tmp_path, monkeypatch):
+    """Local has unpushed authored changes (differs from baseline) while S3
+    also moved — _pull_one's local-ahead guard must keep the local bytes."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    node = tmp_path / "world" / "knowledge" / "node.md"
+    node.write_bytes(b"my unpushed local edit")
+    be.s3[str(node)] = b"peer bytes"
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    stats = _mod.pull_sweep(be)
+    assert node.read_bytes() == b"my unpushed local edit"
+    assert stats["pulled"] == 0
+    assert stats["local_ahead_skipped"] == 1
+
+
+def test_pull_sweep_skips_machine_local_and_excluded(tmp_path, monkeypatch):
+    """S3 keys under _EXCLUDE_DIRS segments or with machine-local basenames
+    must never pull (the flat LIST bypasses walk-pruning — pull_sweep filters
+    them itself; pulling e.g. changelog.jsonl would clobber a per-machine
+    append log with a peer's)."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    w = tmp_path / "world"
+    be.s3[str(w / "changelog.jsonl")] = b"peer audit log"        # machine-local name
+    be.s3[str(w / ".history" / "snap2.gz")] = b"\x1f\x8b"        # excluded dir
+    be.s3[str(w / "sessions" / "S9" / "x.json")] = b"{}"         # excluded dir
+    stats = _mod.pull_sweep(be)
+    assert not (w / "sessions").exists()
+    assert not (w / ".history" / "snap2.gz").exists()
+    assert (w / "changelog.jsonl").read_bytes() == b"audit\n"    # untouched
+    assert stats["pulled"] == 0
+    assert stats["skipped_machine_local"] >= 3
+
+
+def test_pull_sweep_in_sync_prefilter_skips_head(tmp_path, monkeypatch):
+    """When every S3 ETag equals this box's baseline, the pull sweep must cost
+    LIST-only — zero per-file HEADs (stat calls)."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    calls = {"stat": 0}
+    orig_stat = be.stat
+    be.stat = lambda p: (calls.__setitem__("stat", calls["stat"] + 1),
+                         orig_stat(p))[1]
+    stats = _mod.pull_sweep(be)
+    assert stats["pulled"] == 0
+    assert calls["stat"] == 0, "in-sync pre-filter must avoid per-file HEADs"
+    assert stats["in_sync"] == stats["scanned"] > 0
+
+
+def test_pull_sweep_noop_on_local_backend(tmp_path, monkeypatch):
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    stats = _mod.pull_sweep(be)  # STORAGE_BACKEND unset -> local
+    assert stats["skipped"] == "local backend (no-op)"
+    assert stats["scanned"] == 0
+
+
+def test_sync_one_stale_pulls_under_own_cloud_authority(tmp_path):
+    """Gap B: local == baseline + S3 moved. Under own-cloud authority this is
+    the provably-safe pull (baseline proves nothing unpushed) — heal instead
+    of skip; baseline advances to the pulled content."""
+    f = tmp_path / "world" / "store.md"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"old agreed content")
+    baseline = _md5(b"old agreed content")
+    be = FakeBackend([(tmp_path / "world", "world")])
+    be.s3[str(f)] = b"peer moved this"
+    stats = {"errors": 0, "in_sync": 0}
+    new_md5 = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                             baseline_md5=baseline, multi_machine=True,
+                             own_cloud_authority=True)
+    assert f.read_bytes() == b"peer moved this"
+    assert stats["stale_pulled"] == 1
+    assert new_md5 == _md5(b"peer moved this")
+
+
+def test_sync_one_stale_dry_run_counts_would_pull(tmp_path):
+    f = tmp_path / "world" / "store.md"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"old agreed content")
+    be = FakeBackend([(tmp_path / "world", "world")])
+    be.s3[str(f)] = b"peer moved this"
+    stats = {"errors": 0, "in_sync": 0}
+    out = _mod._sync_one(be, f, dry_run=True, stats=stats,
+                         baseline_md5=_md5(b"old agreed content"),
+                         multi_machine=True, own_cloud_authority=True)
+    assert out is None
+    assert stats["stale_would_pull"] == 1
+    assert f.read_bytes() == b"old agreed content"   # dry-run: untouched
+
+
+def test_sync_one_stale_still_skips_without_own_cloud_authority(tmp_path):
+    """Multi-machine but NOT own-cloud: no single authority — the conservative
+    STALE skip is preserved (pre-g-115-2268 behavior)."""
+    f = tmp_path / "world" / "store.md"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"old agreed content")
+    be = FakeBackend([(tmp_path / "world", "world")])
+    be.s3[str(f)] = b"peer moved this"
+    stats = {"errors": 0, "in_sync": 0}
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(b"old agreed content"),
+                         multi_machine=True, own_cloud_authority=False)
+    assert out is None
+    assert stats["stale_skipped"] == 1
+    assert f.read_bytes() == b"old agreed content"
+
+
+def test_conflict_streaks_surface_after_threshold(tmp_path, monkeypatch):
+    """Gap C: a both-diverged file is conflict-skipped every sweep; after
+    _CONFLICT_STREAK_THRESHOLD consecutive sweeps it surfaces in
+    stats['conflict_persistent'] and the machine-local streak file. Resolving
+    the conflict drops it from the streak file automatically."""
+    roots = _build_tree(tmp_path)
+    be = FakeBackend(roots)
+    _prime_baselines(be, monkeypatch, tmp_path)
+    node = tmp_path / "world" / "knowledge" / "node.md"
+    node.write_bytes(b"local divergent edit")                    # local moved
+    os.utime(node, ns=(2_000_000_000_000_000_000,) * 2)          # bypass mtime-skip
+    be.s3[str(node)] = b"peer divergent edit"                    # S3 moved too
+    results = []
+    for _ in range(_mod._CONFLICT_STREAK_THRESHOLD):
+        stats = _mod.sweep(be, only_root=None, dry_run=False,
+                           use_manifest=True, full=False)
+        results.append(list(stats.get("conflict_persistent") or []))
+        assert stats["diverged_skipped"] == 1
+    assert results[:-1] == [[] for _ in results[:-1]], \
+        "below threshold: no persistent surfacing"
+    assert results[-1] == [str(node)], "at threshold: surfaced"
+    streaks = __import__("json").loads(
+        _mod._conflict_streaks_path().read_text())
+    assert streaks[str(node)] == _mod._CONFLICT_STREAK_THRESHOLD
+    # Resolve the conflict (adopt S3 bytes locally) -> next sweep pushes/agrees
+    # and the streak entry drops out.
+    node.write_bytes(b"peer divergent edit")
+    os.utime(node, ns=(3_000_000_000_000_000_000,) * 2)
+    _mod.sweep(be, only_root=None, dry_run=False, use_manifest=True, full=False)
+    streaks = __import__("json").loads(
+        _mod._conflict_streaks_path().read_text())
+    assert str(node) not in streaks
 
 
 if __name__ == "__main__":

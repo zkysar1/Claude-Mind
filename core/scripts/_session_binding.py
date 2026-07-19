@@ -150,6 +150,36 @@ def _try_phase26_binding(sid: str, project_root: Path) -> Optional[SessionBindin
     return binding
 
 
+def _log_binding_shadow(
+    sid: str, project_root: Path, chosen: str, all_agents: "list[str]"
+) -> None:
+    """Append a greppable record when 2+ agents carry a binding.yaml for one SID.
+
+    Fully guarded — a logging failure MUST NEVER break identity resolution
+    (preserves this module's "no exception escapes" contract). The shadow is
+    the g-115-1814 "one binding.yaml per SID" invariant surviving /start's
+    --retire-legacy retirement (e.g. a foreign binding.yaml synced in AFTER
+    /start ran). resolve_binding now picks deterministically (freshest), so the
+    misattribution is fixed; this record makes the creation-side gap visible.
+    """
+    try:
+        import json
+        from datetime import datetime
+        log_dir = Path(project_root) / "core" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": "binding-shadow-resolved",
+            "sid": sid,
+            "chosen_agent": chosen,
+            "shadow_agents": sorted(set(all_agents)),
+        }
+        with open(log_dir / "binding-shadow.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 def _try_phase26_binding_with_reason(
     sid: str, project_root: Path
 ) -> tuple[Optional[SessionBinding], str]:
@@ -180,6 +210,9 @@ def _try_phase26_binding_with_reason(
         return None, "agents-root-missing"
 
     reason = "binding-yaml-missing"
+    # Collect ALL valid matches rather than returning the first (4).
+    # Each element: (SessionBinding, candidate_path, started_at_for_sort).
+    matches: "list[tuple[SessionBinding, Path, str]]" = []
     for child in children:
         if not child.is_dir():
             continue
@@ -215,16 +248,53 @@ def _try_phase26_binding_with_reason(
         started_at = _coerce_str_field(data.get("started_at"))
         started_by = _coerce_str_field(data.get("started_by"))
 
-        return SessionBinding(
-            session_id=sid,
-            agent=agent_name,
-            mode=mode,
-            started_at=started_at,
-            started_by=started_by,
-            source="binding.yaml",
-        ), ""
+        matches.append((
+            SessionBinding(
+                session_id=sid,
+                agent=agent_name,
+                mode=mode,
+                started_at=started_at,
+                started_by=started_by,
+                source="binding.yaml",
+            ),
+            candidate,
+            started_at or "",
+        ))
 
-    return None, reason
+    if not matches:
+        return None, reason
+    if len(matches) == 1:
+        # Happy path — exactly one binding.yaml for this SID (the 4
+        # invariant holds). Byte-identical to the pre-4 first-match
+        # return.
+        return matches[0][0], ""
+
+    # SHADOW (4): 2+ agents carry a VALID binding.yaml for the SAME
+    # SID — the 4 "one binding.yaml per SID" invariant is violated (a
+    # stale cross-agent binding slipped past /start's --retire-legacy, e.g.
+    # arrived via own-cloud sync AFTER /start ran). The pre-fix code returned
+    # the FIRST match in ar.iterdir() order, which is filesystem-nondeterministic
+    # — so identity resolution silently misattributed (observed 2026-07-19 02:30:
+    # an alpha session resolved to echo → completed_by=echo). Resolve
+    # DETERMINISTICALLY to the freshest session: the newest started_at is the
+    # most recent /start, which --retire-legacy semantics make the current
+    # owner. Tie-break by binding.yaml mtime then agent name so the choice NEVER
+    # depends on iterdir order. Log the shadow so the creation-side gap stays
+    # greppable.
+    def _shadow_sort_key(m: "tuple[SessionBinding, Path, str]"):
+        binding, path, started = m
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (started, mtime, binding.agent)
+
+    matches.sort(key=_shadow_sort_key, reverse=True)
+    winner = matches[0][0]
+    _log_binding_shadow(
+        sid, project_root, winner.agent, [m[0].agent for m in matches]
+    )
+    return winner, ""
 
 
 def _try_legacy_active_agent(sid: str, project_root: Path) -> Optional[SessionBinding]:

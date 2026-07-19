@@ -318,7 +318,9 @@ stale_sentinel:
 #   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
 #                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
 #                (0.5e.5), felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
-#                health-regression-cadence (0.5h), curriculum-cadence (0.5i).
+#                health-regression-cadence (0.5h), curriculum-cadence (0.5i),
+#                evolution-cadence (0.5j), defer-drift-check (0.5b.10),
+#                reason-less-blocked-check (0.5b.11).
 #                All are themselves cadence-gated, so dropping them in tight
 #                zones is safe.
 #
@@ -463,6 +465,12 @@ plateau_detection:
   diminishing_returns_window: 5   # Goals over which to check monotonic decline
   # Learning is measured by aspiration-trajectory.py as: reasoning bank entries,
   # guardrails, pattern signatures, and tree node updates attributed to each goal.
+  # Exemption is RECORD-level, not config-level (7): a maintenance
+  # queue whose normal operating point is ~0 learning velocity carries
+  # `plateau_exempt: true` on its aspiration record (set via
+  # aspirations-update.sh <asp-id> plateau_exempt true). The trajectory
+  # compiler suppresses both flags for exempt records. No ID list here —
+  # aspiration IDs are domain data and do not belong in framework config.
 
 # --- CYCLE DETECTION (AVO-inspired: arXiv 2603.24517) ---
 # Detects when the agent cycles through similar failing approaches across
@@ -480,7 +488,8 @@ cycle_detection:
 # Notify user via forged notification skill or pending-questions when blocked beyond these thresholds.
 # Caller-side cooldown via proactive_escalation_log WM slot prevents spam.
 proactive_escalation:
-  blocker_age_hours: 2          # Phase 0.5b: notify when blocker active > N hours
+  blocker_age_hours: 2          # Phase 0.5b: FIRST-FIRE age — notify when blocker active > N hours (never seen by user yet)
+  re_escalation_hours: 24       # Phase 0.5b.1: minimum hours between REPEAT notifications for the same standing blocker (g-115-2400 — blocker_age_hours previously served both roles, making the protocol letter a 2-hourly re-send)
   b7_notify: true               # B7: notify before exponential backoff sleep
   circuit_breaker_notify: true   # Phase 5.5: notify when circuit breaker fires
   inbox_alert_age_hours:        # Phase 0.5b.1b (g-115-848): notify when an alert-sweep-filed Unblock has aged unclaimed.
@@ -755,10 +764,11 @@ felt_sense:
 
 # --- L1 DISTRIBUTION SKEW CHECK (S1 — Phase 1 of tree taxonomy review) ---
 # Periodic passive check: every N completed goals, compute per-L1 distribution
-# (structural mass, retrieval volume, mature capability mass) and flag skews
-# above `threshold`x via coordination-board post. Surfaces "L1 X has 10x the
-# leaves of L1 Y — is the boundary right?" signals that no other trigger
-# asks. Consumed by /fresh-eyes-tree (S5) when that ritual fires.
+# (structural mass, retrieval volume, mature capability mass) and flag
+# taxonomy-shape defects via coordination-board post: dominance (one L1 holds
+# >= dominance_threshold of a metric's mass), share_creep (dominant L1's share
+# grew >= share_creep_pp points since last fire), empty_l1 (a real L1 has zero
+# nodes). Consumed by /fresh-eyes-tree (S5) when that ritual fires.
 #
 # NOT a user-facing ritual — no email, no pending-question. Quiet on balanced
 # state. Designed to accumulate evidence the taxonomy review can act on.
@@ -766,7 +776,17 @@ felt_sense:
 l1_skew_check:
   goal_cadence: 50              # Every N completed goals — passive observability
   wm_slot: last_l1_skew_check
-  threshold: 5.0                # Skew ratio that triggers a board post
+  threshold: 5.0                # LEGACY: ratio evidence carried in the payload
+                                # only — no longer gates flagging (5:
+                                # a tiny-but-healthy min-denominator L1 made
+                                # max/min unsatisfiable by any taxonomy action)
+  dominance_threshold: 0.90     # Flag when one L1 holds >= this share of a
+                                # metric's total (hoover bucket — a split
+                                # satisfies it; healthy tree measured 0.847
+                                # on 2026-07-17, below the ceiling)
+  share_creep_pp: 3.0           # Flag when the already-majority (>=50%) L1's
+                                # share grew this many percentage points since
+                                # the last cadence fire — degradation trend
   first_fire_offset: 20         # Stagger first-fire so it doesn't collide with
                                 # fresh-eyes (+5) or felt-sense (+15) on a fresh
                                 # seed event — 20 goals out lands distinctly.
@@ -1405,6 +1425,43 @@ quiescence_gate:
     min_delta: 2          # require >= N new goals before running selector
     min_executable: 2     # require selector to return >= N candidates to flag
 
+# --- DRY-IDLE BACKOFF (4, alpha 2026-07-13) — parallel to quiescence ---
+# The DRY state: an iteration finds ZERO executable goals but does NOT qualify
+# for the quiescence gate (no formal blocker_ref to gate on). Before this block,
+# that state fell through to the immediate deadman-pair re-entry — the synchronous
+# Skill(aspirations) beats the 600s wakeup every iteration — so the loop spun at
+# full LLM speed re-deriving "nothing to do", burning tokens with no backoff
+# (observed 2026-07-13 on cc-04). quiescence_gate handles all-blocked-WITH-refs;
+# this handles honestly-nothing-to-do-but-not-formally-blocked. Layer 3
+# (4-c) routes the dry case to the interruptible-sleep bg terminal (the
+# same mechanism quiescence uses) and DROPS the synchronous re-entry (that
+# re-entry IS the spin). This is Layer 1 (4-a): the config + the
+# signals.dry_idle counter schema documented below.
+#
+# COUNTER — loop_state.signals.dry_idle (dynamic sub-slot, sibling of
+# signals.quiescence; created by the dry-idle logic in Layer 2/3, preserved
+# across compaction by compact-restore SKIP_SLOTS — pinned by
+# test_compact_restore_loop_state_shape.py::test_compact_restore_preserves_dry_idle_signals):
+#   streak           : int  consecutive dry iterations (0 = not dry)
+#   last_dry_at      : str  ISO timestamp of the last dry iteration
+#   sleep_total_s    : int  cumulative dry-sleep this session (budget_pct enforcement)
+#   session_start_at : str  per-session reset anchor (mirror quiescence session-rollover)
+#   cap_cycles       : int  consecutive sleeps at max_seconds (optional stop escalation)
+dry_idle_backoff:
+  enabled: true
+  base_seconds: 120        # streak 1 -> 2 min
+  multiplier: 2.0          # exponential
+  max_seconds: 7200        # cap -> 2 h
+  budget_pct: 0.90         # dry sleep may consume up to 90% of session wall-clock
+                           # (genuinely-nothing-to-do warrants a high ceiling;
+                           #  quiescence's 0.40 guards a drainable user-gated queue)
+  reset_on_executable: true
+  stop_after_cap_cycles: null  # null = hold at cap forever (~12 wakes/day, negligible tokens);
+                               # int N = after N cap-level sleeps, route to
+                               # productivity-stop-gate for a graceful drop to assistant
+  # sleep(streak) = min(base_seconds * multiplier**(streak-1), max_seconds)
+  #   streak 1->120s 2->240s 3->480s 4->960s 5->1920s 6->3840s 7+->7200s (capped)
+
 # --- BATCH CALIBRATION SWEEP (Change 3) ---
 # When a single recurring goal hits cargo_cult_threshold, redirect to a
 # batch sweep instead of filing a per-goal Idea. The sweep evaluates EVERY
@@ -1479,18 +1536,20 @@ multi_agent:
   # other agents may pick it up (if the goal has reallocatable: true).
   reallocation_hours: 8             # Hours before unclaimed targeted goals become eligible
 
-# Cross-agent goal SURFACING gate (2026-07-04, 4 follow-up).
+# Cross-agent goal SURFACING gate (ENABLED 2026-07-15, 8; part iii of 4).
 # goal-selector.py collect_cross_agent_candidates pulls pending goals from
-# sibling agent queues where intended_agent == this agent (). That
-# SURFACING half is built; the EXECUTION half (claim/update/complete resolving
-# a sibling's queue) is NOT — the daemon claim endpoint resolves only world +
-# the caller's own-agent queue, so a surfaced sibling-queue goal 404s at claim
-# -> hard selector livelock (6). Until the execution path is wired
-# (filed as a follow-up framework goal), keep surfacing OFF so the selector
-# does not repeatedly surface un-actionable cross-agent work. Flip to true once
-# claim/update/complete resolve sibling queues.
+# sibling agent queues where intended_agent == this agent (), stamping
+# source='cross-agent:<owner>'. The EXECUTION half is now wired: aspirations-select
+# Phase 2.95 splits that source into (effective_source='agent', cross_agent_owner),
+# and aspirations-execute Phase 4 env-prefixes MIND_AGENT=<owner> on the claim so it
+# resolves the OWNER's queue under the owner's identity — no 404, no 6
+# selector livelock. Prereq 7 (cross-agent-write.sh write-back helper,
+# option A) landed; select/execute wiring proven by test_goal_selector_cross_agent_pull.py
+# + test_loop_state_save_cross_agent_owner.py + test_cross_agent_write.py. Flipped ON
+# only after verifying BOTH (a) the wiring above AND (b) >=2 partner agents active
+# (fleet-validation precondition met: bravo + zeta). Reversible: set enabled:false.
 cross_agent_surfacing:
-  enabled: false
+  enabled: true
 
 modifiable:
   multi_agent.dependency_timeout_hours: {min: 12, max: 168, default: 48}
@@ -1523,6 +1582,7 @@ modifiable:
   cycle_detection.lookback_window: {min: 2, max: 5, default: 3}
   # Proactive escalation bounds
   proactive_escalation.blocker_age_hours: {min: 1, max: 8, default: 2}
+  proactive_escalation.re_escalation_hours: {min: 4, max: 168, default: 24}
   # Recurring goal scoring bounds
   recurring.urgency_base: {min: 0.5, max: 3.0, default: 1.5}
   recurring.urgency_log_scale: {min: 0.5, max: 3.0, default: 1.5}
@@ -1761,10 +1821,12 @@ health_regression:
   #   full              — + tiered revert pipeline active (Phase 3, post-calibration)
   #  (2026-07-06): advanced collect-only -> detect-and-report (agent-judgable
   # low-risk step; calibration AND-gate satisfied 2026-07-06, alpha composite 0.7497
-  # trend +0.0026 healthy). Detection sweep now files Investigate goals on health
-  # regressions; NO auto-revert (that is the detect-and-report -> full step, which is
-  # user-paced per health-ledger.md §10 — left for the user to advance).
-  mode: detect-and-report
+  # trend +0.0026 healthy). 2026-07-14: advanced detect-and-report -> full with explicit
+  # in-session user authorization ("I am granting you permission to revert") — the
+  # user-paced step per health-ledger.md §10. Calibration marker at crossing:
+  # days=30 records=475. Tiered revert pipeline now active (Ring 3 auto-revert
+  # gated by revert.confidence_gate below; Ring 1.5/2 route to Unblock goals).
+  mode: full
 
   # --- Composite weights (health-ledger §4). Reused signals from
   # world/productivity-snapshots.jsonl — NOT recomputed. Renormalized over

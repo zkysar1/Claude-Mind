@@ -182,10 +182,12 @@ For each priority change:
 
 ```
 1. Apply the priority change directly — field-merge, no read-modify-write needed:
-   Bash: aspirations-update.sh {asp-id} priority {new-priority}
+   Bash: aspirations-update.sh {asp-id} priority {new-priority} --source world
    # Positional <asp_id> <field> <value>. The daemon (update_aspiration) merges
    # ONLY the named field — `asp[field] = value` — preserving all other
    # aspiration fields. The pre-2026-05-14 stdin full-replacement form is retired.
+   # --source world: this path handles WORLD-queue rows (the dashboard's agent-local
+   # rows route through agent-aspirations-update.sh, which forces --source agent).
 ```
 
 After all updates:

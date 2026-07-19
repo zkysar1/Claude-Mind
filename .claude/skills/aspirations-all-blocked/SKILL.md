@@ -747,9 +747,25 @@ Backoff that ramps "because the partner is silent" is exactly the unverified nar
 the rule prevents.
 
 ```
-BACKOFF_SCHEDULE = [300, 600, 1200, 1800]  # 5min, 10min, 20min, 30min cap
-sleep_index = min(session_signals.consecutive_blocked_sleeps, len(BACKOFF_SCHEDULE) - 1)
-sleep_seconds = BACKOFF_SCHEDULE[sleep_index]
+# Dry-idle curve (g-115-2084-c, Layer 3): every B7 arrival IS the dry state
+# by construction — the selector returned all_blocked (zero executable) and
+# B6.5 did not approve (denied → B6.7 fell through; gate-error → na). The
+# single-writer tick applies the Layer-2 streak transition (interlude reset
+# per reset_on_executable), persists loop_state.signals.dry_idle under the WM
+# lock, and returns the exponential sleep (120s→7200s cap) that replaces the
+# legacy flat schedule. Fail-open: dry=false / enabled=false → legacy schedule.
+Bash: tick=$(py -3 core/scripts/dry-idle-tick.py --executable-count 0 --quiescence-decision denied)
+IF tick.enabled == true AND tick.dry == true:
+    sleep_seconds = tick.sleep_seconds
+    dry_sleep_env = "DRY_SLEEP=1"   # B7.2 prefix — registers the Tier-A bg job
+                                    # (guard-967) WITHOUT quiescence's
+                                    # informational-signal demotion: dry sleeps
+                                    # wake on board activity (criterion 4).
+ELSE:
+    # Tick disabled or fail-open — legacy flat schedule (pre-Layer-3 behavior).
+    BACKOFF_SCHEDULE = [300, 600, 1200, 1800]  # 5min, 10min, 20min, 30min cap
+    sleep_index = min(session_signals.consecutive_blocked_sleeps, len(BACKOFF_SCHEDULE) - 1)
+    sleep_seconds = BACKOFF_SCHEDULE[sleep_index]
 session_signals.consecutive_blocked_sleeps += 1
 wake_at = (now + sleep_seconds seconds) as ISO timestamp
 echo '"{wake_at}"' | Bash: wm-set.sh blocked_sleep_until
@@ -822,11 +838,17 @@ CRITICAL contract (do not weaken):
 # Magic Wand #2 (alpha session-60): when arriving from B6.5 with quiescence
 # approval, prepend QUIESCENCE_SLEEP=1 so interruptible-sleep.sh demotes
 # informational wake signals (board-activity, goal-claim-released — partner
-# activity) without breaking the sleep. From the B7 backoff path,
-# quiescence_sleep_env is unset and the call uses default behavior (all wake
-# signals can break the sleep).
-Bash: {quiescence_sleep_env:-} core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
-RETURN
+# activity) without breaking the sleep. From the B7 dry path (g-115-2084-c),
+# dry_sleep_env carries DRY_SLEEP=1 instead — same Tier-A bg-job registration
+# (stop-hook Gate 2.6 ALLOW, guard-967) but NO informational demotion: partner
+# activity may create claimable work in the dry state, so it wakes the sleep.
+# Legacy fail-open arrivals leave both unset (all wake signals break the sleep,
+# unregistered — pre-Layer-3 behavior).
+Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
+RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call;
+         # the harness re-invokes on completion/wake — no ScheduleWakeup arm,
+         # no synchronous Skill re-entry (that re-entry is the dry spin this
+         # branch exists to stop — g-115-2084).
 ```
 
 > **RETURN-PROTOCOL TRAP — read before you write anything after the Bash call (g-115-770, zeta session 74).**

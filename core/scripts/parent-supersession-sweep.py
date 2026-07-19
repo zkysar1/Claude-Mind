@@ -41,6 +41,18 @@ Heuristic (conservative for v1 — favors precision):
     If >= --min-siblings (default 2) such siblings: P is a supersession
     candidate.
 
+Second lane — structural split-parents (g-115-2603, evidence g-115-2601):
+    Parents titled OTHER than "Apply:" (e.g. "Feature 3 (Tools): ...")
+    qualify when completed siblings carry a DECOMPOSITION BACKREF naming
+    them (origin_signal "decomposition:{parent_id}*" or discovered_by ==
+    parent_id). Guards: ALL backref siblings must be completed (one
+    non-terminal or skipped child = residual scope, no fire); a non-empty
+    parent.blocked_by must consist entirely of completed same-aspiration
+    siblings; and the newest backref completion must be >= --max-age-hours
+    old (grace window). No defer_reason is required on this lane — the
+    canonical g-350-04 shape had none. Result rows carry "lane":
+    "apply" | "structural".
+
 Action modes:
     --report (default): print JSON {candidates: [...], details: [...]}
     --apply: mark each candidate parent as status=completed with
@@ -237,6 +249,78 @@ def _find_superseding_siblings(parent, siblings):
     return out
 
 
+def _find_structural_split_siblings(parent, siblings):
+    """Return completed decomposition-siblings that structurally superseded parent.
+
+    Second candidate lane (g-115-2603, evidence g-115-2601): g-350-04
+    "Feature 3 (Tools): ..." was split into g-350-17+g-350-18 (origin_signal
+    "decomposition:g-350-04-*", both completed same night) but stranded 2 days
+    because the Apply:-title lane above excluded it. Title prefixes are
+    incidental; the DECOMPOSITION BACKREF is the structural signal:
+
+      backref sibling := origin_signal startswith "decomposition:{parent_id}"
+                         OR discovered_by == parent_id
+
+    Guards (precision-first, mirrors the temporal conservatism of
+    _find_superseding_siblings):
+      - No backref siblings at all -> [] (lane does not apply).
+      - ANY backref sibling not status=completed -> [] (split still in
+        flight, or a child was skipped — residual scope may remain; the
+        umbrella must not be auto-closed).
+      - parent.blocked_by non-empty: every listed id must be a completed
+        sibling in this aspiration; an unknown or non-completed dep -> []
+        (the parent is a consumer still waiting, not a superseded umbrella).
+    """
+    pid = parent.get("id") or ""
+    if not pid:
+        return []
+    backrefs = []
+    for s in siblings:
+        if s.get("id") == pid:
+            continue
+        osig = str(s.get("origin_signal") or "")
+        # Boundary-anchored match (fresh-eyes finding, 2026-07-18): a bare
+        # startswith("decomposition:{pid}") prefix-collides when one goal id
+        # is a prefix of another ( vs ) — the longer id's
+        # children would falsely count as the shorter parent's backrefs.
+        if (osig == f"decomposition:{pid}"
+                or osig.startswith(f"decomposition:{pid}-")
+                or s.get("discovered_by") == pid):
+            backrefs.append(s)
+    if not backrefs:
+        return []
+    for s in backrefs:
+        if s.get("status") != "completed":
+            return []
+    blocked_by = parent.get("blocked_by") or []
+    if blocked_by:
+        by_id = {s.get("id"): s for s in siblings}
+        for dep_id in blocked_by:
+            dep = by_id.get(dep_id)
+            if dep is None or dep.get("status") != "completed":
+                return []
+    return [{
+        "id": s.get("id"),
+        "title": s.get("title", ""),
+        "completed_at": s.get("completed_at") or s.get("completed_date"),
+    } for s in backrefs]
+
+
+def _newest_completion_age_hours(siblings_match):
+    """Age in hours since the NEWEST completion among matched siblings, or
+    None if no timestamp parses. Used as the structural lane's grace window:
+    supersession fires only after the finished split has sat for
+    --max-age-hours (a fresher completion may still be mid-handoff)."""
+    newest = None
+    for s in siblings_match:
+        t = _parse_ts(s.get("completed_at"))
+        if t is not None and (newest is None or t > newest):
+            newest = t
+    if newest is None:
+        return None
+    return (dt.datetime.now() - newest).total_seconds() / 3600
+
+
 def _mark_superseded(source, goal_id, sibling_ids):
     """Mark parent as completed with outcome_note. Returns True on success.
 
@@ -311,24 +395,45 @@ def main():
             continue
         # Index siblings once per aspiration (cheap).
         for g in goals:
-            if not _is_apply_goal(g):
-                continue
+            # Two candidate lanes (3):
+            #   apply      — original title-prefix lane (defer_reason required)
+            #   structural — decomposition-backref lane for split-parents
+            #                titled otherwise (no defer_reason required; the
+            #                 shape had none post-reconcile)
+            lane = "apply" if _is_apply_goal(g) else None
+            struct_sibs = []
+            if lane is None:
+                if g.get("status") in ("pending", "in-progress"):
+                    struct_sibs = _find_structural_split_siblings(g, goals)
+                if not struct_sibs:
+                    continue
+                lane = "structural"
             scanned += 1
             if g.get("status") not in ("pending", "in-progress"):
-                continue
-            if not g.get("defer_reason"):
                 continue
             if g.get("deferred_until"):
                 # Structured time gate is authoritative — same skip rule
                 # as defer-recheck.py.
                 continue
-            age_h = _age_hours(g.get("defer_reason_set_at")
-                               or g.get("started")
-                               or g.get("created_at"))
-            if age_h is None or age_h < args.max_age_hours:
-                continue
-            eligible += 1
-            siblings_match = _find_superseding_siblings(g, goals)
+            if lane == "apply":
+                if not g.get("defer_reason"):
+                    continue
+                age_h = _age_hours(g.get("defer_reason_set_at")
+                                   or g.get("started")
+                                   or g.get("created_at"))
+                if age_h is None or age_h < args.max_age_hours:
+                    continue
+                eligible += 1
+                siblings_match = _find_superseding_siblings(g, goals)
+            else:
+                # Structural lane grace window: fire only after the newest
+                # split completion has aged past --max-age-hours (a fresher
+                # completion may still be mid-handoff to the parent).
+                age_h = _newest_completion_age_hours(struct_sibs)
+                if age_h is None or age_h < args.max_age_hours:
+                    continue
+                eligible += 1
+                siblings_match = struct_sibs
             if len(siblings_match) < args.min_siblings:
                 details.append({
                     "goal_id": g.get("id"),
@@ -345,15 +450,17 @@ def main():
                 "goal_id": g.get("id"),
                 "aspiration_id": asp.get("id"),
                 "source": source,
+                "lane": lane,
                 "age_hours": round(age_h, 1),
                 "title": g.get("title", ""),
-                "defer_reason": g.get("defer_reason", "")[:120],
+                "defer_reason": (g.get("defer_reason") or "")[:120],
                 "siblings": siblings_match,
                 "action": "would_mark",
             }
             candidates.append({
                 "goal_id": g.get("id"),
                 "aspiration_id": asp.get("id"),
+                "lane": lane,
                 "siblings": sibling_ids,
             })
             if args.apply:
@@ -363,6 +470,7 @@ def main():
                     applied += 1
                     _append_metric(metrics_path, {
                         "type": "parent_superseded",
+                        "lane": lane,
                         "timestamp": dt.datetime.now().isoformat(
                             timespec="seconds"),
                         "goal_id": g.get("id"),

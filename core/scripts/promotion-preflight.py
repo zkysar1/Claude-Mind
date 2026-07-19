@@ -169,6 +169,114 @@ def classify_direction(
     return "ambiguous"
 
 
+def parse_known_criteria(repo_root: Path) -> set[str] | None:
+    """AST-parse KNOWN_CRITERIA from <root>/core/scripts/goal-selector.py.
+
+    g-115-2525: the selector's code-side criteria manifest, extracted without
+    importing the module (goal-selector.py resolves agent/meta paths at import
+    time — import would bind to THIS box's deployment, and fail entirely on a
+    bare checkout). Returns None when the file or the frozenset literal is
+    absent (pre-manifest selector) — caller skips the contract check.
+    """
+    sel = repo_root / "core" / "scripts" / "goal-selector.py"
+    if not sel.is_file():
+        return None
+    import ast
+    try:
+        tree = ast.parse(sel.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "KNOWN_CRITERIA"
+                        for t in node.targets)
+                and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "id", "") == "frozenset"
+                and node.value.args
+                and isinstance(node.value.args[0], ast.Set)):
+            elts = node.value.args[0].elts
+            if all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                   for e in elts):
+                return {e.value for e in elts}
+    return None
+
+
+def check_weights_contract(src: Path, tgt: Path) -> dict:
+    """Cross-check meta-strategy weight keys against the SOURCE selector's
+    KNOWN_CRITERIA (g-115-2525 part 3).
+
+    Closes the blind spot that let the rb-498-era promotion orphan a weight in
+    prod: meta/ is external and deployment-local, so the framework-path walk
+    above never sees it — yet promoting selector code that no longer computes
+    a criterion the target's meta still weights used to KeyError selection
+    fleet-wide (now degraded to a runtime warning by load_weights, but the
+    mismatch should be caught HERE, before the overwrite).
+
+    Two layers:
+      seed_orphans   — SOURCE seed template (core/config/meta.yaml
+                       initial_state.goal_selection_strategy.weights) keys the
+                       SOURCE selector does not compute. Always checkable;
+                       blocking (a fresh deployment would seed the mismatch).
+      target_metas   — best-effort: each TARGET agents/*/local-paths.conf is
+                       parsed for META_PATH and that live meta's weights are
+                       cross-checked. Reachable only for same-box targets;
+                       unreachable metas are reported informationally (the
+                       load_weights runtime warning covers them on their box).
+    """
+    result: dict = {"checked": False, "seed_orphans": [], "target_metas": []}
+    known = parse_known_criteria(src)
+    if known is None:
+        result["note"] = "source selector has no KNOWN_CRITERIA manifest — check skipped"
+        return result
+    try:
+        import yaml
+    except ImportError:
+        result["note"] = "PyYAML unavailable — check skipped"
+        return result
+    result["checked"] = True
+
+    def weights_of(meta_yaml: Path, dotted: tuple[str, ...]) -> dict | None:
+        try:
+            data = yaml.safe_load(meta_yaml.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        for k in dotted:
+            if not isinstance(data, dict):
+                return None
+            data = data.get(k)
+        return data if isinstance(data, dict) else None
+
+    seed = src / "core" / "config" / "meta.yaml"
+    if seed.is_file():
+        w = weights_of(seed, ("initial_state", "goal_selection_strategy", "weights"))
+        if w:
+            result["seed_orphans"] = sorted(set(w) - known)
+
+    # Foreign-root agents/* glob (same documented pattern as seed-transplant.sh):
+    # the TARGET is another repo root, so the target's own AGENTS_PARENT_DIR
+    # constant cannot be resolved from here — literal "agents" is intentional.
+    for conf in sorted(tgt.glob("agents/*/local-paths.conf")):
+        meta_path = None
+        try:
+            for line in conf.read_text(encoding="utf-8").splitlines():
+                if line.startswith("META_PATH="):
+                    meta_path = Path(line.split("=", 1)[1].strip().strip('"'))
+                    break
+        except OSError:
+            pass
+        entry = {"conf": str(conf), "meta": str(meta_path) if meta_path else None,
+                 "status": "unreachable", "orphans": []}
+        if meta_path:
+            strategy = meta_path / "goal-selection-strategy.yaml"
+            if strategy.is_file():
+                w = weights_of(strategy, ("weights",))
+                if w is not None:
+                    entry["status"] = "checked"
+                    entry["orphans"] = sorted(set(w) - known)
+        result["target_metas"].append(entry)
+    return result
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Promotion preflight drift gate (reconcile, not mirror).")
     ap.add_argument("--source", required=True, help="incoming repo (e.g. ../staging-repo)")
@@ -220,12 +328,23 @@ def main() -> int:
     sa_core, sa_skills, sa_deploy = bucket(diff_source_ahead)
     am_core, am_skills, am_deploy = bucket(diff_ambiguous)
 
+    # Weights contract (5 part 3): meta-strategy weight keys vs the
+    # source selector's KNOWN_CRITERIA. Seed orphans + reachable target-meta
+    # orphans BLOCK (the promotion would land/leave a weight no criterion
+    # computes); unreachable target metas are informational.
+    wc = check_weights_contract(src, tgt)
+    wc_blocking = list(wc.get("seed_orphans") or [])
+    wc_target_orphans = [(e["conf"], e["orphans"])
+                         for e in wc.get("target_metas") or []
+                         if e["status"] == "checked" and e["orphans"]]
+    wc_drift = bool(wc_blocking or wc_target_orphans)
+
     # Blocking drift: target-only core (orphan risk) + target-ahead core (clobber risk)
     # ALWAYS block -- not gated by --strict
     blocking = list(to_core) + list(ta_core)
     if args.strict:
         blocking += am_core  # ambiguous blocks only in strict mode
-    drift = len(blocking) > 0
+    drift = len(blocking) > 0 or wc_drift
 
     if args.json:
         print(json.dumps({
@@ -236,6 +355,7 @@ def main() -> int:
             "ambiguous_core": am_core, "ambiguous_skills": am_skills,
             "deployment_local_differing": sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy)),
             "source_only_core": so_core, "source_only_skills": so_skills,
+            "weights_contract": wc,
             "verdict": "DRIFT" if drift else "CLEAN", "exit": 2 if drift else 0,
         }, indent=2))
         return 2 if drift else 0
@@ -280,6 +400,29 @@ def main() -> int:
     if all_deploy:
         print(f"deployment-local files differing/only (expected, not drift): {', '.join(all_deploy)}")
         print()
+    if wc.get("checked"):
+        if wc_blocking:
+            print("WEIGHTS-CONTRACT ORPHANS (SOURCE seed) -- seed template weights the")
+            print("   source selector does not compute (a fresh deployment would seed the")
+            print("   mismatch). Fix core/config/meta.yaml or restore the criteria:")
+            for k in wc_blocking:
+                print(f"     {k}")
+            print()
+        for conf, orphans in wc_target_orphans:
+            print(f"WEIGHTS-CONTRACT ORPHANS (target meta via {conf}) -- live weights the")
+            print("   incoming selector does not compute (the rb-498 orphaned-weight class).")
+            print("   Remove the weight in the target meta or restore the criteria:")
+            for k in orphans:
+                print(f"     {k}")
+            print()
+        unreachable = [e for e in wc.get("target_metas") or [] if e["status"] != "checked"]
+        if unreachable:
+            print(f"weights-contract: {len(unreachable)} target meta(s) unreachable from this box "
+                  f"(cross-box target — load_weights' runtime warning covers them there)")
+            print()
+    elif wc.get("note"):
+        print(f"weights-contract: {wc['note']}")
+        print()
     print(f"normal promotion payload (source-only): {len(so_core)} core + {len(so_skills)} skills")
     print()
 
@@ -287,6 +430,7 @@ def main() -> int:
         print(f"VERDICT: DRIFT DETECTED -- {len(to_core)} orphan-risk"
               + (f" + {len(ta_core)} target-ahead" if ta_core else "")
               + (f" + {len(am_core)} ambiguous(strict)" if args.strict and am_core else "")
+              + (f" + weights-contract orphans (seed:{len(wc_blocking)}, target-metas:{len(wc_target_orphans)})" if wc_drift else "")
               + " framework file(s).")
         print("         Promotion would lose target-ahead content. Reconcile before overwriting. (exit 2)")
         if not args.strict and am_core:

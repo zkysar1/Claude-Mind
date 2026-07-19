@@ -6,20 +6,23 @@ tree node references in the summary produced no helpful signal at all.
 Across 655 leaves on alpha's tree at audit time, 0/655 carried
 times_helpful>0 — every retrieval-bumped node sat at utility_ratio=0.
 
-The new scan extracts kebab-case tokens from --summary, validates them
-against existing _tree.yaml node keys, and increments
-times_inferred_helpful (the half-weight counter, mirroring --infer
-semantics — citation is a weaker signal than explicit attestation).
+The scan extracts kebab-case tokens from --summary, validates them against
+existing _tree.yaml node keys, and increments times_inferred_helpful (the
+half-weight counter, mirroring --infer semantics — citation is a weaker
+signal than explicit attestation).
 
-This test isolates the scan logic by:
-  1. Building a minimal temp _tree.yaml with three nodes.
-  2. Setting MIND_WORLD to the temp dir so tree-update.sh routes there.
-  3. Running journal-append.sh with a summary that mentions one of the
-     three keys plus several non-key kebab tokens.
-  4. Asserting only the matching key got its times_inferred_helpful
-     bumped; non-matching tokens did not corrupt the tree.
+Transport (g-115-2351 rewrite): the scan's write half is
+`tree-update.sh --increment`, a DAEMON-ONLY wrapper. On a `.mind-data/` box
+the LIVE daemon resolves EVERY agent to the live world before consulting
+local-paths.conf (agent_paths._resolve_src tier order: env -> .mind-data ->
+conf), so the old shape — seed a conf, talk to the live daemon — could
+never sandbox the write (observed: node_not_found against the LIVE tree,
+silenced by the scan's fail-open `>/dev/null || true`, tmp tih stayed 0;
+the quarantined red). The repair drives an in-process DaemonFixture daemon
+rooted in a tmp project (no .mind-data, MIND_WORLD pinned to the fixture
+world) and points the journal-append.sh subprocess at it via RT_DIR.
 
-Self-contained: never touches the live tree.
+Self-contained: never touches the live tree or the live daemon.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
+sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
     import yaml
@@ -42,15 +46,10 @@ except ImportError:
     print("PyYAML required: pip install pyyaml", file=sys.stderr)
     sys.exit(2)
 
-
-# Resolve bash via shared helper (, 2026-05-16). See
-# core/scripts/tests/_bash_helpers.py for the canonical resolution
-# priority (MIND_SHELL → Git-Bash candidates → shutil.which) and the
-# detailed rationale (the WSL-bash failure mode that motivated this
-# helper). This file's previous local _resolve_bash docstring is the
-# ancestor of the shared helper's module docstring.
-sys.path.insert(0, str(SCRIPT_DIR))
+# Resolve bash via shared helper (). See _bash_helpers.py for the
+# canonical resolution priority and the WSL-bash failure mode it works around.
 from _bash_helpers import BASH  # noqa: E402
+from _daemon_fixture import DaemonFixture  # noqa: E402
 
 
 def _seed_tree(world_dir: Path) -> None:
@@ -114,23 +113,19 @@ def _read_tree(world_dir: Path) -> dict:
         return yaml.safe_load(f)
 
 
-def _seed_minimal_paths_conf(repo_root: Path, world_dir: Path) -> Path:
-    """Create a temp agent dir with local-paths.conf so _paths.sh resolves
-    WORLD_DIR to our scratch dir. Hyphenated agent name is intentional —
-    matches the rest of the project conventions."""
-    agent_dir = repo_root / "test-journal-cite-agent"
+def _seed_real_repo_agent(repo_root: Path, world_dir: Path, meta_dir: Path) -> Path:
+    """journal-append.sh writes the journal under the REAL repo's
+    agents/<MIND_AGENT>/ (its _paths.sh agent_dir), so a real-repo test
+    agent dir must exist. Post-relocation layout: under agents/ parent
+    (g-115-960 polluter class; g-115-2351)."""
+    agent_dir = repo_root / "agents" / "test-journal-cite-agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
-    # Forward slashes only — _paths.sh sources this verbatim and bash
-    # treats backslashes as escape sequences. CLAUDE.md says the same.
     conf_text = (
-        f"# auto-generated test config — safe to delete\n"
+        "# auto-generated test config — safe to delete\n"
         f"WORLD_PATH={world_dir.as_posix()}\n"
-        f"META_PATH={(world_dir.parent / 'meta').as_posix()}\n"
+        f"META_PATH={meta_dir.as_posix()}\n"
     )
     (agent_dir / "local-paths.conf").write_text(conf_text, encoding="utf-8")
-    # Also seed a session dir + journal/ skeleton so journal-append doesn't
-    # error on missing parents (it creates parents itself but the active_context
-    # read needs SOMETHING to look at; the wm_read.sh fallback handles missing).
     (agent_dir / "session").mkdir(parents=True, exist_ok=True)
     (agent_dir / "journal").mkdir(parents=True, exist_ok=True)
     return agent_dir
@@ -145,45 +140,37 @@ def main() -> int:
 
     agent_dir = None
     try:
-        agent_dir = _seed_minimal_paths_conf(PROJECT_ROOT, world_dir)
+        agent_dir = _seed_real_repo_agent(PROJECT_ROOT, world_dir, meta_dir)
 
-        # Run journal-append.sh with a summary mentioning ONE valid key plus
-        # several kebab-case decoys (none of which exist in the seeded tree).
-        # The decoys exercise the validation step — pre-fix, any kebab token
-        # would have been bumped against tree-update.sh which would have
-        # exited 1 silently per node (wasted spawns; no corruption since
-        # tree-update rejects unknown keys), so this test verifies the
-        # validation pre-filter narrows to actual matches.
         summary = (
             "Encoded findings to alpha-test-node — touched fail-open path. "
             "Investigated post-execution flow and pre-commit-hook race. "
             "Did not touch bravo-test-node this iteration."
         )
-        env = os.environ.copy()
-        env["MIND_AGENT"] = agent_dir.name
-        # _paths.sh reads MIND_AGENT to find <agent>/local-paths.conf.
-        env["MIND_WORLD"] = world_dir.as_posix()
 
-        # Use POSIX path form for the script path. Windows backslashes get
-        # mangled when bash interprets the argv as a single string and the
-        # PATH-resolved bash on this machine swallows the backslashes (the
-        # observed failure mode: `/bin/bash: C:<WORKSPACE>GitHub...`). Relative
-        # path from PROJECT_ROOT cwd is portable.
-        script_rel = (CORE_SCRIPTS / "journal-append.sh").relative_to(PROJECT_ROOT)
-        result = subprocess.run(
-            [
-                BASH,
-                script_rel.as_posix(),
-                "--goal", "g-test-001",
-                "--outcome-class", "deep",
-                "--summary", summary,
-            ],
-            capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT),
-            timeout=30,
-        )
+        with DaemonFixture(world_dir, agent="test-journal-cite-agent") as df:
+            # os.environ now carries the fixture pins (__enter__): RT_DIR ->
+            # fixture daemon.port, MIND_AGENT, STORAGE_BACKEND=local,
+            # MIND_WORLD -> tmp world. The subprocess copy inherits them so
+            # journal-append.sh's CLI half (scan against tmp _tree.yaml) and
+            # its daemon half (tree-update.sh --increment via RT_DIR) both
+            # land on the fixture world.
+            env = os.environ.copy()
+            env["MIND_META"] = meta_dir.as_posix()
 
-        # Surface stderr regardless of pass/fail — useful for debugging
-        # journal-merge / journal-add fail-open paths that print warnings.
+            script_rel = (CORE_SCRIPTS / "journal-append.sh").relative_to(PROJECT_ROOT)
+            result = subprocess.run(
+                [
+                    BASH,
+                    script_rel.as_posix(),
+                    "--goal", "g-test-001",
+                    "--outcome-class", "deep",
+                    "--summary", summary,
+                ],
+                capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT),
+                timeout=60,
+            )
+
         if result.stderr:
             sys.stderr.write(f"[journal-append stderr]\n{result.stderr}\n")
 
@@ -191,7 +178,7 @@ def main() -> int:
             print(f"FAIL: journal-append exited rc={result.returncode}", file=sys.stderr)
             return 1
 
-        # Verify the citation scan landed.
+        # Verify the citation scan landed in the FIXTURE world.
         tree = _read_tree(world_dir)
         nodes = tree["nodes"]
         alpha_tih = nodes["alpha-test-node"].get("times_inferred_helpful", 0)
@@ -202,27 +189,27 @@ def main() -> int:
             print(f"FAIL: alpha-test-node times_inferred_helpful expected 1, got {alpha_tih}",
                   file=sys.stderr)
             return 1
-        # bravo was MENTIONED in the summary ("Did not touch bravo-test-node this iteration")
-        # — and the scan does substring matching (it doesn't read intent). This is
-        # acceptable: the scan is purposely simple. The half-weight signal is
-        # designed to compose with other signals; false positives here mean the
-        # node had SOME relevance to the goal, just maybe negative — which a
-        # half-weight counter ill-represents but doesn't catastrophically corrupt.
+        # bravo was MENTIONED in the summary ("Did not touch bravo-test-node...")
+        # — the scan does substring matching (it doesn't read intent). This is
+        # acceptable: the half-weight signal composes with other signals;
+        # a false positive means the node had SOME relevance to the goal.
         if bravo_tih != 1:
             print(f"FAIL: bravo-test-node times_inferred_helpful expected 1 "
                   f"(scan does substring match — 'Did not touch bravo-test-node' counts), "
                   f"got {bravo_tih}", file=sys.stderr)
             return 1
 
-        # utility_ratio should reflect the bump: (0 + 0.5*1) / 5 = 0.1
+        # utility_ratio reflects the bump: (0 + 0.5*1) / 5 = 0.1. Tree nodes
+        # deliberately KEEP the max(rc, 1) denominator (9 changed
+        # only rb/guardrails — tree th<=rc precondition holds).
         expected_ur = round((0 + 0.5 * 1) / 5, 4)
         if alpha_ur != expected_ur:
             print(f"FAIL: alpha-test-node utility_ratio expected {expected_ur}, got {alpha_ur}",
                   file=sys.stderr)
             return 1
 
-        # Verify the decoys ("fail-open", "post-execution", "pre-commit-hook")
-        # did NOT appear as new nodes — the validator should have rejected them.
+        # Decoys ("fail-open", "post-execution", "pre-commit-hook") must NOT
+        # appear as new nodes — the validator rejects non-key tokens.
         decoy_keys = {"fail-open", "post-execution", "pre-commit-hook"}
         intruders = decoy_keys & set(nodes.keys())
         if intruders:
@@ -231,8 +218,8 @@ def main() -> int:
             return 1
 
         print(f"PASS: journal-append tree-cite scan bumped alpha-test-node "
-              f"(tih=0→1, ur=0→{expected_ur}); decoys rejected; substring "
-              f"semantics confirmed.")
+              f"(tih=0→1, ur=0→{expected_ur}) through the fixture daemon; "
+              f"decoys rejected; substring semantics confirmed.")
         return 0
 
     finally:

@@ -39,6 +39,32 @@ When forming a negative conclusion about capabilities, features, or possibilitie
    — Tier 1 (tree) → Tier 2 (codebase) → Tier 3 (web search) before concluding
    something doesn't exist.
 
+6. **Search the GOAL QUEUE — not just the code** (added 2026-07-14, zeta). A large
+   class of invocations lives in a **recurring goal's `description`**, never in
+   `.claude/skills/`, `core/config/`, or `core/scripts/*.sh`. Grepping only the code
+   surfaces and concluding "nothing invokes this / this detector has no consumer" is a
+   **structurally guaranteed false negative** for every goal-queue-driven sweep.
+
+   Before any "nothing runs X / X has no consumer / X was built and abandoned" claim:
+   ```bash
+   # search DESCRIPTIONS, not just titles — the invocation lives in the body
+   py -3 -c "import json,sys; sys.path.insert(0,'core/scripts'); from _paths import WORLD_DIR; import os; \
+   [print(g['id'],'|',g.get('title','')[:60]) for r in (json.loads(l) for l in open(os.path.join(str(WORLD_DIR),'aspirations.jsonl'),encoding='utf-8') if l.strip()) \
+    for g in (r.get('goals') or []) if '<script-or-tool-name>' in json.dumps(g)]"
+   ```
+   **`aspirations-query.sh --contains` is NOT sufficient** — it matches TITLES only, so it
+   returns empty for a script named solely in a description. An empty result from it is a
+   silent-failure negative (`verify-before-assuming` rule 4: a silently-empty command is
+   ZERO signals, not one), *not* a confirming second signal. Two weak signals drawn from
+   the same blind spot are not two signals.
+
+   Canonical incident (2026-07-14, zeta fresh-eyes): grepped skills/config/scripts for
+   `fixture-leak-scan.py`, found nothing, and wrote "a working detector with ZERO
+   consumers" into a briefing. It is in fact wired to **g-115-1651** (recurring, 24h) via
+   that goal's Step 2, and had run **that same morning**. The empty
+   `--contains "fixture-leak"` query was read as corroboration; it only ever searched
+   titles. Caught by the goal-duplication gate, not by the agent.
+
 ## Trigger Phrases
 
 Apply this protocol whenever the agent is about to output or act on:
@@ -49,6 +75,8 @@ Apply this protocol whenever the agent is about to output or act on:
 - "We'd need to build..."
 - "Not possible with current..."
 - "Doesn't support..."
+- "Nothing invokes this" / "this has no consumer" / "this was built and never wired"
+  (→ rule 6 above: search the goal queue's DESCRIPTIONS before asserting)
 
 ## Anti-Patterns
 

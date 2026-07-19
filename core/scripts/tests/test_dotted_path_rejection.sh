@@ -34,6 +34,12 @@
 
 set -uo pipefail
 
+# Pin storage backend to local so subprocess writes (aspirations.py, experience.py)
+# never inherit an ambient STORAGE_BACKEND=own-cloud and collide on a production
+# S3 key — the isolated MIND_WORLD tmp dir below only redirects LocalBackend
+# paths, not own-cloud's customer_prefix+env_id+filename S3 key (guard-955, rb-3208).
+export STORAGE_BACKEND=local
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../_paths.sh"
 

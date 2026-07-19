@@ -277,7 +277,13 @@ def cmd_graduate(args):
 
     found = False
     for monitor in monitors:
-        if monitor["meta_change_id"] == args.change_id:
+        # active_monitors mixes weight-monitors (meta_change_id) with evolution
+        # monitors (monitor_kind/revision_id, NO meta_change_id). .get() skips
+        # the latter, mirroring cmd_check's EVOLUTION_KINDS skip (7);
+        # graduate was the sibling that fix missed — an unguarded subscript
+        # KeyError'd the whole endpoint on any co-resident evolution monitor,
+        # breaking graduate fleet-wide (7).
+        if monitor.get("meta_change_id") == args.change_id:
             monitor["status"] = "graduated"
             found = True
             break
@@ -646,6 +652,8 @@ def _email_rollback(rollback_entry):
         "Title": subject,
         "InfoMessage": subject,
         "Body": body,
+        # Provenance stamp — email-send.sh refuses payloads without it (6).
+        "XPayloadProvenance": "meta-backpressure/v1",
     }
     email_script = (WORLD_DIR / "scripts" / "email-send.sh").as_posix()
     env = os.environ.copy()

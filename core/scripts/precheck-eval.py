@@ -155,8 +155,11 @@ def _run_script(args, input_text=None, timeout=30):
 # ─────────────────────────────────────────────────────────────────────────
 
 def cmd_zombies(args, config, compact):
-    """Detect aspirations with high completion but blocked-stale trailing goals.
+    """Detect zombie aspirations: blocked-stale tails AND all-terminal never-closed.
 
+    Two kinds (discriminated by entry["kind"]): `blocked_stale` — high completion
+    with only blocked-and-stale goals remaining; `all_terminal` — every
+    non-recurring goal terminal but the aspiration never closed (g-115-2584).
     Mirrors aspirations-precheck/SKILL.md Phase 0.5.0a. Does NOT route to
     complete-review — emits a `zombies[]` list and a `needs_complete_review`
     flag. The orchestrator invokes /aspirations-complete-review per entry.
@@ -176,13 +179,35 @@ def cmd_zombies(args, config, compact):
 
     for asp in active:
         goals = asp.get("goals", [])
-        if any(g.get("recurring") for g in goals):
-            continue
+        has_recurring = any(g.get("recurring") for g in goals)
         non_recurring = [g for g in goals if not g.get("recurring")]
         if not non_recurring:
             continue
         unfinished = [g for g in non_recurring if g.get("status") not in TERMINAL_STATUSES]
-        if not non_recurring or not unfinished:
+        if not unfinished:
+            # All-terminal class (4): every non-recurring goal is
+            # terminal yet the aspiration is still active. The in-loop closer
+            # (complete-review at the completing goal's iteration close) is a
+            # moment-in-time trigger — sweep-completions, cross-box closes, and
+            # autocompact at the closing moment all miss it, and nothing
+            # re-visited (census 2026-07-18: 10 such aspirations, oldest ~2mo).
+            # complete-review discriminates the sub-shapes itself: no recurring
+            # → fully-complete close; recurring riders → functionally-complete
+            # stamp. A present stamp is the sanctioned documented-hold — skip.
+            if has_recurring and asp.get("functionally_complete_at"):
+                continue
+            nonrec_total, nonrec_completed = effective_counts(asp, include_recurring=False)
+            zombies.append({
+                "aspiration_id": asp.get("id"),
+                "title": asp.get("title"),
+                "source": asp.get("source", "agent"),
+                "kind": "all_terminal",
+                "completion_ratio": round(nonrec_completed / nonrec_total, 3) if nonrec_total else 0.0,
+                "blocked_goal_ids": [],
+                "has_recurring": has_recurring,
+            })
+            continue
+        if has_recurring:
             continue
         # Census-augmented (B9-deep): archived completed/abandoned goals still
         # count toward the zombie completion ratio, so eviction can't make a
@@ -210,6 +235,7 @@ def cmd_zombies(args, config, compact):
             "aspiration_id": asp.get("id"),
             "title": asp.get("title"),
             "source": asp.get("source", "agent"),
+            "kind": "blocked_stale",
             "completion_ratio": round(completion_ratio, 3),
             "blocked_goal_ids": [g.get("id") for g in unfinished],
         })
@@ -578,8 +604,8 @@ def cmd_cycles(args, config, compact):
         # 1 (2026-05-27) REMOVED the  synthetic-tag branch
         # (`or "synthetic" in g.get("tags")`). It was DEAD in production: the
         # live compact projection (_COMPACT_GOAL_KEEP in
-        # mind_api/src/endpoints/aspirations.py — the daemon duplicate of the
-        # now-orphaned CLI COMPACT_GOAL_KEEP) strips `tags`, so cmd_cycles
+        # mind_api/src/endpoints/aspirations.py — the SSOT; the orphaned CLI
+        # COMPACT_GOAL_KEEP copy was retired 9) strips `tags`, so cmd_cycles
         # always saw g.get("tags") == None here and the branch never matched on
         # real compact data. The  "confirmed via simulation" used
         # hand-injected tags that bypassed the projection (false-confidence,
@@ -595,13 +621,107 @@ def cmd_cycles(args, config, compact):
         # below STAYS — `title` survives the projection, so it is genuinely live.
         # Migration skip-by-design FPs () are a separate live concern;
         # if they recur, address with a dedicated mechanism, not tag-resurrection.
+        # 5: also exclude NEVER-ATTEMPTED skips. A failure requires an
+        # attempt — 96.5% of live skipped goals (109/113) carry no attempt marker
+        # (they are WITHDRAWN: duplicate/superseded/obsolete/misrouted, skipped
+        # straight from pending by a dedup sweep, never claimed). Only a skip that
+        # WAS attempted (carries `started`, stamped at goal-CLAIM time by
+        # aspirations_write.py) is genuine failure evidence. Without this a dedup
+        # sweep in ANY active aspiration trips a phantom repeated_failure (it did
+        # on ). `started` survives the compact projection (it is in
+        # _COMPACT_GOAL_KEEP), so cmd_cycles sees it here. A naive filter on
+        # `started` ALONE was reverted under 1 because `started` had no
+        # writer then — genuine failures also lacked it; making it truthful at
+        # claim time (5) is the prerequisite that makes this exclusion
+        # safe. test_never_attempted_skips_no_cycle + the (now `started`-carrying)
+        # genuine tests pin both directions.
         resolved = [
             g for g in resolved
             if not (
                 g.get("status") == "skipped"
-                and (g.get("title") or "").strip().startswith("Unblock:")
+                and (
+                    (g.get("title") or "").strip().startswith("Unblock:")
+                    or not g.get("started")
+                )
             )
         ]
+        # 7 (2026-07-16, zeta): exclude recurring goals from the window.
+        # Recurring cadence goals (e.g. "Reflect and journal", "Review and resolve
+        # hypotheses") re-resolve perpetually by design, share one category within
+        # their aspiration, are NOT primitive-prefixed (so the all_primitives
+        # suppression below never catches them), and their routine closes produce
+        # rb/tree encodings only sometimes — so a recurring-heavy stretch
+        # systematically false-positives as zero_learning_velocity (fired 07-15 on
+        # a g-001-* routine-close run while the session's overall deep ratio was
+        # 69%). Recurring-goal pathology (staleness, cargo-cult closes) has its own
+        # dedicated detector (cargo-cult-detector.py via recurring-close.sh) — this
+        # cycle detector owns non-recurring learning-intent goals. `recurring` is
+        # in _COMPACT_GOAL_KEEP (verified live, not a 1 dead-branch field);
+        # the completion_ratio block below already relies on it the same way.
+        resolved = [g for g in resolved if not g.get("recurring")]
+        # 1 (2026-07-14, zeta) — WHY THERE IS NO never-attempted FILTER HERE,
+        # and what a future agent must build FIRST before adding one.
+        #
+        # This detector treats `skipped` as failure evidence. It is not: a skip can
+        # be WITHDRAWN work (byte-identical duplicate, superseded, obsolete,
+        # misrouted) which was never attempted at all. A failure requires an attempt.
+        # Canonical incident: alpha overrode the (correct) duplication gate 3x with
+        # one boilerplate justification, landing 3 byte-identical Pearl P3-4 goals
+        # (/46/47); the dupes were correctly dedup-skipped 4 min later,
+        # never claimed. Those 3 skips filled this lookback window and tripped
+        # repeated_failure on  — the team's PRIMARY strategic aspiration —
+        # auto-filing a phantom Investigate that pulled an agent off strategic work.
+        #
+        # CORRECTION (7-t, same day): the paragraph that stood here was
+        # WRONG on its central claim, and the error is instructive enough to keep.
+        # It asserted that `started` "has NO WRITER on the goal path — nothing sets
+        # it when a goal is claimed or executed," and inferred that from a grep that
+        # came back empty. The grep was empty because it searched for a HARDCODED
+        # writer. The real writer was the LLM: aspirations-loop-digest.md Phase 4
+        # instructed "aspirations-update-goal.sh status in-progress; started today",
+        # which reaches the field through the GENERIC setter and so matches no
+        # field-specific grep. Measured across 1695 live goals: 527 (31.1%) carried
+        # `started`, with 122 written that very month — not the "~4 legacy records"
+        # the old comment claimed. (The 4-of-119 figure was true of SKIPPED goals
+        # only, and generalizing it to the whole corpus is what produced the false
+        # conclusion.) An empty confirming grep is not proof of absence.
+        #
+        # So `started` was never a field without a writer; it was a field with an
+        # HONOR-SYSTEM writer that drifted to 31% — and honor-system writes are
+        # exactly what this framework keeps having to move into bash (loop_state:
+        # /05/06, 1, 5).
+        #
+        # AS OF 7-t the daemon claim endpoint writes it:
+        # aspirations_write.py claim() does `goal.setdefault("started", _claim_ts)`
+        # beside claimed_by/claimed_at. It is now script-enforced at the one place a
+        # goal is actually attempted, costs zero hot-path tax (`started` was already
+        # in _COMPACT_GOAL_KEEP), and setdefault preserves first-attempt semantics
+        # across release/re-claim and stale-claim take-back.
+        #
+        # THE never-attempted FILTER STILL CANNOT LAND HERE — but for a different
+        # reason than the old comment gave. It is no longer "there is no marker";
+        # it is COVERAGE: 1168 legacy goals pre-date the writer and carry no
+        # `started`. A naive `exclude skips lacking started` would classify every
+        # one of them as never-attempted and DELETE genuine repeated-failure
+        # detection — precisely the trap that caught the 1 author, stopped
+        # only by test_genuine_repeated_failure_still_detected + the 1
+        # synthetic-skip test (both of which model real goals as having no
+        # `started`, which was correct for pre-fix data and is now the thing to
+        # migrate). The filter therefore needs a CUTOVER: apply it only to goals
+        # created after the claim-writer landed. That is its own goal; file it once
+        # coverage has accumulated.
+        #
+        # (`claimed_by` remains the other candidate marker and remains projected
+        # AWAY by _COMPACT_GOAL_KEEP — carrying it would cost the same hot-path tax
+        # that correctly killed tag-resurrection above. `started` wins precisely
+        # because it is already on the hot path.)
+        #
+        # This is also WHY the two exclusions that DO exist here (the Unblock:
+        # title-prefix above, the removed synthetic-tag branch) are both hacks:
+        # every author hit the same missing datum and reached for a proxy.
+        # Until the cutover lands, repeated_failure stays ADVISORY (rb-1320) —
+        # believe it only after checking whether the window's skips were ever
+        # actually attempted.
         if len(resolved) < lookback:
             continue
         recent = resolved[-lookback:]
@@ -634,6 +754,37 @@ def cmd_cycles(args, config, compact):
                     for g in recent
                 )
                 if not all_primitives:
+                    # 2 (rb-3820, diagnosed by ): all-product
+                    # windows are velocity-blind by construction — their
+                    # deliverables are sibling product-repo commits, which none
+                    # of compute_learning_velocity's five counters can see
+                    # (rb + guard + sig + tree + framework scripts/conventions
+                    # per rb-803). A stretch of product Fix-closes therefore
+                    # false-positives zero_learning_velocity until a
+                    # batch-encoding goal lands framework-side artifacts
+                    # (canonical:  flagged during Vinheim/Lodestar
+                    # closes, velocity 0->1.0 only after  encoded).
+                    # Suppress when EVERY window goal carries
+                    # work_class == "product": strict all() mirrors
+                    # all_primitives, keeps the detector fully live for mixed
+                    # and framework windows, and legacy goals missing
+                    # work_class fail the equality so their behavior is
+                    # unchanged (safe-cutover semantics per 7-t).
+                    # work_class is in _COMPACT_GOAL_KEEP (added 2,
+                    # both copies) — without that this check would be a dead
+                    # branch (1 class). Placed BEFORE the trajectory
+                    # probe: also saves the 60s subprocess on product windows.
+                    # Attribution option (a) — scanning sibling product repos
+                    # by goal-id — was rejected as box-DEPENDENT: repo
+                    # presence varies per box, so the flag would still fire on
+                    # boxes lacking the repo (worse than suppression, which
+                    # reads only the shared store and is box-consistent).
+                    all_product = all(
+                        g.get("work_class") == "product" for g in recent
+                    )
+                    if all_product:
+                        continue
+
                     # : completion-ratio gate. A near-complete
                     # aspiration consolidating its final goals will
                     # naturally have all recent goals in the same
@@ -850,14 +1001,35 @@ def cmd_temp_pressure(args, config, compact):
                 ephemera_count += 1
     pressure_count = count + ephemera_count
 
-    # Dedup: if a drain-temp goal is already open, do NOT re-suggest filing —
+    # Dedup: if a drain-temp ACTION goal is already open, do NOT re-suggest filing —
     # else every iteration above threshold would spawn a duplicate HIGH goal.
+    # Only ACTION goals drain temp/; ANALYSIS goals (Investigate:/Idea:) whose title
+    # happens to contain "drain"+"temp" must NOT satisfy the dedup — else an
+    # "Investigate: temp-drain goal not auto-surfaced..." goal (0) falsely
+    # counts as the open drain goal, permanently suppressing the real "Maintain: drain
+    # N accumulated temp/ working docs" goal from ever filing and letting temp/ grow
+    # unbounded (the confirmed 0 root cause: 134 undrained files, 0 auto-filed).
+    # Agent-scope the dedup (7): the undrained-doc COUNT above targets
+    # AGENT_DIR/temp (the BOUND agent's store), so this dedup must match. World-
+    # queue drain goals appear in EVERY agent's compact, so without scoping, one
+    # agent's open drain goal set existing != None for ALL agents -> suggested_goal
+    # stays null (temp_drain_pending) fleet-wide and every OTHER agent's temp/ grew
+    # unbounded. Skip a drain goal that is identifiably ANOTHER agent's; scope by
+    # filed_by_agent (stamped at add time, ) / handoff_to. A drain goal
+    # with no owner stamp still dedups fleet-wide (conservative — real auto-filed
+    # drain goals always carry filed_by_agent; preserves the legacy contract).
+    agent_name = AGENT_DIR.name if AGENT_DIR is not None else None
     existing = None
     for asp in _active_aspirations(compact):
         for g in asp.get("goals", []):
             if g.get("status") in ("pending", "in-progress"):
                 t = (g.get("title") or "").lower()
+                if t.startswith(("investigate:", "idea:")):
+                    continue  # analysis goal, not a drain action (0)
                 if "drain" in t and "temp" in t:
+                    owner = g.get("filed_by_agent") or g.get("handoff_to")
+                    if owner is not None and owner != agent_name:
+                        continue  # another agent's drain goal (7) — not ours
                     existing = g.get("id")
                     break
         if existing:

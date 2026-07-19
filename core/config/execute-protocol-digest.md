@@ -216,6 +216,18 @@ IF gate_d_status == "on":
 # ── End Step 5e ─────────────────────────────────────────────────────────────
 ```
 
+# Pre-apply consult gate (g-115-826 / g-115-2203) — pre-hoc consult-before-edit
+# forcing banner for INHERITED cross-agent framework Applies. Fires ONLY when
+# handoff_from is set AND != current agent AND a framework path is referenced;
+# own-authored goals skip silently (verified: pre-apply-consult-gate.py:182) —
+# their coverage is the post-close drift gate pre-apply-consult-drift-gate.py
+# (g-115-2201). Exits 0 unconditionally (advisory, fail-open). MUST be wired
+# HERE, not only at aspirations-execute/SKILL.md:562 — this digest IS the
+# documented hot path (post-compaction re-reads load it, NOT the full SKILL.md),
+# so a gate present only in the SKILL.md never fires on the hot path
+# (g-115-2203 finding). Parity asserted mechanically by /verify-learning.
+Bash: bash core/scripts/pre-apply-consult-gate.sh {goal.id}
+
 Execute primary goal: `result = invoke goal.skill with goal.args`
 
 ## Outcome Classification (Binary)
@@ -285,10 +297,18 @@ IF exists: follow steps, collect external_changes + behavioral_observations
 
 ```
 IF productive:
-    experience_id = "exp-{goal.id}-{skill_slug}"
+    # Dated id (g-115-1915): a static exp-{goal}-{slug} id collides on any
+    # re-execution of the same goal+slug and the add endpoint 409s, losing
+    # the trace. Date-suffix by default; append -2/-3 on same-day re-runs.
+    # (The archive-goal ENDPOINT auto-uniquifies server-side; the add path
+    # uses the id verbatim, so compose it collision-free here.)
+    experience_id = "exp-{goal.id}-{skill_slug}-{YYYYMMDD}"
     Write agents/<agent>/experience/{experience_id}.md (full trace)
     echo '<experience-json>' | bash core/scripts/experience-add.sh
-    # Include: retrieval_audit, verbatim_anchors, content_path
+    # Include: goal_id "{goal.id}" (CANONICAL join key — the recurring-close 4.25
+    #   canary and experience-read --goal match on goal_id, NOT source_goal;
+    #   omitting it false-fires force_experience_archival, g-115-2511),
+    #   retrieval_audit, verbatim_anchors, content_path
     echo '{"experience_refs": ["{experience_id}"]}' | Bash: wm-set.sh active_context.experience_refs
 ```
 

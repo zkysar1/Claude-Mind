@@ -126,8 +126,13 @@ CASES = [
     ("mkdir into EXISTING toplevel (must approve)",
      f"mkdir -p {A}/journal/2026/05/test-subdir-zzz",     "approve"),
     # Negative case: TWO existing toplevels must NOT trigger (multi-arg sanity).
+    # journal/ + experience/ are both GIT-TRACKED so they exist on every clone.
+    # The prior fixture used session/, which is gitignored (**/session/) and
+    # exists only on boxes where alpha has RUN — on any other box the hook
+    # CORRECTLY denied it as a new toplevel and this case false-failed
+    # (cc-05, 3: mis-triaged as a hook multi-path parsing defect).
     ("mkdir two EXISTING toplevels (must approve)",
-     f"mkdir -p {A}/journal/zz1 {A}/session/zz2",         "approve"),
+     f"mkdir -p {A}/journal/zz1 {A}/experience/zz2",      "approve"),
 ]
 
 

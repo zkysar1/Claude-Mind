@@ -174,6 +174,48 @@ def test_try_new_patterns_dispatcher_attaches_pattern_field():
     assert r.get("pattern") == "precon_studio"
 
 
+def test_time_gated_dep_recognized_when_all_deps_completed():
+    """8: deferred_until goal whose defer names ALL-completed deps
+    → recognize-only classification (never a clear)."""
+    mod = _import_defer_recheck()
+    by_id = _make_by_id({
+        "id": "g-115-2051",
+        "status": "completed",
+        "completed_at": _completed_iso(4),
+    })
+    g = {"id": "g-115-2052",
+         "status": "pending",
+         "deferred_until": "2026-07-16T00:00:00",
+         "defer_reason": "blocked_on_dependency: g-115-2051 (fleet census)"}
+    r = mod._classify_time_gated_dep(g, by_id)
+    assert r is not None, "expected classification for completed dep + time gate"
+    assert r["action"] == "skipped", f"must be recognize-only, got {r['action']}"
+    assert r["pattern"] == "deps_complete_time_gated"
+    assert r["dep_ids"] == ["g-115-2051"]
+    assert "Never auto-cleared" in r["reason"]
+
+
+def test_time_gated_dep_none_when_dep_pending():
+    """Dep still pending → no classification (silent skip, prior behavior)."""
+    mod = _import_defer_recheck()
+    by_id = _make_by_id({"id": "g-115-2051", "status": "pending"})
+    g = {"id": "g-115-2052",
+         "status": "pending",
+         "deferred_until": "2026-07-16T00:00:00",
+         "defer_reason": "blocked_on_dependency: g-115-2051 (fleet census)"}
+    assert mod._classify_time_gated_dep(g, by_id) is None
+
+
+def test_time_gated_dep_none_when_no_dep_pattern():
+    """Pure time-gate narrative (no dep ids) → None ( skip stands)."""
+    mod = _import_defer_recheck()
+    g = {"id": "g-115-2094",
+         "status": "pending",
+         "deferred_until": "2026-07-16T00:00:00",
+         "defer_reason": "observation window: stale writers need days to reveal"}
+    assert mod._classify_time_gated_dep(g, {}) is None
+
+
 # Standalone runner — match the bare-pytest-style of sibling regression tests
 # (no pytest dependency assumed in CI).
 
@@ -195,6 +237,12 @@ def _run_all():
             test_try_new_patterns_returns_none_for_unrecognized),
         ("dispatcher attaches pattern field",
             test_try_new_patterns_dispatcher_attaches_pattern_field),
+        ("time-gated dep recognized when all deps completed",
+            test_time_gated_dep_recognized_when_all_deps_completed),
+        ("time-gated dep none when dep pending",
+            test_time_gated_dep_none_when_dep_pending),
+        ("time-gated dep none when no dep pattern",
+            test_time_gated_dep_none_when_no_dep_pattern),
     ]
     failed = 0
     names = []

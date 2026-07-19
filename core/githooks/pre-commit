@@ -11,8 +11,32 @@
 set -e
 REPO="$(git rev-parse --show-toplevel)"
 
+# Telemetry (g-115-2404 earn-the-keep review, 2026-07-16): BLOCK-ONLY logging.
+# A gate that refuses a commit logs one `block` firing to meta/gate-firings.jsonl
+# via gate-log.sh; clean passes log NOTHING. Rationale: on own-cloud boxes one
+# gate-firings append is a whole-object S3 read-modify-write (measured 4.7-10s
+# at 38MB / 117k records) — per-gate pass/noop logging would multiply hook
+# latency ~6-12x on every commit. The exposure denominator for these gates is
+# the git commit count (landed commits all passed; blocked attempts are each
+# logged), so fire-rate stays measurable at zero happy-path cost. Retirement
+# criterion (guard-769): a gate with 0 block firings across a review window of
+# N-thousand commits AND whose regression class is no longer plausible is a
+# retire candidate at the next earn-the-keep review; insurance-class gates
+# (secrets, constitutional anchor) are exempt from count-based retirement.
+# Telemetry is fail-open: gate-log failure never changes the gate verdict.
+_gate() {
+  local id="$1"; shift
+  local rc=0
+  "$@" || rc=$?          # `|| rc=$?` captures the real gate status under set -e
+  [ "$rc" -eq 0 ] && return 0
+  bash "$REPO/core/scripts/gate-log.sh" "$id" block \
+    --caller "core/githooks/pre-commit" \
+    --trigger "gate-exit=$rc" 2>/dev/null || true
+  exit "$rc"
+}
+
 # Gate 1: Python CLI fallback regression (existing).
-bash "$REPO/core/scripts/check-no-python-cli-fallback.sh"
+_gate check-no-python-cli-fallback bash "$REPO/core/scripts/check-no-python-cli-fallback.sh"
 
 # Gate 1b: Daemon-wrapper reparse regression (g-115-740 sister gate,
 # 2026-05-18). Catches the SUBTLER shape — wrapper calls rt_call AND
@@ -20,31 +44,31 @@ bash "$REPO/core/scripts/check-no-python-cli-fallback.sh"
 # Sister to Gate 1; that gate catches `_fallback_exec` /
 # `python3 -m core.scripts.X`, this one catches `rt_call` + inline
 # `py -3 -c` block reading `Path(WORLD_PATH|META_PATH|AGENT_DIR)/*.jsonl`.
-bash "$REPO/core/scripts/check-no-daemon-wrapper-reparse.sh"
+_gate check-no-daemon-wrapper-reparse bash "$REPO/core/scripts/check-no-daemon-wrapper-reparse.sh"
 
 # Gate 2: Daemon endpoint registry vs filesystem (g-115-802).
 case "$(uname -s 2>/dev/null || echo unknown)" in
     MINGW*|MSYS*|CYGWIN*) PY="py -3" ;;
     *) PY="python3" ;;
 esac
-$PY "$REPO/core/scripts/check-mind-api-endpoint-registry.py"
+_gate check-mind-api-endpoint-registry $PY "$REPO/core/scripts/check-mind-api-endpoint-registry.py"
 
 # Gate 3: Phase-5 meta -> world import invariant (sec15; see
 # mind_api/src/INTERFACE.md). Refuses commits where mind_api/src/meta/**
 # imports mind_api.src.world or any world-domain endpoint module.
-$PY "$REPO/core/scripts/meta-imports-world-gate.py"
+_gate meta-imports-world-gate $PY "$REPO/core/scripts/meta-imports-world-gate.py"
 
 # Gate 4: Phase-6 Layer-1 -> Layer-2 import invariant (sec15; see
 # core/BOUNDARY.md). Refuses commits where a Layer-1 file imports/sources
 # mind_api.src (daemon-launcher `python -m mind_api.src` is whitelisted).
-$PY "$REPO/core/scripts/layer1-no-runtime-imports-gate.py"
+_gate layer1-no-runtime-imports-gate $PY "$REPO/core/scripts/layer1-no-runtime-imports-gate.py"
 
 # Gate 5: settings.json deny-baseline net (constitutional anchor, 2026-05-16).
 # Independent second net behind the PreToolUse settings-structural-validator;
 # reuses its _validate() (single source of truth for PROTECTED_DENY). No-op
 # unless .claude/settings.json is staged. See CLAUDE.md "two-file settings
 # rule", core/config/conventions/constitutional-rings.md Ring 0, rb-931.
-$PY "$REPO/core/scripts/check-settings-deny-baseline.py"
+_gate check-settings-deny-baseline $PY "$REPO/core/scripts/check-settings-deny-baseline.py"
 
 # Gate 6: Domain-leak surveillance (ADVISORY, 2026-05-18 packaging plan
 # Phase 4.4). Runs core/scripts/domain-leak-check.sh on every commit to
@@ -74,7 +98,7 @@ bash "$REPO/core/scripts/domain-leak-check.sh" --staged >&2 || true
 # when the LLM substitutes the placeholder (the 2026-05-19 bravo/
 # cruft incident shape). Refuses commits introducing the regression
 # in staged .md files. See .claude/rules/path-resolution.md.
-bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"
+_gate check-no-bare-agent-prefix bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"
 
 # Gate 8: Secret-content scanner (2026-05-21). Refuses commits whose
 # staged content contains GitHub PAT / OAuth-token / AWS-access-key
@@ -84,7 +108,7 @@ bash "$REPO/core/scripts/check-no-bare-agent-prefix.sh"
 # (Write/Edit/MultiEdit only) and iteration-commit.sh's filename
 # filter both missed it. See script header for full pattern set +
 # bypass mechanisms.
-bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"
+_gate check-no-hardcoded-secrets bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"
 
 # Gate 9: session-manifest sync_tier completeness (2026-06-03). Fail-closed
 # gate from the session-continuity redesign (#45). core/config/session-
@@ -99,7 +123,7 @@ bash "$REPO/core/scripts/check-no-hardcoded-secrets.sh"
 # but left unwired; wired here as one of the 7 orphan-script resolutions
 # (2026-06-03). Self-contained bash; needs no MIND_AGENT.
 if git diff --cached --name-only | grep -q '^core/config/session-manifest\.yaml$'; then
-    bash "$REPO/core/scripts/session-manifest-gate.sh"
+    _gate session-manifest-gate bash "$REPO/core/scripts/session-manifest-gate.sh"
 fi
 
 # Gate 10: skill-edit earn-the-keep chokepoint (g-115-1467, earn-the-keep
@@ -114,7 +138,7 @@ fi
 # SKILL_EDIT_GATE_OVERRIDE="<justification>". See
 # core/scripts/skill-edit-precommit-gate.py.
 if git diff --cached --name-only | grep -qE '^\.claude/skills/[^/]+/SKILL\.md$'; then
-    $PY "$REPO/core/scripts/skill-edit-precommit-gate.py"
+    _gate skill-edit-precommit-gate $PY "$REPO/core/scripts/skill-edit-precommit-gate.py"
 fi
 
 # Gate 11: OWNERSHIP_MODE / MACHINE_OWNED_AGENTS re-introduction (g-115-1737,
@@ -127,4 +151,4 @@ fi
 # only STAGED added lines, so it is cheap and never blocks unrelated commits.
 # Sister to Gate 1. See .claude/rules/... + mind_api/docs/lodestar-dynamic-
 # ownership-design.md (SUPERSEDED note). Bypass is NOT the answer — fix the code.
-bash "$REPO/core/scripts/check-no-ownership-flag.sh"
+_gate check-no-ownership-flag bash "$REPO/core/scripts/check-no-ownership-flag.sh"

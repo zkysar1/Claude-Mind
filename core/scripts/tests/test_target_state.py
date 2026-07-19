@@ -277,4 +277,8 @@ class TestIsMaintainCheckAboutGoal:
 
 if __name__ == "__main__":
     import pytest
-    pytest.main([__file__, "-v"])
+    # SystemExit propagates pytest's exit code — a bare pytest.main() call
+    # discards it, so script-mode invocation (run-invisible-suites.sh) exits 0
+    # even with failing tests (2; mirrors
+    # test_recurring_close_outcome_origin's shape).
+    raise SystemExit(pytest.main([__file__, "-v"]))

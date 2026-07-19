@@ -28,10 +28,7 @@ Pipeline (mirrors aspirations.py cmd_add_goal order):
       7. goal-duplication-gate  (gates.goal_duplication.evaluate) — blocks
                                  on peer-work overlap. Override:
                                  X-Mind-Override-Duplication.
-      8. stale-read-gate        (gates.stale_read.evaluate) — only fires when
-                                 goal.parent_goal is set. Override:
-                                 X-Mind-Override-Stale-Read.
-      9. scaffolded-exploration (gates.scaffolded_exploration.evaluate) —
+      8. scaffolded-exploration (gates.scaffolded_exploration.evaluate) —
                                  only fires on Apply: + product-category +
                                  no discovered_by. Override:
                                  X-Mind-Override-No-Investigate.
@@ -73,14 +70,15 @@ import _gate_log  # noqa: E402
 # back into progress so goal eviction is metric-neutral. _goal_census is a pure
 # leaf, resolvable via the same core/scripts sys.path entry file_locks adds.
 from _goal_census import effective_counts as _effective_counts, census_completed as _census_completed  # noqa: E402
+from _goal_census import all_evicted_ids as _all_evicted_ids  # noqa: E402  # 0 mint-site tombstone awareness
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
+from gates.operator_offload import evaluate as _operator_offload_eval  # noqa: E402
 from gates.uncommitted_work import evaluate as _uncommitted_work_eval  # noqa: E402
 from gates.capability import evaluate as _capability_eval  # noqa: E402
 from gates.completion_artifact import evaluate as _completion_artifact_eval  # noqa: E402
 from _override_helpers import audit_bulk_override as _audit_bulk_override  # noqa: E402
 # PR 7c additions:
-from gates.stale_read import evaluate as _stale_read_eval  # noqa: E402
 from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
@@ -194,6 +192,162 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 
     _atomic_write_with_fallback(
         path, _write, fallback_counter_key="daemon_aspirations_write")
+
+
+def _verify_goal_persisted(live_path: Path, asp_id: str, goal_id: str) -> bool:
+    """never-success-without-persistence invariant (8).
+
+    Under own-cloud, a bare-``file_locks.locked()`` write can RETURN without
+    the goal reaching S3 — the 2026-07-14 forensic specimen: add-goal returned
+    HTTP 200 + a complete success-shaped goal JSON with id g-115-2083 (computed
+    from a ~34h-stale local mirror, max=2082 vs true max=2203), ZERO conflict
+    logged, and NOTHING persisted (dual-store read-backs on cc-03 + cc-02 show
+    no trace). The bare-locked path does not carry ``locked_rmw``'s 412-retry,
+    and a *silent* no-conflict loss (stale-mirror fenced PUT that resolves
+    away) is invisible to a conflict-only guard anyway.
+
+    Confirm the goal landed in the AUTHORITATIVE store by reading the
+    aspiration file's S3 object DIRECTLY (raw ``get_object``) — NOT through the
+    local mirror the daemon just wrote (a mirror-routed read, even
+    ``force_fresh``, can return the local copy and mask the loss; same raw-S3
+    discipline as ``liveness_check.py``, g-115-2149).
+
+    CONSERVATIVE fail-open — this can only ADD an error-return for a
+    definitively-lost write, NEVER turn a real fleet-wide success into a false
+    failure. Returns True (assume persisted) on the local backend (the local
+    write IS authoritative) and on ANY read/parse error or missing-aspiration;
+    returns False ONLY when a clean raw-S3 read shows the aspiration PRESENT but
+    the goal ABSENT — the specimen's exact signature. Correctness rests on the
+    write being S3-synchronous (``atomic_write`` -> backend ``_put`` ->
+    ``s3.put_object(IfMatch=...)``; a 412 is an atomic reject) so read-after-PUT
+    reflects true persistence under S3 strong consistency.
+    """
+    status, _goal = _authoritative_goal_lookup(live_path, asp_id, goal_id)
+    return status != "goal-absent"
+
+
+def _authoritative_goal_lookup(live_path: Path, asp_id: str, goal_id: str):
+    """Shared raw-S3 authoritative-store goal fetch (8 / 6).
+
+    The read-back core behind _verify_goal_persisted (add_goal) and
+    _verify_claim_persisted (claim) — one helper, multiple call sites.
+    Returns (status, goal_record):
+
+      ("no-verify", None)   — cannot verify: local backend (the local write IS
+                              authoritative), backend unavailable, raw S3 read
+                              error, parse anomaly, or aspiration absent from
+                              the raw read. Callers MUST fail open (assume
+                              persisted) — see _verify_goal_persisted's
+                              conservative-fail-open contract.
+      ("goal-absent", None) — clean raw-S3 read: aspiration PRESENT, goal id
+                              ABSENT (the g-115-2208 loss signature).
+      ("found", goal)       — the goal record as stored in the authoritative
+                              store (field checks belong to the caller).
+    """
+    import sys  # local-import convention (this module imports sys per-function)
+
+    try:
+        be = get_backend()
+    except Exception:  # noqa: BLE001 — backend unavailable -> can't verify -> assume ok
+        return "no-verify", None
+    # LocalBackend (no S3 surface): the local write IS authoritative.
+    if not all(hasattr(be, a) for a in ("s3", "bucket", "_s3_key")):
+        return "no-verify", None
+    try:
+        key = be._s3_key(str(live_path))
+        obj = be.s3.get_object(Bucket=be.bucket, Key=key)
+        raw = obj["Body"].read().decode("utf-8", errors="replace")
+    except Exception as e:  # noqa: BLE001 — raw S3 read failed -> fail-open
+        print(f"[daemon] persistence read-back unavailable "
+              f"({type(e).__name__}); assuming persisted (fail-open, g-115-2208)",
+              file=sys.stderr)
+        return "no-verify", None
+    try:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("id") == asp_id:
+                # Aspiration present in the authoritative store — the goal
+                # either landed (persisted) or was lost.
+                for g in (rec.get("goals") or []):
+                    if g.get("id") == goal_id:
+                        return "found", g
+                return "goal-absent", None
+    except Exception:  # noqa: BLE001 — parse anomaly -> fail-open
+        return "no-verify", None
+    # Raw S3 read succeeded but the aspiration itself is absent — a
+    # whole-aspiration anomaly (or sharding) we cannot pin to this goal;
+    # fail-open rather than risk a false failure.
+    return "no-verify", None
+
+
+def _verify_claim_persisted(live_path: Path, asp_id: str, goal_id: str,
+                            agent_name: str) -> bool:
+    """never-success-without-persistence invariant for claim() (6).
+
+    The add_goal guard checks goal EXISTENCE; a lost CLAIM leaves the goal
+    present with ``claimed_by`` unset/stale — the two cc-05 specimens
+    (2026-07-16): claim returned complete success JSON with claimed_by set,
+    raw-store read-back showed claimed_by=None moments later. Silent claim
+    loss is a cross-agent DOUBLE-CLAIM hazard (two agents each holding a
+    success response for the same goal).
+
+    Same conservative fail-open contract as _verify_goal_persisted: returns
+    False ONLY on a clean raw-S3 read where the claim is definitively absent
+    — goal present with ``claimed_by != agent_name``, or goal absent entirely
+    (a clean read that lacks the goal also lacks the claim). Local backend
+    and every read/parse failure assume persisted (True).
+    """
+    status, g = _authoritative_goal_lookup(live_path, asp_id, goal_id)
+    if status == "no-verify":
+        return True
+    if status == "goal-absent":
+        return False
+    return (g or {}).get("claimed_by") == agent_name
+
+
+# Critical update-goal fields: a swallowed PUT on one of these time-travels
+# the goal's lifecycle state (re-served claim, un-deferred defer, resurrected
+# completion) — the 1 class. Deliberately NOT every field: the
+# verification costs one raw-S3 GET per write, acceptable at release/defer/
+# complete frequency, not for bulk field edits (9 cost note).
+_CRITICAL_TRANSITION_FIELDS = {"status", "defer_reason"}
+
+
+def _verify_transition_persisted(live_path: Path, asp_id: str, goal_id: str,
+                                 expected: Dict[str, Any]) -> bool:
+    """never-success-without-persistence invariant for critical goal
+    TRANSITIONS — update-goal status/defer_reason, release, complete-by
+    (g-115-2429; siblings: add_goal g-115-2208, claim g-115-2306).
+
+    A swallowed transition PUT leaves the goal PRESENT in the authoritative
+    store with the OLD field values — the g-115-2351 specimen (2026-07-16):
+    a release+defer write was locally applied and local-read-back verified,
+    but the store PUT silently resolved away (rb-3636 mechanism B); the
+    daemon-restart re-sync (guard-1043) later pulled the stale store copy
+    back over local and the goal time-traveled 7h (rb-3744: local read-back
+    is necessary, not sufficient).
+
+    ``expected`` maps each just-written critical field to its final
+    in-memory value (post in-lock cascades — compare what the endpoint
+    actually persisted, not the caller's raw input). Persisted iff a clean
+    raw-S3 read shows the goal present with EVERY expected field equal
+    (``None`` expects absent-or-null, so cleared fields verify too).
+
+    Same conservative fail-open contract as the sibling verifiers:
+    "no-verify" (local backend, backend/read/parse failure, aspiration
+    absent) → True; goal ABSENT on a clean read → False (the store lacks
+    the goal, so it certainly lacks the transition).
+    """
+    status, g = _authoritative_goal_lookup(live_path, asp_id, goal_id)
+    if status == "no-verify":
+        return True
+    if status == "goal-absent":
+        return False
+    g = g or {}
+    return all(g.get(f) == v for f, v in expected.items())
 
 
 # ---------------------------------------------------------------------------
@@ -557,16 +711,9 @@ def _file_unblock_inline(items: List[Dict[str, Any]],
         f"{original_goal_id}."
     )
 
-    # Allocate next g-NNN-NN under target_asp. Mirrors _allocate_goal_id but
-    # operates on the already-located asp tuple to avoid re-scanning.
-    asp_num = target_asp_id[len("asp-"):]
-    max_seq = 0
-    for g in target_asp.get("goals", []):
-        gid = g.get("id", "")
-        match = re.match(r"^g-\d{3}-(\d{2,4})", gid)
-        if match:
-            max_seq = max(max_seq, int(match.group(1)))
-    new_goal_id = f"g-{asp_num}-{max_seq + 1:02d}"
+    # Allocate next g-NNN-NN under target_asp via the shared allocator (it
+    # counts evicted ids toward max+1 — 0 tombstone awareness).
+    new_goal_id = _allocate_goal_id(target_asp)
 
     unblock_goal = {
         "id": new_goal_id,
@@ -666,14 +813,17 @@ def _log_defer_date_extraction(ctx, goal_id: str, defer_reason_text: str,
 
 def _allocate_goal_id(asp: Dict[str, Any]) -> str:
     """Allocate next g-NNN-NN id for the aspiration. Mirrors aspirations.py's
-    max-seq-plus-one logic; uses two-digit zero-padding (NN)."""
+    max-seq-plus-one logic; uses two-digit zero-padding (NN). Evicted ids count
+    toward max+1 (g-115-2430): re-minting an evicted seq would collide with the
+    merge-layer resurrection tombstone, which drops any goal carrying an
+    evicted id."""
     asp_id = asp["id"]
     if not _ASP_ID_RE.match(asp_id):
         raise ValueError(f"Invalid aspiration ID format: {asp_id}")
     asp_num = asp_id[len("asp-"):]
     max_seq = 0
-    for g in asp.get("goals", []):
-        gid = g.get("id", "")
+    live_ids = [g.get("id", "") for g in asp.get("goals", [])]
+    for gid in live_ids + _all_evicted_ids(asp):
         m = re.match(r"^g-\d{3}-(\d{2,4})", gid)
         if m:
             max_seq = max(max_seq, int(m.group(1)))
@@ -767,6 +917,67 @@ def _header_override(ctx, header_name: str) -> Optional[str]:
     return val or None
 
 
+def _is_forge_goal(goal: Dict[str, Any]) -> bool:
+    """True when a goal will invoke /forge-skill — by explicit skill, the
+    canonical 'Forge skill:' title prefix, or the 'idea:forge-ready-' origin
+    signal the evolve/spark forge-check filing sites stamp. See g-115-2514."""
+    if (goal.get("skill") or "") == "/forge-skill":
+        return True
+    if str(goal.get("title") or "").startswith("Forge skill:"):
+        return True
+    if str(goal.get("origin_signal") or "").startswith("idea:forge-ready-"):
+        return True
+    return False
+
+
+def _ensure_forge_curriculum_precondition(goal: Dict[str, Any]) -> bool:
+    """Guarantee a /forge-skill goal carries the pc-curriculum-forge structured
+    precondition, attaching the canonical form if absent. Returns True on mutate.
+
+    Why (g-115-2514): forging requires the EXECUTING agent be past the curriculum
+    Growth gate (allow_forge_skill). The four forge-filing sites (aspirations-evolve
+    Step 9, aspirations-spark Phase 6.5, respond, reflect-on-outcome) route a forge
+    goal to a domain-owner intended_agent but historically curriculum-checked only
+    the FILING agent, never the TARGET (g-315-383 routed to echo at cur-01). The
+    canonical guard is this precondition: goal-selector.py evaluates structured
+    preconditions via predicate.command_succeeds, whose subprocess inherits the
+    SELECTING agent's MIND_AGENT — so the check runs against the ACTUAL executor
+    and a routed forge goal is filtered from a below-Growth target's candidates
+    until it can forge. Guaranteeing the precondition here makes the target-agent
+    check structural (script-enforced across all filing sites) instead of relying
+    on each LLM filing site to add it. Non-refusing (the forge signal is preserved)
+    and strictly more correct than a filing-time curriculum snapshot, which would
+    go stale as curriculum stages advance between filing and execution."""
+    verification = goal.get("verification")
+    if not isinstance(verification, dict):
+        verification = {}
+        goal["verification"] = verification
+    pcs = verification.get("preconditions")
+    if not isinstance(pcs, list):
+        pcs = []
+        verification["preconditions"] = pcs
+    for p in pcs:
+        if isinstance(p, dict) and (
+            p.get("id") == "pc-curriculum-forge"
+            or "allow_forge_skill" in str(p.get("command") or "")
+        ):
+            return False  # already gated — respect a caller-supplied precondition
+    pcs.append({
+        "id": "pc-curriculum-forge",
+        "type": "command_succeeds",
+        "command": "bash core/scripts/curriculum-contract-check.sh --action allow_forge_skill",
+        "timeout_seconds": 30,
+        "description": (
+            "Curriculum contract permits forge_skill for the EXECUTING agent "
+            "(exit 0 = permitted; unlocks at Growth). Auto-attached by the "
+            "forge-curriculum gate (g-115-2514) so a forge goal routed to a "
+            "below-Growth agent is filtered from that agent's selection "
+            "candidates until it can forge."
+        ),
+    })
+    return True
+
+
 def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
                            ) -> Tuple[Optional["Response"], List[str], Optional[Tuple[str, List[str]]]]:  # type: ignore[name-defined]
     """Run the full add-goal pipeline: advisories → mutators → blockers.
@@ -793,22 +1004,22 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     bulk_override = _header_override(ctx, "X-Mind-Override-All")
     raw_sig = _header_override(ctx, "X-Mind-Override-Signal")
     raw_dup = _header_override(ctx, "X-Mind-Override-Duplication")
-    raw_sr = _header_override(ctx, "X-Mind-Override-Stale-Read")
     raw_ni = _header_override(ctx, "X-Mind-Override-No-Investigate")
+    raw_off = _header_override(ctx, "X-Mind-Override-Offload")
     bulk_slots_filled: List[str] = []
     if bulk_override:
         if raw_sig is None:
             bulk_slots_filled.append("override_signal")
         if raw_dup is None:
             bulk_slots_filled.append("override_duplication")
-        if raw_sr is None:
-            bulk_slots_filled.append("override_stale_read")
         if raw_ni is None:
             bulk_slots_filled.append("override_no_investigate")
+        if raw_off is None:
+            bulk_slots_filled.append("override_offload")
     eff_sig = raw_sig or bulk_override
     eff_dup = raw_dup or bulk_override
-    eff_sr = raw_sr or bulk_override
     eff_ni = raw_ni or bulk_override
+    eff_off = raw_off or bulk_override
     bulk_audit: Optional[Tuple[str, List[str]]] = (
         (bulk_override, bulk_slots_filled)
         if (bulk_override and bulk_slots_filled) else None
@@ -887,15 +1098,44 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     # wins; gate never overrides. Mirrors cmd_add_goal lines ~3086-3111.
     if not goal.get("intended_agent"):
         route_to = _header_override(ctx, "X-Mind-Route-To")
-        route_result = _cap_route_eval(
-            goal.get("title", "") or "",
-            category=goal.get("category", "") or "",
-            description=goal.get("description", "") or "",
-            route_to=route_to,
-        )
-        ia = route_result.get("intended_agent")
-        if ia in _valid_intended_agents():
-            goal["intended_agent"] = ia
+        handoff_to = goal.get("handoff_to")
+        if (not route_to) and isinstance(handoff_to, str) \
+                and handoff_to in _valid_intended_agents():
+            # An explicit handoff_to is ALSO the caller's routing choice
+            # (7): without this, the title-verb classifier can stamp a
+            # THIRD agent and the selector's intended_agent filter then hides
+            # the goal from the very agent the handoff named — handoff_bonus
+            # unreachable (observed: "Apply:" slices with handoff_to=zeta
+            # stamped intended_agent=alpha, invisible to zeta across 3
+            # consecutive selector runs). The X-Mind-Route-To header remains
+            # the stronger per-call override when present.
+            goal["intended_agent"] = handoff_to
+        else:
+            route_result = _cap_route_eval(
+                goal.get("title", "") or "",
+                category=goal.get("category", "") or "",
+                description=goal.get("description", "") or "",
+                route_to=route_to,
+            )
+            ia = route_result.get("intended_agent")
+            if ia in _valid_intended_agents():
+                goal["intended_agent"] = ia
+
+    # === Phase D.5: forge-curriculum precondition guarantee (4) ===
+    # A /forge-skill goal is executable only by an agent past the curriculum
+    # Growth gate. Guarantee the pc-curriculum-forge precondition so the
+    # goal-selector's per-executor check (predicate.command_succeeds inherits the
+    # selecting agent's MIND_AGENT) gates the TARGET agent — closing the
+    # filing-site gap where only the FILING agent's curriculum was checked
+    # ( was routed to echo at cur-01, which cannot forge). Pure
+    # in-process mutation; no I/O. Non-refusing — preserves the forge signal.
+    if _is_forge_goal(goal):
+        if _ensure_forge_curriculum_precondition(goal):
+            warnings.append(
+                "forge-curriculum-gate: attached pc-curriculum-forge precondition "
+                "(g-115-2514) — this forge goal is selectable only by an agent whose "
+                "curriculum permits allow_forge_skill (Growth+)."
+            )
 
     # === Phase E: goal-duplication blocker ===
     dup_result = _goal_duplication_eval(
@@ -912,26 +1152,23 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
             "gate_output": dup_result,
         }, status=400), warnings, None
 
-    # === Phase F: stale-read blocker — only when parent_goal cited ===
-    if goal.get("parent_goal"):
-        sr_payload = {
-            "parent_goal": goal["parent_goal"],
-            "agent": ctx.paths.agent_name,
-        }
-        sr_result = _stale_read_eval(
-            sr_payload,
-            override=eff_sr,
-            agent_name=ctx.paths.agent_name,
-            world_dir=ctx.paths.world,
-            agent_dir=ctx.paths.agent,
-        )
-        if sr_result.get("would_block"):
-            return Response.json({
-                "error": "stale_read_blocked",
-                "gate": "stale-read-gate",
-                "gate_output": {k: v for k, v in sr_result.items()
-                                if not k.startswith("_")},
-            }, status=400), warnings, None
+    # === Phase E.5: operator-offload blocker — only when recurring ===
+    # Layer-B backstop for gh-005 (meta/aspiration-generation-strategy.yaml):
+    # a recurring goal must carry an `offload_decision` explaining why the
+    # work stays on the LLM loop instead of becoming an operator job.
+    # Pure no-op for non-recurring goals. user-directed 2026-07-13 (mc-066).
+    off_result = _operator_offload_eval(
+        goal,
+        override_offload=eff_off,
+        meta_dir=ctx.paths.meta,
+        agent_name=ctx.paths.agent_name,
+    )
+    if off_result.get("would_block"):
+        return Response.json({
+            "error": "operator_offload_blocked",
+            "gate": "operator-offload-gate",
+            "gate_output": off_result,
+        }, status=400), warnings, None
 
     # === Phase G: scaffolded-exploration blocker (Apply: + product cat) ===
     scaff_result = _scaff_eval(
@@ -1320,6 +1557,26 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # never-success-without-persistence invariant (8): the write above
+    # returned without raising, but under own-cloud a bare-locked() write can
+    # report success while the fenced PUT never reached S3 (stale-mirror /
+    # silent no-conflict loss — the 2026-07-14 forensic specimen: HTTP 200,
+    # id from a 34h-stale mirror, zero trace in S3). Confirm the goal is in the
+    # authoritative store BEFORE the post-write audits (which record blast
+    # radius only for goals that persisted) and BEFORE returning success;
+    # refuse the false 200 otherwise so the caller retries instead of silently
+    # losing the goal. Conservative fail-open (see _verify_goal_persisted): a
+    # real success can never become a false failure.
+    if not _verify_goal_persisted(live_path, asp_id, goal["id"]):
+        print(f"[daemon add_goal] WRITE-LOSS DETECTED: {goal['id']} in {asp_id} "
+              f"returned success-shaped but is ABSENT from the authoritative "
+              f"store after write (own-cloud silent write-loss, g-115-2208)",
+              file=sys.stderr)
+        return Response.error(
+            500, "write_not_persisted",
+            f"add-goal for {goal['id']} did not persist to the authoritative "
+            f"store (own-cloud write-loss, g-115-2208); retry the add")
 
     # Audit bulk override AFTER the goal lands (mirror of add(ctx) and legacy
     # cmd_add_goal's post-write audit ordering — records blast radius only for
@@ -1729,9 +1986,10 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # rely on a single timestamp moment per write.
 
             # 1. last_modified — stamped on every successful write.
-            # Consumed by stale-read-gate to detect when a caller's reads
-            # outpaced their writes. Single timestamp per call. Auto-cascades
-            # below share this moment (defer_reason_set_at, blocker_ref, etc.).
+            # A general last-touched timestamp (originally added for the
+            # stale-read gate, retired 7). Single timestamp per call;
+            # auto-cascades below share this moment (defer_reason_set_at,
+            # blocker_ref, etc.).
             goal["last_modified"] = datetime.now().isoformat(timespec="seconds")
 
             # 2. defer_reason cascade.
@@ -1885,6 +2143,30 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # never-success-without-persistence for critical transitions (9;
+    # siblings: add_goal 8, claim 6). Runs BEFORE the E9
+    # post-lock hook and the success return — a swallowed status/defer_reason
+    # PUT is the 1 time-travel shape; detect it in THIS writing
+    # iteration, not 7h later at the next re-sync. Conservative fail-open
+    # (see _verify_transition_persisted): a real success can never become a
+    # false failure.
+    if field in _CRITICAL_TRANSITION_FIELDS:
+        expected = {field: goal.get(field)}
+        if field == "status" and value in _TERMINAL_GOAL_STATUSES:
+            expected["claimed_by"] = None  # step 9 popped the claim in-lock
+        if not _verify_transition_persisted(live_path, asp["id"], goal_id,
+                                            expected):
+            import sys
+            print(f"[daemon update_goal] WRITE-LOSS DETECTED: {field} "
+                  f"transition on {goal_id} returned success-shaped but the "
+                  f"authoritative store does not carry it (own-cloud silent "
+                  f"write-loss, g-115-2429)", file=sys.stderr)
+            return Response.error(
+                500, "update_not_persisted",
+                f"update-goal {goal_id} {field} did not persist to the "
+                f"authoritative store (own-cloud write-loss, g-115-2429); "
+                f"retry the update")
 
     # === PR 7i post-lock E9 skip observation ===
     # Fires AFTER the lock releases so the wm-append doesn't hold
@@ -2461,14 +2743,100 @@ def _team_state_append_completion(world_dir: Path, record: dict,
         return str(e)
 
 
+def _recent_break_actuals(log_path: Path, goal_id: str,
+                          window: int = 5) -> List[float]:
+    """Last `window` actual_elapsed_hours for goal_id from streak-breaks.jsonl.
+
+    Read-side twin of cargo-cult-detector.py::_recent_actual_cadence (same
+    file, same field, same skip-corrupt-lines posture). Fail-open: a missing
+    or unreadable file returns [] — the canary basis falls back to the raw
+    interval, so a broken read can only make the canary fire MORE, never
+    silently suppress it.
+    """
+    vals: List[float] = []
+    try:
+        if not log_path.exists():
+            return []
+        with open(log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("goal_id") != goal_id:
+                    continue
+                v = rec.get("actual_elapsed_hours")
+                if isinstance(v, (int, float)) and v > 0:
+                    vals.append(float(v))
+    except OSError:
+        return []
+    return vals[-window:]
+
+
+def _streak_break_canary_fields(interval: float, elapsed: float,
+                                streak_mult: float,
+                                recent_actuals: List[float],
+                                signal_gated: bool,
+                                min_samples: int = 3) -> Dict[str, Any]:
+    """Classify a streak-break emission as canary-worthy vs informational.
+
+    g-115-2310 (g-115-2300 item b): the break RECORD is still emitted
+    unconditionally on the raw interval basis — cargo-cult-detector's
+    contract-suppression predicate reads actual_elapsed_hours from every
+    record and must never starve. These fields only tell
+    streak-break-reflector.py which records deserve an Investigate canary:
+
+      canary=False — signal-gated source (fire_when set: interval_hours is
+        vestigial, "late" has no meaning), or the recent ACTUAL cadence
+        (p50 of the last N same-goal breaks) explains the elapsed window —
+        the rb-1391 chronic-late class where a low-priority selection-gated
+        goal's interval_hours << its selector-driven effective cadence, so
+        a break records on nearly EVERY fire (g-001-01: 25/25).
+      canary=True — elapsed exceeds streak_mult x max(interval, recent p50):
+        late even by the goal's own demonstrated cadence. Real drift signal.
+
+    Pure function — no I/O; unit-tested in
+    core/scripts/tests/test_streak_break_canary_basis.py.
+    """
+    import statistics
+    if signal_gated:
+        return {"canary": False,
+                "canary_basis_hours": None,
+                "basis_reason": "signal_gated"}
+    basis = interval
+    reason = "interval"
+    vals = [float(v) for v in (recent_actuals or [])
+            if isinstance(v, (int, float)) and v > 0]
+    if len(vals) >= min_samples:
+        p50 = statistics.median(vals)
+        if p50 > basis:
+            basis = p50
+            reason = "recent_actual_p50"
+    return {"canary": bool(elapsed > streak_mult * basis),
+            "canary_basis_hours": round(basis, 2),
+            "basis_reason": reason}
+
+
 def _emit_streak_break_signal_daemon(ctx, goal_id: str,
                                      interval: float,
                                      elapsed: float,
-                                     aspiration_id: Optional[str]) -> None:
+                                     aspiration_id: Optional[str],
+                                     streak_mult: float = 2.0,
+                                     signal_gated: bool = False) -> None:
     """Append a streak-break event to <agent>/session/streak-breaks.jsonl.
 
-    Daemon-side mirror of aspirations.py::_emit_streak_break_signal.
-    Fail-silent so the recurring close path is never blocked.
+    Daemon-side mirror of aspirations.py::_emit_streak_break_signal (the CLI
+    twin has no live caller since the daemon-only cutover; this is the sole
+    emission site). Fail-silent so the recurring close path is never blocked.
+
+    g-115-2310: emission is UNCONDITIONAL on the raw-interval break test the
+    caller already ran — the record additionally carries canary/basis fields
+    (see _streak_break_canary_fields) so the reflector can skip filing
+    Investigates for informational breaks without starving the cargo-cult
+    contract-suppression predicate that reads actual_elapsed_hours here.
 
     KNOWN RACE (accept-with-doc, g-115-1595): this append shares NO lock with
     the reflector's full-file rewrite (streak-break-reflector.py _write_signals,
@@ -2482,6 +2850,9 @@ def _emit_streak_break_signal_daemon(ctx, goal_id: str,
     assert_not_cruft(session_dir, "mkdir (streak-break session dir)")
     session_dir.mkdir(parents=True, exist_ok=True)
     log_path = session_dir / "streak-breaks.jsonl"
+    canary_fields = _streak_break_canary_fields(
+        interval, elapsed, streak_mult,
+        _recent_break_actuals(log_path, goal_id), signal_gated)
     record = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "goal_id": goal_id,
@@ -2490,6 +2861,7 @@ def _emit_streak_break_signal_daemon(ctx, goal_id: str,
         "actual_elapsed_hours": round(elapsed, 2),
         "lateness_ratio": round(elapsed / interval, 2)
                           if interval > 0 else None,
+        **canary_fields,
         "processed": False,
     }
     try:
@@ -2595,10 +2967,14 @@ def complete_by(ctx):
                 goal["longestWindowStreak"] = max(
                     goal.get("longestWindowStreak", 0), goal["windowStreak"])
 
-                # Streak-break signal
+                # Streak-break signal (0: streak_mult + fire_when
+                # pass through so the record's canary classification uses
+                # the same knob as the break test above)
                 if streak_broken:
                     _emit_streak_break_signal_daemon(
-                        ctx, goal_id, interval, elapsed, asp.get("id"))
+                        ctx, goal_id, interval, elapsed, asp.get("id"),
+                        streak_mult=streak_mult,
+                        signal_gated=("fire_when" in goal))
 
                 goal["status"] = "pending"
             else:
@@ -2621,6 +2997,29 @@ def complete_by(ctx):
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # never-success-without-persistence for complete-by (9): a
+    # swallowed completion PUT re-serves the goal to the selector later (the
+    # 1 reversion class applied to completions). Verify the final
+    # in-memory state landed — status for one-shot goals, lastAchievedAt for
+    # recurring (whose status stays pending by design). Runs BEFORE the
+    # team-state cross-write so downstream records only persisted completions
+    # (mirror of add_goal's audit ordering). Conservative fail-open.
+    _cb_expected: Dict[str, Any] = {"status": goal.get("status")}
+    if goal.get("lastAchievedAt") is not None:
+        _cb_expected["lastAchievedAt"] = goal.get("lastAchievedAt")
+    if not _verify_transition_persisted(live_path, asp["id"], goal_id,
+                                        _cb_expected):
+        import sys
+        print(f"[daemon complete_by] WRITE-LOSS DETECTED: completion of "
+              f"{goal_id} returned success-shaped but the authoritative "
+              f"store does not carry it (own-cloud silent write-loss, "
+              f"g-115-2429)", file=sys.stderr)
+        return Response.error(
+            500, "complete_not_persisted",
+            f"complete-by for {goal_id} did not persist to the "
+            f"authoritative store (own-cloud write-loss, g-115-2429); "
+            f"retry the completion")
 
     # Team-state cross-write AFTER aspirations lock released.
     if key_finding:
@@ -2770,6 +3169,27 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # never-success-without-persistence for release (9): a swallowed
+    # release PUT leaves claimed_by set in the authoritative store — the goal
+    # stays claimed on every other box and time-travels back to claimed on
+    # THIS one at the next re-sync (the 1 specimen: an 11:53 release
+    # verified against the local mirror, reverted by the 18:21 restart
+    # re-sync). Verified unconditionally (not just had_claim): the store copy
+    # may carry a claim the stale local mirror lacked. Conservative fail-open
+    # (see _verify_transition_persisted).
+    if not _verify_transition_persisted(live_path, asp["id"], goal_id,
+                                        {"claimed_by": None,
+                                         "claimed_at": None}):
+        import sys
+        print(f"[daemon release] WRITE-LOSS DETECTED: release of {goal_id} "
+              f"returned success-shaped but a claim persists in the "
+              f"authoritative store (own-cloud silent write-loss, "
+              f"g-115-2429)", file=sys.stderr)
+        return Response.error(
+            500, "release_not_persisted",
+            f"release of {goal_id} did not persist to the authoritative "
+            f"store (own-cloud write-loss, g-115-2429); retry the release")
 
     if had_claim:
         try:
@@ -2979,6 +3399,7 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
 
             asp_idx, goal_idx, asp = found
             goal = asp["goals"][goal_idx]
+            claimed_asp_id = asp.get("id")  # for the post-write persistence read-back
 
             intended = goal.get("intended_agent")
             if (intended and intended != agent_name
@@ -3045,6 +3466,18 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
 
             goal["claimed_by"] = agent_name
             goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # Attempt marker (5): a CLAIM is the goal's first real
+            # attempt signal. `started` already rides _COMPACT_GOAL_KEEP but had
+            # NO writer on the goal path, so precheck-eval cmd_cycles could not
+            # tell a WITHDRAWN skip (never attempted — 96.5% of skips, e.g. a
+            # dedup sweep skipping a pending duplicate straight from pending)
+            # from genuine attempted-then-failed work, and a dedup sweep could
+            # trip a phantom repeated_failure Investigate (it hit asp-335, the
+            # team's primary strategic aspiration). setdefault → idempotent
+            # (never overwrite an existing marker; a stale-claim take-back keeps
+            # the original attempt time). Zero hot-path tax: `started` is already
+            # in the compact projection both sides read.
+            goal.setdefault("started", goal["claimed_at"])
 
             history.snapshot(live_path, base_dir, agent,
                              summary=claim_summary)
@@ -3055,6 +3488,30 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # never-success-without-persistence invariant extended to claim()
+    # (6; add_goal-pattern 8). Two live specimens on cc-05
+    # 2026-07-16 (6 ~03:29 + 1 04:34): claim returned a
+    # complete success JSON with claimed_by set, raw-store read-back showed
+    # claimed_by=None moments later — the bare-locked write's fenced PUT
+    # resolved away against stale mirror state. A silent claim loss is a
+    # cross-agent DOUBLE-CLAIM hazard (two agents both believing they own the
+    # goal). Verify claimed_by landed in the authoritative store BEFORE
+    # returning success; refuse the false 200 on definitive absence so the
+    # wrapper/caller retries. Conservative fail-open (see
+    # _verify_claim_persisted): a real success can never become a false failure.
+    if not _verify_claim_persisted(live_path, claimed_asp_id, goal_id,
+                                   agent_name):
+        import sys
+        print(f"[daemon claim] WRITE-LOSS DETECTED: claim of {goal_id} by "
+              f"{agent_name} returned success-shaped but claimed_by is absent "
+              f"from the authoritative store after write (own-cloud silent "
+              f"claim-loss, g-115-2306)", file=sys.stderr)
+        return Response.error(
+            500, "claim_not_persisted",
+            f"claim of {goal_id} by {agent_name} did not persist to the "
+            f"authoritative store (own-cloud claim-loss, g-115-2306); retry "
+            f"the claim")
 
     return Response.json({"ok": True, "goal": goal})
 
@@ -3173,8 +3630,22 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     archived_goal_ids.add(g["id"])
 
             # Read existing archive, extend, normalize each, write the whole list back.
+            # Replace-by-id on collision (4): a record already present in
+            # the archive (e.g. resurrected into the live file by an own-cloud
+            # partial write, then re-retired) must NOT append a duplicate — the
+            # incoming copy carries the newest state, so it replaces the stale
+            # archive copy in place. Extend-only here appended a second copy per
+            # re-sweep (observed: asp-344 archived as completed, resurrected,
+            # retired in live — a plain extend would have doubled it).
             archive = _read_jsonl(archive_path)
-            archive.extend(to_archive)
+            incoming_by_id = {a.get("id"): a for a in to_archive}
+            deduped_replaced = 0
+            for i, existing in enumerate(archive):
+                eid = existing.get("id")
+                if eid in incoming_by_id:
+                    archive[i] = incoming_by_id.pop(eid)
+                    deduped_replaced += 1
+            archive.extend(incoming_by_id.values())
             for asp in archive:
                 _normalize_terminal_goals_in(asp)
             _atomic_write_jsonl(archive_path, archive)
@@ -3195,6 +3666,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({
         "ok": True,
         "archived_count": len(to_archive),
+        "deduped_replaced": deduped_replaced,
         "recovered": recovered,
         "warnings": warnings if warnings else None,
     })
@@ -3539,14 +4011,18 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     bulk_override = _header_override(ctx, "X-Mind-Override-All")
     raw_override_signal = _header_override(ctx, "X-Mind-Override-Signal")
     raw_override_dup = _header_override(ctx, "X-Mind-Override-Duplication")
+    raw_override_off = _header_override(ctx, "X-Mind-Override-Offload")
     bulk_slots_filled: List[str] = []
     if bulk_override:
         if raw_override_signal is None:
             bulk_slots_filled.append("override_signal")
         if raw_override_dup is None:
             bulk_slots_filled.append("override_duplication")
+        if raw_override_off is None:
+            bulk_slots_filled.append("override_offload")
     override_signal = raw_override_signal or bulk_override
     override_dup = raw_override_dup or bulk_override
+    override_off = raw_override_off or bulk_override
 
     # Origin-signal gate per goal (batch — any block rejects the whole asp)
     for g in asp.get("goals", []):
@@ -3592,6 +4068,25 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
                 "gate": "goal-duplication-gate",
                 "blocked_goal": g.get("id"),
                 "gate_output": dup_result,
+            }, status=400)
+
+    # Operator-offload gate per goal (any block rejects the whole asp) —
+    # Layer-B backstop for gh-005: recurring goals must carry an
+    # offload_decision. Pure no-op for non-recurring goals (the common case).
+    # override_off was set above with bulk-fan-out (per-gate wins over bulk).
+    for g in asp.get("goals", []):
+        off_result = _operator_offload_eval(
+            g,
+            override_offload=override_off,
+            meta_dir=ctx.paths.meta,
+            agent_name=ctx.paths.agent_name,
+        )
+        if off_result.get("would_block"):
+            return Response.json({
+                "error": "operator_offload_blocked",
+                "gate": "operator-offload-gate",
+                "blocked_goal": g.get("id"),
+                "gate_output": off_result,
             }, status=400)
 
     # --- Lock: archive-check + dup-check + recompute + write ---

@@ -38,7 +38,14 @@ Heuristic (conservative for v1 — title-anchored):
                emits this exact form via _build_suggestion in capability-gate.py)
             2. title regex r"\bfor\s+(g-\d+-\d+)\b"  (Layer D title shape:
                "Unblock: <verb> for <parent-id>")
-            3. discovered_by field == "<g-id>"  (legacy/manual unblock)
+            3. discovered_by field == "<g-id>"  (legacy/manual unblock) —
+               ADDITIONALLY guarded by _provenance_fp_guard (rb-3887,
+               g-115-2534): sweeps ONLY when the Unblock's created_at
+               PREDATES the parent's completion. discovered_by is also the
+               sq-013 PROVENANCE field (the completed goal whose audit
+               discovered the work); an Unblock created after its parent
+               completed cannot be waiting on it, and sweeping it auto-skips
+               brand-new work (proven FP: g-115-2530/2531).
         - age (created_at OR defer_reason_set_at) >= --max-age-hours
           (default 0 — fire immediately; tunable for testing)
     Parent status lookup:
@@ -115,6 +122,28 @@ GOAL_ID_PATTERN = re.compile(r"^g-\d+-\d+$")
 # expired+decomposed, bogus archived). Parity enforced by
 # tests/test_terminal_goal_states_parity.py.
 TERMINAL_STATES = {"completed", "skipped", "expired", "decomposed", "superseded"}
+
+# 1 — close-sequence tolerance for the _provenance_fp_guard.
+#
+# The 4 guard tested `created < parent_completed` and called ANY
+# earlier creation a "genuine wait". That boundary is wrong at the margin: an
+# Unblock filed DURING its parent's close sequence (Phase 4 surfaces a finding
+# -> the agent files the follow-up -> verify/state-update/learning-gate then
+# stamp the parent terminal) is created SECONDS-to-MINUTES *before* the parent
+# completes, and is a FOLLOW-UP, not a wait. Measured FPs, all re-swept under
+# the bare test:  (28s lead),  (93s), 3 (97s) — each
+# description literally opens "MEASURED during <parent>", i.e. the parent's
+# completion is their PRECONDITION, not what moots them.
+#
+# Direction of the asymmetry (rb-4149): a wrongly-swept goal leaves BOTH the
+# candidate list and the blocked list, so it is invisible; a wrongly-KEPT goal
+# just stays pending and visible. Guard generously.
+#
+# 900s is ~an order of magnitude above the observed leads while staying far
+# below the genuine-wait population (a real Layer-D defer-time Unblock is filed
+# while the parent is still PENDING — typically hours to days ahead), so the
+# sweep's reach is preserved. Tunable for a domain with slower closes.
+CLOSE_SEQUENCE_WINDOW_S = int(os.environ.get("UNBLOCK_CLOSE_WINDOW_S", "900"))
 
 
 def _resolve_metrics_log(cli_path):
@@ -235,7 +264,9 @@ def _parse_parent_id(g):
     Priority order (matches Layer D capability-gate emission):
       1. origin_signal "unblock:<g-id>" — exact form
       2. Title "Unblock: <verb> for <g-id>" — Layer D canonical title
-      3. discovered_by "<g-id>" — legacy/manual unblock
+      3. discovered_by "<g-id>" — legacy/manual unblock. NOTE: the main
+         loop additionally applies _provenance_fp_guard to priority-3
+         links (rb-3887) — this parser stays permissive by design.
     """
     os_ = (g.get("origin_signal") or "").strip()
     m = ORIGIN_SIGNAL_PATTERN.match(os_)
@@ -260,6 +291,120 @@ def _build_status_index(all_aspirations):
             if gid:
                 idx[gid] = g.get("status")
     return idx
+
+
+def _parse_ts(ts):
+    """ISO timestamp/date string → NAIVE-LOCAL datetime, or None on missing/
+    unparseable. Offset-aware stamps (e.g. +00:00 from a UTC-stamping box —
+    the fleet is TZ-split, rb-3741) are converted to local then stripped
+    naive (guard-982 pattern); without this, one aware stamp meeting a naive
+    one at the `created < done` comparison raises TypeError and crashes the
+    whole sweep."""
+    if not ts:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+    except Exception:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed
+
+
+def _build_completed_ts_index(all_aspirations):
+    """Return {goal_id: completed_at-or-completed_date-or-None} across queues.
+
+    Companion index to _build_status_index (kept separate so that function's
+    contract and tests stay untouched). completed_at (datetime) preferred;
+    completed_date (bare date → parses as midnight) is the fallback, which
+    biases the rb-3887 guard toward NOT sweeping same-day cases — the safe
+    direction.
+    """
+    idx = {}
+    for asp, _src in all_aspirations:
+        for g in (asp.get("goals") or []):
+            gid = g.get("id")
+            if gid:
+                idx[gid] = g.get("completed_at") or g.get("completed_date")
+    return idx
+
+
+def _provenance_only_parent(g, parent_id):
+    """True when parent_id came SOLELY from discovered_by (priority 3) —
+    neither the origin_signal exact form nor the title 'for <g-id>' form
+    matched. Mirrors _parse_parent_id's priority order."""
+    if ORIGIN_SIGNAL_PATTERN.match((g.get("origin_signal") or "").strip()):
+        return False
+    if TITLE_FOR_PATTERN.search(g.get("title") or ""):
+        return False
+    return (g.get("discovered_by") or "").strip() == parent_id
+
+
+def _provenance_fp_guard(g, parent_id, completed_ts_idx):
+    """rb-3887 FP guard for created-after-parent-completion parent links.
+
+    discovered_by carries TWO incompatible meanings: (1) legacy/manual
+    unblock — the goal WAITS on that parent; (2) provenance — the completed
+    goal whose audit DISCOVERED this work (the sq-013 work-discovery shape).
+    An Unblock created AT/AFTER its parent's completion cannot have been
+    waiting on it — that is shape (2), and sweeping it auto-skips brand-new
+    live work (proven: g-115-2530/2531 auto-skipped within one iteration).
+
+    Returns a skip-reason string when the link is provenance (or when the
+    timestamps cannot PROVE a genuine wait — missing/unparseable stamps are
+    guarded too: the FP direction kills live work, the miss direction is
+    benign and other sweeps still cover it). Returns None when sweeping may
+    proceed.
+
+    g-115-2674 (2026-07-19) — TWO-TIER guard. The PROVEN test (both stamps
+    present AND created >= done) now applies at ALL link priorities; the
+    CONSERVATIVE test (stamps missing/unparseable) stays priority-3-only,
+    exactly as before.
+
+    Why the proven test had to widen: priority-1/2 links were fully exempt on
+    the premise that "Layer D emits those at defer time by construction".
+    That premise is FALSE for a hand-filed follow-up Unblock —
+    `origin_signal: unblock:<parent>` is also the DOCUMENTED convention for
+    filing one by hand, so the field cannot distinguish a Layer-D
+    auto-conversion from an agent-authored follow-up. The hole fired: 7 live
+    goals auto-skipped fleet-wide, incl. two HIGH goals killed within minutes
+    of filing (g-312-09, g-318-63) and a HIGH heartbeat-writer fix
+    (g-115-2182) dead 5 days.
+
+    Why the conservative test did NOT widen: a parent whose terminal status
+    is `skipped` carries no completion stamp at all, so widening the
+    missing-stamp branch would guard nearly every skipped-parent pair and
+    silently reduce the sweep to a near-no-op. That is a real cost with no
+    matching benefit — the observed incident is fully caught by the PROVEN
+    branch (g-312-08 completed_date 2026-07-19 -> midnight; child created
+    08:37 -> created >= done -> guarded). Keeping the conservative branch
+    scoped preserves the sweep's existing reach.
+
+    Net: genuine Layer-D goals are unaffected (filed at defer time while the
+    parent is still pending, so created < done and this returns None).
+    """
+    created = _parse_ts(g.get("created_at"))
+    done = _parse_ts(completed_ts_idx.get(parent_id))
+    if created is not None and done is not None:
+        lead = (done - created).total_seconds()
+        if lead > CLOSE_SEQUENCE_WINDOW_S:
+            return None  # genuine wait: Unblock long predates parent completion
+        if lead > 0:
+            why = (f"goal created {created.isoformat()} only {lead:.0f}s before "
+                   f"parent completion {done.isoformat()} — inside the "
+                   f"{CLOSE_SEQUENCE_WINDOW_S}s close-sequence window")
+        else:
+            why = (f"goal created {created.isoformat()} at/after parent "
+                   f"completion {done.isoformat()}")
+    else:
+        # Stamps cannot PROVE anything. Conservative guard stays scoped to
+        # priority-3 (discovered_by-only) links — see docstring.
+        if not _provenance_only_parent(g, parent_id):
+            return None
+        why = "created_at/parent-completion timestamp missing or unparseable"
+    return (f"parent link is provenance, not a wait ({why}) — "
+            f"rb-3887 created-after-parent-completion FP guard "
+            f"(all link priorities since g-115-2674)")
 
 
 def _mark_skipped(source, goal_id, parent_id, parent_status):
@@ -316,6 +461,7 @@ def main():
     all_aspirations = (_read_aspirations("world")
                        + _read_aspirations("agent"))
     status_idx = _build_status_index(all_aspirations)
+    completed_ts_idx = _build_completed_ts_index(all_aspirations)
 
     scanned = 0
     eligible = 0
@@ -371,6 +517,18 @@ def main():
                     "action": "skipped",
                     "reason": (f"parent not in terminal state "
                                f"(parent.status={parent_status})"),
+                })
+                continue
+            fp_reason = _provenance_fp_guard(g, parent_id, completed_ts_idx)
+            if fp_reason:
+                details.append({
+                    "goal_id": g.get("id"),
+                    "aspiration_id": asp.get("id"),
+                    "parent_id": parent_id,
+                    "parent_status": parent_status,
+                    "age_hours": round(age_h, 1),
+                    "action": "skipped",
+                    "reason": fp_reason,
                 })
                 continue
             entry = {

@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -79,7 +80,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
 from _goal_census import (  # noqa: E402
     ABANDONED_STATUSES, TERMINAL_STATUSES, CENSUS_KEY, effective_counts,
-    census_completed, census_by_status,
+    census_completed, census_by_status, census_evicted_ids, all_evicted_ids,
 )
 
 # The exact denominators the live consumers use — recomputed before/after each
@@ -119,6 +120,120 @@ def _eligible(goal: dict, cutoff: datetime) -> bool:
     return dt < cutoff
 
 
+# Sequence-space goal ids: g-NNN-NN..NNNN with an optional concurrent-mint /
+# decompose suffix letter (see coordination_merge._union_goals re-key grammar).
+_GOAL_SEQ_RE = re.compile(r"^g-(\d{3})-(\d{2,4})(-[a-z])?$")
+
+
+def _legacy_census_loose(asp: dict, in_list: int, capacity: int) -> bool:
+    """3: is the pigeonhole capacity a KNOWN-loose lower bound here?
+
+    True iff the census is 100% LEGACY count-only (no recorded evicted_ids,
+    pre-g-115-2430) AND the aspiration is not-all-live (in_list < capacity). In
+    that regime the capacity estimate (max_seq + suffixed over live + recorded
+    evicted ids) cannot observe the sequence numbers OR suffix-letters of goals
+    evicted before id-tracking existed, so it SYSTEMATICALLY undercounts real
+    allocations and FALSE-flags legitimate eviction. The excess is
+    capacity-undercount noise, not a resurrection double-count.
+
+    Deliberately does NOT suppress two reliable regimes:
+      * evicted_ids populated  -> capacity is observable/tight; trust the check.
+      * in_list == capacity (all-live) -> every minted id is live yet census
+        claims evictions = impossible; this is the genuine asp-306 resurrection
+        signature and stays refused regardless of evicted_ids visibility.
+
+    Loses no reliable detection: the id-intersection resurrection check is
+    ALREADY blind on legacy census (no ids to intersect), and every new eviction
+    records ids (g-115-2430), so post-fix resurrection is caught by id. Rationale
+    + evidence (g-115-2503): .history evicted-id recovery is infeasible (shallow
+    copy-on-write snapshots); --repair-census is a wrong-direction treadmill that
+    shrinks a CORRECT census to satisfy the undercounted capacity (repaired
+    asp-115 to exactly-fit 2026-07-16, regrew +22 in one day)."""
+    return not all_evicted_ids(asp) and in_list < capacity
+
+
+def _conservation_violation(asp: dict):
+    """Cross-run conservation canary (8; Mechanism D resurrection).
+
+    The in-run _metric_fingerprint assert proves ONE eviction is metric-neutral
+    but is blind to cross-run resurrection: a stale write restoring goals[]
+    AFTER a census bump leaves the same goals counted twice (asp-306 signature:
+    all 87 minted ids in-list + census=8). Evicting from that state re-bumps
+    census for the resurrected goals, compounding the double-count — so the
+    evictor must REFUSE the aspiration instead.
+
+    Pigeonhole invariant: sequence-minted goals ever allocated cannot exceed
+    the id capacity, so  len(sequence goals in list) + census_sum  must be
+    <= max minted seq + one extra per suffixed id (each suffix letter is an
+    allocation beyond the numeric sequence). Foreign ids (g-xw-*, short test
+    ids, other-asp prefixes) sit outside the sequence space — excluded from
+    BOTH sides. Returns a violation dict, or None when clean/underivable
+    (empty goals[] or no parseable sequence ids: capacity has no observable
+    lower bound there, and a false refusal would freeze legitimate eviction).
+    """
+    goals = asp.get("goals") or []
+    # Effective census (legacy counts + evicted-id set, 0).
+    census_sum = sum(census_by_status(asp).values())
+    asp_id = str(asp.get("id", ""))
+    asp_num = asp_id[len("asp-"):] if asp_id.startswith("asp-") else None
+    max_seq = 0
+    suffixed = 0
+    counted = 0
+    for g in goals:
+        m = _GOAL_SEQ_RE.match(str((g or {}).get("id") or ""))
+        if not m or (asp_num is not None and m.group(1) != asp_num):
+            continue
+        counted += 1
+        max_seq = max(max_seq, int(m.group(2)))
+        if m.group(3):
+            suffixed += 1
+    # Recorded evicted ids are real minted allocations — count their seqs toward
+    # capacity (NOT toward counted: they are census-side, not in-list). Without
+    # this, evicting the max-seq goal shrinks the ceiling while the census grows
+    # — a built-in false violation. Ids that are ALSO live (resurrected state)
+    # are skipped: one allocation, one capacity unit. (0)
+    live_id_set = {str((g or {}).get("id") or "") for g in goals}
+    for gid in all_evicted_ids(asp):
+        if gid in live_id_set:
+            continue
+        m = _GOAL_SEQ_RE.match(gid)
+        if not m or (asp_num is not None and m.group(1) != asp_num):
+            continue
+        max_seq = max(max_seq, int(m.group(2)))
+        if m.group(3):
+            suffixed += 1
+    if max_seq == 0:
+        return None
+    capacity = max_seq + suffixed
+    if counted + census_sum <= capacity:
+        return None
+    # 3: suppress the KNOWN-loose legacy-census false positive (capacity
+    # undercounts invisible pre-id-tracking evictions), preserving the all-live
+    # resurrection signature. See _legacy_census_loose.
+    if _legacy_census_loose(asp, counted, capacity):
+        return None
+    return {
+        "asp_id": asp_id, "goals_in_list": counted, "census_sum": census_sum,
+        "max_minted_seq": max_seq, "suffixed_extra": suffixed,
+        "capacity": capacity, "excess": counted + census_sum - capacity,
+    }
+
+
+def _warn_violation(v: dict, where: str) -> None:
+    """Loud human warning + one machine-readable audit line (stderr)."""
+    print(f"[evict] WARN: CONSERVATION VIOLATION on {v['asp_id']} ({where}): "
+          f"{v['goals_in_list']} in-list + census {v['census_sum']} exceeds id "
+          f"capacity {v['capacity']} (max seq {v['max_minted_seq']}"
+          f" + {v['suffixed_extra']} suffixed) by {v['excess']} — SKIPPING this "
+          "aspiration (evicting from a resurrected state would re-bump census "
+          "and compound the double-count; see tree node "
+          "counter-clobber-mechanisms Mechanism D / g-115-1936).",
+          file=sys.stderr)
+    print("CONSERVATION-VIOLATION " + json.dumps(v, sort_keys=True,
+                                                 ensure_ascii=True),
+          file=sys.stderr)
+
+
 def _metric_fingerprint(asp: dict) -> dict:
     """All completion metrics this aspiration influences — must be invariant."""
     fp = {label: effective_counts(asp, exclude_statuses=excl, include_recurring=rec)
@@ -128,34 +243,53 @@ def _metric_fingerprint(asp: dict) -> dict:
     return fp
 
 
-def _bump_census(asp: dict, status: str) -> None:
+def _bump_census(asp: dict, status: str, goal_id) -> None:
+    """Record an evicted goal id in archived_census.evicted_ids[status] (sorted,
+    deduped). g-115-2430: the id SET replaces the legacy by_status count as the
+    census authority — it merges by union (commutative/idempotent, so a stale
+    peer can never revert a repair or double it), doubles as the resurrection
+    tombstone in coordination_merge._merge_goals, and makes re-evicting a
+    resurrected goal a NO-OP (set add), killing the double-count lane of
+    g-115-2401. `by_status` is the FROZEN legacy baseline: new evictions never
+    touch it; only census repairs shrink it."""
     census = asp.setdefault(CENSUS_KEY, {})
     if not isinstance(census, dict):
         census = {}
         asp[CENSUS_KEY] = census
-    by_status = census.setdefault("by_status", {})
-    if not isinstance(by_status, dict):
-        by_status = {}
-        census["by_status"] = by_status
-    by_status[status] = int(by_status.get(status, 0) or 0) + 1
+    ids = census.setdefault("evicted_ids", {})
+    if not isinstance(ids, dict):
+        ids = {}
+        census["evicted_ids"] = ids
+    bucket = ids.setdefault(status, [])
+    if not isinstance(bucket, list):
+        bucket = []
+        ids[status] = bucket
+    gid = str(goal_id)
+    if gid not in bucket:
+        bucket.append(gid)
+        bucket.sort()
 
 
 def _capacity(asp) -> int:
     """Pigeonhole ceiling for an aspiration's id-space: the max sequence number
-    among live goal ids (+ count of distinct suffixed ids). Ids are minted
-    contiguously from 1, so this is the observable lower bound on how many
-    distinct goal ids the aspiration ever allocated. in_list + census_sum must
-    not exceed it — if it does, archived_census double-counts evicted goals
-    (phantom allocations from evict->resurrect->re-evict cycles). Evicted
-    higher-seq ids are invisible here, so this is a CONSERVATIVE ceiling
-    (maximizes detected excess); g-115-1936's independent completions-delta
-    cross-check confirmed the excess is genuine phantom, not hidden high-seq
-    eviction. (g-115-1951 / g-115-1938 conservation canary)"""
+    among live goal ids AND recorded evicted ids (+ count of distinct suffixed
+    ids). Ids are minted contiguously from 1, so this is the observable lower
+    bound on how many distinct goal ids the aspiration ever allocated. in_list +
+    census_sum must not exceed it — if it does, archived_census double-counts
+    evicted goals (phantom allocations from evict->resurrect->re-evict cycles).
+    Post-g-115-2430, evicted ids are visible via archived_census.evicted_ids and
+    counted here (each names a real minted id — and without them, evicting the
+    max-seq goal would SHRINK the ceiling while growing the census, a built-in
+    false positive). LEGACY count-only census entries still have invisible ids,
+    so for those the ceiling stays CONSERVATIVE (maximizes detected excess);
+    g-115-1936's independent completions-delta cross-check confirmed that excess
+    is genuine phantom, not hidden high-seq eviction. (g-115-1951 / g-115-1938
+    conservation canary)"""
     prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"   #  -> g-249-
+    live_ids = [str(g.get("id", "")) for g in asp.get("goals", []) or []]
     max_seq = 0
     suffixed = 0
-    for g in asp.get("goals", []) or []:
-        gid = str(g.get("id", ""))
+    for gid in dict.fromkeys(live_ids + all_evicted_ids(asp)):  # deduped, ordered
         if not gid.startswith(prefix):
             continue
         tail = gid[len(prefix):]
@@ -180,7 +314,9 @@ def _audit_violations(items):
         cap = _capacity(asp)
         census_sum = sum(census_by_status(asp).values())
         claimed = in_list + census_sum
-        if cap > 0 and claimed > cap:
+        # 3: skip the KNOWN-loose legacy-census false positive (see
+        # _legacy_census_loose) — the all-live resurrection signature is retained.
+        if cap > 0 and claimed > cap and not _legacy_census_loose(asp, in_list, cap):
             out.append({
                 "id": asp.get("id", "?"),
                 "in_list": in_list,
@@ -211,32 +347,49 @@ def _scale_by_status(bs: dict, old_sum: int, target: int) -> dict:
 
 def _make_census_repair(stamp: str):
     """locked_modify_jsonl modifier: for each aspiration with a pigeonhole
-    violation, shrink archived_census.by_status so census_sum == capacity -
-    in_list (the max conservation-valid evicted count), preserving per-status
-    proportions and stamping a census_note. Non-violating aspirations untouched.
-    Returns the modified items; raises if any violation SURVIVES (post-repair
-    conservation guard — the write aborts rather than land a partial fix)."""
+    violation, shrink the LEGACY archived_census.by_status counts so
+    legacy_sum == capacity - in_list - len(evicted_ids) (the max
+    conservation-valid evicted count), preserving per-status proportions and
+    stamping a census_note. evicted_ids entries are GROUND TRUTH (each names a
+    real evicted goal id) and are never clamped — post-g-115-2430 phantom can
+    only live in the legacy counts. Statuses present pre-repair keep an EXPLICIT
+    0 (never key-dropped): the cross-box merge treats an absent by_status key as
+    no-opinion, so a dropped key would let a stale peer's nonzero resurrect it,
+    while an explicit 0 wins the per-status MIN. Non-violating aspirations
+    untouched. Returns the modified items; raises if any violation SURVIVES
+    (post-repair conservation guard — the write aborts rather than land a
+    partial fix)."""
     def _repair(items):
         for asp in items:
             goals = asp.get("goals", []) or []
             prefix = str(asp.get("id", "")).replace("asp-", "g-", 1) + "-"
             in_list = sum(1 for g in goals if str(g.get("id", "")).startswith(prefix))
             cap = _capacity(asp)
-            bs = census_by_status(asp)
-            census_sum = sum(bs.values())
+            census_sum = sum(census_by_status(asp).values())  # legacy + ids
             if cap <= 0 or in_list + census_sum <= cap:
                 continue  # no violation — leave untouched
-            target = max(0, cap - in_list)
             census = asp.setdefault(CENSUS_KEY, {})
             if not isinstance(census, dict):
                 census = {}
                 asp[CENSUS_KEY] = census
-            census["by_status"] = _scale_by_status(bs, census_sum, target)
+            raw_bs = census.get("by_status")
+            legacy = {}
+            if isinstance(raw_bs, dict):
+                for s, n in raw_bs.items():
+                    try:
+                        legacy[s] = max(0, int(n))
+                    except (TypeError, ValueError):
+                        continue
+            legacy_sum = sum(legacy.values())
+            ids_total = sum(len(v) for v in census_evicted_ids(asp).values())
+            target = max(0, min(legacy_sum, cap - in_list - ids_total))
+            scaled = _scale_by_status(legacy, legacy_sum, target)
+            census["by_status"] = {s: scaled.get(s, 0) for s in sorted(legacy)}
             census["census_note"] = (
-                f"reconciled g-115-1951 {stamp}: census_sum {census_sum}->{target} "
-                f"(capacity {cap} - in_list {in_list}); per-status proportionally "
-                f"scaled from prior distribution; exact evicted-id status recovery "
-                f"from .history deferred (estimate).")
+                f"reconciled g-115-1951 {stamp}: legacy census_sum "
+                f"{legacy_sum}->{target} (capacity {cap} - in_list {in_list} - "
+                f"{ids_total} evicted ids); per-status proportionally scaled "
+                f"from prior distribution; evicted_ids untouched (ground truth).")
         # Post-repair conservation guard: no violation may survive.
         survivors = _audit_violations(items)
         if survivors:
@@ -248,11 +401,18 @@ def _make_census_repair(stamp: str):
 
 
 def _plan(items, cutoff):
-    """Return (per_asp_report, total_goals, bytes_freed)."""
+    """Return (per_asp_report, total_goals, bytes_freed, violations).
+    Aspirations failing the conservation canary are excluded from the plan."""
     report = []
     grand_n = 0
     grand_bytes = 0
+    violations = []
     for asp in items:
+        v = _conservation_violation(asp)
+        if v:
+            violations.append(v)
+            _warn_violation(v, "plan")
+            continue
         n = 0
         freed = 0
         for g in asp.get("goals", []) or []:
@@ -264,7 +424,7 @@ def _plan(items, cutoff):
             grand_n += n
             grand_bytes += freed
     report.sort(key=lambda x: -x[1])
-    return report, grand_n, grand_bytes
+    return report, grand_n, grand_bytes, violations
 
 
 def _make_evictor(cutoff):
@@ -275,11 +435,19 @@ def _make_evictor(cutoff):
         before = {asp.get("id", f"#{i}"): _metric_fingerprint(asp)
                   for i, asp in enumerate(items)}
         for asp in items:
+            v = _conservation_violation(asp)
+            if v:
+                # Re-checked INSIDE the lock (not just at plan time): the locked
+                # read is force-fresh and may see resurrected state the dry-run
+                # pass did not. Skipping leaves goals+census untouched, so the
+                # before/after fingerprint assert below still holds for this asp.
+                _warn_violation(v, "apply")
+                continue
             goals = asp.get("goals", []) or []
             kept = []
             for g in goals:
                 if _eligible(g, cutoff):
-                    _bump_census(asp, g.get("status"))
+                    _bump_census(asp, g.get("status"), g.get("id"))
                 else:
                     kept.append(g)
             asp["goals"] = kept
@@ -408,7 +576,7 @@ def main():
 
     before_bytes = path.stat().st_size
     total_goals_now = sum(len(a.get("goals", []) or []) for a in items)
-    report, total_n, freed = _plan(items, cutoff)
+    report, total_n, freed, violations = _plan(items, cutoff)
 
     print(f"[evict] source={args.source} path={path}")
     print(f"[evict] current: {before_bytes:,} bytes, {total_goals_now} goals "
@@ -416,6 +584,11 @@ def main():
     print(f"[evict] cutoff: terminal before {cutoff.isoformat()} "
           f"(--age-days {args.age_days})")
     print(f"[evict] eligible: {total_n} goals to evict, ~{freed:,} bytes freed")
+    if violations:
+        print(f"[evict] WARN: {len(violations)} aspiration(s) SKIPPED on "
+              f"conservation violation (details on stderr) — resolve the "
+              f"resurrection (see counter-clobber-mechanisms Mechanism D) "
+              f"before those can be evicted.")
     for asp_id, n, fb in report[:12]:
         print(f"         {asp_id:12} {n:5} goals  ~{fb:,} bytes")
 

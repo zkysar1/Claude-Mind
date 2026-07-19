@@ -46,23 +46,64 @@ TERMINAL_STATUSES = ABANDONED_STATUSES | frozenset({"completed"})
 CENSUS_KEY = "archived_census"
 
 
+def census_evicted_ids(asp):
+    """Return {status: [sorted goal-ids]} recorded by post-cutover eviction.
+
+    g-115-2430: `evicted_ids` is the merge-correct census — an ID SET, so the
+    cross-box reconcile (coordination_merge._merge_archived_census) unions it
+    (commutative + idempotent) instead of LWW'ing a bare count, and the ids
+    double as tombstones that stop _merge_goals resurrecting evicted goals.
+    Tolerant of absent/partial/garbage shape; values normalized to sorted
+    deduped string lists."""
+    c = asp.get(CENSUS_KEY)
+    if not isinstance(c, dict):
+        return {}
+    ids = c.get("evicted_ids")
+    if not isinstance(ids, dict):
+        return {}
+    out = {}
+    for status, v in ids.items():
+        if not isinstance(v, list):
+            continue
+        vals = sorted({str(x) for x in v})
+        if vals:
+            out[status] = vals
+    return out
+
+
+def all_evicted_ids(asp):
+    """Flat sorted list of every evicted goal id (all statuses). Consumed by the
+    goal-id mint sites so max+1 allocation never re-mints an evicted id (which
+    the merge-layer tombstone would then wrongly drop as a resurrection)."""
+    out = set()
+    for vals in census_evicted_ids(asp).values():
+        out.update(vals)
+    return sorted(out)
+
+
 def census_by_status(asp):
     """Return {status: count} of evicted goals for an aspiration (possibly empty).
+
+    Effective count per status = legacy `by_status` baseline (pre-g-115-2430
+    count-only census, FROZEN at cutover: only census repairs shrink it) +
+    len(evicted_ids[status]) (post-cutover id-set census). Legacy-only and
+    ids-only aspirations both read correctly; pre-eviction aspirations return {}.
 
     Tolerant of absent/partial/garbage census so a hand-edited or pre-eviction
     aspiration never raises in the scorer."""
     c = asp.get(CENSUS_KEY)
     if not isinstance(c, dict):
         return {}
-    bs = c.get("by_status")
-    if not isinstance(bs, dict):
-        return {}
     out = {}
-    for status, n in bs.items():
-        try:
-            out[status] = max(0, int(n))
-        except (TypeError, ValueError):
-            continue
+    bs = c.get("by_status")
+    if isinstance(bs, dict):
+        for status, n in bs.items():
+            try:
+                out[status] = max(0, int(n))
+            except (TypeError, ValueError):
+                continue
+    for status, ids in census_evicted_ids(asp).items():
+        out[status] = out.get(status, 0) + len(ids)
     return out
 
 

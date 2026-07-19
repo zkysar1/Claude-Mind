@@ -177,3 +177,50 @@ def test_cmd_check_meta_only_still_processed(tmp_path):
     meta = state["active_monitors"][0]
     assert meta["goals_since_change"] == 1
     assert meta["imp_k_samples"] == [0.5]
+
+
+# -- Case 4: cmd_graduate mixed list -- 7 sibling of the check() skip -
+def test_cmd_graduate_mixed_list_no_keyerror(tmp_path):
+    """cmd_graduate iterated active_monitors doing monitor["meta_change_id"];
+    an evolution monitor (no meta_change_id) KeyError'd the WHOLE endpoint,
+    breaking graduate fleet-wide (g-115-2677 -- the sibling cmd_check got fixed
+    in g-115-1277 but graduate was missed). Post-fix: .get() skips evolution
+    monitors, the named weight monitor graduates, evolution monitors untouched.
+    Evolution monitor is FIRST in the list -- exactly where the pre-fix KeyError
+    fired."""
+    monitors = [_evolution_monitor("skill-a"), _meta_strategy_monitor(),
+                _evolution_monitor("skill-b")]
+    args = argparse.Namespace(change_id="mc-test-001")
+    with _bp_state(tmp_path, monitors) as bp_file:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            M.cmd_graduate(args)          # raises KeyError pre-fix (evo monitor first)
+        out = buf.getvalue()
+        state = yaml.safe_load(bp_file.read_text(encoding="utf-8"))
+
+    assert '"status": "graduated"' in out
+    # graduated weight monitor removed from the active list; both evolution
+    # monitors remain (still monitoring, never a match for the weight change_id)
+    assert len(state["active_monitors"]) == 2
+    for m in state["active_monitors"]:
+        assert m.get("monitor_kind") == "skill_evolution"
+    assert all(m.get("meta_change_id") != "mc-test-001"
+               for m in state["active_monitors"])
+
+
+# -- Case 5: cmd_graduate evolution-only list -- not-found, no crash, no drop --
+def test_cmd_graduate_evolution_only_not_found(tmp_path):
+    """An all-evolution active_monitors list + graduate for a weight change_id
+    must report not-found WITHOUT raising (the pre-fix crash) and must NOT drop
+    any evolution monitor (not-found returns before write_yaml)."""
+    monitors = [_evolution_monitor(f"skill-{i}") for i in range(3)]
+    args = argparse.Namespace(change_id="mc-nonexistent")
+    with _bp_state(tmp_path, monitors) as bp_file:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            M.cmd_graduate(args)          # raises KeyError pre-fix
+        out = buf.getvalue()
+        state = yaml.safe_load(bp_file.read_text(encoding="utf-8"))
+
+    assert "not found" in out
+    assert len(state["active_monitors"]) == 3   # nothing dropped on not-found

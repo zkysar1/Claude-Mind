@@ -51,16 +51,26 @@ Applies to:
    and Read the file first.
 
    But the gate fires ONLY for the path classes the context-reads manifest
-   actually tracks: `core/config/**`, `.claude/skills/**`,
-   `world/knowledge/tree/**`, `world/conventions/**`, and
-   `aspirations-compact.json`. For everything else — `core/scripts/**`,
-   `.claude/rules/**`, `agents/<agent>/**` (including `self.md`), and all
-   product-code / external files — the gate stays **silent by design**: a read
-   of those is never recorded in the manifest, so a "has not been Read" warning
-   there would be a guaranteed false positive that desensitizes you to the
-   banner. The absence of a warning is therefore NOT evidence you have current
-   context. Rules 1-3 are honor-system for the out-of-scope majority — the gate
-   backstops only the trackable subset.
+   advisory-tracks: `core/config/**`, `.claude/skills/**`,
+   `world/knowledge/tree/**`, `world/conventions/**`, `aspirations-compact.json`,
+   and — since g-115-2210 — `core/scripts/**` (framework code, the surface where
+   loop self-evolution lands). For everything else — `.claude/rules/**`,
+   `agents/<agent>/**` (including `self.md`), and all product-code / external
+   files — the gate stays **silent by design**: a read of those is never
+   recorded in the manifest, so a "has not been Read" warning there would be a
+   guaranteed false positive that desensitizes you to the banner. The absence of
+   a warning is therefore NOT evidence you have current context. Rules 1-3 are
+   honor-system for the out-of-scope majority — the gate backstops only the
+   trackable subset.
+
+   Scope-split caveat (g-115-2210): `core/scripts/**` is *advisory-only*. Its
+   reads are recorded and the edit advisory fires there, but the separate
+   PreToolUse[Read] re-read dedup gate (which BLOCKS a redundant whole-file
+   re-read) keeps the NARROWER pre-2210 scope — so a mandated whole-file
+   re-verify of a script after a linter/user touch (verify-before-assuming.md)
+   is never refused as "already in context." The `is_in_scope` (narrow, dedup)
+   vs `is_in_scope_advisory` (wide, recorder+advisory) split in
+   `context-reads.py` is the single source of truth for this.
 
 ## Anti-patterns
 

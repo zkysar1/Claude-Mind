@@ -223,7 +223,7 @@ Read {node.file}
 # Growth is STRUCTURAL now, not line-count (outcome 3 — the old
 # `line_count > decompose_threshold` trigger is retired). Flag a node for
 # regroup when its direct children exceed K_max; retrieval-subtree leaf overflow
-# (> K_max^(D_retrieval-1) = 64) is computed at maintain time by
+# (> K_max^(D_retrieval-1), derived from config) is computed at maintain time by
 # `tree-read.sh --decompose-candidates` / `--validate`.
 Read core/config/tree.yaml for K_max
 If child_count > K_max:
@@ -359,30 +359,39 @@ as the former `/tree-growth` skill.
 
 ### Operations (in order)
 
-> **K=D=4 retrieval-locality contract (g-306-13, board decision
-> msg-20260619-075228-bravo-086).** DECOMPOSE and REGROUP are STRUCTURAL,
-> not line-count (outcome 3 — the `decompose_threshold` line trigger is
-> retired). Per Zhong et al. (PRL 134:237402, 2025) recall saturates at
-> `K_max^(D_retrieval-1)` = 4^3 = 64 leaves under a retrieval entry point;
-> the locality bound is therefore <=K_max (4) children/node and <=64 leaves
-> under any retrieval root. Policy is HYBRID report-mode-first +
-> enforce-going-forward: **GRANDFATHER** the ~650 existing depth-5..8 nodes
-> (no forced whole-tree rebalance), and regroup a subtree **opportunistically
-> — only when maintain is already touching it.** Both operations introduce
-> intermediate category nodes and REPARENT existing children under them
-> (moving nodes, preserving content + history) — they do NOT split `.md`
-> sections.
+> **Retrieval-locality contract — K_max=40 (user directive 2026-07-14,
+> supersedes the K=4 half of g-306-13 / board decision
+> msg-20260619-075228-bravo-086; see decisions-board amendment of
+> 2026-07-14).** DECOMPOSE and REGROUP remain STRUCTURAL, not line-count
+> (outcome 3 — the `decompose_threshold` line trigger is retired). The
+> original K=4 bound (Zhong et al., PRL 134:237402, 2025: recall saturates
+> at `K_max^(D_retrieval-1)` leaves under a retrieval entry point) modeled
+> hierarchical-descent retrieval; this deployment's `retrieve.sh`
+> flat-scores nodes, the fleet never actioned a count-based regroup in
+> practice (observed max fan-out 26 vs the 4-cap), and wide-shallow shapes
+> shorten file paths (Windows MAXPATH). K_max and the derived leaf cap live
+> in `core/config/tree.yaml` (single source of truth — tree.py derives
+> `K_max^(D_retrieval-1)`; do NOT hardcode either number here). With
+> K_max=40 the count trigger is effectively dormant: regroup/decompose fire
+> on **semantic incoherence** (a hub whose children span unrelated topics),
+> judged opportunistically when maintain is already touching the subtree.
+> Both operations introduce intermediate category nodes and REPARENT
+> existing children under them (moving nodes, preserving content + history)
+> — they do NOT split `.md` sections. CAUTION when reparenting: git-tracked
+> framework files (e.g. `.claude/rules/path-resolution.md`) hardcode some
+> node paths — `tree-inbound-ref-fix.py` repairs tree-node bodies only;
+> grep `.claude/` for any moved path.
 
 #### 1. DECOMPOSE — Restore retrieval locality (subtree leaf overflow)
 
 **Trigger** (STRUCTURAL): a non-root node whose retrieval subtree holds more
-than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
+than the leaf cap (`K_max^(D_retrieval-1)`, derived from config) leaves. Reported by
 `tree-read.sh --decompose-candidates` with `reason: leaf_overflow`,
 `recommended_action: decompose`, plus `subtree_leaves` / `depth` / `child_count`.
 
 **Steps**:
 1. Scan: `Bash: tree-read.sh --decompose-candidates`
-2. For each candidate (largest `subtree_leaves` first), restore the <=64 bound
+2. For each candidate (largest `subtree_leaves` first), restore the derived leaf-cap bound
    by introducing intermediate category nodes that partition the children into
    <=K_max balanced semantic groups:
    a. Read the node and its children to find the natural clustering.
@@ -403,6 +412,17 @@ than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
       `bash core/scripts/tree-update.sh` reparent ops. Use `--encoding-source
       tree-maintain-decompose` so the L1 pick log (S9) attributes the new
       intermediates to structural maintenance, not agent-judgment SPROUTs.
+   c2. **Repair inbound cross-refs (g-115-1830)**: after this candidate's
+      reparents AND their physical file moves are applied (all bodies now
+      readable at their new paths), rewrite any OTHER node's backtick-quoted
+      body ref that pointed at a moved child's OLD path — else it silently
+      dangles until a later `/tree validate` flags it (g-115-1419), and every
+      retrieval through it misses in the meantime. Collect this candidate's
+      reparent `file_moves` into one JSON array and apply:
+      `echo '[{"old":"world/...","new":"world/..."}, ...]' | py -3 core/scripts/tree-inbound-ref-fix.py --apply`.
+      The output lists every ref rewritten (node + old_ref -> new_ref) — surface
+      it in the maintenance log. Backtick-scoped, form-preserving, idempotent;
+      never mutates the moved node itself, only inbound refs.
    d. **Depth guard / grandfather**: skip any reparent that would push a child
       past `D_max` (20). If the subtree is already deep (grandfathered
       depth-5..8) and cannot be regrouped without exceeding the ceiling, LEAVE
@@ -417,7 +437,7 @@ than the leaf cap (`K_max^(D_retrieval-1)` = 64) leaves. Reported by
 
 #### 1.5. REGROUP — Cap fan-out at K_max (formerly REDISTRIBUTE)
 
-**Trigger** (STRUCTURAL): an interior node with more than `K_max` (4) children.
+**Trigger** (STRUCTURAL): an interior node with more than `K_max` (40, per core/config/tree.yaml) children.
 Reported by `tree-read.sh --redistribute-candidates` with `reason: k_overflow`,
 `recommended_action: regroup`, plus `child_count` / `children` / `depth`.
 
@@ -429,6 +449,18 @@ Reported by `tree-read.sh --redistribute-candidates` with `reason: k_overflow`,
    b. Create one intermediate category node per group as a child of `<key>`.
    c. REPARENT each existing child under its group's intermediate node
       (`tree-update.sh` reparent ops — moves nodes, preserves content/history).
+   c2. **Repair inbound cross-refs (g-115-1830)**: after this candidate's
+      reparents AND their physical file moves are applied (all bodies now
+      readable at their new paths), rewrite any OTHER node's backtick-quoted
+      body ref that pointed at a moved child's OLD path — else it silently
+      dangles until a later `/tree validate` flags it (g-115-1419). Collect this
+      candidate's reparent `file_moves` into one JSON array and apply:
+      `echo '[{"old":"world/...","new":"world/..."}, ...]' | py -3 core/scripts/tree-inbound-ref-fix.py --apply`.
+      The output lists every ref rewritten (node + old_ref -> new_ref) — surface
+      it in the maintenance log. Backtick-scoped, form-preserving, idempotent;
+      never mutates the moved node itself, only inbound refs. (This is the
+      systemic auto-fix for the exact breakage the g-115-398 regroup hit — 8
+      inbound refs across 7 nodes, then fixed by hand.)
    d. **Depth guard / grandfather**: skip reparents that would exceed `D_max`
       (20); leave grandfathered deep subtrees in place rather than force-migrate.
    d2. **Durable exemption (coherence judgment, g-115-1648)**: if a candidate is
@@ -483,7 +515,7 @@ of utility tracking have accumulated signal.
 4. Create child nodes (compute paths from parent `file` field)
 5. Ensure `min_articles_per_child` (2) is met
 6. Convert parent to interior, register children
-7. Verify parent `child_count <= K_max` (4)
+7. Verify parent `child_count <= K_max` (40, per core/config/tree.yaml)
 8. Log to tree_growth_log
 
 #### 3. SPROUT — Add a new node for unmapped content
@@ -808,6 +840,18 @@ IF old_dir exists as directory:
     mv old_dir new_dir
 # Verify: remaining file_moves entries should now resolve to existing files
 # (moved implicitly by the directory move)
+
+# --- Repair inbound cross-references (g-115-1830) ---
+# The reparent updated _tree.yaml + moved the file, but any OTHER node whose BODY
+# hardcodes a backtick-quoted ref to this node's OLD path now dangles — a later
+# `/tree validate` would flag it as a g-115-1419 warning, and until then every
+# retrieval through that ref misses. Now that the physical move is applied and
+# every body is readable at its current path, repair those inbound refs old->new.
+# The reparent `result` already carries file_moves; pipe it straight in.
+echo "$result" | py -3 core/scripts/tree-inbound-ref-fix.py --apply
+# Output JSON lists every ref rewritten (node + old_ref -> new_ref) + fixed count.
+# Surface it. Backtick-scoped (bare-prose mentions untouched), form-preserving
+# (world/knowledge/tree/ prefix or L1-first kept), and idempotent — safe to re-run.
 ```
 
 ## Sub-Command: /tree stats
@@ -845,7 +889,7 @@ ELSE:
 
 ## Constraints
 
-- `K_max` (4): soft limit at all levels (can exceed when justified, log reason)
+- `K_max` (40, per core/config/tree.yaml): soft limit at all levels (can exceed when justified, log reason)
 - `D_max` (20): hard limit — never create nodes beyond depth 20
 - Never prune L1 domain nodes
 - Always append to `tree_growth_log` for every structural change

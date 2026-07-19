@@ -36,6 +36,26 @@ Cases covered:
   G9 over-suppression guard for the G8 verb stopwords: a genuine 2-identifier
      dup (loop_state + g-115-999) carrying cause/confirmed still BLOCKS,
      proving the verb stopwording did not suppress real duplicate detection.
+  G10 exclusion-context file-path FP (g-115-2207) → DEMOTE: a path named ONLY
+     in an "excluding retrieve.sh" clause is not aboutness, so it must NOT be a
+     structural co-signal (canonical incident g-115-2206: g-115-760's
+     "feature-path-excluded for retrieve.sh" false-blocked a Maintain goal).
+  G11 recall / over-suppression guard for g-115-2207: the SAME overlap with
+     retrieve.sh named POSITIVELY (sole co-signal) still BLOCKS — the
+     exclusion-context disqualifier must not suppress genuine file-path dups
+     (guard-958 adversarial genuine-positive control).
+  G12 recurring keyword-vacuum completion (g-248-114) → DEMOTE: a recurring
+     completion matched on hyphenated-compound keywords only (env-server /
+     end-to-end, [-_0-9] structured) with ZERO file-path hits is a keyword
+     vacuum — demoted to a recurring_vacuum_exempt advisory, never a block
+     (false-block class: g-335-103/104/105 vs the g-115-23 recurring sweep).
+  G13 NON-recurring keyword-vacuum (g-248-114 control) → BLOCK: the identical
+     vacuum shape with a non-recurring completion still hard-blocks, proving
+     the exemption is scoped to recurring completions.
+  G14 recurring completion + REAL file-path hit (g-248-114 control) → BLOCK:
+     a recurring completion sharing a real file path (hit_paths non-empty) is
+     NOT a vacuum → still hard-blocks, proving the exemption requires empty
+     hit_paths.
 
 Test isolation strategy (g-115-1375, 2026-06-09): redirect MIND_WORLD to a
 tmp directory and seed team-state.yaml THERE, so the live shared
@@ -155,10 +175,35 @@ def _seed_state(tmp_world: Path, target_entry):
         f.write("")
 
 
+def _seed_recurring(tmp_world: Path, recurring_goal_ids):
+    """Overwrite tmp_world/aspirations.jsonl (which _seed_state leaves empty)
+    with one aspiration whose goals carry recurring:true for each id in
+    recurring_goal_ids. The g-248-114 exemption keys off a COMPLETION whose
+    goal_id is recurring — the gate's _recurring_goal_ids(world_dir) reads this
+    file to build the recurring set. Call AFTER _seed_state (which resets
+    aspirations.jsonl to empty).
+    """
+    asp = {
+        "id": "asp-scs-recur",
+        "title": "SCS recurring-vacuum fixture",
+        "status": "active",
+        "goals": [
+            {"id": gid, "title": f"Recurring sweep {gid}",
+             "status": "completed", "recurring": True}
+            for gid in recurring_goal_ids
+        ],
+    }
+    with open(tmp_world / "aspirations.jsonl", "w", encoding="utf-8") as f:
+        f.write(json.dumps(asp) + "\n")
+
+
 def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
+    # Hermetic agent-queue scan (5): keep live agent queues out
+    # of the wrapper's pending_queue check (rb-3784 corpus coupling).
+    env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),
@@ -551,6 +596,234 @@ def main() -> int:
                 f"reason={rc9.get('reason')} matches={rc9.get('matches')}"
             )
 
+        # ── G10: exclusion-context file-path FP (7) → DEMOTE ─────
+        # The file-path twin of G4/G8, for a path named ONLY in a NEGATIVE
+        # (exclusion) context. Both goals share strong PLAIN-word overlap
+        # (fallback/coverage/sweep/audit/excluding — no -_0-9) so strong=True,
+        # and BOTH name retrieve.sh in an "excluding retrieve.sh" clause. Before
+        # the 7 exclusion-context disqualifier, retrieve.sh entered the
+        # proposed goal's file_paths -> hit_paths=[retrieve.sh] -> has_specific
+        # -> HARD block (canonical incident 6: 's
+        # "feature-path-excluded for retrieve.sh" false-blocked a Maintain goal
+        # at weighted 7.53). After the fix the exclusion-scoped path is dropped
+        # from the co-signal set -> has_specific=False (no structured keyword
+        # among the plain shared words) -> DEMOTE to advisory, never a block.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G10",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Ran the fallback coverage sweep audit, excluding retrieve.sh "
+                "throughout the pass."
+            ),
+        })
+        case_g10 = {
+            "title": "Maintain: fallback coverage sweep audit",
+            "description": (
+                "Recurring fallback coverage sweep audit, excluding retrieve.sh "
+                "from the scan."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg10 = _run_gate(case_g10, tmp_world)
+        rc10 = _find_check(rg10, "recent_completions")
+        if rc10 is None:
+            failures.append("G10: recent_completions check missing from result")
+        elif rc10.get("passed") is not True:
+            failures.append(
+                "G10: recent_completions should PASS (exclusion-context file-path "
+                "FP demote, g-115-2207). retrieve.sh is named ONLY in an "
+                "'excluding retrieve.sh' clause, so it is not aboutness and must "
+                "not be a structural co-signal. reason="
+                f"{rc10.get('reason')} matches={rc10.get('matches')}"
+            )
+        else:
+            fp_detected = rg10.get("file_paths_detected") or []
+            if "retrieve.sh" in fp_detected:
+                failures.append(
+                    "G10: retrieve.sh must be dropped from file_paths_detected "
+                    f"(exclusion-context), got {fp_detected}"
+                )
+
+        # ── G11: recall / over-suppression guard for 7 ───────────
+        # The adversarial genuine-POSITIVE control (guard-958): the SAME plain
+        # overlap, but retrieve.sh is named POSITIVELY ("audit on retrieve.sh")
+        # and IS the sole structural co-signal. It must STILL BLOCK — proving
+        # the exclusion-context disqualifier did not suppress real file-path
+        # duplicate detection. A path mentioned in aboutness context survives
+        # the filter (recall preserved).
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-filler-G11",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Patched the fallback coverage sweep audit directly in "
+                "retrieve.sh last pass."
+            ),
+        })
+        case_g11 = {
+            "title": "Maintain: fallback coverage sweep audit",
+            "description": (
+                "Recurring fallback coverage sweep audit performed on "
+                "retrieve.sh directly."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg11 = _run_gate(case_g11, tmp_world)
+        rc11 = _find_check(rg11, "recent_completions")
+        if rc11 is None:
+            failures.append("G11: recent_completions check missing from result")
+        elif rc11.get("passed") is not False:
+            failures.append(
+                "G11: recent_completions should BLOCK (positive-context "
+                "retrieve.sh is the sole structural co-signal; the g-115-2207 "
+                "filter must NOT suppress genuine file-path dups). reason="
+                f"{rc11.get('reason')} matches={rc11.get('matches')}"
+            )
+        else:
+            matches = rc11.get("matches") or []
+            if not any("retrieve.sh" in (m.get("file_path_hits") or [])
+                       for m in matches):
+                failures.append(
+                    "G11: expected retrieve.sh in file_path_hits (recall), got "
+                    f"{[m.get('file_path_hits') for m in matches]}"
+                )
+
+        # ── G12: recurring keyword-vacuum completion → DEMOTE () ──
+        # A recurring/reflection COMPLETION (its goal_id carries recurring:true
+        # in the aspirations queue) matched on hyphenated-compound KEYWORDS ONLY
+        # (env-server + end-to-end — both trip has_specific via [-_0-9]) with
+        # ZERO shared file path is a "keyword vacuum": generic domain vocab, not
+        # duplicate work. Before  the two structured compounds pushed
+        # N>=2 + weighted>=1.5 + has_specific=True → HARD block, false-blocking
+        # new-capability goals (canonical incident: /104/105 blocked by
+        # the  recurring sweep +  reflection). After the fix the
+        # completion's recurring goal_id + empty hit_paths → recurring_vacuum →
+        # DEMOTE to an advisory (recurring_vacuum_exempt), never a block.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-recur-vac",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Recurring sweep confirmed the env-server end-to-end reconnect "
+                "handshake stayed healthy across the cycle."
+            ),
+        })
+        _seed_recurring(tmp_world, ["g-scs-recur-vac"])
+        case_g12 = {
+            "title": "Investigate: env-server end-to-end reconnect gap",
+            "description": (
+                "Add an env-server end-to-end reconnect probe in a new "
+                "monitoring module."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg12 = _run_gate(case_g12, tmp_world)
+        rc12 = _find_check(rg12, "recent_completions")
+        if rc12 is None:
+            failures.append("G12: recent_completions check missing from result")
+        elif rc12.get("passed") is not True:
+            failures.append(
+                "G12: recent_completions should PASS (recurring keyword-vacuum "
+                "demote, g-248-114). The completion goal_id is recurring and the "
+                "env-server/end-to-end match has ZERO file-path hits — a keyword "
+                f"vacuum, not duplicate work. reason={rc12.get('reason')} "
+                f"matches={rc12.get('matches')}"
+            )
+        else:
+            advisories = rc12.get("advisories") or []
+            if not any(a.get("recurring_vacuum_exempt") for a in advisories):
+                failures.append(
+                    "G12: expected a recurring_vacuum_exempt advisory (demoted "
+                    f"recurring completion), got advisories={advisories}"
+                )
+
+        # ── G13: NON-recurring keyword-vacuum → BLOCK ( control) ──
+        # Identical vacuum shape to G12, but the completion goal_id is NOT
+        # recurring (aspirations queue left empty by _seed_state, no
+        # _seed_recurring). recurring_vacuum=False → the structured co-signal
+        # still HARD-blocks. Proves the exemption is scoped to recurring
+        # completions and did not blanket-suppress the structured-vacuum path.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-nonrecur-vac",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Refactor confirmed the env-server end-to-end reconnect "
+                "handshake stayed healthy across the run."
+            ),
+        })
+        # (no _seed_recurring — g-scs-nonrecur-vac is not in the recurring set)
+        case_g13 = {
+            "title": "Investigate: env-server end-to-end reconnect gap",
+            "description": (
+                "Add an env-server end-to-end reconnect probe in a new "
+                "monitoring module."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg13 = _run_gate(case_g13, tmp_world)
+        rc13 = _find_check(rg13, "recent_completions")
+        if rc13 is None:
+            failures.append("G13: recent_completions check missing from result")
+        elif rc13.get("passed") is not False:
+            failures.append(
+                "G13: recent_completions should BLOCK (NON-recurring keyword "
+                "vacuum — the g-248-114 exemption is scoped to recurring "
+                "completions only; a non-recurring structured co-signal still "
+                f"hard-blocks). reason={rc13.get('reason')} "
+                f"matches={rc13.get('matches')}"
+            )
+
+        # ── G14: recurring completion + REAL file-path hit → BLOCK ────────
+        #  control: the completion IS recurring, but it shares a real
+        # FILE PATH (core/scripts/env-reconnect.py) with the proposed goal, so
+        # hit_paths is non-empty → recurring_vacuum=False → still HARD-blocks.
+        # Proves the exemption requires the VACUUM condition (empty hit_paths);
+        # a recurring completion doing genuine shared-file work is NOT exempt.
+        _seed_state(tmp_world, {
+            "goal_id": "g-scs-recur-path",
+            "completed_by": "bravo",
+            "completed_at": _now_iso(-2),
+            "key_finding": (
+                "Recurring sweep patched core/scripts/env-reconnect.py during "
+                "the env-server end-to-end reconnect pass."
+            ),
+        })
+        _seed_recurring(tmp_world, ["g-scs-recur-path"])
+        case_g14 = {
+            "title": "Investigate: env-server reconnect fix",
+            "description": (
+                "Patch core/scripts/env-reconnect.py for the env-server "
+                "end-to-end reconnect path."
+            ),
+            "participants": ["agent"],
+            "source": "world",
+        }
+        rg14 = _run_gate(case_g14, tmp_world)
+        rc14 = _find_check(rg14, "recent_completions")
+        if rc14 is None:
+            failures.append("G14: recent_completions check missing from result")
+        elif rc14.get("passed") is not False:
+            failures.append(
+                "G14: recent_completions should BLOCK (recurring completion "
+                "sharing a REAL file path core/scripts/env-reconnect.py — "
+                "hit_paths non-empty → recurring_vacuum=False → not exempt). "
+                f"reason={rc14.get('reason')} matches={rc14.get('matches')}"
+            )
+        else:
+            matches = rc14.get("matches") or []
+            if not any("core/scripts/env-reconnect.py" in (m.get("file_path_hits") or [])
+                       for m in matches):
+                failures.append(
+                    "G14: expected core/scripts/env-reconnect.py in file_path_hits, "
+                    f"got {[m.get('file_path_hits') for m in matches]}"
+                )
+
     finally:
         shutil.rmtree(tmp_world, ignore_errors=True)
 
@@ -559,12 +832,12 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (9/9 cases)")
+    print("PASS (14/14 cases)")
     return 0
 
 
 def test_structural_co_signal_gate():
-    """Pytest entry point (5) — runs the 9-case suite in an isolated
+    """Pytest entry point (5) — runs the 14-case suite in an isolated
     tmp world and asserts all cases pass."""
     assert main() == 0
 

@@ -230,8 +230,34 @@ ELSE:
         productivity_cooldown_streak: 0    # cool-down ladder level (Fix E — productivity-stop-gate.sh)
     }
 
+# Phase -0.5a0: Orchestrator Entry Battery (g-115-2550 — ONE call replaces the
+# per-phase presence checks of -0.5a / -0.5c / -0.5c.2 / -0.5e Branch B)
+# Consumer action of CONFIRMED hypothesis 2026-07-16_sentinel-battery-survives-
+# compaction: the precheck battery (g-115-2303) provably killed the omission
+# class for precheck sentinels, but THIS entry sequence stayed LLM-enumerated —
+# fresh miss 2026-07-18T00:07: a post-compaction re-entry ran the precheck
+# battery correctly yet skipped Phase -0.5c (compact-checkpoint.yaml sat
+# unconsumed 25min). Post-autocompact, "run the entry battery" is the only line
+# that must survive summarization; the output re-derives the full entry
+# protocol (actionable dispatches + the always-run footer in protocol order).
+Bash: `bash core/scripts/orchestrator-entry-battery.sh`
+IF output says "all 4 entry checks clean — no dispatches":
+    The presence-gated phases below (-0.5a, -0.5c, -0.5c.2, -0.5e Branch B)
+    have nothing to do — SKIP their preamble checks. STILL run the always-run
+    calls the footer lists, each ONCE, at its own phase (-0.5c.1 stranded
+    sweep, -0.5e.0/-0.5e.0b cache checks, -0.5e idle-tick, -0.5e' verify-wake,
+    -0.5d identity restore).
+FOR EACH "▸ ENTRY: <name> (phase <phase>) payload=<json> → dispatch: <section>" line:
+    Handle it via the NAMED phase section below. The payload is on the line —
+    do NOT re-run wm-read for pending_phase_6_spark / blocked_sleep_until (the
+    battery read IS the read; wm-read mutates accessed_at). The phase bodies
+    keep ownership of action + clear (the battery is READ-ONLY).
+IF output reports wrapper_failed or error=...:
+    Fall back to the per-phase checks below unchanged. The battery must never
+    block the loop.
+
 # Phase -0.5a: Background Agent Result Collection
-IF agents/<agent>/session/pending-agents.yaml EXISTS:
+IF agents/<agent>/session/pending-agents.yaml EXISTS:  # battery: pending_agents line
     # list --json prunes stale agents (past timeout_minutes) before returning.
     # Stale agents are removed from the file and excluded from output.
     Bash: `pending-agents.sh list --json`
@@ -239,7 +265,7 @@ IF agents/<agent>/session/pending-agents.yaml EXISTS:
 
 # Phase -0.5c: Compact Checkpoint Processing
 # Full protocol: core/config/conventions/compact-recovery.md
-IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:
+IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:  # battery: compact_checkpoint line
     # Step 1: Restore ALL WM slots from checkpoint (not just 4 — includes dynamic slots like loop_state)
     Bash: `compact-restore-slots.sh`
     # Step 2: Process encoding queue (precision-first — queue items contain precision_manifests)
@@ -265,9 +291,15 @@ IF agents/<agent>/session/compact-checkpoint.yaml EXISTS:
 Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
 
 # Phase -0.5c.2: Pending Phase-6 Spark Sentinel (g-115-1174)
-# Consumes the `pending_phase_6_spark` WM slot written by recurring-close.sh
-# at end-of-script — AFTER the four iteration-close phases, just before the
-# terminal imperative (NOT during Block C/D, which runs earlier). Corollary:
+# Consumes the `pending_phase_6_spark` WM slot written by TWO producers:
+# (1) recurring-close.sh at end-of-script — AFTER the four iteration-close
+# phases, just before the terminal imperative (NOT during Block C/D, which
+# runs earlier); (2) iteration-close.sh do_verify for NON-recurring deep
+# completions (g-115-2416 — script-enforced parity; previously Phase 6 for
+# non-recurring deep closes rode on LLM memory alone and drifted, observed
+# miss g-115-2404). Both producers emit a stdout imperative AND the sentinel;
+# spark-fire-dedup makes in-turn firing + sentinel consumption idempotent.
+# Corollary:
 # a NULL read here while the bg recurring-close is still mid-phase is EXPECTED,
 # not a bug — the sentinel lands only once the bg reaches end-of-script.
 # When recurring-close.sh's wall-clock
@@ -282,7 +314,8 @@ Bash: `py -3 core/scripts/stranded-claim-sweep.py --apply`
 #
 # Sentinel-lifecycle pattern (rb-428): wm-read → if non-null → action →
 # clear via `echo null | wm-set.sh`. One-shot. Lifecycle below.
-Bash: wm-read.sh pending_phase_6_spark --json
+signal = Phase -0.5a0 battery payload for pending_phase_6_spark
+         (fallback only if battery errored: Bash: wm-read.sh pending_phase_6_spark --json)
 IF signal is not null:
     expires_at = signal.get("expires_at")
     now_iso    = current ISO timestamp
@@ -361,6 +394,41 @@ IF stdout contains "=== QUIESCENCE CACHE HIT ===":
     # auto-notifies on bg completion (schedule-wakeup-correctness.md
     # Anti-pattern A). This mirrors idle-tick.sh Branch A's terminal contract.
     Emit the directive's single `Bash(... interruptible-sleep.sh {sleep_seconds}, run_in_background=true)` call. RETURN.
+# ELSE: cache MISS (empty stdout) — fall through to the dry-idle cache check below.
+
+# Phase -0.5e.0b: Dry-Idle-Cycle Fast-Path Short-Circuit (g-115-2084-d, Layer 4)
+# Runs right AFTER the quiescence-cache check (dry and quiescence are mutually
+# exclusive — _dry_idle.is_dry_state is False whenever quiescence approved) and
+# BEFORE idle-tick.sh. When the loop is in a persistent DRY trough (zero
+# executable goals + quiescence denied/na), each re-entry otherwise re-runs the
+# full precheck/select/create-aspiration/re-select chain only to re-derive
+# "still dry, sleep the backoff curve". This fast path re-validates the last
+# dry-idle-tick decision (still dry per the dry_idle signal, goal count
+# unchanged, no timer elapsed, no pending wake signal, under the
+# consecutive-short-circuit cap) and on a HIT re-sleeps the SAME dry-curve
+# backoff directly WITHOUT loading the heavy skill chain. Unlike the quiescence
+# cache (which caps each short-circuit at 600s for health cadence), the dry cache
+# honors the full exponential curve (up to 2h) because long sleeps under a
+# stable-empty queue ARE the point of the dry-idle backoff (Layers 1-3);
+# soundness comes from capping the emitted sleep at earliest_wake_at (the next
+# defer/recurring/blocker timer) instead. Every path fails open to a MISS (empty
+# stdout). Common path (not in a dry trough) is ONE cheap script call (one WM
+# read, no queue scan) returning empty.
+Bash: py -3 core/scripts/dry-idle-cycle-cache.py check
+IF stdout contains "=== DRY-IDLE CACHE HIT ===":
+    # Same terminal contract as the quiescence cache above: emit ONLY the
+    # directive's single Bash(... DRY_SLEEP=1 ... interruptible-sleep.sh
+    # {sleep_seconds}, run_in_background=true) call and RETURN. Do NOT run
+    # idle-tick.sh, do NOT load Skill(aspirations), do NOT run precheck/
+    # selection/execution. The bg sleep IS the terminal tool call; when the
+    # harness notifies you of its exit, re-enter via Skill(aspirations)
+    # args='loop'. Do NOT ScheduleWakeup to poll the sleep — the harness
+    # auto-notifies on bg completion (schedule-wakeup-correctness.md
+    # Anti-pattern A). guard-967/882: the DRY_SLEEP=1 bg sleep is the sanctioned
+    # Tier-A registered-mechanism pacing — interruptible-sleep.sh registers it as
+    # a background job (type dry-idle-sleep) so stop-hook Gate 2.6 ALLOWs the
+    # turn-end. This mirrors the quiescence cache's terminal contract exactly.
+    Emit the directive's single `Bash(... interruptible-sleep.sh {sleep_seconds}, run_in_background=true)` call. RETURN.
 # ELSE: cache MISS (empty stdout) — fall through to idle-tick.sh below.
 
 # Phase -0.5e: Blocked-Sleep Recovery — cheap-path sentinel + gated digest load.
@@ -378,7 +446,8 @@ IF stdout contains "=== IDLE TICK ===":
     Bash: core/scripts/load-blocked-sleep-recovery.sh → IF path returned: Read it
     Follow Branch A from the digest. RETURN.
 ELSE:
-    Bash: wm-read.sh blocked_sleep_until
+    value = Phase -0.5a0 battery payload for blocked_sleep_until
+            (fallback only if battery errored: Bash: wm-read.sh blocked_sleep_until)
     IF value is not "null" and not empty:
         # Branch B — post-sleep residual / checkpoint-wake / expired-timer.
         Bash: core/scripts/load-blocked-sleep-recovery.sh → IF path returned: Read it

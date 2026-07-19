@@ -53,6 +53,14 @@ def _seed_goal(project_root: Path, port: int, *, title: str = "Seed",
             "origin_signal": origin_signal, "description": description}
     if extras:
         goal.update(extras)
+    # mc-066 (0): the Phase E.5 operator-offload gate 400s any
+    # recurring-shaped seed (recurring=True OR interval_hours present) that
+    # lacks an offload_decision — inject the fixture decision unless the
+    # test supplies its own.
+    if (goal.get("recurring") is True
+            or goal.get("interval_hours") is not None) \
+            and "offload_decision" not in goal:
+        goal["offload_decision"] = "stays-mind: test fixture"
     qs = urllib.parse.urlencode({"asp_id": "asp-001", "source": "world"})
     url = f"http://127.0.0.1:{port}/v1/aspirations/add-goal?{qs}"
     req = urllib.request.Request(

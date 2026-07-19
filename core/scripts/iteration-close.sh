@@ -282,6 +282,28 @@ do_verify() {
     fi
     echo "[iteration-close] verify: goal=$GOAL_ID status=$GOAL_STATUS source=$SOURCE"
 
+    # ── Pending-deploys ENFORCE gate (SG-b, g-115-2688-b) ───────────────────
+    # Refuse CLEAN-SUCCESS closure while a deploy THIS goal pushed is unverified.
+    # For a completed goal, resolve every pending {repo,sha} obligation via
+    # deploy-verify.sh (BOUNDED so the loop never blocks on slow CI): cleared on
+    # ok/no_ci; HIGH Unblock filed + closure flagged not-clean on CI failure;
+    # entry kept for re-probe on unverified. Fail-open (script always exits 0);
+    # the has-pending fast-path is a single cheap call when nothing is pending
+    # (the common case). stderr (the not-clean signal) stays loop-visible; the
+    # summary JSON goes to the iteration-close diagnostic log. Placed BEFORE the
+    # state mutation below so a bounded CI-wait that autocompacts leaves the goal
+    # not-yet-completed (closure re-runs idempotently next iteration).
+    if [[ "$GOAL_STATUS" == "completed" ]]; then
+        # NOTE: do NOT forward --source "$SOURCE" here. The gate's --source is
+        # used ONLY to file the deploy-failure Unblock, which always lands in
+        # the WORLD aspiration asp-115 (infra Unblocks are world-scoped); an
+        # agent-sourced closing goal would otherwise make the gate try asp-115
+        # in the agent queue, where it does not exist, and the filing would
+        # fail-open-silently. The gate defaults --source to world (correct).
+        bash "$SCRIPT_DIR/pending-deploys-gate.sh" --agent "$AGENT" --goal "$GOAL_ID" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+    fi
+
     # g-284-06 Step 0: Ordered-write intent marker. BEFORE any state mutation
     # of aspirations.jsonl or team-state.yaml, record intent in the
     # iteration-checkpoint.json so a crash mid-verify leaves a recoverable
@@ -421,6 +443,33 @@ print(json.dumps({
             --set "intent_state=committed" || true
     fi
 
+    # ── Close-time dependent-defer recheck (g-115-2572, rb-3946 — ADVISORY) ──
+    # Scans open goals' defer_reason texts for references to the just-closed
+    # goal (exact id OR >=2 significant title-token overlaps) and prints one
+    # advisory line per hit so the LLM re-probes that defer premise-by-premise
+    # instead of waiting out the TTL (observed ~11h frozen on g-336-03/06/07).
+    # Surface-only: never mutates, never files; fail-open (`|| true` + the
+    # script's own exit-0-on-error contract). completed-status closes only —
+    # a blocked/skipped close cannot have satisfied anyone's defer premise.
+    if [[ "$GOAL_STATUS" == "completed" ]]; then
+        _cdi_title="$(CDI_SRC="$SOURCE" CDI_GOAL="$GOAL_ID" python3 -c "
+import json, os, sys
+sys.path.insert(0, os.path.join(r'$PROJECT_ROOT', 'core', 'scripts'))
+import _rt
+try:
+    data = _rt.tolerant_decode_aggregate('cdi-title', _rt.aspirations_read(source=os.environ['CDI_SRC'], active=False))
+    for asp in (data.get('aspirations') if isinstance(data, dict) else data) or []:
+        for g in asp.get('goals', []) or []:
+            if g.get('id') == os.environ['CDI_GOAL']:
+                print(g.get('title') or '')
+                raise SystemExit(0)
+except Exception:
+    pass
+" 2>/dev/null || true)"
+        python3 "$CORE_ROOT/scripts/close-defer-invalidation.py" \
+            --goal "$GOAL_ID" --title "$_cdi_title" || true
+    fi
+
     # ── Gate D OUTCOME telemetry (DORMANT — gated by GATE_D_ENABLED) ──────────
     # Gate D experiment seam (methodology §4.6 / R7, RATIFIED 2026-06-10). Writes
     # the per-goal OUTCOME record that R5 joins to the Step 5e ASSIGNMENT record
@@ -475,6 +524,52 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
 ' || echo "[iteration-close] WARN: gate-d outcome telemetry write failed for $GOAL_ID" >&2
     fi
     # ── End Gate D OUTCOME telemetry ──────────────────────────────────────────
+
+    # ── Phase-6 spark imperative for NON-recurring deep closes (g-115-2416) ──
+    # recurring-close.sh already emits an outcome-aware imperative + the
+    # pending_phase_6_spark WM sentinel for recurring deep closes (g-115-977 /
+    # g-115-1174). Non-recurring deep closes had NEITHER: Phase 6 sits between
+    # verify and state-update purely on LLM memory of digest ordering, and it
+    # drifted (observed miss: g-115-2404, journal OBLIGATION LATE 2026-07-16).
+    # Emit the same two signals here so the prompt is script-enforced:
+    #   - stdout imperative (visible in this turn's tool output)
+    #   - pending_phase_6_spark sentinel (next-iteration Phase -0.5c.2 consumer
+    #     catches the backgrounded-verify case; spark-fire-dedup.py prevents a
+    #     double-fire when the LLM DID spark in-turn — the same transport
+    #     recurring closes use, zero new consumer code)
+    # Routine outcomes stay silent (skip-rule: spark is deep-only). Recurring
+    # closes skip this block — recurring-close.sh writes the sentinel itself
+    # with the POST-FLIP outcome, which this phase cannot know.
+    if [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && "$IS_RECURRING" != "true" ]]; then
+        local _sp_expires _sp_setat _sp_payload
+        _sp_expires="$(python3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
+        _sp_setat="$(python3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
+        if [[ -n "$_sp_expires" ]]; then
+            # python3 (not py -3) is correct inside this .sh — it sources _paths.sh.
+            # Values pass via env (guard-165), never interpolated into the source.
+            _sp_payload="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="${SUMMARY:-}" EXP="$_sp_expires" SETAT="$_sp_setat" python3 -c '
+import json, os
+print(json.dumps({
+    "goal_id":    os.environ["GID"],
+    "outcome":    os.environ["OUT"],
+    "source":     os.environ["SRC"],
+    "summary":    os.environ.get("SUM", ""),
+    "expires_at": os.environ["EXP"],
+    "set_at":     os.environ.get("SETAT", ""),
+}))
+' 2>/dev/null || true)"
+            if [[ -n "$_sp_payload" ]]; then
+                echo "$_sp_payload" | bash "$SCRIPT_DIR/wm-set.sh" pending_phase_6_spark >/dev/null 2>&1 \
+                    || echo "[iteration-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — stdout imperative remains)" >&2
+            else
+                echo "[iteration-close] WARN: could not build pending_phase_6_spark payload (non-fatal)" >&2
+            fi
+        else
+            echo "[iteration-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
+        fi
+        echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+    fi
+    # ── End Phase-6 spark imperative ──────────────────────────────────────────
 
     _checkpoint_refresh verify
     # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
@@ -974,7 +1069,10 @@ print(sha)
         # COMMIT_SHA (g-115-1178): scope the gate to the files iteration-commit
         # just committed. Empty when iteration-commit no-op'd or parse failed →
         # gate falls back to working-tree scope (backward-compatible).
-        gate_json=$(COMMIT_SHA="${_commit_sha:-}" bash "$SCRIPT_DIR/post-state-update-gate.sh" deep 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{"fired":false}')
+        # GOAL_ID (g-115-2030): lets the gate union in mid-goal commits stamped
+        # "(goal-id)" by iteration-commit — the close-time sha alone missed
+        # Phase-4 commits (e.g. daemon-restart commits) entirely.
+        gate_json=$(COMMIT_SHA="${_commit_sha:-}" GOAL_ID="${GOAL_ID:-}" bash "$SCRIPT_DIR/post-state-update-gate.sh" deep 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{"fired":false}')
         local fired
         fired=$(echo "$gate_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print('true' if d.get('fired') else 'false')" 2>/dev/null || echo false)
         if [[ "$fired" == "true" ]]; then
@@ -1108,9 +1206,34 @@ print(sha)
     [[ -n "$ARTIFACTS_COUNT" ]] && audit_args+=(--artifacts-count "$ARTIFACTS_COUNT")
     [[ -n "$ENCODING_SCORE" ]]  && audit_args+=(--encoding-score "$ENCODING_SCORE")
     [[ -n "$FINDINGS_COUNT" ]]  && audit_args+=(--findings-count "$FINDINGS_COUNT")
-    bash "$SCRIPT_DIR/state-update-audit.sh" "${audit_args[@]}" \
-        >/dev/null \
-        || echo "[iteration-close] WARN: state-update-audit.sh failed (non-fatal — velocity/backpressure snapshot not recorded for $GOAL_ID)" >&2
+    # Exit-code contract (state-update-audit.py:484, header line 23):
+    # 0=clean, 1=FLAGS RAISED (audit ran fully; snapshot recorded; advisory
+    # signal on stdout), 2=input error. The previous form treated ANY nonzero
+    # as failure and swallowed stdout — every flagged close (rollbacks_applied,
+    # dead_ends_registered, …) lost its advisory signal and misreported
+    # "snapshot not recorded" (g-115-1945: 2+ consecutive false WARNs on
+    # zeta/cc-02 closes; standalone repro passed because state had 0 flags).
+    local audit_out audit_rc audit_flags
+    # set -e-safe rc capture (g-115-1945 follow-up): `var=$(cmd) ; rc=$?` dies
+    # at the assignment under `set -euo pipefail` (L53) before rc=$? runs —
+    # every FLAG-RAISING close (audit rc=1 by design) killed state-update here,
+    # skipping the metric/drift gates below. `|| audit_rc=$?` captures without
+    # tripping errexit.
+    audit_rc=0
+    audit_out="$(bash "$SCRIPT_DIR/state-update-audit.sh" "${audit_args[@]}")" || audit_rc=$?
+    if [[ $audit_rc -eq 1 ]]; then
+        audit_flags="$(printf '%s' "$audit_out" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin).get("flags",[])))' 2>/dev/null || echo "unparsable")"
+        echo "[iteration-close] state-update-audit flags (advisory, audit ran + snapshot recorded): ${audit_flags}" >&2
+    elif [[ $audit_rc -ne 0 ]]; then
+        echo "[iteration-close] WARN: state-update-audit.sh failed rc=${audit_rc} (non-fatal — velocity/backpressure snapshot not recorded for $GOAL_ID)" >&2
+    fi
+    # g-115-2441: unmeasured-skip is rc=0 (the audit completed — it
+    # deliberately skipped the snapshot), so it never reaches the rc=1
+    # advisory above. Surface it explicitly or unflagged closers never learn
+    # why their deep closes stopped appearing in the velocity series.
+    if [[ "$audit_out" == *velocity_unmeasured_skipped* ]]; then
+        echo "[iteration-close] LLM-ACTION: deep close UNMEASURED — no § STATE-UPDATE quality flags passed; imp@k snapshot SKIPPED instead of recording a false 0.0 (g-115-2441). Pass --tree-updated / --artifacts-count / --encoding-score / --findings-count so learning velocity is measured." >&2
+    fi
 
     # Step 8.79 Post-State-Update METRIC Gate (g-115-724, rb-917 content-gate
     # sibling). Counter-gate sibling to post-state-update-gate.sh (above) and
@@ -1353,7 +1476,16 @@ do_learning_gate() {
     echo "[iteration-close] learning-gate: goal=$GOAL_ID outcome=$OUTCOME"
 
     # Retrieval-performed tracking (g-001-132). retrieve.py --goal auto-writes
-    # retrieval-session.json when intelligent retrieval fires (Phase 4). Recurring
+    # retrieval-session.json when intelligent retrieval fires (Phase 4). A bare
+    # `retrieve.sh --category` consult (the code-review-protocol step-4 pre-apply
+    # consult passes no --goal) ALSO writes this file via retrieve.py's g-115-137
+    # in-flight-goal inference WHENEVER agent_status.<agent>.in_flight is set — so
+    # the step-4 consult is NOT invisible to the pre-apply-consult drift gate
+    # below; it sets perf=true too. The narrow residual where a consulted
+    # framework-deep close still reads perf=false needs BOTH no Phase-4 --goal
+    # retrieval AND in_flight unset at consult time, and is fail-safe (worst case:
+    # one forced, harmless consult next precheck). g-115-2662 verified this
+    # empirically (in_flight=null -> inference returns None -> no write). Recurring
     # / routine goals skip that path entirely, so the PRIOR goal's file persists
     # with utilization_pending=false and both gates silently short-circuit —
     # leaving "did this goal retrieve?" unobservable and allowing orphan
@@ -1364,17 +1496,31 @@ do_learning_gate() {
     # over N iterations gives retrieval_using_ratio.
     local ret_file="$AGENT_DIR/session/retrieval-session.json"
     local current_file_goal=""
+    local current_file_stub="stub"
+    local perf="false"   # g-115-2201: retrieval-performed flag for the pre-apply-consult drift gate below
     if [[ -f "$ret_file" ]]; then
-        current_file_goal="$(python3 -c "
+        # g-115-2454 stub-detect probe: emits "goal_id<TAB>stub|real". Only the
+        # no-retrieval stub written below carries retrieval_performed:false (the
+        # daemon-written real manifest omits the field), so a SECOND
+        # learning-gate run for the same goal (operator retry, recovery re-run)
+        # must NOT read its own prior stub as performed — goal_id match alone
+        # reported a false performed=true and wrongly reset the
+        # pre-apply-consult miss streak (lenient-direction error).
+        local probe_out
+        probe_out="$(python3 -c "
 import json
 try:
-    print(json.loads(open(r'$ret_file', encoding='utf-8').read()).get('goal_id',''))
+    d = json.loads(open(r'$ret_file', encoding='utf-8').read())
+    kind = 'stub' if d.get('retrieval_performed') is False else 'real'
+    print((d.get('goal_id') or '') + '\t' + kind)
 except Exception:
     print('')
 " 2>/dev/null || echo "")"
+        current_file_goal="${probe_out%%$'\t'*}"
+        current_file_stub="${probe_out##*$'\t'}"
     fi
 
-    if [[ "$current_file_goal" != "$GOAL_ID" ]]; then
+    if [[ "$current_file_goal" != "$GOAL_ID" || "$current_file_stub" == "stub" ]]; then
         # Missing or stale file — write no-retrieval stub so this iteration is
         # detectable in retrospective analysis. utilization_pending=false means
         # neither gate runs feedback (correct — nothing was retrieved to score).
@@ -1405,6 +1551,7 @@ os.replace(tmp, str(p))
 ' 2>/dev/null || echo "[iteration-close] WARN: retrieval stub write failed for $GOAL_ID" >&2
         echo "[iteration-close] retrieval-summary: performed=false goal=$GOAL_ID (no-retrieval stub)"
     else
+        perf="true"   # g-115-2201: retrieval fired for this goal
         # Retrieval was performed for this goal — run safety-net feedback if pending.
         local pending
         pending="$(python3 -c "
@@ -1456,6 +1603,70 @@ except Exception:
         fi
         echo "[iteration-close] retrieval-summary: performed=true goal=$GOAL_ID"
     fi
+
+    # ── Pre-apply-consult DRIFT gate (g-115-2201) ─────────────────────────
+    # Consume the retrieval-performed flag ($perf) computed above. On N
+    # consecutive framework-deep closes with performed=false, set the
+    # force_pre_apply_consult sentinel so the next aspirations-precheck forces a
+    # retrieve.sh consult — code-review-protocol step 4 drifted to a 100% miss
+    # rate on framework deep goals (g-115-2194/2195/2179, 2026-07-14) and an
+    # advisory cannot fix a 3/3 miss. The pure, unit-tested helper owns the
+    # decision (incl. work_class resolution); this block owns only the WM
+    # read/write, mirroring the force_tree_maintain template above. Python
+    # script path via $CORE_ROOT (NOT $SCRIPT_DIR — MSYS path resolution on
+    # Windows, same reason as the obligation-audit call below); wm-*.sh via
+    # $SCRIPT_DIR (bash-invoked). Routine closes are transparent to the streak,
+    # so the whole block is guarded by OUTCOME==deep — the common path is one
+    # bash comparison. Fail-open everywhere; a gate error never wedges the close.
+    if [[ "$OUTCOME" == "deep" ]]; then
+        local _pac_streak _pac_decision _pac_new _pac_set
+        _pac_streak="$(bash "$SCRIPT_DIR/wm-read.sh" pre_apply_consult_miss_streak 2>/dev/null | tr -dc '0-9')"
+        [ -z "$_pac_streak" ] && _pac_streak=0
+        # g-115-2655: framework-files-edited signal. Only a framework-deep close
+        # that ACTUALLY edited a framework file (core/.claude/CLAUDE.md/mind_api)
+        # is a real pre-apply-consult miss — a read-only framework diagnostic
+        # (tree scan, gate audit) edits none and must stay transparent to the
+        # streak, else a run of diagnostics climbs it on false pretenses and
+        # re-fires the gate every iteration. iteration-commit stamps the goal-id
+        # into each commit message, so grep-by-goal-id finds THIS goal's
+        # commit(s) regardless of HEAD position or state-update backgrounding.
+        # --since bounds the walk cheaply (the goal's commit is minutes old).
+        # Fail-SAFE to "true" on any git error (preserve the real-drift catch);
+        # only a clean git success that shows no framework file flips to "false".
+        # world/conventions/ is intentionally out of scope (external/gitignored,
+        # never committed, domain-classified not framework).
+        local _fw_edited="true" _fw_files
+        if _fw_files="$(git -C "$PROJECT_ROOT" log --fixed-strings --grep="$GOAL_ID" \
+                --since='2 days ago' -5 --name-only --format= 2>/dev/null)"; then
+            if [[ -z "$_fw_files" ]]; then
+                _fw_edited="false"   # no commit mentions this goal — no framework file committed
+            elif printf '%s\n' "$_fw_files" | grep -qE '^(core/|\.claude/|CLAUDE\.md|mind_api/)'; then
+                _fw_edited="true"
+            else
+                _fw_edited="false"   # commit(s) exist but touch no framework file
+            fi
+        fi
+        _pac_decision="$(python3 "$CORE_ROOT/scripts/pre-apply-consult-drift-gate.py" \
+            --goal "$GOAL_ID" --source "$SOURCE" --outcome "$OUTCOME" \
+            --performed "$perf" --streak "$_pac_streak" \
+            --framework-edited "$_fw_edited" 2>/dev/null || echo '{}')"
+        _pac_new="$(printf '%s' "$_pac_decision" | python3 -c 'import sys,json
+try: print(int(json.load(sys.stdin).get("new_streak",0)))
+except Exception: print(0)' 2>/dev/null || echo 0)"
+        _pac_set="$(printf '%s' "$_pac_decision" | python3 -c 'import sys,json
+try: print("true" if json.load(sys.stdin).get("set_sentinel") else "false")
+except Exception: print("false")' 2>/dev/null || echo false)"
+        printf '%s' "$_pac_new" | bash "$SCRIPT_DIR/wm-set.sh" pre_apply_consult_miss_streak >/dev/null 2>&1 || true
+        if [[ "$_pac_set" == "true" ]]; then
+            local _pac_now
+            _pac_now="$(date +%Y-%m-%dT%H:%M:%S)"
+            printf '{"triggered_at":"%s","goal_id":"%s","streak":%s,"source":"framework-deep-consult-drift"}' \
+                "$_pac_now" "$GOAL_ID" "$_pac_new" \
+                | bash "$SCRIPT_DIR/wm-set.sh" force_pre_apply_consult >/dev/null 2>&1 || true
+            echo "[iteration-close] LLM-ACTION: pre-apply-consult drift ($_pac_new consecutive framework-deep closes, retrieval performed=false) — next precheck MUST run retrieve.sh (code-review-protocol step 4) before goal selection" >&2
+        fi
+    fi
+    # ── end pre-apply-consult drift gate ──────────────────────────────────
 
     # Check unreflected hypotheses count — signal via exit; LLM sees stderr
     local unreflected
@@ -1656,6 +1867,33 @@ do_productivity_check() {
     # world/conventions/self-program-evolution.md "Stub Expiry".
     python3 "$(_winpath "$SCRIPT_DIR/evolution-stub-expiry.py")" --threshold-hours 24 \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Evolution-stub PENDING check (g-115-2180, 2026-07-14) — the missing PROMPT
+    # half of the same lifecycle. The expiry sweep ABOVE is the honest fallback
+    # ("rationale never supplied"); nothing ever PROMPTED the LLM to supply it.
+    # Measured: of 65 MATERIAL Self edits fleet-wide only 11 (17%) ever reached
+    # the user; 22 EXPIRED unnotified — the agent's identity changed and the user
+    # was never told, silently breaking the 2026-04-22 "notify after, revert if
+    # wrong" bargain that guard-380 encodes. This sets a `force_evolution_finalize`
+    # WM sentinel while the stub is STILL FINALIZABLE; aspirations-precheck Phase
+    # 0-pre2.5 forces the completion before goal selection. Same rb-428 sentinel
+    # shape as tree-debt / experience-archival / fresh-eyes-code / metric-encoding
+    # — every sibling obligation already had a forcing consumer; this one did not.
+    #
+    # Ordered AFTER the expiry sweep deliberately: a stub still `awaiting_completion`
+    # once expiry has run is guaranteed < 24h old and therefore genuinely
+    # finalizable, so the sentinel can never name a stub that evolution-complete.sh
+    # would refuse (it hard-errors on status != awaiting_completion).
+    #
+    # Scoped to the self+program streams ONLY. script-evolution has 152 pending /
+    # 1992 expired vs 23 final (99% expiry) — widening this gate there would fire
+    # every iteration forever and train the agent to ignore the sentinel. That
+    # backlog is filed separately.
+    #
+    # Same stderr sink + `|| true` contract as the sweeps around it: a missed tick
+    # is fully recovered next iteration (idempotent, re-fires until finalized), so
+    # it must never abort productivity-check.
+    bash "$SCRIPT_DIR/evolution-stub-pending-check.sh" --threshold-minutes 20 \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Execution-diary trim (g-333-03, asp-333 A1): bound the otherwise-unbounded
     # execution-diary.jsonl. It is appended every phase and full-scanned by
     # presence-tick (on EVERY tool call), postcompact-restore, and skill_discovery.
@@ -1666,6 +1904,28 @@ do_productivity_check() {
     # + stderr redirect mirror the sibling sweeps; uses the .sh wrapper (proven at
     # L370) rather than direct python3+cygpath.
     bash "$SCRIPT_DIR/execution-diary.sh" trim --hours 8 \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Gate-firings spool flush (g-115-2405): under own-cloud, _gate_log.log()
+    # appends each firing to a machine-local spool instead of paying a
+    # whole-object S3 RMW per record (measured 3.8-10.1s each at ~40MB store).
+    # This tick drains the spool into meta/gate-firings.jsonl with ONE batched
+    # locked RMW. Self-gating: quiet no-op when the spool is empty; internal
+    # 300s min-interval bounds S3 churn to ~1 RMW / 5min / box (burst override
+    # at 200 spooled records). Idempotent + duplicate-safe (dedup by serialized
+    # line — the same identity merge_append_only_jsonl unions by), so `|| true`
+    # is safe: a missed tick just leaves the spool for the next iteration.
+    python3 "$(_winpath "$SCRIPT_DIR/gate-firings-flush.py")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Pending-deploys re-probe sweep (SG-b, g-115-2688-b). The do_verify gate
+    # resolves the CLOSING goal's deploy obligations; this all-sweep re-probes
+    # every REMAINING entry (from earlier closures left unverified) so an entry
+    # whose CI has since concluded is auto-cleared (ok) or surfaced as a HIGH
+    # Unblock (failed) mid-session — not left to linger until the SG-c stop-hook.
+    # Same idempotent/cheap/fail-open contract as the sweeps above: has-pending
+    # fast-exits when nothing is pending (the common case), the CI poll is
+    # bounded, and the script always exits 0. `|| true` + full stderr redirect
+    # mirror the sibling sweeps.
+    bash "$SCRIPT_DIR/pending-deploys-gate.sh" --agent "$AGENT" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # CRITICAL: productivity-stop-gate.sh is the ONLY authorized caller of
     # stop-requested outside /stop (per .claude/rules/stop-hook-compliance.md

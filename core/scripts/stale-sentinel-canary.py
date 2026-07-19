@@ -71,15 +71,18 @@ try:
     from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
     from _fileops import acquire_lock, release_lock
     from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
+    from _sentinel_registry import canary_tracked_slots, consumption_aware_map
+    from _sentinel_registry import is_set as _registry_is_set
 except Exception:
     sys.exit(0)
 
-TRACKED_SENTINELS = [
-    "force_tree_encoding",
-    "force_tree_maintain",
-    "fresh_eyes_dispatch_pending",
-    "force_metric_encoding_pending",
-]
+# Registry-derived (3): _sentinel_registry.py is the single source of
+# truth shared with precheck-sentinel-battery.py. canary_tracked_slots()
+# yields exactly the four slots previously hardcoded here (force_tree_maintain,
+# fresh_eyes_dispatch_pending, force_metric_encoding_pending + the
+# force_tree_encoding legacy tripwire); parity is pinned by
+# tests/test_precheck_sentinel_battery.py.
+TRACKED_SENTINELS = canary_tracked_slots()
 
 CANARY_SLOT = "stale_sentinel_canary"
 # Target aspiration for filed Investigate goals.  is the framework-
@@ -131,38 +134,19 @@ DEDUP_HOURS = 168
 # in-iteration iteration-close-digest item-7 path) stamps the dispatch slot
 # on ANY handling — dispatch OR a justified no-dispatch clear (e.g. files
 # were partner-attributed). Maps sentinel -> consumer dispatch slot.
-CONSUMPTION_AWARE = {
-    "fresh_eyes_dispatch_pending": "fresh_eyes_last_dispatch",
-    # force_tree_maintain (9): same false-fire shape as the sibling
-    # above. Writer tree-encoding-drift-gate.py arms it in iteration-close
-    # do_state_update; the canary samples it in do_productivity_check (SAME
-    # close, AFTER the arm), BEFORE the next iteration's precheck Phase 0-pre
-    # consumer clears it — so a bare presence-count reads "set" at sample time
-    # on the arming close even though the consumer clears it every iteration.
-    # Deep-close-heavy agents (charlie/echo) accumulated stuck-counts to the
-    # fire threshold while the sentinel was null between iterations (false
-    # fire). The consumer (aspirations-precheck Phase 0-pre) now stamps
-    # force_tree_maintain_last_dispatch on ANY handling; the count climbs ONLY
-    # while that dispatch timestamp stays frozen, so a genuinely-bypassed
-    # consumer still fires while a keeping-up one does not.
-    "force_tree_maintain": "force_tree_maintain_last_dispatch",
-    # force_metric_encoding_pending (6): the THIRD dispatch-consumer
-    # sentinel with the identical false-fire shape, left out of the consumption-
-    # aware treatment its two siblings received. Writer post-state-update-metric-
-    # gate.sh arms it in iteration-close do_state_update (Phase 8) on deep closes
-    # with >=2 distinct numeric findings; the canary samples it in
-    # do_productivity_check (Phase 12, SAME close, AFTER the arm), BEFORE the next
-    # iteration's precheck Phase 0-pre4 consumer clears it. A bare presence-count
-    # therefore reads "set" at sample time on every metric-arming deep close even
-    # though the consumer clears it every iteration -> 3 consecutive such closes
-    # false-fire. The consumer (aspirations-precheck Phase 0-pre4) now stamps
-    # force_metric_encoding_last_dispatch on ANY handling; the count climbs ONLY
-    # while that dispatch timestamp stays frozen (a GENUINE consumer bypass, e.g.
-    # a phantom candidate node the consumer cannot Edit -- the other 6
-    # cause fixed at post-state-update-metric-gate.sh:264), so a keeping-up
-    # consumer no longer false-fires.
-    "force_metric_encoding_pending": "force_metric_encoding_last_dispatch",
-}
+# Registry-derived (3): {slot: dispatch_slot} for every canary-tracked
+# slot carrying a dispatch stamp — currently fresh_eyes_dispatch_pending
+# (3), force_tree_maintain (9), force_metric_encoding_pending
+# (6). All three share the identical false-fire shape those goals
+# fixed: the writer re-arms the sentinel in iteration-close do_state_update
+# (Phase 8) and the canary samples in do_productivity_check (Phase 12, SAME
+# close, AFTER the arm), BEFORE the next iteration's precheck consumer clears
+# it — so a bare presence-count reads "set" on every arming close even when the
+# consumer keeps up. The dispatch-ADVANCEMENT discriminator in the run loop
+# below (count climbs only while the consumer's dispatch stamp stays frozen)
+# is what makes these consumption-aware. New dispatch-stamped sentinels get
+# this behavior by setting dispatch_slot in _sentinel_registry.py.
+CONSUMPTION_AWARE = consumption_aware_map()
 # Canary-state key prefix for the last-observed consumer dispatch timestamp.
 # Stored alongside the per-sentinel stuck counts in CANARY_SLOT; the prefix
 # keeps it from ever colliding with a TRACKED_SENTINELS name (the run loop
@@ -175,25 +159,13 @@ def _now_iso() -> str:
 
 
 def _is_set(value) -> bool:
-    """A sentinel is 'set' when it carries a meaningful non-empty value.
+    """Registry-shared set-semantics (3) — see _sentinel_registry.is_set.
 
-    JSON null / boolean false / empty / 'null'-strings are NOT set.
-    Dict-shaped sentinels (post-state-update-gate.sh JSON payloads) are
-    set when their top-level 'fired' key is truthy, or — if 'fired' is
-    absent — when the dict has any keys at all (defensive default).
+    Moved verbatim to the registry so the battery and this canary can never
+    diverge on what counts as "set". This alias keeps every internal call
+    site and the test suite's import surface unchanged.
     """
-    if value is None or value is False:
-        return False
-    if isinstance(value, str):
-        s = value.strip().lower()
-        return s not in ("", "null", "false")
-    if isinstance(value, dict):
-        if "fired" in value:
-            return bool(value["fired"])
-        return bool(value)
-    if isinstance(value, (list, tuple)):
-        return bool(value)
-    return True
+    return _registry_is_set(value)
 
 
 def _read_threshold(override: int | None) -> int:
@@ -328,14 +300,42 @@ def _file_investigate(sentinel: str, stuck: int, dry_run: bool) -> dict:
     # Mirrors the proven obligation-audit.py pattern.
     # aspirations-add-goal.sh lives in SCRIPT_DIR (core/scripts/).
     script_path = (SCRIPT_DIR / "aspirations-add-goal.sh").as_posix()
-    try:
-        result = subprocess.run(
-            bash_cmd(script_path, "--source", "world", ASP_ID),
+    def _run_add(extra):
+        return subprocess.run(
+            bash_cmd(script_path, "--source", "world", ASP_ID, *extra),
             input=json.dumps(payload),
             capture_output=True, text=True, timeout=30,
         )
+
+    try:
+        result = _run_add([])
     except Exception as exc:
         return {"error": "subprocess_failed", "detail": str(exc)}
+    # 4: the goal-duplication gate's prose-overlap heuristic
+    # false-positives on canary Investigates BY CONSTRUCTION — a stale-sentinel
+    # Investigate shares vocabulary ("stale sentinel", the sentinel name, the
+    # consumer-phase names) with any recently-completed goal about the same
+    # sentinel. This canary runs UNATTENDED (iteration-close productivity-check),
+    # so a bare add_goal_rc_nonzero return silently drops the alert (nobody reads
+    # this return value — the  silent-death shape). Machine-key dedup
+    # already ran upstream (_recent_investigate_exists on the exact origin_signal,
+    # fail-closed), so reaching here means the sentinel is genuinely NEW and any
+    # dup-block is a structural-overlap-only false-positive — the override is
+    # justified. Mirrors alert-sweep.sh / ohs-husk-cluster
+    # (automated-filer-gate-interaction tree node, rb-3835).
+    if result.returncode != 0 and "goal_duplication_blocked" in (
+        (result.stdout or "") + (result.stderr or "")
+    ):
+        reason = (
+            f"stale-sentinel-canary: origin_signal "
+            f"investigate:stale-sentinel-canary:{sentinel} already dedup'd upstream "
+            f"(_recent_investigate_exists, fail-closed); dup-gate prose-overlap on "
+            f"canary vocabulary is a structural false-positive (g-115-2504)"
+        )
+        try:
+            result = _run_add(["--override-duplication", reason])
+        except Exception as exc:
+            return {"error": "subprocess_failed", "detail": str(exc)}
     if result.returncode != 0:
         return {
             "error": "add_goal_rc_nonzero",

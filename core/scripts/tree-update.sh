@@ -20,10 +20,12 @@
 #   --record-maintenance        (+--backlog-mode +--stop-mode +--with-run-record
 #                                with run-record JSON on stdin)
 #
-# --encoding-source / --encoding-reason are ACCEPTED but no-ops: they drove the
-# CLI's L1-pick-log telemetry (_log_l1_pick_for_key), a fail-open append to a
-# SEPARATE file that the daemon endpoint defers (no _tree.yaml byte impact). See
-# tree_write.py "DELIBERATELY NOT YET IMPLEMENTED" + mycelium-api-impl.md.
+# --encoding-source / --encoding-reason are FORWARDED as encoding_source /
+# encoding_reason in the POST body (3): the daemon now appends the
+# S9 L1-pick-log telemetry itself (tree_write.py → _l1_pick.py SSOT) for
+# add-child / batch / reparent. Fail-open on the daemon side — a telemetry
+# error never blocks the tree write. They were no-ops 2026-05-28→2026-07-12
+# while the daemonization deferred the append (log went silent that window).
 set -euo pipefail
 
 # --- Skinny PROJECT_ROOT resolve ------------------------------------------
@@ -40,6 +42,8 @@ WITH_RUN_RECORD=false
 NO_DEDUP=false
 ACCEPT_OVERFLOW=""
 HAVE_ACCEPT=false
+ENC_SOURCE=""
+ENC_REASON=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -84,8 +88,11 @@ while [[ $# -gt 0 ]]; do
             HAVE_ACCEPT=true
             ACCEPT_OVERFLOW="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
-        --encoding-source|--encoding-reason)
-            # Accepted, no-op (daemon defers the L1-pick-log telemetry append).
+        --encoding-source)
+            ENC_SOURCE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --encoding-reason)
+            ENC_REASON="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
         *) shift;;
     esac
@@ -135,11 +142,19 @@ _build_body() {
     TU_WRR="$WITH_RUN_RECORD" TU_NODEDUP="$NO_DEDUP" \
     TU_HAVE_ACCEPT="$HAVE_ACCEPT" TU_ACCEPT="$ACCEPT_OVERFLOW" \
     TU_STDIN="$STDIN_DATA" \
+    TU_ENC_SOURCE="$ENC_SOURCE" TU_ENC_REASON="$ENC_REASON" \
     $(rt_python_launcher) -c '
 import json, os, sys
 op = os.environ["TU_OP"]
 a = sys.argv[1:]
 body = {"op": op}
+# S9 telemetry passthrough (3): the daemon reads these top-level for
+# add-child/batch/reparent; harmless-ignored elsewhere. Only set when given.
+for flag, key in (("TU_ENC_SOURCE", "encoding_source"),
+                  ("TU_ENC_REASON", "encoding_reason")):
+    v = os.environ.get(flag, "")
+    if v:
+        body[key] = v
 if op == "set":
     body["key"], body["field"], body["value"] = a[0], a[1], a[2]
 elif op == "add-child":

@@ -41,9 +41,26 @@ set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 ASP_ID="${1:-}"
 
 # --- Read stdin into BODY -------------------------------------------------
+# Guarded (1, guard-664 bash twin — same class as pipeline-move.sh):
+# non-tty stdin does not guarantee EOF; a backgrounded task inherits an open,
+# never-closing stdin and a bare `cat` wedges forever. Bounded first-line
+# probe: piped callers deliver instantly; an idle descriptor degrades to
+# empty BODY after 2s with a loud note.
 BODY=""
 if [ ! -t 0 ]; then
-    BODY="$(cat)"
+    first_chunk=""
+    rc_read=0
+    IFS= read -r -t 2 first_chunk || rc_read=$?
+    if [ "$rc_read" -eq 0 ] || [ -n "$first_chunk" ]; then
+        rest="$(cat)"
+        if [ -n "$rest" ]; then
+            BODY="$first_chunk"$'\n'"$rest"
+        else
+            BODY="$first_chunk"
+        fi
+    elif [ "$rc_read" -gt 128 ]; then
+        echo "aspirations-complete-intent.sh: stdin open but idle after 2s — proceeding without stdin body (backgrounded-task guard, g-115-2291)" >&2
+    fi
 fi
 
 # Missing asp_id -> error

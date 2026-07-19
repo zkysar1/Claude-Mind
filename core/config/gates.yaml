@@ -21,7 +21,15 @@
 #                        for the auto-retirement evaluator — uninstrumented gates
 #                        produce no firing signal and so are invisible to it.
 #   sites                where the gate is invoked from (file + phase).
-#   dominant_risk        FN | FP | both — which error mode hurts more.
+#   dominant_risk        FN | FP | both — which error mode DOMINATES in
+#                        practice. May be likelihood-weighted (which mode is
+#                        more PROBABLE) where the pair's costs disagree with
+#                        its frequencies — e.g. the intent-verbs pair is FP
+#                        (strict matchers over-match) while fn_cost=medium >
+#                        fp_cost=low. Cost decisions (the retirement
+#                        evaluator's all-noop downgrade, 5) key on
+#                        fp_cost/fn_cost, NOT on this label — do not read
+#                        dominant_risk as a cost field.
 #   asymmetry_magnitude  extreme | high | medium | low — how lopsided.
 #   keyword_bias         generous | strict | balanced — tuning policy.
 #                        FN-dominant → generous (better to over-fire, cheap
@@ -43,7 +51,7 @@
 # pending_audit pending the same analysis.
 
 schema_version: 1
-last_updated: "2026-04-22"
+last_updated: "2026-07-13"
 
 gates:
 
@@ -145,25 +153,6 @@ gates:
     rb_evidence: ["rb-466"]
     tuning_notes: "4-check mosaic (recent_completions, git_log, insight_triggers, target_state). target_state has class-name inference fallback (g-248-56). IDF-weighted keywords (cd93fe4)."
     retirement_eligible: true
-
-  - id: stale-read-gate
-    script: core/scripts/stale-read-gate.py
-    embedded: false
-    instrumented: true
-    sites:
-      - { file: "core/scripts/aspirations.py", phase: "cmd_add_goal (parent_goal stale-context check)" }
-    dominant_risk: FN
-    asymmetry_magnitude: medium
-    keyword_bias: balanced
-    override_flag: "--override-stale-read"
-    fp_cost: low
-    fn_cost: medium
-    fp_description: "Agent with a stale tracked receipt forced to re-read parent before filing child; ~1 extra read. Never-read case (no receipt) retired g-115-1572 -- it passes (was fail-open under g-115-1569)."
-    fn_description: "Child filed on stale parent context; constraints/decomposition shape derived from outdated requirements (g-115-410 class)."
-    rb_evidence: []
-    tuning_notes: "g-115-410 sub-task 3. Skips when parent_goal absent OR parent has no last_modified (legacy). Block 2 compares parent.last_modified vs <agent>/session/goal-reads.jsonl most-recent read_at. g-115-1569: the never-read branch (no receipt) FAILS OPEN instead of blocking. g-115-1572 (decision B): never-read branch PERMANENTLY RETIRED -- option A (extract a daemon-safe goal-read writer to re-activate it) was REJECTED. The receipt mechanism is structurally false-positive-prone (parent context arrives via compact data / selector / prior session, not only daemon reads); all 29 ledger overrides were never-read FPs where the agent HAD read the parent, zero genuine. Restoring the writer would re-create that 100pct-override friction at write-on-every-read cost. Block 2 is itself DORMANT here (no path writes goal-reads.jsonl, so last_read is always None) -- retained as correct logic should receipts return; the gate is currently inert (a whole-gate-retirement candidate). g-115-1796 (2026-07-06): alpha's g-333-02-MISSED straggler goal-reads.jsonl (114667 frozen lines, last content read_at 2026-05-14) DELETED -- it was the sole survivor (bravo/charlie/delta/echo/zeta already clean under g-333-02), so Block 2's 'last_read is always None' now holds FLEET-WIDE and the gate is provably inert for every agent. The gate-retirement-eval 'tighten' recommendation is SUPERSEDED: it rested on the 29 never-read overrides, a branch ALREADY retired under g-115-1572 -- nothing remains to tighten (Block 2 is the irreducible genuine check; further tightening = a no-op = de-facto retirement). Honest disposition is RETIREMENT, staged as a follow-up for the daemon-hot-path code removal (gates.yaml entry + aspirations.py cmd_add_goal + daemon aspirations_write.py + stale-read-gate.py + gates/stale_read.py + --override-stale-read flag + test_stale_read_gate.py). Audit ledger: world/stale-read-overrides.jsonl."
-    retirement_eligible: true
-
   # ─── Asymmetry: FP-dominant (the inversions) ─────────────────────────
 
   - id: notify-user-approval-gate
@@ -217,7 +206,85 @@ gates:
     fp_description: "Read-only goal flagged as write; stricter dup check blocks legit new read."
     fn_description: "Write-intent goal classified as read-only; dup-gate skipped; possible duplicate writes."
     rb_evidence: []
-    tuning_notes: "INVERSION. Trim verb list; default-to-write-intent is the safer side."
+    tuning_notes: >-
+      INVERSION. Trim verb list; default-to-write-intent is the safer side.
+      TELEMETRY CONTAMINATION (g-248-102, measured 2026-07-13): 20% of ALL
+      lifetime firings (3,569/17,883) and 45% of all pass firings
+      (2,521/5,560) were SYNTHETIC — leaked by
+      test_target_state_check_positional.py per suite run since 2026-05-17
+      (fingerprint: caller="unknown"; production callers always pass
+      _caller). Fixed by the PYTEST_CURRENT_TEST guard in _gate_log.log()
+      plus in-file neutralization; records before 2026-07-13T18:47 are
+      contaminated — evaluator windows spanning that date should discount
+      caller="unknown" records or wait for the 30d window to age them out.
+    retirement_eligible: true
+
+  - id: removal-intent-verbs
+    script: core/scripts/_target_state.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/_target_state.py", phase: "REMOVAL_INTENT_VERBS classification" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Non-removal goal misread as removal; dup check skipped; possible duplicate filing."
+    fn_description: "Removal goal not detected; target_state false-blocks it (identifiers ARE the removal target); author needs --override-duplication."
+    rb_evidence: []
+    tuning_notes: >-
+      INVERSION sibling of read-intent-verbs (g-248-101). Matches pre-colon
+      words + the FIRST post-colon word only (removal verbs are action verbs
+      behind generic labels like Apply:/Maintain:). Origin: 3 override-audited
+      FPs in session 104 (g-248-100, g-115-2107, g-115-2108); the verb-shape
+      fix covers the g-115-2107 class. TAXONOMY (g-115-2295): dominant_risk=FP
+      here is LIKELIHOOD (strict matcher over-matches), kept symmetric with
+      read-intent-verbs; the COST shape is FN-heavier (fn_cost=medium >
+      fp_cost=low), and the retirement evaluator keys its all-noop downgrade
+      on the cost fields — the FP label must not be read as "FP is the
+      expensive side" (that misread produced the rejected retire
+      recommendation in g-115-2281 at gate age 2.1d). Citation-shape FPs (evidence-file
+      mentions) remain open — see g-248-103 (also: adverb-prefixed +
+      no-colon-position residual classes from the 2026-07-13 fresh-eyes
+      pass). TELEMETRY NOTE (g-248-102): the first 17 lifetime firings
+      (2026-07-13, caller="unknown") were synthetic pytest leakage from the
+      first run of test_target_state_removal_intent.py, before the
+      PYTEST_CURRENT_TEST guard landed in _gate_log.log(); discount them in
+      any lifetime ratio (30d window ages them out by 2026-08-12).
+    retirement_eligible: true
+
+  - id: modify-intent-verbs
+    script: core/scripts/_target_state.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/_target_state.py", phase: "MODIFY_INTENT_VERBS classification" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Non-modify goal misread as modify; target_state block demoted to advisory; a genuine duplicate could slip the hard block (other 4 checks still apply)."
+    fn_description: "Modify goal not detected; target_state hard-blocks it (named identifiers are the modification SUBJECT, present pre- AND post-change); author needs --override-duplication."
+    rb_evidence: []
+    tuning_notes: >-
+      DEMOTE sibling of read-intent-verbs / removal-intent-verbs (g-115-2565),
+      but semantically distinct: read/removal SKIP the check (identifier presence
+      INVERTS the completion semantic), whereas modify DEMOTES the block to a
+      visible advisory — modify-presence is AMBIGUOUS (the symbol is present both
+      before AND after the change), so it proves neither duplication nor
+      completion. Matches pre-colon words + first post-colon word + an -ly
+      adverb-delayed second post-colon word (same position contract as
+      removal-intent-verbs). Origin: echo g-115-2556 quantified 71% (37/52) of
+      target_state solo-block overrides since 2026-07-04 as subject-not-deliverable
+      modify-verb FPs (citation-shape 16, modification-surface 11, test-absence 6,
+      union-masks-miss 4). MORE-ROBUST ALT deferred (create-intent allowlist
+      inversion) — larger blast radius, its own goal. TAXONOMY: dominant_risk=FP
+      is LIKELIHOOD (strict matcher may over-match); cost shape is FN-heavier
+      (fn_cost=medium > fp_cost=low), same as the removal sibling.
     retirement_eligible: true
 
   # ─── Asymmetry: FN > FP (medium-high) ────────────────────────────────
@@ -310,6 +377,25 @@ gates:
     fn_description: "Make-work goal slips through; one wasted iteration on category-label goal (B2.5 saturation class)."
     rb_evidence: ["rb-466"]
     tuning_notes: "Closed allowlist (ALLOWED_PREFIXES tuple). Tuning is via prefix-set expansion as new agent classes emerge — not keyword fuzziness."
+    retirement_eligible: true
+
+  - id: operator-offload-gate
+    script: core/scripts/gates/operator_offload.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "_run_add_goal_pipeline Phase E.5 (single goal)" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "aspiration-creation batch (per-goal, after duplication gate)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: "--override-offload"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Legit stays-mind recurring goal blocked; agent adds a one-line offload_decision or overrides (~10s)."
+    fn_description: "Deterministic recurring goal filed without the gh-005 test; burns a full LLM iteration every interval_hours indefinitely (~200-240K tokens/day measured across the 2026-07 migration candidates)."
+    rb_evidence: ["rb-3281"]
+    tuning_notes: "Layer-B backstop for gh-005 (meta/aspiration-generation-strategy.yaml). Structural trigger (recurring:true OR interval_hours present) + presence check on offload_decision string — no keyword matching to tune. Fires ONLY on recurring goals, so all-noop streaks on ordinary adds are expected and not retirement signal. Filed 2026-07-13 (user-directed, mc-066 companion)."
     retirement_eligible: true
 
   # ─── Asymmetry: both-low ─────────────────────────────────────────────
@@ -452,3 +538,22 @@ pending_audit:
   - context-reads-gate.sh
   - context-reads-skill-gate.sh
   - test-background-jobs-output-gate.sh
+  # Pre-commit hook suite (core/githooks/pre-commit) — earn-the-keep review
+  # 4 (2026-07-16): all kept (incident-born insurance class; 0 blocks
+  # in ~1685 commits over 13 days, deterrence unmeasured). BLOCK-ONLY telemetry
+  # via the hook's _gate wrapper (gate_id = script basename sans extension) —
+  # clean passes log nothing because one gate-firings append on own-cloud is a
+  # whole-object S3 RMW (measured 4.7-10s @ 38MB). Denominator for fire-rate =
+  # git commit count. Decision doc: knowledge tree
+  # system/framework-guardrails-and-gates/precommit-suite-earn-the-keep.
+  - check-no-python-cli-fallback.sh     # Gate 1 — CLI-fallback reintro (no-python-cli-fallback.md)
+  - check-no-daemon-wrapper-reparse.sh  # Gate 1b — rt_call + direct JSONL reparse (g-115-740)
+  - check-mind-api-endpoint-registry.py # Gate 2 — endpoint registry vs filesystem (g-115-802)
+  - meta-imports-world-gate.py          # Gate 3 — meta->world import invariant (sec15)
+  - layer1-no-runtime-imports-gate.py   # Gate 4 — L1->L2 import invariant (sec15)
+  - check-settings-deny-baseline.py     # Gate 5 — constitutional-anchor net (Ring 0, rb-931); NEVER count-retire
+  - domain-leak-check.sh                # Gate 6 — advisory; instrumented since g-248-80 (block + full-tree noop only)
+  - check-no-bare-agent-prefix.sh       # Gate 7 — Phase 2.6 bare-agent-prefix regression
+  - check-no-hardcoded-secrets.sh       # Gate 8 — secret-content scanner; security class, NEVER count-retire
+  - session-manifest-gate.sh            # Gate 9 — sync_tier completeness (conditional: manifest staged)
+  - check-no-ownership-flag.sh          # Gate 11 — OWNERSHIP_MODE reintro (g-115-1737)

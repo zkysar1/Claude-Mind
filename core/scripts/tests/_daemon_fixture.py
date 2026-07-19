@@ -158,15 +158,41 @@ class DaemonFixture:
         tmp = self.world.parent
         self._pr = make_project_root(tmp, self.world, self.agent,
                                      agent_dir=self.agent_dir)
-        self._httpd, self._port = _start_daemon(self._pr)
 
         self._prev_env = {
             "RT_DIR": os.environ.get("RT_DIR"),
             "RT_PORT_FILE": os.environ.get("RT_PORT_FILE"),
             "MIND_AGENT": os.environ.get("MIND_AGENT"),
+            "STORAGE_BACKEND": os.environ.get("STORAGE_BACKEND"),
+            "MIND_WORLD": os.environ.get("MIND_WORLD"),
+            "MIND_META": os.environ.get("MIND_META"),
         }
         os.environ["RT_DIR"] = str(self.runtime_dir)
         os.environ["MIND_AGENT"] = self.agent
+        # 1: hard-pin STORAGE_BACKEND=local (mirror conftest.py:78) so
+        # every in-process DaemonFixture daemon binds to LocalBackend regardless
+        # of invocation path. main()-style `python3 test_x.py` and bash
+        # aggregators never load conftest's session pin, so an ambient own-cloud
+        # env would otherwise leak world-isolated writes onto the production S3
+        # key (guard-955/rb-2983). NOT setdefault — the shell may carry own-cloud.
+        os.environ["STORAGE_BACKEND"] = "local"
+        # 2: hard-pin MIND_WORLD to the FIXTURE world, BEFORE
+        # _start_daemon. get_backend()'s _bootstrap_env_defaults (7
+        # bare-subprocess self-heal) exports the REAL repo's world as
+        # MIND_WORLD when unset — but its pytest guard makes it a no-op under
+        # pytest, so ONLY main()-style runs got poisoned: AgentPathResolver's
+        # env tier then beat the fixture's local-paths.conf and every daemon
+        # request resolved the PRODUCTION world (uniform 404s on fixture
+        # goals). Pinning before daemon start means the bootstrap's setdefault
+        # no-ops and any init-time resolution caches the fixture world.
+        # MIND_META is deliberately NOT pinned: subprocesses spawned inside
+        # the fixture (os.environ.copy()) legitimately resolve strategy files
+        # from the real meta (test_cross_aspiration_support's selector runs);
+        # an empty pr/meta pin broke them. It IS captured above so whatever
+        # the bootstrap sets during the fixture window is restored on exit.
+        os.environ["MIND_WORLD"] = str(self.world)
+
+        self._httpd, self._port = _start_daemon(self._pr)
         return self
 
     def __exit__(self, *exc):

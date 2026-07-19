@@ -12,9 +12,59 @@
 #                                          core/scripts onto sys.path):
 #                                            core/scripts/gates/**  (gate evaluators)
 #                                            core/scripts/storage_backend.py
-#                                            core/scripts/experience.py
+#                                            core/scripts/owncloud_backend.py
+#                                            core/scripts/coordination_merge.py
+#                                            core/scripts/owncloud_sync.py
+#                                            core/scripts/retrieve.py
+#                                            core/scripts/tree_idf.py
+#                                            core/scripts/trigger_firings.py
+#                                            core/scripts/experience.py   (see NOTE)
 #                                            core/scripts/tree.py
 #                                            core/scripts/tree_match.py
+#
+#      This list is NOT hand-maintained guesswork — it is COMPUTED and pinned.
+#      core/scripts/tests/test_daemon_import_surface.py recomputes the daemon's
+#      real core/scripts import surface and FAILS if any member is unmatched by
+#      the pathspec below. Adding an import to daemon code without adding it here
+#      now breaks a test instead of silently serving stale code. Run that test
+#      after ANY new import in mind_api/src or in a module it loads.
+#
+#      The 5 modules added 2026-07-14 (5) were ALL missing while being
+#      loaded. A grep of top-of-file imports does NOT find them and that is
+#      exactly how the gap survived — most are lazy in-function imports:
+#        coordination_merge <- owncloud_backend.py:122 (LAZY; owns _union_goals +
+#                              the concurrent-mint re-key -> a stale daemon copy
+#                              silently serves OLD merge semantics)
+#        owncloud_sync      <- mind_api/src/endpoints/admin.py:77,149 +
+#                              __main__.py:348 + owncloud_backend.py:537 (LAZY)
+#        retrieve           <- mind_api/src/endpoints/retrieve.py:68 (EAGER!) —
+#                              the retrieval ENGINE was never in the pathspec, so
+#                              every commit to it since the daemon-only cutover
+#                              skipped the restart and the daemon served a stale
+#                              retrieve.py
+#        trigger_firings    <- core/scripts/retrieve.py:82 (eager, via retrieve)
+#        tree_idf           <- retrieve.py:1663 + tree_match.py:520 (LAZY)
+#
+#      NOTE on experience.py: it is in the pathspec but is NOT in the computed
+#      surface — mind_api/src/store_registry.py:327 says "Do NOT `from experience
+#      import` — daemon-import-unsafe", and nothing under mind_api/src imports it
+#      (the daemon's experience endpoint reimplements via _jsonl_common). It is
+#      therefore OVER-INCLUSIVE: touching it forces a restart the daemon does not
+#      need ("pure churn"). Left in deliberately — removing an entry moves AWAY
+#      from the fail-toward-restart guarantee and deserves its own goal, not a
+#      drive-by delete. The test allowlists it as a known over-inclusion.
+#      owncloud_backend.py added 2026-07-14 (0). It was MISSING while
+#      being TRANSITIVELY loaded: storage_backend.py (in the list) instantiates
+#      OwnCloudBackend.from_env() at import-use, so the daemon holds this module
+#      in-process. A commit touching ONLY owncloud_backend.py therefore diffed
+#      CLEAN against this pathspec -> post-commit skipped the restart -> the
+#      daemon kept serving the OLD storage backend (stale _put / fence /
+#      _overwrite_decision / root-map). That is precisely the "never serve stale
+#      daemon code" guarantee this predicate exists to uphold (rb-711, rb-936,
+#      guard-559). NOTE the same transitive-load question is OPEN for
+#      coordination_merge.py and owncloud_sync.py (both lazily imported INSIDE
+#      owncloud_backend functions, so they land in the daemon process at first
+#      use) — audited under a follow-up goal, not assumed here.
 #                                          The `_` prefix is NOT the boundary —
 #                                          these non-underscore modules are
 #                                          loaded too. Audited 2026-05-31 against
@@ -105,6 +155,12 @@ for _attempt in 1 2 3; do
         'core/scripts/_*.py' \
         core/scripts/gates \
         core/scripts/storage_backend.py \
+        core/scripts/owncloud_backend.py \
+        core/scripts/coordination_merge.py \
+        core/scripts/owncloud_sync.py \
+        core/scripts/retrieve.py \
+        core/scripts/tree_idf.py \
+        core/scripts/trigger_firings.py \
         core/scripts/experience.py \
         core/scripts/tree.py \
         core/scripts/tree_match.py \

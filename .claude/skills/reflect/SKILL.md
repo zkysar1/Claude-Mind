@@ -248,9 +248,11 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 # Phase C: Maintenance
 5.5. invoke /reflect-maintain Mode: Curate Memory (light sweep scoped to categories touched this session)
 5.55. **Weakness Analysis (AutoContext-inspired)**:
-     # Aggregates signals from pattern signatures, guardrails, experience archive,
-     # and backpressure rollbacks into a coherent weakness report. HIGH-severity
-     # weaknesses auto-create investigation goals.
+     # Aggregates signals from pattern signatures, experience archive, and
+     # backpressure rollbacks into a coherent weakness report. HIGH-severity
+     # weaknesses auto-create investigation goals. (The guardrail times_active
+     # source is RETIRED — g-115-2141, re-applied by g-115-2470; see the
+     # retirement block below.)
      # Only runs during --full-cycle.
 
      Read agents/<agent>/weakness-report.yaml (create with {last_analyzed: null, analysis_count: 0, weaknesses: [], signal_baseline: {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}}} if missing)
@@ -271,65 +273,96 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # counter, on the delta ABOVE the iteration-correlated BACKGROUND (median delta),
      # so a guardrail signals only when it fired MORE than the per-iteration
      # keyword-match rate. Windowing keeps agent-judgment synthesis unchanged below;
-     # only the signal INPUTS change.
+     # only the signal INPUTS change. (The guardrail half of this fix is now
+     # HISTORY — even windowed, the counter carries no fire information; the
+     # source is retired outright in the g-115-2141 block below. The windowing
+     # doctrine stands for pattern totals + any future counter-derived source.)
      baseline = weakness_report.signal_baseline (default {captured_at: null, guardrail_times_active: {}, rollback_count: 0, pattern_totals: {}})
      first_pass = (baseline.captured_at is null)  # no history yet → cumulative-counter sources emit nothing; baseline is written at end-of-pass
 
-     # Gather signals from multiple sources
+     # Gather signals — 3 CONSUMED sources: pattern_signatures (windowed,
+     # script-side), experience, backpressure. Signature windowing (g-115-1905):
+     # lifetime counters stop discriminating on a mature store (127/722
+     # guardrails matched the old lifetime `times_active >= 3`; guard-054 sat
+     # at 3520 because the precheck guardrail-check mass-matches ~58 rules
+     # every iteration). The baseline lives in weakness-report.yaml
+     # `signal_baseline:` (advisory-ratchet shape, same pattern as
+     # meta/audit-baselines.yaml) and is advanced by the script. The guardrail
+     # source is computed by the script but NOT consumed — retired, block below.
      signals = []
 
-     # 1. Pattern signatures with high false positive rate
-     # Live schema: outcome_stats.{confirmed, total, accuracy}.
-     # false_positive_rate = 1 - accuracy; gate on sufficient sample size. (DRIFT-EXEMPT: rename-documentation)
-     # rb-245 pre-read gate: verify schema before aggregating. If the gate fails,
-     # SKIP this sub-phase (other phases continue). Do NOT --override: that
-     # silences the signal the gate exists to produce. Fix field paths below instead.
+     # 1. Pattern signatures (windowed accuracy) — computed by
+     # core/scripts/weakness-signals.py (guard-399: mechanical arithmetic is
+     # script baseline; LLM synthesis on top). A sig flags when window
+     # accuracy < 0.70 over >=3 window outcomes. First run seeds the baseline
+     # and emits no signals. (The script also computes guardrail windowed
+     # deltas — those are baseline-bookkeeping only, NOT consumed as signals;
+     # see the retirement block below.)
+     # rb-245 pre-read gates: verify schema before the script consumes the
+     # fields. If a gate fails, SKIP this sub-phase (other phases continue).
+     # Do NOT --override: fix field paths in the script instead.
      Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
              --jsonl-path "$WORLD_DIR/pattern-signatures.jsonl" \
              --field-names "outcome_stats.accuracy,outcome_stats.total"
-     Bash: pattern-signatures-read.sh --active
-     # WINDOWED (g-115-2002): accuracy is a ratio (already discriminating), but a
-     # stale low-accuracy signature that has seen NO new outcomes since the last
-     # pass re-fires forever. Require total to have ADVANCED since baseline (the
-     # signature was actually exercised in this window) so we surface patterns
-     # failing NOW, not ones that failed long ago and went dormant. First pass and
-     # brand-new signatures (no baseline entry) pass through on the accuracy gate.
-     FOR EACH sig WHERE sig.outcome_stats.accuracy < 0.70 AND sig.outcome_stats.total >= 3:
-         prev_total = baseline.pattern_totals.get(sig.id)  # null if unseen last pass
-         IF (NOT first_pass) AND prev_total is not null AND (sig.outcome_stats.total - prev_total) < 1:
-             continue  # dormant this window — no new outcomes, skip
-         signals.append({source: "pattern_signature", id: sig.id, detail: sig})
-
-     # 2. Guardrails that fired frequently
-     # rb-245 pre-read gate: same contract as above.
      Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
              --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
              --field-names "utilization.times_active"
-     Bash: guardrails-read.sh --active
-     # WINDOWED (g-115-2002 / sig-27): times_active is a monotonic cumulative
-     # counter AND iteration-correlated (header note — the pre-selection keyword
-     # match bumps it ~once/iteration for every guardrail whose rule text matches
-     # PHASE_PRE_SELECTION_KEYWORDS, real trigger or not). An absolute
-     # `times_active >= 3` therefore fires for nearly every guardrail forever, AND
-     # a naive delta fails too once ≥3 iterations elapse between passes (every
-     # keyword-matching guardrail gains +3 from background alone). Window on the
-     # delta since baseline, THEN subtract the iteration-correlated BACKGROUND so
-     # only guardrails that fired MORE than the per-iteration keyword rate survive:
-     #   delta[g]   = times_active_now - baseline.guardrail_times_active[g]  (skip g with no baseline entry — no history to window)
-     #   background = median(delta[g] over all g that HAVE a baseline entry)  (≈ iterations elapsed between passes = the uniform per-iteration bump)
-     #   signal iff (delta[g] - background) >= guardrail_delta_threshold (default 3)
-     # When most guardrails don't match the keywords their delta is 0, background
-     # collapses to 0, and this reduces to a pure `delta >= 3` (the genuinely-fired
-     # ones). When many accumulate background, subtracting the median removes it.
-     # First pass (no baseline) emits no guardrail signal — correct, not a miss.
-     IF NOT first_pass:
-         deltas = {g.id: g.utilization.times_active - baseline.guardrail_times_active[g.id]
-                   FOR EACH active guard WHERE g.id in baseline.guardrail_times_active}
-         background = median(list(deltas.values())) if deltas else 0
-         FOR EACH guard WHERE guard.id in deltas AND (deltas[guard.id] - background) >= 3:
-             signals.append({source: "guardrail", id: guard.id, delta: deltas[guard.id], background: background, detail: guard})
+     # g-115-2002 windowing is SCRIPT-SIDE (weakness-signals.py, g-115-1905):
+     # the two implementations met at the 2026-07-11 g-115-2022 merge — upstream
+     # carried equivalent LLM-side pseudocode (signature total-advance gate;
+     # guardrail delta-minus-median-background). The script supersedes it:
+     # signatures get true WINDOW accuracy (delta_confirmed/delta_total >= 3
+     # outcomes, < 0.70 signals); guardrails get windowed deltas with ambient
+     # discrimination (>= ambient_mult x median of nonzero deltas — the
+     # iteration-correlated keyword-match background sig-27 warned about);
+     # baseline seeding + storage owned by the script (signal_baseline section).
+     # Script-enforced beats LLM-discretionary (Phase 3.7 doctrine) — do NOT
+     # re-inline the windowing math here.
+     Bash: py -3 core/scripts/weakness-signals.py --agent $MIND_AGENT
+     Parse JSON: seeded, guardrail_signals[], signature_signals[], window_start
+     IF seeded == true:
+         Log: "▸ Weakness signals: baseline seeded — windowed signals available from the next analysis"
+     FOR EACH sig in signature_signals:
+         signals.append({source: "pattern_signature", id: sig.id, detail: sig})   # window_accuracy < 0.70, window_total >= 3
+
+     # Guardrails that fired frequently — RETIRED as a weakness signal source
+     # (g-115-2141, 2026-07-14; re-applied 2026-07-17 by g-115-2470 after the
+     # ac3730ea31d7 sync merge silently dropped the retirement). The script's
+     # guardrail_signals[] output is deliberately NOT consumed here.
+     #
+     # WHY RETIRED (rationale updated for the script-side impl this lineage runs):
+     #   (a) guard-841 spirit: a weakness signal must reflect GENUINE activity.
+     #       utilization.times_active increments on keyword-scan matches
+     #       (Phase 0.5a guardrail-check.sh: matches_context("any") is always
+     #       True; matches_phase filters on STATIC rule-text keywords) — so even
+     #       a WINDOWED delta measures keyword-match rate. Windowing satisfies
+     #       the freshness letter of guard-841, but the counter never contained
+     #       fire information to begin with.
+     #   (b) times_active cannot distinguish a real fire from a keyword-scan
+     #       bump — no arithmetic downstream of the counter can recover a
+     #       distinction the counter never recorded.
+     #   (c) residual false-signal paths survive the script's nonzero-median x2
+     #       ambient filter (which DOES defeat the uniform-cohort shape that
+     #       killed the inline variant — pass 19: 61 guards all delta=31 →
+     #       nonzero-median 31 → threshold 62 → zero signals): the <6-movers
+     #       path (AMBIENT_MIN_COHORT) thresholds at bare min_delta, and a
+     #       guard whose rule text matches ~2x more scan keywords than the
+     #       cohort clears 2x-median EVERY pass — a chronic FP carrying zero
+     #       fire content. Empirical yield: 19 passes → zero real weaknesses
+     #       (origin lineage, inline variant); 6 passes → zero (this box,
+     #       script variant).
+     #
+     # RE-ADD CONDITION: only when guardrail-check.py logs REAL fires
+     # (action_hint ran AND surfaced an issue) as a field DISTINCT from
+     # keyword-scan matches. A real_fires_since_baseline delta can then replace
+     # this block; a keyword-bump-derived signal never can (guard-841).
+     # (weakness-signals.py still computes + baselines guardrail deltas for
+     # schema stability and a clean future re-add; CONSUMPTION alone is
+     # retired. The rb-245 schema gate on guardrails.jsonl above stays — it
+     # protects the script's computation, not this retired consumption.)
 
      # 3. Experience records with negative relative_advantage clustered by approach
+     #    (already windowed — recent 20; unchanged by g-115-1905)
      Bash: experience-read.sh --recent 20
      negative_experiences = filter WHERE relative_advantage < -0.1
      IF len(negative_experiences) >= 3:
@@ -338,17 +371,14 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
          FOR EACH cluster WHERE len(cluster.items) >= 2:
              signals.append({source: "experience_cluster", category: cluster.key, count: len(cluster.items)})
 
-     # 4. Backpressure rollback patterns
+     # 4. Backpressure rollback patterns — windowed to the last 14 days
+     #    (lifetime history counted months-old rollbacks as current weakness
+     #    signal; entries carry timestamps — filter, no baseline needed)
      Bash: meta-backpressure.sh status
-     # WINDOWED (g-115-2002): rollback_history is lifetime-cumulative — a rollback
-     # from months ago otherwise re-appears as a "signal" every pass forever. Only
-     # rollbacks appended SINCE the last snapshot count. rollback_history is
-     # append-ordered, so the new tail is the slice past baseline.rollback_count.
-     # (Prefer a timestamp filter on rollback.at > baseline.captured_at when the
-     # entries carry a timestamp; fall back to the count slice otherwise.) First
-     # pass emits no rollback signal.
-     new_rollbacks = result.rollback_history[baseline.rollback_count:] if (NOT first_pass) else []
-     FOR EACH rollback in new_rollbacks:
+     # (g-115-2002 upstream variant used a baseline.rollback_count slice; the
+     # timestamp filter below is self-contained — entries carry timestamps, no
+     # baseline dependency — and was kept at the g-115-2022 merge.)
+     FOR EACH rollback in result.rollback_history WHERE rollback timestamp within last 14d:
          signals.append({source: "backpressure_rollback", id: rollback.meta_change_id, detail: rollback})
 
      # Synthesize weaknesses from signals

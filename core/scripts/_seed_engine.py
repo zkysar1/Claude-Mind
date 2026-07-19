@@ -128,6 +128,30 @@ def walk_include_entry(entry: dict, source_root: Path) -> list:
     raw_patterns = entry.get("exclude_patterns", [])
     exclude_children = set(entry.get("exclude_children", []))
 
+    # : auto-derive forged-skill exclusions from world/forged-skills.yaml
+    # so a newly-forged domain skill can NEVER leak into the domain-free seed.
+    # The manifest's static exclude_children was hand-mirrored against the forged
+    # registry with no sync enforcement; that drift recurrently produced
+    # promote-blocking leaks (v2.2.0 audit-roblox-deliverable, v2.4.0
+    # build-operator-job). Scoped to the .claude/skills/ entry — forged skills
+    # live only there. UNION, not replace: the static list legitimately also
+    # carries non-forged ephemeral entries (worktrees, .history) AND remains the
+    # fail-safe floor when the registry is unlocatable (_dest_forged_skill_names
+    # returns None -> the union is a no-op and the static list still applies).
+    if entry["path"].rstrip("/") == ".claude/skills":
+        # Fail-safe: ANY registry-read error (e.g. a non-UTF-8 local-paths.conf
+        # raising UnicodeDecodeError past _read_conf_path_key's OSError-only
+        # guard) must fall back to the static exclude_children floor, NOT crash
+        # seed-create — a crash blocks ALL promotion, strictly worse than the
+        # leak the downstream domain-leak preflight already catches. Mirrors the
+        # defensive wrap the scan caller uses (_seed_create_scan.py).
+        try:
+            _forged = _dest_forged_skill_names(source_root)
+        except Exception:
+            _forged = None
+        if _forged:
+            exclude_children |= _forged
+
     # Pre-compute the set of bare directory names to exclude anywhere
     excluded_dir_names = set()
     other_patterns = []
@@ -366,11 +390,24 @@ def do_backup(dest_root: Path, manifest: dict, source_root: Path) -> Path:
 # Staged copy
 # ============================================================================
 
-def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict) -> dict:
+def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict, *,
+                   preserve_deployment_local: bool = False) -> dict:
     """Copy include set to <dest>/.seed-staging/ applying transformations.
 
-    Returns: {"staged": int, "transformed": int, "binary": int, "pending_skip": [rel,...], "failures": [...]}.
+    Returns: {"staged": int, "transformed": int, "binary": int,
+              "pending_skip": [rel,...], "failures": [...],
+              "preserved_deployment_local": [rel,...]}.
     Raises SystemExit on failure (after cleaning staging dir).
+
+    When *preserve_deployment_local* is True (``--living-prod`` mode), any
+    include-set member that is protected at a living destination (deployment-
+    local file, in-repo store root, dest-owned forged skill, operational dir —
+    see _living_dest_preserve_predicate) AND already exists at the destination
+    is NOT staged, so the downstream swap never overwrites the destination's
+    own copy. A protected file ABSENT at the destination is still staged
+    (planted fresh). Filtering here is sufficient and complete: do_swap only
+    ever moves what this step stages, and staging is rebuilt fresh on every
+    call — so do_swap needs no preserve flag of its own (Bug #1).
     """
     staging = dest_root / STAGING_DIRNAME
     if staging.exists():
@@ -380,9 +417,20 @@ def do_copy_staged(source_root: Path, dest_root: Path, manifest: dict) -> dict:
     files_in = resolve_include_set(manifest, source_root)
     transformations = manifest.get("transformations", [])
 
-    stats = {"staged": 0, "transformed": 0, "binary": 0, "pending_skip": [], "failures": []}
+    stats = {"staged": 0, "transformed": 0, "binary": 0, "pending_skip": [],
+             "failures": [], "preserved_deployment_local": []}
+
+    preserve_pred = (_living_dest_preserve_predicate(dest_root)
+                     if preserve_deployment_local else None)
 
     for rel in files_in:
+        # --living-prod: never stage a protected file that already exists at
+        # the destination — leaving it out of staging keeps the dest's own
+        # deployment-local content (do_swap moves only what is staged).
+        if (preserve_pred is not None and preserve_pred(rel)
+                and (dest_root / rel).is_file()):
+            stats["preserved_deployment_local"].append(rel)
+            continue
         src = source_root / rel
         dst = staging / rel
         try:
@@ -837,6 +885,34 @@ def _is_protected_dest_skill(rel: str, forged_prefixes: set,
     return False
 
 
+def _living_dest_preserve_predicate(dest_root: Path):
+    """Return a predicate rel->bool: True if an include-set member *rel* must be
+    KEPT at a living-prod destination instead of overwritten by copy-staged/swap.
+
+    Unifies the preservation already enforced by do_clean_cruft (its
+    _should_preserve closure) and do_remove_orphans so the PLANT step
+    (copy-staged) and the PLAN report (do_plan §1) agree on exactly which
+    deployment-local / dest-owned paths survive under --living-prod. The union
+    is: in-repo store roots + _DEPLOYMENT_LOCAL_FILES + .seed-backup-* +
+    _ORPHAN_SCAN_SKIP_TOP + _OPERATIONAL_DIRS (via _is_preserved_at_dest) and
+    dest-owned forged skills (via _is_protected_dest_skill). The predicate is
+    existence-agnostic; callers gate on `(dest_root/rel).is_file()` so a file
+    ABSENT at dest is still planted fresh while a PRESENT one is preserved.
+    """
+    store_tops = _in_repo_store_tops(dest_root)
+    dest_forged = _dest_forged_skill_names(dest_root)
+    protect_all_skills = dest_forged is None
+    forged_prefixes = set() if dest_forged is None else {
+        f".claude/skills/{n}" for n in dest_forged
+    }
+
+    def _pred(rel: str) -> bool:
+        return (_is_preserved_at_dest(rel, store_tops)
+                or _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills))
+
+    return _pred
+
+
 def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
                       dry_run: bool = False) -> dict:
     """Remove files at destination that are NOT in the manifest-resolved include set.
@@ -852,7 +928,9 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
     though they are absent from the source include set — see
     _is_protected_dest_skill (omni orphan-removal guard, 2026-06-06).
 
-    Returns {"removed": [...], "kept_preserved": [...], "dry_run": bool}.
+    Returns {"removed": [...], "kept_preserved_count": <int>, "dry_run": bool}
+    — note the preserved paths are returned as a COUNT, not a list (callers
+    needing the preserved sublist must recompute it; see do_plan §5).
     """
     expected = set(resolve_include_set(manifest, source_root))
 
@@ -1159,6 +1237,367 @@ def do_diff(source_root: Path, dest_root: Path, manifest: dict) -> dict:
 
 
 # ============================================================================
+# Plan — read-only blast-radius report ( / , P0 keystone)
+# ============================================================================
+# A pre-promote observability pass. It NEVER mutates: it re-derives what each
+# real plant step WOULD do for a given (manifest, source, dest, living_prod)
+# tuple using the SAME helpers those steps use, then classifies the blast
+# radius into six sections + a verdict. Automates the manual guard-119/121
+# pre-promote review the operator otherwise does by eye.
+#
+# Grounding facts the sections encode (verified 2026-07-14 against the live
+# engine — the  spec was authored from an older ZDS snapshot and is
+# partly stale; these reflect CURRENT behavior):
+#   * copy-staged + swap take NO preserve flag — they overwrite the full
+#     include set unconditionally. So deployment-local files IN the include
+#     set are overwritten regardless of --living-prod (spec Bug #1, live).
+#   * clean-cruft preservation is --living-prod-gated (store roots excepted:
+#     those are unconditional). Without the flag, operational dirs matched by
+#     a cruft pattern (core/logs/, mind_api/state/, ...) ARE deleted (Bug #2).
+#   * remove-orphans protects dest-owned forged skills + store roots
+#     UNCONDITIONALLY (commits 3e3a7a5d7 + 7988999ca) — the ZDS forged-skill
+#     wipe vector is closed there.
+
+def _substantive_lines(text: str) -> set:
+    """Line set for divergence detection — trailing ws stripped, blanks dropped.
+
+    Post-transform comparison already neutralizes the brand/env-var rename
+    (gotcha #4); dropping blank/whitespace-only lines further suppresses pure
+    formatting noise so a reported dest-only line is genuine content.
+    """
+    out = set()
+    for ln in text.splitlines():
+        s = ln.rstrip()
+        if s.strip():
+            out.add(s)
+    return out
+
+
+def _compare_dest_vs_seed(rel: str, source_root: Path, dst: Path,
+                          transformations: list):
+    """(diverged, dest_only_line_count) — dest vs POST-TRANSFORM seed content.
+
+    Transform the source first (reusing xform.transform_file, exactly as
+    copy-staged/diff/verify-integrity do) so the MIND_->MIND_ style rename is
+    applied before comparison and never shows as a spurious diff. dest_only is
+    the count of substantive lines present at dest but absent from the
+    transformed seed — the prod-ahead (back-port-up) signal.
+    """
+    src = source_root / rel
+    try:
+        raw = src.read_bytes()
+    except OSError:
+        return (False, 0)
+    if xform.is_binary_path(rel) or xform.is_likely_binary_content(raw):
+        try:
+            return (raw != dst.read_bytes(), 0)  # no line-diff for binary
+        except OSError:
+            return (False, 0)
+    try:
+        content = raw.decode("utf-8")
+        transformed, _, _ = xform.transform_file(rel, content, transformations, source_root)
+        dst_text = dst.read_text(encoding="utf-8", errors="replace")
+    except (OSError, UnicodeDecodeError):
+        return (False, 0)
+    if transformed == dst_text:
+        return (False, 0)
+    dest_only = _substantive_lines(dst_text) - _substantive_lines(transformed)
+    return (True, len(dest_only))
+
+
+def _cruft_protection_class(rel: str, forged_prefixes: set,
+                            protect_all_skills: bool, store_tops: set):
+    """Name why *rel* SHOULD survive a cruft sweep, or None if it is plain cruft.
+
+    Ordered most-specific-first so the report labels the strongest reason.
+    """
+    if rel.split("/", 1)[0] in store_tops:
+        return "in-repo-store"
+    if _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills):
+        return "forged-skill"
+    if rel in _DEPLOYMENT_LOCAL_FILES:
+        return "deployment-local"
+    for op_dir in _OPERATIONAL_DIRS:
+        if rel == op_dir or rel.startswith(op_dir + "/"):
+            return "operational-dir"
+    return None
+
+
+def do_plan(source_root: Path, dest_root: Path, manifest: dict,
+            living_prod: bool = False) -> dict:
+    """Read-only blast-radius plan for a prospective seed-plant to *dest_root*.
+
+    Returns a JSON-serializable dict with six sections + a verdict. NEVER
+    writes: do_remove_orphans is invoked dry_run=True; every other helper is a
+    pure read.
+    """
+    include_set = resolve_include_set(manifest, source_root)
+    include_lookup = set(include_set)
+    transformations = manifest.get("transformations", [])
+    cruft_patterns = manifest.get("cruft_patterns", [])
+
+    store_tops = _in_repo_store_tops(dest_root)
+    dest_forged = _dest_forged_skill_names(dest_root)
+    protect_all_skills = dest_forged is None
+    forged_prefixes = set() if dest_forged is None else {
+        f".claude/skills/{n}" for n in dest_forged
+    }
+
+    # ── §1 DEPLOYMENT-LOCAL OVERWRITES ──
+    # Deployment-local include files present at dest. Under --living-prod,
+    # copy-staged SKIPS these (Bug #1 fixed) so they are PRESERVED, not
+    # overwritten — the overwrite list goes empty and the divergent dest
+    # content is kept. Without the flag, copy/swap overwrite them (warned).
+    dl_overwrites = []
+    dl_preserved = []
+    for rel in include_set:
+        if rel not in _DEPLOYMENT_LOCAL_FILES:
+            continue
+        dst = dest_root / rel
+        if not dst.is_file():
+            continue  # absent at dest -> nothing to overwrite (planted fresh)
+        diverged, _ = _compare_dest_vs_seed(rel, source_root, dst, transformations)
+        entry = {"rel": rel, "diverged": diverged}
+        if living_prod:
+            dl_preserved.append(entry)   # copy-staged skips -> dest kept
+        else:
+            dl_overwrites.append(entry)
+    dl_diverged = [d for d in dl_overwrites if d["diverged"]]
+
+    # ── §2 CRUFT-SWEEP DELETIONS (Bug #2/#3 — clean-cruft, flag-gated) ──
+    # For each cruft pattern present at dest, would clean-cruft delete it under
+    # the current flag, and does it carry a protection class it SHOULD keep?
+    # LIMITATION: glob patterns (containing * or ?) are NOT expanded here — a
+    # literal `dest/.active-agent-*` never .exists() — so only EXACT-PATH cruft
+    # patterns are classified. Safe for the current manifest (every
+    # protected-class pattern — skill dirs, operational dirs — is exact-path;
+    # the globs are all disposable session-state cruft). A future protected
+    # path matched only by a glob would be under-reported here; add glob
+    # expansion if the manifest ever gains one.
+    cruft_deletions = []
+    for p in cruft_patterns:
+        target = dest_root / p.rstrip("/")
+        if not target.exists():
+            continue
+        rel = _norm(str(target.relative_to(dest_root)))
+        cls = _cruft_protection_class(rel, forged_prefixes, protect_all_skills, store_tops)
+        # Replicate do_clean_cruft._should_preserve for this flag:
+        if rel.split("/", 1)[0] in store_tops:
+            would_delete = False           # store roots: unconditional keep
+        elif not living_prod:
+            would_delete = True            # no flag -> nothing else preserved
+        else:
+            would_delete = not (_is_preserved_at_dest(rel)
+                                or _is_protected_dest_skill(rel, forged_prefixes, protect_all_skills))
+        cruft_deletions.append({"pattern": p, "rel": rel,
+                                "protection_class": cls,
+                                "would_delete": would_delete})
+    # Dangerous = would be deleted AND carries a protection class (should survive).
+    cruft_dangerous = [c for c in cruft_deletions
+                       if c["would_delete"] and c["protection_class"]]
+
+    # ── §3 PROD-AHEAD FRAMEWORK FILES (guard-119 — hard DO-NOT-PROMOTE) ──
+    # Framework (non-deployment-local) include files present at both where dest
+    # carries substantive lines the transformed seed lacks -> downstream is
+    # AHEAD; promoting would overwrite a downstream framework change. Back-port
+    # UP instead. Deliberately conservative (over-flags toward caution).
+    prod_ahead = []
+    for rel in include_set:
+        if rel in _DEPLOYMENT_LOCAL_FILES:
+            continue  # handled in §1
+        dst = dest_root / rel
+        if not dst.is_file():
+            continue
+        diverged, dest_only = _compare_dest_vs_seed(rel, source_root, dst, transformations)
+        if diverged and dest_only > 0:
+            prod_ahead.append({"rel": rel, "dest_only_lines": dest_only})
+    prod_ahead.sort(key=lambda e: e["dest_only_lines"], reverse=True)
+
+    # ── §4 STORE BLAST RADIUS (guard-121) ──
+    store_status = {
+        "in_repo_store_roots": sorted(store_tops),
+        "protected": True,   # store_tops protection is unconditional in both sweeps
+        "layout": "in-repo" if store_tops else "external (no in-repo store roots at dest)",
+    }
+
+    # ── §5 ORPHAN DELETIONS (dry-run — all preservation already applied) ──
+    # do_remove_orphans returns only a COUNT of preserved paths, so the
+    # dest-owned forged-skill sublist is recomputed here directly: a skill in
+    # the dest registry whose dir exists at dest but is absent from the source
+    # include set is one that orphan-removal preserves UNCONDITIONALLY (the ZDS
+    # forged-skill-wipe class closed by commit 3e3a7a5d7). Note a skill can be
+    # BOTH preserved here (orphan sweep) AND deletable in §2 (a cruft pattern
+    # matches it and --living-prod was not passed) — two distinct sweep steps.
+    orphan = do_remove_orphans(dest_root, manifest, source_root, dry_run=True)
+    real_orphans = orphan.get("removed", [])
+    forged_preserved = []
+    if dest_forged:
+        for name in sorted(dest_forged):
+            prefix = f".claude/skills/{name}/"
+            if (dest_root / ".claude" / "skills" / name).exists() \
+               and not any(f.startswith(prefix) for f in include_set):
+                forged_preserved.append(f".claude/skills/{name}")
+
+    # ── §6 OPERATIONAL DIRS + DEST-BEHIND ──
+    op_dirs_present = []
+    for op_dir in sorted(_OPERATIONAL_DIRS):
+        if (dest_root / op_dir).exists():
+            # At risk only if a cruft pattern would delete it under this flag.
+            at_risk = any(c["rel"] == op_dir and c["would_delete"] for c in cruft_deletions)
+            op_dirs_present.append({"dir": op_dir, "at_risk": at_risk})
+    diff = do_diff(source_root, dest_root, manifest)
+    dest_behind = {
+        "missing_at_dest": len(diff.get("missing_at_dest", [])),
+        "modified": len(diff.get("modified", [])),
+        "identical": diff.get("identical_count", 0),
+    }
+
+    # ── VERDICT ──
+    if prod_ahead:
+        verdict = "DO NOT PROMOTE"
+        verdict_reason = (f"{len(prod_ahead)} framework file(s) are prod-ahead "
+                          f"(dest carries lines the seed lacks) — back-port up first")
+    elif dl_diverged or cruft_dangerous or real_orphans:
+        parts = []
+        if dl_diverged:
+            parts.append(f"{len(dl_diverged)} diverged deployment-local overwrite(s)")
+        if cruft_dangerous:
+            parts.append(f"{len(cruft_dangerous)} protected path(s) cruft-swept")
+        if real_orphans:
+            parts.append(f"{len(real_orphans)} real orphan deletion(s)")
+        verdict = "REVIEW REQUIRED"
+        verdict_reason = " | ".join(parts)
+    else:
+        verdict = "SAFE"
+        verdict_reason = "no diverged deployment-local, no protected-path deletion, no real orphans"
+
+    return {
+        "version": 1,
+        "source_root": str(source_root),
+        "dest_root": str(dest_root),
+        "living_prod": living_prod,
+        "include_count": len(include_set),
+        "sections": {
+            "deployment_local_overwrites": {
+                "all": dl_overwrites, "diverged": dl_diverged,
+                "preserved": dl_preserved,
+            },
+            "cruft_sweep_deletions": {
+                "all": cruft_deletions, "dangerous": cruft_dangerous,
+            },
+            "prod_ahead_framework_files": prod_ahead,
+            "store_blast_radius": store_status,
+            "orphan_deletions": {
+                "real_orphans": real_orphans,
+                "forged_skills_preserved": forged_preserved,
+            },
+            "operational_dirs_and_dest_behind": {
+                "operational_dirs_present": op_dirs_present,
+                "dest_behind": dest_behind,
+            },
+        },
+        "verdict": verdict,
+        "verdict_reason": verdict_reason,
+    }
+
+
+def _render_plan_report(plan: dict) -> str:
+    """Human-readable text rendering of a do_plan dict (for the operator)."""
+    s = plan["sections"]
+    L = []
+    L.append("═══ SEED-PLANT BLAST-RADIUS PLAN (read-only) ═══════════════════")
+    L.append(f"source     : {plan['source_root']}")
+    L.append(f"dest       : {plan['dest_root']}")
+    L.append(f"living-prod: {plan['living_prod']}   include-set: {plan['include_count']} files")
+    L.append("")
+
+    # §1
+    dl = s["deployment_local_overwrites"]
+    if plan["living_prod"]:
+        L.append("§1 DEPLOYMENT-LOCAL OVERWRITES — --living-prod preserves these at dest (Bug #1 fixed)")
+        preserved = dl.get("preserved", [])
+        if not preserved:
+            L.append("   no deployment-local files present at dest — clean")
+        else:
+            for d in preserved:
+                tag = "diverged (dest content KEPT)" if d["diverged"] else "identical"
+                L.append(f"   {d['rel']}  →  preserved ({tag})")
+    else:
+        L.append("§1 DEPLOYMENT-LOCAL OVERWRITES — copy/swap overwrite these without --living-prod (Bug #1)")
+        if not dl["all"]:
+            L.append("   none in include-set present at dest — clean")
+        else:
+            for d in dl["all"]:
+                tag = "⚠ DIVERGED (KEEP DEST — pass --living-prod)" if d["diverged"] else "identical (harmless)"
+                L.append(f"   {d['rel']}  →  {tag}")
+    L.append("")
+
+    # §2
+    cs = s["cruft_sweep_deletions"]
+    L.append("§2 CRUFT-SWEEP DELETIONS — clean-cruft (--living-prod-gated; store roots unconditional)")
+    if not cs["all"]:
+        L.append("   no cruft patterns present at dest")
+    else:
+        for c in cs["all"]:
+            if c["would_delete"] and c["protection_class"]:
+                L.append(f"   ⚠ {c['rel']}  →  WOULD DELETE (protected class: {c['protection_class']}) — pass --living-prod")
+            elif c["would_delete"]:
+                L.append(f"   {c['rel']}  →  delete (plain cruft, expected)")
+            else:
+                L.append(f"   {c['rel']}  →  preserved ({c['protection_class'] or 'store'})")
+    L.append("")
+
+    # §3
+    pa = s["prod_ahead_framework_files"]
+    L.append("§3 PROD-AHEAD FRAMEWORK FILES — dest carries lines the seed lacks → BACK-PORT UP (guard-119)")
+    if not pa:
+        L.append("   none — no framework file is ahead at dest")
+    else:
+        for e in pa:
+            L.append(f"   ⛔ {e['rel']}  ({e['dest_only_lines']} dest-only line(s)) — DO NOT PROMOTE OVER")
+    L.append("")
+
+    # §4
+    st = s["store_blast_radius"]
+    L.append("§4 STORE BLAST RADIUS — in-repo world/meta data stores (guard-121)")
+    L.append(f"   layout: {st['layout']}")
+    if st["in_repo_store_roots"]:
+        L.append(f"   roots : {', '.join(st['in_repo_store_roots'])}  →  PROTECTED (unconditional, both sweeps)")
+    L.append("")
+
+    # §5
+    od = s["orphan_deletions"]
+    L.append("§5 ORPHAN DELETIONS — files at dest absent from include-set (all preservation applied)")
+    L.append(f"   real orphans to delete: {len(od['real_orphans'])}")
+    for r in od["real_orphans"][:12]:
+        L.append(f"     - {r}")
+    if len(od["real_orphans"]) > 12:
+        L.append(f"     … +{len(od['real_orphans']) - 12} more")
+    if od["forged_skills_preserved"]:
+        L.append(f"   dest-owned forged-skill paths PROTECTED from orphan-sweep: {len(od['forged_skills_preserved'])}")
+    L.append("")
+
+    # §6
+    ob = s["operational_dirs_and_dest_behind"]
+    L.append("§6 OPERATIONAL DIRS + DEST-BEHIND")
+    if ob["operational_dirs_present"]:
+        for o in ob["operational_dirs_present"]:
+            tag = "⚠ AT RISK (would be cruft-deleted — pass --living-prod)" if o["at_risk"] else "present (safe)"
+            L.append(f"   {o['dir']}  →  {tag}")
+    else:
+        L.append("   no operational dirs present at dest")
+    db = ob["dest_behind"]
+    L.append(f"   dest-behind: {db['missing_at_dest']} missing + {db['modified']} modified "
+             f"({db['identical']} identical) — magnitude of change this plant applies")
+    L.append("")
+
+    L.append(f"═══ VERDICT: {plan['verdict']} ═══")
+    L.append(f"    {plan['verdict_reason']}")
+    L.append("    (read-only report — no files were changed)")
+    return "\n".join(L)
+
+
+# ============================================================================
 # CLI
 # ============================================================================
 
@@ -1179,6 +1618,9 @@ def _parse_args():
     sp.add_argument("--manifest", required=True)
     sp.add_argument("--source", default=str(PROJECT_ROOT))
     sp.add_argument("--dest", required=True)
+    sp.add_argument("--preserve-deployment-local", action="store_true",
+                    help="--living-prod: skip staging deployment-local/dest-owned "
+                         "files that already exist at dest (do not overwrite them)")
 
     sp = sub.add_parser("swap")
     sp.add_argument("--dest", required=True)
@@ -1223,6 +1665,15 @@ def _parse_args():
     sp.add_argument("--manifest", required=True)
     sp.add_argument("--source", default=str(PROJECT_ROOT))
 
+    sp = sub.add_parser("plan")
+    sp.add_argument("--manifest", required=True)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+    sp.add_argument("--living-prod", dest="living_prod", action="store_true",
+                    help="Model the preservation clean-cruft applies with --living-prod")
+    sp.add_argument("--json", dest="as_json", action="store_true",
+                    help="Emit the raw plan dict instead of the rendered report")
+
     return p.parse_args()
 
 
@@ -1244,7 +1695,9 @@ def main():
         bd = do_backup(dest_root, manifest, source_root)
         print(json.dumps({"backup_dir": str(bd)}, indent=2))
     elif args.cmd == "copy-staged":
-        stats = do_copy_staged(source_root, dest_root, manifest)
+        pdl = getattr(args, "preserve_deployment_local", False)
+        stats = do_copy_staged(source_root, dest_root, manifest,
+                               preserve_deployment_local=pdl)
         print(json.dumps(stats, indent=2))
     elif args.cmd == "swap":
         result = do_swap(dest_root)
@@ -1285,6 +1738,15 @@ def main():
     elif args.cmd == "list-includes":
         files = resolve_include_set(manifest, source_root)
         print(json.dumps({"count": len(files), "files": files}, indent=2))
+    elif args.cmd == "plan":
+        plan = do_plan(source_root, dest_root, manifest,
+                       living_prod=getattr(args, "living_prod", False))
+        if getattr(args, "as_json", False):
+            print(json.dumps(plan, indent=2))
+        else:
+            print(_render_plan_report(plan))
+        # Read-only observability — ALWAYS exit 0. The plan is a report, not a
+        # gate; wiring the verdict as a promote GATE is P1.5 (), not P0.
 
 
 if __name__ == "__main__":

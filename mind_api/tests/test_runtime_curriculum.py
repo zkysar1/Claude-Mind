@@ -93,7 +93,15 @@ _CURRICULUM_YAML = (
 
 def _seed_agent(agent_dir: Path, *, completed: int = 1):
     """Seed curriculum.yaml + the three gate-input files. completed=0 makes the
-    count_check gate FAIL (for the not-all-passed promote path)."""
+    count_check gate FAIL (for the not-all-passed promote path).
+
+    Also seeds the WORLD competence inputs (g-115-2026 adjudication,
+    g-115-2480): evaluate now RECOMPUTES average_competence from world
+    evidence via refresh_competence_for_gates, overwriting the stored 0.7 —
+    an empty world derives 0.0 and the g-metric gate fails. The stored value
+    below remains only the pre-refresh baseline (and what promote — which
+    does not refresh — reads). Seeded inputs: pipeline 5/5 resolved +
+    rb 20/20 active + 25/25 completed world goals → recomputed 0.75 ≥ 0.5."""
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "curriculum.yaml").write_text(_CURRICULUM_YAML, encoding="utf-8")
     asp_lines = "".join(
@@ -105,6 +113,22 @@ def _seed_agent(agent_dir: Path, *, completed: int = 1):
         json.dumps({"event": "did-thing"}) + "\n", encoding="utf-8")
     (agent_dir / "developmental-stage.yaml").write_text(
         "current_assessment:\n  average_competence: 0.7\n", encoding="utf-8")
+    # World layout differs per harness: HTTP tests use <root>/agents/alpha with
+    # world at <root>/world; the CLI byte-compat tmp layout puts world beside
+    # the agent dir (_run_cli's MIND_WORLD = agent_dir.parent / "world").
+    world = (agent_dir.parent.parent if agent_dir.parent.name == "agents"
+             else agent_dir.parent) / "world"
+    world.mkdir(parents=True, exist_ok=True)
+    (world / "pipeline.jsonl").write_text("".join(
+        json.dumps({"id": f"hyp-{i}", "stage": "resolved"}) + "\n"
+        for i in range(5)), encoding="utf-8")
+    (world / "reasoning-bank.jsonl").write_text("".join(
+        json.dumps({"id": f"rb-{i}", "status": "active"}) + "\n"
+        for i in range(20)), encoding="utf-8")
+    (world / "aspirations.jsonl").write_text(json.dumps(
+        {"id": "asp-w", "goals": [
+            {"id": f"g-w-{i}", "status": "completed"} for i in range(25)]}
+    ) + "\n", encoding="utf-8")
 
 
 def _norm(s: str) -> str:
@@ -143,15 +167,20 @@ def _run_cli(agent_dir: Path, args, allowed_rcs=(0,)) -> str:
 
 
 class _FakePaths:
-    def __init__(self, agent: Path, project_root: Path):
+    def __init__(self, agent: Path, project_root: Path, agent_name="alpha"):
         self.agent = agent
         self.project_root = project_root
+        # Mirrors _run_cli's MIND_WORLD convention (agent's sibling world/) —
+        # the endpoint now reads ctx.paths.world + ctx.paths.agent_name for the
+        # 6 competence refresh and _evaluate_gate (curriculum.py:404).
+        self.world = agent.parent / "world"
+        self.agent_name = agent_name
 
 
 class _FakeCtx:
     def __init__(self, agent: Path, project_root: Path, query: dict, *,
                  agent_name="alpha"):
-        self.paths = _FakePaths(agent, project_root)
+        self.paths = _FakePaths(agent, project_root, agent_name=agent_name or "alpha")
         self.query = query
         self.body = b""
         self.headers = {"x-mind-agent": agent_name} if agent_name else {}

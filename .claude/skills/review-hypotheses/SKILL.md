@@ -188,6 +188,25 @@ For each active hypothesis:
       known binary outcome trigger (e.g., scheduled event), check if
       the triggering event has occurred
 
+2.9. Subject-liveness gate for zero-event windows (rb-3721, g-115-2403):
+   IF the hypothesis predicts an EVENT COUNT over a time window AND the
+   observed count is zero/absent:
+       # A zero is three-way ambiguous — (a) predicted cause resolved,
+       # (b) no exposure/traffic, (c) the SUBJECT was dead — and the count
+       # alone cannot discriminate. Mirrors guard-346 (tool-signal zero).
+       Check the subject (env/service/process) was alive AND exposed across
+       the window BEFORE accepting the zero as evidence:
+         - uptime/heartbeat probe or the record's own measurement_channel
+         - open restore/outage goals naming the subject
+         - usage/traffic channel for the window
+       IF the liveness/exposure precondition collapsed for a material part
+       of the window:
+           outcome: UNRESOLVABLE (already in pipeline VALID_OUTCOMES;
+           excluded from accuracy stats, so calibration stays clean)
+           outcome_detail: name the collapse evidence (downtime span, restore
+           goal id) + "re-form post-restore" when the prediction still matters
+           SKIP Steps 3-4 for this hypothesis (do NOT record CORRECTED/CONFIRMED)
+
 3. If resolution is confirmed:
    Record outcome:
      actual_outcome: "YES" | "NO" (or the relevant outcome value)

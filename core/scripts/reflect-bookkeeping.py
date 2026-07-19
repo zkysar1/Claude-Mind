@@ -524,6 +524,13 @@ def _read_micro_hypotheses():
     if not wm.exists():
         return []
     data = _load_yaml(wm, {}) or {}
+    # Slots live under the top-level `slots:` map in the live WM layout — the
+    # old top-level read returned None for every invocation, so batch-micro
+    # always early-exited with "no micro-hypotheses to process" (9).
+    # Keep the top-level read as fallback for pre-slots layouts.
+    slots = data.get("slots")
+    if isinstance(slots, dict) and slots.get("micro_hypotheses") is not None:
+        return slots.get("micro_hypotheses") or []
     return data.get("micro_hypotheses") or []
 
 
@@ -639,6 +646,24 @@ def cmd_batch_micro(args):
     if actionable:
         flags.append("actionable_discoveries")
 
+    # 9: counted-once contract. Settled micros are counted into the
+    # all-time counters at THIS pass and must then LEAVE the WM slot — the
+    # caller writes micro_hypotheses_writeback (pending-only) back to WM.
+    # total_all_time is DERIVED (confirmed_all_time + corrected_all_time +
+    # pending_now), never `+= total`: a carried pending micro re-batches every
+    # pass, so the old increment counted it once per pass (observed 30 vs 9
+    # resolved). The derived form counts each settled micro exactly once and
+    # self-heals historical inflation on every write.
+    pending_writeback = [m for m in micros if m.get("outcome") is None]
+    stats_delta = {
+        "confirmed_delta": confirmed,
+        "corrected_delta": corrected,
+        "pending_now": unresolved,
+        "rule": ("confirmed_all_time += confirmed_delta; corrected_all_time += "
+                 "corrected_delta; total_all_time = confirmed_all_time + "
+                 "corrected_all_time + pending_now (DERIVED, never += total)"),
+    }
+
     _emit({
         "subcommand": "batch-micro",
         "total": total,
@@ -652,10 +677,13 @@ def cmd_batch_micro(args):
         "promoted_to_encoding": len(surprises),
         "surprises": surprises,
         "actionable_discoveries": actionable,
+        "stats_delta": stats_delta,
+        "micro_hypotheses_writeback": pending_writeback,
         "flags": flags,
         "summary": (
             f"{total} micros: {confirmed} confirmed / {corrected} corrected "
-            f"({accuracy_pct}%), promoted {len(surprises)}"
+            f"({accuracy_pct}%), promoted {len(surprises)}; "
+            f"writeback {len(pending_writeback)} pending (settled pruned)"
         ),
     }, 1 if flags else 0)
 

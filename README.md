@@ -6,7 +6,7 @@ Give Claude Code a persistent mind. It sets its own goals, researches topics, fo
 
 ## Prerequisites
 
-- **Python 3.8+ and PyYAML** — `pip install -r requirements.txt` (or `py -3 -m pip install -r requirements.txt` on Windows)
+- **Python 3.10+ and PyYAML** — `pip install -r requirements.txt` (or `py -3 -m pip install -r requirements.txt` on Windows)
 - **bash 4+** — already present on macOS / Linux; on Windows use Git for Windows (bundles bash 5.x)
 - **Claude Code** — CLI, desktop app, or IDE extension
 - **git** (optional) — enables per-iteration audit trail; framework runs without it (auto-detected)

@@ -456,6 +456,30 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         fi
         # --restart: healthy but a daemon-code commit landed, so the
         # in-memory code is stale. Recycle.
+        #
+        # Claim-liveness gate (3, Layer B for guard-1151): a restart
+        # of a HEALTHY daemon issued mid-goal is the redundant-restart shape —
+        # canonical: 7 restarted 47 min after its claim was superseded
+        # and released (2026-07-16, rb-3735). When the invoking agent has an
+        # in_flight goal, verify the claim is still live before recycling.
+        # ONLY this healthy+--restart branch is gated: the unhealthy/stale
+        # recovery paths below never consult the (possibly down) daemon.
+        # Fail-open on every probe error. Override: MIND_RESTART_FORCE_STALE_CLAIM=1.
+        if [ -n "${MIND_AGENT:-}" ] && [ "${MIND_RESTART_FORCE_STALE_CLAIM:-0}" != "1" ]; then
+            # grep -oE + head -n1 extracts exactly ONE goal-id even if the
+            # transport ever emits a duplicated/concatenated body again (the
+            # 2026-07-18 "11" rt_call retry double-emit —
+            # fixed at the source in _runtime.sh rt_call, defended here too).
+            # null / absent field yields empty, caught by the -n test below.
+            _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null \
+                | grep -oE 'g-[0-9]+-[0-9]+' | head -n1) || _clc_gid=""
+            if [ -n "$_clc_gid" ]; then
+                if ! bash "$SCRIPT_DIR/claim-liveness-check.sh" "$_clc_gid"; then
+                    _log "REFUSED --restart: claim on in-flight goal $_clc_gid is STALE (superseded/released while executing — guard-1151). The daemon is HEALTHY; a recycle now is the redundant-restart shape. Re-read your goal + the coordination board. Override: MIND_RESTART_FORCE_STALE_CLAIM=1 bash core/scripts/mind-api-start.sh --restart"
+                    exit 3
+                fi
+            fi
+        fi
         _log "daemon healthy (PID=$existing_pid parent=${existing_parent_pid:-?}) but --restart requested; recycling for fresh code"
         need_recycle=1
     elif _is_pid_alive "$existing_pid"; then

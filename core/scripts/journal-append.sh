@@ -127,7 +127,10 @@ VALUE_FRAMING="$(python3 "$CORE_ROOT/scripts/_value_framing.py" "$OUTCOME" "$WOR
 if [[ -n "$SUMMARY" || -n "$RETRIEVAL_INFLUENCE" ]]; then
     # Scan BOTH summary and retrieval-influence lines — citations may appear
     # only in the influence articulation (R12 / G10 closure).
-    citations="$(printf '%s\n%s' "$SUMMARY" "$RETRIEVAL_INFLUENCE" | grep -oE '\b(rb|guard)-[0-9]{3}\b' | sort -u || true)"
+    # [0-9]{3,}: IDs crossed into 4 digits (rb-3742, guard-1151) — the old
+    # {3} exact-width silently dropped every modern cite (1, same
+    # defect class as the board.py / board_write.py _CITE_RE fix).
+    citations="$(printf '%s\n%s' "$SUMMARY" "$RETRIEVAL_INFLUENCE" | grep -oE '\b(rb|guard)-[0-9]{3,}\b' | sort -u || true)"
     for cite in $citations; do
         if [[ "$cite" == rb-* ]]; then
             bash "$CORE_ROOT/scripts/reasoning-bank-increment.sh" "$cite" utilization.times_cited >/dev/null 2>&1 || true

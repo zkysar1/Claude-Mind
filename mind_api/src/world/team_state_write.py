@@ -30,6 +30,7 @@ from pathlib import Path
 
 # EMPTY_STATE single source of truth: the read module mirrors team-state.py.
 from .team_state import _EMPTY_STATE_DEFAULTS as EMPTY_STATE
+from .. import file_locks  # noqa: F401 — installs core/scripts on sys.path at module load (rb-3868; explicit, not transitive through .team_state)
 
 from _fileops import locked_modify_yaml, locked_write_yaml  # noqa: E402
 #  sharding: shared routing/composition helper (core/scripts on

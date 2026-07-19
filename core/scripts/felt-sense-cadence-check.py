@@ -209,6 +209,86 @@ def main() -> int:
             f"felt-sense-cadence-check: current={current} last={last_count} "
             f"diff={diff} cadence={goal_cadence}"
         )
+    # Negative-diff self-heal (6 pattern, ported here by 4).
+    # A DOWNWARD count-basis correction (census double-count repair, store
+    # surgery, archival, count-basis change) leaves the stamped slot ABOVE the
+    # live count. Without this branch diff stays negative and the ritual
+    # SILENTLY STARVES until the count regrows past the stale stamp.
+    #
+    # This is not hypothetical: measured 2026-07-14, this slot held
+    # goals_count_at_last_fire=5686 against a live count of 5351 (diff=-335),
+    # so the 7-lane self-audit needed 335+75=410 MORE completed goals (~8
+    # sessions) before it could fire again. It reported `rc=1 noop
+    # (diff=-335 < cadence=75)` the whole time — byte-identical to a healthy
+    # not-yet-due skip. The ritual whose JOB is noticing drift was the one
+    # drifting, and nothing could tell.
+    #
+    # fresh-eyes-cadence-check.py got this heal (6 per-agent,
+    # 1 team-layer); its two siblings (this file, l1-skew-check.py)
+    # never did. Same count basis, same failure, no guard.
+    #
+    # Re-stamp to the current count and NOOP — do NOT fire. Firing here would
+    # trade a starved ritual for one that fires on every basis correction
+    # (banner fatigue, guard-1090). Preserve the last REAL fire timestamp: a
+    # re-baseline is not a fire and must not masquerade as one. Fires at most
+    # once per correction; upward jumps and the last_count==0 first-fire path
+    # are unaffected (diff >= 0 there).
+    if diff < 0:
+        # ZERO-GUARD (guard-1091; fresh-eyes-code F-001, 2026-07-14). A FAILED
+        # measurement is not a measurement of ZERO. count_completed_goals()
+        # above returns 0 as a SILENT FAILURE SENTINEL: every candidate file
+        # missing (`if not p.exists(): continue`) or unreadable (`except
+        # OSError: continue`) leaves total=0. The world store is S3-backed on
+        # an own-cloud deployment, so a mid-sync read miss is routine, not
+        # hypothetical.
+        #
+        # Re-baselining on that 0 would PERSIST the transient error as the new
+        # basis (goals_count_at_last_fire=0) and then SPURIOUSLY FIRE next
+        # iteration via the last_count==0 first-fire path. Note what that costs:
+        # BEFORE this heal existed a transient 0 was HARMLESS — diff<0 =>
+        # fire=False => noop => NO WRITE => self-recovering on the next check.
+        # The heal must not convert a self-recovering error into permanent
+        # state corruption. Noop WITHOUT re-stamping; the next check retries.
+        #
+        # `current == 0` inside `diff < 0` already implies `last_count > 0`, so
+        # this cannot mask a legitimate basis: a real count never falls to zero
+        # (it folds in archives + census_completed and is eviction-invariant).
+        # A genuinely empty store is not starved either — it self-heals here the
+        # moment ONE goal completes (current >= 1 takes the re-baseline below).
+        if current == 0:
+            print(
+                f"felt-sense-cadence-check: negative diff ({diff}) with current=0 "
+                f"vs last={last_count} — FAILED MEASUREMENT, not a real basis "
+                f"(count_completed_goals returns 0 on read failure); noop WITHOUT "
+                f"re-stamp — retries next check",
+                file=sys.stderr,
+            )
+            return 1
+        rebase_payload = json.dumps({
+            "timestamp": last.get("timestamp", "0000-00-00T00:00:00"),
+            "goals_count_at_last_fire": current,
+            "rebaselined_from": last_count,
+        })
+        try:
+            subprocess.run(
+                [sys.executable, str(HERE / "wm.py"), "set", SLOT_NAME],
+                input=rebase_payload,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            print(
+                f"felt-sense-cadence-check: negative diff ({diff}) — count basis "
+                f"moved backward (last={last_count} > current={current}); "
+                f"re-baselined {SLOT_NAME} to {current} — noop this iter"
+            )
+        except (subprocess.CalledProcessError, OSError) as exc:
+            print(
+                f"felt-sense-cadence-check: negative-diff re-baseline write "
+                f"failed ({exc!r}) — noop without re-stamp; retries next check",
+                file=sys.stderr,
+            )
+        return 1
     if diff >= goal_cadence:
         # 4 min_session_goals gate: world-goal completions tick every
         # agent's cadence counter, but felt-sense lanes 1-6 require firing-

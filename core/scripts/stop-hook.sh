@@ -68,20 +68,21 @@ unset _RFILE _RSIZE _RTMP
 # --- Read stdin ONCE (sole Stop hook — no stdin sharing, no race) ---
 STDIN_JSON=$(cat)
 
-# --- Resolve a working Python launcher ONCE (g-115-2205, rb-370/guard-335) ---
-# Every $PY site below (SID extraction first, then insight capture, body-manifest,
-# trailing-text detector, decision payload, timing) used a BARE `py -3`. On any
-# Linux host with NO `py` shim (foxtrot 2026-07-14: WSL/Ubuntu, no shim installed)
-# that is command-not-found; the trailing `2>/dev/null || echo ""` swallowed it,
-# HOOK_SID came back empty, the hook logged `ALLOW gate=no-sid` and the stop hook
-# — the loop's life support — silently became a no-op, so the loop died on its
-# first text-death and STAYED dead with no alarm. Resolve py-3-then-python3 ONCE
-# here (test-execute, so a present-but-broken `py` still falls through), then use
-# "$PY" at every site. The python3 fallback is what makes a fresh Linux deploy
-# (WSL, new container, seed plant, transplant land) boot with a LIVE stop hook.
-# Placed before the SID extraction, which fires on EVERY hook invocation ahead of
+# --- Resolve a working Python launcher ONCE (5, rb-370/guard-335) ---
+# Every $PY site below (SID extraction at line 75 first, then insight capture,
+# body-manifest, trailing-text detector, decision payload, timing) used a BARE
+# `py -3`. On any Linux host with NO `py` shim (foxtrot 2026-07-14: WSL/Ubuntu,
+# no shim installed) that is command-not-found; the trailing `2>/dev/null ||
+# echo ""` swallowed it, HOOK_SID came back empty, the hook logged
+# `ALLOW gate=no-sid` and the stop hook — the loop's life support — silently
+# became a no-op, so the loop died on its first text-death and STAYED dead with
+# no alarm. Resolve py-3-then-python3 ONCE here (test-execute, so a
+# present-but-broken `py` still falls through), then use "$PY" at every site.
+# Matches the established idiom in bring-up-doctor.sh:34 / permissions-add.sh:48.
+# The python3 fallback is what makes a fresh Linux deploy (WSL, new container,
+# seed plant, transplant land) boot with a LIVE stop hook instead of a dead one.
+# Placed here — before line 75, which fires on EVERY hook invocation ahead of
 # any gate — so the resolver is never wasted on an early-exit ALLOW path.
-# (Promoted from Ayoai g-115-2205 per g-030-15; ZDS keeps its MIND_AGENT binding.)
 PY=""
 if command -v py >/dev/null 2>&1 && py -3 -c "pass" >/dev/null 2>&1; then PY="py -3"
 elif command -v python3 >/dev/null 2>&1 && python3 -c "pass" >/dev/null 2>&1; then PY="python3"
@@ -96,13 +97,16 @@ HOOK_SID=$(printf '%s' "$STDIN_JSON" | $PY -c "import sys,json; print(json.load(
 # Can't identify this session — don't risk blocking the wrong window
 if [ -z "$HOOK_SID" ]; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-sid" >> "$LOG" 2>/dev/null || true
-    # LOUD degradation signal (g-115-2204). gate=no-sid = the SID could not be
+    # LOUD degradation signal (4). gate=no-sid = the SID could not be
     # extracted, so the stop hook (the loop's life support) is a NO-OP this fire
-    # and CANNOT force the Skill(aspirations) re-entry — the loop dies silently on
-    # its next text-only turn-end (foxtrot 2026-07-14 ran dead for HOURS this way).
-    # Emit to STDERR so it surfaces in the pane immediately. Does NOT change the
+    # and CANNOT force the Skill(aspirations) re-entry — the loop dies silently
+    # on its next text-only turn-end (foxtrot 2026-07-14 ran dead for HOURS this
+    # way; the only trace was a log line nobody reads). Emit to STDERR so it
+    # surfaces in the Claude Code pane immediately. STDERR, not a per-agent
+    # session-signal file, because the agent is UNRESOLVABLE here — resolution
+    # needs the very SID we just failed to extract. Does NOT change the
     # fail-open ALLOW (blocking the wrong window is the worse hazard — HARD
-    # CONSTRAINT of g-115-2204); it only makes the silent degradation loud.
+    # CONSTRAINT of 4); it only makes the silent degradation loud.
     echo "[stop-hook] DEGRADED gate=no-sid: session_id could not be extracted from the Stop event — the stop hook is a NO-OP this fire and CANNOT keep the autonomous loop alive; the loop will die on its next text-only turn-end with no other alarm. Likely cause: no Python launcher (py/python3) resolvable in the hook env, or malformed Stop-event JSON. Fix the launcher / hook env (see g-115-2205, g-115-2204)." >&2
     exit 0
 fi
@@ -267,6 +271,22 @@ export MIND_AGENT="$HOOK_AGENT"
 # --- Gate 1: Not RUNNING → allow stop ---
 STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
 if [ "$STATE" != "RUNNING" ]; then
+    # SG-c (8-c): the runner session is ending. A graceful /stop sets
+    # IDLE at D1 BEFORE stop-loop at D2, so THIS not-RUNNING gate — not Gate 2 —
+    # is the allow-path that actually fires on a graceful stop (and it also
+    # covers a crash/recovery-to-IDLE end). Before allowing the stop, roll any
+    # unresolved deploy obligations into handoff.yaml so they are SURFACED in the
+    # next session's boot summary instead of silently crossing the stop boundary.
+    # Roll-then-ALLOW backstop: NEVER blocks the stop (an un-clearable framework-CI
+    # obligation must not wedge a session), idempotent (dedup by repo+sha), and
+    # fail-open. pending-deploys.yaml is NOT cleared — it lives in the agent-wide
+    # session dir and persists for the next session's SG-b all-sweep (the source
+    # of truth); handoff carries the visibility mirror. Also covers an
+    # autocompact-interrupted graceful-stop D-flow.
+    if [ -n "$HOOK_AGENT" ] && [ -n "$PY" ]; then
+        _PDROLL=$($PY "$CORE_ROOT/scripts/pending-deploys.py" --agent "$HOOK_AGENT" roll-handoff 2>/dev/null || echo '')
+        [ -n "$_PDROLL" ] && echo "$(date +%Y-%m-%dT%H:%M:%S) pending-deploys-roll agent=$HOOK_AGENT sid=$HOOK_SID $_PDROLL" >> "$LOG" 2>/dev/null || true
+    fi
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=not-running sid=$HOOK_SID agent=$HOOK_AGENT state=$STATE runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
     exit 0
 fi

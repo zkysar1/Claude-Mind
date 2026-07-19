@@ -149,6 +149,15 @@ _EXCLUDE_NAMES = {
     "local-paths.conf",
     "daemon.port", "daemon.pid", "daemon.lock",
     ".DS_Store", "Thumbs.db",
+    # gate-firings own-cloud spool lane (g-115-2405): per-box buffer files
+    # drained into the SHARED meta/gate-firings.jsonl by gate-firings-flush.py.
+    # Machine-local by construction — syncing them would clobber peers' spools
+    # and re-create the franken-copy class the spool exists to avoid. The
+    # .flush.lock companion is covered by the *.lock glob below; the last-flush
+    # stamp needs an exact entry.
+    "gate-firings.spool.jsonl",
+    "gate-firings.spool.flushing.jsonl",
+    "gate-firings.spool.last-flush",
 }
 # Basename glob patterns never synced.
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
@@ -531,6 +540,66 @@ def _etag_is_multipart(etag: str) -> bool:
     return "-" in (etag or "").strip('"')
 
 
+_MERGE_NA = object()  # sentinel: store not merge-registered -> caller's default action
+
+
+def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
+                   counter: str):
+    """Union-merge push via the store's registered commutative handler
+    (g-115-2297). The sync sweep's whole-object ``mirror_put`` is a CLOBBER
+    for append-only logs whenever S3 holds records local lacks — the If-Match
+    fence passes because it fences on the just-observed CURRENT etag. For a
+    merge-REGISTERED store (coordination_merge._HANDLERS), push the UNION
+    instead: no side's records are ever dropped, and both S3 and local
+    converge to the merged bytes.
+
+    Returns:
+      _MERGE_NA -> store not merge-registered (or backend lacks merge_put):
+                   caller falls through to its pre-existing default action.
+      md5 str   -> merged + pushed; record as the new baseline.
+      None      -> merge attempted but failed: counted as an error; treat as
+                   this sweep's skip, the next sweep retries.
+    """
+    merge_put = getattr(be, "merge_put", None)
+    if merge_put is None:
+        return _MERGE_NA
+    try:
+        from owncloud_backend import _coordination_merge_handler
+        if _coordination_merge_handler(full) is None:
+            return _MERGE_NA
+    except Exception:  # noqa: BLE001 — registry unavailable -> default action
+        return _MERGE_NA
+    # Preserve-before-drop (g-115-2325): merge_put's write-back REPLACES the
+    # local file with the merged bytes. For parseable content the union loses
+    # nothing, but merge_append_only_jsonl now DROPS torn half-lines (truncated
+    # appends) instead of wedging on them — snapshot the pre-merge local so the
+    # dropped bytes stay recoverable from .history. Content-deduped + capped +
+    # fail-open (same helper as the nobaseline lane's g-115-1928 call), so the
+    # unconditional call at this shared chokepoint covers all three union lanes
+    # (pushed_merged / diverged_merged / nobaseline_merged) at bounded cost.
+    _snapshot_before_pull(full)
+    try:
+        res = merge_put(full, local_bytes)
+    except Exception as e:  # noqa: BLE001 — CAS exhausted / transport error
+        print(f"[sync] WARN: union-merge push failed for {full}: {e}",
+              file=sys.stderr)
+        stats["errors"] += 1
+        return None
+    if res is None:  # backend-side not-registered/machine-local double-check
+        return _MERGE_NA
+    stats[counter] = stats.get(counter, 0) + 1
+    # Per-file lane attribution (g-115-2468): the aggregate counters alone
+    # cannot answer "WHICH union lane healed WHICH store" after the fact —
+    # exactly the reconstruction the 2026-07-16_cc02-gate-firings-self-heal
+    # resolution needed forensic snapshots for.
+    stats.setdefault("merge_events", []).append(
+        {"file": str(full), "lane": counter})
+    try:
+        return hashlib.md5(full.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 # --- core: one file --------------------------------------------------------
 def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
               baseline_md5=None, multi_machine: bool = False,
@@ -559,7 +628,10 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
           multi-machine, not own-cloud -> skip + warn (no single authority)
           single-machine -> push (legacy; local IS authoritative here)
       S3 ETag multipart (uncomparable to an md5):
-          multi-machine -> skip + warn (defer; never clobber)
+          multi-machine, merge-registered -> UNION via _try_merge_put
+              (g-115-2474: a commutative merge needs no baseline
+              classification — safe in every divergence sub-case)
+          multi-machine, unregistered -> skip + warn (defer; never clobber)
           single-machine -> push (no peer to clobber)
     """
     try:
@@ -588,6 +660,18 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     # local write. Single-machine: no peer to clobber -> local is authoritative.
     if st is not None and _etag_is_multipart(st.version):
         if multi_machine:
+            # g-115-2474: a merge-REGISTERED store needs no baseline
+            # classification — the commutative union is safe in every
+            # divergence sub-case, so merge instead of the forever-defer.
+            # (Capability the pre-ac3730ea31d7 lineage had; lost with the
+            # superseded impl, restored here through the current chokepoint.)
+            # _MERGE_NA (unregistered / no merge_put) falls through to the
+            # defer below — unregistered stores keep the old behavior exactly.
+            if not dry_run:
+                merged_md5 = _try_merge_put(be, full, local_bytes, stats,
+                                            counter="multipart_merged")
+                if merged_md5 is not _MERGE_NA:
+                    return merged_md5
             stats["multipart_deferred"] = stats.get("multipart_deferred", 0) + 1
             print(f"[sync] skip (S3 ETag is multipart — cannot classify vs "
                   f"baseline; deferring, no clobber): {full}", file=sys.stderr)
@@ -600,15 +684,59 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
         s3_at_baseline = (baseline_md5 is not None
                           and _etag_matches(st.version, baseline_md5))
         if local_at_baseline and not s3_at_baseline:
-            # Local untouched since last sync, S3 moved -> peer wrote -> STALE.
+            # Local untouched since last sync, S3 moved -> peer wrote.
+            if own_cloud_authority:
+                # g-115-2268 Gap B: under own-cloud S3 is authoritative and the
+                # baseline PROVES local carries nothing unpushed (bytes == last
+                # reconciled content), so this is the provably-safe pull — heal
+                # the stale cache instead of skipping it forever. No pre-pull
+                # snapshot: local == baseline means nothing unique is lost
+                # (same rule as _pull_one's local==baseline pull branch and the
+                # _snapshot_before_pull docstring).
+                if dry_run:
+                    stats["stale_would_pull"] = \
+                        stats.get("stale_would_pull", 0) + 1
+                    return None
+                try:
+                    be.refresh(full)  # GET S3 -> local (materialize peer bytes)
+                except Exception as e:  # noqa: BLE001 — transient fetch error
+                    # Fall back to the conservative skip; next sweep retries.
+                    print(f"[sync] WARN: stale-pull refresh failed for "
+                          f"{full}: {e}", file=sys.stderr)
+                    stats["stale_skipped"] = stats.get("stale_skipped", 0) + 1
+                    return None
+                stats["stale_pulled"] = stats.get("stale_pulled", 0) + 1
+                # Advance the baseline to the pulled content so the next sweep
+                # reads in-sync (aggregate counter only — no per-file print;
+                # same flood rationale as nobaseline_reconciled, g-328-14).
+                try:
+                    return hashlib.md5(full.read_bytes()).hexdigest()
+                except OSError:
+                    return None
+            # Multi-machine but NOT own-cloud: no single authority -> keep the
+            # conservative clobber-safe STALE skip.
             stats["stale_skipped"] = stats.get("stale_skipped", 0) + 1
             print(f"[sync] skip (stale local vs newer S3 — peer wrote): {full}",
                   file=sys.stderr)
             return None
         if baseline_md5 is not None and not local_at_baseline and not s3_at_baseline:
-            # Both moved since the baseline -> concurrent divergence. Do NOT
-            # auto-clobber either side; surface it for reconciliation.
+            # Both moved since the baseline -> concurrent divergence.
+            # g-115-2297: a merge-REGISTERED store reconciles by UNION instead
+            # of skipping — both sides' records survive (commutative handler,
+            # guard-907), the merged bytes land on S3 (fenced CAS) AND local,
+            # and the returned md5 becomes the new baseline so the next sweep
+            # reads in-sync. Unregistered stores keep the clobber-safe skip.
+            if not dry_run:
+                merged_md5 = _try_merge_put(be, full, local_bytes, stats,
+                                            counter="diverged_merged")
+                if merged_md5 is not _MERGE_NA:
+                    return merged_md5
+            # Do NOT auto-clobber either side; surface it for reconciliation.
+            # g-115-2268 Gap C: record the path so sweep() can track a
+            # per-path consecutive-conflict streak and surface PERSISTENT
+            # conflicts loudly instead of skipping silently forever.
             stats["diverged_skipped"] = stats.get("diverged_skipped", 0) + 1
+            stats.setdefault("conflict_paths", []).append(str(full))
             print(f"[sync] skip (CONFLICT — local and S3 both changed since "
                   f"baseline): {full}", file=sys.stderr)
             return None
@@ -643,6 +771,17 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 # (no baseline can prove otherwise) — snapshot before adopting
                 # S3 so the reconcile is recoverable instead of lossy.
                 _snapshot_before_pull(full)
+                # g-115-2297: for a merge-REGISTERED store the deterministic
+                # reconcile is the UNION, not the pull — adopting S3 wholesale
+                # drops any locally-authored-but-unpushed tail (the
+                # LocalBackend-degraded-append lane behind the cc-02
+                # gate-firings franken-copy). The union preserves both sides
+                # and still terminates: merged bytes land on S3 + local, the
+                # returned md5 is the baseline, next sweep reads in-sync.
+                merged_md5 = _try_merge_put(be, full, local_bytes, stats,
+                                            counter="nobaseline_merged")
+                if merged_md5 is not _MERGE_NA:
+                    return merged_md5
                 try:
                     be.refresh(full)  # GET S3 -> local cache (materialize authority)
                 except Exception as e:  # noqa: BLE001
@@ -679,6 +818,20 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
         stats["would_push"] += 1
         stats["push_paths"].append(str(full))
         return None
+    # g-115-2297: a merge-REGISTERED store NEVER takes a blind whole-object PUT
+    # when S3 already holds an object. Even a "confirmed local change" can
+    # carry a stale TAIL — appends degraded to LocalBackend while peers
+    # appended to S3 — and the If-Match fence passes because it fences on the
+    # just-observed CURRENT etag (this is the PostToolUse sync_file lane that
+    # replaced the newer meta/gate-firings.jsonl S3 head at 2026-07-16
+    # 03:09:14). The union is a superset of the push: local-only records still
+    # land, S3-only records survive. S3-absent stays the plain PUT (nothing to
+    # merge); unregistered stores keep the fenced mirror_put below.
+    if st is not None:
+        merged_md5 = _try_merge_put(be, full, local_bytes, stats,
+                                    counter="pushed_merged")
+        if merged_md5 is not _MERGE_NA:
+            return merged_md5
     expected = st.version if st is not None else None
     try:
         from owncloud_backend import ConflictError
@@ -707,6 +860,118 @@ def _roots(be, only_root: str | None):
     if only_root:
         rs = [(r, p) for r, p in rs if p == only_root]
     return rs
+
+
+# g-115-2268 Gap C: a both-diverged file is skipped by _sync_one every sweep —
+# correct (never auto-clobber), but SILENT forever. Track a per-path
+# consecutive-conflict streak in a machine-local side file (next to the
+# manifest) and surface paths that stay conflicted >= threshold sweeps loudly,
+# so persistent split-brain reaches an operator/agent instead of scrolling by
+# as one stderr line per sweep. Conflicts are monotone until someone merges
+# (both sides diverged from baseline never self-heals), so streak bookkeeping
+# is simple: paths conflicting THIS sweep increment; paths no longer
+# conflicting drop out of the file automatically.
+_CONFLICT_STREAK_THRESHOLD = 3
+_CONFLICT_PERSISTENT_PRINT_CAP = 10
+
+
+def _conflict_streaks_path() -> Path:
+    return _runtime_dir() / "owncloud-conflict-streaks.json"
+
+
+def _update_conflict_streaks(stats: dict) -> None:
+    """Increment streaks for this sweep's conflict paths, surface persistent
+    ones (>= _CONFLICT_STREAK_THRESHOLD consecutive sweeps), persist the new
+    streak map. Fail-open: bookkeeping errors warn and never block the sweep."""
+    cur = stats.get("conflict_paths") or []
+    p = _conflict_streaks_path()
+    try:
+        old = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        if not isinstance(old, dict):
+            old = {}
+    except (ValueError, OSError):
+        old = {}
+    new = {c: int(old.get(c, 0)) + 1 for c in cur}
+    persistent = sorted(k for k, v in new.items()
+                        if v >= _CONFLICT_STREAK_THRESHOLD)
+    stats["conflict_persistent"] = persistent
+    for k in persistent[:_CONFLICT_PERSISTENT_PRINT_CAP]:
+        print(f"[sync] CONFLICT-PERSISTENT ({new[k]} consecutive sweeps): {k} "
+              f"— local and S3 both diverged from baseline; needs "
+              f"merge/reconcile (g-115-2268 Gap C)", file=sys.stderr)
+    if len(persistent) > _CONFLICT_PERSISTENT_PRINT_CAP:
+        print(f"[sync] CONFLICT-PERSISTENT: ... and "
+              f"{len(persistent) - _CONFLICT_PERSISTENT_PRINT_CAP} more",
+              file=sys.stderr)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(new, indent=0), encoding="utf-8")
+        tmp.replace(p)
+    except OSError as e:
+        print(f"[sync] WARN: conflict-streaks persist failed: {e}",
+              file=sys.stderr)
+
+
+# --- sweep-outcome telemetry sink (g-115-2468) ------------------------------
+# core/logs/ is gitignored AND core/ is not a sync root, so this sink is
+# machine-local by construction — the sync layer never writes through itself
+# (a synced telemetry log would join the CAS-conflict class rb-3636/rb-2639).
+_SWEEP_STATS_LOG = (Path(__file__).resolve().parents[1] / "logs"
+                    / "owncloud-sweep-stats.jsonl")
+
+# Counters that do NOT make a run worth logging on their own: a healthy sweep
+# is scanned==in_sync(+skipped_unchanged) and logging it would bury the
+# forensic signal under heartbeat noise.
+_BORING_STATS = frozenset({"scanned", "in_sync", "skipped_unchanged",
+                           "pruned_agents", "push_paths"})
+
+# Self-trim bounds (g-115-2468 fresh-eyes F2): the live 2-min sweep cadence
+# logs a line for every active-session push heartbeat (~720/day observed
+# 2026-07-17), so the sink grows ~8MB/month unbounded — the .history-regrowth
+# class. Trim keeps the newest ~half when the cap is crossed; best-effort.
+_SWEEP_LOG_MAX_BYTES = 2_000_000
+_SWEEP_LOG_KEEP_BYTES = 1_000_000
+
+
+def _log_sweep_stats(stats: dict, *, source: str,
+                     extra_boring: frozenset = frozenset()) -> None:
+    """Append one JSON line of sweep/sync-file outcome telemetry to the
+    machine-local sink (g-115-2468).
+
+    The union-lane counters (pushed_merged / diverged_merged /
+    nobaseline_merged) and the per-file merge_events were previously
+    stdout-transient — post-hoc lane attribution (WHICH lane healed WHICH
+    store) required forensic snapshots during the
+    2026-07-16_cc02-gate-firings-self-heal resolution. One line per
+    NON-BORING run keeps the sink small and forensically dense; pure
+    in-sync runs are suppressed. Fail-open: telemetry must never break the
+    sweep or the PostToolUse push path.
+    """
+    boring = _BORING_STATS | extra_boring
+    interesting = any(
+        (len(v) if isinstance(v, (list, dict)) else v)
+        for k, v in stats.items() if k not in boring)
+    if not interesting:
+        return
+    try:
+        _SWEEP_STATS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        try:  # size-capped self-trim (F2) — keep newest tail, whole lines only
+            if (_SWEEP_STATS_LOG.exists()
+                    and _SWEEP_STATS_LOG.stat().st_size > _SWEEP_LOG_MAX_BYTES):
+                data = _SWEEP_STATS_LOG.read_bytes()[-_SWEEP_LOG_KEEP_BYTES:]
+                nl = data.find(b"\n")
+                _SWEEP_STATS_LOG.write_bytes(data[nl + 1:] if nl >= 0 else data)
+        except OSError:
+            pass  # trim is best-effort; the append below still fail-opens
+        line = json.dumps(
+            {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "source": source,
+             **stats}, default=str)
+        with open(_SWEEP_STATS_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:  # noqa: BLE001 — telemetry is strictly fail-open
+        print(f"[sync] WARN: sweep-stats telemetry write failed: {e}",
+              file=sys.stderr)
 
 
 def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
@@ -795,6 +1060,7 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                         and base_mtime == mtime_ns):
                     stats["skipped_unchanged"] += 1
                     continue
+                stale_pulled_before = stats.get("stale_pulled", 0)
                 new_md5 = _sync_one(be, full_path, dry_run=dry_run, stats=stats,
                                     baseline_md5=base_md5, multi_machine=mm,
                                     own_cloud_authority=own_cloud)
@@ -803,14 +1069,142 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                 # baseline so the next sweep re-evaluates instead of trusting a
                 # stale cache.
                 if not dry_run and mtime_ns is not None and new_md5 is not None:
+                    # Gap B stale-pull rewrote THIS local file — re-stat so the
+                    # manifest mtime matches the pulled bytes (a stale pre-pull
+                    # mtime would force a spurious re-HEAD next sweep).
+                    if stats.get("stale_pulled", 0) > stale_pulled_before:
+                        try:
+                            mtime_ns = full_path.stat().st_mtime_ns
+                        except OSError:
+                            pass
                     new_manifest[rel_key] = {"mtime": mtime_ns, "md5": new_md5}
+    # g-115-2268 Gap C: surface persistent conflicts (>= N consecutive sweeps)
+    # and persist the streak map. Real sweeps only — a dry-run must not mutate
+    # the machine-local streak state.
+    if not dry_run:
+        _update_conflict_streaks(stats)
     if not dry_run and use_manifest:
         _save_manifest(new_manifest)
+    # g-115-2122 part 2: temp/ move-propagation. Runs AFTER the walk + manifest
+    # save as a STANDALONE pass — it only issues remote HEAD/DELETE calls and
+    # never reads-merges-rewrites a local file, so it adds zero length to the
+    # unlocked read->merge->PUT->local-rewrite window zeta flagged in
+    # msg-20260711-205747-zeta-3102.
+    if only_root in (None, "agents"):
+        stats["temp_move_propagation"] = propagate_temp_moves(
+            be, dry_run=dry_run, owned=owned, only_agent=only_agent)
+    if not dry_run:
+        _log_sweep_stats(stats, source="sweep")
+    return stats
+
+
+def propagate_temp_moves(be, *, dry_run=False, owned=None, only_agent=None):
+    """Propagate local temp/ drains to the store: delete the remote ROOT key
+    agents/<agent>/temp/<name> when the local drained/<name> twin exists.
+
+    g-115-2122 part 2. The sync layer has no move propagation, so a local
+    drain (mv temp/<name> -> temp/drained/<name>) leaves the remote root key
+    forever; pull_temp's drained-twin veto (part 1) stops the resurrection
+    treadmill but the stale key still accumulates. A move is copy+delete —
+    the drained copy IS the archive, so deleting the root twin satisfies
+    archive-before-delete.
+
+    Safety predicate, in order:
+      1. Only agents this machine OWNS (same single-runner claims the sweep
+         push uses) — a peer's drained/ state is not this box's authority.
+      2. Only root keys whose basename exists in the LOCAL drained/ dir
+         (a genuine live root doc with no drained twin is NEVER touched).
+      3. Newer-than guard: skip when the remote root's LastModified is newer
+         than the local drained twin's drain-floor (max of st_mtime/st_ctime
+         — on Linux the rename updates ctime, approximating drain time; on
+         Windows ctime is creation time and the guard degrades to file
+         times). Single-runner-per-agent + ISO-timestamped temp filenames
+         make a post-drain same-name peer push contrived; the guard is
+         belt-and-suspenders, predicate 2 is the archive guarantee.
+
+    No-op unless the backend exposes delete_object (own-cloud only —
+    LocalBackend has no remote root twins to clean)."""
+    stats = {"agents_checked": 0, "candidates": 0, "deleted": 0,
+             "would_delete": 0, "skipped_remote_newer": 0, "errors": 0,
+             "deleted_keys": []}
+    if not hasattr(be, "delete_object"):
+        return stats
+    agents_roots = _roots(be, "agents")
+    if not agents_roots:
+        return stats
+    agents_root = agents_roots[0][0]
+    if not agents_root.exists():
+        return stats
+    if owned is None and os.environ.get("STORAGE_BACKEND", "local")\
+            .strip().lower() == "own-cloud":
+        owned = _owned_agents(be=be)
+    for agent_dir in sorted(p for p in agents_root.iterdir() if p.is_dir()):
+        agent = agent_dir.name
+        if only_agent is not None and agent != only_agent:
+            continue
+        if owned is not None and agent not in owned:
+            continue
+        local_drained = agent_dir / "temp" / "drained"
+        if not local_drained.is_dir():
+            continue
+        try:
+            drained = {p.name: p for p in local_drained.iterdir()
+                       if p.suffix in (".md", ".json")}
+        except OSError:
+            continue
+        if not drained:
+            continue
+        stats["agents_checked"] += 1
+        temp_dir = agent_dir / "temp"
+        try:
+            children = be.list_dir(temp_dir)
+        except Exception as e:  # noqa: BLE001 — enumeration is best-effort
+            stats["errors"] += 1
+            print(f"[sync] temp-move-propagation list_dir failed for "
+                  f"{agent}: {e}", file=sys.stderr)
+            continue
+        for name in children:
+            # Extension routing mirrors pull_temp: only *.md/*.json are root
+            # working docs; anything else is a subdir (drained/) or ephemera.
+            if not (name.endswith(".md") or name.endswith(".json")):
+                continue
+            twin = drained.get(name)
+            if twin is None:
+                continue  # live root doc — never touched
+            stats["candidates"] += 1
+            try:
+                st = twin.stat()
+                drain_floor = max(st.st_mtime, st.st_ctime)
+                remote_lm = None
+                if hasattr(be, "head_last_modified"):
+                    remote_lm = be.head_last_modified(temp_dir / name)
+                if remote_lm is not None and remote_lm > drain_floor + 1.0:
+                    stats["skipped_remote_newer"] += 1
+                    continue
+                if dry_run:
+                    stats["would_delete"] += 1
+                    continue
+                if be.delete_object(temp_dir / name):
+                    stats["deleted"] += 1
+                    stats["deleted_keys"].append(
+                        f"agents/{agent}/temp/{name}")
+            except Exception as e:  # noqa: BLE001 — per-key isolation
+                stats["errors"] += 1
+                print(f"[sync] temp-move-propagation delete failed for "
+                      f"agents/{agent}/temp/{name}: {e}", file=sys.stderr)
     return stats
 
 
 # --- single-file mode (the PostToolUse hook) -------------------------------
-def sync_file(be, target: Path, *, dry_run) -> int:
+def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
+    # stats_out (optional dict): filled with the outcome so daemon callers
+    # (POST /v1/admin/owncloud-sync-file, g-115-2447) can report pushed vs
+    # skipped-and-why without a second code path. Callers passing nothing are
+    # unchanged (CLI --file keeps the bare int rc contract).
+    def _skip(reason):
+        if stats_out is not None:
+            stats_out["reason"] = reason
+        return 0
     target = target.resolve()
     # under a governed root?
     prefix = None
@@ -825,18 +1219,18 @@ def sync_file(be, target: Path, *, dry_run) -> int:
             continue
     if prefix is None:
         # Not governed (core/, .claude/, product repos are git-synced, not S3).
-        return 0
+        return _skip("not_governed")
     if _is_machine_local(target.name, prefix, full_path=target, root_path=matched_root):
-        return 0
+        return _skip("machine_local")
     # H4a: never push a PEER agent's file — its local copy is a stale cache of
     # the owning machine's S3 writes (this machine does not run that agent).
     owned = _owned_agents(be=be)
     if prefix == "agents" and owned is not None and matched_root is not None:
         parts = target.relative_to(matched_root).parts
         if parts and parts[0] not in owned:
-            return 0
+            return _skip("peer_agent")
     if not target.exists() or target.is_dir():
-        return 0
+        return _skip("missing_or_dir")
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "stale_skipped": 0,
              "diverged_skipped": 0, "nobaseline_skipped": 0,
@@ -849,6 +1243,14 @@ def sync_file(be, target: Path, *, dry_run) -> int:
         print(f"[sync] pushed {target}")
     elif stats["would_push"]:
         print(f"[sync] would push {target}")
+    if stats_out is not None:
+        stats_out.update(stats)
+    # Telemetry (g-115-2468): plain pushes are the NORMAL PostToolUse path and
+    # would flood the sink — log single-file runs only when something beyond a
+    # clean push happened (merge lanes, conflicts, errors, stale/diverged).
+    if not dry_run:
+        _log_sweep_stats(stats, source="sync_file",
+                         extra_boring=frozenset({"pushed", "would_push"}))
     return 1 if stats["errors"] else 0
 
 
@@ -941,17 +1343,29 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         if _etag_matches(st.version, local_md5):
             stats["in_sync"] += 1
             return local_md5  # already current
-        if _etag_is_multipart(st.version):
-            # Uncomparable S3 ETag — cannot classify vs baseline. Defer; never
-            # risk clobbering local on an ambiguous compare.
-            stats["multipart_deferred"] = stats.get("multipart_deferred", 0) + 1
-            print(f"[pull] skip (S3 ETag multipart — cannot classify; no clobber): "
-                  f"{full}", file=sys.stderr)
-            return None
+        # g-115-2651: baseline gate BEFORE the multipart defer, symmetric to
+        # _overwrite_decision (owncloud_backend.py L812-828). Computing
+        # local_at_baseline FIRST lets a local==baseline (or no-baseline-at-bind)
+        # multipart continuity file PULL — S3-authoritative, nothing unpushed
+        # masked — instead of the old unconditional bind-time defer that froze it
+        # behind a stale cache until the next force_fresh read healed it via
+        # _overwrite_decision. Multipart is deferred ONLY when local != baseline
+        # (genuine unpushed writes we must not clobber AND cannot classify against
+        # an uncomparable ETag).
         local_at_baseline = baseline_md5 is not None and local_md5 == baseline_md5
         if baseline_md5 is not None and not local_at_baseline:
             # Local diverged from the last reconciled content -> unpushed local
             # writes -> local is authoritative. Do NOT pull (the sweep pushes it).
+            if _etag_is_multipart(st.version):
+                # Uncomparable S3 ETag AND local diverged from baseline -> cannot
+                # classify and must not clobber. Defer (the sole surviving
+                # bind-time multipart defer, per the goal's "defer multipart ONLY
+                # when local != baseline").
+                stats["multipart_deferred"] = stats.get("multipart_deferred", 0) + 1
+                print(f"[pull] skip (S3 ETag multipart, local diverged from "
+                      f"baseline — cannot classify; no clobber): {full}",
+                      file=sys.stderr)
+                return None
             stats["local_ahead_skipped"] = stats.get("local_ahead_skipped", 0) + 1
             print(f"[pull] skip (local has unpushed writes vs baseline — not "
                   f"clobbering; sweep will push): {full}", file=sys.stderr)
@@ -959,11 +1373,17 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         if baseline_md5 is None:
             # No baseline to prove local authority. At /start the agent is being
             # bound here FROM elsewhere, so S3 is authoritative — pull, but log it
-            # (the Phase-5 drift detector reconciles genuine surprises).
+            # (the Phase-5 drift detector reconciles genuine surprises). A multipart
+            # S3 reaches here too (uncomparable, but no baseline == S3-authoritative
+            # first pull, matching _overwrite_decision L852-854).
             print(f"[pull] pulling no-baseline local (S3-authoritative at bind): "
                   f"{full}", file=sys.stderr)
             snapshot_first = True  # local may be an unpushed authored write
-        # else local == baseline, S3 differs -> peer wrote -> fall through to pull
+        # else local == baseline, S3 differs (comparable OR multipart) -> peer
+        # wrote -> fall through to pull. A multipart here is the 2026-07-02
+        # freeze-avoidance case: local==baseline proves nothing unpushed is lost,
+        # so adopting S3 refreshes the fence (symmetric to _overwrite_decision
+        # L814-828's "download").
 
     if dry_run:
         stats["would_pull"] += 1
@@ -1066,7 +1486,8 @@ def pull_temp(be, agent: str, *, dry_run: bool = False,
     counters rather than failing the whole pull."""
     stats = {"agent": agent, "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
-             "multipart_deferred": 0, "errors": 0, "pulled_files": []}
+             "multipart_deferred": 0, "skipped_drained_twins": 0,
+             "errors": 0, "pulled_files": []}
     agents_roots = _roots(be, "agents")
     if not agents_roots:
         stats["error"] = "no agents root on backend"
@@ -1087,24 +1508,55 @@ def pull_temp(be, agent: str, *, dry_run: bool = False,
         stats["errors"] += 1
         stats["error"] = f"temp list_dir failed: {e}"
         return stats
-    targets = []
+    # Two-pass target build so a drained twin can veto its stale root twin.
+    # Route by extension: temp/ working docs are *.md / *.json (the file-naming
+    # convention); anything else is a subdir (drained/, or a stray one the
+    # convention discourages). Recurse ONE level into a subdir so its contents
+    # still resume cross-machine — temp/ is flat-plus-one-subdir by convention,
+    # so a single level suffices. Routing by extension (vs hardcoding "drained")
+    # avoids mis-counting a subdir as a file (a spurious s3_absent) and future-
+    # proofs against any subdir name.
+    #
+    # g-115-2121: the sync layer has NO move/delete propagation, so a local
+    # drain (mv temp/<name> -> temp/drained/<name>) leaves the remote root key
+    # temp/<name> forever. _pull_one's "local absent -> S3 is the only copy ->
+    # pull" branch would then RESURRECT the drained file at the root on every
+    # /start (observed treadmill: a drain of 273->3 fully un-done by the next
+    # pull). Skipping a root key that has a drained twin (remote OR local) breaks
+    # the treadmill: the drained/ copy is the live archive; the root twin is a
+    # stale pre-drain leftover.
+    root_names = []          # root-level *.md / *.json working docs
+    subdir_targets = []      # files under drained/ (or any subdir) — always pulled
+    drained_names = set()    # basenames present under drained/ (the veto set)
     for name in children:
-        # Route by extension: temp/ working docs are *.md / *.json (the file-naming
-        # convention); anything else is a subdir (drained/, or a stray one the
-        # convention discourages). Recurse ONE level into a subdir so its contents
-        # still resume cross-machine — temp/ is flat-plus-one-subdir by convention,
-        # so a single level suffices. Routing by extension (vs hardcoding "drained")
-        # avoids mis-counting a subdir as a file (a spurious s3_absent) and future-
-        # proofs against any subdir name.
         if name.endswith(".md") or name.endswith(".json"):
-            targets.append(temp_dir / name)
+            root_names.append(name)
         else:
             try:
                 for dname in be.list_dir(temp_dir / name):
                     if dname.endswith(".md") or dname.endswith(".json"):
-                        targets.append(temp_dir / name / dname)
+                        subdir_targets.append(temp_dir / name / dname)
+                        if name == "drained":
+                            drained_names.add(dname)
             except Exception:  # noqa: BLE001 — best-effort on a subdir
                 pass
+    # A local drain may not yet be reflected under the remote drained/ prefix
+    # (the drained file is pushed by a separate sweep pass); count local drained/
+    # twins too so the veto holds in the drain->push window.
+    try:
+        local_drained = temp_dir / "drained"
+        if local_drained.is_dir():
+            for p in local_drained.iterdir():
+                if p.suffix in (".md", ".json"):
+                    drained_names.add(p.name)
+    except OSError:  # best-effort on the local subdir
+        pass
+    targets = list(subdir_targets)
+    for name in root_names:
+        if name in drained_names:
+            stats["skipped_drained_twins"] += 1
+            continue  # stale pre-drain twin — do NOT resurrect (g-115-2121)
+        targets.append(temp_dir / name)
 
     for full in targets:
         stats["scanned"] += 1
@@ -1321,6 +1773,100 @@ def pull_bootstrap(be, *, only_root=None, dry_run=False):
     return stats
 
 
+# --- periodic pull sweep (g-115-2268 Gap A) ---------------------------------
+def pull_sweep(be, *, only_root=None, dry_run=False):
+    """Periodic PULL half of the mirror sweep (g-115-2268 Gap A).
+
+    The push sweep is LOCAL-walk driven (os.walk + mtime manifest), so a file
+    this box never touches is never re-examined and a peer's S3 advance stays
+    invisible forever to RAW-read consumers (bare-bash world/scripts execs,
+    grep/Read of tree .md) — the only pull path was backend read-through,
+    which raw reads never trigger. Measured cost: 162/2952 world/ objects
+    diverged on one box; a stale alert-sweep.sh ran in production.
+
+    This is the S3-LIST-driven inverse: one flat paginated LIST per governed
+    root (be.list_objects — ~1 request per 1000 objects, no per-file HEAD),
+    then a cheap local ETag-vs-manifest-baseline pre-filter; only candidates
+    whose S3 ETag moved off this box's baseline (or that have no baseline /
+    no local copy) reach `_pull_one`, which applies the full no-clobber
+    decision table (local-ahead skip, multipart defer, no-baseline snapshot
+    + pull, local-absent materialize). An unchanged fleet costs LIST-only.
+
+    Scope: world/ + meta/ (`_BOOTSTRAP_ROOTS`) — agents/ is deliberately
+    excluded for the same reasons as pull_bootstrap (per-agent continuity is
+    pulled freshness-aware at /start by pull_continuity; eagerly pulling
+    agent dirs is huge and risks resurrecting deliberately-deleted files).
+    Machine-local files never pull: basenames via _is_machine_local, and any
+    key with a path segment in _EXCLUDE_DIRS (the flat LIST bypasses the
+    walk-pruning that normally handles those — filter them here; the
+    owncloud-local-cache-staleness node documents why pulling a machine-local
+    file, e.g. changelog.jsonl, would be actively harmful).
+
+    own-cloud only (no-op on local). Fail-open: every error counts + surfaces
+    on stderr, never raises — a broken pull tick must not kill the daemon
+    sweep thread. Idempotent: manifest baselines make re-runs cheap."""
+    stats = {"backend": os.environ.get("STORAGE_BACKEND", "local").strip().lower(),
+             "pulled_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
+             "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
+             "multipart_deferred": 0, "errors": 0, "pulled_files": [],
+             "skipped_machine_local": 0, "skipped": None}
+    if stats["backend"] != "own-cloud":
+        stats["skipped"] = "local backend (no-op)"
+        return stats
+    roots = _BOOTSTRAP_ROOTS if only_root is None else (only_root,)
+    manifest = _load_manifest()
+    new_manifest = dict(manifest)
+    for prefix in roots:
+        if prefix not in ("world", "meta"):
+            continue
+        for root_path, _pfx in _roots(be, prefix):
+            try:
+                objs = be.list_objects(root_path)
+            except Exception as e:  # noqa: BLE001 — enumeration failed: count + next root
+                stats["errors"] += 1
+                print(f"[pull-sweep] WARN: list_objects failed for {root_path}: {e}",
+                      file=sys.stderr)
+                continue
+            stats["pulled_roots"].append(prefix)
+            for rel, etag, _size in objs:
+                parts = rel.split("/")
+                if any(seg in _EXCLUDE_DIRS for seg in parts[:-1]):
+                    stats["skipped_machine_local"] += 1
+                    continue
+                full = root_path.joinpath(*parts)
+                if _is_machine_local(parts[-1], prefix, full_path=full,
+                                     root_path=root_path):
+                    stats["skipped_machine_local"] += 1
+                    continue
+                stats["scanned"] += 1
+                rel_key = f"{prefix}/{rel}"
+                _bm, base_md5 = _manifest_entry(manifest.get(rel_key))
+                # Cheap pre-filter: a single-part ETag equal to this box's
+                # baseline md5 means S3 has not moved since the last reconcile
+                # — nothing to pull (local-ahead changes are the PUSH half's
+                # job). Multipart ETags never match and fall through to
+                # _pull_one's defer/pull classification.
+                if base_md5 is not None and _etag_matches(etag, base_md5):
+                    stats["in_sync"] += 1
+                    continue
+                before = stats["pulled"]
+                new_md5 = _pull_one(be, full, dry_run=dry_run, stats=stats,
+                                    baseline_md5=base_md5)
+                if stats["pulled"] > before:
+                    stats["pulled_files"].append(rel_key)
+                if not dry_run and new_md5 is not None:
+                    try:
+                        mtime_ns = full.stat().st_mtime_ns
+                    except OSError:
+                        mtime_ns = None
+                    if mtime_ns is not None:
+                        new_manifest[rel_key] = {"mtime": mtime_ns,
+                                                 "md5": new_md5}
+    if not dry_run:
+        _save_manifest(new_manifest)
+    return stats
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1338,6 +1884,12 @@ def main() -> int:
                         "to local (run BEFORE init on a fresh own-cloud clone so "
                         "init sees the true initialized state, not an empty "
                         "cache). Honors --root to limit to one root.")
+    g.add_argument("--pull-sweep", action="store_true",
+                   help="periodic PULL half of the mirror sweep (g-115-2268): "
+                        "one flat paginated LIST per root + ETag-vs-baseline "
+                        "pre-filter, pulling only peer-advanced files via the "
+                        "no-clobber classifier. Much cheaper than --pull on a "
+                        "warm mirror. Honors --root (world|meta).")
     ap.add_argument("--root", choices=("world", "meta", "agents"),
                     help="limit --all / --pull to one root")
     ap.add_argument("--dry-run", action="store_true",
@@ -1355,15 +1907,17 @@ def main() -> int:
     if args.file:
         return sync_file(be, Path(args.file), dry_run=args.dry_run)
 
-    if args.pull:
+    if args.pull or args.pull_sweep:
         t0 = time.time()
-        stats = pull_bootstrap(be, only_root=args.root, dry_run=args.dry_run)
+        fn = pull_sweep if args.pull_sweep else pull_bootstrap
+        stats = fn(be, only_root=args.root, dry_run=args.dry_run)
         dt = time.time() - t0
+        tag = "pull-sweep" if args.pull_sweep else "pull"
         if stats.get("skipped"):
-            print(f"[pull] skipped: {stats['skipped']}")
+            print(f"[{tag}] skipped: {stats['skipped']}")
             return 0
         mode = "DRY-RUN" if args.dry_run else "APPLIED"
-        print(f"[pull] {mode} in {dt:.1f}s — roots {stats['pulled_roots']}, "
+        print(f"[{tag}] {mode} in {dt:.1f}s — roots {stats['pulled_roots']}, "
               f"scanned {stats['scanned']}, "
               f"{'would-pull' if args.dry_run else 'pulled'} "
               f"{stats['would_pull'] if args.dry_run else stats['pulled']}, "

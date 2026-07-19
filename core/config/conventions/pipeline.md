@@ -71,6 +71,22 @@ echo '{"outcome":"CONFIRMED","surprise":2,"outcome_date":"2026-03-09"}' | pipeli
 Scripts validate JSON schema before writing. On validation failure: exit non-zero with error.
 All backed by `core/scripts/pipeline.py` (Python 3, stdlib only except PyYAML for migration).
 
+## Tombstone-in-Live Archival (g-115-1986 / g-115-2326)
+
+A move to `archived` does NOT remove the record from `pipeline.jsonl` — it
+stays as a `stage=archived` tombstone carrying an `archived_date` (its prune
+clock), and the archive copy is appended to `pipeline-archive.jsonl` exactly
+once (deduped by id). Rationale: the own-cloud merge is a per-file
+union-by-id that cannot express a cross-file removal, so a pre-removal
+remote copy used to resurrect archived records at their old stage (94
+records, 2026-07-11); the in-place stage flip converges fleet-wide via the
+monotonic stage rank. `archive_sweep` maintains tombstones: stamps a missing
+`archived_date`, prunes tombstones older than `PRUNE_GRACE_DAYS` (14d,
+`pipeline_write.py`), and reports `pruned_count` alongside `archived_count`.
+Consequences for readers: `stage=archived` records in the LIVE file are
+normal (not corruption); an id may exist in BOTH files by design —
+`compute_meta` (CLI + daemon) dedups the join by id so nothing double-counts.
+
 ## Resolution-Evidence Requirement (g-303-27)
 
 A move INTO the `resolved` stage with `outcome` of `CONFIRMED` or `CORRECTED`

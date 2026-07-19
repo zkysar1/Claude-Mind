@@ -200,6 +200,12 @@ class _FakePaths:
         self.world = world
         self.agent_name = "alpha"
 
+    def wm_path(self, unit_key=None):
+        # Mirrors AgentPaths.wm_path ( per-Body routing): no unit_key /
+        # no forked body-WM-file collapses to the agent-wide WM. Tests pass no
+        # SID header, so the fallback is the only branch exercised.
+        return self.agent / "session" / "working-memory.yaml"
+
 
 class _FakeCtx:
     def __init__(self, agent: Path, project_root: Path, world: Path,

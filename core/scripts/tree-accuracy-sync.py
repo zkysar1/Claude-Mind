@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import _paths  # noqa: E402
-from tree import read_tree, write_tree, _load_competence_config, _graduate_node_level  # noqa: E402
+from tree import read_tree, write_tree, _load_competence_config, _graduate_node_level, _stamp_progression  # noqa: E402
 from tree_match import find_nodes  # noqa: E402
 from pipeline import read_jsonl, LIVE_PATH, ARCHIVE_PATH  # noqa: E402
 
@@ -231,6 +231,7 @@ def apply_plan(plan, tree, dry_run=False):
         for field, value in mutations.items():
             node[field] = value
         if confidence_changed:
+            _stamp_progression(node)  # 5: durable under own-cloud merge
             old_level, new_level = _graduate_node_level(node, competence)
             if old_level is not None:
                 capability_changes.append({

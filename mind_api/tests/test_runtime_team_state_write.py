@@ -47,8 +47,19 @@ def _post(port, path, query, body=None, *, agent="alpha"):
 
 
 def _read_ts(world: Path) -> dict:
-    p = world / "team-state.yaml"
-    return yaml.safe_load(p.read_text(encoding="utf-8"))
+    """Compose shared monolith + per-agent shard rows, row-first — mirrors
+    _team_state.load_rows (g-328-27: agent_status rows moved to
+    world/team-state/agents/<name>.yaml; the monolith keeps shared fields
+    only, so a monolith-only read KeyErrors on per-agent writes)."""
+    doc = yaml.safe_load((world / "team-state.yaml").read_text(encoding="utf-8")) or {}
+    rows = world / "team-state" / "agents"
+    if rows.is_dir():
+        status = doc.setdefault("agent_status", {})
+        for p in sorted(rows.glob("*.yaml")):
+            row = yaml.safe_load(p.read_text(encoding="utf-8"))
+            if isinstance(row, dict):
+                status[p.stem] = {**(status.get(p.stem) or {}), **row}
+    return doc
 
 
 # ---------------------------------------------------------------------------

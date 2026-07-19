@@ -44,6 +44,18 @@ _SUPERSEDE_CHECK_SECONDS = 10
 # OWNCLOUD_SYNC_INTERVAL to override.
 _OWNCLOUD_SYNC_DEFAULT_INTERVAL = 120
 
+# 8 Gap A: every Nth push-sweep cycle, ALSO run the PULL half
+# (owncloud_sync.pull_sweep) so peer-side S3 advances reach this box's local
+# mirror for raw-read consumers (bare-bash world/scripts execs, grep/Read of
+# tree .md) that never touch the backend read-through. A pull tick is one flat
+# paginated LIST per governed root (world+meta, ~1 request per 1000 objects)
+# + a local ETag-vs-baseline pre-filter; only peer-moved files incur HEAD/GET.
+# Default 5 (with the 120s push interval -> a pull every ~10 min; peer writes
+# become locally visible well inside the staleness windows that bit us:
+# a stale alert-sweep.sh ran in production, a false OHS-drift verdict).
+# Override via OWNCLOUD_PULL_EVERY_N; 0 disables the pull half.
+_OWNCLOUD_PULL_DEFAULT_EVERY_N = 5
+
 
 def _project_root() -> Path:
     """Resolve PROJECT_ROOT — the directory containing `mind_api/`."""
@@ -338,6 +350,12 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
     except ValueError:
         interval = _OWNCLOUD_SYNC_DEFAULT_INTERVAL
     interval = max(30, interval)
+    try:
+        pull_every = int(os.environ.get("OWNCLOUD_PULL_EVERY_N",
+                                        str(_OWNCLOUD_PULL_DEFAULT_EVERY_N)))
+    except ValueError:
+        pull_every = _OWNCLOUD_PULL_DEFAULT_EVERY_N
+    pull_every = max(0, pull_every)  # 0 disables the pull half
 
     scripts_dir = str(project_root / "core" / "scripts")
     if scripts_dir not in sys.path:
@@ -372,20 +390,61 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
         # Settle delay: don't fire the periodic PUSH sweep during startup churn.
         if shutdown.wait(timeout=min(interval, 30)):
             return
+        cycle = 0
         while not shutdown.is_set():
             t0 = time.monotonic()
             try:
                 stats = owncloud_sync.sweep(
                     get_backend(), only_root=None, dry_run=False,
                     use_manifest=True, full=False)
-                if stats.get("pushed") or stats.get("errors") or stats.get("conflicts"):
+                # Surface diverged_skipped as "conflict-skip" — the persistent
+                # split-brain signal (local AND S3 both changed since baseline, so
+                # the sweep skips forever and the file never reconverges). It is
+                # counted in _sync_one (owncloud_sync.py:611) but was OMITTED from
+                # this daemon summary, so the periodic line read "conflicts 0" while
+                # thousands of CONFLICT skips printed above it — false-clean telemetry
+                # (guard-465 class) that let a fleet-wide split-brain run undetected.
+                # The near-zero `conflicts` counter only tracks the RARE mid-push
+                # ConflictError (owncloud_sync.py:695), NOT divergence. Mirrors the
+                # already-honest CLI summary at owncloud_sync.py:1437. Gate on
+                # diverged_skipped too, so a tick with only divergence-skips (no push)
+                # still reports instead of staying silent. (3)
+                # stale-pull (8 Gap B) added: own-cloud heals
+                # local==baseline+S3-moved caches instead of skipping them.
+                if (stats.get("pushed") or stats.get("errors")
+                        or stats.get("conflicts") or stats.get("diverged_skipped")
+                        or stats.get("stale_pulled")):
                     print(f"[owncloud-sync] pushed {stats.get('pushed', 0)}, "
+                          f"conflict-skip {stats.get('diverged_skipped', 0)}, "
+                          f"conflict-persistent {len(stats.get('conflict_persistent') or [])}, "
+                          f"stale-pull {stats.get('stale_pulled', 0)}, "
+                          f"stale-skip {stats.get('stale_skipped', 0)}, "
+                          f"nobaseline-reconcile {stats.get('nobaseline_reconciled', 0)}, "
                           f"conflicts {stats.get('conflicts', 0)}, "
                           f"errors {stats.get('errors', 0)} "
                           f"(scanned {stats.get('scanned', 0)})", file=sys.stderr)
             except Exception as e:  # noqa: BLE001 — a bad tick never kills the thread
                 print(f"[owncloud-sync] sweep error (retry next tick): {e}",
                       file=sys.stderr)
+            # 8 Gap A: every Nth cycle, run the PULL half so peer S3
+            # advances reach this box's mirror for raw-read consumers. Cheap on
+            # a quiescent fleet (flat LIST per root + local ETag pre-filter);
+            # fail-open — a bad pull tick never kills the thread.
+            cycle += 1
+            if pull_every and cycle % pull_every == 0:
+                try:
+                    pstats = owncloud_sync.pull_sweep(get_backend())
+                    if pstats.get("pulled") or pstats.get("errors"):
+                        print(f"[owncloud-pull] pulled {pstats.get('pulled', 0)}, "
+                              f"in-sync {pstats.get('in_sync', 0)}, "
+                              f"local-ahead-skip {pstats.get('local_ahead_skipped', 0)}, "
+                              f"multipart-defer {pstats.get('multipart_deferred', 0)}, "
+                              f"errors {pstats.get('errors', 0)} "
+                              f"(scanned {pstats.get('scanned', 0)})",
+                              file=sys.stderr)
+                except Exception as e:  # noqa: BLE001 — pull must never kill the thread
+                    print(f"[owncloud-pull] pull-sweep error (retry next cycle): {e}",
+                          file=sys.stderr)
             elapsed = time.monotonic() - t0
             if shutdown.wait(timeout=max(1.0, interval - elapsed)):
                 break

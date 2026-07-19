@@ -15,13 +15,16 @@ BYTE-COMPATIBILITY:
   - read/discover (stdout): json.dumps(x, indent=2, ensure_ascii=False) + "\n"
     (skill-relations.py:121/229/273). read merges base_relations + forged_relations
     (BASE FIRST). discover on empty log emits "[]\n" early.
-  - add/co-invoke writes: world/skill-relations.yaml via write_yaml ->
+  - add/co-invoke writes: world/skill-relations.yaml via _write_yaml ->
     yaml.dump(data, f, default_flow_style=False, allow_unicode=True,
-    sort_keys=False) with the DEFAULT yaml.Dumper (NOT CSafeDumper),
-    atomic tmp(.yaml.tmp)+os.replace, and NO lock/.history/changelog
-    (skill-relations.py:66-72). This module replicates that EXACTLY and adds
-    file_locks.locked() for daemon-process concurrency only (byte-neutral —
-    the lock file is transient; the wm_write precedent). Success stdout is
+    sort_keys=False) with the DEFAULT yaml.Dumper (NOT CSafeDumper) and NO
+    .history/changelog (skill-relations.py:66-72). Serialization bytes are
+    replicated EXACTLY; the WRITE MECHANISM routes through
+    _fileops._atomic_write_with_fallback -> get_backend().atomic_write since
+    g-001-42 (was raw tmp+os.replace — the last multi-agent RMW daemon writer
+    bypassing the backend, g-115-1948), plus file_locks.locked() for
+    daemon-process concurrency (byte-neutral — the lock file is transient;
+    the wm_write precedent). Success stdout is
     PLAIN TEXT, not JSON: add -> "Added relation: {s} --{t}--> {tgt}\n"
     (line 186); co-invoke -> "Logged co-invocation: {n} skills for goal {g}\n"
     (line 218).
@@ -96,14 +99,26 @@ def _load_all_relations(ctx) -> List[Dict[str, Any]]:
 
 
 def _write_yaml(path: Path, data: Any) -> None:
-    """Byte-identical to skill-relations.py:write_yaml (default Dumper, raw
-    tmp+os.replace). Caller holds file_locks.locked() for daemon concurrency."""
+    """Byte-identical SERIALIZATION to skill-relations.py:write_yaml (default
+    Dumper — NOT CSafeDumper — default_flow_style=False, allow_unicode=True,
+    sort_keys=False). The WRITE MECHANISM routes through
+    _fileops._atomic_write_with_fallback -> get_backend().atomic_write
+    (g-001-42): the previous raw tmp+os.replace was the last multi-agent RMW
+    daemon writer bypassing the storage backend (g-115-1948 enumeration), so
+    world/skill-relations.yaml reached S3 only at the periodic sweep and the
+    stale-baseline no_clobber window applied (loss-lane class). Backend
+    routing also stamps the manifest baseline at put (g-115-1946). Caller
+    holds file_locks.locked() for daemon concurrency."""
+    from _fileops import _atomic_write_with_fallback
     assert_not_cruft(path.parent, "mkdir (skill_relations)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".yaml.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-    tmp.replace(path)
+
+    def _write(handle):
+        yaml.dump(data, handle, default_flow_style=False, allow_unicode=True,
+                  sort_keys=False)
+
+    _atomic_write_with_fallback(
+        path, _write, fallback_counter_key="daemon_skill_relations_write")
 
 
 # ---------------------------------------------------------------------------

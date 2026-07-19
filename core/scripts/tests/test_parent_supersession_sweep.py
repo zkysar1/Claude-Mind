@@ -245,6 +245,140 @@ def test_fallback_to_created_at_when_no_defer_set():
     assert ids == ["g-002"], f"expected g-002 via created_at fallback, got {ids}"
 
 
+# ── Structural split-parent lane (3,  canonical shape) ──
+
+
+def _g350_shape(sib_status_a="completed", sib_status_b="completed",
+                blocked_by=("g-350-17", "g-350-18"), hours_since_completion=48.0):
+    """Build the  canonical shape: non-Apply-titled parent split into
+    two decomposition-backref siblings."""
+    parent = {
+        "id": "g-350-04",
+        "title": "Feature 3 (Tools): the framework NPC Equips + Activates a Tool in DEV",
+        "status": "pending",
+        "blocked_by": list(blocked_by),
+        "created_at": _iso_hours_ago(96),
+    }
+    siblings = [
+        parent,
+        {
+            "id": "g-350-17",
+            "title": "Feature 3a: Tool census + weld-on-touch equip demo in DEV",
+            "status": sib_status_a,
+            "origin_signal": "decomposition:g-350-04-equip-demo",
+            "completed_at": _iso_hours_ago(hours_since_completion + 1),
+        },
+        {
+            "id": "g-350-18",
+            "title": "Feature 3b: NPC tool ACTIVATION mechanic — spec (M9)",
+            "status": sib_status_b,
+            "origin_signal": "decomposition:g-350-04-activation-mechanic",
+            "completed_at": _iso_hours_ago(hours_since_completion),
+        },
+    ]
+    return parent, siblings
+
+
+def test_structural_lane_catches_g350_04_shape():
+    """Non-Apply parent + 2 completed decomposition-backref siblings → both flagged."""
+    mod = _import_sweep()
+    parent, siblings = _g350_shape()
+    out = mod._find_structural_split_siblings(parent, siblings)
+    ids = sorted(s["id"] for s in out)
+    assert ids == ["g-350-17", "g-350-18"], f"expected both siblings, got {ids}"
+
+
+def test_structural_lane_discovered_by_backref():
+    """discovered_by == parent_id qualifies as a backref too."""
+    mod = _import_sweep()
+    parent = {"id": "g-1", "title": "Feature X umbrella", "status": "pending"}
+    siblings = [
+        parent,
+        {"id": "g-2", "title": "part 1", "status": "completed",
+         "discovered_by": "g-1", "completed_at": _iso_hours_ago(48)},
+        {"id": "g-3", "title": "part 2", "status": "completed",
+         "discovered_by": "g-1", "completed_at": _iso_hours_ago(48)},
+    ]
+    ids = sorted(s["id"] for s in mod._find_structural_split_siblings(parent, siblings))
+    assert ids == ["g-2", "g-3"], f"expected g-2+g-3, got {ids}"
+
+
+def test_structural_lane_nonterminal_sibling_blocks_fire():
+    """One decomposition sibling still pending → residual scope → NO fire
+    (verification outcome 2: only fires when ALL split siblings complete)."""
+    mod = _import_sweep()
+    parent, siblings = _g350_shape(sib_status_b="pending")
+    out = mod._find_structural_split_siblings(parent, siblings)
+    assert out == [], f"expected empty (split in flight), got {out}"
+
+
+def test_structural_lane_skipped_sibling_blocks_fire():
+    """A SKIPPED decomposition child means its share of scope was not done —
+    conservative: no fire."""
+    mod = _import_sweep()
+    parent, siblings = _g350_shape(sib_status_b="skipped")
+    out = mod._find_structural_split_siblings(parent, siblings)
+    assert out == [], f"expected empty (skipped child), got {out}"
+
+
+def test_structural_lane_unresolved_blocked_by_blocks_fire():
+    """parent.blocked_by naming a non-sibling (cross-aspiration dep) → the
+    parent is a waiting consumer, not a superseded umbrella → no fire."""
+    mod = _import_sweep()
+    parent, siblings = _g350_shape(blocked_by=("g-350-17", "g-350-18", "g-999-01"))
+    out = mod._find_structural_split_siblings(parent, siblings)
+    assert out == [], f"expected empty (unknown dep in blocked_by), got {out}"
+
+
+def test_structural_lane_no_backrefs_no_fire():
+    """Completed siblings WITHOUT decomposition backrefs never qualify —
+    the lane requires the explicit structural signal, not co-residence."""
+    mod = _import_sweep()
+    parent = {"id": "g-1", "title": "Feature X umbrella", "status": "pending"}
+    siblings = [
+        parent,
+        {"id": "g-2", "title": "unrelated done", "status": "completed",
+         "origin_signal": "idea:something-else", "completed_at": _iso_hours_ago(48)},
+        {"id": "g-3", "title": "also unrelated", "status": "completed",
+         "completed_at": _iso_hours_ago(48)},
+    ]
+    out = mod._find_structural_split_siblings(parent, siblings)
+    assert out == [], f"expected empty (no backrefs), got {out}"
+
+
+def test_structural_lane_prefix_collision_excluded():
+    """A goal id that is a string-prefix of another id ( vs )
+    must NOT absorb the longer id's decomposition children (boundary-anchored
+    match — fresh-eyes finding 2026-07-18)."""
+    mod = _import_sweep()
+    parent = {"id": "g-350-17", "title": "Feature umbrella", "status": "pending"}
+    siblings = [
+        parent,
+        {"id": "g-350-90", "title": "child of OTHER parent", "status": "completed",
+         "origin_signal": "decomposition:g-350-171-part-a",
+         "completed_at": _iso_hours_ago(48)},
+        {"id": "g-350-91", "title": "true child", "status": "completed",
+         "origin_signal": "decomposition:g-350-17-part-b",
+         "completed_at": _iso_hours_ago(48)},
+    ]
+    out = mod._find_structural_split_siblings(parent, siblings)
+    ids = [s["id"] for s in out]
+    assert ids == ["g-350-91"], f"expected only the true child, got {ids}"
+
+
+def test_structural_grace_window_age():
+    """_newest_completion_age_hours returns hours since the NEWEST completion
+    (the grace-window basis) and None when no timestamp parses."""
+    mod = _import_sweep()
+    sibs = [
+        {"id": "a", "completed_at": _iso_hours_ago(50)},
+        {"id": "b", "completed_at": _iso_hours_ago(10)},
+    ]
+    age = mod._newest_completion_age_hours(sibs)
+    assert age is not None and 9.5 < age < 10.5, f"expected ~10h, got {age}"
+    assert mod._newest_completion_age_hours([{"id": "c"}]) is None
+
+
 if __name__ == "__main__":
     test_canonical_incident_shape()
     test_sibling_completed_before_parent_defer_excluded()
@@ -254,4 +388,12 @@ if __name__ == "__main__":
     test_apply_pattern_matcher()
     test_design_or_apply_pattern_matcher()
     test_fallback_to_created_at_when_no_defer_set()
-    print("All 8 tests passed.")
+    test_structural_lane_catches_g350_04_shape()
+    test_structural_lane_discovered_by_backref()
+    test_structural_lane_nonterminal_sibling_blocks_fire()
+    test_structural_lane_skipped_sibling_blocks_fire()
+    test_structural_lane_unresolved_blocked_by_blocks_fire()
+    test_structural_lane_no_backrefs_no_fire()
+    test_structural_lane_prefix_collision_excluded()
+    test_structural_grace_window_age()
+    print("All 16 tests passed.")

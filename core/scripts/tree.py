@@ -13,7 +13,7 @@ import os
 import random
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
@@ -375,6 +375,31 @@ def write_tree(data):
         release_lock(lock_path)
 
 
+# --- PROGRESSION calibration stamp (5) ------------------------------
+# _PROGRESSION_STAMP_FIELDS MUST match coordination_merge._TREE_PROGRESSION_FIELDS
+# (the merge-side SSOT for which node fields are PROGRESSION-class). Any writer
+# that changes one of these MUST call _stamp_progression(node): the own-cloud
+# _tree.yaml reconcile keys the PROGRESSION LWW on progression_updated_at, which
+# advances on a calibration edit — last_updated deliberately does NOT (3
+# keeps it tracking .md article freshness). Without the stamp, own-cloud merges
+# hit _merge_field_progression's never-regress tiebreak and silently revert
+# data-derived DOWNGRADES to the stale-higher value (4; rb-3823,
+# guard-1170). The merge falls back to last_updated when the stamp is absent, so
+# un-migrated nodes behave exactly as before (backfill-safe).
+_PROGRESSION_STAMP_FIELDS = ("confidence", "capability_level", "domain_confidence")
+
+
+def _stamp_progression(node):
+    """Bump the PROGRESSION calibration stamp on a node (5). Call from
+    any writer that changes a _PROGRESSION_STAMP_FIELDS value. Date-granular
+    (matches last_updated) so CLI and daemon writes stay byte-identical for the
+    byte-compat parity tests; day resolution suffices because same-day cross-box
+    recalibration derives from the same shared pipeline data (no real conflict),
+    while the common one-box-calibrates case advances the date past the stale
+    peer's older stamp."""
+    node["progression_updated_at"] = date.today().isoformat()
+
+
 # ---------------------------------------------------------------------------
 # Helpers: node operations
 # ---------------------------------------------------------------------------
@@ -651,6 +676,7 @@ def get_distill_candidates(tree, include_skipped=False):
     When include_skipped=True, returns {candidates, skipped} where skipped is a
     list of {node_key, skip_reason}. Skip-reason enum:
       has_children, distill_exempt, insufficient_retrievals, no_feedback,
+      insufficient_feedback_votes, stale_retrieval_signal,
       utility_above_threshold.
     (file_not_found / read_error are NOT skip reasons here — a missing file
     just yields line_count=0, which feeds into crit2. distill_exempt is the
@@ -667,6 +693,16 @@ def get_distill_candidates(tree, include_skipped=False):
     min_ret = pruning.get("distill_min_retrievals", 5)
     line_threshold = pruning.get("distill_line_threshold", 50)
     line_util_threshold = pruning.get("distill_line_utility_threshold", 0.5)
+    # 7: sparse-feedback + stale-signal filters for the utility
+    # triggers. One noise vote made utility_ratio=0 look meaningful (the
+    #  has_feedback>=1 gate was too permissive), flagging 525 of 817
+    # leaves as a STANDING false-positive pool — and the debt computation
+    # below counts the same list, so every debt-keyed gate fired perpetually
+    # (post_run_debt 692 vs threshold 40). Utility is evidence only when it
+    # rests on enough votes AND recent-enough retrieval.
+    min_votes = pruning.get("distill_min_feedback_votes", 3)
+    recency_days = pruning.get("distill_recency_days", 45)
+    recency_cutoff = date.today() - timedelta(days=recency_days)
     # crit3 (0): proactive oversized append-grown sweep node.
     token_cap = pruning.get("distill_token_cap", 25000)            # Read tool ~25k-token cap
     token_ratio = pruning.get("distill_token_ratio", 0.8)          # fire at this fraction of the cap
@@ -685,13 +721,27 @@ def get_distill_candidates(tree, include_skipped=False):
         ur = node.get("utility_ratio", 0.0)
         th = node.get("times_helpful", 0)
         tn = node.get("times_noise", 0)
-        has_feedback = (th + tn) >= 1
+        feedback_votes = th + tn
+        has_feedback = feedback_votes >= 1
+        # 7: utility is evidence only on >= min_votes feedback events
+        # (one noise vote computes ur=0 and mis-fires as "low utility" — the
+        #  >=1 gate was necessary but not sufficient) AND a
+        # recent-enough last_retrieved (a 2-month-stale signal describes a node
+        # nobody consults anymore, not one whose payoff is measured; missing
+        # last_retrieved = unverifiable = stale).
+        has_min_votes = feedback_votes >= min_votes
+        last_ret_raw = str(node.get("last_retrieved") or "")[:10]
+        try:
+            signal_recent = (date.fromisoformat(last_ret_raw) >= recency_cutoff)
+        except ValueError:
+            signal_recent = False
+        utility_signal_ok = has_min_votes and signal_recent
         # Criterion 1: low utility after sufficient retrievals — but only when
         # we have at least one helpful/noise feedback signal. Before ,
         # crit1 was rc-only; utilization-feedback wasn't firing on tree
         # retrievals (--goal absent), so 108/109 candidates had ur=0.0 and th=tn=0
         # purely from the default. Require real feedback to avoid false positives.
-        crit1 = rc >= min_ret and has_feedback and ur < threshold
+        crit1 = rc >= min_ret and utility_signal_ok and ur < threshold
         # Criterion 2: large node with mediocre payoff
         file_path = node.get("file", "")
         abs_path = str(resolve_file_path(file_path)) if file_path else ""
@@ -703,7 +753,8 @@ def get_distill_candidates(tree, include_skipped=False):
                 line_count, est_tokens, refresh_sections = _analyze_node_body(f.read())
         # crit2 requires feedback too — same root cause as crit1 (zero-feedback
         # nodes have ur=0.0 by default and mis-fire as "mediocre"). .
-        crit2 = line_count > line_threshold and ur < line_util_threshold and rc >= min_ret and has_feedback
+        # 7: same min-votes + recency bar as crit1 (utility_signal_ok).
+        crit2 = line_count > line_threshold and ur < line_util_threshold and rc >= min_ret and utility_signal_ok
         # Criterion 3 (0): proactive oversized append-grown sweep node.
         # Fires BEFORE the node trips the Read ~25k-token cap that forces
         # read-before-edit to re-read it on every recurring sweep (rb-2085's
@@ -752,6 +803,16 @@ def get_distill_candidates(tree, include_skipped=False):
                 skipped.append({"node_key": key, "skip_reason": "insufficient_retrievals"})
             elif not has_feedback:
                 skipped.append({"node_key": key, "skip_reason": "no_feedback"})
+            elif not has_min_votes:
+                # 7: 1..min_votes-1 feedback events — utility_ratio
+                # exists but rests on too few votes to act on.
+                skipped.append({"node_key": key,
+                                "skip_reason": "insufficient_feedback_votes"})
+            elif not signal_recent:
+                # 7: enough votes, but last_retrieved is older than
+                # distill_recency_days (or missing) — signal too stale to act on.
+                skipped.append({"node_key": key,
+                                "skip_reason": "stale_retrieval_signal"})
             else:
                 skipped.append({"node_key": key, "skip_reason": "utility_above_threshold"})
     # Surface proactive oversized-append-grown candidates FIRST: they block Read
@@ -1107,6 +1168,78 @@ def _canonical_path_key(p):
     return s
 
 
+def _iter_body_md_refs(nodes):
+    """Yield (referencing_key, raw_ref, rel, body_abs) for every unique
+    backtick-quoted .md tree-node reference in every node body.
+
+    rel = the reference path relative to the tree root (`world/knowledge/tree/`
+    stripped, or an L1-first path left as-is). body_abs = the on-disk path the
+    body was read from. Shared by validate_tree (dangling-ref detection,
+    g-115-1419) and tree-inbound-ref-fix.py (post-reparent inbound-ref repair,
+    g-115-1830). Fail-open: unreadable bodies are skipped. Ellipsis placeholders
+    and non-tree refs (core/, .claude/, world/conventions/, ...) are out of
+    scope to keep false positives low. rb-8: treat every cross-reference as a
+    positive-state assertion.
+    """
+    import re  # local: keeps the whole 9 feature one contiguous block
+    # Derive the live set of L1 tree directories from node files (domain-agnostic
+    # — never hardcode category names; the tree owns its own taxonomy).
+    known_l1 = set()
+    for _n in nodes.values():
+        _fp = _n.get("file")
+        if not _fp:
+            continue
+        _rel = _fp
+        if _rel.startswith("world/knowledge/tree/"):
+            _rel = _rel[len("world/knowledge/tree/"):]
+        elif _rel.startswith(("world/", "meta/")):
+            continue  # non-tree world/meta file
+        _seg = _rel.split("/", 1)[0]
+        if _seg.endswith(".md"):
+            _seg = _seg[:-3]
+        if _seg:
+            known_l1.add(_seg)
+    _md_ref_re = re.compile(r"`([^`\n]+?\.md)`")
+    for key, node in nodes.items():
+        file_path = node.get("file")
+        if not file_path:
+            continue
+        body_abs = str(resolve_file_path(file_path))
+        if not _path_exists_longsafe(body_abs):
+            # Mirror the physical-file check's prefix tolerance before giving up.
+            if not file_path.startswith(("world/", "meta/")):
+                for _alt in (str(WORLD_DIR / file_path),
+                             str(WORLD_DIR / "knowledge" / "tree" / file_path)):
+                    if _path_exists_longsafe(_alt):
+                        body_abs = _alt
+                        break
+            if not _path_exists_longsafe(body_abs):
+                continue  # missing body — fail-open (validate warns separately)
+        try:
+            with open(body_abs, "r", encoding="utf-8") as _bf:
+                body = _bf.read()
+        except (OSError, UnicodeDecodeError):
+            continue  # unreadable body — fail-open, never abort
+        seen_refs = set()
+        for _m in _md_ref_re.finditer(body):
+            ref = _m.group(1).strip()
+            if ref in seen_refs:
+                continue
+            seen_refs.add(ref)
+            # Skip illustrative/abbreviated paths: a literal '...' ellipsis (or
+            # its unicode form, U+2026) is a prose placeholder for omitted path
+            # segments, not a real target (9 live-validation finding).
+            if "..." in ref or "…" in ref:
+                continue
+            if ref.startswith("world/knowledge/tree/"):
+                rel = ref[len("world/knowledge/tree/"):]
+            elif ref.split("/", 1)[0] in known_l1:
+                rel = ref
+            else:
+                continue  # not a tree-node reference — out of scope
+            yield (key, ref, rel, body_abs)
+
+
 def validate_tree(tree):
     """Check parent-child consistency and field completeness.
     Returns {valid: bool, errors: [...], warnings: [...]}."""
@@ -1212,80 +1345,19 @@ def validate_tree(tree):
             warnings.append("Node '{}' references file '{}' which does not exist on disk".format(key, file_path))
 
     # --- Node-body dangling cross-reference check (9) ---
-    # The physical-file check above validates each node's OWN `file` field, but
-    # not the cross-references embedded in node .md BODIES. When a node is
-    # relocated (its `file` moves to a new path), every OTHER node whose body
-    # referenced the old path is left with a dangling inbound ref pointing at a
-    # path no longer on disk. Those never surfaced here because no check read
-    # node bodies — root cause of the  / 7 dangling-ref
-    # incidents (a single relocation left 6 inbound refs across 5 files). This
-    # block scans each node body for backtick-quoted tree-node references
-    # (paths ending in .md whose first segment is a live L1 tree directory) and
-    # warns when the target does not exist on disk. rb-8: treat every
-    # cross-reference as a positive-state assertion; probe target existence
-    # before trusting. Directory-style refs (ending in '/') and non-tree refs
-    # (core/, .claude/, world/conventions/, ...) are intentionally out of scope
-    # to keep false positives low.
-    import re  # local: keeps the whole 9 feature one contiguous block
+    # Walk every backtick-quoted tree-node .md reference in every node body
+    # (shared iterator _iter_body_md_refs — also drives tree-inbound-ref-fix.py's
+    # post-reparent repair, 0) and warn when the target is missing on
+    # disk. When a node is relocated, other nodes whose body referenced the old
+    # path dangle here; that class never surfaced before this check because no
+    # validate read node bodies (root cause of the  / 7
+    # incidents — one relocation left 6 inbound refs across 5 files). rb-8: treat
+    # every cross-reference as a positive-state assertion; probe target existence.
     tree_root = WORLD_DIR / "knowledge" / "tree"
-    # Derive the live set of L1 tree directories from node files (domain-agnostic
-    # — never hardcode category names; the tree owns its own taxonomy).
-    known_l1 = set()
-    for _n in nodes.values():
-        _fp = _n.get("file")
-        if not _fp:
-            continue
-        _rel = _fp
-        if _rel.startswith("world/knowledge/tree/"):
-            _rel = _rel[len("world/knowledge/tree/"):]
-        elif _rel.startswith(("world/", "meta/")):
-            continue  # non-tree world/meta file
-        _seg = _rel.split("/", 1)[0]
-        if _seg.endswith(".md"):
-            _seg = _seg[:-3]
-        if _seg:
-            known_l1.add(_seg)
-    _md_ref_re = re.compile(r"`([^`\n]+?\.md)`")
-    for key, node in nodes.items():
-        file_path = node.get("file")
-        if not file_path:
-            continue
-        body_abs = str(resolve_file_path(file_path))
-        if not _path_exists_longsafe(body_abs):
-            # Mirror the physical-file check's prefix tolerance before giving up.
-            if not file_path.startswith(("world/", "meta/")):
-                for _alt in (str(WORLD_DIR / file_path),
-                             str(WORLD_DIR / "knowledge" / "tree" / file_path)):
-                    if _path_exists_longsafe(_alt):
-                        body_abs = _alt
-                        break
-            if not _path_exists_longsafe(body_abs):
-                continue  # missing body already warned above
-        try:
-            with open(body_abs, "r", encoding="utf-8") as _bf:
-                body = _bf.read()
-        except (OSError, UnicodeDecodeError):
-            continue  # unreadable body — fail-open, never abort validation
-        seen_refs = set()
-        for _m in _md_ref_re.finditer(body):
-            ref = _m.group(1).strip()
-            if ref in seen_refs:
-                continue
-            seen_refs.add(ref)
-            # Skip illustrative/abbreviated paths: a literal '...' ellipsis (or
-            # its unicode form, U+2026) is a prose placeholder for omitted path
-            # segments, not a real target (9 live-validation finding).
-            if "..." in ref or "…" in ref:
-                continue
-            if ref.startswith("world/knowledge/tree/"):
-                rel = ref[len("world/knowledge/tree/"):]
-            elif ref.split("/", 1)[0] in known_l1:
-                rel = ref
-            else:
-                continue  # not a tree-node reference — out of scope
-            if not _path_exists_longsafe(str(tree_root / rel)):
-                warnings.append(
-                    "Node '{}' body references tree node '{}' which does not exist on disk".format(key, ref))
+    for _key, _ref, _rel, _body_abs in _iter_body_md_refs(nodes):
+        if not _path_exists_longsafe(str(tree_root / _rel)):
+            warnings.append(
+                "Node '{}' body references tree node '{}' which does not exist on disk".format(_key, _ref))
 
     # Check for orphan .md files (exist on disk but have no _tree.yaml entry)
     tree_dir = str(WORLD_DIR / "knowledge" / "tree")
@@ -1313,6 +1385,18 @@ def validate_tree(tree):
                     continue
                 full_path = os.path.normpath(os.path.join(dirpath, fname))
                 if _canonical_path_key(full_path) not in referenced_files:
+                    # 8: retired-tombstone files are documented state
+                    # (moved-node stale twins; S3 DeleteObject is IAM-denied,
+                    # so tombstone-overwrite is the retirement terminal state)
+                    # — not orphans. Only unreferenced files reach this open,
+                    # and tombstones are ~1 KiB, so the check stays cheap.
+                    try:
+                        with open(full_path, "r", encoding="utf-8",
+                                  errors="replace") as fh:
+                            if "status: retired-tombstone" in fh.read(400):
+                                continue
+                    except OSError:
+                        pass
                     rel = os.path.relpath(full_path, str(WORLD_DIR)).replace("\\", "/")
                     warnings.append("Orphan file 'world/{}' exists on disk but has no _tree.yaml entry".format(rel))
 
@@ -1421,51 +1505,24 @@ def validate_tree(tree):
 # write makes. Append-only JSONL at meta/l1-pick-log.jsonl. Consumed by
 # l1-skew-check.py and /fresh-eyes-tree. Fail-open: a logging error MUST NOT
 # block the tree write that just succeeded.
+# Implementation lives in _l1_pick.py (SSOT, 3) so the daemon
+# tree-write endpoints share it — the CLI wrappers below keep the original
+# names/signatures for the 3 call sites (cmd_add_child, cmd_batch,
+# cmd_reparent).
 # ---------------------------------------------------------------------------
-
-def _get_l1_for_node(nodes, key):
-    """Walk parent chain to find the L1 (depth==1) ancestor.
-
-    Returns the L1 key. For a node that IS L1, returns itself. Returns None
-    if the chain is malformed or breaks before reaching depth==1.
-    """
-    visited = set()
-    current = key
-    while current is not None and current not in visited:
-        visited.add(current)
-        node = nodes.get(current)
-        if not node:
-            return None
-        depth = node.get("depth")
-        if depth == 1:
-            return current
-        if depth == 0:
-            return None
-        current = node.get("parent")
-    return None
+from _l1_pick import (  # noqa: E402
+    get_l1_for_node as _get_l1_for_node,
+    append_l1_pick_log as _l1_append,
+    log_l1_pick as _l1_log,
+)
 
 
 def _append_l1_pick_log(target_node, l1, decision_type, source, reason):
-    """Append one L1 pick log entry. Fail-open."""
-    try:
-        log_path = META_DIR / "l1-pick-log.jsonl"
-        agent = os.environ.get("MIND_AGENT", "").strip() or None
-        sid = os.environ.get("MIND_SID", "").strip() or None
-        entry = {
-            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "agent": agent,
-            "session_id": sid,
-            "target_node": target_node,
-            "l1": l1,
-            "decision_type": decision_type,
-            "source": source,
-            "reason": reason,
-        }
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(str(log_path), "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print("[l1-pick-log] WARN: " + str(e), file=sys.stderr)
+    """Append one L1 pick log entry (CLI form: META_DIR + env identity). Fail-open."""
+    _l1_append(META_DIR, target_node, l1, decision_type,
+               source=source, reason=reason,
+               agent=os.environ.get("MIND_AGENT", "").strip() or None,
+               session_id=os.environ.get("MIND_SID", "").strip() or None)
 
 
 def _log_l1_pick_for_key(key, decision_type, source=None, reason=None):
@@ -1477,10 +1534,9 @@ def _log_l1_pick_for_key(key, decision_type, source=None, reason=None):
     try:
         tree = read_tree()
         nodes = tree.get("nodes", {}) if isinstance(tree, dict) else {}
-        l1 = _get_l1_for_node(nodes, key)
-        if l1 is None:
-            l1 = "_orphan"
-        _append_l1_pick_log(key, l1, decision_type, source, reason)
+        _l1_log(nodes, META_DIR, key, decision_type, source=source, reason=reason,
+                agent=os.environ.get("MIND_AGENT", "").strip() or None,
+                session_id=os.environ.get("MIND_SID", "").strip() or None)
     except Exception as e:
         print("[l1-pick-log] WARN: " + str(e), file=sys.stderr)
 
@@ -1994,6 +2050,11 @@ def cmd_set(args):
         if field == "file" and isinstance(v, str):
             v = normalize_virtual_path(v)
         node[field] = v
+        # 5: stamp the dedicated PROGRESSION calibration signal (NOT
+        # last_updated, per 3) so an own-cloud reconcile preserves a
+        # data-derived downgrade instead of reverting it via never-regress.
+        if field in _PROGRESSION_STAMP_FIELDS:
+            _stamp_progression(node)
         # 3 (Option B): do NOT auto-bump per-node last_updated on a
         # metadata --set. node .md front matter is the single source of truth
         # (); the _tree.yaml index last_updated is synced to it ONLY by
@@ -2484,6 +2545,8 @@ def cmd_batch(args):
                 if field == "file" and isinstance(value, str):
                     value = normalize_virtual_path(value)
                 node[field] = value
+                if field in _PROGRESSION_STAMP_FIELDS:
+                    _stamp_progression(node)  # 5 (see cmd_set)
                 # 3 (Option B): no per-node last_updated auto-bump on
                 # batch --set, same as cmd_set above. node .md fm is the single
                 # source of truth (); the index last_updated is synced

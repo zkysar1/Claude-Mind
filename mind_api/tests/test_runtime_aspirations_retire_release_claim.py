@@ -34,6 +34,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -393,12 +394,24 @@ def test_claim_idempotent_same_agent(running_daemon):
 
 
 def test_claim_already_claimed_different_agent(running_daemon):
-    """Goal claimed by bravo, alpha claims -> 409."""
+    """Goal FRESHLY claimed by bravo, alpha claims -> 409 already_claimed.
+
+    The claim must be NON-stale for this to test the conflict path: since
+    g-115-1841, claim() takes back a claim whose age exceeds
+    claim_timeout_hours (default 4h), returning 200 instead of 409. A
+    hardcoded past claimed_at is therefore a TIME-BOMB — it silently ages
+    into the take-back path and the assertion flips 409->200 (g-115-2125:
+    the old "2026-05-10T10:00:00" seed had aged ~64d past the 4h timeout).
+    Seed a fresh timestamp so the claim is genuinely in-flight. The
+    stale-claim take-back (200) path is covered by
+    test_claim_stale_claim_takeback below.
+    """
     project_root, port = running_daemon
     world = project_root / "world"
     asp = _make_asp_with_unclaimed_goal()
     asp["goals"][0]["claimed_by"] = "bravo"
-    asp["goals"][0]["claimed_at"] = "2026-05-10T10:00:00"
+    asp["goals"][0]["claimed_at"] = (
+        datetime.now() - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%S")
     _seed_aspiration(world, asp)
 
     status, body = _post(port, "/v1/aspirations/claim",
@@ -406,6 +419,44 @@ def test_claim_already_claimed_different_agent(running_daemon):
     assert status == 409
     resp = json.loads(body)
     assert resp["error"] == "already_claimed"
+
+
+def test_claim_stale_claim_takeback(running_daemon):
+    """Goal claimed by bravo LONG ago (claim expired), alpha claims -> 200 take-back.
+
+    The g-115-1841 companion to test_claim_already_claimed_different_agent:
+    once a prior claim ages past the effective timeout, claim() re-assigns
+    the goal (mirroring goal-selector.py's claim-visibility contract, which
+    re-offers stale-claimed world goals — a hard 409 here would livelock the
+    world queue). The take-back is audited to override-bypass-ledger.jsonl
+    under gate 'claim-staleness-takeback'. Added by g-115-2125 to close the
+    coverage gap the failing-test fix would otherwise open (the old
+    time-bomb test was the ONLY accidental exercise of this path).
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    asp = _make_asp_with_unclaimed_goal()
+    asp["goals"][0]["claimed_by"] = "bravo"
+    # Ancient claim — far past the 4h claim_timeout_hours default -> expired.
+    asp["goals"][0]["claimed_at"] = "2026-05-10T10:00:00"
+    _seed_aspiration(world, asp)
+
+    status, body = _post(port, "/v1/aspirations/claim",
+                         {"id": "g-001-01", "agent": "alpha"})
+    assert status == 200, f"Expected 200 take-back, got {status}: {body}"
+    resp = json.loads(body)
+    assert resp["goal"]["claimed_by"] == "alpha"
+
+    # The take-back is audited to the bypass ledger under its own gate tag.
+    ledger_path = world / "override-bypass-ledger.jsonl"
+    if ledger_path.exists():
+        records = _read_jsonl(ledger_path)
+        takebacks = [r for r in records
+                     if r.get("gate") == "claim-staleness-takeback"]
+        assert len(takebacks) >= 1
+        tb_ctx = takebacks[-1]["context"]
+        assert tb_ctx["agent_claiming"] == "alpha"
+        assert tb_ctx["prior_claimer"] == "bravo"
 
 
 def test_claim_cross_lane_refused(running_daemon):

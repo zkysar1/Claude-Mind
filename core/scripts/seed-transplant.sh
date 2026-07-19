@@ -27,6 +27,7 @@ FRESH_GIT=0
 DO_COMMIT=0
 NO_CLEAN_CRUFT=0
 SKIP_PREFLIGHT_JUSTIFICATION=""
+PLAN=0
 
 # Parse args
 while [ $# -gt 0 ]; do
@@ -43,6 +44,7 @@ while [ $# -gt 0 ]; do
         --clean-cruft) NO_CLEAN_CRUFT=0 ;;
         --yes) DO_YES=1 ;;
         --living-prod) LIVING_PROD=1 ;;
+        --plan) PLAN=1 ;;
         --skip-preflight)
             SKIP_PREFLIGHT_JUSTIFICATION="$2"
             if [ -z "$SKIP_PREFLIGHT_JUSTIFICATION" ] || [[ "$SKIP_PREFLIGHT_JUSTIFICATION" == --* ]]; then
@@ -73,6 +75,24 @@ echo "[seed-transplant] dest=$DEST"
 echo "[seed-transplant] manifest=$MANIFEST"
 if [ $LIVING_PROD -eq 1 ]; then
     echo "[seed-transplant] mode=living-prod (deployment-local + domain files preserved)"
+fi
+
+# --plan: read-only blast-radius report, then exit. Runs BEFORE the pre-flight
+# refusals (uncommitted-changes / running-agent) because those guard MUTATION —
+# the plan touches nothing, so a dirty or live destination must not block it.
+# It is precisely the tool an operator runs to decide whether a plant is safe,
+# so it must work against exactly the destination state a plant would see.
+# (P0 keystone,  / . --plan as a promote GATE is P1.5.)
+if [ $PLAN -eq 1 ]; then
+    if [ ! -d "$DEST" ]; then
+        echo "[seed-transplant] --plan needs an existing destination to inspect: $DEST" >&2
+        exit 2
+    fi
+    PLAN_FLAGS=""
+    [ $LIVING_PROD -eq 1 ] && PLAN_FLAGS="--living-prod"
+    py -3 "$SCRIPT_DIR/_seed_engine.py" plan \
+        --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $PLAN_FLAGS
+    exit 0
 fi
 
 # Step 3: Pre-flight checks
@@ -226,13 +246,27 @@ fi
 
 # Step 8: Staged copy
 echo "[seed-transplant] Copying + transforming to staging..."
-COPY_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" copy-staged --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
+# --living-prod: preserve deployment-local + dest-owned files that already exist
+# at the destination (do not stage the source's version over them). Mirrors the
+# clean-cruft flag threading at Step 10 (Bug #1 — copy/swap previously ignored it).
+COPY_EXTRA_FLAGS=""
+if [ $LIVING_PROD -eq 1 ]; then
+    COPY_EXTRA_FLAGS="--preserve-deployment-local"
+fi
+COPY_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" copy-staged --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $COPY_EXTRA_FLAGS)"
 echo "$COPY_JSON" | py -3 -c "
 import sys, json
 d = json.load(sys.stdin)
 print(f\"  staged: {d['staged']}, transformed: {d['transformed']}, binary: {d['binary']}\")
 if d['pending_skip']:
-    print(f\"  pending_template (used chain fallback): {len(d['pending_skip'])} files\")"
+    print(f\"  pending_template (used chain fallback): {len(d['pending_skip'])} files\")
+preserved = d.get('preserved_deployment_local', [])
+if preserved:
+    print(f\"  preserved (living-prod, dest kept): {len(preserved)}\")
+    for pf in preserved[:10]:
+        print(f\"    + {pf}\")
+    if len(preserved) > 10:
+        print(f\"    ... and {len(preserved)-10} more\")"
 
 # Step 9: Atomic swap
 echo "[seed-transplant] Swapping staged files into place..."

@@ -229,7 +229,10 @@ def test_patsig_append_created_stamped(running_daemon):
 
 def test_patsig_append_history_and_changelog(running_daemon):
     project_root, port = running_daemon
-    hist = project_root / "world" / ".history" / "pattern-signatures.jsonl"
+    # CAS-delta store manifests (7) — no legacy .history/<rel>/ copies.
+    hist = (project_root / "world" / ".history" / "snapshots"
+            / "pattern-signatures.jsonl")
+    legacy = project_root / "world" / ".history" / "pattern-signatures.jsonl"
     cl = project_root / "world" / "changelog.jsonl"
     assert not hist.exists()
 
@@ -237,6 +240,7 @@ def test_patsig_append_history_and_changelog(running_daemon):
           json.dumps(_patsig_rec()).encode("utf-8"))
 
     assert hist.exists()
+    assert not legacy.exists()
     entries = _read_jsonl(cl)
     assert any("store-append pattern-signatures" in (e.get("summary", "") or "")
                for e in entries)

@@ -13,7 +13,7 @@
 #
 # --override-all maps to the X-Mind-Override-All header. The daemon
 # add_goal endpoint owns the bulk fan-out (origin-signal / duplication /
-# stale-read / no-investigate slots) and writes the blast-radius audit via
+# no-investigate slots) and writes the blast-radius audit via
 # _override_helpers.audit_bulk_override — single source of truth, no
 # bash-side fan-out to split-brain with.
 set -euo pipefail
@@ -45,8 +45,9 @@ Options:
   --source world|<agent>           Source aspirations file (default: world).
   --override-signal <reason>       Bypass origin-signal gate.
   --override-duplication <reason>  Bypass goal-duplication gate.
-  --override-stale-read <reason>   Bypass stale-read gate.
   --override-no-investigate <reason>  Bypass no-investigate-slots gate.
+  --override-offload <reason>      Bypass operator-offload gate (recurring
+                                   goals must otherwise carry offload_decision).
   --override-all <reason>          Bulk-override all gates (audited).
 
 Goal fields go in the JSON body — NOT as CLI flags. The following are
@@ -73,8 +74,8 @@ SOURCE_VAL="world"
 ASP_ID=""
 OVERRIDE_SIGNAL=""
 OVERRIDE_DUPLICATION=""
-OVERRIDE_STALE_READ=""
 OVERRIDE_NO_INVESTIGATE=""
+OVERRIDE_OFFLOAD=""
 OVERRIDE_ALL=""
 SCHEMA=0
 declare -a PASSTHROUGH=()
@@ -114,12 +115,12 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_DUPLICATION="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
-        --override-stale-read)
-            OVERRIDE_STALE_READ="${2-}"
-            PASSTHROUGH+=("$1" "${2-}")
-            shift $(( $# >= 2 ? 2 : 1 ));;
         --override-no-investigate)
             OVERRIDE_NO_INVESTIGATE="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-offload)
+            OVERRIDE_OFFLOAD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
@@ -162,6 +163,7 @@ if [ "$SCHEMA" = "1" ]; then
     "status": "string - pending (default) | in-progress | completed | blocked | skipped | expired",
     "recurring": "boolean",
     "interval_hours": "number - positive; required when recurring=true",
+    "offload_decision": "string - REQUIRED when recurring=true or interval_hours set (operator-offload gate, gh-005): why this stays on the LLM loop vs an operator job. e.g. 'stays-mind: judgement/retrieval-heavy (<what>)' or 'operator-pull: reads <JobName> audit rows'",
     "verification": "object - {outcomes: string[], checks: [{type,target,condition}], preconditions: [string | {type,id,...}]}",
     "handoff_to": "string - target agent for cross-agent handoff",
     "blocked_by": "string[] - goal-ids this goal is blocked on"
@@ -191,8 +193,8 @@ QUERY="asp_id=${ASP_ID}&source=${SOURCE_VAL}"
 declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_SIGNAL" ] && HEADER_ARGS+=(--header "X-Mind-Override-Signal: $OVERRIDE_SIGNAL")
 [ -n "$OVERRIDE_DUPLICATION" ] && HEADER_ARGS+=(--header "X-Mind-Override-Duplication: $OVERRIDE_DUPLICATION")
-[ -n "$OVERRIDE_STALE_READ" ] && HEADER_ARGS+=(--header "X-Mind-Override-Stale-Read: $OVERRIDE_STALE_READ")
 [ -n "$OVERRIDE_NO_INVESTIGATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-No-Investigate: $OVERRIDE_NO_INVESTIGATE")
+[ -n "$OVERRIDE_OFFLOAD" ] && HEADER_ARGS+=(--header "X-Mind-Override-Offload: $OVERRIDE_OFFLOAD")
 [ -n "$OVERRIDE_ALL" ] && HEADER_ARGS+=(--header "X-Mind-Override-All: $OVERRIDE_ALL")
 
 rc=0

@@ -88,7 +88,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 try:
     import yaml
     from _paths import AGENT_DIR, CORE_ROOT
-    from _fileops import acquire_lock, release_lock, loop_state_cas_retry
+    from _fileops import acquire_lock, release_lock, loop_state_cas_retry, durable_write_text
 except Exception:
     # Cannot resolve framework — fail-open with no-op echo.
     # We don't know the outcome arg yet; this branch should be unreachable
@@ -369,7 +369,7 @@ def main():
 
         def _write(wm):
             tmp = wm_path.with_suffix(wm_path.suffix + ".tmp")
-            tmp.write_text(yaml.safe_dump(wm, sort_keys=False), encoding="utf-8")
+            durable_write_text(tmp, yaml.safe_dump(wm, sort_keys=False))  # os.fsync before rename via _fileops.durable_write_text ()
             tmp.replace(wm_path)
 
         try:

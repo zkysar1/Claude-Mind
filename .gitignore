@@ -64,17 +64,6 @@ tmp_*
 #     runtime invocation with the wrong CWD/var.
 /sessions/
 /SPAWN_LOG
-# 2026-07-13: /environment_files/ — the ARC-AGI-3 arcengine (arc_agi.Arcade)
-# writes per-game cache dirs (environment_files/<game>/<hash>/{<game>.py,
-# metadata.json}) RELATIVE TO CWD. echo's solver A/B harnesses live in
-# /opt/ARC-AGI-3-Kaggle-Starter/experiments/ but were launched with
-# CWD=/opt/ayoai-mind (the mind repo), so 4.2M / 25 game dirs / 50 files landed
-# here and got swept into an iteration-commit (0489bd4a, g-315-350). The real
-# cache belongs in the ARC repo. This net only STOPS the cruft entering git; the
-# actual fix is CWD discipline — run ARC harnesses with cwd=/opt/ARC-AGI-3-Kaggle-Starter
-# (guard-1026). Anchored with leading / (repo-root only; the arcengine never
-# writes this deeper in the mind tree).
-/environment_files/
 
 # OS files
 .DS_Store
@@ -183,9 +172,13 @@ node_modules/
 # Pattern uses ** for both legacy and Phase 2.5.D layouts.
 **/session/crash-marker
 
-# Forged skills (domain-specific, registered in world/forged-skills.yaml)
-.claude/skills/operator-health-trend/
-.claude/skills/audit-roblox-deliverable/
+# Forged skills are GIT-TRACKED as of 2026-07-16 (g-115-2373): the registry
+# (world/forged-skills.yaml) advertised triggers fleet-wide while gitignored
+# bodies stayed birth-box-only — 6 skills un-invokable on 4/5 boxes. Bodies now
+# ride the fleet git channel. Promotion-seed purity is enforced by
+# _seed_engine.py auto-deriving exclusions from the registry (g-306-88), NOT by
+# gitignore. Do NOT re-add .claude/skills/<name>/ ignore lines here or as
+# nested per-skill .gitignore files.
 
 # Runtime logs — per-agent watchdog logs, stderr captures, dated investigation
 # artifacts. Regenerated per session; should never ship in a packaged framework.
@@ -257,3 +250,18 @@ core/logs/
 # to preserve the temp/ dir on a fresh clone.
 agents/*/temp/*
 !agents/*/temp/.gitkeep
+# 2026-07-13: /environment_files/ — the ARC-AGI-3 arcengine (arc_agi.Arcade)
+# writes per-game cache dirs (environment_files/<game>/<hash>/{<game>.py,
+# metadata.json}) RELATIVE TO CWD. echo's solver A/B harnesses live in
+# /opt/ARC-AGI-3-Kaggle-Starter/experiments/ but were launched with
+# CWD=/opt/ayoai-mind (the mind repo), so 4.2M / 25 game dirs / 50 files landed
+# here and got swept into an iteration-commit (0489bd4a, g-315-350). The real
+# cache belongs in the ARC repo. This net only STOPS the cruft entering git; the
+# actual fix is CWD discipline — run ARC harnesses with cwd=/opt/ARC-AGI-3-Kaggle-Starter
+# (guard-1026). Anchored with leading / (repo-root only; the arcengine never
+# writes this deeper in the mind tree).
+/environment_files/
+# (Former forged-skills LEGACY-FROZEN section removed 2026-07-16, g-115-2373 —
+# forged bodies are git-tracked now; see the note at the .claude/skills marker
+# above. The g-115-2272 parallel-forge collision class stays dead: forges add
+# disjoint NEW dirs and no longer touch any shared ignore file.)

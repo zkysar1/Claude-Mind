@@ -35,11 +35,12 @@ Compatibility holds because:
 SIDE-EFFECTS replicated from board.py cmd_post:
   - coordination channel -> _wake_signals.touch_peer_signals("board-activity")
   - findings channel with guard-NNN / rb-NNN tags -> bump the cited entry's
-    utilization.times_inferred_helpful. board.py shells out to reasoning-bank.py;
-    here we drive the canonical in-process store increment (store.py increment),
-    avoiding a daemon->CLI->daemon subprocess hop. NEVER switch the counter to
+    utilization.times_inferred_helpful. board.py routes via _rt.store_increment
+    (g-115-2351 — its old reasoning-bank.py subprocess was a silent no-op after
+    H2 Wave 2); here we drive the canonical in-process store increment
+    (store.py increment), no subprocess hop. NEVER switch the counter to
     times_cited — it carries zero weight in the active utilization_score v1
-    formula (board.py:163-188, guard-343 measurement-gap incident).
+    formula (board.py cmd_post, guard-343 measurement-gap incident).
 """
 from __future__ import annotations
 
@@ -57,8 +58,11 @@ from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read fre
 
 DEFAULT_CHANNELS = ["general", "findings", "coordination", "decisions"]
 
-# Citation tag form: guard-NNN / rb-NNN (exactly 3 digits — board.py:175).
-_CITE_RE = re.compile(r"(?:guard|rb)-\d{3}")
+# Citation tag form: guard-NNN / rb-NNN, 3+ digits (board.py cmd_post twin).
+# 1: the old \d{3} (exactly three) silently excluded every 4-digit
+# ID once rb/guard numbering crossed 999 (rb-3742, guard-1151 live) — modern
+# findings cites produced ZERO attribution. Keep both regexes in sync.
+_CITE_RE = re.compile(r"(?:guard|rb)-\d{3,}")
 
 
 # ---------------------------------------------------------------------------

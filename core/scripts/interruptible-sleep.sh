@@ -76,6 +76,34 @@ HEARTBEAT_TICK_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/heartbeat-tick.sh"
 # QUIESCENCE_SLEEP unset / 0: classic backoff sleep. All wake signals
 # behave the same way (exit 2 outside debounce window).
 #
+# DRY_SLEEP=1 (4-c, Layer 3): caller signals this is a dry-idle
+# backoff sleep (zero executable goals + quiescence denied/na). Triggers the
+# SAME Tier-A background-job registration as QUIESCENCE_SLEEP (stop-hook
+# Gate 2.6 ALLOWs the turn-end so the sleep paces its full duration —
+# guard-967 registered-mechanism requirement) but does NOT demote
+# informational wake signals: in the dry state, partner board activity and
+# claim releases are exactly the signals that may create claimable work, so
+# they keep their classic exit-2 behavior (criterion 4). Mutually exclusive
+# with QUIESCENCE_SLEEP by construction (_dry_idle.is_dry_state returns False
+# whenever quiescence approved); if both are ever set, quiescence naming wins.
+#
+# EXTERNAL_WAIT=1 (8): caller signals this is a MID-GOAL sleep while
+# waiting on a long external command the agent legitimately started and must
+# see the result of (e.g. the ~32min daemon-safe full test suite before a deep
+# code close). Unlike QUIESCENCE_SLEEP (all-blocked) and DRY_SLEEP (empty
+# queue) — both IDLE-scoped — this covers the mid-Phase-4 wait that had NO
+# sanctioned pacing: a bare interruptible-sleep registers no background job, so
+# `background-jobs.sh has-pending` returns rc=1, stop-hook Gate 2.6 sees no
+# pending job and BLOCKs the turn-end, and the loop re-enters immediately —
+# busy-spinning ~20 turns over a 32min wait (foxtrot felt-sense measurement,
+# 2026-07-19). EXTERNAL_WAIT triggers the SAME Tier-A background-job
+# registration (job type external-wait-sleep) so Gate 2.6 ALLOWs the turn-end
+# and the sleep paces its full duration. Wake-signal behavior is CLASSIC like
+# DRY_SLEEP (no informational demotion). NOTE: prefer backgrounding the command
+# (run_in_background) and ending the turn so the harness auto-notifies on
+# completion (guard-1230); use EXTERNAL_WAIT only when a bounded in-turn sleep
+# is the right shape (external state the harness cannot track).
+#
 # Wake-signal debounce (, prior incident ; tuned ):
 # When the partner agent is bursty-active, _wake_signals.touch_peer_signals
 # fans out to this agent's session dir on every board post + claim release.
@@ -225,7 +253,7 @@ _qs_deregister() {
     _QS_JOB_ID=""
   fi
 }
-if [ "${QUIESCENCE_SLEEP:-0}" = "1" ]; then
+if [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ] || [ "${EXTERNAL_WAIT:-0}" = "1" ]; then
   # Traps BEFORE register so no catchable-signal window exists where a
   # registered row outlives the process. Deregistering an unregistered id
   # is a harmless no-op ("not found").
@@ -233,11 +261,21 @@ if [ "${QUIESCENCE_SLEEP:-0}" = "1" ]; then
   trap 'exit 143' TERM
   trap 'exit 130' INT
   trap 'exit 129' HUP
+  # Each sanctioned flag registers under its own id/type for ledger
+  # observability; precedence QUIESCENCE > DRY > EXTERNAL_WAIT if more than
+  # one is set (they are mutually exclusive by construction).
+  if [ "${QUIESCENCE_SLEEP:-0}" = "1" ]; then
+    _QS_JOB_NAME="quiescence-sleep-$$"; _QS_JOB_TYPE="quiescence-sleep"
+  elif [ "${DRY_SLEEP:-0}" = "1" ]; then
+    _QS_JOB_NAME="dry-idle-sleep-$$"; _QS_JOB_TYPE="dry-idle-sleep"
+  else
+    _QS_JOB_NAME="external-wait-sleep-$$"; _QS_JOB_TYPE="external-wait-sleep"
+  fi
   _QS_PID="$(cat "/proc/$$/winpid" 2>/dev/null || echo "$$")"
   if bash "$_QS_BGJOBS_SCRIPT" register \
-        --id "quiescence-sleep-$$" --type quiescence-sleep --pid "$_QS_PID" \
+        --id "$_QS_JOB_NAME" --type "$_QS_JOB_TYPE" --pid "$_QS_PID" \
         --completion-check "true" >/dev/null; then
-    _QS_JOB_ID="quiescence-sleep-$$"
+    _QS_JOB_ID="$_QS_JOB_NAME"
   fi
 fi
 

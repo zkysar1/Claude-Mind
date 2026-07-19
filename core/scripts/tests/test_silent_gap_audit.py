@@ -255,6 +255,84 @@ def test_detect_telemetry_stale_no_content_ts_suppressed():
             sga.WORLD_DIR = orig
 
 
+# ---- recent_completed_corpus (6: time-windowed completed-goal dedup) ----
+
+_NOW = dt.datetime(2026, 7, 15, 12, 0, 0)  # fixed reference for deterministic windowing
+
+
+def _completed(gid, days_ago, title="t", desc="d", origin="o", field="completed_at"):
+    ts = (_NOW - dt.timedelta(days=days_ago)).replace(microsecond=0).isoformat()
+    g = {"id": gid, "status": "completed", "title": title, "description": desc,
+         "origin_signal": origin}
+    g[field] = ts if field == "completed_at" else ts[:10]
+    return g
+
+
+def test_recent_completed_corpus_includes_within_window():
+    goals = [_completed("g-1", 2, origin="investigate:deadline_urgency")]
+    corpus = sga.recent_completed_corpus(goals, 14, now=_NOW)
+    assert corpus == [("g-1", "t d investigate:deadline_urgency")]  # blob shape = open_goal_corpus
+
+
+def test_recent_completed_corpus_excludes_older_completion():
+    # 25d > 14d window -> NOT in corpus, so a gap matching ONLY this old
+    # completion still fires (legitimate regression — the audit's tail purpose).
+    goals = [_completed("g-old", 25, origin="investigate:deadline_urgency")]
+    assert sga.recent_completed_corpus(goals, 14, now=_NOW) == []
+
+
+def test_recent_completed_corpus_boundary_inclusive():
+    # exactly window_days old -> included (ts == cutoff is not < cutoff)
+    goals = [_completed("g-edge", 14)]
+    assert [gid for gid, _ in sga.recent_completed_corpus(goals, 14, now=_NOW)] == ["g-edge"]
+
+
+def test_recent_completed_corpus_skips_non_completed():
+    ts = _NOW.isoformat()
+    goals = [
+        {"id": "p", "status": "pending", "title": "x", "completed_at": ts},
+        {"id": "ip", "status": "in-progress", "title": "y", "completed_at": ts},
+        {"id": "sk", "status": "skipped", "title": "z", "completed_at": ts},
+    ]
+    assert sga.recent_completed_corpus(goals, 14, now=_NOW) == []
+
+
+def test_recent_completed_corpus_skips_no_timestamp():
+    # completed but no completed_at/completed_date -> cannot window -> SKIP
+    # (regression-safe: the gap fires rather than being suppressed forever).
+    goals = [{"id": "g-nots", "status": "completed", "title": "t",
+              "description": "d", "origin_signal": "o"}]
+    assert sga.recent_completed_corpus(goals, 14, now=_NOW) == []
+
+
+def test_recent_completed_corpus_completed_date_fallback():
+    # only completed_date (date-only, no completed_at) within window -> included
+    goals = [_completed("g-date", 3, field="completed_date")]
+    assert [gid for gid, _ in sga.recent_completed_corpus(goals, 14, now=_NOW)] == ["g-date"]
+
+
+def test_completed_corpus_suppresses_refire_via_is_covered():
+    # THE fix (6): a gap whose primary token matches a RECENTLY-completed
+    # investigation is COVERED even when NO open goal exists — the exact re-fire the
+    # open-only dedup missed (3/3 deep-investigated twice).
+    completed = [_completed(
+        "g-2233", 1, title="Investigate: silent-gap zero-input deadline_urgency",
+        origin="investigate:silent-gap-zero-input-goal-selector-deadline_urgency")]
+    corpus = sga.recent_completed_corpus(completed, 14, now=_NOW)
+    covered, gid = sga.is_covered(["deadline_urgency"], corpus)
+    assert covered is True and gid == "g-2233"
+
+
+def test_completed_corpus_old_refire_still_fires_via_is_covered():
+    # Symmetric guard: the SAME gap matched only by an OLD completion is NOT
+    # covered -> the audit fires it (regression detection preserved).
+    completed = [_completed("g-old", 30, title="Investigate: deadline_urgency",
+                            origin="investigate:deadline_urgency")]
+    corpus = sga.recent_completed_corpus(completed, 14, now=_NOW)
+    covered, gid = sga.is_covered(["deadline_urgency"], corpus)
+    assert covered is False and gid is None
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

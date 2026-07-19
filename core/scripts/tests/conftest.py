@@ -154,3 +154,29 @@ def _restore_env_per_test():
     else:
         os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = _BOOTSTRAP_ALLOW_TMP_PUT
     yield
+
+
+@pytest.fixture(autouse=True)
+def _redirect_sweep_stats_sink(tmp_path_factory):
+    """Redirect the owncloud_sync sweep-telemetry sink away from the REAL
+    core/logs/owncloud-sweep-stats.jsonl for every test (g-115-2468).
+
+    Any test that runs a real sweep()/sync_file() with non-boring stats would
+    otherwise append test residue into the production forensic sink (the sink
+    is machine-local and gitignored, so the pollution would be invisible to
+    git yet corrupt lane-attribution forensics). Same defense shape as the
+    STORAGE_BACKEND pin above: protect the shared surface once in conftest
+    instead of asking every owncloud test to remember. No-op when
+    owncloud_sync was never imported by the test session.
+    """
+    mod = sys.modules.get("owncloud_sync")
+    if mod is None or not hasattr(mod, "_SWEEP_STATS_LOG"):
+        yield
+        return
+    orig = mod._SWEEP_STATS_LOG
+    mod._SWEEP_STATS_LOG = (tmp_path_factory.mktemp("sweep-stats")
+                            / "owncloud-sweep-stats.jsonl")
+    try:
+        yield
+    finally:
+        mod._SWEEP_STATS_LOG = orig

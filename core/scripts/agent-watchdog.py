@@ -1434,6 +1434,145 @@ class FreshnessProbe(Probe):
         self.prev = (state.get("prev") or {}) if isinstance(state, dict) else {}
 
 
+class MirrorWedgeProbe(Probe):
+    """Own-cloud mirror-wedge visibility (9): classifies the sweep's
+    conflict-streaks artifact (mirror_health.probe()) every tick. A both-
+    diverged conflict silently freezes a file's mirror refresh — this box
+    served days-stale world reads for ~21h (30 files, g-115-2548 wedge)
+    because the skip only appeared in spawn.log. Advisory: the REPAIR is the
+    g-115-2548 /reconcile-owncloud-conflicts protocol; this probe surfaces
+    the condition where the agent looks (watchdog event log + a deduped
+    Investigate goal).
+
+    Transitions (state-deduped, mirroring StalledProbe episodes):
+      - mirror_wedged (critical): verdict=wedged on WEDGED_TICKS_TO_FILE
+        consecutive ticks. Emits once per episode AND files an Investigate
+        goal deduped by origin_signal (pointer_freshness.open_goal_exists
+        scan — at most one open goal regardless of episodes).
+      - mirror_wedge_cleared (info): healthy after a fired episode.
+    'unknown' verdicts (sweep not running / not own-cloud) neither advance
+    nor reset the streak — absence of signal is not health (guard-980 class).
+    Heavy logic lazy-imports inside check() so a mirror_health syntax error
+    can never crash the watchdog tick (FreshnessProbe convention).
+    """
+
+    name = "mirror-wedge"
+    WEDGED_TICKS_TO_FILE = 2
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.consecutive_wedged = 0
+        self.fired = False
+
+    def check(self) -> list[Event]:
+        try:
+            import mirror_health
+            verdict = mirror_health.probe()
+        except Exception as e:  # noqa: BLE001 — probe must never kill the tick
+            sys.stderr.write(f"[mirror-wedge] probe error (skipped): {e}\n")
+            return []
+        events: list[Event] = []
+        v = verdict.get("verdict")
+        if v == "wedged":
+            self.consecutive_wedged += 1
+            if self.consecutive_wedged >= self.WEDGED_TICKS_TO_FILE and not self.fired:
+                self.fired = True
+                goal = self._file_wedge_goal(verdict)
+                events.append(Event(
+                    probe=self.name, event="mirror_wedged", severity="critical",
+                    payload={"wedged_count": verdict.get("wedged_count"),
+                             "files": verdict.get("files"),
+                             "consecutive_ticks": self.consecutive_wedged,
+                             "goal": goal},
+                    summary=(f"mirror WEDGED: {verdict.get('wedged_count')} file(s) "
+                             f"both-diverged {self.consecutive_wedged} ticks — "
+                             f"stale reads until reconciled ({goal.get('goal_id') or goal.get('error')})"),
+                ))
+        elif v == "healthy":
+            if self.fired:
+                events.append(Event(
+                    probe=self.name, event="mirror_wedge_cleared", severity="info",
+                    payload={"after_ticks": self.consecutive_wedged},
+                    summary="mirror wedge cleared — conflict streaks drained",
+                ))
+            self.consecutive_wedged = 0
+            self.fired = False
+        # 'unknown': no live signal — hold state unchanged.
+        return events
+
+    def _file_wedge_goal(self, verdict: dict) -> dict:
+        """File one deduped Investigate goal. Fail-open ({filed: False, error})."""
+        # Box-scoped signal (fresh-eyes F1): the wedge is BOX-LOCAL state, so
+        # dedup per agent/box — a box-agnostic signal would let box A's open
+        # goal mask box B's simultaneous wedge, and the repair must run ON the
+        # wedged box.
+        origin_signal = f"investigate:mirror-wedge-detected-{self.ctx.agent_name}"
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            if pf.open_goal_exists(origin_signal, WORLD_DIR, self.ctx.agent_dir):
+                return {"filed": False, "goal_id": None, "error": "open goal exists (dedup)"}
+            files = sorted((verdict.get("files") or {}).items())
+            listing = "; ".join(f"{p} ({n} sweeps)" for p, n in files[:8])
+            body = {
+                "title": (f"Investigate: own-cloud mirror wedge on {self.ctx.agent_name}'s box "
+                          f"— both-diverged conflict-skips frozen"),
+                "priority": "HIGH",
+                "participants": ["agent"],
+                "description": (
+                    f"The watchdog mirror-wedge probe on {self.ctx.agent_name}'s box found "
+                    f"{verdict.get('wedged_count')} "
+                    f"file(s) both-diverged for >= {mh_threshold()} consecutive sweeps "
+                    f"across {self.consecutive_wedged}+ watchdog ticks — their mirror "
+                    f"refresh is frozen and every consumer on THAT box reads stale data "
+                    f"(repair must run on {self.ctx.agent_name}'s box) "
+                    f"(the g-115-2548 class; 21h undetected last time). Files: {listing}. "
+                    f"Run: bash core/scripts/mirror-health.sh for the live list, then "
+                    f"repair via the /reconcile-owncloud-conflicts protocol "
+                    f"(per-file direction decision + manifest rebaseline; see "
+                    f"g-115-2548 + world board msg-20260718-002816). Auto-filed by "
+                    f"agent-watchdog MirrorWedgeProbe (g-115-2549)."
+                ),
+                "category": "framework-infrastructure",
+                "origin_signal": origin_signal,
+            }
+            from _runtime_bash import BASH as _bash
+            proc = subprocess.run(
+                [_bash, "core/scripts/aspirations-add-goal.sh", "asp-115",
+                 "--source", "world"],
+                input=json.dumps(body, ensure_ascii=True),
+                capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"filed": False, "goal_id": None,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:200]}
+            try:
+                goal_id = json.loads(proc.stdout).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                goal_id = None
+            return {"filed": True, "goal_id": goal_id, "error": None}
+        except Exception as e:  # noqa: BLE001 — filing failure must not kill the event
+            return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def to_dict(self) -> dict:
+        return {"consecutive_wedged": self.consecutive_wedged, "fired": self.fired}
+
+    def from_dict(self, state: dict) -> None:
+        if isinstance(state, dict):
+            self.consecutive_wedged = int(state.get("consecutive_wedged") or 0)
+            self.fired = bool(state.get("fired"))
+
+
+def mh_threshold() -> int:
+    """Probe threshold for goal text — import-guarded so a mirror_health
+    import error degrades to the documented default rather than crashing."""
+    try:
+        import mirror_health
+        return mirror_health.DEFAULT_THRESHOLD
+    except Exception:  # noqa: BLE001
+        return 3
 
 
 def build_probes(ctx: WatchdogContext) -> list[Probe]:
@@ -1446,6 +1585,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         StopHookBlockProbe(ctx),
         DaemonHealthProbe(ctx),
         FreshnessProbe(ctx),
+        MirrorWedgeProbe(ctx),
     ]
 
 

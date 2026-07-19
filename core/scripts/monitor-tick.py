@@ -154,8 +154,13 @@ def _subprocess_runner(script_abs, args, timeout=DEFAULT_PROBE_TIMEOUT, project_
         cmd = ["bash"] + cmd
     elif str(script_abs).endswith(".py"):
         cmd = [sys.executable] + cmd
+    # FW-1b.2 win32 fix (6): probes are non-interactive by contract, so
+    # detach stdin. Without this, MSYS bash on win32 blocks on the inherited
+    # stdin handle under capture_output and EVERY .sh probe rides the 60s
+    # timeout (proven with a trivial `echo ok; exit 0` probe — ZDS rb-523,
+    # rb-225/rb-247 family). DEVNULL is behavior-preserving on POSIX.
     run_kwargs = {"capture_output": True, "text": True, "timeout": timeout,
-                  "env": _probe_env()}
+                  "env": _probe_env(), "stdin": subprocess.DEVNULL}
     if project_root:
         try:
             if Path(project_root).is_dir():

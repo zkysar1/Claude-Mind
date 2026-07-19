@@ -1,8 +1,8 @@
 # Rationale: aspirations-precheck Gate Narratives
 
 Referenced from `.claude/skills/aspirations-precheck/SKILL.md` — Phases 0-pre,
-0-pre3, 0-pre4, 0.5b.1b, 0.5b.4, 0.5b.5, 0.5b.6, 0.5b.7, 0.5b.8, 0.5b.9,
-0.5b.10, 0.5c, and 0.5h. Contains canonical incidents, design rationale,
+0-pre2.5, 0-pre3, 0-pre4, 0.5b.1b, 0.5b.4, 0.5b.5, 0.5b.6, 0.5b.7, 0.5b.8,
+0.5b.9, 0.5b.10, 0.5c, and 0.5h. Contains canonical incidents, design rationale,
 test coverage references, and implementation cross-references extracted to
 reduce the hot-path reload size of aspirations-precheck/SKILL.md.
 
@@ -29,6 +29,51 @@ and stamp FIRST: an interrupt then leaves stamp-done + sentinel-still-set, which
 the canary reads as "advanced → reset" (the safe direction).
 
 Origin: g-115-1649.
+
+## Why the evolution-finalize gate exists (Phase 0-pre2.5)
+
+Measured 2026-07-14 across `world/self-evolution.jsonl` (6 agents, 65 MATERIAL
+Self edits): 30 were git-sweep backfill (notification correctly not expected),
+11 emailed the user, 2 were user-directive — and **22 EXPIRED UNNOTIFIED**. Where
+notification was owed it fired 11/33 = **33%**. On 2026-04-22 the user explicitly
+traded "ask first" for "notify after, revert if wrong" (guard-380). The
+notify-after half was silently not executing, so the autonomy the agents were
+exercising had never been paid for.
+
+Mechanism: `evolution-record.py` writes an `awaiting_completion` stub on every
+`self.md` / `program.md` edit. `evolution-complete.sh` records the WHY and fires
+the guard-380 email. **Nothing ever PROMPTED that call.** 24h later
+`evolution-stub-expiry.py` transitions the stub to `expired`. Every sibling
+obligation in the rb-428 family already had a forcing consumer (tree-debt 0-pre,
+experience-archival 0-pre2, fresh-eyes-code 0-pre3, metric-encoding 0-pre4);
+self-evolution finalization was the only one that did not — so it simply did not
+happen, and nothing noticed.
+
+**Why the producer runs AFTER `evolution-stub-expiry.py`, not before**
+(`iteration-close.sh`): expiry is the honest FALLBACK, not the bug — its docstring
+explicitly refuses to fabricate `reasoning='[AUTO-FILLED]'` and records the honest
+terminal state instead. Ordering the pending-check after it guarantees the sentinel
+can never name a stub that `evolution-complete.sh` would then refuse, which would
+wedge the gate in a re-fire loop.
+
+**Why scoped to `self` + `program` only.** Those two carry the guard-380
+user-notification promise and are low-volume. `script-evolution` measured 152
+pending / 1992 expired vs 23 final (a **99% expiry rate**) — a firehose. Widening
+the gate to it without first fixing that would fire every iteration forever and
+train the agent to ignore the sentinel, destroying the gate for the streams that
+matter.
+
+**NEVER FABRICATE.** If the rationale for a stub is genuinely unrecoverable, leave
+it and let expiry record `expired`. An honest "we never recorded this" is worth more
+than an invented one — inventing rationales for identity changes is precisely the
+failure the expiry sweep was written to avoid.
+
+Cross-references: rb-428 (sentinel-lifecycle pattern), guard-380
+(autonomous-self-evolution notify-after), guard-1076 + rb-3429 (the
+reflection-vs-SSOT registration defect the full suite caught while landing this),
+`core/scripts/evolution-stub-pending-check.sh` (producer),
+`/verify-learning` § `evolution-finalize-gate-wiring` (3-leg assertion).
+Origin: g-115-2180.
 
 ## Why the fresh_eyes_last_dispatch stamp (Phase 0-pre3)
 
@@ -58,9 +103,9 @@ refresh sweep caught it manually. Filed g-115-707 Investigate → rb-917 +
 content-vs-counter-gate decision rule + g-115-724 Apply.
 
 This is a content-gate sibling to the rb-428 counter-gate family (tree-debt,
-experience-archival, fresh-eyes-code, tree-encoding-drift) — it catches "LLM
-did the encoding step on the wrong content" rather than "LLM skipped the
-encoding step entirely."
+experience-archival, evolution-finalize, fresh-eyes-code, tree-encoding-drift)
+— it catches "LLM did the encoding step on the wrong content" rather than "LLM
+skipped the encoding step entirely."
 
 ## Why the inbox-alert severity ladder and shared cooldown (Phase 0.5b.1b)
 

@@ -532,7 +532,19 @@ def empty_meta():
 def compute_meta(live_items, archive_items):
     """Recompute meta from all records."""
     meta = empty_meta()
-    all_items = live_items + archive_items
+    # Dedup by id across live+archive (6; mirrors pipeline_write.py
+    # _compute_meta): a tombstoned id is present in BOTH files by design —
+    # count each hypothesis once (archive copy wins) so accuracy denominators
+    # never double-count.
+    _by_id = {}
+    _no_id = []
+    for rec in live_items + archive_items:
+        rid = rec.get("id")
+        if rid is None:
+            _no_id.append(rec)
+        else:
+            _by_id[rid] = rec  # archive iterates second -> archive copy wins
+    all_items = list(_by_id.values()) + _no_id
 
     # Stage counts
     for rec in live_items:

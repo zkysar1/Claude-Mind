@@ -237,7 +237,8 @@ def test_add_bulk_override_audits_ledger(running_daemon):
 
     Aspiration has an agent-sourced goal missing origin_signal (would block).
     With X-Mind-Override-All, gates pass and the ledger gets a record naming
-    both override_signal and override_duplication as the bulk-silenced slots.
+    override_signal, override_duplication, and override_offload as the
+    bulk-silenced slots.
     """
     root, port = running_daemon
     asp = _make_aspiration("asp-070", n_goals=1)
@@ -255,7 +256,7 @@ def test_add_bulk_override_audits_ledger(running_daemon):
     bulk_records = [r for r in records if r.get("justification") == "bulk justification"]
     assert len(bulk_records) == 1
     rec = bulk_records[0]
-    assert set(rec["slots_filled"]) == {"override_signal", "override_duplication"}
+    assert set(rec["slots_filled"]) == {"override_signal", "override_duplication", "override_offload"}
     assert "origin-signal-gate" in rec["gate_ids"]
     assert "goal-duplication-gate" in rec["gate_ids"]
     assert rec["context"]["caller"] == "aspirations_write.py:add"
@@ -286,8 +287,8 @@ def test_add_per_gate_override_wins_over_bulk(running_daemon):
     bulk_records = [r for r in records if r.get("justification") == "bulk fallback"]
     assert len(bulk_records) == 1
     rec = bulk_records[0]
-    assert rec["slots_filled"] == ["override_duplication"]
-    assert rec["gate_ids"] == ["goal-duplication-gate"]
+    assert rec["slots_filled"] == ["override_duplication", "override_offload"]
+    assert rec["gate_ids"] == ["goal-duplication-gate", "operator-offload-gate"]
 
 
 def test_add_no_bulk_override_no_audit(running_daemon):

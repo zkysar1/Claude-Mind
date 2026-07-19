@@ -89,9 +89,14 @@ def _seed_state(tmp_world: Path):
         f.write(json.dumps(finding) + "\n")
 
     # Seed multiple non-overlapping recent_completions so IDF can distinguish
-    # rare identifiers (rare-identifier-foo, unique-marker-baz) from common
+    # rare identifiers (rare_identifier_foo9, unique_marker_baz7) from common
     # vocabulary. With N=1 corpus, every term has weight 0 and the gate's
     # WEIGHT_THRESHOLD=1.5 floor can't fire. Bigger corpus = real IDF separation.
+    # The tokens carry underscores+digits ON PURPOSE (): the
+    # recent_completions has_specific co-signal is [_0-9] — hyphen-only
+    # fixtures (the pre-2026-07-11 rare-identifier-foo shape) are ordinary
+    # compound prose, demoted to advisory, and CASE 3's keyword block would
+    # never fire. Do not "simplify" them back to hyphenated forms.
     team_state = {
         "strategic_focus": {
             "primary": None, "rationale": None,
@@ -105,7 +110,7 @@ def _seed_state(tmp_world: Path):
                 "completed_at": _now_iso(-2),
                 "key_finding": (
                     "Modified core/scripts/iter-close-test.sh phase ordering — "
-                    "rare-identifier-foo unique-marker-baz fixed."
+                    "rare_identifier_foo9 unique_marker_baz7 fixed."
                 ),
             },
             # Filler entries — diverse so IDF gives high weight to terms that
@@ -148,6 +153,9 @@ def _run_gate(goal: dict, tmp_world: Path) -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = "alpha"
     env["MIND_WORLD"] = str(tmp_world)
+    # Hermetic agent-queue scan (5): keep live agent queues out
+    # of the wrapper's pending_queue check (rb-3784 corpus coupling).
+    env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
         [sys.executable, str(GATE_PY)],
         input=json.dumps(goal),
@@ -203,7 +211,7 @@ def main() -> int:
             "title": "Refactor iter-close-test.sh phase ordering",
             "description": (
                 f"Standalone refactor of {target_path}. "
-                "rare-identifier-foo and unique-marker-baz cleanup."
+                "rare_identifier_foo9 and unique_marker_baz7 cleanup."
             ),
             "participants": ["agent"],
             "source": "world",
@@ -218,9 +226,9 @@ def main() -> int:
         # ── Case 3: response goal + KEYWORD overlap → BLOCK on keywords ────
         # Force keyword-heavy match on the seeded recent_completion.
         case3 = {
-            "title": "Idea: investigate rare-identifier-foo and unique-marker-baz",
+            "title": "Idea: investigate rare_identifier_foo9 and unique_marker_baz7",
             "description": (
-                "Generic file investigation for rare-identifier-foo unique-marker-baz "
+                "Generic file investigation for rare_identifier_foo9 unique_marker_baz7 "
                 "ordering — heavy keyword overlap with bravo's prior completion. "
                 "No file_path; keyword duplicate detection should fire."
             ),
@@ -266,8 +274,8 @@ def main() -> int:
         case5 = {
             "title": "Idea: tighten iter-close-test.sh phase ordering",
             "description": (
-                f"Improve {target_path} phase ordering — rare-identifier-foo "
-                "unique-marker-baz adjustment per upstream finding."
+                f"Improve {target_path} phase ordering — rare_identifier_foo9 "
+                "unique_marker_baz7 adjustment per upstream finding."
             ),
             "participants": ["agent"],
             "source": "world",

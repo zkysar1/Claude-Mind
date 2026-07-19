@@ -50,6 +50,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -259,6 +260,26 @@ def _check_no_duplicate_id(items, rec_id, archive_items=None) -> None:
                 raise ValueError(f"Duplicate record ID (in archive): {rec_id}")
 
 
+def _uniquify_id(base_id: str, items, archive_items=None) -> str:
+    """5: auto-suffix on id collision. A recurring re-run of the same
+    goal+skill is a NEW execution, not an idempotent retry — the pre-fix 409
+    refusal silently lost the fresh trace (orphaned .md). Try base, then
+    -YYYYMMDD, then -YYYYMMDD-2..-99; same-day exhaustion raises ValueError."""
+    existing = {r.get("id") for r in items}
+    existing.update(r.get("id") for r in (archive_items or []))
+    if base_id not in existing:
+        return base_id
+    dated = f"{base_id}-{date.today().strftime('%Y%m%d')}"
+    if dated not in existing:
+        return dated
+    for n in range(2, 100):
+        cand = f"{dated}-{n}"
+        if cand not in existing:
+            return cand
+    raise ValueError(
+        f"could not uniquify {base_id} after 99 same-day attempts")
+
+
 def _parse_value(value_str: str):
     """experience.py parse_value."""
     if value_str == "true":
@@ -396,6 +417,16 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     # Order MUST match cmd_add: normalize THEN created (key lands after defaults).
     rec = _normalize_record(rec)
     rec["created"] = _stamp_now()
+
+    # 7: derive goal_id from the id when the payload omits it — a
+    # null goal_id makes the record invisible to the exact-match --goal read
+    # filter even though the goal id is embedded in the record id
+    # (fleet measured 28-34% null on 2026-07-10). Conservative prefix regex:
+    # only the canonical exp-{goal-id}-{suffix} shape derives.
+    if not rec.get("goal_id"):
+        m = re.match(r"^exp-(g-\d+-\d+(?:-\d+)?)-", str(rec.get("id") or ""))
+        if m:
+            rec["goal_id"] = m.group(1)
 
     try:
         _validate_record(ctx, rec)
@@ -555,10 +586,20 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
     if len(summary.strip()) < MIN_SUMMARY_CHARS:
         warnings.append(f"summary is only {len(summary.strip())} chars (<{MIN_SUMMARY_CHARS})")
 
-    experience_id = f"exp-{goal_id}-{skill_slug}"
-    if not ID_RE.match(experience_id):
+    base_experience_id = f"exp-{goal_id}-{skill_slug}"
+    if not ID_RE.match(base_experience_id):
         return Response.error(400, "invalid_id",
-                              f"computed experience id fails validation: {experience_id}")
+                              f"computed experience id fails validation: {base_experience_id}")
+
+    # 5: uniquify BEFORE deriving the canonical .md path so a
+    # recurring re-run gets a fresh id (dated suffix) instead of a 409 that
+    # orphans the trace. Suffix chars ([0-9-]) preserve ID_RE validity.
+    items = _read_jsonl(_live_path(ctx))
+    archive = _read_jsonl(_archive_path(ctx))
+    try:
+        experience_id = _uniquify_id(base_experience_id, items, archive)
+    except ValueError as e:
+        return Response.error(409, "duplicate_id", str(e))
 
     content_dir = ctx.paths.agent / "experience"
     assert_not_cruft(content_dir, "mkdir (experience content_dir)")
@@ -569,21 +610,34 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
     except ValueError:
         content_path_rel = str(canonical).replace("\\", "/")
 
-    # Early dup-check BEFORE the filesystem move (avoid orphan .md).
-    items = _read_jsonl(_live_path(ctx))
-    archive = _read_jsonl(_archive_path(ctx))
-    try:
-        _check_no_duplicate_id(items, experience_id, archive)
-    except ValueError as e:
-        return Response.error(409, "duplicate_id", str(e))
-
-    # Move trace to canonical (must precede validate_record's content_path check).
+    # COPY trace to canonical (must precede _validate_record's content_path
+    # check — the validator requires the file to exist at content_path, so the
+    # ordering itself cannot change without splitting the validator).
+    # 5: copy-not-move. The old os.replace consumed the caller's
+    # trace on EVERY post-move failure (validation_failed, in-lock 409s,
+    # write_failed), stranding an orphan .md and making retries
+    # non-idempotent (observed 5-attempt sequence, 3 close). The
+    # source is deleted only after the record lands; _abort removes the copy
+    # on every post-copy failure path.
+    copied_from: Optional[Path] = None
     if trace_src.resolve() != canonical.resolve():
         if canonical.exists():
             return Response.error(
                 409, "content_path_exists",
                 f"canonical content_path already exists: {canonical}")
-        os.replace(str(trace_src), str(canonical))
+        shutil.copy2(str(trace_src), str(canonical))
+        copied_from = trace_src
+
+    def _abort(resp):
+        # Failed attempt must leave trace_src intact and no orphan .md.
+        # `canonical` is read at call time — after the in-lock race rename
+        # it is rebound to new_canonical, so the right copy is removed.
+        if copied_from is not None:
+            try:
+                canonical.unlink()
+            except OSError:
+                pass
+        return resp
 
     # Assemble record — key order MUST match cmd_archive_goal (experience.py:533-545).
     rec = {
@@ -607,19 +661,45 @@ def archive_goal(ctx) -> "Response":  # type: ignore[name-defined]
     try:
         _validate_record(ctx, rec)
     except ValueError as e:
-        return Response.error(400, "validation_failed", str(e))
+        return _abort(Response.error(400, "validation_failed", str(e)))
 
     try:
         with file_locks.locked(_live_path(ctx)):
             cur = _read_jsonl(_live_path(ctx))
             cur_archive = _read_jsonl(_archive_path(ctx))
-            try:
-                _check_no_duplicate_id(cur, experience_id, cur_archive)
-            except ValueError as e:
-                return Response.error(409, "duplicate_id", str(e))
-            _append_record(ctx, rec, summary=f"experience-archive-goal {experience_id}")
+            cur_ids = {r.get("id") for r in cur}
+            cur_ids.update(r.get("id") for r in cur_archive)
+            if rec["id"] in cur_ids:
+                # Race: another writer took the id between the unlocked
+                # uniquify and this lock. Re-uniquify against the fresh sets
+                # and rename the already-moved canonical .md to match.
+                try:
+                    new_id = _uniquify_id(base_experience_id, cur, cur_archive)
+                except ValueError as e:
+                    return _abort(Response.error(409, "duplicate_id", str(e)))
+                new_canonical = content_dir / f"{new_id}.md"
+                if new_canonical.exists():
+                    return _abort(Response.error(
+                        409, "content_path_exists",
+                        f"canonical content_path already exists: {new_canonical}"))
+                os.replace(str(canonical), str(new_canonical))
+                canonical = new_canonical
+                try:
+                    rec["content_path"] = str(
+                        new_canonical.relative_to(ctx.paths.project_root)).replace("\\", "/")
+                except ValueError:
+                    rec["content_path"] = str(new_canonical).replace("\\", "/")
+                rec["id"] = new_id
+            _append_record(ctx, rec, summary=f"experience-archive-goal {rec['id']}")
     except OSError as e:
-        return Response.error(500, "write_failed", str(e))
+        return _abort(Response.error(500, "write_failed", str(e)))
+
+    # Record landed — consume the source now (completes the move semantics).
+    if copied_from is not None:
+        try:
+            copied_from.unlink()
+        except OSError:
+            warnings.append(f"trace source cleanup failed: {copied_from}")
 
     _update_meta(ctx)
     resp = {"ok": True, "record": rec}

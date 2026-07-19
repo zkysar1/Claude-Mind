@@ -8,7 +8,7 @@ script preserves the legacy argv shape, stdin JSON contract, output shape,
 and exit codes — subprocess callers in aspirations-execute/SKILL.md Step 2.55
 are unchanged.
 
-Hard check BEFORE writing a new blocker. Catches the four false-positive
+Hard check BEFORE writing a new blocker. Catches the five false-positive
 failure modes:
 
   1. Non-canonical probe (synthetic ssh/curl instead of the skill's
@@ -18,6 +18,9 @@ failure modes:
   3. Statistical negation without schema probe. Enforces rb-245 / rb-258 /
      rb-259.
   4. Infrastructure blocker without infra-health-check evidence.
+  5. credentials-required blocker without per-source identity enumeration
+     (a self-serviceable grant wrongly routed to a human). Enforces
+     guard-1160 / g-248-111.
 
 Exit 1 with a specific reason when any check fails, unless
 `--override-blocker-gate "<justification>"` is passed. The override is

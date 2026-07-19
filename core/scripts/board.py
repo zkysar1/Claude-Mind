@@ -14,10 +14,8 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from datetime import datetime, timedelta
-from pathlib import Path
 
 # : force utf-8 on stdin/stdout/stderr (covers Windows cp1252 fallback
 # when callers bypass the _platform.sh PYTHONIOENCODING=utf-8 shim).
@@ -162,30 +160,43 @@ def cmd_post(args):
 
     # : source-tag attribution — guard-NNN / rb-NNN tags on a
     # findings post bump the named entry's times_inferred_helpful (half-
-    # weight in utilization_score per reasoning-bank.py:382). The finding's
-    # existence IS positive signal: the gate fired, defect surfaced.
+    # weight in utilization_score per reasoning-bank.py recompute). The
+    # finding's existence IS positive signal: the gate fired, defect surfaced.
     #
     # CRITICAL — never change `times_inferred_helpful` to `times_cited`:
     # times_cited carries zero weight in the active v1 utilization_score
-    # formula (reasoning-bank.py:194 + :382). The whole point is to FLOW
-    # value into the score; switching to times_cited silently re-creates
-    # the measurement gap (guard-343 read 0.04 despite producing 57% of
-    # critical findings, n=246, 2026-04-27..05-09).
+    # formula. The whole point is to FLOW value into the score; switching
+    # to times_cited silently re-creates the measurement gap (guard-343
+    # read 0.04 despite producing 57% of critical findings, n=246,
+    # 2026-04-27..05-09).
+    #
+    # DAEMON-ROUTED (1): the previous subprocess spawn of
+    # `reasoning-bank.py <family> increment ...` had been a silent no-op
+    # since H2 Wave 2 (2026-05-15) removed the rb CLI subcommands — the
+    # child imported the library and exited 0 without writing. Route
+    # through _rt.store_increment (POST /v1/store/increment), the same
+    # canonical Python->daemon client utilization-feedback.py uses.
+    # Fail-soft with a VISIBLE stderr line per cite — silent swallow is
+    # exactly how this path stayed dead for two months.
+    # ID width \d{3,}: rb/guard IDs crossed into 4 digits (rb-3742,
+    # guard-1151); the old \d{3} silently excluded every modern cite.
     if channel == "findings":
-        cited = {t for t in msg["tags"] if re.fullmatch(r"(?:guard|rb)-\d{3}", t)}
+        cited = {t for t in msg["tags"] if re.fullmatch(r"(?:guard|rb)-\d{3,}", t)}
         if cited:
-            rb_script = Path(__file__).parent / "reasoning-bank.py"
-            for cite in sorted(cited):
-                family = "rb" if cite.startswith("rb-") else "guard"
+            try:
+                import _rt
+            except Exception as e:  # fail-soft: the post already landed
+                print(f"[board] citation increments skipped — _rt import "
+                      f"failed: {e}", file=sys.stderr)
+                _rt = None
+            for cite in sorted(cited) if _rt else []:
+                store = "reasoning-bank" if cite.startswith("rb-") else "guardrails"
                 try:
-                    subprocess.run(
-                        [sys.executable, str(rb_script), family, "increment",
-                         cite, "utilization.times_inferred_helpful"],
-                        capture_output=True,
-                        timeout=10,
-                    )
-                except Exception:
-                    pass  # fail-open per-cite
+                    _rt.store_increment(store, cite,
+                                        "utilization.times_inferred_helpful")
+                except Exception as e:  # fail-soft per-cite, visibly
+                    print(f"[board] citation increment failed for {cite} "
+                          f"({store}): {e}", file=sys.stderr)
 
 def reads_sidecar_path(channel):
     """Get the sidecar path for a channel's read events."""

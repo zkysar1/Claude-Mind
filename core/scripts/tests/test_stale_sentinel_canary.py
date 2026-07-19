@@ -163,6 +163,14 @@ class TestStaleSentinelCanary(unittest.TestCase):
         env = _hermetic_env(
             MIND_AGENT=self._tmp_agent_name,
             MIND_AGENT_DIR=str(self._tmp_agent_dir),  # route resolution at the tmp dir (3)
+            # 2: pin the subprocess to the local backend. _hermetic_env
+            # strips STORAGE_* but the backend ALSO resolves from box-level
+            # config — on an own-cloud box the lock layer derives env-scoped
+            # S3/lock keys and REFUSES the tmp WM lock path ("not under any
+            # configured root"), so run() early-returns lock_acquire_failed
+            # with an EMPTY sentinels dict (14 KeyErrors). guard-955/rb-3208:
+            # tests must pin ambient backend switches, not just strip them.
+            STORAGE_BACKEND="local",
         )
         result = subprocess.run(
             args, capture_output=True, text=True, timeout=60, env=env,
@@ -553,6 +561,76 @@ class TestRecentInvestigateDedup(unittest.TestCase):
         # A directory where aspirations.jsonl is expected makes open() raise.
         (self.world / "aspirations.jsonl").mkdir(parents=True, exist_ok=True)
         self.assertTrue(self.ssc._recent_investigate_exists("force_tree_maintain"))
+
+
+class TestFileInvestigateDuplicationOverride(unittest.TestCase):
+    """4: `_file_investigate` retries ONCE with --override-duplication
+    when the goal-duplication gate blocks (goal_duplication_blocked). Upstream
+    `_recent_investigate_exists` (fail-closed, exact origin_signal) already
+    guarantees no true duplicate, so a dup-block here is a structural
+    prose-overlap false-positive and the override is justified. Without the
+    retry, the UNATTENDED canary (iteration-close productivity-check) silently
+    dropped the Investigate via an add_goal_rc_nonzero return nobody reads —
+    the g-335-95 silent-death shape. Mirrors alert-sweep.sh / ohs-husk-cluster.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_ssc_ovr_under_test", str(CANARY))
+        cls.ssc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.ssc)
+
+    def _run_with_fake(self, fake, sentinel="force_tree_maintain", stuck=5):
+        """Swap the module's `subprocess` binding for a fake namespace (does NOT
+        touch the real subprocess module — isolated + restored in finally)."""
+        class _FakeSub:
+            run = staticmethod(fake)
+        orig = self.ssc.subprocess
+        self.ssc.subprocess = _FakeSub
+        try:
+            return self.ssc._file_investigate(sentinel, stuck, dry_run=False)
+        finally:
+            self.ssc.subprocess = orig
+
+    @staticmethod
+    def _seq_fake(first_rc, first_out, first_err, second_rc=0,
+                  second_out='{"id":"g-115-9999"}'):
+        calls = []
+
+        class _CP:
+            def __init__(self, rc, out, err):
+                self.returncode, self.stdout, self.stderr = rc, out, err
+
+        def _fake(cmd, **kw):
+            calls.append(list(cmd))
+            if len(calls) == 1:
+                return _CP(first_rc, first_out, first_err)
+            return _CP(second_rc, second_out, "")
+
+        return _fake, calls
+
+    def test_dup_block_triggers_override_retry(self):
+        fake, calls = self._seq_fake(1, '{"error": "goal_duplication_blocked"}', "")
+        res = self._run_with_fake(fake)
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(len(calls), 2, "expected exactly one override retry after dup-block")
+        self.assertNotIn("--override-duplication", calls[0], "first attempt must NOT override")
+        self.assertIn("--override-duplication", calls[1], "retry must carry the override")
+
+    def test_non_dup_error_does_not_retry(self):
+        # A non-duplication failure (schema, daemon down) must NOT be overridden —
+        # override only masks the dup gate, never a real rejection.
+        fake, calls = self._seq_fake(1, '{"error": "schema_validation_failed"}', "bad schema")
+        res = self._run_with_fake(fake)
+        self.assertEqual(res.get("error"), "add_goal_rc_nonzero", res)
+        self.assertEqual(len(calls), 1, "a non-duplication error must not retry")
+
+    def test_clean_first_attempt_no_retry(self):
+        fake, calls = self._seq_fake(0, '{"id": "g-115-8888"}', "")
+        res = self._run_with_fake(fake)
+        self.assertTrue(res.get("ok"), res)
+        self.assertEqual(len(calls), 1, "a clean first attempt must not retry")
 
 
 if __name__ == "__main__":

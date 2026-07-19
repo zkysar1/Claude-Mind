@@ -95,7 +95,7 @@ def cmd_compute(args):
     window = args.window
     if len(entries) < window:
         result = {
-            "metric": args.metric,
+            "series": "learning_value",
             "window": window,
             "imp_at_k": 0.0,
             "direction": "insufficient_data",
@@ -115,12 +115,20 @@ def cmd_compute(args):
 
         direction = "improving" if imp > 0.001 else ("declining" if imp < -0.001 else "stable")
         result = {
-            "metric": args.metric,
+            "series": "learning_value",
             "window": window,
             "imp_at_k": round(imp, 6),
             "direction": direction,
             "recent_avg": round(recent_avg, 4),
         }
+
+    # Non-default label: echo it but say plainly the computation ignored it
+    # (1 — the old output echoed the label as "metric", implying
+    # per-metric series that never existed).
+    if args.metric != "learning_value":
+        result["metric_label"] = args.metric
+        result["note"] = ("metric is a caller label; computation always "
+                          "runs over the single learning_value series")
 
     print(json.dumps(result, ensure_ascii=False))
 
@@ -166,9 +174,17 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Improvement velocity (imp@k)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_compute = sub.add_parser("compute", help="Compute imp@k for a metric")
+    p_compute = sub.add_parser("compute", help="Compute imp@k over the learning_value series")
     p_compute.add_argument("--window", type=int, required=True, help="Rolling window size (k)")
-    p_compute.add_argument("--metric", required=True, help="Metric name to compute")
+    # 1: there is exactly ONE series in the store (per-goal
+    # learning_value snapshots). The old required --metric was decorative —
+    # any name produced identical output, which misled the evolve Step 0.7
+    # caller into believing pipeline_accuracy and goal_completion_rate were
+    # independently tracked. Optional caller label now; output names the real
+    # series and warns on non-default labels.
+    p_compute.add_argument("--metric", default="learning_value",
+                           help="Caller label only — computation ALWAYS runs "
+                                "over the single learning_value series")
 
     p_snap = sub.add_parser("snapshot", help="Record learning value for a goal")
     p_snap.add_argument("--goal-id", required=True, help="Goal ID")

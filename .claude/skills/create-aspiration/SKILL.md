@@ -115,7 +115,7 @@ IF mode == "from-followup":
       # to see and act on.
 
     File the seed goal under the minted id (goal id minted server-side — omit "id"):
-      Bash: echo '<seed-goal-json>' | bash core/scripts/aspirations-add-goal.sh <asp-id>
+      Bash: echo '<seed-goal-json>' | bash core/scripts/aspirations-add-goal.sh <asp-id> --source world
       where <seed-goal-json> =
       {
         "title": "Design implementation plan and file sub-goals under this aspiration",
