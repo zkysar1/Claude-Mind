@@ -507,6 +507,26 @@ def list_snapshots(file_path, base_dir):
 # Public API: vacuum
 # ---------------------------------------------------------------------------
 
+def _iter_manifest_files(snapshots_root):
+    """Yield manifest FILES under snapshots_root, skipping directories.
+
+    A source file whose NAME ends in .yaml (e.g. a team-state shard
+    `team-state/agents/zeta.yaml`, or `infra-health.yaml`) has a manifest
+    DIRECTORY that also ends in .yaml
+    (`.history/snapshots/team-state/agents/zeta.yaml/`). `rglob("*.yaml")`
+    matches that directory as well as the manifest files inside it; reading the
+    directory as a manifest raises "Is a directory", and vacuum Phase 2a's
+    fail-safe then classifies it as a corrupt manifest and ABORTS the entire
+    vacuum — reclaiming nothing (g-115-2789-a: 12 such .yaml-named source dirs
+    on the live store made vacuum abort with corrupt_manifests_detected while
+    ~4G of orphan blobs accumulated). A directory is never a manifest; skipping
+    non-files here is the fix.
+    """
+    for m_path in snapshots_root.rglob("*.yaml"):
+        if m_path.is_file():
+            yield m_path
+
+
 def vacuum(base_dir, dry_run=True, metadata_only_after_days=None):
     """Walk manifests, identify reachable blobs/patches, delete orphans.
 
@@ -529,7 +549,7 @@ def vacuum(base_dir, dry_run=True, metadata_only_after_days=None):
     # Phase 1: optionally rewrite stale manifests to encoding=dropped.
     if metadata_only_after_days is not None and snapshots_root.exists():
         cutoff = datetime.now().timestamp() - metadata_only_after_days * 86400
-        for m_path in snapshots_root.rglob("*.yaml"):
+        for m_path in _iter_manifest_files(snapshots_root):
             try:
                 if m_path.stat().st_mtime > cutoff:
                     continue
@@ -553,7 +573,7 @@ def vacuum(base_dir, dry_run=True, metadata_only_after_days=None):
     result["aborted"] = None
     result["corrupt_manifests"] = []
     if snapshots_root.exists():
-        for m_path in snapshots_root.rglob("*.yaml"):
+        for m_path in _iter_manifest_files(snapshots_root):
             try:
                 m = _read_manifest(m_path)
             except OSError as e:
@@ -592,7 +612,7 @@ def vacuum(base_dir, dry_run=True, metadata_only_after_days=None):
     reachable_blobs = set()
     reachable_patches = set()  # set of (target_hash, base_hash)
     if snapshots_root.exists():
-        for m_path in snapshots_root.rglob("*.yaml"):
+        for m_path in _iter_manifest_files(snapshots_root):
             try:
                 m = _read_manifest(m_path)
             except OSError:
@@ -670,6 +690,342 @@ def _mark_chain_reachable(content_hash, base_dir, reachable_blobs, reachable_pat
         _mark_chain_reachable(base_hash, base_dir,
                               reachable_blobs, reachable_patches, _seen=_seen)
         return  # one patch path is enough
+
+
+# ---------------------------------------------------------------------------
+# Archive-before-delete: enumerate / delete split (-b)
+# ---------------------------------------------------------------------------
+#
+# vacuum() above is the legacy single-shot path (walk -> unlink), kept
+# byte-for-byte for its 25 passing tests. The archive-before-delete wrapper
+# (history_vacuum_archive.py) needs the delete set enumerated FIRST so it can
+# archive + verify the exact payloads before any unlink (archive-before-delete.md,
+# rb-2859). These two functions provide that split and MUST stay behaviorally
+# consistent with vacuum(apply=True): enumerate_vacuum_targets() + then
+# delete_vacuum_targets() must free the SAME blobs/patches vacuum(apply=True)
+# would (asserted by test_enumerate_delete_matches_vacuum). They deliberately
+# reuse the SAME reachability helpers (_iter_manifest_files, _read_manifest,
+# _mark_chain_reachable) — the Phase-2a abort-on-corrupt invariant (Decision 2
+# of the -a design) is preserved here and MUST NOT be relaxed.
+
+
+def _would_retention_drop(m, m_path, cutoff):
+    """True if manifest `m` would be retention-dropped: stale + full/delta.
+
+    cutoff is an epoch-seconds threshold (mtime < cutoff => stale), or None
+    when metadata_only_after_days was not requested (nothing is dropped).
+    """
+    if cutoff is None:
+        return False
+    try:
+        if m_path.stat().st_mtime > cutoff:
+            return False
+    except OSError:
+        return False
+    return m.get("encoding") in ("full", "delta")
+
+
+def enumerate_vacuum_targets(base_dir, metadata_only_after_days=None):
+    """ENUMERATE step of archive-before-delete: return exactly what a
+    subsequent delete_vacuum_targets() will destroy, WITHOUT mutating anything.
+
+    Mirrors vacuum()'s reachability proof (including the load-bearing Phase-2a
+    abort-on-corrupt) but COLLECTS the orphan payloads + retention drop-manifests
+    into a structured enumeration instead of unlinking. The caller archives +
+    verifies the enumerated payloads, then calls delete_vacuum_targets() to
+    perform the unlink+rewrite. Splitting enumerate/delete is what makes the
+    archive-before-delete guarantee exact: the bytes archived are the bytes
+    deleted (no second walk, no TOCTOU when both run under the per-box lock).
+
+    The post-retention-drop orphan set is computed by excluding the
+    to-be-dropped manifests from the reachable set — identical to what
+    vacuum(apply=True, metadata_only_after_days=N) produces after it rewrites
+    those manifests to encoding=dropped, but achieved without mutating them.
+    Content-shared blobs stay safe: a blob a stale manifest references is still
+    marked reachable if ANY surviving manifest also references it.
+
+    Returns dict:
+      aborted:           None | "corrupt_manifests_detected"
+      corrupt_manifests: [(path, reason), ...]
+      orphan_blobs:      [{"hash","path","size_bytes"}, ...]
+      orphan_patches:    [{"target_hash","base_hash","path","size_bytes"}, ...]
+      drop_manifests:    [{"path","hash","encoding"}, ...]   # retention rewrites
+      bytes_freed:       int   # sum of orphan payload sizes (pre-delete, accurate)
+    """
+    base_dir = Path(base_dir)
+    history_dir = base_dir / ".history"
+    out = {"aborted": None, "corrupt_manifests": [],
+           "orphan_blobs": [], "orphan_patches": [],
+           "drop_manifests": [], "bytes_freed": 0}
+    if not history_dir.exists():
+        return out
+    snapshots_root = history_dir / "snapshots"
+
+    cutoff = None
+    if metadata_only_after_days is not None:
+        cutoff = datetime.now().timestamp() - metadata_only_after_days * 86400
+
+    # Phase 2a: validate ALL manifests first — abort on ANY corrupt one.
+    # Identical invariant to vacuum(); MUST NOT be relaxed (Decision 2).
+    if snapshots_root.exists():
+        for m_path in _iter_manifest_files(snapshots_root):
+            try:
+                m = _read_manifest(m_path)
+            except OSError as e:
+                out["corrupt_manifests"].append((str(m_path), f"OSError: {e}"))
+                continue
+            enc = m.get("encoding")
+            if enc not in ("full", "delta", "dropped"):
+                out["corrupt_manifests"].append(
+                    (str(m_path), f"unknown encoding={enc!r}"))
+                continue
+            if enc in ("full", "delta") and not m.get("hash"):
+                out["corrupt_manifests"].append((str(m_path), "missing hash"))
+                continue
+            if enc == "delta" and not m.get("base"):
+                out["corrupt_manifests"].append((str(m_path), "missing base"))
+                continue
+    if out["corrupt_manifests"]:
+        out["aborted"] = "corrupt_manifests_detected"
+        return out
+
+    # Phase 2b: reachable set from SURVIVING manifests only (all live manifests
+    # EXCEPT the retention-drop set). Excluding the to-drop manifests here is
+    # equivalent to vacuum() rewriting them to encoding=dropped first.
+    reachable_blobs = set()
+    reachable_patches = set()  # set of (target_hash, base_hash)
+    if snapshots_root.exists():
+        for m_path in _iter_manifest_files(snapshots_root):
+            try:
+                m = _read_manifest(m_path)
+            except OSError:
+                continue  # Unreachable: Phase 2a would have aborted.
+            if _would_retention_drop(m, m_path, cutoff):
+                out["drop_manifests"].append(
+                    {"path": str(m_path), "hash": m.get("hash"),
+                     "encoding": m.get("encoding")})
+                continue  # excluded from the surviving/reachable set
+            enc = m.get("encoding")
+            if enc == "full":
+                reachable_blobs.add(m["hash"])
+            elif enc == "delta":
+                reachable_patches.add((m["hash"], m["base"]))
+                _mark_chain_reachable(m["base"], base_dir,
+                                      reachable_blobs, reachable_patches)
+            # encoding=dropped: nothing to mark.
+
+    # Phase 3: enumerate unreachable blobs.
+    blobs_root = history_dir / "blobs"
+    if blobs_root.exists():
+        for blob_file in blobs_root.rglob("*.gz"):
+            blob_hash = blob_file.parent.name + blob_file.name[:-len(".gz")]
+            if blob_hash in reachable_blobs:
+                continue
+            try:
+                size = blob_file.stat().st_size
+            except OSError:
+                continue
+            out["orphan_blobs"].append(
+                {"hash": blob_hash, "path": str(blob_file), "size_bytes": size})
+            out["bytes_freed"] += size
+
+    # Phase 4: enumerate unreachable patches.
+    patches_root = history_dir / "patches"
+    if patches_root.exists():
+        for patch_file in patches_root.rglob("*.gz"):
+            stem = patch_file.name[:-len(".gz")]
+            if ".from." not in stem:
+                continue
+            target_part, _, base_hash = stem.partition(".from.")
+            target_hash = patch_file.parent.name + target_part
+            if (target_hash, base_hash) in reachable_patches:
+                continue
+            try:
+                size = patch_file.stat().st_size
+            except OSError:
+                continue
+            out["orphan_patches"].append(
+                {"target_hash": target_hash, "base_hash": base_hash,
+                 "path": str(patch_file), "size_bytes": size})
+            out["bytes_freed"] += size
+
+    return out
+
+
+def delete_vacuum_targets(base_dir, targets):
+    """DELETE step of archive-before-delete: unlink the enumerated orphan
+    payloads and rewrite the enumerated drop-manifests to encoding=dropped.
+
+    MUST be called only AFTER the caller has archived + verified every payload
+    in `targets` (archive-before-delete.md ordering). This function performs no
+    archiving and no verification — it assumes the caller upheld the ordering.
+    Retention drop-manifests are rewritten to encoding=dropped (metadata —
+    timestamp/agent/summary/hash — is preserved; only the reconstructable
+    payload is freed, and that payload is an orphan blob/patch archived above).
+
+    Returns dict: manifests_dropped, blobs_deleted, patches_deleted, bytes_freed.
+    """
+    base_dir = Path(base_dir)
+    result = {"manifests_dropped": 0, "blobs_deleted": 0,
+              "patches_deleted": 0, "bytes_freed": 0}
+    for dm in targets.get("drop_manifests", []):
+        try:
+            m_path = Path(dm["path"])
+            m = _read_manifest(m_path)
+            m["encoding"] = "dropped"
+            m["base"] = None
+            _write_manifest(m_path, m)
+            result["manifests_dropped"] += 1
+        except OSError:
+            continue
+    for ob in targets.get("orphan_blobs", []):
+        try:
+            p = Path(ob["path"])
+            sz = p.stat().st_size
+            p.unlink()
+            result["blobs_deleted"] += 1
+            result["bytes_freed"] += sz
+        except OSError:
+            continue
+    for op in targets.get("orphan_patches", []):
+        try:
+            p = Path(op["path"])
+            sz = p.stat().st_size
+            p.unlink()
+            result["patches_deleted"] += 1
+            result["bytes_freed"] += sz
+        except OSError:
+            continue
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Legacy per-file-dir drain () — a SEPARATE store from the CAS vacuum
+# above. enumerate_vacuum_targets() covers ONLY the content-addressed store
+# (.history/{snapshots,blobs,patches}) via a reachability proof. The frozen
+# pre-2026-07-16 legacy per-file dirs (copy-on-write timestamped snapshots, one
+# dir per tracked file: aspirations.jsonl/, knowledge/, board/, ...) have NO
+# manifest/blob/patch model and NO reachability, so they are enumerated +
+# archived PATH-PRESERVINGLY, NOT folded into the reachability walk (that would
+# violate enumerate_vacuum_targets()'s contract). See
+# world/knowledge/tree/system/history-store-gc-cadence.md "Legacy per-file-dir
+# drain gap". Gated OFF by default (history_vacuum.drain_legacy_dirs) — see
+# history_vacuum_archive.run_legacy_drain().
+# ---------------------------------------------------------------------------
+
+# The content-addressed-store dirs the CAS vacuum owns; everything ELSE under
+# .history/ (except operational dotfiles) is legacy. MUST stay in sync with the
+# dirs enumerate_vacuum_targets() walks (snapshots_root/blobs_root/patches_root)
+# — if the CAS store ever adds a top-level dir, add it here too, or the legacy
+# drain would misclassify it. The OFF-by-default drain gate + the mandatory
+# pre-flip dry-run enumeration review are the backstops for this sync contract.
+_NEW_STORE_DIRS = ("snapshots", "blobs", "patches")
+
+
+def _append_legacy_file(f, history_dir, out):
+    """Add one legacy file to the enumeration (path-preserving rel_path)."""
+    try:
+        size = f.stat().st_size
+    except OSError:
+        return
+    rel = f.relative_to(history_dir).as_posix()
+    out["legacy_files"].append(
+        {"rel_path": rel, "path": str(f), "size_bytes": size})
+    out["bytes_freed"] += size
+
+
+def enumerate_legacy_dir_targets(base_dir):
+    """ENUMERATE the frozen legacy per-file .history dirs for archive-before-delete.
+
+    READ-ONLY — mutates nothing. Enumerates every file under the legacy entries
+    so history_vacuum_archive.run_legacy_drain() can archive + verify them to the
+    durable graveyard BEFORE delete_legacy_targets() unlinks them
+    (archive-before-delete.md ordering; rb-2859 single-copy-store caution).
+
+    Legacy entries = top-level children of .history/ that are NEITHER a
+    content-addressed-store dir (_NEW_STORE_DIRS) NOR an operational dotfile
+    (.vacuum-last-run, .vacuum.lock, ...). Items are PATH-PRESERVING: rel_path is
+    relative to .history/, because legacy files are NOT content-addressed and a
+    restore must land at the historical path (not a hash-derived path). Symlinks
+    are skipped (never archive/delete a symlink target outside the tree).
+
+    Returns dict:
+      legacy_files: [{"rel_path","path","size_bytes"}, ...]  # rel to .history/
+      entries:      [<top-level legacy entry name>, ...]     # for dry-run review
+      bytes_freed:  int
+    """
+    base_dir = Path(base_dir)
+    history_dir = base_dir / ".history"
+    out = {"legacy_files": [], "entries": [], "bytes_freed": 0}
+    if not history_dir.exists():
+        return out
+    for entry in sorted(history_dir.iterdir(), key=lambda p: p.name):
+        name = entry.name
+        if name in _NEW_STORE_DIRS:
+            continue  # CAS store — owned by enumerate_vacuum_targets()
+        if name.startswith("."):
+            continue  # operational dotfiles (.vacuum-last-run, .vacuum.lock)
+        if entry.is_symlink():
+            continue  # never follow a symlink out of the .history tree
+        out["entries"].append(name)
+        if entry.is_file():
+            _append_legacy_file(entry, history_dir, out)
+            continue
+        if not entry.is_dir():
+            continue
+        for f in entry.rglob("*"):
+            if f.is_symlink() or not f.is_file():
+                continue
+            _append_legacy_file(f, history_dir, out)
+    return out
+
+
+def delete_legacy_targets(base_dir, targets):
+    """DELETE step for the legacy-dir drain: unlink the enumerated legacy files,
+    then prune now-empty legacy dirs bottom-up.
+
+    MUST be called only AFTER the caller archived + verified every file in
+    targets["legacy_files"] (archive-before-delete.md ordering). Performs no
+    archiving/verification. Never removes .history/ itself or a CAS store dir —
+    it only prunes empty dirs UNDER the enumerated legacy top-level entries.
+
+    Returns dict: files_deleted, dirs_pruned, bytes_freed.
+    """
+    base_dir = Path(base_dir)
+    history_dir = base_dir / ".history"
+    result = {"files_deleted": 0, "dirs_pruned": 0, "bytes_freed": 0}
+    for lf in targets.get("legacy_files", []):
+        try:
+            p = Path(lf["path"])
+            sz = p.stat().st_size
+            p.unlink()
+            result["files_deleted"] += 1
+            result["bytes_freed"] += sz
+        except OSError:
+            continue
+    # Prune now-empty dirs under each legacy top-level entry, deepest-first, then
+    # the top-level entry itself. Guarded to never touch .history/ or a CAS dir.
+    for name in targets.get("entries", []):
+        if name in _NEW_STORE_DIRS or name.startswith("."):
+            continue  # defense-in-depth: never prune a CAS/operational entry
+        top = history_dir / name
+        if not top.exists() or not top.is_dir():
+            continue  # a bare legacy file (already unlinked) — nothing to prune
+        subdirs = [p for p in top.rglob("*") if p.is_dir() and not p.is_symlink()]
+        for d in sorted(subdirs, key=lambda p: len(p.parts), reverse=True):
+            try:
+                if not any(d.iterdir()):
+                    d.rmdir()
+                    result["dirs_pruned"] += 1
+            except OSError:
+                continue
+        try:
+            if top.is_dir() and not any(top.iterdir()):
+                top.rmdir()
+                result["dirs_pruned"] += 1
+        except OSError:
+            pass
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -11,12 +11,19 @@ Setup:
       guard-quiet    — times_active=0 currently  (delta 0 vs baseline 0)
   * synthetic retrieval-session.json with both guards in supplementary_detail,
     distinctive_tokens deliberately set to bogus values so token classification
-    routes BOTH to the unknown bucket.
+    routes BOTH to the `noise` bucket (zero structural matches). Since
+    g-115-3144 `unknown` means "SOME structural evidence but below threshold"
+    and is unreachable at the default min_distinctive=1 — the point of the
+    fixture is that classification finds NO evidence, so the backstop is the
+    only thing that can rescue guard-active.
   * synthetic goal record (so _fetch_goal_text returns prose)
 
 Assertion: after infer_feedback runs:
-  * guard-active is in `helpful` (active_promotions == 1)
-  * guard-quiet stays in `unknown`
+  * guard-active is in `helpful` (active_promotions == 1) — rescued from
+    `noise` purely by its times_active delta, which is what this suite exists
+    to pin: the backstop discards from `noise` AND `unknown`, so it does not
+    care which bucket token classification chose.
+  * guard-quiet stays out of `helpful` (delta 0)
   * stats.active_promotions reflects the count
 """
 from __future__ import annotations
@@ -35,7 +42,13 @@ sys.path.insert(0, str(CORE_SCRIPTS))
 def _seed_session(agent_dir: Path):
     """Write retrieval-session.json with two guards, both in unknown."""
     session = {
-        "schema_version": 2,
+        # Must be >= the version infer_feedback accepts (3 since ,
+        # which refuses older sessions because their distinctive_tokens were
+        # split on -/_ and prose-dominated). The version is incidental
+        # scaffolding here — this suite's subject is the C.2 times_active
+        # backstop, which is independent of token vintage. Bump alongside any
+        # future token-contract change rather than pinning an old version.
+        "schema_version": 3,
         "goal_id": "g-test-c2-001",
         "timestamp": "2026-05-09T12:00:00",
         "categories": ["test"],
@@ -131,9 +144,16 @@ def test_fallback_active_promotes_unknown_to_helpful():
         "MIND_AGENT_DIR": os.environ.get("MIND_AGENT_DIR"),
         "MIND_AGENT": os.environ.get("MIND_AGENT"),
     }
+    # `retrieve` joined this list in : utilization_feedback now
+    # imports it (for the shared tokenizer + structural test) at classify time,
+    # so re-exec'ing utilization_feedback under the tmp MIND_WORLD drags
+    # `retrieve` into sys.modules bound to a tmp dir that is deleted on exit.
+    # Restoring utilization_feedback without restoring retrieve leaves the
+    # poisoned module behind for every later test — the same leak class the
+    # env snapshot above was added for.
     _mod_snapshot = {
         name: sys.modules.get(name)
-        for name in ("_paths", "utilization_feedback")
+        for name in ("_paths", "utilization_feedback", "retrieve")
     }
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -166,7 +186,7 @@ def test_fallback_active_promotes_unknown_to_helpful():
                 session = json.load(f)
 
             result = mod.infer_feedback(session, confidence="balanced")
-            assert result is not None, "infer returned None on schema_version=2 session"
+            assert result is not None, "infer returned None on schema_version=3 session"
             helpful, noise, unknown, stats = result
 
             # Balanced confidence + 0 token matches puts both items in `noise`

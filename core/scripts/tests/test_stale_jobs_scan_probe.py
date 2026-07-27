@@ -195,7 +195,7 @@ class ProbeRespondingBridgePidsTest(unittest.TestCase):
 
 
 class MultiEnvBridgePidsTest(unittest.TestCase):
-    """7: multi_env_bridge_pids protects roblox-bridge processes on the
+    """: multi_env_bridge_pids protects roblox-bridge processes on the
     canonical multi-env ports (28080-28083) UNCONDITIONALLY -- regardless of
     probe-response / plugin_connected state. Closes the g-115-106 / g-115-625 gap
     where a bridge whose plugin was disconnected (probe_responding returns empty)
@@ -248,7 +248,7 @@ class MultiEnvBridgePidsTest(unittest.TestCase):
         self.assertEqual(sjs.multi_env_bridge_pids([proc]), set())
 
     def test_port_28083_candidate_reported_but_not_killed(self):
-        """Goal verification (7): an aged 28083 bridge that WOULD be a
+        """Goal verification (): an aged 28083 bridge that WOULD be a
         Tier-B kill candidate is excluded from candidates because build_do_not_kill
         now contains it -- so --auto-kill never reaps it. Negative control: an
         identically-aged bridge on a non-protected port (29999) IS a candidate,
@@ -374,7 +374,7 @@ class HookPythonOrphanTest(unittest.TestCase):
 
 
 class ForeignRootOrphanScopingTest(unittest.TestCase):
-    """8: a hook-python orphan rooted in a SIBLING Mind install
+    """: a hook-python orphan rooted in a SIBLING Mind install
     (.../Zak-Data-Solutions-Mind/core/scripts/...) belongs to that install's
     scanner, not ours. It must be EXCLUDED from our candidate set so it cannot
     form a permanent floor that pins MAX_KILLS_PER_RUN and blocks auto-reap of

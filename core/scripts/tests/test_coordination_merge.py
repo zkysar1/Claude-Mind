@@ -110,7 +110,7 @@ def test_rb_empty_inputs():
 
 
 def test_rb_collision_reid_stamps_tombstone():
-    # 7 (flat-record mirror of the 7 goals-array fix): the
+    #  (flat-record mirror of the  goals-array fix): the
     # displaced loser carries displaced_from = the contested id it lost.
     recA = {"id": "rb-2", "created": "2026-07-02T10:00:00", "title": "machineA"}
     recB = {"id": "rb-2", "created": "2026-07-02T11:00:00", "title": "machineB"}
@@ -174,7 +174,7 @@ def test_guard_collision_reid_tombstone_zero_pad():
     assert cm.merge_reasoning_bank(b"", one) == one
 
 
-# --- key-order byte-commutativity (1) -------------------------------
+# --- key-order byte-commutativity () -------------------------------
 
 def test_rb_distinct_new_keys_byte_commutative():
     """Same record, each side adds a DIFFERENT new key. out=dict(a)+b-extras
@@ -338,7 +338,7 @@ def test_ts_active_blockers_union_dedup_by_id():
     assert sorted(x["id"] for x in m["active_blockers"]) == ["blk-1", "blk-2"]
 
 
-# --- team-state per-agent shards (3 / rb-3150) ---------------------
+# --- team-state per-agent shards ( / rb-3150) ---------------------
 # The  split moved per-agent liveness into world/team-state/agents/
 # <name>.yaml. Those shard basenames are dynamic (alpha.yaml/bravo.yaml/...) so
 # the basename-keyed _HANDLERS never registered them -> merge_handler_for
@@ -409,7 +409,7 @@ def test_shard_non_mapping_fallback_deterministic():
     assert fb1 == fb2
 
 
-# --- aspirations.jsonl (1 follow-up) -------------------------------
+# --- aspirations.jsonl ( follow-up) -------------------------------
 def _asp(aid, goals, **kw):
     a = {"id": aid, "status": "active", "last_selected": "2026-07-03T09:00:00",
          "selection_count": 1, "sessions_active": 1, "goals": goals}
@@ -504,7 +504,7 @@ def test_aspirations_multiround_convergence():
 
 
 def test_aspirations_fulltie_order_divergence_heals():
-    """5: VALUE-identical order-divergent copies (canon-blind corner —
+    """: VALUE-identical order-divergent copies (canon-blind corner —
     _canon sorts keys) tie on both last_modified/last_selected AND canon, so
     the pre-fix _order_by_ts full-tie picked the FIRST ARG and dict(win) key
     order reached the bytes: merge(a,b) != merge(b,a), permanent ping-pong.
@@ -526,7 +526,7 @@ def test_aspirations_fulltie_order_divergence_heals():
 
 
 def test_aspirations_concurrent_add_same_id_keeps_both():
-    # 7: two boxes each add a DISTINCT new goal to the same aspiration
+    # : two boxes each add a DISTINCT new goal to the same aspiration
     # and both decentralized max+1 allocate the SAME id (same eventual-consistency
     # window). The merge must keep BOTH (loser re-id'd), never field-interleave
     # them into one franken-record (the old id-keyed union dropped a writer —
@@ -570,7 +570,7 @@ def test_aspirations_concurrent_add_converges_multiround():
 
 
 def test_aspirations_variant_id_not_reallocated():
-    # A -letter variant id (1-a) is OUTSIDE the sequential space and must
+    # A -letter variant id (-a) is OUTSIDE the sequential space and must
     # pass through unchanged — never displaced into the g-115-{seq} sequence.
     a = _rb([_asp("asp-115", [_goal("g-115-1991-a", title="variant",
                                     created_at="2026-07-14T10:00:00")])])
@@ -578,11 +578,11 @@ def test_aspirations_variant_id_not_reallocated():
                                     created_at="2026-07-14T10:00:00")])])
     ab, ba = cm.merge_aspirations(a, b), cm.merge_aspirations(b, a)
     assert ab == ba
-    assert _goal_ids(ab) == {"1-a", ""}   # variant kept verbatim
+    assert _goal_ids(ab) == {"-a", ""}   # variant kept verbatim
 
 
 def test_aspirations_reid_winner_no_duplicate_id():
-    # 7 fresh-eyes finding: the SAME goal seen under two seq ids (its
+    #  fresh-eyes finding: the SAME goal seen under two seq ids (its
     # original id + a peer's re-id) where _merge_goal's LWW picks the HIGHER-seq
     # id must NOT let the keeper carry that higher id into its (lower) home bucket
     # and collide with the DISTINCT goal legitimately at the higher seq. All output
@@ -605,7 +605,7 @@ def test_aspirations_reid_winner_no_duplicate_id():
 
 
 def test_aspirations_collision_reid_stamps_tombstone():
-    # 7: the displaced loser carries displaced_from = the contested id
+    # : the displaced loser carries displaced_from = the contested id
     # it lost, so external references (claims, discovered_by, origin_signal
     # dedup) can be traced and re-merges recognize the settled displacement.
     gA = _goal("g-115-02", title="alpha work", created_at="2026-07-14T10:00:00")
@@ -620,7 +620,7 @@ def test_aspirations_collision_reid_stamps_tombstone():
 
 
 def test_aspirations_collision_reid_associative_stale_replay():
-    # 7 core property: replaying a STALE pre-collision side against the
+    #  core property: replaying a STALE pre-collision side against the
     # settled result must be a FIXPOINT — merge(merge(a,b), a) == merge(a,b) on
     # the collision path. Pre-tombstone, the settled displaced goal was dragged
     # back into its home bucket and re-displaced to a pair-dependent next-free
@@ -643,7 +643,7 @@ def test_aspirations_collision_reid_associative_stale_replay():
 
 
 def test_aspirations_chained_displacement_stale_replay_no_refight():
-    # 7 second-pass hardening: a CHAIN-displaced goal (displaced 50->67,
+    #  second-pass hardening: a CHAIN-displaced goal (displaced 50->67,
     # then lost 67 to an earlier-created contender -> 68; tombstone stays 50) has
     # home OUTSIDE its seen-id set on stale replay {67, 68}. It must anchor its
     # LATEST settled slot (68) directly — never re-fight bucket 67 it already
@@ -848,7 +848,7 @@ def test_append_only_multiround_convergence():
     assert whos.count("a") == 1 and whos.count("b") == 1     # neither duplicated
 
 
-# --- torn-line tolerance (5) ----------------------------------------
+# --- torn-line tolerance () ----------------------------------------
 def _torn_tail(records, cut=38):
     """A franken blob: valid records + a truncated final append (the cc-04
     wedge shape — the writer died mid-line, leaving a torn half-line tail).
@@ -862,7 +862,7 @@ def _torn_tail(records, cut=38):
 
 
 def test_append_only_torn_local_no_longer_wedges(capsys):
-    # THE 5 behavior: a torn half-line on one side must NOT raise
+    # THE  behavior: a torn half-line on one side must NOT raise
     # (pre-fix: json.loads raised -> _merge_reconcile_put wrapped it in
     # ConflictError -> the union lane wedged forever on the franken local).
     base = _log("2026-07-03T09:00:00", n=1)
@@ -903,7 +903,7 @@ def test_append_only_torn_both_sides_and_mid_utf8_cut(capsys):
 
 
 def test_torn_tolerance_does_not_leak_to_id_keyed_handlers():
-    # Scope boundary (5): id-keyed stores keep the STRICT parse — a
+    # Scope boundary (): id-keyed stores keep the STRICT parse — a
     # parse failure there can mean real corruption of an editable record and
     # must freeze (ConflictError at the caller), never silently skip.
     torn = _rb([{"id": "rb-1", "created": "2026-07-02T10:00:00",
@@ -914,7 +914,7 @@ def test_torn_tolerance_does_not_leak_to_id_keyed_handlers():
         cm.merge_reasoning_bank(torn, clean)
 
 
-# --- _HANDLERS registration (6) ------------------------------------
+# --- _HANDLERS registration () ------------------------------------
 def test_handler_registration_board_and_override_g115_2006():
     # The non-default board channels + the Phase 4 bulk-override ledger are
     # shared append-only stores that were unregistered and wedged on
@@ -933,10 +933,10 @@ def test_handler_registration_excludes_pruned_stores_g115_2006():
     # pruned/superseded records. journal.jsonl gets index rewrites and stays
     # fully unregistered. The evolution streams (rewritten in place by
     # evolution-complete/stub-expiry) left this exclusion 2026-07-18
-    # (1): they are now registered with merge_evolution_stream — a
+    # (): they are now registered with merge_evolution_stream — a
     # revision_id-keyed STATUS-MONOTONIC merge that handles the rewrite
     # correctly — but must NEVER regress to merge_append_only_jsonl.
-    # (changelog.jsonl lived here until 3 — it is ROTATED into
+    # (changelog.jsonl lived here until  — it is ROTATED into
     # changelog-archive.jsonl, a MOVE not a record-dropping rewrite, so the
     # pair is append-only-registered; see
     # test_handler_registration_changelog_g115_2173 below.)
@@ -953,7 +953,7 @@ def test_handler_registration_excludes_pruned_stores_g115_2006():
 
 
 def test_handler_registration_changelog_g115_2173():
-    # 3 (ports cc-02 7b6801e1): changelog.jsonl is ROTATED into
+    #  (ports cc-02 7b6801e1): changelog.jsonl is ROTATED into
     # changelog-archive.jsonl by store-hygiene.yaml — a MOVE, not a record-dropping
     # rewrite — so the pair carries the SAME bounded rotate+line-union tradeoff
     # already accepted for the board channels, and BOTH must route to the
@@ -973,7 +973,7 @@ def test_changelog_two_box_concurrent_append_converges_g115_2173():
     # distinct audit record on top of a shared baseline; resolve the handler the
     # way OwnCloudBackend._put does (merge_handler_for) and confirm the fenced-PUT
     # retry loop CONVERGES (byte-identical from both vantages) with no wedge and no
-    # lost append. Regression lock for the 5-week freeze: before 3,
+    # lost append. Regression lock for the 5-week freeze: before ,
     # merge_handler_for("changelog.jsonl") returned None and the backend safe-froze
     # the store out of S3. Sort is by `timestamp` (a _log_ts field).
     handler = cm.merge_handler_for("agents/alpha/changelog.jsonl")
@@ -1010,7 +1010,7 @@ def test_board_reasoning_two_box_concurrent_append_converges_g115_2006():
 
 
 def test_handler_registration_g115_2009_verified_append_only():
-    # 6 remainder: the lower-churn shared append-only stores, EACH
+    #  remainder: the lower-churn shared append-only stores, EACH
     # verified strictly append-only by reading its writer (rb-245). The 9 per-gate
     # override ledgers + 6 audit/telemetry logs MUST route to the append-only
     # handler. Dispatch is by basename, so a leading world/ path is irrelevant.
@@ -1028,14 +1028,14 @@ def test_handler_registration_g115_2009_verified_append_only():
 
 
 def test_handler_registration_g115_2009_excludes_rewritten_stores():
-    # Regression guard (rb-245): the 9 audit DISQUALIFIED these because
+    # Regression guard (rb-245): the  audit DISQUALIFIED these because
     # their writers REWRITE the whole file — dead-ends via meta-dead-ends.py
     # write_all() -> locked_write_jsonl; knowledge-graph via knowledge-graph-
     # build.py rebuild. A line-union handler would resurrect deleted records, so
     # they MUST stay unregistered (safe-freeze). meta-log/l1-pick-log/scoring-
     # criterion-audit were DEFERRED (writer not confirmed) — also unregistered.
     # meta-log.jsonl + l1-pick-log.jsonl left the DEFERRED list 2026-07-18
-    # (1): writers read and verified append-only (meta-yaml.py
+    # (): writers read and verified append-only (meta-yaml.py
     # append_log open('a') — its open('r') is only mc-NNN allocation;
     # _l1_pick.py open('a') + l1-domain-rename.py append), now registered.
     for path in ["dead-ends.jsonl", "knowledge-graph.jsonl",
@@ -1198,7 +1198,7 @@ def test_aspirations_meta_multiround_and_empty():
 
 
 # --- registry ---------------------------------------------------------------
-# --- pipeline (7 / rb-2849 — the cc-04 NON-multipart no_clobber freeze) ---
+# --- pipeline ( / rb-2849 — the cc-04 NON-multipart no_clobber freeze) ---
 def _hyp(rec_id, **kw):
     base = {"id": rec_id, "title": f"hyp {rec_id}", "stage": "active",
             "horizon": "short", "type": "calibration", "confidence": 0.5,
@@ -1278,7 +1278,7 @@ def test_pipeline_multiround_convergence():
 
 
 def test_pipeline_fulltie_order_divergence_heals():
-    """5: two VALUE-identical copies whose key sequences diverged tie
+    """: two VALUE-identical copies whose key sequences diverged tie
     on stage rank AND canon (_canon sorts keys — blind to order); the pre-fix
     tiebreak picked the FIRST ARG, so merge(a,b) != merge(b,a) bytes and the
     fenced-PUT loop ping-ponged forever. Post-fix the diverged sequences
@@ -1459,7 +1459,7 @@ def test_spark_multiround_convergence_and_empty():
 
 
 def test_spark_fulltie_order_divergence_heals():
-    """5: same-type union path — VALUE-identical order-divergent
+    """: same-type union path — VALUE-identical order-divergent
     copies tie on canon and pre-fix fell to first-arg-wins key order."""
     s1 = {"id": "sq-001", "type": "question", "text": "Q1?",
           "times_asked": 5, "mf": 1, "nf": 2}
@@ -1471,7 +1471,7 @@ def test_spark_fulltie_order_divergence_heals():
     assert cm.merge_spark_questions(ab, _rb([s2])) == ab    # settles
 
 
-# --- pipeline-meta.json (7 — rewritten by every pipeline mutation) ---
+# --- pipeline-meta.json ( — rewritten by every pipeline mutation) ---
 def _pmeta(last_updated, micro=None, **kw):
     d = {"last_updated": last_updated,
          "stage_counts": {"discovered": 1, "active": 2,
@@ -1506,7 +1506,7 @@ def test_pipeline_meta_byte_exact_and_same_day_tiebreak():
 
 
 def test_pipeline_meta_micro_counters_numeric_max_not_lexicographic():
-    # 3 (guard-1153 sweep): confirmed_all_time/corrected_all_time are
+    #  (guard-1153 sweep): confirmed_all_time/corrected_all_time are
     # grow-only counters. The pre-fix per-key _canon compare ordered
     # lexicographically ("10" < "9"), so the higher count LOST on a same-key
     # clash — a counter went backward on merge. Pin numeric MAX + the derived
@@ -1531,14 +1531,14 @@ def test_pipeline_meta_micro_counters_numeric_max_not_lexicographic():
 
 
 def test_handler_registry_pipeline_spark_basenames():
-    # Lock the 7 / rb-2849 registrations — an accidental removal
+    # Lock the  / rb-2849 registrations — an accidental removal
     # re-opens the cc-04 non-multipart both-diverged write-freeze.
     assert cm.merge_handler_for("world/pipeline.jsonl") is cm.merge_pipeline
     assert cm.merge_handler_for("world/pipeline-archive.jsonl") is cm.merge_pipeline
     assert cm.merge_handler_for("world/pipeline-meta.json") is cm.merge_pipeline_meta
     assert cm.merge_handler_for("meta/spark-questions.jsonl") is cm.merge_spark_questions
-    # pattern-signatures.jsonl REGISTERED (3, 2026-07-16) — the
-    # 7-era None-lock's premise ("two live writers disagree on
+    # pattern-signatures.jsonl REGISTERED (, 2026-07-16) — the
+    # -era None-lock's premise ("two live writers disagree on
     # serialization") was re-verified STALE: the H2 Wave 3 migration gutted the
     # CLI CRUD writers to the daemon generic store endpoint (ensure_ascii=True,
     # store.py), the bespoke record-outcome daemon endpoint emits True, and the
@@ -1687,10 +1687,10 @@ def test_tree_progression_never_regress_on_equal_timestamp():
 
 
 def test_tree_progression_stamp_preserves_downgrade_on_equal_last_updated_g_115_2495():
-    # 5: a data-derived confidence DOWNGRADE must survive an own-cloud
-    # merge even when last_updated is EQUAL on both sides (the 4 bug:
+    # : a data-derived confidence DOWNGRADE must survive an own-cloud
+    # merge even when last_updated is EQUAL on both sides (the  bug:
     # accuracy-sync lowers confidence WITHOUT bumping last_updated, per the
-    # 3 decoupling). progression_updated_at is the dedicated LWW key,
+    #  decoupling). progression_updated_at is the dedicated LWW key,
     # so the side that recalibrated (fresher stamp) wins and the downgrade holds.
     lu = "2026-07-01T00:00:00"                        # SAME article last_updated
     a = _tnode(confidence=0.5, last_updated=lu, progression_updated_at="2026-07-17")
@@ -2073,13 +2073,13 @@ def test_merge_tree_str_vs_date_last_updated_commutative():
     assert yaml.safe_load(ab.decode())["last_updated"] == "2026-07-01"
 
 
-# --- _HANDLERS registry integrity (3) ------------------------------
+# --- _HANDLERS registry integrity () ------------------------------
 # The _HANDLERS dict literal (coordination_merge.py) is edited from BOTH boxes at
 # every fork reconcile (55+ keys). Python dict literals accept DUPLICATE keys
 # SILENTLY (last value wins), so a merge that duplicates a store key with a
 # DIFFERENT handler would silently misroute that store's both-diverged merge with
 # ZERO runtime signal. This AST-level check (supersedes the ad-hoc re.findall used
-# at the 2 resolution) asserts every registry key is unique in SOURCE --
+# at the  resolution) asserts every registry key is unique in SOURCE --
 # ast preserves duplicates because Python dedups only at dict CONSTRUCTION, not at
 # parse. Complements guard-907 (handlers must be COMMUTATIVE): guard-907 governs
 # each handler's behavior; this governs the registry's key-uniqueness.
@@ -2118,7 +2118,7 @@ def _handlers_key_nodes():
 
 
 def test_handlers_registry_has_no_duplicate_keys():
-    """3: the _HANDLERS store->handler registry must have NO duplicate
+    """: the _HANDLERS store->handler registry must have NO duplicate
     keys in source. A dup key with a different handler is a silent last-wins
     misroute at every fork reconcile (Python dict-literal semantics)."""
     keys = _handlers_key_nodes()
@@ -2148,8 +2148,8 @@ def test_handlers_registry_is_nonempty_and_ast_findable():
 
 
 # ---------------------------------------------------------------------------
-# forged-skills.yaml — keyed dict union (5; CURE for the 8 +
-# 9 stale-base row-clobber incidents)
+# forged-skills.yaml — keyed dict union (; CURE for the  +
+#  stale-base row-clobber incidents)
 # ---------------------------------------------------------------------------
 
 def _fs(skills: dict) -> bytes:
@@ -2233,7 +2233,7 @@ def test_fs_unquoted_yaml_date_newer_side_wins():
     assert yaml.safe_load(ab.decode())["skills"]["skill-x"]["parent"] == "p"
 
 
-# --- skill-relations.yaml handler (6) -------------------------------
+# --- skill-relations.yaml handler () -------------------------------
 
 
 def _sr(rels=None, log=None, last_updated=None, extra=None) -> bytes:
@@ -2374,7 +2374,7 @@ def test_sr_unquoted_datetime_last_updated_newer_wins():
             == cm.merge_skill_relations(same_str, same_dt))
 
 
-# --- evolution event streams (1) -----------------------------------
+# --- evolution event streams () -----------------------------------
 def _evo(recs):
     return _rb(recs)
 
@@ -2429,7 +2429,7 @@ def test_evo_malformed_record_without_revision_id_survives():
     assert len(_recs(ab)) == 2
 
 
-# --- infra-health.yaml (1) -----------------------------------------
+# --- infra-health.yaml () -----------------------------------------
 def _ih(components):
     return yaml.dump({"components": components}).encode()
 
@@ -2463,7 +2463,7 @@ def test_ih_unparseable_side_byte_tiebreak_commutative():
     assert cm.merge_infra_health(good, bad) == cm.merge_infra_health(bad, good)
 
 
-# --- goal-selection-strategy.yaml (1) ------------------------------
+# --- goal-selection-strategy.yaml () ------------------------------
 def _gss(version, last_updated, weights, log):
     return yaml.dump({"version": version, "last_updated": last_updated,
                       "weights": weights, "applications_log": log}).encode()
@@ -2506,7 +2506,7 @@ def test_gss_version_tie_newer_last_updated_wins():
     assert yaml.safe_load(ab.decode())["weights"]["priority"] == 2.0
 
 
-# --- hypothesis-category-bindings.json (1) --------------------------
+# --- hypothesis-category-bindings.json () --------------------------
 def test_hcb_key_union_and_deterministic_value_conflict():
     a = json.dumps({"arc": "node-1", "only-a": "x"}).encode()
     b = json.dumps({"arc": "node-2", "only-b": "y"}).encode()

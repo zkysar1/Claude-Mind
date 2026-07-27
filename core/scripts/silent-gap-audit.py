@@ -62,6 +62,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 from _paths import WORLD_DIR, META_DIR, AGENT_NAME, agent_dir  # noqa: E402
 
@@ -90,7 +91,7 @@ READER_SOURCE_EXTS = {".py", ".sh", ".md", ".yaml", ".yml", ".js", ".ts"}
 # is correct-by-design, not an orphaned-asset gap. Recovery is manual (git
 # history / direct read), mirroring the changelog/journal entries above. Without
 # this, the detector false-flags reasoning-bank-archive / guardrails-archive /
-# pipeline-archive / etc. every cadence (2, 0). Same
+# pipeline-archive / etc. every cadence (, ). Same
 # archive-exclusion principle as jsonl_hygiene._glob_or_single ().
 WRITTEN_NEVER_READ_EXCLUDE = (
     "changelog", "journal", "experience", "diary", "skill-invocations",
@@ -126,7 +127,7 @@ SITUATIONAL_SKILL_BASE = (
     "access", "analyze", "monitor", "health",
 )
 
-# Time-windowed completed-goal dedup (6). Dedup-against-open-goals alone
+# Time-windowed completed-goal dedup (). Dedup-against-open-goals alone
 # lets a gap that was investigated-and-CLOSED re-fire every ~4h strategic scan —
 # the SAME sparse-by-design gap was DEEP-investigated twice before catch. So the
 # dedup corpus ALSO includes goals COMPLETED within this many days: a re-detected
@@ -182,7 +183,7 @@ def _parse_iso(ts):
     if not ts:
         return None
     try:
-        return dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        return parse_naive_iso(ts)
     except Exception:
         return None
 
@@ -674,7 +675,7 @@ def main():
     corpus = open_goal_corpus(all_goals)
     open_corpus_count = len(corpus)
 
-    # Time-windowed completed-goal dedup (6): extend the dedup corpus
+    # Time-windowed completed-goal dedup (): extend the dedup corpus
     # with goals COMPLETED within COMPLETED_DEDUP_WINDOW_DAYS so a gap that was
     # investigated-and-closed does not re-fire every ~4h scan. all_goals already
     # spans mixed status — the active-aspiration read returns completed goals too

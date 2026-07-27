@@ -42,7 +42,7 @@ shopt -s nullglob
 # agents/<name>/local-paths.conf layout is matched. A bare */local-paths.conf is
 # one level relative to PROJECT_ROOT and matched ZERO confs under
 # AGENTS_PARENT_DIR=agents, silently collapsing canonical_roots to {PROJECT_ROOT}
-# and skipping every agent WORLD/META root in the permission audit (4).
+# and skipping every agent WORLD/META root in the permission audit ().
 for conf in "$(agents_root)"/*/local-paths.conf; do
   while IFS='=' read -r key value; do
     value="${value%%$'\r'}"   # strip trailing CR on Windows

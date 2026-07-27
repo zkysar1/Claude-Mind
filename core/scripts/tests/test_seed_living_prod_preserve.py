@@ -213,3 +213,104 @@ def test_plan_report_renders_preserved_under_living_prod(tmp_path):
     assert "preserved" in report
     # No overwrite/keep-dest warning for deployment-local files under the flag.
     assert "KEEP DEST — pass --living-prod" not in report
+
+
+# ── PLAN: skill-dir cruft-sweep is ALWAYS dangerous ( regression) ──
+
+# A cruft pattern that targets a forged-skill dir — the shape that lists
+# .claude/skills/notify-user/ in the live seed manifest (16 of 35 cruft_patterns
+# are .claude/skills/<name>/ dirs stripped from the domain-free seed).
+MANIFEST_WITH_SKILL_CRUFT = {
+    "include": [
+        {"path": "CLAUDE.md", "type": "file"},
+        {"path": ".claude/settings.json", "type": "file"},
+        {"path": "core/base.py", "type": "file"},
+    ],
+    "transformations": [],
+    "cruft_patterns": [".claude/skills/notify-user/"],
+}
+
+
+def _add_unregistered_skill(dest: Path, name: str = "notify-user") -> None:
+    """A forged-skill dir present at dest but ABSENT from dest/world/forged-skills.yaml
+    — the notify-user-at-ZDS shape: a promoted skill dir the dest registry does not
+    list (registration is external/gitignored, so it never traveled with the git
+    promotion). It carries a SKILL.md, so the root-cause-A fix (g-115-2739) protects
+    it by presence — would_delete=False, protection_class='forged-skill'."""
+    sk = dest / ".claude" / "skills" / name
+    sk.mkdir(parents=True)
+    (sk / "SKILL.md").write_text(
+        f"# {name}\ndomain notification transport\n", encoding="utf-8")
+
+
+def test_plan_unregistered_skill_dir_with_skillmd_protected_from_cruft(tmp_path):
+    """Root cause A fix (; supersedes the  flag-as-dangerous
+    behavior). A .claude/skills/<name>/ dir carrying a SKILL.md but ABSENT from
+    the dest registry is now PROTECTED (would_delete=False, protection_class=
+    'forged-skill') even when a cruft pattern matches it — SKILL.md-presence
+    protection, not registry membership (guard-1271). The danger the earlier
+    regression surfaced is ELIMINATED at the source, not merely flagged: the
+    promoted-but-unregistered skill (the notify-user-at-ZDS shape) survives.
+    The real seed-manifest.yaml no longer lists skill dirs as cruft at all
+    (g-115-2739); this custom manifest exercises the engine's defense-in-depth.
+    See test_plan_flags_no_skillmd_skill_dir_cruft_sweep_as_dangerous for the
+    still-flagged case (a skill dir WITHOUT a SKILL.md is not a real skill).
+
+    (Supersedes the retired test_plan_flags_unregistered_skill_dir_cruft_sweep_
+    as_dangerous, which asserted the pre-fix would_delete=True behavior.)"""
+    src = _mk_source(tmp_path)
+    dest = _mk_living_dest(tmp_path)
+    _add_unregistered_skill(dest, "notify-user")   # has a SKILL.md
+
+    plan = _engine.do_plan(src, dest, MANIFEST_WITH_SKILL_CRUFT, living_prod=True)
+    cruft = plan["sections"]["cruft_sweep_deletions"]
+
+    entry = next(c for c in cruft["all"] if c["rel"] == ".claude/skills/notify-user")
+    assert entry["would_delete"] is False                 # SKILL.md protects it
+    assert entry["protection_class"] == "forged-skill"    # recognized via SKILL.md presence
+    # Correctly protected -> NOT in the dangerous list, no false REVIEW from this skill.
+    assert not any(c["rel"] == ".claude/skills/notify-user" for c in cruft["dangerous"])
+
+
+def test_plan_flags_no_skillmd_skill_dir_cruft_sweep_as_dangerous(tmp_path):
+    """ honest-plan coverage, PRESERVED under the  fix. A
+    `.claude/skills/<name>/` dir WITHOUT a SKILL.md is NOT a real skill, so the
+    SKILL.md-presence protection does not cover it. If a cruft pattern would
+    delete it under --living-prod, the plan MUST still surface it as dangerous
+    (skills-prefix clause) — the plan never silently under-reports a skill-dir
+    deletion, even though real (SKILL.md-bearing) skills are now protected."""
+    src = _mk_source(tmp_path)
+    dest = _mk_living_dest(tmp_path)
+    # skill dir with NO SKILL.md — not protected by presence
+    sk = dest / ".claude" / "skills" / "malformed"
+    sk.mkdir(parents=True)
+    (sk / "notes.txt").write_text("no SKILL.md here\n", encoding="utf-8")
+    manifest = dict(MANIFEST_WITH_SKILL_CRUFT)
+    manifest["cruft_patterns"] = [".claude/skills/malformed/"]
+
+    plan = _engine.do_plan(src, dest, manifest, living_prod=True)
+    cruft = plan["sections"]["cruft_sweep_deletions"]
+
+    entry = next(c for c in cruft["all"] if c["rel"] == ".claude/skills/malformed")
+    assert entry["would_delete"] is True                 # no SKILL.md -> not protected
+    assert entry["protection_class"] is None
+    assert any(c["rel"] == ".claude/skills/malformed" for c in cruft["dangerous"])
+    assert plan["verdict"] == "REVIEW REQUIRED"
+
+
+def test_plan_registered_skill_dir_cruft_pattern_not_flagged(tmp_path):
+    """Negative control: a REGISTERED dest forged skill matched by a cruft
+    pattern is protected (would_delete=False) and never enters 'dangerous' —
+    the fix flags only GENUINE skill-dir deletions, no false positives."""
+    src = _mk_source(tmp_path)
+    dest = _mk_living_dest(tmp_path)   # registers domain-thing in dest/world/forged-skills.yaml
+    manifest = dict(MANIFEST_WITH_SKILL_CRUFT)
+    manifest["cruft_patterns"] = [".claude/skills/domain-thing/"]
+
+    plan = _engine.do_plan(src, dest, manifest, living_prod=True)
+    cruft = plan["sections"]["cruft_sweep_deletions"]
+
+    entry = next(c for c in cruft["all"] if c["rel"] == ".claude/skills/domain-thing")
+    assert entry["would_delete"] is False              # registry protects it
+    assert entry["protection_class"] == "forged-skill"
+    assert cruft["dangerous"] == []                    # correctly protected -> not flagged

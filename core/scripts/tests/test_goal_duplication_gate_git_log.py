@@ -84,7 +84,7 @@ def _build_repo(tmp: Path) -> Path:
 
 
 def _check(repo: Path, file_paths):
-    # A/B/C pass {} as the goal — an empty dict never triggers the 3
+    # A/B/C pass {} as the goal — an empty dict never triggers the 
     # completed-Maintain carve-out (status is None), so these cases exercise
     # the file-path matching path. Cases D/E build explicit goal dicts to test
     # the carve-out (which now reads goal.status + goal.title).
@@ -131,7 +131,7 @@ def main() -> int:
             )
 
         # ── D: completed-Maintain goal w/ qualified-path overlap → PASS ────
-        # 3: a status=completed Maintain goal names framework files
+        # : a status=completed Maintain goal names framework files
         # touched by its OWN just-shipped commit in the 48h window — that
         # overlap IS the completion evidence, not duplication. The carve-out
         # (mirroring _check_target_state's  skip) passes it despite
@@ -155,7 +155,7 @@ def main() -> int:
         # ── E: completed NON-Maintain goal w/ overlap → BLOCK (symmetry) ───
         # The carve-out is scoped to Maintain: titles. A completed goal with a
         # different title prefix must STILL block on the same overlap — proves
-        # the 3 skip is Maintain-scoped, not a blanket completed-goal
+        # the  skip is Maintain-scoped, not a blanket completed-goal
         # exemption (run-full-suite testSymmetry discipline).
         nonmaintain_goal = {"status": "completed",
                             "title": "Fix: rewrite widget_xyz.py"}
@@ -168,10 +168,10 @@ def main() -> int:
                 f"passed={re_.get('passed')}"
             )
 
-    # ── F-I: git_log lineage exemption (2) ────────────────────────
+    # ── F-I: git_log lineage exemption () ────────────────────────
     # A follow-up filed from a just-closed goal matches the parent's OWN
     # tagged commit — 5th lineage false-positive shape, observed live when
-    # filing 1 against parent 6's commit e6032338. Build a
+    # filing  against parent 's commit e6032338. Build a
     # second repo whose commit carries the conventional tag.
     with tempfile.TemporaryDirectory() as td:
         repo2 = Path(td) / "repo2"
@@ -216,9 +216,9 @@ def main() -> int:
                 "H: expected PASS on origin_signal-embedded parent id; got "
                 f"passed={rh.get('passed')} reason={rh.get('reason')!r}")
 
-        # I: PREFIX guard — discovered_by  must NOT exempt the
+        # I: PREFIX guard — discovered_by g-888-7 must NOT exempt the
         #  tag (shorter-id-inside-longer-id class, fresh-eyes F1 of
-        # 6); the block must hold.
+        # ); the block must hold.
         ri = goal_duplication._check_git_log(
             {"discovered_by": "g-888-7"},
             {"core/scripts/widget_xyz.py"}, repo2)
@@ -227,11 +227,11 @@ def main() -> int:
                 "I: expected BLOCK — prefix id g-888-7 must not exempt tag "
                 f"g-888-77; got passed={ri.get('passed')}")
 
-    # ── J-O: git_log self-completion demotion (5) ─────────────────
+    # ── J-O: git_log self-completion demotion () ─────────────────
     # A commit whose tag maps to a goal the FILING agent itself completed
     # (per team-state recent_completions) demotes to a visible advisory;
     # partner-completed tags and untagged commits still hard-block. Basis:
-    # 4 telemetry (19 solo git_log attempts / 9 overridden all
+    #  telemetry (19 solo git_log attempts / 9 overridden all
     # verified-FP / 0 demonstrated TPs).
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)

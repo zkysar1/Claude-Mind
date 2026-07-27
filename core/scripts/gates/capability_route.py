@@ -140,6 +140,16 @@ def _load_routing_tables() -> tuple:
 # _load_routing_tables() and reassign the module-level constants.
 TITLE_PREFIX_ROUTES, CATEGORY_ROUTES, DESCRIPTION_HEURISTICS = _load_routing_tables()
 
+# Vertical-ownership override threshold (). A category route to a
+# SPECIFIC active agent at confidence >= this value is treated as DOMAIN-VERTICAL
+# ownership (foxtrot's npc-*/roblox, echo's arc-*, bravo's monitoring lanes) that
+# overrides a DISAGREEING generic work-type title prefix (investigate:/build:/
+# audit:...) — the vertical owner does ALL work-types in their vertical, so a
+# generic 'investigate:'->zeta must not swallow foxtrot's npc-behavior goals.
+# Weaker categories (< threshold: the 'either' framework categories, maintenance
+# 0.65) keep the prior Tier-1-wins behavior. Consumed in _classify Tier 2.
+CATEGORY_VERTICAL_OVERRIDE_CONF = 0.75
+
 
 def _route_covered_agents() -> set:
     """Agent names appearing as a route target in ANY table (title prefix,
@@ -231,6 +241,26 @@ def _classify(title: str, category: str, description: str) -> dict:
         elif best_agent in active and cat_agent == best_agent:
             # Reinforcing — bump confidence
             best_conf = min(0.95, best_conf + 0.05)
+        elif (best_agent in active and cat_agent in active
+              and cat_agent != best_agent
+              and cat_conf >= CATEGORY_VERTICAL_OVERRIDE_CONF):
+            # Vertical-ownership override (). A high-confidence
+            # domain-vertical category (foxtrot's npc-*/roblox, echo's arc-*,
+            # bravo's monitoring lanes) represents DOMAIN ownership that a
+            # GENERIC work-type title prefix (investigate:/build:/audit:...)
+            # must not override — the vertical owner does ALL work-types in
+            # their vertical. Symmetric to the Tier-3 high-delta override
+            # below. Before this branch, 'investigate:'->zeta (Tier 1, 0.88)
+            # silently swallowed foxtrot's npc-behavior 'Investigate:' goals,
+            # causing cross_lane_refused on every foxtrot claim attempt.
+            prev_agent = best_agent
+            best_agent = cat_agent
+            best_conf = max(cat_conf, best_conf)
+            rationale_parts.append(
+                f"  (OVERRIDE {prev_agent}->{cat_agent}: vertical category "
+                f"conf {cat_conf} >= {CATEGORY_VERTICAL_OVERRIDE_CONF} "
+                f"outranks generic title prefix)"
+            )
 
     # Tier 3: description heuristic biases
     for phrase, agent, delta, why in DESCRIPTION_HEURISTICS:
@@ -242,7 +272,7 @@ def _classify(title: str, category: str, description: str) -> dict:
             elif best_agent == agent:
                 best_conf = min(0.95, best_conf + delta)
             elif best_agent in active and agent != best_agent:
-                # Tier 3 high-delta override (4): a high-conviction
+                # Tier 3 high-delta override (): a high-conviction
                 # description heuristic (delta >= 0.30) overrides a *low-confidence*
                 # Tier 1/2 signal (best_conf < 0.85). At/above 0.85 the stronger
                 # Tier 1/2 signal still wins (kept path) — without the confidence

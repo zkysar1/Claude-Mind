@@ -44,7 +44,7 @@ _SUPERSEDE_CHECK_SECONDS = 10
 # OWNCLOUD_SYNC_INTERVAL to override.
 _OWNCLOUD_SYNC_DEFAULT_INTERVAL = 120
 
-# 8 Gap A: every Nth push-sweep cycle, ALSO run the PULL half
+#  Gap A: every Nth push-sweep cycle, ALSO run the PULL half
 # (owncloud_sync.pull_sweep) so peer-side S3 advances reach this box's local
 # mirror for raw-read consumers (bare-bash world/scripts execs, grep/Read of
 # tree .md) that never touch the backend read-through. A pull tick is one flat
@@ -295,7 +295,7 @@ def _ensure_owncloud_roots(project_root: Path) -> None:
     # test/throwaway agent dir (e.g. _gate_test_throwaway_agent_) sorts BEFORE
     # real agents; if its conf lacks WORLD_PATH, resolve(None) raises — and the
     # prior silent fail-open then served own-cloud with NO roots, 500ing every
-    # governed-path op (9). Skip `_`-prefixed dirs and try each real
+    # governed-path op (). Skip `_`-prefixed dirs and try each real
     # agent; the first that resolves wins.
     candidates = [c.parent.name
                   for c in sorted(resolver._agents_root().glob("*/local-paths.conf"))
@@ -408,8 +408,8 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
                 # ConflictError (owncloud_sync.py:695), NOT divergence. Mirrors the
                 # already-honest CLI summary at owncloud_sync.py:1437. Gate on
                 # diverged_skipped too, so a tick with only divergence-skips (no push)
-                # still reports instead of staying silent. (3)
-                # stale-pull (8 Gap B) added: own-cloud heals
+                # still reports instead of staying silent. ()
+                # stale-pull ( Gap B) added: own-cloud heals
                 # local==baseline+S3-moved caches instead of skipping them.
                 if (stats.get("pushed") or stats.get("errors")
                         or stats.get("conflicts") or stats.get("diverged_skipped")
@@ -426,7 +426,7 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
             except Exception as e:  # noqa: BLE001 — a bad tick never kills the thread
                 print(f"[owncloud-sync] sweep error (retry next tick): {e}",
                       file=sys.stderr)
-            # 8 Gap A: every Nth cycle, run the PULL half so peer S3
+            #  Gap A: every Nth cycle, run the PULL half so peer S3
             # advances reach this box's mirror for raw-read consumers. Cheap on
             # a quiescent fleet (flat LIST per root + local ETag pre-filter);
             # fail-open — a bad pull tick never kills the thread.
@@ -542,6 +542,24 @@ def main(argv=None) -> int:
     # mind-api-start.sh --restart). Gated on own-cloud, so local mode is
     # untouched. See _ensure_owncloud_roots.
     _ensure_owncloud_roots(project_root)
+
+    # : state the RESOLVED backend outright, every start. Until now the
+    # only way to tell from spawn.log which backend a daemon came up on was the
+    # SIDE EFFECT of the "own-cloud mirror sweep thread started" line, which
+    # prints ONLY on the own-cloud path — so a local-only start looked identical
+    # to an own-cloud start whose log had not yet reached that point. That proxy
+    # is why the 2026-07-26 flip (28 of 49 starts local-only, ~8 encodings
+    # stranded) could only be reconstructed by mining a discriminator after the
+    # fact. Printed AFTER _apply_environment_registry + _ensure_owncloud_roots so
+    # it reports the value actually in force. Reads env rather than calling
+    # get_backend() on purpose: constructing the backend here would move that
+    # side effect earlier in startup.
+    print(
+        "[runtime] resolved STORAGE_BACKEND="
+        f"{os.environ.get('STORAGE_BACKEND') or '<unset->local>'}"
+        f" ENVIRONMENT_ID={os.environ.get('ENVIRONMENT_ID') or '<unset>'}",
+        file=sys.stderr,
+    )
 
     # Acquire spawn lock BEFORE the alive-check so concurrent rt_spawn calls
     # serialize. The second caller sees the live daemon written by the first

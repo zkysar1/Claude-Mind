@@ -25,14 +25,14 @@ from ..yaml_cache import cache
 
 # Shared sharding helper (core/scripts lands on sys.path via the file_locks
 # import above — the ordering is load-bearing; isolated import breaks without
-# it (rb-3868 / 7). Single source of truth for row composition;
+# it (rb-3868 / ). Single source of truth for row composition;
 # guard-742 parity by construction.
 from _team_state import compose_state  # noqa: E402
 
 
 # Mirrored from team-state.py EMPTY_STATE. When that schema gains a key,
 # mirror here. Field-set parity cross-checked by
-# core/scripts/tests/test_daemon_cli_mirror_parity.py (4).
+# core/scripts/tests/test_daemon_cli_mirror_parity.py ().
 _EMPTY_STATE_DEFAULTS = {
     "last_updated": None,
     "last_updated_by": None,
@@ -48,7 +48,7 @@ _EMPTY_STATE_DEFAULTS = {
     "agent_status": {},
     "critical_blockers": [],
     # Mirror of team-state.py inbox_alert_backlog (); null when zero
-    # matching goals. 9: this daemon mirror lagged the CLI schema add,
+    # matching goals. : this daemon mirror lagged the CLI schema add,
     # so daemon writes dropped the trailing key vs the CLI (byte-compat drift).
     "inbox_alert_backlog": None,
 }

@@ -28,6 +28,16 @@ Two hard properties for the retrieval hot path:
 import os
 from pathlib import Path
 
+# : put the per-box vendored encoder stack on sys.path. Defensive by
+# design — this module's contract is that the retrieval path never raises, and a
+# module-level ImportError would fire BEFORE cosine_scores' own guard exists and
+# break every importer. On failure we simply keep the pre-vendor behavior: numpy
+# stays unavailable, cosine_scores returns {}, callers fall back to token-overlap.
+try:
+    import _vendor_path  # noqa: F401
+except Exception:  # pragma: no cover - sibling dir not importable
+    pass
+
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -35,6 +45,36 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INDEX_DIR = SCRIPT_DIR.parent.parent / "mind_api" / "state" / "retrieval-embedding-index"
 MODEL_NAME = "all-MiniLM-L6-v2"  # fallback for meta.json without a model field
+
+# Test seam (). A caller that does NOT pass index_dir gets the real
+# per-box index — correct in production, a HERMETICITY HOLE under test: a test
+# can redirect GUARD_PATH/RB_PATH to a tmp store, but retrieve.py's
+# `_embedding_blend` calls `cosine_scores(query)` with no index_dir, so the
+# widen pass scores tmp-seeded records against PRODUCTION embeddings and pulls
+# in any real ID above embedding_min_cosine.
+#
+# Measured 2026-07-27: test_load_guardrails_filters_by_category seeds a tmp
+# guard-001/002/003 and asserts {guard-002}; the real index scores the
+# UNRELATED real "guard-001" at 0.588 vs "framework-architecture" (threshold
+# 0.35), so guard-001 was widened in and the assert failed. That test had
+# passed for 17 days only because the index named a model that could not load
+# — cosine_scores returned {} and the blend silently no-opped. The moment the
+# channel was repaired the latent breach surfaced. conftest.py points this at
+# a nonexistent dir so every test is hermetic by default; a test wanting the
+# blend passes index_dir= explicitly or monkeypatches cosine_scores.
+#
+# Resolved at CALL time, never bound as a def-time default: conftest sets the
+# env at import, and a def-time default would capture the value before that,
+# making the seam silently inert.
+_INDEX_DIR_ENV = "MIND_EMBEDDING_INDEX_DIR"
+
+
+def _resolve_index_dir(index_dir):
+    """Explicit arg wins; else the env seam; else the real per-box index."""
+    if index_dir is not None:
+        return Path(index_dir)
+    env = os.environ.get(_INDEX_DIR_ENV)
+    return Path(env) if env else DEFAULT_INDEX_DIR
 
 _encoders = {}  # model_name -> encoder adapter (see _embedding_model)
 _index_cache = {}  # str(index_dir) -> (mtime_ns, embeddings float32, id_list, model_name)
@@ -51,10 +91,10 @@ def _get_model(model_name=MODEL_NAME):
     return enc
 
 
-def index_available(index_dir=DEFAULT_INDEX_DIR):
+def index_available(index_dir=None):
     """True iff both index files exist. Cheap presence check for the hybrid flag
     gate — retrieve.py calls this before deciding whether to attempt cosine."""
-    d = Path(index_dir)
+    d = _resolve_index_dir(index_dir)
     return (d / "embeddings.npy").exists() and (d / "meta.json").exists()
 
 
@@ -86,7 +126,7 @@ def _load_index(index_dir):
     return emb, ids, model_name
 
 
-def cosine_scores(query, index_dir=DEFAULT_INDEX_DIR):
+def cosine_scores(query, index_dir=None):
     """{doc_id: cosine_similarity} for `query` against the persisted index.
 
     Returns {} (graceful degrade — caller falls back to token-overlap) when the
@@ -96,7 +136,7 @@ def cosine_scores(query, index_dir=DEFAULT_INDEX_DIR):
     if not query or not isinstance(query, str):
         return {}
     try:
-        emb, ids, model_name = _load_index(index_dir)
+        emb, ids, model_name = _load_index(_resolve_index_dir(index_dir))
         if emb is None or emb.shape[0] == 0 or not ids:
             return {}
         enc = _get_model(model_name)

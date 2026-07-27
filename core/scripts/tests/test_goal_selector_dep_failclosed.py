@@ -1,4 +1,4 @@
-"""test_goal_selector_dep_failclosed.py — 4 regression.
+"""test_goal_selector_dep_failclosed.py —  regression.
 
 Hardens the dependency_timeout fail-open in goal-selector.py's collect_candidates
 and collect_blocked. BEFORE this fix, a pending goal with unmet blocked_by was
@@ -238,7 +238,7 @@ def test_no_blocked_by_is_selectable():
 
 def test_prefix_leak_shape_now_closed():
     # g-1337..1340 carried blocked_since aged ~66h > 48h above still-pending root
-    # 6 and leaked as executable. Reproduce: aged blocked_since + LIVE
+    #  and leaked as executable. Reproduce: aged blocked_since + LIVE
     # root dep -> must stay blocked now.
     asp = _asp([
         _goal("g-root", status="pending"),                      # design root, live

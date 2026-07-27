@@ -3057,3 +3057,30 @@ it is dead (never pulled, never updated) and is NOT evidence the file syncs.
 Removing the exclusion entry silently re-arms cross-box changelog clobber.
 
 45. **Static**: `grep -q '"changelog.jsonl"' core/scripts/owncloud_sync.py` — the exact-basename exclusion survives in `_EXCLUDE_NAMES`. Verified by g-115-2385.
+
+## BR14. aspirations-query Six-Key Projection — Guards Reading Beyond It Need `--full` (g-115-3127)
+
+`aspirations-query.sh` returns exactly SIX keys by default — `asp_id`, `category`,
+`goal_id`, `source`, `status`, `title`. Every other field (`claimed_by`,
+`defer_reason`, `blocked_by`, `blocker_ref`, `id`, `participants`) is absent unless
+`--full` is passed, which widens the projection to 88 distinct keys. A guard that
+tests an absent field reads null on EVERY record and inverts silently:
+
+- felt-sense Phase 2's Multi-Agent Safety Rule — added *after* the g-115-683
+  partner-race incident — concluded "claimed_by is null → safe to mutate" for
+  partner-claimed goals, i.e. the guard was inert against the exact race it was
+  written to prevent.
+- felt-sense Phase 3 classified every blocked goal as having no recorded block
+  reason, silently contradicting the authoritative `reason-less-blocked-check.sh`.
+- `aspirations-graceful-stop`'s orphan-revert referenced `goal.id` while the
+  projection returns `goal_id`, so the revert could pass an empty goal-id to a
+  status mutation.
+
+Measured 2026-07-25: `claimed_by` present on 0/190 records without `--full`, 8/190
+with it. Dedup probes that only test result-COUNT through a server-side
+`--goal-field` filter correctly do NOT need `--full` (the filter runs before the
+projection). This is the rb-245 discipline applied to a query projection: verify the
+field is in the schema before believing it is null.
+
+46. **Static**: `grep -q 'Bash: aspirations-query.sh --goal-status in-progress --full' .claude/skills/felt-sense-checkin/SKILL.md && grep -q 'Bash: aspirations-query.sh --goal-status blocked --full' .claude/skills/felt-sense-checkin/SKILL.md` — felt-sense Phases 2 and 3 keep `--full`, so the `claimed_by` and `defer_reason`/`blocker_ref` guards stay live. Anchored on the `Bash:` code line, not surrounding prose (guard-1099). Verified by g-115-3127.
+47. **Static**: `grep -q 'Bash: aspirations-query.sh --goal-status in-progress --full' .claude/skills/aspirations-graceful-stop/SKILL.md` — the orphan-revert loop keeps `--full`, so `goal.id` resolves instead of mutating with an empty id. Verified by g-115-3127.

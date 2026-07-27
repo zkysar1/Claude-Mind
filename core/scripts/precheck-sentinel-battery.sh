@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # precheck-sentinel-battery.sh — thin wrapper for precheck-sentinel-battery.py
-# (3). One call enumerating all precheck force-gate sentinels; see
+# (). One call enumerating all precheck force-gate sentinels; see
 # the .py docstring. Fail-open by design: the battery must never block the
 # loop, so any wrapper-level failure still exits 0 with a structured line
 # (guard-614).

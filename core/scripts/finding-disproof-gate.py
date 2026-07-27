@@ -76,7 +76,7 @@ CAUSAL = [
 # exactly backwards: this gate exists to force disconfirmation, and a retraction
 # IS the disconfirmation. It is also the single most important message an agent
 # can send — never make it harder to withdraw a false claim than to make one.
-# (Found by fresh-eyes-code on this gate's own first review, 6.)
+# (Found by fresh-eyes-code on this gate's own first review, .)
 RETRACTION = [
     r"\bretraction\b", r"\bi retract\b", r"\bretracting\b", r"\bretracted\b",
     r"\bwas (?:wrong|false)\b", r"\bis (?:wrong|false)\b.{0,40}\b(?:claim|finding)\b",

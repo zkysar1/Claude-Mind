@@ -1,4 +1,4 @@
-"""Unit tests for the 1 TEAM-layer negative-diff self-heal in
+"""Unit tests for the  TEAM-layer negative-diff self-heal in
 fresh-eyes-cadence-check.py.
 
 Sibling of the g-115-1936 per-agent guard (test_fresh_eyes_cadence_negative_diff.py).
@@ -140,7 +140,7 @@ def test_negative_team_diff_write_failure_noops(mod, monkeypatch, capsys):
 
 
 def test_team_diff_positive_below_cadence_takes_existing_noop(mod, monkeypatch, capsys):
-    """0 <= team_diff=15 < 25 → 8 noop path, NO daemon write."""
+    """0 <= team_diff=15 < 25 →  noop path, NO daemon write."""
     _wire(
         monkeypatch, mod,
         current=100, current_world=80,

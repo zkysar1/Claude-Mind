@@ -68,7 +68,7 @@ unset _RFILE _RSIZE _RTMP
 # --- Read stdin ONCE (sole Stop hook — no stdin sharing, no race) ---
 STDIN_JSON=$(cat)
 
-# --- Resolve a working Python launcher ONCE (5, rb-370/guard-335) ---
+# --- Resolve a working Python launcher ONCE (, rb-370/guard-335) ---
 # Every $PY site below (SID extraction at line 75 first, then insight capture,
 # body-manifest, trailing-text detector, decision payload, timing) used a BARE
 # `py -3`. On any Linux host with NO `py` shim (foxtrot 2026-07-14: WSL/Ubuntu,
@@ -97,7 +97,7 @@ HOOK_SID=$(printf '%s' "$STDIN_JSON" | $PY -c "import sys,json; print(json.load(
 # Can't identify this session — don't risk blocking the wrong window
 if [ -z "$HOOK_SID" ]; then
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=no-sid" >> "$LOG" 2>/dev/null || true
-    # LOUD degradation signal (4). gate=no-sid = the SID could not be
+    # LOUD degradation signal (). gate=no-sid = the SID could not be
     # extracted, so the stop hook (the loop's life support) is a NO-OP this fire
     # and CANNOT force the Skill(aspirations) re-entry — the loop dies silently
     # on its next text-only turn-end (foxtrot 2026-07-14 ran dead for HOURS this
@@ -106,7 +106,7 @@ if [ -z "$HOOK_SID" ]; then
     # session-signal file, because the agent is UNRESOLVABLE here — resolution
     # needs the very SID we just failed to extract. Does NOT change the
     # fail-open ALLOW (blocking the wrong window is the worse hazard — HARD
-    # CONSTRAINT of 4); it only makes the silent degradation loud.
+    # CONSTRAINT of ); it only makes the silent degradation loud.
     echo "[stop-hook] DEGRADED gate=no-sid: session_id could not be extracted from the Stop event — the stop hook is a NO-OP this fire and CANNOT keep the autonomous loop alive; the loop will die on its next text-only turn-end with no other alarm. Likely cause: no Python launcher (py/python3) resolvable in the hook env, or malformed Stop-event JSON. Fix the launcher / hook env (see g-115-2205, g-115-2204)." >&2
     exit 0
 fi
@@ -271,7 +271,7 @@ export MIND_AGENT="$HOOK_AGENT"
 # --- Gate 1: Not RUNNING → allow stop ---
 STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
 if [ "$STATE" != "RUNNING" ]; then
-    # SG-c (8-c): the runner session is ending. A graceful /stop sets
+    # SG-c (-c): the runner session is ending. A graceful /stop sets
     # IDLE at D1 BEFORE stop-loop at D2, so THIS not-RUNNING gate — not Gate 2 —
     # is the allow-path that actually fires on a graceful stop (and it also
     # covers a crash/recovery-to-IDLE end). Before allowing the stop, roll any

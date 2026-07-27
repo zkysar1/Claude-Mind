@@ -668,7 +668,7 @@ def _propose_new_interval(goal: dict, cfg: dict) -> float | None:
     would have written. Single source of truth — DO NOT hardcode numbers
     here. Returns None if we lack the data to propose.
     """
-    # 9: review-ritual recurring goals (fresh-eyes / felt-sense / l1-skew /
+    # : review-ritual recurring goals (fresh-eyes / felt-sense / l1-skew /
     # curriculum cadences, strategic-scan) fire at a DELIBERATE cadence — a routine
     # "nothing to report" close IS their value, not a signal to stretch the interval.
     # An explicit calibration_exempt flag opts a goal out of auto-extension entirely,
@@ -682,7 +682,7 @@ def _propose_new_interval(goal: dict, cfg: dict) -> float | None:
     cap_ratio = float(cfg.get("cap_ratio", 3.0))
     # original_interval_hours is now persisted at the aspirations.py update-goal
     # chokepoint on EVERY interval_hours write — per-goal, BATCH-CALIBRATE, and
-    # MANUAL apply paths alike (9 anchor-write fix). So the `or interval_h`
+    # MANUAL apply paths alike ( anchor-write fix). So the `or interval_h`
     # fallback below is now only a legacy-goal safety net (goals last extended before
     # the chokepoint fix), NOT the unbounded-ratchet hole it used to be: fresh
     # extensions always read a real anchor, so cap = cap_ratio x TRUE original and
@@ -709,7 +709,7 @@ def _recent_audit_all_batch(hours: float) -> bool:
     if hours <= 0:
         return False
     cutoff = datetime.now() - timedelta(hours=hours)
-    # 9: scan world + EVERY agent queue (not just the current agent). The
+    # : scan world + EVERY agent queue (not just the current agent). The
     # batch goal files to world () by default, so the world scan already dedups
     # cross-agent for the common path; enumerating all agent queues via discover_agents()
     # closes the rare fallback where  is absent and the batch lands in one agent's
@@ -878,7 +878,7 @@ def cmd_audit_all(args, cfg) -> int:
         # Tag agent-side rows with owning agent so calibrators know which
         # agent's queue holds the data (). World rows stay
         # unchanged: shared queue, no owning agent.
-        # Scope column (8 / guard-762): make the apply policy explicit
+        # Scope column ( / guard-762): make the apply policy explicit
         # so the claiming agent does not have to infer ownership from the label.
         # world queue -> "shared" (any claimer may direct-apply); agent queue ->
         # "owned:<agent>" (the owner direct-applies; another claimer must
@@ -1076,7 +1076,7 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
     floor = original * floor_ratio
     above_floor = proposed >= floor
 
-    # Cadence-aware contract suppression (0, regime-c detector fix).
+    # Cadence-aware contract suppression (, regime-c detector fix).
     # For selection-gated goals on a busy loop, the ACTUAL firing cadence is
     # set by selector competition, not the timer — contracting interval_hours
     # cannot raise the firing rate (inert) and only manufactures streak-break

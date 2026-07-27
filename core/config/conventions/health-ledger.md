@@ -176,6 +176,20 @@ checks `meta/evolution-log.jsonl` for a meta-strategy change inside the window
 (so the revert pipeline never fights the evolution engine). **No revert is
 executed in Phase 2** — the system reports candidates only.
 
+**Interval marker survives counter resets.** The every-N-goals gate compares the
+latest record's `iteration` against a persisted `agents/<agent>/health/.last-check`
+marker. `iteration` is a PER-SESSION counter that restarts low each session while
+the marker persists across sessions, so a marker written late in one session sits
+ABOVE the next session's counter; the difference goes negative, a negative is
+always `< interval`, and the detector returns not-elapsed on every call until the
+counter climbs back past the stale value. `health-regression-check.py` therefore
+treats `marker > cur_iter` as a counter reset — it logs to stderr, re-arms, and
+re-anchors the marker to the live counter, self-healing once per reset. Do NOT
+"simplify" this back to the bare `last >= 0` guard: that form defends a MISSING
+marker but not an UNREACHABLE one, and left 4 of 5 agents' detectors silently
+dark for days (g-115-3125). The failure is invisible in the verdict string — 
+`interval not elapsed (-299/10)` reads like ordinary waiting.
+
 ---
 
 ## 9. Change attribution (Phase 2)
@@ -230,6 +244,25 @@ than 30 days, so the windowed form would under-count days and the 30-day gate
 would never trip. The gate is monotonic on an append-only ledger — once
 satisfied it never reverses — so the full scan runs each sweep only until the
 first crossing, then short-circuits (see the marker below).
+
+**One definition, two consumers.** `calibrated` gates BOTH halves of the
+subsystem — detection (`health-regression-check.py`) and revert
+(`health-revert.py`, whose `route_candidate` calls `mode == full AND calibrated`
+the master safety gate). Both MUST read it through
+`_health_ledger.calibration_state(health_dir, min_days, min_records)`, the single
+definition: `.calibrated` marker short-circuit, else the full-history AND-gate.
+Neither may recompute it locally. They did once, and drifted: the revert half
+used `calibration_progress(recent_records(d, 200))` — exactly the bounded window
+this section forbids — so it read False on every PRODUCTIVE agent (the more
+health evidence an agent generated, the more permanently its revert authority
+stayed locked) while detection read True. Measured on one agent 2026-07-26:
+windowed 6 days/200 records → False; full history 43 days/1150 records → True,
+with `mode: full` already granted. The capability was dead while the framework
+reported it live. Regression-guarded by
+`test_health_regression_check.py::TestCalibrationAgreesAcrossEntryPoints`, which
+asserts both halves agree on one fixture AND that the revert half still routes
+through the shared helper (g-115-3125). The marker WRITE stays with detection,
+which owns the fires-exactly-once `calibration_just_completed` edge.
 
 **Calibration-complete trigger (fires exactly once).** `health-regression-check.py`
 evaluates the gate in EVERY mode (including `collect-only`, before the mode
@@ -323,6 +356,7 @@ Write/Edit tools the L1 hook governs.
 | iteration-close wiring | `core/scripts/iteration-close.sh` (`do_productivity_check` tail — runs after the productivity snapshot is written, fail-open) | 1 |
 | Daemon endpoints (read paths only) | `mind_api/src/endpoints/` — reconsidered in Phase 2 for detection/attribution/query reads; collection (append) is a direct local write, no endpoint needed | 2 |
 | Correlation seed | `core/config/aspirations.yaml` → `health_regression.signal_file_correlation` (folded into config, not a standalone `meta/` file — single SoT + avoids the L1 new-top-level gate) | 1 |
+| Shared ledger-read SSOT | `core/scripts/_health_ledger.py` — every ledger read (`recent_records`, `latest_nonwarmup`, `consecutive_below_baseline`, `full_calibration_progress`) plus `calibration_state`, the ONE definition of `calibrated` that both the detection and revert halves must call (§10) | 1 |
 | Detection sweep | `core/scripts/health-regression-check.{py,sh}` | 2 |
 | Attribution engine | `core/scripts/health-attribution.{py,sh}` | 2 |
 | Baseline ratchet | `meta/audit-baselines.yaml` `health_composite` + `health-composite-ratchet.{py,sh}` | 2 |

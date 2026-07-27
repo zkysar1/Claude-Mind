@@ -38,6 +38,7 @@ import sys
 from pathlib import Path
 
 from _gate_log import log as _gate_log
+from _git_state_absence_patterns import GIT_STATE_ABSENCE_PATTERNS
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_ROOT = SCRIPT_DIR.parent
@@ -98,6 +99,11 @@ _TRIGGER_PATTERNS = [
     re.compile(r"\bno (response|route) (from|to)\b", re.IGNORECASE),
     re.compile(r"\bport (\d+ )?(closed|refused|not listening)\b", re.IGNORECASE),
     re.compile(r"\bDNS (lookup|resolution) (failed|failure)\b", re.IGNORECASE),
+    # Git-state-absence negation family () — now sourced from the shared
+    # _git_state_absence_patterns module (), splatted here so both gates
+    # share ONE definition instead of a hand-synced duplicate. Maps to
+    # verify-before-assuming.md "Capability-Absence Claims".
+    *GIT_STATE_ABSENCE_PATTERNS,
 ]
 
 

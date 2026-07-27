@@ -1,4 +1,4 @@
-"""5: pin the daemon-code boundary to the daemon's REAL import surface.
+""": pin the daemon-code boundary to the daemon's REAL import surface.
 
 core/scripts/mind-api-code-changed.sh is the SINGLE SOURCE OF TRUTH for "did the
 daemon's code change?" — three callers (post-commit, post-merge, _runtime.sh
@@ -63,7 +63,7 @@ KNOWN_OVER_INCLUSIONS = {"experience"}
 def _imported_names(path: Path) -> set[str]:
     """Every top-level module name imported anywhere in this file, ANY AST depth."""
     out: set[str] = set()
-    # D2 (0): FAIL LOUD on parse/read error — do NOT swallow into an
+    # D2 (): FAIL LOUD on parse/read error — do NOT swallow into an
     # empty set. An empty return UNDER-approximates the surface (fewer modules ->
     # smaller pathspec passes -> fewer restarts -> STALE daemon code), inverting
     # the predicate's own fail-toward-restart contract (mind-api-code-changed.sh
@@ -169,7 +169,7 @@ def _covered(mod: str, entries: set[str], dir_entries: set[str] | None = None) -
         return True  # the 'core/scripts/_*.py' glob
     if "/" in mod:
         # a package member like 'gates/goal_duplication' — covered IFF its package
-        # DIRECTORY is a pathspec entry (D1(b), 0: MEMBERSHIP, not a
+        # DIRECTORY is a pathspec entry (D1(b), : MEMBERSHIP, not a
         # filesystem check. The pre-fix `(SCRIPTS/'gates'/f'{mod}.py').exists()`
         # returned True even after the dir was deleted from the pathspec, so the
         # mutation "delete core/scripts/gates" still passed 9/9).
@@ -241,7 +241,7 @@ def test_historical_gaps_stay_covered(mod: str):
 
 
 def test_gate_evaluators_are_in_the_surface():
-    """D1(a) 0: every core/scripts/gates/*.py evaluator must appear in the
+    """D1(a) : every core/scripts/gates/*.py evaluator must appear in the
     computed surface. The daemon imports all 16 EAGERLY (aspirations_write.py). Pre-fix,
     daemon_import_surface() resolved `from gates.X import Y` to a `gates.py` FILE that
     does not exist and dropped every one — so the gates half of the boundary pinned
@@ -258,7 +258,7 @@ def test_gate_evaluators_are_in_the_surface():
 
 
 def test_gates_pin_is_membership_not_filesystem():
-    """D1(b) 0 mutation regression: the gates dir entry must be enforced by
+    """D1(b)  mutation regression: the gates dir entry must be enforced by
     pathspec MEMBERSHIP, not filesystem existence. Simulate the pathspec WITHOUT
     `core/scripts/gates` and assert coverage goes RED for every gate module. Pre-fix,
     _covered consulted the filesystem, so deleting the entry still passed 9/9 — the
@@ -277,7 +277,7 @@ def test_gates_pin_is_membership_not_filesystem():
 
 
 def test_imported_names_fails_loud_on_parse_error(tmp_path):
-    """D2 0: a parse/read error must RAISE, not silently return {}. An empty
+    """D2 : a parse/read error must RAISE, not silently return {}. An empty
     set UNDER-approximates the surface (fewer modules -> smaller pathspec passes ->
     stale daemon code), inverting the predicate's fail-toward-restart contract."""
     bad = tmp_path / "broken.py"

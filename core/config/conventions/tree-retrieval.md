@@ -214,7 +214,7 @@ and for semantic matching (choosing which node fits a category).
 | `tree-update.sh --remove-child <parent> <child>` | Deregister child + update parent | — |
 | `tree-update.sh --increment <key> <field>` | Atomic increment of numeric field | — |
 | `tree-find-node.sh --text <text> [--top N] [--leaf-only]` | Find best-matching node(s) for text query | — |
-| `tree-read.sh --summary` | Compact tree: keys, file paths, summaries, depth, capability, confidence, children | — |
+| `tree-read.sh --summary` | Compact tree: keys, file paths, summaries, depth, capability, confidence, children. Omits the utility block (`retrieval_count`, `last_retrieved`, `times_helpful`, `times_noise`, `utility_ratio*`, `poignancy`) — read `_tree.yaml` for those; `.get("retrieval_count", 0)` against this projection silently returns 0 for every node (g-115-3274) | — |
 | `tree-update.sh --batch` | Batch set/increment/add-child/remove-child/propagate (one parse/write cycle) | JSON |
 | `tree-propagate.sh <node-key>` | Propagate confidence up parent chain, detect capability changes | — |
 

@@ -1,4 +1,4 @@
-"""Tests for self-assess-and-decide.sh confirming-vs-drift discriminator (0).
+"""Tests for self-assess-and-decide.sh confirming-vs-drift discriminator ().
 
 The script weights `self_evolution_signals_count` for the act_later gate. Before
 g-115-1680 the weight was the RAW count, so a high count of CONFIRMING signals
@@ -47,7 +47,7 @@ def test_legacy_no_fraction_field_unchanged():
 
 
 def test_incident_high_confirming_fraction_downweights_to_no_change():
-    """The 0 incident: evo=5 with 80% confirming -> effective 1.0 < 2."""
+    """The  incident: evo=5 with 80% confirming -> effective 1.0 < 2."""
     d = _decide({**_QUIET, "self_evolution_signals_count": 5,
                  "confirming_signal_fraction": 0.8})
     assert d["decision"] == "no_change"

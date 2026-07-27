@@ -173,6 +173,72 @@ alongside Q5 on the controlled runner; if unfavorable, options are a longer
 delay (trades common-case latency) or a mid-long-goal re-arm checkpoint (more
 surface). Documented here so the residual is explicit, not silent.
 
+## The resurrection-death gap and the re-arm-first fix (rb-4345 / g-115-2771, 2026-07-19)
+
+Q5's fail-safe reasoning ("worst case is a SLOW loop, never a dead one") rested
+on an unstated assumption: that the resurrected turn RE-ARMS the net before it
+can die again. That assumption has a hole. The net is a SINGLE replace-slot
+wakeup, and FIRING it consumes it, so a resurrected turn begins with **no net
+armed** — it is protected again only once its own terminal-pair re-arms at
+iteration close. If the resurrected turn text-dies BEFORE reaching that close,
+the single net is already spent and nothing remains to resurrect the loop — a
+SECOND silent death with no third net.
+
+This is not hypothetical. On 2026-07-19 (cc-04, SID aae8287f, rb-4345): a turn
+text-died at 23:57; the deadman wakeup fired at 00:00:40 and resurrected the
+loop (the net worked exactly as designed); but the resurrected turns text-died
+again between 00:00 and 00:04 during an Anthropic API storm — 529 Overloaded /
+ECONNRESET / request timeouts made the first tool calls fail, and the model
+narrated the failures instead of re-entering the loop — WITHOUT re-arming. The
+single replace-slot net was already spent by its own firing, so no further
+wakeup existed. The loop stayed dead ~7h until the SessionStart recovery-gate
+zombie-recovery flipped it IDLE at 07:18.
+
+The failure mode is WORSE than the original single death the terminal-pair was
+built to net, because the condition that killed the loop the first time is often
+the SAME condition still active when the 600s resurrection fires: an API storm
+lasts minutes, the resurrection latency is 600s, so the resurrected turn is
+statistically LIKELY to die the same way — and by then the net is already gone.
+
+**Fix (g-115-2771): re-arm FIRST on resurrection.** On a
+`<<autonomous-loop-dynamic>>` wakeup firing, the resurrected turn's FIRST tool
+call MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
+delaySeconds=600)` re-arm — restoring the net BEFORE any loop-entry work that
+could fail — THEN proceeding to Phase -1.5. This converts "death during
+resurrection" from a terminal silent death into at most one more 600s
+resurrection cycle: each resurrection re-establishes the net that protects the
+NEXT resurrection, so the loop keeps getting chances for as long as the API
+storm persists, instead of spending its one-and-only net on the first
+resurrection.
+
+Why this does NOT reintroduce the "arm early" mechanic F2 rejected (see "Why the
+terminal-PAIR" above): F2 rejected arming early in a STEADY-STATE iteration,
+where the arm is turn-terminal and would TRUNCATE the multi-turn iteration
+before its work completed. The resurrection re-arm is different in kind — it is
+a one-shot net-restoration at the very START of a resurrection turn whose ONLY
+job is to re-establish the net the firing consumed; the iteration then proceeds
+normally and its terminal-pair re-arm at close simply REPLACES this restoration
+arm (double-arm is harmless under replace-slot semantics). The steady-state
+terminal-pair is unchanged.
+
+Relationship to Q6 (long-iteration death): Q6 is about the net being OVERDUE
+while the session is BUSY; this gap is about the net being SPENT while the
+session is idle-then-resurrected. They are independent residuals — the
+re-arm-first fix closes THIS one regardless of Q6's resolution.
+
+Detective coverage (Layer C): `core/scripts/aspirations-rejection-audit.py` now
+flags `resurrection_risk` by arm CADENCE — a gap between consecutive
+deadman-sentinel arms exceeding 1h (longer than any legitimate iteration, so the
+net went un-re-armed far too long) that ALSO contains a structured API-error
+event (`isApiErrorMessage`). That is the exact 2026-07-19 signature; run over the
+default 24h window on cc-04 it flags precisely the incident gap (23:38 → 07:32,
+3 API errors) and nothing else. The structured-error requirement discriminates a
+storm-death from a legitimate /stop idle period; event density is deliberately
+NOT used — a storm-death is high-churn (~577 retry/hook lines over the 7.9h gap),
+so density wrongly excluded the real incident when first tried. Catches drift if
+the re-arm-first rule is missed; complements trailing-text-detector.py (non-storm
+text-deaths).
+
 ## Why 600s
 
 The wakeup fires only after `delaySeconds` of CONTINUOUS session idle. On a

@@ -602,7 +602,7 @@ def test_auto_resolve_dry_run_does_not_close():
                 f"dry-run must NOT mutate; got status={status!r}")
 
 
-# ---- Option A filing gate: session-gap canary suppression (9) -----
+# ---- Option A filing gate: session-gap canary suppression () -----
 
 
 def _write_diary(agent_dir: Path, timestamps: list[str]):
@@ -666,11 +666,11 @@ def test_session_gap_suppresses_filing():
             assert "1 session-gap-suppressed" in out
 
 
-# ---- Pass-1 selector-contention suppression (3) ------------------
+# ---- Pass-1 selector-contention suppression () ------------------
 #
-# Supersedes the prior `test_continuous_activity_still_files`. 9
+# Supersedes the prior `test_continuous_activity_still_files`. 
 # treated "continuous activity, cadence missed" as real drift and filed.
-# The 3 investigation (99 world canaries, median 4.77x interval,
+# The  investigation (99 world canaries, median 4.77x interval,
 # 98 closed transient/FP) showed that for best-effort recurring cadence
 # (rb-257) an active-loop miss of a NON-HIGH goal is the selector reasonably
 # prioritizing other work — not drift. The gate now suppresses NON-HIGH

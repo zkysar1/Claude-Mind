@@ -1,4 +1,4 @@
-"""test_team_state_retire.py — 5 sanctioned agent-row retirement.
+"""test_team_state_retire.py —  sanctioned agent-row retirement.
 
 g-115-1909 root-caused a capability gap: team-state had NO way to REMOVE an
 agent_status row. route_field sends agent_status.<name> to a per-agent SHARD
@@ -257,7 +257,7 @@ def test_retire_rejects_hostile_agent_name():
                 pass
 
 
-# --- belief sweep (3) -----------------------------------------------
+# --- belief sweep () -----------------------------------------------
 
 def _belief(about, text="stale", conf=0.5):
     return {"about": about, "belief": text, "confidence": conf,
@@ -312,7 +312,7 @@ def test_retire_sweeps_core_and_shard_beliefs_about_retiree():
 
 
 def test_retire_not_present_but_beliefs_linger_still_sweeps():
-    """The delta case (3): the retiree's OWN row is already gone
+    """The delta case (): the retiree's OWN row is already gone
     (g-115-1965 removed it) but partner-beliefs about it linger. A re-run of
     retire must still sweep them — the not_present guard is belief-aware."""
     with tempfile.TemporaryDirectory() as tmpd:
@@ -361,7 +361,7 @@ def test_dry_run_reports_belief_sweep_without_mutating():
 # --- CLI subprocess ----------------------------------------------------------
 
 def test_cli_retire_removes_core_residual_from_composed_read():
-    """The 9 acceptance criterion: a retired agent disappears from
+    """The  acceptance criterion: a retired agent disappears from
     the COMPOSED team-state read (what every partner/selector actually sees)."""
     with tempfile.TemporaryDirectory() as tmpd:
         world = Path(tmpd)

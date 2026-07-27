@@ -59,7 +59,7 @@ from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read fre
 DEFAULT_CHANNELS = ["general", "findings", "coordination", "decisions"]
 
 # Citation tag form: guard-NNN / rb-NNN, 3+ digits (board.py cmd_post twin).
-# 1: the old \d{3} (exactly three) silently excluded every 4-digit
+# : the old \d{3} (exactly three) silently excluded every 4-digit
 # ID once rb/guard numbering crossed 999 (rb-3742, guard-1151 live) — modern
 # findings cites produced ZERO attribution. Keep both regexes in sync.
 _CITE_RE = re.compile(r"(?:guard|rb)-\d{3,}")
@@ -178,12 +178,30 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
     base = ctx.paths.world
     agent = _agent_name(ctx)
     msg: dict = {}
+    reply_warnings: list = []
 
     try:
         assert_not_cruft(ch_path.parent, "mkdir (board post)")
         ch_path.parent.mkdir(parents=True, exist_ok=True)
         with file_locks.locked(ch_path):
             items = _read_jsonl(ch_path)
+            # : WARN (do NOT block) on a dangling reply_to — one that
+            # references no existing message in this channel silently dangles
+            # thread linkage (observed 2026-07-21: a reply posted with a GUESSED
+            # msg id succeeded with no signal). Cross-box lag means the parent
+            # may legitimately not be local yet, so this is advisory only.
+            # Fail-open: any error skips the check. Twin: board.py cmd_post.
+            if reply_to:
+                try:
+                    if reply_to not in {it.get("id") for it in items
+                                        if isinstance(it, dict)}:
+                        reply_warnings.append(
+                            f"reply_to '{reply_to}' not found in channel "
+                            f"'{channel}' ({len(items)} messages) — thread "
+                            f"linkage may dangle (cross-box lag can delay the "
+                            f"parent; not blocking)")
+                except Exception:
+                    pass
             # Key order MUST match board.py:128-142 for byte-compat.
             msg = {
                 "id": _generate_message_id(author, items),
@@ -229,7 +247,10 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
             except Exception:
                 pass  # fail-open per-cite
 
-    return Response.json({"ok": True, "id": msg["id"], "record": msg})
+    resp = {"ok": True, "id": msg["id"], "record": msg}
+    if reply_warnings:
+        resp["warnings"] = reply_warnings
+    return Response.json(resp)
 
 
 # ---------------------------------------------------------------------------

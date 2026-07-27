@@ -693,7 +693,7 @@ def main() -> int:
             skipped_count += 1
             continue
 
-        # Emission-side basis classification (0, 0 item b).
+        # Emission-side basis classification (,  item b).
         # canary=False marks an INFORMATIONAL break: the writer
         # (aspirations_write._streak_break_canary_fields) judged the source
         # signal-gated (fire_when — vestigial interval) or chronic-late by
@@ -713,17 +713,17 @@ def main() -> int:
                   f"{entry.get('expected_interval_hours')}h)")
             continue
 
-        # Option A filing gate — session-gap canary suppression (9).
+        # Option A filing gate — session-gap canary suppression ().
         # A streak-break whose elapsed window is explained by agent inactivity
         # (the loop wasn't running) is structurally benign, not cadence drift.
         # Filing a canary for it creates top-of-queue noise that Pass-2
         # auto-resolve cannot clear until the source fires AGAIN
-        # (fire-triggered latency, 9) — and a dormant source never
+        # (fire-triggered latency, ) — and a dormant source never
         # does, so the canary sits open accruing urgency for days (
-        # -> 9, ~6d). Discriminating: real drift (continuous activity,
+        # -> , ~6d). Discriminating: real drift (continuous activity,
         # cadence still missed) shows NO session gap, so it still files. Uses
         # the bound agent's diary — same per-agent attribution as the Pass-2
-        # escape hatch (1). Fail-open: a parse error or missing diary
+        # escape hatch (). Fail-open: a parse error or missing diary
         # leaves the canary to file as before.
         ts_raw = entry.get("timestamp")
         elapsed_h = entry.get("actual_elapsed_hours")
@@ -745,7 +745,7 @@ def main() -> int:
                       f"{session_gap_threshold_h}h)")
                 continue
 
-            # Selector-contention suppression (3). Reached only when
+            # Selector-contention suppression (). Reached only when
             # the window data is valid AND there is NO session gap — the agent
             # was continuously active across the elapsed window. For a
             # best-effort recurring goal (rb-257), an active-loop cadence miss
@@ -755,7 +755,7 @@ def main() -> int:
             # HIGH goals still file (cadence matters there, and the selector's
             # overdue boost should have prevented the miss, so a HIGH miss
             # despite continuous activity is worth investigating). Reader-side
-            # like the 9 session-gap gate above because the
+            # like the  session-gap gate above because the
             # discriminator (continuous activity) needs the agent's
             # execution-diary; rb-1377's writer-durability concern does not
             # apply here — the reflector is the SOLE canary filer, so a

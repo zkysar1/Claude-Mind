@@ -1,4 +1,4 @@
-"""test_goal_source_infer_parity.py -- regression for 9.
+"""test_goal_source_infer_parity.py -- regression for .
 
 The origin-signal gate (gates/origin_signal.py: is_valid / ALLOWED_PREFIXES)
 MUST accept every signal that _goal_source.infer() recognizes as a legitimate
@@ -53,6 +53,8 @@ INFER_RECOGNIZED_SIGNALS = [
     "routing-mismatch:g-115-1358",
     "routing-either-resolve:g-001-17",
     "insight_trigger:msg-20260611-120000-zeta-1900",
+    "skill-discovery-audit:some-forged-skill:silently_undertriggering",
+    "blocker_pattern:efs-unreachable",
     # -> agent-self
     "idle_fallback",
     "decomposition:parent-1",
@@ -103,7 +105,7 @@ def test_infer_recognized_implies_gate_valid():
 
 
 def test_g1439_additions_present_in_allowed_prefixes():
-    """The seven prefixes added by 9 are present in the gate whitelist
+    """The seven prefixes added by  are present in the gate whitelist
     (pins the specific fix, not just the general invariant)."""
     for pfx in G1439_ADDED_PREFIXES:
         assert pfx in ALLOWED_PREFIXES, (

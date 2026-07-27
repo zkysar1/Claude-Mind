@@ -76,7 +76,7 @@ HEARTBEAT_TICK_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/heartbeat-tick.sh"
 # QUIESCENCE_SLEEP unset / 0: classic backoff sleep. All wake signals
 # behave the same way (exit 2 outside debounce window).
 #
-# DRY_SLEEP=1 (4-c, Layer 3): caller signals this is a dry-idle
+# DRY_SLEEP=1 (-c, Layer 3): caller signals this is a dry-idle
 # backoff sleep (zero executable goals + quiescence denied/na). Triggers the
 # SAME Tier-A background-job registration as QUIESCENCE_SLEEP (stop-hook
 # Gate 2.6 ALLOWs the turn-end so the sleep paces its full duration —
@@ -87,7 +87,7 @@ HEARTBEAT_TICK_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/heartbeat-tick.sh"
 # with QUIESCENCE_SLEEP by construction (_dry_idle.is_dry_state returns False
 # whenever quiescence approved); if both are ever set, quiescence naming wins.
 #
-# EXTERNAL_WAIT=1 (8): caller signals this is a MID-GOAL sleep while
+# EXTERNAL_WAIT=1 (): caller signals this is a MID-GOAL sleep while
 # waiting on a long external command the agent legitimately started and must
 # see the result of (e.g. the ~32min daemon-safe full test suite before a deep
 # code close). Unlike QUIESCENCE_SLEEP (all-blocked) and DRY_SLEEP (empty
@@ -210,7 +210,7 @@ handle_wake_signal() {
   exit 2
 }
 
-# ─── Quiescence bg-job registration (7, 2026-07-10) ──────────────
+# ─── Quiescence bg-job registration (, 2026-07-10) ──────────────
 # WHY: during RUNNING quiescence troughs the loop launches THIS script as a
 # harness background task and ends its turn (quiescence-cycle-cache.py:193
 # directive; all-blocked B7.2 same shape). stop-hook.sh fires on that
@@ -222,7 +222,7 @@ handle_wake_signal() {
 # Tier-A background job fires the carve-out: the turn-end is ALLOWed, the
 # sleep paces its full duration, and the harness bg-completion notification
 # re-invokes the loop (Skill(aspirations) per the cache-HIT directive).
-# SAFETY RAILS (per the 7 spec):
+# SAFETY RAILS (per the  spec):
 #   - Scoped to QUIESCENCE_SLEEP=1 — hot-path backoff sleeps (5s) never pay
 #     the two python spawns (IRREDUCIBLY LOCAL budget preserved; the spawns
 #     amortize over an 1800s quiescence sleep).

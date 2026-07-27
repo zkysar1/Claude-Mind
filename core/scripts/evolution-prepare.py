@@ -273,7 +273,7 @@ def resolve_agent(project_root, session_id, env_agent):
                 return name
         except Exception:
             pass
-    # Marker-cache fallback (0): cleanup-stale-bindings.sh reaps the
+    # Marker-cache fallback (): cleanup-stale-bindings.sh reaps the
     # Phase 2.6 binding dir at mtime>24h even when the session is still ALIVE
     # (marathon autonomous/assistant sessions), after which both tiers above
     # miss and D1 capture silently dies for every subsequent edit. The
@@ -399,7 +399,7 @@ def main():
                 # EVERY agent_self edit (monitor cannot register). `key` is the
                 # file's agent (classify_path -> parts[1]); derive the per-agent
                 # base dir from it directly, independent of MIND_AGENT.
-                # (2; confirmed by probe -- resolve_base_dir returns
+                # (; confirmed by probe -- resolve_base_dir returns
                 # None with MIND_AGENT unset, agents/<agent> with it set.)
                 from _paths import agent_dir
                 base = agent_dir(key)
@@ -420,7 +420,7 @@ def main():
         except Exception as e:
             # Snapshot failure is non-fatal -- Post will record without snapshot
             # reference. Emit a stderr diagnostic so a real capture failure is
-            # VISIBLE rather than degrading silently to None (2 -- the
+            # VISIBLE rather than degrading silently to None ( -- the
             # prior bare swallow hid the agent_self root cause for days).
             print(
                 f"[evolution-prepare] WARN: history snapshot failed for {abs_path} "

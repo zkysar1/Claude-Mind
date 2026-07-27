@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Layer B (pre-commit, default) + Layer D (--audit) regression guard for the
-# OWNERSHIP_MODE elimination (7, 2026-07-02). SINGLE SOURCE of detection
+# OWNERSHIP_MODE elimination (, 2026-07-02). SINGLE SOURCE of detection
 # for both layers — a recurring audit goal and the pre-commit hook call this same
 # script. Companion to check-no-python-cli-fallback.sh; see CLAUDE.md and
 # mind_api/docs/lodestar-dynamic-ownership-design.md (the SUPERSEDED design record).
@@ -70,21 +70,52 @@ scan() {
 
 rc=0
 if [ "$MODE" = "precommit" ]; then
-    STAGED="$(git diff --cached --name-only)"
-    [ -z "$STAGED" ] && exit 0
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        [ -f "$f" ] || continue
-        ADDED="$(git diff --cached -- "$f" | grep '^+' | grep -v '^+++' || true)"
-        [ -z "$ADDED" ] && continue
-        if scan "$f" "$ADDED"; then
-            echo "BLOCKED: $f re-introduces a read of OWNERSHIP_MODE / MACHINE_OWNED_AGENTS." >&2
-            echo "  Both were removed 2026-07-02 (g-115-1737). Single-runner ownership is" >&2
-            echo "  unconditional, keyed on STORAGE_BACKEND. Fix the code, do not --no-verify." >&2
-            echo "  See mind_api/docs/lodestar-dynamic-ownership-design.md (SUPERSEDED note)." >&2
-            rc=1
-        fi
-    done <<< "$STAGED"
+    # Batched precommit scan (). The prior form ran a separate
+    # `git diff --cached -- "$f"` (plus a ~6-subprocess scan pipeline) for EVERY
+    # staged file — ~134s on the v2.5.0 436-file ZDS plant, contributing to the
+    # >10-min hook budget overrun that forced a documented --no-verify (rb-4251).
+    # Instead: compute the IN-SCOPE staged set first (a plant is mostly non-code,
+    # so this is a small fraction), then ONE `git diff --cached` over ONLY those
+    # files, demuxed into per-file added-line blocks in a pure-bash loop, then the
+    # UNCHANGED `scan` function runs once per file — identical detection (same
+    # sed-strip + comment/blank drop + READ_RE grep). Two git diffs total
+    # (name-only + in-scope content), not one-per-staged-file.
+    mapfile -t staged < <(git diff --cached --name-only)
+    INSCOPE=()
+    for f in "${staged[@]}"; do
+        [ -n "$f" ] || continue
+        in_scope "$f" && INSCOPE+=("$f")
+    done
+    if [ "${#INSCOPE[@]}" -gt 0 ]; then
+        declare -A ADDED_BY_FILE=()
+        order=()   # first-seen (path-sorted) order → deterministic output matching the old per-file loop
+        current=""
+        while IFS= read -r dl; do
+            case "$dl" in
+                'diff --git '*) current="" ;;              # new file block — clear until +++ b/
+                '+++ b/'*) current="${dl#+++ b/}" ;;       # set current file
+                '+++'*) : ;;                               # any other +++ (dev/null, or ++-content rendered +++) — skip, mirroring `grep -v '^+++'`
+                '+'*)
+                    # Added content line. git keeps the leading '+', which scan's
+                    # `sed 's/^+//'` strips — store WITH the '+', exactly like the old
+                    # `git diff | grep '^+' | grep -v '^+++'` ADDED block.
+                    if [ -n "$current" ]; then
+                        [ -n "${ADDED_BY_FILE[$current]+x}" ] || order+=("$current")
+                        ADDED_BY_FILE["$current"]+="${dl}"$'\n'
+                    fi
+                    ;;
+            esac
+        done < <(git diff --cached -- "${INSCOPE[@]}")
+        for f in "${order[@]}"; do
+            if scan "$f" "${ADDED_BY_FILE[$f]}"; then
+                echo "BLOCKED: $f re-introduces a read of OWNERSHIP_MODE / MACHINE_OWNED_AGENTS." >&2
+                echo "  Both were removed 2026-07-02 (g-115-1737). Single-runner ownership is" >&2
+                echo "  unconditional, keyed on STORAGE_BACKEND. Fix the code, do not --no-verify." >&2
+                echo "  See mind_api/docs/lodestar-dynamic-ownership-design.md (SUPERSEDED note)." >&2
+                rc=1
+            fi
+        done
+    fi
 else
     while IFS= read -r f; do
         [ -f "$f" ] || continue

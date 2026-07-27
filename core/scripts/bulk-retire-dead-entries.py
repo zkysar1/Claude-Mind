@@ -48,7 +48,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -65,46 +65,15 @@ RB_PATH = WORLD_DIR / "reasoning-bank.jsonl"
 GUARD_PATH = WORLD_DIR / "guardrails.jsonl"
 
 
-def _parse_created(rec):
-    """Parse the `created` field (date or ISO datetime). Returns date or None."""
-    val = rec.get("created", "") or ""
-    if not val:
-        return None
-    try:
-        if "T" in val:
-            return datetime.strptime(val[:10], "%Y-%m-%d").date()
-        return datetime.strptime(val, "%Y-%m-%d").date()
-    except Exception:
-        return None
-
-
-def _is_candidate(rec, min_retrievals, min_age_days, today):
-    if rec.get("status") != "active":
-        return False
-    # Already pending retirement (or in some other lifecycle state)
-    if rec.get("retirement_date"):
-        return False
-    util = rec.get("utilization") or {}
-    rc = util.get("retrieval_count", 0) or 0
-    helpful = util.get("times_helpful", 0) or 0
-    cited = util.get("times_cited", 0) or 0
-    # times_inferred_helpful is the AUTOMATIC retrieval-application backstop
-    # (utilization-feedback --infer). The rest of the system counts it
-    # (utility_ratio = (th + 0.5*tih)/rc); the retire bar MUST too, else
-    # heavily-retrieved entries attested only by inference (e.g. rb-200 tih=8)
-    # mass-retire as false-positive dead (5).
-    inferred = util.get("times_inferred_helpful", 0) or 0
-    if rc < min_retrievals:
-        return False
-    if (helpful + cited + inferred) > 0:
-        return False
-    created = _parse_created(rec)
-    if created is None:
-        return False
-    age = (today - created).days
-    if age < min_age_days:
-        return False
-    return True
+# The retirement predicate is the active-forgetting SEAM, extracted to a pure,
+# side-effect-free module (core/scripts/_curation_predicate.py) so this production
+# retirement tool AND the MemEvoBench governance-eval (core/scripts/memevo_bench.py)
+# share ONE source of truth and can never drift (). Aliased to the historical
+# private name so the call sites below and test_bulk_retire_inferred_helpful.py are
+# unchanged. The behavior — including the times_inferred_helpful zero-check
+# () and the created-date parsing — is identical; the parser now lives in
+# the pure module, called internally by is_dead_entry.
+from _curation_predicate import is_dead_entry as _is_candidate  # noqa: E402
 
 
 def _read_jsonl(path):

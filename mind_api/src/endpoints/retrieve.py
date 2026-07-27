@@ -464,7 +464,14 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                     })
 
                 session_record = {
-                    "schema_version": 2,
+                    # v3 (): distinctive_tokens now keep identifier
+                    # shape and rank structural tokens ahead of prose. v2 tokens
+                    # were split on -/_ and prose-dominated; infer_feedback
+                    # REFUSES v2 rather than classifying it, because v2's output
+                    # was measured at 0.922 helpful/population with an unrelated
+                    # cake recipe scoring 0.627 (). Bump this whenever
+                    # the token contract changes — the consumer gates on it.
+                    "schema_version": 3,
                     "goal_id": effective_goal,
                     "timestamp": timestamp,
                     "categories": categories,

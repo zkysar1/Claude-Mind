@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""close-defer-invalidation.py — advisory close-time dependent-defer recheck (2).
+"""close-defer-invalidation.py — advisory close-time dependent-defer recheck ().
 
 rb-3946 incident: a goal close declared a premise unblocked, but open goals
 whose defer_reason rested on that premise stayed deferred until TTL lapse
@@ -87,8 +87,8 @@ def main():
         reason = str(g.get("defer_reason") or "")
         matched = None
         # Word-boundary id match: a bare substring check false-flags when the
-        # closed id is a PREFIX of a longer id in the defer text (
-        # inside 2) — confirmed by the fresh-eyes probe 2026-07-18.
+        # closed id is a PREFIX of a longer id in the defer text (g-115-2
+        # inside ) — confirmed by the fresh-eyes probe 2026-07-18.
         if closed_id and re.search(re.escape(closed_id) + r"(?![0-9-])", reason):
             matched = f"names closed id {closed_id}"
         elif title_tokens:

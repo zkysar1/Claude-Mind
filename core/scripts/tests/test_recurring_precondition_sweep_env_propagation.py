@@ -1,4 +1,4 @@
-"""test_recurring_precondition_sweep_env_propagation.py — 2 regression.
+"""test_recurring_precondition_sweep_env_propagation.py —  regression.
 
 recurring-precondition-sweep.py is invoked as a direct `py` call from
 aspirations-precheck Phase 0.5c (no _paths.sh preamble). Its write path spawns

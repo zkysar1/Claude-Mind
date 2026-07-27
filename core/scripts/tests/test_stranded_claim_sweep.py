@@ -1,4 +1,4 @@
-"""test_stranded_claim_sweep.py — stranded-claim sweep (4).
+"""test_stranded_claim_sweep.py — stranded-claim sweep ().
 
 Sweep classifies in-progress claims into kept / stranded based on two signals:
 recent execution-diary entry for the goal_id AND age of claimed_at. Tests
@@ -47,7 +47,7 @@ class _FakeRt:
         self.calls: List[Dict[str, Any]] = []
         self.responses: Dict[str, Any] = {}
         # The script also calls _rt.aspirations_read (helper, not rt_call).
-        # Per-source payloads (7: the no-claim scan reads both).
+        # Per-source payloads (: the no-claim scan reads both).
         self._active_payloads: Dict[str, Any] = {}
         # And _rt.tolerant_decode_aggregate (decoder).
         # We pass through dicts unchanged.
@@ -183,7 +183,7 @@ def _patch_agent_dir(monkeypatch, mod, agent_dir: Path) -> None:
 
 
 def _patch_no_bg(monkeypatch, mod) -> None:
-    """Default the 5 bg-pending probe to False so the pre-existing
+    """Default the  bg-pending probe to False so the pre-existing
     keep/release/flip tests exercise the stale+no-diary logic WITHOUT the
     bg-skip guard, and independent of any real `has-pending` subprocess (which
     is otherwise reachable — and, when subprocess.run is stubbed to
@@ -419,7 +419,7 @@ def test_release_failure_keeps_goal(tmp_agent, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# 1: second shape — agent-source in-progress goals with NO claimed_by.
+# : second shape — agent-source in-progress goals with NO claimed_by.
 # The claimed_by==agent query is structurally blind to them (agent-source goals
 # skip the claim wrapper, the sole claimed_by writer), so the sweep ALSO scans
 # the agent-source active aggregate for in-progress + no-claim goals, using
@@ -540,7 +540,7 @@ def test_apply_flips_no_claim_to_pending(tmp_agent, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# 5: bg-pending guard — mirror of stop-hook Gate 2.5. A claim that
+# : bg-pending guard — mirror of stop-hook Gate 2.5. A claim that
 # meets the stale+no-diary criteria may be legitimately paused across a turn
 # boundary awaiting REGISTERED background work (OS jobs via background-jobs.sh,
 # Claude sub-agents via pending-agents.sh). The sweep skips the release/flip
@@ -645,7 +645,7 @@ def test_has_pending_background_work_probe(tmp_agent, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Digest-ordering invariant (1 / rb-1533)
+# Digest-ordering invariant ( / rb-1533)
 #
 # The sweep's "diary entry after claimed_at → KEPT" heuristic
 # (test_keeps_goal_with_recent_diary above) is only sound if a goal that
@@ -704,7 +704,7 @@ def test_digest_writes_phase_start_after_claim():
 
 
 # ---------------------------------------------------------------------------
-# 7: world-source no-claim orphans. The no-claim scan originally
+# : world-source no-claim orphans. The no-claim scan originally
 # covered only the agent source ("world goals always claim") — falsified by
 # 3 observed world goals stuck in-progress with claimed_by=null. The scan
 # now runs for BOTH sources; world entries carry one extra guard: a goal

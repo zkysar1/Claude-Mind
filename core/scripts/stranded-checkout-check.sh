@@ -16,14 +16,14 @@
 # the working tree, and git says NOTHING. There is no conflict, no warning,
 # no non-zero exit.
 #
-# CANONICAL INCIDENT (2026-07-14, 9 / commit c5814933)
+# CANONICAL INCIDENT (2026-07-14,  / commit c5814933)
 #   zeta ran an origin-checkout of core/scripts/owncloud_{backend,sync}.py to
 #   "activate post-07-03 own-cloud CAS fixes" that lived on origin. cc-02 was
 #   ~200 commits ahead. Three fixes had landed LOCALLY in those exact files and
 #   had never been pushed:
-#       db6ff7ee  6  _stamp_manifest_baseline (persistent sync baseline)
+#       db6ff7ee    _stamp_manifest_baseline (persistent sync baseline)
 #       4e82f120      serialize the baseline manifest RMW
-#       008f0f82  6  _merge_reconcile_sweep (sweep-side merge reconcile)
+#       008f0f82    _merge_reconcile_sweep (sweep-side merge reconcile)
 #   The checkout brought CAS in and wiped all three out: 273 deletions, 46
 #   insertions, ZERO test files touched. Eight tests went red and STAYED red —
 #   and were then repeatedly dismissed across later sessions as "baseline

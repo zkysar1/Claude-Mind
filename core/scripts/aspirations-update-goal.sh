@@ -39,6 +39,7 @@ OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 BLOCKER_REF=""
 FORCE_UNSTRUCTURED_DEFER=""
+OVERRIDE_BLOCKER_GATE=""
 CROSS_LANE=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
@@ -56,12 +57,20 @@ while [[ $# -gt 0 ]]; do
             FORCE_DEFER="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-agent-match)
+            # : wrong-context flag on the defer path (it is the
+            # CREATE_BLOCKER bypass). Plumb flag+value so argparse RECOGNIZES it
+            # and can redirect the user to --force-defer, instead of the bare -*
+            # fallback dropping the value into POSITIONALS (argparse "unrecognized
+            # arguments" / too-many-positionals). Does NOT honor the defer bypass.
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --override-uncommitted)
             OVERRIDE_UNCOMMITTED="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --cross-lane)
-            # 4: bypass the cross-lane TAKEOVER guard
+            # : bypass the cross-lane TAKEOVER guard
             # (status->in-progress / claimed_by on another agent's goal).
             CROSS_LANE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
@@ -76,6 +85,13 @@ while [[ $# -gt 0 ]]; do
             shift $(( $# >= 2 ? 2 : 1 ));;
         --force-unstructured-defer)
             FORCE_UNSTRUCTURED_DEFER="${2-}"
+            PASSTHROUGH+=("$1" "${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-blocker-gate)
+            # : bypass the credential-enumeration check on a
+            # credentials-required blocker_ref. Same flag name + same ledger
+            # as blocker-create-gate.py's override (Door A).
+            OVERRIDE_BLOCKER_GATE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         -*)
@@ -139,6 +155,7 @@ declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_MISSING_ARTIFACT" ] && HEADER_ARGS+=(--header "X-Mind-Override-Missing-Artifact: $OVERRIDE_MISSING_ARTIFACT")
 [ -n "$BLOCKER_REF" ] && HEADER_ARGS+=(--header "X-Mind-Blocker-Ref: $BLOCKER_REF")
 [ -n "$FORCE_UNSTRUCTURED_DEFER" ] && HEADER_ARGS+=(--header "X-Mind-Force-Unstructured-Defer: $FORCE_UNSTRUCTURED_DEFER")
+[ -n "$OVERRIDE_BLOCKER_GATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-Blocker-Gate: $OVERRIDE_BLOCKER_GATE")
 [ -n "$CROSS_LANE" ] && HEADER_ARGS+=(--header "X-Mind-Cross-Lane: $CROSS_LANE")
 
 rc=0

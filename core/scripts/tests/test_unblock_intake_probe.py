@@ -1,4 +1,4 @@
-"""test_unblock_intake_probe.py - 7 regression test.
+"""test_unblock_intake_probe.py -  regression test.
 
 Pins the unblock-intake-probe script's intake-status verdicts:
 

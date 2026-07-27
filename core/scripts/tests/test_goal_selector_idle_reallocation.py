@@ -1,4 +1,4 @@
-"""test_goal_selector_idle_reallocation.py -- 6 gap #4.
+"""test_goal_selector_idle_reallocation.py --  gap #4.
 
 Proves the intended_agent idle-reallocation: a goal routed (intended_agent) to
 an agent that has gone idle beyond reallocation_hours AND is unclaimed falls
@@ -68,7 +68,7 @@ def _pin_team_state(monkeypatch, statuses):
 
 
 def _pin_runner_identity(monkeypatch):
-    """Pin the runner identity PER-TEST (3). The import-time env
+    """Pin the runner identity PER-TEST (). The import-time env
     setdefault above does NOT pin on agent boxes: bash-agent-inject pre-sets
     MIND_AGENT into every Bash call, so on bravo's box the module imported
     with AGENT_NAME="bravo" — flipping self-routed vs other-routed semantics
@@ -170,7 +170,7 @@ def test_mixed_only_idle_routed_surfaces(monkeypatch):
     assert ids == {"g-idle-routed", "g-open"}, ids
 
 
-# ── 5: liveness cross-check on the idle verdict ──────────────────
+# ── : liveness cross-check on the idle verdict ──────────────────
 # A stale LOCAL-mirror last_active alone must not surface another agent's
 # routed goals; the authoritative-store fresh signal decides. Root incident
 # (2026-07-16, echo/cc-03): foxtrot last_active 27.5h stale locally while its
@@ -235,3 +235,76 @@ def test_liveness_probe_memoized_per_agent(monkeypatch):
         gs.collect_candidates(_asps([_goal("g-x", intended="zeta")]),
                               source="world", reallocation_hours=8)
     assert len(calls) == 1, f"expected 1 memoized probe, saw {len(calls)}"
+
+
+# ──  / rb-4792: owner-scoped goals never cross-agent reallocated ──
+# /drain-temp (and the maintain:temp-drain Maintain goal) operate ONLY on the
+# bound agent's own temp dir, so surfacing them to a cross-agent reallocatee via
+# the idle-reallocation strands the reallocatee's top-of-queue on unexecutable
+# work (bravo, 2026-07-23: /339/61 sat unexecutable for 2+ iterations).
+# The _is_owner_scoped_goal exclusion keeps them hidden even when the owner is idle.
+
+def _owner_scoped_goal(gid, intended, *, skill=None, origin=None, title=None):
+    g = _goal(gid, intended=intended)
+    if skill is not None:
+        g["skill"] = skill
+    if origin is not None:
+        g["origin_signal"] = origin
+    if title is not None:
+        g["title"] = title
+    return g
+
+
+def test_is_owner_scoped_goal_detection():
+    """The helper detects owner-scoped goals three independent ways (skill,
+    origin_signal, title). The title signal matches ONLY the exact drain-action
+    template (prefix "Maintain: drain " + infix "accumulated temp/ working docs",
+    via the shared _drain_title.is_drain_action_title SSOT), NOT any goal that
+    merely mentions temp-drain (g-115-2983 — the old both-tokens fallback
+    false-positived analysis/Idea goals ABOUT temp-drain, stranding them with a
+    dormant owner)."""
+    assert gs._is_owner_scoped_goal({"skill": "/drain-temp"}) is True
+    assert gs._is_owner_scoped_goal({"origin_signal": "maintain:temp-drain"}) is True
+    # the REAL templated drain-action title (precheck-eval.py cmd_temp_pressure)
+    assert gs._is_owner_scoped_goal(
+        {"title": "Maintain: drain 25 accumulated temp/ working docs to the knowledge tree"}) is True
+    # negatives: a normal skill, a title that mentions "drain" but is NOT the
+    # drain-action template, and a non-drain origin_signal
+    assert gs._is_owner_scoped_goal({"skill": "/reflect"}) is False
+    assert gs._is_owner_scoped_goal({"title": "drain the pipeline backlog"}) is False
+    assert gs._is_owner_scoped_goal({"origin_signal": "idea:temp-store-audit"}) is False
+    assert gs._is_owner_scoped_goal({}) is False
+    #  regression guard: a goal ABOUT temp-drain (an Idea/analysis goal,
+    # or a "Maintain: add ..." goal) carries "drain"+"temp" but is NOT the
+    # drain-action template — the old fallback wrongly marked these owner-scoped
+    # and non-reallocatable. They MUST be reallocatable (owner-scoped == False).
+    assert gs._is_owner_scoped_goal(
+        {"title": "Idea: unify goal-selector owner-scoped-drain title fallback for temp docs"}) is False
+    assert gs._is_owner_scoped_goal(
+        {"title": "Maintain: add verify-learning check for temp-drain title matcher"}) is False
+
+
+def test_owner_scoped_temp_drain_not_reallocated(monkeypatch):
+    """An owner-scoped temp-drain routed to an idle (200h) agent, unclaimed ->
+    NOT collected (the g-115-2945 fix). Without the exclusion the idle-
+    reallocation would surface it to this running agent, where it is
+    unexecutable (drains the WRONG agent's temp)."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    ids = _collect(monkeypatch, [
+        _owner_scoped_goal("g-owner", intended="zeta",
+                           origin="maintain:temp-drain",
+                           title="Maintain: drain 25 accumulated temp/ working docs to the knowledge tree"),
+    ])
+    assert "g-owner" not in ids, \
+        "owner-scoped temp-drain must NOT reallocate cross-agent even to a running agent"
+
+
+def test_owner_scoped_exclusion_is_narrow(monkeypatch):
+    """The exclusion applies ONLY to owner-scoped goals: a normal idle-routed
+    goal in the SAME queue still reallocates (the g-115-1766 mechanism intact)."""
+    _pin_team_state(monkeypatch, {"zeta": 200})
+    ids = _collect(monkeypatch, [
+        _owner_scoped_goal("g-owner", intended="zeta", skill="/drain-temp"),
+        _goal("g-normal", intended="zeta"),
+    ])
+    assert ids == {"g-normal"}, ids

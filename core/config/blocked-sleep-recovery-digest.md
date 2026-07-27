@@ -38,7 +38,7 @@ Persist CHECKPOINT_SLEEP to WM so the flag survives the turn boundary.
 ```
 Parse CHECKPOINT_SLEEP from idle_tick_stdout (line containing "CHECKPOINT_SLEEP=")
 echo '"{checkpoint_sleep_value}"' | Bash: wm-set.sh last_checkpoint_sleep
-Bash: bash core/scripts/interruptible-sleep.sh {sleep_duration_from_directive} (run_in_background=true)
+Bash: QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh {sleep_duration_from_directive} (run_in_background=true)
 RETURN
 ```
 
@@ -140,10 +140,16 @@ IF valid ISO timestamp in blocked_until_value:
             # Reset checkpoint flag (idle-tick will re-set it if needed).
             echo 'null' | Bash: wm-set.sh last_checkpoint_sleep
             Output: "▸ Blocker persists — re-entering backoff for residual {remaining_seconds}s"
-            Bash: bash core/scripts/interruptible-sleep.sh {min(remaining_seconds, 600)} (run_in_background=true)
+            Bash: QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh {min(remaining_seconds, 600)} (run_in_background=true)
             RETURN
 
-    # Case (c): true residual (≤60s per idle-tick gate).
+    # Case (c): true residual (≤60s per idle-tick gate). FOREGROUND inline —
+    # runs same-turn then checks exit_code below, so there is NO turn-end with a
+    # pending background job here: stop-hook Gate 2.6 never fires for this sleep,
+    # so it stays BARE (no QUIESCENCE_SLEEP=1) BY DESIGN — wake-on-any-signal is
+    # the right responsiveness for a ≤60s residual. Contrast the run_in_background
+    # Branch A (L41) and midway (L143) sleeps, which DO end the turn and therefore
+    # MUST register via QUIESCENCE_SLEEP=1 to avoid the Gate 2.6 busy-spin (g-115-2971).
     ELIF remaining_seconds > 0:
         Output: "▸ Blocked-sleep residual {remaining_seconds}s — sleeping inline"
         Bash: interruptible-sleep.sh {remaining_seconds}

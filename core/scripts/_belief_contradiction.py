@@ -245,7 +245,7 @@ def process_all(team_state, self_agent, prev_streaks, now_iso,
         if partner == self_agent:
             continue
         # Reduce the verbose 'asp-NNN: title' current_focus to its lane key
-        # (6) so the streak below counts CONSECUTIVE cross-lane
+        # () so the streak below counts CONSECUTIVE cross-lane
         # observations rather than resetting on every goal-title change within a
         # lane. classify/revise re-apply _focus_lane idempotently; keeping the
         # lane here is what makes next_streak's same-domain accumulation correct.

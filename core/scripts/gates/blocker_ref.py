@@ -142,7 +142,8 @@ def log_unstructured_override(world_dir: Optional[Path], *,
                               defer_reason_text: str,
                               justification: str,
                               agent_name: str,
-                              source: str = "daemon:update_goal:unstructured-defer"
+                              source: str = "daemon:update_goal:unstructured-defer",
+                              which_checks_bypassed: Optional[list] = None,
                               ) -> Optional[str]:
     """Append an override record to world/blocker-gate-overrides.jsonl.
 
@@ -173,7 +174,7 @@ def log_unstructured_override(world_dir: Optional[Path], *,
         "goal_id": goal_id,
         "defer_reason": str(defer_reason_text)[:200],
         "justification": justification,
-        "which_checks_bypassed": ["blocker_ref_required"],
+        "which_checks_bypassed": which_checks_bypassed or ["blocker_ref_required"],
     }
     try:
         from _fileops import locked_append_jsonl

@@ -75,7 +75,7 @@ def main():
         target = META_DIR / filename
 
         if missing_only:
-            # Additive backfill (4): never overwrite an existing
+            # Additive backfill (): never overwrite an existing
             # (potentially agent-evolved) strategy file.
             if target.exists():
                 continue

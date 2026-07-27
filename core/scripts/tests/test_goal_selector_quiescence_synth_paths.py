@@ -1,4 +1,4 @@
-"""test_goal_selector_quiescence_synth_paths.py — 4 regression.
+"""test_goal_selector_quiescence_synth_paths.py —  regression.
 
 Pins the extension of _synth_blocker_ref_from_structured_defer that closes the
 quiescence C2/C3 coverage gap for three blocker shapes the original a/b/c paths
@@ -154,7 +154,7 @@ def test_path_f_dict_blocker_ref_returned_unchanged():
 
 def test_path_f_stale_dict_blocker_ref_rolled_forward():
     # A STORED typed dict ref whose expires_at has LAPSED is rolled forward to a
-    # future expiry (C3 self-heal, 3 sibling) rather than returned stale
+    # future expiry (C3 self-heal,  sibling) rather than returned stale
     # — the  /  case (user_action refs created 2026-05-03,
     # expired 2026-05-08, still-active blocker) that tripped quiescence C3 into
     # false denial + B7 churn. type/external_id/created_at are preserved so the
@@ -323,8 +323,8 @@ def test_collect_blocked_all_gap_shapes_get_valid_future_refs():
             f"{gid}: C3 requires a future expiry, got {exp}"
 
 
-# ── INFRASTRUCTURE-blocked synth (7 / bravo msg-2949) ──
-# The residual C2/C3 gap the 4 paths above missed: a goal blocked by an
+# ── INFRASTRUCTURE-blocked synth ( / bravo msg-2949) ──
+# The residual C2/C3 gap the  paths above missed: a goal blocked by an
 # INFRASTRUCTURE known_blocker (goal.skill/category in the blocker's affected set)
 # whose known_blocker carries NO blocker_ref of its own AND which has no
 # structured-defer field (so _synth_blocker_ref_from_structured_defer returns None)
@@ -418,11 +418,11 @@ def test_infra_structured_defer_ref_not_clobbered():
         f"structured-defer ref must be preserved, got {ref['external_id']}"
 
 
-# ── precondition_unmet + explicit_status branch synth (8) ──
+# ── precondition_unmet + explicit_status branch synth () ──
 # The remaining two collect_blocked branches that set block_reason without synthing
 # a blocker_ref: check 6 (precondition_unmet — bravo msg-2949 named it as the second
 # residual C2 class after infrastructure) and check 1 (explicit_status — defensive:
-# 4's all-gap-shapes test only covered explicit_status WITH defer fields).
+# 's all-gap-shapes test only covered explicit_status WITH defer fields).
 # Both use the generalized _synth_block_ref(kind, key). rb-3004 "audit the whole
 # branch set" applied.
 

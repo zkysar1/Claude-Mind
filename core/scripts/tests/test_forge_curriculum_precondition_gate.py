@@ -1,4 +1,4 @@
-"""test_forge_curriculum_precondition_gate.py — regression for 4.
+"""test_forge_curriculum_precondition_gate.py — regression for .
 
 The add_goal pipeline must GUARANTEE that every /forge-skill goal carries the
 `pc-curriculum-forge` structured precondition, so the goal-selector's

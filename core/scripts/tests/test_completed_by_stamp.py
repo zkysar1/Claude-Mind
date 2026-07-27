@@ -149,7 +149,7 @@ def test_skipped_does_not_stamp_completed_by():
 
 
 def test_cli_daemon_completed_by_parity():
-    """Both write-path implementations carry the 2 completion stamp (guard-742).
+    """Both write-path implementations carry the  completion stamp (guard-742).
 
     The CLI (core/scripts/aspirations.py cmd_update_goal) and the daemon mirror
     (mind_api/src/endpoints/aspirations_write.py update_goal) were patched as
@@ -161,7 +161,7 @@ def test_cli_daemon_completed_by_parity():
     assert DAEMON_FILE.is_file(), f"daemon aspirations_write missing: {DAEMON_FILE}"
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
-    # the 2 completion-stamp marker present on both sides
+    # the  completion-stamp marker present on both sides
     assert "g-115-1562" in cli
     assert "g-115-1562" in daemon
     # scoped to value==completed on both sides (not all terminal statuses)

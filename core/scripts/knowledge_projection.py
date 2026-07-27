@@ -25,9 +25,18 @@ leave the box (PEARL §10.3). Two filters, then redaction:
      untagged framework entry fails CLOSED (suppressed) rather than leaking.
 
 2. Redaction — every exposed string passes through :func:`redact`: filesystem paths →
-   ``[path]``, known agent names → "the agent", secret-shaped tokens → ``[redacted]``,
-   framework ids (rb-N / guard-N / g-N-N / *.sh / *.py) removed. Injected specifics
-   (agent names, workspace paths, secret values) keep ``core/`` domain-free.
+   ``[path]``, known agent names → "the agent", framework ids (rb-N / guard-N / g-N-N /
+   *.sh / *.py) removed, and secrets dropped in THREE tiers, because any one alone
+   fails open on a public endpoint:
+     a. exact injected ``secret_values`` — what the box's environment holds;
+     b. secret SHAPES (:data:`_SECRET_PATTERNS`) — PEM blocks, URL-embedded credentials,
+        provider-prefixed tokens, ``KEY=value`` pairs. Catches the credential the agent
+        wrote into a research note or pasted from a log, which tier (a) never sees
+        because its value was never in the environment;
+     c. a high-entropy catch-all (:func:`_redact_high_entropy`) for opaque leftovers no
+        pattern can enumerate.
+   Injected specifics (agent names, workspace paths, secret values) keep ``core/``
+   domain-free.
 
 The output preserves wiki SHAPE (titles, summaries, parent/child links, hypothesis
 statement+outcome, guardrail rule in plain language) — a traversable structure, not a
@@ -68,6 +77,76 @@ _ID_PATTERNS: tuple[re.Pattern[str], ...] = (
     # underscore is what disambiguates from legitimate acronyms (NASA, DNA, H2O carry none).
     re.compile(r"\b_[A-Z][A-Z0-9_]{2,}\b"),
 )
+
+#: Secret SHAPES, stripped even when the value was never injected via ``secret_values``.
+#: Exact-value redaction alone only catches secrets the box's environment happens to hold —
+#: a credential the agent wrote into a research note, pasted from a log, or belonging to a
+#: different service passes straight through to a PUBLIC endpoint. These patterns close that
+#: class structurally, mirroring zak-code's sibling ``redact_secrets_extended``.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # PEM private-key blocks. The END fence is OPTIONAL on purpose: a note that
+    # captured a key from a TRUNCATED log has a BEGIN and no END, and requiring the
+    # fence let the key body through verbatim (fresh-eyes F-4). With no END, consume
+    # to end-of-string — everything after an unterminated BEGIN is presumed key
+    # material. Over-redaction is the correct failure direction on a public surface.
+    re.compile(
+        r"-----BEGIN[A-Z ]*PRIVATE KEY-----(?:.*?-----END[A-Z ]*PRIVATE KEY-----|.*\Z)",
+        re.DOTALL,
+    ),
+    # URL-embedded credentials (scheme://user:pass@host): drop the creds, keep the URL shape.
+    re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),
+    # Provider-prefixed API tokens. Prefix + a long opaque tail is never domain prose.
+    re.compile(r"\b(?:gsk_|sk-|vin_|ghp_|gho_|github_pat_|xox[baprs]-|AKIA|ASIA)[A-Za-z0-9_\-]{8,}\b"),
+    # key=value / key: value where the KEY itself names a credential.
+    re.compile(
+        r"\b\w*(?:API_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL)\w*\s*[=:]\s*\S+",
+        re.IGNORECASE,
+    ),
+)
+
+#: High-entropy catch-all thresholds — deliberately identical to zak-code's sibling
+#: projection so both surfaces redact the same strings. A 40-char git SHA scores ~4.0 and
+#: passes; a random API token scores >4.5 and is dropped.
+_ENTROPY_MIN_LEN = 25
+_ENTROPY_THRESHOLD = 4.5
+
+
+def _shannon_entropy(s: str) -> float:
+    """Bits-per-character Shannon entropy of ``s`` (0.0 for the empty string)."""
+    if not s:
+        return 0.0
+    from collections import Counter
+    from math import log2
+
+    n = len(s)
+    return -sum((c / n) * log2(c / n) for c in Counter(s).values())
+
+
+def _redact_high_entropy(text: str) -> str:
+    """Final backstop: drop whitespace-delimited tokens that LOOK like opaque secrets.
+
+    Catches the unprefixed, un-injected case the pattern list cannot enumerate. Bounded to
+    long tokens above the entropy threshold so ordinary prose — and the domain vocabulary
+    this wiki exists to publish — is untouched.
+    """
+    if not text:
+        return text
+    # Split on whitespace RUNS while KEEPING them (capture group), so newlines and
+    # indentation survive verbatim. Splitting on " " alone made a newline part of the
+    # token: "intro\n<blob>" scored as ONE high-entropy token and the whole thing —
+    # the prose AND the line break — was replaced by the marker (fresh-eyes F-2).
+    # Node bodies are multi-line markdown, so that silently ate real content.
+    out = []
+    for part in re.split(r"(\s+)", text):
+        if not part or part.isspace():
+            out.append(part)
+            continue
+        core = part.strip(".,;:!?()[]{}\"'")
+        if len(core) >= _ENTROPY_MIN_LEN and _shannon_entropy(core) > _ENTROPY_THRESHOLD:
+            out.append(part.replace(core, "[redacted]"))
+        else:
+            out.append(part)
+    return "".join(out)
 
 
 def top_level_category(category_or_path: str) -> str:
@@ -141,6 +220,11 @@ def redact(
     #    leave a fragment. Never emit any part of the value.
     for secret in sorted((s for s in secret_values if s), key=len, reverse=True):
         out = out.replace(secret, "[redacted]")
+    # 1b. Secret SHAPES — the un-injected case. Runs BEFORE the path pass so URL-embedded
+    #     credentials are dropped while the URL keeps its shape (the path regex would
+    #     otherwise chew the scheme and leave the password standing).
+    for pat in _SECRET_PATTERNS:
+        out = pat.sub("[redacted]", out)
     # 2. Explicit workspace paths (longest first), then generic absolute paths.
     for wp in sorted((p for p in workspace_paths if p), key=len, reverse=True):
         out = out.replace(wp, "[path]")
@@ -151,6 +235,10 @@ def redact(
     # 4. Framework ids and script/store filenames.
     for pat in _ID_PATTERNS:
         out = pat.sub("", out)
+    # 5. Entropy backstop LAST — after the structural passes have had their chance, so a
+    #    path/id/token is redacted by the rule that describes it, and only genuinely opaque
+    #    leftovers fall to the catch-all.
+    out = _redact_high_entropy(out)
     # Tidy the double spaces / orphaned punctuation id-stripping can leave behind.
     out = re.sub(r"[ \t]{2,}", " ", out)
     return out.strip()
@@ -244,6 +332,7 @@ def project(
                 "key": str(n.get("key") or n.get("id") or ""),
                 "title": redactor(str(n.get("title") or "")),
                 "summary": redactor(str(n.get("summary") or "")),
+                "body": redactor(str(n.get("body") or "")),
                 "parent": str(n.get("parent") or ""),
                 "children": [str(c) for c in (n.get("children") or []) if c],
             }

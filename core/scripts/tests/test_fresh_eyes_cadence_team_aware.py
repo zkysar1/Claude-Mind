@@ -1,4 +1,4 @@
-"""Unit tests for the 8 team-aware cadence gate in
+"""Unit tests for the  team-aware cadence gate in
 fresh-eyes-cadence-check.py.
 
 Shared-resource rituals (fresh_eyes_tree, fresh_eyes_program) have ONE time

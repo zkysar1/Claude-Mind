@@ -169,9 +169,15 @@ def resolve(d):
     return None, None, False
 
 if data is None:
-    # Empty file — start as shape A.
-    data = {"questions": []}
-    append_target, existing = data["questions"], []
+    # Empty file — start as shape C (bare list). Every reader tolerates it, AND
+    # the naive user-facing top-level-status filters (agent-completion-report
+    # Phase 2 step 8, open-questions, respond) see ONLY bare top-level entries;
+    # a dict-wrapper (former shape A) would be invisible to them from day one
+    # ( / : alpha's wrapped file hid 19/21 questions from
+    # every user-facing surface). Both writer classes preserve the bare-list
+    # shape on append (rb-1786).
+    data = []
+    append_target, existing = data, []
 else:
     append_target, existing, ok = resolve(data)
     if not ok:

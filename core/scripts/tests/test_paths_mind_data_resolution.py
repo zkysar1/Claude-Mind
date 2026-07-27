@@ -32,8 +32,8 @@ from pathlib import Path
 
 # parents[1] of core/scripts/tests/<file> is core/scripts; the REPO ROOT is two
 # .parent hops up, not one — `CORE_SCRIPTS.parent` is core/, which left mind_api
-# unimportable (ModuleNotFoundError; the 9 `.parent`-arithmetic bug
-# class from CLAUDE.md "Agent-dir Resolution" third-grep triage). 2.
+# unimportable (ModuleNotFoundError; the  `.parent`-arithmetic bug
+# class from CLAUDE.md "Agent-dir Resolution" third-grep triage). .
 CORE_SCRIPTS = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 for _p in (str(CORE_SCRIPTS), str(PROJECT_ROOT)):

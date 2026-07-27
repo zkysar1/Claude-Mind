@@ -1,4 +1,4 @@
-"""test_experience_archive_goal_stdin_timeout.py -- regression for 2.
+"""test_experience_archive_goal_stdin_timeout.py -- regression for .
 
 experience.py cmd_archive_goal read OPTIONAL stdin via the pattern:
 
@@ -146,7 +146,7 @@ def test_experience_archive_goal_stdin_timeout():
 
 
 def test_wrapper_bash_stdin_is_timeout_bounded():
-    """Regression for 9 (zeta): the DAEMON-ONLY wrapper reads OPTIONAL
+    """Regression for  (zeta): the DAEMON-ONLY wrapper reads OPTIONAL
     stdin in BASH, a SEPARATE site from experience.py `_read_optional_stdin()`
     (cases A/B/C above only reach the Python helper). The mycelium daemon-only
     cutover (fa618aa0) moved the read to bash and DROPPED the Python helper's

@@ -48,6 +48,16 @@ fi
 source "$CORE_ROOT/scripts/_runtime.sh"
 
 QUERY="id=${GOAL_ID}&source=world"
+# Session identity ( outcome 5). The daemon warns when a release is
+# invoked by a session that does NOT hold the claim — but it can only do that
+# if the caller SAYS which session it is. Without this the guard is structurally
+# dead, which is the ORIGINAL bug's shape (claims collided precisely because
+# nothing session-scoped was ever transmitted). Best-effort: an empty value is
+# omitted and the endpoint behaves exactly as before. MIND_SID is injected into
+# every Bash call by bash-agent-inject.py.
+if [ -n "${MIND_SID:-}" ]; then
+    QUERY="${QUERY}&sid=$(rt_url_encode "$MIND_SID")"
+fi
 
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY")" || rc=$?
@@ -58,6 +68,12 @@ case $rc in
         printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
+# : surface daemon warnings (e.g. a non-holder release) to stderr.
+# Without this the endpoint-side guard is invisible to the caller — the
+# warning would be computed, returned, and silently dropped here. Mirrors
+# aspirations-complete-by.sh, which already forwards warnings this way.
+for w in resp.get('warnings') or []:
+    print(w, file=sys.stderr)
 goal = resp.get('goal')
 if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
@@ -75,6 +91,12 @@ if goal is not None:
                 printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
 import json, sys
 resp = json.load(sys.stdin)
+# : surface daemon warnings (e.g. a non-holder release) to stderr.
+# Without this the endpoint-side guard is invisible to the caller — the
+# warning would be computed, returned, and silently dropped here. Mirrors
+# aspirations-complete-by.sh, which already forwards warnings this way.
+for w in resp.get('warnings') or []:
+    print(w, file=sys.stderr)
 goal = resp.get('goal')
 if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))

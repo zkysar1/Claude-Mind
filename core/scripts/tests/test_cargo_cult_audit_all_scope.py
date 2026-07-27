@@ -1,4 +1,4 @@
-"""8: cargo-cult-detector --audit-all row ownership annotation.
+""": cargo-cult-detector --audit-all row ownership annotation.
 
 cmd_audit_all builds the batch-calibration markdown table. Before g-115-1448
 the table showed each row's OWNER (world / agent: X) but not the apply POLICY,

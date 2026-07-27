@@ -13,7 +13,7 @@
 #
 # Activation: LIVE -- bound by .claude/settings.json PostToolUse hook with
 # matcher='*' (settings.json ~L360-367; fires on every tool call). The
-# "deny-list-blocked / dormant" note is STALE (8, 2026-06-20): the
+# "deny-list-blocked / dormant" note is STALE (, 2026-06-20): the
 # hook is active on this install. presence-tick.py bounds its stdin read so
 # an orphaned pipe cannot hang the process (was 120-129h py.exe orphans).
 set -uo pipefail

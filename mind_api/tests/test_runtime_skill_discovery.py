@@ -151,7 +151,7 @@ class _FakePaths:
 
     @property
     def agents_root(self):
-        # Mirror AgentPaths.agents_root: PROJECT_ROOT/agents (5).
+        # Mirror AgentPaths.agents_root: PROJECT_ROOT/agents ().
         return self.project_root / "agents"
 
 

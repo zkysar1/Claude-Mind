@@ -55,6 +55,7 @@ SLOT_TO_GATE_ID = {
     "override_blocker_gate": "blocker-create-gate",
     "override_agent_match": "capability-gate",
     "override_offload": "operator-offload-gate",
+    "override_no_investigate": "scaffolded-exploration-gate",
 }
 
 

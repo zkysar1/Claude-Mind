@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # claim-liveness-check.sh <goal-id> — is MY claim on <goal-id> still live?
 #
-# Layer B automation for guard-1151 (3). Canonical incident:
-# 7 ran 47 minutes past its own supersession (claim released +
+# Layer B automation for guard-1151 (). Canonical incident:
+#  ran 47 minutes past its own supersession (claim released +
 # supersession posted while the agent executed) and performed a redundant
 # daemon restart inside the blind window (2026-07-16, rb-3735).
 #

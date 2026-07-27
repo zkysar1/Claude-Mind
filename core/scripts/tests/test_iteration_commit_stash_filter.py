@@ -1,4 +1,4 @@
-"""test_iteration_commit_stash_filter.py - 4 regression test.
+"""test_iteration_commit_stash_filter.py -  regression test.
 
 Verifies iteration-commit.sh's stash-overlap filter: when a `git stash`
 entry contains paths that also appear in the committer's staged set, those

@@ -210,7 +210,7 @@ def _try_phase26_binding_with_reason(
         return None, "agents-root-missing"
 
     reason = "binding-yaml-missing"
-    # Collect ALL valid matches rather than returning the first (4).
+    # Collect ALL valid matches rather than returning the first ().
     # Each element: (SessionBinding, candidate_path, started_at_for_sort).
     matches: "list[tuple[SessionBinding, Path, str]]" = []
     for child in children:
@@ -264,13 +264,13 @@ def _try_phase26_binding_with_reason(
     if not matches:
         return None, reason
     if len(matches) == 1:
-        # Happy path — exactly one binding.yaml for this SID (the 4
-        # invariant holds). Byte-identical to the pre-4 first-match
+        # Happy path — exactly one binding.yaml for this SID (the 
+        # invariant holds). Byte-identical to the pre- first-match
         # return.
         return matches[0][0], ""
 
-    # SHADOW (4): 2+ agents carry a VALID binding.yaml for the SAME
-    # SID — the 4 "one binding.yaml per SID" invariant is violated (a
+    # SHADOW (): 2+ agents carry a VALID binding.yaml for the SAME
+    # SID — the  "one binding.yaml per SID" invariant is violated (a
     # stale cross-agent binding slipped past /start's --retire-legacy, e.g.
     # arrived via own-cloud sync AFTER /start ran). The pre-fix code returned
     # the FIRST match in ar.iterdir() order, which is filesystem-nondeterministic

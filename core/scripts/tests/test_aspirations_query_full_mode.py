@@ -1,4 +1,4 @@
-"""test_aspirations_query_full_mode.py - 4 regression test.
+"""test_aspirations_query_full_mode.py -  regression test.
 
 Pins the --full goal-by-id full-record read mode added to the
 /v1/aspirations/query endpoint (mind_api/src/endpoints/aspirations_query.py)
@@ -45,7 +45,7 @@ ASP_ID = "asp-qfull"
 
 # Fields the default projection MUST drop and --full MUST surface.
 FULL_ONLY_FIELDS = {"description", "verification", "priority", "intended_agent"}
-# 4 added "category" to the default projection (npc-composition-sweep
+#  added "category" to the default projection (npc-composition-sweep
 # needs it to key cat::prefix clusters instead of degenerating to bare-prefix).
 DEFAULT_PROJECTION_KEYS = {"goal_id", "asp_id", "source", "title", "status", "category"}
 

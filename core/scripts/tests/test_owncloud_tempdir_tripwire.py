@@ -1,4 +1,4 @@
-"""5 regression: OwnCloudBackend._put tempdir tripwire.
+""" regression: OwnCloudBackend._put tempdir tripwire.
 
 Unit-tests _assert_not_tempdir_put -- the UNIVERSAL net that refuses an
 own-cloud S3 PUT whose path resolves under a tempfile/pytest temp dir. This is

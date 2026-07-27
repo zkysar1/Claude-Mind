@@ -1,4 +1,4 @@
-"""test_tree_add_child_node_type_derive.py — 7 (asp-115).
+"""test_tree_add_child_node_type_derive.py —  (asp-115).
 
 Pins the fix that makes tree-update add-child / batch add-child flip a parent's
 node_type from leaf to interior when it gains its first child. Before the fix,
@@ -116,8 +116,8 @@ def test_add_child_already_interior_stays_interior(tmp_path):
     assert parent["child_count"] == 2
 
 
-# ── 5: symmetric remove-child paths flip interior->leaf on last child ──
-# The add-child fix (7) above made gaining a first child flip
+# ── : symmetric remove-child paths flip interior->leaf on last child ──
+# The add-child fix () above made gaining a first child flip
 # leaf->interior. The remove paths (cmd_remove_child + cmd_batch remove-child)
 # had the symmetric gap: removing the LAST child updated child_count but left
 # node_type=interior, so an emptied node stayed mislabeled interior. cmd_reparent's
@@ -183,8 +183,8 @@ def test_remove_non_last_child_keeps_parent_interior(tmp_path):
     assert parent["child_count"] == 1
 
 
-# ── 3: the CHILD's OWN node_type is derive-always at create ──────────
-# 7 (above) fixed the PARENT flip; this is the sibling gap where the
+# ── : the CHILD's OWN node_type is derive-always at create ──────────
+#  (above) fixed the PARENT flip; this is the sibling gap where the
 # freshly-created CHILD kept a caller-supplied (or default) node_type that
 # contradicted its own children. node_type is now derived from child-presence at
 # the create path (cmd_add_child + cmd_batch add-child), mirroring child_count: a
@@ -208,7 +208,7 @@ def test_add_child_with_children_is_interior(tmp_path):
 
 
 def test_add_child_leaf_node_type_overridden_when_children_present(tmp_path):
-    """THE BUG (3): caller passes node_type=leaf with a non-empty
+    """THE BUG (): caller passes node_type=leaf with a non-empty
     children list; the create path derives interior anyway (caller value ignored)."""
     world, meta = tmp_path / "world", tmp_path / "meta"
     tree_path = _seed_tree(world)

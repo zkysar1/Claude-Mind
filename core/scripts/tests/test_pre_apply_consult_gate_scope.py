@@ -1,4 +1,4 @@
-"""1: the pre-apply consult gate must fire on OWN-AUTHORED framework goals.
+""": the pre-apply consult gate must fire on OWN-AUTHORED framework goals.
 
 THE BUG THIS PINS
 -----------------
@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -73,7 +74,7 @@ QUEUE = [
     {"id": "g-2", "title": "Research market pricing for widgets",
      "description": "interview customers", "category": "market-research"},
     # own-authored, bare filenames + framework CATEGORY -> MUST fire via category.
-    # 2 was written exactly this way and slipped through the first widening.
+    #  was written exactly this way and slipped through the first widening.
     {"id": "g-3", "title": "Maintain: fix bare_filename.py counter",
      "description": "names files bare, no path prefix",
      "category": "framework-maintenance"},
@@ -97,13 +98,30 @@ def queue_file(tmp_path):
     return p
 
 
+def _env(agent="zeta", **extra) -> dict:
+    """Ambient env with MIND_AGENT pinned — NOT a hand-built POSIX PATH ().
+
+    These sites used {"MIND_AGENT": agent, "PATH": "/usr/bin:/bin"}. sys.executable
+    is absolute so Python itself starts, but the gate shells out, and on Windows a
+    POSIX-only PATH resolves none of it — so the gate silently did not fire and the
+    load-bearing assertions read as "the gate is broken". Proven by controlled
+    comparison, same goal and queue file, ONLY env differing:
+        POSIX-only PATH {"PATH": "/usr/bin:/bin"} -> rc=0, fired=False
+        ambient env + MIND_AGENT                 -> rc=0, fired=True
+    The gate was correct throughout; the harness was not.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("MIND_")}
+    env["MIND_AGENT"] = agent
+    env.update(extra)
+    return env
+
+
 def _fires(queue_file, goal_id, agent="zeta", env_extra=None) -> bool:
-    env = {"MIND_AGENT": agent, "PATH": "/usr/bin:/bin"}
-    if env_extra:
-        env.update(env_extra)
+    env = _env(agent, **(env_extra or {}))
     r = subprocess.run(
         [sys.executable, str(GATE), goal_id, "--queue-file", str(queue_file)],
         capture_output=True, text=True, timeout=30, env=env,
+        encoding="utf-8", errors="replace",
     )
     assert r.returncode == 0, "the gate is advisory — it must ALWAYS exit 0"
     return "PRE-APPLY CONSULT GATE" in (r.stdout or "")
@@ -206,10 +224,11 @@ def test_banner_recommends_goal_scoped_retrieval(queue_file):
     gate's suppression never fires, and any measurement of the miss-rate counts every
     consult as a failure. The recommendation and the audit must agree.
     """
-    env = {"MIND_AGENT": "zeta", "PATH": "/usr/bin:/bin"}
+    env = _env("zeta")
     r = subprocess.run(
         [sys.executable, str(GATE), "g-1", "--queue-file", str(queue_file)],
         capture_output=True, text=True, timeout=30, env=env,
+        encoding="utf-8", errors="replace",
     )
     assert "--goal g-1" in r.stdout, (
         "the recommended retrieve.sh invocation MUST carry --goal <goal-id>, or the "

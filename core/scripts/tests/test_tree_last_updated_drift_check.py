@@ -1,4 +1,4 @@
-"""test_tree_last_updated_drift_check.py — 3.
+"""test_tree_last_updated_drift_check.py — .
 
 Regression tests for core/scripts/tree-last-updated-drift-check.py, which
 audits (and with --apply backfills) the _tree.yaml per-node `last_updated`
@@ -145,7 +145,7 @@ def test_missing_front_matter_is_skipped_not_crashed():
 
 
 def test_full_emits_complete_lists_beyond_sample_cap():
-    # 0: --full must emit EVERY index_ahead/index_stale entry, not the
+    # : --full must emit EVERY index_ahead/index_stale entry, not the
     # capped [:8] sample. Set up 10 index_ahead nodes so the sample (8) and the
     # full list (10) are distinguishable — the whole point of the flag: a
     # capped sample cannot prove a property (e.g. "no entry has idx > cutoff")

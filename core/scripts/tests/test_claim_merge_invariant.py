@@ -1,4 +1,4 @@
-"""Regression tests for the 8 single-claim invariant in
+"""Regression tests for the  single-claim invariant in
 coordination_merge._merge_goal (claimed_by / claimed_at merge rule).
 
 Design residual of g-115-1899-a (rb-3043): the own-cloud CAS layer makes
@@ -44,10 +44,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import coordination_merge as cm  # noqa: E402
 
-# Fleet adoption landed (6, 2026-07-16): the claim-pair rule now
+# Fleet adoption landed (, 2026-07-16): the claim-pair rule now
 # lives in coordination_merge._merge_goal on origin — these are hard
 # regression tests. (History: the rule was first a cc-02-local fix,
-# 8, superseded at the 2 unwedge merge; this file carried
+# , superseded at the  unwedge merge; this file carried
 # the spec as strict=False xfail pins until the fleet fix shipped.)
 
 
@@ -151,10 +151,10 @@ def test_reclaim_after_release_wins():
     assert m.get("claimed_at") == "2026-07-11T09:00:00"
 
 
-# --- one-side-null claim preservation (7) ---------------------------
+# --- one-side-null claim preservation () ---------------------------
 
 def test_one_side_null_both_lack_last_modified_keeps_claim():
-    """7 headline: a claim written locally, merged against a remote
+    """ headline: a claim written locally, merged against a remote
     snapshot that lacks the claim AND last_modified — the realistic own-cloud
     shape, since claim() never stamps last_modified. The equal-(missing)-
     last_modified content tiebreak used to drop the LIVE claim, double-claiming

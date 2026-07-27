@@ -242,11 +242,11 @@ def test_tree_add_child_absent_when_no_in_flight(tmp_path):
     assert "origin_goal_id" not in tree["nodes"]["child-c"]
 
 
-# ── 3: batch add-child must mirror the single-path origin_goal_id ──
+# ── : batch add-child must mirror the single-path origin_goal_id ──
 # instrumentation. The  fix landed in cmd_add_child only; cmd_batch
 # add-child silently dropped origin_goal_id (both explicit AND auto-inject) for
 # every batch-created node — invisible to Gate D SPILL-1 attribution — until
-# 3 restored parity. These three pin the batch path against the same
+#  restored parity. These three pin the batch path against the same
 # three cases as the single-path tests above (duplicated-path divergence,
 # rb-1776 — enumerate ALL sibling paths; the coverage gap here is what let the
 # omission ship undetected: run-full-suite-after-deep-code.md).

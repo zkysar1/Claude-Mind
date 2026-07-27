@@ -1,4 +1,4 @@
-"""Unit tests for the 6 negative-diff self-heal in fresh-eyes-cadence-check.py.
+"""Unit tests for the  negative-diff self-heal in fresh-eyes-cadence-check.py.
 
 A DOWNWARD count-basis correction (census double-count repair, store surgery)
 leaves the stamped WM slot ABOVE the live completed-goal count. Without the

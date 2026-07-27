@@ -155,6 +155,34 @@ IF the goal produced code changes in the primary workspace:
     builds locally; this gate proves the remote pipeline actually deployed it.
     A green local build with a red deploy run leaves prod on the OLD code.
 
+    **2b.3: Post-Deploy Service-Health Assertion (MANDATORY when the deploy affects a live service)**
+
+    2b.2 proves the deploy RUN reached success — i.e. the code was DEPLOYED. It
+    does NOT prove the deployed SERVICE is HEALTHY. A green run can still leave a
+    service that crashed on startup, fails its health endpoint, or brought a
+    dependency down. "Deployed" and "healthy" are different claims.
+
+    IF the deploy affects a LIVE running service (not a pure client/config/docs
+    push):
+      After the run SUCCEEDED, assert the deployed service is healthy using the
+      domain-specified service-health probe (a companion health/status script
+      named in the domain post-execution convention) — probe with the CANONICAL
+      companion script, never a synthetic curl/ssh (which misses the wrapper's
+      auth headers / connection flags and false-negatives).
+      IF healthy: Log "Service healthy post-deploy: <repo> <signal>" and proceed.
+      IF unhealthy: the code shipped but the deploy DEGRADED the service. Do NOT
+        proceed to Step 2c or Phase 5 verify as clean success — fix-forward or
+        create an Unblock goal:
+          "Unblock: <repo> deploy degraded service-health — <degraded signal>"
+      IF the probe is UNREACHABLE (the probe infra itself down, not the service):
+        state "service-health unverified: <detail>" — do NOT claim healthy from
+        an unreachable probe (a silent-failure probe is zero signal).
+    ELSE (push does not affect a live service): skip — run success suffices.
+
+    This is NOT redundant with 2b.2: 2b.2 proves the pipeline deployed the code;
+    this gate proves the deployed service came back healthy. A green run with a
+    crashed service is a failed deploy that reads as success.
+
   **IF pre-conditions NOT met:**
     Log which pre-condition failed and why.
     Do NOT hold silently — create an Unblock goal:

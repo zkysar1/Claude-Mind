@@ -10,7 +10,7 @@ Hypothesis pipeline records use JSONL (one JSON object per line) with script-bas
 ## Record Schema
 Required: `id`, `title`, `stage`, `horizon`, `type`, `confidence`, `position`, `formed_date`, `category`
 Defaults: `slug` (from id), `rationale` (""), `outcome` (null), `reflected` (false), `surprise` (null)
-Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `verification`, `resolves_by`,
+Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `reflected_by`, `verification`, `resolves_by`,
           `resolves_no_earlier_than`, `strategy`, `depth`, `mechanism`, `context_manifest`,
           `context_quality`, `process_score`, `replay_metadata`, `source_validation`, `experience_ref`,
           `evidence_for`, `evidence_override`

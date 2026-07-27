@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_init_backfill.py — 4 additive seed-backfill regression pins.
+"""test_init_backfill.py —  additive seed-backfill regression pins.
 
 THE CLASS UNDER GUARD (seed-drift, guard-146 incident): a world/meta
 initialized BEFORE a seed line was added to init-world.sh / init-meta.sh
@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+from _bash_helpers import BASH  # : bare "bash" hits the System32 WSL launcher outside pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 INIT_META = PROJECT_ROOT / "core" / "scripts" / "init-meta.sh"
 INIT_WORLD = PROJECT_ROOT / "core" / "scripts" / "init-world.sh"
@@ -47,7 +49,7 @@ def _run_init_meta(meta_dir: Path, world_dir: Path, extra_env: dict | None = Non
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
-        ["bash", str(INIT_META)],
+        [BASH, str(INIT_META)],
         capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT),
         timeout=120,
     )
@@ -75,7 +77,7 @@ def test_fresh_init_seeds_meta(meta_env):
 
 
 def test_backfill_restores_missing_seed(meta_env):
-    """The core 4 property: a seed absent from an already-initialized
+    """The core  property: a seed absent from an already-initialized
     meta/ (added to the script after this meta/ was initialized, or lost) is
     re-seeded on the next init run instead of being skipped forever."""
     meta, world = meta_env
@@ -153,7 +155,7 @@ WORLD_GUARDED_TARGETS = [
     '$WORLD/skill-relations.yaml',
     '$WORLD/scripts/output-style-mode-guard.sh',
     '$WORLD/scripts/trailing-text-detector.py',
-    # 4: bare-touch targets routed through seed_needed too — under
+    # : bare-touch targets routed through seed_needed too — under
     # own-cloud BACKFILL a bare touch on a cache-absent-but-store-present file
     # creates a 0-byte local that the single-file push path would push over
     # the store content (guard-980 class; zeta fresh-eyes finding
@@ -204,7 +206,7 @@ def test_init_meta_defines_seed_needed():
         "backfill mode must call meta-init.py --missing-only (bare call clobbers all strategies)"
 
 
-# 4: init-meta.sh bare-touch targets routed through seed_needed
+# : init-meta.sh bare-touch targets routed through seed_needed
 # (same clobber class as the WORLD_GUARDED_TARGETS touch entries above).
 META_GUARDED_TOUCH_TARGETS = [
     '$META/meta-log.jsonl',

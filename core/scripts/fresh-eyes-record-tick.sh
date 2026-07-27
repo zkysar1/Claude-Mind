@@ -77,7 +77,7 @@ fi
 
 echo "fresh-eyes-record-tick: wrote $SLOT_NAME goals_count_at_last_fire=$current at $now"
 
-# 8 team-aware shared stamp: when the slot belongs to a config block
+#  team-aware shared stamp: when the slot belongs to a config block
 # declaring `team_aware: true` (tree/program — shared resources with ONE time
 # series), also stamp world/team-state.yaml shared_cadences.<slot> so OTHER
 # agents' cadence gates see this fire. Stamp carries the WORLD-ONLY count —

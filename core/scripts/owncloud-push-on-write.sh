@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PostToolUse[Write,Edit,MultiEdit] hook — real-time own-cloud single-file push.
 #
-# 6: owncloud_sync.py has documented this invocation as "the PostToolUse
+# : owncloud_sync.py has documented this invocation as "the PostToolUse
 # hook" since B15, and the sweep's no-baseline classifier RELIES on it existing
 # ("a no-baseline divergence reaching the PERIODIC sweep is a STALE CACHE, not an
 # unpushed authored write") — but nothing ever wired it. Consequence: every LLM
@@ -9,7 +9,7 @@
 # the sweep refused to push it (cannot prove local authority), and the 
 # S3-authoritative reconcile eventually PULLED the stale S3 object back over the
 # verified local fix (observed twice on world/scripts/stale-jobs-scan.py:
-# 7 fix eaten between 2026-07-08 and 2026-07-10; re-fixed 3).
+#  fix eaten between 2026-07-08 and 2026-07-10; re-fixed ).
 # This hook closes the class: a tool write under a governed root is pushed to S3
 # immediately via sync_file (multi_machine=False — the single-file path that
 # KNOWS the write is locally authored and records the manifest baseline).
@@ -53,7 +53,7 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || exit 0
 # (core/config/environments/<id>.yaml `backend:` key) — the SAME resolution
 # chain the daemon runs (_apply_environment_registry, setdefault precedence).
 # Env-config deployments set ONLY ENVIRONMENT_ID, so the old env.local-only
-# grep silently killed this hook on them (7, proven cc-02
+# grep silently killed this hook on them (, proven cc-02
 # 2026-07-16: every governed write waited for the ~120s sweep — the
 # both-moved conflict-freeze breeder).
 ENV_LOCAL="${OWNCLOUD_PUSH_HOOK_ENV_LOCAL:-$PROJECT_ROOT/.env.local}"
@@ -113,7 +113,7 @@ if [ "${OWNCLOUD_PUSH_HOOK_DRYRUN:-}" = "1" ]; then
     exit 0
 fi
 
-# Real push — daemon-first (7): POST the per-file admin route. The
+# Real push — daemon-first (): POST the per-file admin route. The
 # daemon already carries the registry-derived STORAGE_* + MIND_AWS_* context,
 # so this works on env-config deployments where the bare CLI would see no
 # backend config. NEVER auto-spawn a daemon from a hook (30s budget, guard-141

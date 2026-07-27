@@ -257,6 +257,126 @@ _checkpoint_refresh() {
         --set "last_updated=$NOW_ISO" || true
 }
 
+# ─── Shared helper: probe whether GOAL_ID is a recurring goal ───────────────
+# Reads the goal record from the source aspirations file; echoes "true"/"false".
+# Fail-open: any probe error → "false" (treat as non-recurring; the caller's own
+# non-recurring path then surfaces the real error). Two call sites (g-115-2848):
+# do_verify's IS_RECURRING/complete-by branch, and do_state_update's Phase-6
+# sentinel guard (recurring goals get their sentinel from recurring-close.sh, so
+# do_state_update must NOT double-write it).
+_probe_is_recurring() {
+    local _src_file
+    if [[ "$SOURCE" == "world" ]]; then
+        _src_file="$WORLD_DIR/aspirations.jsonl"
+    else
+        _src_file="$AGENT_DIR/aspirations.jsonl"
+    fi
+    GID="$GOAL_ID" SF="$_src_file" python3 -c '
+import json, os, sys
+with open(os.environ["SF"], "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        asp = json.loads(line)
+        for g in asp.get("goals", []):
+            if g.get("id") == os.environ["GID"]:
+                print("true" if g.get("recurring") else "false")
+                sys.exit(0)
+print("false")
+' 2>/dev/null || echo "false"
+}
+
+# ─── Shared helper: repair a pending utilization obligation (g-115-3123) ────
+# Two call sites, one implementation:
+#   1. do_state_update, immediately BEFORE phase-4-26-gate.sh — the PRODUCER
+#      for the flag that gate consumes.
+#   2. do_learning_gate, on the "real manifest for this goal" path — the
+#      historical site, kept as a backstop for the case where state-update
+#      never ran (operator retry, crash-resume straight into learning-gate).
+#
+# WHY the state-update call site is load-bearing: the loop runs
+# verify -> state-update -> learning-gate. The repair used to live ONLY in
+# do_learning_gate, one full phase AFTER its consumer, so a manifest with
+# utilization_pending=true always reached phase-4-26-gate.sh un-repaired. The
+# gap stayed invisible because the intended backstop (utilization-gate.sh) is
+# registered as a PreToolUse[Skill] matcher for a Skill the bash hot path no
+# longer invokes (15 fires across 12,325 iterations), and because
+# phase-4-26-gate.py's own utilization check is inert. Three mutually-masking
+# defects; this fixes the producer half. See g-115-3113 / g-115-3123.
+#
+# Idempotent: no-ops when the manifest is absent, belongs to another goal, is a
+# no-retrieval stub, or already has utilization_pending=false — so calling it at
+# both sites in one iteration costs one cheap JSON read on the second call.
+# Fail-open: always returns 0. Callers run under `set -e`; a feedback blip must
+# never abort the phase (the pending flag itself drives the retry).
+_repair_utilization_pending() {
+    local ret_file="$AGENT_DIR/session/retrieval-session.json"
+    [[ -f "$ret_file" ]] || return 0
+    local pending
+    # Env-var names are deliberately RUP_-prefixed, NOT the GID/RET_FILE pair the
+    # no-retrieval stub writer below uses: `test_learning_gate_stub_double_invocation.py`
+    # locates that writer by regex-matching its `GID="$GOAL_ID" RET_FILE="$ret_file"
+    # python3 -c '` prefix, and this block sits EARLIER in the file — sharing the
+    # prefix makes re.search extract THIS block instead (observed, g-115-3123).
+    pending="$(RUP_GID="$GOAL_ID" RUP_SESSION="$ret_file" python3 -c '
+import json, os
+try:
+    d = json.loads(open(os.environ["RUP_SESSION"], encoding="utf-8").read())
+    # Repair only a REAL manifest belonging to THIS goal. A no-retrieval stub
+    # (retrieval_performed is False) or a prior goal file is not ours to touch.
+    ok = (d.get("goal_id") == os.environ["RUP_GID"]
+          and d.get("retrieval_performed") is not False
+          and bool(d.get("utilization_pending")))
+    print("true" if ok else "false")
+except Exception:
+    print("false")
+' || { echo "[iteration-close] WARN: retrieval-session.json probe failed — utilization repair skipped for $GOAL_ID" >&2; echo "false"; })"
+    # No `2>/dev/null` on the probe (fresh-eyes F-001, g-115-3123): the python block
+    # already swallows every parse/IO error into a conservative "false", so the only
+    # stderr that can reach here is python3 itself failing to start (shim/PATH). That
+    # is exactly the signal worth seeing — suppressing it, as the first draft of this
+    # helper did, makes a dead interpreter indistinguishable from "nothing to repair".
+    [[ "$pending" == "true" ]] || return 0
+
+    # Two-tier safety-net feedback (g-242-06, fix-a for rb-428/g-242-05 cycle):
+    # (1) Try --infer --confidence balanced first. Produces
+    #     times_inferred_helpful (half-weight counter) when distinctive tokens
+    #     match execution diary / guardrail triggers — unblocks utilization_score
+    #     movement without requiring LLM attestation in Phase 4.26.
+    #     C.2: balanced (min_distinctive=1) replaces conservative (>=2).
+    #     Token-overlap inference is the second-stage classifier — its job is to
+    #     find candidates the explicit-attest path missed. The fallback-active
+    #     backstop in infer_feedback (utilization-feedback.py) is the third stage
+    #     that catches deterministic trigger-fires. Conservative was starving
+    #     positive signal: 0 helpful across 320 active guardrails (2026-05-09).
+    # (2) On exit 4 (schema_version < 2; documented fallback signal), fall back
+    #     to --all-unknown (no-op on counters; just records the method so the
+    #     pending flag clears). Replaces the older --all-noise fallback whose
+    #     blanket times_noise++ was the root cause of the 0/655 helpful audit
+    #     2026-05-07: legitimate retrieval-but-unattested nodes accumulated noise
+    #     that fed tree.py distill candidates. See utilization-gate.sh header.
+    # (3) On any other non-zero: warn + leave pending=true so a later phase or
+    #     the next iteration retries.
+    local infer_rc
+    if bash "$SCRIPT_DIR/utilization-feedback.sh" --goal "$GOAL_ID" --infer --confidence balanced; then
+        echo "[iteration-close] retrieval gate ($_CURRENT_PHASE): inferred utilization feedback for $GOAL_ID (balanced)"
+    else
+        infer_rc=$?
+        if [[ $infer_rc -eq 4 ]]; then
+            # Schema too old — documented fallback path
+            if bash "$SCRIPT_DIR/utilization-feedback.sh" --goal "$GOAL_ID" --all-unknown; then
+                echo "[iteration-close] retrieval gate ($_CURRENT_PHASE): --infer schema<2, fell back to --all-unknown for $GOAL_ID"
+            else
+                echo "[iteration-close] WARN: utilization-feedback --all-unknown fallback failed for $GOAL_ID (pending=true persists)" >&2
+            fi
+        else
+            echo "[iteration-close] WARN: utilization-feedback --infer failed (rc=$infer_rc) for $GOAL_ID (pending=true persists, will retry)" >&2
+        fi
+    fi
+    return 0
+}
+
 # --------------------------- phase: verify ---------------------------
 do_verify() {
     _CURRENT_PHASE="verify"
@@ -325,28 +445,10 @@ do_verify() {
     # never advances). See plan improve-recurring-goals-kind-yao.md.
     local IS_RECURRING="false"
     if [[ "$GOAL_STATUS" == "completed" ]]; then
-        local _src_file
-        if [[ "$SOURCE" == "world" ]]; then
-            _src_file="$WORLD_DIR/aspirations.jsonl"
-        else
-            _src_file="$AGENT_DIR/aspirations.jsonl"
-        fi
-        # Fail-open: probe error → treat as non-recurring. The non-recurring path
-        # then hits cmd_update_goal's recurring guard and exits with the real error.
-        IS_RECURRING="$(GID="$GOAL_ID" SF="$_src_file" python3 -c '
-import json, os, sys
-with open(os.environ["SF"], "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        asp = json.loads(line)
-        for g in asp.get("goals", []):
-            if g.get("id") == os.environ["GID"]:
-                print("true" if g.get("recurring") else "false")
-                sys.exit(0)
-print("false")
-' || echo "false")"
+        # g-115-2848: shared helper (also used by do_state_update's Phase-6
+        # sentinel guard). Fail-open: probe error → "false"; the non-recurring
+        # path then hits cmd_update_goal's recurring guard and surfaces the real error.
+        IS_RECURRING="$(_probe_is_recurring)"
     fi
 
     if [[ "$IS_RECURRING" == "true" ]]; then
@@ -526,21 +628,65 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
     # ── End Gate D OUTCOME telemetry ──────────────────────────────────────────
 
     # ── Phase-6 spark imperative for NON-recurring deep closes (g-115-2416) ──
-    # recurring-close.sh already emits an outcome-aware imperative + the
+    # recurring-close.sh emits an outcome-aware imperative + the
     # pending_phase_6_spark WM sentinel for recurring deep closes (g-115-977 /
     # g-115-1174). Non-recurring deep closes had NEITHER: Phase 6 sits between
     # verify and state-update purely on LLM memory of digest ordering, and it
     # drifted (observed miss: g-115-2404, journal OBLIGATION LATE 2026-07-16).
-    # Emit the same two signals here so the prompt is script-enforced:
-    #   - stdout imperative (visible in this turn's tool output)
-    #   - pending_phase_6_spark sentinel (next-iteration Phase -0.5c.2 consumer
-    #     catches the backgrounded-verify case; spark-fire-dedup.py prevents a
-    #     double-fire when the LLM DID spark in-turn — the same transport
-    #     recurring closes use, zero new consumer code)
+    # This phase emits the stdout imperative; the sentinel WRITE lives in
+    # do_state_update (g-115-2848 — see below).
+    #   - stdout imperative (visible in this turn's tool output) — HERE
+    #   - pending_phase_6_spark sentinel — MOVED to do_state_update, which
+    #     REQUIRES --outcome. In verify --outcome is optional (usage line 33), so
+    #     a verify call that omitted it left OUTCOME empty, this gate false, and
+    #     the g-115-2416 backstop silently no-op'd (observed g-115-2839: a deep
+    #     non-recurring verify without --outcome wrote no sentinel; Phase 6 spark
+    #     skipped). The reliable write now sits where --outcome is guaranteed.
     # Routine outcomes stay silent (skip-rule: spark is deep-only). Recurring
     # closes skip this block — recurring-close.sh writes the sentinel itself
     # with the POST-FLIP outcome, which this phase cannot know.
     if [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && "$IS_RECURRING" != "true" ]]; then
+        # Best-effort in-turn prompt — fires when --outcome IS on the verify call
+        # (the common path). When omitted, this is skipped but do_state_update's
+        # reliable sentinel still fires the spark next iteration.
+        echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+    fi
+    # ── End Phase-6 spark imperative ──────────────────────────────────────────
+
+    _checkpoint_refresh verify
+    # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
+    # See core/config/iteration-close-digest.md § VERIFY.
+}
+
+# --------------------------- phase: state-update ---------------------------
+do_state_update() {
+    _CURRENT_PHASE="state-update"
+    [[ -z "$GOAL_ID" || -z "$SOURCE" || -z "$OUTCOME" ]] && {
+        echo "state-update: --goal, --source, --outcome required" >&2
+        echo "  usage: iteration-close.sh --phase state-update --goal <id> --source <world|agent> --outcome <deep|routine>" >&2
+        exit 2;
+    }
+    echo "[iteration-close] state-update: goal=$GOAL_ID outcome=$OUTCOME"
+
+    # ── Phase-6 spark sentinel for NON-recurring deep closes (g-115-2848) ──
+    # MOVED here from do_verify: do_state_update REQUIRES --outcome (validated
+    # above), so OUTCOME is guaranteed present — unlike do_verify where --outcome
+    # is optional and an omission silently defeated the g-115-2416 backstop
+    # (g-115-2839: a deep non-recurring verify without --outcome wrote no
+    # sentinel; Phase 6 spark was skipped). Recurring goals get their sentinel
+    # from recurring-close.sh's end-of-script write (POST-FLIP outcome), so guard
+    # on !recurring to avoid a double-write. Routine outcomes skip (spark is
+    # deep-only). Dedup: the sentinel is now written AFTER the in-turn spark
+    # (Phase 6 runs between verify and state-update), so fired_at < set_at;
+    # spark-fire-dedup's consumption window brackets set_at by [-15min, +60min]
+    # (g-306-80/rb-2615; lower bound widened 10->15 by g-115-2988 after a slow
+    # post-compaction resume's Phase-6->Phase-8 gap hit 10m08s and false-fired at
+    # 8s past the old 10min bound), covering the proactive-before-set_at fire. A
+    # slow spark (>15min before state-update) would fire once redundantly next
+    # iteration — the dedup's own safe failure direction (a redundant fire, never a lost one).
+    local _su_is_recurring
+    _su_is_recurring="$(_probe_is_recurring)"
+    if [[ "$OUTCOME" == "deep" && "$_su_is_recurring" != "true" ]]; then
         local _sp_expires _sp_setat _sp_payload
         _sp_expires="$(python3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
         _sp_setat="$(python3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
@@ -560,31 +706,15 @@ print(json.dumps({
 ' 2>/dev/null || true)"
             if [[ -n "$_sp_payload" ]]; then
                 echo "$_sp_payload" | bash "$SCRIPT_DIR/wm-set.sh" pending_phase_6_spark >/dev/null 2>&1 \
-                    || echo "[iteration-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — stdout imperative remains)" >&2
+                    || echo "[iteration-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — verify stdout imperative remains)" >&2
             else
                 echo "[iteration-close] WARN: could not build pending_phase_6_spark payload (non-fatal)" >&2
             fi
         else
             echo "[iteration-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
         fi
-        echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
     fi
-    # ── End Phase-6 spark imperative ──────────────────────────────────────────
-
-    _checkpoint_refresh verify
-    # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
-    # See core/config/iteration-close-digest.md § VERIFY.
-}
-
-# --------------------------- phase: state-update ---------------------------
-do_state_update() {
-    _CURRENT_PHASE="state-update"
-    [[ -z "$GOAL_ID" || -z "$SOURCE" || -z "$OUTCOME" ]] && {
-        echo "state-update: --goal, --source, --outcome required" >&2
-        echo "  usage: iteration-close.sh --phase state-update --goal <id> --source <world|agent> --outcome <deep|routine>" >&2
-        exit 2;
-    }
-    echo "[iteration-close] state-update: goal=$GOAL_ID outcome=$OUTCOME"
+    # ── End Phase-6 spark sentinel ──
 
     # g-115-453: session YAML lint (advisory). Catches malformed YAML in
     # <agent>/session/*.yaml at write-time rather than days later when a
@@ -607,6 +737,13 @@ do_state_update() {
     # silently: retrieval_performed=false, empty population, method=manual,
     # method=all_helpful, method=infer with helpful>0, stale-session-id
     # mismatch (fail-open). See core/scripts/phase-4-26-gate.py docstring.
+    #
+    # PRODUCER FIRST (g-115-3123): run the utilization repair immediately BEFORE
+    # the gate that consumes its output. The repair previously lived only in
+    # do_learning_gate — one full phase LATER — so every manifest reached this
+    # gate with utilization_pending still true and no method recorded. Ordering
+    # is the whole fix: same helper, called where its consumer can see the result.
+    _repair_utilization_pending
     local gate_args=(--goal "$GOAL_ID")
     if [[ -n "$NO_RETRIEVAL_APPLICABLE" ]]; then
         gate_args+=(--no-retrieval-applicable "$NO_RETRIEVAL_APPLICABLE")
@@ -1552,55 +1689,13 @@ os.replace(tmp, str(p))
         echo "[iteration-close] retrieval-summary: performed=false goal=$GOAL_ID (no-retrieval stub)"
     else
         perf="true"   # g-115-2201: retrieval fired for this goal
-        # Retrieval was performed for this goal — run safety-net feedback if pending.
-        local pending
-        pending="$(python3 -c "
-import json
-try:
-    d = json.loads(open(r'$ret_file', encoding='utf-8').read())
-    print('true' if d.get('utilization_pending') else 'false')
-except Exception:
-    print('false')
-" || { echo "[iteration-close] WARN: retrieval-session.json read failed — retrieval gate skipped" >&2; echo "false"; })"
-        if [[ "$pending" == "true" ]]; then
-            # Two-tier safety-net feedback (g-242-06, fix-a for rb-428/g-242-05 cycle):
-            # (1) Try --infer --confidence conservative first. Produces
-            #     times_inferred_helpful (half-weight counter) when distinctive tokens
-            #     match execution diary / guardrail triggers — unblocks utilization_score
-            #     movement without requiring LLM attestation in Phase 4.26.
-            # (2) On exit 4 (schema_version < 2; documented fallback signal), fall back
-            #     to --all-unknown (no-op on counters; just records the method so the
-            #     pending flag clears). Replaces the older --all-noise fallback whose
-            #     blanket times_noise++ was the root cause of the 0/655 helpful audit
-            #     2026-05-07: legitimate retrieval-but-unattested nodes accumulated noise
-            #     that fed tree.py distill candidates. See utilization-gate.sh header.
-            # (3) On any other non-zero: warn + leave pending=true so next iteration retries.
-            # Non-fatal either way: retrieval-session.json's utilization_pending flag is
-            # what drives retry; we never crash iteration-close over a feedback blip.
-            local infer_rc
-            # C.2: balanced (min_distinctive=1) replaces conservative (>=2).
-            # Token-overlap inference is the second-stage classifier — its job
-            # is to find candidates the explicit-attest path missed. The
-            # fallback-active backstop in infer_feedback (utilization-feedback.py)
-            # is the third stage that catches deterministic trigger-fires.
-            # Conservative was starving positive signal: 0 helpful across 320
-            # active guardrails as of 2026-05-09 audit.
-            if bash "$SCRIPT_DIR/utilization-feedback.sh" --goal "$GOAL_ID" --infer --confidence balanced; then
-                echo "[iteration-close] retrieval gate: inferred utilization feedback for $GOAL_ID (balanced)"
-            else
-                infer_rc=$?
-                if [[ $infer_rc -eq 4 ]]; then
-                    # Schema too old — documented fallback path
-                    if bash "$SCRIPT_DIR/utilization-feedback.sh" --goal "$GOAL_ID" --all-unknown; then
-                        echo "[iteration-close] retrieval gate: --infer schema<2, fell back to --all-unknown for $GOAL_ID"
-                    else
-                        echo "[iteration-close] WARN: utilization-feedback --all-unknown fallback failed for $GOAL_ID (pending=true persists)" >&2
-                    fi
-                else
-                    echo "[iteration-close] WARN: utilization-feedback --infer failed (rc=$infer_rc) for $GOAL_ID (pending=true persists, next iteration will retry)" >&2
-                fi
-            fi
-        fi
+        # Retrieval was performed for this goal — run safety-net feedback if
+        # pending. BACKSTOP call site (g-115-3123): do_state_update already ran
+        # this immediately before phase-4-26-gate.sh, so on the normal loop path
+        # the helper finds pending=false and no-ops. It still fires when
+        # state-update never ran (operator retry, crash-resume straight into
+        # learning-gate) or when the repair there failed and left pending=true.
+        _repair_utilization_pending
         echo "[iteration-close] retrieval-summary: performed=true goal=$GOAL_ID"
     fi
 
@@ -1812,6 +1907,28 @@ do_productivity_check() {
     # Invokes the productivity stop gate, which may set stop-requested.
     # Runs AFTER learning-gate phase; productive_goals counter is already updated.
     echo "[iteration-close] productivity-check"
+
+    # Durability-critical push FIRST (g-115-2915, felt-sense finding alpha ~goal 294):
+    # iteration-push runs BEFORE the ~16-script maintenance battery below, not after it.
+    # The push is the one durability-critical, cross-fleet-visible step; gating it behind
+    # ~16 best-effort maintenance scripts meant that on a busy fleet the battery wall-clock
+    # (each own-cloud S3 RMW can be 3.8-10.1s — see the gate-firings-flush note below)
+    # approached/exceeded the 2-min Bash timeout, SIGTERM-killing the terminal Bash before
+    # the push completed and stranding local commits (observed: 2 timeouts, 4 commits
+    # stranded, manual push to recover; git fetch itself was 0.6s so network was NOT the
+    # cause — cumulative battery latency was). Pushing first guarantees the commits land
+    # regardless of battery slowness. Bonus: iteration-push.sh's merge REFUSES a dirty
+    # working tree (never overwrites); running it before the battery writes its ~6 files
+    # means the merge sees a cleaner tree and defers less often. do_state_update (an
+    # earlier phase) already committed this iteration's work, so the push has all it needs
+    # and NO dependency on the battery below. fail-soft, rate-limited (g-115-1734, USER
+    # DIRECTIVE Zachary 2026-07-02): batches (pushes only when origin is behind by >= N
+    # commits OR oldest unpushed >= T min), skips when .git/index.lock is held (guard-853),
+    # never force-pushes, fail-open — a push failure logs to stderr and NEVER aborts
+    # productivity-check or blocks loop continuation.
+    {
+        bash "$SCRIPT_DIR/iteration-push.sh" --repo "$PROJECT_ROOT"
+    } || true
     # Phase 4.25 drift compliance check (g-248-16, rb-428). Warn-only — surfaces
     # when experience.jsonl is stale because the LLM-only experience-add.sh
     # call has drifted out of the hot path. Never blocks iteration.
@@ -1996,6 +2113,33 @@ do_productivity_check() {
     python3 "$(_winpath "$SCRIPT_DIR/stale-sentinel-canary.py")" --quiet \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
+    # Cadence-stale canary (g-115-2986) — defense-in-depth for the g-115-2984
+    # cadence battery, one level below the sentinel canary. The battery makes the
+    # six cadence CHECKS un-skippable, but the DISPATCH (invoking the ritual skill
+    # on a printed '▸ CADENCE FIRE' line) stays LLM-orchestrated. This canary
+    # counts a cadence that keeps FIRING (its check returns exit 0) across N canary
+    # runs without its dispatch stamp advancing — a skipped dispatch, the
+    # felt-sense-starvation class (g-115-2982) — and files an Investigate.
+    # Threshold: stale_cadence.threshold_iterations in core/config/aspirations.yaml
+    # (default 3). Fail-open: any error is non-fatal and routed to
+    # iteration-close-stderr.log. --quiet suppresses the JSON when nothing fired.
+    python3 "$(_winpath "$SCRIPT_DIR/cadence-stale-canary.py")" --quiet \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
+    # History-store vacuum tick (g-115-2792-b; design g-115-2792-a) — cadence
+    # for _history_store.vacuum, which had NO caller (measured .history 8.1G =
+    # 98% of WORLD_PATH). 24h time-gated + per-box locked + BACKGROUNDED so the
+    # ~114k-file walk never blocks iteration close. Archive-before-delete
+    # (Decision 3): orphan payloads copy to a lifecycle-exempt REMOTE graveyard
+    # + are verified before any local unlink; archive/verify failure aborts
+    # WITHOUT deleting. Lands SAFE (history_vacuum.apply defaults false =>
+    # enumerate+report only) until g-115-2792-c runs the positive control and
+    # flips apply=true. Same LOCAL-tick + fail-open (`|| true`) + stderr-sink
+    # contract as the sibling ticks above. Uses the .sh wrapper (sources
+    # _paths.sh, backgrounds its own run). Config: aspirations.yaml § history_vacuum.
+    bash "$SCRIPT_DIR/history-vacuum-tick.sh" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+
     # Orphan-root sweep (plan v1 D5, 2026-05-19) — periodic detector for
     # cruft directories at the wrong root (external-path-resolution drift).
     # Six scans: Mode A duplicates (world-parent), Mode B skeleton dirs
@@ -2017,18 +2161,11 @@ do_productivity_check() {
         } >>"$orphan_log" 2>&1
     } || true
 
-    # Keep origin current (g-115-1734, USER DIRECTIVE Zachary 2026-07-02):
-    # fail-soft, rate-limited push of accumulated loop-commits. productivity-check
-    # is the terminal phase, so the state-update commit (do_state_update) has
-    # already landed. iteration-push.sh batches (pushes only when origin is behind
-    # by >= N commits OR the oldest unpushed commit is >= T minutes old), skips
-    # when .git/index.lock is held (guard-853), never force-pushes, and is
-    # fail-open — a push failure logs to stderr and NEVER aborts productivity-check
-    # or blocks loop continuation. Placed BEFORE the ITERATION COMPLETE imperative
-    # so that imperative stays the terminal stdout line (return-protocol).
-    {
-        bash "$SCRIPT_DIR/iteration-push.sh" --repo "$PROJECT_ROOT"
-    } || true
+    # iteration-push MOVED to the TOP of this phase (g-115-2915, 2026-07-22):
+    # the durability-critical push now runs BEFORE the ~16-script maintenance
+    # battery, not after it, so a slow battery can no longer SIGTERM the terminal
+    # Bash before the push lands. See the "Durability-critical push FIRST" block
+    # right after the productivity-check echo above for the full rationale.
 
     # Iteration-anchor cleanup (g-115-206 follow-up — bravo session-58 reflection).
     # productivity-check is the canonical terminal phase, so the iteration anchor

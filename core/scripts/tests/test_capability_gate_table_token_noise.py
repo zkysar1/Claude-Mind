@@ -1,4 +1,4 @@
-"""test_capability_gate_table_token_noise.py — regression test for 6.
+"""test_capability_gate_table_token_noise.py — regression test for .
 
 Markdown-table STRUCTURAL vocabulary + prose function words from
 capability-routing.md row text ("row", "entry", "table", "because",
@@ -41,7 +41,7 @@ GATE_PY = CORE_SCRIPTS / "capability-gate.py"
 
 _NEW_STOPWORDS = {"row", "entry", "table", "because", "verified", "evidence"}
 
-# Echo-shaped FP defer (9 class): structural/table vocabulary and
+# Echo-shaped FP defer ( class): structural/table vocabulary and
 # verification prose, but NO capability reference — no imperative verbs, no
 # row-naming compounds. Pre-fix, 'because'+'row' co-occurred in the PLAY-mode
 # row and 'entry'+'evidence' in the bounded-config-tune row, each forming a

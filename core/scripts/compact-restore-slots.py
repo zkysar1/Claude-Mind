@@ -136,7 +136,7 @@ def _delete_checkpoint_safely(path, reason: str) -> bool:
 
 
 def _recover_lost_loop_state():
-    """Null-guarded loop_state recovery across compaction (2).
+    """Null-guarded loop_state recovery across compaction ().
 
     loop_state is in SKIP_SLOTS (the general merge never restores it) AND the
     freshness gate below skips the whole restore when wm.yaml mtime > checkpoint
@@ -195,10 +195,10 @@ def main():
     # recovery write bumps wm.yaml's mtime, which would otherwise make this
     # gate wrongly skip a legitimate general restore — the gate's premise is
     # "an iteration completed after PreCompact", which a recovery write does
-    # NOT satisfy. 2.
+    # NOT satisfy. .
     _wm_fresher_than_checkpoint = _is_checkpoint_stale(CHECKPOINT_PATH, _resolve_wm_path())
 
-    # 2: recover loop_state if it was nulled/lost in the compaction
+    # : recover loop_state if it was nulled/lost in the compaction
     # window. MUST run before the general merge — loop_state is in SKIP_SLOTS
     # (never restored) and the freshness gate below skips the whole restore,
     # so neither would recover it. Null-guarded: no-op (no write) when on-disk

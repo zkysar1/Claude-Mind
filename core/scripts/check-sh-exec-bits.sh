@@ -5,7 +5,7 @@
 # runs on a Linux box. On a Linux checkout a *.sh at 100644 is NOT executable,
 # so DIRECT-EXEC chains — `exec "$DIR/foo.sh"`, `./foo.sh` — fail with
 # 'Permission denied'. Scripts invoked as `bash foo.sh` are unaffected, which is
-# why the gap hid until an `exec`-chain hit it (echo boot 2026-07-10, 1:
+# why the gap hid until an `exec`-chain hit it (echo boot 2026-07-10, :
 # agent-aspirations-add-goal.sh line 7 exec'd aspirations-add-goal.sh).
 #
 # This check catches a newly-added core/scripts *.sh that lacks the exec bit

@@ -1,4 +1,4 @@
-"""test_experience_goal_id_backfill.py -- regression for 7.
+"""test_experience_goal_id_backfill.py -- regression for .
 
 experience.py builds ids as exp-{goal_id}-{skill_slug} (cmd_archive_goal), so an
 id EMBEDS the owning goal-id. But a caller-formed cmd_add record can leave the
@@ -35,7 +35,10 @@ import experience  # conftest puts core/scripts on sys.path
     ("exp-g-307-01-2026-05-16", "g-307-01"),
     ("exp-g-001-02-delta-20260524", "g-001-02"),
     ("exp-g-250-107-20260526", "g-250-107"),
-    ("exp-7-fix", "7"),            # 4-digit tail supported
+    ("exp--fix", ""),            # 4-digit tail supported
+    ("exp--a-slug", ""),             # : decompose child derives to PARENT (embed ambiguous w/ slug-<letter>)
+    ("exp--a-s93", ""),          #  fresh-eyes: REAL archive slug-<letter> case — parent, NOT nonexistent -a
+    ("exp-g-xw-20260719T110333-01-flywheel", "g-xw-20260719T110333-01"),  # : cross-world id
     ("exp-encode-session-2026-05-25-x", None),        # slug-only, genuinely goal-less
     ("exp-577-behavioral-analysis-20260524", None),   # leading number is not a goal-id
     ("exp-2026-05-16_ohs-perception", None),
@@ -90,7 +93,7 @@ def test_backfill_apply_and_idempotent(tmp_path, monkeypatch):
     records = [
         {"id": "exp--a", "goal_id": None},        # -> 
         {"id": "exp--b", "goal_id": ""},          # empty -> 
-        {"id": "exp--c", "goal_id": ""},   # present -> untouched
+        {"id": "exp-g-115-9-c", "goal_id": ""},   # present -> untouched
         {"id": "exp-encode-session-d", "goal_id": None},  # slug-only -> stays null
     ]
     jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
@@ -102,7 +105,7 @@ def test_backfill_apply_and_idempotent(tmp_path, monkeypatch):
     by_id = {r["id"]: r.get("goal_id") for r in out}
     assert by_id["exp-g-307-01-a"] == "g-307-01"
     assert by_id["exp-g-001-02-b"] == "g-001-02"
-    assert by_id["exp--c"] == ""    # present value never overwritten
+    assert by_id["exp-g-115-9-c"] == ""    # present value never overwritten
     assert by_id["exp-encode-session-d"] is None    # slug-only stays null
     assert len(out) == 4                            # no records dropped
 

@@ -1,4 +1,4 @@
-"""test_capability_gate_causal_relevance.py — regression test for 3.
+"""test_capability_gate_causal_relevance.py — regression test for .
 
 Two hardenings to the capability-gate Layer-D auto-conversion (rb-3955):
 
@@ -174,8 +174,8 @@ def test_mode2_adjectival_clean_suppresses_unblock_end_to_end():
     # "clean session" (adjectival) + a domain-noun ('npc') that token-matches an
     # NPC capability -> would_block True, but 'clean' is rejected as the action
     # verb and no other imperative verb remains, so action_verb=None and the
-    # 2 guard suppresses the Unblock (unblock_suggested=False).
-    # WITHOUT the 3 fix, 'clean' would be picked -> unblock_suggested
+    #  guard suppresses the Unblock (unblock_suggested=False).
+    # WITHOUT the  fix, 'clean' would be picked -> unblock_suggested
     # True with a nonsensical "Unblock: clean" title (the rb-3955 bug).
     rc, d = _run_gate("clean session npc memory hierarchy node")
     if not d.get("would_block"):

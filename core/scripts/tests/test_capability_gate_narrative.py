@@ -50,7 +50,7 @@ CASES = [
             "decision before we land the unit-file change"
         ),
         "expected_narrative_substr": "user approves",
-        # Flipped True→False (3 triage, 2026-07-16): the block relied
+        # Flipped True→False ( triage, 2026-07-16): the block relied
         # on the sole generic-prose token 'always' (from "Restart=always")
         # accidentally matching the bridge-server capability row — semantically
         # unrelated vocabulary, exactly the class the  sole-token

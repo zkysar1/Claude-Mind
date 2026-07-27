@@ -1,4 +1,4 @@
-"""0 (0 item b): streak-break canary basis classification.
+""" ( item b): streak-break canary basis classification.
 
 The streak-break CANARY fired on expected_interval_hours = interval_hours, so
 selection-gated goals (interval 2.67h, actual median ~10.9h) and signal-gated
@@ -159,7 +159,7 @@ def test_reader_missing_file_returns_empty(tmp_path):
 def test_reflector_gate_three_way_contract():
     informational = {"goal_id": "g-1", "canary": False}
     canary_worthy = {"goal_id": "g-1", "canary": True}
-    legacy = {"goal_id": "g-1"}                      # pre-0 record
+    legacy = {"goal_id": "g-1"}                      # pre- record
     assert (informational.get("canary") is False) is True    # suppressed
     assert (canary_worthy.get("canary") is False) is False   # files
     assert (legacy.get("canary") is False) is False          # files (compat)

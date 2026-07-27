@@ -1,4 +1,4 @@
-"""test_pending_questions_sweep.py — regression test for 9.
+"""test_pending_questions_sweep.py — regression test for .
 
 Asserts that pending-questions-sweep.py's `_h_source_goal_completed` heuristic
 EXEMPTS self.md Decision-Authority decision-logs from source-goal-completion

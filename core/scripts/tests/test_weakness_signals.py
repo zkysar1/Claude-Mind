@@ -1,4 +1,4 @@
-"""Tests for weakness-signals.py (5 — windowed weakness deltas).
+"""Tests for weakness-signals.py ( — windowed weakness deltas).
 
 Pins the discrimination contract: ambient mass-matched guardrails (the
 precheck guardrail-check inflates ~58 rules by the same amount every
@@ -94,7 +94,7 @@ def test_uniform_ambient_yields_no_signals(tmp_path):
 
 
 def test_g115_2141_large_nonmover_majority_does_not_collapse_median(tmp_path):
-    """1 regression: a large NON-MOVING guardrail majority must NOT
+    """ regression: a large NON-MOVING guardrail majority must NOT
     collapse the discrimination median to 0.
 
     The script computes the ambient median over NONZERO movers only (the

@@ -150,7 +150,7 @@ def cmd_check(args):
         # carry a disjoint schema (monitor_kind/revision_id/metric_samples, NOT
         # goals_since_change/imp_k_samples/strategy_file). They are checked by
         # cmd_evolution_check, NOT here. Without this skip, cmd_check raises
-        # KeyError on the first evolution monitor (7). Symmetric to the
+        # KeyError on the first evolution monitor (). Symmetric to the
         # "if kind not in EVOLUTION_KINDS: continue" filter in cmd_evolution_check.
         if monitor.get("monitor_kind") in EVOLUTION_KINDS:
             continue
@@ -279,10 +279,10 @@ def cmd_graduate(args):
     for monitor in monitors:
         # active_monitors mixes weight-monitors (meta_change_id) with evolution
         # monitors (monitor_kind/revision_id, NO meta_change_id). .get() skips
-        # the latter, mirroring cmd_check's EVOLUTION_KINDS skip (7);
+        # the latter, mirroring cmd_check's EVOLUTION_KINDS skip ();
         # graduate was the sibling that fix missed — an unguarded subscript
         # KeyError'd the whole endpoint on any co-resident evolution monitor,
-        # breaking graduate fleet-wide (7).
+        # breaking graduate fleet-wide ().
         if monitor.get("meta_change_id") == args.change_id:
             monitor["status"] = "graduated"
             found = True
@@ -652,7 +652,7 @@ def _email_rollback(rollback_entry):
         "Title": subject,
         "InfoMessage": subject,
         "Body": body,
-        # Provenance stamp — email-send.sh refuses payloads without it (6).
+        # Provenance stamp — email-send.sh refuses payloads without it ().
         "XPayloadProvenance": "meta-backpressure/v1",
     }
     email_script = (WORLD_DIR / "scripts" / "email-send.sh").as_posix()

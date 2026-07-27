@@ -292,6 +292,14 @@ temp_pressure:
 stale_sentinel:
   threshold_iterations: 3   # consecutive canary runs with the sentinel still set before filing Investigate
 
+# Cadence-stale canary () — defense-in-depth for the  cadence
+# battery, one level below stale_sentinel. Counts a cadence whose check keeps
+# FIRING (exit 0) across N consecutive canary runs without its dispatch stamp
+# advancing (a skipped ritual dispatch — the felt-sense-starvation class,
+# ) and files an Investigate. Read by core/scripts/cadence-stale-canary.py.
+stale_cadence:
+  threshold_iterations: 3   # consecutive canary runs with a cadence still FIRING (dispatch skipped) before filing Investigate
+
 # --- PRECHECK BUDGET CAP (Magic Wand 2 — ) ---
 # Budget cap on aspirations-precheck wall-clock cost. When cumulative precheck
 # elapsed-ms exceeds budget_pct of iteration_budget_ms, deferrable sweeps are
@@ -311,7 +319,7 @@ stale_sentinel:
 #                Plus the two notification-age safety gates inbox-alert-age-check
 #                (0.5b.1b) + handoff-aging-check (0.5b.2b) — they escalate aged
 #                unclaimed work to external parties (user email / partner board),
-#                so they fire reliably; not meter-gated (6).
+#                so they fire reliably; not meter-gated ().
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval (run-all), blocker-recheck (Phase 0.5b.0.5),
 #                defer-recheck (Phase 0.5b.4).
@@ -320,7 +328,8 @@ stale_sentinel:
 #                (0.5e.5), felt-sense-cadence (0.5f), l1-skew-cadence (0.5g),
 #                health-regression-cadence (0.5h), curriculum-cadence (0.5i),
 #                evolution-cadence (0.5j), defer-drift-check (0.5b.10),
-#                reason-less-blocked-check (0.5b.11).
+#                reason-less-blocked-check (0.5b.11),
+#                blocked-signal-resolution-check (0.5b.12).
 #                All are themselves cadence-gated, so dropping them in tight
 #                zones is safe.
 #
@@ -465,7 +474,7 @@ plateau_detection:
   diminishing_returns_window: 5   # Goals over which to check monotonic decline
   # Learning is measured by aspiration-trajectory.py as: reasoning bank entries,
   # guardrails, pattern signatures, and tree node updates attributed to each goal.
-  # Exemption is RECORD-level, not config-level (7): a maintenance
+  # Exemption is RECORD-level, not config-level (): a maintenance
   # queue whose normal operating point is ~0 learning velocity carries
   # `plateau_exempt: true` on its aspiration record (set via
   # aspirations-update.sh <asp-id> plateau_exempt true). The trajectory
@@ -497,7 +506,7 @@ proactive_escalation:
     medium: 12                  #   Aged > medium with no prior HIGH fire → fire MEDIUM-severity notification.
                                 #   Cooldown via wm.proactive_escalation_log keyed on f"inbox_alert_{goal.id}". Closes  finding (2).
 
-# --- UNBLOCK INTAKE PROBE (7, rb-1111) ---
+# --- UNBLOCK INTAKE PROBE (, rb-1111) ---
 # Fast intake-time probe for Unblock goals at claim time. Parses the goal's
 # failure_reason for named artifacts (commit hashes, file:line refs, function
 # names) and emits a probable-fix-landed | bug-still-present | inconclusive
@@ -603,7 +612,7 @@ lightweight_mode:
     - framework-maintenance
 
 # --- STRATEGIC SCAN (Environmental Observation) ---
-# ── Per-runner capability filter (0) ──
+# ── Per-runner capability filter () ──
 # Declares what THIS box can do, so goal-selector drops candidates whose explicit
 # `requires_capability` this runner cannot satisfy (a capability-constrained fresh
 # box stops burning tokens ranking goals it cannot execute -- Class C fresh-box
@@ -621,6 +630,27 @@ lightweight_mode:
 #   provides: []
 #   lacks: []
 #   probe: true
+#
+# SCOPE WARNING -- this file is GIT-SHARED, so the block above applies to the
+# WHOLE FLEET. It is correct for a claim true of every box ("no runner here has
+# a GPU"); it is WRONG for anything true of one box only. Setting
+# `provides: [studio-session]` here would claim a live Studio session on every
+# runner, and goals needing it would be selected on boxes that cannot execute
+# them -- moving the failure from selection-time to execution-time, which is
+# strictly worse (the goal is picked, burns an iteration, then fails).
+#
+# PER-BOX declarations go in the bound agent's `local-paths.conf` instead --
+# the only genuinely machine-local surface (gitignored AND listed in
+# owncloud_sync._EXCLUDE_NAMES, so it reaches neither git nor S3):
+#   RUNNER_CAPABILITIES_PROVIDES=studio-session
+#   RUNNER_CAPABILITIES_LACKS=gpu,ml-deps
+#   RUNNER_CAPABILITIES_PROBE=true
+# Both layers merge in goal-selector._get_runner_capabilities: provides/lacks
+# UNION (lacks stays the authoritative last word from either layer), and the
+# box wins on `probe`. See _runner_capabilities.merge_capability_config.
+# `studio-session` is deliberately never probed -- it is a transient runtime
+# resource on one host, not a static box property -- so a Studio host asserting
+# it via local-paths.conf is the ONLY way any runner ever provides it.
 
 # Periodic "step back and look" phase that reads world signals
 # and generates work from environmental observation rather than
@@ -777,7 +807,7 @@ l1_skew_check:
   goal_cadence: 50              # Every N completed goals — passive observability
   wm_slot: last_l1_skew_check
   threshold: 5.0                # LEGACY: ratio evidence carried in the payload
-                                # only — no longer gates flagging (5:
+                                # only — no longer gates flagging (:
                                 # a tiny-but-healthy min-denominator L1 made
                                 # max/min unsatisfiable by any taxonomy action)
   dominance_threshold: 0.90     # Flag when one L1 holds >= this share of a
@@ -791,7 +821,7 @@ l1_skew_check:
                                 # fresh-eyes (+5) or felt-sense (+15) on a fresh
                                 # seed event — 20 goals out lands distinctly.
 
-# --- CURRICULUM RE-EVALUATION CADENCE (1) ---
+# --- CURRICULUM RE-EVALUATION CADENCE () ---
 # Time-based cadence that re-runs curriculum-evaluate for the CURRENT agent so
 # its graduation-gate snapshot never goes stale. The only OTHER /curriculum-gates
 # triggers (session-end consolidation, cadence-gated evolution) can skip a
@@ -941,7 +971,7 @@ recurring:
                                   # (fewer FP canaries), and the reflector's recovered-cadence
                                   # auto-resolve window widens (more lingering canaries
                                   # self-close). Pairs with the existing anti-flood gates
-                                  # 9 (filing-suppression) +  (auto-resolve).
+                                  #  (filing-suppression) +  (auto-resolve).
   session_gap_threshold_hours: 2.0  # Auto-resolve threshold for streak-break canaries
                                     # that recover OUTSIDE the streak_mult window.
                                     # When a canary's source goal fires again later than
@@ -972,13 +1002,13 @@ recurring:
                                     # canaries, 98 of which closed transient/FP). HIGH goals
                                     # still file (cadence matters there; the selector's overdue
                                     # boost should have prevented the miss). Set false to
-                                    # restore the pre-3 behavior (continuous-activity
+                                    # restore the pre- behavior (continuous-activity
                                     # non-HIGH breaks file). Single source of truth:
                                     # streak-break-reflector.py _load_contention_suppress()
                                     # is the sole reader.
   cargo_cult_threshold: 3         # consecutive routine outcomes before auto-filing Idea
                                   # (see rb-335: YAML duplicate-key collision fix 2026-04-20)
-  # --- CARGO-CULT PLACEHOLDER SUPPRESSION (9) ---
+  # --- CARGO-CULT PLACEHOLDER SUPPRESSION () ---
   # Second-layer suppression of Phase 4.25 force_experience_archival sentinel
   # for forced-flip routine→deep closes that produce no substantive artifact.
   # First layer is  (empty encoding_queue + sensory_buffer); this
@@ -1111,6 +1141,30 @@ user_signal_boost:
   thread_active_boost: 1.0          # user_thread_id present AND recent replies/directives observed
                                     # Weight: meta/goal-selection-strategy.yaml → user_signal_boost
                                     # (default 1.2)
+
+# --- STANDING USER DIRECTIVE BOOST () ---
+# world/team-state.yaml `strategic_focus` is set by the USER and acknowledged by
+# every agent. It names the aspiration(s) that currently outrank routine work.
+# Before  it was consumed by boot/SKILL.md and create-aspiration only —
+# a directive whose own text said "at selection time" never reached the scorer.
+#
+# Rides the EXISTING directive_boost criterion (goal-selector.py 13b) rather than
+# adding a knob: board directives and the standing user directive are the same
+# kind of signal ("someone with authority said this matters more") and share the
+# criterion weight (meta/goal-selection-strategy.yaml → directive_boost, 1.5).
+#
+# The natural gate is field presence — no `enabled` flag. Absent strategic_focus,
+# or prose naming no `asp-NNN`, contributes zero. Self-retiring: a named
+# aspiration at completion_ratio >= 1.0 stops being boosted, so stale directive
+# prose costs nothing once the work has drained.
+strategic_focus_boost:
+  weight: 1.0                         # raw boost per goal under a named aspiration
+                                      # (x1.5 criterion weight -> +1.5 effective).
+                                      # Calibrated so product goals clear ROUTINE
+                                      # infra sweeps — matching the directive's own
+                                      # wording — without overriding higher-scoring
+                                      # verified-defect work. Bias, not veto
+                                      # (Scorer Sovereignty, ).
 
 # --- WORK-CLASS BALANCE (Tranche C — rb-390) ---
 # Pulls under-represented work_class values up when the last-N session
@@ -1425,7 +1479,7 @@ quiescence_gate:
     min_delta: 2          # require >= N new goals before running selector
     min_executable: 2     # require selector to return >= N candidates to flag
 
-# --- DRY-IDLE BACKOFF (4, alpha 2026-07-13) — parallel to quiescence ---
+# --- DRY-IDLE BACKOFF (, alpha 2026-07-13) — parallel to quiescence ---
 # The DRY state: an iteration finds ZERO executable goals but does NOT qualify
 # for the quiescence gate (no formal blocker_ref to gate on). Before this block,
 # that state fell through to the immediate deadman-pair re-entry — the synchronous
@@ -1433,9 +1487,9 @@ quiescence_gate:
 # full LLM speed re-deriving "nothing to do", burning tokens with no backoff
 # (observed 2026-07-13 on cc-04). quiescence_gate handles all-blocked-WITH-refs;
 # this handles honestly-nothing-to-do-but-not-formally-blocked. Layer 3
-# (4-c) routes the dry case to the interruptible-sleep bg terminal (the
+# (-c) routes the dry case to the interruptible-sleep bg terminal (the
 # same mechanism quiescence uses) and DROPS the synchronous re-entry (that
-# re-entry IS the spin). This is Layer 1 (4-a): the config + the
+# re-entry IS the spin). This is Layer 1 (-a): the config + the
 # signals.dry_idle counter schema documented below.
 #
 # COUNTER — loop_state.signals.dry_idle (dynamic sub-slot, sibling of
@@ -1536,14 +1590,14 @@ multi_agent:
   # other agents may pick it up (if the goal has reallocatable: true).
   reallocation_hours: 8             # Hours before unclaimed targeted goals become eligible
 
-# Cross-agent goal SURFACING gate (ENABLED 2026-07-15, 8; part iii of 4).
+# Cross-agent goal SURFACING gate (ENABLED 2026-07-15, ; part iii of ).
 # goal-selector.py collect_cross_agent_candidates pulls pending goals from
 # sibling agent queues where intended_agent == this agent (), stamping
 # source='cross-agent:<owner>'. The EXECUTION half is now wired: aspirations-select
 # Phase 2.95 splits that source into (effective_source='agent', cross_agent_owner),
 # and aspirations-execute Phase 4 env-prefixes MIND_AGENT=<owner> on the claim so it
-# resolves the OWNER's queue under the owner's identity — no 404, no 6
-# selector livelock. Prereq 7 (cross-agent-write.sh write-back helper,
+# resolves the OWNER's queue under the owner's identity — no 404, no 
+# selector livelock. Prereq  (cross-agent-write.sh write-back helper,
 # option A) landed; select/execute wiring proven by test_goal_selector_cross_agent_pull.py
 # + test_loop_state_save_cross_agent_owner.py + test_cross_agent_write.py. Flipped ON
 # only after verifying BOTH (a) the wiring above AND (b) >=2 partner agents active
@@ -1900,3 +1954,71 @@ health_regression:
           - "core/config/aspirations.yaml"
           - "core/scripts/productivity-stop-gate.sh"
           - "meta/reflection-strategy.yaml"
+
+# --- History-store vacuum cadence (-b; design -a in
+# world/knowledge/tree/system/history-store-gc-cadence.md). The CAS-delta
+# .history store's GC (_history_store.vacuum) had NO caller; orphaned
+# blobs/patches accumulated (measured 8.1G = 98% of WORLD_PATH). This block
+# drives history-vacuum-tick.sh (24h time-gate + per-box lock + backgrounded)
+# from the iteration-close productivity-check maintenance sink. Archive-before-
+# delete (archive-before-delete.md / rb-2859): orphan payloads COPY to a
+# lifecycle-exempt REMOTE graveyard + are verified (count+bytes+content-hash
+# key) before any local unlink; archive/verify failure ABORTS without deleting.
+history_vacuum:
+  enabled: true
+  interval_hours: 24
+  # Local fast-access retention for the CAS payload. Because retention-dropped
+  # payloads are graveyard-archived first (Decision 3), "dropped" means
+  # local-only — the payload stays restorable from the graveyard indefinitely,
+  # so a short LOCAL window is safe on the 98%-full disk. null disables
+  # retention-drop (orphan-sweep only).
+  metadata_only_after_days: 30
+  # apply=true (): the tick now ARCHIVES orphans to the remote
+  # graveyard, VERIFIES, then deletes locally (archive/verify failure => abort,
+  # NO delete — fail-safe). Flipped ONLY after four independent proofs the
+  # pipeline is safe: (1) 11/11 test_history_vacuum_archive.py (run()
+  # orchestration + ordering + every abort path, LocalDirArchiver); (2) direct
+  # real-S3 put+GET+md5-match against zds-own-cloud-data (stronger than the
+  # S3Archiver head-size check); (3) full real-S3 end-to-end via the PRODUCTION
+  # code path (synthetic orphan: reachable-survives + archived + deleted +
+  # restored+content-verified, and the cloud SDK's default credential chain
+  # authenticates in the tick env — no latent abort-trap); (4) lifecycle-safety
+  # verified (see
+  # graveyard_bucket note above). CAS orphan count was 0 at flip time
+  # (-c), so no immediate deletion — the guard fires on the first
+  # retention-drop orphans (~metadata_only_after_days). To revert: set false.
+  apply: true
+  # drain_legacy_dirs=false (): gates the SEPARATE legacy-per-file-dir
+  # drain pass (run_legacy_drain). The CAS vacuum (apply above) covers ONLY the
+  # content-addressed store (.history/{snapshots,blobs,patches}); the frozen
+  # pre-2026-07-16 legacy per-file dirs (aspirations.jsonl/, knowledge/, board/,
+  # reasoning-bank.jsonl/, ...) are a SEPARATE store with no manifest/blob/patch
+  # model. Landing INERT (false): even with apply=true the legacy pass NEVER runs
+  # until this flag is deliberately flipped — safe-by-construction (a buggy
+  # enumeration cannot delete anything while off). Flip to true ONLY after (1) a
+  # dry-run enumeration review — `python3 core/scripts/history_vacuum_archive.py
+  # --base-dir <WORLD|META> --drain-legacy --dry-run` — confirms exactly which
+  # top-level entries + file count would drain, and (2) a positive control
+  # (archive+delete+restore-verify a copy), exactly as apply=true was flipped
+  # (-c). Archives PATH-PRESERVING copies (legacy/<rel_path> gkey) to
+  # the retention-immune graveyard before delete. To revert: set false.
+  drain_legacy_dirs: false
+  # s3 = production (REMOTE graveyard; Decision 3 forbids a local archive on the
+  # near-full disk). local = test/dev only.
+  archiver: s3
+  # graveyard_bucket: this env's OWN own-cloud data bucket (per
+  # core/config/environments/ayoai-mind.yaml -> bucket: zds-own-cloud-data).
+  # It is NOT "lodestar-data" — that bucket never existed (-c
+  # HeadBucket 404 + full `aws s3 ls`); the topology is per-env buckets
+  # (claude-mind-own-cloud-data, zds-own-cloud-data, vinheim-data), not a
+  # shared "lodestar-data". The graveyard rides a lifecycle-SAFE prefix in this
+  # bucket: the only lifecycle rule that could expire data is
+  # NoncurrentVersionExpiration(90d), which touches ONLY overwritten
+  # (noncurrent) versions — graveyard objects are write-once with unique
+  # date/run-id keys, so they stay CURRENT forever and no clock touches them
+  # (there is no current-version Expiration rule). Verified .
+  graveyard_bucket: zds-own-cloud-data
+  graveyard_prefix: ayoai-mind/graveyard/history
+  # A vacuum lock dir older than this is presumed dead (backgrounded run
+  # crashed before rmdir) and reclaimed, so GC is never wedged forever.
+  stale_lock_reclaim_hours: 2

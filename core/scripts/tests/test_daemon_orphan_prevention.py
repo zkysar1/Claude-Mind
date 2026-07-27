@@ -113,7 +113,16 @@ def _read_state_files() -> dict:
 def _run_start(args=()):
     """Invoke mind-api-start.sh and return CompletedProcess."""
     cmd = [BASH, _bash_path(START_SH), *args]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(PROJECT_ROOT))
+    # : this file is the deliberate-operator exception to the
+    # shared-runtime claim gate in mind-api-start.sh. It spawns REAL daemons
+    # into the SHARED mind_api/state on purpose — it counts system-wide
+    # mind_api.src processes, so RUNTIME_DIR isolation cannot make it safe
+    # (see the pytestmark note above). Opt in explicitly; every OTHER test
+    # must isolate with RUNTIME_DIR instead of taking this hatch.
+    env = dict(os.environ)
+    env["MIND_ALLOW_SHARED_DAEMON_FROM_TEST"] = "1"
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                          cwd=str(PROJECT_ROOT), env=env)
 
 
 def _run_sweep(args=()):

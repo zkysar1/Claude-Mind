@@ -69,7 +69,7 @@ except ImportError:
 GATE_PY = CORE_SCRIPTS / "goal-duplication-gate.py"
 
 # Unique synthetic tag — defense-in-depth against fixture collisions (agent
-# queues are tmp-redirected via MIND_AGENTS_ROOT since 1; the tag
+# queues are tmp-redirected via MIND_AGENTS_ROOT since ; the tag
 # predates that and stays as a second isolation layer).
 TAG = "pendqtest12345"
 
@@ -152,7 +152,7 @@ def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
-    # Hermetic agent-queue scan (1): point the gate's per-agent
+    # Hermetic agent-queue scan (): point the gate's per-agent
     # enumeration at a test-controlled root instead of live agents/.
     env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
@@ -237,6 +237,56 @@ def main() -> int:
                 failures.append(
                     f"P1: expected origin_signal in match_strategy set, "
                     f"got strategies={strategies}"
+                )
+
+        # ── P1c: origin_signal exact match vs a COMPLETED twin → BLOCK ────
+        # : a finding already converted+COMPLETED under an
+        # origin_signal must block a re-file. Before the fix Strategy-1
+        # scanned pending/in-progress only, so a same-origin_signal COMPLETED
+        # goal did NOT dedup (canonical:  dup'd completed ,
+        # both board_post:msg-4248). The match_strategy is
+        # "origin_signal_completed" (distinct from the pending "origin_signal")
+        # so the block reason tells the agent the twin is DONE —
+        # verify-before-assuming (git log the finding id, rb-5047) rather than
+        # re-implement. Structural/fuzzy Strategy-2 stays pending-only, so a
+        # completed goal alone can only block via this EXACT-origin path.
+        completed_origin = f"board_post:{TAG}-p1c-completed-twin"
+        seed_p1c = _mk_aspiration("asp-pendq-p1c", [{
+            "id": "g-pendq-p1c-completed",
+            "title": "Fix: pendq p1c already-done work",
+            "description": "This finding was already converted and completed.",
+            "status": "completed",
+            "origin_signal": completed_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p1c])
+
+        case_p1c = {
+            "title": "Fix: pendq p1c re-filed duplicate of completed work",
+            "description": ("A later same-origin_signal filing that must be "
+                            "blocked against the COMPLETED twin, not slip "
+                            "through the pending-only Strategy-1 blind spot."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": completed_origin,
+        }
+        rp1c = _run_gate(case_p1c, tmp_world)
+        pq1c = _find_check(rp1c, "pending_queue")
+        if pq1c is None:
+            failures.append("P1c: pending_queue check missing from result")
+        elif pq1c.get("passed") is not False:
+            failures.append(
+                f"P1c: pending_queue should have FAILED (origin_signal exact "
+                f"vs COMPLETED twin, g-115-3048). reason={pq1c.get('reason')} "
+                f"matches={pq1c.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq1c.get("matches") or []}
+            if "origin_signal_completed" not in strategies:
+                failures.append(
+                    f"P1c: expected origin_signal_completed in match_strategy "
+                    f"set, got strategies={strategies}"
                 )
 
         # ── P2: file-path overlap → BLOCK ────────────────────────────────
@@ -419,7 +469,7 @@ def main() -> int:
             )
 
         # ── P7: decomposition siblings (same parent origin) → PASS ────────
-        # 6: filing the 2nd+ child of one parent shares the parent's
+        # : filing the 2nd+ child of one parent shares the parent's
         # origin_signal ("decomposition:<parent>") BY DESIGN. The siblings are
         # DISTINCT deliverables (low structural overlap). Strategy 1 must NOT
         # exact-match-block them (the prefix is exempt); Strategy 2 must not
@@ -468,7 +518,7 @@ def main() -> int:
         # The exemption only skips Strategy 1 (origin_signal). A genuine
         # duplicate child (same parent origin AND shared file path) must STILL
         # block via the structural overlap path — proving the exemption does
-        # not open a real-dup hole (6 verification outcome 2).
+        # not open a real-dup hole ( verification outcome 2).
         dup_origin = f"decomposition:g-{TAG}-parent2"
         dup_path = f"core/scripts/{TAG}-p8-shared.py"
         seed_p8 = _mk_aspiration("asp-pendq-p8", [{
@@ -604,7 +654,7 @@ def main() -> int:
             )
 
         # ── P10: discovered_by parent → DEMOTE (lineage advisory) ─────────
-        # 6: a follow-up goal filed FROM a discovery goal cites its
+        # : a follow-up goal filed FROM a discovery goal cites its
         # parent's file path + vocabulary BY DESIGN. Without the lineage
         # exemption this shape hard-blocks via Strategy 2 (observed: echo
         #  blocked against its own discoverer ). The same
@@ -710,7 +760,7 @@ def main() -> int:
 
         # ── P12: same-discoverer siblings → DEMOTE (lineage advisory) ─────
         # Two children filed by ONE discovery pass share its vocabulary but
-        # carry DISTINCT origin_signals (observed: echo 2 blocked
+        # carry DISTINCT origin_signals (observed: echo  blocked
         # against same-discoverer lane siblings). Contrast P8: same shape
         # WITHOUT the shared discovered_by still blocks.
         p12_path = f"core/scripts/{TAG}-p12-shared.py"
@@ -808,7 +858,7 @@ def main() -> int:
         # ── P14: goal-id PREFIX collision → still BLOCK (no exemption) ─────
         # Goal ids have 2-4 digit suffixes, so bare substring matching would
         # let candidate g-...-1 claim lineage inside an origin_signal naming
-        # g-...-10 (live corpus:  inside "idea:1-slug").
+        # g-...-10 (live corpus:  inside "idea:-slug").
         # The boundary rule (id not followed by a digit) must keep this a
         # hard block — exempting it would let a true duplicate through.
         p14_path = f"core/scripts/{TAG}-p14-shared.py"
@@ -888,7 +938,7 @@ def main() -> int:
         # what _run_gate points at) and a decoy root the gate is NOT pointed
         # at. The visible goal must surface as an agent-source candidate; the
         # decoy goal must be absent from the entire check result — proving
-        # the scan reads ONLY the override root (1).
+        # the scan reads ONLY the override root ().
         p16_path = f"core/scripts/{TAG}-p16-shared.py"
         for root_name, gid in (("agents", "g-pendq-p16-visible"),
                                ("agents-decoy", "g-pendq-p16-decoy")):
@@ -937,7 +987,7 @@ def main() -> int:
                 "the scan — hermeticity broken"
             )
 
-        # ── P17-P20: completed-Maintain carve-out (7) ───────────
+        # ── P17-P20: completed-Maintain carve-out () ───────────
         # P17: status=completed Maintain proposal with STRUCTURAL overlap
         # (file-path + identifier keywords) vs a pending goal, AND a partner
         # in_flight sharing generic keywords → BOTH pending_queue and
@@ -1081,13 +1131,13 @@ def main() -> int:
                 f"P20: expected title_exact match strategy, got {blob20[:250]}")
 
         # ── P21: bare-filename-only overlap → DEMOTE (advisory) ───────────
-        # Regression guard for 3 (mirrors the git_log 6
+        # Regression guard for  (mirrors the git_log 
         # bare-basename floor). A PROSE proposal whose ONLY file-path hit is a
         # bare filename with no directory component (retrieve.sh, SKILL.md,
         # README.md, CLAUDE.md) shares VOCABULARY, not a work-target path —
         # dozens of topically-unrelated goals mention it. Before the fix this
         # bare hit counted as the has_specific co-signal and HARD-blocked
-        # (canonical: 3's own Investigate filing false-blocked on
+        # (canonical: 's own Investigate filing false-blocked on
         # "retrieve.sh"). Post-fix only a directory-QUALIFIED path (contains
         # "/") is specific enough to block; a bare-filename-only overlap
         # demotes to a visible strong_keyword_only advisory. Distinct from P3
@@ -1137,6 +1187,149 @@ def main() -> int:
                     f"advisories={advisories}"
                 )
 
+        # ── P22: lane-constant origin_signal siblings → PASS ──────────────
+        # : encode-session Lane 5 mandates the VERBATIM origin_signal
+        # "maintain:sq-018-verify-learning" in its JSON template, so every
+        # verify-learning candidate carries the byte-identical string. Strategy 1
+        # exact-match therefore blocks the Nth filing against all N-1
+        # predecessors even when they target entirely unrelated surfaces. Same
+        # class as the bare-tag origins (a LANE identity, not a symptom key), but
+        # prefixed, so _GENERIC_BARE_ORIGINS never catches it. WITHOUT the fix
+        # this case BLOCKS via origin_signal. Canonical incident: a Lane 5 filing
+        # hit 25 matches, 23 via origin_signal/origin_signal_completed, across
+        # runner_capabilities / tree-read projection / CRLF parsing / git modes.
+        lane_origin = "maintain:sq-018-verify-learning"
+        seed_p22 = _mk_aspiration("asp-pendq-p22", [{
+            "id": "g-pendq-p22-existing",
+            "title": f"Maintain: add verify-learning check for {TAG}-alpha probe",
+            "description": (f"Assert the {TAG}-alpha probe emits a verdict line "
+                            f"when its upstream sentinel is absent."),
+            "status": "pending",
+            "origin_signal": lane_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p22])
+
+        case_p22 = {
+            "title": f"Maintain: add verify-learning check for {TAG}-omega census",
+            "description": (f"Assert the {TAG}-omega consumer census has not "
+                            f"drifted; unrelated surface to the alpha probe."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": lane_origin,
+        }
+        rp22 = _run_gate(case_p22, tmp_world)
+        pq22 = _find_check(rp22, "pending_queue")
+        if pq22 is None:
+            failures.append("P22: pending_queue check missing from result")
+        elif pq22.get("passed") is not True:
+            failures.append(
+                f"P22: distinct verify-learning candidates sharing the "
+                f"lane-constant origin_signal should PASS (lane-constant "
+                f"exemption). reason={pq22.get('reason')} "
+                f"matches={pq22.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq22.get("matches") or []}
+            if "origin_signal" in strategies:
+                failures.append(
+                    f"P22: origin_signal must NOT be a match strategy for "
+                    f"lane-constant siblings, got strategies={strategies}"
+                )
+
+        # ── P23: TRUE duplicate sharing a lane constant → BLOCK (Strategy 2) ─
+        # The exemption only skips Strategy 1. A genuine duplicate (same lane
+        # constant AND a shared directory-qualified file path) must STILL block
+        # structurally — proving the exemption opens no real-dup hole. Mirrors
+        # P8's role for the decomposition-sibling exemption.
+        seed_p23 = _mk_aspiration("asp-pendq-p23", [{
+            "id": "g-pendq-p23-existing",
+            "title": f"Maintain: add verify-learning check for {TAG}_widget parity",
+            "description": (f"Grep core/scripts/{TAG}_widget.py and assert the "
+                            f"{TAG}_widget consumer set matches the baseline."),
+            "status": "pending",
+            "origin_signal": lane_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p23])
+
+        case_p23 = {
+            "title": f"Maintain: add verify-learning check for {TAG}_widget parity",
+            "description": (f"Grep core/scripts/{TAG}_widget.py and assert the "
+                            f"{TAG}_widget consumer set matches the baseline."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": lane_origin,
+        }
+        rp23 = _run_gate(case_p23, tmp_world)
+        pq23 = _find_check(rp23, "pending_queue")
+        if pq23 is None:
+            failures.append("P23: pending_queue check missing from result")
+        elif pq23.get("passed") is not False:
+            failures.append(
+                f"P23: a TRUE duplicate sharing the lane constant AND a file "
+                f"path must still BLOCK via structural overlap. "
+                f"reason={pq23.get('reason')} matches={pq23.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq23.get("matches") or []}
+            if "origin_signal" in strategies:
+                failures.append(
+                    f"P23: block must come from structural overlap, NOT "
+                    f"origin_signal (lane constant is exempt), got "
+                    f"strategies={strategies}"
+                )
+
+        # ── P24: parent_aspiration siblings → PASS ────────────────────────
+        # : every goal auto-filed under an aspiration carries
+        # "parent_aspiration:<asp-id>", so the Nth filing exact-matches all N-1
+        # predecessors under that parent — the decomposition-sibling shape one
+        # level up. Measured on the live queue: 19 pending/in-progress goals
+        # carry this origin, 18 under asp-115 alone, and they are self-evidently
+        # distinct deliverables. Strategy 1 must NOT exact-match-block them; the
+        # P8 control already proves a TRUE duplicate still blocks structurally
+        # through this same prefix branch.
+        par_origin = "parent_aspiration:asp-pendq-p24"
+        seed_p24 = _mk_aspiration("asp-pendq-p24", [{
+            "id": "g-pendq-p24-existing",
+            "title": f"Check the {TAG} inbox for unread operator alerts",
+            "description": (f"Poll the {TAG} operator mailbox and surface any "
+                            f"unread alert envelopes."),
+            "status": "pending",
+            "origin_signal": par_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p24])
+
+        case_p24 = {
+            "title": f"Reap stale {TAG} telemetry records past their grace window",
+            "description": (f"Sweep {TAG} telemetry rows whose lease expired and "
+                            f"mark them reaped; unrelated to the mailbox poll."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": par_origin,
+        }
+        rp24 = _run_gate(case_p24, tmp_world)
+        pq24 = _find_check(rp24, "pending_queue")
+        if pq24 is None:
+            failures.append("P24: pending_queue check missing from result")
+        elif pq24.get("passed") is not True:
+            failures.append(
+                f"P24: distinct goals sharing a parent_aspiration origin_signal "
+                f"should PASS (sibling-prefix exemption). "
+                f"reason={pq24.get('reason')} matches={pq24.get('matches')}"
+            )
+        else:
+            strategies = {m.get("match_strategy")
+                          for m in pq24.get("matches") or []}
+            if "origin_signal" in strategies:
+                failures.append(
+                    f"P24: origin_signal must NOT be a match strategy for "
+                    f"parent_aspiration siblings, got strategies={strategies}"
+                )
+
     finally:
         if tmp_world.exists():
             shutil.rmtree(tmp_world, ignore_errors=True)
@@ -1146,12 +1339,12 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (21/21 cases)")
+    print("PASS (24/24 cases)")
     return 0
 
 
 def test_pending_queue_gate():
-    """Pytest entry point (5) — runs the full pending-queue case
+    """Pytest entry point () — runs the full pending-queue case
     suite (already tmp-world isolated) and asserts all cases pass."""
     assert main() == 0
 

@@ -63,7 +63,7 @@ TRACKED = [
 # MIND_AGENT/MIND_WORLD/STORAGE_BACKEND — every other framework var leaks.
 # Stripping the whole framework prefix set is polluter-agnostic: env is the
 # only cross-test vector (no os.chdir in the suite), so a freshly-spawned
-# subprocess can only be perturbed via env. Mirrors the 0 fix in
+# subprocess can only be perturbed via env. Mirrors the  fix in
 # test_uncommitted_edits_log_filter.py (rb-1569 / commit bdb74df6).
 _FRAMEWORK_ENV_PREFIXES = (
     "MIND_", "WORLD_", "META_", "STORAGE_", "FILEOPS_", "RT_",
@@ -97,7 +97,7 @@ class TestStaleSentinelCanary(unittest.TestCase):
     def setUpClass(cls):
         cls._tmp_root = Path(tempfile.mkdtemp(prefix="stale-sentinel-canary-test-"))
         cls._tmp_agent_name = "_test_canary_agent"
-        # 3: create the agent dir UNDER the tmp root, NOT live
+        # : create the agent dir UNDER the tmp root, NOT live
         # PROJECT_ROOT/agents/. Resolution routes here via MIND_AGENT_DIR (now
         # honored by _paths.py AND _paths.sh) at the _hermetic_env call below.
         # The prior PROJECT_ROOT/agents/_test_canary_agent was adopted by the
@@ -162,8 +162,8 @@ class TestStaleSentinelCanary(unittest.TestCase):
             args.append("--dry-run")
         env = _hermetic_env(
             MIND_AGENT=self._tmp_agent_name,
-            MIND_AGENT_DIR=str(self._tmp_agent_dir),  # route resolution at the tmp dir (3)
-            # 2: pin the subprocess to the local backend. _hermetic_env
+            MIND_AGENT_DIR=str(self._tmp_agent_dir),  # route resolution at the tmp dir ()
+            # : pin the subprocess to the local backend. _hermetic_env
             # strips STORAGE_* but the backend ALSO resolves from box-level
             # config — on an own-cloud box the lock layer derives env-scoped
             # S3/lock keys and REFUSES the tmp WM lock path ("not under any
@@ -216,6 +216,9 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self.assertEqual(filed["stuck_count"], 3)
         self.assertTrue(filed["result"].get("dry_run"))
         self.assertIn("force_tree_maintain", filed["result"]["payload_title"])
+        # : the FILER agent is surfaced in the title so a cross-agent
+        # reader triages the FILER's WM, not their own (rb-5069 cross-agent nuance).
+        self.assertIn("filed by", filed["result"]["payload_title"])
 
     def test_resets_when_sentinel_cleared(self):
         """Clearing the sentinel mid-stretch resets stuck_count to 0."""
@@ -269,7 +272,7 @@ class TestStaleSentinelCanary(unittest.TestCase):
         r2 = self._run_canary(dry_run=False, threshold=3)
         self.assertEqual(r2["sentinels"]["force_tree_maintain"]["new_stuck_count"], 0)
 
-    # ---- Consumption-aware contract (3) -----------------------------
+    # ---- Consumption-aware contract () -----------------------------
 
     def test_consumption_aware_no_fire_when_dispatch_advances(self):
         """fresh_eyes_dispatch_pending re-armed every run while the consumer
@@ -342,7 +345,7 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self.assertEqual(fe["new_stuck_count"], 0)
         self.assertFalse(fe["fired"])
 
-    # ---- Consumption-aware contract for force_tree_maintain (9) ------
+    # ---- Consumption-aware contract for force_tree_maintain () ------
     # force_tree_maintain joined CONSUMPTION_AWARE keyed on
     # force_tree_maintain_last_dispatch. The drift-gate arms it (real shape:
     # {triggered_at, source, threshold}, no "fired" key -> _is_set true via the
@@ -409,7 +412,7 @@ class TestStaleSentinelCanary(unittest.TestCase):
         self.assertEqual(ftm["new_stuck_count"], 0)
         self.assertFalse(ftm["fired"])
 
-    # ---- Consumption-aware contract for force_metric_encoding_pending (6)
+    # ---- Consumption-aware contract for force_metric_encoding_pending ()
     # force_metric_encoding_pending is the THIRD dispatch-consumer sentinel; it
     # joined CONSUMPTION_AWARE keyed on force_metric_encoding_last_dispatch. The
     # metric gate arms it (real shape: {"fired": True, distinct_count, set_at,
@@ -485,7 +488,7 @@ class TestStaleSentinelCanary(unittest.TestCase):
 
 
 class TestRecentInvestigateDedup(unittest.TestCase):
-    """4: `_recent_investigate_exists` suppresses a re-file when an
+    """: `_recent_investigate_exists` suppresses a re-file when an
     OPEN or recently-filed identical-origin_signal canary Investigate already
     exists. Loads the hyphenated module via importlib and monkeypatches its
     WORLD_DIR/AGENT_DIR module globals at a seeded temp queue — a pure unit test
@@ -564,7 +567,7 @@ class TestRecentInvestigateDedup(unittest.TestCase):
 
 
 class TestFileInvestigateDuplicationOverride(unittest.TestCase):
-    """4: `_file_investigate` retries ONCE with --override-duplication
+    """: `_file_investigate` retries ONCE with --override-duplication
     when the goal-duplication gate blocks (goal_duplication_blocked). Upstream
     `_recent_investigate_exists` (fail-closed, exact origin_signal) already
     guarantees no true duplicate, so a dup-block here is a structural

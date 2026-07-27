@@ -73,7 +73,7 @@ JSON output:
        "hours_past": float, "defer_prefix", "precondition_status",
        "title", "classification": "drift"}
     ],
-    "on_schedule_expiry_count": N,     # 1: defers that expired on their
+    "on_schedule_expiry_count": N,     # : defers that expired on their
     "on_schedule_expiry": [            # own prose maturity date — NOT drift, so
       {..., "classification": "on_schedule_expiry", "prose_date": "YYYY-MM-DD"}
     ],                                 # the precheck files no drift Investigate
@@ -101,6 +101,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # The three STRUCTURED_DEFER_PREFIXES (single source of truth:
@@ -170,7 +171,7 @@ def _parse_iso(ts):
     if not ts:
         return None
     try:
-        return dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        return parse_naive_iso(ts)
     except Exception:
         return None
 
@@ -294,7 +295,7 @@ def _classify_drift(goal, now, min_hours_past=0.0, on_schedule_window_days=1):
     hours_past = (now - du).total_seconds() / 3600
     if hours_past < min_hours_past:
         return None
-    # On-schedule-expiry discrimination (1): a defer whose prose
+    # On-schedule-expiry discrimination (): a defer whose prose
     # maturity date ~= deferred_until expired on its own schedule — that is a
     # satisfied calendar-defer, NOT drift. Classify it distinctly so main()
     # keeps it OUT of drifted[] (and thus out of the precheck's drift
@@ -366,7 +367,7 @@ def main():
         "scanned": scanned,
         "drift_count": len(drifted),
         "drifted": drifted,
-        # On-schedule expiries are NOT drift (1): a defer that expired
+        # On-schedule expiries are NOT drift (): a defer that expired
         # on its own prose maturity date. Surfaced distinctly so the precheck
         # files no drift Investigate for them; deferred_readiness surfaces them
         # for selection / clearing on the normal path.

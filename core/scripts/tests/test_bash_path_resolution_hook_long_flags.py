@@ -130,7 +130,7 @@ CASES = [
     # The prior fixture used session/, which is gitignored (**/session/) and
     # exists only on boxes where alpha has RUN — on any other box the hook
     # CORRECTLY denied it as a new toplevel and this case false-failed
-    # (cc-05, 3: mis-triaged as a hook multi-path parsing defect).
+    # (cc-05, : mis-triaged as a hook multi-path parsing defect).
     ("mkdir two EXISTING toplevels (must approve)",
      f"mkdir -p {A}/journal/zz1 {A}/experience/zz2",      "approve"),
 ]

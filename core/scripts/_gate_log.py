@@ -46,7 +46,7 @@ from _fileops import locked_append_jsonl
 _SCHEMA_VERSION = 1
 _VALID_DECISIONS = ("noop", "pass", "block", "override", "fail_open")
 
-# Own-cloud spool lane (5). Under STORAGE_BACKEND=own-cloud a direct
+# Own-cloud spool lane (). Under STORAGE_BACKEND=own-cloud a direct
 # locked_append_jsonl on gate-firings.jsonl is a whole-object S3
 # read-modify-write — measured 3.8-10.1s per append at 38-40MB/~118k records,
 # paid by EVERY instrumented gate on EVERY decision including noop. The spool

@@ -31,8 +31,8 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     # They are value-copies, so converting META_DIR/WORLD_DIR alone leaves the
     # aliases unconverted — and _paths.py prefers MIND_WORLD/MIND_META, so
     # python resolves /c/... rooted on the current drive (C:\c\... mangle;
-    # broke every FORCE_FALLBACK tree.py scan, found 2026-07-14). Re-export
-    # the aliases from the converted value.
+    # broke every FORCE_FALLBACK tree.py scan, found 2026-07-14 at ZDS). Re-export
+    # the aliases from the converted value. (Back-port of ZDS-Mind 3f946c9.)
     if [ -n "$META_DIR" ]; then
         META_DIR="$(cygpath -m "$META_DIR")"
         export META_PATH="$META_DIR" MIND_META="$META_DIR"

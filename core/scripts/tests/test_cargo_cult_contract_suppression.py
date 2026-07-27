@@ -1,4 +1,4 @@
-"""0: cadence-aware auto-contract suppression in cargo-cult-detector.
+""": cadence-aware auto-contract suppression in cargo-cult-detector.
 
 For selection-gated recurring goals on a busy loop, the ACTUAL firing cadence
 is set by selector competition, not the timer — contracting interval_hours is

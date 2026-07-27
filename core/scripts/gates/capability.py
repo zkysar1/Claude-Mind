@@ -36,6 +36,8 @@ Return shape (matches the legacy CLI's `result` dict verbatim):
       "session_requirement_detected": bool,
       "session_requirement_phrases": [...],
       "session_requirement_classification": str|None,
+      "event_gated_detected": bool,
+      "event_gated_patterns": [...],
       "cure_action": str|None,
       "cure_overrides_exemption": bool,
       "reason": str,
@@ -115,6 +117,35 @@ def _match_narrative_patterns(text: str) -> list:
         return []
     lo = text.lower()
     return [p for p in NARRATIVE_PATTERNS if p in lo]
+
+
+# --- Event-gated / awaiting-external-observation exemption (g-115-2943) ------
+# A defer whose blocker is an EXTERNAL EVENT the agent must passively OBSERVE
+# (a naturally-occurring event it cannot trigger) is genuinely non-provisionable
+# — same class as user_only-without-cure and user_keystroke_required, and it
+# must SUPPRESS the keyword block. Without this, a coincidental forged-skill
+# token match (the 3-char "arc" from "DEV/ARC delete_environment" matching the
+# skill measure-arc-two-arm-prereg) auto-filed a spurious HIGH "Unblock: create"
+# goal for an event that fires only when a live session ends (g-335-94 ->
+# g-335-220, skipped). Each phrase names PASSIVE waiting for a natural
+# occurrence, so a provisionable defer ("external service returned 500",
+# "awaiting deploy", "the event handler needs wiring") does NOT match. Add new
+# idioms here as they appear — same incremental-tuning model as the keyword
+# stopword set.
+EVENT_GATED_PATTERNS = [
+    "awaiting the first organic",
+    "organic occurrence",
+    "event-gated",
+    "an external event",
+    "fires when a live session ends",
+]
+
+
+def _match_event_gated_patterns(text: str) -> list:
+    if not text:
+        return []
+    lo = text.lower()
+    return [p for p in EVENT_GATED_PATTERNS if p in lo]
 
 
 # --- User-only-precondition exemption (g-115-372) ---------------------------
@@ -470,6 +501,22 @@ _STOPWORDS = {
     # bounded-config/tune compounds) — recall proven by the adjacent-to-
     # stopword control in test_capability_gate_table_token_noise.py (guard-958).
     "row", "entry", "table", "because", "verified", "evidence",
+    # g-115-2829: pure user-approval PROSE tokens that appear only incidentally
+    # in trigger/row vocabulary, never as a capability identifier -- demoting
+    # them kills the incidental multi-token overlap that BYPASSES the g-248-105
+    # single-token distinctiveness rule (>=2-token matches always survive by
+    # design). Live repro (2026-07-22, zeta): a genuinely user-only defer "the
+    # analysis is complete but human sign-off on the conclusions is pending"
+    # matched analyze-npc-behavior on {analysis, human} (multi-token) AND
+    # audit-roblox-deliverable on {sign-off} (compound-token, so it passes the
+    # single-token rule). 'human' is a pure USER-ONLY signal -- a defer naming it
+    # is user-facing, never an agent capability; 'sign-off' is generic
+    # human-approval prose. Both can only LOOSEN the gate, never a real
+    # discriminator -- every colliding skill keeps its true tokens
+    # (analyze/npc/behavior; roblox/deliverable/audit), recall proven by the
+    # adjacent-discriminator control in test_capability_gate_imperative_noun.py.
+    # guard-958, rb-2996.
+    "human", "sign-off",
 }
 
 
@@ -620,6 +667,41 @@ _ABSENCE_LOCATION_BEFORE = re.compile(
     r"[^.!?\n]{0,20}\b(?:on|in|at|under|from|inside)\s*$"
 )
 
+# g-115-2829: an imperative-verb keyword used as a NOUN, not an action request.
+# An imperative verb GOVERNED by an article/determiner or a need-verb immediately
+# before (only adjectives intervening, never the infinitive marker "to") AND
+# FOLLOWED by an UNAMBIGUOUS external/source/object preposition (by | of | from)
+# reads as a noun phrase whose complement is an external agent, source, or object
+# -- "a manual audit BY the security team", "a full security scan OF the vendor",
+# "needs review FROM the architecture owner" -- naming a THING done BY/FROM/OF
+# someone else, never a provisionable ACTION by this agent.
+#
+# WHY only {by, of, from} and NOT a broader preposition set: 'to'/'for'/'on'
+# ambiguously mark an agent-action TARGET ("commit TO main", "deploy TO staging",
+# "push TO origin"). Disqualifying those opens a recall hole in the g-115-792
+# wrongly-user-gated direction -- the fresh-eyes review (2026-07-22, zeta) caught
+# "a commit to main"/"the merge to master" wrongly PASSING with 'to' in the set.
+# Per guard-958 (fail toward MATCHING when ambiguous) 'to' stays matchable, so an
+# ambiguous "a commit TO one approach" (a design decision) is left BLOCKING as a
+# safe residual rather than risking a real "a commit TO main" recall loss.
+#
+# FALSE-NEGATIVE-SAFE by construction: a genuine verb request is FOLLOWED BY AN
+# OBJECT (determiner+noun: "commit THE fix", "audit THE deliverable") -- never a
+# bare by/of/from -- so it can't match _NOUN_USE_PREP_AFTER; and a verb+prep
+# WITHOUT a governing article fails _IMPERATIVE_NOUN_GOVERNOR_PRE. Both conditions
+# AND'd, scoped to kw in _IMPERATIVE_VERBS only (like _EVIDENCE_VERB_AFTER). Live
+# repro + single-keyword recall control: test_capability_gate_imperative_noun.py.
+# rb-2996, guard-958.
+_IMPERATIVE_NOUN_GOVERNOR_PRE = re.compile(
+    r"\b(?:a|an|the|one|this|that|another|each|some|any|no|"
+    r"needs?|needing|require[sd]?|requiring|wants?|wanting|"
+    r"awaits?|awaiting|pending)\s+"
+    r"(?:(?!to\b)[a-z][a-z-]*\s+){0,2}$"
+)
+_NOUN_USE_PREP_AFTER = re.compile(
+    r"^\W*(?:by|of|from)\b"
+)
+
 
 def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
     """True if `keyword` has at least one valid-context occurrence.
@@ -650,6 +732,18 @@ def _keyword_is_invocation_signal(text_lower: str, keyword: str) -> bool:
         # g-115-1882: verb-noun used as a reported-evidence subject, not an
         # action request ("fresh probe 2026-07-09 shows X", "the audit found Y").
         if kw in _IMPERATIVE_VERBS and _EVIDENCE_VERB_AFTER.search(post):
+            continue
+        # g-115-2829: imperative verb used as a NOUN -- governed by an article/
+        # need-verb immediately before AND followed by an external/source/object
+        # preposition by|of|from ("a manual audit by the team", "a scan of the
+        # vendor", "needs review from the owner"). Names a thing done by/from/of
+        # someone else, not a provisionable action. False-negative-safe: genuine
+        # verb requests are followed by an object (not a bare by/of/from), and
+        # 'to'/target prepositions are deliberately excluded so "commit to main"
+        # stays matched. See the _IMPERATIVE_NOUN_* comment above. rb-2996.
+        if (kw in _IMPERATIVE_VERBS
+                and _IMPERATIVE_NOUN_GOVERNOR_PRE.search(pre)
+                and _NOUN_USE_PREP_AFTER.match(post)):
             continue
         # g-115-2583: incidental keyword whose narrative asserts the referent is
         # available / not-the-blocker, or names it as the location of some OTHER
@@ -948,6 +1042,7 @@ def evaluate(failure_reason: str, *,
     matches = _find_matches(keywords, all_entries)
 
     narrative_matches = _match_narrative_patterns(failure_reason)
+    event_gated_matches = _match_event_gated_patterns(failure_reason)
     session_req_matches = _match_session_requirement_patterns(failure_reason)
     session_req_classification = None
     if session_req_matches:
@@ -1020,7 +1115,14 @@ def evaluate(failure_reason: str, *,
         and session_req_classification != "user_keystroke_required"
     )
 
-    would_block = keyword_block or session_req_block or cure_block
+    # Event-gated exemption (g-115-2943): a blocker that is an external event
+    # the agent must passively observe is non-provisionable — suppress ALL block
+    # types uniformly. keyword_block/session_req_block/cure_block stay computed
+    # (surfaced in the result for observability) but do not force a route.
+    would_block = (
+        (keyword_block or session_req_block or cure_block)
+        and not event_gated_matches
+    )
 
     # Log evidence approval ONLY when the gate would have blocked without
     # it — preserves the ledger from no-signal entries.
@@ -1200,6 +1302,8 @@ def evaluate(failure_reason: str, *,
         "session_requirement_detected": bool(session_req_matches),
         "session_requirement_phrases": [phrase for phrase, _ in session_req_matches],
         "session_requirement_classification": session_req_classification,
+        "event_gated_detected": bool(event_gated_matches),
+        "event_gated_patterns": event_gated_matches,
         "cure_action": cure_action,
         "cure_overrides_exemption": cure_action is not None,
     }
@@ -1261,6 +1365,15 @@ def evaluate(failure_reason: str, *,
             "instead of routing to user. If this match is a false positive, "
             're-call with --override-agent-match "<justification>".'
             f"{canonical_hint}"
+        )
+    elif matches and event_gated_matches:
+        result["reason"] = (
+            f"{len(matches)} capability keyword match(es) exempted: "
+            f"failure_reason describes an EVENT-GATED blocker "
+            f"({event_gated_matches}) — an external event the agent must "
+            "passively observe, not an action it can provision. The keyword "
+            "match (e.g. a short token coinciding with a forged-skill name) is "
+            "not actionable. Defer permitted (g-115-2943)."
         )
     elif matches and user_only_matches:
         result["reason"] = (

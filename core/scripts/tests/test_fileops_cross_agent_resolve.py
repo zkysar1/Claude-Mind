@@ -1,4 +1,4 @@
-"""test_fileops_cross_agent_resolve.py — cross-agent resolve_base_dir (Defect A / 9).
+"""test_fileops_cross_agent_resolve.py — cross-agent resolve_base_dir (Defect A / ).
 
 Ports + locks zeta's b34a169b (stranded unpushed on cc-02): _fileops.resolve_base_dir
 and its mirror _classify_base must resolve ANY agent dir under agents_root(), not

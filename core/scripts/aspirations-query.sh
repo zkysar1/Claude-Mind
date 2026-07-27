@@ -38,7 +38,7 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH+=("$1" "${2-}" "${3-}")
             shift $(( $# >= 3 ? 3 : ($# >= 2 ? 2 : 1) ));;
         --full)
-            # Boolean flag (no value): full-record read mode (4).
+            # Boolean flag (no value): full-record read mode ().
             # Translated to the full=true query param after the filter check below,
             # so --full alone (no filter) still hits the "filter required" error.
             FULL=1; shift;;
@@ -68,7 +68,7 @@ if [ -z "$QUERY" ]; then
     exit 1
 else
     # --full appends full=true ONLY when a filter is present (QUERY non-empty),
-    # so --full alone falls through to the filter-required error above (4).
+    # so --full alone falls through to the filter-required error above ().
     if [ "$FULL" = "1" ]; then QUERY+="&full=true"; fi
     rc=0
     rt_call GET /v1/aspirations/query --query "$QUERY" || rc=$?

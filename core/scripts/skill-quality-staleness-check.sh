@@ -84,7 +84,12 @@ last_str = str(last_raw)
 # Accept both ISO and ISO with T
 try:
     if "T" in last_str:
-        last_dt = datetime.datetime.fromisoformat(last_str.replace("Z",""))
+        # : strip tzinfo (not just Z) so `now - last_dt` below never
+        # hits the aware/naive TypeError on an offset-bearing last_updated.
+        _ls = last_str.replace("Z", "+00:00")
+        last_dt = datetime.datetime.fromisoformat(_ls)
+        if last_dt.tzinfo is not None:
+            last_dt = last_dt.astimezone().replace(tzinfo=None)
     else:
         last_dt = datetime.datetime.fromisoformat(last_str)
 except ValueError:

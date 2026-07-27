@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # iteration-push.sh — Fail-soft, rate-limited push of the shared Mind tree to origin.
 #
-# USER DIRECTIVE (user 2026-07-02, 4): loop-commits
+# USER DIRECTIVE (user 2026-07-02, ): loop-commits
 # accumulate locally via iteration-commit.sh (which explicitly does NOT push —
 # see its header "push is manual or via a future iteration-push.sh"). This is
 # that durable mechanism: keep origin current without a per-commit push storm.
@@ -25,7 +25,7 @@
 #     Any merge failure (dirty tree, staged entries, true conflict) is aborted
 #     cleanly (merge --abort if MERGE_HEAD exists) and logged LOUDLY. Dirty-tree
 #     refusals self-heal in-run (agents/<self>/* churn is COMMITTED pathspec-
-#     limited, 9; agents/<other>/* churn is CLEARED, 3) and
+#     limited, ; agents/<other>/* churn is CLEARED, ) and
 #     the merge retries once; remaining shapes (staged partner work, dirty
 #     core/world files) defer to next iteration. A REPEATED conflict log means
 #     a true cross-machine content conflict — surface it, do not silence it.
@@ -43,7 +43,7 @@
 #   - Fail-soft: ANY failure (auth, network, fetch, merge) logs to stderr and
 #     exits 0 — a sync failure MUST NEVER block or abort the loop. Next iteration
 #     retries. Never forced.
-#   - Push-race recovery (9): a race-shaped push rejection
+#   - Push-race recovery (): a race-shaped push rejection
 #     (non-fast-forward / fetch-first / cannot-lock-ref) triggers ONE bounded
 #     in-invocation recovery — unthrottled fetch + merge + one retry push —
 #     before deferring. Without it, the fetch throttle makes the next
@@ -60,7 +60,7 @@
 # Exit: always 0 (fail-soft) UNLESS --strict is passed (tests only), in which
 #       case a genuine push/merge failure exits 1 and a throttle/skip still exits 0.
 #
-# Origin: 4 (alpha, user-directed keep-github-current-autopush).
+# Origin:  (alpha, user-directed keep-github-current-autopush).
 #         Fetch+integrate: user-directed 2026-07-03 (bolster the GitHub side of
 #         the relationship — both directions, regardless of what computer).
 
@@ -191,7 +191,7 @@ if [ "$NO_FETCH" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
-# --- Cross-agent-churn self-heal helper (3, per 3) ---------
+# --- Cross-agent-churn self-heal helper (, per ) ---------
 # On a dirty-tree merge REFUSAL (git refuses before starting; MERGE_HEAD absent),
 # the deadlock is almost always unstaged cross-agent churn: agents/<other>/*
 # files that owncloud re-materialised and iteration-commit's namespace filter
@@ -205,7 +205,7 @@ fi
 #     (owncloud re-syncs the sibling's authoritative state next cycle; origin
 #     is authoritative).
 #   - agents/<self>/* churn: COMMIT it via an index-clean + explicit-pathspec
-#     + pathspec-limited commit (9). Own agent-dir ledgers
+#     + pathspec-limited commit (). Own agent-dir ledgers
 #     (changelog.jsonl re-appends on EVERY write) re-dirty between
 #     iteration-commit and this merge — and iteration-commit only runs on
 #     deep closes at all — so the pre-2249 defer wedged a behind box
@@ -287,7 +287,7 @@ _selfheal_cross_agent_churn_remerge() {
   done
 
   # SELF-namespace churn: COMMIT it, never clear, never defer on it
-  # (9). guard-741/836-safe here because (a) the staged-index check
+  # (). guard-741/836-safe here because (a) the staged-index check
   # above proved the shared index holds ZERO staged entries, (b) staging is by
   # EXPLICIT self-namespace paths only, and (c) the commit is pathspec-limited
   # to agents/<self>/ — a partner's stage racing in between (a) and the commit
@@ -352,7 +352,7 @@ if [ "$BEHIND" -gt 0 ]; then
         soft_exit 1
       fi
       # Dirty tree — merge refused before starting (MERGE_HEAD absent). Try the
-      # narrow cross-agent-churn self-heal (3): if the entire blocking
+      # narrow cross-agent-churn self-heal (): if the entire blocking
       # set is unstaged agents/<other>/* churn, clear it and retry the merge
       # once. Any other shape (staged entries, self/core/world dirty) DEFERS —
       # exactly the pre-1843 behaviour (log + soft_exit 1).
@@ -376,11 +376,11 @@ if [ "$AHEAD" -eq 0 ]; then
   log "origin/$BRANCH up to date (0 ahead) — nothing to push"; soft_exit 0
 fi
 
-# Stranded-depth alarm (8 user correction). A push-blocked window
+# Stranded-depth alarm ( user correction). A push-blocked window
 # (read-only deploy key rb-3236/guard-1021, disabled push, repeated fail-soft)
-# lets AHEAD grow silently — 121 (8) then 281 by 2026-07-16, and the
+# lets AHEAD grow silently — 121 () then 281 by 2026-07-16, and the
 # eventual bulk unwedge push carried a stale store base that transiently
-# regressed world/aspirations.jsonl by ~184 goals (2). Once depth
+# regressed world/aspirations.jsonl by ~184 goals (). Once depth
 # crosses the cap, bang the drum EVERY iteration until it drains: the banner
 # lands in iteration-close stdout where the loop LLM must act on it (fix the
 # push pipe or notify the user — never let depth keep growing). Alarm only;
@@ -421,7 +421,7 @@ if [ "$PUSH_RC" -eq 0 ]; then
   soft_exit 0
 fi
 
-# --- Push-race recovery (9, rb-3970 phantom window) -----------------
+# --- Push-race recovery (, rb-3970 phantom window) -----------------
 # A race-shaped rejection here means origin advanced AFTER the fetch/merge
 # above — or the THROTTLED fetch used a stale tracking ref, so the integrate
 # step saw BEHIND=0 and skipped the merge entirely. "Retry next iteration"
@@ -429,7 +429,7 @@ fi
 # again, computes BEHIND against the SAME stale ref, skips the merge, and
 # fails the identical push — up to FETCH_INTERVAL_MIN of repeated failures
 # while a deep-close commit sits stranded local-only (the goal-status-vs-origin
-# phantom window; both 2026-07-18 phantoms rode this shape, and 3
+# phantom window; both 2026-07-18 phantoms rode this shape, and 
 # landed first-try via exactly this unthrottled fetch+merge+push sequence).
 # Recover ONCE in-invocation: unthrottled fetch -> merge (same safety as the
 # integrate step: abort on MERGE_HEAD, defer on refusal — churn was already

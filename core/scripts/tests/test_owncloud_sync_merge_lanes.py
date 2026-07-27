@@ -1,4 +1,4 @@
-"""test_owncloud_sync_merge_lanes.py — sync-one merge-lane engagement (1).
+"""test_owncloud_sync_merge_lanes.py — sync-one merge-lane engagement ().
 
 The dedicated sync-one merge tests were dropped by the ac3730ea31d7 sync merge
 ALONG WITH the superseded impl they targeted (`_merge_diverged` — coherent-pair
@@ -51,6 +51,17 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("MACHINE_MULTI", raising=False)
     monkeypatch.delenv("OWNERSHIP_STALE_SECONDS", raising=False)
     monkeypatch.delenv("STORAGE_BACKEND", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _redirect_merge_events_log(tmp_path, monkeypatch):
+    """: _try_merge_put (reached via _sync_one merge lanes) now
+    appends a durable merge-event line via _persist_merge_event on every
+    successful union merge. Keep every merge-lane test's write inside tmp so
+    it never touches the real mind_api/state/owncloud-merge-events.jsonl."""
+    monkeypatch.setattr(
+        _mod, "_merge_events_path",
+        lambda: tmp_path / "owncloud-merge-events.jsonl")
 
 
 def _jl(*records) -> bytes:
@@ -192,7 +203,7 @@ def test_sync_one_multipart_merges_registered(tmp_path):
 
 
 def test_sync_one_multipart_unregistered_still_defers(tmp_path):
-    """Negative control for 4: multipart + UNREGISTERED store keeps
+    """Negative control for : multipart + UNREGISTERED store keeps
     the defer exactly (no merge attempt, neither side touched)."""
     be = _MultipartMergeBackend([(tmp_path, "world")])
     f = tmp_path / "some-unregistered.jsonl"
@@ -227,6 +238,65 @@ def test_sync_one_unregistered_diverged_keeps_skip(tmp_path):
     assert be.merge_puts == []
     assert be.s3[str(f)] == _jl(BASE, PEER)  # S3 untouched
     assert f.read_bytes() == _jl(BASE, MINE)  # local untouched
+
+
+def test_diverged_no_merge_put_backend_is_distinguishable(tmp_path, capsys):
+    """: a backend WITHOUT merge_put reaching a registered both-diverged
+    file records a DISTINCT counter + a labeled CONFLICT line — no longer
+    indistinguishable from a genuinely-unregistered skip (the undiagnosable
+    2026-07-20 cc-02 shape)."""
+    be = FakeBackend([(tmp_path, "world")])  # no merge_put attribute
+    assert not hasattr(be, "merge_put")
+    f = tmp_path / "evolution-log.jsonl"  # registered store
+    f.write_bytes(_jl(BASE, MINE))
+    be.s3[str(f)] = _jl(BASE, PEER)
+    stats = _new_stats()
+    out = _mod._sync_one(be, f, dry_run=False, stats=stats,
+                         baseline_md5=_md5(_jl(BASE)), multi_machine=True)
+    assert out is None
+    assert stats.get("diverged_skipped") == 1
+    # Distinct counter + reason set by _try_merge_put (not a silent bail).
+    assert stats.get("merge_na_no_merge_put") == 1
+    assert stats.get("last_merge_na_reason") == "backend-lacks-merge_put"
+    # The CONFLICT line now NAMES why the merge lane bailed.
+    err = capsys.readouterr().err
+    assert "merge-lane NA: backend-lacks-merge_put" in err
+    assert "CONFLICT" in err
+
+
+def test_diverged_unregistered_records_distinct_reason(tmp_path, capsys):
+    """: an unregistered store gets a DIFFERENT reason label
+    ('not-merge-registered') than a merge-eligible bail — 'merge-attempt-failed
+    vs unregistered print different lines' (the deliverable). merge_put EXISTS
+    here (MergeBackend) but the basename has no handler."""
+    be = MergeBackend([(tmp_path, "world")])
+    f = tmp_path / "some-unregistered.jsonl"
+    f.write_bytes(_jl(BASE, MINE))
+    be.s3[str(f)] = _jl(BASE, PEER)
+    stats = _new_stats()
+    _mod._sync_one(be, f, dry_run=False, stats=stats,
+                   baseline_md5=_md5(_jl(BASE)), multi_machine=True)
+    assert stats.get("merge_na_unregistered") == 1
+    assert stats.get("last_merge_na_reason") == "not-merge-registered"
+    err = capsys.readouterr().err
+    assert "merge-lane NA: not-merge-registered" in err
+    # A registered-but-no-merge_put bail (other test) says a DIFFERENT reason,
+    # so the two failure modes are now distinguishable from the log alone.
+
+
+def test_sync_print_carries_iso_timestamp(capsys):
+    """ / : every [sync] line carries a naive-UTC ISO
+    timestamp prefix so forensics can reconstruct arrival/sweep timing."""
+    import re
+    _mod._sync_print("[sync] canary line")
+    out = capsys.readouterr().out
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} \[sync\] canary line",
+                    out.strip()), f"missing ISO prefix: {out!r}"
+    # stderr routing preserved (the merge/conflict lines use file=sys.stderr).
+    _mod._sync_print("[sync] err canary", file=sys.stderr)
+    err = capsys.readouterr().err
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} \[sync\] err canary",
+                    err.strip())
 
 
 if __name__ == "__main__":

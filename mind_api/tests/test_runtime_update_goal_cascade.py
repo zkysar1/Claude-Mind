@@ -67,7 +67,7 @@ def _seed_goal(port, **fields):
         "description": "x" * 100,
     }
     goal.update(fields)
-    # mc-066 (0): the Phase E.5 operator-offload gate 400s any
+    # mc-066 (): the Phase E.5 operator-offload gate 400s any
     # recurring-shaped seed (recurring=True OR interval_hours present) that
     # lacks an offload_decision. Inject the fixture decision unless the test
     # supplies its own — the gate-shape pin test seeds via raw _post
@@ -931,7 +931,7 @@ def test_layer_d_emits_gate_firing_telemetry(running_daemon,
     # unless GATE_LOG_ALLOW_PYTEST is set (synthetic-firing pollution guard).
     # This test POSITIVELY asserts on the firing record and its destination is
     # already the hermetic fixture repo (ctx.paths.meta), so opt in — the
-    # in-process daemon shares this env (0; twin of the opt-in
+    # in-process daemon shares this env (; twin of the opt-in
     #  itself added to test_layer_d_telemetry.py).
     monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
     g = _seed_goal(port)
@@ -961,7 +961,7 @@ def test_layer_d_emits_gate_firing_telemetry(running_daemon,
     # one byte per pre-existing line and dropping the new record's leading '{'
     # (json.loads then fails "Extra data" on the headless line). Slice the raw
     # bytes, then decode — matches the read_bytes() approach the tree
-    # byte-compat tests already use. 9.
+    # byte-compat tests already use. .
     new_bytes = firings_path.read_bytes()
     if pre_size:
         new_bytes = new_bytes[pre_size:]
@@ -1035,7 +1035,7 @@ def test_defer_date_no_extraction_no_audit_log_entry(running_daemon,
 
 
 def test_recurring_seed_without_offload_decision_blocked(running_daemon):
-    """mc-066 gate-shape pin (0 companion): a recurring goal filed
+    """mc-066 gate-shape pin ( companion): a recurring goal filed
     WITHOUT an offload_decision must 400 with operator_offload_blocked.
 
     Seeds via raw _post — deliberately bypassing _seed_goal's fixture

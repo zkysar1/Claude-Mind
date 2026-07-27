@@ -554,7 +554,7 @@ def do_swap(dest_root: Path) -> dict:
     if failures:
         return {"moved": moved, "failures": failures}
 
-    # Success — remove staging dir. FAIL-LOUD (0): the moves already
+    # Success — remove staging dir. FAIL-LOUD (): the moves already
     # succeeded, so a staging-dir cleanup error must NOT fail the swap, but it
     # MUST be surfaced as a NAMED field rather than silently swallowed by
     # ignore_errors=True — a silent post-move raise on this step was the
@@ -575,15 +575,22 @@ def do_swap(dest_root: Path) -> dict:
 # Cruft cleanup
 # ============================================================================
 
-def do_clean_cruft(dest_root: Path, manifest: dict, *,
+def do_clean_cruft(dest_root: Path, manifest: dict, source_root: Path = None, *,
                    preserve_deployment_local: bool = False) -> dict:
     """Remove cruft_patterns at destination.
 
+    A cruft pattern that names a *source-include* path is NEVER swept: when
+    *source_root* is provided the include set is resolved and any ``rel`` in it
+    is preserved unconditionally — parity with do_remove_orphans' ``rel in
+    expected`` gate (g-115-2739). Passing source_root=None disables that gate
+    (expected stays empty), preserving legacy behavior for callers/tests that
+    don't supply a source.
+
     When *preserve_deployment_local* is True (``--living-prod`` mode),
-    every candidate is checked against ``_is_preserved_at_dest`` and
-    ``_is_protected_dest_skill`` before deletion. Matches are skipped
-    and reported in ``skipped_preserved`` so callers can see what was
-    protected.
+    every candidate is additionally checked against ``_is_preserved_at_dest``
+    and ``_is_protected_dest_skill`` (registry-forged AND SKILL.md-present
+    skills) before deletion. Matches are skipped and reported in
+    ``skipped_preserved`` so callers can see what was protected.
     """
     patterns = manifest.get("cruft_patterns", [])
     removed = []
@@ -594,13 +601,18 @@ def do_clean_cruft(dest_root: Path, manifest: dict, *,
     # (2026-07-07 ZDS wipe). Empty set on fresh plants (no agents/ dir).
     store_tops = _in_repo_store_tops(dest_root)
 
-    # Build dest forged-skill protection set (same logic as do_remove_orphans)
+    # Source-include members are never cruft (parity with do_remove_orphans).
+    # None source_root -> empty set -> gate is a no-op (legacy/test callers).
+    expected = set(resolve_include_set(manifest, source_root)) if source_root else set()
+
+    # Build dest forged-skill protection set (same logic as do_remove_orphans):
+    # registry-forged UNION SKILL.md-present (root cause A, ).
     if preserve_deployment_local:
         dest_forged = _dest_forged_skill_names(dest_root)
         protect_all_skills = dest_forged is None
-        forged_prefixes = set() if dest_forged is None else {
-            f".claude/skills/{n}" for n in dest_forged
-        }
+        _skill_names = (set() if dest_forged is None else set(dest_forged)) \
+            | _dest_skill_names_with_skillmd(dest_root)
+        forged_prefixes = {f".claude/skills/{n}" for n in _skill_names}
     else:
         protect_all_skills = False
         forged_prefixes = set()
@@ -608,6 +620,8 @@ def do_clean_cruft(dest_root: Path, manifest: dict, *,
     def _should_preserve(rel: str) -> bool:
         """Return True if *rel* must be kept at a living destination."""
         if rel.split("/", 1)[0] in store_tops:
+            return True
+        if rel in expected:
             return True
         if not preserve_deployment_local:
             return False
@@ -856,6 +870,35 @@ def _dest_forged_skill_names(dest_root: Path):
     return names
 
 
+def _dest_skill_names_with_skillmd(dest_root: Path) -> set:
+    """Return the set of skill NAMES present at the destination whose dir
+    carries a SKILL.md — a filesystem-presence signal INDEPENDENT of the
+    forged-skills.yaml registry.
+
+    Root cause A (g-115-2738): forged-skill REGISTRATION lives in the external,
+    gitignored world/forged-skills.yaml, so it does NOT travel with a git
+    promotion. A skill promoted frontier->seed->prod arrives as a real
+    .claude/skills/<name>/SKILL.md dir but is ABSENT from the downstream
+    registry — so _dest_forged_skill_names (registry-based) does not protect it
+    and orphan-removal deletes it (the notify-user deletion, twice). A dir with
+    a SKILL.md IS a live skill regardless of registration; protecting it by
+    filesystem presence closes that gap. Un-forging a skill must be a
+    deliberate act, never a transplant side-effect. Empty set when no skills
+    dir exists (fresh plant).
+    """
+    skills_dir = dest_root / ".claude" / "skills"
+    if not skills_dir.is_dir():
+        return set()
+    names = set()
+    try:
+        for child in skills_dir.iterdir():
+            if child.is_dir() and (child / "SKILL.md").is_file():
+                names.add(child.name)
+    except OSError:
+        pass
+    return names
+
+
 def _is_protected_dest_skill(rel: str, forged_prefixes: set,
                              protect_all_skills: bool) -> bool:
     """Whether `rel` belongs to a destination-owned skill orphan-removal must
@@ -902,9 +945,11 @@ def _living_dest_preserve_predicate(dest_root: Path):
     store_tops = _in_repo_store_tops(dest_root)
     dest_forged = _dest_forged_skill_names(dest_root)
     protect_all_skills = dest_forged is None
-    forged_prefixes = set() if dest_forged is None else {
-        f".claude/skills/{n}" for n in dest_forged
-    }
+    # SKILL.md-present skills are protected too (root cause A, ) so the
+    # PLANT/copy-staged step and the PLAN report agree with the sweep lanes.
+    _skill_names = (set() if dest_forged is None else set(dest_forged)) \
+        | _dest_skill_names_with_skillmd(dest_root)
+    forged_prefixes = {f".claude/skills/{n}" for n in _skill_names}
 
     def _pred(rel: str) -> bool:
         return (_is_preserved_at_dest(rel, store_tops)
@@ -942,9 +987,13 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
     # unlocatable/unparseable registry protects ALL `.claude/skills/<name>/`.
     dest_forged = _dest_forged_skill_names(dest_root)
     protect_all_skills = dest_forged is None
-    forged_prefixes = set() if dest_forged is None else {
-        f".claude/skills/{n}" for n in dest_forged
-    }
+    # Union registry-forged names with SKILL.md-present names so a
+    # promoted-but-unregistered real skill survives too (root cause A,
+    # ). When protect_all_skills is True every skill is already
+    # preserved, so the union only matters when the registry IS locatable.
+    _skill_names = (set() if dest_forged is None else set(dest_forged)) \
+        | _dest_skill_names_with_skillmd(dest_root)
+    forged_prefixes = {f".claude/skills/{n}" for n in _skill_names}
 
     # In-repo world/meta stores (e.g. .mind-data/) — dynamic protection.
     # The static _ORPHAN_SCAN_SKIP_TOP covers known names; this resolves the
@@ -1339,9 +1388,11 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
     store_tops = _in_repo_store_tops(dest_root)
     dest_forged = _dest_forged_skill_names(dest_root)
     protect_all_skills = dest_forged is None
-    forged_prefixes = set() if dest_forged is None else {
-        f".claude/skills/{n}" for n in dest_forged
-    }
+    # Registry-forged UNION SKILL.md-present (root cause A, ) so the
+    # plan's protection classes match what the sweep lanes actually apply.
+    skillmd_names = _dest_skill_names_with_skillmd(dest_root)
+    _skill_names = (set() if dest_forged is None else set(dest_forged)) | skillmd_names
+    forged_prefixes = {f".claude/skills/{n}" for n in _skill_names}
 
     # ── §1 DEPLOYMENT-LOCAL OVERWRITES ──
     # Deployment-local include files present at dest. Under --living-prod,
@@ -1384,6 +1435,8 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
         # Replicate do_clean_cruft._should_preserve for this flag:
         if rel.split("/", 1)[0] in store_tops:
             would_delete = False           # store roots: unconditional keep
+        elif rel in include_lookup:
+            would_delete = False           # source-include member: never cruft ()
         elif not living_prod:
             would_delete = True            # no flag -> nothing else preserved
         else:
@@ -1392,9 +1445,25 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
         cruft_deletions.append({"pattern": p, "rel": rel,
                                 "protection_class": cls,
                                 "would_delete": would_delete})
-    # Dangerous = would be deleted AND carries a protection class (should survive).
-    cruft_dangerous = [c for c in cruft_deletions
-                       if c["would_delete"] and c["protection_class"]]
+    # Dangerous = would be deleted AND (carries a protection class it should
+    # keep, OR is a .claude/skills/<name>/ dir). A skill dir is domain
+    # capability, never disposable session-state cruft — so a would-delete
+    # skill-dir sweep is ALWAYS dangerous, even when it carries NO
+    # protection_class (i.e. it is neither a dest-registered forged skill nor a
+    # source-include base skill). Without the skills-prefix clause an
+    # unregistered-at-dest forged skill (protection_class=None, would_delete=
+    # True) lands in cruft_deletions["all"] but is EXCLUDED from this headline +
+    # the verdict — the exact blind spot that let a --living-prod plant delete
+    # .claude/skills/notify-user/ at ZDS while the plan reported "0 dangerous
+    # cruft-sweeps" (; recurrence of the v2.4.0 SES-transport
+    # deletion). Skill-dir removal is orphan-removal's jurisdiction (stronger
+    # protection: it also gates on `rel in expected`); surfacing any skill-dir
+    # cruft-sweep here makes the plan faithful to what clean-cruft actually does.
+    cruft_dangerous = [
+        c for c in cruft_deletions
+        if c["would_delete"]
+        and (c["protection_class"] or c["rel"].startswith(".claude/skills/"))
+    ]
 
     # ── §3 PROD-AHEAD FRAMEWORK FILES (guard-119 — hard DO-NOT-PROMOTE) ──
     # Framework (non-deployment-local) include files present at both where dest
@@ -1430,13 +1499,15 @@ def do_plan(source_root: Path, dest_root: Path, manifest: dict,
     # matches it and --living-prod was not passed) — two distinct sweep steps.
     orphan = do_remove_orphans(dest_root, manifest, source_root, dry_run=True)
     real_orphans = orphan.get("removed", [])
+    # Itemize every dest skill dir orphan-removal preserves though it is absent
+    # from the source include set: registry-forged AND SKILL.md-present
+    # (root cause A, ). Both classes are protected by do_remove_orphans.
     forged_preserved = []
-    if dest_forged:
-        for name in sorted(dest_forged):
-            prefix = f".claude/skills/{name}/"
-            if (dest_root / ".claude" / "skills" / name).exists() \
-               and not any(f.startswith(prefix) for f in include_set):
-                forged_preserved.append(f".claude/skills/{name}")
+    for name in sorted(_skill_names):
+        prefix = f".claude/skills/{name}/"
+        if (dest_root / ".claude" / "skills" / name).exists() \
+           and not any(f.startswith(prefix) for f in include_set):
+            forged_preserved.append(f".claude/skills/{name}")
 
     # ── §6 OPERATIONAL DIRS + DEST-BEHIND ──
     op_dirs_present = []
@@ -1706,7 +1777,7 @@ def main():
             sys.exit(1)
     elif args.cmd == "clean-cruft":
         pdl = getattr(args, "preserve_deployment_local", False)
-        result = do_clean_cruft(dest_root, manifest,
+        result = do_clean_cruft(dest_root, manifest, source_root=source_root,
                                 preserve_deployment_local=pdl)
         print(json.dumps(result, indent=2))
     elif args.cmd == "remove-orphans":

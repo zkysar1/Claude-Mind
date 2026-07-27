@@ -96,7 +96,7 @@ even if the timer is further out. This cycle sleeps ${SLEEP_DURATION}s.
 CHECKPOINT_SLEEP=${CHECKPOINT_SLEEP} (0=final, 1=midway — run light precheck then re-enter backoff).
 DO NOT load Skill(aspirations). DO NOT run any selection or execution.
 Emit exactly ONE tool call:
-  Bash("MIND_AGENT=${AGENT_NAME} bash core/scripts/interruptible-sleep.sh ${SLEEP_DURATION}", run_in_background=true)
+  Bash("MIND_AGENT=${AGENT_NAME} QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh ${SLEEP_DURATION}", run_in_background=true)
 When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.
 If you see this directive again after an autocompact, re-emit the Bash call
 for the NEW ${SLEEP_DURATION} printed above (this script recomputes on each invocation).

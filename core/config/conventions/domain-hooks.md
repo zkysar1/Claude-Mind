@@ -130,6 +130,7 @@ the framework already has.
 | `post-execution` | `.claude/skills/aspirations-execute/SKILL.md` Phase 4.2 | Domain post-execution steps (e.g., run tests, commit-and-push) | `core/config/templates/post-execution-default.md` | `/start` Phase C0.5 — per-slot detection; always `cp` template (installed by construction), optional domain additions appended under `## Domain Additions` |
 | `signal-refresh` | `.claude/skills/aspirations-precheck/SKILL.md` Phase 0.5.0-pre | Refresh user-signal inputs before goal scoring | none (no canonical default) | On-demand — create `world/conventions/signal-refresh.md` when the domain has a signal source to scan. `/start` C0.5 prints an informational note about this slot. |
 | `outcome-observation` | `.claude/skills/aspirations-state-update/SKILL.md` Step 8.12 | Pull business-layer outcome metrics (commits, CI, service health) after state update to detect process-vs-outcome divergence | none (no canonical default) | On-demand — create `world/conventions/outcome-observation.md` when the domain has measurable outcomes beyond goal-completion counts. `/start` C0.5 prints an informational note about this slot. |
+| `commons-retrieval` | `core/config/execute-protocol-digest.md` Step 4a (after Step 4 retrieval) | Retrieve from a SHARED cross-world knowledge commons, so goal execution builds on what other agents/worlds already learned instead of re-deriving it | none (no canonical default) | On-demand — create `world/conventions/commons-retrieval.md` when the domain participates in a shared commons. A world that shares nothing simply has no file, and Step 4a is a silent no-op. |
 
 Adding a new slot is allowed and expected — the framework should grow new
 hook slots as new kinds of core→world coupling are discovered. Each new slot
@@ -161,10 +162,11 @@ as a result. New call-site logic should use the four-way classifier below.
 | Verification, cleanup, commit, test run, or health record AFTER a goal completes | `post-execution` |
 | A new input channel to scan or refresh BEFORE goal scoring (user email, board directive count, external queue state) | `signal-refresh` |
 | A new outcome metric to pull from the real world AFTER state update (repo commits, CI pass rate, service health, business KPI) | `outcome-observation` |
+| A new EXTERNAL knowledge source to consult while retrieving context for a goal (shared commons, partner-org index, foreign-world store) | `commons-retrieval` |
 | None of the above fit cleanly | SKIP — do not force a fit. An unroutable proposal is signal that a new slot may be needed; file an Idea goal to add one. |
 
 **Decision order (check specific before general):** outcome-observation →
-signal-refresh → post-execution → pre-execution → skip. Treat
+commons-retrieval → signal-refresh → post-execution → pre-execution → skip. Treat
 `pre-execution` as catch-all only when the proposal is about *preparing a
 single goal's execution*, not *refreshing inputs that affect all goals*.
 

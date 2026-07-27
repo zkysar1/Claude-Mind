@@ -1,4 +1,4 @@
-"""bulk-retire-dead-entries: retire bar must honor times_inferred_helpful (5).
+"""bulk-retire-dead-entries: retire bar must honor times_inferred_helpful ().
 
 The retire bar previously checked (times_helpful + times_cited) == 0 and IGNORED
 times_inferred_helpful -- the automatic retrieval-application backstop the rest of

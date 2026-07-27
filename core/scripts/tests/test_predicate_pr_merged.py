@@ -1,4 +1,4 @@
-"""pr_merged predicate (3 / rb-3995) — branch-per-goal estate gate.
+"""pr_merged predicate ( / rb-3995) — branch-per-goal estate gate.
 
 All gh probes are monkeypatched; no network. Cache isolation via a tmp agent
 dir + MIND_AGENT env so the per-agent session cache never touches live state.

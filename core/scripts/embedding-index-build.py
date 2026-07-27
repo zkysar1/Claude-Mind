@@ -44,6 +44,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
+import _vendor_path  # noqa: E402,F401  : per-box vendored encoder stack
 import retrieve as R  # noqa: E402  canonical store readers (read_jsonl / paths)
 
 MODEL_NAME = "all-MiniLM-L6-v2"  # fallback when config + --model are absent
@@ -117,14 +118,64 @@ def tree_doc_id(node):
     return ("tree:" + rel) if rel else None
 
 
+TREE_BODY_CHAR_CAP = 400
+
+
+def tree_body_paragraph(node, cap=TREE_BODY_CHAR_CAP):
+    """First prose paragraph of a tree node's .md body, for the embed surface.
+
+    g-306-87: the g-306-83 tree-lane A/B missed 5/12 node-paraphrase queries
+    because the embedded surface was only humanized-key + summary, and a
+    one-line summary carries too little signal to match a paraphrase. The
+    node's opening paragraph is the cheapest available depth.
+
+    The node's `file` carries the VIRTUAL `world/` prefix, which is NOT
+    PROJECT_ROOT-relative under the .mind-data layout — it MUST go through
+    _paths.resolve_file_path. (g-115-3099: `PROJECT_ROOT / file_path` silently
+    yields a nonexistent path, so every body read returns empty and the caller
+    degrades to exactly the thin surface this function exists to widen.)
+
+    Fail-open: any unreadable or malformed node yields "" so a 1251-node build
+    never dies on one bad file."""
+    f = (node or {}).get("file")
+    if not isinstance(f, str) or not f:
+        return ""
+    try:
+        from _paths import resolve_file_path
+        text = Path(resolve_file_path(f)).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    # Strip YAML front matter when present (--- ... ---).
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end >= 0:
+            text = text[end + 4:]
+    # First paragraph that is prose, not a heading / list / table / code fence.
+    for block in text.split("\n\n"):
+        para = " ".join(block.split()).strip()
+        if not para or para[0] in "#|->`*" or para.startswith("---"):
+            continue
+        return para[:cap]
+    return ""
+
+
 def tree_doc_text(key, node):
-    """The embedded surface for a tree node: humanized key + summary (the
-    _tree.yaml retrieval surface — no .md body reads; bodies are the LLM's
-    post-triage Read, not the match surface)."""
+    """The embedded surface for a tree node: humanized key + summary + the
+    first body paragraph (g-306-87).
+
+    Body reads were deliberately absent before g-306-87 ("bodies are the LLM's
+    post-triage Read, not the match surface"). The g-306-83 A/B refuted that
+    for MATCHING specifically: 5/12 node-paraphrase queries missed both arms on
+    the key+summary surface alone. Bodies remain the post-triage Read; only
+    their first paragraph joins the match surface, capped so one long node
+    cannot dominate the embedding."""
     parts = [str(key or "").replace("-", " ")]
     s = (node or {}).get("summary")
     if isinstance(s, str) and s:
         parts.append(s)
+    body = tree_body_paragraph(node)
+    if body:
+        parts.append(body)
     return " ".join(p for p in parts if p).strip()
 
 

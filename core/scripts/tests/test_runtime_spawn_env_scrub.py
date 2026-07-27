@@ -1,4 +1,4 @@
-"""test_runtime_spawn_env_scrub.py — 8 regression tests.
+"""test_runtime_spawn_env_scrub.py —  regression tests.
 
 Verifies rt_spawn (core/scripts/_runtime.sh) canonicalizes the daemon
 environment at the wrapper auto-respawn chokepoint. Incident (2026-07-16,

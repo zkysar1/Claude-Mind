@@ -1,4 +1,4 @@
-"""3 — structural prevention for aspirations.jsonl null-byte corruption.
+""" — structural prevention for aspirations.jsonl null-byte corruption.
 
 Pins the three outcomes:
   1. save_history parse-validates JSONL sources; raises CorruptSourceError

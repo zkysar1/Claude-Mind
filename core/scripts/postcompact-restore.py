@@ -234,7 +234,7 @@ def main():
         # of loop_state; the three streak/drift counters are nested under
         # loop_state["signals"]. Reading the nested keys at top-level returned
         # None and silently dropped the boredom/streak signal from the
-        # post-autocompact display (2 / zeta-1385).
+        # post-autocompact display ( / zeta-1385).
         for key in ["goals_completed", "productive_goals", "evolutions"]:
             val = loop_state.get(key)
             if val is not None and val != 0:
@@ -249,7 +249,7 @@ def main():
             # Show touched aspirations if present. The canonical loop_state key
             # is "touched" (written by the bash loop-state gates); the prior
             # "touched_aspirations" lookup never matched and silently omitted
-            # the line (same display-vs-shape defect class, 2).
+            # the line (same display-vs-shape defect class, ).
             touched = loop_state.get("touched")
             if touched and isinstance(touched, list):
                 lines.append(f"  Touched aspirations: {', '.join(str(a) for a in touched[:10])}")

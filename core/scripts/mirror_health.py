@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mirror_health — detect a silent own-cloud mirror wedge (9).
+"""mirror_health — detect a silent own-cloud mirror wedge ().
 
 A both-diverged conflict freezes a file's mirror refresh (owncloud_backend
 _overwrite_decision -> no_clobber): the sweep skips the file every pass and

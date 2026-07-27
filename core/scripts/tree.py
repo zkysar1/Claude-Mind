@@ -375,22 +375,22 @@ def write_tree(data):
         release_lock(lock_path)
 
 
-# --- PROGRESSION calibration stamp (5) ------------------------------
+# --- PROGRESSION calibration stamp () ------------------------------
 # _PROGRESSION_STAMP_FIELDS MUST match coordination_merge._TREE_PROGRESSION_FIELDS
 # (the merge-side SSOT for which node fields are PROGRESSION-class). Any writer
 # that changes one of these MUST call _stamp_progression(node): the own-cloud
 # _tree.yaml reconcile keys the PROGRESSION LWW on progression_updated_at, which
-# advances on a calibration edit — last_updated deliberately does NOT (3
+# advances on a calibration edit — last_updated deliberately does NOT (
 # keeps it tracking .md article freshness). Without the stamp, own-cloud merges
 # hit _merge_field_progression's never-regress tiebreak and silently revert
-# data-derived DOWNGRADES to the stale-higher value (4; rb-3823,
+# data-derived DOWNGRADES to the stale-higher value (; rb-3823,
 # guard-1170). The merge falls back to last_updated when the stamp is absent, so
 # un-migrated nodes behave exactly as before (backfill-safe).
 _PROGRESSION_STAMP_FIELDS = ("confidence", "capability_level", "domain_confidence")
 
 
 def _stamp_progression(node):
-    """Bump the PROGRESSION calibration stamp on a node (5). Call from
+    """Bump the PROGRESSION calibration stamp on a node (). Call from
     any writer that changes a _PROGRESSION_STAMP_FIELDS value. Date-granular
     (matches last_updated) so CLI and daemon writes stay byte-identical for the
     byte-compat parity tests; day resolution suffices because same-day cross-box
@@ -670,8 +670,15 @@ def _analyze_node_body(text):
 
 
 def get_distill_candidates(tree, include_skipped=False):
-    """Return leaf nodes eligible for DISTILL based on utility thresholds.
+    """Return nodes eligible for DISTILL based on utility + structural thresholds.
     Reads thresholds from core/config/tree.yaml pruning section.
+
+    LEAF nodes are evaluated against all three criteria (crit1 low-utility,
+    crit2 large-mediocre, crit3 oversized-append-grown). INTERIOR nodes (with
+    children) are evaluated against the STRUCTURAL crit3 ONLY (read-cap
+    protection, g-115-1570) — the utility triggers crit1/crit2 are leaf-only
+    (g-115-2913/rb-4648: an oversized interior hub too big to Read escaped every
+    maintenance detector because this loop used to skip interior nodes entirely).
 
     When include_skipped=True, returns {candidates, skipped} where skipped is a
     list of {node_key, skip_reason}. Skip-reason enum:
@@ -681,7 +688,9 @@ def get_distill_candidates(tree, include_skipped=False):
     (file_not_found / read_error are NOT skip reasons here — a missing file
     just yields line_count=0, which feeds into crit2. distill_exempt is the
     durable coherence judgment g-115-1700/guard-896, suppressing the utility
-    triggers crit1/crit2 but NOT the structural crit3.)
+    triggers crit1/crit2 but NOT the structural crit3. has_children now means
+    "interior node, crit3-eligible, crit3 did not trip" — an interior node that
+    DOES trip crit3 is returned as a candidate, not skipped.)
     """
     config_path = str(CONFIG_DIR / "tree.yaml")
     pruning = {}
@@ -693,7 +702,7 @@ def get_distill_candidates(tree, include_skipped=False):
     min_ret = pruning.get("distill_min_retrievals", 5)
     line_threshold = pruning.get("distill_line_threshold", 50)
     line_util_threshold = pruning.get("distill_line_utility_threshold", 0.5)
-    # 7: sparse-feedback + stale-signal filters for the utility
+    # : sparse-feedback + stale-signal filters for the utility
     # triggers. One noise vote made utility_ratio=0 look meaningful (the
     #  has_feedback>=1 gate was too permissive), flagging 525 of 817
     # leaves as a STANDING false-positive pool — and the debt computation
@@ -703,7 +712,7 @@ def get_distill_candidates(tree, include_skipped=False):
     min_votes = pruning.get("distill_min_feedback_votes", 3)
     recency_days = pruning.get("distill_recency_days", 45)
     recency_cutoff = date.today() - timedelta(days=recency_days)
-    # crit3 (0): proactive oversized append-grown sweep node.
+    # crit3 (): proactive oversized append-grown sweep node.
     token_cap = pruning.get("distill_token_cap", 25000)            # Read tool ~25k-token cap
     token_ratio = pruning.get("distill_token_ratio", 0.8)          # fire at this fraction of the cap
     token_trigger = token_ratio * token_cap
@@ -713,17 +722,27 @@ def get_distill_candidates(tree, include_skipped=False):
     candidates = []
     skipped = []
     for key, node in nodes.items():
-        if node.get("children"):
-            if include_skipped:
-                skipped.append({"node_key": key, "skip_reason": "has_children"})
-            continue  # skip interior nodes
+        # Interior nodes (with children) are evaluated for the STRUCTURAL
+        # read-cap criterion crit3 () ONLY — the utility triggers
+        # crit1/crit2 stay leaf-only (an interior hub's low utility is a
+        # structural signal owned by decompose/redistribute via child-count,
+        # not a distill signal). Before /rb-4648 this loop skipped
+        # interior nodes ENTIRELY (an early `continue`), so an oversized
+        # interior hub too big to Read (e.g. an ~28.5k-token index node past the
+        # ~25k Read cap) escaped ALL THREE distill criteria AND the redistribute
+        # body-trigger (retired ) AND decompose (leaf-count) — every
+        # maintenance detector was blind to it. crit3 is explicitly structural
+        # (fires independent of the utility triggers — see the distill_exempt
+        # path below), so an oversized interior node is exactly its target.
+        # is_interior suppresses crit1/crit2 symmetrically to is_distill_exempt.
+        is_interior = bool(node.get("children"))
         rc = node.get("retrieval_count", 0)
         ur = node.get("utility_ratio", 0.0)
         th = node.get("times_helpful", 0)
         tn = node.get("times_noise", 0)
         feedback_votes = th + tn
         has_feedback = feedback_votes >= 1
-        # 7: utility is evidence only on >= min_votes feedback events
+        # : utility is evidence only on >= min_votes feedback events
         # (one noise vote computes ur=0 and mis-fires as "low utility" — the
         #  >=1 gate was necessary but not sufficient) AND a
         # recent-enough last_retrieved (a 2-month-stale signal describes a node
@@ -753,9 +772,9 @@ def get_distill_candidates(tree, include_skipped=False):
                 line_count, est_tokens, refresh_sections = _analyze_node_body(f.read())
         # crit2 requires feedback too — same root cause as crit1 (zero-feedback
         # nodes have ur=0.0 by default and mis-fire as "mediocre"). .
-        # 7: same min-votes + recency bar as crit1 (utility_signal_ok).
+        # : same min-votes + recency bar as crit1 (utility_signal_ok).
         crit2 = line_count > line_threshold and ur < line_util_threshold and rc >= min_ret and utility_signal_ok
-        # Criterion 3 (0): proactive oversized append-grown sweep node.
+        # Criterion 3 (): proactive oversized append-grown sweep node.
         # Fires BEFORE the node trips the Read ~25k-token cap that forces
         # read-before-edit to re-read it on every recurring sweep (rb-2085's
         # reactive-distill trigger). STRUCTURAL — independent of
@@ -766,17 +785,20 @@ def get_distill_candidates(tree, include_skipped=False):
         # false-positive rate stays near zero. Action reuses the rb-2085 distill
         # procedure (archive verbatim + keep newest-N + dated rollup).
         crit3 = est_tokens >= token_trigger and refresh_sections >= refresh_min
-        # 0 / guard-896: a node durably marked distill-exempt via the
+        #  / guard-896: a node durably marked distill-exempt via the
         # coherence gate (rb-94 body-read judgment) is suppressed from the UTILITY
         # triggers — low retrieval signals niche value, not bloat, so distilling it
         # would DESTROY load-bearing context. This mirrors how "decompose"/
         # "redistribute" exempt their detectors, EXCEPT it is inline (not a
-        # top-of-loop continue) because crit3 (oversized append-grown, 0)
+        # top-of-loop continue) because crit3 (oversized append-grown, )
         # is STRUCTURAL + non-destructive (archive+keep-newest): an exempt node too
         # big to Read must STILL get the rollup, so the exemption clears crit1/crit2
         # only and leaves crit3 to fire.
         is_distill_exempt = "distill" in _node_maintain_exempt(node)
-        if is_distill_exempt:
+        if is_distill_exempt or is_interior:
+            # is_interior (): crit1/crit2 are leaf-utility criteria;
+            # an interior hub gets crit3 (structural read-cap) ONLY. Same
+            # suppression shape as distill_exempt.
             crit1 = crit2 = False
         if crit1 or crit2 or crit3:
             trigger = ("oversized_append_grown" if crit3
@@ -795,21 +817,30 @@ def get_distill_candidates(tree, include_skipped=False):
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
-            # distill_exempt first (the durable coherence judgment, 0) —
+            # Interior nodes first (): they are crit3-eligible ONLY,
+            # so the leaf-utility skip reasons below (insufficient_retrievals,
+            # no_feedback, ...) do not describe why they were skipped — crit3
+            # simply did not trip. Preserve the "has_children" skip_reason so
+            # telemetry that counts it stays valid (its meaning refines from
+            # "not evaluated at all" to "interior, crit3-eligible, crit3 not
+            # tripped").
+            # distill_exempt next (the durable coherence judgment, ) —
             # mirrors get_decompose_candidates' decompose_exempt skip_reason.
-            if is_distill_exempt:
+            if is_interior:
+                skipped.append({"node_key": key, "skip_reason": "has_children"})
+            elif is_distill_exempt:
                 skipped.append({"node_key": key, "skip_reason": "distill_exempt"})
             elif rc < min_ret:
                 skipped.append({"node_key": key, "skip_reason": "insufficient_retrievals"})
             elif not has_feedback:
                 skipped.append({"node_key": key, "skip_reason": "no_feedback"})
             elif not has_min_votes:
-                # 7: 1..min_votes-1 feedback events — utility_ratio
+                # : 1..min_votes-1 feedback events — utility_ratio
                 # exists but rests on too few votes to act on.
                 skipped.append({"node_key": key,
                                 "skip_reason": "insufficient_feedback_votes"})
             elif not signal_recent:
-                # 7: enough votes, but last_retrieved is older than
+                # : enough votes, but last_retrieved is older than
                 # distill_recency_days (or missing) — signal too stale to act on.
                 skipped.append({"node_key": key,
                                 "skip_reason": "stale_retrieval_signal"})
@@ -818,7 +849,7 @@ def get_distill_candidates(tree, include_skipped=False):
     # Surface proactive oversized-append-grown candidates FIRST: they block Read
     # entirely (rb-2085), so they must win the max_distill_per_invocation budget
     # over low-utility / large-mediocre leaves. Within each tier, lowest utility
-    # first (preserves the prior ordering for crit1/crit2 candidates). (0)
+    # first (preserves the prior ordering for crit1/crit2 candidates). ()
     candidates.sort(key=lambda x: (0 if x["trigger"] == "oversized_append_grown" else 1, x["utility_ratio"]))
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
@@ -980,7 +1011,7 @@ def _subtree_leaf_counts(nodes):
 
 
 # Maintenance actions a node may be durably exempted from via its optional
-# per-node `maintain_exempt` field (8). A one-time semantic judgment
+# per-node `maintain_exempt` field (). A one-time semantic judgment
 # (set through /tree maintain's coherence gate) records that a node is
 # intentionally wide — a coherent interior hub (overview, chronological
 # build/research log) or a grandfathered top-level taxonomy cut — so the
@@ -988,10 +1019,10 @@ def _subtree_leaf_counts(nodes):
 # Symmetric across the candidate detectors: "decompose" exempts from
 # get_decompose_candidates, "redistribute" from get_redistribute_candidates,
 # and "distill" from get_distill_candidates' UTILITY triggers (crit1/crit2) — a
-# coherence judgment (guard-896 / 0) that a low-RETRIEVAL node is
+# coherence judgment (guard-896 / ) that a low-RETRIEVAL node is
 # niche-but-valuable, not bloated (the util_ratio over-flag class, sibling of
-# the 4 article_count=0 over-flag). NOTE distill-exempt does NOT suppress
-# the STRUCTURAL oversized-append-grown trigger (crit3, 0): a coherent
+# the  article_count=0 over-flag). NOTE distill-exempt does NOT suppress
+# the STRUCTURAL oversized-append-grown trigger (crit3, ): a coherent
 # node too big to Read still gets the non-destructive rollup (archive+keep-newest).
 MAINTAIN_EXEMPT_ACTIONS = {"decompose", "redistribute", "distill"}
 
@@ -1181,7 +1212,7 @@ def _iter_body_md_refs(nodes):
     scope to keep false positives low. rb-8: treat every cross-reference as a
     positive-state assertion.
     """
-    import re  # local: keeps the whole 9 feature one contiguous block
+    import re  # local: keeps the whole  feature one contiguous block
     # Derive the live set of L1 tree directories from node files (domain-agnostic
     # — never hardcode category names; the tree owns its own taxonomy).
     known_l1 = set()
@@ -1228,7 +1259,7 @@ def _iter_body_md_refs(nodes):
             seen_refs.add(ref)
             # Skip illustrative/abbreviated paths: a literal '...' ellipsis (or
             # its unicode form, U+2026) is a prose placeholder for omitted path
-            # segments, not a real target (9 live-validation finding).
+            # segments, not a real target ( live-validation finding).
             if "..." in ref or "…" in ref:
                 continue
             if ref.startswith("world/knowledge/tree/"):
@@ -1273,7 +1304,7 @@ def validate_tree(tree):
         if child_count is not None and child_count != len(children):
             errors.append("Node '{}' has child_count={} but {} children listed".format(key, child_count, len(children)))
 
-        # Check node_type consistency (6): a stored node_type must
+        # Check node_type consistency (): a stored node_type must
         # match the canonical derivation (interior if children else leaf).
         # apply_defaults DERIVES node_type when ABSENT but does NOT mask a
         # PRESENT-but-wrong value on reads, so validate is the right surface
@@ -1304,7 +1335,7 @@ def validate_tree(tree):
         if "node_type" not in node:
             expected = "interior" if children else "leaf"
             warnings.append("Node '{}' missing 'node_type' (default: {})".format(key, expected))
-        # Validate optional maintain_exempt field (8): a list (or bare
+        # Validate optional maintain_exempt field (): a list (or bare
         # string) of known maintenance actions. Unknown/malformed values silently
         # fail to exempt in the candidate detectors, so surface them here as a
         # warning rather than letting a typo become an invisible no-op.
@@ -1344,13 +1375,13 @@ def validate_tree(tree):
                     continue  # found under a prefix — don't warn
             warnings.append("Node '{}' references file '{}' which does not exist on disk".format(key, file_path))
 
-    # --- Node-body dangling cross-reference check (9) ---
+    # --- Node-body dangling cross-reference check () ---
     # Walk every backtick-quoted tree-node .md reference in every node body
     # (shared iterator _iter_body_md_refs — also drives tree-inbound-ref-fix.py's
-    # post-reparent repair, 0) and warn when the target is missing on
+    # post-reparent repair, ) and warn when the target is missing on
     # disk. When a node is relocated, other nodes whose body referenced the old
     # path dangle here; that class never surfaced before this check because no
-    # validate read node bodies (root cause of the  / 7
+    # validate read node bodies (root cause of the  / 
     # incidents — one relocation left 6 inbound refs across 5 files). rb-8: treat
     # every cross-reference as a positive-state assertion; probe target existence.
     tree_root = WORLD_DIR / "knowledge" / "tree"
@@ -1385,7 +1416,7 @@ def validate_tree(tree):
                     continue
                 full_path = os.path.normpath(os.path.join(dirpath, fname))
                 if _canonical_path_key(full_path) not in referenced_files:
-                    # 8: retired-tombstone files are documented state
+                    # : retired-tombstone files are documented state
                     # (moved-node stale twins; S3 DeleteObject is IAM-denied,
                     # so tombstone-overwrite is the retirement terminal state)
                     # — not orphans. Only unreferenced files reach this open,
@@ -1505,7 +1536,7 @@ def validate_tree(tree):
 # write makes. Append-only JSONL at meta/l1-pick-log.jsonl. Consumed by
 # l1-skew-check.py and /fresh-eyes-tree. Fail-open: a logging error MUST NOT
 # block the tree write that just succeeded.
-# Implementation lives in _l1_pick.py (SSOT, 3) so the daemon
+# Implementation lives in _l1_pick.py (SSOT, ) so the daemon
 # tree-write endpoints share it — the CLI wrappers below keep the original
 # names/signatures for the 3 call sites (cmd_add_child, cmd_batch,
 # cmd_reparent).
@@ -1773,7 +1804,7 @@ def cmd_read(args):
                 # last_updated + article_count: consumed by strategic-scan S2
                 # (knowledge-frontier staleness/thin detection). Both fields
                 # exist on every node; omitting them here left S2a/S2b dead.
-                # 8.
+                # .
                 "last_updated": node.get("last_updated"),
                 "article_count": node.get("article_count", 0),
                 "children": node.get("children", []),
@@ -2050,19 +2081,19 @@ def cmd_set(args):
         if field == "file" and isinstance(v, str):
             v = normalize_virtual_path(v)
         node[field] = v
-        # 5: stamp the dedicated PROGRESSION calibration signal (NOT
-        # last_updated, per 3) so an own-cloud reconcile preserves a
+        # : stamp the dedicated PROGRESSION calibration signal (NOT
+        # last_updated, per ) so an own-cloud reconcile preserves a
         # data-derived downgrade instead of reverting it via never-regress.
         if field in _PROGRESSION_STAMP_FIELDS:
             _stamp_progression(node)
-        # 3 (Option B): do NOT auto-bump per-node last_updated on a
+        #  (Option B): do NOT auto-bump per-node last_updated on a
         # metadata --set. node .md front matter is the single source of truth
         # (); the _tree.yaml index last_updated is synced to it ONLY by
         # tree-front-matter-sync.py (the Edit/Write PostToolUse hook, which
         # writes BOTH stores) and at node creation. The old auto-bump fired on
         # ANY non-date field (confidence/growth_state/summary), marching the
         # index AHEAD of the .md fm -> the index-ahead drift class (250 nodes;
-        # 2 audit). Rationale: performance/agent-performance/
+        #  audit). Rationale: performance/agent-performance/
         # tree-maintenance-patterns.md "last_updated Index/Front-Matter Drift".
         # Explicit `--set <k> last_updated <d>` still lands via node[field]=v
         # above; the index-level data["last_updated"] below (tree-file write
@@ -2184,19 +2215,19 @@ def cmd_add_child(args):
         child_node["parent"] = parent_key
         child_node["children"] = child_data.get("children", [])
         child_node["child_count"] = len(child_node["children"])
-        # 3: node_type is derive-always from child-presence (mirror
+        # : node_type is derive-always from child-presence (mirror
         # child_count) — set HERE at the create path, not copied (removed from
         # the allowlist below) and not via apply_defaults' fill-if-absent (which
         # also normalizes reads, masking on-disk drift). The parent-flip below
         # keeps a later-childed node correct; this keeps it correct AT creation.
-        # Sibling 7.
+        # Sibling .
         child_node["node_type"] = "interior" if child_node["children"] else "leaf"
         # poignancy (, BRD Gap 1a producer): copy an LLM-rated 1-10
         # importance value at creation so the tree-node write path assigns
         # poignancy AT WRITE TIME (the  blend consumes it). Absent →
         # apply_defaults sets None (null-safe). Without this allowlist entry a
         # poignancy in child_data would be silently dropped.
-        # node_type intentionally excluded — derive-always at create (3).
+        # node_type intentionally excluded — derive-always at create ().
         for field in ("summary", "domain_confidence", "capability_level", "confidence",
                       "article_count", "growth_state", "origin_goal_id",
                       "poignancy"):
@@ -2230,7 +2261,7 @@ def cmd_add_child(args):
                 parent["children"] = []
             parent["children"].append(child_key)
             parent["child_count"] = len(parent["children"])
-            # 7: a freshly-created parent that gains its first
+            # : a freshly-created parent that gains its first
             # child via add-child must flip leaf->interior. add-child
             # updates child_count but historically left node_type stale,
             # mislabeling interior nodes as leaves (misleads retrieval/
@@ -2319,9 +2350,9 @@ def cmd_remove_child(args):
         parent["children"] = children
         parent["child_count"] = len(children)
         if not children:
-            # 5: removing the last child flips parent interior->leaf
+            # : removing the last child flips parent interior->leaf
             # (mirrors cmd_reparent old-parent path; symmetric to the
-            # 7 add-child leaf->interior flip).
+            #  add-child leaf->interior flip).
             parent["node_type"] = "leaf"
         nodes[parent_key] = parent
         if child_key in nodes:
@@ -2546,8 +2577,8 @@ def cmd_batch(args):
                     value = normalize_virtual_path(value)
                 node[field] = value
                 if field in _PROGRESSION_STAMP_FIELDS:
-                    _stamp_progression(node)  # 5 (see cmd_set)
-                # 3 (Option B): no per-node last_updated auto-bump on
+                    _stamp_progression(node)  #  (see cmd_set)
+                #  (Option B): no per-node last_updated auto-bump on
                 # batch --set, same as cmd_set above. node .md fm is the single
                 # source of truth (); the index last_updated is synced
                 # ONLY by tree-front-matter-sync.py + at node creation. Old
@@ -2593,18 +2624,18 @@ def cmd_batch(args):
                 child_node["parent"] = parent_key
                 child_node["children"] = child_data.get("children", [])
                 child_node["child_count"] = len(child_node["children"])
-                # 3: node_type is derive-always from child-presence
+                # : node_type is derive-always from child-presence
                 # (mirror child_count) — set at the create path, not copied
                 # (removed from the allowlist below) and not via apply_defaults'
-                # fill-if-absent. Mirrors cmd_add_child. Sibling 7.
+                # fill-if-absent. Mirrors cmd_add_child. Sibling .
                 child_node["node_type"] = "interior" if child_node["children"] else "leaf"
-                # poignancy () + origin_goal_id ( / 3):
+                # poignancy () + origin_goal_id ( / ):
                 # batch add-child mirrors cmd_add_child — copy the LLM-rated 1-10
                 # poignancy AND the executing-goal provenance at creation. The
                 # origin_goal_id allowlist entry landed only in cmd_add_child, so
                 # every batch-created node was invisible to the Gate D SPILL-1
                 # attribution (duplicated-path divergence, rb-1776). Restored here.
-                # node_type intentionally excluded — derive-always at create (3).
+                # node_type intentionally excluded — derive-always at create ().
                 for field in ("summary", "domain_confidence", "capability_level", "confidence",
                               "article_count", "growth_state", "origin_goal_id",
                               "poignancy"):
@@ -2616,7 +2647,7 @@ def cmd_batch(args):
                         child_node["capability_level"] = parent_cl
                 child_node = apply_defaults(child_node)
                 child_node["last_updated"] = date.today().isoformat()
-                # origin_goal_id auto-inject ( / 3): mirror
+                # origin_goal_id auto-inject ( / ): mirror
                 # cmd_add_child — caller-wins (an explicit value copied above is
                 # preserved); otherwise auto-inject from team-state in_flight.
                 if "origin_goal_id" not in child_node:
@@ -2629,7 +2660,7 @@ def cmd_batch(args):
                         parent["children"] = []
                     parent["children"].append(child_key)
                     parent["child_count"] = len(parent["children"])
-                    # 7: flip parent leaf->interior on first child
+                    # : flip parent leaf->interior on first child
                     # (mirrors cmd_add_child / cmd_reparent new-parent idiom).
                     if parent.get("node_type") == "leaf":
                         parent["node_type"] = "interior"
@@ -2664,9 +2695,9 @@ def cmd_batch(args):
                     parent["children"] = children
                     parent["child_count"] = len(children)
                     if not children:
-                        # 5: last-child removal flips parent
+                        # : last-child removal flips parent
                         # interior->leaf (mirrors cmd_reparent; symmetric to
-                        # the 7 add-child path).
+                        # the  add-child path).
                         parent["node_type"] = "leaf"
                 if child_key in nodes:
                     del nodes[child_key]

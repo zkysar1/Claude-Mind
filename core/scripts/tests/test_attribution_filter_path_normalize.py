@@ -1,4 +1,4 @@
-"""test_attribution_filter_path_normalize.py — 0 regression.
+"""test_attribution_filter_path_normalize.py —  regression.
 
 Verifies the path-format normalization in _cross_agent_attribution_filter.py
 (and, by SSOT import, iteration-commit.sh — rb-1405): the Source 2
@@ -126,7 +126,7 @@ def _write_uncommitted_log(agent_dir, recorded_paths):
 
 
 def test_source2_absolute_log_entry_drops_relative_candidate(tmp_path):
-    """0 core fix: partner recorded an ABSOLUTE path in its
+    """ core fix: partner recorded an ABSOLUTE path in its
     uncommitted-edits.jsonl (legacy writer). A RELATIVE candidate for the same
     file must be dropped as partner-uncommitted-log. Before the fix the exact
     string match missed and the file was wrongly KEPT (mis-attribution)."""

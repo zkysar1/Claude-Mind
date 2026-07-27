@@ -1,4 +1,4 @@
-"""test_aspirations_read_active_filter.py - 4 regression test.
+"""test_aspirations_read_active_filter.py -  regression test.
 
 Pins the status filter on the /v1/aspirations/read ?active=1 branch
 (mind_api/src/endpoints/aspirations.py). Before g-115-2604 that branch
@@ -119,7 +119,7 @@ def _http_post(port: int, path: str, agent: str = "alpha"):
 
 
 def test_archive_sweep_replaces_stale_archive_copy_by_id():
-    """4 leg 2: a retired live record whose id ALREADY exists in the
+    """ leg 2: a retired live record whose id ALREADY exists in the
     archive (resurrection shape: archived once, reappeared in live via a
     partial write, re-retired) must REPLACE the stale archive copy on sweep —
     not append a duplicate. Pre-fix, archive.extend() appended blindly."""

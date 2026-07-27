@@ -1,4 +1,4 @@
-"""Tests for evolution-cadence-check.py decide() (0).
+"""Tests for evolution-cadence-check.py decide() ().
 
 The evolution-cadence precheck safety-net fires /aspirations-evolve when
 last_evolution_at_time is stale beyond maintenance_cadence.evolution.hours_cadence

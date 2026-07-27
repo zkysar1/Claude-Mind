@@ -1,4 +1,4 @@
-"""test_goal_duplication_gate_recent_completions_maintain.py — 6.
+"""test_goal_duplication_gate_recent_completions_maintain.py — .
 
 Regression test for the Completed-Maintain skip in _check_recent_completions.
 
@@ -72,7 +72,7 @@ def _run_gate(goal: dict, w: Path) -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = "alpha"
     env["MIND_WORLD"] = str(w)
-    env["MIND_AGENTS_ROOT"] = str(w / "agents")  # hermetic agent-queue scan (1)
+    env["MIND_AGENTS_ROOT"] = str(w / "agents")  # hermetic agent-queue scan ()
     env["STORAGE_BACKEND"] = "local"
     p = subprocess.run([sys.executable, str(GATE_PY)], input=json.dumps(goal),
                        capture_output=True, text=True, env=env, timeout=30)

@@ -207,7 +207,7 @@ ALWAYS_EXEMPT = {
     # orphan-gate.sh wired into verify-learning, and meta-transfer.py deleted
     # as daemon-superseded dead code.)
     "skill-gaps-validate.sh",          # operator/CI: validate meta/skill-gaps.yaml
-                                       # schema (3). Tested by
+                                       # schema (). Tested by
                                        # test_skill_gaps_hardening.py; run on
                                        # demand -- not in a production call path
                                        # (meta-set does not yet invoke it).

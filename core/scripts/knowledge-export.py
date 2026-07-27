@@ -17,6 +17,7 @@ target ``[redacted]`` (guard-724).
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -27,10 +28,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import yaml  # noqa: E402 — PyYAML, available in the framework venv
 
-from knowledge_projection import ProjectedBundle, Redactor, project  # noqa: E402
+from knowledge_projection import ProjectedBundle, Redactor, is_domain_tree_node, project  # noqa: E402
 
 #: Env var name suffixes whose VALUES are stripped from exposed text (never their names).
 _SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+
+
+def _generated_at() -> str:
+    """Naive ISO 8601 UTC stamp — the bundle's freshness marker (g-335-270).
+
+    Without this the served bundle is a PRE-PROJECTED artifact with no age: every
+    ``/knowledge/*`` route happily returns whatever the last export wrote, however
+    old, and a failed or unscheduled export is indistinguishable from a current one
+    from the serving side. The hourly ``mind-knowledge-export@.timer`` reduces how
+    often that happens but cannot make it detectable — a timer that stops firing
+    (box down, stale seed, export FATAL) leaves the previous bundle in place and
+    silent. The stamp is the detection mechanism, not the timer.
+
+    Shape matches the repo-wide naive-no-suffix convention (CLAUDE.md "Naming
+    Rules"), but is derived from ``timezone.utc`` EXPLICITLY rather than from a bare
+    ``now()``: this script's production caller is a systemd unit on the sidecar box,
+    which does NOT inherit the ``TZ=UTC`` env that ``.claude/settings.json`` pins on
+    agent boxes. A bare ``now()`` there would silently stamp box-local time and make
+    every age comparison wrong by the offset.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -61,14 +83,63 @@ def _humanize_key(key: str) -> str:
     return s[:1].upper() + s[1:] if s else key
 
 
+#: Cap on the per-node markdown body carried into the export bundle (chars). PEARL renders
+#: the full article; 32K bounds the very largest nodes without truncating normal ones.
+_NODE_BODY_CAP = 32_000
+
+
+def _strip_front_matter(text: str) -> str:
+    """Return the markdown body after a leading ``---``-fenced YAML front-matter block.
+
+    A node ``.md`` opens with ``---\\n<yaml>\\n---\\n<body>``. Strip that block so the
+    exported body is prose only — the front matter carries framework-internal fields
+    (topic, last_update_trigger, agent/session ids) that must never reach the kid-facing
+    UI. A file with no front matter (or an unterminated fence) is returned unchanged.
+    """
+    if not text.startswith("---"):
+        return text
+    lines = text.split("\n")
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[i + 1:]).lstrip("\n")
+    return text  # unterminated fence → treat the whole file as body (malformed front matter)
+
+
+def _read_node_body(tree_dir: Path, file_rel: str) -> str:
+    """Read a node's ``.md`` body (front matter stripped, capped) for the export bundle.
+
+    ``file_rel`` is the node ``file`` field — a repo-relative path shaped like
+    ``world/knowledge/tree/<cat>/<node>.md``. Resolve it under ``tree_dir`` by dropping the
+    ``world/knowledge/tree`` prefix. Any read failure → ``""`` (a missing/unreadable body
+    must never fail the export; the node still carries its summary).
+    """
+    if not file_rel:
+        return ""
+    parts = file_rel.strip("/").split("/")
+    if parts[:3] == ["world", "knowledge", "tree"]:
+        parts = parts[3:]
+    if not parts:
+        return ""
+    try:
+        text = tree_dir.joinpath(*parts).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return _strip_front_matter(text)[:_NODE_BODY_CAP]
+
+
 def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     """Read ``_tree.yaml`` into node dicts shaped for :func:`project`.
 
-    Uses the index-level ``summary`` (already in the tree yaml, so no per-node file read)
-    and a humanized key for the title. ``category`` is taken from the node ``file`` path
-    so the projection's system/-subtree suppression works on the reliable path segment.
+    Uses the index-level ``summary`` (already in the tree yaml) and a humanized key for the
+    title. ``category`` is taken from the node ``file`` path so the projection's
+    system/-subtree suppression works on the reliable path segment. Each DOMAIN node also
+    carries its full ``.md`` ``body`` (front matter stripped, capped) so the kid-facing UI
+    can render the article on click; framework (``system/``) node bodies are NOT read — the
+    projection suppresses that subtree anyway, so skipping the read keeps framework bodies
+    out of memory entirely (defense in depth) and halves the per-export file reads.
     """
-    tree_yaml = world_path / "knowledge" / "tree" / "_tree.yaml"
+    tree_dir = world_path / "knowledge" / "tree"
+    tree_yaml = tree_dir / "_tree.yaml"
     if not tree_yaml.is_file():
         return []
     data = yaml.safe_load(tree_yaml.read_text(encoding="utf-8")) or {}
@@ -81,14 +152,19 @@ def read_tree_nodes(world_path: Path) -> list[dict[str, object]]:
     for key, node in items:
         if not isinstance(node, dict):
             continue
+        file_rel = str(node.get("file") or "")  # file path → top-level category + body source
+        # Read the full body ONLY for domain nodes (see docstring — framework bodies are
+        # suppressed downstream, so we never even load them).
+        body = _read_node_body(tree_dir, file_rel) if is_domain_tree_node(file_rel) else ""
         out.append(
             {
                 "key": key,
                 "title": _humanize_key(key),
                 "summary": str(node.get("summary") or ""),
+                "body": body,
                 "parent": str(node.get("parent") or ""),
                 "children": [str(c) for c in (node.get("children") or []) if c],
-                "category": str(node.get("file") or ""),  # file path → top-level category
+                "category": file_rel,
             }
         )
     return out
@@ -194,7 +270,9 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             "parent": n.get("parent") or "",
             "children": list(n.get("children") or []),
         }
-        body = str(n.get("summary") or "")
+        # Prefer the full node body (carried end-to-end for the kid-facing wiki); fall back
+        # to the index summary when a node has no body. Already redacted by project().
+        body = str(n.get("body") or n.get("summary") or "")
         (nodes_dir / f"{stem}.md").write_text(
             f"{_okf_frontmatter(fm)}\n# {title}\n\n{body}\n", encoding="utf-8"
         )
@@ -232,13 +310,22 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
         )
 
     # index.md — the optional progressive-disclosure index (invariant 7).
+    # `generated_at` rides in the frontmatter AND as a visible line: the downloadable
+    # wiki outlives the box it came from, so a reader holding an unzipped copy needs
+    # to know how old it is without access to the exporter (g-335-270).
+    # Frontmatter goes through _okf_frontmatter (the same emitter every other concept
+    # file uses) rather than hand-built literal lines: safe_dump QUOTES the stamp, so a
+    # consumer's yaml.safe_load gets a `str` matching the JSON payload's type. Written
+    # unquoted by hand, YAML auto-types it to a `datetime` whose str() renders
+    # "2026-07-26 09:15:53" — a space, not a T — so the same value would read back in a
+    # different shape from the two bundle formats.
+    generated_at = _generated_at()
     lines = [
-        "---",
-        "type: index",
-        "---",
+        _okf_frontmatter({"type": "index", "generated_at": generated_at}).rstrip("\n"),
         "",
         "# Knowledge base",
         "",
+        f"- Generated: {generated_at} UTC",
         f"- Wiki articles: {counts['tree']}",
         f"- Hypotheses: {counts['hypotheses']}",
         f"- Guardrails: {counts['guardrails']}",
@@ -287,6 +374,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     payload = {
+        # First key so a consumer reading the head of the file sees the age
+        # immediately. Additive — every existing key keeps its name and shape.
+        "generated_at": _generated_at(),
         "counts": bundle.counts(),
         "tree": bundle.tree,
         "hypotheses": bundle.hypotheses,

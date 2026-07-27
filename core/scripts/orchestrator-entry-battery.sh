@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # orchestrator-entry-battery.sh — thin wrapper for orchestrator-entry-battery.py
-# (0). One call enumerating the aspirations/SKILL.md orchestrator
+# (). One call enumerating the aspirations/SKILL.md orchestrator
 # entry-phase checks; see the .py docstring. Fail-open by design: the battery
 # must never block the loop, so any wrapper-level failure still exits 0 with a
 # structured line (guard-614).

@@ -9,6 +9,7 @@ meta/skill-quality-strategy.yaml.
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -309,6 +310,189 @@ def cmd_underperforming(args):
     print(json.dumps(results, indent=2, ensure_ascii=False))
 
 
+def _load_skill_attribution():
+    """Load the hyphenated skill-attribution.py as an importable module.
+
+    The filename has a hyphen (not a valid identifier), so a plain `import`
+    can't reach it — importlib from the file path is the standard way. Both
+    scripts live in the same core/scripts dir.
+    """
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill-attribution.py")
+    spec = importlib.util.spec_from_file_location("skill_attribution", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def build_reconsolidation_candidates(join, quality_skills, min_failures, min_fail_rate):
+    """Pure: from an invocation->outcome join + quality data, build review candidates.
+
+    A skill with failing invocations at/above BOTH thresholds is a
+    reconsolidation-review candidate. reconsolidation_priority weights skills
+    that are BOTH failing invocations AND low subjective quality highest
+    (failure_rate * (1 - quality_overall); a skill with no quality data is
+    treated as neutral 0.5). Sorted worst-first. Extracted for unit testing.
+    """
+    candidates = []
+    for skill, counts in join.get("per_skill", {}).items():
+        fails = counts.get("failure", 0)
+        classified = counts.get("classified", 0)
+        fail_rate = (fails / classified) if classified else 0.0
+        if fails < min_failures or fail_rate < min_fail_rate:
+            continue
+        recent = [f["goal_id"] for f in join.get("failing", []) if f["skill"] == skill][-8:]
+        q_overall = quality_skills.get(skill, {}).get("aggregate", {}).get("overall")
+        priority = round(fail_rate * (1.0 - (q_overall if q_overall is not None else 0.5)), 4)
+        candidates.append({
+            "skill": skill,
+            "failing_invocations": fails,
+            "classified_invocations": classified,
+            "failure_rate": round(fail_rate, 4),
+            "success_rate": counts.get("success_rate"),
+            "recent_failing_goals": recent,
+            "current_quality_overall": q_overall,
+            "reconsolidation_priority": priority,
+        })
+    candidates.sort(key=lambda x: -x["reconsolidation_priority"])
+    return candidates
+
+
+def _recon_slug(s):
+    """Slug a skill name into a stable per-skill origin_signal dedup key."""
+    return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:48]
+
+
+def _open_origin_signals():
+    """Set of origin_signals across all OPEN (pending/in-progress) goals in the
+    world+agent queues — the exact-match dedup base for `reconsolidation --apply`
+    (a filed candidate carries origin_signal investigate:skill-reconsolidation-<slug>,
+    so the next cadence's read finds it and suppresses a re-file; g-115-2196 exact-
+    key dedup, NOT a title substring scan). Fail-open: a per-source read error
+    skips that source (a missed dedup files a duplicate the daemon's own
+    Duplication gate then catches — better than aborting the advisory scan).
+    Lazy `import _rt` keeps the daemon client off the module-level import path
+    of the read/report/score subcommands (no import-cycle with the daemon endpoint)."""
+    import _rt  # noqa: E402 (lazy — only the --apply path needs the daemon client)
+    sigs = set()
+    for source in ("world", "agent"):
+        try:
+            out = _rt.aspirations_read(source=source, active=True)
+        except Exception as e:  # noqa: BLE001 — fail-open per docstring
+            print(f"[skill-evaluate reconsolidation] {source} read failed: {e}", file=sys.stderr)
+            continue
+        data = _rt.tolerant_decode_aggregate(f"skill-evaluate reconsolidation: {source}", out)
+        if data is None:
+            continue
+        for asp in (data.get("aspirations") if isinstance(data, dict) else data) or []:
+            for g in asp.get("goals", []) or []:
+                if g.get("status") in ("pending", "in-progress"):
+                    sig = g.get("origin_signal")
+                    if sig:
+                        sigs.add(sig)
+    return sigs
+
+
+def file_reconsolidation_investigate(candidate, target_asp="asp-115"):
+    """--apply: file ONE reconsolidation candidate as an ADVISORY Investigate via
+    the daemon add-goal endpoint (_rt — canonical Python->daemon path, NOT a bash
+    subprocess). ADVISORY only: the goal asks the agent to REVIEW the failing
+    skill's pseudocode against its failures, NEVER to auto-modify it (advisory-refine
+    constraint, g-355-07). Best-effort, fail-open — a filing error is logged and
+    returns None without aborting the scan. Returns the new goal id or None."""
+    import _rt  # noqa: E402 (lazy — see _open_origin_signals)
+    skill = candidate["skill"]
+    sig = f"investigate:skill-reconsolidation-{_recon_slug(skill)}"
+    record = {
+        "title": f"Investigate: reconsolidate failing skill {skill} (failure_rate {candidate.get('failure_rate')})"[:140],
+        "description": (
+            f"skill-evaluate reconsolidation flagged '{skill}': "
+            f"{candidate.get('failing_invocations')} failing / "
+            f"{candidate.get('classified_invocations')} classified invocations "
+            f"(failure_rate {candidate.get('failure_rate')}, current_quality_overall "
+            f"{candidate.get('current_quality_overall')}, reconsolidation_priority "
+            f"{candidate.get('reconsolidation_priority')}). Recent failing goals "
+            f"(evidence): {candidate.get('recent_failing_goals', [])}. ADVISORY review "
+            "of the skill's SKILL.md against these failures — identify the recurring "
+            "failure mode and refine the pseudocode. Do NOT auto-modify the skill "
+            "without human/verification review (advisory-refine constraint, g-355-07)."
+        ),
+        "priority": "MEDIUM",
+        "participants": ["agent"],
+        "category": "skill-quality",
+        "intended_agent": "either",
+        "origin_signal": sig,
+        "tags": ["skill-reconsolidation", "advisory"],
+    }
+    override = {"Duplication": (
+        f"reconsolidation exact-origin_signal dedup confirmed '{sig}' not open "
+        "(no pending/in-progress goal carries this key)")}
+    try:
+        resp = _rt.aspirations_add_goal(target_asp, record, source="world", overrides=override)
+    except Exception as e:  # noqa: BLE001 — fail-open per docstring
+        print(f"[skill-evaluate reconsolidation] file failed for {skill}: {e}", file=sys.stderr)
+        return None
+    gid = None
+    if isinstance(resp, dict):
+        g = resp.get("goal")
+        if isinstance(g, dict):
+            gid = g.get("id")
+        gid = gid or resp.get("id")
+    return gid
+
+
+def cmd_reconsolidation(args):
+    """Surface skills whose invocations are FAILING as reconsolidation-review candidates.
+
+    Continual-Harness lifecycle (g-355-06): a skill is not just five-dimension
+    quality-scored, it is success/failure-scored per invocation (via the
+    skill-attribution invocation->outcome join). Any skill with failing
+    invocations above the threshold is attached to a reconsolidation review,
+    cross-referenced against its current subjective quality.
+    """
+    sa = _load_skill_attribution()
+    agents = [args.agent] if args.agent else sa.find_agent_dirs()
+    since_dt = sa.parse_since(args.since) if args.since else None
+    join = sa.compute_join(agents, since_dt=since_dt)
+
+    quality_skills = read_yaml(QUALITY_PATH).get("skills", {})
+    candidates = build_reconsolidation_candidates(
+        join, quality_skills, args.min_failures, args.min_fail_rate)
+
+    result = {
+        "reconsolidation_candidates": candidates,
+        "candidate_count": len(candidates),
+        "threshold": {"min_failures": args.min_failures, "min_fail_rate": args.min_fail_rate},
+        "agents_scanned": agents,
+        "window": args.since or "all_time",
+    }
+
+    # --apply: route each candidate into an ADVISORY Investigate goal, deduped
+    # against open goals by exact origin_signal ( — exact key, never a
+    # title substring). Mirrors silent-gap-audit's self-filing so the cadence
+    # surface (strategic-scan S4.5) actually turns failing-invocation skills into
+    # reviewable work instead of a report nobody reads. Advisory only: the filed
+    # goal REVIEWS the skill against its failures, never auto-modifies it ().
+    if getattr(args, "apply", False):
+        target_asp = getattr(args, "target_asp", "asp-115")
+        open_sigs = _open_origin_signals()
+        filed, suppressed_dedup = [], []
+        for c in candidates:
+            sig = f"investigate:skill-reconsolidation-{_recon_slug(c['skill'])}"
+            if sig in open_sigs:
+                suppressed_dedup.append({"skill": c["skill"], "origin_signal": sig})
+                continue
+            gid = file_reconsolidation_investigate(c, target_asp=target_asp)
+            if gid:
+                filed.append({"skill": c["skill"], "goal_id": gid, "origin_signal": sig})
+        result["filed"] = filed
+        result["suppressed_dedup"] = suppressed_dedup
+        result["target_asp"] = target_asp
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -336,8 +520,25 @@ def main():
     p_under = sub.add_parser("underperforming", help="Skills below quality threshold")
     p_under.add_argument("--threshold", type=float, default=0.50)
 
+    p_recon = sub.add_parser("reconsolidation",
+                             help="Surface failing-invocation skills for reconsolidation review "
+                                  "(invocation->outcome join from skill-attribution)")
+    p_recon.add_argument("--agent", help="Limit to one agent (else all with a ledger)")
+    p_recon.add_argument("--since", default="", help="Time window: 7d, 24h, 30m, or ISO date")
+    p_recon.add_argument("--min-failures", type=int, default=2,
+                         help="Minimum failing invocations to flag a skill (default 2)")
+    p_recon.add_argument("--min-fail-rate", type=float, default=0.20,
+                         help="Minimum failure rate to flag a skill (default 0.20)")
+    p_recon.add_argument("--apply", action="store_true",
+                         help="File each candidate as an advisory Investigate goal "
+                              "(exact-origin_signal dedup; advisory-refine only, g-355-07)")
+    p_recon.add_argument("--target-asp", default="asp-115",
+                         help="Aspiration to file reconsolidation Investigate goals into "
+                              "(default asp-115)")
+
     args = parser.parse_args()
-    cmds = {"score": cmd_score, "read": cmd_read, "report": cmd_report, "underperforming": cmd_underperforming}
+    cmds = {"score": cmd_score, "read": cmd_read, "report": cmd_report,
+            "underperforming": cmd_underperforming, "reconsolidation": cmd_reconsolidation}
     cmds[args.command](args)
 
 

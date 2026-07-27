@@ -174,7 +174,7 @@ CADENCE_TRACKER_PATTERNS = (
 # cmd_maintain's evict path cleans a crashed-consolidation leftover.
 # MIRRORED in mind_api/src/endpoints/wm_write.py (the LIVE runtime path —
 # wm-reset.sh routes to POST /v1/wm/reset, not to cmd_reset). Keep both in
-# sync; parity asserted by test_wm_reset_cadence.py. (2)
+# sync; parity asserted by test_wm_reset_cadence.py. ()
 RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
 
 def _is_cadence_tracker(slot_name):
@@ -508,7 +508,7 @@ def cmd_set(args):
             if gate_result.get("override_applied"):
                 # Echo override to stderr for audit trail
                 print(f"[loop-state-merge-gate] {gate_result['reason']}", file=sys.stderr)
-            # 8: monotonic-counter preservation. When the gate floored
+            # : monotonic-counter preservation. When the gate floored
             # stale-lower top-level counters (goals_completed/productive_goals)
             # or unioned a subset counted_goals_this_session against the on-disk
             # committed state, write the PRESERVED value, not the raw incoming —
@@ -857,7 +857,7 @@ def cmd_reset(args):
         # slots (not slot_types) because cadence-trackers are typically
         # added dynamically and may not appear in slot_types config.
         # RESET_SURVIVING_SLOTS members survive the same way — their reader
-        # runs AFTER this reset by design (2).
+        # runs AFTER this reset by design ().
         existing_slots = existing.get("slots", {})
         existing_meta = existing.get("slot_meta", {})
         cadence_preserved = []

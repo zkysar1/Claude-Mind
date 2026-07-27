@@ -17,6 +17,11 @@ Tested invariants:
   5. source enum stays strict at ('world', 'agent') — cross_agent_owner is
      the ONLY escape hatch for sibling-queue routing; widening source would
      defeat the orchestrator-entry design.
+  6. init payload with cross-world ids (g-xw-<ts>-NN / asp-xw-<ts>) validates —
+     the g-115-2757 fix (canonical widened them via g-115-1641; this SCHEMA is
+     a duplicated copy that must mirror canonical).
+  7. goal_id / aspiration_id SCHEMA patterns stay STRING-EQUAL to aspirations.py
+     GOAL_ID_RE / ASP_ID_RE (SSOT) — this test fails loud on any future drift.
 """
 
 from __future__ import annotations
@@ -142,6 +147,41 @@ def test_cross_agent_owner_pattern_rejects_uppercase():
     warns = module._validate_keys(payload, "init")
     assert any("cross_agent_owner" in w and "pattern" in w for w in warns), (
         f"Uppercase cross_agent_owner should fail pattern validation; got warns={warns}"
+    )
+
+
+def test_init_accepts_cross_world_ids():
+    """: cross-world ids (g-xw-<ts>-NN / asp-xw-<ts>) must validate.
+    Canonical widened GOAL_ID_RE/ASP_ID_RE for them (g-115-1641) but this
+    SCHEMA's duplicated copy wasn't mirrored, so every cross-world goal's
+    checkpoint init/update was rejected (stuck at 0/1 forever)."""
+    module = _import_module()
+    payload = {
+        "goal_id": "g-xw-20260719T110333-01",
+        "aspiration_id": "asp-xw-20260719T110333",
+        "source": "world",
+        "phase": "selected",
+        "selected_at": "2026-07-20T08:00:00",
+    }
+    warns = module._validate_keys(payload, "init")
+    assert warns == [], f"cross-world id payload rejected: {warns}"
+
+
+def test_id_patterns_match_canonical():
+    """SSOT guard: the SCHEMA goal_id/aspiration_id patterns MUST stay
+    string-equal to the canonical GOAL_ID_RE/ASP_ID_RE in aspirations.py.
+    This SCHEMA is a duplicated copy; the g-115-2757 drift (canonical widened
+    for the xw branch, this copy not) is exactly what this test prevents from
+    recurring silently."""
+    import aspirations  # canonical SSOT (core/scripts on sys.path via line 33)
+    module = _import_module()
+    assert module.SCHEMA["goal_id"]["pattern"] == aspirations.GOAL_ID_RE.pattern, (
+        "loop-state-save goal_id pattern drifted from canonical GOAL_ID_RE "
+        "(aspirations.py) — re-sync per g-115-2757"
+    )
+    assert module.SCHEMA["aspiration_id"]["pattern"] == aspirations.ASP_ID_RE.pattern, (
+        "loop-state-save aspiration_id pattern drifted from canonical ASP_ID_RE "
+        "(aspirations.py) — re-sync per g-115-2757"
     )
 
 

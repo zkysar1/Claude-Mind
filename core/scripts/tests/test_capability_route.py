@@ -1,4 +1,4 @@
-"""Tests for capability_route Tier 3 high-delta override (4).
+"""Tests for capability_route Tier 3 high-delta override ().
 
 Validates the structural classifier fix: a high-conviction Tier 3 description
 heuristic (delta >= 0.30) overrides a low-confidence Tier 1/2 signal
@@ -90,3 +90,68 @@ def test_apply_framework_no_heuristic_regression(monkeypatch):
     )
     assert r["intended_agent"] == "alpha", r
     assert "OVERRIDE" not in r["rationale"], r
+
+
+def test_vertical_category_overrides_generic_prefix(monkeypatch):
+    """ (Tier-2 vertical override): a high-conf vertical category
+    (npc-behavior -> foxtrot, 0.80 >= CATEGORY_VERTICAL_OVERRIDE_CONF) overrides
+    the generic 'investigate:'->zeta title prefix (Tier 1, 0.88). Before the fix
+    foxtrot's 'Investigate:' npc-behavior goals routed to zeta, causing
+    cross_lane_refused on every foxtrot claim attempt."""
+    _setup(monkeypatch)
+    monkeypatch.setattr(cr, "_active_agents",
+                        lambda: ("alpha", "bravo", "zeta", "echo", "foxtrot"))
+    monkeypatch.setattr(cr, "CATEGORY_ROUTES", {
+        "npc-behavior": ("foxtrot", 0.80, "npc-behavior -> foxtrot vertical"),
+    })
+    r = cr._classify(
+        "Investigate: original-cohort dip in the two 2026-07 sessions",
+        "npc-behavior",
+        "OHS regression analysis",
+    )
+    assert r["intended_agent"] == "foxtrot", r
+    assert "OVERRIDE" in r["rationale"], r
+
+
+def test_subthreshold_category_no_override(monkeypatch):
+    """Threshold guard: a specific-agent category BELOW
+    CATEGORY_VERTICAL_OVERRIDE_CONF (0.55 < 0.75) does NOT override the title
+    prefix — the generic work-type still wins for non-vertical categories, so
+    the override cannot creep onto weak categorizations."""
+    _setup(monkeypatch)
+    monkeypatch.setattr(cr, "CATEGORY_ROUTES", {
+        "npc-intelligence": ("alpha", 0.55, "npc-intelligence -> alpha (weak)"),
+    })
+    r = cr._classify(
+        "Investigate: npc-intelligence benchmark drift",
+        "npc-intelligence",
+        "",
+    )
+    assert r["intended_agent"] == "zeta", r
+    assert "OVERRIDE" not in r["rationale"], r
+
+
+def test_boundary_category_at_threshold_overrides_prefix(monkeypatch):
+    """ (threshold boundary): a vertical category at EXACTLY
+    CATEGORY_VERTICAL_OVERRIDE_CONF (client-runtime-regression -> foxtrot, 0.75)
+    overrides a generic 'fix:'->alpha title prefix. The override branch gates on
+    cat_conf >= CATEGORY_VERTICAL_OVERRIDE_CONF, so 0.75 (the exact threshold)
+    MUST fire — this is the client-runtime-regression bump 0.70->0.75 that lifts
+    foxtrot's client/runtime vertical above a generic Fix: prefix (alpha cannot
+    reach the product repo). Guards the >= (not >) comparison against regression."""
+    _setup(monkeypatch)
+    monkeypatch.setattr(cr, "_active_agents",
+                        lambda: ("alpha", "bravo", "zeta", "echo", "foxtrot"))
+    monkeypatch.setattr(cr, "TITLE_PREFIX_ROUTES", {
+        "fix:": ("alpha", 0.82, "fix prefix -> implementer alpha"),
+    })
+    monkeypatch.setattr(cr, "CATEGORY_ROUTES", {
+        "client-runtime-regression": ("foxtrot", 0.75, "client-runtime -> foxtrot vertical"),
+    })
+    r = cr._classify(
+        "Fix: client-runtime regression in NPC behavior client surface",
+        "client-runtime-regression",
+        "regression in the Roblox client runtime",
+    )
+    assert r["intended_agent"] == "foxtrot", r
+    assert "OVERRIDE" in r["rationale"], r

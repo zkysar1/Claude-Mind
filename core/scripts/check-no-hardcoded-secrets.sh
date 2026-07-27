@@ -77,29 +77,51 @@ allowed_path() {
 hits=0
 hit_report=""
 
+# Collect in-scope staged files (non-binary, not allowlisted) via numstat —
+# the SAME filter as the prior per-file loop (identical file set): binary files
+# (adds=="-") and allowed_path() files are excluded so the scan never touches
+# them.
+staged_files=()
 while IFS=$'\t' read -r adds dels path; do
     [[ -z "$path" ]] && continue
     [[ "$adds" == "-" ]] && continue      # binary
     allowed_path "$path" && continue
-
-    # Scan the STAGED blob, not the working tree (working tree may have
-    # unstaged edits that aren't part of the commit).
-    matches=$(git show ":$path" 2>/dev/null | grep -nE "$patterns" 2>/dev/null || true)
-    [[ -z "$matches" ]] && continue
-
-    # Drop lines carrying the per-line skip marker.
-    matches=$(echo "$matches" | grep -vE 'secret-scanner:[[:space:]]*skip' || true)
-    [[ -z "$matches" ]] && continue
-
-    hits=$((hits + 1))
-    hit_report+="${path}:"$'\n'
-    # Indent for readability; truncate each match line at 200 chars so we
-    # don't echo full long tokens to the user's terminal.
-    while IFS= read -r line; do
-        hit_report+="    ${line:0:200}"$'\n'
-    done <<< "$matches"
-    hit_report+=$'\n'
+    staged_files+=("$path")
 done < <(git diff --cached --numstat --diff-filter=ACM)
+
+if [[ ${#staged_files[@]} -gt 0 ]]; then
+    # ONE `git grep --cached` over ALL in-scope files instead of a per-file
+    # `git show ":$path" | grep` (one subprocess PER FILE — ~76s on the 436-file
+    # v2.5.0 plant, g-115-2750). `--cached` greps the STAGED index content — the
+    # same blob `git show ":$path"` returned — so this preserves the FULL staged
+    # blob scan (every line, not diff-only): detection stays IDENTICAL (same
+    # $patterns, same all-line coverage, verified git-grep-vs-grep ERE parity).
+    # Output shape: `path:lineno:content` (git grep -n); no matches => exit 1.
+    raw=$(git grep --cached -nE "$patterns" -- "${staged_files[@]}" 2>/dev/null || true)
+    # Drop lines carrying the per-line skip marker (same override as before).
+    raw=$(printf '%s\n' "$raw" | grep -vE 'secret-scanner:[[:space:]]*skip' || true)
+
+    if [[ -n "$raw" ]]; then
+        # Regroup git grep's flat `path:lineno:content` stream into the prior
+        # report shape: one `path:` header per file, then `    lineno:content`
+        # (truncated 200). hits = distinct files (git grep emits a file's matches
+        # contiguously, so a path change marks a new file block).
+        prev=""
+        while IFS= read -r gl; do
+            [[ -z "$gl" ]] && continue
+            path="${gl%%:*}"           # path (before first colon)
+            linecontent="${gl#*:}"     # lineno:content — same shape as old grep -n
+            if [[ "$path" != "$prev" ]]; then
+                [[ -n "$prev" ]] && hit_report+=$'\n'   # blank line ends prior block
+                hit_report+="${path}:"$'\n'
+                hits=$((hits + 1))
+                prev="$path"
+            fi
+            hit_report+="    ${linecontent:0:200}"$'\n'
+        done <<< "$raw"
+        [[ -n "$prev" ]] && hit_report+=$'\n'           # trailing blank after last block
+    fi
+fi
 
 # ─── Verdict ──────────────────────────────────────────────────────────────
 if [[ $hits -gt 0 ]]; then

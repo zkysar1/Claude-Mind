@@ -49,6 +49,7 @@ except ImportError:
     sys.exit(1)
 
 from _paths import META_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
+from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
 
 
 FORGED_PATH = WORLD_DIR / "forged-skills.yaml"
@@ -102,13 +103,15 @@ def parse_iso(s):
     """
     if not s or not isinstance(s, str):
         return None
+    # : robust tzinfo-strip (fixes aware->naive TypeError in days_between
+    # when a skill-invocation source carries an offset). Preserves the date-only fallback.
+    dt = parse_naive_iso(s)
+    if dt is not None:
+        return dt
     try:
-        return datetime.fromisoformat(s.replace("Z", ""))
+        return datetime.strptime(s[:10], "%Y-%m-%d")
     except ValueError:
-        try:
-            return datetime.strptime(s[:10], "%Y-%m-%d")
-        except ValueError:
-            return None
+        return None
 
 
 def days_between(d1, d2):
@@ -260,7 +263,7 @@ def collect_journal_skill_dates(skill_names):
         r'(?<![\w-])(' + '|'.join(re.escape(n) for n in skill_names) + r')(?![\w-])'
     )
 
-    # AGENTS-ROOT GLOB (5): agent dirs live at PROJECT_ROOT/agents/<name>
+    # AGENTS-ROOT GLOB (): agent dirs live at PROJECT_ROOT/agents/<name>
     # (AGENTS_PARENT_DIR), so journals are at agents/<name>/journal.jsonl. Use the
     # _paths SSOT agents_root() — NEVER PROJECT_ROOT.glob("*/...") (depth-1 matches
     # nothing post-relocation; the agents/ glob-drift bug class, CLAUDE.md sync-list).
@@ -373,7 +376,7 @@ def collect_companion_script_dates(skill_names, forged_skills):
     # is intentionally excluded to keep the genuine-cold signal (e.g.
     # manage-roblox-scripts) at 0 even with historical mentions.
     # Glob is forgiving when a fresh agent has not yet created its session/ dir.
-    # AGENTS-ROOT GLOB (5): diaries live at agents/<name>/session/
+    # AGENTS-ROOT GLOB (): diaries live at agents/<name>/session/
     # execution-diary.jsonl — use _paths SSOT agents_root(), NEVER
     # PROJECT_ROOT.glob("*/...") (agents/ glob-drift bug class, CLAUDE.md sync-list).
     scan_paths = list(agents_root().glob("*/session/execution-diary.jsonl"))

@@ -133,6 +133,10 @@ include:
     required: true
     transformed: true  # Replaced via F2
 
+  - path: "RELEASES.json"
+    type: file
+    required: false  # bootstraps the target's release feed so release.sh's CW2 frontier-invariant can fetch it (raw.githubusercontent) instead of 404-ing; domain-clean (0 domain strings), verbatim copy, no transform (g-115-2731)
+
   - path: "SETUP.md"
     type: file
     required: true
@@ -523,11 +527,11 @@ transformations:
 
   - id: G13
     type: global_regex
-    pattern: 'g-\d{2,4}-\d{1,3}'
+    pattern: 'g-\d{3}-\d{2,4}'
     replacement: ''
     applies_to: ["core/**/*.py", "core/**/*.sh", "core/**/*.md", "core/**/*.yaml", "mind_api/**/*.py"]
     when_in_context: "comment"
-    reason: "Production goal IDs in comments (~30 hits)"
+    reason: "Production goal IDs in comments (~30 hits). Pattern MUST match the canonical goal-id regex g-\\d{3}-\\d{2,4} (aspirations.py:1301). Do NOT narrow the second group back to \\d{1,3}: goal sequences expanded to 4 digits 2026-05-19 (g-115-999+), and \\d{1,3} greedily matched only the first 3 digits of a 4-digit seq — stripping g-115-2397 to a bare '7' fragment in every downstream seed (g-115-2919)."
 
   - id: G14
     type: global_regex
@@ -608,26 +612,16 @@ cruft_patterns:
   # future work — destructive, needs careful design.
   - "core/scripts/set-active-agent-env.sh"
 
-  # Forged skills — if pre-existing at destination from a prior plant or
-  # local /forge-skill, clean them up (manifest excludes them from copy, but
-  # the plant ADDS files rather than DELETING absent ones, so stale
-  # forged skills from earlier seeds linger without this cleanup).
-  - ".claude/skills/access-aws-services/"
-  - ".claude/skills/access-efs-data/"
-  - ".claude/skills/access-email/"
-  - ".claude/skills/access-operator-api/"
-  - ".claude/skills/access-roblox-studio/"
-  - ".claude/skills/add-npc-task/"
-  - ".claude/skills/analyze-npc-behavior/"
-  - ".claude/skills/audit-roblox-deliverable/"
-  - ".claude/skills/manage-roblox-scripts/"
-  - ".claude/skills/notify-user/"
-  - ".claude/skills/operator-health-trend/"
-  - ".claude/skills/run-game-session/"
-  - ".claude/skills/run-processor/"
-  - ".claude/skills/run-test-circuit/"
-  - ".claude/skills/scan-stale-jobs/"
-  - ".claude/skills/state-replay/"
+  # Forged/domain skill dirs are DELIBERATELY NOT cruft_patterns (g-115-2739).
+  # Skill-dir lifecycle at a destination is do_remove_orphans' SOLE jurisdiction:
+  # it fails SAFE when the registry is unlocatable, protects registry-forged AND
+  # SKILL.md-present skills (root cause A, g-115-2738 — a promoted-but-unregistered
+  # skill is still a real skill), and gates on `rel in expected`. Listing a skill
+  # dir here let the cruft lane delete a live skill whose registration (external,
+  # gitignored world/forged-skills.yaml) never traveled with the git promotion —
+  # the notify-user deletion, twice (v2.4.0 SES transport; v2.5.0 g-115-2736).
+  # Stale forged skills from an earlier seed are removed by orphan-removal only
+  # when genuinely absent from the source include set AND carrying no SKILL.md.
 
 
 # =============================================================================

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_loop_state_cas_stale_steal.py — 4 regression test.
+"""test_loop_state_cas_stale_steal.py —  regression test.
 
 Pins the ROBUST tier of the g-115-1349 fix hierarchy: optimistic concurrency
 on slot_meta.loop_state.update_count guards the local working-memory

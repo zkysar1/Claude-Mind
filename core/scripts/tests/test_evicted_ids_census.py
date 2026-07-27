@@ -1,4 +1,4 @@
-"""0: merge-correct evicted-ids census — kills both 1 phantom
+""": merge-correct evicted-ids census — kills both  phantom
 producers.
 
 FAST lane (killed): archived_census rode opaque LWW-by-`last_selected` in
@@ -151,7 +151,7 @@ def test_merge_census_one_sided_and_absent():
 # ------------------------------------------------- full-record merge + tombstone
 
 def test_lww_reversion_regression_census_survives_stale_selection_winner():
-    """THE 1 fast lane: stale peer wins LWW via newer last_selected;
+    """THE  fast lane: stale peer wins LWW via newer last_selected;
     pre-fix the whole census reverted to the stale copy. Now: union survives."""
     a = {"id": "asp-009", "title": "x", "goals": [], "last_selected": "2026-06-01T00:00:00",
          "archived_census": {"by_status": {"completed": 10},
@@ -175,7 +175,7 @@ def test_lose_side_only_census_is_not_dropped():
 
 
 def test_tombstone_drops_resurrected_goal_both_directions():
-    """THE 1 slow lane: stale replica still carries an evicted goal
+    """THE  slow lane: stale replica still carries an evicted goal
     live; the id-union used to resurrect it. Now the evicted-id set drops it."""
     evicted_goal = _goal("g-007-01", "completed", completed_at=OLD)
     live_goal = _goal("g-007-02", "pending")

@@ -168,10 +168,10 @@ def test_classify_overlap_single_keyword_below_threshold():
     assert race is False
 
 
-# ── 5: boilerplate goal-vocabulary stopwording ──────────────────────
+# ── : boilerplate goal-vocabulary stopwording ──────────────────────
 
 def test_extract_keywords_drops_boilerplate_goal_vocab():
-    # 5: agent/user/participants/field/etc. are boilerplate goal-record
+    # : agent/user/participants/field/etc. are boilerplate goal-record
     # vocabulary with no same-surface identity; they must be stopworded so
     # race_risk fires on substantive overlap, not goal boilerplate.
     kw = M.extract_keywords(
@@ -183,7 +183,7 @@ def test_extract_keywords_drops_boilerplate_goal_vocab():
 
 
 def test_classify_overlap_boilerplate_only_no_race():
-    # 5 canonical FP (): when a goal's only keyword overlap with
+    #  canonical FP (): when a goal's only keyword overlap with
     # a recent commit is boilerplate goal-vocabulary ("agent", "user"), it must
     # NOT flag a same-surface race. Mirrors the merge-authority 286090d7d
     # incident (matched_paths empty, "agent"+"user" the sole shared tokens).
@@ -208,7 +208,7 @@ def test_classify_overlap_substantive_token_still_races():
     assert {"coordination", "scoring"} <= set(overlapping[0]["matched_keywords"])
 
 
-# ── _basename_stem (5) ──────────────────────────────────────────────
+# ── _basename_stem () ──────────────────────────────────────────────
 
 def test_basename_stem_strips_dir_and_extension():
     assert M._basename_stem(
@@ -223,7 +223,7 @@ def test_basename_stem_edge_cases():
     assert M._basename_stem("foo.test.py") == "foo.test"  # only final ext stripped
 
 
-# ── classify_uncommitted_overlap (5) ────────────────────────────────
+# ── classify_uncommitted_overlap () ────────────────────────────────
 
 def test_classify_uncommitted_bare_class_name_stem_match():
     # THE incident: a goal names a class WITHOUT an extension
@@ -264,7 +264,7 @@ def test_classify_uncommitted_stem_carries_no_boilerplate():
     # The stem path matches against the goal KEYWORD set, which extract_keywords
     # already stripped of stopwords / sub-4-char tokens. So a boilerplate-only
     # title yields an empty keyword set and a stem like 'status' cannot match
-    # status.py — no self-FP on goal-record vocabulary (5 family).
+    # status.py — no self-FP on goal-record vocabulary ( family).
     affected = set()
     kw = M.extract_keywords("Set status field on the goal")  # -> empty
     assert kw == set()
@@ -280,7 +280,7 @@ def _msg(mid, author, mtype, text, tags=None, ts="2026-07-09T15:50:08"):
 
 
 def test_board_claim_by_type():
-    # 1 contract: a type=claim post is claim-kind for the id it
+    #  contract: a type=claim post is claim-kind for the id it
     # STRUCTURALLY claims — extracted from goal-id-shaped tags (the ceremony
     # always tags the claimed id) or a "claim:/Claiming <id>" text prefix.
     msgs = [_msg("m1", "alpha", "claim", "picked up g-115-1876",
@@ -290,7 +290,7 @@ def test_board_claim_by_type():
 
 
 def test_board_claim_by_type_body_mention_only_dropped():
-    # 1: a claim post with NO parseable claimed id (no goal-shaped
+    # : a claim post with NO parseable claimed id (no goal-shaped
     # tag, no claim prefix) does NOT become claim-kind via a body mention —
     # body mentions are citations, dropped like any bare mention.
     msgs = [_msg("m1", "alpha", "claim", "picked up g-115-1876")]
@@ -298,7 +298,7 @@ def test_board_claim_by_type_body_mention_only_dropped():
 
 
 def test_board_claim_prefix_text_form_extracts_id():
-    # The 3 atomic-announce text shape, tags absent: the claimed id
+    # The  atomic-announce text shape, tags absent: the claimed id
     # comes from the "claim: <id> — <title>" prefix.
     msgs = [_msg("m1", "alpha", "claim", "claim: g-115-1876 — fix the gate")]
     hits = M.classify_board_mentions("g-115-1876", "bravo", msgs)
@@ -306,11 +306,11 @@ def test_board_claim_prefix_text_form_extracts_id():
 
 
 def test_board_claim_post_citing_another_goal_dropped():
-    # Live FP specimen msg-20260713-171224-alpha-5101 (1): alpha's
-    # atomic claim-announce FOR 4 cites 4-c in its body
-    # ("clears 4-c Layer 3 suite-green gate"). Probing 4-c
+    # Live FP specimen msg-20260713-171224-alpha-5101 (): alpha's
+    # atomic claim-announce FOR  cites -c in its body
+    # ("clears -c Layer 3 suite-green gate"). Probing -c
     # must NOT see a claim (the pre-fix type-only leg did, and the digest
-    # branch would have wrongly yielded); probing 4 must.
+    # branch would have wrongly yielded); probing  must.
     text = ("claim: g-115-2104 — make test_compact_restore_preserves_live_"
             "loop_state daemon-agnostic (direct WM-file read like test 2/4); "
             "clears g-115-2084-c Layer 3 suite-green gate. rb-3331.")
@@ -369,6 +369,54 @@ def test_board_recurring_skips_completions_keeps_claims():
     assert [h["id"] for h in hits] == ["m2"]
 
 
+def test_board_recurring_drops_stale_prior_cycle_claim():
+    # : a recurring-goal CLAIM whose timestamp PRE-DATES the goal's
+    # lastAchievedAt was a claim for an already-completed prior cycle — history,
+    # not a live race. It must be dropped when goal_last_achieved is passed.
+    # (Incident: echo claim 15:19:21 pre-dated  lastAchievedAt
+    # 15:27:15, causing an unnecessary yield of a due, collision-safe goal.)
+    msgs = [_msg("stale", "echo", "claim", "claiming g-115-105",
+                 tags=["g-115-105", "echo"], ts="2026-07-23T15:19:21")]
+    # Without lastAchievedAt: claim counts (baseline preserved).
+    hits = M.classify_board_mentions("g-115-105", "foxtrot", msgs,
+                                     goal_recurring=True)
+    assert [h["id"] for h in hits] == ["stale"]
+    # With lastAchievedAt AFTER the claim: stale-cycle claim dropped.
+    hits = M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs, goal_recurring=True,
+        goal_last_achieved="2026-07-23T15:27:15")
+    assert hits == []
+
+
+def test_board_recurring_keeps_fresh_claim_after_last_achieved():
+    # A claim AFTER lastAchievedAt is a live race for the current cycle — kept.
+    msgs = [_msg("fresh", "echo", "claim", "claiming g-115-105",
+                 tags=["g-115-105", "echo"], ts="2026-07-23T15:30:00")]
+    hits = M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs, goal_recurring=True,
+        goal_last_achieved="2026-07-23T15:27:15")
+    assert [h["id"] for h in hits] == ["fresh"]
+
+
+def test_board_stale_drop_failsafe_unparseable_ts_keeps_claim():
+    # Fail-safe: an unparseable timestamp must KEEP the claim (conservative —
+    # a false yield is safer than a missed race). Also: the drop is
+    # recurring-only — a non-recurring goal never drops on staleness.
+    msgs = [_msg("bad", "echo", "claim", "claiming g-115-105",
+                 tags=["g-115-105", "echo"], ts="not-a-timestamp")]
+    hits = M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs, goal_recurring=True,
+        goal_last_achieved="2026-07-23T15:27:15")
+    assert [h["id"] for h in hits] == ["bad"]
+    # Non-recurring goal: staleness drop does not apply even with a stale ts.
+    msgs2 = [_msg("nr", "echo", "claim", "claiming g-115-105",
+                  tags=["g-115-105", "echo"], ts="2026-07-23T15:19:21")]
+    hits2 = M.classify_board_mentions(
+        "g-115-105", "foxtrot", msgs2, goal_recurring=False,
+        goal_last_achieved="2026-07-23T15:27:15")
+    assert [h["id"] for h in hits2] == ["nr"]
+
+
 def test_board_empty_me_returns_nothing():
     # MIND_AGENT injection is fail-open and can drop (bravo-fec 2026-07-13):
     # with me="" every author passes the partner filter, so the agent's OWN
@@ -379,7 +427,7 @@ def test_board_empty_me_returns_nothing():
     assert M.classify_board_mentions("g-115-1876", None, msgs) == []
 
 
-# ── _git_log_commits (stale-clone fetch, 6) ─────────────────────────
+# ── _git_log_commits (stale-clone fetch, ) ─────────────────────────
 # The  miss: the race scan ran on a clone whose last pull predated 20h
 # of upstream commits, so the REAL overlap (partner's pushed fix) was invisible
 # to a HEAD-only `git log`. The fix fetches remote-tracking refs first and
@@ -443,8 +491,8 @@ def test_git_log_commits_no_remote_fail_open(tmp_path, monkeypatch):
     assert any("local-only" in c["subject"] for c in commits)
 
 
-# ── 8: product-repo surface extension ───────────────────────────────
-# The check was blind to AGENT_WRITE_PATH product repos — the 6 shape
+# ── : product-repo surface extension ───────────────────────────────
+# The check was blind to AGENT_WRITE_PATH product repos — the  shape
 # (deliverable PR shipped ~24h before claim, only a sibling mind commit
 # flagged). These tests pin the pure detection/classification contract plus
 # the impure scan end-to-end on synthetic repos.
@@ -469,7 +517,7 @@ def test_detect_full_repo_name_matches():
 
 
 def test_detect_distinctive_token_selects_repo_family():
-    # Goal prose says just 'operator' (no full repo name) — the 8
+    # Goal prose says just 'operator' (no full repo name) — the 
     # trigger list names exactly this case. The token is distinctive (2/8
     # names < thresh 3) so it selects the operator-family repos.
     labels, matched = M.detect_product_surfaces(
@@ -534,7 +582,7 @@ def test_detect_empty_inputs():
 # classify_product_overlap (pure) ---------------------------------------------
 
 def test_product_overlap_force_includes_own_goal_id():
-    # THE 6 shape: the shipped product commit carries the CLAIMING
+    # THE  shape: the shipped product commit carries the CLAIMING
     # goal's id. classify_overlap would exclude it as own-WIP; the product
     # variant force-includes it as the strongest already-shipped evidence.
     commits = [_commit("p1", "feat(g-115-2156): add start-session endpoint",

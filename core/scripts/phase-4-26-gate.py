@@ -105,8 +105,17 @@ def _evaluate(session, goal_id):
     if sess_goal and sess_goal != goal_id:
         return ("pass", "stale session (different goal_id) — fail-open",
                 None, 0)
-    if not session.get("retrieval_performed"):
-        return ("pass", "retrieval_performed=false (no signal to gate)",
+    # `retrieval_performed` is written ONLY by iteration-close.sh's no-retrieval
+    # STUB, always as an explicit False; the real retrieve.sh path records
+    # goal_id + counts and leaves the key ABSENT. So `not session.get(...)` —
+    # the obvious check — reads every REAL retrieval as "no signal" and returns a
+    # vacuous pass, which is why this gate was 100% inert since it shipped
+    # (). Only the explicit-False stub means "nothing was retrieved".
+    # Contract established empirically in  (4 experiments over live
+    # session files); `pre-apply-consult-gate.py:203` is the reference
+    # implementation of the same predicate.
+    if session.get("retrieval_performed") is False:
+        return ("pass", "retrieval_performed=false (no-retrieval stub — nothing to gate)",
                 None, 0)
     pop = len(session.get("tree_nodes_loaded") or []) + \
           len(session.get("supplementary_items") or [])

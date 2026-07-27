@@ -1,4 +1,4 @@
-"""test_inbox_alert_age_check.py - regression tests for  + 3.
+"""test_inbox_alert_age_check.py - regression tests for  + .
 
 Asserts that inbox-alert-age-check.py's scan + cooldown logic correctly:
   1. NOOP when no goal in asp-115 has aged past the medium threshold
@@ -166,13 +166,13 @@ def test_aged_high_alert_fires(tmp_path):
 
 
 def test_cross_agent_board_cooldown_noop(tmp_path):
-    """Case 3 (3 core fix): a recent `inbox-alert-aged` board breadcrumb
+    """Case 3 ( core fix): a recent `inbox-alert-aged` board breadcrumb
     for this goal_id - posted by a DIFFERENT agent (charlie) 1h ago - suppresses
     self's (alpha's) email escalation. This is the shared, durable cooldown: the
     per-agent WM log is gone; one team-wide board breadcrumb per window is the
     cooldown."""
     mod = _import_module()
-    goals = [_make_unblock("g-test-003", hours_ago=14.0)]  # >= 12h -> HIGH (9)
+    goals = [_make_unblock("g-test-003", hours_ago=14.0)]  # >= 12h -> HIGH ()
     _install_mock_aspirations(mod, goals)
 
     board_path = tmp_path / "board.json"
@@ -199,11 +199,11 @@ def test_cross_agent_board_cooldown_noop(tmp_path):
 
 
 def test_board_post_outside_window_fires(tmp_path):
-    """Case 4 (3): an `inbox-alert-aged` breadcrumb OLDER than the
+    """Case 4 (): an `inbox-alert-aged` breadcrumb OLDER than the
     severity's cooldown window does NOT suppress - the window elapsed, so the
     alert re-escalates. A 5h-old breadcrumb is past the 4h HIGH window."""
     mod = _import_module()
-    goals = [_make_unblock("g-test-004", hours_ago=14.0)]  # 14h -> HIGH (>= 12h, 9)
+    goals = [_make_unblock("g-test-004", hours_ago=14.0)]  # 14h -> HIGH (>= 12h, )
     _install_mock_aspirations(mod, goals)
 
     board_path = tmp_path / "board.json"
@@ -222,7 +222,7 @@ def test_board_post_outside_window_fires(tmp_path):
 
 
 def test_board_post_other_goal_does_not_suppress(tmp_path):
-    """Case 5 (3): a recent `inbox-alert-aged` breadcrumb for a DIFFERENT
+    """Case 5 (): a recent `inbox-alert-aged` breadcrumb for a DIFFERENT
     goal_id must NOT suppress this goal - the cooldown is keyed per goal_id tag."""
     mod = _import_module()
     goals = [_make_unblock("g-test-005", hours_ago=5.0)]
@@ -275,7 +275,7 @@ def test_non_unblock_title_skipped():
 
 
 def test_classify_severity_bands():
-    """9: _classify_severity maps the LONGER-aged alert to "high".
+    """: _classify_severity maps the LONGER-aged alert to "high".
 
     Regression for the dead-medium-branch bug: the prior code checked
     `age >= thresholds["high"]` (4h) FIRST, so with high(4) < medium(12) the

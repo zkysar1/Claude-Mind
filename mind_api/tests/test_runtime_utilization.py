@@ -127,7 +127,7 @@ class _FakePaths:
 
     @property
     def agents_root(self):
-        # Mirrors AgentPaths.agents_root (5 glob-routing fix consumed
+        # Mirrors AgentPaths.agents_root ( glob-routing fix consumed
         # at utilization.py:283). The fake agent dir's parent plays the agents/
         # parent; sibling enumeration finds no local-paths.conf there, matching
         # the single-agent behavior these byte-compat tests pin.

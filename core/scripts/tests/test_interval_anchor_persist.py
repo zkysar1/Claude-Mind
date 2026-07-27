@@ -173,7 +173,7 @@ def test_fresh_goal_first_interval_no_spurious_anchor():
 
 
 def test_cli_daemon_anchor_parity():
-    """Both write-path implementations carry the 9 anchor-persist (guard-742).
+    """Both write-path implementations carry the  anchor-persist (guard-742).
 
     A fix to only one side is half a fix. The daemon side is the LIVE batch-apply path,
     so losing it there silently reopens the unbounded ratchet even with the CLI patched.

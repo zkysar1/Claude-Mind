@@ -1,4 +1,4 @@
-"""test_post_decompose_routing_audit.py — regression tests for 5.
+"""test_post_decompose_routing_audit.py — regression tests for .
 
 Covers the 5 acceptance cases enumerated in the goal description:
   (1) solver_v0 stamped alpha but echo matches better -> file
@@ -172,7 +172,7 @@ def test_case1_solver_v0_stamped_alpha_echo_better_matches_files(
         f"scores={decision['scores']}"
     )
     assert decision["best_agent"] == "echo", decision
-    # 0: metric is now Jaccard (float in [0,1]); echo's stand-out gap
+    # : metric is now Jaccard (float in [0,1]); echo's stand-out gap
     # (~0.26) clears the default min_gap 0.015. Was `>= 5` on the raw scale.
     assert decision["gap"] >= 0.015, decision
     assert decision["investigate_spec"] is not None
@@ -235,7 +235,7 @@ def test_case3_generic_maintain_no_clear_domain_no_file(
     }
     decision = audit_mod.audit(goal, project_root=project_root)
     assert decision["decision"] == "no_file", decision
-    # 0: a routine timestamp-refresh has no clear domain owner, so the
+    # : a routine timestamp-refresh has no clear domain owner, so the
     # best-vs-stamped Jaccard gap is tiny (~0.003) and sits below the default
     # min_gap 0.015 → no_file. Was `< 5` on the raw set-intersection scale.
     assert decision["gap"] < 0.015, decision
@@ -243,7 +243,7 @@ def test_case3_generic_maintain_no_clear_domain_no_file(
 
 
 # ---------------------------------------------------------------------------
-# 5: specific-agent gap of exactly 3 is now below min_gap=5 → no-file
+# : specific-agent gap of exactly 3 is now below min_gap=5 → no-file
 # ---------------------------------------------------------------------------
 
 def test_g1245_specific_agent_weak_gap_below_min_gap_no_file(tmp_path, audit_mod):
@@ -270,7 +270,7 @@ def test_g1245_specific_agent_weak_gap_below_min_gap_no_file(tmp_path, audit_mod
         "description": "Update solvers benchmark tracking.",
         "intended_agent": "alpha",
     }
-    # min_best_score=0.0 disables the orthogonal absolute-floor (1):
+    # min_best_score=0.0 disables the orthogonal absolute-floor ():
     # echo's synthetic Jaccard (~0.091) sits below the production floor 0.10, so
     # without this the floor would suppress with a "min_best_score" reason and
     # this test (which isolates the GAP-threshold mechanism) would never reach
@@ -380,7 +380,7 @@ def test_case5_unreadable_selfmd_fail_open_no_file(tmp_path, audit_mod):
 
 
 # ---------------------------------------------------------------------------
-# 2: either-case stand-out path
+# : either-case stand-out path
 # ---------------------------------------------------------------------------
 
 def test_g1122_either_strong_match_fires_file(tmp_path, audit_mod):
@@ -411,7 +411,7 @@ def test_g1122_either_strong_match_fires_file(tmp_path, audit_mod):
         f"{decision['reason']} scores={decision['scores']}"
     )
     assert decision["best_agent"] == "echo", decision
-    assert decision["gap"] >= 0.015, decision  # 0 Jaccard scale (~0.26)
+    assert decision["gap"] >= 0.015, decision  #  Jaccard scale (~0.26)
     assert decision["stamped_score"] == 0, (
         "either-case stamped_score is 0 by convention: "
         f"{decision['stamped_score']}"
@@ -447,7 +447,7 @@ def test_g1122_either_weak_match_below_threshold_no_file(tmp_path, audit_mod):
         "description": "Update solvers benchmark tracking.",
         "intended_agent": "either",
     }
-    # min_best_score=0.0 disables the orthogonal absolute-floor (1) so
+    # min_best_score=0.0 disables the orthogonal absolute-floor () so
     # this test isolates the either-case GAP-threshold mechanism (echo's
     # synthetic Jaccard ~0.091 is below the production floor 0.10; the floor has
     # its own dedicated tests below).
@@ -543,7 +543,7 @@ def test_decision_schema_complete(tmp_path, audit_mod):
 
 
 # ---------------------------------------------------------------------------
-# 1 / rb-1488: absolute min_best_score floor + insight-trigger guard
+#  / rb-1488: absolute min_best_score floor + insight-trigger guard
 # ---------------------------------------------------------------------------
 
 def test_g1351_floor_suppresses_nearzero_specific_agent(tmp_path, audit_mod):

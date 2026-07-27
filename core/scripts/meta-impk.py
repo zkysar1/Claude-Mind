@@ -33,12 +33,12 @@ def read_yaml(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
-    # OneDrive sync-corruption guard (1): a transiently un-synced replica of a
+    # OneDrive sync-corruption guard (): a transiently un-synced replica of a
     # shared meta hot-file reads as NUL bytes -- full zero-fill, or (on a partial block
     # sync) a real-YAML prefix + NUL suffix. The mechanism is a sync-write race on a
     # frequently rewritten file, NOT Files-On-Demand dehydration: all meta files are
     # pinned ("always keep on this device"), census-verified 0 dehydration-prone of 40,237
-    # (1) -- so do not chase a dehydration fix, it is already maxed out. Both
+    # () -- so do not chase a dehydration fix, it is already maxed out. Both
     # forms make yaml.safe_load raise
     # a cryptic "#x0000 ReaderError". Translate to an actionable message so the next reader
     # does not burn an investigation. Behavior is UNCHANGED -- the read still raises, so the
@@ -123,7 +123,7 @@ def cmd_compute(args):
         }
 
     # Non-default label: echo it but say plainly the computation ignored it
-    # (1 — the old output echoed the label as "metric", implying
+    # ( — the old output echoed the label as "metric", implying
     # per-metric series that never existed).
     if args.metric != "learning_value":
         result["metric_label"] = args.metric
@@ -176,7 +176,7 @@ def build_parser():
 
     p_compute = sub.add_parser("compute", help="Compute imp@k over the learning_value series")
     p_compute.add_argument("--window", type=int, required=True, help="Rolling window size (k)")
-    # 1: there is exactly ONE series in the store (per-goal
+    # : there is exactly ONE series in the store (per-goal
     # learning_value snapshots). The old required --metric was decorative —
     # any name produced identical output, which misled the evolve Step 0.7
     # caller into believing pipeline_accuracy and goal_completion_rate were

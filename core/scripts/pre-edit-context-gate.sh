@@ -12,7 +12,7 @@
 # which is the SINGLE SOURCE OF TRUTH for (a) what path classes are advisory-
 # tracked (is_in_scope_advisory: core/config, .claude/skills,
 # world/knowledge/tree, world/conventions, aspirations-compact.json, AND
-# core/scripts framework code — 0) and (b) session-scoped tracked-set
+# core/scripts framework code — ) and (b) session-scoped tracked-set
 # membership. The advisory therefore fires ONLY for files the context-reads
 # manifest can actually have signal about — editing a still-out-of-scope file
 # (.claude/rules, self.md, product code) stays SILENT rather than crying wolf

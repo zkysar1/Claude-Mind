@@ -120,7 +120,7 @@ bash "$(dirname "$0")/live-phase-emit.sh" || true
 # DDB heartbeat_at alongside the local mtime above so a peer machine's
 # stale-lock-break (OWNERSHIP_STALE_SECONDS) never reclaims a LIVE runner. Gated on
 # STORAGE_BACKEND=own-cloud — the ONLY signal (no OWNERSHIP_MODE flag; removed
-# 2026-07-02 7) — so the local backend keeps THIS script IRREDUCIBLY
+# 2026-07-02 ) — so the local backend keeps THIS script IRREDUCIBLY
 # LOCAL: NO subprocess, NO daemon hop. STORAGE_BACKEND is not exported into the
 # agent shell, so resolve it the same cheap way check-prerequisites.sh does: live
 # env first, else one grepped .env.local line (no secret sourcing). When own-cloud,

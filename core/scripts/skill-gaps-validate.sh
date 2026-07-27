@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# skill-gaps-validate.sh — Validate meta/skill-gaps.yaml schema (3)
+# skill-gaps-validate.sh — Validate meta/skill-gaps.yaml schema ()
 # Usage: skill-gaps-validate.sh [path]   (defaults to meta/skill-gaps.yaml)
 # Exit 0 = valid, 1 = corrupt (diagnostic on stderr), 2 = could not load.
 set -euo pipefail

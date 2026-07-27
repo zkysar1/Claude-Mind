@@ -49,14 +49,14 @@ REMINDER_TEXT_GENERIC = (
     "</system-reminder>"
 )
 
-# 8 (zeta investigation 1): on DEEP recurring closes,
+#  (zeta investigation ): on DEEP recurring closes,
 # Phase 6 (aspirations-spark) must fire BEFORE Phase 8 state-update. The
 # generic reminder above directs Skill(aspirations) only, silently overriding
 # recurring-close.sh's outcome-aware stdout imperative (system-reminder wins
 # over plain stdout in LLM priority). This second reminder restores the
 # spark-first sequence when the OUTCOME=deep marker is present in
 # tool_response.stdout. See agents/zeta/reports/
-# 1-posttool-hook-overrides-recurring-imperative-analysis.md.
+# -posttool-hook-overrides-recurring-imperative-analysis.md.
 REMINDER_TEXT_DEEP_RECURRING = (
     "<system-reminder>\n"
     "A deep recurring close just completed (recurring-close.sh OUTCOME=deep). "
@@ -228,7 +228,7 @@ def _read_stdin_with_timeout(timeout_s=None):
         # stdin never reached EOF -- orphaned/inherited pipe. Fail open: no
         # reminder injected this turn (Stop hook + return-protocol discipline
         # are the backstops), but the process EXITS instead of becoming a
-        # multi-day orphan (2).
+        # multi-day orphan ().
         return ""
     return box["data"]
 
@@ -237,7 +237,7 @@ def main():
     raw = _read_stdin_with_timeout()
     if not raw:
         # tty, empty stdin, or stdin never reached EOF (orphaned pipe) -> fail
-        # open with no injection rather than hang forever (2).
+        # open with no injection rather than hang forever ().
         sys.exit(0)
     try:
         data = json.loads(raw)

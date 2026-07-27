@@ -253,7 +253,7 @@ def _has_pending_background_work(agent: str) -> bool:
 
 
 def _decode_team_state_field(raw: str) -> Any:
-    """Decode a /v1/team-state/read field response (fresh-eyes 7).
+    """Decode a /v1/team-state/read field response (fresh-eyes ).
 
     The daemon serializes dict-valued fields as YAML and IGNORES a
     format=json query param (live-probed 2026-07-17; the .sh wrapper's
@@ -357,7 +357,7 @@ def _clear_team_in_flight(agent: str, goal_id: str) -> Dict[str, Any]:
 
 
 def _query_inprogress_no_claim(agent: str, source: str = "agent") -> List[Dict[str, Any]]:
-    """1 (+ 7): in-progress goals with NO claimed_by.
+    """ (+ ): in-progress goals with NO claimed_by.
 
     The claimed-by query path (_query_claimed_goals) cannot see these:
     aspirations-claim.sh is the only claimed_by writer, so a goal that went
@@ -399,7 +399,7 @@ def _query_inprogress_no_claim(agent: str, source: str = "agent") -> List[Dict[s
 
 
 def _read_all_in_flight_goal_ids() -> set:
-    """Goal-ids ANY agent's team-state in_flight currently names (7).
+    """Goal-ids ANY agent's team-state in_flight currently names ().
 
     Guard for the world-source no-claim scan: the world queue is shared, so a
     claim-less in-progress world goal MIGHT still be live on a peer whose
@@ -433,7 +433,7 @@ def _read_all_in_flight_goal_ids() -> set:
 
 
 def _flip_pending_no_claim(goal_id: str, source: str) -> Dict[str, Any]:
-    """Flip a stranded no-claim in-progress goal back to pending (1).
+    """Flip a stranded no-claim in-progress goal back to pending ().
 
     No claim to release (claimed_by was never set) and no team-state in_flight
     to clear (in_flight is written at claim time). The single operative action
@@ -493,7 +493,7 @@ def main() -> int:
         "skipped_bg": 0,
     }
 
-    # 5: lazily computed on the first would-be release/flip so the
+    # : lazily computed on the first would-be release/flip so the
     # has-pending subprocess cost is paid only when a release is actually about
     # to happen (never on the common scanned=0 / all-kept path).
     bg_pending: Optional[bool] = None
@@ -555,7 +555,7 @@ def main() -> int:
             "reason": "no diary entry after claimed_at AND age >= stale threshold",
         }
 
-        # 5: bg-pending guard (mirrors stop-hook Gate 2.5). A claim
+        # : bg-pending guard (mirrors stop-hook Gate 2.5). A claim
         # that looks stranded may be legitimately paused awaiting REGISTERED
         # background work (OS jobs / Claude sub-agents). Skip the release; the
         # next sweep after the bg work completes re-evaluates. rb-1533's
@@ -586,9 +586,9 @@ def main() -> int:
 
         summary["stranded"].append(record)
 
-    # 1: second shape — in-progress goals with NO claimed_by
+    # : second shape — in-progress goals with NO claimed_by
     # (structurally invisible to the claimed_by==agent query above).
-    # 7: third shape — the same scan over the WORLD source (a
+    # : third shape — the same scan over the WORLD source (a
     # release-without-status-reset or a death between the two writes leaves
     # world orphans too; 3 observed 2026-07-16). World entries carry one
     # extra guard: a goal named by ANY agent's team-state in_flight is kept.
@@ -636,7 +636,7 @@ def main() -> int:
 
         if age < stale_threshold:
             # Also covers a NEGATIVE age from a cross-box future stamp
-            # (8 TZ skew) — keep is the safe direction there.
+            # ( TZ skew) — keep is the safe direction there.
             summary["kept"] += 1
             continue  # too fresh — race / mid-transition window
 
@@ -650,7 +650,7 @@ def main() -> int:
                       "last_modified AND age >= stale threshold",
         }
 
-        # 7: shared-queue guard — a world goal a peer is live on
+        # : shared-queue guard — a world goal a peer is live on
         # (in_flight names it) is kept even though its claim record is gone;
         # flipping would yank the goal mid-execution. Agent-source goals are
         # private (no peer can be live on them) — guard skipped.
@@ -666,7 +666,7 @@ def main() -> int:
                 summary["stranded"].append(record)
                 continue
 
-        # 5: bg-pending guard (mirrors the claimed-path guard above /
+        # : bg-pending guard (mirrors the claimed-path guard above /
         # stop-hook Gate 2.5). A no-claim in-progress goal can be bg-paused too.
         if bg_pending is None:
             bg_pending = _has_pending_background_work(agent)
