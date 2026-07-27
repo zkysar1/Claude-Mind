@@ -19,6 +19,12 @@ import stat
 import subprocess
 from pathlib import Path
 
+import sys
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-github-from-vault.sh"
 
@@ -43,7 +49,7 @@ def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None)
     if mock_state is not None:
         env["PROVISION_GH_MOCK_STATE"] = str(mock_state)
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--agent", agent, *extra_args],
+        [BASH, str(SCRIPT), "--agent", agent, *extra_args],
         capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
     )
     return proc, ssh_dir

@@ -14,6 +14,12 @@ from pathlib import Path
 
 import pytest
 
+import sys
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 SCRIPT = Path(__file__).resolve().parents[1] / "check-no-bare-agent-prefix.sh"
 TARGET = ".claude/rules/fixture.md"
 
@@ -31,7 +37,7 @@ def _repo(tmp_path, body: str) -> Path:
 
 def _run(repo: Path):
     return subprocess.run(
-        ["bash", str(SCRIPT)], cwd=repo, capture_output=True, text=True
+        [BASH, str(SCRIPT)], cwd=repo, capture_output=True, text=True
     )
 
 

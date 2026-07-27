@@ -120,13 +120,48 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > **RE-BASELINED 2026-07-26 (g-115-3085 Layer 2 landed, alpha). The 2026-06-17
 > AND 2026-07-25 figures are both HISTORICAL — do not compare against either.**
 >
-> | | 2026-06-17 | 2026-07-25 | **2026-07-26** |
-> |---|---|---|---|
-> | tests run | 2,234 | 5,226 | **5,969** |
-> | passed | 2,231 | 5,199 | **5,937** |
-> | failed | 2 | 20 | **32** |
-> | errors | 0 | 2 | **0** |
-> | run completes? | yes | **no** — needed `--ignore`, a chunk died at 51% | **yes, all 6 chunks 100%** |
+> | | 2026-06-17 | 2026-07-25 | 2026-07-26 | **2026-07-27 (cc-04, Linux)** |
+> |---|---|---|---|---|
+> | tests run | 2,234 | 5,226 | 5,969 | **6,223** |
+> | passed | 2,231 | 5,199 | 5,937 | **6,223** |
+> | failed | 2 | 20 | 32 | **0** |
+> | errors | 0 | 2 | 0 | **0** |
+> | run completes? | yes | **no** — needed `--ignore`, a chunk died at 51% | yes, all 6 chunks 100% | **yes, all 4 chunks, VERDICT: CLEAN** |
+>
+> **2026-07-27 (g-115-3471, alpha on cc-04/Linux): all 12 files the 07-26 entry
+> named as failing PASS here** — re-run explicitly, 91 passed / 1 skipped / 0
+> failed. That covers both the 6 called GENUINE and the 6 called newly-visible.
+> Do NOT read this as "the 07-26 entry was wrong": **that entry does not record
+> which box or OS it measured**, and its own root-cause narrative is about
+> Windows `CreateProcess`/System32/WSL mechanics, so the two runs may simply be
+> different platforms. Unmeasured by me: whether those 12 still fail on a Windows
+> box. Useful for g-115-3180's triage either way — a failure that reproduces on
+> one platform and not another is a portability finding, not a broken test.
+>
+> **Record the box and OS with every future baseline row.** The inability to
+> reconcile 32-failed with 0-failed comes entirely from that field being absent,
+> and a baseline you cannot attribute is a baseline you cannot trust.
+>
+> **The TOTAL line is not a cross-run comparison metric — this is why the rule
+> above says judge by FAILING FILE SET, never the count.** Measured the same day,
+> same tree, ~40 minutes apart: a 4-chunk run reported 6,223 passed and an 8-chunk
+> run reported 6,156, while `--collect-only` counted 6,234 tests across 513 files.
+> Those three numbers do not reconcile. The runner's summary reports only
+> `passed`, so xfail/xpass/skip (chunk logs show `X`/`x` markers) are silently
+> outside it, and the residual still does not close. Do NOT read a moved TOTAL as
+> tests appearing or vanishing, and do NOT quote it as a baseline others will
+> diff against. `failed` and `errors` are the trustworthy fields; for a
+> population figure use `--collect-only`, which counts one thing and counts it
+> the same way every run.
+>
+> **A CLEAN verdict under a live fleet is possible but not reliable — re-run with
+> more chunks rather than reading a contended run.** Same tree, three runs in one
+> hour: 4 chunks CLEAN, 4 chunks **INVALID (contended)** with chunk 02 stopping at
+> 96%, then 8 chunks CLEAN. The INVALID run's per-chunk line read
+> `chunk 02: 1799 passed, 0 failed, 0 errors` and looked completed; only the
+> runner's own exit-2 classification caught that it never finished. Trust the
+> VERDICT, not the per-chunk lines, and reach for `--chunks 8` before concluding
+> anything about the tree. (g-115-3471, alpha/cc-04.)
 >
 > **The environmental-timeout class is GONE, and the previous entry's guidance is
 > now REVERSED.** The 2026-07-25 baseline told you to treat failures in 9 named

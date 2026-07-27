@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.7.1",
+    "previous_version": "2.7.0",
+    "date": "2026-07-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Resolve bash explicitly at 7 grandfathered argv sites that violated the repo's own bare-bash gate and silently blocked the seed->downstream plant commit",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.7.0",
     "previous_version": "2.6.0",
     "date": "2026-07-27",
