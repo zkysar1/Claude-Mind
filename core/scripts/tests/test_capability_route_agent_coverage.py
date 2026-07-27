@@ -104,7 +104,7 @@ def test_uncovered_active_agents_either_only_route_does_not_cover(monkeypatch):
 # active roster (cat_agent in active) — by design, so routes to absent/retired
 # agents demote to "either". On a box whose roster lacks foxtrot (e.g. the
 # agent dir/team-state row postdates the box's last sync), "either" IS the
-# correct output and the foxtrot pin below is untestable (0).
+# correct output and the foxtrot pin below is untestable ().
 _foxtrot_active = pytest.mark.skipif(
     "foxtrot" not in cr._active_agents(),
     reason="foxtrot not in this box's active roster — evaluate() demotes the "
@@ -114,7 +114,7 @@ _foxtrot_active = pytest.mark.skipif(
 
 @_foxtrot_active
 def test_npc_evaluation_routes_to_specialist():
-    # Was charlie's lane (3); charlie -> foxtrot per the 2026-07-07
+    # Was charlie's lane (); charlie -> foxtrot per the 2026-07-07
     # agent-merge overlay re-key. A retired-agent route demotes to "either",
     # so this test breaking on a future roster change is it doing its job:
     # roster changes must update routing, then this pin.
@@ -126,7 +126,7 @@ def test_npc_evaluation_routes_to_specialist():
 
 @_foxtrot_active
 def test_roblox_integration_routes_to_specialist():
-    # Was delta's lane (3); delta -> foxtrot per the same re-key.
+    # Was delta's lane (); delta -> foxtrot per the same re-key.
     if "roblox-integration" not in cr.CATEGORY_ROUTES:
         pytest.skip("capability-routing overlay absent (fresh deployment)")
     # Category-only goal (no strong dev title-prefix to win Tier 1).

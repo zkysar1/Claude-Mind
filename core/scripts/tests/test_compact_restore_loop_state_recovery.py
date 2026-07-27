@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_compact_restore_loop_state_recovery.py — 2 regression test.
+"""test_compact_restore_loop_state_recovery.py —  regression test.
 
 Verifies the null-guarded loop_state recovery added to
 compact-restore-slots.py (`_recover_lost_loop_state`).
@@ -51,7 +51,7 @@ def _load_crs_module(tmpdir: Path):
     # env → else AGENT_DIR/session/working-memory.yaml, and read_wm/write_wm
     # call wm_path() directly. Patching wm.WM_PATH / WORKING_MEMORY_PATH was a
     # post- NO-OP for I/O (WM_PATH became a dynamic __getattr__
-    # property) and contradicted the conftest guidance — removed. (6)
+    # property) and contradicted the conftest guidance — removed. ()
     wm_module.AGENT_DIR = tmpdir
 
     spec = importlib.util.spec_from_file_location(

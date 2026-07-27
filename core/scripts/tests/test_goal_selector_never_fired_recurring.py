@@ -136,7 +136,7 @@ def test_non_recurring_has_zero_urgency():
 
 
 def test_future_lastachieved_clock_skew_not_treated_as_overdue():
-    """3: a lastAchievedAt stamped in THIS box's FUTURE (an off-machine
+    """: a lastAchievedAt stamped in THIS box's FUTURE (an off-machine
     ahead-clock agent stamped it) must NOT be misclassified as never-fired-stale.
 
     Pre-fix: hours_since(future) returns None (the hours<0 clamp), never_fired was
@@ -160,7 +160,7 @@ def test_future_lastachieved_clock_skew_not_treated_as_overdue():
 
 
 def test_future_lastachieved_does_not_starve_genuine_never_fired():
-    """Companion guard: the 3 fix must NOT weaken the  escalation.
+    """Companion guard: the  fix must NOT weaken the  escalation.
 
     A genuinely never-fired goal (lastAchievedAt absent) is still treated as
     overdue-since-creation. This pins the two None-cases apart: absent field ->

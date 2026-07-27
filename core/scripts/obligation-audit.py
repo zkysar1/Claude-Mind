@@ -171,15 +171,35 @@ def _existing_investigate_goal() -> bool:
 def _file_investigate_goal(session_false_claims: int, audit_log_path: Path) -> None:
     # Find a target aspiration (first active framework-maintenance, else first active).
     try:
-        r = subprocess.run(
-            bash_cmd(SCRIPT_DIR / "world-cat.sh", "aspirations-compact.json"),
-            capture_output=True, text=True, timeout=15,
-        )
+        # : read the compact from the AGENT-SESSION path, not $WORLD_DIR.
+        # The previous `world-cat.sh aspirations-compact.json` resolved to
+        # $WORLD_DIR/aspirations-compact.json, which DOES NOT EXIST — the compact is
+        # written by load-aspirations-compact.sh to AGENT_DIR/session/. world-cat.sh
+        # is a bare `cat`, so the miss returned rc=1 + empty stdout, the guard below
+        # failed, target_id stayed None, and this function NEVER filed. Since it is
+        # the enforcement arm for false abbreviation claims (Phase 9.5d), the whole
+        # escalation path was structurally dead.
+        # Mirrors findings-gate.py:192-205 — refresh best-effort FIRST so the target
+        # is picked from a FRESH snapshot; a bare path swap would merely trade
+        # not-found for the  stale-read defect.
         target_id = None
         target_source = "world"
-        if r.returncode == 0 and r.stdout.strip():
+        compact_path = (Path(AGENT_DIR) / "session" / "aspirations-compact.json"
+                        if AGENT_DIR else None)
+        loader = SCRIPT_DIR / "load-aspirations-compact.sh"
+        if compact_path is not None and loader.exists():
             try:
-                compact = json.loads(r.stdout)
+                subprocess.run(
+                    bash_cmd(loader),
+                    env={**os.environ,
+                         "MIND_AGENT": os.environ.get("MIND_AGENT", "")},
+                    capture_output=True, timeout=10, check=False,
+                )
+            except Exception:
+                pass
+        if compact_path is not None and compact_path.exists():
+            try:
+                compact = json.loads(compact_path.read_text(encoding="utf-8"))
             except Exception:
                 compact = []
             active = [a for a in (compact if isinstance(compact, list) else [])

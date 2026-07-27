@@ -394,10 +394,16 @@ def main():
         return 0
 
     cfg = _load_revert_cfg(config_dir)
+    # `records` is the recent WINDOW, consumed only by the verify path below
+    # (its latest non-warmup record). It must NOT gate calibration: a bounded
+    # window under-counts calendar days on a busy agent, which is exactly the
+    # form spec §10 forbids and the  defect. Calibration routes
+    # through the shared full-history helper so this half cannot drift from
+    # health-regression-check.py's again.
     records = hl.recent_records(Path(agent_dir) / "health", 200)
-    cal_days, cal_records = hl.calibration_progress(records)
-    calibrated = (cal_days >= cfg["calibration"]["min_days"]
-                  and cal_records >= cfg["calibration"]["min_records"])
+    calibrated, _ = hl.calibration_state(
+        Path(agent_dir) / "health",
+        cfg["calibration"]["min_days"], cfg["calibration"]["min_records"])
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     if args.cmd == "route":

@@ -82,12 +82,12 @@ def compute_learning_value(tree_updated, artifacts_count, encoding_score, findin
 
 
 def cmd_velocity(args):
-    # 1: UNMEASURED closes must not poison the imp@k series. When the
+    # : UNMEASURED closes must not poison the imp@k series. When the
     # caller passed NO quality input at all (no --tree-updated, and all three
     # value args at their None sentinels), the close was never measured —
     # recording learning_value=0.0 injects a false zero that drags every
     # rolling window down (observed: 0.0 for unambiguously deep goals
-    # 2/8 beside flagged siblings at 0.6-0.79; pre-fix
+    # / beside flagged siblings at 0.6-0.79; pre-fix
     # history was 206/206 dead-zero). Skip the snapshot instead — a gap is
     # honest, a fabricated zero is not. An EXPLICIT `--encoding-score 0.0`
     # (ritual outcome) still records a real zero.
@@ -201,8 +201,8 @@ def cmd_backpressure(args):
         #   "null"   -> a real YAML null: no crash, but load_weights emits a
         #     loud non-numeric WARNING every selection AND the key stays
         #     present, so the restore->re-null thrash recurs (mc-081/083 = 2
-        #     rollbacks = dead-end; rb-4159 / zeta 2).
-        #   "0.0"    -> a NUMERIC floor (this fix, 7). load_weights
+        #     rollbacks = dead-end; rb-4159 / zeta ).
+        #   "0.0"    -> a NUMERIC floor (this fix, ). load_weights
         #     KEEPS 0.0 (isinstance int/float) and the weighted sum adds
         #     raw*0.0 = 0, so the criterion opts out IDENTICALLY to an absent
         #     key (the sum iterates `for k in WEIGHTS`) — but with NO warning,
@@ -476,7 +476,7 @@ def cmd_run_all(args):
         }
     r1 = cmd_velocity(args)
     if "velocity_unmeasured_skipped" in r1.get("flags", []):
-        # 1: no quality inputs → no measurement. Backpressure,
+        # : no quality inputs → no measurement. Backpressure,
         # temporal-credit, and relative-advantage all consume the measured
         # learning_value; feeding them a fabricated 0.0 recreates the same
         # false-zero poison one layer down (backpressure could trip rollback
@@ -527,14 +527,14 @@ DISPATCH = {
 # (iteration-close.sh WARNs on rc!=0). Every OTHER flag is an informational finding
 # (above_mean/below_mean, backpressure events — often positive) or a best-effort/
 # transient telemetry-write failure: impk_snapshot_failed = a write_conflict that
-# survived the daemon's own RMW retry (meta_impk.locked_rmw, 1) — a
+# survived the daemon's own RMW retry (meta_impk.locked_rmw, ) — a
 # "safe-to-retry 409" (rb-2639) that records on a later, less-contended close;
 # board_post_failed and impk_snapshot_skipped_no_goal are likewise non-fatal.
 # Pre-partition, `exit(1 if flags else 0)` fired a spurious "state-update-audit.sh
 # failed (non-fatal)" WARN inside iteration-close on nearly every deep close — any
 # goal above/below its category mean, or any transient snapshot write_conflict —
-# while the audit's core computation succeeded (5; the read/exit-side
-# complement to 1's write-side retry). Do NOT add a client-side snapshot
+# while the audit's core computation succeeded (; the read/exit-side
+# complement to 's write-side retry). Do NOT add a client-side snapshot
 # retry here: conflict-retry is owned by the daemon endpoint (single writer).
 HARD_FAIL_FLAGS = {
     "check_failed",                # a sub-check raised / returned non-zero
@@ -563,7 +563,7 @@ def main():
     p.add_argument("--category", type=str, default="uncategorized")
     p.add_argument("--experience-id", type=str, default=None)
     p.add_argument("--tree-updated", action="store_true")
-    # None defaults are MEASUREMENT sentinels (1): cmd_velocity treats
+    # None defaults are MEASUREMENT sentinels (): cmd_velocity treats
     # "no quality input passed at all" as UNMEASURED and skips the imp@k
     # snapshot instead of recording a false learning_value=0.0. An explicit
     # `--encoding-score 0.0` (ritual outcome) still records a real zero.

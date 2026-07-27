@@ -171,6 +171,39 @@ def test_converter_dedups_on_probe_id_in_text():
     assert res["deduped"] is True
 
 
+def test_converter_dedups_against_completed_goal():
+    # : a finding already converted+COMPLETED under this
+    # origin_signal must NOT re-file. Before the fix is_duplicate scanned open
+    # goals only, so a same-origin_signal COMPLETED goal slipped through and
+    # re-filed a duplicate of done work (sibling incident ).
+    filed = []
+    completed_goals = [{"status": "completed",
+                        "origin_signal": "monitor-probe:p1",
+                        "title": "Investigate: monitor-tick probe p1 tripped (done)"}]
+    res = CONV.convert_finding(PROBE_P1, "trip evidence", goals=[],
+                               completed_goals=completed_goals,
+                               filer=lambda *a: filed.append(1) or "g-x")
+    assert res["deduped"] is True
+    assert res["filed"] is False
+    assert filed == []            # daemon NEVER hit when a completed twin exists
+
+
+def test_converter_completed_dedup_is_exact_origin_only():
+    # The completed scan is EXACT origin_signal ONLY — a completed goal whose
+    # TEXT merely references the probe id but carries a DIFFERENT origin_signal
+    # must NOT suppress (fuzzy text/pid stays open-goals-only to keep FPs low).
+    # The finding SHOULD still file here.
+    filed = []
+    completed_goals = [{"status": "completed",
+                        "origin_signal": "monitor-probe:other",
+                        "description": "old completed work that mentions p1 in prose"}]
+    res = CONV.convert_finding(PROBE_P1, "ev", goals=[],
+                               completed_goals=completed_goals,
+                               filer=lambda *a: filed.append(1) or "g-y")
+    assert res["deduped"] is False
+    assert res["filed"] is True
+
+
 def test_converter_record_is_valid(tmp_path):
     res = CONV.convert_finding(PROBE_P1, "evidence text", goals=[], dry_run=True)
     rec = res["record"]
@@ -213,7 +246,7 @@ def test_tripped_files_exactly_one_deduped_goal_end_to_end(tmp_path):
 
     assert len(r1["filed"]) == 1
     assert r2["filed"] == [] and r2["deduped"] == ["p1"]
-    assert filed == ["0"]       # exactly ONE goal across both trips
+    assert filed == [""]       # exactly ONE goal across both trips
 
 
 # ---- E1: external-path resolution (world/ meta/ -> external dirs) ----------
@@ -349,7 +382,13 @@ def test_subprocess_runner_env_and_cwd(tmp_path, monkeypatch):
     rc, out = TICK._subprocess_runner(str(probe), [], project_root=proj)
     assert rc == 0
     assert "AGENT=alpha" in out
-    assert os.path.realpath(str(proj)) in out    # ran with cwd=project_root
+    # ran with cwd=project_root. Compared on the notation-independent TAIL:
+    # MSYS bash's `pwd -P` prints the mounted form (/tmp/pytest-of-.../proj)
+    # for the very path Python reports as C:\Users\...\Temp\pytest-of-.../proj
+    # — same directory, two notations, so a raw substring test can never match
+    # on win32. The tmp-unique dir name still proves the cwd ().
+    tail = "/".join(Path(os.path.realpath(str(proj))).parts[-2:])
+    assert tail in out.replace("\\", "/")
 
 
 def test_probe_env_fills_agent_when_absent(tmp_path, monkeypatch):
@@ -390,7 +429,7 @@ def test_subprocess_runner_missing_script_not_clean(tmp_path):
     assert rc != 0
 
 
-# ---- FW-1b.2 win32 stdin-detach fix (6) ---------------------------
+# ---- FW-1b.2 win32 stdin-detach fix () ---------------------------
 
 def test_subprocess_runner_detaches_stdin(monkeypatch):
     """The runner must pass stdin=DEVNULL: MSYS bash on win32 blocks on the
@@ -413,11 +452,17 @@ def test_subprocess_runner_detaches_stdin(monkeypatch):
     assert rc == 0 and out == "ok"
     assert captured.get("stdin") == sp.DEVNULL
     assert captured.get("capture_output") is True
-    assert captured["cmd"][0] == "bash"
+    # argv[0] is the RESOLVED bash, not the literal "bash" ().
+    # Pinning the bare literal here would re-assert the bug: on win32,
+    # CreateProcess searches System32 before PATH, so a bare "bash" reaches
+    # the WSL launcher (C:\Windows\System32\bash.exe) and blocks forever on a
+    # dead LxssManager. _runtime_bash.BASH resolves Git Bash explicitly.
+    assert Path(captured["cmd"][0]).name.lower().startswith("bash")
+    assert "system32" not in captured["cmd"][0].lower()
 
 
 def test_subprocess_runner_live_echo_probe(tmp_path):
-    """A trivial echo probe returns clean fast — the 6 acceptance
+    """A trivial echo probe returns clean fast — the  acceptance
     check (on win32 this is THE acceptance test; on POSIX it proves the
     stdin=DEVNULL change is behavior-preserving)."""
     import time

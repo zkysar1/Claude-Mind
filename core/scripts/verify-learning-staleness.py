@@ -108,7 +108,7 @@ _GREP_TARGET_RE = re.compile(
 # dedup-guard form `Bash: existing=$(bash <script> --flag ...)` is scanned —
 # without it the whole line was skipped and stale flags on the highest-stakes
 # call sites (dedup guards whose false-empty result fails open into filing a
-# DUPLICATE goal) were never checked (6). The args capture STILL STOPS
+# DUPLICATE goal) were never checked (). The args capture STILL STOPS
 # at the first shell metacharacter (`|`, `&`, `;`, `>`, `<`) OR opening paren `(`
 # so flags belonging to (a) a downstream piped command (e.g., `grep -q`
 # after `script.sh ... |`) or (b) parenthesized prose comments (e.g.,

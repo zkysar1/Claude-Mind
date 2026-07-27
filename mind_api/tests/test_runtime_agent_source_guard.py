@@ -97,7 +97,7 @@ def test_agent_source_with_header_passes_guard(running_daemon):
     assert "missing_agent_header" not in resp, resp
 
 
-# 1: extend FW-2 coverage from add-goal/update-goal to the 11 other
+# : extend FW-2 coverage from add-goal/update-goal to the 11 other
 # source-accepting write handlers. Each tuple is (path, extra_query, body) —
 # the minimal request that reaches the agent-header gate without being
 # short-circuited by an earlier validation. source=agent is added by the test.

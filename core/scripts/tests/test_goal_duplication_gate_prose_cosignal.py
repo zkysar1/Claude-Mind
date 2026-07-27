@@ -1,4 +1,4 @@
-"""test_goal_duplication_gate_prose_cosignal.py — regression test for 1.
+"""test_goal_duplication_gate_prose_cosignal.py — regression test for .
 
 Verifies the PROSE-source structural-co-signal tightening in
 `_check_pending_queue`: a prose-sourced proposal (no verification block) that
@@ -105,7 +105,7 @@ def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
-    # Hermetic agent-queue scan (5): keep live agent queues out
+    # Hermetic agent-queue scan (): keep live agent queues out
     # of the wrapper's pending_queue check (rb-3784 corpus coupling).
     env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(

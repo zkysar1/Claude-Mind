@@ -1,4 +1,4 @@
-"""test_goal_selector_capability_filter.py -- 0 collection-time filter.
+"""test_goal_selector_capability_filter.py --  collection-time filter.
 
 Proves the per-runner capability filter works through the LIVE goal-selector
 selection path (collection-time skip + not_my_lane classification), the

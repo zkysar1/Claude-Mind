@@ -137,10 +137,10 @@ _release_spawn_lock() {
 # _kill_escalate PID [PORT] — SIGTERM → short graceful wait → caller follows
 # up with _force_kill_tree for guaranteed reap.
 #
-# 2 v3: the wait loop now uses HEALTH PROBE (curl) when PORT is
+#  v3: the wait loop now uses HEALTH PROBE (curl) when PORT is
 # available, falling back to _is_pid_alive only when no port is known. The
 # original kill -0 loop false-negatives on MSYS Git Bash against detached
-# native-Windows processes (the same fault that motivated 0's
+# native-Windows processes (the same fault that motivated 's
 # idempotency-check fix; the wait loop was the second site that never got
 # the same treatment), exiting at the first 100ms iteration and logging a
 # misleading "PID X exited after SIGTERM" while the daemon was still serving.
@@ -381,7 +381,7 @@ mkdir -p "$RT_DIR"
 # responsive AND no --restart was requested. Keeps the common path
 # (SessionStart hook with a live daemon) lock-free.
 #
-# 0 fix: health-probe ALONE is the authoritative liveness signal
+#  fix: health-probe ALONE is the authoritative liveness signal
 # here. POSIX `kill -0` false-negatives on MSYS Git Bash against detached
 # native-Windows processes spawned via `py -3 -m mind_api.src` — every
 # invocation was falling through to the slow path and recycling a healthy
@@ -395,6 +395,63 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
    [ "$FORCE_RESTART" != "1" ]; then
     _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port)"
     exit 0
+fi
+
+# ─── Shared-runtime claim gate () ───────────────────────────────────
+# Placed AFTER the fast path deliberately: a test that merely pokes a HEALTHY
+# daemon is harmless and must keep working (that is the common case and this
+# gate must not touch it). Reaching HERE means we are about to _force_kill_tree
+# the live daemon and write THIS process's pid/port into the shared
+# PROJECT_ROOT/mind_api/state — repointing every agent on the box at whatever
+# world the caller resolved. When the caller is pytest, that is never intended.
+#
+# Observed 2026-07-26: test_post_state_update_metric_gate_category.py builds a
+# tmp world + tmp agent dir, touches a daemon wrapper, and the runtime recycled
+# the live daemon out from under the running fleet.
+#
+# rt_spawn (_runtime.sh, ) already SCRUBS test env off the respawned
+# daemon, but scrubbing is fail-OPEN: the shared port is still claimed and the
+# live daemon still dies — only the replacement's environment is clean. That
+# comment explicitly exempts this script as "a deliberate operator", which is
+# false when the parent process is a test. This gate fails CLOSED instead, and
+# does not depend on every future test author remembering a convention.
+#
+# Two sanctioned ways past it:
+#   RUNTIME_DIR=<dir>  — the isolation override (B16 / lifecycle.runtime_dir).
+#                        Spawning into your own runtime dir is never a hijack.
+#   MIND_ALLOW_SHARED_DAEMON_FROM_TEST=1 — deliberate-operator opt-in for the
+#                        one test that must use the shared dir
+#                        (test_daemon_orphan_prevention.py counts system-wide
+#                        mind_api.src processes, so RUNTIME_DIR isolation alone
+#                        cannot make it safe — the marker plus this opt-in are).
+# DELIBERATE trade-off: the gate does NOT first check whether a live daemon
+# exists to protect. Consequence — on a box with NO daemon running, a test that
+# relied on wrapper auto-spawn now FAILS instead of silently spawning. That is
+# the intended direction: the failure is loud, names the fix (set RT_DIR), and
+# costs one line in the test, whereas the alternative (refuse only when a live
+# daemon would be killed) reopens the original harm on any box without the
+# .mind-data/ tier — there, a test-spawned daemon can resolve the test's tmp
+# world and then serve it to the whole fleet. Fail closed, per .
+#
+# Condition compares the dir ACTUALLY being claimed, not env-var names: the
+# sibling gate in _runtime.sh must accept RT_DIR (what _daemon_fixture.py sets)
+# as well as RUNTIME_DIR, and comparing the resolved path also catches
+# RUNTIME_DIR pointed explicitly AT the shared dir. Keep both conditions in sync.
+if [ -n "${PYTEST_CURRENT_TEST:-}" ] \
+   && [ "$RT_DIR" = "$PROJECT_ROOT/mind_api/state" ] \
+   && [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then
+    _log "REFUSED shared-runtime claim from pytest (${PYTEST_CURRENT_TEST})"
+    {
+        echo "[daemon-start] REFUSED: recycle/spawn requested from inside pytest"
+        echo "[daemon-start]   PYTEST_CURRENT_TEST=${PYTEST_CURRENT_TEST}"
+        echo "[daemon-start]   no runtime isolation -> would claim SHARED $RT_DIR"
+        echo "[daemon-start] This would kill the live daemon and repoint every"
+        echo "[daemon-start] agent on this box at the test's world resolution."
+        echo "[daemon-start] Fix: set RUNTIME_DIR=<tmp dir> in the test env, or"
+        echo "[daemon-start] MIND_ALLOW_SHARED_DAEMON_FROM_TEST=1 if the test"
+        echo "[daemon-start] genuinely requires the shared runtime. (g-115-3329)"
+    } >&2
+    exit 1
 fi
 
 # Slow path: need to recycle and/or spawn. Acquire wrapper-side spawn
@@ -423,7 +480,7 @@ fi
 trap '_release_spawn_lock' EXIT
 
 # Re-probe inside the lock — daemon may have come up while we waited.
-# 0 fix: health-probe alone (kill -0 false-negatives on Windows).
+#  fix: health-probe alone (kill -0 false-negatives on Windows).
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
@@ -433,12 +490,12 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
     exit 0
 fi
 
-# 2 v3: read parent_pid (py.exe launcher PID) for the kill
+#  v3: read parent_pid (py.exe launcher PID) for the kill
 # path — see _force_kill_tree.
 existing_parent_pid="$(_read_parent_pid || echo "")"
 
 # 1. Check if daemon is already up and healthy.
-# 0 fix: health-probe FIRST. POSIX `kill -0` false-negatives on
+#  fix: health-probe FIRST. POSIX `kill -0` false-negatives on
 # MSYS Git Bash against detached native-Windows processes — concluding
 # "stale PID, cleaning up" against a HEALTHY daemon was the root cause of
 # the 112-restarts-in-24h pileup. Health-probe on the published port is
@@ -457,9 +514,9 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         # --restart: healthy but a daemon-code commit landed, so the
         # in-memory code is stale. Recycle.
         #
-        # Claim-liveness gate (3, Layer B for guard-1151): a restart
+        # Claim-liveness gate (, Layer B for guard-1151): a restart
         # of a HEALTHY daemon issued mid-goal is the redundant-restart shape —
-        # canonical: 7 restarted 47 min after its claim was superseded
+        # canonical:  restarted 47 min after its claim was superseded
         # and released (2026-07-16, rb-3735). When the invoking agent has an
         # in_flight goal, verify the claim is still live before recycling.
         # ONLY this healthy+--restart branch is gated: the unhealthy/stale
@@ -468,7 +525,7 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         if [ -n "${MIND_AGENT:-}" ] && [ "${MIND_RESTART_FORCE_STALE_CLAIM:-0}" != "1" ]; then
             # grep -oE + head -n1 extracts exactly ONE goal-id even if the
             # transport ever emits a duplicated/concatenated body again (the
-            # 2026-07-18 "11" rt_call retry double-emit —
+            # 2026-07-18 "" rt_call retry double-emit —
             # fixed at the source in _runtime.sh rt_call, defended here too).
             # null / absent field yields empty, caught by the -n test below.
             _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null \
@@ -505,7 +562,7 @@ fi
 
 #  v3 BULLETPROOF KILL:
 #   1. _kill_escalate sends SIGTERM with a SHORT graceful window. The wait
-#      now uses health-probe (curl) when port is known — the 0 fix
+#      now uses health-probe (curl) when port is known — the  fix
 #      applied to the second site (kill wait) that the original fix missed.
 #   2. _force_kill_tree force-kills BOTH the child python.exe AND the py.exe
 #      parent (read from daemon.parent.pid). No Win32 Get-CimInstance

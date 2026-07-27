@@ -3,7 +3,9 @@
 
 Implements the scoring formula from aspirations/SKILL.md Goal Selection Algorithm.
 The LLM no longer computes scores — this script handles the arithmetic.
-The LLM still handles Phase 2.5 (metacognitive assessment) and can override rankings.
+The LLM still handles Phase 2.5 (metacognitive assessment) but MUST NOT override the
+ranking except via a sanctioned deviation code at claim time (Scorer Sovereignty Layer B;
+see scorer-verdict-gate.py + the system-constraints-loop/scorer-sovereignty tree node).
 
 Scoring criteria (21 deterministic + 1 stochastic weighted factors):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
@@ -55,8 +57,10 @@ import json
 import math
 import os
 import random
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, datetime, timedelta
 import hashlib
@@ -69,7 +73,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml  # Required — tree.py already depends on PyYAML
 
-from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT, agents_root as _agents_root
+from _paths import (WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT,
+                    agents_root as _agents_root, read_agent_conf)
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm  # noqa: E402
 from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gated cadence)
@@ -79,9 +84,10 @@ from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gate
 from aspirations import TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES  # noqa: E402
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
-from _runner_capabilities import (  # noqa: E402  (0 per-runner capability filter)
-    derive_runner_capabilities,
+from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter)
+    derive_runner_capabilities, box_config_from_conf, merge_capability_config,
     goal_is_locally_executable, goal_required_capabilities)
+from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
@@ -91,7 +97,7 @@ ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # termina
 _ASP_COMPLETION_RATIOS: dict = {}
 _STRUCTURED_DEFER_PREFIXES_LOWER = tuple(p.lower() for p in STRUCTURED_DEFER_PREFIXES)
 
-# 0 per-runner capability filter. Lazily-computed, process-cached set of
+#  per-runner capability filter. Lazily-computed, process-cached set of
 # capability tokens THIS runner provides (config override > cheap probes). Cached
 # because the probes (shutil.which / import checks) should run at most once per
 # process, and cmd_select reads it once per selection.
@@ -99,33 +105,77 @@ _RUNNER_CAPABILITIES = None
 
 
 def _get_runner_capabilities():
-    """Return (process-cached) the capability set this runner provides. Reads the
-    `runner_capabilities` block from aspirations.yaml (provides/lacks/probe);
-    fail-open to probe-only on any config error, and to an empty set on any probe
-    error (an empty set never filters a goal that lacks requires_capability, so
-    the conservative default is a no-op filter)."""
+    """Return (process-cached) the capability set this runner provides.
+
+    Two config layers merge before probing (g-115-3079):
+      1. `runner_capabilities` in aspirations.yaml -- git-shared, so it applies
+         FLEET-WIDE. Correct for "no box in this fleet has a GPU"; WRONG for any
+         claim true of one box only.
+      2. `RUNNER_CAPABILITIES_{PROVIDES,LACKS,PROBE}` in the bound agent's
+         `local-paths.conf` -- the only genuinely per-box surface (gitignored AND
+         in owncloud_sync._EXCLUDE_NAMES, so it never reaches git or S3). This is
+         where a Studio host asserts `studio-session`, which by design is never
+         probed (a transient runtime resource on one host, not a box property).
+    merge_capability_config unions provides/lacks (lacks stays authoritative) and
+    lets the box win on `probe`.
+
+    Fail-open at every layer: a config error degrades to probe-only, and a probe
+    error to the empty set. An empty set never filters a goal that lacks
+    requires_capability, so the conservative default is a no-op filter."""
     global _RUNNER_CAPABILITIES
     if _RUNNER_CAPABILITIES is not None:
         return _RUNNER_CAPABILITIES
-    cfg = {}
+    fleet_cfg = {}
     try:
         asp_config = read_yaml_file(CONFIG_DIR / "aspirations.yaml")
         rc = asp_config.get("runner_capabilities")
         if isinstance(rc, dict):
-            cfg = rc
+            fleet_cfg = rc
     except Exception:
-        cfg = {}
+        fleet_cfg = {}
+    box_cfg = {}
     try:
-        _RUNNER_CAPABILITIES = derive_runner_capabilities(cfg)
+        box_cfg = box_config_from_conf(read_agent_conf())
+    except Exception:
+        box_cfg = {}
+    try:
+        _RUNNER_CAPABILITIES = derive_runner_capabilities(
+            merge_capability_config(fleet_cfg, box_cfg))
     except Exception:
         _RUNNER_CAPABILITIES = set()
     return _RUNNER_CAPABILITIES
-# 6: the one structured prefix that NEVER auto-clears. collect_eligible
+# : the one structured prefix that NEVER auto-clears. collect_eligible
 # and collect_blocked exempt it from the 120h defer fall-through so a genuinely
 # human-gated goal stays suppressed-from-selector + counted-in-blocked[] (enabling
 # quiescence) instead of re-surfacing as a candidate every iteration. The other
 # structured prefixes keep the fail-open expiry (their sweeps auto-clear them).
 _HUMAN_BLOCKED_PREFIX = "human_blocked:"
+
+
+def _has_future_deferred_until(goal):
+    """True only when deferred_until is present AND still in the future.
+
+    The single predicate both collect_candidates and collect_blocked use to
+    decide whether a goal's structural time gate SUPERSEDES its defer_reason.
+    It must be one helper, not two inline checks: the two call sites are
+    required to stay logical complements, and the defect this closes
+    (g-115-3150) was precisely the two of them agreeing on a WRONG shared
+    precedence — `if not goal.get("deferred_until")`, which treats a PAST date
+    the same as a FUTURE one and hands the goal to a time gate that clears
+    past dates unconditionally. A live defer_reason was therefore never
+    evaluated, and the goal fell out of BOTH lists.
+
+    Corrupt/unparseable values return False (no structural gate) so the
+    defer_reason arm — which carries its own fail-open expiry — decides,
+    rather than a garbage timestamp silently releasing the goal.
+    """
+    raw = goal.get("deferred_until")
+    if not raw:
+        return False
+    try:
+        return datetime.fromisoformat(str(raw)) > datetime.now()
+    except (ValueError, TypeError):
+        return False
 
 
 def _parse_rne_dt(rne):
@@ -153,7 +203,7 @@ def _parse_rne_dt(rne):
 
 
 def _synth_blocker_ref_from_structured_defer(goal):
-    """For quiescence-gate compatibility (, extended 4): when a
+    """For quiescence-gate compatibility (, extended ): when a
     goal is structurally deferred/blocked but lacks a valid typed blocker_ref,
     synthesize one so quiescence-gate.py C2 (blocker_ref_required) + C3
     (future-expiry) treat the structural marker as structured-enough. Evaluation
@@ -187,7 +237,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
     existing = goal.get("blocker_ref")
     if isinstance(existing, dict):
         # C3 roll-forward for a STORED typed dict ref whose expires_at has
-        # lapsed (3 sibling): a long-lived user_action / infrastructure
+        # lapsed ( sibling): a long-lived user_action / infrastructure
         # ref on a user-gated recurring monitor (e.g.  game-session,
         #  npc-deploy) keeps its stored typed ref for months, but its
         # original short TTL (created_at + N days) expired long ago — tripping
@@ -196,8 +246,8 @@ def _synth_blocker_ref_from_structured_defer(goal):
         # independently — blocker-recheck cleared 0, confirming still-active).
         # expires_at is a fail-open RE-CHECK window, NOT a hard deadline, so roll
         # a lapsed window forward to now+120h, preserving type/external_id/
-        # created_at. Mirrors path (a) roll-forward (below) + 0 /
-        # 4 rolling-expiry idiom. A future expires_at is returned
+        # created_at. Mirrors path (a) roll-forward (below) +  /
+        #  rolling-expiry idiom. A future expires_at is returned
         # unchanged (no behavior change for already-fresh stored refs).
         try:
             _exp = existing.get("expires_at")
@@ -211,7 +261,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
         except (ValueError, TypeError):
             pass
         return existing
-    # Path (f): legacy BARE-STRING blocker_ref (4). A plain-string
+    # Path (f): legacy BARE-STRING blocker_ref (). A plain-string
     # blocker_ref (e.g. "worldbuilders-apikey-missing" from an older write path)
     # is NOT a dict, so quiescence C2 counts it missing — AND the L1659 call site
     # would DISCARD the string by returning None here. Coerce to a typed resource
@@ -231,7 +281,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
     defer = goal.get("defer_reason") or ""
     deferred_until = goal.get("deferred_until")
 
-    # Path (b): deferred_until time gate. CHECKED BEFORE path (a) — 1:
+    # Path (b): deferred_until time gate. CHECKED BEFORE path (a) — :
     # an explicit future deferred_until is the AUTHORITATIVE structural expiry and
     # must win over the 120h structured-prefix fail-open. A goal carrying BOTH a
     # structured-prefix defer_reason AND a future deferred_until previously matched
@@ -270,14 +320,14 @@ def _synth_blocker_ref_from_structured_defer(goal):
         except (ValueError, TypeError):
             created = datetime.now()
         expires = created + timedelta(hours=120)
-        # C3 roll-forward (4): a long-lived structured defer whose
+        # C3 roll-forward (): a long-lived structured defer whose
         # defer_reason_set_at is >120h in the past previously synthesized an
         # ALREADY-EXPIRED ref (created+120h < now), tripping quiescence C3 into
         # false denial + B7 churn (observed : set_at 2026-05-23 ->
         # expires 2026-05-28). The 120h is a fail-open RE-CHECK window, not a real
         # deadline — Phase 0.5b re-probes the defer independently — so roll the
         # window to now+120h when it has lapsed (self-healing; created_at stays
-        # set_at, mirrors the not-my-lane / 0 rolling expiry).
+        # set_at, mirrors the not-my-lane /  rolling expiry).
         _now_a = datetime.now()
         if expires <= _now_a:
             expires = _now_a + timedelta(hours=120)
@@ -296,7 +346,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
     rne = goal.get("resolves_no_earlier_than")
     if rne:
         try:
-            # Handles BOTH date-only and datetime forms (7 — the old
+            # Handles BOTH date-only and datetime forms ( — the old
             # f"{rne}T00:00:00" promotion raised on datetime-form values).
             expires_dt = _parse_rne_dt(rne)
             if expires_dt is not None and expires_dt > datetime.now():
@@ -318,7 +368,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
         except (ValueError, TypeError):
             pass
 
-    # Path (d): bare blocked_by dependency (4). A goal blocked on a
+    # Path (d): bare blocked_by dependency (). A goal blocked on a
     # machine-readable predecessor (blocked_by non-empty) but carrying NO
     # structured-prefix defer_reason previously synthesized nothing -> quiescence
     # C2 rejected it forever, forcing B7 backoff churn instead of honest quiescent
@@ -334,7 +384,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
     # set and the synth vanishes). NOTE: a not_my_lane goal (branch 7) with a
     # fully-COMPLETED blocked_by would get a "dependency:" external_id here rather
     # than "not-my-lane:" — cosmetic only (both type=resource, identical C2/C3/C4;
-    # 0 current collisions verified 4).
+    # 0 current collisions verified ).
     blocked_by = goal.get("blocked_by") or []
     if isinstance(blocked_by, list) and blocked_by:
         _now_d = datetime.now()
@@ -349,7 +399,7 @@ def _synth_blocker_ref_from_structured_defer(goal):
             "synthesized": True,
         }
 
-    # Path (e): narrative defer_reason with no structured prefix (4). A
+    # Path (e): narrative defer_reason with no structured prefix (). A
     # goal deferred with free-text (e.g. "Requires solver-v0 baseline ...",
     # observed ) that did NOT match a STRUCTURED_DEFER_PREFIX and has no
     # blocked_by. By the time a defer_reason is persisted it has passed the
@@ -468,7 +518,7 @@ def _record_strategy_application(strategy_path, summary):
 # Code-side contract manifest: every criterion key score_goal() computes into
 # `raw`, EXCLUDING exploration_noise (dynamic weight = epsilon * noise_scale,
 # never in the meta weights dict — see META_GOAL_SELECTION note above).
-# 5: load_weights() filters meta keys against this set so an orphaned
+# : load_weights() filters meta keys against this set so an orphaned
 # weight (meta names a criterion the code no longer computes — the rb-498-era
 # promotion-clobber class that killed selection fleet-wide in prod via KeyError
 # at the weighted sum) degrades to a loud stderr warning + opt-out instead.
@@ -1169,7 +1219,7 @@ def read_yaml_file(path):
 
 
 def _log_transient_allblocked_recovery(first_world, retry_world, retry_count):
-    """Record a transient all_blocked recovery for root-cause evidence (5).
+    """Record a transient all_blocked recovery for root-cause evidence ().
 
     Emitted by cmd_select when the FIRST collection pass returns zero candidates
     but a fresh re-read + re-collect finds work. The WORLD aspirations file lives
@@ -1414,9 +1464,41 @@ def get_interval_hours(goal):
 # FILTER + COLLECT
 # ---------------------------------------------------------------------------
 
+def _is_owner_scoped_goal(goal):
+    """True when a goal operates ONLY on the bound agent's own dir tree and so
+    CANNOT be executed by a cross-agent reallocatee (rb-4792, g-115-2945).
+
+    /drain-temp is the canonical case: its SKILL.md Phase 1 sets
+    TEMP_DIR=$AGENT_DIR/temp and operates on the bound agent ONLY. Surfacing
+    such a goal to another agent via idle-reallocation puts it in the
+    reallocatee's candidate list where it is UNEXECUTABLE -- running it drains
+    the WRONG agent's temp, and running it as the owner collides with the
+    owner's live session. Owner-scoped goals must therefore never be
+    cross-agent reallocated, even when their owner looks idle.
+
+    Detected three independent ways so a rename of any one signal still catches
+    it: the skill id, the origin_signal, or the title. The `maintain:temp-drain`
+    Maintain goal (skill=None) is caught by origin_signal/title; the
+    orchestrator-filed HIGH `/drain-temp` action goal is caught by skill.
+    """
+    if (goal.get("skill") or "") == "/drain-temp":
+        return True
+    origin = (goal.get("origin_signal") or "").lower()
+    if "temp" in origin and "drain" in origin:
+        return True
+    # Positive drain-action signature () — the SAME SSOT matcher
+    # precheck-eval.py dedup uses, so a title-template edit cannot desync the
+    # two. The prior '"drain" in title and "temp" in title' fallback false-
+    # positived on any goal that merely MENTIONS temp-drain and stranded it
+    # with a dormant owner (rb-3452 "assert the mechanism, not the case").
+    if is_drain_action_title(goal.get("title")):
+        return True
+    return False
+
+
 def _get_idle_agents(reallocation_hours):
     """Set of agent names whose team-state last_active is older than
-    reallocation_hours (6 gap #4 — intended_agent idle-reallocation).
+    reallocation_hours ( gap #4 — intended_agent idle-reallocation).
 
     An intended_agent-routed goal is normally hidden from every other agent
     (collect_candidates intended_agent filter). When the routed-to agent has
@@ -1527,11 +1609,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
     """
     today = date.today()
     results = []
-    # Per-runner capability set (0 Slice 2) — derived once, cached
+    # Per-runner capability set ( Slice 2) — derived once, cached
     # module-wide so cmd_select AND quiescence-gate's candidate check skip
     # locally-unexecutable goals consistently (no call-site threading).
     runner_caps = _get_runner_capabilities()
-    # Agents idle beyond reallocation_hours (6 gap #4) — used below to
+    # Agents idle beyond reallocation_hours ( gap #4) — used below to
     # reallocate intended_agent-routed goals stranded on an idle target. Derived
     # once per run (mirrors runner_caps); empty set when reallocation is disabled
     # (reallocation_hours is None) or team-state is unavailable.
@@ -1569,7 +1651,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
 
         # live_ids: goal IDs that could still complete (non-terminal status).
         # Re-validates dependency liveness before honoring the dependency_timeout
-        # fail-open (4). Mirrors done_ids: global set when supplied,
+        # fail-open (). Mirrors done_ids: global set when supplied,
         # else per-aspiration scope.
         if global_live_ids is not None:
             live_ids = global_live_ids
@@ -1619,7 +1701,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     else:
                         continue  # No expiry configured — legacy behavior
 
-            # blocked_by check (dependency timeout — fail-CLOSED hardening, 4).
+            # blocked_by check (dependency timeout — fail-CLOSED hardening, ).
             # Keep the goal blocked UNLESS the block is genuinely stale: blocked_since
             # is set AND aged past the timeout AND every unmet dep is terminal-
             # unresolvable (abandoned status or orphan ref — none still live).
@@ -1675,7 +1757,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     if la is not None and la < interval:
                         continue
 
-            # Hypothesis time gate (datetime-form safe — 7, _parse_rne_dt)
+            # Hypothesis time gate (datetime-form safe — , _parse_rne_dt)
             rne_dt = _parse_rne_dt(goal.get("resolves_no_earlier_than"))
             if rne_dt is not None and datetime.now() < rne_dt:
                 continue
@@ -1690,8 +1772,26 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # leaving 5 goals with deferred_until in the past permanently blocked because they
             # never reached the time gate at L678-685.)
             if goal.get("defer_reason"):
-                if not goal.get("deferred_until"):
-                    # human_blocked: never expires (6). A genuinely
+                # Only a FUTURE deferred_until defers to the time gate below. A
+                # PAST (or corrupt) one must NOT bypass the defer_reason
+                # evaluation — the time gate clears past dates unconditionally,
+                # so bypassing here RELEASED goals whose defer_reason was
+                # simultaneously fresh and structured. Measured :
+                #  (a DESTRUCTIVE own-cloud S3 prune whose defer_reason
+                # "precondition_unmet:fleet_quiesced_window" had been re-stamped
+                # 2h earlier and was still true) was released by a deferred_until
+                # 3.6h in the past to scorer rank #1 of 59 — and deferred_readiness
+                # (L3005) then ADDED +0.9, so the stale field did not merely fail
+                # to block, it BOOSTED the goal to the top of the shared queue.
+                # 's fix (a past date must not block forever) is preserved:
+                # this arm has its own defer_reason_timeout_hours fail-open, so a
+                # genuinely stale defer still ages out — it is just no longer
+                # INSTANTLY cleared by a past date. Also restores parity with
+                # _synthesize_blocker_ref (L239-246), which already falls through
+                # a past deferred_until to its path (a).
+                # SYMMETRY: collect_blocked has the identical guard. Change both.
+                if not _has_future_deferred_until(goal):
+                    # human_blocked: never expires (). A genuinely
                     # human-gated block can never auto-clear, so the 120h
                     # fall-through below would wrongly re-surface it as a live
                     # candidate every iteration. Always skip it (excluded from
@@ -1793,7 +1893,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             if (intended_agent
                     and intended_agent != AGENT_NAME
                     and intended_agent != "either"):
-                # Idle-agent reallocation (6 gap #4): when the routed-to
+                # Idle-agent reallocation ( gap #4): when the routed-to
                 # agent has been idle beyond reallocation_hours AND the goal is
                 # unclaimed, fall through so a running capable agent can pick up
                 # otherwise-stranded work. Mirrors the reallocatable path above
@@ -1802,12 +1902,20 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 # POSITIVELY shows the target idle (missing last_active => not
                 # idle => keep routing, status quo). Unclaimed-only so a goal an
                 # active peer already owns is never yanked away.
-                if intended_agent in idle_agents and not goal.get("claimed_by"):
+                # Owner-scoped exclusion (, rb-4792): NEVER reallocate
+                # a goal that operates only on its owner's own dir tree (e.g.
+                # /drain-temp) -- the reallocatee cannot execute it (wrong temp),
+                # so surfacing it here just strands the reallocatee's top-of-queue
+                # on unexecutable work. Owner-idle is NOT a reason to reallocate
+                # owner-scoped work; it waits for the owner to revive.
+                if (intended_agent in idle_agents
+                        and not goal.get("claimed_by")
+                        and not _is_owner_scoped_goal(goal)):
                     pass  # reallocate — surface to this running agent
                 else:
                     continue
 
-            # Per-runner capability skip (0 Slice 2): drop goals whose
+            # Per-runner capability skip ( Slice 2): drop goals whose
             # EXPLICIT requires_capability this runner cannot satisfy. A per-RUNNER
             # gap (distinct from a global block) — executable by OTHER agents, just
             # not on this box. Skipping keeps them out of ranking (mixed queue) AND
@@ -1859,7 +1967,7 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
     if project_root is None or agent_dir is None or not agent_name:
         return []
     results = []
-    # 4: derive the agents-parent from agent_dir.parent, NOT
+    # : derive the agents-parent from agent_dir.parent, NOT
     # `project_root / "agents"`. Both wired call sites pass AGENT_DIR.parent
     # (which is ALREADY the agents parent = PROJECT_ROOT/agents) as project_root,
     # so `project_root / "agents"` computed PROJECT_ROOT/agents/agents
@@ -1935,7 +2043,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
     """
     today = date.today()
     blocked = []
-    # Per-runner capability set (0 Slice 2) — derived once, cached
+    # Per-runner capability set ( Slice 2) — derived once, cached
     # module-wide (same accessor as collect_candidates) so the not_my_lane
     # classification below is the exact inverse of the candidate skip.
     runner_caps = _get_runner_capabilities()
@@ -1967,7 +2075,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
 
         # live_ids: mirror of collect_candidates — goal IDs still able to complete
         # (non-terminal status). Re-validates dependency liveness so the timeout
-        # fail-open stays the logical complement across both functions (4).
+        # fail-open stays the logical complement across both functions ().
         if global_live_ids is not None:
             live_ids = global_live_ids
         else:
@@ -2012,10 +2120,10 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             if status == "blocked":
                 entry["block_reason"] = "explicit_status"
                 entry["block_detail"] = goal.get("block_reason", "No reason given")
-                # C2 coverage (8): an explicitly-blocked goal with no defer
+                # C2 coverage (): an explicitly-blocked goal with no defer
                 # fields keeps blocker_ref=None (the L1817 synth found nothing) ->
                 # quiescence C2 fails -> B7 churn. Synth a type=resource ref keyed on
-                # the goal id (mirrors branch 7). Defensive: 4's
+                # the goal id (mirrors branch 7). Defensive: 's
                 # all-gap-shapes test only exercised explicit_status WITH a
                 # defer/blocked_by/string-ref (which the L1817 synth already covers).
                 if not isinstance(entry.get("blocker_ref"), dict):
@@ -2040,7 +2148,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 # not the individual goal. create-blocker.py writes this.
                 if b.get("blocker_ref"):
                     entry["blocker_ref"] = b["blocker_ref"]
-                # Residual gap (7, bravo msg-2949): the known_blocker may
+                # Residual gap (, bravo msg-2949): the known_blocker may
                 # carry NO blocker_ref of its own, and the L1817 structured-defer
                 # synth returns None for an infra-blocked goal with no defer fields,
                 # leaving entry.blocker_ref=None -> quiescence C2 never passes ->
@@ -2063,7 +2171,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     if b.get("blocker_ref"):
                         entry["blocker_ref"] = b["blocker_ref"]
                     # Same residual gap as the skill-based branch above
-                    # (7): synth a type=resource ref when neither the
+                    # (): synth a type=resource ref when neither the
                     # known_blocker nor the structured-defer synth supplied one.
                     if not isinstance(entry.get("blocker_ref"), dict):
                         entry["blocker_ref"] = _synth_block_ref(
@@ -2073,7 +2181,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
 
             # 3. Dependency (blocked_by with unmet prerequisites, timeout-aware).
             # SYMMETRY: must be the logical complement of the blocked_by check in
-            # collect_candidates. If you change one, change the other. (4
+            # collect_candidates. If you change one, change the other. (
             # fail-CLOSED hardening — same two branches: (a) null blocked_since and
             # (b) live unmet dep both KEEP the goal blocked; fail-open only when the
             # block is stale AND every unmet dep is dead/orphan.)
@@ -2121,8 +2229,14 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             # (: prior `else: append blocked + continue` marked goals
             # with both fields as "deferred" even when deferred_until had passed.)
             if goal.get("defer_reason"):
-                if not goal.get("deferred_until"):
-                    # human_blocked: never expires (6). Keep it in
+                # SYMMETRY (): identical guard to collect_candidates —
+                # only a FUTURE deferred_until defers to the time gate. A past one
+                # must not bypass the defer_reason evaluation, or the goal lands in
+                # NEITHER list (not blocked here, and a live candidate there) —
+                # which is exactly how  escaped both. See the full
+                # rationale at the collect_candidates site.
+                if not _has_future_deferred_until(goal):
+                    # human_blocked: never expires (). Keep it in
                     # blocked[] (synth blocker_ref already set on `entry` above by
                     # _synth_blocker_ref_from_structured_defer) so all_blocked can
                     # be asserted and quiescence fires, instead of falling through
@@ -2152,7 +2266,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                         continue
                 # else: has deferred_until — handled by time gate at L864-877
 
-            # 5. Hypothesis time gate (datetime-form safe — 7, _parse_rne_dt)
+            # 5. Hypothesis time gate (datetime-form safe — , _parse_rne_dt)
             rne = goal.get("resolves_no_earlier_than")
             rne_dt = _parse_rne_dt(rne)
             if rne_dt is not None and datetime.now() < rne_dt:
@@ -2181,7 +2295,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     entry["block_reason"] = "precondition_unmet"
                     entry["block_detail"] = "Preconditions unmet: " + ", ".join(failed_ids)
                     entry["precondition_unmet"] = failed_ids
-                    # C2 coverage (8, bravo msg-2949): a goal whose
+                    # C2 coverage (, bravo msg-2949): a goal whose
                     # preconditions fail LIVE here but which carries no defer fields
                     # keeps blocker_ref=None (the L1817 synth found nothing) ->
                     # quiescence C2 fails -> B7 churn (//).
@@ -2194,7 +2308,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     continue
 
             # 7. Not-my-lane: this runner lacks a capability the goal EXPLICITLY
-            #    requires (0 Slice 2). A per-RUNNER gap, distinct from a
+            #    requires ( Slice 2). A per-RUNNER gap, distinct from a
             #    global block — the goal is executable by OTHER agents, just not on
             #    this box. Classifying it blocked (the INVERSE of collect_candidates'
             #    capability skip — same runner_caps + goal_is_locally_executable, so
@@ -2462,6 +2576,96 @@ def _get_directives():
     return _ACTIVE_DIRECTIVES
 
 
+# --- strategic_focus: the standing user directive () --------------
+# world/team-state.yaml `strategic_focus` is set by the USER and acknowledged by
+# every agent. The live one reads: "Product goals outrank routine infra sweeps
+# AT SELECTION TIME until  drains." Until now it was consumed by exactly
+# two readers — boot/SKILL.md and create-aspiration/SKILL.md — and NOT by this
+# file. A directive whose own text names selection time had no path into
+# selection, so five agents acknowledged it and the ranking never changed.
+#
+# It rides the EXISTING directive_boost criterion instead of adding a new one:
+# that term already means "user / cross-agent priority influence", already
+# carries WEIGHTS["directive_boost"] = 1.5, and reusing it adds no breakdown key
+# for downstream consumers to break on. Bounded bias, never a veto — the scorer
+# still owns the ranking (Scorer Sovereignty, ).
+#
+# Only the aspiration ids in the prose are machine-usable; the rest is rationale
+# for humans. Parsing is therefore deliberately narrow (an `asp-NNN` regex), and
+# every failure path yields no boost — the selector must never depend on this.
+_STRATEGIC_FOCUS_ASP_RE = re.compile(r"\basp-\d+\b")
+_STRATEGIC_FOCUS = None
+
+
+def load_strategic_focus():
+    """-> {"aspirations": set[str], "weight": float}.
+
+    Reads team-state via the run-scoped cache (no extra I/O — handoff liveness
+    already loads it). Missing/malformed strategic_focus, or prose naming no
+    aspiration, yields an empty aspiration set = no boost anywhere.
+
+    Prose that EXISTS but names no `asp-NNN` warns on stderr. Silence there
+    would be the vacuous-pass shape (`checker-input-assumption-defects` tree
+    node): the user writes "asp 335" or renames a lane, the regex matches
+    nothing, the boost quietly does nothing, and the directive looks honored
+    because no error was raised. A live directive that parses to zero targets
+    is always worth one loud line.
+    """
+    global _STRATEGIC_FOCUS
+    if _STRATEGIC_FOCUS is not None:
+        return _STRATEGIC_FOCUS
+    weight = 1.0
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py")
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        sfb = overlay.merged_config("aspirations.yaml").get(
+            "strategic_focus_boost", {})
+        if isinstance(sfb, dict) and sfb.get("weight") is not None:
+            weight = float(sfb["weight"])
+    except Exception:  # noqa: BLE001 — advisory input, keep the default
+        pass
+    asps = set()
+    try:
+        sf = (_load_team_state_cached() or {}).get("strategic_focus")
+        if isinstance(sf, dict):
+            # `primary` is the directive proper; `secondary` is optional and
+            # only present in some deployments.
+            text = " ".join(
+                str(sf.get(k) or "") for k in ("primary", "secondary")).strip()
+            asps = set(_STRATEGIC_FOCUS_ASP_RE.findall(text))
+            if text and not asps:
+                print(f"[goal-selector] WARN: strategic_focus is set but names "
+                      f"no asp-NNN, so it boosts nothing — check the wording "
+                      f"(set_by={sf.get('set_by')!r}): {text[:160]!r}",
+                      file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — never block selection on this
+        print(f"[goal-selector] WARN: strategic_focus unreadable "
+              f"({type(e).__name__}: {e}); directive boost disengaged",
+              file=sys.stderr)
+    _STRATEGIC_FOCUS = {"aspirations": asps, "weight": weight}
+    return _STRATEGIC_FOCUS
+
+
+def strategic_focus_boost(asp_id, completion_ratio):
+    """Bounded boost for goals under an aspiration the user's directive names.
+
+    Self-retiring: the live directive says "until asp-335 drains", so a named
+    aspiration at completion_ratio >= 1.0 stops being boosted without anyone
+    having to edit team-state. Stale prose then costs nothing.
+    """
+    if not asp_id:
+        return 0.0
+    sf = load_strategic_focus()
+    if asp_id not in sf["aspirations"]:
+        return 0.0
+    if completion_ratio is not None and completion_ratio >= 1.0:
+        return 0.0  # drained — the directive has satisfied itself here
+    return sf["weight"]
+
+
 def directive_boost_score(goal_id, category):
     """Compute directive boost for a goal based on active directives."""
     boost = 0.0
@@ -2471,6 +2675,119 @@ def directive_boost_score(goal_id, category):
         elif category in d["target_categories"]:
             boost += d["weight"]
     return boost
+
+
+def emit_directive_honor_banner(scored, agent_name, board_path=None):
+    """Emit a LOUD stderr DIRECTIVE-HONOR banner (guard-1310, ) for each
+    active directive DIRECTED AT agent_name that targets a goal PRESENT in the
+    scored candidate list AND that agent_name has NOT yet acked.
+
+    Compaction-proof companion to aspirations-select Phase 2.07's LLM-executed
+    DIRECTIVE-HONOR hard rule. That LLM path is skippable after autocompact (the
+    exact 2026-07-20 miss: a user directive targeting zeta was lane-skipped 5+
+    times over 8h with 0 acks / 0 read-receipts). goal-selector.py runs EVERY
+    iteration ("goal-selector.sh MUST run every iteration, no exceptions"), so a
+    bash-emitted banner here cannot be summarized away by compaction. Reuses the
+    same board parse + expiry/target tag semantics as load_active_directives, but
+    keys on the directive id + agent-target (which load_active_directives drops)
+    so it can filter "directed at THIS agent" and check ack existence.
+
+    Fire condition mirrors the SKILL.md hard rule exactly ("any target goal-id is
+    in ranked_goals"): the target must be an EXECUTABLE candidate (present in
+    scored). A blocked / precondition-gated directive target is absent from
+    scored and is handled by the justified-deferral path instead -- and that
+    ack then suppresses this banner (a plain ack OR a justified-deferral ack both
+    reply_to the directive). Returns the list of warnings emitted (for testing);
+    the side effect is the stderr banner. Fail-open: any error prints a skip note
+    to stderr and returns []; the banner must never block goal selection.
+    """
+    if not agent_name or not scored:
+        return []
+    bp = board_path if board_path is not None else BOARD_COORD_PATH
+    try:
+        if not bp.exists():
+            return []
+        rows = list(read_jsonl(bp))
+    except Exception as e:  # pragma: no cover - fail-open guard
+        print(f"[goal-selector] directive-honor banner skipped "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+        return []
+    # Directive-ids this agent has already replied to (a plain ack OR a
+    # justified-deferral ack both reply_to the directive -> honored -> no nag).
+    acked = {r.get("reply_to") for r in rows
+             if r.get("author") == agent_name and r.get("reply_to")}
+    rank_by_id = {s.get("goal_id"): i for i, s in enumerate(scored)}
+    now = datetime.now()
+    # Roster for bare-agent-name routing-tag detection (). Fetched
+    # ONCE per run; fail-open to empty (then only requires_action_by:* tags —
+    # which need no roster — count as explicit routing, still fixing the
+    # canonical incident).
+    try:
+        from _agents import get_active_agents
+        known_agents = set(get_active_agents())
+    except Exception:  # pragma: no cover - fail-open guard
+        known_agents = set()
+    warnings = []
+    for msg in rows:
+        if msg.get("type") != "directive":
+            continue
+        tags = _ensure_list(msg.get("tags"))
+        expires = None
+        for tag in tags:
+            if tag.startswith("expires:"):
+                try:
+                    expires = datetime.fromisoformat(tag[8:])
+                except (ValueError, TypeError):
+                    pass
+        if expires and now > expires:
+            continue  # expired -- same semantics as load_active_directives
+        text = str(msg.get("text", "") or "")
+        # : an explicit routing tag takes PRECEDENCE over a loose
+        # prose mention. A directive routed to agent X (requires_action_by:X or
+        # a bare agent-name tag) but naming agent Y in an exclusionary prose
+        # clause ("X please claim; Y cannot do it") must NOT flag Y — the
+        # prose-mention fallback fires ONLY when the directive carries no
+        # explicit routing tag. Live incident msg-20260721-211141-bravo-5456
+        # (routed requires_action_by:alpha, prose "bravo cannot deploy it well")
+        # false-flagged bravo on every selection; self-authored directives
+        # (author names self in prose) hit the identical trap.
+        has_routing_tag = (
+            any(t.startswith("requires_action_by:") for t in tags)
+            or any(t in known_agents for t in tags))
+        explicitly_directed = (agent_name in tags
+                               or f"requires_action_by:{agent_name}" in tags)
+        directed = explicitly_directed or (
+            not has_routing_tag and agent_name.lower() in text.lower())
+        if not directed:
+            continue
+        did = msg.get("id")
+        if did in acked:
+            continue  # already honored (ack or justified-deferral)
+        target_goals = [t[7:] for t in tags if t.startswith("target:")]
+        for gid in target_goals:
+            if gid not in rank_by_id:
+                continue  # blocked/gated -> not an executable candidate
+            idx = rank_by_id[gid]
+            rank = idx + 1
+            score = scored[idx].get("score")
+            warnings.append({"directive_id": did, "goal_id": gid, "rank": rank})
+            print(
+                f"\n[goal-selector] ========== DIRECTIVE-HONOR REQUIRED "
+                f"(guard-1310) ==========\n"
+                f"[goal-selector]   Directive {did} (directed at {agent_name}, "
+                f"UNACKED) targets {gid}\n"
+                f"[goal-selector]   -> candidate #{rank}/{len(scored)} "
+                f"(score {score}).\n"
+                f"[goal-selector]   SELECT it now, OR post a justified-deferral "
+                f"ack (--reply-to {did})\n"
+                f"[goal-selector]   naming a HARD blocker (infra / capability gap "
+                f"-- NOT lane / focus).\n"
+                f"[goal-selector]   A silent lane/focus/consolidate skip is "
+                f"FORBIDDEN (guard-1310).\n"
+                f"[goal-selector] ================================================"
+                f"============",
+                file=sys.stderr)
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -2521,7 +2838,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # 7. recurring_urgency (log-scaled: base + log2(1 + overdue_ratio) * scale, capped at urgency_max)
     # Logarithmic scaling preserves differentiation among overdue goals — a 72x-overdue
     # goal scores higher than a 4x-overdue one, unlike the old linear cap at 5.0.
-    # urgency_max (0, zeta-1477 fix) caps raw at a ceiling so heavily-overdue
+    # urgency_max (, zeta-1477 fix) caps raw at a ceiling so heavily-overdue
     # recurring goals can no longer systematically out-score capped role_affinity
     # (1.5x ceiling × weight 1.0 = 1.5 max contribution) — bounds asymmetry while
     # preserving relative ordering up to the cap point (~3x overdue at default 4.0).
@@ -2530,7 +2847,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
                          # post-scoring substantive-demotion exemption can read it.
     if goal.get("recurring"):
         interval = get_interval_hours(goal)
-        # 3 (cross-machine clock-skew fix): capture the RAW lastAchievedAt
+        #  (cross-machine clock-skew fix): capture the RAW lastAchievedAt
         # field separately from the computed elapsed. hours_since() returns None for
         # BOTH an ABSENT lastAchievedAt AND a PRESENT-but-FUTURE one (an off-machine
         # ahead-clock stamps lastAchievedAt in this box's future; the hours<0 clamp
@@ -2558,7 +2875,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # urgency the escalator intends. Mirrors the created-age precedent at the
         # reallocation filter (hours_since(goal.get("created")…)). created_at is
         # the live field name (goal-schemas.md); `created` is the legacy alias.
-        never_fired = la_raw is None  # 3: FIELD absence, not `la is None`
+        never_fired = la_raw is None  # : FIELD absence, not `la is None`
         if never_fired:
             la = hours_since(goal.get("created_at") or goal.get("created"))
         if never_fired or (la is not None and la >= interval and interval > 0):
@@ -2689,7 +3006,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     total_goals, done_goals = effective_counts(
         asp, exclude_statuses=ABANDONED_STATUSES)
     completion_ratio = done_goals / total_goals if total_goals > 0 else 0
-    # Completability factor (0; zeta rb-2384 / exp-0). Bare
+    # Completability factor (; zeta rb-2384 / exp-). Bare
     # completion_ratio² radiated near-max pressure FOREVER from never-completable
     # aspirations — recurring catch-alls (: recurring goals refill `total`
     # indefinitely so the ratio is pinned ~0.96) and blocked tails (:
@@ -2786,9 +3103,13 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     sq_overall = sq_aggregate.get("overall", 0.5)  # default neutral
     raw["skill_affinity"] = (sq_overall - 0.5) * 2  # maps [0,1] to [-1, +1]
 
-    # 13b. directive_boost (cross-agent priority influence from board directives)
-    raw["directive_boost"] = directive_boost_score(
-        goal.get("id", ""), category)
+    # 13b. directive_boost (cross-agent priority influence from board directives
+    # PLUS the standing user directive in team-state strategic_focus, ).
+    # Both are "someone with authority said this matters more"; they share the
+    # criterion and its 1.5 weight rather than splitting into two knobs.
+    raw["directive_boost"] = (
+        directive_boost_score(goal.get("id", ""), category)
+        + strategic_focus_boost(asp.get("id", ""), completion_ratio))
 
     # 13c. handoff_bonus (cross-agent handoff routing).
     # A planning/reviewer agent files implementer-targeted goals via
@@ -2913,7 +3234,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
             cbs_cfg["downstream_cap"],
         )
 
-    # 13f. opportunity_boost (5 restore): scoring teeth for the
+    # 13f. opportunity_boost ( restore): scoring teeth for the
     # standing pursue-opportunities user directive (ZDS meta-log 2026-06-18,
     #  signal). The original criterion was implemented prod-side in
     # ZDS-Mind and clobbered by the rb-498-era promotion — framework code
@@ -2947,7 +3268,7 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         total = iaus_score(raw, WEIGHTS, IAUS_CONFIG)["score"]
         total += raw["exploration_noise"] * noise_weight
     else:
-        # raw.get backstop (5): load_weights() already filters
+        # raw.get backstop (): load_weights() already filters
         # unknown keys, but a KNOWN criterion skipped by a future early-exit
         # path must degrade to 0-contribution, never KeyError selection dead.
         total = sum(raw.get(k, 0.0) * WEIGHTS[k] for k in WEIGHTS)
@@ -2963,6 +3284,15 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # instead of rendering them indistinguishably from native goals. None for
         # native goals -> no false badge.
         "cross_world_origin": goal.get("cross_world_origin"),
+        # : preserve intended_agent + derive routed_to_me so the target
+        # agent's LLM sees a cross-agent candidate is routed TO IT, not "someone
+        # else's goal". By collect_cross_agent_candidates' strict-match contract
+        # (intended_agent==agent_name), EVERY source='cross-agent:<owner>' candidate
+        # is routed to the selecting agent — so a 'cross-agent' not-my-lane abstention
+        # on it is ALWAYS wrong. Dropping the field made bravo abstain 13x from its
+        # own HIGH-routed .
+        "intended_agent": goal.get("intended_agent"),
+        "routed_to_me": bool((source or "").startswith("cross-agent:")),
         "skill": goal.get("skill"),
         "category": category,
         "tags": _ensure_list(goal.get("tags")),
@@ -3187,6 +3517,55 @@ def apply_substantive_demotion(scored, config):
 # Subcommands
 # ---------------------------------------------------------------------------
 
+def write_scorer_verdict(scored, agent_dir):
+    """Atomically record the scorer's top pick + top-5 to the per-agent session
+    verdict sidecar (Scorer Sovereignty Layer B, g-115-2812).
+
+    The claim chokepoint (aspirations-claim.sh -> scorer_verdict_gate.py) reads
+    this file to refuse unsanctioned divergence from the scorer's top pick. This
+    is a DETERMINISTIC-code writer (never the LLM). tempfile + os.replace gives
+    an atomic swap so a concurrent reader never sees a half-written verdict
+    (same durability pattern as the loop-state save).
+
+    FAIL-OPEN: any error is swallowed to stderr — a verdict-write failure must
+    never block selection output, and the claim gate independently fail-opens on
+    a missing/stale verdict, so the worst case of a write failure is that the
+    gate simply does not run this iteration.
+    """
+    if agent_dir is None or not scored:
+        return
+    try:
+        session_dir = agent_dir / "session"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        top = scored[0]
+        verdict = {
+            "top_goal_id": top.get("goal_id"),
+            "top_score": round(float(top.get("score") or 0.0), 4),
+            "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "top_5": [
+                {"goal_id": s.get("goal_id"), "score": round(float(s.get("score") or 0.0), 4)}
+                for s in scored[:5]
+            ],
+        }
+        target = session_dir / "scorer-verdict.json"
+        fd, tmp = tempfile.mkstemp(
+            dir=str(session_dir), prefix=".scorer-verdict-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(verdict, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, target)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:  # pragma: no cover - defensive; write must never block
+        print(f"[goal-selector] scorer-verdict write error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+
 def cmd_select(args):
     """Score and rank all unblocked goals from both world and agent queues.
 
@@ -3226,7 +3605,7 @@ def cmd_select(args):
     # (Mirrors the global goal_map approach already used by collect_blocked/trace_root_bottleneck.)
     all_aspirations = world_aspirations + agent_aspirations
     global_done_ids = set()
-    global_live_ids = set()  # non-terminal goals — dependency-liveness check (4)
+    global_live_ids = set()  # non-terminal goals — dependency-liveness check ()
     for asp in all_aspirations:
         if asp.get("status") != "active":
             continue
@@ -3287,10 +3666,10 @@ def cmd_select(args):
     # landed in the FILER's private queue and were invisible to the TARGET.
     # Strict-match contract: only intended_agent == AGENT_NAME pulls; "either"
     # and unset stay in their owner's queue. Fail-open per sibling.
-    # Gated by cross_agent_surfacing.enabled (ENABLED 2026-07-15, 8).
+    # Gated by cross_agent_surfacing.enabled (ENABLED 2026-07-15, ).
     # See load_cross_agent_surfacing_enabled() — the execution path is wired
     # (select Phase 2.95 split + execute Phase 4 owner env-prefix), so a surfaced
-    # sibling-queue goal claims under the owner's identity, no 404 (6 resolved).
+    # sibling-queue goal claims under the owner's identity, no 404 ( resolved).
     if AGENT_DIR is not None and CROSS_AGENT_SURFACING_ENABLED:
         candidates += collect_cross_agent_candidates(
             AGENT_DIR.parent, AGENT_DIR, AGENT_NAME,
@@ -3303,7 +3682,7 @@ def cmd_select(args):
             dependency_timeout_hours=dependency_timeout_hours,
             global_live_ids=global_live_ids)
     if not candidates:
-        # VERIFY-BEFORE-ASSUMING (5): all_blocked is a NEGATIVE,
+        # VERIFY-BEFORE-ASSUMING (): all_blocked is a NEGATIVE,
         # work-gating conclusion ("no executable goals exist"). The WORLD
         # aspirations file is on a synced network drive (OneDrive); a transient
         # stale/partial snapshot during sync can produce a valid-but-empty FIRST
@@ -3322,7 +3701,7 @@ def cmd_select(args):
         agent_retry = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
         all_aspirations_retry = world_retry + agent_retry
         global_done_ids_retry = set()
-        global_live_ids_retry = set()  # non-terminal goals (4)
+        global_live_ids_retry = set()  # non-terminal goals ()
         for asp in all_aspirations_retry:
             if asp.get("status") != "active":
                 continue
@@ -3395,7 +3774,7 @@ def cmd_select(args):
                 print("[]")
             return
 
-    # Per-runner capability filtering happens at COLLECTION time (0
+    # Per-runner capability filtering happens at COLLECTION time (
     # Slice 2): collect_candidates skips locally-unexecutable goals and
     # collect_blocked classifies them not_my_lane (same cached runner_caps, so
     # the two stay exact inverses). A fully capability-constrained box therefore
@@ -3459,6 +3838,25 @@ def cmd_select(args):
         "top_goal_id": scored[0]["goal_id"] if scored else None,
     })
 
+    # Scorer-verdict sidecar (Scorer Sovereignty Layer B, ): record the
+    # top pick + top-5 so the claim chokepoint can refuse unsanctioned divergence
+    # from the scorer's top pick. Deterministic writer, fail-open. Placed BEFORE
+    # the banner so it can never disturb the pinned emit_directive_honor_banner
+    # call site ( / test_goal_selector_directive_honor_banner.py).
+    write_scorer_verdict(scored, AGENT_DIR)
+
+    # DIRECTIVE-HONOR banner (guard-1310, ): stderr-only so the stdout
+    # JSON the orchestrator parses is untouched. Fires when an unacked directive
+    # directed at THIS agent targets a goal present in `scored`. Runs every
+    # iteration -> compaction cannot summarize it away (the Phase 2.07 LLM path
+    # can). Fail-open inside the helper; wrap defensively so a banner bug can
+    # never suppress the ranked-candidate output.
+    try:
+        emit_directive_honor_banner(scored, AGENT_NAME)
+    except Exception as e:  # pragma: no cover - defensive; banner must never block
+        print(f"[goal-selector] directive-honor banner error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
     print(json.dumps(scored, indent=2, ensure_ascii=False))
 
 
@@ -3503,7 +3901,7 @@ def cmd_blocked(args):
 
     # Build global done_ids + live_ids for cross-aspiration dependency resolution
     global_done_ids = set()
-    global_live_ids = set()  # non-terminal goals — dependency-liveness check (4)
+    global_live_ids = set()  # non-terminal goals — dependency-liveness check ()
     for asp in aspirations:
         if asp.get("status") != "active":
             continue

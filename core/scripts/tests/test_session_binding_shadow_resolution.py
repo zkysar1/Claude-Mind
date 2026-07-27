@@ -1,4 +1,4 @@
-"""test_session_binding_shadow_resolution.py — 4.
+"""test_session_binding_shadow_resolution.py — .
 
 Resolver-side defense for the binding-shadow class. The g-115-1814 fix guards
 the CREATION side (retire stale cross-agent binding.yaml at /start), but the

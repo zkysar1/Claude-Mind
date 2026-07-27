@@ -1,4 +1,4 @@
-"""Prose-verification-drift gate — daemon-safe shared extraction (4).
+"""Prose-verification-drift gate — daemon-safe shared extraction ().
 
 Goal descriptions that advertise "Verification outcomes:" / "Verification
 checks:" prose headers WITHOUT a corresponding structured verification.checks

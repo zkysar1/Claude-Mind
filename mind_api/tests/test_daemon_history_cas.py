@@ -1,4 +1,4 @@
-"""mind_api.src.history.snapshot — CAS-delta delegation contract (0/7).
+"""mind_api.src.history.snapshot — CAS-delta delegation contract (/).
 
 The daemon snapshot writer previously carried its own plain shutil.copy2
 body claiming byte-parity with _fileops.save_history; it drifted from the

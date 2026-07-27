@@ -3,9 +3,17 @@
 
 Aggregates `world/override-bypass-ledger.jsonl` entries by gate and by
 reason-cluster (simple keyword grouping), producing per-gate override
-counts, override-rate (vs `meta/gate-firings.jsonl` decision=override
-denominator), top reason clusters, and heuristic threshold-adjustment
-suggestions.
+counts, a ledger-to-firings CONSISTENCY ratio (ledger records vs
+`meta/gate-firings.jsonl` decision=override count — a cross-store
+audit-trail-integrity signal, NOT a bounded override fraction; can exceed
+1.0), top reason clusters, and heuristic threshold-adjustment suggestions.
+
+The BOUNDED override fraction (override / (block + override), in [0,1]) — the
+canonical "this gate is over-ridden a lot" metric and the source of the
+g-115-603 tighten trigger — lives in gate-retirement-eval.py and gate-stats.py.
+This analyzer intentionally does NOT recompute it (single source of truth); the
+ratio here answers a different question (are the two override-logging paths
+consistent?). See the note at analyze() (g-115-2790).
 
 Distinct from gate-stats.py: that script is a passive descriptive dashboard
 across the entire firings + ledger telemetry surface. This script is a
@@ -74,6 +82,17 @@ REASON_TAG_PATTERNS = [
     ("false-positive-prose", [r"false[- ]positive prose", r"false[- ]positive match"]),
     ("cross-lane-partner-pto", [r"partner on PTO", r"urgent.*partner"]),
     ("cross-lane-coordination", [r"cross-lane", r"capability-route"]),
+    # Clusters observed in the live ledger (, 2026-07-21). The
+    # justification field IS populated — the earlier "--tag path unused / 100%
+    # untagged" premise was stale; the true cause of the ~95% untagged share was
+    # this table lacking patterns for the dominant real reasons. "insight-trigger
+    # conversion" alone was ~30% of records and fell through to "untagged".
+    ("insight-trigger-conversion", [r"insight[- ]trigger conversion"]),
+    ("arc-planning", [r"validated arc\b", r"arc task/action boundary"]),
+    ("tree-contradiction-audit", [r"tree contradiction audit"]),
+    ("stale-claim-takeback", [r"stale[- ]claim take[- ]?back", r"intended_agent stale", r"dormant.*reallocation"]),
+    ("handoff-routing", [r"handoff_to="]),
+    ("test-fixture", [r"test[- ]fixture", r"test justification"]),
 ]
 
 
@@ -228,11 +247,21 @@ def analyze(days: int, gate_filter: str | None, top_k: int):
             per_gate_records[gate].append(rec)
             per_agent_gates[agent][gate] += 1
 
-    # Override-rate per gate: ledger_count / firings_decision_override_count.
-    # When the denominator is 0 (no firings logged with decision=override for
-    # that gate within the window), the rate is undefined — we report null
-    # rather than collapsing to 0 or 1, so consumers can distinguish "rate
-    # known to be low" from "no firings telemetry available."
+    # Ledger-to-firings CONSISTENCY ratio per gate: ledger_count /
+    # firings_decision_override_count. This is a cross-store AUDIT-INTEGRITY
+    # signal (how many override-bypass-ledger records exist per gate-side
+    # decision=override firing), NOT a bounded override fraction. It can exceed
+    # 1.0 — one bulk-override ledger record maps to many gate_ids, and cross-lane
+    # claims log to the ledger but not always to firings — so it is NOT
+    # comparable to the 0.5 tighten threshold. A ratio near 1.0 is healthy
+    # (every override logged in both stores); far from 1.0 flags a logging-path
+    # gap. The BOUNDED override fraction (override / (block + override), in
+    # [0,1]) that the  tighten trigger uses is computed in
+    # gate-retirement-eval.py / gate-stats.py — this analyzer does NOT recompute
+    # it (single source of truth). When the denominator is 0 (no decision=override
+    # firings for that gate in the window), the ratio is undefined — reported as
+    # null rather than collapsing to 0 or 1, so consumers can distinguish
+    # "ratio known to be low" from "no firings telemetry available." ()
     per_gate_rate: dict[str, dict] = {}
     for gate, count in per_gate_count.items():
         firings = firings_override_counts.get(gate, 0)
@@ -293,7 +322,7 @@ def analyze(days: int, gate_filter: str | None, top_k: int):
             gate: {
                 "ledger_count": per_gate_count[gate],
                 "firings_override_count": per_gate_rate[gate]["firings_override_count"],
-                "override_rate": per_gate_rate[gate]["rate"],
+                "ledger_to_firings_ratio": per_gate_rate[gate]["rate"],
                 "top_tags": dict(per_gate_tags[gate].most_common(5)),
             }
             for gate in per_gate_count
@@ -331,11 +360,12 @@ def render_human(result: dict) -> str:
             reverse=True,
         )
         for gate, stats in sorted_gates:
-            rate = stats["override_rate"]
-            rate_str = f"{rate:.1%}" if rate is not None else "n/a (no firings)"
+            ratio = stats["ledger_to_firings_ratio"]
+            ratio_str = f"{ratio:.2f}" if ratio is not None else "n/a (no firings)"
             lines.append(
                 f"  {gate}: {stats['ledger_count']} ledger overrides | "
-                f"firings={stats['firings_override_count']} | rate={rate_str}"
+                f"firings={stats['firings_override_count']} | "
+                f"ledger/firings ratio={ratio_str}"
             )
             if stats["top_tags"]:
                 tags_str = ", ".join(f"{t}={n}" for t, n in stats["top_tags"].items())

@@ -131,7 +131,7 @@ FAIL_OPEN_RECENCY_DAYS = 7  # fail_opens older than this are HISTORICAL, not a
                             # windows on recency so a long-resolved exception
                             # burst inside the --days window stops re-flagging
                             # every eval run (rb-1531 recency-windowing pattern;
-                            # 8 — origin-signal/capability/stale-read
+                            #  — origin-signal/capability/stale-read
                             # each carried a May fail_open burst, 0 in last 7d).
 TIGHTEN_RECENCY_DAYS = 7    # block/override firings older than this are
                             # HISTORICAL for the tighten signal. The tighten rule
@@ -141,8 +141,8 @@ TIGHTEN_RECENCY_DAYS = 7    # block/override firings older than this are
                             # PRE-fix high-override firings for ~--days, so the
                             # cumulative rate stays above threshold and the eval
                             # re-recommends tighten ~25d after the fix landed
-                            # (9: origin-signal-gate re-flagged at 50.2%
-                            # on 2026-06-16 though 9 fixed it 2026-06-14;
+                            # (: origin-signal-gate re-flagged at 50.2%
+                            # on 2026-06-16 though  fixed it 2026-06-14;
                             # verified post-fix rate 30.6%). Symmetric to
                             # FAIL_OPEN_RECENCY_DAYS (rb-1531 — cumulative
                             # counters are not current weaknesses): measure the
@@ -156,7 +156,7 @@ WIDEN_RECENCY_DAYS = 7      # noop/total firings older than this are HISTORICAL
                             # stays >= widen_threshold and the eval re-recommends
                             # widen long after the fix landed — the identical
                             # lagging-window staleness as tighten, mirror-imaged
-                            # (0, follow-on from 9). Symmetric
+                            # (, follow-on from ). Symmetric
                             # to TIGHTEN_RECENCY_DAYS / FAIL_OPEN_RECENCY_DAYS
                             # (rb-1931 — recency-window the recommendation signal,
                             # not just the cumulative rate): measure the CURRENT
@@ -279,13 +279,13 @@ def _gate_modified_epoch(script_str):
 # fail_open already falls through to the asymmetry rules.
 _INERT_CONVERTIBLE = ("retire", "tighten", "widen")
 
-# Cost-rank map for the all-noop cost-asymmetry downgrade (5).
+# Cost-rank map for the all-noop cost-asymmetry downgrade ().
 # Unknown / missing values rank None → the cost side contributes no downgrade
 # (fail toward pre-existing behavior; taxonomy drift adds a rank here, it
 # never silently flips a recommendation).
 _COST_RANK = {"low": 0, "medium": 1, "high": 2}
 
-# Minimum gate age before ACTION recommendations are trusted (5).
+# Minimum gate age before ACTION recommendations are trusted ().
 # An embedded per-goal-write classifier reaches MIN_TOTAL_FIRINGS in days —
 # volume is not maturity. Gates younger than min(--days, this) get their
 # action recommendation replaced by insufficient_data via
@@ -323,7 +323,7 @@ def _gate_registry_first_epoch(gid):
 
 
 def _apply_min_age_transform(scored, gate_age_days, window_days):
-    """Replace an action recommendation on a too-young gate (5).
+    """Replace an action recommendation on a too-young gate ().
 
     Pure function (no I/O) so the self-test can exercise it synthetically.
     `gate_age_days` None → age unknown (git + ledger both failed) → no
@@ -357,7 +357,7 @@ def _apply_min_age_transform(scored, gate_age_days, window_days):
 def _apply_inert_transform(scored, recent_total,
                            last_firing_epoch, last_firing_ts,
                            modified_epoch, modified_ts):
-    """Convert a stale action recommendation to inert_candidate (8).
+    """Convert a stale action recommendation to inert_candidate ().
 
     Pure function (no I/O) so the self-test can exercise it synthetically.
     Converts ONLY when ALL hold:
@@ -546,12 +546,12 @@ def _score_gate(gate, counts, min_fires,
         # preempts the widen path (unreachable when meaningful==0) and deletes a
         # guard that never had a chance to fire.
         #
-        # Cost-asymmetry key (5): dominant_risk is a LIKELIHOOD label
+        # Cost-asymmetry key (): dominant_risk is a LIKELIHOOD label
         # (which error mode is more probable), not a cost label — gates.yaml
         # registers e.g. removal-intent-verbs as FP because the strict matcher
         # over-matches, while its COST shape (fn_cost=medium > fp_cost=low) is
         # the same as the canonical FN gate. Keying the downgrade only on
-        # dominant_risk==FN retire-recommended that gate (1). Fire the
+        # dominant_risk==FN retire-recommended that gate (). Fire the
         # downgrade when EITHER key says the quiet side is the expensive side:
         # dominant_risk==FN OR fn_cost outranks fp_cost (rank low<medium<high;
         # unknown/missing ranks → no cost-side downgrade, taxonomy-drift-proof).
@@ -594,7 +594,7 @@ def _score_gate(gate, counts, min_fires,
         override_rate = override / bo_total
         evidence["override_rate"] = round(override_rate, 3)
         if override_rate > TIGHTEN_THRESHOLD and bo_total >= MIN_RATE_SAMPLES:
-            # Recency-improvement suppression (9). The full-window
+            # Recency-improvement suppression (). The full-window
             # override rate lags a fix by ~`--days`: a gate fixed inside the
             # window keeps its pre-fix high-override firings, so the cumulative
             # rate re-recommends tighten long after the fix landed. If the
@@ -649,7 +649,7 @@ def _score_gate(gate, counts, min_fires,
     if (noop_rate >= WIDEN_THRESHOLD
             and retirement_eligible
             and keyword_bias == "generous"):
-        # Recency-improvement suppression (0). The full-window noop
+        # Recency-improvement suppression (). The full-window noop
         # rate lags a widen fix by ~`--days`: a gate widened inside the window
         # keeps its pre-widen high-noop firings, so the cumulative rate
         # re-recommends widen long after the patterns were added. If the RECENT
@@ -770,11 +770,11 @@ def _self_test():
           "keyword_bias": "balanced", "dominant_risk": "FN"},
          Counter({"noop": 15}),
          "investigate"),
-        # Cost-asymmetry key (5, canonical gate removal-intent-verbs):
+        # Cost-asymmetry key (, canonical gate removal-intent-verbs):
         # dominant_risk=FP is a LIKELIHOOD label; the COST shape
         # (fn_cost=medium > fp_cost=low) says the quiet side is the expensive
         # side. The downgrade must fire on cost asymmetry independent of the
-        # dominant_risk label — this pins the exact 1 miss.
+        # dominant_risk label — this pins the exact  miss.
         ("fp-labeled-fn-costly-all-noop-investigate-not-retire",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "strict", "dominant_risk": "FP",
@@ -822,13 +822,13 @@ def _self_test():
           "keyword_bias": "strict"},
          Counter({"noop": 6, "block": 1, "override": 3}),
          "keep"),
-        # ── Tighten recency-improvement suppression (9) ──────────
+        # ── Tighten recency-improvement suppression () ──────────
         # Full-window override rate is high enough to tighten, but the RECENT
         # window (recent_counts, position 5) shows the rate dropped below
         # threshold with enough samples → the over-firing was fixed, the
         # cumulative rate is lag → suppress tighten, fall through to keep.
         # Mirrors the real origin-signal-gate case: full window 50%+, recent 7d
-        # 30.6% (11 override / 36) after 9 widened the whitelist.
+        # 30.6% (11 override / 36) after  widened the whitelist.
         ("tighten-suppressed-by-recent-improvement",
          {"id": "_test", "instrumented": True, "retirement_eligible": True,
           "keyword_bias": "strict"},
@@ -863,7 +863,7 @@ def _self_test():
           "keyword_bias": "balanced"},
          Counter({"noop": 62, "block": 3}),
          "keep"),
-        # ── Widen recency-improvement suppression (0) ─────────────
+        # ── Widen recency-improvement suppression () ─────────────
         # Full-window noop rate is high enough to widen, but the RECENT window
         # (recent_counts_widen, position 6) shows the noop rate dropped below
         # threshold with enough total firings → the gate now catches cases, the
@@ -904,7 +904,7 @@ def _self_test():
           "keyword_bias": "balanced"},
          Counter({"block": 1, "fail_open": 1}),
          "investigate"),
-        # Recency-windowed fail_open (rb-1531 / 8). 5-tuple: the
+        # Recency-windowed fail_open (rb-1531 / ). 5-tuple: the
         # trailing int is recent_fail_open (count within FAIL_OPEN_RECENCY_DAYS).
         # recent>0 → live bug → investigate (same verdict as the legacy case
         # above, but now driven by the recency split, not the cumulative count).
@@ -916,7 +916,7 @@ def _self_test():
         # recent==0 → every fail_open is HISTORICAL (older than the window).
         # The cumulative fail_open count is non-zero, but the gate has not
         # raised an exception lately — fall through to the normal asymmetry
-        # rules instead of re-flagging. This is the exact 8 fix: a
+        # rules instead of re-flagging. This is the exact  fix: a
         # gate carrying a long-resolved May fail_open burst must NOT investigate
         # forever. Counts mirror keep-balanced-firings + 5 historical fail_opens,
         # so the expected verdict is the same "keep".
@@ -941,7 +941,7 @@ def _self_test():
          Counter({"noop": 99}),
          "uninstrumented"),
     ]
-    # ── Inert-transform cases (8) ────────────────────────────────
+    # ── Inert-transform cases () ────────────────────────────────
     # Pure-function tests for _apply_inert_transform — no git, no telemetry.
     # Tuples: (label, scored-dict, recent_total, last_epoch, mod_epoch, expected).
     T0, T1 = 1000.0, 2000.0  # T1 strictly after T0
@@ -985,10 +985,10 @@ def _self_test():
         #       self-test contract)
         #   [5] recent_counts (optional Counter; None default — exercises the
         #       legacy "tighten fires on the full-window rate alone" branch,
-        #       9)
+        #       )
         #   [6] recent_counts_widen (optional Counter; None default — exercises
         #       the legacy "widen fires on the full-window noop rate alone"
-        #       branch, 0)
+        #       branch, )
         label, gate, counts, expected = case[0], case[1], case[2], case[3]
         recent = case[4] if len(case) > 4 else None
         recent_counts = case[5] if len(case) > 5 else None
@@ -1018,10 +1018,10 @@ def _self_test():
             failures += 1
         status = "PASS" if ok else "FAIL"
         print(f"  [{status}] {label}: expected={expected!r} actual={actual!r}")
-    # Min-age transform cases (5): pure-function checks mirroring the
+    # Min-age transform cases (): pure-function checks mirroring the
     # inert_cases pattern. (label, scored, gate_age_days, window_days, expected)
     min_age_cases = [
-        # 2.1d-old retire (the exact 1 shape) → insufficient_data.
+        # 2.1d-old retire (the exact  shape) → insufficient_data.
         ("min-age-young-retire-to-insufficient",
          {"recommendation": "retire", "reason": "r", "evidence": {}},
          2.1, 30, "insufficient_data"),
@@ -1103,15 +1103,15 @@ def main(argv=None):
     # Recency window for the fail_open trigger (rb-1531). A fail_open whose
     # ts is older than this is HISTORICAL (a long-resolved exception burst),
     # not a current bug — the investigate trigger windows on it so the eval
-    # stops re-flagging the same May burst every run (8).
+    # stops re-flagging the same May burst every run ().
     recency_cutoff = datetime.now() - timedelta(days=FAIL_OPEN_RECENCY_DAYS)
-    # Recency window for the tighten trigger (9). block/override
+    # Recency window for the tighten trigger (). block/override
     # firings older than this are HISTORICAL for the override-rate signal — a
     # gate fixed inside the --days window keeps its pre-fix high-override
     # firings, so the cumulative rate re-recommends tighten for ~--days after
     # the fix landed. recent_counts_per_gate measures the CURRENT rate (rb-1531).
     tighten_recency_cutoff = datetime.now() - timedelta(days=TIGHTEN_RECENCY_DAYS)
-    # Recency window for the widen trigger (0). noop/total firings
+    # Recency window for the widen trigger (). noop/total firings
     # older than this are HISTORICAL for the under-firing signal — a gate
     # widened inside the --days window keeps its pre-widen high-noop firings,
     # so the cumulative noop rate re-recommends widen for ~--days after the
@@ -1125,11 +1125,11 @@ def main(argv=None):
     recent_counts_widen_per_gate = {}   # ALL decisions within WIDEN_RECENCY_DAYS
     latest_ts_per_gate = {}             # ISO ts of the most recent firing (any
                                         # decision) — inert transform input
-                                        # (8); ISO sorts lexically
+                                        # (); ISO sorts lexically
     first_ts_per_gate = {}              # ISO ts of the EARLIEST in-window firing
                                         # — min-age transform's ledger fallback
-                                        # bound (5); a LOWER bound on
-                                        # true age (window + 4 month-
+                                        # bound (); a LOWER bound on
+                                        # true age (window +  month-
                                         # hole both truncate history)
     for rec in _load_firings(since):
         gid = rec.get("gate_id")
@@ -1153,12 +1153,12 @@ def main(argv=None):
         prev_first = first_ts_per_gate.get(gid)
         if prev_first is None or ts_raw < prev_first:
             first_ts_per_gate[gid] = ts_raw
-        # Tighten recency bucketing (9): count block/override within
+        # Tighten recency bucketing (): count block/override within
         # the tighten recency window. Only those two decisions feed the
         # override-rate suppression; noop/pass/fail_open are irrelevant to it.
         if ts >= tighten_recency_cutoff and dec in ("block", "override"):
             recent_counts_per_gate.setdefault(gid, Counter())[dec] += 1
-        # Widen recency bucketing (0): count ALL decisions within the
+        # Widen recency bucketing (): count ALL decisions within the
         # widen recency window. The widen noop-rate suppression needs recent
         # noop AND recent total, so unlike the tighten bucket (block/override
         # only) this captures every decision.
@@ -1186,12 +1186,12 @@ def main(argv=None):
             recent_counts=recent_counts_per_gate.get(gid, Counter()),
             recent_counts_widen=recent_counts_widen_per_gate.get(gid, Counter()))
         scored["gate_id"] = gid
-        # Min-age transform (5): lazy — the registry git probe runs
+        # Min-age transform (): lazy — the registry git probe runs
         # ONLY for gates that scored an action recommendation (typically 0-3
         # per run), and BEFORE the inert transform (a too-young gate should
         # not reach inert conversion either). Age source preference: registry
         # introduction commit (git -S on gates.yaml) — the firings ledger
-        # carries the 4 month-hole, so its first ts understates age
+        # carries the  month-hole, so its first ts understates age
         # exactly when this rule needs it. Ledger first-in-window ts is the
         # fail-open fallback bound when git is unavailable.
         if scored["recommendation"] in _MIN_AGE_CONVERTIBLE:
@@ -1212,7 +1212,7 @@ def main(argv=None):
                         "ledger-first-in-window-firing (lower bound; " \
                         "g-115-2294 month-hole caveat)"
             scored = _apply_min_age_transform(scored, age_days, args.days)
-        # Inert transform (8): lazy — the git probe runs ONLY for
+        # Inert transform (): lazy — the git probe runs ONLY for
         # gates that scored an action recommendation with zero recent-window
         # firings (typically 0-2 per run). recent_counts_widen already counts
         # ALL decisions in the recent window, so its sum is the recent total.

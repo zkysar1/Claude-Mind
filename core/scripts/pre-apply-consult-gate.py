@@ -97,9 +97,9 @@ FRAMEWORK_FILE_NEEDLES = (
     "claude.md",
 )
 
-# Structured second trigger (1). The needle scan above reads goal PROSE and
+# Structured second trigger (). The needle scan above reads goal PROSE and
 # therefore misses any goal that names its files bare rather than by full path --
-# 2 ("session_artifacts_count.py", "productivity-stop-gate.sh") did exactly
+#  ("session_artifacts_count.py", "productivity-stop-gate.sh") did exactly
 # that and slipped through. `category` is a field on the goal record, so it holds
 # regardless of how the author phrased the description.
 FRAMEWORK_CATEGORIES = frozenset({
@@ -173,7 +173,7 @@ def _detect_framework_refs(title: str, description: str):
 
 
 def _consult_already_done(agent: str, goal_id: str) -> bool:
-    """True when a retrieval was already recorded FOR THIS GOAL (1).
+    """True when a retrieval was already recorded FOR THIS GOAL ().
 
     `retrieval-session.json` is the same artifact iteration-close.sh's learning gate
     reads to emit `retrieval-summary: performed=<bool>` — so the gate that ASKS for the
@@ -249,15 +249,15 @@ def main(argv=None) -> int:
         # already landed the record, so this case is rare.
         return 0
 
-    # 1 — WIDENED. This used to `return 0` unless the goal was an INHERITED
+    #  — WIDENED. This used to `return 0` unless the goal was an INHERITED
     # cross-agent spec (handoff_from set and != agent). That scoped the gate to its
     # originating incident (, an Apply of another agent's spec) and left the
     # COMMON case completely uncovered: an agent skipping the consult on its OWN
     # framework goals.
     #
     # Measured (zeta, 2026-07-14): FOUR consecutive deep framework goals closed with
-    # `retrieval-summary: performed=false` — 4, 5, 9,
-    # 2. All four have handoff_from=None, so this gate was SILENT on every
+    # `retrieval-summary: performed=false` — , , ,
+    # . All four have handoff_from=None, so this gate was SILENT on every
     # one. The 4/4 miss rate was never evidence that "the advisory doesn't work"; the
     # advisory never ran. Cost of the gap, measured: guard-1077 was written at 17:25
     # and the exact incident it describes was then re-derived from scratch by an hour
@@ -275,10 +275,10 @@ def main(argv=None) -> int:
     description = (goal.get("description") or "").strip()
     hits = _detect_framework_refs(title, description)
 
-    # 1 — the needle scan reads the goal's PROSE, which is fragile: a goal
+    #  — the needle scan reads the goal's PROSE, which is fragile: a goal
     # that names its files bare ("session_artifacts_count.py", "productivity-stop-
     # gate.sh") rather than by full path matches NOTHING. That is not hypothetical --
-    # 2 was written exactly that way and slipped through the widened gate on
+    #  was written exactly that way and slipped through the widened gate on
     # its first positive-control run. `category` is a STRUCTURED field on the goal
     # record, so it does not depend on how the author happened to phrase the prose.
     category = (goal.get("category") or "").strip().lower()
@@ -311,7 +311,7 @@ def main(argv=None) -> int:
     out.write(f"Goal:        {goal_id}\n")
     out.write(f"Title:       {one_line}\n")
     if inherited:
-        # Escalator, not a gate (1). An inherited spec carries the extra
+        # Escalator, not a gate (). An inherited spec carries the extra
         # hazard of rb-987: a test suite that pins the spec pins its violation too.
         out.write(f"INHERITED:   handoff_from={handoff_from} (current agent: {agent})\n")
         out.write("             ^ an inherited spec may CONTRADICT a guardrail you\n")
@@ -329,7 +329,7 @@ def main(argv=None) -> int:
     out.write("NOT falsify a guard violation.\n")
     out.write("\n")
     out.write("Recommended invocation:\n")
-    # --goal is LOAD-BEARING (1). Without it, retrieve.sh does the retrieval
+    # --goal is LOAD-BEARING (). Without it, retrieve.sh does the retrieval
     # but never records it against THIS goal, so:
     #   * iteration-close.sh:1398 (which credits on goal_id match) writes a
     #     `performed=false` stub -- the consult you actually did is logged as a MISS;

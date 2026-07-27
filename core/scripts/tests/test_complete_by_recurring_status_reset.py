@@ -1,4 +1,4 @@
-"""test_complete_by_recurring_status_reset.py — 6 regression test.
+"""test_complete_by_recurring_status_reset.py —  regression test.
 
 Pins the RECURRING-GOAL STATUS RESET invariant of the complete-by daemon
 handler (mind_api/src/endpoints/aspirations_write.py::complete_by):
@@ -154,7 +154,7 @@ def _complete_by(goal_id: str, agent: str = "alpha") -> None:
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 def test_recurring_complete_by_resets_status_to_pending():
-    """The core 6 invariant: a recurring goal cycles back to
+    """The core  invariant: a recurring goal cycles back to
     status="pending" (NOT stuck in-progress, NOT terminal completed), with
     achievedCount incremented and the claim released."""
     with tempfile.TemporaryDirectory() as tmpd:

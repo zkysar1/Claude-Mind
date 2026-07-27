@@ -72,7 +72,7 @@ class TestTreeSyncCheckAgentInject(unittest.TestCase):
         # from this conf. Pointing them at the real PROJECT_ROOT/{world,meta}
         # let every run leak telemetry into the repo root, surviving tearDown
         # (which only rmtree's agent_dir). Sandboxing under agent_dir means
-        # tearDown's existing rmtree cleans the telemetry too. (5 —
+        # tearDown's existing rmtree cleans the telemetry too. ( —
         # orphan-root cruft; same pollution class as guard-652 l1-pick-log
         # isolation, but via the local-paths.conf mechanism rather than env.)
         self.sandbox_world = self.agent_dir / "world"

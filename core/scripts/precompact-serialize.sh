@@ -83,7 +83,7 @@ while [ "$WAITED" -lt 60 ]; do
         # "compact has been running >60 min" rather than the pre-fix
         # "no iteration BLOCK in >60 min" — which false-positive-fired during
         # deep Phase 4 work that ran >60 min without a phase boundary
-        # (canonical incident: 2026-05-22 delta 7 Phase 4 = 1h 31m,
+        # (canonical incident: 2026-05-22 delta  Phase 4 = 1h 31m,
         # compact-pending mtime crossed 60-min threshold at 17:02:31 with no
         # autocompact actually running).
         mkdir -p "$(agent_dir "$MY_AGENT")/session" 2>/dev/null || true

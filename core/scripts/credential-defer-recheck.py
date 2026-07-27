@@ -53,6 +53,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
 import _rt
 from _paths import WORLD_DIR
@@ -125,8 +126,9 @@ def _extract_env_key(defer_reason: str) -> str | None:
 def _probe_env_key(key: str) -> bool:
     """Return True iff env-read.sh reports the key as present (exit 0)."""
     env_read = SCRIPT_DIR / "env-read.sh"
+    from _runtime_bash import BASH  # rb-1472: not bare "bash"
     result = subprocess.run(
-        ["bash", str(env_read), "has", key],
+        [BASH, str(env_read), "has", key],
         capture_output=True,
         timeout=10,
     )
@@ -161,7 +163,7 @@ def _age_hours(ts: str | None) -> float | None:
     if not ts:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        t = parse_naive_iso(ts)
         return (dt.datetime.now() - t).total_seconds() / 3600
     except Exception:
         return None

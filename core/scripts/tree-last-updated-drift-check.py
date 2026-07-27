@@ -137,7 +137,7 @@ def cmd_audit(exit_on_ahead, full=False):
         "sample_index_stale": sorted(r["index_stale"], key=lambda x: x["idx"])[:8],
     }
     if full:
-        # 0: emit the COMPLETE lists (not just the capped [:8] samples)
+        # : emit the COMPLETE lists (not just the capped [:8] samples)
         # so a hypothesis resolution_method can evaluate every entry against the
         # full set. The full sets are already computed by _classify; this only
         # changes what is serialized at output.

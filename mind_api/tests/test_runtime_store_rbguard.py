@@ -172,7 +172,7 @@ def test_rb_append_defaults_applied(running_daemon):
 
 
 def test_rb_append_history_and_changelog(running_daemon):
-    # 0: history.snapshot delegates to _fileops.save_history, whose
+    # : history.snapshot delegates to _fileops.save_history, whose
     # Stage-2 authoritative store is the CAS-delta layout — assert a manifest
     # lands under .history/snapshots/<rel>/ instead of the legacy per-file
     # uncompressed tree (which is no longer written by default).
@@ -191,7 +191,7 @@ def test_rb_append_history_and_changelog(running_daemon):
     assert len(manifests) == 1
     assert manifests[0].name.endswith("_alpha.yaml")
     # The legacy uncompressed tree must NOT be re-created (the 13.9G/4days
-    # growth shape the 0 unification killed).
+    # growth shape the  unification killed).
     assert not legacy_dir.exists()
     entries = _read_jsonl(cl)
     assert any("store-append reasoning-bank" in (e.get("summary", "") or "")
@@ -279,7 +279,7 @@ def test_rb_set_field_recomputes_on_utilization(running_daemon):
                           "value": util})
     assert status == 200
     rec = json.loads(body)["record"]
-    # 9 smoothed formula: (5 + 0.5*2) / (max(10, 5+2) + 1) = 6/11 = 0.5455
+    #  smoothed formula: (5 + 0.5*2) / (max(10, 5+2) + 1) = 6/11 = 0.5455
     assert rec["utilization"]["utilization_score"] == pytest.approx(0.5455)
 
 
@@ -297,7 +297,7 @@ def test_rb_increment_counter(running_daemon):
     assert status == 200
     rec = json.loads(body)["record"]
     assert rec["utilization"]["times_helpful"] == 4
-    # 9 smoothed formula: (4 + 0.5*0) / (max(5, 4) + 1) = 4/6 = 0.6667
+    #  smoothed formula: (4 + 0.5*0) / (max(5, 4) + 1) = 4/6 = 0.6667
     assert rec["utilization"]["utilization_score"] == pytest.approx(0.6667)
 
     on_disk = next(r for r in _read_jsonl(_rb_path(project_root))
@@ -408,7 +408,7 @@ def test_guard_append_defaults_applied(running_daemon):
 
 
 def test_guard_append_history_and_changelog(running_daemon):
-    # 0: CAS-delta manifest shape, not the legacy per-file tree —
+    # : CAS-delta manifest shape, not the legacy per-file tree —
     # see test_rb_append_history_and_changelog for the full rationale.
     project_root, port = running_daemon
     manifest_dir = (project_root / "world" / ".history" / "snapshots"
@@ -500,7 +500,7 @@ def test_guard_increment_counter(running_daemon):
     assert status == 200
     rec = json.loads(body)["record"]
     assert rec["utilization"]["times_helpful"] == 1
-    # 9 smoothed formula: (1 + 0.5*0) / (max(0, 1) + 1) = 1/2 = 0.5
+    #  smoothed formula: (1 + 0.5*0) / (max(0, 1) + 1) = 1/2 = 0.5
     assert rec["utilization"]["utilization_score"] == pytest.approx(0.5)
 
     on_disk = next(r for r in _read_jsonl(_guard_path(project_root))

@@ -42,7 +42,7 @@ _WORLD = _TMPDIR / "world"
 # META_DIR/l1-pick-log.jsonl on every add-child/set. Without MIND_META set in
 # _run_tree, those writes hit the REAL meta dir — the 'new-child' test key
 # polluted 840/896 production l1-pick-log entries, starving the S9/S7 L1-skew
-# signal (0).
+# signal ().
 _META = _TMPDIR / "meta"
 _TREE_DIR = _WORLD / "knowledge" / "tree"
 _TREE_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,7 @@ def _run_tree(args, stdin_text=None):
     """Invoke tree.py with the configured WORLD_DIR pointing at our tmp."""
     env = dict(os.environ)
     env["MIND_WORLD"] = str(_WORLD)
-    env["MIND_META"] = str(_META)  # isolate l1-pick-log writes to tmp (0)
+    env["MIND_META"] = str(_META)  # isolate l1-pick-log writes to tmp ()
     env.pop("MIND_AGENT", None)
     return subprocess.run(
         [PYTHON, str(TREE_PY)] + args,
@@ -204,7 +204,7 @@ def test_cmd_add_child_falls_back_to_explore_when_parent_lacks_capability():
 # ---------------------------------------------------------------------------
 
 def test_cmd_set_does_not_bump_last_updated():
-    """3 (Option B): a metadata `--set <key> summary <new>` does NOT
+    """ (Option B): a metadata `--set <key> summary <new>` does NOT
     auto-bump per-node last_updated — it stays at its seeded value. The node
     .md front matter is the single source of truth (g-001-67); the _tree.yaml
     index last_updated is synced to it ONLY by tree-front-matter-sync.py (the

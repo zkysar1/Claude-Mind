@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""recompute-utilization-scores.py — one-shot backfill for 9.
+"""recompute-utilization-scores.py — one-shot backfill for .
 
 Re-runs recompute_utilization_score over every reasoning-bank and guardrail
 record so stored utilization_score / utilization_score_v2 values reflect the

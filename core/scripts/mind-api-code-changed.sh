@@ -29,7 +29,7 @@
 #      now breaks a test instead of silently serving stale code. Run that test
 #      after ANY new import in mind_api/src or in a module it loads.
 #
-#      The 5 modules added 2026-07-14 (5) were ALL missing while being
+#      The 5 modules added 2026-07-14 () were ALL missing while being
 #      loaded. A grep of top-of-file imports does NOT find them and that is
 #      exactly how the gap survived — most are lazy in-function imports:
 #        coordination_merge <- owncloud_backend.py:122 (LAZY; owns _union_goals +
@@ -53,7 +53,7 @@
 #      need ("pure churn"). Left in deliberately — removing an entry moves AWAY
 #      from the fail-toward-restart guarantee and deserves its own goal, not a
 #      drive-by delete. The test allowlists it as a known over-inclusion.
-#      owncloud_backend.py added 2026-07-14 (0). It was MISSING while
+#      owncloud_backend.py added 2026-07-14 (). It was MISSING while
 #      being TRANSITIVELY loaded: storage_backend.py (in the list) instantiates
 #      OwnCloudBackend.from_env() at import-use, so the daemon holds this module
 #      in-process. A commit touching ONLY owncloud_backend.py therefore diffed
@@ -86,7 +86,7 @@
 #       restart-on-merge trigger (merges bypass post-commit; ORIG_HEAD is the
 #       pre-merge HEAD, so the FULL merged range — including fast-forwards
 #       that move HEAD by N commits with no merge commit — is diffed, which
-#       HEAD~1 would miss). 5.
+#       HEAD~1 would miss). .
 #   - core/scripts/_runtime.sh rt_check_staleness   BASE = daemon's running
 #       /v1/admin/health git_head_sha
 #       narrows the  stale-code auto-restart so a docs/world-only

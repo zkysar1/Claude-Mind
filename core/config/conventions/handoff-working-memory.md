@@ -148,15 +148,33 @@ slots:
         attempted_fix: null
 ```
 
+**Two writers produce these entries** — `core/scripts/create-blocker.py` (the
+canonical CREATE_BLOCKER path) and `core/scripts/infra-health.py` (streak
+alerts, `blocker_id` prefixed `streak-`). Both now emit the canonical keys
+below. Until g-115-3348 create-blocker.py alone wrote `id`/`created_at`/
+`failure_reason` instead of `blocker_id`/`detected_at`/`reason`, which made
+blockers born there invisible to EVERY reader at once (aged-blocker recheck,
+proactive user escalation, and goal-selector's block-reason renderer). It now
+emits both spellings; the legacy trio is retained only so blockers already in
+agents' working memories stay readable. **Readers must tolerate the legacy
+names** (`blocker_id or id`, `detected_at or created_at`, `reason or
+failure_reason`) until fleet blockers have cycled — and must NOT be "fixed" by
+flipping to the legacy names, which would break infra-health.py's entries.
+
 Fields:
-- `blocker_id` — `infra-{skill-slug}-{date}` or user goal ID
+- `blocker_id` — `infra-{skill-slug}-{date}` or user goal ID. Legacy alias: `id`
 - `reason` — human-readable description
 - `type` — `infrastructure` | `resource` | `user_action`
 - `affected_skills` — list of skill paths
 - `affected_categories` — list of goal categories (optional). When a goal has skill=null, goal-selector falls back to checking if goal.category matches. Secondary to affected_skills.
 - `affected_goals` — list of goal IDs (appended as new goals hit this blocker)
 - `unblocking_goal` — goal ID created to resolve this blocker (null for legacy backfills)
-- `detected_session`, `detected_at` — when first detected
+- `detected_session`, `detected_at` — when first detected. Legacy alias for
+  `detected_at`: `created_at`. Both writers stamp `detected_at` at record
+  creation; infra-health.py CARRIES IT FORWARD across its re-derivation sweep
+  (it rebuilds `streak-*` entries every run, so re-stamping would reset the age
+  each sync and the blocker could never age into a recheck or escalation)
+- `reason` — human-readable description. Legacy alias: `failure_reason`
 - `resolution` — null (active) or string describing how it was resolved
 - `diagnostic_context` — object with `error_emails` (count), `cascade_chain` (report or null), `attempted_fix` (description or null)
 

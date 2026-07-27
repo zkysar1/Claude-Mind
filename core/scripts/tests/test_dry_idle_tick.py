@@ -1,4 +1,4 @@
-"""Integration tests for dry-idle Layer 3 (4-c).
+"""Integration tests for dry-idle Layer 3 (-c).
 
 Two halves:
   1. dry-idle-tick.py engine -- subprocess against an isolated MIND_AGENT_DIR
@@ -37,13 +37,13 @@ def _seed_wm(tmpdir: Path, goals_items=None, dry_idle=None) -> Path:
         signals["dry_idle"] = dry_idle
     wm = {
         # Top-level canonical LIST (dicts with _item_ts) — the field
-        # _interlude_happened reads (8). Matches production wm shape.
+        # _interlude_happened reads (). Matches production wm shape.
         "goals_completed_this_session": goals_items or [],
         "slots": {
             "loop_state": {
                 "goals_completed": 5,
                 # INT counter here (NOT the list) — mirrors production AND guards
-                # the 8 regression: if _interlude_happened ever reverts to
+                # the  regression: if _interlude_happened ever reverts to
                 # reading THIS field, `for item in <int>` raises TypeError.
                 "goals_completed_this_session": len(goals_items or []),
                 "signals": signals,

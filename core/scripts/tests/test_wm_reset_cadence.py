@@ -52,7 +52,7 @@ def main() -> int:
         # AGENT_DIR/session/working-memory.yaml), NOT the module attribute. The
         # old wm.WM_PATH=tmp patch left cmd_init/cmd_reset targeting the REAL
         # bound agent's WM -- running this under MIND_AGENT clobbered live
-        # working memory. (6, 2026-06-23)
+        # working memory. (, 2026-06-23)
         original_body = os.environ.get("BODY_WM_PATH")
         os.environ["BODY_WM_PATH"] = str(tmp / "working-memory.yaml")
         try:
@@ -81,7 +81,7 @@ def main() -> int:
                 "test_marker_a": "remove_me",
             }
             # RESET_SURVIVING_SLOTS member — content payload (not a timestamp),
-            # written pre-reset and consumed post-reset (2).
+            # written pre-reset and consumed post-reset ().
             surviving_slots = {
                 "journal_cluster_summaries": [
                     {"label": "asp-115", "summary": "framework fixes cluster"},
@@ -145,7 +145,7 @@ def main() -> int:
                 )
 
             # 7. Verify RESET_SURVIVING_SLOTS members survived with value + meta
-            #    (2 — journal_cluster_summaries crosses the reset boundary)
+            #    ( — journal_cluster_summaries crosses the reset boundary)
             for k, expected in surviving_slots.items():
                 actual = after["slots"].get(k)
                 if actual != expected:
@@ -185,7 +185,7 @@ def test_wm_reset_cadence_preservation():
 
 # Constants wm_write.py hand-mirrors from wm.py. A one-sided edit to ANY of
 # them silently diverges CLI-vs-daemon reset/maintain behavior (rb-915 class;
-# 2 hit RESET_SURVIVING_SLOTS, 2 pins the other five).
+#  hit RESET_SURVIVING_SLOTS,  pins the other five).
 SHARED_WM_CONSTANTS = (
     "SESSION_IDENTITY_FIELDS",
     "DEFAULT_SLOT_TYPES",
@@ -267,7 +267,7 @@ def test_shared_wm_constants_parity_with_daemon():
 
 
 def test_daemon_reset_endpoint_preserves_surviving_slot():
-    """2 (2): actual endpoint invocation. POST /v1/wm/reset against an
+    """ (2): actual endpoint invocation. POST /v1/wm/reset against an
     in-process daemon (thread-local, tmp project root — hermetic, no
     daemon_integration marker needed) must preserve journal_cluster_summaries
     value + slot_meta AND a cadence tracker, null a canary slot, keep

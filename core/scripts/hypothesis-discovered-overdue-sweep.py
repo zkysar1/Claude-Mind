@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep discovered-stage hypotheses orphaned past their deadline (9;
+"""Sweep discovered-stage hypotheses orphaned past their deadline (;
 formed_date+horizon fallback g-115-1981).
 
 review-hypotheses/SKILL.md Mode 1 Step 1 loads `--stage active` +
@@ -75,12 +75,12 @@ from pipeline import validate_formation_quality  # noqa: E402  (gate mirror)
 DEFAULT_EXPIRE_DAYS_SHORT = 30
 DEFAULT_EXPIRE_DAYS_LONG = 90
 
-# 1: when a discovered record has NO parseable resolves_by, fall back to
+# : when a discovered record has NO parseable resolves_by, fall back to
 # formed_date + the horizon's expected resolution window to synthesize an
 # effective deadline. Without this fallback, resolves_by-absent records -- the
 # majority, since most discovered hypotheses are drafted without a resolves_by --
 # were skipped entirely and never swept, silently accumulating in the discovered
-# stage (the manual cleanup that motivated this: 6 triaged 165 such
+# stage (the manual cleanup that motivated this:  triaged 165 such
 # records by hand). Windows are "time from formation until the prediction should
 # be settleable": a micro hypothesis resolves within a day, a long one over months.
 HORIZON_WINDOW_DAYS = {"micro": 1, "session": 3, "short": 14, "long": 90}

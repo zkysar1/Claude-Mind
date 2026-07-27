@@ -1,4 +1,4 @@
-"""Regression tests for 5: experience archive-goal must not consume
+"""Regression tests for : experience archive-goal must not consume
 the caller's trace file on a post-copy validation failure.
 
 The old ordering (os.replace BEFORE _validate_record) made every failed

@@ -9,11 +9,28 @@ Experience records store full-fidelity interaction traces in JSONL with script-b
 - `agents/<agent>/experience/{id}.md` — Full content files (one per experience)
 
 ## Record Schema
-Required: `id`, `type`, `created`, `category`, `summary`, `content_path`
+**Caller MUST supply** (`REQUIRED_FIELDS`, `experience.py:72`): `id`, `type`,
+`category`, `summary`, `content_path`. Omitting any returns
+`{"error":"validation_failed","detail":"Missing required fields: {...}"}`.
+
+**Script-owned — caller MUST NOT supply**: `created`. It is stamped at add time
+from the system clock (`_stamp_now`, `experience.py:441`); any stdin value is
+overwritten, and `update-field` rejects `field == "created"`. (This line
+previously listed `created` under "Required", which told callers to supply a
+field they must not supply — corrected 2026-07-21, g-115-2847.)
+
+`content_path` must point to a file that EXISTS ON DISK at add time
+(`experience.py:212-214`) — write the `.md` before calling the script.
+
 Default: `goal_id` (null), `hypothesis_id` (null), `tree_nodes_related` ([]), `verbatim_anchors` ([]), `retrieval_stats` (zeros), `archived` (false), `archived_date` (null)
 
 ID format: `exp-{source-id-or-slug}` (regex: `^exp-[a-z0-9._-]+$`)
-Valid types: `goal_execution`, `hypothesis_formation`, `research`, `reflection`, `user_correction`, `user_interaction`, `execution_reflection`
+Valid types: `goal_execution`, `hypothesis_formation`, `research`, `reflection`, `user_correction`, `user_interaction`, `execution_reflection`, `chat_session`
+
+> **Validation failures are easy to miss.** The error object is valid JSON, so a
+> caller reading `.id` off the response gets `None` and can report success while
+> nothing was written. Confirm with
+> `grep -c "<experience_id>" agents/<agent>/experience.jsonl` → `1`.
 
 Element schemas (enforced by `experience-add.sh` validation):
 - `verbatim_anchors` — list of `{key, content}` objects, NOT plain strings.

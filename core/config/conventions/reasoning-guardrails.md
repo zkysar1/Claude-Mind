@@ -37,7 +37,7 @@ values surface under `guardrail_candidates_unfiled` as an opportunity queue,
 not a schema error. Mining candidate-form prose into real guardrails drains
 the queue over time without forced migration.
 
-ID format: `rb-NNN` (zero-padded 3-digit, regex: `^rb-\d{3}$`)
+ID format: `rb-NNN` (regex: `^rb-\d+$`, open-ended per guard-1161; new IDs zero-padded to 3+ digits, but legacy sub-3-digit record IDs exist, e.g. rb-1)
 Valid types: `success`, `failure`, `user_provided`
 Valid statuses: `active`, `retired`
 Valid `entry_type`: `procedure` (or null — the default)
@@ -98,13 +98,19 @@ Guardrails use JSONL (one JSON object per line) with script-based access:
 ## Record Schema
 Required: `id`, `rule`, `category`, `trigger_condition`, `source`, `created`
 Defaults: `status` ("active"), `utilization` ({`times_active`: 0, `times_skipped`: 0, `times_helpful`: 0, `times_noise`: 0, `retrieval_count`: 0, `utilization_score`: 0.0}). Authoritative field list: `core/scripts/reasoning-bank.py` `UTILIZATION_COUNTERS`. No top-level `times_triggered` — that field belongs to `pattern-signatures.jsonl`, not guardrails.
-Optional: `tags`, `related_patterns`, `violation_history`, `experience_ref`
+Optional: `tags`, `title`, `when_to_use`, `severity`, `action_hint`, `phases`, `context_triggers`, `trigger_pattern`, `experience_ref`, `source_reflection_id`, `auto_flagged_for_review`, `next_review_eligible_at`, `valid_from`, `valid_to`, `retirement_date`, `retirement_reason`
+
+`related_patterns` and `violation_history` are **NOT** guardrail fields — `guardrails-add.sh` rejects both with `validation_failed: Unknown field(s)`. They were documented here in error. The authoritative allowlist is `GUARD_KNOWN_FIELDS` in `mind_api/src/store_registry.py` (~L301; its L487 raises the error), mirrored CLI-side in `core/scripts/reasoning-bank.py` (~L195) — extend BOTH in sync or not at all.
+
+`related_patterns` is not merely unlisted, it is *deliberately* excluded: the `reasoning-bank.py` comment above the allowlist names it among the fields that "drifted into legacy records … their writers either don't exist anymore or write junk that health metrics downstream can't interpret" (alongside `type`, `context`, top-level `times_triggered`, `phase`, `applies_to`, `content`, `evidence`). Measured 2026-07-26 (g-335-266): across 1279 active guardrails `related_patterns` appears on **1** legacy record and `violation_history` on **0** — the same pre-validator stray class as the `times_triggered` note above.
+
+To cross-link a guardrail to reasoning-bank entries, put the IDs in `tags` or name them inline in the `rule` text. (`related_entries` is the **reasoning-bank** record's linkage field — that is the one this line was likely confused with.)
 
 `experience_ref` (format `exp-SLUG`, see `experience.md`) links the
 prescriptive rule to the full-fidelity trace it was learned from. Same
 schema and semantics as on reasoning-bank records. Optional.
 
-ID format: `guard-NNN` (zero-padded 3-digit, regex: `^guard-\d{3}$`)
+ID format: `guard-NNN` (regex: `^guard-\d+$`, open-ended per guard-1161; new IDs zero-padded to 3+ digits, but legacy sub-3-digit record IDs exist, e.g. guard-97)
 Valid statuses: `active`, `retired`
 
 ## Script-Based Access (Exclusive Data Layer)

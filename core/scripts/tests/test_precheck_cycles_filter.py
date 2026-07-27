@@ -113,7 +113,7 @@ def test_all_unblock_skips_no_cycle():
 def test_genuine_repeated_failure_still_detected():
     """3 skipped non-Unblock goals → repeated_failure cycle fires."""
     goals = [
-        # 5: a GENUINE repeated failure was ATTEMPTED then skipped, so it
+        # : a GENUINE repeated failure was ATTEMPTED then skipped, so it
         # carries the claim-time `started` marker. A skip WITHOUT `started` is
         # WITHDRAWN work (test_never_attempted_skips_no_cycle), not failure.
         {"id": f"g-test-{i}", "status": "skipped", "title": f"Apply: something {i}",
@@ -132,7 +132,7 @@ def test_genuine_repeated_failure_still_detected():
 
 
 def test_never_attempted_skips_no_cycle():
-    """5: 3 skipped NON-Unblock goals with NO `started` marker (never
+    """: 3 skipped NON-Unblock goals with NO `started` marker (never
     attempted — WITHDRAWN: duplicate/superseded/obsolete) → NO repeated_failure.
 
     Regression lock for the g-115-2175 fix: a failure requires an attempt, and
@@ -159,7 +159,7 @@ def test_never_attempted_skips_no_cycle():
 
 
 def test_synthetic_skips_fire_post_removal():
-    """1: synthetic-tagged skips are NO LONGER specially excluded.
+    """: synthetic-tagged skips are NO LONGER specially excluded.
 
     The dead g-115-615 tag branch was removed. 3 skipped goals fire
     repeated_failure like any non-Unblock skip — even with `tags` present in
@@ -168,7 +168,7 @@ def test_synthetic_skips_fire_post_removal():
     """
     goals = [
         {"id": f"g-test-{i}", "status": "skipped", "title": f"Wire test {i}",
-         # 5: attempted-then-skipped carries `started` (this test's point
+         # : attempted-then-skipped carries `started` (this test's point
          # is that `tags` don't exclude — not the never-attempted rule).
          "started": "2026-07-14T10:00:00",
          "tags": ["synthetic", "wire-test"], "category": "framework-self-improvement"}
@@ -184,7 +184,7 @@ def test_synthetic_skips_fire_post_removal():
 
 
 def test_cmd_cycles_through_real_projection():
-    """1 REQUIRED: cmd_cycles on a real-projection compact, not hand-injected dicts.
+    """ REQUIRED: cmd_cycles on a real-projection compact, not hand-injected dicts.
 
     Pins (1) the live projection strips `tags` (so any tag-based cmd_cycles
     exclusion is dead), and (2) the title-based Unblock: exclusion survives the
@@ -293,7 +293,7 @@ def _velocity_fixture(work_classes):
 
 
 def test_all_product_window_no_velocity_cycle():
-    """2 (rb-3820): 3 completed work_class=product goals, velocity 0
+    """ (rb-3820): 3 completed work_class=product goals, velocity 0
     → NO zero_learning_velocity. Product deliverables are sibling-repo commits,
     invisible to all five velocity counters — the zero is expected, not a stall.
     Canonical: asp-335 flagged during Vinheim/Lodestar Fix-close stretches."""
@@ -308,7 +308,7 @@ def test_all_product_window_no_velocity_cycle():
 
 
 def test_mixed_class_window_velocity_cycle_fires():
-    """Control for 2: a MIXED window (2 product + 1 framework) with
+    """Control for : a MIXED window (2 product + 1 framework) with
     velocity 0 still fires — strict all() keeps the detector live, and this
     proves the monkeypatched probe actually reaches the firing branch (making
     the all-product no-fire above meaningful, not a fixture artifact)."""

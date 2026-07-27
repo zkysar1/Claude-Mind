@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # fleet-reconcile-preflight.sh — READ-ONLY preflight probe for a fleet fork
-# reconciliation (forged-skill companion, gap-15 / 4).
+# reconciliation (forged-skill companion, gap-15 / ).
 #
 # Emits a single JSON object measuring everything the reconcile playbook
 # (world/knowledge/tree/system/fleet-git-divergence-reconciliation.md, sig-29,

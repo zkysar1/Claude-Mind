@@ -1,4 +1,4 @@
-"""test_goal_selector_team_state_parse_or_restore.py -- 8 / rb-2429 regression.
+"""test_goal_selector_team_state_parse_or_restore.py --  / rb-2429 regression.
 
 _load_team_state_cached must NOT crash the whole selector when it reads a
 partial/truncated team-state.yaml. team-state.yaml is written by every agent via

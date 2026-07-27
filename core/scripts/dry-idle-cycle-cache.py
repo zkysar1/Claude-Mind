@@ -50,6 +50,13 @@ Safety (why a short-circuit cannot strand executable work or mask drift):
   - timer horizon: if the soonest defer/recurring/blocker timer is elapsed OR
     within MIN_SHORTCIRCUIT_S, a goal may now be executable -> MISS (and the
     emitted sleep is capped at that horizon so we never oversleep it).
+  - baseline-timer horizon (g-115-3033): the freshly-rescanned horizon above can
+    silently shift LATER when the soonest goal DROPS OUT of the scan between write
+    and check -- notably a recurring goal whose next-due ELAPSES (future-only guard
+    g-115-3018 drops the now-past due-time). So the STORED baseline earliest_wake_at
+    (the soonest becomes-executable moment recorded when the sleep started) is ALSO
+    checked: once it has arrived, a goal may now be executable -> MISS. Catches the
+    elapsed-recurring false HIT the fresh-scan check alone missed.
   - pending wake signal (blocker-cleared / pq-resolved / email-received /
     board-activity / goal-claim-released) -> MISS.
   - cap (default 3): after N consecutive short-circuits, force one full cycle so
@@ -66,7 +73,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -74,6 +81,18 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR  # noqa: E402
+from _idle_cache_common import (  # noqa: E402
+    wake_timer_elapsed,
+    authoritative_earliest_wake_at,
+)
+from _wake_timers import (  # noqa: E402
+    _parse_iso, _add_hours, _goal_wake_time, _iter_goals,
+    scan_queue as _scan_queue,
+    DEFAULT_DEFER_TIMEOUT_H as _DEFAULT_DEFER_TIMEOUT_H,
+    ABSTENTION_TIMEOUT_H as _ABSTENTION_TIMEOUT_H,
+    DEFAULT_RECURRING_INTERVAL_H as _DEFAULT_RECURRING_INTERVAL_H,
+    MIN_FLOOR_S as MIN_SHORTCIRCUIT_S,
+)
 
 # MUST equal the name dry-idle-tick.py writes via write_baseline_cache(). A drift
 # only causes a fail-open MISS here (the safe direction), never a wrong
@@ -88,10 +107,7 @@ DRY_STALE_MARGIN_S = 900
 # Defer to idle-tick.sh's checkpoint logic while a fresh dry sleep is still
 # mid-flight (blocked_sleep_until has more than this many seconds remaining).
 DEFER_REMAINING_S = 60
-# Floor on a short-circuit sleep. Below this the re-entry cost outweighs the
-# savings, so MISS and let the full cycle handle imminent timer work rather than
-# emit a sub-minute bg sleep.
-MIN_SHORTCIRCUIT_S = 60
+# MIN_SHORTCIRCUIT_S imported from _wake_timers (as MIN_FLOOR_S alias) above.
 
 # Wake signal files (all under <agent>/session/) that imply executable work MAY
 # now exist. Superset of quiescence's blocker-only set: in the DRY state,
@@ -103,14 +119,8 @@ DRY_WAKE_SIGNAL_FILES = (
     "board-activity", "goal-claim-released",
 )
 
-# Default defer TTL when a deferred goal carries no explicit deferred_until
-# (mirrors capability-gate / quiescence-gate defer_reason_timeout_hours=120).
-_DEFAULT_DEFER_TIMEOUT_H = 120
-# Default abstention TTL (aspirations-select Phase 2.55 abstention_timeout_hours).
-_ABSTENTION_TIMEOUT_H = 72
-# Default recurring interval when a recurring goal names neither interval_hours
-# nor remind_days (mirrors aspirations-select's `OR 24` fallback).
-_DEFAULT_RECURRING_INTERVAL_H = 24
+# _DEFAULT_DEFER_TIMEOUT_H, _ABSTENTION_TIMEOUT_H, _DEFAULT_RECURRING_INTERVAL_H
+# imported from _wake_timers above.
 
 
 # --- cache file I/O (mirrors quiescence-cycle-cache._read_cache/_write_cache) --
@@ -158,27 +168,7 @@ def delete_cache():
         print(f"[dry-idle-cycle-cache] delete failed: {e}", file=sys.stderr)
 
 
-# --- time helpers ------------------------------------------------------------
-
-def _parse_iso(val):
-    """Tolerant ISO parse -> naive datetime, or None. Strips a trailing Z."""
-    if not val:
-        return None
-    s = str(val).strip().strip('"')
-    if not s or s == "null":
-        return None
-    try:
-        return datetime.fromisoformat(s.rstrip("Z"))
-    except (ValueError, TypeError):
-        return None
-
-
-def _add_hours(dt, hours):
-    try:
-        return dt + timedelta(hours=float(hours))
-    except (TypeError, ValueError, OverflowError):
-        return None
-
+# _parse_iso, _add_hours imported from _wake_timers above.
 
 # --- dry-state signal + timers (the queue scan) ------------------------------
 
@@ -217,96 +207,7 @@ def _pending_wake_signal():
     return any((sess / name).exists() for name in DRY_WAKE_SIGNAL_FILES)
 
 
-def _goal_wake_time(goal, now):
-    """The soonest time THIS goal could become executable, or None if it carries
-    no timer. Covers the four timer-gated 'becomes executable' events that have
-    no wake-signal file: defer timeout, recurring interval, blocker expiry,
-    abstention expiry. Purely defensive .get()s -- an unparseable field yields
-    None for that lane, never a crash."""
-    candidates = []
-    status = str(goal.get("status") or "").lower()
-    recurring = bool(goal.get("recurring"))
-
-    # Deferred (an explicit deferred_until wins; else set_at + timeout hours).
-    if goal.get("defer_reason") and status not in ("completed", "skipped", "expired"):
-        du = _parse_iso(goal.get("deferred_until"))
-        if du is not None:
-            candidates.append(du)
-        else:
-            set_at = _parse_iso(goal.get("defer_reason_set_at"))
-            if set_at is not None:
-                timeout_h = goal.get("defer_reason_timeout") or _DEFAULT_DEFER_TIMEOUT_H
-                w = _add_hours(set_at, timeout_h)
-                if w is not None:
-                    candidates.append(w)
-
-    # Recurring interval: next-due = lastAchievedAt + interval. A never-run
-    # recurring goal (no lastAchievedAt) carries no computable timer -- skip it
-    # (the cap backstops); if it were already executable the selector would not
-    # have returned dry.
-    if recurring:
-        last = _parse_iso(goal.get("lastAchievedAt"))
-        if last is not None:
-            interval_h = goal.get("interval_hours")
-            if not interval_h:
-                remind_days = goal.get("remind_days")
-                interval_h = (remind_days * 24) if remind_days else _DEFAULT_RECURRING_INTERVAL_H
-            w = _add_hours(last, interval_h)
-            if w is not None:
-                candidates.append(w)
-
-    # Blocked with a typed blocker_ref expiry.
-    br = goal.get("blocker_ref")
-    if isinstance(br, dict):
-        exp = _parse_iso(br.get("expires_at"))
-        if exp is not None:
-            candidates.append(exp)
-
-    # Abstention expiry (abstained_at + 72h). Long horizon; the cap dominates,
-    # but including it keeps the timer set faithful to the selector's gates.
-    ab = _parse_iso(goal.get("abstained_at"))
-    if ab is not None:
-        w = _add_hours(ab, _ABSTENTION_TIMEOUT_H)
-        if w is not None:
-            candidates.append(w)
-
-    return min(candidates) if candidates else None
-
-
-def _iter_goals(asps):
-    for asp in asps:
-        if isinstance(asp, dict):
-            for g in asp.get("goals", []) or []:
-                if isinstance(g, dict):
-                    yield g
-
-
-def _scan_queue(now):
-    """Single load of world + agent aspirations -> (goal_count, earliest_wake_at).
-
-    goal_count is the total-goals new-work detector (mirrors
-    quiescence-gate._total_goal_count). earliest_wake_at is the soonest timer
-    across the queue (ISO string) or None. Raises on load failure so cmd_check
-    fails open to a MISS; write_baseline_cache catches so a scan failure at
-    write time simply leaves no cache (next check MISSes)."""
-    import importlib
-    qg = importlib.import_module("quiescence-gate")
-    from _paths import WORLD_DIR
-
-    asps = []
-    asps.extend(qg._load_aspirations_from(
-        AGENT_DIR / "aspirations.jsonl" if AGENT_DIR else None))
-    asps.extend(qg._load_aspirations_from(
-        WORLD_DIR / "aspirations.jsonl" if WORLD_DIR else None))
-
-    goal_count = 0
-    earliest = None
-    for g in _iter_goals(asps):
-        goal_count += 1
-        w = _goal_wake_time(g, now)
-        if w is not None and (earliest is None or w < earliest):
-            earliest = w
-    return goal_count, (earliest.isoformat(timespec="seconds") if earliest else None)
+# _goal_wake_time, _iter_goals, _scan_queue imported from _wake_timers above.
 
 
 # --- WRITER (called by dry-idle-tick.py) -------------------------------------
@@ -367,8 +268,23 @@ def evaluate_cache(cache, dry_active, stale, blocked_remaining,
     if (isinstance(cached_count, int) and isinstance(current_goal_count, int)
             and current_goal_count > cached_count):
         return ("miss", f"new-work:{current_goal_count}>{cached_count}")
-    wake = _parse_iso(current_earliest_wake_at)
-    if wake is not None and (now + timedelta(seconds=MIN_SHORTCIRCUIT_S)) >= wake:
+    # Baseline-timer-elapsed + fresh-timer checks (), via the shared
+    # _idle_cache_common.wake_timer_elapsed helper (facet-1, ). The FRESH
+    # current_earliest_wake_at can silently MISS when the soonest goal drops out of
+    # the queue scan between write and check -- the load-bearing case being a
+    # recurring goal whose next-due ELAPSES mid-sleep: the future-only guard
+    # () drops the now-past due from the fresh rescan (jumps to a LATER
+    # goal or None), goal_count is unchanged (the recurring goal was always
+    # present), so the new-work guard is silent too -> false HIT that sleeps through
+    # the now-due recurring goal (observed 2026-07-24, alpha msg-4248: dry cache
+    # reported "queue empty" while goal-selector returned  executable for
+    # ~10min). So the STORED baseline earliest_wake_at (the soonest
+    # becomes-executable moment recorded when this dry sleep STARTED) is checked
+    # FIRST; once it has arrived a goal MAY now be executable regardless of the
+    # fresh scan. Shared LOGIC only (): each cache passes its own margin.
+    if wake_timer_elapsed(cache.get("earliest_wake_at"), now, MIN_SHORTCIRCUIT_S):
+        return ("miss", "baseline-timer-elapsed")
+    if wake_timer_elapsed(current_earliest_wake_at, now, MIN_SHORTCIRCUIT_S):
         return ("miss", "timer-imminent-or-elapsed")
     if pending_signal:
         return ("miss", "pending-wake-signal")
@@ -453,7 +369,23 @@ def cmd_check(_args):
     if decision != "hit":
         return 0
 
-    # HIT -- increment the consecutive-short-circuit counter and re-sleep.
+    # facet-2 authoritative recheck (; guard-1139 / ) -- see
+    # quiescence-cycle-cache.cmd_check for the full rationale. Every cheap LOCAL
+    # gate HIT (would sleep); the local aspirations mirror can lag the store under
+    # own-cloud, so verify the earliest wake against the AUTHORITATIVE store before
+    # sleeping. R2 latency: this S3 read runs ONLY on the HIT path, never every
+    # cycle. Fail-open to MISS on an unreadable store, matching the `_scan_queue`
+    # `except -> return 0` full-cycle fail-open above (guard-1139: never sleep on a
+    # local-only decision when the authoritative check could not run).
+    try:
+        auth_wake = authoritative_earliest_wake_at(now)
+    except Exception:
+        return 0  # authoritative store unreadable -> MISS -> normal full cycle
+    if wake_timer_elapsed(auth_wake, now, MIN_SHORTCIRCUIT_S):
+        return 0  # store shows an imminent/elapsed wake the local mirror missed
+
+    # HIT confirmed authoritatively -- increment the consecutive-short-circuit
+    # counter and re-sleep.
     cache["cycle_count"] = int(cache.get("cycle_count", 0) or 0) + 1
     cache["last_hit_at"] = now.isoformat(timespec="seconds")
     _write_cache(cache)

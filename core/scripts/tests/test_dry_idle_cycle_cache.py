@@ -1,4 +1,4 @@
-"""test_dry_idle_cycle_cache.py -- 4-d dry-cycle short-circuit (Layer 4).
+"""test_dry_idle_cycle_cache.py -- -d dry-cycle short-circuit (Layer 4).
 
 Exercises the fast-path that collapses consecutive DRY cycles
 (dry-idle-cycle-cache.py) plus the cache WRITER wired into dry-idle-tick.py
@@ -193,6 +193,57 @@ def test_evaluate_clean_hit():
     assert d == "hit" and r == "ok"
 
 
+# --- baseline-timer-elapsed guard () -------------------------------
+# The elapsed-recurring false-HIT class: a recurring goal whose next-due was
+# FUTURE at write time (stored into earliest_wake_at) ELAPSES mid-sleep. The
+# shared _wake_timers future-only guard () drops the now-past due-time
+# from the FRESH rescan, so current_earliest_wake_at jumps to a LATER goal (or
+# None) and goal_count is unchanged -> pre-fix false HIT that sleeps through the
+# now-due recurring goal (alpha finding msg-4248, 2026-07-24). The STORED
+# baseline earliest_wake_at forces the MISS.
+
+def test_evaluate_baseline_timer_elapsed_fresh_scan_later():
+    # Stored baseline wake ELAPSED; fresh scan reports a LATER goal (the dropped
+    # recurring due left a later defer/blocker as the new soonest). Pre-fix the
+    # fresh-scan timer check saw only the far-future wake -> HIT. Fix -> MISS.
+    now = datetime.now()
+    cache = _mk_cache(now, earliest_wake_at=_iso(now - timedelta(minutes=1)))
+    d, r = dcc.evaluate_cache(**_hit_kwargs(
+        now, cache,
+        current_earliest_wake_at=_iso(now + timedelta(hours=3))))
+    assert d == "miss" and r == "baseline-timer-elapsed"
+
+
+def test_evaluate_baseline_timer_elapsed_fresh_scan_none():
+    # Same drop-out, but the recurring goal was the ONLY timer -> fresh scan
+    # returns None. Pre-fix: no fresh timer -> HIT (test_evaluate_no_timer_is_hit
+    # shape). Fix: stored baseline elapsed -> MISS.
+    now = datetime.now()
+    cache = _mk_cache(now, earliest_wake_at=_iso(now - timedelta(minutes=1)))
+    d, r = dcc.evaluate_cache(**_hit_kwargs(now, cache, current_earliest_wake_at=None))
+    assert d == "miss" and r == "baseline-timer-elapsed"
+
+
+def test_evaluate_baseline_timer_imminent():
+    # A stored baseline wake WITHIN MIN_SHORTCIRCUIT_S is imminent -> MISS
+    # (boundary parity with the fresh-scan timer-imminent check).
+    now = datetime.now()
+    cache = _mk_cache(now,
+                      earliest_wake_at=_iso(now + timedelta(seconds=dcc.MIN_SHORTCIRCUIT_S - 5)))
+    d, r = dcc.evaluate_cache(**_hit_kwargs(
+        now, cache, current_earliest_wake_at=_iso(now + timedelta(hours=3))))
+    assert d == "miss" and r == "baseline-timer-elapsed"
+
+
+def test_evaluate_baseline_timer_far_future_is_hit():
+    # The guard must NOT over-trigger: a stored baseline wake still comfortably in
+    # the future leaves the HIT intact (the steady dry-trough short-circuit).
+    now = datetime.now()
+    cache = _mk_cache(now, earliest_wake_at=_iso(now + timedelta(hours=2)))
+    d, r = dcc.evaluate_cache(**_hit_kwargs(now, cache, current_earliest_wake_at=None))
+    assert d == "hit" and r == "ok"
+
+
 # --- _is_stale ---------------------------------------------------------------
 
 def test_is_stale_fresh_is_false():
@@ -240,6 +291,18 @@ def test_goal_wake_time_defer_explicit_timeout():
     assert dcc._goal_wake_time(g, now) == expected
 
 
+def test_goal_wake_time_defer_lingering_on_blocked_ignored():
+    # defer_reason LINGERS after a goal transitions pending -> blocked; a BLOCKED
+    # goal with a stale defer_reason must NOT contribute a defer wake (the 
+    # case: status=blocked yet a vestigial defer fired a 4.4d-past wake). A blocked
+    # goal is gated by its blocker lane, not its stale defer -- with no blocker_ref
+    # here, the goal carries no computable wake at all. .
+    now = datetime.now()
+    set_at = now - timedelta(hours=200)  # defer TTL long expired in the past
+    g = {"status": "blocked", "defer_reason": "x", "defer_reason_set_at": _iso(set_at)}
+    assert dcc._goal_wake_time(g, now) is None
+
+
 def test_goal_wake_time_recurring_interval_hours():
     now = datetime.now()
     last = now - timedelta(hours=1)
@@ -264,6 +327,31 @@ def test_goal_wake_time_recurring_never_run_is_none():
     assert dcc._goal_wake_time(g, now) is None
 
 
+def test_goal_wake_time_recurring_overdue_future_only_ignored():
+    # FUTURE-ONLY (): a recurring goal whose next-due is in the PAST
+    # (overdue) contributes NO recurring wake -- emitting the past due-time only
+    # floors quiescence. With no other lane, the goal carries no computable wake.
+    now = datetime.now()
+    last = now - timedelta(hours=30)  # interval 24h -> due 6h AGO (overdue)
+    g = {"status": "pending", "recurring": True,
+         "lastAchievedAt": _iso(last), "interval_hours": 24}
+    assert dcc._goal_wake_time(g, now) is None
+
+
+def test_goal_wake_time_recurring_overdue_but_precond_gated_uses_precond():
+    # The  case: recurring-overdue (past due-time) AND precond-gated
+    # (resolves_no_earlier_than in the future). The past recurring-due is skipped
+    # (future-only); the FUTURE precond release is the real wake -- NOT the past
+    # recurring-due that used to pin the floor. .
+    now = datetime.now()
+    last = now - timedelta(hours=30)          # recurring-due 6h AGO
+    rnb = now + timedelta(hours=4)            # precond releases in 4h
+    g = {"status": "pending", "recurring": True,
+         "lastAchievedAt": _iso(last), "interval_hours": 24,
+         "preconditions": [{"resolves_no_earlier_than": _iso(rnb)}]}
+    assert dcc._goal_wake_time(g, now) == rnb.replace(microsecond=0)
+
+
 def test_goal_wake_time_blocker_expiry():
     now = datetime.now()
     exp = now + timedelta(hours=3)
@@ -271,12 +359,59 @@ def test_goal_wake_time_blocker_expiry():
     assert dcc._goal_wake_time(g, now) == exp.replace(microsecond=0)
 
 
+def test_goal_wake_time_blocker_lingering_on_pending_ignored():
+    # blocker_ref LINGERS after a goal un-blocks (blocked -> pending); a PENDING
+    # goal with a stale blocker_ref must NOT contribute a blocker wake (the
+    #  /  floor bug -- both pending + recurring, achieved today,
+    # yet a MAY blocker_ref.expires_at pinned earliest_wake_at to a past date).
+    # Only the real (recurring) wake counts. .
+    now = datetime.now()
+    stale = now - timedelta(hours=1)  # blocker "expired" in the past
+    last = now - timedelta(hours=1)
+    g = {"status": "pending", "recurring": True,
+         "blocker_ref": {"external_id": "x", "expires_at": _iso(stale)},
+         "lastAchievedAt": _iso(last), "interval_hours": 24}
+    expected = last.replace(microsecond=0) + timedelta(hours=24)  # FUTURE recurring wake
+    assert dcc._goal_wake_time(g, now) == expected
+
+
 def test_goal_wake_time_abstention():
+    # Abstention wake fires ONLY for a CURRENTLY-abstained goal (status ==
+    # "abstained"). .
     now = datetime.now()
     ab = now - timedelta(hours=1)
-    g = {"status": "pending", "abstained_at": _iso(ab)}
+    g = {"status": "abstained", "abstained_at": _iso(ab)}
     expected = ab.replace(microsecond=0) + timedelta(hours=dcc._ABSTENTION_TIMEOUT_H)
     assert dcc._goal_wake_time(g, now) == expected
+
+
+def test_goal_wake_time_abstention_lingering_on_pending_ignored():
+    # abstained_at LINGERS after a goal un-abstains; a PENDING goal with a stale
+    # abstained_at must NOT contribute an abstention wake (the  floor
+    # bug -- a pending+recurring goal achieved today whose May abstained_at
+    # pinned earliest_wake_at to a past date). Only its real (recurring) wake
+    # counts. .
+    now = datetime.now()
+    ab = now - timedelta(hours=1)  # abstention would have "expired" in the past
+    last = now - timedelta(hours=1)
+    g = {"status": "pending", "recurring": True, "abstained_at": _iso(ab),
+         "lastAchievedAt": _iso(last), "interval_hours": 24}
+    expected = last.replace(microsecond=0) + timedelta(hours=24)  # FUTURE recurring wake
+    assert dcc._goal_wake_time(g, now) == expected
+
+
+def test_goal_wake_time_terminal_status_returns_none():
+    # Terminal goals have no future 'becomes executable' event -- no wake timer
+    # in ANY lane, even with a lingering lastAchievedAt / abstained_at /
+    # blocker_ref. The non-defer lanes previously lacked this guard, so terminal
+    # goals contributed stale PAST wakes that floored quiescence. .
+    now = datetime.now()
+    past = now - timedelta(hours=1)
+    for st in ("completed", "skipped", "expired", "retired"):
+        g = {"status": st, "recurring": True, "lastAchievedAt": _iso(past),
+             "interval_hours": 1, "abstained_at": _iso(past),
+             "blocker_ref": {"external_id": "x", "expires_at": _iso(past)}}
+        assert dcc._goal_wake_time(g, now) is None, f"{st} should carry no wake timer"
 
 
 def test_goal_wake_time_no_timers_is_none():
@@ -286,13 +421,17 @@ def test_goal_wake_time_no_timers_is_none():
 
 
 def test_goal_wake_time_picks_min():
+    # min() across two SIMULTANEOUSLY-active lanes. Under the status-gated guards
+    # ( / ) defer fires only for pending and blocker only for
+    # blocked, so those two can no longer co-fire on one goal; pair the pending
+    # defer lane with the status-agnostic recurring lane instead.
     now = datetime.now()
     soon = now + timedelta(hours=1)
-    later = now + timedelta(hours=10)
+    last = now - timedelta(hours=1)  # recurring next-due = last + 10h = now + 9h (later)
     g = {
-        "status": "blocked",
-        "blocker_ref": {"external_id": "x", "expires_at": _iso(later)},
+        "status": "pending",
         "defer_reason": "y", "deferred_until": _iso(soon),
+        "recurring": True, "lastAchievedAt": _iso(last), "interval_hours": 10,
     }
     assert dcc._goal_wake_time(g, now) == soon.replace(microsecond=0)
 
@@ -393,6 +532,7 @@ def test_scan_queue_counts_and_earliest(tmp_path, monkeypatch):
     ])
 
     monkeypatch.setattr(dcc, "AGENT_DIR", agent_dir)
+    monkeypatch.setattr(_paths, "AGENT_DIR", agent_dir)
     monkeypatch.setattr(_paths, "WORLD_DIR", world_dir)
 
     goal_count, earliest = dcc._scan_queue(now)
@@ -415,6 +555,7 @@ def test_write_baseline_cache_round_trips_through_scan(tmp_path, monkeypatch):
     _seed_aspirations(world_dir / "aspirations.jsonl", [])
 
     monkeypatch.setattr(dcc, "AGENT_DIR", agent_dir)
+    monkeypatch.setattr(_paths, "AGENT_DIR", agent_dir)
     monkeypatch.setattr(_paths, "WORLD_DIR", world_dir)
 
     dcc.write_baseline_cache(480, 3, now)
@@ -430,16 +571,29 @@ def test_write_baseline_cache_round_trips_through_scan(tmp_path, monkeypatch):
 # --- cmd_check integration (fully monkeypatched -- no daemon, no I/O) ---------
 
 def _isolate_cmd_check(monkeypatch, tmp_path, *, streak=2, goal_count=5,
-                       earliest=None, blocked=None, pending=False):
+                       earliest=None, blocked=None, pending=False,
+                       auth_earliest=None, auth_raises=None):
     """Wire cmd_check's external reads to hermetic stand-ins (mirrors the
     quiescence integration harness). Returns nothing -- the cache file under
-    tmp_path/session is the shared state."""
+    tmp_path/session is the shared state.
+
+    auth_earliest / auth_raises control the facet-2 authoritative recheck
+    (g-115-3062): default auth_earliest=None means the AUTHORITATIVE store agrees
+    with the local HIT (no imminent wake), so pre-facet-2 HIT tests pass unchanged.
+    Set auth_earliest to an ISO to simulate the store showing a sooner wake than the
+    local mirror; set auth_raises to an exception to simulate an unreadable store."""
     (tmp_path / "session").mkdir(exist_ok=True)
     monkeypatch.setattr(dcc, "AGENT_DIR", tmp_path)
     monkeypatch.setattr(dcc, "_dry_signal", lambda: {"streak": streak})
     monkeypatch.setattr(dcc, "_blocked_sleep_remaining", lambda now: blocked)
     monkeypatch.setattr(dcc, "_pending_wake_signal", lambda: pending)
     monkeypatch.setattr(dcc, "_scan_queue", lambda now: (goal_count, earliest))
+
+    def _fake_auth(now, **kw):
+        if auth_raises is not None:
+            raise auth_raises
+        return auth_earliest
+    monkeypatch.setattr(dcc, "authoritative_earliest_wake_at", _fake_auth)
     monkeypatch.delenv("DRY_IDLE_CACHE_CAP", raising=False)
 
 
@@ -467,12 +621,66 @@ def test_cmd_check_three_hits_then_cap_forces_full(tmp_path, monkeypatch, capsys
     assert dcc._read_cache()["cycle_count"] == 3
 
 
+def test_cmd_check_authoritative_imminent_forces_miss(tmp_path, monkeypatch, capsys):
+    # facet-2 (): every cheap LOCAL gate would HIT (local scan shows a
+    # far-future earliest, cache fresh) but the AUTHORITATIVE store shows a wake
+    # imminent within MIN_SHORTCIRCUIT_S -> MISS, no HIT directive, counter frozen
+    # (guard-1139 / : the local mirror was stale about a sooner wake).
+    now = datetime.now()
+    _isolate_cmd_check(monkeypatch, tmp_path, goal_count=5,
+                       earliest=_iso(now + timedelta(hours=2)),
+                       auth_earliest=_iso(now + timedelta(seconds=10)))
+    dcc._write_cache(_mk_cache(now, cycle_count=0,
+                               earliest_wake_at=_iso(now + timedelta(hours=2))))
+    rc = dcc.cmd_check(None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== DRY-IDLE CACHE HIT ===" not in out
+    assert dcc._read_cache()["cycle_count"] == 0  # MISS -> counter NOT incremented
+
+
+def test_cmd_check_authoritative_read_error_fails_open_to_miss(tmp_path, monkeypatch, capsys):
+    # facet-2 fail-open: an unreadable authoritative store (any non-FileNotFound
+    # error) MISSes (full cycle), never sleeps on the local-only decision -- the
+    # `except -> return 0` direction, guard-1139.
+    now = datetime.now()
+    _isolate_cmd_check(monkeypatch, tmp_path, goal_count=5,
+                       earliest=_iso(now + timedelta(hours=2)),
+                       auth_raises=RuntimeError("s3 unreachable"))
+    dcc._write_cache(_mk_cache(now, cycle_count=0,
+                               earliest_wake_at=_iso(now + timedelta(hours=2))))
+    rc = dcc.cmd_check(None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== DRY-IDLE CACHE HIT ===" not in out
+    assert dcc._read_cache()["cycle_count"] == 0
+
+
 def test_cmd_check_new_work_misses(tmp_path, monkeypatch, capsys):
     now = datetime.now()
     # cached goal_count 5, live scan reports 6 -> new work arrived.
     _isolate_cmd_check(monkeypatch, tmp_path, goal_count=6,
                        earliest=_iso(now + timedelta(hours=2)))
     dcc._write_cache(_mk_cache(now, cycle_count=0, goal_count=5))
+    rc = dcc.cmd_check(None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "=== DRY-IDLE CACHE HIT ===" not in out
+    assert dcc._read_cache()["cycle_count"] == 0  # untouched on miss
+
+
+def test_cmd_check_baseline_timer_elapsed_misses(tmp_path, monkeypatch, capsys):
+    #  end-to-end regression: the stored baseline earliest_wake_at has
+    # ELAPSED (a recurring goal crossed its due-time mid-sleep) while the FRESH
+    # _scan_queue reports the recurring goal dropped out (future-only guard) ->
+    # a LATER soonest timer, SAME goal_count. Pre-fix cmd_check HIT (sleeps through
+    # the now-due goal); the fix MISSes so the full cycle lets the selector pick
+    # up the due recurring goal.
+    now = datetime.now()
+    _isolate_cmd_check(monkeypatch, tmp_path, goal_count=5,
+                       earliest=_iso(now + timedelta(hours=3)))  # fresh scan: later
+    dcc._write_cache(_mk_cache(now, cycle_count=0, goal_count=5,
+                               earliest_wake_at=_iso(now - timedelta(minutes=1))))
     rc = dcc.cmd_check(None)
     out = capsys.readouterr().out
     assert rc == 0

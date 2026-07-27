@@ -74,6 +74,7 @@ def main():
     tree_updated = "--tree-updated" in sys.argv[1:]
 
     from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
+    from wm import update_modified as _update_modified  # guard-449/guard-540 ()
     wm_path = _resolve_wm_path()
     if not wm_path.exists():
         sys.exit(0)
@@ -144,7 +145,7 @@ def main():
                 # handles the encoding-drift signal on the HOT path. This is the
                 # ONLY sentinel set here.
                 #
-                # 1: the former companion `force_tree_encoding` set was
+                # : the former companion `force_tree_encoding` set was
                 # REMOVED. Its only consumer (aspirations-state-update SKILL.md
                 # Step 8) runs on the COLD path, which the normal loop
                 # (iteration-close.sh --phase state-update / recurring-close.sh)
@@ -173,6 +174,29 @@ def main():
         loop_state["signals"] = signals
         slots["loop_state"] = loop_state
         wm["slots"] = slots
+
+        # guard-449 / guard-540: this gate does direct YAML I/O on
+        # working-memory.yaml (bypassing wm-set.sh — see the header note on the
+        # Windows bash-subprocess hang). Bypassing the wrapper does NOT exempt
+        # it from the wrapper's bookkeeping: a direct writer MUST still advance
+        # slot_meta, because wm-prune's eviction predicate reads
+        # slot_meta[slot].updated_at — NOT the slot's own content. Left stale,
+        # that timestamp still points at the LAST wm-set.sh call (the Phase
+        # 0-pre `wm-set.sh force_tree_maintain null` clear, often hours back),
+        # so mins_since > evict_threshold_minutes and wm-prune sets the
+        # freshly-written sentinel back to None — in the SAME iteration, since
+        # loop Phase 11 runs wm-prune every cycle.
+        #
+        # : reproduced against the real wm._do_prune —
+        # evicted_slots=[{"slot":"force_tree_maintain","minutes_stale":180}].
+        # The asymmetry that made this hard to see: the counter reset from this
+        # same write SURVIVES (it is nested inside loop_state, which prune never
+        # descends into) while the top-level sentinel is dropped. Net effect was
+        # silent: the drift signal got CONSUMED (counter zeroed) and the consumer
+        # never ran, on every firing, while the gate printed success.
+        _update_modified(wm, "loop_state")
+        if sentinel_set:
+            _update_modified(wm, "force_tree_maintain")
 
         try:
             tmp = wm_path.with_suffix(wm_path.suffix + ".tmp")

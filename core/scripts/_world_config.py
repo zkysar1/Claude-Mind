@@ -128,7 +128,7 @@ def load_world_config(name: str, default: Optional[Dict[str, Any]] = None) -> Di
         path = world / "config" / f"{name}.yaml"
         # own-cloud read-path fix (2026-07-02): materialize an S3-only overlay on
         # a fresh box BEFORE the is_file() gate, else every world/config overlay
-        # silently degrades to defaults (the 9 config-404 class). Lazy,
+        # silently degrades to defaults (the  config-404 class). Lazy,
         # fail-open import (this loader is defensive by design and stays import-
         # cycle-proof); no-op on LocalBackend and for out-of-root paths (keystone).
         try:

@@ -42,6 +42,7 @@ import sys
 from pathlib import Path
 
 from _gate_log import log as _gate_log
+from _git_state_absence_patterns import GIT_STATE_ABSENCE_PATTERNS
 from _paths import agent_dir as _agent_dir
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -71,6 +72,12 @@ _TRIGGER_PATTERNS = [
     re.compile(r"\bis not available\b", re.IGNORECASE),
     re.compile(r"\bno such (file|entry|node|record|thing)\b", re.IGNORECASE),
     re.compile(r"\bwe don't have\b", re.IGNORECASE),
+    # Git-state-absence negation family () — now sourced from the shared
+    # _git_state_absence_patterns module (), splatted here so both gates
+    # share ONE definition instead of a hand-synced duplicate. Firing this gate
+    # forces a `git log --all -- <path>` / HEAD grep before the claim is accepted.
+    # See verify-before-assuming.md "Capability-Absence Claims".
+    *GIT_STATE_ABSENCE_PATTERNS,
 ]
 
 

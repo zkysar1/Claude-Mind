@@ -64,6 +64,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # Commit SHA extraction is KEYWORD-ANCHORED for precision AND to bound the
@@ -76,7 +77,7 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 # validation in probe_sha_origin remove the intra-box false positives; the
 # CROSS-box false positive (a commit on the remote but unfetched into THIS box's
 # origin/* refs) is closed separately by the `git fetch origin` main() runs once
-# before probing (0) — without that fetch `git branch -r --contains`
+# before probing () — without that fetch `git branch -r --contains`
 # reads stale local refs and flags already-shipped cross-box work.
 _ANCHORED_SHA_RE = re.compile(
     r"(?:commit(?:ted)?|pushed?|merged?|\bsha\b)"
@@ -139,7 +140,7 @@ def _parse_iso(ts):
     if not ts:
         return None
     try:
-        return dt.datetime.fromisoformat(str(ts).replace("Z", ""))
+        return parse_naive_iso(ts)
     except Exception:
         return None
 
@@ -265,7 +266,7 @@ def classify_goal(goal, now, sha_status, min_age_minutes=30.0,
     if not shas:
         # Zero SHA tokens in the record. Loop-commit messages embed the goal-id,
         # not a SHA (rb-3999), so the COMMON phantom shape carries no SHA and the
-        # extracted-SHA path above never sees it (0: both 2026-07-18
+        # extracted-SHA path above never sees it (: both 2026-07-18
         # phantoms had zero SHA tokens). Fall back to goal-id resolution: main()
         # injects goalid_status[goal_id] = {sha: origin_status} for commits whose
         # message carries "(<goal-id>)". Apply the SAME landing check + None-drop.
@@ -313,6 +314,35 @@ def classify_goal(goal, now, sha_status, min_age_minutes=30.0,
         "shas_absent_local_only": absent,
         "title": (goal.get("title") or "")[:80],
     }
+
+
+def apply_superseded(entry, superseded_status):
+    """Mark a flagged committed_not_pushed entry benign_superseded when EVERY
+    local-only SHA's changed files are already byte-identical in HEAD. PURE
+    (git status injected via superseded_status={sha: True|False}). g-115-3032.
+
+    This distinguishes a convergent-parallel-fix ORPHAN — a narrow local fix
+    superseded+generalized by another box's commit at merge, so the SHA is
+    absent from origin yet its DELIVERABLE is on origin under a DIFFERENT SHA —
+    from a genuinely lost deliverable. The orphan is a benign false positive
+    that cost an Investigate each run under SHA-absence-alone flagging
+    (g-115-3031: fcb8dd05e superseded by g-115-3023/3024).
+
+    A benign_superseded entry stays in the REPORT (log-only visibility) but is
+    NOT Investigate-filed by main() --apply. An entry keeps
+    reason=committed_not_pushed (and IS filed) when >=1 of its local-only SHAs
+    is NOT superseded — i.e. >=1 changed file's content is genuinely absent from
+    HEAD — preserving the g-115-2570 / rb-3135 real-loss detection this sweep
+    exists for. Requiring ALL absent SHAs superseded (not any) is the
+    conservative direction: one un-superseded SHA is enough to keep the flag.
+    """
+    absent = entry.get("shas_absent_local_only") or []
+    benign = bool(absent) and all(
+        superseded_status.get(s) is True for s in absent)
+    entry["benign_superseded"] = benign
+    if benign:
+        entry["reason"] = "benign_superseded"
+    return entry
 
 
 # ─────────────────────────── impure git probe ───────────────────────────
@@ -435,6 +465,47 @@ def build_sha_status(goals, candidate_repos):
         for sha in extract_commit_shas(g):
             if sha not in status:
                 status[sha] = probe_sha_origin(sha, candidate_repos)
+    return status
+
+
+def sha_superseded(sha, candidate_repos):
+    """True when SHA's changed files are byte-identical in HEAD — the deliverable
+    is already present under HEAD's lineage (benign convergent-parallel-fix
+    orphan, g-115-3032), NOT a lost deliverable. Impure (git).
+
+    CONSERVATIVE by construction: any inability to determine (SHA in no candidate
+    repo, root/merge parent-diff error, no changed files) returns False so the
+    entry stays FLAGGED. The direction of safety is deliberate — a missed
+    suppression costs one benign Investigate; a wrong suppression would hide a
+    real lost deliverable (the exact failure g-115-2570 / rb-3135 exists to
+    catch). We compare against HEAD (not origin/main) as the goal specifies:
+    if local HEAD is behind origin the diff is non-empty -> the entry stays
+    flagged, which is the safe direction (never a false suppression)."""
+    for repo in candidate_repos:
+        rc, _ = _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+        if rc != 0:
+            continue  # not in this repo
+        rc_f, files_out = _git(repo, "diff", "--name-only", f"{sha}^", sha)
+        if rc_f != 0:
+            return False  # root/merge/parent-resolve error — cannot determine
+        files = [f for f in files_out.splitlines() if f.strip()]
+        if not files:
+            return False  # no changed files — nothing to prove present in HEAD
+        # `git diff --quiet <sha> HEAD -- <files>` exits 0 when <sha> and HEAD
+        # are identical on <files> (deliverable present in HEAD -> superseded),
+        # 1 when >=1 file's content differs/absent (-> keep the flag).
+        rc_d, _ = _git(repo, "diff", "--quiet", sha, "HEAD", "--", *files)
+        return rc_d == 0
+    return False  # SHA in no candidate repo — cannot check, keep the flag
+
+
+def build_superseded_status(shas, candidate_repos):
+    """Probe each flagged local-only SHA once for superseded-in-HEAD status.
+    Returns {sha: bool}. Impure. g-115-3032."""
+    status = {}
+    for sha in shas:
+        if sha not in status:
+            status[sha] = sha_superseded(sha, candidate_repos)
     return status
 
 
@@ -568,7 +639,7 @@ def main():
     now = dt.datetime.now()
     all_goals = _read_goals("world") + _read_goals("agent")
     candidate_repos = discover_candidate_repos()
-    # 0: refresh origin/* refs ONCE before probing `branch -r --contains`,
+    # : refresh origin/* refs ONCE before probing `branch -r --contains`,
     # else a cross-box commit (landed on the remote from another box, unfetched
     # here) reads local-only and false-positives as committed_not_pushed. Fetch
     # is refs-only (never pushes / never touches the tree) and fail-open.
@@ -589,9 +660,26 @@ def main():
 
     flagged.sort(key=lambda e: e["age_hours"], reverse=True)
 
+    # : distinguish a convergent-parallel-fix ORPHAN (benign — the
+    # narrow local fix's changed files are already identical in HEAD, so the
+    # DELIVERABLE is on origin under a different SHA) from a genuinely lost
+    # deliverable. Probe each flagged local-only SHA for superseded-in-HEAD
+    # status and mark benign entries; benign entries stay in the report
+    # (benign_superseded, log-only) but are NOT Investigate-filed. Preserves the
+    # real-loss detection (>=1 changed file's content genuinely absent from
+    # HEAD) that  / rb-3135 targets, while cutting the false-positive
+    # Investigate noise (: fcb8dd05e superseded by /3024).
+    flagged_shas = sorted({
+        s for e in flagged for s in (e.get("shas_absent_local_only") or [])})
+    superseded_status = build_superseded_status(flagged_shas, candidate_repos)
+    for e in flagged:
+        apply_superseded(e, superseded_status)
+    benign_superseded = [e for e in flagged if e.get("benign_superseded")]
+    real_flagged = [e for e in flagged if not e.get("benign_superseded")]
+
     investigate_created = []
     if args.apply:
-        for entry in flagged:
+        for entry in real_flagged:
             if _existing_investigate(entry["goal_id"], all_goals):
                 continue
             gid = _file_investigate(entry)
@@ -602,21 +690,28 @@ def main():
         "scanned": scanned,
         "candidate_repos": [str(r) for r in candidate_repos],
         "fetch_status": fetch_status,
-        "flagged_count": len(flagged),
-        "flagged": flagged,
+        "flagged_count": len(real_flagged),
+        "flagged": real_flagged,
+        "benign_superseded_count": len(benign_superseded),
+        "benign_superseded": benign_superseded,
         "investigate_created": investigate_created,
         "applied": bool(args.apply),
         "now": now.isoformat(timespec="seconds"),
     }
 
     if args.output == "human":
-        print(f"scanned={scanned} flagged={len(flagged)} "
+        print(f"scanned={scanned} flagged={len(real_flagged)} "
+              f"benign_superseded={len(benign_superseded)} "
               f"repos={len(candidate_repos)} applied={bool(args.apply)}")
-        for e in flagged:
+        for e in real_flagged:
             print(f"  [{e['reason']}] {e['goal_id']} ({e['source']}): "
                   f"completed {e['age_hours']}h ago | "
                   f"local-only={e['shas_absent_local_only']} "
                   f"via={e.get('resolved_via', 'record-sha')} | {e['title']}")
+        for e in benign_superseded:
+            print(f"  [benign_superseded log-only] {e['goal_id']} ({e['source']}): "
+                  f"deliverable present in HEAD under a different SHA | "
+                  f"local-only={e['shas_absent_local_only']} | {e['title']}")
     else:
         print(json.dumps(result, indent=2))
     return 0

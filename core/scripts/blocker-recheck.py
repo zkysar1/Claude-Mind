@@ -31,6 +31,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # Blocker types that are STRUCTURALLY ineligible for auto-clearance by this
@@ -159,10 +160,36 @@ def _age_hours(detected_at):
     if not detected_at:
         return None
     try:
-        t = dt.datetime.fromisoformat(str(detected_at).replace("Z", ""))
+        t = parse_naive_iso(detected_at)
     except Exception:
         return None
+    # parse_naive_iso RETURNS None for an unparsable value rather than raising,
+    # so the except above never fires for e.g. a dict/list/int stamp — and the
+    # subtraction below then raised an uncaught TypeError, aborting the entire
+    # sweep instead of skipping the one bad blocker. That contradicted this
+    # function's own contract ("if we cannot determine age, the caller skips
+    # the blocker"). Latent while detected_at was universally absent (the
+    # `if not detected_at` early return caught every real call); reachable once
+    #  made the created_at alias readable. Surfaced by
+    # test_reader_returns_none_when_both_absent.
+    if t is None:
+        return None
     return (dt.datetime.now() - t).total_seconds() / 3600.0
+
+
+def _blocker_id(b: dict) -> str | None:
+    """Blocker identity, tolerating the legacy key ().
+
+    `blocker_id` is the documented schema key (handoff-working-memory.md:152)
+    and is what infra-health.py and every other reader use. create-blocker.py
+    historically wrote `id` instead, so blockers already in agents' working
+    memories carry only that. Without the alias, an aged legacy blocker that
+    reaches the recheck reports blocker_id=null in its detail record and its
+    failure_reason fallback collapses to the empty string -- the recheck runs
+    but its output cannot be traced back to a blocker. Bounded migration shim;
+    removable once fleet blockers have cycled.
+    """
+    return b.get("blocker_id") or b.get("id")
 
 
 def _run_gate(failure_reason: str, intended: str) -> dict:
@@ -273,8 +300,18 @@ def main(argv=None):
             updated.append(b)
             continue
 
-        age = _age_hours(b.get("detected_at"))
-        # age is None if detected_at is missing or unparsable — skip rather
+        # LEGACY-SHAPE TOLERANCE (). `detected_at` is the documented
+        # schema key and is now emitted by both writers, but blockers created
+        # BEFORE that fix are live in agents' working memories carrying only
+        # create-blocker.py's `created_at`. Without this alias they stay
+        # permanently unreachable: age is None -> `continue` at EVERY age, so
+        # the recheck sweep silently reports rechecked=0 forever rather than
+        # "not yet aged". Same shape as unblock-intake-probe.py:469. The two
+        # keys are aliases for one fact (both stamped at record creation), not
+        # competing sources -- this is a bounded migration shim, removable once
+        # fleet blockers have cycled, NOT a permanent fallback chain.
+        age = _age_hours(b.get("detected_at") or b.get("created_at"))
+        # age is None if BOTH keys are missing or unparsable — skip rather
         # than guess. age_hours below threshold — not yet aged, also skip.
         if age is None or age < args.max_age_hours:
             updated.append(b)
@@ -282,15 +319,26 @@ def main(argv=None):
 
         report["rechecked"] += 1
         failure_reason = (
-            b.get("reason")
+            b.get("reason")                       # infra-health.py streak alerts
+            # create-blocker.py stores the narrative at TOP LEVEL as
+            # `failure_reason`, not under diagnostic_context (which is
+            # caller-supplied JSON and carries the key only by luck). This
+            # rung was missing, so for every canonically-created blocker the
+            # chain fell through to the ID STRING and fed *that* to the
+            # capability gate below -- a meaningless verdict on an
+            # identifier rather than a re-probe of the actual failure.
+            # Unreachable until  fixed the age filter above; fixing
+            # only the filter would have made the sweep run and still decide
+            # on garbage input.
+            or b.get("failure_reason")
             or (b.get("diagnostic_context") or {}).get("failure_reason")
-            or b.get("blocker_id", "")
+            or _blocker_id(b) or ""
         )
         gate = _run_gate(failure_reason, "user")
         first_match = (gate.get("matches") or [{}])[0] if gate.get("matches") else {}
         top_match = first_match.get("skill") or (first_match.get("row") or "")[:80] or None
         detail = {
-            "blocker_id": b.get("blocker_id"),
+            "blocker_id": _blocker_id(b),
             "age_hours": round(age, 1),
             "match_count": gate.get("match_count", 0),
             "would_block": gate.get("would_block", False),
@@ -321,7 +369,7 @@ def main(argv=None):
                     }
                     report["cleared"] += 1
                     report["investigate_goals_created"].append({
-                        "blocker_id": b.get("blocker_id"),
+                        "blocker_id": _blocker_id(b),
                         "goal_id": goal_id,
                         "aspiration_id": asp_id,
                     })
@@ -346,8 +394,9 @@ def main(argv=None):
         # escape interpretation. Wrapped in except Exception: pass so the
         # advisory signal never blocks the script.
         try:
+            from _runtime_bash import BASH  # rb-1472: not bare "bash"
             subprocess.run(
-                ["bash",
+                [BASH,
                  (SCRIPT_DIR / "session-signal-set.sh").as_posix(),
                  "blocker-cleared"],
                 check=False,

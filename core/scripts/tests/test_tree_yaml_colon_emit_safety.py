@@ -1,4 +1,4 @@
-"""test_tree_yaml_colon_emit_safety.py — regression for 7 / 8.
+"""test_tree_yaml_colon_emit_safety.py — regression for  / .
 
 Canonical incident (2026-05-21): node cold-start-handshake.summary contained an
 unquoted multi-line scalar with 'Option D: client_type...'. PyYAML's default

@@ -121,7 +121,7 @@ def test_compound_single_token_still_matches():
 
 
 def test_imperative_verb_single_token_still_matches():
-    # 3 recall guards: "commit the hotfix. Confirm ..." survives on
+    #  recall guards: "commit the hotfix. Confirm ..." survives on
     # the sole imperative capability verb "commit" against the row.
     skills = _match_skills({"commit", "hotfix"}, [_COMMIT_ROW])
     assert _COMMIT_ROW["row"] in skills

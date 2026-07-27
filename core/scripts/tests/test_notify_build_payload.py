@@ -101,8 +101,11 @@ def test_completion_payload_shape(fake_root):
     assert payload["InfoMessage"] == "completion: Completion Report (31h)"
     assert payload["InfoType"] == "Completion Report"
     assert payload["Title"] == "Completion Report (31h)"
-    assert payload["Body"].startswith("I am Alpha, the developer for the framework")
-    assert "Window covered 31h" in payload["Body"]
+    # : Body is the message verbatim — NO identity prepend (plain-
+    # language contract). The old assertion checked Body.startswith the '# Self'
+    # identity sentence; that prepend is gone.
+    assert payload["Body"] == "Window covered 31h. 6 goals closed across 2 aspirations. System HEALTHY."
+    assert not payload["Body"].startswith("I am Alpha")
     assert payload["Sections"] == []
     assert payload["NextSteps"] == []
 
@@ -120,7 +123,9 @@ def test_blocker_payload_shape(fake_root):
     assert "ErrorMessage" in payload
     assert "ErrorFrom" in payload
     assert payload["ErrorFrom"] == "Bridge down"
-    assert payload["ErrorMessage"].startswith("I am Alpha")
+    # : ErrorMessage is the message verbatim — NO identity prepend.
+    assert payload["ErrorMessage"] == "Bridge servers unreachable across 4 environments for 3 consecutive probes."
+    assert not payload["ErrorMessage"].startswith("I am Alpha")
     # SendErrorAlert and SendInfoAlert are different  functions; do
     # NOT mix fields between them.
     assert "InfoMessage" not in payload
@@ -152,7 +157,13 @@ def test_info_update_decision_categories(fake_root):
 # ============================================================================
 
 def test_double_front_matter_self_md(fake_root):
-    """Bravo-style self.md with two YAML blocks before '# Self' still works."""
+    """Bravo-style self.md with two YAML blocks before '# Self' still VALIDATES.
+
+    g-115-2822: the identity is no longer prepended to the body, but
+    extract_self_identity() is still called for the rc=3 validation. rc==0 here
+    proves the double-front-matter shape still parses without a false rc=3 —
+    that is the function's remaining contract. The body is the message verbatim.
+    """
     rc, out, err = run_helper([
         "--agent", "bravo",
         "--category", "completion",
@@ -162,17 +173,18 @@ def test_double_front_matter_self_md(fake_root):
     ])
     assert rc == 0, f"stderr: {err}"
     payload = json.loads(out)
-    assert payload["Body"].startswith(
-        "I am the product manager and business analyst for the framework"
-    )
-    # Identity ends at the period — verify no overrun into the next sentence
-    identity_line = payload["Body"].split("\n", 1)[0]
-    assert identity_line.endswith("the product forward.")
-    assert "More body content follows" not in identity_line
+    # Body is verbatim — no identity prepend, no '# Self' sentence leak.
+    assert payload["Body"] == "Long enough to clear the 20-char minimum body threshold easily."
+    assert "product manager and business analyst" not in payload["Body"]
 
 
 def test_first_sentence_wraps_lines(fake_root):
-    """Echo's first sentence spans 2 source lines — verify collapse works."""
+    """Echo's first sentence spans 2 source lines — the self.md still VALIDATES.
+
+    g-115-2822: identity is no longer emitted in the body, but
+    extract_self_identity() still runs for validation. rc==0 proves the
+    wrapped-first-sentence shape parses without a false rc=3.
+    """
     rc, out, err = run_helper([
         "--agent", "echo",
         "--category", "info",
@@ -182,8 +194,9 @@ def test_first_sentence_wraps_lines(fake_root):
     ])
     assert rc == 0, f"stderr: {err}"
     payload = json.loads(out)
-    identity_line = payload["Body"].split("\n", 1)[0]
-    assert identity_line == "I am Echo — the ARC-AGI-3 Vertical Owner for the framework."
+    # Body is verbatim — no identity prepend.
+    assert payload["Body"] == "Long enough to clear the 20-char minimum body threshold easily."
+    assert "ARC-AGI-3 Vertical Owner" not in payload["Body"]
 
 
 # ============================================================================
@@ -295,7 +308,10 @@ def test_agent_from_env_var(fake_root):
     )
     assert rc == 0, f"stderr: {err}"
     payload = json.loads(out)
-    assert payload["Body"].startswith("I am Alpha")
+    # : Body is verbatim — no identity prepend (the env-var fallback
+    # still resolves the agent + validates its self.md; only the prepend is gone).
+    assert payload["Body"] == "Long enough to clear the 20-char minimum body threshold easily."
+    assert not payload["Body"].startswith("I am Alpha")
 
 
 def test_message_file_input(fake_root):

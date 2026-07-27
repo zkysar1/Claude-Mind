@@ -49,6 +49,11 @@ from _fileops import locked_append_jsonl  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
 from _skill_md import get_companion_scripts  # type: ignore
 
+try:  # normal package import (core/scripts on sys.path)
+    from gates.credential_enum import check as _credential_enum_check
+except ImportError:  # loaded with gates/ itself on sys.path
+    from credential_enum import check as _credential_enum_check  # type: ignore
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # core/scripts/
 PROJECT_ROOT = SCRIPT_DIR.parent.parent              # repo root
@@ -283,132 +288,14 @@ def _check_credential_enumeration(blocker: dict) -> dict:
     credentials-required blockers previously bypassed every self-service
     verification. This check restores one for exactly that class.
 
-    Requires blocker.credential_source_enumeration: a list of
-    {source, identity, probed, denied} — one per credential source the runtime
-    could resolve (e.g. an env pair, the default chain, a stored profile, an
-    instance role). `probed` records that the source's identity + action were
-    actually tested; `denied` records that the resolved identity CANNOT perform
-    the action; `identity` is the resolved caller identity (null when the source
-    is absent). Refuses when:
-      (b1) fewer than 2 distinct sources are enumerated — one source cannot
-           establish that no OTHER source holds the grant;
-      (b2) any listed source is un-probed (`probed` != true) — an untested
-           source is an untested self-service path;
-      (c)  any source is NOT denied (`denied` != true) — that identity CAN
-           perform the action, so the work is self-serviceable, not human-only
-           (the pq-s3 failure mode; guard-1160);
-      (a)  two sources resolve to the SAME non-null identity
-           (pseudo-independence) — two labels for one identity is one source,
-           and the agent may already hold the grant under the other label.
-    Skipped for every non-credentials-required type. Domain-agnostic: the source
-    labels are supplied by the caller, not enumerated here.
+    THE PREDICATE ITSELF LIVES IN `gates.credential_enum` (g-115-3158) because
+    the SAME question is asked at a second door — the blocker_ref payload on
+    `aspirations-update-goal.sh` defer_reason / status=blocked writes, which
+    previously ran only the 5-key envelope validator and never checked
+    credentials at all. One implementation, both doors; a copy here would
+    drift. Behavior at this call site is unchanged.
     """
-    if (blocker.get("type") or "") != "credentials-required":
-        return {"name": "credential_enumeration", "passed": True,
-                "reason": "not a credentials-required blocker; check skipped"}
-
-    enum = blocker.get("credential_source_enumeration")
-    if not isinstance(enum, list) or not enum:
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                "credentials-required blocker without credential_source_enumeration: "
-                "list each credential source as {source, identity, probed, denied} — "
-                "its resolved identity (sts/whoami), whether it was actually probed, "
-                "and whether that identity is denied the action. The pq-s3-deleteobject "
-                "grant sat human-gated 86h while the root credential in the default CLI "
-                "chain could already perform it — guard-1160 / g-248-111."
-            ),
-        }
-
-    probed_sources = set()
-    identities: dict = {}
-    unprobed = []
-    can_perform = []
-    malformed = []
-    for e in enum:
-        if (not isinstance(e, dict) or not e.get("source")
-                or "probed" not in e or "denied" not in e):
-            malformed.append(e)
-            continue
-        src = str(e["source"])
-        probed_sources.add(src)
-        if not e.get("probed"):
-            unprobed.append(src)
-        if not e.get("denied"):
-            can_perform.append(src)
-        ident = e.get("identity")
-        if ident:
-            identities.setdefault(str(ident), []).append(src)
-
-    if malformed:
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                f"credential_source_enumeration has {len(malformed)} malformed "
-                "entry(ies); each must be an object with 'source', 'probed', and "
-                "'denied' ('identity' may be null when the source is absent)."
-            ),
-        }
-
-    if len(probed_sources) < 2:
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                f"only {len(probed_sources)} credential source enumerated; need >=2 "
-                "distinct sources — one source cannot establish that no OTHER source "
-                "holds the grant (g-248-111)."
-            ),
-        }
-
-    if unprobed:
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                f"un-probed credential source(s): {unprobed}. Every enumerated source "
-                "must set probed:true (its sts/whoami + action attempt was actually "
-                "run) — an un-probed source is an untested self-service path."
-            ),
-        }
-
-    if can_perform:
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                f"self-serviceable credential source(s): {can_perform} are NOT denied "
-                "— that identity CAN perform the action, so this is agent-provisionable, "
-                "not human-only. Route participants:[agent], do not file a "
-                "credentials-required blocker (the pq-s3 failure mode; guard-1160)."
-            ),
-        }
-
-    collisions = {ident: srcs for ident, srcs in identities.items() if len(srcs) >= 2}
-    if collisions:
-        ident, srcs = next(iter(collisions.items()))
-        return {
-            "name": "credential_enumeration",
-            "passed": False,
-            "reason": (
-                f"pseudo-independent credential sources: {srcs} both resolve to "
-                f"identity '{ident}'. Two labels for one identity is ONE source, not "
-                "two — the agent may already hold the grant under the other label. "
-                "Confirm the grant is genuinely absent before blocking (g-248-111)."
-            ),
-        }
-
-    return {
-        "name": "credential_enumeration",
-        "passed": True,
-        "reason": (
-            f"{len(probed_sources)} credential sources enumerated, all probed, all "
-            "denied, no pseudo-independence"
-        ),
-    }
+    return _credential_enum_check(blocker)
 
 
 def _log_override(world_dir: Optional[Path], agent_name: str,

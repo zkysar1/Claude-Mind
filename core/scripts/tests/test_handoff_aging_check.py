@@ -1,4 +1,4 @@
-"""test_handoff_aging_check.py — regression tests for 4.
+"""test_handoff_aging_check.py — regression tests for .
 
 Asserts that handoff-aging-check.py's scan + cooldown logic correctly:
   1. NOOP when no cross-agent handoff has aged past escalate_hours (the
@@ -141,7 +141,7 @@ def test_aged_handoff_fires(tmp_path):
 
 
 def test_cross_agent_board_cooldown_noop(tmp_path):
-    """Case 3 (1 core fix): a recent `handoff-aged` board post for this
+    """Case 3 ( core fix): a recent `handoff-aged` board post for this
     goal_id — posted by a DIFFERENT agent (charlie) 1h ago — suppresses self's
     (bravo's) escalation. This is the shared, durable cooldown: the per-agent WM
     log is gone; one team-wide board post per window is the cooldown."""
@@ -174,7 +174,7 @@ def test_cross_agent_board_cooldown_noop(tmp_path):
 
 
 def test_board_post_outside_window_fires(tmp_path):
-    """Case 6 (1): a `handoff-aged` board post OLDER than escalate_hours
+    """Case 6 (): a `handoff-aged` board post OLDER than escalate_hours
     does NOT suppress — the window elapsed, so the handoff re-escalates."""
     mod = _import_module()
     _install_mock_goals(mod, [_make_handoff("g-test-006", hours_ago=200.0, handoff_to="echo")])
@@ -198,7 +198,7 @@ def test_board_post_outside_window_fires(tmp_path):
 
 
 def test_board_post_other_goal_does_not_suppress(tmp_path):
-    """Case 7 (1): a recent `handoff-aged` post for a DIFFERENT goal_id
+    """Case 7 (): a recent `handoff-aged` post for a DIFFERENT goal_id
     must NOT suppress this goal — the cooldown is keyed per goal_id tag."""
     mod = _import_module()
     _install_mock_goals(mod, [_make_handoff("g-test-007", hours_ago=100.0, handoff_to="alpha")])

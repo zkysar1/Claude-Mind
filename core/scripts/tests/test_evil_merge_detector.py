@@ -1,4 +1,4 @@
-"""test_evil_merge_detector.py — evil-merge detector (4).
+"""test_evil_merge_detector.py — evil-merge detector ().
 
 Golden replay of the rb-3692 incident SHAPE: mainline adds a gate-paired
 feature line (the XPayloadProvenance stamp) to a framework builder; a side

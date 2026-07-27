@@ -16,6 +16,21 @@ Scope (narrow on purpose to minimize false positives):
      under WORLD_PATH / META_PATH / bound-agent-dir.
   2. Relative paths of the shape `agents/<bound-agent>/<NEW_SEGMENT>/...`
      (treated as relative-to-PROJECT_ROOT — the dominant Bash-cwd case).
+  3. Absolute write targets OUTSIDE every allowed root (g-115-3338) — the
+     tool-surface parity branch, without which the same write was refused on
+     the Edit surface and approved here minutes later. Both branches DENY.
+
+Both refusals key on WRITE INTENT, never on the mere presence of a path: an
+Edit is a write by definition, while a shell command's write intent is
+INFERRED, so it can be inferred wrongly. Three mechanisms bound that
+inference — heredoc bodies and quoted payload spans are stripped as DATA
+before extraction, and verbs/redirect operators are matched only OUTSIDE
+quoted spans, with a bounded `bash -c "..."` allowlist that descends into a
+quoted command that really is executed locally (g-115-3349). The branch-3
+deny was demoted to a stderr advisory for one iteration while those FP classes
+were open; it was restored only after a full-corpus replay measured BOTH
+directions (see the comment at the branch itself, and
+core/scripts/bash-hook-corpus-replay.py).
 
 OUT of scope (intentional — too false-positive-prone):
 
@@ -45,6 +60,17 @@ from hook_helpers import (  # noqa: E402
     emit_deny,
     stdin_json_or_approve,
 )
+# Root resolution is SHARED with path-resolution-hook.py (g-115-3338) so the
+# two surfaces cannot drift. These five were duplicated verbatim in both hooks
+# — verified semantically identical before consolidating.
+from _path_roots import (  # noqa: E402
+    compute_allowed_roots,
+    is_new_toplevel,
+    is_under,
+    is_write_exempt_sink,
+    norm_path,
+    read_paths_conf,
+)
 
 # Sync with path-resolution-hook.py / _paths.py.
 AGENTS_PARENT_DIR = "agents"
@@ -55,70 +81,6 @@ def _resolve_agent_dir(project_root, agent):
     if AGENTS_PARENT_DIR:
         return os.path.join(project_root, AGENTS_PARENT_DIR, agent)
     return os.path.join(project_root, agent)
-
-
-def norm_path(p):
-    """Same algorithm as path-resolution-hook.py:norm_path."""
-    if not p:
-        return ""
-    try:
-        p = p.replace("\\", "/")
-        if len(p) >= 3 and p[0] == "/" and p[2] == "/" and p[1].isalpha():
-            p = p[1].lower() + ":" + p[2:]
-        if p.startswith("//") and len(p) >= 5 and p[3] == ":":
-            p = p[2:].lower()[0] + p[3:]
-        if len(p) >= 2 and p[1] == ":":
-            p = p[0].lower() + p[1:]
-        while "//" in p:
-            p = p.replace("//", "/")
-        if len(p) > 1 and p.endswith("/"):
-            p = p[:-1]
-        return p
-    except Exception:
-        return ""
-
-
-def is_under(child, root):
-    if not child or not root:
-        return False
-    if child == root:
-        return True
-    return child.startswith(root + "/")
-
-
-def is_new_toplevel(target, root):
-    """Same algorithm as path-resolution-hook.py:is_new_toplevel."""
-    if not is_under(target, root) or target == root:
-        return False
-    rel = target[len(root) + 1:]
-    if not rel:
-        return False
-    first_segment = rel.split("/", 1)[0]
-    if not first_segment:
-        return False
-    toplevel_path = root + "/" + first_segment
-    return not os.path.exists(toplevel_path)
-
-
-def read_paths_conf(conf_path):
-    """Read WORLD_PATH, META_PATH from a local-paths.conf file."""
-    result = {"WORLD_PATH": None, "META_PATH": None, "AGENT_WRITE_PATH": None}
-    try:
-        with open(conf_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip().replace("\r", "")
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key in result:
-                    result[key] = value
-    except Exception:
-        pass
-    return result
 
 
 # Regex catalog of write-creating bash constructs. Each pattern extracts
@@ -185,13 +147,207 @@ _MULTI_ARG_TAIL_RE = {
 }
 _PATH_TOKEN_RE = re.compile(r'^' + PATH_CHARS + r'+$')
 
+# Heredoc opener: `<<DELIM`, `<<-DELIM`, `<<'DELIM'`, `<<"DELIM"`. Group 1 is
+# the delimiter with quotes stripped by the alternation.
+# `(?<!<)` + `(?!<)` exclude the HERESTRING `<<<`. Without them the regex still
+# matches at the SECOND `<` of `<<<` (consuming chars 2-3), so `cat <<< "hello"`
+# read as a heredoc opened by the delimiter `hello`. Found by fresh-eyes probe
+# F-2 (g-115-3338); see the terminator-exists guard in strip_heredoc_bodies for
+# the other half of the same defect class.
+_HEREDOC_OPEN_RE = re.compile(
+    r'(?<!<)<<-?(?!<)\s*(?:"([^"]+)"|\'([^\']+)\'|([A-Za-z_][A-Za-z0-9_]*))')
 
-def extract_targets(cmd):
-    """Return a list of (verb, path) tuples extracted from the bash command."""
+
+def strip_heredoc_bodies(cmd):
+    """Return `cmd` with every heredoc BODY removed, opener lines preserved.
+
+    The extractor's regexes are written for COMMAND text. A heredoc body is
+    DATA — JSON payloads piped into `*-add.sh`, inline Python source, prose in
+    a reasoning-bank entry. Scanning it produces phantom targets: measured
+    2026-07-26 over 11,554 real Bash calls (g-115-3338), EVERY out-of-root
+    candidate that survived the allowlist came from a heredoc body, e.g. an
+    rb-entry's prose yielding ('touch', '/') — a refusal keyed on the
+    filesystem root.
+
+    The opener LINE is kept, because the real sink lives there
+    (`cat > /path/f <<'EOF'`); only the lines after it, up to the terminator,
+    are dropped. This is the shell-command instance of the two-layer prose
+    filter in the `prose-filter-pattern` tree node (rb-349: fix at source,
+    not by loosening the regex).
+
+    Fail-open: any error returns the original command unchanged.
+    """
+    try:
+        if '<<' not in cmd:
+            return cmd
+        lines = cmd.split('\n')
+        # TERMINATOR-EXISTS GUARD (fresh-eyes probe F-1, g-115-3338). `<<` is
+        # also bash/python/C LEFT-SHIFT, and `1 << n` matches the opener regex
+        # with delimiter `n`. Before this guard, `py -3 -c 'x = 1 << n'` on line
+        # 1 silently swallowed EVERY later line — so a following
+        # `mkdir -p /opt/not-a-root/x` extracted no target and sailed past the
+        # refusal (measured: targets [] vs [('mkdir', ...)] for the identical
+        # command without the shift). A real heredoc ALWAYS has its delimiter on
+        # a line of its own; a left-shift operand essentially never does. So a
+        # candidate delimiter is honored only when such a line exists. This is
+        # the false-NEGATIVE direction rb-401 mandates re-checking when a
+        # static-scan regex is tightened — the same bypass class as the four
+        # 2026-05-21 fresh-eyes findings this hook already guards.
+        standalone = {ln.strip() for ln in lines}
+        out = []
+        pending = []          # delimiters opened on the current line
+        terminator = None
+        for line in lines:
+            if terminator is not None:
+                if line.strip() == terminator:
+                    terminator = pending.pop(0) if pending else None
+                continue
+            out.append(line)
+            found = [m.group(1) or m.group(2) or m.group(3)
+                     for m in _HEREDOC_OPEN_RE.finditer(line)
+                     if (m.group(1) or m.group(2) or m.group(3)) in standalone]
+            if found:
+                terminator = found[0]
+                pending = found[1:]
+        return '\n'.join(out)
+    except Exception:
+        return cmd
+
+
+# A quoted span that is an argument to a payload-emitting verb. `echo`/`printf`
+# never write a file themselves — their redirect target sits OUTSIDE the quotes
+# — so the span's CONTENTS are always data, never a write target.
+_PAYLOAD_SPAN_RE = re.compile(
+    r"\b(?:echo|printf)\s+(?:-[a-zA-Z]+\s+)*(?:'([^']*)'|\"([^\"]*)\")")
+
+
+def strip_payload_spans(cmd):
+    """Blank the CONTENTS of quoted payloads passed to `echo`/`printf`.
+
+    Sibling of strip_heredoc_bodies for the single-line case. The dominant
+    framework idiom is `echo '<json>' | some-script.sh` — board posts,
+    goal records, reasoning-bank entries. When that JSON happens to quote a
+    path (`"... write to /opt/elsewhere/x ..."`) the extractor reads it as a
+    redirect target and the out-of-root branch refuses an ordinary write of a
+    DATA payload.
+
+    Not hypothetical and not caught by the corpus: across 16,830 historical
+    Bash calls this fired zero times, because none of them were commands ABOUT
+    out-of-root paths — then it fired on the FIRST live wrapper probe of this
+    very feature (g-115-3338). A corpus can only bound the false-positive
+    classes it happens to contain; a live probe found the one it did not.
+
+    Narrow on purpose: only `echo`/`printf` arguments are blanked, so a quoted
+    redirect target (`echo hi > '/opt/GitHub/Ayoai/f.txt'`) is untouched — it
+    sits outside the span. Fail-open: any error returns the command unchanged.
+    """
+    try:
+        if "'" not in cmd and '"' not in cmd:
+            return cmd
+
+        def _blank(m):
+            # Blank by SPAN OFFSET, not str.replace: the payload's first
+            # occurrence inside the matched text can be in the VERB, not the
+            # quotes. `echo 'o'` blanked the 'o' of "echo" and left the payload
+            # intact ("ech  'o'"); `printf 'p'` corrupted "printf". Harmless
+            # today (a 1-2 char payload is never a path token) but wrong, and
+            # the offsets are exact. Fresh-eyes probe F-3, g-115-3338.
+            grp = 1 if m.group(1) is not None else 2
+            start, end = m.span(grp)
+            if start < 0 or end <= start:
+                return m.group(0)
+            off = m.start()
+            text = m.group(0)
+            return text[:start - off] + " " * (end - start) + text[end - off:]
+
+        return _PAYLOAD_SPAN_RE.sub(_blank, cmd)
+    except Exception:
+        return cmd
+
+
+_QUOTED_SPAN_RE = re.compile(
+    r"""'[^']*'"""   # single-quoted span
+    r'|"[^"]*"'      # double-quoted span
+)
+
+# Verbs that EXECUTE their quoted argument on THIS machine. Their argument is
+# command text, so it must be rescanned rather than skipped. Everything else
+# receiving a quoted argument (remote-exec wrappers like efs-ssh.sh/ssh, and
+# ordinary tools taking prose like `git commit -m` or `--summary "..."`) is
+# either not-local or not-executed, so its quoted span is DATA. (g-115-3349)
+# BOTH halves of this pattern are load-bearing, and a looser first draft
+# re-enabled the very FP class this allowlist exists beside (found by the
+# same-iteration fresh-eyes review of g-115-3349):
+#   * the shell name must be its OWN token, not a filename suffix. `\bsh\b`
+#     matches the `sh` in `efs-ssh.sh` (the `.` before it IS a word boundary),
+#     so a remote-exec wrapper re-entered the allowlist.
+#   * the flag must be a genuine SHORT option cluster containing `c` (-c, -lc,
+#     -ec). `-[a-z]*c[a-z]*` alone also matches LONG flags — `--exec`,
+#     `--check`, `--cached`, `--category` — so `wrapper.sh --exec "..."` and
+#     even `retrieve.sh --category "..."` were rescanned as local command text.
+# Measured before the fix: 1,544 of 48,731 corpus calls (3.2%) matched without
+# being a bare shell -c, and `retrieve.sh --category "...mkdir /opt/x..."` —
+# the pre-apply consultation shape code-review-protocol.md step 4 MANDATES —
+# was denied outright.
+_LOCAL_EXEC_RE = re.compile(
+    r"""(?<![\w.\-])(?:bash|sh|zsh|dash)"""   # shell as its own token, not `.sh`/`-ssh`
+    r"""(?:\s+-[a-z]+)*?"""                   # optional preceding short-flag clusters
+    r"""\s+-[a-z]*c[a-z]*"""                  # the -c cluster (single dash ONLY)
+    r"""\s+("(?:[^"]*)"|'(?:[^']*)')"""       # its quoted argument
+)
+
+
+def quoted_spans(cmd):
+    """Offsets of every quoted region: [(start, end), ...]. Never raises."""
+    try:
+        return [m.span() for m in _QUOTED_SPAN_RE.finditer(cmd)]
+    except Exception:
+        return []
+
+
+def _in_span(pos, spans):
+    return any(s <= pos < e for s, e in spans)
+
+
+def extract_targets(cmd, _depth=0):
+    """Return a list of (verb, path) tuples extracted from the bash command.
+
+    SPAN RULE (g-115-3349). A redirect OPERATOR or command VERB only counts
+    when its offset lies OUTSIDE every quoted span. This kills two measured
+    false-positive classes that shared one shape — `<verb> "<text with a
+    path>"` — where the quoted text is DATA, not command text:
+      * remote-exec wrapper args  (`efs-ssh.sh "mkdir -p /home/ec2-user/..."`)
+      * quoted prose on any verb  (`--summary "...>>/tee -a..."`,
+                                    `git commit -m "...>>/tee -a..."`)
+    The redirect TARGET may still be quoted (`echo hi > '/opt/x'`) because the
+    OPERATOR sits outside the span — that case keeps working and is pinned.
+
+    The rule alone would be a false-NEGATIVE bypass, because `bash -c "mkdir
+    /x"` has the identical shape yet DOES run locally (rb-401: tightening a
+    static scan demands re-checking the other direction). Measured: 5 such
+    forms. So local-exec verbs are allowlisted and their quoted argument is
+    RESCANNED. A remote-exec denylist was rejected by measurement — it cannot
+    reach the prose class at all, since neither iteration-close.sh nor git is
+    an exec wrapper.
+    """
+    cmd = strip_payload_spans(strip_heredoc_bodies(cmd))
     targets = []
+    spans = quoted_spans(cmd)
+
+    # Local-exec allowlist: rescan the quoted argument as command text. Bounded
+    # recursion — a nested `bash -c "bash -c ..."` is legitimate but must not
+    # loop; depth 2 covers observed shapes and terminates unconditionally.
+    if _depth < 2:
+        for m in _LOCAL_EXEC_RE.finditer(cmd):
+            inner = m.group(1)[1:-1]
+            if inner.strip():
+                targets.extend(extract_targets(inner, _depth + 1))
+
     # Multi-arg verbs (mkdir / touch / tee): scan every positional token after the flags.
     for verb in MULTI_ARG_VERBS:
         for m in _MULTI_ARG_TAIL_RE[verb].finditer(cmd):
+            if _in_span(m.start(), spans):
+                continue
             tail = m.group(1)
             for tok in tail.split():
                 tok = tok.strip('"\'')
@@ -203,6 +359,11 @@ def extract_targets(cmd):
     # Single-target patterns (cp/mv last-arg, > redirect destination).
     for pattern, target_group in PATTERNS_LAST_ARG:
         for m in re.finditer(pattern, cmd):
+            # Span rule: the OPERATOR/VERB position decides, not the target's.
+            # `echo hi > '/opt/x'` keeps working (the `>` is outside the quote);
+            # `--summary "...>>/tee..."` does not (the `>>` is inside one).
+            if _in_span(m.start(), spans):
+                continue
             verb_match = re.search(r'\b(cp|mv)\b', m.group(0))
             verb = verb_match.group(1) if verb_match else "redirect"
             path = m.group(target_group)
@@ -248,7 +409,14 @@ def main():
     # Read paths conf for WORLD/META
     conf_path = os.path.join(_resolve_agent_dir(project_root, agent),
                               "local-paths.conf")
-    paths = read_paths_conf(conf_path) if os.path.isfile(conf_path) else {}
+    conf_present = os.path.isfile(conf_path)
+    paths = read_paths_conf(conf_path) if conf_present else {}
+
+    # Allowed roots — the SAME list path-resolution-hook.py builds, from the
+    # SAME helper, so the two tool surfaces cannot answer "is this path in
+    # bounds?" differently. Includes each AGENT_WRITE_PATH entry (multi-root,
+    # ';'-separated), which is what keeps product-repo writes usable here.
+    allowed_roots = compute_allowed_roots(project_root, paths)
 
     agent_dir_norm = norm_path(_resolve_agent_dir(project_root, agent))
     wp_norm = norm_path(paths.get("WORLD_PATH") or "")
@@ -272,8 +440,20 @@ def main():
 
     # Check each target
     for verb, raw_path in targets:
-        # Resolve to absolute candidate path
-        if os.path.isabs(raw_path) or (len(raw_path) >= 2 and raw_path[1] == ":"):
+        # Resolve to absolute candidate path.
+        # The Windows drive-prefix test REQUIRES an alphabetic first character.
+        # A bare `raw_path[1] == ":"` also matched ordinary Python/shell
+        # comparisons that leak in as redirect captures — `if count > 0:`
+        # yields the token `0:`, which then read as an absolute drive path.
+        # Measured 2026-07-26 (g-115-3338): 3 of 4 surviving out-of-root
+        # candidates over 11,554 real Bash calls were this exact `0:` shape.
+        # Harmless while the only check is is_new_toplevel (a bogus drive is
+        # under no governed root), but it becomes a live refusal the moment an
+        # out-of-root branch is added — the direction rb-401 warns to re-check
+        # when tightening a static-scan regex.
+        if os.path.isabs(raw_path) or (
+            len(raw_path) >= 2 and raw_path[1] == ":" and raw_path[0].isalpha()
+        ):
             abs_path = raw_path
         elif raw_path.startswith("/"):
             abs_path = raw_path
@@ -320,6 +500,75 @@ def main():
                     f"\"L1 Cruft Prevention\" section."
                 )
                 emit_deny(reason)
+
+        # --- Block: write target is absolute AND outside all allowed roots ---
+        # Tool-surface parity with path-resolution-hook.py's closing branch
+        # (g-115-3338). Without this, the identical write was refused on the
+        # Edit surface and approved on the Bash surface minutes later.
+        #
+        # Scoped to WRITE INTENT only. An Edit is a write by definition, so a
+        # path-shaped refusal there has no false-positive surface; shell
+        # commands are mostly READS, so a refusal keyed on the mere presence
+        # of an outside path would refuse nearly all of them. `targets` is
+        # already the write-intent set (redirect / tee / cp / mv destinations,
+        # mkdir / touch operands, and heredoc sinks via the opener-line
+        # redirect), so the refusal applies to that set alone.
+        #
+        # Conf-missing fail-open, mirroring the Edit side: without
+        # local-paths.conf only PROJECT_ROOT is known, and an external target
+        # cannot be validated against unknown WORLD/META roots.
+        if not conf_present or not allowed_roots:
+            continue
+        if not os.path.isabs(target_norm) and not (
+            len(target_norm) >= 2 and target_norm[1] == ":"
+        ):
+            continue
+        if is_write_exempt_sink(target_norm):
+            continue
+        if any(is_under(target_norm, root) for _, root in allowed_roots):
+            continue
+        # DENY — restored by g-115-3349 after the two false-positive classes
+        # that forced the advisory downgrade were bounded by the span rule in
+        # extract_targets() (see its docstring for the design and the rejected
+        # alternative).
+        #
+        # HOW THE RESTORE WAS EARNED, since a previous restore was NOT:
+        # this branch originally shipped as a hard deny on a 0.000% measurement
+        # taken over a SUBSET (11,559 calls / 2 transcripts). A wider replay
+        # (48,348 / 4) then found 0.062% and two live FP classes that broke
+        # documented capabilities — the remote-exec wrapper argument and quoted
+        # prose on a non-echo verb. That is the guard-1557 lesson: a clean rate
+        # bounds only the FP classes the corpus CONTAINS.
+        #
+        # So the restore required BOTH directions measured, not one:
+        #   FP  full corpus, ALL 4 transcripts, 48,646 calls -> residual EMPTY,
+        #       with a positive control proving the instrument still flags
+        #       genuine writes (a bare zero is what misled the first restore).
+        #   FN  five local-exec forms (`bash -c`, `sh -c`, `env ... bash -c`,
+        #       `bash -lc`, quoted-redirect) verified STILL flagged, because a
+        #       span rule alone would have approved every one of them (rb-401).
+        # Harness: core/scripts/bash-hook-corpus-replay.py — durable, defaults
+        # to ALL transcripts; re-run it before touching this branch again.
+        # Contract: core/scripts/tests/test_bash_path_hook_out_of_root.py holds
+        # both floors, including test_local_exec_quoted_write_must_stay_flagged,
+        # which must keep passing. Do NOT relax it to make a span change pass.
+        reason = (
+            f"[l1-bash-path] DENY: write target outside all configured roots\n"
+            f"  verb: {verb}\n"
+            f"  write target: {raw_path}\n"
+            f"{chr(10).join(f'  {label} = {root}' for label, root in allowed_roots)}\n"
+            f"The Write/Edit hook REFUSES this same target. If this is a real "
+            f"local write, redirect it under a configured root — for scratch use "
+            f"agents/{agent}/temp/. System temp (/tmp, /var/tmp) and device sinks "
+            f"(/dev, /proc) are exempt. For a product repo, add the root to "
+            f"AGENT_WRITE_PATH in <agent>/local-paths.conf (user-authorized).\n"
+            f"If this is command TEXT rather than a local write (a remote-exec "
+            f"wrapper argument, or prose in a quoted flag), it should already be "
+            f"approved by the quoted-span rule — if it is not, that is a bug "
+            f"worth reporting, not a reason to weaken the branch.\n"
+            f"See: .claude/rules/path-resolution.md.\n"
+        )
+        emit_deny(reason)
 
     approve_no_mutation()
 

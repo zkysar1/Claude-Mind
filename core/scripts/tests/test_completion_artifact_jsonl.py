@@ -1,4 +1,4 @@
-"""test_completion_artifact_jsonl.py — regression for 5 / rb-1838.
+"""test_completion_artifact_jsonl.py — regression for  / rb-1838.
 
 The completion-artifact gate's ARTIFACT_PATH_RE extension alternation was
 leftmost-match-ordered (`json` before `jsonl`) with no trailing boundary, and

@@ -102,12 +102,12 @@ def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
-# ── 8: monotonic loop_state counters (Mechanism C backstop) ──
+# ── : monotonic loop_state counters (Mechanism C backstop) ──
 # These three top-level loop_state fields only ever advance within a session
 # (goals_completed / productive_goals increment; counted_goals_this_session
 # appends). A full-slot write carrying stale-lower values must never lower the
 # on-disk committed state. Scope is deliberately these three (named in
-# guard-746 + the 1 live repro); evolutions / touched are monotonic
+# guard-746 + the  live repro); evolutions / touched are monotonic
 # too but out of this goal's scope — add here only if a future incident shows
 # them reverted (guard-416: forward-looking ballast is still ballast).
 _MONOTONIC_MAX_FIELDS = ("goals_completed", "productive_goals")
@@ -233,7 +233,7 @@ def check(
         "reason": "",
         "missing_subkeys": [],
         "override_applied": False,
-        # 8 monotonic-counter preservation (Mechanism C backstop).
+        #  monotonic-counter preservation (Mechanism C backstop).
         # preserved_value is what the caller should WRITE (the incoming value
         # with stale-lower top-level counters floored to on-disk + counted_goals
         # unioned). Defaults to the incoming value unchanged; counters_preserved
@@ -268,7 +268,7 @@ def check(
         result["reason"] = "incoming value is not a dict and on-disk is not a dict — pass through"
         return result
 
-    # ── Monotonic-counter preservation (8, Mechanism C backstop) ──
+    # ── Monotonic-counter preservation (, Mechanism C backstop) ──
     # rb-715 (below) guards DROPPED signals subkeys; it does NOT guard LOWERED
     # top-level counters. A collateral full-slot writer that captured loop_state
     # before a peer's bump carries stale-lower goals_completed/productive_goals

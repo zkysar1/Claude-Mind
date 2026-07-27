@@ -36,6 +36,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta  # noqa: F401 — timedelta used by hypothesis-health
 from pathlib import Path
 
@@ -44,11 +45,13 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT, META_DIR  # type: ignore
+from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT, META_DIR, WORLD_DIR  # type: ignore
 from _fileops import log_script_decision  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
 from _prefix_registry import PRIMITIVE_PREFIXES  # type: ignore
 from _goal_census import effective_counts  # type: ignore  (B9-deep census-augmented counts)
+from _drain_title import (  # type: ignore  ( owner-scope drain SSOT)
+    _DRAIN_GOAL_TITLE_PREFIX, _DRAIN_GOAL_TITLE_INFIX, is_drain_action_title)
 
 try:
     import yaml  # type: ignore
@@ -107,6 +110,101 @@ def _load_compact():
         return None
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _compact_staleness(compact_path=None):
+    """ — is the compact OLDER than the stores it summarizes?
+
+    Every one of the 8 detectors takes `compact` as a parameter and none
+    re-reads live state, so a stale compact makes them return a WRONG ANSWER
+    rather than an error. The refresh (`load-aspirations-compact.sh`) lives in
+    a SEPARATE, LLM-invoked precheck step — so detector correctness rides on
+    the LLM having remembered a different line first. LLM-gated steps drift;
+    this makes the drift VISIBLE instead of silent.
+
+    Paired with `_refresh_compact()`: main() refreshes when this reports stale,
+    then re-runs this probe on the result. So this serves two roles — the
+    TRIGGER for the auto-refresh, and the VERIFICATION that the refresh
+    actually worked. A staleness flag surviving the refresh means the rebuild
+    failed, which is a genuinely loud condition rather than routine drift.
+
+    The staleness DEFINITION is not invented here — it is the same test
+    load-aspirations-compact.sh already uses to decide whether to regenerate
+    (`[ "$WORLD_JSONL" -nt "$COMPACT" ]` / `[ "$AGENT_JSONL" -nt "$COMPACT" ]`,
+    i.e. newest-source-mtime > compact-mtime). Mirroring the refresher's own
+    predicate keeps ONE definition of "stale" (communication-clarity rule 5):
+    whenever this reports stale, the canonical refresher would regenerate, so
+    the reported condition is always clearable by the documented action.
+
+    Returns a dict always; never raises (a staleness probe must not be able to
+    break the detectors it is reporting on).
+    """
+    info = {"checked": False, "stale": False}
+    try:
+        path = Path(compact_path) if compact_path else (
+            (AGENT_DIR / "session" / "aspirations-compact.json")
+            if AGENT_DIR is not None else None)
+        if path is None or not path.exists():
+            return info
+        c_mtime = path.stat().st_mtime
+        # Both queues are literally named `aspirations.jsonl`, so a basename
+        # cannot tell them apart — carry an explicit kind so the report can say
+        # WHICH queue moved without string-matching a path.
+        sources = []
+        if WORLD_DIR:
+            sources.append(("world", Path(WORLD_DIR) / "aspirations.jsonl"))
+        if AGENT_DIR is not None:
+            sources.append(("agent", AGENT_DIR / "aspirations.jsonl"))
+        newest, newest_src, newest_kind = 0.0, None, None
+        for kind, s in sources:
+            try:
+                if s.exists() and s.stat().st_mtime > newest:
+                    newest, newest_src, newest_kind = s.stat().st_mtime, str(s), kind
+            except OSError:
+                continue
+        if newest_src is None:
+            return info
+        info["checked"] = True
+        info["compact_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                              time.localtime(c_mtime))
+        info["age_minutes"] = round((time.time() - c_mtime) / 60.0, 1)
+        if newest > c_mtime:
+            info["stale"] = True
+            info["newer_source"] = newest_src
+            info["newer_source_kind"] = newest_kind
+            info["source_ahead_minutes"] = round((newest - c_mtime) / 60.0, 1)
+    except Exception as e:  # noqa: BLE001 — never break the detectors
+        # An errored probe does not know the answer. Say so rather than letting
+        # the default `stale: False` read as a verified-fresh verdict — an
+        # unverified negative is exactly what this whole fix exists to remove.
+        info["checked"] = False
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def _refresh_compact(timeout=90):
+    """ — rebuild the compact via its canonical builder. Fail-OPEN.
+
+    Delegates to load-aspirations-compact.sh, the ONE thing that knows how to
+    build a compact, rather than rebuilding inline — an inline rebuild would
+    fork a second copy of the build logic that drifts from the real one
+    (communication-clarity rule 5). The builder is itself a no-op when the
+    compact is already fresh, but the caller still gates on staleness so the
+    common fresh path costs zero subprocesses.
+
+    Never raises. On timeout, spawn failure, or a non-zero builder exit, the
+    caller proceeds with whatever compact is on disk AND the post-refresh
+    staleness probe flags it loudly — so a failed refresh degrades to
+    visible-stale, never to a stall or a silent wrong answer.
+    """
+    try:
+        _out, err, rc = _run_script(["load-aspirations-compact.sh"], timeout=timeout)
+        info = {"attempted": True, "rc": rc}
+        if rc != 0:
+            info["stderr"] = (err or "").strip()[-300:]
+        return info
+    except Exception as e:  # noqa: BLE001 — subprocess timeout / spawn failure
+        return {"attempted": True, "rc": None, "error": f"{type(e).__name__}: {e}"}
 
 
 def _active_aspirations(compact):
@@ -185,7 +283,7 @@ def cmd_zombies(args, config, compact):
             continue
         unfinished = [g for g in non_recurring if g.get("status") not in TERMINAL_STATUSES]
         if not unfinished:
-            # All-terminal class (4): every non-recurring goal is
+            # All-terminal class (): every non-recurring goal is
             # terminal yet the aspiration is still active. The in-loop closer
             # (complete-review at the completing goal's iteration close) is a
             # moment-in-time trigger — sweep-completions, cross-box closes, and
@@ -601,11 +699,11 @@ def cmd_cycles(args, config, compact):
         # designed. Genuine repeated failures of non-primitive work still
         # surface (Apply/Maintain/Investigate skips fall through unchanged).
         #
-        # 1 (2026-05-27) REMOVED the  synthetic-tag branch
+        #  (2026-05-27) REMOVED the  synthetic-tag branch
         # (`or "synthetic" in g.get("tags")`). It was DEAD in production: the
         # live compact projection (_COMPACT_GOAL_KEEP in
         # mind_api/src/endpoints/aspirations.py — the SSOT; the orphaned CLI
-        # COMPACT_GOAL_KEEP copy was retired 9) strips `tags`, so cmd_cycles
+        # COMPACT_GOAL_KEEP copy was retired ) strips `tags`, so cmd_cycles
         # always saw g.get("tags") == None here and the branch never matched on
         # real compact data. The  "confirmed via simulation" used
         # hand-injected tags that bypassed the projection (false-confidence,
@@ -621,7 +719,7 @@ def cmd_cycles(args, config, compact):
         # below STAYS — `title` survives the projection, so it is genuinely live.
         # Migration skip-by-design FPs () are a separate live concern;
         # if they recur, address with a dedicated mechanism, not tag-resurrection.
-        # 5: also exclude NEVER-ATTEMPTED skips. A failure requires an
+        # : also exclude NEVER-ATTEMPTED skips. A failure requires an
         # attempt — 96.5% of live skipped goals (109/113) carry no attempt marker
         # (they are WITHDRAWN: duplicate/superseded/obsolete/misrouted, skipped
         # straight from pending by a dedup sweep, never claimed). Only a skip that
@@ -630,9 +728,9 @@ def cmd_cycles(args, config, compact):
         # sweep in ANY active aspiration trips a phantom repeated_failure (it did
         # on ). `started` survives the compact projection (it is in
         # _COMPACT_GOAL_KEEP), so cmd_cycles sees it here. A naive filter on
-        # `started` ALONE was reverted under 1 because `started` had no
+        # `started` ALONE was reverted under  because `started` had no
         # writer then — genuine failures also lacked it; making it truthful at
-        # claim time (5) is the prerequisite that makes this exclusion
+        # claim time () is the prerequisite that makes this exclusion
         # safe. test_never_attempted_skips_no_cycle + the (now `started`-carrying)
         # genuine tests pin both directions.
         resolved = [
@@ -645,7 +743,7 @@ def cmd_cycles(args, config, compact):
                 )
             )
         ]
-        # 7 (2026-07-16, zeta): exclude recurring goals from the window.
+        #  (2026-07-16, zeta): exclude recurring goals from the window.
         # Recurring cadence goals (e.g. "Reflect and journal", "Review and resolve
         # hypotheses") re-resolve perpetually by design, share one category within
         # their aspiration, are NOT primitive-prefixed (so the all_primitives
@@ -656,10 +754,10 @@ def cmd_cycles(args, config, compact):
         # 69%). Recurring-goal pathology (staleness, cargo-cult closes) has its own
         # dedicated detector (cargo-cult-detector.py via recurring-close.sh) — this
         # cycle detector owns non-recurring learning-intent goals. `recurring` is
-        # in _COMPACT_GOAL_KEEP (verified live, not a 1 dead-branch field);
+        # in _COMPACT_GOAL_KEEP (verified live, not a  dead-branch field);
         # the completion_ratio block below already relies on it the same way.
         resolved = [g for g in resolved if not g.get("recurring")]
-        # 1 (2026-07-14, zeta) — WHY THERE IS NO never-attempted FILTER HERE,
+        #  (2026-07-14, zeta) — WHY THERE IS NO never-attempted FILTER HERE,
         # and what a future agent must build FIRST before adding one.
         #
         # This detector treats `skipped` as failure evidence. It is not: a skip can
@@ -672,7 +770,7 @@ def cmd_cycles(args, config, compact):
         # repeated_failure on  — the team's PRIMARY strategic aspiration —
         # auto-filing a phantom Investigate that pulled an agent off strategic work.
         #
-        # CORRECTION (7-t, same day): the paragraph that stood here was
+        # CORRECTION (-t, same day): the paragraph that stood here was
         # WRONG on its central claim, and the error is instructive enough to keep.
         # It asserted that `started` "has NO WRITER on the goal path — nothing sets
         # it when a goal is claimed or executed," and inferred that from a grep that
@@ -689,9 +787,9 @@ def cmd_cycles(args, config, compact):
         # So `started` was never a field without a writer; it was a field with an
         # HONOR-SYSTEM writer that drifted to 31% — and honor-system writes are
         # exactly what this framework keeps having to move into bash (loop_state:
-        # /05/06, 1, 5).
+        # /05/06, , ).
         #
-        # AS OF 7-t the daemon claim endpoint writes it:
+        # AS OF -t the daemon claim endpoint writes it:
         # aspirations_write.py claim() does `goal.setdefault("started", _claim_ts)`
         # beside claimed_by/claimed_at. It is now script-enforced at the one place a
         # goal is actually attempted, costs zero hot-path tax (`started` was already
@@ -703,8 +801,8 @@ def cmd_cycles(args, config, compact):
         # it is COVERAGE: 1168 legacy goals pre-date the writer and carry no
         # `started`. A naive `exclude skips lacking started` would classify every
         # one of them as never-attempted and DELETE genuine repeated-failure
-        # detection — precisely the trap that caught the 1 author, stopped
-        # only by test_genuine_repeated_failure_still_detected + the 1
+        # detection — precisely the trap that caught the  author, stopped
+        # only by test_genuine_repeated_failure_still_detected + the 
         # synthetic-skip test (both of which model real goals as having no
         # `started`, which was correct for pre-fix data and is now the thing to
         # migrate). The filter therefore needs a CUTOVER: apply it only to goals
@@ -754,7 +852,7 @@ def cmd_cycles(args, config, compact):
                     for g in recent
                 )
                 if not all_primitives:
-                    # 2 (rb-3820, diagnosed by ): all-product
+                    #  (rb-3820, diagnosed by ): all-product
                     # windows are velocity-blind by construction — their
                     # deliverables are sibling product-repo commits, which none
                     # of compute_learning_velocity's five counters can see
@@ -769,10 +867,10 @@ def cmd_cycles(args, config, compact):
                     # all_primitives, keeps the detector fully live for mixed
                     # and framework windows, and legacy goals missing
                     # work_class fail the equality so their behavior is
-                    # unchanged (safe-cutover semantics per 7-t).
-                    # work_class is in _COMPACT_GOAL_KEEP (added 2,
+                    # unchanged (safe-cutover semantics per -t).
+                    # work_class is in _COMPACT_GOAL_KEEP (added ,
                     # both copies) — without that this check would be a dead
-                    # branch (1 class). Placed BEFORE the trajectory
+                    # branch ( class). Placed BEFORE the trajectory
                     # probe: also saves the 60s subprocess on product windows.
                     # Attribution option (a) — scanning sibling product repos
                     # by goal-id — was rejected as box-DEPENDENT: repo
@@ -945,6 +1043,13 @@ def cmd_user_goals(args, config, compact):
 # Phase 0.5.x — temp/ accumulation pressure (file-model normalization Phase 5)
 # ─────────────────────────────────────────────────────────────────────────
 
+# Drain-action goal title template markers + positive-signature matcher now live
+# in the shared SSOT module core/scripts/_drain_title.py (imported at top), so BOTH
+# this file's suggested_goal template/dedup AND goal-selector.py's
+# _is_owner_scoped_goal key off the same constants and cannot drift
+# (;  / rb-3452 "assert the mechanism, not the case").
+
+
 def cmd_temp_pressure(args, config, compact):
     """Count undrained working docs in the bound agent's temp/ store and flag
     accumulation pressure, so temp/ never becomes the new slush directory.
@@ -979,11 +1084,11 @@ def cmd_temp_pressure(args, config, compact):
     #     orphan-*.py / restart-poller.sh / gs.err) -> carry NO knowledge;
     #     /drain-temp Phase 1.5 PURGES them (deletes — gitignored + unencodable,
     #     120-min age guard protects in-flight writes). Counted as
-    #     `ephemera_count`. 7 added the scratch-script class (.py/.sh/
-    #     .err); 7 added .log/.txt.
+    #     `ephemera_count`.  added the scratch-script class (.py/.sh/
+    #     .err);  added .log/.txt.
     # Both classes accumulate in temp/ root, so BOTH must feed the pressure
     # signal — else the ephemera slush stays invisible to the drain trigger and
-    # grows unbounded (7: 7 .log/.txt survived a full drain because the
+    # grows unbounded (: 7 .log/.txt survived a full drain because the
     # glob AND this metric both saw only .md/.json). Threshold flags fire on the
     # COMBINED pressure; the two counts stay distinct so the drain goal can name
     # what it drains vs purges.
@@ -1003,13 +1108,15 @@ def cmd_temp_pressure(args, config, compact):
 
     # Dedup: if a drain-temp ACTION goal is already open, do NOT re-suggest filing —
     # else every iteration above threshold would spawn a duplicate HIGH goal.
-    # Only ACTION goals drain temp/; ANALYSIS goals (Investigate:/Idea:) whose title
-    # happens to contain "drain"+"temp" must NOT satisfy the dedup — else an
-    # "Investigate: temp-drain goal not auto-surfaced..." goal (0) falsely
-    # counts as the open drain goal, permanently suppressing the real "Maintain: drain
-    # N accumulated temp/ working docs" goal from ever filing and letting temp/ grow
-    # unbounded (the confirmed 0 root cause: 134 undrained files, 0 auto-filed).
-    # Agent-scope the dedup (7): the undrained-doc COUNT above targets
+    # Only ACTION goals drain temp/; a goal whose title merely MENTIONS temp-drain must
+    # NOT satisfy the dedup. The match below is a POSITIVE drain-action signature
+    # () firing only on the real "Maintain: drain N accumulated temp/ working
+    # docs" template this check files — so BOTH an Investigate:/Idea: analysis goal (the
+    # original  case) AND a "Maintain:" goal merely ABOUT the drain ()
+    # are excluded by CONSTRUCTION. Otherwise such a goal falsely counts as the open drain
+    # goal, permanently suppressing the real drain goal from filing and letting temp/ grow
+    # unbounded (the confirmed  root cause: 134 undrained files, 0 auto-filed).
+    # Agent-scope the dedup (): the undrained-doc COUNT above targets
     # AGENT_DIR/temp (the BOUND agent's store), so this dedup must match. World-
     # queue drain goals appear in EVERY agent's compact, so without scoping, one
     # agent's open drain goal set existing != None for ALL agents -> suggested_goal
@@ -1023,15 +1130,20 @@ def cmd_temp_pressure(args, config, compact):
     for asp in _active_aspirations(compact):
         for g in asp.get("goals", []):
             if g.get("status") in ("pending", "in-progress"):
-                t = (g.get("title") or "").lower()
-                if t.startswith(("investigate:", "idea:")):
-                    continue  # analysis goal, not a drain action (0)
-                if "drain" in t and "temp" in t:
-                    owner = g.get("filed_by_agent") or g.get("handoff_to")
-                    if owner is not None and owner != agent_name:
-                        continue  # another agent's drain goal (7) — not ours
-                    existing = g.get("id")
-                    break
+                # Positive drain-action signature (/, shared
+                # SSOT is_drain_action_title): match ONLY the real drain template
+                # this check files (prefix + count + infix). A goal whose title
+                # merely MENTIONS temp-drain — an Investigate:/Idea: analysis goal
+                # () OR a "Maintain:" goal ABOUT the drain () —
+                # never starts with the template prefix, so it is excluded by
+                # CONSTRUCTION and can no longer falsely count as the open drain goal.
+                if not is_drain_action_title(g.get("title")):
+                    continue
+                owner = g.get("filed_by_agent") or g.get("handoff_to")
+                if owner is not None and owner != agent_name:
+                    continue  # another agent's drain goal () — not ours
+                existing = g.get("id")
+                break
         if existing:
             break
 
@@ -1042,7 +1154,7 @@ def cmd_temp_pressure(args, config, compact):
         _purge_clause = (f" + purge {ephemera_count} stale ephemera file(s)"
                          if ephemera_count else "")
         suggested_goal = {
-            "title": (f"Maintain: drain {count} accumulated temp/ working docs "
+            "title": (f"{_DRAIN_GOAL_TITLE_PREFIX}{count} {_DRAIN_GOAL_TITLE_INFIX} "
                       f"to the knowledge tree" + _purge_clause),
             "priority": "HIGH",
             "participants": ["agent"],
@@ -1062,6 +1174,18 @@ def cmd_temp_pressure(args, config, compact):
                 f"file-model normalization exists to prevent."
             ),
         }
+        # Route to the temp OWNER, not the content classifier (, rb-3876).
+        # /drain-temp is bound-agent-scoped (drains agents/<BOUND-AGENT>/temp/), so this
+        # goal is satisfiable ONLY by the agent whose store triggered it (agent_name).
+        # Without an explicit intended_agent, capability_route's Tier-3 "knowledge tree"
+        # ->bravo heuristic (matching the drain DESTINATION named in title/description,
+        # NOT the owner) misroutes to bravo; the drain then no-ops on bravo's temp while
+        # the owner's grows unbounded (observed: alpha temp 14->83). The daemon add-goal
+        # Phase D honors an explicit intended_agent (skips the classifier). agent_name is
+        # None only when AGENT_DIR is unresolved (no live agent) — omit then so the
+        # pre-fix classifier path still applies (no regression).
+        if agent_name:
+            suggested_goal["intended_agent"] = agent_name
     elif pressure_count >= drain_threshold and existing is not None:
         flags.append("temp_drain_pending")
     elif pressure_count >= warn_threshold:
@@ -1174,16 +1298,36 @@ def main():
         }))
         sys.exit(2)
 
+    refresh_info = None
     if args.compact_path:
+        # Caller supplied its own snapshot and owns its freshness — never
+        # rebuild the agent's compact behind a caller that asked for a
+        # specific file.
         with open(args.compact_path, "r", encoding="utf-8") as f:
             compact = json.load(f)
     else:
+        #  — own our own input. The refresh used to live ONLY in a
+        # separate, LLM-invoked precheck step, so every detector's correctness
+        # rode on the LLM having remembered a different line first. It drifted
+        # twice in one day, each time producing a confident WRONG answer rather
+        # than an error. Refreshing here removes the cross-step dependency
+        # instead of documenting it again: per rb-428 / , the durable
+        # pattern is to move the obligation into the script, never into another
+        # instruction telling the LLM to remember.
+        #
+        # Gated on staleness so the common fresh case costs zero subprocesses.
+        # `not checked` covers the missing-compact case, which used to make
+        # this whole script a no-op on a fresh agent.
+        pre = _compact_staleness()
+        if pre.get("stale") or not pre.get("checked"):
+            refresh_info = _refresh_compact()
         compact = _load_compact()
         if compact is None:
             print(json.dumps({
                 "subcommand": args.subcommand,
                 "summary": "no aspirations-compact.json (run aspirations-compact.sh first)",
                 "flags": [],
+                "compact_refresh": refresh_info,
             }))
             sys.exit(0)
 
@@ -1196,6 +1340,57 @@ def main():
             "flags": ["error"],
         }))
         sys.exit(2)
+
+    #  — staleness is reported at the SINGLE output chokepoint, so
+    # all 9 subcommands are covered without touching any of the 8 detectors
+    # (they take `compact` as a parameter and none re-reads live state, so the
+    # defect is uniform across them and the fix should be too).
+    freshness = _compact_staleness(args.compact_path)
+    result["compact_freshness"] = freshness
+    if refresh_info is not None:
+        result["compact_refresh"] = refresh_info
+    if freshness.get("stale"):
+        # Reaching here means the auto-refresh above did NOT resolve the
+        # staleness (it errored, timed out, or the builder exited non-zero) —
+        # or a --compact-path caller supplied a stale snapshot. Either way this
+        # is no longer routine drift, it is a rebuild that failed, so fail LOUD.
+        #
+        # A stale run's verdict is not wrong-SHAPED, it is confidently-wrong-
+        # VALUED — the summary reads exactly like a healthy one. Marking the
+        # summary itself (not just a nested field) is what removes the silence,
+        # because the summary is what a consumer reads first.
+        # Headline the STALENESS MAGNITUDE (how far behind the source), not the
+        # snapshot's wall-clock age — a 2m-old compact written 1.9m behind its
+        # source is barely stale, while a 101m-old one 95m behind is the
+        # originating incident. Both numbers ship; the actionable one leads.
+        # Attribute the surviving staleness correctly. "rebuild failed" and
+        # "rebuild worked but the shared world queue was written again in the
+        # interval" are DIFFERENT problems pointing at different fixes, and in a
+        # multi-agent fleet the second is routine — any partner filing a goal
+        # writes that queue. Reporting the race as a builder failure sends the
+        # reader to debug a builder that is working fine.
+        if refresh_info is None:
+            rebuilt = "not auto-rebuilt (explicit --compact-path)"
+        elif refresh_info.get("rc") == 0:
+            rebuilt = "rebuild SUCCEEDED — source written again since; likely a concurrent write, not a builder fault"
+        else:
+            rebuilt = f"auto-rebuild FAILED (rc={refresh_info.get('rc')})"
+        # .get() with fallbacks, NOT bracket indexing: these three keys are set
+        # together inside one branch of the probe, so any future edit that sets
+        # `stale` without them would raise KeyError HERE — after all 8 detectors
+        # already ran, discarding their entire output. The probe promises it
+        # cannot break the detectors; that promise only holds if its consumer
+        # honours it too (fresh-eyes finding F-001 on this file).
+        ahead = freshness.get("source_ahead_minutes", "?")
+        kind = freshness.get("newer_source_kind", "source")
+        age = freshness.get("age_minutes", "?")
+        result["summary"] = (
+            f"[COMPACT STALE — {ahead}m behind the {kind} queue "
+            f"(snapshot {age}m old; {rebuilt}); this verdict "
+            f"is computed from that snapshot and may be wrong] "
+            f"{result.get('summary', '')}"
+        )
+        result.setdefault("flags", []).append("compact_stale")
 
     log_script_decision("precheck-eval", {
         "subcommand": args.subcommand,

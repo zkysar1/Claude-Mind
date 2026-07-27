@@ -190,12 +190,37 @@ def _build_investigate(entries):
 
 def _file_investigate(aspiration_id, entries):
     """File the audit Investigate via the daemon. Returns goal_id or an
-    <add-goal-failed:...> marker (never raises — the caller surfaces it)."""
+    <add-goal-failed:...> marker (never raises — the caller surfaces it).
+
+    On a goal_duplication_blocked refusal, retries ONCE with a justified,
+    audited X-Mind-Override-Duplication. _file_investigate is reached ONLY
+    when the caller's _find_open_audit found NO open reconcile audit, so the
+    gate's block is against COMPLETED prior recurring audits — a structural
+    false positive for this inherently-recurring audit (each fresh straggler
+    needs its own audit once the prior one closed). Without the retry the
+    reason-less safety mechanism can never escalate a straggler once >=1
+    reconcile audit has completed. Mirrors ohs-husk-cluster-check.py
+    file_goal() (g-335-96) + the automated-filer-gate-interaction tree node.
+    (g-115-3067)"""
     record = _build_investigate(entries)
     try:
         result = _rt.aspirations_add_goal(aspiration_id, record, source="world")
     except _rt.RtError as e:
-        return f"<add-goal-failed:{(e.body or str(e)).strip() or 'no detail'}>"
+        body = (e.body or str(e)).strip()
+        if "goal_duplication_blocked" not in body:
+            return f"<add-goal-failed:{body or 'no detail'}>"
+        # Retry ONCE with a justified override — the sweep's own open-audit
+        # dedup already guarantees no OPEN duplicate (audited to
+        # world/goal-duplication-overrides.jsonl).
+        try:
+            result = _rt.aspirations_add_goal(
+                aspiration_id, record, source="world",
+                overrides={"Duplication": (
+                    "reason-less sweep: _find_open_audit confirmed no OPEN "
+                    "reconcile audit; dup-gate match is COMPLETED prior "
+                    "recurring audits (structural FP). g-115-3067")})
+        except _rt.RtError as e2:
+            return f"<add-goal-failed:{(e2.body or str(e2)).strip() or 'no detail'}>"
     if isinstance(result, dict):
         return result.get("goal_id") or result.get("id") or "<unknown-id>"
     return "<unknown-id>"

@@ -1,4 +1,4 @@
-"""test_mind_api_isolated_imports.py — regression guard for rb-3868 / 7.
+"""test_mind_api_isolated_imports.py — regression guard for rb-3868 / .
 
 Import-order class: a mind_api/src/** module that imports a core/scripts
 sibling module (_gate_log, _fileops, _team_state, ...) BEFORE the

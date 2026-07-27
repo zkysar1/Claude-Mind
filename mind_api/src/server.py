@@ -227,7 +227,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self._write_response(resp)
                     return
 
-            # T-c (1): multi-tenant customer activation + app-authz,
+            # T-c (): multi-tenant customer activation + app-authz,
             # GATED behind MIND_MULTI_TENANT (default OFF = today's single-tenant
             # deployment). OFF: the tenant header is still propagated through
             # ctx.tenant (the R4 seam, unchanged) but does NOT scope storage keys

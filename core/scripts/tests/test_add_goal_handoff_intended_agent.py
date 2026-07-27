@@ -1,4 +1,4 @@
-"""test_add_goal_handoff_intended_agent.py — regression for 7.
+"""test_add_goal_handoff_intended_agent.py — regression for .
 
 Phase D of the add-goal endpoint (capability-route mutator) stamps
 `intended_agent` when the caller didn't set one. Before g-115-2577 it ran the

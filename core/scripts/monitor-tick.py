@@ -40,6 +40,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
+
 DEFAULT_PROBE_TIMEOUT = 60  # seconds per probe (bounded; a hung probe must not stall the tick)
 
 
@@ -49,13 +51,13 @@ def _now_iso():
 
 
 def _parse_ts(s):
-    """guard-420: tolerant ISO parse (strip trailing Z, swallow malformed)."""
+    """guard-420: tolerant ISO parse (strip trailing Z, swallow malformed).
+    g-115-3027: robust tzinfo-strip via shared _dt.parse_naive_iso (an
+    offset-bearing input previously yielded an aware datetime and crashed the
+    probe-time compare)."""
     if not s or not isinstance(s, str):
         return None
-    try:
-        return dt.datetime.fromisoformat(s.replace("Z", "").strip())
-    except Exception:
-        return None
+    return parse_naive_iso(s)
 
 
 def load_registry(registry_path):
@@ -151,10 +153,11 @@ def _subprocess_runner(script_abs, args, timeout=DEFAULT_PROBE_TIMEOUT, project_
     """
     cmd = [str(script_abs)] + list(args or [])
     if str(script_abs).endswith(".sh"):
-        cmd = ["bash"] + cmd
+        from _runtime_bash import BASH  # rb-1472: not bare "bash"
+        cmd = [BASH] + cmd
     elif str(script_abs).endswith(".py"):
         cmd = [sys.executable] + cmd
-    # FW-1b.2 win32 fix (6): probes are non-interactive by contract, so
+    # FW-1b.2 win32 fix (): probes are non-interactive by contract, so
     # detach stdin. Without this, MSYS bash on win32 blocks on the inherited
     # stdin handle under capture_output and EVERY .sh probe rides the 60s
     # timeout (proven with a trivial `echo ok; exit 0` probe — ZDS rb-523,

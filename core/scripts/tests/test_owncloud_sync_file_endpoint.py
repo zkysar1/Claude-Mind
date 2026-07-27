@@ -1,4 +1,4 @@
-"""test_owncloud_sync_file_endpoint.py — route contract for 7 (0).
+"""test_owncloud_sync_file_endpoint.py — route contract for  ().
 
 POST /v1/admin/owncloud-sync-file is the per-file governed push route the
 PostToolUse shim (owncloud-push-on-write.sh) and reconcile-owncloud-conflicts

@@ -39,6 +39,20 @@ from hook_helpers import (  # noqa: E402
     is_absolute_path,
     stdin_json_or_approve,
 )
+# Root resolution is SHARED with bash-path-resolution-hook.py ().
+# Both surfaces MUST answer "is this path in bounds?" identically — before
+# this, each hook carried its own verbatim copy and the bash side had no
+# out-of-root branch at all. compute_allowed_roots is the single writer of
+# that list; the local norm_path / is_under / is_new_toplevel / read_paths_conf
+# definitions below were removed in favour of these imports (verified
+# semantically identical first).
+from _path_roots import (  # noqa: E402
+    compute_allowed_roots,
+    is_new_toplevel,
+    is_under,
+    norm_path,
+    read_paths_conf,
+)
 
 
 # --- Agent-dir resolution (Phase 2.5.C) ---
@@ -95,64 +109,14 @@ def _resolve_agent_session_dir(project_root, agent, sid):
                         SESSIONS_DIRNAME, sid)
 
 
-def norm_path(p):
-    """Normalize a path for root-prefix comparison across MSYS2/Windows forms.
-    Converts `/c/foo` -> `c:/foo`, strips trailing separators, lowercases drive
-    letter, and uses forward slashes throughout. Returns empty string on any
-    error (caller must treat empty as 'cannot compare')."""
-    if not p:
-        return ""
-    try:
-        p = p.replace("\\", "/")
-        # MSYS2 form: /c/Users/... -> c:/Users/...
-        if len(p) >= 3 and p[0] == "/" and p[2] == "/" and p[1].isalpha():
-            p = p[1].lower() + ":" + p[2:]
-        # //C:/... (Claude Code allowlist style) -> c:/...
-        if p.startswith("//") and len(p) >= 5 and p[3] == ":":
-            p = p[2:].lower()[0] + p[3:]
-        # Lowercase drive letter if present (C:/... -> c:/...)
-        if len(p) >= 2 and p[1] == ":":
-            p = p[0].lower() + p[1:]
-        # Collapse double slashes, strip trailing slash
-        while "//" in p:
-            p = p.replace("//", "/")
-        if len(p) > 1 and p.endswith("/"):
-            p = p[:-1]
-        return p
-    except Exception:
-        return ""
-
-
-def is_under(child, root):
-    """True if normalized child path is at or below normalized root path."""
-    if not child or not root:
-        return False
-    if child == root:
-        return True
-    return child.startswith(root + "/")
-
-
-def is_new_toplevel(target, root):
-    """True if writing to `target` would create a new top-level entry under
-    `root`. The "top-level entry" is the first path segment under root —
-    e.g. for `WORLD/handoffs/foo.txt` it is `handoffs`; for `WORLD/scratch.md`
-    it is `scratch.md`. If that entry does not exist on disk at write time,
-    this write would create it.
-
-    Root-agnostic by design — caller picks which roots to apply this against.
-    Currently applied to WORLD_PATH, META_PATH, and the bound agent dir; see
-    the allow-check loop in main() and `.claude/rules/path-resolution.md`
-    "L1 Cruft Prevention" section."""
-    if not is_under(target, root) or target == root:
-        return False
-    rel = target[len(root) + 1:]
-    if not rel:
-        return False
-    first_segment = rel.split("/", 1)[0]
-    if not first_segment:
-        return False
-    toplevel_path = root + "/" + first_segment
-    return not os.path.exists(toplevel_path)
+# norm_path / is_under / is_new_toplevel / read_paths_conf now live in
+# _path_roots.py (imported above) — they were duplicated verbatim in
+# bash-path-resolution-hook.py, which is exactly the silent drift 
+# set out to remove. Semantics are unchanged: the copies were verified
+# semantically identical before consolidation. is_new_toplevel stays
+# root-agnostic; this hook applies it to WORLD_PATH, META_PATH, and the bound
+# agent dir in the allow-check loop below (`.claude/rules/path-resolution.md`
+# "L1 Cruft Prevention").
 
 
 def is_allowlisted_agent_toplevel(target, agent_root):
@@ -181,32 +145,6 @@ def is_allowlisted_agent_toplevel(target, agent_root):
         return first_segment in _AGENT_DIR_ALLOWLIST_FILES
     # A path under a first-segment subdirectory — that dir must be allowlisted.
     return first_segment in _AGENT_DIR_ALLOWLIST_DIRS
-
-
-def read_paths_conf(conf_path):
-    """Parse KEY=VALUE lines. Returns dict with WORLD_PATH, META_PATH, and
-    AGENT_WRITE_PATH keys (values may be None if unset/unreadable). Strips
-    surrounding quotes and CR. AGENT_WRITE_PATH is an optional additional
-    write root outside PROJECT_ROOT/WORLD_PATH/META_PATH — per g-115-156,
-    lets an agent modify sibling codebases it is responsible for (e.g.,
-    external product code) without relaxing L1's default-deny on arbitrary paths."""
-    result = {"WORLD_PATH": None, "META_PATH": None, "AGENT_WRITE_PATH": None}
-    try:
-        with open(conf_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip().replace("\r", "")
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key in result:
-                    result[key] = value
-    except Exception:
-        pass
-    return result
 
 
 def main():
@@ -259,7 +197,7 @@ def main():
     # below are computable from PROJECT_ROOT + the bound agent ALONE — they do
     # NOT need WORLD/META from local-paths.conf. So a MISSING conf must NOT
     # blanket-approve: that silently disables the cruft gate for every agent not
-    # provisioned on THIS box (6 — the L1 allowlist fail-open, where
+    # provisioned on THIS box ( — the L1 allowlist fail-open, where
     # bravo/echo/zeta/foxtrot had no conf on a secondary box and every cruft
     # path under their agent dirs silently approved). Fall through with empty
     # external paths: allowed_roots then holds only PROJECT_ROOT, so the
@@ -286,29 +224,22 @@ def main():
     # `.claude/rules/path-resolution.md` "L1 Cruft Prevention" section).
     agent_dir_norm = norm_path(_resolve_agent_dir(project_root, agent))
 
-    allowed_roots = []
+    # PROJECT_ROOT, then WORLD_PATH / META_PATH, then each AGENT_WRITE_PATH
+    # entry.  / : AGENT_WRITE_PATH is an optional
+    # agent-declared additional write root for cross-repo work (external
+    # product code), edited in local-paths.conf by the user or by the agent
+    # under explicit user authorization, and reversible by removing the path.
+    # MULTI-ROOT: the value may name several roots separated by ';', each
+    # becoming an independent allowed root.
+    #
+    # Built by the SHARED helper () so bash-path-resolution-hook.py
+    # cannot answer this question differently — order is significant for the
+    # first-match-wins cruft checks below.
+    allowed_roots = compute_allowed_roots(project_root, paths)
+    # Still needed by the virtual-prefix rewrite + the PROJECT_ROOT cruft check
+    # below, which reason about PROJECT_ROOT specifically rather than about the
+    # allowed-roots list as a whole.
     pr_norm = norm_path(project_root)
-    if pr_norm:
-        allowed_roots.append(("PROJECT_ROOT", pr_norm))
-    wp_norm = norm_path(paths.get("WORLD_PATH") or "")
-    if wp_norm:
-        allowed_roots.append(("WORLD_PATH", wp_norm))
-    mp_norm = norm_path(paths.get("META_PATH") or "")
-    if mp_norm:
-        allowed_roots.append(("META_PATH", mp_norm))
-    #  / : optional agent-declared additional write root(s) for
-    # cross-repo work (e.g., external product code). Edited in local-paths.conf —
-    # by the user, or (per the  principal directive, 2026-06-07) by the
-    # agent under explicit user authorization. Reversible by removing the path.
-    # MULTI-ROOT (): the value may name several roots separated by ';'
-    # (e.g. "C:/.../Ayoai;C:/.../Zak-Data-Solutions") so an agent can write to
-    # more than one product workspace. Each becomes an independent allowed root;
-    # single-path values (no ';') are unchanged. read_paths_conf already stripped
-    # the surrounding quotes that bash-source safety requires in the conf.
-    for awp_part in (paths.get("AGENT_WRITE_PATH") or "").split(";"):
-        awp_norm = norm_path(awp_part.strip())
-        if awp_norm:
-            allowed_roots.append(("AGENT_WRITE_PATH", awp_norm))
 
     if not allowed_roots:
         approve_no_mutation()
@@ -527,7 +458,7 @@ def main():
             approve_no_mutation()
 
     # --- Block: target is absolute AND outside all configured roots ---
-    # Conf-missing fail-open (6): when local-paths.conf was absent we
+    # Conf-missing fail-open (): when local-paths.conf was absent we
     # only know PROJECT_ROOT. A target that reached here is outside PROJECT_ROOT
     # (in-repo targets, incl. the agent dir, were already gated by the
     # PROJECT_ROOT branch above); it cannot be validated against the unknown

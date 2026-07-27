@@ -1,4 +1,4 @@
-"""9: recurring-close.sh substantive-artifact probe suppression.
+""": recurring-close.sh substantive-artifact probe suppression.
 
 Verifies the second-layer suppression added to the Phase 4.25 enforcement
 block in recurring-close.sh. When the empty-WM check (g-115-634) does NOT
@@ -86,7 +86,7 @@ def with_sandbox(test_fn):
         meta_dir.mkdir()
 
         # Seed WM with non-empty encoding_queue so  does NOT suppress
-        # (lets the test reach the 9 probe).
+        # (lets the test reach the  probe).
         wm = {"encoding_queue": [{"kind": "test"}], "slots": {"sensory_buffer": [{"event": "x"}]}}
         (agent_dir / "session" / "working-memory.yaml").write_text(
             yaml.safe_dump(wm, sort_keys=False), encoding="utf-8"
@@ -136,7 +136,7 @@ def _run_canary(agent_dir: Path, *, gid="g-test", outcome="deep",
 
 @with_sandbox
 def test_forced_flip_with_recent_tree_md_does_not_suppress(sandbox, agent_dir, world_dir):
-    """Tree .md edited in window → substantive → no 9 suppress.
+    """Tree .md edited in window → substantive → no  suppress.
 
     Sets mtime of a tree .md to now. The probe should find it and set
     substantive=True, so the g-115-1089 suppression path does NOT fire.
@@ -153,7 +153,7 @@ def test_forced_flip_with_recent_tree_md_does_not_suppress(sandbox, agent_dir, w
 
 @with_sandbox
 def test_forced_flip_with_no_artifact_in_window_suppresses(sandbox, agent_dir, world_dir):
-    """No artifact in window → 9 suppresses with diagnostic.
+    """No artifact in window →  suppresses with diagnostic.
 
     No tree edits, no new goals, no board posts, no pipeline-meta. The probe
     finds nothing in the 90s window. g-115-1089 should print the suppression

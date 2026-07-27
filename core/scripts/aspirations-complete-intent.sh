@@ -41,7 +41,7 @@ set -- ${POSITIONAL[@]+"${POSITIONAL[@]}"}
 ASP_ID="${1:-}"
 
 # --- Read stdin into BODY -------------------------------------------------
-# Guarded (1, guard-664 bash twin — same class as pipeline-move.sh):
+# Guarded (, guard-664 bash twin — same class as pipeline-move.sh):
 # non-tty stdin does not guarantee EOF; a backgrounded task inherits an open,
 # never-closing stdin and a bare `cat` wedges forever. Bounded first-line
 # probe: piped callers deliver instantly; an idle descriptor degrades to

@@ -231,7 +231,7 @@ def test_no_fetch_skips_integrate(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# push-race recovery (9 — the rb-3970 phantom-window shape)
+# push-race recovery ( — the rb-3970 phantom-window shape)
 # --------------------------------------------------------------------------- #
 def test_pushrace_recovery_lands_same_invocation(tmp_path):
     """THE 2026-07-18 phantom shape: A's pre-push fetch is THROTTLED, so the
@@ -326,21 +326,29 @@ def test_union_merge_selfresolves_appendonly(tmp_path):
 
 
 def _union_attrs_pre_merge() -> bool:
-    """True when origin/main's .gitattributes carries the union entries but
-    the local checkout does not yet (behind box, merge deferred) — check-attr
-    then reports 'unspecified' for box-state reasons, not regression
-    (g-115-1940). Both-missing returns False so a REAL regression (entry
-    removed everywhere) still fails the test."""
+    """True when origin/main's .gitattributes carries the ledger-merge entries
+    but the local checkout does not yet (behind box, merge deferred) — check-attr
+    then reports 'unspecified' for box-state reasons, not regression (g-115-1940;
+    extended for the g-115-2767 ayoai-ledger migration). Checks BOTH the union
+    needle (line-append-safe ledgers) and the ayoai-ledger needle (RMW ledgers)
+    so a box behind on EITHER migration skips rather than fails. A needle absent
+    locally but present in origin = behind box; absent everywhere returns False
+    so a REAL regression (entry removed everywhere) still fails the test."""
+    needles = ("skill-invocations.jsonl merge=union",
+               "journal.jsonl merge=ayoai-ledger")
     try:
-        needle = "skill-invocations.jsonl merge=union"
         ga = PROJECT_ROOT / ".gitattributes"
-        if ga.is_file() and needle in ga.read_text(encoding="utf-8"):
-            return False
+        local = ga.read_text(encoding="utf-8") if ga.is_file() else ""
+        missing = [n for n in needles if n not in local]
+        if not missing:
+            return False  # local carries both migrations — run the test
         r = subprocess.run(
             ["git", "-C", str(PROJECT_ROOT), "show", "origin/main:.gitattributes"],
             capture_output=True, text=True, timeout=10,
         )
-        return r.returncode == 0 and needle in r.stdout
+        origin = r.stdout if r.returncode == 0 else ""
+        # Behind box: a needle absent locally but present in origin.
+        return any(n in origin for n in missing)
     except Exception:
         return False
 
@@ -352,15 +360,21 @@ def _union_attrs_pre_merge() -> bool:
            "(g-115-1940)",
 )
 def test_real_repo_union_scope_is_evidence_gated():
-    """Read-only probe of the REAL .gitattributes: union ONLY where append-only
-    was proven (zero historical deleted lines); RMW stores stay unspecified."""
+    """Read-only probe of the REAL .gitattributes: line-append-safe ledgers get
+    merge=union; RMW ledgers (rewritten/pruned/archived) route to the record-aware
+    merge=ayoai-ledger driver (g-115-2767), NOT unspecified — leaving them
+    unspecified stranded cross-box MIND commits, and union would resurrect
+    pruned/edited lines."""
     paths = {
         "agents/alpha/skill-invocations.jsonl": "union",
         "agents/alpha/health/2026-01-01.jsonl": "union",
-        "agents/alpha/journal.jsonl": "unspecified",       # index rewrites
-        "agents/alpha/changelog.jsonl": "unspecified",     # pruning
-        "agents/alpha/experience.jsonl": "unspecified",    # archival
-        "agents/alpha/aspirations.jsonl": "unspecified",   # RMW status updates
+        # RMW ledgers → record-aware ayoai-ledger driver (), NOT
+        # unspecified: union resurrects pruned/edited lines, and unspecified
+        # stranded cross-box MIND commits (the exact reason  added it).
+        "agents/alpha/journal.jsonl": "ayoai-ledger",       # index rewrites
+        "agents/alpha/changelog.jsonl": "ayoai-ledger",     # pruning
+        "agents/alpha/experience.jsonl": "ayoai-ledger",    # archival
+        "agents/alpha/aspirations.jsonl": "ayoai-ledger",   # RMW status updates
     }
     r = subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), "check-attr", "merge", "--",
@@ -374,18 +388,18 @@ def test_real_repo_union_scope_is_evidence_gated():
 
 
 # --------------------------------------------------------------------------- #
-# churn self-heal for the dirty-tree merge deadlock (3 + 9)
+# churn self-heal for the dirty-tree merge deadlock ( + )
 #
-# The deadlock (per 3): origin advances a file that THIS machine has
+# The deadlock (per ): origin advances a file that THIS machine has
 # UNSTAGED churn on. `git merge` refuses BEFORE starting (no MERGE_HEAD), the
 # tree is deferred, and the churn re-creates every cycle so it never
 # self-heals. Two healable namespaces (all-or-nothing scan first):
 #   - agents/<other>/* (owncloud re-materialised sibling state): CLEARED —
-#     origin is authoritative, owncloud re-syncs next cycle (3).
+#     origin is authoritative, owncloud re-syncs next cycle ().
 #   - agents/<self>/* (own ledgers; changelog re-appends on EVERY write, so
 #     pre-2249 the defer wedged a behind box forever — cc-05
 #     15-ahead/53-behind): COMMITTED pathspec-limited, then merged + pushed
-#     (9).
+#     ().
 # NEVER touches staged entries (guard-741: a concurrent agent's in-flight
 # staged work) nor any file outside agents/* (core/world). Any such file in
 # the blocking set defers the WHOLE tree untouched.
@@ -485,7 +499,7 @@ def test_selfheal_staged_crossagent_defers_guard741(tmp_path):
 
 
 def test_selfheal_self_dir_dirty_commits_and_merges(tmp_path):
-    """t4 (9): the TRUE cc-05 wedge shape — a union-attributed self
+    """t4 (): the TRUE cc-05 wedge shape — a union-attributed self
     ledger (health/*.jsonl) advanced at origin while THIS box holds an
     UNCOMMITTED append to the same ledger. git refuses the merge
     (checkout-over-dirty) even though content-level merge is clean
@@ -528,7 +542,7 @@ def test_selfheal_self_dir_dirty_commits_and_merges(tmp_path):
 
 
 def test_selfheal_self_dir_both_diverged_surfaces_conflict(tmp_path):
-    """t4b (9 rare shape): self file diverged on BOTH sides (origin
+    """t4b ( rare shape): self file diverged on BOTH sides (origin
     advanced it AND local dirty). The self churn is committed (preserved in
     history), the merge then hits a TRUE content conflict which is aborted
     cleanly and surfaced LOUDLY — strictly better than the pre-2249 silent
@@ -551,7 +565,7 @@ def test_selfheal_self_dir_both_diverged_surfaces_conflict(tmp_path):
 
 
 def test_selfheal_mixed_self_and_crossagent_heals_both(tmp_path):
-    """t6 (9): blocking set spans BOTH namespaces — self churn is
+    """t6 (): blocking set spans BOTH namespaces — self churn is
     committed, cross-agent churn is cleared, merge retries and the push
     converges."""
     origin, a, b = _clone_pair(tmp_path)

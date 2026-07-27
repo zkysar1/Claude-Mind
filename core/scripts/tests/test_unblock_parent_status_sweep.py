@@ -231,7 +231,7 @@ def test_status_index_builder():
 
 
 def test_rb3887_provenance_created_after_parent_completion_guarded():
-    """rb-3887 / 4 canonical FP: an Unblock whose ONLY parent link
+    """rb-3887 /  canonical FP: an Unblock whose ONLY parent link
     is discovered_by (sq-013 provenance) and whose created_at POSTDATES the
     parent's completion must be guarded — it was never waiting on that
     parent (g-115-2530/2531 shape: auto-skipped within one iteration)."""
@@ -288,7 +288,7 @@ def test_rb3887_missing_timestamps_conservative_guard():
 
 
 def test_g115_2674_origin_signal_form_guarded_when_created_after_parent():
-    """REVERSED by 4 (2026-07-19). This test previously asserted the
+    """REVERSED by  (2026-07-19). This test previously asserted the
     OPPOSITE — that a priority-1/2 link is NEVER provenance-guarded, on the
     premise that "Layer D emits those at defer time by construction".
 
@@ -324,7 +324,7 @@ def test_g115_2674_origin_signal_form_guarded_when_created_after_parent():
 
 
 def test_g115_2674_layer_d_defer_time_unblock_still_sweeps():
-    """No-regression proof for the 4 widening: a GENUINE Layer-D
+    """No-regression proof for the  widening: a GENUINE Layer-D
     Unblock is emitted at DEFER time, while its parent is still pending, so
     it is created BEFORE the parent ever completes. `created < done` holds,
     the guard returns None, and the sweep proceeds exactly as it did before
@@ -343,7 +343,7 @@ def test_g115_2674_layer_d_defer_time_unblock_still_sweeps():
 
 
 def test_rb3887_aware_offset_timestamp_normalized_no_crash():
-    """Fresh-eyes-code finding (4 dispatch): an offset-aware stamp
+    """Fresh-eyes-code finding ( dispatch): an offset-aware stamp
     (+00:00 — the fleet is TZ-split, rb-3741) meeting a naive one at the
     `created < done` comparison raised TypeError and crashed the whole
     sweep. _parse_ts must normalize to naive-local (guard-982 pattern).
@@ -408,7 +408,7 @@ if __name__ == "__main__":
 
 
 def test_g115_2681_close_sequence_window_guards_followup_filed_during_parent_close():
-    """1 (2026-07-19) — boundary fix for the 4 guard.
+    """ (2026-07-19) — boundary fix for the  guard.
 
     g-115-2674 tested `created < parent_completed` and treated ANY earlier
     creation as a "genuine wait". Wrong at the margin: an Unblock filed

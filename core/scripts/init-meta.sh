@@ -60,7 +60,7 @@ if [ ! -f "$META/.initialized" ] && [ "${STORAGE_BACKEND:-local}" = "own-cloud" 
     fi
 fi
 
-# --- Idempotent gate (+ 4 additive seed-backfill) ---
+# --- Idempotent gate (+  additive seed-backfill) ---
 # A meta/ initialized BEFORE a seed line was added to this script never
 # received it — the early-exit closed the gate forever (seed-drift class,
 # guard-146 incident; e.g. the cognitive-horizons ~3wk fleet-wide FNF).
@@ -91,7 +91,7 @@ extract_initial_state() {
     echo "  Seeded $(basename "$target_file") from $(basename "$config_file")"
 }
 
-# --- Helper: should <target> be seeded? (4 additive backfill) ---
+# --- Helper: should <target> be seeded? ( additive backfill) ---
 # TRUE only when the target is genuinely missing. Backfill runs are additive-
 # only: an existing local file is NEVER touched. Under own-cloud in backfill
 # mode, local absence is not authoritative (read-through cache, guard-980
@@ -120,7 +120,7 @@ seed_needed() {
 # sanctioned init step so it bypasses the L1 new-top-level-entry cruft gate
 # (which blocks bare Write/Edit of a new dir under META_PATH but not shell
 # mkdir in an init-*.sh). See .claude/rules/path-resolution.md "L1 Cruft
-# Prevention" option 2 + 6.
+# Prevention" option 2 + .
 mkdir -p \
     "$META/experiments" \
     "$META/transfer" \
@@ -137,7 +137,7 @@ else
 fi
 
 # --- 3. Create JSONL stores (existing) ---
-# 4: touch targets route through seed_needed too — under own-cloud
+# : touch targets route through seed_needed too — under own-cloud
 # BACKFILL a bare touch on a cache-absent-but-store-present file creates a
 # 0-byte local with no manifest baseline, which the real-time single-file
 # push path (sync_file, multi_machine=False) or a single-machine sweep would
@@ -171,7 +171,7 @@ if seed_needed "$META/spark-questions.jsonl"; then
 fi
 
 # Evolution log: meta-strategy change audit trail
-# 4: seed_needed-guarded (see the section-3 comment above).
+# : seed_needed-guarded (see the section-3 comment above).
 if seed_needed "$META/evolution-log.jsonl"; then
     touch "$META/evolution-log.jsonl"
     echo "  Created empty evolution-log.jsonl"
@@ -201,12 +201,12 @@ fi
 # hardcoded fallback, guard-424). MUST be seeded here so fresh-box init does not
 # FileNotFoundError -- the ~3wk fleet-wide FNF since 2026-06-13 was this exact
 # missing seed (init-seed parity; echo-2744 audit / ).
-# Per-file guard (3): the bootstrap pull above can populate meta/
+# Per-file guard (): the bootstrap pull above can populate meta/
 # WITHOUT bringing .initialized (marker absent in S3), so the script-level
 # gate falls through — a bare cp here would clobber the S3-pulled evolved
 # SSOT with the pristine template, and the next sweep would push the clobber.
 # (seed_needed subsumes the [[ -f ]] guard and adds the backfill-mode
-# store-of-record probe — 4.)
+# store-of-record probe — .)
 if seed_needed "$META/cognitive-horizons.yaml"; then
     cp "$CONFIG/cognitive-horizons.yaml" "$META/cognitive-horizons.yaml"
     echo "  Seeded cognitive-horizons.yaml from core/config"

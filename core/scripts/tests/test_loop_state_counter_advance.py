@@ -164,7 +164,7 @@ def test_fail_open_on_missing_wm() -> bool:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── 1: orphaned-accumulator writers ────────────────────────────────
+# ── : orphaned-accumulator writers ────────────────────────────────
 
 def test_touched_and_alignment_advance() -> bool:
     """--goal-id adds aspiration_id to touched AND increments alignment_check_at."""
@@ -214,7 +214,7 @@ def test_reset_alignment_zeroes() -> bool:
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-test-"))
     try:
         wm_path = _seed_wm(tmpdir, goals_completed=5, productive_goals=3)
-        _run_helper(tmpdir, "deep", ["--goal-id", "1"])  # alignment -> 1
+        _run_helper(tmpdir, "deep", ["--goal-id", ""])  # alignment -> 1
         rc, stderr = _run_helper(tmpdir, None, ["--reset-alignment"])
         if rc != 0:
             print(f"FAIL: reset — exit {rc}, stderr: {stderr}", file=sys.stderr)
@@ -251,8 +251,8 @@ def test_evolution_fired_increments() -> bool:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ── 5: non-recurring streak ownership (--recurring false) ───────────
-# Before 5, streaks (routine_streak_global, routine_count_total,
+# ── : non-recurring streak ownership (--recurring false) ───────────
+# Before , streaks (routine_streak_global, routine_count_total,
 # productive_streak, routine_streaks[id], consecutive_blocked_sleeps) + the
 # _this_session counters had a RECURRING bash writer (recurring-loop-state-
 # mutate.py) but NO non-recurring one — the digest told the LLM to apply Block
@@ -492,7 +492,7 @@ def main() -> int:
         test_touched_dedups_within_aspiration(),
         test_reset_alignment_zeroes(),
         test_evolution_fired_increments(),
-        # 5: non-recurring streak ownership
+        # : non-recurring streak ownership
         test_nonrecurring_routine_advances_streaks(),
         test_nonrecurring_deep_resets_global(),
         test_nonrecurring_ceiling_reset(),

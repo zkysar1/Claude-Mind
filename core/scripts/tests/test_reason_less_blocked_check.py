@@ -1,4 +1,4 @@
-"""test_reason_less_blocked_check.py — regression tests for 5.
+"""test_reason_less_blocked_check.py — regression tests for .
 
 Asserts reason-less-blocked-check.py correctly:
   1. FLAGS a status=blocked goal with an empty Blocker Reference Schema
@@ -160,8 +160,9 @@ def _patch_reads(monkeypatch, world_goals, agent_goals=None):
 def _patch_add_goal(monkeypatch, calls, returns=None):
     returns = returns or {"goal_id": "g-115-audit-new"}
 
-    def fake_add(asp_id, record, source="world"):
-        calls.append({"asp_id": asp_id, "record": record, "source": source})
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"asp_id": asp_id, "record": record, "source": source,
+                      "overrides": overrides})
         return returns
 
     monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
@@ -240,3 +241,57 @@ def test_main_apply_surfaces_filing_failure(monkeypatch, capsys):
     assert rc == 0
     assert res["investigate_filed"] is None
     assert "investigate_error" in res  # failure surfaced, not swallowed
+
+
+def test_main_apply_retries_with_override_on_duplication_block(monkeypatch, capsys):
+    # : _file_investigate must retry ONCE with a justified
+    # X-Mind-Override-Duplication when the daemon blocks on
+    # goal_duplication_blocked (the dup-gate matches COMPLETED prior recurring
+    # audits — a structural FP the sweep's own open-audit dedup already rules
+    # out). Without the retry the reason-less safety mechanism can never
+    # escalate a straggler once >=1 reconcile audit has completed.
+    _patch_reads(monkeypatch, [_blocked(id="g-350-04")])
+    calls = []
+
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"overrides": overrides})
+        if overrides is None:
+            raise mod._rt.RtError(
+                "blocked", status=409,
+                body='{"error": "goal_duplication_blocked", '
+                     '"gate": "goal-duplication-gate"}')
+        return {"goal_id": "g-115-audit-override"}
+
+    monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["reason_less_count"] == 1
+    # Filed on the SECOND (override) attempt.
+    assert res["investigate_filed"] == "g-115-audit-override"
+    assert res.get("investigate_error") is None
+    # Exactly two attempts: first without override (blocked), retry WITH override.
+    assert len(calls) == 2
+    assert calls[0]["overrides"] is None
+    assert "Duplication" in (calls[1]["overrides"] or {})
+
+
+def test_main_apply_no_retry_on_non_duplication_error(monkeypatch, capsys):
+    # : a NON-duplication RtError must NOT trigger the override retry
+    # — it surfaces as investigate_error. The retry is scoped strictly to the
+    # goal_duplication_blocked false positive, never a blind override on an
+    # unrelated failure.
+    _patch_reads(monkeypatch, [_blocked(id="g-350-04")])
+    calls = []
+
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"overrides": overrides})
+        raise mod._rt.RtError("daemon 500", status=500, body="internal error")
+
+    monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["investigate_filed"] is None
+    assert "investigate_error" in res
+    # Only ONE attempt — no override retry on a non-duplication error.
+    assert len(calls) == 1
+    assert calls[0]["overrides"] is None

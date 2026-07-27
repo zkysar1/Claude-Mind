@@ -105,7 +105,7 @@ def _read_last_line(path, encoding="utf-8", tail_bytes=8192):
 
 def main() -> int:
     # Step 1: Parse hook payload from stdin (bounded read -- guard-664/rb-1568;
-    # an unbounded json.load here orphaned this hook 120-129h, 8).
+    # an unbounded json.load here orphaned this hook 120-129h, ).
     raw = _read_stdin_with_timeout()
     if not raw:
         return 0

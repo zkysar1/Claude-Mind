@@ -48,7 +48,7 @@ from ..agent_paths import assert_not_cruft
 # installs core/scripts on sys.path at module load (sibling-module pattern,
 # e.g. meta_backpressure). _gate_log ahead of them ModuleNotFoundError'd on
 # any isolated import (tests); the real daemon only worked because another
-# module happened to load first (0).
+# module happened to load first ().
 import _gate_log  # noqa: E402 — module-level log(); daemon passes meta_dir explicitly
 from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noqa: E402
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cross-agent-write.sh — enforced env-prefix for cross-agent write-back.
 #
-# 7 (option A, per bravo decision msg-20260709-021804-bravo-118:
+#  (option A, per bravo decision msg-20260709-021804-bravo-118:
 # "formalize/enforce the cross-agent env-prefix via a shared HELPER [LOW-blast]";
 # NOT option B daemon-level source='cross-agent:<owner>' resolution).
 #

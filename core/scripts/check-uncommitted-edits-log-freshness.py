@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify uncommitted-edits.jsonl logs are free of regressions 5 fixed.
+"""Verify uncommitted-edits.jsonl logs are free of regressions  fixed.
 
 The two silent bugs g-115-1125 fixed in uncommitted-edits-record.sh:
   1. Neutral-path filter under AGENTS_PARENT_DIR=agents — entries like
@@ -30,7 +30,7 @@ import re
 import sys
 from pathlib import Path
 
-# 5 fix landed in commit 3c4a61c4 at 2026-05-22T12:26:02 (per
+#  fix landed in commit 3c4a61c4 at 2026-05-22T12:26:02 (per
 # `git log core/scripts/uncommitted-edits-record.sh`). The BASELINE sits
 # immediately after that commit so pre-fix log entries (with absolute
 # Windows paths and missing AGENTS_PARENT_DIR-aware filtering) are

@@ -93,6 +93,77 @@ def test_redact_never_emits_a_secret() -> None:
     assert "[redacted]" in out
 
 
+def test_redact_strips_secrets_never_injected() -> None:
+    """The tier-(b)/(c) case: a credential whose value the box never held.
+
+    Exact-value redaction only sees ``secret_values``; a key the agent wrote into a
+    research note or pasted from a log is invisible to it and would otherwise reach a
+    PUBLIC endpoint verbatim. Each case passes NO secret_values on purpose.
+
+    Per guard-1270, every assertion is a derived boolean — the candidate secret is never
+    printed, only tested for absence.
+    """
+    cases = [
+        # (text, the substring that must NOT survive)
+        ("the key is gsk_live_abcdef0123456789SECRETvalue ok", "gsk_live_abcdef0123456789SECRETvalue"),
+        ("bearer sk-proj-abcdef0123456789ABCDEF fine", "sk-proj-abcdef0123456789ABCDEF"),
+        # AWS's canonical DOCUMENTATION placeholder, used here as a redaction
+        # fixture — not a credential. (A test for secret-stripping necessarily
+        # contains secret-shaped strings; that is the point of the fixture.)
+        ("aws AKIAIOSFODNN7EXAMPLE here", "AKIAIOSFODNN7EXAMPLE"),  # secret-scanner: skip
+        ("opaque aZ9x2Qm7Lp4Wd8Rt6Yv3Nb1Kc5Hj0Fg tail", "aZ9x2Qm7Lp4Wd8Rt6Yv3Nb1Kc5Hj0Fg"),
+        ("API_KEY=hunter2plaintext done", "hunter2plaintext"),
+        ("-----BEGIN PRIVATE KEY-----\nMIIBVQIBADAN\n-----END PRIVATE KEY-----", "MIIBVQIBADAN"),
+    ]
+    for text, must_not_survive in cases:
+        out = redact(text)
+        assert must_not_survive not in out
+        assert "[redacted]" in out
+
+
+def test_redact_strips_url_embedded_credentials_but_keeps_the_host() -> None:
+    # Shape preservation matters even here: the reader should still see WHICH service was
+    # referenced, just not the credentials used to reach it.
+    out = redact("see https://svcuser:hunter2pass@example.com/docs")
+    assert "hunter2pass" not in out
+    assert "svcuser" not in out
+    assert "example.com" in out
+
+
+def test_redact_entropy_backstop_spares_ordinary_prose() -> None:
+    # The catch-all is bounded (>=25 chars AND entropy >4.5) so the domain vocabulary this
+    # wiki exists to publish is never eaten. A false positive here silently deletes real
+    # knowledge, so this guard is as load-bearing as the leak tests above.
+    prose = "Photosynthesis converts carbon dioxide into glucose inside chloroplasts"
+    assert redact(prose) == prose
+
+
+def test_redact_entropy_pass_preserves_line_structure() -> None:
+    """fresh-eyes F-2: the entropy pass must not eat prose or newlines.
+
+    Node bodies are multi-line markdown. Tokenizing on " " alone made a newline part
+    of the token, so "intro\\n<blob>" scored as ONE high-entropy token and the marker
+    replaced the prose AND the line break. The secret must still go; everything around
+    it must survive byte-for-byte.
+    """
+    blob = "aZ9x2Qm7Lp4Wd8Rt6Yv3Nb1Kc5Hj0Fg"
+    out = redact(f"Reefs bleach above 30C.\n\nLogged {blob} during the run.\n- bullet")
+    assert blob not in out
+    assert "Reefs bleach above 30C." in out
+    assert "during the run." in out
+    assert "\n\n" in out and "\n- bullet" in out
+
+
+def test_redact_strips_unterminated_pem_block() -> None:
+    """fresh-eyes F-4: a key captured from a TRUNCATED log has BEGIN and no END.
+
+    Requiring the closing fence let the key body through verbatim. The body is short
+    enough to slip under the entropy floor too, so this was a real leak path with no
+    backstop. Consuming to end-of-string is the correct (fail-closed) direction.
+    """
+    assert "MIIBVQIBADAN" not in redact("-----BEGIN PRIVATE KEY-----\nMIIBVQIBADAN\n")
+
+
 def test_redact_paths_posix_and_windows() -> None:
     assert "[path]" in redact("see /home/ec2-user/mind-workspace/world/x.md")
     assert "/home/ec2-user" not in redact("see /home/ec2-user/mind-workspace/world/x.md")
@@ -209,6 +280,24 @@ def test_project_suppresses_framework_and_exposes_domain() -> None:
     assert "Cross-check" in bundle.lessons[0]["title"]
 
 
+def test_project_preserves_parent_child_links() -> None:
+    """Shape preservation (PEARL §10.3): an exposed node keeps its graph edges.
+
+    The sibling assertions all check what must be REMOVED; this checks what must SURVIVE.
+    Without it a refactor that treated parent/children as framework internals would flatten
+    the wiki into an unnavigable list while every other test in this file still passed.
+    """
+    f = _fixtures()
+    bundle = project(
+        tree_nodes=f["tree_nodes"], reasoning=f["reasoning"],
+        guardrails=f["guardrails"], hypotheses=f["hypotheses"],
+        redactor=Redactor(agent_names=("alpha",)),
+    )
+    node = bundle.tree[0]
+    assert node["parent"] == "marine-biology"
+    assert node["children"] == ["bleaching"]
+
+
 def test_project_redacts_exposed_strings() -> None:
     f = _fixtures()
     bundle = project(
@@ -223,6 +312,41 @@ def test_project_redacts_exposed_strings() -> None:
     assert "Reefs studied by the agent" in summary
     # The exposed hypothesis outcome named alpha.
     assert "alpha" not in bundle.hypotheses[0]["outcome"].lower()
+
+
+def test_project_exposes_redacted_body() -> None:
+    # A domain node's full .md body is exposed as its own field, redacted, and distinct
+    # from the summary (the click-through content the PEARL UI renders).
+    node = {"key": "reefs", "category": "marine-biology/reefs", "title": "Coral reefs",
+            "summary": "Short reef summary.",
+            "body": "Full article: reefs studied by alpha at /home/x/world in depth.",
+            "parent": "marine-biology", "children": []}
+    bundle = project(tree_nodes=[node], reasoning=[], guardrails=[], hypotheses=[],
+                     redactor=Redactor(agent_names=("alpha",)))
+    body = bundle.tree[0]["body"]
+    assert "Full article" in body
+    assert "alpha" not in body.lower()
+    assert "/home/x" not in body
+    assert "the agent" in body
+    assert body != bundle.tree[0]["summary"]
+
+
+def test_project_never_exposes_framework_node_body() -> None:
+    # The system/ subtree is suppressed wholesale — its body must never reach the bundle,
+    # even though summary-suppression is the property test_project_never_leaks... covers.
+    nodes = [
+        {"key": "reefs", "category": "marine-biology/reefs", "title": "Reefs",
+         "summary": "s", "body": "domain reef body", "parent": "marine-biology",
+         "children": []},
+        {"key": "hooks", "category": "system/hooks", "title": "Hooks",
+         "summary": "s", "body": "SECRET framework plumbing internals", "parent": "system",
+         "children": []},
+    ]
+    bundle = project(tree_nodes=nodes, reasoning=[], guardrails=[], hypotheses=[],
+                     redactor=Redactor())
+    assert len(bundle.tree) == 1  # framework node suppressed entirely
+    blob = " ".join(str(t.get("body")) for t in bundle.tree)
+    assert "framework plumbing" not in blob
 
 
 def test_project_suppresses_any_tagged_framework_lesson() -> None:

@@ -1,4 +1,4 @@
-"""Regression tests for the 9 utilization-score shrinkage denominator.
+"""Regression tests for the  utilization-score shrinkage denominator.
 
 rb/guardrail entries take DIRECT times_helpful bumps for context-carried
 citations that never pass a tracked retrieve.sh scan, so th > retrieval_count

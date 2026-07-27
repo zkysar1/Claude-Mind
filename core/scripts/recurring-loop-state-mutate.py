@@ -205,8 +205,8 @@ def main():
         flip_threshold = _read_flip_threshold()
         global_ceiling = _read_global_ceiling()
 
-        # 4: the read-modify-write runs inside loop_state_cas_retry,
-        # which guards the stale-lock-steal race (9 mechanism B) via
+        # : the read-modify-write runs inside loop_state_cas_retry,
+        # which guards the stale-lock-steal race ( mechanism B) via
         # optimistic concurrency on slot_meta.loop_state.update_count. On a
         # stale-steal the helper re-reads fresh and re-applies Blocks A-D on the
         # peer's landed counters — the correct serialised result. The closures
@@ -352,7 +352,7 @@ def main():
 
             # : advance slot_meta.loop_state.updated_at + increment
             # update_count so wm-prune's stale-detection sees this write.
-            # update_count is ALSO the 4 CAS token the helper compares.
+            # update_count is ALSO the  CAS token the helper compares.
             _update_modified(wm, "loop_state")
 
             result["final_outcome"] = oc

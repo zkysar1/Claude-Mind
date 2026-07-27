@@ -233,7 +233,7 @@ def test_post_findings_citation_increments(running_daemon):
     assert g_tih == 1, f"guard-901 tih expected 1, got {g_tih}"
     assert r_tih == 1, f"rb-3742 (4-digit) tih expected 1, got {r_tih} " \
                        "— \\d{3}-only regex regression"
-    # Smoothed 9 score: (th + 0.5*tih)/(max(rc, th+tih)+1)
+    # Smoothed  score: (th + 0.5*tih)/(max(rc, th+tih)+1)
     # = (0 + 0.5)/(max(0, 1)+1) = 0.25 on a fresh record.
     assert g_score == 0.25 and r_score == 0.25, (g_score, r_score)
 

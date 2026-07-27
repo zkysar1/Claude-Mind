@@ -245,7 +245,7 @@ def test_fallback_to_created_at_when_no_defer_set():
     assert ids == ["g-002"], f"expected g-002 via created_at fallback, got {ids}"
 
 
-# ── Structural split-parent lane (3,  canonical shape) ──
+# ── Structural split-parent lane (,  canonical shape) ──
 
 
 def _g350_shape(sib_status_a="completed", sib_status_b="completed",

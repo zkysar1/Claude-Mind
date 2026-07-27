@@ -49,7 +49,7 @@ from _bash_helpers import BASH  # noqa: E402
 
 # Real in-scope / out-of-scope files in this repo (used by scope tests).
 IN_SCOPE_FILE = PROJECT_ROOT / ".claude" / "skills" / "respond" / "SKILL.md"
-# core/scripts is advisory-tracked since 0 (framework-code edit surface).
+# core/scripts is advisory-tracked since  (framework-code edit surface).
 CORE_SCRIPTS_FILE = SCRIPT_DIR / "iteration-close.sh"
 # Genuinely still-out-of-scope: .claude/rules stays silent-by-design (Rule 4).
 OUT_OF_SCOPE_FILE = PROJECT_ROOT / ".claude" / "rules" / "read-before-edit.md"
@@ -183,7 +183,7 @@ def test_silent_when_out_of_scope_file():
 
 
 def test_advisory_when_core_scripts_unread():
-    """core/scripts framework code IS advisory-tracked since 0 — an
+    """core/scripts framework code IS advisory-tracked since  — an
     unread script edit MUST fire the advisory (the whole point of the goal)."""
     with _throwaway_agent(manifest_paths=[]) as env:
         rc, stdout, stderr = _run_gate(_make_hook_json(str(CORE_SCRIPTS_FILE)), env=env)

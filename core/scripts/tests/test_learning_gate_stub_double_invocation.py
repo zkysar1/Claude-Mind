@@ -1,4 +1,4 @@
-"""test_learning_gate_stub_double_invocation.py — 4 regression pin.
+"""test_learning_gate_stub_double_invocation.py —  regression pin.
 
 BUG: iteration-close.sh do_learning_gate set perf=true whenever
 retrieval-session.json goal_id == GOAL_ID, without checking whether the file
@@ -30,7 +30,7 @@ SRC = SCRIPT.read_text(encoding="utf-8")
 
 
 def _extract_probe_py() -> str:
-    """The 4 stub-detect probe body (between the sentinel comment's
+    """The  stub-detect probe body (between the sentinel comment's
     python3 -c opening quote and the closing quote line)."""
     m = re.search(
         r'g-115-2454 stub-detect probe.*?probe_out="\$\(python3 -c "\n(.*?)\n" 2>/dev/null',
@@ -40,12 +40,24 @@ def _extract_probe_py() -> str:
 
 
 def _extract_stub_writer_py() -> str:
-    """The no-retrieval stub writer (single-quoted python3 -c block)."""
-    m = re.search(
-        r"GID=\"\$GOAL_ID\" RET_FILE=\"\$ret_file\" python3 -c '\n(.*?)\n' 2>/dev/null",
-        SRC, re.S)
-    assert m, "stub writer not found in iteration-close.sh"
-    return m.group(1)
+    """The no-retrieval stub writer (single-quoted python3 -c block).
+
+    The `GID=/RET_FILE=` env prefix is this extractor's ONLY anchor, so it must
+    stay unique in iteration-close.sh. When a second block reused it (g-115-3123
+    added `_repair_utilization_pending` ABOVE the writer), re.search silently
+    returned the wrong block and this file failed with a confusing
+    FileNotFoundError. Assert uniqueness so the next collision fails loudly and
+    names its own cause.
+    """
+    pat = r"GID=\"\$GOAL_ID\" RET_FILE=\"\$ret_file\" python3 -c '\n(.*?)\n' 2>/dev/null"
+    hits = re.findall(pat, SRC, re.S)
+    assert hits, "stub writer not found in iteration-close.sh"
+    assert len(hits) == 1, (
+        f"{len(hits)} blocks share the GID=/RET_FILE= extraction anchor — this "
+        "extractor can no longer identify the stub writer. Rename the other "
+        "block's env vars (see _repair_utilization_pending's RUP_ prefix)."
+    )
+    return hits[0]
 
 
 def _run_probe(ret_file: Path) -> str:
@@ -85,7 +97,7 @@ def test_corrupt_manifest_probes_empty(tmp_path):
 
 
 def test_double_invocation_stub_is_not_performed(tmp_path):
-    """THE 4 sequence, on the real shipped snippets: invocation 1
+    """THE  sequence, on the real shipped snippets: invocation 1
     writes the stub for goal X; invocation 2's probe reads it back — it MUST
     classify as stub (goal_id matches, kind=stub), never as performed."""
     f = tmp_path / "session" / "retrieval-session.json"

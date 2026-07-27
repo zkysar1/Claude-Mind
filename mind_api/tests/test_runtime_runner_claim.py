@@ -52,7 +52,7 @@ class _Backend:
         self._heartbeat_exc = heartbeat_exc
         self._release_ret = release_ret
         self._release_exc = release_exc
-        # §5 stale-lock-break (9): reclaim_if_stale outcome + the
+        # §5 stale-lock-break (): reclaim_if_stale outcome + the
         # acquire-retry path the acquire endpoint runs on RunnerHeld.
         self._reclaim_ret = reclaim_ret
         self._reclaim_exc = reclaim_exc
@@ -187,7 +187,7 @@ def test_acquire_own_cloud_error_500(running_daemon, monkeypatch):
         raise AssertionError("expected HTTP 500 on acquire failure")
 
 
-# ── acquire §5 stale-lock-break: reclaim-on-held (9) ────────────────
+# ── acquire §5 stale-lock-break: reclaim-on-held () ────────────────
 def test_acquire_reclaims_stale_peer_then_succeeds(running_daemon, monkeypatch):
     """On RunnerHeld the endpoint reclaims a CRASHED peer's stale claim and
     retries acquire ONCE — a crash-no-release can never PIN ownership (§5)."""

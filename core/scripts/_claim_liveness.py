@@ -1,4 +1,4 @@
-"""Pure claim-liveness verdict for claim-liveness-check.sh (3).
+"""Pure claim-liveness verdict for claim-liveness-check.sh ().
 
 Layer B automation for guard-1151: mid-execution, before an irreversible
 action (daemon restart is the wired chokepoint — mind-api-start.sh

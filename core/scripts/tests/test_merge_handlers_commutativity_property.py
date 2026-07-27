@@ -302,7 +302,7 @@ def _assert_commutative(fn, a: bytes, b: bytes, basename: str, case: str):
 
 
 def test_divergent_keys_commutative():
-    """(a) same-id records with DISTINCT new keys — the 1 shape."""
+    """(a) same-id records with DISTINCT new keys — the  shape."""
     failures = []
     for basename, fn in sorted(_handlers_under_test().items()):
         side_a, side_b, _, _ = _builder_for(basename, fn)()

@@ -115,6 +115,43 @@ def test_add_missing_content_path_400(running_daemon):
         raise AssertionError("expected 400 for missing content_path file")
 
 
+def test_add_rejects_temp_content_path(running_daemon):
+    """ / guard-1373 (Layer-B): a content_path under a temp/ segment
+    is rejected at write time even when the file EXISTS (temp/ is drained, so
+    the body would orphan). The record must NOT land on disk."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    # Create the temp body so the reject fires on the temp segment, not on the
+    # existence check (proves the guard is independent of file existence).
+    cp = _make_trace(project_root, "agents/alpha/temp/orphan-prone.md")
+    rec = {"id": "exp-temp-reject", "type": "research", "category": "c",
+           "summary": "summary long enough here", "content_path": cp}
+    try:
+        _post_json(port, "/v1/experience/add", {}, rec)
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        payload = json.loads(e.read())
+        assert payload["error"] == "validation_failed"
+        assert "temp/" in payload["detail"]
+    else:
+        raise AssertionError("expected 400 rejecting a temp/ content_path")
+    # Never written.
+    assert "exp-temp-reject" not in [r["id"] for r in _live_records(agent_dir)]
+
+
+def test_add_allows_template_segment_not_substring(running_daemon):
+    """The guard matches a temp/ path SEGMENT (PurePosixPath.parts), not the
+    substring 'temp' — so a legitimate 'template/' directory is unaffected."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    cp = _make_trace(project_root, "agents/alpha/experience/template/keep.md")
+    rec = {"id": "exp-template-ok", "type": "research", "category": "c",
+           "summary": "summary long enough here", "content_path": cp}
+    status, body = _post_json(port, "/v1/experience/add", {}, rec)
+    assert status == 200, body
+    assert "exp-template-ok" in [r["id"] for r in _live_records(agent_dir)]
+
+
 def test_add_duplicate_409(running_daemon):
     project_root, port = running_daemon
     cp = _make_trace(project_root, "agents/alpha/experience/dup.md")
@@ -438,11 +475,11 @@ def test_byte_compat_recompute_index(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 5 / 7 regression tests (experience-pipeline triple defect)
+#  /  regression tests (experience-pipeline triple defect)
 # ---------------------------------------------------------------------------
 
 def test_archive_goal_recurring_rerun_uniquifies(running_daemon):
-    """5: re-archiving the same goal+skill_slug must PERSIST a fresh
+    """: re-archiving the same goal+skill_slug must PERSIST a fresh
     record with an auto-suffixed id (-YYYYMMDD, then -2), never 409 and lose
     the trace (the pre-fix behavior orphaned the .md on every recurring
     re-run)."""
@@ -478,7 +515,7 @@ def test_archive_goal_recurring_rerun_uniquifies(running_daemon):
 
 
 def test_add_derives_goal_id_from_id(running_daemon):
-    """7: add without goal_id derives it from the canonical
+    """: add without goal_id derives it from the canonical
     exp-{goal-id}-{suffix} id shape so --goal queries can find the record;
     non-goal-shaped ids stay null (conservative)."""
     project_root, port = running_daemon

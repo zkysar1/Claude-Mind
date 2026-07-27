@@ -306,6 +306,14 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: scorer-verdict.json
+    purpose: scorer top pick + top-5 sidecar (Scorer Sovereignty Layer B, g-115-2812) — the claim gate (scorer-verdict-gate.py) reads it to refuse unsanctioned divergence from the scorer's top pick
+    writer: goal-selector.py write_scorer_verdict (cmd_select, every iteration)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   - file: pending-questions.yaml
     purpose: async user questions (read by /open-questions, /backlog-report)
     writer: /respond, /aspirations-execute, /aspirations-spark, /aspirations-evolve
@@ -602,7 +610,7 @@ files:
   # goal-selector.py session_completions parameter) both use WM. The orphan
   # file was debris from the migration and has been deleted ().
 
-  # ── Orphans registered 2026-05-20 (1 triage) ───────────────
+  # ── Orphans registered 2026-05-20 ( triage) ───────────────
   # Surfaced by session-desync-check.sh in alpha/session/. Both are
   # append-only audit logs with confirmed framework writers, missing
   # only their manifest entries. Preserve across recovery for cross-
@@ -726,7 +734,7 @@ files:
     required_when_idle: false
     required_when_running: false
 
-  # ── Orphans registered 2026-07-10 (0) ──────────────────────
+  # ── Orphans registered 2026-07-10 () ──────────────────────
   # Surfaced by session-desync-check.sh on every boot (echo boot 2026-07-10,
   # Phase -1.5 advisory). Both have confirmed framework writers, missing only
   # their manifest entries. Both are this-machine state (cadence / runner
@@ -742,12 +750,12 @@ files:
     required_when_idle: false
     required_when_running: false
 
-  # (runner-write-attribution was registered above with the other 0
+  # (runner-write-attribution was registered above with the other 
   # signal-shaped orphans — a duplicate entry here crashed session-manifest-clear.sh
   # mid-clear on 2026-07-16: first unlink succeeded, second hit FileNotFoundError,
   # skipping the rb-671 team-state in_flight clear. Removed 2026-07-16.)
 
-  # Two more of the same class surfaced on bravo during 0 verification
+  # Two more of the same class surfaced on bravo during  verification
   # (2026-07-10) — registered here to leave the desync check fully clean rather
   # than defer identical trivial work to a follow-up.
   - file: loop-state-bump-failures.jsonl

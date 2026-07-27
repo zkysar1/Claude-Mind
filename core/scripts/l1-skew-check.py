@@ -364,14 +364,14 @@ def _cadence_gate():
     # self-heal: a permanent migration deadlock that silently disabled the L1
     # skew ritual. Coercing a non-dict to {} reseeds via the first-fire path
     # below, after which _record_fire overwrites with the correct dict shape.
-    # (rb-810 type-guard-before-method-call; 8-session l1-skew fix.)
+    # (rb-810 type-guard-before-method-call; -session l1-skew fix.)
     if not isinstance(last, dict):
         last = {}
     last_count = int(last.get("goals_count_at_last_fire", 0) or 0)
     diff = current - last_count
     if last_count == 0:
         diff = min(diff, cfg["goal_cadence"])
-    # Negative-diff self-heal (6 pattern, ported here by 4).
+    # Negative-diff self-heal ( pattern, ported here by ).
     # A DOWNWARD count-basis correction (census double-count repair, store
     # surgery, archival) leaves the stamped slot ABOVE the live count. Without
     # this branch diff stays negative, `fire` is permanently False, and the
@@ -383,8 +383,8 @@ def _cadence_gate():
     # healthy "cadence not crossed": no crash, no warning, just silence. A gate
     # that cannot distinguish "not due" from "never again" is not a gate.
     #
-    # fresh-eyes-cadence-check.py got this heal (6 per-agent,
-    # 1 team-layer); its two siblings (this file, felt-sense-cadence-
+    # fresh-eyes-cadence-check.py got this heal ( per-agent,
+    #  team-layer); its two siblings (this file, felt-sense-cadence-
     # check.py) never did. Measured 2026-07-14: felt-sense sat at diff=-335 and
     # needed 410 more completed goals before it could fire again.
     #
@@ -430,7 +430,7 @@ def _cadence_gate():
         }
         # Preserve the share baseline across a re-baseline — a count-basis
         # correction says nothing about tree shape, and dropping the shares
-        # would blind the next fire's share_creep comparison (5).
+        # would blind the next fire's share_creep comparison ().
         if isinstance(last.get("shares"), dict):
             rebase["shares"] = last["shares"]
         _wm_set(cfg["wm_slot"], rebase)
@@ -538,7 +538,7 @@ def main():
             "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "goals_count_at_last_fire": current,
             "any_flagged": verdict.get("any_flagged", False),
-            # share_creep baseline for the NEXT fire (5)
+            # share_creep baseline for the NEXT fire ()
             "shares": {f["metric"]: f.get("share", 0.0)
                        for f in verdict.get("findings", [])},
         }

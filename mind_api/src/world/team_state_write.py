@@ -257,7 +257,7 @@ def in_flight(ctx) -> "Response":  # type: ignore[name-defined]
 
     agent_author = _agent_name(ctx)
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    # current_focus: lane indicator for partner Theory-of-Mind (5).
+    # current_focus: lane indicator for partner Theory-of-Mind ().
     # Aspiration (lane) parsed from goal_id (g-NNN-MM -> asp-NNN) + title, so
     # partners track the actual lane instead of inferring from lagging
     # completions. Persists across clear-in-flight (the last-claimed lane).
@@ -396,7 +396,7 @@ def init(ctx) -> "Response":  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
-# POST /v1/team-state/retire-agent  (5 — the sanctioned REMOVE path)
+# POST /v1/team-state/retire-agent  ( — the sanctioned REMOVE path)
 # ---------------------------------------------------------------------------
 
 def retire_agent(ctx) -> "Response":  # type: ignore[name-defined]

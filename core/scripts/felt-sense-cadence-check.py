@@ -132,7 +132,7 @@ def main() -> int:
 
     current = count_completed_goals()
     last = wm_slot_value() or {}
-    # Defensive type-guard (2, mirror of l1-skew-check.py:307): a
+    # Defensive type-guard (, mirror of l1-skew-check.py:307): a
     # legacy/restored WM slot may hold a bare timestamp string (the
     # pre-dict-migration shape) instead of the {goals_count_at_last_fire: N}
     # dict the recorder writes. Without this, last.get() raises AttributeError
@@ -209,7 +209,7 @@ def main() -> int:
             f"felt-sense-cadence-check: current={current} last={last_count} "
             f"diff={diff} cadence={goal_cadence}"
         )
-    # Negative-diff self-heal (6 pattern, ported here by 4).
+    # Negative-diff self-heal ( pattern, ported here by ).
     # A DOWNWARD count-basis correction (census double-count repair, store
     # surgery, archival, count-basis change) leaves the stamped slot ABOVE the
     # live count. Without this branch diff stays negative and the ritual
@@ -223,8 +223,8 @@ def main() -> int:
     # not-yet-due skip. The ritual whose JOB is noticing drift was the one
     # drifting, and nothing could tell.
     #
-    # fresh-eyes-cadence-check.py got this heal (6 per-agent,
-    # 1 team-layer); its two siblings (this file, l1-skew-check.py)
+    # fresh-eyes-cadence-check.py got this heal ( per-agent,
+    #  team-layer); its two siblings (this file, l1-skew-check.py)
     # never did. Same count basis, same failure, no guard.
     #
     # Re-stamp to the current count and NOOP — do NOT fire. Firing here would
@@ -290,7 +290,7 @@ def main() -> int:
             )
         return 1
     if diff >= goal_cadence:
-        # 4 min_session_goals gate: world-goal completions tick every
+        #  min_session_goals gate: world-goal completions tick every
         # agent's cadence counter, but felt-sense lanes 1-6 require firing-
         # agent's session-scoped data (sensory-buffer, recent goals, in-flight
         # signals). When the firing-agent has <min_session_goals completed

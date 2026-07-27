@@ -216,7 +216,7 @@ def test_set_field_roundtrip(running_daemon):
     assert status == 200, body
     tree = _read_tree(world)
     assert tree["nodes"]["alpha-test-node"]["summary"] == "updated summary text"
-    # 3 Option B (ported to the daemon in 2): a metadata set
+    #  Option B (ported to the daemon in ): a metadata set
     # must NOT auto-bump per-node last_updated — node .md front matter is the
     # source of truth and the index syncs to it only via
     # tree-front-matter-sync.py. The baseline node carries no last_updated, so
@@ -635,7 +635,7 @@ def test_byte_compat_add_child(tmp_path):
 
 
 # Baseline with an EXPLICIT node_type=leaf parent so add-child exercises the
-# 7 leaf->interior flip (the _BASELINE_TREE parent has no node_type,
+#  leaf->interior flip (the _BASELINE_TREE parent has no node_type,
 # so .get("node_type") != "leaf" and the flip is a no-op there).
 _LEAF_PARENT_TREE = (
     "nodes:\n"
@@ -667,7 +667,7 @@ _LEAF_PARENT_TREE = (
                     reason="libyaml (CSafeDumper) required for byte-compat")
 @pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
 def test_byte_compat_add_child_flips_leaf_parent(tmp_path):
-    """5: add-child onto an EXPLICIT node_type=leaf parent must flip the
+    """: add-child onto an EXPLICIT node_type=leaf parent must flip the
     parent leaf->interior (g-115-1437) in the daemon exactly as the CLI does. The
     pre-fix daemon _apply_add_child left the parent node_type stale; this
     byte-compat add proves the flip lands identically, and the explicit assertion
@@ -692,7 +692,7 @@ def test_byte_compat_add_child_flips_leaf_parent(tmp_path):
                     reason="libyaml (CSafeDumper) required for byte-compat")
 @pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
 def test_byte_compat_add_child_injects_origin_goal_id(tmp_path):
-    """5: add-child with NO explicit origin_goal_id auto-injects the
+    """: add-child with NO explicit origin_goal_id auto-injects the
     EXECUTING goal id from world/team-state.yaml in_flight (g-325-06 / g-115-1463)
     in the daemon exactly as the CLI does. The pre-fix daemon dropped the inject;
     seeding BOTH worlds with an identical in_flight goal proves the daemon now
@@ -919,9 +919,9 @@ def test_byte_compat_reparent(tmp_path):
 
 # Baseline with TWO interior parents: 'intelligence' (2 children) exercises the
 # NON-flip path (remove one of two -> stays interior); 'spatial' (1 child)
-# exercises the 3 last-child-removal flip (interior -> leaf), the
+# exercises the  last-child-removal flip (interior -> leaf), the
 # inverse of the add-child leaf->interior flip and the gap _apply_remove_child
-# carried until 3 (it updated child_count but not node_type).
+# carried until  (it updated child_count but not node_type).
 _REMOVE_CHILD_TREE = (
     "nodes:\n"
     "  root:\n"
@@ -1019,7 +1019,7 @@ def test_byte_compat_remove_child(tmp_path):
                     reason="libyaml (CSafeDumper) required for byte-compat")
 @pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
 def test_byte_compat_remove_child_flips_interior_parent(tmp_path):
-    """3: removing the LAST child of an interior parent flips it
+    """: removing the LAST child of an interior parent flips it
     interior->leaf in the daemon exactly as cmd_remove_child does (tree.py
     g-115-1445) -- the inverse of the add-child leaf->interior flip. Pre-fix
     _apply_remove_child updated child_count but left node_type stale at

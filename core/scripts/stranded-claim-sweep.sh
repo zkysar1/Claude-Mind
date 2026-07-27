@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stranded Claim Sweep — thin wrapper for stranded-claim-sweep.py.
-# See the .py header for the protocol and 4 for the rationale.
+# See the .py header for the protocol and  for the rationale.
 #
 # Usage:
 #   bash core/scripts/stranded-claim-sweep.sh              # dry-run

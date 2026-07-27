@@ -155,7 +155,7 @@ def test_sanitize_reason():
 
 
 def test_per_sid_reason_sentinel_distinct(tmp_path):
-    """Two DISTINCT reasons for the same SID each log once (the 7 fix).
+    """Two DISTINCT reasons for the same SID each log once (the  fix).
 
     Before the fix, the second reason would be suppressed by the per-SID
     sentinel set on the first miss.
@@ -196,7 +196,7 @@ def test_memo_rejects_traversal_sid(tmp_path):
         assert list(resolved_dir.iterdir()) == []
 
 
-# ── Surface 3: fail-safe agent reuse on transient resolve failure (6) ──
+# ── Surface 3: fail-safe agent reuse on transient resolve failure () ──
 
 def test_resolved_memo_stores_agent_name(tmp_path):
     """The memo now persists the agent NAME so a TRANSIENT resolve failure can

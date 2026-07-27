@@ -177,6 +177,65 @@ def test_load_tree_nodes_below_threshold_not_widened(tmp_tree, monkeypatch):
     assert "runner-leases" not in keys
 
 
+# ── tree-lane eligibility floor () ───────────────────────────────────
+# The tree lane reads embedding_tree_min_cosine, falling back to the SHARED
+# embedding_min_cosine when that key is absent. 0.33 is chosen to sit strictly
+# between the two live values (tree 0.32, shared 0.35), so each test below can
+# only pass under the floor it is asserting.
+
+_BETWEEN_FLOORS = 0.33
+
+
+def test_tree_lane_floor_overrides_shared(tmp_tree, monkeypatch):
+    """A node under the shared floor but over the tree floor IS widened."""
+    cfg = _cfg(True)
+    cfg["embedding_min_cosine"] = 0.35
+    cfg["embedding_tree_min_cosine"] = 0.32
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    raw = {"tree:system/runner-leases": _BETWEEN_FLOORS,
+           "tree:system/shutdown-steps": 0.5}
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: raw)
+    results, _ = _retrieve.load_tree_nodes(QUERY, "medium", read_only=True)
+    by_key = {r["key"]: r for r in results}
+    assert "runner-leases" in by_key, (
+        "cosine 0.33 clears the tree floor 0.32 and must be widened, even "
+        "though it is below the shared 0.35")
+    assert by_key["runner-leases"]["match_channel"] == "embedding"
+
+
+def test_tree_lane_floor_falls_back_to_shared_when_absent(tmp_tree, monkeypatch):
+    """THE REVERT PATH: delete the tree key -> prior shared-floor behaviour.
+
+    _cfg() builds from _DEFAULT_RETRIEVAL_CFG, which deliberately does NOT
+    carry embedding_tree_min_cosine, so this is the genuine key-absent case.
+    """
+    cfg = _cfg(True)
+    cfg["embedding_min_cosine"] = 0.35
+    cfg.pop("embedding_tree_min_cosine", None)
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    raw = {"tree:system/runner-leases": _BETWEEN_FLOORS,
+           "tree:system/shutdown-steps": 0.5}
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: raw)
+    results, _ = _retrieve.load_tree_nodes(QUERY, "medium", read_only=True)
+    keys = {r["key"] for r in results}
+    assert "runner-leases" not in keys, (
+        "with the tree key absent the lane must fall back to the shared 0.35, "
+        "which 0.33 does not clear")
+
+
+def test_tree_floor_key_absent_from_defaults():
+    """Pins the reason the revert path works.
+
+    embedding_tree_min_cosine MUST NOT be added to _DEFAULT_RETRIEVAL_CFG. The
+    lookup is cfg.get(tree_key, cfg.get(shared_key)) against a dict that is
+    defaults-merged-with-tree.yaml, so a default value would ALWAYS be found
+    and the shared-floor fallback could never fire — silently breaking the
+    documented "delete the config line to revert" path with no test failure
+    anywhere else. Configure the value in core/config/tree.yaml only.
+    """
+    assert "embedding_tree_min_cosine" not in _retrieve._DEFAULT_RETRIEVAL_CFG
+
+
 # ── _score_weight_limit bonus swap ───────────────────────────────────────────
 
 def test_scorer_uses_embedding_bonus_over_tfidf():

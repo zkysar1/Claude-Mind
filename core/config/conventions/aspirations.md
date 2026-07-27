@@ -106,9 +106,9 @@ Two script families — world (default) and agent — operate on separate queues
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `load-aspirations-compact.sh` | Cached compact active aspirations (dedup-aware) | — |
-| `aspirations-query.sh --goal-status <status>` | Query goals by status across both queues (lightweight) | — |
-| `aspirations-query.sh --goal-field <field> <value>` | Query goals by field value across both queues | — |
-| `aspirations-query.sh --title-contains <substr>` | Query goals by title substring across both queues | — |
+| `aspirations-query.sh --goal-status <status>` | Query goals by status across both queues (lightweight) — **LIVE only, see note below** | — |
+| `aspirations-query.sh --goal-field <field> <value>` | Query goals by field value across both queues — **LIVE only** | — |
+| `aspirations-query.sh --title-contains <substr>` | Query goals by title substring across both queues — **LIVE only** | — |
 | `aspirations-read.sh --active` | Return active world aspirations as full JSON | — |
 | `aspirations-read.sh --active-compact` | Compact active aspirations (no descriptions/verification) | — |
 | `aspirations-read.sh --id <id>` | Return one world aspiration by ID | — |
@@ -123,6 +123,21 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-complete-intent.sh <asp-id>` | Close world aspiration via intent-satisfaction pathway (evidence-gated) | JSON |
 | `aspirations-retire.sh <asp-id>` | Mark world aspiration retired + archive | — |
 | `aspirations-archive.sh` | Sweep completed/retired world aspirations to archive | — |
+
+> **"across both queues" means WORLD + AGENT, never LIVE + ARCHIVE.** Every
+> `aspirations-query.sh` form reads only the two LIVE files. When an aspiration
+> completes it is archived, and all of its goals leave that query — a lookup by
+> goal-id then returns NOT-FOUND, which is byte-identical to the answer for a
+> goal that never existed. Any lookup deciding "is goal X done?" must ALSO read
+> `aspirations-read.sh --archive --json` (2026-07-26: 353 archived aspirations /
+> 2278 completed goals — not a rare edge). Prefer keeping the two results
+> DISTINCT rather than merging them: a goal completed inside an archived
+> aspiration is more finished than a merely-completed live one, and an id in
+> NEITHER store is an anomaly worth reporting rather than skipping.
+> Measured cost of assuming otherwise (g-115-3332): a fleet PR probe built on
+> the live query alone silently dropped 6 of the 11 findings it was written to
+> surface — all owned by one archived aspiration — while reporting its own
+> status as `ok`. See `guard-1555`, `rb-5272`.
 | `aspirations-meta-update.sh <field> <value>` | Update world aspirations metadata | — |
 | `evolution-log-append.sh` | Append evolution event | JSON |
 
@@ -150,7 +165,21 @@ Agent queue goals do not need claims (single-agent access).
 
 **Rules:**
 1. `goal-selector.py` skips goals claimed by another agent — claims are respected at selection time.
-2. Claim is atomic — if another agent claimed first, the script exits non-zero. On conflict, re-enter the selection loop.
+2. Claim is atomic **with respect to a DIFFERENT agent** — if another agent
+   claimed first, the script exits non-zero. On conflict, re-enter the selection
+   loop. **Claim exclusion is AGENT-scoped, NOT session-scoped** (g-115-3176):
+   the endpoint's conflict test is `existing != agent_name`, so a claim from a
+   different *session of the same agent* falls through as an idempotent no-op
+   and BOTH sessions believe they hold an exclusive claim, with no warning to
+   either. Do NOT read "claims prevent duplicate execution" as "only one session
+   can be working a goal" — that assumption is false today. Observed live
+   2026-07-25: two sessions of the same agent held one world goal 16 minutes
+   apart; the second was still doing reconnaissance when the first completed the
+   goal, one write away from creating duplicate credentials in an external
+   service. Wasted work is the mild failure mode; duplicate production side
+   effects are the real one. **If you run a second session of an agent that is already
+   running autonomously, treat claims as advisory and verify by hand before any
+   irreversible action.**
 3. Claim-clearing invariant: any transition to a terminal status (`completed`,
    `skipped`, `expired`, `decomposed`, `superseded`), AND each successful cycle
    of a recurring goal via `complete-by`, clears `claimed_by` and `claimed_at`.
@@ -161,6 +190,45 @@ Agent queue goals do not need claims (single-agent access).
    in depth — terminal goals should already be claim-free per Rule 3.
 5. Self-heal: `aspirations-clear-stale-claims.sh [--dry-run]` sweeps any residue
    left by past writers. Idempotent; zero-effect when no residue exists.
+6. **Claiming session identity** (`claimed_by_sid`, g-115-3176): a claim records
+   the SID of the claiming session alongside `claimed_by`.
+   `aspirations-claim.sh` sends `&sid=$MIND_SID` (hook-injected into every Bash
+   call); the daemon stamps `goal["claimed_by_sid"]` — but ONLY when supplied, so
+   a take-back or a legacy caller never erases the holding session's identity.
+   This makes a same-agent cross-session collision **diagnosable** (compare
+   `claimed_by_sid` against your own `$MIND_SID`).
+7. **Session-scoped claim exclusion** (g-115-3176, landed): `claim` returns
+   **409 `same_agent_other_session`** when the holder is a DIFFERENT session of
+   the same agent that is positively confirmed to be this agent's LIVE
+   autonomous runner (`running-session-id` match + fresh `runner-heartbeat`
+   mtime vs `runner_heartbeat.stale_minutes`). Unchanged: different-agent
+   take-back, same-session re-claim (idempotent no-op), legacy sid-less claims,
+   and takeover of a **dormant** holder — which is logged to history/changelog
+   as `cross-session take-over from dormant <sid>`. The runner always wins:
+   an observer session cannot take a goal from the live loop, but the loop can
+   take one from a dormant observer.
+
+   The probe **fails open on every ambiguous path**, and that asymmetry is
+   load-bearing (same reasoning as
+   `.claude/rules/check-team-state-before-silent.md`): a FRESH heartbeat is
+   positive evidence of life, but a STALE one is ambiguous — an idle session
+   and a broken heartbeat writer are indistinguishable, and a live agent has
+   been observed reading 59h stale. So the REFUSAL is gated on freshness and
+   the ALLOW is never gated on staleness. A wrong allow permits only what was
+   already possible; a wrong refusal would wedge the goal for every session of
+   the agent.
+8. **`release` / `complete-by` WARN, never refuse** (g-115-3176 outcome 5):
+   invoked by a session that does not hold the claim, both apply the operation
+   and return a `warnings` entry naming the holding SID (also stderr). They must
+   NOT refuse: `stranded-claim-sweep.py --apply` releases claims left by DEAD
+   sessions and therefore always runs from a non-holding session, so a refusal
+   would break that sweep fleet-wide and wedge exactly the stranded goals it
+   repairs. The claim side can refuse because the caller can pick another goal;
+   the release side cannot, because there is no other path to un-wedge a goal.
+   Both wrappers send `&sid=$MIND_SID` — without it the guard is structurally
+   dead, which is the original bug's shape. Both also clear `claimed_by_sid`
+   along with the claim: a stamp that outlives its claim would mislabel the next
+   sid-less claimer with the previous holder's session.
 
 #### Claim Expiry (Straggler Mitigation)
 

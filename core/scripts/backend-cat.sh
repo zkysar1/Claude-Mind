@@ -7,7 +7,7 @@
 # to-memory read that never mutates the local mirror; local = plain
 # filesystem), replacing the recurring 10-line `python3 -c` incantation
 # (source _paths.sh + cd core/scripts + get_backend() ceremony) that gap-12
-# recorded across 6 (write-propagation HEAD probe) and 9
+# recorded across  (write-propagation HEAD probe) and 
 # (sharded-store read forensics).
 #
 # Usage:
@@ -83,7 +83,7 @@ else:
 b = get_backend()
 
 if sub == "cat":
-    # Diagnostic reads must be PURE (7). read_text(force_fresh=True)
+    # Diagnostic reads must be PURE (). read_text(force_fresh=True)
     # routes through _refresh, which (a) downloads S3 INTO the local mirror
     # (rb-3128 read-side clobber) and (b) in the both-diverged no_clobber
     # state returns the LOCAL bytes while claiming freshness.
@@ -120,7 +120,7 @@ elif sub == "head":
     if st.mtime_ns:
         mt = datetime.datetime.fromtimestamp(st.mtime_ns / 1e9)
         print(f"mtime:    {mt.isoformat(timespec='seconds')}")
-    # Local-mirror drift indicator — the 6 use case: did the write
+    # Local-mirror drift indicator — the  use case: did the write
     # actually propagate, and does the local mirror match the store?
     if b.name == "local":
         print("local:    (local backend — the file IS the store)")

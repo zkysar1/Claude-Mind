@@ -240,7 +240,7 @@ def resolve_agent(project_root, session_id, env_agent):
                 return name
         except Exception:
             pass
-    # Marker-cache fallback (0): cleanup-stale-bindings.sh reaps the
+    # Marker-cache fallback (): cleanup-stale-bindings.sh reaps the
     # Phase 2.6 binding dir at mtime>24h even when the session is still ALIVE
     # (marathon autonomous/assistant sessions), after which both tiers above
     # miss and D1 capture silently dies for every subsequent edit. The

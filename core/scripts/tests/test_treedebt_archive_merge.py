@@ -144,7 +144,7 @@ def test_archive_normalization_drift_merges_not_duplicates():
     goals = recs[0]["goals"]
     assert len(goals) == 1
     # terminal non-recurring goal must not carry a claim pair (write-path
-    # Rule 3 mirror in _merge_goal, 8)
+    # Rule 3 mirror in _merge_goal, )
     assert "claimed_by" not in goals[0]
     assert "claimed_at" not in goals[0]
 

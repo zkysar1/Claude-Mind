@@ -153,7 +153,7 @@ def _run_gate(goal: dict, tmp_world: Path) -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = "alpha"
     env["MIND_WORLD"] = str(tmp_world)
-    # Hermetic agent-queue scan (5): keep live agent queues out
+    # Hermetic agent-queue scan (): keep live agent queues out
     # of the wrapper's pending_queue check (rb-3784 corpus coupling).
     env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
@@ -305,7 +305,7 @@ def main() -> int:
 
 
 def test_insight_trigger_gate():
-    """Pytest entry point (6) — runs the 5-case suite (tmp-world
+    """Pytest entry point () — runs the 5-case suite (tmp-world
     isolated) and asserts all cases pass."""
     assert main() == 0
 

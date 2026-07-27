@@ -1,4 +1,4 @@
-"""Tests for pre-apply-consult-drift-gate.py (1).
+"""Tests for pre-apply-consult-drift-gate.py ().
 
 The gate is the CONSUMER for iteration-close.sh's `retrieval-summary:
 performed=false` signal: on N consecutive framework-touching DEEP closes with
@@ -132,16 +132,16 @@ def test_threshold_floor_is_one():
     assert d["set_sentinel"] is True
 
 
-# ── framework_edited gate (5) ───────────────────────────────────────
+# ── framework_edited gate () ───────────────────────────────────────
 # A framework-CLASSIFIED deep close that edited NO framework file (a read-only
 # diagnostic — tree scan, gate audit) must be transparent: it has nothing to
 # pre-apply-consult FOR, so it must neither increment the streak nor trip the
 # sentinel. Only a framework-deep close that ACTUALLY edited a framework file is
-# a real miss. This is the false-positive class 5 fixes while
-# preserving the 1 real-drift catch.
+# a real miss. This is the false-positive class  fixes while
+# preserving the  real-drift catch.
 
 def test_framework_deep_no_file_edited_is_transparent():
-    # THE 5 fix: framework + deep + performed=false, but edited no
+    # THE  fix: framework + deep + performed=false, but edited no
     # framework file -> UNCHANGED, no trip, no sentinel.
     d = MOD.decide("deep", performed=False, streak=1, work_class="framework",
                    threshold=2, framework_edited=False)
@@ -165,7 +165,7 @@ def test_framework_deep_no_file_edited_does_not_reset():
 
 def test_framework_deep_file_edited_still_increments():
     # Real-drift catch preserved: framework + deep + performed=false + edited a
-    # framework file -> increments and trips at threshold, exactly as 1.
+    # framework file -> increments and trips at threshold, exactly as .
     d = MOD.decide("deep", performed=False, streak=1, work_class="framework",
                    threshold=2, framework_edited=True)
     assert d["new_streak"] == 2
@@ -174,7 +174,7 @@ def test_framework_deep_file_edited_still_increments():
 
 
 def test_framework_deep_file_edited_consulted_resets():
-    # Genuine framework edit that consulted -> reset (the 1 reset path).
+    # Genuine framework edit that consulted -> reset (the  reset path).
     d = MOD.decide("deep", performed=True, streak=4, work_class="framework",
                    threshold=2, framework_edited=True)
     assert d["new_streak"] == 0
@@ -182,7 +182,7 @@ def test_framework_deep_file_edited_consulted_resets():
 
 
 def test_framework_edited_defaults_true_backward_compat():
-    # Absent framework_edited -> True, so every pre-5 call site and the
+    # Absent framework_edited -> True, so every pre- call site and the
     # git-signal-unavailable path preserve the original increment behavior.
     d = MOD.decide("deep", performed=False, streak=1, work_class="framework", threshold=2)
     assert d["framework_edited"] is True
@@ -244,7 +244,7 @@ def test_resolve_work_class_framework_category_then_trips(monkeypatch):
 
 
 def test_resolve_explicit_unclassified_falls_through_to_category(monkeypatch):
-    # 8 regression pin (incident 6): the goal-creation
+    #  regression pin (incident ): the goal-creation
     # stamper bakes work_class="unclassified" onto records whose category is
     # unmapped at creation time. An explicit "unclassified" must NOT win
     # verbatim — it falls through to live category resolution so a later
@@ -257,7 +257,7 @@ def test_resolve_explicit_unclassified_falls_through_to_category(monkeypatch):
 
 
 def test_consulted_close_resets_streak_despite_unclassified_stamp(monkeypatch):
-    # END-TO-END incident shape (8 acceptance): a framework-category
+    # END-TO-END incident shape ( acceptance): a framework-category
     # deep close stamped work_class="unclassified" that DID consult
     # (performed=true) must RESET the miss streak — before the fix it was
     # transparent (streak unchanged), so the sentinel re-tripped on the next
@@ -274,7 +274,7 @@ def test_consulted_close_resets_streak_despite_unclassified_stamp(monkeypatch):
 
 def test_live_mapping_covers_incident_category():
     # Layer-2 pin: the REAL core mapping must know the incident category (it
-    # was unmapped at 6's creation — that gap created the stale
+    # was unmapped at 's creation — that gap created the stale
     # stamp). Uses the deployment mapping deliberately (no monkeypatch).
     import importlib
     sys.modules.pop("_work_class", None)
@@ -291,7 +291,7 @@ def test_decide_returns_full_contract_keys():
         assert k in d
 
 
-# ── CLI wiring for --framework-edited (5) ───────────────────────────
+# ── CLI wiring for --framework-edited () ───────────────────────────
 
 def _run_cli(*args):
     """Invoke the gate as a subprocess (STORAGE_BACKEND=local per guard-955) and

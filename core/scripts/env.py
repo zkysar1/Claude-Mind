@@ -24,8 +24,21 @@ LOCAL_PATH = PROJECT_ROOT / ".env.local"
 # Category header pattern: # --- Category Name ---
 CATEGORY_RE = re.compile(r"^#\s*---\s*(.+?)\s*---\s*$")
 # Key entry pattern: # KEY=  or # KEY=  # description  or KEY=value
-COMMENTED_KEY_RE = re.compile(r"^#\s*([A-Z][A-Z0-9_]*)=\s*(?:#\s*(.*))?$")
-ACTIVE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+#
+# The name class is [A-Za-z_][A-Za-z0-9_]* — the ACTUAL shell/dotenv rule, where
+# a lowercase letter and a leading underscore are both legal. Do NOT "tighten"
+# this back to [A-Z][A-Z0-9_]*: an uppercase-only class does not reject a
+# lowercase key, it SILENTLY SKIPS it — parse_local()/parse_example() just omit
+# the entry and return an empty value, with no error raised. Nine live
+# credentials sat invisible that way in a downstream deployment's .env.local
+# (found 2026-07-26, fixed there first and back-ported here as ).
+# Widening is regression-free by measurement, not by argument: a before/after
+# census over the real .env.example and .env.local gained the lowercase class
+# and lost ZERO keys, and prose comments stay unmatched because the commented
+# form still requires `=` followed only by optional whitespace or a `#` comment
+# (`# TODO=fix` matches neither pattern).
+COMMENTED_KEY_RE = re.compile(r"^#\s*([A-Za-z_][A-Za-z0-9_]*)=\s*(?:#\s*(.*))?$")
+ACTIVE_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
 
 def parse_example():

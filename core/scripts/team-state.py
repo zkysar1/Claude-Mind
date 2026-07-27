@@ -199,7 +199,7 @@ def cmd_in_flight(args):
     target_agent = args.agent
     agent_author = args.author or _agent_name()
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    # current_focus: lane indicator for partner Theory-of-Mind (5).
+    # current_focus: lane indicator for partner Theory-of-Mind ().
     # Aspiration (lane) parsed from goal_id (g-NNN-MM -> asp-NNN) + title, so
     # partners track the actual lane instead of inferring from lagging
     # completions. Persists across clear-in-flight (the last-claimed lane).
@@ -456,7 +456,7 @@ def build_parser():
                                     "per-agent row files (optional cleanup)")
     migrate_p.add_argument("--author", help="Author name (defaults to MIND_AGENT)")
 
-    # retire-agent (5) — the sanctioned REMOVE path
+    # retire-agent () — the sanctioned REMOVE path
     retire_p = sub.add_parser("retire-agent",
                               help="Remove an agent's team-state presence "
                                    "(core residual + shard), archive-before-delete gated")

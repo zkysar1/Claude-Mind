@@ -1,4 +1,4 @@
-"""1: _locked_bump_jsonl conflict-retry + graceful degrade.
+""": _locked_bump_jsonl conflict-retry + graceful degrade.
 
 The retrieval counter bump was a SINGLE-SHOT fenced write — on own-cloud, a
 conflict on a hot shared store (world/reasoning-bank.jsonl) failed the ENTIRE

@@ -7,7 +7,7 @@
 # --- FRAMEWORK ---
 
 # Stage labels derived from tree_maturity (knowledge-tree competence mean — the
-# mean mapped capability_level of tree LEAVES at depth >= 2). Since 4
+# mean mapped capability_level of tree LEAVES at depth >= 2). Since 
 # the WHOLE stage block (overall_stage, current_assessment.{stage,tree_maturity,
 # highest_capability,lowest_capability,exploration_budget,resolved_hypotheses},
 # exploration.epsilon) is script-computed by core/scripts/_competence.py
@@ -16,7 +16,7 @@
 # LLM-discretionary and drifted silent (rb-3171; agents pinned at 'exploring').
 # The band keys below (tree_maturity_min/max) mirror _competence.STAGE_BANDS —
 # keep the two in sync when re-calibrating. average_competence remains the
-# separate 4-component evidence formula (8 split) consumed by
+# separate 4-component evidence formula ( split) consumed by
 # curriculum.yaml metric_threshold gates.
 stages:
   exploring:

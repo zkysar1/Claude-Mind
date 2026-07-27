@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dry-idle-tick.py -- single-writer tick for loop_state.signals.dry_idle (4-c, Layer 3).
+"""dry-idle-tick.py -- single-writer tick for loop_state.signals.dry_idle (-c, Layer 3).
 
 Wires the Layer-2 pure functions (_dry_idle.py) into the two dry-state call
 sites: the loop digest's Phase-2 goal-is-None branch (quiescence_decision=na)
@@ -159,7 +159,7 @@ def main():
     streak = result["streak"]
     sleep_seconds = _dry_idle.dry_sleep_seconds(streak, cfg) if dry else 0
 
-    # Layer 4 (4-d): maintain the dry-cycle short-circuit baseline so
+    # Layer 4 (-d): maintain the dry-cycle short-circuit baseline so
     # consecutive dry re-entries can re-sleep WITHOUT reloading the heavy skill
     # chain (aspirations/SKILL.md Phase -0.5e.0b -> dry-idle-cycle-cache.py).
     # This tick is the SINGLE WRITER of that cache -- the DRY analog of

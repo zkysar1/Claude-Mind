@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""_init_seed_probe.py — store-of-record existence probe for init seed-backfill (4).
+"""_init_seed_probe.py — store-of-record existence probe for init seed-backfill ().
 
 Answers ONE question for init-world.sh / init-meta.sh `seed_needed()` (and
 meta-init.py --missing-only) when a candidate seed target is absent from the

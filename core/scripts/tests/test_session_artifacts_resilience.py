@@ -1,4 +1,4 @@
-"""9: ONE malformed tree node must not blind the encoding signal.
+""": ONE malformed tree node must not blind the encoding signal.
 
 THE BUG THIS PINS
 -----------------
@@ -55,7 +55,7 @@ last_update_trigger:
 body
 """
 
-# The EXACT corruption shape observed in the wild (9): a regex front-matter
+# The EXACT corruption shape observed in the wild (): a regex front-matter
 # edit replaced the nested MAPPING key `last_update_trigger:` with a SCALAR, orphaning
 # its child keys at their old indent -> "expected <block end>, but found
 # '<block mapping start>'".

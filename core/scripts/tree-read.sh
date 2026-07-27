@@ -19,7 +19,7 @@
 # index->authoritative-store-absent bodies — both index-body desync and the
 # never-pushed-at-risk class. The authoritative-store-aware complement is
 # core/scripts/tree-body-presence-audit.py (remote-backend-only; backend.stat
-# HEAD), run on cadence via recurring goal 8. See rb-4089 for the
+# HEAD), run on cadence via recurring goal . See rb-4089 for the
 # single-box coverage asymmetry.
 set -euo pipefail
 

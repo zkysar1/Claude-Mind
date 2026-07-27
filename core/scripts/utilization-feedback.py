@@ -45,6 +45,36 @@ except ImportError:
     sys.exit(1)
 
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CORE_ROOT
+
+# --- producer-side token helpers (single source of truth, ) --------
+# This module CONSUMES what retrieve.py's _distinctive_tokens produces. The
+# tokenizer and the structural test MUST be the same on both sides: a local
+# copy would keep parsing without error while silently matching nothing the day
+# either side changed — the verbatim-twin drift class. Imported lazily and
+# cached so an import problem in retrieve.py cannot break this module's other
+# subcommands at load time.
+_PRODUCER = None
+
+
+def _producer():
+    global _PRODUCER
+    if _PRODUCER is None:
+        d = str(Path(__file__).resolve().parent)
+        if d not in sys.path:
+            sys.path.insert(0, d)
+        import retrieve as _r
+        _PRODUCER = _r
+    return _PRODUCER
+
+
+def _prod_token_re():
+    """The producer's identifier-preserving tokenizer (`retrieve._TOKEN_RE`)."""
+    return _producer()._TOKEN_RE
+
+
+def _prod_is_structural():
+    """The producer's rb-1729 shape test (`retrieve._is_structural_token`)."""
+    return _producer()._is_structural_token
 import _rt
 
 
@@ -430,7 +460,17 @@ def infer_feedback(session, confidence="conservative"):
     Returns (helpful_ids, noise_ids, unknown_ids, stats_dict), or None if the
     session is too old (schema_version < 2) to carry distinctive_tokens.
     """
-    if session.get("schema_version", 1) < 2:
+    # schema_version 3 () is the first version whose distinctive_tokens
+    # keep identifier shape AND rank structural tokens ahead of prose. v2 sessions
+    # are refused, NOT run through the old classifier: v2's output was MEASURED
+    # (, 6 real manifests / 485 items) at helpful/population 0.922, with
+    # an unrelated cake recipe scoring 0.627 against the same manifests — 68% of
+    # its "helpful" verdicts were reproducible by topically-unrelated text. It was
+    # never a measurement, so continuing to write counters from it during the
+    # transition would knowingly inject bad data into times_inferred_helpful
+    # (which carries half weight in utility_ratio). Sessions are per-goal and
+    # short-lived, so the transition window is a few iterations.
+    if session.get("schema_version", 1) < 3:
         return None
 
     goal_id = session.get("goal_id", "")
@@ -444,8 +484,13 @@ def infer_feedback(session, confidence="conservative"):
     # this was diary-only, which failed because diary entries are mostly
     # phase-marker structural text.
     combined_text = (goal_text + "\n" + diary_text).strip()
-    combined_tokens = set(re.findall(r"[a-z0-9]+", combined_text.lower()))
     combined_lc = combined_text.lower()
+    # Tokenize the SAME way the producer does, via the producer's own helpers —
+    # a local copy of the regex would silently stop matching the day either side
+    # changed (the verbatim-twin drift class this codebase keeps re-learning).
+    combined_tokens = {
+        t.strip("-_") for t in _prod_token_re().findall(combined_lc)}
+    combined_tokens.discard("")
 
     min_distinctive = 2 if confidence == "conservative" else 1
 
@@ -453,16 +498,38 @@ def infer_feedback(session, confidence="conservative"):
     noise = set()
     unknown = set()
 
+    is_structural = _prod_is_structural()
+
     def classify(entry_id, tokens):
         # Key-or-id appearance is a strong signal (agent referenced it).
         if entry_id and entry_id.lower() in combined_lc:
             return "helpful"
-        # Distinctive token overlap with goal+diary prose.
-        matches = [t for t in tokens if t in combined_tokens]
-        if len(matches) >= min_distinctive:
+        # STRUCTURAL overlap only (rb-1729: token SHAPE is the discriminator,
+        # not generic prose vocab). Counting any shared token made this
+        # near-certain for a multi-KB goal description — a goal in category
+        # `framework-architecture` marked every `*-architecture` node helpful
+        # because its prose contained the word "architecture". Requiring a
+        # [-_0-9]-bearing identifier drops that to zero false positives across
+        # the 6-manifest corpus while every manifest still clears helpful>0.
+        structural = [t for t in tokens
+                      if t in combined_tokens and is_structural(t)]
+        if len(structural) >= min_distinctive:
             return "helpful"
-        if len(matches) == 0:
+        if len(structural) == 0:
             return "noise"
+        # `unknown` keeps its original meaning — SOME structural evidence but
+        # below threshold (reachable only when confidence=conservative sets
+        # min_distinctive=2). Do NOT route prose-only overlap here: at the
+        # default min_distinctive=1 that would populate a bucket which was
+        # previously unreachable, and every unknown supplementary item
+        # increments times_inferred_unknown, which at unknown_threshold=5 sets
+        # auto_flagged_for_review=true and force-feeds the item into the
+        # curation candidate list REGARDLESS of evidence. Since virtually every
+        # item shares some prose token with a multi-KB goal, that would flag
+        # most of the rb/guardrail corpus within ~5 deep closes. Routing to
+        # `noise` costs nothing: the C.2 backstop below discards from `noise`
+        # AND `unknown`, so a genuinely-used item is still rescued by its
+        # times_active delta. (Caught by the  fresh-eyes pass.)
         return "unknown"
 
     for entry in session.get("tree_nodes_detail", []) or []:
@@ -574,13 +641,57 @@ def main():
         }))
         sys.exit(0)
 
-    # Idempotency guard
+    # Idempotency guard — with ONE sanctioned supersede path ().
+    #
+    # iteration-close.sh do_state_update runs `--infer` immediately BEFORE
+    # phase-4-26-gate.sh (it is the PRODUCER for the flag that gate consumes),
+    # so by the time the gate refuses — "method=infer with helpful=0 ... run
+    # utilization-feedback.sh manually with explicit --helpful items" — the
+    # session is ALREADY closed and that instructed recovery returned
+    # already_processed. The recovery was unreachable by construction, leaving
+    # --no-retrieval-applicable as the only exit, which is FALSE whenever
+    # retrieval genuinely helped. The gate's own escape hatch therefore
+    # corrupted the signal the gate exists to protect. Observed 4x in 2 days
+    # (, , , ).
+    #
+    # An EXPLICIT-POSITIVE verdict superseding a NON-POSITIVE one is a
+    # CORRECTION, not a double-count. The three non-positive methods each
+    # leave times_helpful untouched: `--infer` increments
+    # times_inferred_helpful, `--all-noise` increments times_noise, and
+    # `--all-unknown` increments nothing at all. So the explicit pass adds
+    # signal on a counter the prior pass never wrote. Explicit-positive over
+    # explicit-positive (manual / all_helpful) stays refused — THAT would be a
+    # genuine double-count of times_helpful.
+    #
+    # all_noise/all_unknown were added to this set on 2026-07-26 ()
+    # after the original infer-only fix proved too narrow: the same unreachable
+    # recovery reappeared one iteration later with method=all_noise. The gate's
+    # instruction ("run utilization-feedback.sh manually with explicit --helpful
+    # items") is identical in both cases, so restricting the supersede to
+    # `infer` left the instruction still-unfollowable — and left
+    # --no-retrieval-applicable, a FALSE assertion whenever retrieval ran, as
+    # the only exit. The defect is the mismatch between what the gate tells you
+    # to do and what this function permits; it is not specific to `infer`.
+    SUPERSEDABLE_METHODS = ("infer", "all_noise", "all_unknown")
+    prior_method = session.get("utilization_method")
+    is_explicit = bool(args.helpful) or args.all_helpful
+    superseding_infer = False
     if not session.get("utilization_pending", False):
-        print(json.dumps({
-            "status": "already_processed",
-            "completed_at": session.get("utilization_completed_at"),
-        }))
-        sys.exit(0)
+        if prior_method in SUPERSEDABLE_METHODS and is_explicit:
+            superseding_infer = True   # fall through and record the correction
+        else:
+            print(json.dumps({
+                "status": "already_processed",
+                "completed_at": session.get("utilization_completed_at"),
+                "method": prior_method,
+                # Name the reachable correction so a caller that hits this
+                # is not left guessing, the way the gate's instruction did.
+                "hint": ("an explicit --helpful/--all-helpful call may supersede a "
+                         "non-positive verdict (method in "
+                         f"{list(SUPERSEDABLE_METHODS)}); nothing may supersede an "
+                         "explicit-positive one"),
+            }))
+            sys.exit(0)
 
     # Determine which items are helpful vs noise (vs inferred_helpful vs unknown)
     tree_nodes = session.get("tree_nodes_loaded", [])
@@ -642,9 +753,27 @@ def main():
         supp_helpful = [s for s in supp_items if s["id"] in helpful_ids]
         supp_noise = [s for s in supp_items if s["id"] not in helpful_ids]
 
+    if superseding_infer:
+        # The superseded pass ALREADY applied its noise verdict to these same
+        # items (infer per-item, all_noise to every item; all_unknown applied
+        # none), and the explicit paths above mark everything not-named as
+        # noise — so re-applying here would double-count times_noise. A
+        # supersede contributes ONLY the corrective helpful increments.
+        #
+        # KNOWN RESIDUE (): an item the superseded pass marked noise
+        # that this explicit pass marks HELPFUL keeps that earlier times_noise++.
+        # The correction can add times_helpful but cannot retract the earlier
+        # noise increment, so such an entry reads as both. Deliberately not
+        # decrementing here — a counter rollback is a separate, riskier change
+        # than making honest positive signal recordable at all. The residue is
+        # widest under all_noise, which marked EVERY item noise ().
+        tree_noise = []
+        supp_noise = []
+
     if args.dry_run:
         print(json.dumps({
             "status": "dry_run",
+            "superseding_infer": superseding_infer,
             "utilization_method": utilization_method,
             "inference_stats": inference_stats,
             "tree_helpful": tree_helpful,
@@ -770,6 +899,12 @@ def main():
     session["utilization_pending"] = False
     session["utilization_completed_at"] = now_str()
     session["utilization_method"] = utilization_method
+    if superseding_infer:
+        # Keep the correction auditable: without this the record would just
+        # read "manual" and the earlier inferred verdict (whose noise
+        # increments are still on the entries) would vanish from the history.
+        session["superseded_method"] = "infer"
+        session["superseded_at"] = session["utilization_completed_at"]
     if inference_stats is not None:
         session["inference_stats"] = inference_stats
     tmp = Path(str(SESSION_PATH) + ".tmp")

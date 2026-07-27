@@ -1,4 +1,4 @@
-"""test_presence_tick_stdin_timeout.py -- regression for 8.
+"""test_presence_tick_stdin_timeout.py -- regression for .
 
 presence-tick.py is a LIVE PostToolUse hook (settings.json matcher='*', fires
 on every tool call). It read its event payload via an UNBOUNDED

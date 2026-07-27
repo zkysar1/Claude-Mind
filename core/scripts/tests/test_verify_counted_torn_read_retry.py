@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_verify_counted_torn_read_retry.py — 5 regression test.
+"""test_verify_counted_torn_read_retry.py —  regression test.
 
 Pins the bounded-read-retry behavior added to `_verify_counted` in
 loop-state-bump-counters.py (g-115-1495).

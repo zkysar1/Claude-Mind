@@ -309,7 +309,7 @@ def test_parallel_five_agent_bumps_all_land_zero_conflicts():
                     == f"2026-07-07T13:00:0{i}")
 
 
-# --- backend sibling-row overlay (9 / 0) -------------------
+# --- backend sibling-row overlay ( / ) -------------------
 # The push-only own-cloud mirror never lands sibling shards locally, so a
 # local-only reader composes clone-era fossils for every partner (the
 # 2026-07-11 fleet-wide last_active split-brain). These cases pin the fix:
@@ -351,7 +351,7 @@ def test_load_rows_overlays_backend_siblings():
     restore = _patched_backend(_FakeBackend({
         # older than local -> local (newest) wins
         "zeta.yaml": "last_active: '2026-07-11T09:00:00'\n",
-        # absent locally -> overlay must surface it (the 9 bug shape)
+        # absent locally -> overlay must surface it (the  bug shape)
         "alpha.yaml": "last_active: '2026-07-11T11:00:00'\n",
     }))
     try:

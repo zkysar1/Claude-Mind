@@ -1,4 +1,4 @@
-"""test_owncloud_push_on_write.py — 6 regression.
+"""test_owncloud_push_on_write.py —  regression.
 
 Pins the PostToolUse own-cloud single-file push shim
 (core/scripts/owncloud-push-on-write.sh): backend gate, governed-root filter,
@@ -145,7 +145,7 @@ def test_missing_env_local_fast_exits(tmp_path):
     assert "would push" not in r.stdout
 
 
-# --- 7: environment-registry backend gate ----------------------------
+# --- : environment-registry backend gate ----------------------------
 # Env-config deployments set ONLY ENVIRONMENT_ID in .env.local; the daemon
 # derives STORAGE_BACKEND from core/config/environments/<id>.yaml. The shim's
 # old gate grepped .env.local alone, so it silently fast-exited on every such
@@ -226,8 +226,8 @@ def test_unknown_environment_id_fast_exits(tmp_path):
     assert "would push" not in r.stdout
 
 
-# --- 7: PostToolUse hook-ordering invariant --------------------------
-# Restores the coverage the 3 merge dropped when it retired
+# --- : PostToolUse hook-ordering invariant --------------------------
+# Restores the coverage the  merge dropped when it retired
 # test_sync_governed_write.py — the ONLY prior test of the wiring-order
 # invariant. Distinct from the shim-behavior tests above (which exercise the
 # script at runtime); this reads .claude/settings.json and pins the WIRING.

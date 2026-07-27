@@ -1,4 +1,4 @@
-"""test_bash_inject_always_on.py — regression for 8.
+"""test_bash_inject_always_on.py — regression for .
 
 Pre-fix, bash-agent-inject.py skipped the MIND_AGENT export entirely when
 `MIND_AGENT=` appeared ANYWHERE in the command — so a single per-statement
@@ -76,7 +76,7 @@ def _run_hook(monkeypatch, command: str, resolved_agent: str | None):
 
 
 def test_per_statement_override_no_longer_disables_injection(monkeypatch):
-    """The 8 shape: override on stmt-1, sibling stmt-2 must be bound."""
+    """The  shape: override on stmt-1, sibling stmt-2 must be bound."""
     cmd = ("MIND_AGENT=alpha py -3 core/scripts/quiescence-gate.py verify-wake; "
            "bash core/scripts/execution-diary.sh phase-start phase-0-precheck")
     result = _run_hook(monkeypatch, cmd, resolved_agent="zeta")

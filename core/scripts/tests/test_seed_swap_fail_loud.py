@@ -1,4 +1,4 @@
-"""test_seed_swap_fail_loud.py — 0 regression.
+"""test_seed_swap_fail_loud.py —  regression.
 
 Bug shape: seed-transplant.sh L239 captured `_seed_engine.py swap` STDOUT only,
 under the top-of-file `set -e`. When the swap engine exited non-zero AFTER the
@@ -64,7 +64,7 @@ def test_do_swap_happy_path_removes_staging(tmp_path):
 
 
 def test_do_swap_reports_staging_cleanup_error_not_silent(tmp_path, monkeypatch):
-    """0: a post-move staging-cleanup failure is REPORTED as a named
+    """: a post-move staging-cleanup failure is REPORTED as a named
     field (fail-loud), the moves still count as succeeded, and do_swap does NOT
     raise — eliminating the silent-post-swap-death."""
     dest = tmp_path / "dest"

@@ -25,13 +25,13 @@ pruning:
   distill_min_retrievals: 5               # minimum retrievals before DISTILL eligible
   distill_line_threshold: 50              # line count threshold for large-but-mediocre nodes
   distill_line_utility_threshold: 0.5     # utility threshold for line-count-based DISTILL
-  # 7: sparse-feedback + stale-signal filters for the UTILITY triggers
+  # : sparse-feedback + stale-signal filters for the UTILITY triggers
   # (crit1/crit2 only — crit3 is structural and unaffected). One noise vote made
   # utility_ratio=0 look meaningful, flagging 525 of 817 leaves as a STANDING
   # false-positive pool that polluted the tree-debt metric (692 vs threshold 40).
   distill_min_feedback_votes: 3           # (times_helpful + times_noise) below this = utility signal is noise, not evidence
   distill_recency_days: 45                # last_retrieved older than this = utility signal too stale to act on (missing = stale)
-  # crit3 (0): proactive trigger for append-grown recurring-sweep nodes.
+  # crit3 (): proactive trigger for append-grown recurring-sweep nodes.
   # Fires DISTILL before a node trips the Read ~25k-token cap (which forces a
   # read-before-edit re-read on every sweep), reusing the rb-2085 procedure.
   # STRUCTURAL — keyed on size + append-grown shape, NOT utility/feedback, so it
@@ -82,13 +82,36 @@ dedup:
   enforce_from_depth: 2                   # don't block L1 growth (keeps top-level flexibility)
 
 # Utility-weighted retrieval ranking (Phase 1.5 of cognitive-core curation plan).
-# Reweights base match score by each node's utility_ratio: effective = base * clamp(0.5 + utility_ratio, min, max).
+# Reweights base match score by each node's utility_ratio:
+#   effective = base * clamp(1.0 + (utility_ratio - utility_weight_center), min, max)
 # Proven-helpful nodes outrank zero-utility ones; bad nodes stop being selected →
 # retrieval_count stops climbing → existing RETIRE rule (retrieval_count == 0 for N sessions) fires naturally.
+#
+# CENTERING (, 2026-07-26). The formula was `0.5 + utility_ratio`, which
+# INVERTED the intent above. Measured over 1254 live nodes: utility_ratio averages
+# 0.206 among the 1180 nodes that reach the ratio path, so the average PROVEN node
+# scored 0.706 while every unmeasured node got the neutral 1.0 — a ~41% ranking
+# edge for having no track record, and a cliff (not a gradient) at retrieval_count 5.
+# Per-bucket mean weight before the fix: rc0-4 1.0000 (n=70) · rc5-9 0.6640 (n=281)
+# · rc10-24 0.7063 (n=388) · rc25-49 0.7384 (n=287) · rc50+ 0.7217 (n=228).
+# Centering on the corpus mean makes the term express RELATIVE merit: an average
+# node lands on 1.0, better-than-average is boosted, worse is penalized, and an
+# unmeasured node's 1.0 now correctly reads "assume average" instead of "best
+# possible". Slope is unchanged (1:1 in utility_ratio) — this is purely a shift.
+# NOT starved counters: 91% of nodes carry nonzero helpful signal and utility_ratio
+# does not decline with retrieval_count, so guard-393's audit passes (it was run).
 retrieval:
   utility_weight_min: 0.5                       # floor on reweight (zero-utility cap)
   utility_weight_max: 1.5                       # ceiling (proven-helpful cap)
   utility_weight_neutral_below_retrievals: 5    # nodes below this retrieval_count get weight 1.0
+  # Corpus mean utility_ratio among nodes that reach the ratio path. RE-DERIVE
+  # when the corpus shifts materially: mean of `utility_ratio` over nodes with
+  # retrieval_count >= utility_weight_neutral_below_retrievals AND at least one
+  # nonzero times_helpful / times_inferred_helpful / times_noise.
+  # Measured 2026-07-26 (): n=1180, mean 0.2061, median 0.2000,
+  # p10 0.0282, p90 0.3871. A stale value only shifts the neutral point; it
+  # cannot invert the ordering, so drift here degrades gracefully.
+  utility_weight_center: 0.2061
   # Poignancy blend (, BRD Gap 1a; Generative Agents 2304.03442). A
   # third multiplicative factor on the effective score, mapping a record's
   # poignancy (1-10, LLM-rated at write) into [poignancy_weight_min,
@@ -116,7 +139,44 @@ retrieval:
   # graceful degradation is structural (_embedding_retrieval.cosine_scores
   # never raises). The daemon caches this config per process — flipping the
   # flag needs a daemon restart, same as the poignancy blend above.
-  embedding_blend_enabled: false                # master flag — false = current behavior
+  # ENABLED 2026-07-25 (, zeta on cc-02) — supersedes the 
+  # DORMANCY DECISION, which correctly held this false until >=1 box could measure
+  # a real after-state rather than STAGE a fix (rb-5100). That precondition is met.
+  # PROVISIONING (cc-02): `pip install --target ~/.ayoai-vendor/py fastembed`.
+  # PEP 668 does NOT block --target (it writes to a named directory, not the system
+  # environment) — verified two-way: the vendored stack imports, while a bare
+  # `python3 -c "import numpy"` STILL fails, so the system Python the daemon and all
+  # 5 agents share is untouched. apt was not an option: python3-numpy exists but
+  # onnxruntime/fastembed/tokenizers have NO apt candidate. A venv was rejected as
+  # heavier blast radius (needs python3-venv + re-pointing mind-api-start.sh on a
+  # live box). core/scripts/_vendor_path.py APPENDS that dir to sys.path from the
+  # embedding chokepoints, so the encoder resolves for the daemon, the CLI and hooks
+  # alike regardless of how the process was launched; append (never prepend) keeps
+  # it a fallback provider that can never shadow a real install.
+  # KEEP IT OUT OF THE REPO. The first attempt used mind_api/state/vendor/py
+  # (gitignored, beside the index cache) and broke check_version_ssot — test_release.py
+  # went 9 red, because that scanner rglobs mind_api/ for stray __version__ and 28
+  # third-party packages legitimately declare one. Patching that one scanner would
+  # have treated the symptom: a 199MB dependency tree inside the repo sits in the
+  # path of EVERY tool that walks it. ~/.ayoai-vendor/py also matches the precedent
+  # this subsystem already set — load_encoder caches its ONNX model at ~/.ayoai-emb.
+  # MIND_VENDOR_DIR overrides the location.
+  # INDEX: fastembed backend (ONNX, no torch), all-MiniLM-L6-v2, 7271 docs, dim 384.
+  # GOTCHA: the initial build needs HF_HUB_OFFLINE=0 — the builder hard-defaults to
+  # offline, so `embedding-index-build.py --build` alone FAILS on an empty cache
+  # (fastembed misses, then falls through to an absent sentence_transformers).
+  # MEASURED before/after, 4-query set, cc-02, read_only (so utilization is not
+  # perturbed): meta_lessons went from 1 unique result set across 4 queries
+  # (query-INVARIANT, the defect) to 4 distinct sets; entries carrying the exact
+  # queried category went 0/5 -> 1/5 on 'framework-maintenance'. Slots 1-3 stay
+  # utilization-ordered, slots 4-5 are cosine-picked (universal_relevance_slots=2).
+  # FLEET SAFETY: this flag is fleet-shared but the vendored stack and index are
+  # PER-BOX. An un-provisioned box has no index -> cosine_scores returns {} ->
+  # both consumers return the byte-identical pre-blend list, i.e. exactly today's
+  # behavior (verified at runtime against an empty index dir). Provision another
+  # box by repeating the two steps above; the daemon caches this config per
+  # process, so a restart is required for the flip to take effect.
+  embedding_blend_enabled: true                 # master flag — per-box index gates the real effect
   embedding_min_cosine: 0.35                    # widen threshold for non-token-matched entries
   # : when the blend is ON, this many of the UNIVERSAL_RB_CAP(5)
   # meta_lessons slots are picked by query-cosine (from universal entries
@@ -135,22 +195,82 @@ retrieval:
   # (mixing models in one matrix corrupts cosines); switching models requires
   # an explicit --build. Backend auto-selects per box: fastembed (ONNX, no
   # torch) when installed + model supported, else sentence-transformers.
-  # DEFAULT stays all-MiniLM-L6-v2 because that is the model every fleet box
-  # has HF-cached today — do NOT flip to bge-small here until fastembed +
-  # model files are provisioned fleet-wide (offline posture: an uncached
-  # model cannot download at build time). Boxes with fastembed provisioned
+  # DEFAULT stays all-MiniLM-L6-v2 — do NOT flip to bge-small here until
+  # fastembed + model files are provisioned fleet-wide (offline posture: an
+  # uncached model cannot download at build time).
+  # CORRECTION (, alpha 2026-07-25): this comment previously read
+  # "that is the model every fleet box has HF-cached today". MEASURED FALSE on
+  # cc-04 — no HF cache in any of 6 probed locations, and no encoder at all
+  # (fastembed / sentence_transformers / numpy / onnxruntime ALL absent).
+  # Do not treat fleet-wide model availability as given; probe per box. Boxes with fastembed provisioned
   # can rebuild with: py -3 core/scripts/embedding-index-build.py --build
   # --model "BAAI/bge-small-en-v1.5" (the  GO model).
   embedding_model_name: all-MiniLM-L6-v2
   # : tree-lane embedding channel. When true AND the index carries
-  # tree docs (embedding-index-build.py now embeds key+summary per node as
-  # 'tree:<relpath>' ids), load_tree_nodes gains a semantic eligibility
-  # channel ('embedding' — nodes above embedding_min_cosine join the match
-  # set even when all four token strategies miss) and _score_weight_limit
-  # swaps its TF-IDF cosine bonus for true embedding cosine. SEPARATE flag
-  # from embedding_blend_enabled (supplementary lane) so each lane enables
-  # on its own A/B evidence. DEFAULT OFF — byte-identical when false.
-  embedding_tree_channel_enabled: false
+  # tree docs (embedding-index-build.py embeds humanized-key + summary +
+  # first body paragraph capped 400 chars per node, as 'tree:<relpath>' ids
+  # — the body paragraph was added by ), load_tree_nodes gains a
+  # semantic eligibility channel ('embedding' — nodes above
+  # embedding_min_cosine join the match set even when all four token
+  # strategies miss) and _score_weight_limit swaps its TF-IDF cosine bonus
+  # for true embedding cosine. SEPARATE flag from embedding_blend_enabled
+  # (supplementary lane) so each lane enables on its own A/B evidence.
+  #
+  # ENABLED 2026-07-26 () on the  A/B, 12 node-paraphrase
+  # queries, same set both arms:
+  #   key+summary            hit@1=3 hit@3=7  hit@5=9  MRR=0.432
+  #   +first body paragraph  hit@1=7 hit@3=10 hit@5=10 MRR=0.709
+  # 8 improved / 2 regressed / 2 unchanged. The  measurement that
+  # justified DEFAULT OFF was taken on the thin key+summary surface, which
+  #  replaced — so the original reason to keep it off no longer holds.
+  # Per-box: a box without an encoder/index degrades structurally to
+  # token-overlap (cosine_scores returns {}), so enabling fleet-wide is safe
+  # where unprovisioned, not broken. Reversible — set false to revert.
+  # Replay the A/B with world/scripts/tree-embed-ab-harness.py.
+  embedding_tree_channel_enabled: true
+  # : reserve this many returned slots for the top nodes by SEMANTIC
+  # cosine (among those clearing the eligibility floor). The cosine bonus is
+  # ADDITIVE — at most COSINE_BONUS_WEIGHT(2.0) on a ~4.5-5.4 base, roughly
+  # 25% — while utility_weight and the MMR path-similarity penalty act on the
+  # WHOLE base. So a node could hold the highest cosine of ANY node for a query
+  # and still never be returned. Live instance: `server-lifecycle` at cosine
+  # 0.5653 (top for its query) was dropped while 27 SUB-FLOOR nodes were
+  # returned — base 4.481, utility_weight 0.705, pre-MMR rank 21 of 61, then
+  # MMR cut it as path-redundant with sibling server/session nodes above it.
+  # Reserved nodes are GUARANTEED a slot but NOT promoted: the union is
+  # re-sorted by effective score, so this fixes exclusion without distorting
+  # returned ORDER. Capped at limit-1 so MMR always keeps authority over >=1
+  # slot. MEASURED before/after on the 12-query harness (depth=medium,
+  # read_only so utilization is not perturbed): queries having >=1 floor-clearing
+  # node whose TOP-cosine node is returned went 8/10 -> 10/10; total
+  # eligible-but-lost 19 -> 18 of 104. The 2 queries still missing their
+  # top-cosine node have ZERO floor-clearing nodes (cosine 0.333/0.334 vs floor
+  # 0.35) — correct eligibility behavior, not downstream loss. Set 0 to disable
+  # (byte-identical to pre-). Only active on the real-embedding path;
+  # the TF-IDF fallback is untouched.
+  cosine_reserved_slots: 3
+  # : TREE-LANE eligibility floor. Deliberately SEPARATE from the
+  # shared embedding_min_cosine (0.35) above, which governs the supplementary
+  # rb/guardrail lane and was tuned on THAT lane's A/B evidence — lowering the
+  # shared value would silently change reasoning-bank behaviour that has its own
+  # basis. Only load_tree_nodes reads this key; it falls back to
+  # embedding_min_cosine when unset, so removing this line restores the prior
+  # shared-floor behaviour exactly (the revert path).
+  #
+  # MEASURED 2026-07-26 (alpha), end-to-end on what retrieval actually RETURNS
+  # (not cosine rank — see the harness note below). Canonical failing case:
+  # query 'which box is foxtrot on' ranked fleet-topology-roster FIRST by
+  # cosine at 0.3330 and missed the 0.35 floor by 0.017, so the query token-
+  # matched 0 nodes and returned ZERO results. Floor sweep, 4 real queries:
+  #   0.35  foxtrot case returns 0 nodes            (the defect)
+  #   0.32  foxtrot returned at rank 0; mean match set 52 -> 68
+  #   0.30  no ADDITIONAL case rescued, and measurably worse elsewhere —
+  #         template-budget-profiles degrades from returned-rank 10 to 28
+  # 0.32 is therefore the knee: it fixes the zero-result case at the smallest
+  # dilution. Margin is thin by construction (0.3330 vs 0.32 = 0.013) — if the
+  # embedding model or index is rebuilt, re-measure rather than assuming it
+  # still clears.
+  embedding_tree_min_cosine: 0.32
   # M-4: Rehearsal-weighted decay parameters.
   # Frequently-retrieved nodes get a longer recency TAU, so their recency bonus
   # persists longer. Uses retrieval_count (monotonic, safe) not last_retrieved

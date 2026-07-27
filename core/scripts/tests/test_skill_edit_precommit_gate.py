@@ -1,4 +1,4 @@
-"""Tests for skill-edit-precommit-gate.py (7, earn-the-keep Phase 1 / G3).
+"""Tests for skill-edit-precommit-gate.py (, earn-the-keep Phase 1 / G3).
 
 Hermetic: loads the hyphenated module via importlib (rb-1830 — register in
 sys.modules BEFORE exec_module so the eval_harness sibling import resolves), and

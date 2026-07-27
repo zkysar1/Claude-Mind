@@ -2,7 +2,7 @@
 # DAEMON-ONLY. No Python CLI fallback. See:
 #   .claude/rules/no-python-cli-fallback.md
 #   world/knowledge/tree/system/daemon-only-architecture.md
-# Sanctioned agent-row retirement (5): removes an agent's team-state
+# Sanctioned agent-row retirement (): removes an agent's team-state
 # presence (core-file agent_status residual + per-agent shard), gated by
 # archive-before-delete (archive lands in world/team-state/.graveyard/).
 # Daemon path: rt_call POST /v1/team-state/retire-agent.

@@ -1,0 +1,145 @@
+[
+  {
+    "version": "2.6.0",
+    "previous_version": "2.5.0",
+    "date": "2026-07-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet-cycle sync: 418 framework commits since v2.5.0 — promotion-gate hardening, bare-bash argv[0] sweep, deadman/liveness rails, temp-store + seed-purity conventions, meta-set dotpath contract fix",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.5.0",
+    "previous_version": "2.4.0",
+    "date": "2026-07-19",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Deploy-evidence rails (deploy-verify + no-op-trap closure), religious GitHub sync conventions, operator-health hardening seed, fleet liveness + coordination fixes",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.4.0",
+    "previous_version": "2.3.1",
+    "date": "2026-07-13",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Operator ramp: /build-operator-job forged skill (deterministic-work offload recipe — TaskVerticleBase job + registry + pure-static test + Mind-side audit-trail pull), proven by 3 live jobs (InboxWatch inbox cutover, EfsSessionSweep, PropertyWatch) and the inbox pull-first goal transform",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.3.1",
+    "previous_version": "2.3.0",
+    "date": "2026-07-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Domain-leak genericization of g-328-28/29 comments (seed-preflight publishability gate) — carrier release for promoting the v2.3.0 own-cloud fence-freeze BRD wave (g-115-1787 + g-328-27/28/29).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.3.0",
+    "previous_version": "2.2.0",
+    "date": "2026-07-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Own-cloud fence-freeze BRD wave: register pipeline/spark-questions/pipeline-meta merge handlers ending the deterministic no_clobber write-freeze (g-115-1787); shard team-state agent_status into per-agent row files, zero cross-writer contention (g-328-27); per-path FIFO write queue with loud bounded backpressure (429 write_queue_backpressure) + conflict-rate metric at /v1/admin/write-queue (g-328-28); race-free in-lock server-side aspiration ID minting (g-328-29). Plus foxtrot agent-merge round-2 audit fixes + notification empty-body fix.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.2.0",
+    "previous_version": "2.1.1",
+    "date": "2026-07-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Own-cloud sync hardening wave (g-328-2x: fail-loud IAM gaps, bounded retry+backoff, watchdog STALLED detection, divergence reconcile, init-parity seeds) + capability-gate false-positive fixes (g-115-1791/1783/1794) + forge-gate curriculum-contract consistency (g-115-1801) + OHS coverage-breadth axis (g-318-30/33)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.1.1",
+    "previous_version": "2.1.0",
+    "date": "2026-07-04",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Re-cut of v2.1.0 content at current HEAD for promotion (fleet agent-data snapshots only since v2.1.0; zero framework delta). Own-cloud multi-machine GA release.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.1.0",
+    "previous_version": "2.0.2",
+    "date": "2026-07-04",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Own-cloud multi-machine GA: coordination merge-on-conflict (both-diverged stores), environment registry (ENVIRONMENT_ID as single storage key), bidirectional GitHub sync (fetch+integrate in iteration-push), fresh-box bring-up doctor + _fileops lock local-fallback. Legacy STORAGE_* env forms remain honored with deprecation warnings.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.0.2",
+    "previous_version": "2.0.1",
+    "date": "2026-06-06",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.0.2: rb-1472 seed-preflight bash-resolver fix (prefer Git bin/bash login-launcher over raw usr/bin across _bash_helpers/_runtime_bash/verify-pseudocode/_paths.sh; mind_api conftest PATH-prepend defeats System32 WSL-bash shadowing) + merge-authority policy (agent may merge promotion PRs once mergeable + checks pass; guard-680/grant-002, lifts M2 human-merge clause).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.0.1",
+    "previous_version": "2.0.0",
+    "date": "2026-06-06",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "fix: seed orphan-removal preserves dest-owned forged skills + robust gh detection on Windows git-bash",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.0.0",
+    "previous_version": "1.0.0",
+    "date": "2026-06-06",
+    "breaking": true,
+    "cross_world": true,
+    "summary": "N4: rename own-cloud AWS resources -- S3 lodestar-data -> zds-own-cloud-data, DDB lodestar-{locks,sessions} -> zds-{locks,sessions} (cross_world live S3+DynamoDB migration; dual-grant IAM window, H3b snapshot/restore, 7-day soak). Also lands N1 (tier vocab public|selective|private) + N2 (primary noun environment; renames cancelled) -- both reversible/run-free, no separate release.",
+    "upgrade_recipe": "core/config/upgrade-recipes/v2.0.0-n4-aws-resource-names.sh",
+    "rollback_recipe": "core/config/upgrade-recipes/v2.0.0-n4-aws-resource-names-rollback.sh",
+    "min_source": "1.0.0"
+  },
+  {
+    "version": "1.0.0",
+    "previous_version": "0.2.0",
+    "date": "2026-06-05",
+    "breaking": true,
+    "cross_world": false,
+    "summary": "N3: de-overload MIND_ env-var prefix into 7 semantic buckets (ENVIRONMENT_/STORAGE_/MACHINE_/AGENTS_/OWNCLOUD_/RUNTIME_/COMMONS_). Hard cutover, no back-compat; exact-allowlist credential filter (_N3_ALLOWED_EXACT + MIND_AWS_* family).",
+    "upgrade_recipe": "core/config/upgrade-recipes/v1.0.0-n3-mind-prefix.sh",
+    "rollback_recipe": "core/config/upgrade-recipes/v1.0.0-n3-mind-prefix-rollback.sh",
+    "min_source": "0.2.0"
+  },
+  {
+    "version": "0.2.0",
+    "previous_version": "0.1.0",
+    "date": "2026-06-04",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Encode frontier lead; establish version SSOT (mind_api/src/__init__.py). Wave 0 of the cross-world versioning rails: eliminate the dual-source version by deleting core/config/profile.yaml system.version.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  }
+]

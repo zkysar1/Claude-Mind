@@ -118,7 +118,7 @@ from .. import file_locks, history, changelog
 from ..agent_paths import assert_not_cruft
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
-from _l1_pick import log_l1_pick  # noqa: E402  # S9 SSOT, 3
+from _l1_pick import log_l1_pick  # noqa: E402  # S9 SSOT, 
 
 
 VALID_OPS = {"add-child", "set", "increment", "remove-child",
@@ -128,13 +128,13 @@ VALID_OPS = {"add-child", "set", "increment", "remove-child",
 # Fields copied verbatim from the add-child payload onto the new node, in the
 # SAME order as core/scripts/tree.py cmd_add_child._do_add (insertion order
 # matters for sort_keys=False byte-compat).
-# 4: re-synced origin_goal_id + poignancy to match the CLI copy list.
+# : re-synced origin_goal_id + poignancy to match the CLI copy list.
 # The CLI added both to cmd_add_child._do_add (origin_goal_id instrumentation;
 # poignancy ) but this mirror lagged, so a daemon add-child payload
 # carrying either field silently dropped it vs the CLI (byte-compat drift, same
-# class as 9). Enforced by
+# class as ). Enforced by
 # core/scripts/tests/test_daemon_cli_mirror_parity.py.
-# 3: node_type is intentionally NOT in this copy list — it is
+# : node_type is intentionally NOT in this copy list — it is
 # derive-always from child-presence at the create path (_apply_add_child,
 # mirroring child_count). Do NOT re-add it; the copy-tuple parity test
 # (test_daemon_cli_mirror_parity.py) pins this against the CLI cmd_add_child
@@ -194,7 +194,7 @@ def _apply_defaults(node: Dict[str, Any]) -> Dict[str, Any]:
         out["times_noise"] = 0
     if "utility_ratio" not in out:
         out["utility_ratio"] = 0.0
-    # 9: mirror tree.py apply_defaults' trailing fields (poignancy
+    # : mirror tree.py apply_defaults' trailing fields (poignancy
     # , last_relevant_at ) — inserted before last_updated in
     # CLI order. This mirror had lagged tree.py:347-394, so daemon-created
     # child nodes dropped both keys vs the CLI (byte-compat drift at the first
@@ -772,10 +772,10 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     child_node["parent"] = parent_key
     child_node["children"] = child_data.get("children", [])
     child_node["child_count"] = len(child_node["children"])
-    # 3: node_type is derive-always from child-presence (mirror
+    # : node_type is derive-always from child-presence (mirror
     # child_count) — set at the create path, not copied (removed from
     # _CHILD_COPY_FIELDS) and not via _apply_defaults' fill-if-absent (which
-    # also normalizes reads, masking on-disk drift). Sibling 7.
+    # also normalizes reads, masking on-disk drift). Sibling .
     child_node["node_type"] = "interior" if child_node["children"] else "leaf"
     for field in _CHILD_COPY_FIELDS:
         if field in child_data:
@@ -789,7 +789,7 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     # origin_goal_id (): record the EXECUTING goal that created this
     # node, for the Gate D SPILL-1 spillover analysis. Caller-wins (an explicit
     # value copied above is preserved); otherwise auto-inject from team-state
-    # in_flight. Mirrors tree.py cmd_add_child:1849-1852 ( / 3).
+    # in_flight. Mirrors tree.py cmd_add_child:1849-1852 ( / ).
     # Absent when no goal is executing (a manual add) — pre- readers
     # ignore the unknown field, so existing consumers parse unchanged.
     if "origin_goal_id" not in child_node:
@@ -803,7 +803,7 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
             parent["children"] = []
         parent["children"].append(child_key)
         parent["child_count"] = len(parent["children"])
-        # 7: a freshly-created parent that gains its first child via
+        # : a freshly-created parent that gains its first child via
         # add-child must flip leaf->interior. add-child updates child_count but
         # historically left node_type stale, mislabeling interior nodes as
         # leaves (misleads retrieval/decompose and trips tree-validate). Mirrors
@@ -817,17 +817,17 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     return child_node
 
 
-# --- PROGRESSION calibration stamp (5; mirror of tree.py) ------------
+# --- PROGRESSION calibration stamp (; mirror of tree.py) ------------
 # MUST match tree.py._PROGRESSION_STAMP_FIELDS / _stamp_progression byte-for-byte
 # (the byte-compat parity tests enforce CLI<->daemon equality). See tree.py for
 # the full rationale: PROGRESSION-field writers stamp progression_updated_at so
 # the own-cloud _tree.yaml merge keys the PROGRESSION LWW on a signal that
-# advances on a calibration edit (last_updated deliberately does not, 3).
+# advances on a calibration edit (last_updated deliberately does not, ).
 _PROGRESSION_STAMP_FIELDS = ("confidence", "capability_level", "domain_confidence")
 
 
 def _stamp_progression(node: Dict[str, Any]) -> None:
-    """Bump the PROGRESSION calibration stamp (5). Date-granular to
+    """Bump the PROGRESSION calibration stamp (). Date-granular to
     match tree.py._stamp_progression exactly (byte-compat parity)."""
     node["progression_updated_at"] = date.today().isoformat()
 
@@ -841,20 +841,20 @@ def _apply_set(tree: Dict[str, Any], key: str, field: str, value: Any,
     if field == "file" and isinstance(v, str):
         v = _normalize_virtual_path(v, world_path)
     node[field] = v
-    # 5: stamp the PROGRESSION calibration signal (mirror tree.py
+    # : stamp the PROGRESSION calibration signal (mirror tree.py
     # cmd_set) so an own-cloud reconcile preserves a data-derived downgrade
     # instead of reverting it via _merge_field_progression's never-regress tie.
     if field in _PROGRESSION_STAMP_FIELDS:
         _stamp_progression(node)
-    # 3 (Option B): do NOT auto-bump per-node last_updated on a
+    #  (Option B): do NOT auto-bump per-node last_updated on a
     # metadata set. node .md front matter is the single source of truth
     # (); the _tree.yaml index last_updated is synced to it ONLY by
     # tree-front-matter-sync.py and at node creation. The old auto-bump here
     # marched the index AHEAD of the .md fm (the index-ahead drift class,
-    # 2 audit). The CLI (tree.py cmd_set) dropped its stamp
+    #  audit). The CLI (tree.py cmd_set) dropped its stamp
     # 2026-06-28; this daemon path kept it for 19 days — the live write path,
     # so the Option B fix never actually shipped until the byte-compat parity
-    # tests flagged the divergence (2). Explicit
+    # tests flagged the divergence (). Explicit
     # `set <k> last_updated <d>` still lands via node[field]=v above; the
     # index-level tree["last_updated"] below is intentionally retained.
     nodes[key] = node
@@ -892,11 +892,11 @@ def _apply_remove_child(tree: Dict[str, Any], parent_key: str,
     parent["children"] = children
     parent["child_count"] = len(children)
     if not children:
-        # 3: last-child removal flips parent interior->leaf, mirroring
-        # cmd_remove_child (tree.py 5) + the daemon reparent old-parent
+        # : last-child removal flips parent interior->leaf, mirroring
+        # cmd_remove_child (tree.py ) + the daemon reparent old-parent
         # path (L1431-1432). Pre-fix the daemon updated child_count but left
         # node_type stale at "interior" on a now-childless parent -- a byte-compat
-        # parity gap vs the CLI and a present-but-wrong node_type (6
+        # parity gap vs the CLI and a present-but-wrong node_type (
         # validate ERROR class). Shared by the standalone remove-child op AND the
         # batch remove-child sub-op (both call this helper).
         parent["node_type"] = "leaf"
@@ -1324,14 +1324,14 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
 
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-add-child {child_key} -> {parent_key}")
-                # S9 pick-log (3): restores the telemetry the tree
+                # S9 pick-log (): restores the telemetry the tree
                 # daemonization deferred. Fail-open; separate file, no
                 # _tree.yaml byte impact. `nodes` is post-add (child present),
                 # so the L1 walk resolves the fresh node. Path() is guarded:
                 # a None meta (parity-test ctx, misconfigured env) must reach
                 # log_l1_pick's own swallow-to-WARN interior instead of
                 # raising TypeError at the call site — telemetry must never
-                # crash the write path (2).
+                # crash the write path ().
                 _meta = ctx.paths.meta
                 log_l1_pick(nodes, Path(_meta) if _meta else None,
                             child_key, "add-child",
@@ -1471,7 +1471,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
             # confidences the first pass wrote; order is part of byte-compat.
             # Physical .md moves are NOT performed: reported in `file_moves` for
             # the caller. The L1-pick-log telemetry (cmd_reparent S9) appends
-            # after the write (3) — separate file, no _tree.yaml byte
+            # after the write () — separate file, no _tree.yaml byte
             # impact.
             if op == "reparent":
                 node_key = (req.get("key") or req.get("node") or "").strip()
@@ -1590,11 +1590,11 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 _write_tree_locked(
                     path, tree, base_dir, agent,
                     summary=f"tree-reparent {node_key} -> {new_parent_key}")
-                # S9 pick-log (3): the formerly-DEFERRED reparent
+                # S9 pick-log (): the formerly-DEFERRED reparent
                 # telemetry — cross-L1 reparents are the highest-signal
                 # entries. `nodes` is post-reparent, so the walk resolves the
                 # NEW L1 (mirrors the CLI's fresh-read semantics). Fail-open;
-                # None-meta guarded at the call site (2).
+                # None-meta guarded at the call site ().
                 _meta = ctx.paths.meta
                 log_l1_pick(nodes, Path(_meta) if _meta else None,
                             node_key, "reparent",
@@ -1687,7 +1687,7 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                      else mutation_ops).append(o)
 
                 updated_keys = set()
-                batch_added_child_keys: List[str] = []  # S9 pick-log, 3
+                batch_added_child_keys: List[str] = []  # S9 pick-log, 
                 propagate_results: List[Dict[str, Any]] = []
                 try:
                     # ---- Phase 1: mutations in order ----
@@ -1767,9 +1767,9 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 tree["last_updated"] = date.today().isoformat()
                 _write_tree_locked(path, tree, base_dir, agent,
                                    summary=f"tree-batch ({len(operations)} ops)")
-                # S9 pick-log per add-child in this batch (3; mirrors
+                # S9 pick-log per add-child in this batch (; mirrors
                 # cmd_batch's per-op logging). Fail-open; None-meta guarded at
-                # the call site (2).
+                # the call site ().
                 _meta = ctx.paths.meta
                 for _ck in batch_added_child_keys:
                     log_l1_pick(nodes, Path(_meta) if _meta else None, _ck,

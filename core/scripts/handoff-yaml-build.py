@@ -2,9 +2,21 @@
 """handoff-yaml-build.py — Tier 2 utility extraction.
 
 Replaces aspirations-consolidate/SKILL.md Step 9 handoff YAML assembly.
-The LLM provides the judgment fields (prose next_focus, key_outcomes, reasons);
-the script assembles the final handoff.yaml with schema validation + atomic
-write via _fileops.
+The LLM provides the judgment fields (prose next_focus, reasons, and
+session_summary.key_outcomes); the script assembles the final handoff.yaml
+with schema validation + atomic write via _fileops.
+
+FIELD-PATH NOTE (g-115-3385): `key_outcomes` is NESTED under `session_summary`,
+NOT a top-level field. The canonical schema in
+core/config/conventions/handoff-working-memory.md nests it, and boot/SKILL.md
+(the only consumer) reads `session_summary.key_outcomes`. `session_summary`
+passes through _assemble() whole, so the nested form round-trips. An earlier
+reading of this docstring — which listed "key_outcomes" beside the genuinely
+top-level "next_focus" — led a consolidation to emit it at TOP level, where
+_assemble()'s fixed allowlist silently discarded it. Emit it nested. Any
+top-level payload key _assemble() does not carry is now reported in the
+`dropped_keys` output field and a stderr WARN rather than vanishing (rb-538:
+allowlist parsers that silently drop unknown keys hide contract breaks).
 
 Plan: ~/.claude/plans/i-had-one-agent-luminous-reddy.md (Tier 2 #1).
 
@@ -169,11 +181,33 @@ def main():
 
     handoff = _assemble(payload)
 
+    # Dropped-key detection (). _assemble() is a fixed allowlist, so a
+    # top-level payload key it does not carry is discarded with no error — the
+    # failure mode that hid the key_outcomes contract break for an entire
+    # release (a payload carrying top-level key_outcomes validated cleanly,
+    # wrote 17 fields, reported flags:[], and the field was simply gone).
+    # Report rather than reject: unknown keys are not necessarily wrong (a
+    # caller may pass provenance the schema does not persist), but they must
+    # never be SILENT. rb-538 / guard-527.
+    dropped_keys = sorted(k for k in payload if k not in handoff)
+    if dropped_keys:
+        print(
+            "WARN: handoff-yaml-build dropped %d unrecognized top-level "
+            "payload key(s): %s. _assemble() carries a fixed allowlist; these "
+            "were NOT written to handoff.yaml. If one is meant to persist, add "
+            "it to _assemble() or nest it under an allowlisted field (e.g. "
+            "key_outcomes belongs at session_summary.key_outcomes). "
+            "See core/config/conventions/handoff-working-memory.md."
+            % (len(dropped_keys), ", ".join(dropped_keys)),
+            file=sys.stderr,
+        )
+
     if args.dry_run:
         print(json.dumps({
             "dry_run": True,
             "summary": f"handoff.yaml validated; {len(handoff)} fields assembled",
-            "flags": ["dry_run"],
+            "flags": ["dry_run"] + (["dropped_keys"] if dropped_keys else []),
+            "dropped_keys": dropped_keys,
             "handoff_preview": handoff,
         }, ensure_ascii=False, default=str))
         sys.exit(0)
@@ -201,8 +235,9 @@ def main():
         "session_number": handoff["session_number"],
         "timestamp": handoff["timestamp"],
         "fields_written": len(handoff),
+        "dropped_keys": dropped_keys,
         "summary": f"handoff.yaml written for session {handoff['session_number']}",
-        "flags": [],
+        "flags": ["dropped_keys"] if dropped_keys else [],
     }, ensure_ascii=False, default=str))
     sys.exit(0)
 

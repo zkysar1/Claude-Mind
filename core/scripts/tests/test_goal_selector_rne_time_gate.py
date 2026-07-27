@@ -1,4 +1,4 @@
-"""test_goal_selector_rne_time_gate.py -- 8 regression (2026-07-17).
+"""test_goal_selector_rne_time_gate.py --  regression (2026-07-17).
 
 Pins the hypothesis time gate (`resolves_no_earlier_than`) against the
 datetime-form inert-gate bug fixed in g-115-2507 (commit 0893a074e).

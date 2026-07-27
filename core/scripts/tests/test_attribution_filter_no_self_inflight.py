@@ -1,4 +1,4 @@
-"""test_attribution_filter_no_self_inflight.py — regression test for 2.
+"""test_attribution_filter_no_self_inflight.py — regression test for .
 
 Pins the contract of core/scripts/_cross_agent_attribution_filter.py when the
 SELF agent has NO in_flight claim (self.in_flight=null → self_claimed_at=0).

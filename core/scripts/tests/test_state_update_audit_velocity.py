@@ -1,4 +1,4 @@
-"""Regression pins for the 1 velocity-meter honesty fixes.
+"""Regression pins for the  velocity-meter honesty fixes.
 
 Defect chain: iteration-close.sh state-update forwards the § STATE-UPDATE
 quality flags only when the LLM passes them; state-update-audit.py's old

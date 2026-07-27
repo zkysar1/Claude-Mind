@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema validator for meta/skill-gaps.yaml (3).
+"""Schema validator for meta/skill-gaps.yaml ().
 
 Detective layer (defense-in-depth) guarding the two corruption classes that
 rotted skill-gaps.yaml to zero gaps on 2026-05-26 and motivated the

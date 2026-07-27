@@ -252,7 +252,7 @@ def filter_paths(paths, self_agent, project_root, world_dir):
 
     # Source 2: partner uncommitted-edits logs (explicit authorship record).
     # Phase 2.5.D: agent dirs live under PROJECT_ROOT/agents/<name>/.
-    # Keys are normalized to PROJECT_ROOT-relative POSIX form (0) so a
+    # Keys are normalized to PROJECT_ROOT-relative POSIX form () so a
     # legacy absolute log entry and a relative git-diff candidate for the same
     # file compare equal. The owner value is the partner name (unchanged).
     partner_uncommitted = {}
@@ -269,7 +269,7 @@ def filter_paths(paths, self_agent, project_root, world_dir):
 
         # Source 2 wins first: an explicit partner authorship record.
         # Normalize the candidate to the same PROJECT_ROOT-relative POSIX form
-        # the keys were built with (0) so an absolute-vs-relative
+        # the keys were built with () so an absolute-vs-relative
         # format mismatch does not cause a silent set-membership miss. The
         # original (unnormalized) path is preserved in the decision record so
         # downstream consumers see the path exactly as it was passed in.

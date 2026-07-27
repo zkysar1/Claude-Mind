@@ -1,4 +1,4 @@
-"""test_check_stderr_json_merge.py — 5 / guard-659 detector regression test.
+"""test_check_stderr_json_merge.py —  / guard-659 detector regression test.
 
 Pins the behavior of core/scripts/check-stderr-json-merge.py, the detective-layer
 scanner for the guard-659 regression class: a shell command captured with `2>&1`

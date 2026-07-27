@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -111,6 +112,163 @@ def is_skill(rel: str) -> bool:
     return rel.startswith(".claude/skills/")
 
 
+# ── Phase 0 zone classifier (, REPORT-ONLY) ──────────────────────
+# Maps a framework rel-path to one of the genome-model promotion zones. This is
+# a COARSE PATH+EXTENSION heuristic BY DESIGN: Phase 0 only REPORTS the zone
+# (zero gating-behavior change); Phase 2 () replaces it with a TESTED
+# machine diff-classifier that reads the actual change to tell parametric from
+# structural. Zones (see world/knowledge/tree/system/publication-pipeline.md
+# "Planned Evolution — Zone-Aware Bidirectional Promotion"):
+#   KERNEL               -- constitutional anchor + the promotion mechanism itself
+#                           (HUMAN-LOCKED, DOWN-ONLY, FOREVER; never reconciles up)
+#   PHENOTYPE-parametric -- value/threshold config DATA (reconcile-up eligible)
+#   PHENOTYPE-structural -- skills/rules/scripts/docs logic (reconcile-up w/ review)
+#   NICHE                -- world/domain data (never promoted, either direction)
+ZONE_KERNEL = "KERNEL"
+ZONE_PHENO_PARAM = "PHENOTYPE-parametric"
+ZONE_PHENO_STRUCT = "PHENOTYPE-structural"
+ZONE_NICHE = "NICHE"
+
+# Constitutional anchor + the promotion mechanism = KERNEL. Kept deliberately
+# TIGHT: only the anchor, its enforcer, and the core transplant/preflight
+# orchestrators + manifest. The publishability GATE scripts (domain-leak-check
+# etc.) are tooling, not the mechanism, so they stay PHENOTYPE.
+_KERNEL_EXACT = {
+    ".claude/settings.local.json",                      # constitutional anchor
+    "core/scripts/settings-structural-validator.py",    # anchor enforcer
+    "core/scripts/settings-structural-validator.sh",
+    "core/scripts/seed-transplant.sh",                  # promotion mechanism
+    "core/scripts/seed-preflight.sh",
+    "core/scripts/promotion-preflight.py",
+    "core/scripts/promotion-preflight.sh",
+    "core/scripts/_seed_engine.py",
+    "core/config/seed-manifest.yaml",
+}
+_KERNEL_PREFIXES = (".claude/skills/seed/", "core/config/seed-templates/")
+_NICHE_PREFIXES = ("world/", "meta/", "agents/")
+
+
+def classify_zone(rel: str) -> str:
+    """Classify a framework rel-path into a promotion zone (report-only heuristic).
+
+    Pure + deterministic (path string only, no I/O). Phase 2 supersedes the
+    parametric/structural split with a diff-content classifier; the KERNEL and
+    NICHE decisions are path-inherent and remain valid regardless.
+    """
+    r = rel.replace("\\", "/")
+    if r in _KERNEL_EXACT or r.startswith(_KERNEL_PREFIXES):
+        return ZONE_KERNEL
+    if r.startswith(_NICHE_PREFIXES):
+        return ZONE_NICHE
+    # PHENOTYPE split: parametric = config DATA (tunable values/thresholds);
+    # structural = everything else (skills/rules/scripts/docs logic). A
+    # .yaml/.yml/.json under core/config that is NOT the KERNEL manifest is
+    # treated as parametric.
+    if r.startswith("core/config/") and r.endswith((".yaml", ".yml", ".json")):
+        return ZONE_PHENO_PARAM
+    return ZONE_PHENO_STRUCT
+
+
+_UNPARSEABLE = object()
+
+
+def _parse_config(path: Path, text: str):
+    """Parse a parametric config file's text into a comparable data structure.
+
+    Returns the parsed data (dict/list/scalar), or the _UNPARSEABLE sentinel when
+    the file is not a YAML/JSON config or fails to parse. yaml is imported lazily
+    so the module has no hard dependency on PyYAML for the path-only code paths.
+    """
+    suf = path.suffix.lower()
+    try:
+        if suf in (".yaml", ".yml"):
+            import yaml  # lazy — only parametric divergence checks need it
+            return yaml.safe_load(text)
+        if suf == ".json":
+            return json.loads(text)
+    except Exception:
+        return _UNPARSEABLE
+    return _UNPARSEABLE
+
+
+def classify_divergence(src_abs: Path, tgt_abs: Path, zone: str) -> dict:
+    """Classify the CONTENT divergence between two versions of a framework file.
+
+    Path-based zone classification (classify_zone) says WHAT a file is; this says
+    what CHANGED inside it. The Phase-1 pilot (g-115-2867) found that a
+    PHENOTYPE-parametric file's diff can be pure comment/provenance drift
+    (downstream goal-id sanitization, e.g. Ayoai->Claude stripping private
+    goal-ids from comments) with NO value change — reconciling that "up" would
+    REGRESS the dev repo by stripping provenance. So a parametric divergence is
+    reconcile-eligible ONLY when a VALUE actually changed, not when only comments
+    or formatting differ.
+
+    Discriminator: parse both versions (YAML/JSON) and compare the DATA. Comments
+    and formatting vanish in the parse, so equal parsed data == comment/format-only
+    divergence (NOT reconcile-eligible); differing parsed data == a real value
+    change (reconcile-eligible). Structural (non-config) files have no
+    value/comment split — they always reconcile with review. Unparseable configs
+    fall back to conservative "value" so a real change is never silently dropped.
+
+    Returns {kind, reconcile_eligible, detail}:
+      kind: "identical" | "comment" | "value" | "structural" | "unparseable"
+    """
+    if zone != ZONE_PHENO_PARAM:
+        # Structural / kernel / niche: no value-vs-comment split. Structural
+        # changes reconcile with review; kernel/niche are governed by zone policy.
+        return {"kind": "structural", "reconcile_eligible": True,
+                "detail": f"{zone}: content value/comment split not applicable"}
+    try:
+        src_text = src_abs.read_text(errors="replace")
+        tgt_text = tgt_abs.read_text(errors="replace")
+    except OSError as e:
+        return {"kind": "unparseable", "reconcile_eligible": True,
+                "detail": f"read error ({e}); treat as value-change (conservative)"}
+    if src_text == tgt_text:
+        return {"kind": "identical", "reconcile_eligible": False,
+                "detail": "byte-identical"}
+    parsed_s = _parse_config(src_abs, src_text)
+    parsed_t = _parse_config(tgt_abs, tgt_text)
+    if parsed_s is _UNPARSEABLE or parsed_t is _UNPARSEABLE:
+        # Cannot compare data — never silently drop a possible real change.
+        return {"kind": "unparseable", "reconcile_eligible": True,
+                "detail": "config did not parse; treat as value-change (conservative)"}
+    if parsed_s == parsed_t:
+        return {"kind": "comment", "reconcile_eligible": False,
+                "detail": "parsed data identical — divergence is comment/formatting "
+                          "only (provenance drift, not a value change)"}
+    return {"kind": "value", "reconcile_eligible": True,
+            "detail": "parsed data differs — a real config value changed"}
+
+
+def excuse_comment_only_blocks(blocking: list[str],
+                               content_divergence: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """Phase 2 ENFORCEMENT (): drop comment/provenance-drift false-blocks.
+
+    A PHENOTYPE-parametric file can land in the blocking set (as target_ahead
+    "clobber risk", or ambiguous under --strict) when its ONLY difference from
+    source is comment/provenance drift — the g-115-2867 Phase-1 finding:
+    downstream goal-id sanitization (Ayoai->Claude) strips private goal-ids from
+    comments, leaving the parsed VALUE identical. Blocking that is a FALSE
+    positive: there is nothing of value to clobber, only comments differ. This
+    filter removes such files (classify_divergence kind=="comment",
+    reconcile_eligible False) from the blocking set.
+
+    CONSERVATIVE by construction — a file is excused ONLY when content_divergence
+    proved kind=="comment". VALUE and UNPARSEABLE parametric diffs are NOT excused
+    (a real change is never silently dropped). Orphan-risk (target-only) and
+    structural/non-parametric blocks have no content_divergence entry, so they
+    can never match — orphan and structural blocks are unaffected.
+
+    Returns (filtered_blocking, excused) where excused is the removed subset.
+    """
+    excused = [k for k in blocking
+               if content_divergence.get(k, {}).get("kind") == "comment"]
+    excused_set = set(excused)
+    filtered = [k for k in blocking if k not in excused_set]
+    return filtered, excused
+
+
 def git_last_commit_ts(repo_root: Path, rel_path: str) -> int | None:
     """Return committer-date unix timestamp of the last commit touching rel_path, or None."""
     try:
@@ -125,20 +283,59 @@ def git_last_commit_ts(repo_root: Path, rel_path: str) -> int | None:
     return None
 
 
+def git_last_transplant_ts(repo_root: Path) -> int | None:
+    """Committer-date unix ts of the target's most recent transplant/sync commit.
+
+    seed-transplant.sh lands a transplant as ONE bulk commit
+    'chore: sync framework (<TS>)' (seed-transplant.sh:420) that stamps EVERY
+    planted file with the promotion date. That timestamp is the baseline below
+    which a per-file target last-commit ts is a recency SHADOW, not a genuine
+    target-side edit (rb-4253 / g-115-2744: a v2.5.0 run flagged 654/657 files
+    target_ahead purely because the transplant commit post-dated every
+    since-untouched source file). Returns None when no such commit exists (the
+    target never received a transplant) -- classify_direction then trusts the raw
+    per-file timestamps, preserving legacy behavior with zero regression.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--grep=^chore: sync framework"],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return int(r.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return None
+
+
 def classify_direction(
     src_root: Path, tgt_root: Path, rel_path: str,
     src_abs: Path, tgt_abs: Path,
+    baseline_ts: int | None = None,
 ) -> str:
-    """Classify a differing file as 'source_ahead', 'target_ahead', or 'ambiguous'."""
-    # Signal 1: git commit timestamps
+    """Classify a differing file as 'source_ahead', 'target_ahead', or 'ambiguous'.
+
+    baseline_ts: committer-date of the target's most recent transplant/sync commit
+    (git_last_transplant_ts). A per-file tgt_ts > src_ts is only a GENUINE
+    target-ahead signal when tgt_ts > baseline_ts (the target file was edited AFTER
+    the transplant landed). When tgt_ts <= baseline_ts the recency is a transplant
+    SHADOW (rb-4253) -- fall through to the content heuristic instead of declaring
+    target_ahead. None disables the guard (no transplant baseline -> raw per-file
+    timestamps, legacy behavior).
+    """
+    # Signal 1: git commit timestamps (recency-shadow-guarded, )
     src_ts = git_last_commit_ts(src_root, rel_path)
     tgt_ts = git_last_commit_ts(tgt_root, rel_path)
     if src_ts is not None and tgt_ts is not None:
         if tgt_ts > src_ts:
-            return "target_ahead"
-        if src_ts > tgt_ts:
+            # Only trust "target newer" when the target file was committed AFTER the
+            # last transplant baseline. Otherwise tgt_ts is the bulk-transplant
+            # commit date (a shadow) -- fall through to the content heuristic below.
+            if baseline_ts is None or tgt_ts > baseline_ts:
+                return "target_ahead"
+        elif src_ts > tgt_ts:
             return "source_ahead"
-        # Equal timestamps -- fall through to content heuristic
+        # Equal timestamps, or a shadowed tgt_ts -- fall through to content heuristic
 
     # Signal 1b: filesystem mtime fallback (when git unavailable)
     if src_ts is None or tgt_ts is None:
@@ -302,18 +499,52 @@ def main() -> int:
     source_only = sorted(s_keys - t_keys)
     differing = sorted(k for k in (s_keys & t_keys) if digest(S[k]) != digest(T[k]))
 
+    # Phase 0 zone classification () — REPORT-ONLY, computed over the
+    # full drift surface (differing + orphans both directions). Emitted below in
+    # both output paths; NEVER feeds `blocking`/`drift`/exit codes.
+    all_drift_files = sorted(set(differing) | set(target_only) | set(source_only))
+    zone_map = {k: classify_zone(k) for k in all_drift_files}
+    zone_summary: dict[str, int] = {}
+    for _z in zone_map.values():
+        zone_summary[_z] = zone_summary.get(_z, 0) + 1
+
+    # Recency-shadow baseline (): a bulk transplant commit stamps every
+    # planted file with the promotion date, so raw per-file target timestamps
+    # over-report target_ahead right after a promotion (rb-4253: 654/657 shadows).
+    # Anchor direction on the target's last-transplant commit -- computed ONCE
+    # (per-target, not per-file); a per-file tgt_ts at/before it is a shadow.
+    baseline_ts = git_last_transplant_ts(tgt)
+
     # Direction-classify every differing file
     diff_target_ahead: list[str] = []
     diff_source_ahead: list[str] = []
     diff_ambiguous: list[str] = []
     for k in differing:
-        direction = classify_direction(src, tgt, k, S[k], T[k])
+        direction = classify_direction(src, tgt, k, S[k], T[k], baseline_ts)
         if direction == "target_ahead":
             diff_target_ahead.append(k)
         elif direction == "source_ahead":
             diff_source_ahead.append(k)
         else:
             diff_ambiguous.append(k)
+
+    # Phase 2 content-divergence classification () — for DIFFERING
+    # PHENOTYPE-parametric files, classify each diff as VALUE vs COMMENT via
+    # parsed-data comparison (classify_divergence). Phase-1 pilot finding
+    # (): a parametric file's diff can be pure comment/provenance drift
+    # (downstream goal-id sanitization) with NO value change — reconcile-eligible
+    # ONLY on a real value change; reconciling comment drift "up" would REGRESS
+    # the dev repo by stripping provenance. REPORT-ONLY for now (mirrors the
+    # Phase 0 zone column); feeds a future reconcile-eligibility enforcement.
+    content_divergence: dict[str, dict] = {}
+    for k in differing:
+        z = zone_map.get(k) or classify_zone(k)
+        if z == ZONE_PHENO_PARAM:
+            content_divergence[k] = classify_divergence(S[k], T[k], z)
+    param_value_diffs = sorted(k for k, v in content_divergence.items()
+                               if v.get("kind") == "value")
+    param_comment_diffs = sorted(k for k, v in content_divergence.items()
+                                 if v.get("kind") == "comment")
 
     def bucket(keys):
         core = [k for k in keys if not is_skill(k) and k not in DEPLOYMENT_LOCAL]
@@ -328,7 +559,7 @@ def main() -> int:
     sa_core, sa_skills, sa_deploy = bucket(diff_source_ahead)
     am_core, am_skills, am_deploy = bucket(diff_ambiguous)
 
-    # Weights contract (5 part 3): meta-strategy weight keys vs the
+    # Weights contract ( part 3): meta-strategy weight keys vs the
     # source selector's KNOWN_CRITERIA. Seed orphans + reachable target-meta
     # orphans BLOCK (the promotion would land/leave a weight no criterion
     # computes); unreachable target metas are informational.
@@ -344,11 +575,37 @@ def main() -> int:
     blocking = list(to_core) + list(ta_core)
     if args.strict:
         blocking += am_core  # ambiguous blocks only in strict mode
+    # Phase 2 ENFORCEMENT (): excuse PHENOTYPE-parametric files that
+    # block ONLY on comment/provenance drift (no value change — the 
+    # Phase-1 finding). This promotes content_divergence from report-only to a
+    # verdict-affecting gate: a preflight that was DRIFT purely because of a
+    # downstream goal-id scrub now goes CLEAN. VALUE/UNPARSEABLE parametric diffs
+    # and all orphan/structural blocks are conservatively retained.
+    blocking, comment_only_excused = excuse_comment_only_blocks(blocking, content_divergence)
     drift = len(blocking) > 0 or wc_drift
+
+    # Phase 3b (): partition the target-ahead blocking set by promotion
+    # zone so the STRUCTURAL-WITH-REVIEW gate is EXPLICIT. This is pure LABELING —
+    # every file here is already in ta_core and already blocks; the partition does
+    # NOT change `drift`/verdict/exit, it distinguishes the RECONCILE TYPE each
+    # target-ahead file needs (per core/config/conventions/promotion-cycle.md):
+    #   KERNEL target-ahead  -> CANNOT back-port up (down-only, guard-98). A prod
+    #                           leading on KERNEL is an anomaly needing human
+    #                           resolution, never a mechanical reconcile.
+    #   PHENOTYPE-structural -> back-port up WITH REVIEW (logic change; guard-97).
+    #   else (parametric)    -> mechanical value reconcile up.
+    _ta_excused_set = set(comment_only_excused)
+    ta_core_blocking = [k for k in ta_core if k not in _ta_excused_set]
+    kernel_up_conflict = [k for k in ta_core_blocking if zone_map.get(k) == ZONE_KERNEL]
+    structural_requires_review = [k for k in ta_core_blocking
+                                  if zone_map.get(k) == ZONE_PHENO_STRUCT]
+    param_reconcile_up = [k for k in ta_core_blocking
+                          if zone_map.get(k) not in (ZONE_KERNEL, ZONE_PHENO_STRUCT)]
 
     if args.json:
         print(json.dumps({
             "source": str(src), "target": str(tgt), "strict": args.strict,
+            "baseline_transplant_ts": baseline_ts,
             "orphan_risk_core": to_core, "orphan_risk_skills": to_skills,
             "target_ahead_core": ta_core, "target_ahead_skills": ta_skills,
             "source_ahead_core": sa_core, "source_ahead_skills": sa_skills,
@@ -356,6 +613,26 @@ def main() -> int:
             "deployment_local_differing": sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy)),
             "source_only_core": so_core, "source_only_skills": so_skills,
             "weights_contract": wc,
+            # Phase 0 () REPORT-ONLY zone column — per-file zone map +
+            # summary counts. Does NOT affect verdict/exit.
+            "zone_classification_report_only": zone_map,
+            "zone_summary": zone_summary,
+            # Phase 2 content-divergence for differing parametric files: value vs
+            # comment/provenance drift ( built the classifier). As of the
+            # Phase 2 ENFORCEMENT () this NOW AFFECTS verdict/exit:
+            # comment-only parametric blocks are excused (see
+            # comment_only_excused_from_blocking); the per-file map + diff lists
+            # remain diagnostic.
+            "content_divergence": content_divergence,
+            "param_value_diffs": param_value_diffs,
+            "param_comment_diffs": param_comment_diffs,
+            "comment_only_excused_from_blocking": comment_only_excused,
+            # Phase 3b (): zone partition of the target-ahead blocking
+            # set — the explicit structural-with-review gate. Labeling only; every
+            # file here is already blocking (does NOT affect verdict/exit).
+            "kernel_up_conflict": kernel_up_conflict,
+            "structural_requires_review": structural_requires_review,
+            "param_reconcile_up": param_reconcile_up,
             "verdict": "DRIFT" if drift else "CLEAN", "exit": 2 if drift else 0,
         }, indent=2))
         return 2 if drift else 0
@@ -364,7 +641,21 @@ def main() -> int:
     print(f"source (incoming)    : {src}")
     print(f"target (overwritten) : {tgt}")
     print(f"mode                 : {'STRICT (block on any diff)' if args.strict else 'default (block on orphan risk)'}")
+    if baseline_ts is not None:
+        bl = datetime.datetime.fromtimestamp(baseline_ts, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"transplant baseline  : {bl} UTC -- per-file target timestamps at/before this are shadows, not target-ahead (g-115-2744)")
+    else:
+        print("transplant baseline  : none (target has no 'chore: sync framework' commit -- raw per-file timestamps used)")
     print()
+
+    # Phase 2 ENFORCEMENT (): display the EFFECTIVE (post-excusal)
+    # blocking buckets so the human verdict stays consistent with `drift`. A
+    # comment-only parametric file excused from blocking must not appear as
+    # CLOBBER RISK while the verdict reads CLEAN.
+    excused_set = set(comment_only_excused)
+    # ta_core_blocking + the zone partition (kernel_up_conflict /
+    # structural_requires_review / param_reconcile_up) were computed above.
+    am_core_blocking = [k for k in am_core if k not in excused_set]
 
     if to_core:
         print("ORPHAN RISK -- framework files the TARGET has but SOURCE lacks.")
@@ -373,16 +664,38 @@ def main() -> int:
         for k in to_core:
             print(f"     {k}")
         print()
-    if ta_core:
+    if ta_core_blocking:
         print("CLOBBER RISK -- framework files the TARGET LEADS ON (more recent).")
-        print("   A mirror promotion would REGRESS these. Back-port UP to source first:")
-        for k in ta_core:
-            print(f"     {k}")
+        print("   A mirror promotion would REGRESS these. Reconcile UP to source first.")
+        print("   Reconcile TYPE by promotion zone (g-115-2907; all still block):")
+        # Phase 3b (): the explicit structural-with-review gate.
+        if kernel_up_conflict:
+            print("   KERNEL -- CANNOT reconcile up (down-only, guard-98). A prod that")
+            print("      LEADS on a KERNEL file is an anomaly; resolve by HUMAN, not back-port:")
+            for k in kernel_up_conflict:
+                print(f"        {k}")
+        if structural_requires_review:
+            print("   PHENOTYPE-structural -- back-port up WITH REVIEW (logic change,")
+            print("      guard-97). Not a mechanical reconcile; review the diff before landing:")
+            for k in structural_requires_review:
+                print(f"        {k}")
+        if param_reconcile_up:
+            print("   PHENOTYPE-parametric -- mechanical value reconcile up:")
+            for k in param_reconcile_up:
+                print(f"        {k}")
         print()
-    if am_core:
+    if am_core_blocking:
         tag = "BLOCKED" if args.strict else "REVIEW"
         print(f"{tag} -- framework files that DIFFER (direction ambiguous):")
-        for k in am_core:
+        for k in am_core_blocking:
+            print(f"     {k}")
+        print()
+    if comment_only_excused:
+        print(f"EXCUSED ({len(comment_only_excused)}) -- PHENOTYPE-parametric files whose diff is")
+        print("   COMMENT/PROVENANCE drift only (no value change; e.g. downstream goal-id")
+        print("   scrub). NOT blocked -- reconciling comment drift up would strip provenance")
+        print("   (g-115-2867 Phase-1 finding; g-115-2885 enforcement):")
+        for k in comment_only_excused:
             print(f"     {k}")
         print()
     if sa_core:
@@ -426,20 +739,40 @@ def main() -> int:
     print(f"normal promotion payload (source-only): {len(so_core)} core + {len(so_skills)} skills")
     print()
 
+    # Phase 0 zone column () — REPORT-ONLY, zero gating effect.
+    if zone_map:
+        print("ZONE CLASSIFICATION (report-only, g-115-2864 Phase 0 -- does NOT affect verdict):")
+        for z in (ZONE_KERNEL, ZONE_PHENO_PARAM, ZONE_PHENO_STRUCT, ZONE_NICHE):
+            files = [k for k in all_drift_files if zone_map[k] == z]
+            if not files:
+                continue
+            note = " (HUMAN-LOCKED, down-only -- never back-port up)" if z == ZONE_KERNEL else \
+                   " (never promoted)" if z == ZONE_NICHE else ""
+            print(f"   {z}: {len(files)}{note}")
+            for k in files[:25]:
+                print(f"     {k}")
+            if len(files) > 25:
+                print(f"     ... +{len(files) - 25} more")
+        print("   (heuristic path-based; Phase 2 g-115-2865 replaces with a tested diff-classifier)")
+        print()
+
     if drift:
         print(f"VERDICT: DRIFT DETECTED -- {len(to_core)} orphan-risk"
-              + (f" + {len(ta_core)} target-ahead" if ta_core else "")
-              + (f" + {len(am_core)} ambiguous(strict)" if args.strict and am_core else "")
+              + (f" + {len(ta_core_blocking)} target-ahead" if ta_core_blocking else "")
+              + (f" + {len(am_core_blocking)} ambiguous(strict)" if args.strict and am_core_blocking else "")
               + (f" + weights-contract orphans (seed:{len(wc_blocking)}, target-metas:{len(wc_target_orphans)})" if wc_drift else "")
+              + (f" ({len(comment_only_excused)} comment-only excused)" if comment_only_excused else "")
               + " framework file(s).")
         print("         Promotion would lose target-ahead content. Reconcile before overwriting. (exit 2)")
-        if not args.strict and am_core:
-            print(f"         (also {len(am_core)} ambiguous framework files -- run --strict to block on them too.)")
+        if not args.strict and am_core_blocking:
+            print(f"         (also {len(am_core_blocking)} ambiguous framework files -- run --strict to block on them too.)")
         return 2
 
     print("VERDICT: CLEAN -- target framework is a subset of source. Safe to promote. (exit 0)")
-    if am_core and not args.strict:
-        print(f"         (note: {len(am_core)} ambiguous framework files -- review with --strict if cautious.)")
+    if am_core_blocking and not args.strict:
+        print(f"         (note: {len(am_core_blocking)} ambiguous framework files -- review with --strict if cautious.)")
+    if comment_only_excused:
+        print(f"         ({len(comment_only_excused)} PHENOTYPE-parametric comment/provenance-only diff(s) excused -- see EXCUSED above.)")
     return 0
 
 

@@ -80,7 +80,7 @@ def test_subtree_leaf_counts_cycle_safe():
 def test_leaf_cap_derives_from_k_and_d(monkeypatch):
     # Live config: the derivation invariant must hold whatever K_max is tuned
     # to (K_max is user-tunable — raised 4->40 by directive 2026-07-14; never
-    # pin the live literal, 3).
+    # pin the live literal, ).
     assert tree._config_leaf_cap() == tree._config_k_max() ** (tree._config_d_retrieval() - 1)
     # Isolated config: deterministic derivation check at the Zhong reference
     # tuning (K=4, D=4 -> 4^3 = 64 saturation point), immune to live retuning.
@@ -199,7 +199,7 @@ def test_decompose_within_cap_not_flagged(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# maintain_exempt -- durable per-node exemption (8)
+# maintain_exempt -- durable per-node exemption ()
 # --------------------------------------------------------------------------
 
 def test_redistribute_exempt_skips_overflow(monkeypatch):
@@ -237,11 +237,11 @@ def test_decompose_exempt_skips_overflow(monkeypatch):
 
 def test_distill_exempt_skips_low_utility(monkeypatch):
     # A low-utility leaf that WOULD be a crit1 distill candidate but is durably
-    # distill-exempt (coherence gate, guard-896 / 0) is NOT a candidate;
+    # distill-exempt (coherence gate, guard-896 / ) is NOT a candidate;
     # its skip_reason is distill_exempt. A metric-identical non-exempt twin IS
     # flagged -- proving the exemption is the only difference (the over-flag fix:
     # low retrieval = niche value, not bloat). file="" => no crit2/crit3.
-    # 7: crit1 now also needs >= distill_min_feedback_votes (3) and a
+    # : crit1 now also needs >= distill_min_feedback_votes (3) and a
     # fresh last_retrieved — both twins carry them so the exemption stays the
     # ONLY difference.
     fresh = date.today().isoformat()

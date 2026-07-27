@@ -136,7 +136,7 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
     """
     from ..server import Response
 
-    # 1: `metric` is OPTIONAL (default learning_value). The store
+    # : `metric` is OPTIONAL (default learning_value). The store
     # holds exactly ONE series — per-goal learning_value snapshots — so the
     # old required param was decorative: any name produced identical output,
     # misleading the evolve Step 0.7 caller into believing pipeline_accuracy
@@ -186,7 +186,7 @@ def compute(ctx) -> "Response":  # type: ignore[name-defined]
         }
 
     # Non-default label: echo it but state plainly the computation ignored it
-    # (pre-1 output echoed the label as "metric", implying per-metric
+    # (pre- output echoed the label as "metric", implying per-metric
     # series that never existed).
     if metric != "learning_value":
         result["metric_label"] = metric
@@ -280,8 +280,8 @@ def snapshot(ctx) -> "Response":  # type: ignore[name-defined]
         # survives all retries re-raises ConflictError (NOT an OSError), so it
         # propagates past this handler to the server's universal 409
         # "write_conflict" floor — the caller still gets the safe-to-retry 409,
-        # never a false 500. (1: closes the recurring non-fatal
-        # state-update-audit velocity-snapshot failure diagnosed in 0.)
+        # never a false 500. (: closes the recurring non-fatal
+        # state-update-audit velocity-snapshot failure diagnosed in .)
         file_locks.locked_rmw(live_path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))

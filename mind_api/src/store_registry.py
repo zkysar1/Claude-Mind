@@ -375,7 +375,7 @@ def _recompute_utilization_score(rec):
     tih = util["times_inferred_helpful"]
     ta = util.get("times_active", 0)
     tc = util.get("times_cited", 0)
-    # Denominator = max(retrievals, credited usages) + 1 (9) —
+    # Denominator = max(retrievals, credited usages) + 1 () —
     # verbatim twin of reasoning-bank.py recompute_utilization_score; see the
     # full WHY comment there (context-carried helpful bumps make th>rc
     # legitimate for rb/guardrails; old max(rc,1) let untested entries outrank

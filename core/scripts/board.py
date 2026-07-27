@@ -123,6 +123,22 @@ def cmd_post(args):
     # second from one agent's parallel processes both saw count=N and
     # both wrote msg-...-(N+1).
     def _build(items):
+        # : WARN (do NOT block) on a dangling reply_to — one that
+        # references no existing message in this channel silently dangles
+        # thread linkage. Cross-box lag means the parent may legitimately not
+        # be local yet, so this is advisory only. Fail-open: any error skips
+        # the check. Twin: board_write.py daemon post handler.
+        if args.reply_to:
+            try:
+                if args.reply_to not in {it.get("id") for it in items
+                                         if isinstance(it, dict)}:
+                    print(f"[board-post] WARN: reply_to '{args.reply_to}' not "
+                          f"found in channel '{channel}' ({len(items)} "
+                          f"messages) — thread linkage may dangle (cross-box "
+                          f"lag can delay the parent; not blocking)",
+                          file=sys.stderr)
+            except Exception:
+                pass
         return {
             "id": generate_message_id(channel, author, items=items),
             "author": author,
@@ -170,7 +186,7 @@ def cmd_post(args):
     # read 0.04 despite producing 57% of critical findings, n=246,
     # 2026-04-27..05-09).
     #
-    # DAEMON-ROUTED (1): the previous subprocess spawn of
+    # DAEMON-ROUTED (): the previous subprocess spawn of
     # `reasoning-bank.py <family> increment ...` had been a silent no-op
     # since H2 Wave 2 (2026-05-15) removed the rb CLI subcommands — the
     # child imported the library and exited 0 without writing. Route

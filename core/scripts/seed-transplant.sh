@@ -276,16 +276,48 @@ echo "[seed-transplant] Swapping staged files into place..."
 # traceback to STDERR — which the stdout-only $(...) capture drops — and the
 # top-of-file `set -e` kills the wrapper SILENTLY before [moved: N] and before
 # --commit. The operator then sees a scary mid-swap death on a tree that is
-# actually fully swapped, with NO diagnostic (0; v2.1.1 prod promotion
+# actually fully swapped, with NO diagnostic (; v2.1.1 prod promotion
 # 2026-07-05). Capture stderr, check rc, fail LOUD with the named diagnostic,
 # and distinguish engine-crash-after-swap (exit 8) from per-file swap failures
-# (exit 6, below).
+# (exit 6) — both resolved in the rc-check block below by parsing stdout
+# (: the exit-6 path was previously unreachable dead code).
 SWAP_ERR="$(mktemp 2>/dev/null || echo "/tmp/seed-transplant-swaperr.$$")"
 set +e
 SWAP_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" swap --dest "$DEST" 2>"$SWAP_ERR")"
 SWAP_RC=$?
 set -e
 if [ $SWAP_RC -ne 0 ]; then
+    # Distinguish a PARTIAL swap (per-file failures) from an engine crash by
+    # parsing stdout: the engine prints a structured result with failures[]
+    # THEN exits 1 (swap dispatch, _seed_engine.py L1721-1722), whereas a
+    # pre-print crash (the pre-move "No staging dir" SystemExit at do_swap L502,
+    # or any traceback) leaves stdout empty/unparseable. : the old
+    # blanket `exit 8` labeled EVERY non-zero rc a post-move crash — so the
+    # per-file-failure exit-6 branch (formerly below) was unreachable and a
+    # genuine partial swap printed the misleading "moves may have FULLY
+    # COMPLETED" diagnostic. -1 = no parseable structured result.
+    SWAP_NFAIL="$(echo "$SWAP_JSON" | py -3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(len(d.get('failures', [])) if isinstance(d, dict) else -1)
+except Exception:
+    print(-1)" 2>/dev/null)"
+    SWAP_NFAIL="${SWAP_NFAIL:--1}"
+    if [ "$SWAP_NFAIL" -gt 0 ]; then
+        # Structured result with per-file failures — a PARTIAL swap. The moves
+        # did NOT all complete; the failing files are listed. This is the
+        # (previously unreachable) exit-6 path, now correctly reached + labeled.
+        echo "[seed-transplant] swap reported $SWAP_NFAIL per-file FAILURE(s) (rc=$SWAP_RC): a PARTIAL swap, NOT an engine crash — the moves did NOT all complete:" >&2
+        echo "$SWAP_JSON" | py -3 -c "import sys,json; [print('   ', f['rel_path'], ':', f['error']) for f in json.load(sys.stdin)['failures']]" >&2
+        echo "[seed-transplant] Resolve the file locks/permissions above and re-run; verify state with:" >&2
+        echo "                  bash \"$SCRIPT_DIR/seed-verify.sh\" \"$DEST\"" >&2
+        rm -f "$SWAP_ERR"
+        exit 6
+    fi
+    # No parseable structured result — the engine crashed BEFORE printing (the
+    # pre-move SystemExit, or a traceback). The moves may have FULLY COMPLETED
+    # or not started at all; seed-verify is the arbiter.
     echo "[seed-transplant] swap ENGINE exited non-zero (rc=$SWAP_RC) after the [Swapping...] step." >&2
     echo "[seed-transplant] This is an engine-crash-during/after-swap, NOT a per-file swap failure." >&2
     echo "[seed-transplant] The file moves may have FULLY COMPLETED — do NOT assume corruption; verify:" >&2
@@ -298,15 +330,12 @@ fi
 rm -f "$SWAP_ERR"
 MOVED="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin)['moved'])")"
 echo "  moved: $MOVED"
-N_FAIL="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(len(json.load(sys.stdin)['failures']))")"
-if [ "$N_FAIL" -gt 0 ]; then
-    echo "  FAILURES during swap:"
-    echo "$SWAP_JSON" | py -3 -c "import sys,json; [print('   ', f['rel_path'], ':', f['error']) for f in json.load(sys.stdin)['failures']]"
-    exit 6
-fi
+# rc==0 guarantees failures==0 (the engine exits non-zero on ANY per-file
+# failure — swap dispatch above), so the former `if N_FAIL>0 -> exit 6` block
+# here was unreachable; its logic is folded into the rc-check above ().
 # Non-fatal post-move staging-cleanup error (moves already succeeded; only the
 # staging-dir removal hiccupped). Surfaced by the engine as a NAMED field rather
-# than silently swallowed (0 fail-loud). Warn; do not fail the swap.
+# than silently swallowed ( fail-loud). Warn; do not fail the swap.
 STAGING_ERR="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin).get('staging_cleanup_error') or '')" 2>/dev/null)"
 if [ -n "$STAGING_ERR" ]; then
     echo "  WARN: post-move staging cleanup reported: $STAGING_ERR" >&2
@@ -377,7 +406,7 @@ py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" -
 # captured in the commit)
 if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     echo "[seed-transplant] Committing planted files at destination..."
-    # SAFE bare add-A + commit (reviewed 4): $DEST is a fresh/re-init'd
+    # SAFE bare add-A + commit (reviewed ): $DEST is a fresh/re-init'd
     # (Step 11) single-purpose publication target, NOT the live shared
     # multi-agent tree. No concurrent autonomous agent stages WIP in $DEST, so
     # guard-741's whole-index-sweep hazard (which motivated the pathspec scoping
@@ -388,6 +417,13 @@ if [ $DO_COMMIT -eq 1 ] && [ -d "$DEST/.git" ]; then
     # Generic, public-safe commit message — source path / repo name MUST NOT
     # appear here. The destination is a publication target; commits show on
     # the public GitHub home page.
+    # SIGNATURE-COUPLED (): the `chore: sync framework` PREFIX is the
+    # transplant-baseline signature that promotion-preflight.py greps
+    # (`--grep=^chore: sync framework`, ~L144) to find this commit for the
+    # recency-shadow guard (, rb-4253). Changing the prefix words here
+    # silently degrades that guard to raw per-file timestamps. verify-learning
+    # Section TCS asserts this literal stays in sync with the reader — keep both
+    # in step.
     git -C "$DEST" commit -m "chore: sync framework ($TS)" -q || echo "  (nothing to commit)"
 fi
 

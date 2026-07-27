@@ -61,6 +61,10 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR  # noqa: E402
+from _idle_cache_common import (  # noqa: E402
+    wake_timer_elapsed,
+    authoritative_earliest_wake_at,
+)
 
 # MUST equal quiescence-gate.py CYCLE_CACHE_NAME (the single WRITER of this
 # file). A drift only causes a fail-open MISS here (the safe direction), never
@@ -140,7 +144,8 @@ def _blocked_sleep_remaining(now):
 
 
 def evaluate_cache(cache, active_snapshot, blocked_remaining, current_hash,
-                   current_goal_count, pending_signal, now, cap=DEFAULT_CAP):
+                   current_goal_count, pending_signal,
+                   current_earliest_wake_at, now, cap=DEFAULT_CAP):
     """Pure decision. Returns (decision, reason) where decision is 'hit'|'miss'.
 
     Ordered cheap-to-expensive so callers can gate the expensive hash recompute:
@@ -173,13 +178,49 @@ def evaluate_cache(cache, active_snapshot, blocked_remaining, current_hash,
         return ("miss", f"new-work:{current_goal_count}>{cached_count}")
     if pending_signal:
         return ("miss", "pending-blocker-signal")
+    # D2: timer-imminent-or-elapsed MISS via the shared wake_timer_elapsed helper
+    # (facet-1, ). A timer-gated goal within SLEEP_CAP_S of now (or already
+    # elapsed) may now be executable -- MISS so the full precheck can re-probe it.
+    #
+    # DEFENSE-IN-DEPTH (, reconciles ): the STORED baseline
+    # earliest_wake_at is checked FIRST, not only the FRESH current_earliest_wake_at.
+    # Hazard: a recurring due elapses mid-sleep, _wake_timers' future-only guard
+    # () drops it from the fresh rescan (-> a LATER goal or None) while hash
+    # + goal_count stay unchanged, so a fresh-ONLY check false-HITs. A twin positive
+    # control () PROVED evaluate_cache returns that false HIT on the elapsed-
+    # dropped inputs -- but those inputs arise ONLY under a cadence OVERSHOOT: the
+    #  invariant (imminent horizon == max sleep == SLEEP_CAP_S) otherwise
+    # flags each due imminent one cycle BEFORE it elapses. Re-entry latency, or a
+    # future max_sleep raise, pushes cadence past the horizon (cmd_check's D1 cap uses
+    # the already-dropped fresh scan, so it can't re-cap). This baseline check makes
+    # correctness INDEPENDENT of that fragile cadence premise; unlike dry-idle (horizon
+    # 60s << 7200s curve) which violated the invariant outright and hit this LIVE
+    # (), quiescence's exposure is the narrow overshoot window, frequency
+    # unquantified (). Shared LOGIC only (): own file + margin.
+    if wake_timer_elapsed(cache.get("earliest_wake_at"), now, SLEEP_CAP_S):
+        return ("miss", "baseline-timer-elapsed")
+    if wake_timer_elapsed(current_earliest_wake_at, now, SLEEP_CAP_S):
+        return ("miss", "timer-imminent-or-elapsed")
     return ("hit", "ok")
 
 
-def _emit_hit_directive(cache, cap):
+def _emit_hit_directive(cache, cap, earliest_wake_at=None):
     sleep_seconds = int(cache.get("sleep_seconds") or SLEEP_CAP_S)
     if sleep_seconds > SLEEP_CAP_S or sleep_seconds < 1:
         sleep_seconds = SLEEP_CAP_S
+    # D1: cap at the earliest timer horizon so we never oversleep the moment
+    # a deferred/recurring/hypothesis-gated goal becomes executable.
+    if earliest_wake_at:
+        try:
+            _wake_dt = datetime.fromisoformat(
+                str(earliest_wake_at).rstrip("Z"))
+            _wake_secs = int((_wake_dt - datetime.now()).total_seconds())
+            if _wake_secs < 60:
+                _wake_secs = 60
+            if _wake_secs < sleep_seconds:
+                sleep_seconds = _wake_secs
+        except (ValueError, TypeError):
+            pass
     agent = os.environ.get("MIND_AGENT", "") or "unknown"
     short = int(cache.get("cycle_count", 0) or 0)
     bhash = cache.get("blocker_set_hash", "")
@@ -241,18 +282,43 @@ def cmd_check(_args):
     except Exception:
         return 0  # fail-open: selector unavailable -> miss -> normal full cycle
 
+    # D1: compute timer horizon for evaluate_cache + _emit_hit_directive.
+    current_earliest_wake_at = None
+    try:
+        from _wake_timers import scan_queue
+        _, current_earliest_wake_at = scan_queue(now)
+    except Exception:
+        pass
+
     pending_signal = _pending_blocker_signal()
     decision, _reason = evaluate_cache(
         cache, active_snapshot, blocked_remaining, current_hash,
-        current_goal_count, pending_signal, now, cap)
+        current_goal_count, pending_signal, current_earliest_wake_at,
+        now, cap)
     if decision != "hit":
         return 0
 
-    # HIT -- increment the consecutive-short-circuit counter and re-sleep.
+    # facet-2 authoritative recheck (; guard-1139 / ). Every
+    # cheap LOCAL gate above HIT (would sleep), but the local aspirations mirror can
+    # lag the store under own-cloud -- a timer-gated goal due SOONER in the store
+    # than the local mirror shows. Re-check the earliest wake against the
+    # AUTHORITATIVE store before committing to sleep. R2 latency: this S3 read runs
+    # ONLY on the HIT path (once every cheap local gate passed), never every cycle.
+    # Fail-open to MISS on an unreadable store -- guard-1139: never sleep on a
+    # local-only decision when the authoritative check could not run (same
+    # direction as the scan_queue/_total_goal_count `except -> return 0` above).
+    try:
+        auth_wake = authoritative_earliest_wake_at(now)
+    except Exception:
+        return 0  # authoritative store unreadable -> MISS -> normal full cycle
+    if wake_timer_elapsed(auth_wake, now, SLEEP_CAP_S):
+        return 0  # store shows an imminent/elapsed wake the local mirror missed
+
+    # HIT confirmed authoritatively -- increment the counter and re-sleep.
     cache["cycle_count"] = int(cache.get("cycle_count", 0) or 0) + 1
     cache["last_hit_at"] = now.isoformat(timespec="seconds")
     _write_cache(cache)
-    _emit_hit_directive(cache, cap)
+    _emit_hit_directive(cache, cap, earliest_wake_at=current_earliest_wake_at)
     return 0
 
 

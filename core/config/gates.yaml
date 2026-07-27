@@ -27,7 +27,7 @@
 #                        its frequencies — e.g. the intent-verbs pair is FP
 #                        (strict matchers over-match) while fn_cost=medium >
 #                        fp_cost=low. Cost decisions (the retirement
-#                        evaluator's all-noop downgrade, 5) key on
+#                        evaluator's all-noop downgrade, ) key on
 #                        fp_cost/fn_cost, NOT on this label — do not read
 #                        dominant_risk as a cost field.
 #   asymmetry_magnitude  extreme | high | medium | low — how lopsided.
@@ -287,6 +287,40 @@ gates:
       (fn_cost=medium > fp_cost=low), same as the removal sibling.
     retirement_eligible: true
 
+  - id: build-test-authoring-intent
+    script: core/scripts/_target_state.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "core/scripts/_target_state.py", phase: "BUILD_INTENT / TEST_AUTHORING classification" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Non-build/test goal misread as build/test; target_state block demoted to advisory; a genuine duplicate could slip the hard block (other 4 checks still apply)."
+    fn_description: "Build/test-authoring goal not detected; target_state hard-blocks it (named identifiers are the integration SURFACE present before the work, not the deliverable); author needs --override-duplication."
+    rb_evidence: []
+    tuning_notes: >-
+      DEMOTE sibling of modify-intent-verbs (g-115-2869). A goal to BUILD a new
+      gate/check/module or ADD an integration test names the EXISTING file it
+      touches; those symbols are the integration SURFACE, present BEFORE the work,
+      not the deliverable — the same before-AND-after ambiguity modify handles, so
+      DEMOTE (not skip). Unlike the VERB-led read/removal/modify siblings, build/
+      test titles are frequently NOUN-led: the deliverable NOUN names the intent
+      with no explicit build verb, so this matches a build VERB or a deliverable
+      NOUN (gate/check/module/...) or the noun "test" in the leading segment
+      (pre-colon words + first THREE post-colon words — wider than the verb
+      siblings' word-1 window because a deliverable noun carries a compound
+      modifier: "goal-creation gate", "integration test"). Origin: g-115-2857
+      ("goal-creation gate refusing ...") and g-115-2862 ("integration test
+      proving ...") both hard-blocked (400) 2026-07 and cleared only after
+      re-wording. TAXONOMY: dominant_risk=FP is LIKELIHOOD (wider window may
+      over-match); cost shape is FN-heavier (fn_cost=medium > fp_cost=low), same
+      as the modify/removal siblings.
+    retirement_eligible: true
+
   # ─── Asymmetry: FN > FP (medium-high) ────────────────────────────────
 
   - id: prose-verification-drift
@@ -539,7 +573,7 @@ pending_audit:
   - context-reads-skill-gate.sh
   - test-background-jobs-output-gate.sh
   # Pre-commit hook suite (core/githooks/pre-commit) — earn-the-keep review
-  # 4 (2026-07-16): all kept (incident-born insurance class; 0 blocks
+  #  (2026-07-16): all kept (incident-born insurance class; 0 blocks
   # in ~1685 commits over 13 days, deterrence unmeasured). BLOCK-ONLY telemetry
   # via the hook's _gate wrapper (gate_id = script basename sans extension) —
   # clean passes log nothing because one gate-firings append on own-cloud is a

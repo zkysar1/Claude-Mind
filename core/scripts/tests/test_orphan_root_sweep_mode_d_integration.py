@@ -189,7 +189,7 @@ def _invoke_sweep(synth_root: Path) -> subprocess.CompletedProcess:
     to CreateProcess (Win32 API), not the shell.
     """
     env = os.environ.copy()
-    # 1: strip the ENTIRE ambient MIND_* namespace before invoking the
+    # : strip the ENTIRE ambient MIND_* namespace before invoking the
     # sweep so it resolves agent/world/meta purely from MIND_AGENT (set below) +
     # the synthetic local-paths.conf — immune to cross-test env pollution in the
     # full suite. The subprocess inherits os.environ; conftest's autouse
@@ -225,7 +225,7 @@ def _invoke_sweep(synth_root: Path) -> subprocess.CompletedProcess:
         text=True,
         env=env,
         cwd=str(synth_root),
-        # 8: 180s, not 60s. This subprocess (orphan-root-sweep.sh ->
+        # : 180s, not 60s. This subprocess (orphan-root-sweep.sh ->
         # `py -3` predicate + `find` filesystem scans) runs ~6s in isolation but
         # ~36s+ under full-suite load (Python launcher cold-start + OneDrive write
         # contention + 5-6 concurrent agents on the shared tree). A 60s cap gave

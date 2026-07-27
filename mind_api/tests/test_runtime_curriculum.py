@@ -172,7 +172,7 @@ class _FakePaths:
         self.project_root = project_root
         # Mirrors _run_cli's MIND_WORLD convention (agent's sibling world/) —
         # the endpoint now reads ctx.paths.world + ctx.paths.agent_name for the
-        # 6 competence refresh and _evaluate_gate (curriculum.py:404).
+        #  competence refresh and _evaluate_gate (curriculum.py:404).
         self.world = agent.parent / "world"
         self.agent_name = agent_name
 

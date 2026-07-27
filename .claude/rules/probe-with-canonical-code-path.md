@@ -16,13 +16,50 @@ false-positive blockers.
 2. The first script listed (or the one most directly exercising the failure
    mode) is the canonical probe. Invoke it with a trivial success argument:
    ```
-   bash world/scripts/efs-ssh.sh "echo ok"
+   source core/scripts/_paths.sh && bash "$WORLD_PATH/scripts/efs-ssh.sh" "echo ok"
    ```
+   The `$WORLD_PATH` resolution is load-bearing, not cosmetic: `world/` is an
+   EXTERNAL path and the Bash hooks do not rewrite path arguments, so a bare
+   `bash world/scripts/...` dies rc=127 "No such file or directory" — which
+   reads exactly like a dead connection and produces the very false-positive
+   blocker this rule exists to prevent.
 3. If that succeeds, the skill is not blocked. If it fails, the failure
    output is your real diagnostic signal.
 4. Only if the canonical probe is unavailable may you fall back to a
    synthetic probe — and that synthetic probe MUST be documented as such in
    the blocker's `diagnostic_context`.
+
+## Canonical BINARY Is Not Canonical INVOCATION
+
+Running the right script is half the rule. The other half is running it with the
+**call shape the production caller uses** — same env vars, same args. A canonical
+script invoked with a non-production arg shape exercises a branch production never
+takes, and because the output is genuine output from the genuine script, it reads
+as authoritative. This is the letter/intent split that makes the class
+self-concealing: the "did I use the canonical script?" reflex fires and reports
+all-clear, so nothing prompts a second look.
+
+Before treating a hand-run script's output as evidence:
+
+1. **Grep the production call site** and diff its env/args against yours. One grep.
+   (`grep -n '<script-name>' core/scripts/*.sh .claude/skills/*/SKILL.md`)
+2. **Read the emitter for CONDITIONAL fields.** A key that appears only on one
+   branch is a fingerprint of which branch ran. Its *absence* is signal, not noise.
+3. **Run wrong-shape and right-shape side by side in one turn.** The diff is the
+   positive control, and it is seconds of work.
+
+Canonical incident (g-115-3260, 2026-07-26): `post-state-update-gate.sh` was
+hand-run with no `GOAL_ID` and returned `{"fired": false, "core_count": 0}`. That
+became a HIGH Unblock declaring the fresh-eyes gate "structurally dead." But
+`iteration-close.sh:1212` *always* passes `GOAL_ID`, and the gate emits
+`commits_scanned` only when committed scope resolves — its absence from the quoted
+verdict was proof the measurement came from a branch the loop never reaches. Re-run
+with `GOAL_ID` set: `fired:true, core_count=3, commits_scanned=2`, on three real
+commits, under the exact condition the goal claimed was uncovered. A speculative fix
+was written and reverted before measurement corrected the premise. Encoded as
+`rb-5235`; structurally identical to `guard-920` (regression tests must replicate
+the literal production arg shape, not the contract-ideal one) — same defect moved
+from tests to diagnostics.
 
 ## Why Synthetic Probes Mislead
 

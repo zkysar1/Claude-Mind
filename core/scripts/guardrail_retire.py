@@ -111,11 +111,13 @@ def _parse_date(value):
 # Signal-B incident-token patterns (design Section 0 fact 2: `source` is free-text,
 # so a STABLE incident token is parsed out - NOT whole-string equality). Order
 # matters: the session-<agent>-<date> prefix is checked first, then a leading
-# g-NNN-NN / rb-NNN / asp-NNN id. Free-text source with no parseable token
-# contributes NO signal-B edge (returns None - not a wildcard match).
+# g-NNN-NN / g-xw-<ts>-NN / rb-NNN / asp-NNN id. Free-text source with no parseable
+# token contributes NO signal-B edge (returns None - not a wildcard match).
 _TOKEN_PATTERNS = (
     re.compile(r"^(session-[a-z0-9]+-\d{4}-\d{2}-\d{2})", re.IGNORECASE),
-    re.compile(r"^(g-\d+-\d+|rb-\d+|asp-\d+)", re.IGNORECASE),
+    # : g- branch admits both g-NNN-NN and the cross-world g-xw-<ts>-NN
+    # form so an xw-goal-sourced guardrail still yields a signal-B clustering token.
+    re.compile(r"^(g-(?:\d+-\d+|xw-\d{8}T\d{6}-\d{2})|rb-\d+|asp-\d+)", re.IGNORECASE),
 )
 
 

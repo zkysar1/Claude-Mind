@@ -1,4 +1,4 @@
-"""Unit tests for 8 auto-reconcile in fresh-eyes-cadence-check.py.
+"""Unit tests for  auto-reconcile in fresh-eyes-cadence-check.py.
 
 The fresh-eyes rituals write their archive report (Phase 4) BEFORE stamping the
 cadence WM slot (Phase 8). Autocompact between those two steps leaves a report on

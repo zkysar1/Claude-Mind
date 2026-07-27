@@ -1,4 +1,4 @@
-"""Competence assessment SSOT — shared by CLI and daemon (6).
+"""Competence assessment SSOT — shared by CLI and daemon ().
 
 Single source of truth for computing and writing the
 `developmental-stage.current_assessment.average_competence` metric consumed
@@ -40,7 +40,7 @@ COMPETENCE_METRIC = "developmental-stage.current_assessment.average_competence"
 
 PRODUCER = "core/scripts/competence-assess.py"
 
-# Stage-assessment constants (4). Mirror of
+# Stage-assessment constants (). Mirror of
 # core/config/developmental-stage.yaml `exploration_budget.competence_mapping`
 # and the per-stage tree_maturity bands. Formula was previously LLM-executed
 # pseudocode in aspirations-evolve Step 0 — LLM-discretionary producers drift

@@ -8,7 +8,16 @@
 #
 # Usage:
 #   bash core/scripts/promote-to-upstream.sh --target <path-to-target-clone> \
-#        [--branch "promote/vX.Y.Z"] [--pr] [--dry-run]
+#        [--branch "promote/vX.Y.Z"] [--pr] [--dry-run] [--living-prod]
+#
+#   --living-prod: force living-prod mode — pass --living-prod through to
+#     seed-transplant so the target's deployment-local files (CLAUDE.md,
+#     .claude/settings.json) and its OWN resident forged skills are preserved.
+#     Auto-enabled when the target carries a resident .mind-data/ store or a
+#     git-tracked in-repo world/ or meta/ store. For a living/populated dest a
+#     read-only --plan blast-radius report runs BEFORE the plant ( P1.5).
+#     See guard-1056: the seed pipeline has known living-prod bugs () —
+#     verify deployment-local + forged-skill survival post-promote.
 #
 # Exit: 0 success/dry-run-ok; 1 pre-flight/invariant/chain failure; 2 usage error.
 # Design: rails A.7 + omni delta M2 (never push/merge from here beyond a PR) +
@@ -19,19 +28,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 2; }
 LIB="$SCRIPT_DIR/_release_lib.py"
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
-# RELEASES.json check delegated to check-releases-current.sh (role-aware, 1);
+# RELEASES.json check delegated to check-releases-current.sh (role-aware, );
 # this script no longer references RELEASES.json directly.
 WORLD="${WORLD_DIR:-${WORLD_PATH:-}}"
 OVERLAY="$WORLD/config/compatibility.yaml"
 FW_COMPAT="$CONFIG_DIR/compatibility.yaml"
 
-TARGET=""; BRANCH=""; DO_PR=0; DRY=0
+TARGET=""; BRANCH=""; DO_PR=0; DRY=0; LIVING_PROD=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target) TARGET="${2:-}"; [[ -z "$TARGET" || "$TARGET" == --* ]] && { echo "ERROR: --target requires a path" >&2; exit 2; }; shift 2;;
     --branch) BRANCH="${2:-}"; [[ -z "$BRANCH" || "$BRANCH" == --* ]] && { echo "ERROR: --branch requires a value" >&2; exit 2; }; shift 2;;
     --pr) DO_PR=1; shift;;
     --dry-run) DRY=1; shift;;
+    --living-prod) LIVING_PROD=1; shift;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//;/^set -euo/d'; exit 0;;
     *) echo "ERROR: unknown argument: $1" >&2; exit 2;;
   esac
@@ -94,7 +104,7 @@ say "local version: $LOCAL"
 # authoritative) — which is what lets a seed->downstream promote run WITHOUT
 # --force-release. The prior inline `seed-latest` check was a duplicate of
 # check-releases-current.sh that dropped its role-awareness and hard-failed
-# EVERY non-frontier promote (1). Single source of truth now.
+# EVERY non-frontier promote (). Single source of truth now.
 CRC_OUT="$(bash "$SCRIPT_DIR/check-releases-current.sh" 2>&1)" \
   || fail "RELEASES.json not current: $CRC_OUT (cut a release with release.sh before promoting)"
 say "$CRC_OUT"
@@ -110,7 +120,7 @@ fi
 # (c) HEAD tagged v$LOCAL — FRONTIER-ONLY provenance. release.sh is the sole
 # v-tagger and only runs at the frontier; a non-frontier role (seed/downstream)
 # re-transplants adopted framework and has no v-tag by design, so the tag gate
-# is skipped for it (1, option 2 role-conditional gating).
+# is skipped for it (, option 2 role-conditional gating).
 if [[ "$SELF_ROLE" == "frontier" ]]; then
   if ! git -C "$PROJECT_ROOT" rev-parse -q --verify "refs/tags/v$LOCAL" >/dev/null 2>&1; then
     if [[ $DRY -eq 1 ]]; then say "[dry-run] note: HEAD has no tag v$LOCAL (would FAIL — cut a release with release.sh first)";
@@ -148,8 +158,8 @@ fi
 say "seed-preflight: PUBLISHABLE"
 
 # --- Step 3b: promotion-preflight (reconcile-not-mirror drift gate) --------
-# 9: the gate existed since its authoring but had ZERO callers — the
-# target-drift audit (and the 5 weights-contract cross-check) only
+# : the gate existed since its authoring but had ZERO callers — the
+# target-drift audit (and the  weights-contract cross-check) only
 # fired on manual invocation, which is exactly how the rb-498-era promotion
 # clobbered prod-side content. seed-preflight answers "is the SOURCE
 # publishable?"; promotion-preflight answers "does the TARGET lead on anything
@@ -178,10 +188,29 @@ fi
 
 [[ -z "$BRANCH" ]] && BRANCH="promote/v$LOCAL"
 
+# --- Step 3c: living-prod detection (guard-1056) ---------------------------
+# A living/populated dest must be planted with --living-prod so its
+# deployment-local files (CLAUDE.md, .claude/settings.json) + its OWN resident
+# forged skills are preserved. Detection errs toward preservation (ANY positive
+# signal => living-prod): a fresh seed has nothing to preserve, so --living-prod
+# is a safe no-op there, whereas MISSING it on a real living dest clobbers
+# deployment-local — the manual-hop hazard this fixes (v2.5.0 seed->prod, where
+# Step 4b's flag-less transplant would have overwritten settings.json + CLAUDE.md
+# and deleted resident forged skills at ZDS-Mind).
+if [[ $LIVING_PROD -eq 0 ]]; then
+  if [[ -d "$TARGET/.mind-data" ]]; then
+    LIVING_PROD=1; say "auto-detected living-prod: '$TARGET/.mind-data' present (guard-1056)"
+  elif [[ -n "$(git -C "$TARGET" ls-files world/ meta/ 2>/dev/null | head -1)" ]]; then
+    LIVING_PROD=1; say "auto-detected living-prod: git-tracked in-repo world/ or meta/ store in target (guard-1056)"
+  fi
+fi
+LP_FLAG=""; [[ $LIVING_PROD -eq 1 ]] && { LP_FLAG="--living-prod"; say "living-prod mode ON — preserve deployment-local + dest forged skills; --plan runs first (guard-1056)"; }
+
 # --- Dry-run stops here (no mutation of the target) ------------------------
 if [[ $DRY -eq 1 ]]; then
   [[ $DO_PR -eq 1 ]] && say "[dry-run] would: create PR branch '$BRANCH' in target FIRST (plant commits there, not on target's main)"
-  say "[dry-run] would: seed-transplant.sh \"$TARGET\" --force --commit  (domain-strip + transforms + verify)"
+  [[ $LIVING_PROD -eq 1 ]] && say "[dry-run] would: seed-transplant.sh \"$TARGET\" --living-prod --plan  (read-only blast-radius report FIRST — g-306-90/guard-1056)"
+  say "[dry-run] would: seed-transplant.sh \"$TARGET\" ${LP_FLAG:+$LP_FLAG }--force --commit  (domain-strip + transforms + verify${LP_FLAG:+; living-prod: deployment-local + dest forged skills preserved})"
   [[ $DO_PR -eq 1 ]] && say "[dry-run] would: push branch '$BRANCH' + gh pr create (NEVER merges)"
   say "[dry-run] would: seed-verify.sh \"$TARGET\""
   say "[dry-run] OK — all pre-flight + invariant + preflight checks passed"
@@ -200,9 +229,20 @@ if [[ $DO_PR -eq 1 ]]; then
   say "PR branch ready in target: $BRANCH (the plant commits here, not on the target's main)"
 fi
 
+# --- Step 4a: living-prod blast-radius gate ( P1.5 / guard-1056) ----
+# For a living/populated dest, surface the read-only --plan report BEFORE any
+# mutation, so deployment-local + forged-skill survival is visible pre-plant
+# (the seed pipeline has known living-prod bugs —  — where --living-prod
+# alone under-protects; the plan is the load-bearing safety checkpoint).
+if [[ $LIVING_PROD -eq 1 ]]; then
+  say "living-prod: seed-transplant --plan (blast-radius report) BEFORE planting (g-306-90/guard-1056) ..."
+  bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" --living-prod --plan \
+    || fail "seed-transplant --plan failed — cannot assess blast radius; aborting before mutation"
+fi
+
 # --- Step 4b: seed-plant into the target (commits onto the CURRENT branch) --
-say "planting framework into $TARGET ..."
-bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" --force --commit || fail "seed plant failed"
+say "planting framework into $TARGET ${LP_FLAG:+(living-prod) }..."
+bash "$SCRIPT_DIR/seed-transplant.sh" "$TARGET" $LP_FLAG --force --commit || fail "seed plant failed"
 
 # --- Step 5: post-promotion verify -----------------------------------------
 say "verifying plant at $TARGET ..."
