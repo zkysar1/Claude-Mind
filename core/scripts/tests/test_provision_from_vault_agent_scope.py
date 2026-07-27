@@ -30,6 +30,12 @@ import pytest
 
 from pathlib import Path
 
+import sys
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-from-vault.sh"
 
@@ -107,7 +113,7 @@ def _run(tmp_path, *, agent, vault_body=VAULT_BODY, name="env",
         env["MIND_AGENT"] = agent
 
     proc = subprocess.run(
-        ["bash", str(SCRIPT), "--out", str(out)],
+        [BASH, str(SCRIPT), "--out", str(out)],
         capture_output=True, text=True, env=env, cwd=str(REPO_ROOT),
     )
     body = out.read_text(encoding="utf-8") if out.exists() else ""

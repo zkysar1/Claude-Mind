@@ -30,6 +30,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 import _history_store as hs  # noqa: E402
 import history_vacuum_archive as hva  # noqa: E402
 
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -273,7 +278,7 @@ def test_tick_cadence_gate(tmp_path):
     tick = str(SCRIPT_DIR / "history-vacuum-tick.sh")
     stamp = hist / ".vacuum-last-run"
 
-    r1 = subprocess.run(["bash", tick, str(base)], env=_tick_env(),
+    r1 = subprocess.run([BASH, tick, str(base)], env=_tick_env(),
                         capture_output=True, text=True, timeout=180)
     assert r1.returncode == 0, r1.stderr
     assert stamp.exists(), f"stamp not created; stderr={r1.stderr}"
@@ -281,7 +286,7 @@ def test_tick_cadence_gate(tmp_path):
     first = stamp.stat().st_mtime
 
     # Second run immediately: fresh stamp within 24h -> gated no-op.
-    r2 = subprocess.run(["bash", tick, str(base)], env=_tick_env(),
+    r2 = subprocess.run([BASH, tick, str(base)], env=_tick_env(),
                         capture_output=True, text=True, timeout=180)
     assert r2.returncode == 0, r2.stderr
     assert stamp.stat().st_mtime == first  # stamp NOT advanced (gated)
@@ -293,7 +298,7 @@ def test_tick_lock_blocks_concurrent(tmp_path):
     lock = hist / ".vacuum.lock.d"
     lock.mkdir()  # simulate a vacuum already running
 
-    r = subprocess.run(["bash", tick, str(base)], env=_tick_env(),
+    r = subprocess.run([BASH, tick, str(base)], env=_tick_env(),
                        capture_output=True, text=True, timeout=180)
     assert r.returncode == 0, r.stderr
     # Locked out -> no run, no stamp; the (fresh) lock is untouched.

@@ -36,6 +36,12 @@ from pathlib import Path
 
 import pytest
 
+import sys
+import pathlib
+# guard-580: resolve bash explicitly — a bare 'bash' argv[0] hits System32 WSL on win32.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _bash_helpers import BASH  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ITER_CLOSE = PROJECT_ROOT / "core" / "scripts" / "iteration-close.sh"
 
@@ -183,7 +189,7 @@ def harness(tmp_path):
             + "\n_repair_utilization_pending\n",
             encoding="utf-8",
         )
-        p = subprocess.run(["bash", str(harness_sh)], capture_output=True,
+        p = subprocess.run([BASH, str(harness_sh)], capture_output=True,
                            text=True, timeout=60)
         log = argv_log.read_text(encoding="utf-8").splitlines() if argv_log.exists() else []
         return p.returncode, p.stdout, p.stderr, log
