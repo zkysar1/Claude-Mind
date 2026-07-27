@@ -50,6 +50,19 @@ if str(CORE_SCRIPTS) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# guard-652 seed-then-pin (): capture the REAL meta dir at import
+# time (collection, real env) so DaemonFixture can seed a temp meta with the
+# strategy config files BEFORE pinning MIND_META to it in __enter__. Captured
+# at module level — NOT inside __enter__ — because __enter__ mutates the env
+# (MIND_WORLD/MIND_AGENT), which would drift a re-resolution off the fixture
+# world; at collection time the real env still resolves the true META_DIR.
+# Best-effort: a _paths import failure leaves _REAL_META_DIR None and the seed
+# step no-ops (fixture still works, just without pre-seeded strategy files).
+try:
+    from _paths import META_DIR as _REAL_META_DIR
+except Exception:
+    _REAL_META_DIR = None
+
 
 def make_project_root(tmp: Path, world: Path, agent: str = "alpha",
                       agent_dir: Path | None = None) -> Path:
@@ -169,15 +182,15 @@ class DaemonFixture:
         }
         os.environ["RT_DIR"] = str(self.runtime_dir)
         os.environ["MIND_AGENT"] = self.agent
-        # 1: hard-pin STORAGE_BACKEND=local (mirror conftest.py:78) so
+        # : hard-pin STORAGE_BACKEND=local (mirror conftest.py:78) so
         # every in-process DaemonFixture daemon binds to LocalBackend regardless
         # of invocation path. main()-style `python3 test_x.py` and bash
         # aggregators never load conftest's session pin, so an ambient own-cloud
         # env would otherwise leak world-isolated writes onto the production S3
         # key (guard-955/rb-2983). NOT setdefault — the shell may carry own-cloud.
         os.environ["STORAGE_BACKEND"] = "local"
-        # 2: hard-pin MIND_WORLD to the FIXTURE world, BEFORE
-        # _start_daemon. get_backend()'s _bootstrap_env_defaults (7
+        # : hard-pin MIND_WORLD to the FIXTURE world, BEFORE
+        # _start_daemon. get_backend()'s _bootstrap_env_defaults (
         # bare-subprocess self-heal) exports the REAL repo's world as
         # MIND_WORLD when unset — but its pytest guard makes it a no-op under
         # pytest, so ONLY main()-style runs got poisoned: AgentPathResolver's
@@ -185,12 +198,30 @@ class DaemonFixture:
         # request resolved the PRODUCTION world (uniform 404s on fixture
         # goals). Pinning before daemon start means the bootstrap's setdefault
         # no-ops and any init-time resolution caches the fixture world.
-        # MIND_META is deliberately NOT pinned: subprocesses spawned inside
-        # the fixture (os.environ.copy()) legitimately resolve strategy files
-        # from the real meta (test_cross_aspiration_support's selector runs);
-        # an empty pr/meta pin broke them. It IS captured above so whatever
-        # the bootstrap sets during the fixture window is restored on exit.
         os.environ["MIND_WORLD"] = str(self.world)
+        # guard-652 seed-then-pin (): previously MIND_META was left
+        # UNPINNED so fixture subprocesses (os.environ.copy()) could resolve
+        # strategy files from the real meta (test_cross_aspiration_support's
+        # selector) — but that let meta-writers which resolve META_DIR
+        # independently of WORLD_DIR (e.g. tree.py _append_l1_pick_log writing
+        # META_DIR/l1-pick-log.jsonl) leak writes into the REAL meta. Pinning to
+        # an EMPTY pr/meta stopped the leak but broke the strategy-file
+        # subprocesses. Seed-then-pin resolves both: copy the real meta's
+        # top-level strategy configs (*.yaml/*.md — NOT the large *.jsonl logs)
+        # into the fixture meta, THEN pin MIND_META to it. Subprocesses find the
+        # strategy files; meta-writers write to the isolated temp dir. _prev_env
+        # captured MIND_META above so the pin is restored on exit.
+        meta_dir = self._pr / "meta"
+        if _REAL_META_DIR is not None:
+            try:
+                real_meta = Path(_REAL_META_DIR)
+                for pat in ("*.yaml", "*.md"):
+                    for src in real_meta.glob(pat):
+                        if src.is_file():
+                            (meta_dir / src.name).write_bytes(src.read_bytes())
+            except Exception:
+                pass  # best-effort seed; the guard-652 pin below still applies
+        os.environ["MIND_META"] = str(meta_dir)
 
         self._httpd, self._port = _start_daemon(self._pr)
         return self

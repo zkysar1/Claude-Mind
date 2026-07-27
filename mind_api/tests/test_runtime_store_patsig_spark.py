@@ -229,7 +229,7 @@ def test_patsig_append_created_stamped(running_daemon):
 
 def test_patsig_append_history_and_changelog(running_daemon):
     project_root, port = running_daemon
-    # CAS-delta store manifests (7) — no legacy .history/<rel>/ copies.
+    # CAS-delta store manifests () — no legacy .history/<rel>/ copies.
     hist = (project_root / "world" / ".history" / "snapshots"
             / "pattern-signatures.jsonl")
     legacy = project_root / "world" / ".history" / "pattern-signatures.jsonl"

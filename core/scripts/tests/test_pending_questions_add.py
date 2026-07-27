@@ -1,4 +1,4 @@
-"""test_pending_questions_add.py — regression for 0.
+"""test_pending_questions_add.py — regression for .
 
 pending-questions-add.sh must tolerate the same on-disk container shapes its
 reader sibling pending-questions-sweep.py reads (rb-1786 — a paired
@@ -166,10 +166,43 @@ def test_unrecognized_shape_rejected():
         assert "schema not recognized" in r.stderr.lower()
 
 
+# --- Case 6: EMPTY file initializes as shape C, visible to naive consumers ----
+# Regression guard for . yaml.safe_load("") is None, which hits the
+# `data is None` initializer branch. That branch MUST seed a bare list (shape C),
+# NOT a dict wrapper (shape A) — a fresh dict-wrapper file is invisible to the
+# naive top-level-status scans in the user-facing consumers
+# (agent-completion-report / open-questions / respond), which was alpha's
+# 19-of-21 hidden-pending incident. If someone reverts the initializer to
+# `data = {"questions": []}`, this test fails.
+
+def test_empty_file_initializes_as_bare_list_seen_by_naive_filter():
+    with tempfile.TemporaryDirectory() as tmpd:
+        pq = Path(tmpd) / "pending-questions.yaml"
+        pq.write_text("", encoding="utf-8")           # empty → yaml.safe_load == None
+        r = _run(pq, "pq-fresh")
+        assert r.returncode == 0, f"empty-file add failed: rc={r.returncode} {r.stderr!r}"
+        data = yaml.safe_load(pq.read_text(encoding="utf-8"))
+        assert isinstance(data, list), \
+            "empty file must initialize as a bare list (shape C), not a dict wrapper"
+        # The naive top-level-status filter the user-facing consumers use: iterate
+        # the top-level list, keep dict entries whose status == pending. A dict
+        # wrapper would make this scan iterate KEYS and see nothing (the bug).
+        naive_pending = [q for q in data
+                         if isinstance(q, dict) and q.get("status") == "pending"]
+        assert [q["id"] for q in naive_pending] == ["pq-fresh"], \
+            "naive top-level-status filter must see the freshly-added pending question"
+        # A second add preserves shape C and stays visible.
+        r2 = _run(pq, "pq-fresh-2")
+        assert r2.returncode == 0, f"second add failed: rc={r2.returncode} {r2.stderr!r}"
+        data2 = yaml.safe_load(pq.read_text(encoding="utf-8"))
+        assert isinstance(data2, list) and set(_ids_in(pq)) == {"pq-fresh", "pq-fresh-2"}
+
+
 if __name__ == "__main__":
     test_shape_c_bare_list_appends_and_preserves_shape()
     test_shape_a_dict_wrapper_appends()
     test_shape_b_wrapper_element_appends_into_wrapper()
     test_mixed_shape_dup_check_sees_bare_entries()
     test_unrecognized_shape_rejected()
+    test_empty_file_initializes_as_bare_list_seen_by_naive_filter()
     print("ok")

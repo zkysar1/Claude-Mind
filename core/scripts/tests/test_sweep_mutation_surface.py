@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for sweep-mutation-surface.py (6).
+"""Tests for sweep-mutation-surface.py ().
 
 The consumer surfaces silent auto-close sweep mutations by reading the 3
 per-sweep metrics logs. These tests pin: (1) it picks only NEW apply-mutation
@@ -185,6 +185,69 @@ def test_first_run_window_default(tmp_path):
                extra=["--no-advance", "--window-hours", "24"])
     ids = [m["goal_id"] for m in out["mutations"]]
     assert ids == ["g-in"], ids
+
+
+def _load_module():
+    """Import sweep-mutation-surface.py in-process (its name is not importable)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_sms", str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_default_watermark_path_is_project_rooted_not_core(tmp_path):
+    """Default watermark lands at agents/<agent>/session/, never core/agents/... ().
+
+    THE BUG: the default branch read `repo = Path(__file__).resolve().parent.parent`,
+    which is CORE_ROOT (this file lives in core/scripts), so the watermark was written
+    to <root>/core/agents/<agent>/session/sweep-surface-watermark — a path nothing
+    reads. _read_watermark then fell back to the window default on EVERY run, so the
+    same mutations re-surfaced forever while local stdout still looked correct.
+
+    This was the SECOND instance of the `.parent`-as-PROJECT_ROOT class in this one
+    file: the g-115-2681 fix corrected the board-post site and missed this one. It
+    survived because every test above passes --watermark-file explicitly, so the
+    default branch — the only branch production uses — was never executed.
+
+    The fix routes through _paths.agent_state_dir rather than re-deriving a root,
+    per CLAUDE.md "Agent-dir Resolution" (never join PROJECT_ROOT/<agent> by hand);
+    that also makes the path track an AGENTS_PARENT_DIR rename for free.
+    """
+    mod = _load_module()
+    assert mod._agent_state_dir is not None, (
+        "_paths.agent_state_dir failed to import — the default branch would fall "
+        "back to the manual derivation, which is exactly what regressed"
+    )
+
+    got = Path(mod._agent_state_dir("someagent")) / "sweep-surface-watermark"
+    parts = got.parts
+
+    assert "core" not in parts, f"watermark path is core-rooted again: {got}"
+    assert parts[-3:] == ("someagent", "session", "sweep-surface-watermark"), (
+        f"expected .../<agent>/session/sweep-surface-watermark, got {got}"
+    )
+    assert got.is_absolute(), f"watermark path must be absolute, got {got}"
+
+
+def test_manual_fallback_derivation_is_project_rooted():
+    """The no-_paths fallback counts TWO parents from core/scripts, not one.
+
+    Pins the arithmetic of the else-branch independently, since a test env without
+    _paths takes it and would otherwise reintroduce the same off-by-one silently.
+    """
+    mod = _load_module()
+    # SCRIPT_DIR is core/scripts; the fallback uses SCRIPT_DIR.parent.parent.
+    assert mod.SCRIPT_DIR.name == "scripts"
+    assert mod.SCRIPT_DIR.parent.name == "core"
+    fallback_root = mod.SCRIPT_DIR.parent.parent
+    assert fallback_root.name != "core", (
+        f"fallback root resolved to {fallback_root} — that is CORE_ROOT, not the "
+        "project root (g-335-253 regression)"
+    )
+    assert (fallback_root / "core" / "scripts").is_dir(), (
+        f"fallback root {fallback_root} does not look like a project root"
+    )
 
 
 if __name__ == "__main__":

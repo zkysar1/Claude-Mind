@@ -1,4 +1,4 @@
-"""Daemon-CLI mirror field-set parity (4).
+"""Daemon-CLI mirror field-set parity ().
 
 Daemon endpoints under ``mind_api/src/world/`` hand-maintain mirror constants
 and functions that reimplement ``core/scripts`` CLI logic. These mirrors drift

@@ -134,6 +134,48 @@ def _proposed_content(tool_name, tool_input, current):
     return None
 
 
+def _new_nodes_missing_body(tree_yaml_path, current, proposed):
+    """: for a _tree.yaml edit, return a list of (key, expected_md_path)
+    for node keys ADDED by this edit (present in proposed 'nodes', absent in
+    current) whose 'file:' .md body does NOT already exist on disk. Empty list =
+    nothing to block. Fail-open (return []) on any error.
+
+    The world root is derived from the edited _tree.yaml path itself
+    (<root>/knowledge/tree/_tree.yaml -> <root>), so a node file field
+    'world/knowledge/tree/foo/bar.md' resolves to <root>/knowledge/tree/foo/bar.md
+    with no _paths dependency. Non-'world/'-prefixed file fields (rare) and
+    file-less (interior-only) new nodes are skipped."""
+    import yaml
+    try:
+        np = _norm(tree_yaml_path)
+        suffix = "/knowledge/tree/_tree.yaml"
+        if not np.endswith(suffix):
+            return []
+        world_root = np[: -len(suffix)]
+        cur = (yaml.safe_load(current) if current else {}) or {}
+        prop = (yaml.safe_load(proposed) or {})
+        if not isinstance(cur, dict) or not isinstance(prop, dict):
+            return []
+        cur_nodes = cur.get("nodes", {}) or {}
+        prop_nodes = prop.get("nodes", {}) or {}
+        new_keys = set(prop_nodes) - set(cur_nodes)
+        missing = []
+        for k in sorted(new_keys):
+            node = prop_nodes.get(k) or {}
+            ff = node.get("file") if isinstance(node, dict) else None
+            if not ff:
+                continue  # no body-bearing file -> no requirement (interior-only)
+            p = str(ff).replace("\\", "/")
+            if not p.startswith("world/"):
+                continue  # non-world path -> fail open (skip)
+            md = Path(world_root) / p[len("world/"):]
+            if not md.exists():
+                missing.append((k, str(md)))
+        return missing
+    except Exception:
+        return []
+
+
 def main():
     data = stdin_json_or_approve()
     tool_name = data.get("tool_name", "") or ""
@@ -165,6 +207,31 @@ def main():
     # (or the file is new). An edit to an already-broken file may be the fix.
     if file_exists and current is not None and not _parses(file_path, current):
         approve_no_mutation()
+
+    # : body-presence gate. A direct _tree.yaml edit that ADDS a node
+    # key must have that node's .md body already on disk (write the body FIRST,
+    # then add the index entry). Closes the PRODUCER of Pattern-B index-body
+    # desync (rb-4597 / ) for the direct-edit path (path 3); the
+    # CLI/daemon add-child writers bypass this tool hook. Only meaningful when
+    # the proposed content parses (else the parse-break DENY below handles it);
+    # the helper fails open on any error.
+    if _norm(file_path).rsplit("/", 1)[-1] == "_tree.yaml" and _parses(file_path, proposed):
+        missing = _new_nodes_missing_body(file_path, current, proposed)
+        if missing:
+            listing = "\n".join(f"    - {k}  (expected body: {p})" for k, p in missing[:20])
+            more = f"\n    ... and {len(missing) - 20} more" if len(missing) > 20 else ""
+            emit_deny(
+                f"tree-yaml-validate-gate (Layer B, body-presence) blocked {tool_name} to:\n"
+                f"  {file_path}\n"
+                f"This edit ADDS {len(missing)} knowledge-tree node key(s) to _tree.yaml whose "
+                f".md body does NOT exist on disk:\n"
+                f"{listing}{more}\n"
+                f"Adding an index entry without its body creates a Pattern-B index-body desync "
+                f"(orphaned index entry, silent knowledge hole; rb-4597 / g-115-2886 / g-115-2891).\n"
+                f"Fix: WRITE each node .md body FIRST (with its YAML front matter), THEN add the "
+                f"_tree.yaml index entry — or use tree.py add-child which couples both writes. "
+                f"Re-run this edit once each new node's .md exists."
+            )
 
     if _parses(file_path, proposed):
         approve_no_mutation()

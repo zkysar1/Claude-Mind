@@ -951,7 +951,7 @@ def test_sync_one_multipart_singlemachine_pushes(tmp_path):
 
 
 def test_pull_one_multipart_local_at_baseline_pulls(tmp_path):
-    """1: local == baseline but the S3 ETag is multipart (uncomparable)
+    """: local == baseline but the S3 ETag is multipart (uncomparable)
     and S3 moved -> PULL. local==baseline proves nothing unpushed is masked, so the
     multipart object is S3-authoritative and safe to adopt -- the read-path twin of
     the 2026-07-02 _overwrite_decision freeze-avoidance fix (owncloud_backend.py
@@ -974,7 +974,7 @@ def test_pull_one_multipart_local_at_baseline_pulls(tmp_path):
 
 
 def test_pull_one_multipart_no_baseline_pulls(tmp_path):
-    """1 companion: no baseline + local present + S3 multipart ->
+    """ companion: no baseline + local present + S3 multipart ->
     S3-authoritative at bind -> PULL (matches _overwrite_decision L852-854). Before
     the reorder the unconditional multipart defer ran first and skipped it."""
     be = _MultipartBackend([(tmp_path, "agents")])
@@ -990,7 +990,7 @@ def test_pull_one_multipart_no_baseline_pulls(tmp_path):
 
 
 def test_pull_one_multipart_local_ahead_still_deferred(tmp_path):
-    """1 invariant: multipart is deferred ONLY when local != baseline.
+    """ invariant: multipart is deferred ONLY when local != baseline.
     Local diverged from baseline (unpushed writes) AND S3 is multipart
     (uncomparable) -> cannot classify AND must not clobber -> DEFER, local intact.
     The reorder preserves this rb-2096 protection (the sole surviving bind-time
@@ -1047,7 +1047,7 @@ def test_sweep_full_pushes_legit_local_edit_multimachine(tmp_path, monkeypatch):
 
 
 def test_sweep_owncloud_reconciles_nobaseline_by_pull_no_clobber(tmp_path, monkeypatch):
-    """H4c / 3 + : under own-cloud the periodic sweep must NEVER
+    """H4c /  + : under own-cloud the periodic sweep must NEVER
     PUSH a no-baseline local file that DIVERGES from a PRESENT S3 object (pushing a
     fresh-clone init-mind default would CLOBBER the learned S3 state). Pre-g-328-22
     the sweep DEFERRED indefinitely (nobaseline_skipped) — clobber-safe, but the
@@ -1119,7 +1119,7 @@ def test_sweep_owns_all_agents_when_unset(tmp_path, monkeypatch):
     assert stats["pruned_agents"] == 0
 
 
-# --- sweep per-agent flush scope (§6 /stop flush — 9) --------------
+# --- sweep per-agent flush scope (§6 /stop flush — ) --------------
 def test_sweep_only_agent_scopes_to_one_owned_dir(tmp_path, monkeypatch):
     """only_agent=<name> flushes exactly agents/<name>/ and prunes every sibling
     agent dir — the per-agent /stop flush scope (design §6). With own-all
@@ -1376,7 +1376,7 @@ def test_pull_temp_drained_subdir_pulled(tmp_path):
 
 
 def test_pull_temp_drained_twin_root_skipped(tmp_path):
-    """1: a root key temp/<name> whose drained twin temp/drained/<name>
+    """: a root key temp/<name> whose drained twin temp/drained/<name>
     also exists on S3 is a STALE pre-drain leftover (the sync layer has no
     move/delete propagation). pull_temp must SKIP the root twin — pulling it would
     RESURRECT the drained file at the root on every /start (the drain treadmill).
@@ -1754,7 +1754,7 @@ def test_pull_bootstrap_no_marker_reruns(tmp_path, monkeypatch):
     assert stats["pulled"] == 1
 
 
-# --- 8: pre-pull .history snapshot ---------------------------------
+# --- : pre-pull .history snapshot ---------------------------------
 # The no-baseline pull branches (_pull_one "S3-authoritative at bind" and
 # _sync_one's  reconcile) are the one shape where a pull can destroy
 # content nothing else holds. These pin: snapshot fires BEFORE the overwrite
@@ -1774,7 +1774,7 @@ def _capture_snapshots(monkeypatch):
 
 
 def test_pull_one_nobaseline_snapshots_pre_pull_bytes(tmp_path, monkeypatch):
-    """The 7 incident shape: authored local bytes, no baseline, S3
+    """The  incident shape: authored local bytes, no baseline, S3
     holds a stale object -> the pull proceeds (designed reconcile) but the
     authored bytes are snapshotted FIRST."""
     calls = _capture_snapshots(monkeypatch)
@@ -1882,7 +1882,7 @@ def test_snapshot_end_to_end_history_store(tmp_path, monkeypatch):
     assert landed, "snapshot must write at least one artifact into .history/"
 
 
-# --- 8: pull sweep (Gap A) + stale-pull (Gap B) + conflict streaks (Gap C)
+# --- : pull sweep (Gap A) + stale-pull (Gap B) + conflict streaks (Gap C)
 def _prime_baselines(be, monkeypatch, tmp_path):
     """Initial full sweep to establish manifest baselines for the local tree."""
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))

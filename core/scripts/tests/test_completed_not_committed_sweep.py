@@ -1,4 +1,4 @@
-"""Tests for completed-not-committed-sweep.py (0).
+"""Tests for completed-not-committed-sweep.py ().
 
 The sweep flags code-deliverable goals closed status=completed whose commit is
 absent from origin past a 30-min push-throttle window (rb-3135 completed!=
@@ -250,7 +250,7 @@ def test_existing_investigate_dedup():
     assert mod._existing_investigate("g-350-99", []) is False
 
 
-# ── 0: zero-SHA goal-id commit resolution (blind-spot fix) ─────────
+# ── : zero-SHA goal-id commit resolution (blind-spot fix) ─────────
 # Loop-commit messages embed the goal-id, not a SHA (rb-3999), so the COMMON
 # phantom record shape carries zero SHA tokens and the extracted-SHA path is
 # structurally blind to it (both 2026-07-18 phantoms had zero SHA tokens).
@@ -268,7 +268,7 @@ def _zero_sha_goal(**kw):
 
 
 def test_zero_sha_goalid_resolved_local_only_flags():
-    """POSITIVE CONTROL (0): a completed framework goal with NO SHA
+    """POSITIVE CONTROL (): a completed framework goal with NO SHA
     token, whose goal-id-resolved commit is local-only (status False), MUST be
     flagged. The exact class the g-115-2570 sweep shipped to catch but could not
     see."""
@@ -344,7 +344,7 @@ def test_resolve_shas_by_goal_id_finds_tagged_commit(tmp_path):
 
     shas = mod.resolve_shas_by_goal_id("g-115-2600", [repo])
     assert len(shas) == 1 and len(shas[0]) == 40      # one full-SHA match
-    # Collision-safe: the prefix  must NOT match "(0)".
+    # Collision-safe: the prefix  must NOT match "()".
     assert mod.resolve_shas_by_goal_id("g-115-260", [repo]) == []
     # A goal-id in no commit -> empty.
     assert mod.resolve_shas_by_goal_id("g-999-99", [repo]) == []
@@ -352,7 +352,7 @@ def test_resolve_shas_by_goal_id_finds_tagged_commit(tmp_path):
     assert mod.resolve_shas_by_goal_id("", [repo]) == []
 
 
-# ── _fetch_origin — cross-box stale-ref fix (false-positive #2, 0) ──
+# ── _fetch_origin — cross-box stale-ref fix (false-positive #2, ) ──
 # probe_sha_origin reads box-LOCAL origin/* refs via `git branch -r --contains`;
 # without a prior `git fetch`, a commit landed on the remote from ANOTHER box
 # (unfetched here) reads as local-only -> false-positive committed_not_pushed.
@@ -419,3 +419,128 @@ def test_fetch_origin_uses_extended_timeout():
     finally:
         mod._git = orig_git
     assert seen.get("fetch_timeout", 15) > 15
+
+
+# ── apply_superseded — benign convergent-parallel-fix orphan () ────
+
+def test_apply_superseded_all_absent_superseded_marks_benign():
+    """Every local-only SHA superseded-in-HEAD -> benign_superseded, suppressed
+    from filing (deliverable present under a different SHA)."""
+    mod = _import()
+    entry = {"goal_id": "g-115-3031", "reason": "committed_not_pushed",
+             "shas_absent_local_only": ["fcb8dd0", "aaa1111"]}
+    out = mod.apply_superseded(entry, {"fcb8dd0": True, "aaa1111": True})
+    assert out["benign_superseded"] is True
+    assert out["reason"] == "benign_superseded"
+
+
+def test_apply_superseded_one_not_superseded_keeps_flag():
+    """>=1 local-only SHA NOT superseded -> real lost deliverable, stays flagged
+    (conservative: one un-superseded SHA keeps the flag)."""
+    mod = _import()
+    entry = {"goal_id": "g-115-9999", "reason": "committed_not_pushed",
+             "shas_absent_local_only": ["fcb8dd0", "bbb2222"]}
+    out = mod.apply_superseded(entry, {"fcb8dd0": True, "bbb2222": False})
+    assert out["benign_superseded"] is False
+    assert out["reason"] == "committed_not_pushed"
+
+
+def test_apply_superseded_empty_status_keeps_flag():
+    """Backward compat — no superseded info (empty map) -> not benign, stays
+    flagged exactly as pre-g-115-3032."""
+    mod = _import()
+    entry = {"goal_id": "g-115-9998", "reason": "committed_not_pushed",
+             "shas_absent_local_only": ["fcb8dd0"]}
+    out = mod.apply_superseded(entry, {})
+    assert out["benign_superseded"] is False
+    assert out["reason"] == "committed_not_pushed"
+
+
+def test_apply_superseded_no_absent_shas_not_benign():
+    """No local-only SHAs -> bool(absent) False -> never benign (guards the
+    all([]) == True vacuous-truth trap)."""
+    mod = _import()
+    entry = {"goal_id": "g-115-9997", "reason": "committed_not_pushed",
+             "shas_absent_local_only": []}
+    out = mod.apply_superseded(entry, {"whatever": True})
+    assert out["benign_superseded"] is False
+
+
+def test_sha_superseded_identical_files_true():
+    """cat-file ok + changed files + `diff --quiet <sha> HEAD -- files` exit 0
+    (identical) -> superseded True."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        if args[:2] == ("cat-file", "-e"):
+            return (0, "")
+        if args[:2] == ("diff", "--name-only"):
+            return (0, "core/scripts/x.py\ncore/scripts/y.py")
+        if args[:2] == ("diff", "--quiet"):
+            return (0, "")  # identical in HEAD
+        return (1, "")
+
+    mod._git = fake_git
+    try:
+        assert mod.sha_superseded("fcb8dd0", ["/repo"]) is True
+    finally:
+        mod._git = orig
+
+
+def test_sha_superseded_differing_files_false():
+    """`diff --quiet` exit 1 (>=1 file differs/absent in HEAD) -> not superseded,
+    keep the flag (real lost deliverable candidate)."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        if args[:2] == ("cat-file", "-e"):
+            return (0, "")
+        if args[:2] == ("diff", "--name-only"):
+            return (0, "core/scripts/x.py")
+        if args[:2] == ("diff", "--quiet"):
+            return (1, "")  # differs from HEAD
+        return (1, "")
+
+    mod._git = fake_git
+    try:
+        assert mod.sha_superseded("fcb8dd0", ["/repo"]) is False
+    finally:
+        mod._git = orig
+
+
+def test_sha_superseded_not_in_any_repo_false():
+    """SHA in no candidate repo (cat-file fails everywhere) -> False (cannot
+    check -> keep the flag, conservative)."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        return (1, "")  # cat-file -e fails in every repo
+
+    mod._git = fake_git
+    try:
+        assert mod.sha_superseded("deadbee", ["/repo1", "/repo2"]) is False
+    finally:
+        mod._git = orig
+
+
+def test_sha_superseded_root_or_merge_parent_error_false():
+    """`diff --name-only <sha>^ <sha>` error (root commit / bad parent) -> False
+    (cannot determine changed files -> keep the flag)."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        if args[:2] == ("cat-file", "-e"):
+            return (0, "")
+        if args[:2] == ("diff", "--name-only"):
+            return (128, "")  # parent-resolve error (root commit)
+        return (1, "")
+
+    mod._git = fake_git
+    try:
+        assert mod.sha_superseded("r00tc0m", ["/repo"]) is False
+    finally:
+        mod._git = orig

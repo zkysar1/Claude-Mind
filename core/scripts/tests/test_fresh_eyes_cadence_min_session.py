@@ -1,4 +1,4 @@
-"""Unit tests for 4 min_session_goals gate in fresh-eyes-cadence-check.py.
+"""Unit tests for  min_session_goals gate in fresh-eyes-cadence-check.py.
 
 Three cases:
 1. no-gate (min_session_goals not set / 0): behaves as before — fire when diff >= cadence

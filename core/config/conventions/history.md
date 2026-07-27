@@ -51,6 +51,7 @@ Current entries:
 | Base | Pattern | Why |
 |------|---------|-----|
 | world | `presence/` | Per-agent liveness heartbeats. Rewritten >>1 Hz across all running agents. Zero historical interest — current state is the only state that matters. |
+| world | `board/` | Append-only message-board logs (coordination/findings/decisions/general/etc.). The file IS the history; full-file snapshots multiply storage by O(N²) with no restore value (changelog.jsonl keeps the audit trail). Added g-115-2789-b (2026-07-20) after pre-g-115-2410 daemon direct-writes accreted ~1.15G of frozen board snapshots. |
 | meta | `gate-firings.jsonl` | Append-only gate-decision audit log. The file IS the history; full-file snapshots multiply storage by O(N²). |
 
 To add an entry:
@@ -70,7 +71,7 @@ To add an entry:
 ## Per-File Snapshot Cap
 
 Even with the blacklist and gzip, files written hundreds of times per day
-(aspirations.jsonl, reasoning-bank.jsonl, the board) accumulate snapshots
+(aspirations.jsonl, reasoning-bank.jsonl) accumulate snapshots
 faster than the weekly date-tiered prune can keep up. The per-file cap
 bounds that growth continuously inside the write path.
 
@@ -85,18 +86,16 @@ Policy: `DEFAULT_SNAPSHOT_CAP = 500` for any file not in
 | world | `pipeline.jsonl`           | 100 |
 | world | `team-state.yaml`          | 100 |
 | world | `aspirations-meta.json`    |  50 |
-| world | `board/coordination.jsonl` | 100 |
-| world | `board/findings.jsonl`     | 100 |
-| world | `board/general.jsonl`      | 100 |
-| world | `board/decisions.jsonl`    | 100 |
 | meta  | `changelog.jsonl`          | 100 |
 | meta  | `improvement-velocity.yaml`|  50 |
 | meta  | `goal-selection-strategy.yaml`| 50 |
 | meta  | `spark-questions.jsonl`    | 100 |
 
-(Board channels + spark-questions added g-115-2410 after measuring 827 / 877
-snapshots in 4 days on cc-04. Note the caps bound the LEGACY per-file tree
-only — the Stage-2 CAS-delta store dedups content and is GC'd by
+(spark-questions cap added g-115-2410 after measuring 877 snapshots in 4 days
+on cc-04. Board channels were also capped then, but that cap was SUPERSEDED by
+the `board/` blacklist in g-115-2789-b (2026-07-20) — blacklisted files get
+zero snapshots, so no cap ever applies to them. Note the caps bound the LEGACY
+per-file tree only — the Stage-2 CAS-delta store dedups content and is GC'd by
 `_history_store.vacuum`, so it needs no count cap.)
 
 Enforcement: `save_history()` calls `_prune_to_cap()` immediately after

@@ -4,7 +4,7 @@
 # Budget cap on aspirations-precheck. Drops deferrable sweeps ONLY when
 # zone == tight (zone_drop_rules.tight=[deferrable]). Always-run sweeps
 # NEVER drop. The former wall-clock "budget-exceeded" drop path was REMOVED
-# (9 — `elapsed` measured inter-tool-call LLM latency, not script
+# ( — `elapsed` measured inter-tool-call LLM latency, not script
 # cost, and dropped every deferrable sweep every iteration, starving the
 # fresh-eyes/felt-sense/health-regression cadence rituals). elapsed-ms is
 # still tracked per sweep for drop-log telemetry only. Decisions logged to
@@ -19,18 +19,28 @@
 # core/config/aspirations.yaml `precheck:` doc-block):
 #
 #   always-run:  tree-debt-gate, experience-archival-gate, evolution-finalize-gate,
-#                fresh-eyes-code-gate, inbox-alert-age-check, handoff-aging-check
+#                fresh-eyes-code-gate, dependency-timeout-check,
+#                inbox-alert-age-check, handoff-aging-check
 #                (the last two are the notification-age safety gates — escalate
 #                aged unclaimed work to external parties, so they fire reliably;
-#                6. evolution-finalize-gate carries the guard-380
+#                . evolution-finalize-gate carries the guard-380
 #                user-notification promise on material Self/Program edits — a
 #                dropped sweep there means the user is never told their agent's
-#                identity changed, so it can never be droppable; 0)
+#                identity changed, so it can never be droppable; )
+#                (dependency-timeout-check:  added it to the SKILL.md
+#                tier table but NOT to this case arm, so it hit the WARN-default
+#                `medium` and was DROPPABLE in a tight zone despite being declared
+#                always-run; caught by test_budget_meter_sweep_tier_parity, the
+#                allowlist-rot guard this drift class exists for. Fixed
+#                independently on two boxes; this merge reconciles them and
+#                restores the "last two" referent above, which BOTH fixes had
+#                broken by appending into that pair.)
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck
 #   deferrable:  pending-questions-sweep, recurring-precondition-sweep,
 #                parent-supersession-sweep, unblock-parent-status-sweep,
 #                defer-drift-check, reason-less-blocked-check,
+#                blocked-signal-resolution-check,
 #                fresh-eyes-cadence, fresh-eyes-program-cadence,
 #                felt-sense-cadence, health-regression-cadence,
 #                curriculum-cadence, evolution-cadence
@@ -85,11 +95,11 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|inbox-alert-age-check|handoff-aging-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|felt-sense-cadence|l1-skew-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration
@@ -114,7 +124,7 @@ from pathlib import Path
 # (AGENT_DIR = PROJECT_ROOT/agents/<agent>). Pre-Phase-2.5.D this was a single
 # agent_dir.parent (AGENT_DIR=PROJECT_ROOT/<agent>); the relocation moved the
 # project root two levels up, silently 404'ing the config and pinning cap_ms to
-# the 9000ms fallback regardless of the configured 90000ms (9).
+# the 9000ms fallback regardless of the configured 90000ms ().
 proot = os.environ.get("PROOT", "")
 agent_dir = Path(os.environ.get("GID", ""))
 proj = Path(proot) if proot else agent_dir.parent.parent
@@ -276,7 +286,7 @@ if tier == 'always-run':
 elif tier in zone_drops:
     decision = 'drop'
     reason = f'zone-drop:{zone}'
-# NOTE (9): the former `elif elapsed > cap_ms and tier == 'deferrable'`
+# NOTE (): the former `elif elapsed > cap_ms and tier == 'deferrable'`
 # wall-clock budget-drop path was REMOVED. `elapsed` is wall-clock since
 # `meter start` (the FIRST precheck phase), dominated by inter-tool-call
 # LLM+daemon latency BETWEEN sweeps, NOT script execution cost. Measured

@@ -1,4 +1,4 @@
-"""test_skill_gaps_hardening.py — 3 regression pins.
+"""test_skill_gaps_hardening.py —  regression pins.
 
 Covers the meta-yaml.py list-value/dotpath hardening + the skill-gaps schema
 validator that together make the gaps-as-string + orphan-key corruption class

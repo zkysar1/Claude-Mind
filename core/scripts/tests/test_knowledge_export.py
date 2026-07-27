@@ -10,6 +10,7 @@ mistakes would re-leak what the pure core already knows to strip.
 
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 from pathlib import Path
@@ -38,8 +39,13 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
 
 
-def _build_world(root: Path) -> Path:
-    """Create a minimal but realistic world/ tree + three JSONL stores under root."""
+def _build_world(root: Path, *, write_bodies: bool = False) -> Path:
+    """Create a minimal but realistic world/ tree + three JSONL stores under root.
+
+    ``write_bodies=True`` also writes the two node ``.md`` files on disk so
+    ``read_tree_nodes`` can carry their body. Default off keeps the legacy tests
+    (which only exercise the ``_tree.yaml`` summary) byte-for-byte unchanged.
+    """
     world = root / "world"
     tree_dir = world / "knowledge" / "tree"
     tree_dir.mkdir(parents=True)
@@ -62,6 +68,29 @@ def _build_world(root: Path) -> Path:
         }
     }
     (tree_dir / "_tree.yaml").write_text(yaml.safe_dump(tree), encoding="utf-8")
+
+    if write_bodies:
+        # Write the actual node .md files so read_tree_nodes can carry the body.
+        # The reef body names alpha + an absolute path so redaction has something to strip;
+        # the system body carries a framework identifier that must NEVER be read/exposed.
+        reef_md = tree_dir / "marine-biology" / "coral-reefs.md"
+        reef_md.parent.mkdir(parents=True, exist_ok=True)
+        reef_md.write_text(
+            "---\n"
+            "topic: Coral reefs\n"
+            "last_updated: '2026-07-20'\n"
+            "---\n\n"
+            "Coral reefs studied by alpha at /home/ec2/world host a quarter of marine\n"
+            "species. Bleaching is a warming signal that alpha tracks.\n",
+            encoding="utf-8",
+        )
+        hook_md = tree_dir / "system" / "hook-internals.md"
+        hook_md.parent.mkdir(parents=True, exist_ok=True)
+        hook_md.write_text(
+            "---\ntopic: Hook internals\n---\n\n"
+            "Framework plumbing internals per guard-321 in _paths.py — never expose.\n",
+            encoding="utf-8",
+        )
 
     _write_jsonl(
         world / "reasoning-bank.jsonl",
@@ -129,6 +158,26 @@ def test_read_tree_nodes_missing_yaml_is_empty(tmp_path: Path) -> None:
     assert M.read_tree_nodes(tmp_path / "world") == []
 
 
+def test_read_tree_nodes_reads_body_for_domain_only(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, write_bodies=True)
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    reef = nodes["coral-reefs"]
+    # Domain node: full body read, front matter stripped, and distinct from the summary.
+    assert "host a quarter of marine" in reef["body"]
+    assert reef["body"] != reef["summary"]
+    assert "topic:" not in reef["body"]        # YAML front matter stripped
+    assert "last_updated" not in reef["body"]
+    # System node: body NOT read (projection suppresses it downstream; defense in depth).
+    assert nodes["9-hook-internals"]["body"] == ""
+
+
+def test_read_tree_nodes_body_empty_when_md_absent(tmp_path: Path) -> None:
+    # No .md files on disk (write_bodies=False) → body defaults to "" (export never fails).
+    world = _build_world(tmp_path)
+    nodes = {n["key"]: n for n in M.read_tree_nodes(world)}
+    assert nodes["coral-reefs"]["body"] == ""
+
+
 def test_agent_names_lists_agent_dirs(tmp_path: Path) -> None:
     _build_world(tmp_path)
     assert M._agent_names(tmp_path) == ["alpha"]
@@ -177,6 +226,28 @@ def test_build_bundle_never_leaks_framework_subtree(tmp_path: Path) -> None:
     assert not any("fail closed" in r for r in rules)
     assert not any("critical()" in r for r in rules)
     assert all(h["status"] != "active" for h in bundle.hypotheses)
+
+
+def test_build_bundle_redacts_node_body(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    body = bundle.tree[0]["body"]
+    # The reef body named alpha + an absolute path — both redacted, content survives.
+    assert body  # non-empty
+    assert "alpha" not in body.lower()
+    assert "/home/ec2" not in body
+    assert "the agent" in body
+    assert "marine" in body
+
+
+def test_build_bundle_never_exposes_framework_node_body(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    # Only the domain node survives; its framework sibling's body never appears.
+    assert len(bundle.tree) == 1
+    blob = " ".join(str(t.get("body")) for t in bundle.tree)
+    assert "Framework plumbing" not in blob
+    assert "_paths.py" not in blob
 
 
 def test_build_bundle_redacts_env_secret_values(tmp_path: Path) -> None:
@@ -241,6 +312,19 @@ def test_okf_bundle_carries_redaction_into_markdown(tmp_path: Path) -> None:
     assert "the agent" in body
 
 
+def test_okf_bundle_prefers_full_body_over_summary(tmp_path: Path) -> None:
+    world = _build_world(tmp_path, write_bodies=True)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    out = tmp_path / "okf"
+    M.write_okf_bundle(bundle, out)
+    body = next((out / "nodes").glob("*.md")).read_text(encoding="utf-8")
+    # The OKF wiki article carries the full body (not just the one-line summary),
+    # with redaction preserved.
+    assert "host a quarter of marine" in body
+    assert "the agent" in body
+    assert "/home/ec2" not in body
+
+
 def test_okf_index_links_resolve_to_written_files(tmp_path: Path) -> None:
     world = _build_world(tmp_path)
     bundle = M.build_bundle(world, tmp_path, env={})
@@ -262,6 +346,72 @@ def test_okf_empty_bundle_writes_index_and_empty_dirs(tmp_path: Path) -> None:
     assert counts == {"tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0}
     assert (out / "index.md").is_file()
     assert list((out / "nodes").glob("*.md")) == []
+
+
+def test_generated_at_is_utc_not_box_local(monkeypatch) -> None:
+    """The stamp must be UTC by construction, not by the box's ambient TZ ().
+
+    The production caller is a systemd unit on the sidecar box, which does NOT inherit
+    the `TZ=UTC` env pinned on agent boxes. A bare `datetime.now()` would stamp
+    box-local time and silently offset every age comparison, so this pins the one
+    property that cannot be checked by eye. Asserting against a fixed non-UTC TZ makes
+    the regression fail loudly instead of drifting by an hour.
+    """
+    import time
+
+    stamp = M._generated_at()
+    assert len(stamp) == 19 and stamp[10] == "T", stamp  # naive ISO, no zone suffix
+    # Same instant, computed independently in UTC. Allow a small window for clock read
+    # skew; a TZ-offset bug is >= 1h, far outside it.
+    expected = datetime.datetime.now(datetime.timezone.utc)
+    got = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+    assert abs((expected.replace(tzinfo=None) - got).total_seconds()) < 120, (stamp, expected)
+    # And under a deliberately non-UTC TZ the stamp must NOT move.
+    monkeypatch.setenv("TZ", "America/New_York")
+    if hasattr(time, "tzset"):
+        time.tzset()
+        try:
+            shifted = M._generated_at()
+            got2 = datetime.datetime.strptime(shifted, "%Y-%m-%dT%H:%M:%S")
+            assert abs((expected.replace(tzinfo=None) - got2).total_seconds()) < 120, shifted
+        finally:
+            monkeypatch.delenv("TZ", raising=False)
+            time.tzset()
+
+
+def test_json_payload_carries_generated_at(tmp_path: Path, monkeypatch, capsys) -> None:
+    """The served JSON bundle carries its own age ().
+
+    Without it the daemon's /knowledge/* routes return whatever the last export wrote,
+    however old, and a stopped timer is indistinguishable from a current bundle.
+    """
+    world = _build_world(tmp_path)
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "generated_at" in payload, sorted(payload)
+    # First key — a consumer reading the head of the file sees the age immediately.
+    assert next(iter(payload)) == "generated_at"
+    datetime.datetime.strptime(payload["generated_at"], "%Y-%m-%dT%H:%M:%S")
+    # Additive: every pre-existing key keeps its name.
+    assert {"counts", "tree", "hypotheses", "guardrails", "lessons"} <= set(payload)
+
+
+def test_okf_index_carries_generated_at(tmp_path: Path) -> None:
+    """The downloadable wiki outlives the box it came from, so its index states its age."""
+    world = _build_world(tmp_path)
+    bundle = M.build_bundle(world, tmp_path, env={})
+    out = tmp_path / "okf"
+    M.write_okf_bundle(bundle, out)
+    index = (out / "index.md").read_text(encoding="utf-8")
+    fm = _fm(index)
+    assert fm["type"] == "index"  # the required discriminator is unchanged
+    stamp = str(fm["generated_at"])
+    datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+    # Also human-visible in the body, not only in machine frontmatter.
+    assert f"- Generated: {stamp} UTC" in index
 
 
 if __name__ == "__main__":  # pragma: no cover

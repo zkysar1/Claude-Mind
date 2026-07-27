@@ -89,6 +89,11 @@ VALID_ENTRY_TYPES = {
     "decision", "failure", "finding", "approach_change",
     "observation", "state_update",
     "phase_start", "phase_end",
+    # Scorer Sovereignty Layer B (): a sanctioned deviation from the
+    # scorer's top pick, logged by scorer_verdict_gate.py. Distinct type so the
+    # Layer C audit can filter overrides via `read --entry-type scorer_override`
+    # rather than grepping content (esp. the audited force-override safety valve).
+    "scorer_override",
 }
 
 
@@ -165,7 +170,7 @@ def cmd_append(args):
     # verify-learning lint at .claude/skills/verify-learning/SKILL.md Section 308.
     etype = entry.get("entry_type", "")
     if etype not in VALID_ENTRY_TYPES:
-        # Missing entry_type fails too (1-adjacent, 2026-07-17): an
+        # Missing entry_type fails too (-adjacent, 2026-07-17): an
         # entry keyed "type" instead of "entry_type" previously passed this
         # gate and crashed live-phase-emit.sh on every heartbeat tick until
         # the tail advanced.

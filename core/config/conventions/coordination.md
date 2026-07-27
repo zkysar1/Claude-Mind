@@ -369,8 +369,11 @@ text is a human-readable summary. Tags carry structured metadata:
 - Directives are **non-blocking** — the agent acknowledges and factors in, never waits
 - `veto` directives carry a strong negative weight (-5.0) — effectively deprioritizes a goal
 - Multiple active directives stack (additive scoring)
-- Directives are advisory, not commands — the agent's own judgment still applies via
-  metacognitive assessment (Phase 2.5)
+- Directive influence is metered by `directive_boost` (+3.0); the agent MUST NOT override a
+  directive-boosted pick citing metacognitive assessment (Phase 2.5) alone — the guard-1310
+  DIRECTIVE-HONOR hard rule governs. A directive-targeted pick is deferred only via a
+  justified-deferral ack naming a hard blocker (infra-blocked / genuine capability gap),
+  never a silent lane/focus skip
 
 ## Cross-Lane Evidence-Clear Coordination (FW-8)
 
@@ -833,7 +836,7 @@ one to derive the other.
 
 | When | Caller | Action |
 |------|--------|--------|
-| Phase 4 claim, before board post | `aspirations-execute` | `team-state-in-flight.sh --agent <self> --goal-id ... --title ... --phase 4` |
+| Phase 4 claim, before board post | `aspirations-claim.sh` — **AUTOMATIC** (`_post_claim_effects`, g-115-3199) | `team-state-in-flight.sh --agent <self> --goal-id ... --title ... --phase 4`. Fires on every rc=0 claim, fail-open, deliberately ungated on `claimed_by`. This row named `aspirations-execute` (LLM pseudocode) until 2026-07-26. Verified that day: the setter had ZERO callers in the codebase, so every write depended on an LLM remembering the step, and execution was UNEVEN rather than uniformly absent — zeta stamped correctly while foxtrot never did (its `current_focus` sat frozen 2h+ on an already-yielded goal across six claims). Uneven is worse than absent for the three readers: a null `in_flight` is indistinguishable from "partner genuinely idle", so the select partner-claim filter, the `goal-pickup-coordination-check` uncommitted-collision probe, and `_cross_agent_attribution_filter`'s Source 1 silently mis-answer instead of failing loud. Covers `source==world` ONLY — agent-queue goals never invoke `aspirations-claim.sh`, so the loop digest's Phase-4 LLM-side `team-state-in-flight.sh` call remains their only stamp path and must NOT be deleted. On the world path that LLM call is now redundant-but-idempotent (same values re-written), not harmful. |
 | Phase 4 → 5 transition (optional) | `aspirations-execute` / `aspirations-verify` | re-run in-flight with `--phase 5` to surface progress |
 | Goal completion | `iteration-close.sh` | `team-state-clear-in-flight.sh --agent <self>` |
 | Goal release (failure / re-select) | `aspirations-execute` release path | `team-state-clear-in-flight.sh --agent <self>` |
@@ -899,7 +902,7 @@ prevent dispatch that would have fired without it.
 - **Prime** (Phase 2): Read team-state and surface partner.in_flight in the PRIMED summary
 - **Precheck** (iteration top): Read team-state and surface partner.in_flight in the iteration header
 - **Select** (candidate filter): Drop goals from the candidate set whose goal_id matches partner.in_flight.goal_id
-- **Execute Phase 4** (claim-conflict gate): Read team-state immediately before posting board claim; if partner.in_flight.goal_id == selected → abort + log + re-select. Otherwise, call `team-state-in-flight.sh` then post board claim.
+- **Execute Phase 4** (claim-conflict gate): Read team-state immediately before posting board claim; if partner.in_flight.goal_id == selected → abort + log + re-select. Otherwise proceed — `aspirations-claim.sh` stamps `in_flight` AND posts the board claim automatically (g-115-3199 / g-115-2123); no LLM-side call for either.
 - **State Update** (Step 3.5): After meta update, append to recent_completions and update agent_status
 - **iteration-close.sh**: After completion, call `team-state-clear-in-flight.sh` to release the live snapshot
 - **All-Blocked** (B0): Before concluding partner is silent, read `agent_status.<partner>.last_active` and apply the 6h pre-silence threshold per `.claude/rules/check-team-state-before-silent.md`

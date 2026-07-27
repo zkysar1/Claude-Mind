@@ -97,7 +97,7 @@ TRACKED_FILES = [
     str(AGENT_DIR / "session" / "aspirations-compact.json")
 ] if AGENT_DIR else []
 
-# Advisory-ONLY extension prefixes (0). The read-before-edit ADVISORY
+# Advisory-ONLY extension prefixes (). The read-before-edit ADVISORY
 # (pre-edit-context-gate.sh -> check-file) plus the RECORDER should cover
 # framework-CODE edits, which concentrate in core/scripts/ — the surface where
 # the loop self-evolves the framework and where stale-context edits after an
@@ -112,7 +112,7 @@ TRACKED_FILES = [
 # own edits — a consecutive follow-up edit does NOT mis-fire a false advisory.
 # (.claude/rules/** is a deliberate future candidate — also framework-text and
 # currently silent per read-before-edit.md Rule 4 — added here only if the same
-# stale-context miss pattern is observed there; scoped out of 0.)
+# stale-context miss pattern is observed there; scoped out of .)
 ADVISORY_EXTRA_PREFIXES = [
     str(PROJECT_ROOT / "core" / "scripts"),
 ]
@@ -244,7 +244,7 @@ def cmd_gate(args):
     # NARROW is_in_scope is load-bearing here — do NOT switch this to
     # is_in_scope_advisory. The block gate must never refuse a core/scripts
     # whole-file re-read (verify-before-assuming.md re-verify mandate); that
-    # prefix is advisory-only (0).
+    # prefix is advisory-only ().
     if not is_in_scope(normalized):
         sys.exit(0)  # Not tracked, always allow
 
@@ -272,7 +272,7 @@ def cmd_record(args):
     tracked = read_tracker(session_id=args.session_id)
 
     if not is_in_scope_advisory(normalized):
-        return  # Not tracked (recorder uses the WIDER advisory scope — 0)
+        return  # Not tracked (recorder uses the WIDER advisory scope — )
 
     if normalized in tracked:
         return  # Already recorded
@@ -372,7 +372,7 @@ def cmd_check_file(args):
 
     for fp in args.file_paths:
         normalized = normalize_path(fp)
-        # WIDER advisory scope (0): the read-before-edit advisory covers
+        # WIDER advisory scope (): the read-before-edit advisory covers
         # core/scripts framework-code edits, which the narrow is_in_scope omits.
         if is_in_scope_advisory(normalized) and normalized not in tracked:
             print(normalized)

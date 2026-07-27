@@ -151,7 +151,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                 # last_updated + article_count: consumed by strategic-scan S2
                 # (knowledge-frontier staleness/thin detection). MIRROR of
                 # core/scripts/tree.py --summary projection — keep in sync.
-                # 8.
+                # .
                 "last_updated": node.get("last_updated"),
                 "article_count": node.get("article_count", 0),
                 "children": node.get("children", []),

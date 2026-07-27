@@ -16,8 +16,8 @@ Defaults: `status` ("candidate")
 Optional: `proposed_by`, `proposed_date`
 
 Two record types coexist in one file:
-- Questions: `sq-NNN` (zero-padded 3-digit, regex: `^sq-\d{3}$`)
-- Candidates: `sq-cNN` (regex: `^sq-c\d{2}$`)
+- Questions: `sq-NNN` (regex: `^sq-\d+$`, open-ended per guard-1161; zero-padded to 3+ digits)
+- Candidates: `sq-cNN` (regex: `^sq-c\d+$`, open-ended per guard-1161)
 Valid statuses: `active`, `retired`, `candidate`
 
 ## Script-Based Access (Exclusive Data Layer)

@@ -176,5 +176,80 @@ class TestFullCalibrationProgress(unittest.TestCase):
         self.assertEqual((days, records), (1, 1))
 
 
+class TestCalibrationState(unittest.TestCase):
+    """hl.calibration_state is THE definition of `calibrated` (spec §10) — both
+    health-regression-check.py (detection) and health-revert.py (revert) route
+    through it. Before g-115-3125 each computed it independently and the revert
+    half used the bounded-window form, reading False on every productive agent
+    while detection read True."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write(self, name, recs):
+        (self.tmp / name).write_text(
+            "".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+
+    def _busy_agent_ledger(self, days=43, per_day=30):
+        """A PRODUCTIVE agent: many records per calendar day. This is the exact
+        shape that broke the windowed form — the newest 200 records span only
+        ~7 calendar days, so a 200-record window sees days=7 and fails the
+        30-day gate, while the full history spans 43 days and passes."""
+        for i in range(days):
+            day = f"2026-05-{i + 1:02d}" if i < 31 else f"2026-06-{i - 30:02d}"
+            self._write(f"{day}.jsonl",
+                        [{"ts": f"{day}T{h:02d}:00:00", "composite": 0.9}
+                         for h in range(per_day)])
+
+    def test_marker_short_circuits_without_scanning(self):
+        # No ledger at all — the marker alone must satisfy the gate, and the
+        # absent progress tuple is what signals "short-circuited".
+        (self.tmp / ".calibrated").write_text("2026-06-01T10:00:00 days=30 records=50\n",
+                                              encoding="utf-8")
+        self.assertEqual(hl.calibration_state(self.tmp, 30, 50), (True, None))
+
+    def test_busy_agent_calibrated_on_full_history(self):
+        # THE regression: windowed says no, full history says yes. Assert both
+        # halves of that claim so the test fails loudly if either flips.
+        self._busy_agent_ledger()
+        windowed_days, windowed_recs = hl.calibration_progress(
+            hl.recent_records(self.tmp, 200))
+        self.assertLess(windowed_days, 30,
+                        "fixture no longer reproduces the windowed under-count")
+        self.assertGreaterEqual(windowed_recs, 50)
+        calibrated, progress = hl.calibration_state(self.tmp, 30, 50)
+        self.assertTrue(calibrated,
+                        "a productive agent with 43 days of history must be calibrated")
+        self.assertEqual(progress, (43, 43 * 30))
+
+    def test_short_history_not_calibrated_and_reports_progress(self):
+        self._write("2026-06-01.jsonl",
+                    [{"ts": "2026-06-01T10:00:00"} for _ in range(60)])
+        calibrated, progress = hl.calibration_state(self.tmp, 30, 50)
+        self.assertFalse(calibrated)          # 60 records but only 1 day
+        self.assertEqual(progress, (1, 60))   # progress returned for display
+
+    def test_records_gate_is_anded_not_ored(self):
+        # 31 distinct days but only 31 records — days pass, records fail.
+        for i in range(31):
+            self._write(f"2026-05-{i + 1:02d}.jsonl",
+                        [{"ts": f"2026-05-{i + 1:02d}T10:00:00"}])
+        calibrated, progress = hl.calibration_state(self.tmp, 30, 50)
+        self.assertFalse(calibrated)
+        self.assertEqual(progress, (31, 31))
+
+    def test_read_only_never_writes_marker(self):
+        # The marker WRITE belongs to the detection half, which owns the
+        # fires-exactly-once edge. If this helper wrote it too, that edge
+        # would fire twice.
+        self._busy_agent_ledger()
+        self.assertTrue(hl.calibration_state(self.tmp, 30, 50)[0])
+        self.assertFalse((self.tmp / ".calibrated").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

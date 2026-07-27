@@ -24,6 +24,10 @@ Seven cases (1-6 per g-257-05; case 7 added by g-115-334 / rb-655):
   7. Cross-source (rb-655): hit on a queue with NO asp-001 → exit 1 + Unblock
      routes to original goal's parent aspiration via strategy=original-parent-asp
      (regression test for hardcoded asp-001 silent-failure bug)
+  8. Wrong-context flag (g-115-2814): hit + --override-agent-match → exit 1 +
+     BLOCKED message redirects to --force-defer + defer NOT applied (the
+     CREATE_BLOCKER bypass is recognized-but-not-honored on the defer path;
+     --force-defer stays the single canonical defer flag)
 
 Pattern: ephemeral tmpdir per case, seeded with forged-skills.yaml and
 capability-routing.md from the live world (so the gate's keyword
@@ -208,7 +212,7 @@ def main() -> int:
     # npc/behavior are identifier-parts of NPC-capability skill names, so the
     # match survives the  sole-token precision rule (the previous
     # fixture "deploy needs human" matched only via the generic-prose token
-    # 'human', which that rule now correctly suppresses — 3 triage).
+    # 'human', which that rule now correctly suppresses —  triage).
     # "deploy" is the first action verb so the Unblock title contains
     # "deploy". Expect exit 1, new Unblock in asp-001, AND the original
     # goal's defer_reason still null (write was refused).
@@ -553,6 +557,56 @@ def main() -> int:
         print(f"  [{'PASS' if ok7 else 'FAIL'}] cross-source: rc={rc} "
               f"parent_unblock_count={len(parent_unblocks)} "
               f"strategy_logged={'original-parent-asp' in stderr}")
+
+    # ---- Case 8: --override-agent-match redirect () ----------------
+    # A user reaching for --override-agent-match (capability-gate's
+    # CREATE_BLOCKER-context bypass) on a BLOCKING defer must NOT get the bypass:
+    # --force-defer is the single canonical defer flag (deliberate one-flag-per-
+    # context design). The flag is RECOGNIZED here (no argparse "unrecognized
+    # arguments" crash — the subprocess reaches the gate) ONLY so the BLOCKED
+    # message can redirect to --force-defer. Expect: rc=1 (still blocks),
+    # stderr carries the "you passed --override-agent-match" redirect naming
+    # --force-defer, AND the original defer_reason stays null (bypass refused).
+    cases_run += 1
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_world = Path(tmp)
+        _build_fixture(tmp_world)
+        rc, _stdout, stderr = _run_update_goal(
+            tmp_world, "g-test-01", "defer_reason",
+            "deploy blocked until npc behavior analysis completes",
+            "--override-agent-match", "wrong-context justification",
+        )
+        items = _read_world_aspirations(tmp_world)
+        orig = _find_goal(items, "g-test-01")
+
+        if rc != 1:
+            failures.append(
+                f"case8 override-agent-match-redirect: expected rc=1 (bypass NOT "
+                f"honored — --force-defer is the sole defer flag), got rc={rc} "
+                f"(stderr head: {stderr[:250]!r})"
+            )
+        if "you passed --override-agent-match" not in stderr:
+            failures.append(
+                f"case8: BLOCKED message should carry the --override-agent-match -> "
+                f"--force-defer redirect, got stderr: {stderr[:400]!r}"
+            )
+        if "--force-defer" not in stderr:
+            failures.append(
+                f"case8: redirect should name --force-defer, got stderr: "
+                f"{stderr[:400]!r}"
+            )
+        if orig is None or orig.get("defer_reason"):
+            failures.append(
+                f"case8: defer_reason should remain None (bypass refused), got "
+                f"{orig.get('defer_reason') if orig else None!r}"
+            )
+        ok8 = (rc == 1
+               and "you passed --override-agent-match" in stderr
+               and "--force-defer" in stderr
+               and orig is not None and not orig.get("defer_reason"))
+        print(f"  [{'PASS' if ok8 else 'FAIL'}] override-agent-match-redirect: "
+              f"rc={rc} redirect_present="
+              f"{'you passed --override-agent-match' in stderr}")
 
     if failures:
         print(f"\n{len(failures)} failure(s):")

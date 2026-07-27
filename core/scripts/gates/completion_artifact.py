@@ -88,7 +88,7 @@ ARTIFACT_PATH_RE = re.compile(
     # longest-match: a bare `(...|json|jsonl)` matched `.json` inside `.jsonl`
     # and truncated the path, so a real `meta/foo.jsonl` artifact resolved to
     # a non-existent `meta/foo.json` and produced a false-positive
-    # missing-artifact block (5 / rb-1838 — the gate's own near_misses
+    # missing-artifact block ( / rb-1838 — the gate's own near_misses
     # then mapped `.json` back to the existing `.jsonl`, surfacing the
     # contradiction). The trailing `(?![A-Za-z0-9])` makes the full-extension
     # match order-independent so a future extension addition cannot re-introduce

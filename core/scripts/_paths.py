@@ -291,6 +291,36 @@ else:
     AGENT_DIR = None
 
 
+def read_agent_conf(name: str = None) -> dict:
+    """Parsed `local-paths.conf` for an agent (default: the bound agent).
+
+    Public accessor over `_parse_conf` for callers that need NON-PATH config
+    out of the conf -- e.g. the per-box `RUNNER_CAPABILITIES_*` declarations
+    read by `_runner_capabilities.box_config_from_conf`. Exists so those
+    callers do not re-implement the KEY=VALUE + quote-stripping parse; this
+    module stays the single source of truth for conf syntax.
+
+    `local-paths.conf` is the ONLY genuinely per-box config surface: it is
+    gitignored AND listed in `owncloud_sync._EXCLUDE_NAMES`, so it never
+    reaches git or S3. `core/config/aspirations.yaml` (git-shared) and
+    `meta/config-overrides.yaml` (S3-shared) both apply fleet-wide and so
+    cannot express "THIS box has a live Studio session".
+
+    Fail-open to {}: an unbound agent, a missing file, or an unreadable conf
+    means "no per-box overrides", never an exception into a caller.
+    """
+    try:
+        agent = name or AGENT_NAME
+        if not agent:
+            return {}
+        conf = agent_dir(agent) / "local-paths.conf"
+        if not conf.is_file():
+            return {}
+        return _parse_conf(conf)
+    except Exception:
+        return {}
+
+
 # --- World contract vars ---
 # ENVIRONMENT_ID and COMMONS_POLICY live in .env.local (not local-paths.conf).
 # Priority for each: env var override > .env.local > default.
@@ -307,7 +337,14 @@ def _read_env_local() -> dict:
     if not env_local.exists():
         return {}
     result = {}
-    _active = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+    # Name class is the real shell/dotenv rule — lowercase and a leading
+    # underscore are both legal. An uppercase-only class does not REJECT such a
+    # key, it SILENTLY SKIPS the line (). Third of three copies of
+    # this parser: the others are core/scripts/env.py (COMMENTED_KEY_RE /
+    # ACTIVE_KEY_RE) and core/scripts/storage_backend.py — keep all three in
+    # sync. Inlined rather than shared because this module is the
+    # import-cycle-proof base others import.
+    _active = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
     for raw in env_local.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):

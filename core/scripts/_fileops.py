@@ -34,7 +34,7 @@ from storage_backend import get_backend, LocalBackend
 
 
 # ---------------------------------------------------------------------------
-# Structural-prevention exceptions (3 — null-byte corruption defense)
+# Structural-prevention exceptions ( — null-byte corruption defense)
 # ---------------------------------------------------------------------------
 # Both raised when JSONL parse-validation detects a non-empty file with zero
 # parseable records — the canonical OneDrive Files-On-Demand rehydration
@@ -211,6 +211,7 @@ def _cruft_tripwire(base_dir, caller, operation):
 _SNAPSHOT_BLACKLIST = {
     "world": (
         "presence/",            # per-agent liveness heartbeats (rewritten >>1Hz, zero historical interest)
+        "board/",               # append-only coordination/findings/decisions/etc. logs — the file IS the history; full-file snapshots multiply storage O(N^2) with no restore value (changelog.jsonl keeps the audit trail). -b: pre- daemon direct-writes had accreted ~1.15G frozen board snapshots; blacklisting bounds board .history to zero in BOTH stores.
     ),
     "meta": (
         "gate-firings.jsonl",   # append-only gate-decision audit log (file IS the history)
@@ -240,7 +241,7 @@ def _classify_base(base_dir):
                 return "meta"
         except (ValueError, OSError):
             pass
-    # Cross-agent (b34a169b port / 9): classify ANY agent dir under
+    # Cross-agent (b34a169b port / ): classify ANY agent dir under
     # agents_root() as "agent", not only the bound AGENT_DIR — mirrors
     # resolve_base_dir so the snapshot blacklist routes to the right store for
     # every agent's files. A base is an agent dir iff it is a direct child of
@@ -306,19 +307,17 @@ _PER_FILE_SNAPSHOT_CAP = {
         "pipeline.jsonl":           100,
         "team-state.yaml":          100,  # cross-agent liveness signal — high churn
         "aspirations-meta.json":    50,
-        # Board channels — proven high-churn (827 coordination snapshots in
-        # 4 days on cc-04, 0). Exact rel-path match, one entry per
-        # fixed channel file.
-        "board/coordination.jsonl": 100,
-        "board/findings.jsonl":     100,
-        "board/general.jsonl":      100,
-        "board/decisions.jsonl":    100,
+        # Board channels are on _SNAPSHOT_BLACKLIST ("board/") — append-only
+        # audit logs get no snapshot in EITHER store, so no cap entry applies
+        # (blacklist short-circuits before the cap logic — save_history's
+        # _is_snapshot_blacklisted early-return).
+        # Do NOT re-add board/* caps here. (-b removed them 2026-07-20.)
     },
     "meta": {
         "changelog.jsonl":          100,
         "improvement-velocity.yaml": 50,
         "goal-selection-strategy.yaml": 50,
-        "spark-questions.jsonl":    100,  # 877 snapshots in 4 days on cc-04 (0)
+        "spark-questions.jsonl":    100,  # 877 snapshots in 4 days on cc-04 ()
     },
 }
 
@@ -479,7 +478,7 @@ def save_history(path, base_dir, agent_name, summary=""):
     if _is_snapshot_blacklisted(base_dir, rel):
         return
 
-    # 3 outcome 1: pre-snapshot parse-validate JSONL sources.
+    #  outcome 1: pre-snapshot parse-validate JSONL sources.
     # Refuses to snapshot a non-empty source with zero parseable records
     # (canonical OneDrive Files-On-Demand rehydration shape, 2026-05-20
     # incident). Snapshotting corrupt state would destroy the last-good
@@ -631,7 +630,7 @@ def append_changelog(base_dir, agent_name, file_path, action, summary="", lines_
 
     changelog = base_dir / "changelog.jsonl"
 
-    # 1: never log a changelog edit INTO the changelog itself. When
+    # : never log a changelog edit INTO the changelog itself. When
     # file_path IS base_dir/changelog.jsonl this call is (a) self-referential
     # noise a cap/rotate would immediately drop again, and (b) a hard self-
     # deadlock when reached from any locked_* function: every
@@ -733,7 +732,7 @@ def resolve_base_dir(path):
                 return META_DIR.resolve()
         except (ValueError, OSError):
             pass
-    # Cross-agent dir resolution (b34a169b port / 9, Defect A fix):
+    # Cross-agent dir resolution (b34a169b port / , Defect A fix):
     # resolve ANY agent dir under agents_root(), not only the MIND_AGENT-bound
     # AGENT_DIR. The own-cloud sweep syncs ALL agent dirs; before this a
     # NON-bound agent path returned None here, so owncloud_sync._snapshot_before_pull's
@@ -906,7 +905,7 @@ def _atomic_write_with_fallback(target_path, write_to_handle, *,
             error_class=result.error_class,
         )
 
-    # 3 outcome 2: post-write parse canary (JSONL only). Restores from
+    #  outcome 2: post-write parse canary (JSONL only). Restores from
     # .history and raises PostWriteValidationError if the just-written file is
     # non-empty but zero-parseable. Runs on BOTH the atomic and fallback paths —
     # the fallback (in-place truncate-rewrite, no crash atomicity) is riskier,
@@ -1313,7 +1312,7 @@ def _parse_jsonl_skip_corrupt(path):
 
 
 # ---------------------------------------------------------------------------
-# Structural-prevention parse canary (3)
+# Structural-prevention parse canary ()
 # ---------------------------------------------------------------------------
 # Shared by save_history (pre-snapshot) and _atomic_write_with_fallback
 # (post-write). Only fires on .jsonl paths — YAML/JSON/Markdown go through
@@ -1474,7 +1473,7 @@ def _rmw_with_conflict_retry(path, cycle_fn):
 
 
 # ---------------------------------------------------------------------------
-# Local-WM stale-lock-steal CAS retry (9 mechanism B — 4)
+# Local-WM stale-lock-steal CAS retry ( mechanism B — )
 # ---------------------------------------------------------------------------
 # The three loop_state writers — loop-state-bump-counters.py,
 # recurring-loop-state-mutate.py, and the daemon wm_write.set_slot — each hold
@@ -1483,11 +1482,11 @@ def _rmw_with_conflict_retry(path, cycle_fn):
 # STALE-BREAKS a lock whose file mtime exceeds stale_seconds: a holder that
 # stalls >10s mid-RMW (OneDrive/daemon write latency, guard-597) has its lock
 # stolen, two critical sections overlap, and the later write clobbers the
-# earlier counter increment (observed bravo session 85; analysis 9 and
+# earlier counter increment (observed bravo session 85; analysis  and
 # the loop-state-integrity tree node "Lock-Atomicity & The Stale-Steal Residual
 # Race").
 #
-# This is the ROBUST tier of 9's fix hierarchy: optimistic concurrency
+# This is the ROBUST tier of 's fix hierarchy: optimistic concurrency
 # keyed on slot_meta[slot].update_count (already maintained by every writer's
 # _update_modified, guard-540/guard-449). A writer captures update_count BEFORE
 # mutating; just before writing it re-reads the on-disk update_count; if it

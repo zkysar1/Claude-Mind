@@ -28,7 +28,27 @@ core/githooks/* text eol=lf
 # qualify (probe: git log -p, count '^-{' lines == 0). journal.jsonl (index
 # rewrites), changelog.jsonl (pruning), experience.jsonl (archival), and
 # aspirations.jsonl (RMW status updates) are NOT union-safe — a union there
-# would resurrect pruned/edited lines. Their conflicts abort loudly in
-# iteration-push.sh and surface for manual resolution instead.
+# would resurrect pruned/edited lines. Those RMW ledgers instead route to the
+# record-aware merge=ayoai-ledger driver below (g-115-2767), which unions them
+# by record/counter rather than by line — so they self-heal like the union
+# files without resurrecting pruned/edited history.
 agents/*/skill-invocations.jsonl merge=union
 agents/*/health/*.jsonl merge=union
+
+# Record-level cross-machine merge for the RMW agent ledgers that merge=union
+# CANNOT safely handle (id-keyed records, counter rollups, pruned/archived
+# history). The ayoai-ledger driver (core/scripts/git-merge-ayoai-ledger.sh)
+# resolves cross-box conflicts by RECORD-LEVEL commutative union, reusing
+# coordination_merge.py's own-cloud handlers — so iteration-push.sh's integrate
+# step self-heals instead of aborting (g-115-2767, from zeta's g-115-2727
+# investigation: experience/changelog/meta conflicts stranded MIND commits
+# g-335-157..159). Driver registered per-clone by install-git-hooks.sh (git
+# driver config is NOT version-controlled, same mechanism as core.hooksPath).
+# NOT union — union resurrects pruned/archived/edited records (the exact reason
+# these are excluded from the union block above).
+agents/*/experience.jsonl merge=ayoai-ledger
+agents/*/experience-archive.jsonl merge=ayoai-ledger
+agents/*/experience-meta.json merge=ayoai-ledger
+agents/*/changelog.jsonl merge=ayoai-ledger
+agents/*/journal.jsonl merge=ayoai-ledger
+agents/*/aspirations.jsonl merge=ayoai-ledger

@@ -28,6 +28,16 @@ deep base path exceeds 260 chars; the g-306-81 spike hit WinError 206).
 """
 import os
 
+# : put the per-box vendored encoder stack (pip --target under PEP 668)
+# on sys.path before any backend import. Defensive for the same reason as in
+# _embedding_retrieval.py — a module-level ImportError here would break the
+# builder AND the query path; absent vendor dir just means the pre-vendor
+# behavior (backends unavailable, callers degrade).
+try:
+    import _vendor_path  # noqa: F401
+except Exception:  # pragma: no cover - sibling dir not importable
+    pass
+
 # The published query instruction for the bge-en v1/v1.5 family. Applied
 # ONLY on the sentence-transformers path (fastembed's query_embed handles
 # it internally) and ONLY for bge-prefixed model names.

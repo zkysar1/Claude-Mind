@@ -1,4 +1,4 @@
-"""test_goal_duplication_gate_cluster_idf.py — regression test for 5.
+"""test_goal_duplication_gate_cluster_idf.py — regression test for .
 
 The token-shape strong path (`has_specific`) previously treated ANY hit
 keyword carrying [-_0-9] as a strong-block co-signal, ignoring per-term IDF.
@@ -118,7 +118,7 @@ def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
-    # Hermetic agent-queue scan (5): keep live agent queues out
+    # Hermetic agent-queue scan (): keep live agent queues out
     # of the wrapper's pending_queue check (rb-3784 corpus coupling).
     env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
@@ -227,7 +227,7 @@ def main() -> int:
 
 
 def test_cluster_idf_gate():
-    """Pytest entry point (5) — runs the 2-case suite in an isolated
+    """Pytest entry point () — runs the 2-case suite in an isolated
     tmp world and asserts all cases pass."""
     assert main() == 0
 

@@ -38,7 +38,7 @@ done
 # guard-664: bound the OPTIONAL stdin read with a timeout. `[ ! -t 0 ]` only
 # proves stdin is non-tty, NOT that it will reach EOF: an inherited pipe with
 # no writer-close blocks a bare `cat` forever — this wrapper hung >90s
-# () and timed out rc=124 (2) on exactly that. `timeout`
+# () and timed out rc=124 () on exactly that. `timeout`
 # bounds the blocking cat (verified on Git-bash), degrading a non-EOF stdin to
 # an empty string (enrichment skipped) instead of hanging. The warning keeps
 # the degradation visible rather than silent (rb-1189). EXPERIENCE_STDIN_TIMEOUT_S

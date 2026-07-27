@@ -491,7 +491,7 @@ _check_state_corruption() {
 # "time since autocompact start" — a deep Phase 4 work session running
 # >60 min without a phase boundary aged out the threshold and false-
 # positive-fired. Canonical incident: 2026-05-22T17:02:31 delta recovered
-# during 1h 31m Phase 4 of 7 (no autocompact actually running).
+# during 1h 31m Phase 4 of  (no autocompact actually running).
 # Fix: compact-in-flight is written ONLY by PreCompact, so its mtime
 # accurately reflects autocompact start. See precompact-serialize.sh and
 # session-save-id.sh for the new sentinel's lifecycle.
@@ -543,7 +543,7 @@ _check_hung_autocompact() {
     hb="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/heartbeat-stale.sh" 2>/dev/null || echo "fresh")"
     [[ "$hb" == "stale" ]] || return 0
 
-    # Execute-in-flight suppressor (7 followup, 2026-05-22). When
+    # Execute-in-flight suppressor ( followup, 2026-05-22). When
     # the agent is mid-Phase-4-execute, deep code work can run >60 min
     # without a phase boundary or diary write — every liveness signal goes
     # stale even though work IS progressing. execute-in-flight is written by
@@ -698,7 +698,7 @@ run_gate_for_agent() {
     [[ -d "$_adir/session" ]] || return 0  # not initialized
 
     # POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
-    # Execute-in-flight suppressor (7 followup, 2026-05-22). Same
+    # Execute-in-flight suppressor ( followup, 2026-05-22). Same
     # contract as Path C's suppressor: when the agent is mid-Phase-4-execute,
     # deep code work can stale every liveness signal even though work IS
     # progressing. Sentinel within 4h (240min) — agent is genuinely working

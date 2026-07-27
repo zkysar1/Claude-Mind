@@ -75,7 +75,7 @@ CADENCE_TRACKER_PATTERNS = (
 # asserted by test_wm_reset_cadence.py). Slots whose writer and reader sit on
 # opposite sides of the aspirations-consolidate Step-5 wm-reset boundary
 # (Step 0.65 writes journal_cluster_summaries; Step 9 consumes it one-shot for
-# handoff key_outcomes). (2)
+# handoff key_outcomes). ()
 RESET_SURVIVING_SLOTS = {"journal_cluster_summaries"}
 
 
@@ -361,9 +361,9 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
     try:
         with _wm_lock(ctx):
             if slot == "loop_state":
-                # 4: optimistic-concurrency on
+                # : optimistic-concurrency on
                 # slot_meta.loop_state.update_count closes the stale-lock-steal
-                # race (9 mechanism B). The two CLI writers
+                # race ( mechanism B). The two CLI writers
                 # (loop-state-bump-counters.py, recurring-loop-state-mutate.py)
                 # use the SAME _fileops.loop_state_cas_retry helper. If a >10s
                 # stall lets a peer stale-break this lock and write, the token
@@ -393,7 +393,7 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
                         err_box["resp"] = Response.error(
                             400, "merge_gate_blocked", gate.get("reason", ""))
                         return False
-                    # 8: write the preserved value when the gate floored
+                    # : write the preserved value when the gate floored
                     # stale-lower monotonic counters. CAS re-runs this _mutate on a
                     # stale-steal with FRESH on_disk, so the re-run gate sees the
                     # peer's higher counter and floors `value` to it — the

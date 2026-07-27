@@ -1,4 +1,4 @@
-"""7: sparse-feedback + stale-signal filters on distill candidacy.
+""": sparse-feedback + stale-signal filters on distill candidacy.
 
 The utility triggers (crit1 low_utility, crit2 large_mediocre) previously fired
 on `has_feedback = (th+tn) >= 1` — ONE noise vote made utility_ratio=0 look
@@ -24,7 +24,7 @@ from pathlib import Path
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tree.py"
 # tree.py imports sibling helpers (`from _stdio import reconfigure_stdio`,
 # added post-daemon-migration), so core/scripts must be importable BEFORE the
-# spec loader executes the module (2 — the test predated that import).
+# spec loader executes the module ( — the test predated that import).
 if str(MODULE_PATH.parent) not in sys.path:
     sys.path.insert(0, str(MODULE_PATH.parent))
 spec = importlib.util.spec_from_file_location("tree_engine_g2317", MODULE_PATH)
@@ -58,7 +58,7 @@ class DistillCandidateFilterTest(unittest.TestCase):
     # ── crit1 (low_utility) vote/recency gating ──────────────────────────
 
     def test_one_noise_vote_is_not_evidence(self):
-        # The 7 over-flag shape: ur=0.0 backed by a SINGLE noise vote.
+        # The  over-flag shape: ur=0.0 backed by a SINGLE noise vote.
         # Fresh signal, plenty of retrievals — still skipped: 1 vote is noise.
         cands, skips = self._skips({"nodes": {"n": self._node(
             retrieval_count=50, utility_ratio=0.0, times_noise=1,

@@ -21,7 +21,7 @@
 # mind_api/src/endpoints/admin.py) returns {ok:true, noop:true} for any
 # non-own-cloud backend, so this wrapper ALWAYS calls the daemon and the daemon
 # decides: real DDB CAS under STORAGE_BACKEND=own-cloud, a clean no-op otherwise.
-# There is no OWNERSHIP_MODE switch (removed 2026-07-02, 7) — single-
+# There is no OWNERSHIP_MODE switch (removed 2026-07-02, ) — single-
 # runner enforcement is unconditional, derived from STORAGE_BACKEND alone.
 # ════════════════════════════════════════════════════════════════════════════
 #

@@ -32,13 +32,16 @@ reconfigure_stdio()
 # a stderr WARN and non-zero exit.
 SCHEMA = {
     # Required at init time:
-    # B13: match the canonical GOAL_ID_RE (aspirations.py:197 / aspirations_write.py:139)
-    # — the hyphenated decomposition-child form g-NNN-NN-a (/decompose,
-    # decompose/SKILL.md:147) was rejected by the old `[a-z]?` (appended, no
-    # hyphen), so checkpoint init aborted on the WARN (~line 136) for any
-    # decomposed child goal.
-    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-\d{3}-\d{2,4}(-[a-z])?$"},
-    "aspiration_id":    {"required": True,  "type": str, "pattern": r"^asp-\d+$"},
+    # Match the canonical ID regexes in aspirations.py (ASP_ID_RE / GOAL_ID_RE,
+    # ~L211-212) — this SCHEMA duplicates them and MUST stay in sync (SSOT).
+    # B13: the old goal_id `[a-z]?` (appended, no hyphen) rejected the
+    # decomposition-child form g-NNN-NN-a (/decompose, decompose/SKILL.md:147),
+    # so checkpoint init aborted on the WARN (~line 136) for any decomposed child.
+    # : the xw branch (g-xw-<ts>-NN / asp-xw-<ts> cross-world ids) was
+    # widened in canonical () but never mirrored here — so loop-state-save
+    # init/update rejected every cross-world goal's checkpoint. This re-syncs both.
+    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$"},
+    "aspiration_id":    {"required": True,  "type": str, "pattern": r"^asp-(\d{3}|xw-\d{8}T\d{6})$"},
     # WORLD_AGENT_ONLY: cross-agent goals reach here already translated to
     # source='agent' + cross_agent_owner (see that field's comment below).
     "source":           {"required": True,  "type": str, "enum": ("world", "agent")},

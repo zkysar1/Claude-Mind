@@ -3,7 +3,7 @@
 # post coordination-board visibility notes. See handoff-aging-check.py for
 # the full docstring + design rationale. Bash-enforces precheck Phase
 # 0.5b.2b — closes the LLM-only-pseudocode gap surfaced by fresh-eyes-review
-# 2026-06-18 (4; sibling of inbox-alert-age-check.sh / ).
+# 2026-06-18 (; sibling of inbox-alert-age-check.sh / ).
 #
 # Usage: handoff-aging-check.sh [--apply] [--escalate-hours N] [--agent NAME]
 #                               [--board-escalation-log <path>]  # tests only

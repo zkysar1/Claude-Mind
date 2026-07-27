@@ -55,7 +55,7 @@ PathLike = Union[str, os.PathLike]
 
 
 # ---------------------------------------------------------------------------
-# Multi-tenant customer dimension (T-b/T-c, 1)
+# Multi-tenant customer dimension (T-b/T-c, )
 # ---------------------------------------------------------------------------
 # The unit of isolation/billing is the CUSTOMER (the daemon's ctx.tenant); an
 # env-id is a world WITHIN a customer. OwnCloudBackend prepends a leading
@@ -476,8 +476,131 @@ class LocalBackend:
 _ACTIVE_BACKEND: Optional[StorageBackend] = None
 
 
+# Registry key (in core/config/environments/<env-id>.yaml) -> env var.
+#
+# MUST stay identical to mind_api/src/__main__.py::_REGISTRY_KEY_TO_ENV. The
+# daemon cannot import this module at its derivation point — core/scripts
+# reaches sys.path only later, inside _start_owncloud_sync_thread (called well
+# after _apply_environment_registry) — so the two copies are held in lockstep by
+# test_storage_backend_registry_fallback.py::test_mapping_matches_daemon rather
+# than by a shared import. Changing one without the other fails that test.
+REGISTRY_KEY_TO_ENV = {
+    "backend": "STORAGE_BACKEND",
+    "bucket": "STORAGE_S3_BUCKET",
+    "sessions_table": "STORAGE_DDB_SESSIONS_TABLE",
+    "lock_table": "STORAGE_DDB_LOCK_TABLE",
+    "region": "AWS_DEFAULT_REGION",
+}
+
+
+def _warn_registry_unresolved(env_id: str, reg_file: Path, why: str) -> None:
+    """Announce a registry-derivation miss on stderr ().
+
+    Fail-open stays fail-open — every caller still returns normally. What
+    changes is that the miss is no longer SILENT. A config-presence failure
+    here is indistinguishable in its effect from a deliberate
+    ``STORAGE_BACKEND=local`` pin: both leave the var unset, and
+    ``get_backend()``'s ``os.environ.get("STORAGE_BACKEND", "local")`` then
+    selects LocalBackend with ``errors=0`` on every downstream surface. That
+    is lane A of ``_bootstrap_env_defaults``' docstring, and it has burned
+    this fleet twice — the cc-02 gate-firings franken-copy (a month of
+    local-tail rot), and the 2026-07-26 flip where 28 of 49 daemon starts came
+    up local-only inside one 12-minute restart storm, stranding ~8 encodings.
+
+    Only reachable when ENVIRONMENT_ID is SET (the caller returns earlier in
+    legacy N-var mode), so a purely local box never sees this line.
+    """
+    print(
+        f"[storage-backend] WARNING: ENVIRONMENT_ID={env_id!r} is set but the "
+        f"storage env could not be derived from {reg_file} ({why}). STORAGE_* "
+        "was NOT filled from the registry; the backend now falls back to the "
+        "ambient value, which is LocalBackend when STORAGE_BACKEND is unset. "
+        "If this box is meant to be own-cloud, writes are landing LOCAL-ONLY.",
+        file=sys.stderr,
+    )
+
+
+def _apply_registry_defaults(root: Path) -> None:
+    """Derive storage env vars from the environment registry ().
+
+    Closes a daemon-vs-CLI split that made the registry migration unsafe. The
+    daemon derives STORAGE_* from ``ENVIRONMENT_ID`` +
+    ``core/config/environments/<id>.yaml`` in ``_apply_environment_registry``;
+    nothing on the bare-subprocess lane did. So a box configured the
+    registry-native way — ENVIRONMENT_ID only, which is exactly what the
+    daemon's own DEPRECATION warning instructs ("remove them from .env.local
+    and keep ONLY ENVIRONMENT_ID") — got a correct daemon and a CLI that
+    silently resolved to LocalBackend. That is lane A of
+    ``_bootstrap_env_defaults``' docstring, reached by following the system's
+    own migration advice.
+
+    Observed on cc-02: g-115-2158 removed precisely the five registry-derived
+    keys on 2026-07-14; every bare subprocess on that box read LocalBackend for
+    11 days until the keys were restored by hand on 2026-07-25.
+
+    ``setdefault`` throughout, so an explicit launch-env value still wins —
+    same "explicit wins" contract as the ``.env.local`` pass and the daemon's
+    own derivation, which keeps the guard-955 ``STORAGE_BACKEND=local``
+    test-runner pin authoritative.
+
+    FAIL-OPEN, unlike the daemon's fail-loud counterpart. ``get_backend()`` is
+    reached from never-raises callers (``_gate_log.log``); raising here would
+    convert a config gap into dropped records. A typo'd ENVIRONMENT_ID is
+    already caught loudly at daemon startup, so nothing is silently swallowed
+    that is not reported elsewhere.
+    """
+    env_id = os.environ.get("ENVIRONMENT_ID", "").strip()
+    if not env_id:
+        return  # legacy N-var mode — registry not in play
+    reg_file = root / "core" / "config" / "environments" / f"{env_id}.yaml"
+    try:
+        if not reg_file.is_file():
+            _warn_registry_unresolved(
+                env_id, reg_file, "the registry file does not exist")
+            return
+        import yaml  # lazy — mirrors the daemon's local import
+        data = yaml.safe_load(reg_file.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        # Absent/unreadable/malformed registry: the daemon raises here, we must
+        # not. Guarded INSIDE the function rather than relying on the caller's
+        # wrapper, so the fail-open contract holds for every future call site.
+        _warn_registry_unresolved(
+            env_id, reg_file, f"{type(e).__name__}: {e}")
+        return
+    if not isinstance(data, dict):
+        # Third silent exit, and the one easiest to miss: this file PARSED
+        # cleanly, so neither guard above fires — yet nothing is derived.
+        _warn_registry_unresolved(
+            env_id, reg_file,
+            f"it parsed as {type(data).__name__}, not a YAML mapping")
+        return
+    for reg_key, env_key in REGISTRY_KEY_TO_ENV.items():
+        val = data.get(reg_key)
+        if val is None or str(val).strip() == "":
+            continue  # registry omits this key (a local backend has no bucket)
+        os.environ.setdefault(env_key, str(val).strip())
+    if not os.environ.get("STORAGE_BACKEND", "").strip():
+        # FOURTH silent path — and the only one that fires no `return` at all:
+        # control falls off the end of the loop having matched zero keys, so an
+        # exit-by-exit audit of this function does not see it. Two inputs reach
+        # it, both PROBED: an EMPTY registry (safe_load -> None, which the
+        # `or {}` above launders into a valid-looking empty mapping that clears
+        # the isinstance guard), and a mapping that simply omits `backend`.
+        # Either way STORAGE_BACKEND stays unset and get_backend() selects
+        # LocalBackend — the exact class this instrumentation exists to kill.
+        #
+        # Deliberately a POST-CONDITION ("is the backend still unresolved?") and
+        # NOT "did the registry carry a backend key?": when STORAGE_BACKEND was
+        # already pinned explicitly — the guard-955 test-runner pin, or any
+        # deliberate override — the setdefault above is a CORRECT no-op and this
+        # must stay silent. Checking the registry's contents instead would
+        # false-fire on every pinned run.
+        _warn_registry_unresolved(
+            env_id, reg_file, "it supplied no usable `backend` key")
+
+
 def _bootstrap_env_defaults(root: Optional[Path] = None) -> None:
-    """Best-effort env self-resolution for BARE subprocesses (7).
+    """Best-effort env self-resolution for BARE subprocesses ().
 
     A hook- or shell-spawned Python that reaches ``get_backend()`` without the
     box's sourced environment degrades in one of two silent lanes:
@@ -519,7 +642,13 @@ def _bootstrap_env_defaults(root: Optional[Path] = None) -> None:
         import re
         env_local = (root or Path(__file__).resolve().parents[2]) / ".env.local"
         if env_local.exists():
-            key_re = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
+            # Real shell/dotenv name class — an uppercase-only class SILENTLY
+            # SKIPS a lowercase key rather than erroring, so the var never
+            # reaches os.environ and the caller sees an unset value it can see
+            # plainly in the file (). setdefault below means widening
+            # can only ADD vars the file already declares, never clobber. Second
+            # of three copies: see core/scripts/env.py and core/scripts/_paths.py.
+            key_re = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
             for line in env_local.read_text(
                     encoding="utf-8", errors="replace").splitlines():
                 m = key_re.match(line.strip())
@@ -529,6 +658,14 @@ def _bootstrap_env_defaults(root: Optional[Path] = None) -> None:
                 if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
                     v = v[1:-1]
                 os.environ.setdefault(k, v)
+    except Exception:
+        pass
+    try:
+        # : fill any storage var .env.local did not supply from the
+        # environment registry, so a registry-native box (ENVIRONMENT_ID only)
+        # resolves the same backend here as it does in the daemon. Runs AFTER
+        # the .env.local pass because that is where ENVIRONMENT_ID comes from.
+        _apply_registry_defaults(root or Path(__file__).resolve().parents[2])
     except Exception:
         pass
     try:
@@ -554,7 +691,7 @@ def get_backend() -> StorageBackend:
     """
     global _ACTIVE_BACKEND
     if _ACTIVE_BACKEND is None:
-        _bootstrap_env_defaults()  # 7: bare-subprocess env self-heal
+        _bootstrap_env_defaults()  # : bare-subprocess env self-heal
         kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
         if kind in ("", "local", "local-files"):
             _ACTIVE_BACKEND = LocalBackend()

@@ -231,7 +231,7 @@ def _fe_wire(monkeypatch, mod, *, current, last_count, current_world=None,
 
 
 def test_fresh_eyes_per_agent_failed_measurement_does_not_rebaseline(fe_mod, monkeypatch, capsys):
-    """Site 3 — the ORIGINAL heal (6). The bug shipped here first; the
+    """Site 3 — the ORIGINAL heal (). The bug shipped here first; the
     g-115-1944 port copied it into two more gates."""
     wm_writes, _rt_writes = _fe_wire(monkeypatch, fe_mod, current=0, last_count=5416)
 

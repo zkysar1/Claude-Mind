@@ -1,4 +1,4 @@
-"""Tests for _l1_pick.py — the S9 L1-pick-log SSOT (3).
+"""Tests for _l1_pick.py — the S9 L1-pick-log SSOT ().
 
 Covers the L1-resolution walk, the fail-open append contract, the CLI/daemon
 delegation wiring (split-brain regression guard, sibling to
@@ -144,7 +144,7 @@ def test_wrapper_forwards_encoding_flags():
     assert 'ENC_REASON="${2-}"' in src, "wrapper dropped --encoding-reason capture"
     assert '"encoding_source"' in src and '"encoding_reason"' in src, \
         "wrapper no longer forwards encoding fields in the POST body"
-    # The stale claims (pre-3) must be gone; the historical note
+    # The stale claims (pre-) must be gone; the historical note
     # "They were no-ops 2026-05-28→..." is allowed to remain.
     assert "ACCEPTED but no-ops" not in src, "stale no-op header claim survived"
     assert "daemon defers the L1-pick-log" not in src, \

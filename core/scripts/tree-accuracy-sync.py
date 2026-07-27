@@ -231,7 +231,7 @@ def apply_plan(plan, tree, dry_run=False):
         for field, value in mutations.items():
             node[field] = value
         if confidence_changed:
-            _stamp_progression(node)  # 5: durable under own-cloud merge
+            _stamp_progression(node)  # : durable under own-cloud merge
             old_level, new_level = _graduate_node_level(node, competence)
             if old_level is not None:
                 capability_changes.append({

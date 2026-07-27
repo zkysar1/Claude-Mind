@@ -63,12 +63,12 @@ def read_yaml(path):
         return {}
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
-    # OneDrive sync-corruption guard (1): a transiently un-synced replica of a
+    # OneDrive sync-corruption guard (): a transiently un-synced replica of a
     # shared meta hot-file reads as NUL bytes -- full zero-fill, or (on a partial block
     # sync) a real-YAML prefix + NUL suffix. The mechanism is a sync-write race on a
     # frequently rewritten file, NOT Files-On-Demand dehydration: all meta files are
     # pinned ("always keep on this device"), census-verified 0 dehydration-prone of 40,237
-    # (1) -- so do not chase a dehydration fix, it is already maxed out. Both
+    # () -- so do not chase a dehydration fix, it is already maxed out. Both
     # forms make yaml.safe_load raise
     # a cryptic "#x0000 ReaderError". Translate to an actionable message so the next reader
     # does not burn an investigation. Behavior is UNCHANGED -- the read still raises, so any
@@ -414,7 +414,7 @@ def cmd_set(args):
     # List-index append: when the target is a list and the index equals the
     # current length, append rather than raising IndexError. Lets
     # `meta-set.sh <file> 'gaps[N]' '<json>'` extend a list (the real
-    # list-overlay behavior the orphan-key bug faked), 3.
+    # list-overlay behavior the orphan-key bug faked), .
     if isinstance(parent, list) and isinstance(key, int) and key == len(parent):
         parent.append(value)
     else:

@@ -100,6 +100,33 @@ def test_save_history_skips_blacklisted_presence_dir(sandbox, meta_sandbox, _fil
 
 
 @with_sandbox
+def test_save_history_skips_blacklisted_board_dir(sandbox, meta_sandbox, _fileops):
+    """board/<channel>.jsonl under WORLD must NOT create a .history snapshot.
+
+    Board channels are append-only message-board audit logs (the file IS the
+    history; changelog.jsonl keeps the audit trail). g-115-2789-b blacklisted
+    board/* after pre-g-115-2410 daemon direct-writes accreted ~1.15G of frozen
+    board snapshots. The trailing-slash `board/` pattern must cover EVERY
+    channel, including future ones — so this exercises a known channel plus an
+    invented one.
+    """
+    board_dir = sandbox / "board"
+    board_dir.mkdir(parents=True)
+    for channel in ("coordination.jsonl", "findings.jsonl", "a-future-channel.jsonl"):
+        target = board_dir / channel
+        target.write_text(json.dumps({"msg": "hi", "ts": "now"}) + "\n",
+                          encoding="utf-8")
+        _fileops.save_history(str(target), str(sandbox), "zeta",
+                              summary="board post")
+    history_root = sandbox / ".history" / "board"
+    # The blacklist must short-circuit BEFORE mkdir, so the .history/board/
+    # tree should not exist at all (clean fresh sandbox), for EVERY channel.
+    assert_true(not history_root.exists(),
+                f"board/ snapshots should be blacklisted; "
+                f"{history_root} unexpectedly exists")
+
+
+@with_sandbox
 def test_save_history_skips_blacklisted_gate_firings_meta(sandbox, meta_sandbox, _fileops):
     """meta/gate-firings.jsonl must NOT create a .history snapshot."""
     target = meta_sandbox / "gate-firings.jsonl"
@@ -489,7 +516,7 @@ def _teardown_history_dir(sandbox, meta, prior_env):
     # values. Was pop-not-restore (WORLD) + setdefault-never-restored
     # (META), which leaked an orphaned tmp MIND_META pointer into the
     # pytest process so a later local-paths.conf-resolving test read a
-    # dead tmp dir (4).
+    # dead tmp dir ().
     for var, val in prior_env.items():
         if val is None:
             os.environ.pop(var, None)
@@ -540,6 +567,7 @@ def test_resolve_version_path_returns_none_for_missing():
 
 TESTS = [
     test_save_history_skips_blacklisted_presence_dir,
+    test_save_history_skips_blacklisted_board_dir,
     test_save_history_skips_blacklisted_gate_firings_meta,
     test_save_history_does_not_skip_same_name_in_wrong_base,
     test_save_history_writes_gzip_compressed_snapshot,

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# deliverable-verify.py — 6
+# deliverable-verify.py — 
 #
 # Verify a recurring goal's named `deliverable_file` was (re)generated since its
 # prior close. Catches the rb-428 LLM-abbreviation drift where a recurring close
@@ -14,7 +14,7 @@
 #   nothing). FAIL-OPEN and FLAG-ONLY — exit code is ALWAYS 0; the verdict is a
 #   single word on stdout. recurring-close.sh consumes the verdict and emits a
 #   NON-BLOCKING warning on "stale"/"missing". A hard refuse is deliberately NOT
-#   implemented: a false-stale mtime (e.g. an own-cloud stale pull, 9)
+#   implemented: a false-stale mtime (e.g. an own-cloud stale pull, )
 #   must never gate a legitimate close.
 #
 # Verdicts (stdout, one word):

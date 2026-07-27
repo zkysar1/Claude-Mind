@@ -119,7 +119,7 @@ def test_eviction_metric_invariance():
         f"eviction changed a metric:\n before={before}\n after ={after}")
 
     # And the eviction actually happened: 5 goals moved to the census.
-    # 0: eviction records IDS (merge-correct, tombstoning); the
+    # : eviction records IDS (merge-correct, tombstoning); the
     # derived per-status counts are unchanged, legacy by_status untouched.
     asp = items[0]
     live_ids = {g["id"] for g in asp["goals"]}
@@ -198,7 +198,7 @@ def test_precheck_tracked_counts_superseded():
 
 
 # ---------------------------------------------------------------------------
-# 8: cross-run conservation canary (pigeonhole invariant).
+# : cross-run conservation canary (pigeonhole invariant).
 # A stale write resurrecting goals[] AFTER a census bump leaves the same goals
 # counted twice (asp-306 signature). The evictor must REFUSE such aspirations —
 # evicting from a resurrected state re-bumps census, compounding the double-count.
@@ -264,9 +264,9 @@ def test_conservation_foreign_ids_excluded():
 
 
 # ---------------------------------------------------------------------------
-# 3: legacy count-only census (no recorded evicted_ids) makes the
+# : legacy count-only census (no recorded evicted_ids) makes the
 # pigeonhole capacity a KNOWN-loose lower bound — it cannot observe the seqs or
-# suffix-letters of goals evicted before 0 id-tracking, so it
+# suffix-letters of goals evicted before  id-tracking, so it
 # false-flags legitimate eviction. Suppress that regime (not-all-live) while
 # PRESERVING the reliable all-live resurrection signature.
 # ---------------------------------------------------------------------------
@@ -344,8 +344,8 @@ def test_audit_mode_reports_without_mutating(tmp_path, monkeypatch, capsys):
     rc = _evict.main()
     assert rc == 1  # violation found
     assert path.read_text(encoding="utf-8") == blob  # read-only sweep
-    # --audit reports on stdout (1 contract, adopted at the
-    # 2026-07-11 origin merge over the 8 stderr machine-line form —
+    # --audit reports on stdout ( contract, adopted at the
+    # 2026-07-11 origin merge over the  stderr machine-line form —
     # no consumers grep the old CONSERVATION-VIOLATION stderr line).
     out = capsys.readouterr().out
     assert "CONSERVATION VIOLATION" in out and "asp-306" in out

@@ -66,10 +66,11 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _agent_dir  # noqa: E402
 from _paths import enumerate_agent_confs as _enumerate_agent_confs  # noqa: E402
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, /)
 
 
-# 7 / rb-1150: terminal statuses that mean "no Investigate needed
-# - target already resolved". Mirrors insight-trigger-sweep.py (6)
+#  / rb-1150: terminal statuses that mean "no Investigate needed
+# - target already resolved". Mirrors insight-trigger-sweep.py ()
 # and unblock-parent-status-sweep.py:112 (rb-908 lineage). Audit-time vs
 # apply-time staleness gap: a finding posted to the board at T0 with
 # `affects:<g-id>` can sit in the queue until /fresh-eyes-code fires this
@@ -235,12 +236,9 @@ def _load_findings(since_hours):
                     continue
                 ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
                 if ts:
-                    try:
-                        rec_time = dt.datetime.fromisoformat(ts.replace("Z", ""))
-                        if rec_time < cutoff:
-                            continue
-                    except Exception:
-                        pass
+                    rec_time = parse_naive_iso(ts)
+                    if rec_time is not None and rec_time < cutoff:
+                        continue
                 results.append(rec)
     except Exception as e:
         return None, "read error: " + str(e)
@@ -466,7 +464,7 @@ def _act_on_trigger(trigger, dry_run):
     actions = []
     verb = "invalidates" if severity == "invalidates" else "constrains"
     for affected in affects:
-        # 7 / rb-1150: re-probe target status at filing time.
+        #  / rb-1150: re-probe target status at filing time.
         # Terminal -> skip + audit-stale note (avoid duplicate Investigate
         # for a goal that already resolved). Missing -> file with warning
         # (target may have been archived after the finding was authored).
@@ -597,7 +595,7 @@ def main(argv=None):
             "actions": acts,
         })
 
-    # 7 / rb-1150: aggregate audit_stale and affects_missing
+    #  / rb-1150: aggregate audit_stale and affects_missing
     # counters from per-trigger action records so callers can detect the
     # staleness-gap closures without re-walking the actions tree.
     audit_stale_count = 0

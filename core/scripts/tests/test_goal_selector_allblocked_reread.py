@@ -1,4 +1,4 @@
-"""test_goal_selector_allblocked_reread.py -- 5 regression.
+"""test_goal_selector_allblocked_reread.py --  regression.
 
 Guards the verify-before-assuming re-read guard in goal-selector cmd_select.
 

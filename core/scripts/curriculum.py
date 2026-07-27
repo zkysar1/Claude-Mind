@@ -252,7 +252,7 @@ def evaluate_gate(gate):
         operator = gate.get("operator", ">=")
         threshold = gate.get("threshold", 0)
         current_value = count_matching_jsonl(file_rel, field, value)
-        # Cross-queue graduation counting (0): opt-in. Without the flag,
+        # Cross-queue graduation counting (): opt-in. Without the flag,
         # behavior is unchanged (agent-queue only) — no existing gate is affected.
         # With cross_queue: true, add WORLD-queue goals attributed to this agent
         # so a world-queue-executor's graduation reflects its real output.
@@ -402,8 +402,8 @@ def cmd_evaluate(args):
         return
 
     # Refresh the competence metric BEFORE evaluating (producer wiring,
-    # 6): script-enforced at the evaluate chokepoint so the
-    # stale-metric class (1) cannot recur. Fail-open — on refresh
+    # ): script-enforced at the evaluate chokepoint so the
+    # stale-metric class () cannot recur. Fail-open — on refresh
     # failure the stored value is used, exactly the pre-wiring behavior.
     competence_refresh = refresh_competence_for_gates(gates, WORLD_DIR, AGENT_DIR)
 
@@ -432,7 +432,7 @@ def cmd_evaluate(args):
 
     # next_stage = the promotion target (next stage by list order), independent
     # of whether gates pass. Emitted for parity with the `status` endpoint and
-    # the daemon evaluate() — the omission caused 3's misdiagnosis.
+    # the daemon evaluate() — the omission caused 's misdiagnosis.
     next_stage = (
         stages[current_idx + 1].get("id")
         if current_idx + 1 < len(stages) else None)

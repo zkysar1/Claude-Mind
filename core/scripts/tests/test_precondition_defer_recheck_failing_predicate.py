@@ -1,4 +1,4 @@
-"""4: regression test for the failing-predicate emission branch of
+""": regression test for the failing-predicate emission branch of
 precondition-defer-recheck.py — the branch that crashed in production.
 
 Incident (2026-07-16, cc-03 echo precheck): the Phase 0.5b.3 sweep died with

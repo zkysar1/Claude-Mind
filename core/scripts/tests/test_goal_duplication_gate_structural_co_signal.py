@@ -6,12 +6,14 @@ Verifies that `_check_recent_completions` requires a STRUCTURAL co-signal
 for any hard block:
 
     has_specific = bool(hit_paths) or any(
-        re.search(r"[-_0-9]", k) for k in hit_kws)
+        _is_structural_identifier(k) for k in hit_kws)
 
 A purely-plain-words strong overlap (e.g. "cache" + "streaming" both 1.0 idf,
 weighted >= 1.5) is demoted to an advisory; it never hard-blocks. A
-file-path hit OR a hit keyword carrying a hyphen/underscore/digit
-(structured identifier — rb-335) is required for the block to fire.
+file-path hit OR a hit keyword that is a structured identifier — an
+underscore/digit token or a file-name (rb-335; g-248-117 dropped the bare
+hyphen so generic compounds like own-cloud/end-to-end no longer qualify) —
+is required for the block to fire.
 
 Cases covered:
   G1 plain-words overlap → DEMOTE (rc.passed=True, strong_keyword_only
@@ -45,13 +47,18 @@ Cases covered:
      exclusion-context disqualifier must not suppress genuine file-path dups
      (guard-958 adversarial genuine-positive control).
   G12 recurring keyword-vacuum completion (g-248-114) → DEMOTE: a recurring
-     completion matched on hyphenated-compound keywords only (env-server /
-     end-to-end, [-_0-9] structured) with ZERO file-path hits is a keyword
-     vacuum — demoted to a recurring_vacuum_exempt advisory, never a block
-     (false-block class: g-335-103/104/105 vs the g-115-23 recurring sweep).
+     completion matched on genuine structured-identifier keywords only
+     (loop_state / session_signals, underscore-structured) with ZERO file-path
+     hits is a keyword vacuum — demoted to a recurring_vacuum_exempt advisory,
+     never a block (false-block class: a recurring sweep re-touching the same
+     symbol vs a new-capability goal). NOTE (g-248-117): the original g-248-114
+     vocab was hyphenated compounds (env-server / end-to-end); those no longer
+     reach has_specific at all (they are not identifiers — see
+     test_goal_duplication_gate_generic_compound.py), so this case now uses
+     genuine underscore ids to still exercise the recurring_vacuum path.
   G13 NON-recurring keyword-vacuum (g-248-114 control) → BLOCK: the identical
-     vacuum shape with a non-recurring completion still hard-blocks, proving
-     the exemption is scoped to recurring completions.
+     vacuum shape (genuine structured ids) with a non-recurring completion still
+     hard-blocks, proving the exemption is scoped to recurring completions.
   G14 recurring completion + REAL file-path hit (g-248-114 control) → BLOCK:
      a recurring completion sharing a real file path (hit_paths non-empty) is
      NOT a vacuum → still hard-blocks, proving the exemption requires empty
@@ -201,7 +208,7 @@ def _run_gate(goal: dict, tmp_world: Path, agent: str = "alpha") -> dict:
     env = os.environ.copy()
     env["MIND_AGENT"] = agent
     env["MIND_WORLD"] = str(tmp_world)
-    # Hermetic agent-queue scan (5): keep live agent queues out
+    # Hermetic agent-queue scan (): keep live agent queues out
     # of the wrapper's pending_queue check (rb-3784 corpus coupling).
     env["MIND_AGENTS_ROOT"] = str(tmp_world / "agents")
     proc = subprocess.run(
@@ -361,11 +368,11 @@ def main() -> int:
                         f"{[m.get('keyword_hits') for m in matches]}"
                     )
 
-        # ── G4: generic-token inflation FP (5) → DEMOTE ──────────
+        # ── G4: generic-token inflation FP () → DEMOTE ──────────
         # Two file-path-DISTINCT framework goals share ONE structural topic
         # token (loop_state, underscore) PLUS generic framework vocabulary
         # (global/exists/populated/recurring/class/close). Before the
-        # 5 stopword expansion each generic counted as a unique_hit,
+        #  stopword expansion each generic counted as a unique_hit,
         # pushing N>=2 + weighted>=1.5 alongside the single structural
         # co-signal -> false hard block on distinct work (alpha session 92:
         # 4 such FPs; bravo: 2). After the fix the generics are stopwords, so
@@ -401,7 +408,7 @@ def main() -> int:
                 f"stopwords. reason={rc4.get('reason')} matches={rc4.get('matches')}"
             )
 
-        # ── G5: genuine 2-identifier dup still BLOCKS after the 5 ─
+        # ── G5: genuine 2-identifier dup still BLOCKS after the  ─
         # stopword expansion (over-suppression guard). Two goals sharing TWO
         # structural identifiers (loop_state + iteration-checkpoint) keep
         # N>=2 even after the generic tokens (recurring/close) are stopworded
@@ -438,7 +445,7 @@ def main() -> int:
         # ── G6: directive-routing goal (origin_signal=user_directive) → EXEMPT
         # Same file-path overlap as G2 (which BLOCKS), but this goal is a user
         # directive — its description necessarily recaps the target agent's
-        # domain work, so completed-overlap is a structural FP. 4
+        # domain work, so completed-overlap is a structural FP. 
         # exempts it -> recent_completions SKIPPED (passed, reason names the
         # exemption, matches empty). The shared file-path co-signal WOULD block
         # a non-directive goal (see G2), so this proves the EXEMPTION, not mere
@@ -519,16 +526,16 @@ def main() -> int:
                 f"reason={rc7.get('reason')}"
             )
 
-        # ── G8: generic-VERB inflation FP (6) → DEMOTE ────────────
+        # ── G8: generic-VERB inflation FP () → DEMOTE ────────────
         # The recent_completions twin of G4, for generic English VERBS/adverbs
         # rather than framework state-vocab. Two semantically-unrelated goals
         # share ONLY common English words (cause/confirmed/every/hardening) plus
-        # the hyphenated plain word "re-run". Before the 6 stopword
+        # the hyphenated plain word "re-run". Before the  stopword
         # expansion "re-run" matched the has_specific hyphen co-signal
         # (re.search(r"[-_0-9]") — line 368) and the five generics pushed
         # N>=2 + weighted>=1.5, so a ZERO-file-path generic-verb overlap
-        # HARD-blocked (session-93 ground truth: 5 vs echo ,
-        # 7 vs delta  — 5 override-ledger entries). After the
+        # HARD-blocked (session-93 ground truth:  vs echo ,
+        #  vs delta  — 5 override-ledger entries). After the
         # fix all five are stopwords -> no shared keyword survives -> PASS.
         _seed_state(tmp_world, {
             "goal_id": "g-scs-filler-G8",
@@ -560,7 +567,7 @@ def main() -> int:
                 f"hits. reason={rc8.get('reason')} matches={rc8.get('matches')}"
             )
 
-        # ── G9: over-suppression guard for the 6 verb stopwords ──
+        # ── G9: over-suppression guard for the  verb stopwords ──
         # A GENUINE 2-identifier duplicate that ALSO carries the newly-added
         # generic verbs must still BLOCK — proving the verb stopwording did not
         # suppress real duplicate-work detection. Shared structural ids
@@ -596,14 +603,14 @@ def main() -> int:
                 f"reason={rc9.get('reason')} matches={rc9.get('matches')}"
             )
 
-        # ── G10: exclusion-context file-path FP (7) → DEMOTE ─────
+        # ── G10: exclusion-context file-path FP () → DEMOTE ─────
         # The file-path twin of G4/G8, for a path named ONLY in a NEGATIVE
         # (exclusion) context. Both goals share strong PLAIN-word overlap
         # (fallback/coverage/sweep/audit/excluding — no -_0-9) so strong=True,
         # and BOTH name retrieve.sh in an "excluding retrieve.sh" clause. Before
-        # the 7 exclusion-context disqualifier, retrieve.sh entered the
+        # the  exclusion-context disqualifier, retrieve.sh entered the
         # proposed goal's file_paths -> hit_paths=[retrieve.sh] -> has_specific
-        # -> HARD block (canonical incident 6: 's
+        # -> HARD block (canonical incident : 's
         # "feature-path-excluded for retrieve.sh" false-blocked a Maintain goal
         # at weighted 7.53). After the fix the exclusion-scoped path is dropped
         # from the co-signal set -> has_specific=False (no structured keyword
@@ -646,7 +653,7 @@ def main() -> int:
                     f"(exclusion-context), got {fp_detected}"
                 )
 
-        # ── G11: recall / over-suppression guard for 7 ───────────
+        # ── G11: recall / over-suppression guard for  ───────────
         # The adversarial genuine-POSITIVE control (guard-958): the SAME plain
         # overlap, but retrieve.sh is named POSITIVELY ("audit on retrieve.sh")
         # and IS the sole structural co-signal. It must STILL BLOCK — proving
@@ -693,29 +700,34 @@ def main() -> int:
 
         # ── G12: recurring keyword-vacuum completion → DEMOTE () ──
         # A recurring/reflection COMPLETION (its goal_id carries recurring:true
-        # in the aspirations queue) matched on hyphenated-compound KEYWORDS ONLY
-        # (env-server + end-to-end — both trip has_specific via [-_0-9]) with
-        # ZERO shared file path is a "keyword vacuum": generic domain vocab, not
-        # duplicate work. Before  the two structured compounds pushed
-        # N>=2 + weighted>=1.5 + has_specific=True → HARD block, false-blocking
-        # new-capability goals (canonical incident: /104/105 blocked by
-        # the  recurring sweep +  reflection). After the fix the
+        # in the aspirations queue) matched on genuine structured-identifier
+        # KEYWORDS ONLY (loop_state + session_signals — underscore identifiers
+        # that trip has_specific) with ZERO shared file path is a "keyword
+        # vacuum": a recurring sweep re-touching the same symbol, not duplicate
+        # work. Without  the two structured ids push N>=2 +
+        # weighted>=1.5 + has_specific=True → HARD block, false-blocking
+        # new-capability goals (false-block class: /104/105 vs the
+        #  recurring sweep +  reflection). After the fix the
         # completion's recurring goal_id + empty hit_paths → recurring_vacuum →
         # DEMOTE to an advisory (recurring_vacuum_exempt), never a block.
+        # : this case originally used hyphenated compounds (env-server /
+        # end-to-end); those no longer reach has_specific (they are not
+        # identifiers — see test_goal_duplication_gate_generic_compound.py), so
+        # it now uses genuine underscore ids to still exercise recurring_vacuum.
         _seed_state(tmp_world, {
             "goal_id": "g-scs-recur-vac",
             "completed_by": "bravo",
             "completed_at": _now_iso(-2),
             "key_finding": (
-                "Recurring sweep confirmed the env-server end-to-end reconnect "
-                "handshake stayed healthy across the cycle."
+                "Recurring sweep confirmed loop_state and session_signals "
+                "restoration stayed consistent across the cycle."
             ),
         })
         _seed_recurring(tmp_world, ["g-scs-recur-vac"])
         case_g12 = {
-            "title": "Investigate: env-server end-to-end reconnect gap",
+            "title": "Investigate: loop_state session_signals restoration gap",
             "description": (
-                "Add an env-server end-to-end reconnect probe in a new "
+                "Add a loop_state session_signals restoration probe in a new "
                 "monitoring module."
             ),
             "participants": ["agent"],
@@ -742,25 +754,26 @@ def main() -> int:
                 )
 
         # ── G13: NON-recurring keyword-vacuum → BLOCK ( control) ──
-        # Identical vacuum shape to G12, but the completion goal_id is NOT
-        # recurring (aspirations queue left empty by _seed_state, no
-        # _seed_recurring). recurring_vacuum=False → the structured co-signal
-        # still HARD-blocks. Proves the exemption is scoped to recurring
-        # completions and did not blanket-suppress the structured-vacuum path.
+        # Identical vacuum shape to G12 (genuine structured ids loop_state +
+        # session_signals), but the completion goal_id is NOT recurring
+        # (aspirations queue left empty by _seed_state, no _seed_recurring).
+        # recurring_vacuum=False → the structured co-signal still HARD-blocks.
+        # Proves the exemption is scoped to recurring completions and did not
+        # blanket-suppress the structured-vacuum path.
         _seed_state(tmp_world, {
             "goal_id": "g-scs-nonrecur-vac",
             "completed_by": "bravo",
             "completed_at": _now_iso(-2),
             "key_finding": (
-                "Refactor confirmed the env-server end-to-end reconnect "
-                "handshake stayed healthy across the run."
+                "Refactor confirmed loop_state and session_signals "
+                "restoration stayed consistent across the run."
             ),
         })
         # (no _seed_recurring — g-scs-nonrecur-vac is not in the recurring set)
         case_g13 = {
-            "title": "Investigate: env-server end-to-end reconnect gap",
+            "title": "Investigate: loop_state session_signals restoration gap",
             "description": (
-                "Add an env-server end-to-end reconnect probe in a new "
+                "Add a loop_state session_signals restoration probe in a new "
                 "monitoring module."
             ),
             "participants": ["agent"],
@@ -837,7 +850,7 @@ def main() -> int:
 
 
 def test_structural_co_signal_gate():
-    """Pytest entry point (5) — runs the 14-case suite in an isolated
+    """Pytest entry point () — runs the 14-case suite in an isolated
     tmp world and asserts all cases pass."""
     assert main() == 0
 

@@ -1,4 +1,4 @@
-"""test_goal_selector_completability.py — 0 regression (2026-06-26).
+"""test_goal_selector_completability.py —  regression (2026-06-26).
 
 Pins the completion_pressure COMPLETABILITY FACTOR (zeta rb-2384 decision,
 implemented by alpha). Bare completion_ratio² radiated near-max selection

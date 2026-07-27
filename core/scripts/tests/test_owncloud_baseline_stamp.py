@@ -1,4 +1,4 @@
-"""moto-mocked regression tests for the 6 per-write manifest
+"""moto-mocked regression tests for the  per-write manifest
 baseline stamp in OwnCloudBackend (_stamp_manifest_baseline).
 
 Root fix for the cross-box lost-update lanes (tree node

@@ -1,4 +1,4 @@
-"""Regression test for meta-backpressure cmd_check evolution-monitor skip (7).
+"""Regression test for meta-backpressure cmd_check evolution-monitor skip ().
 
 `cmd_check` iterates `active_monitors` assuming the meta_strategy schema
 (`goals_since_change` / `imp_k_samples` / `baseline_imp_k` / `strategy_file` /
@@ -179,7 +179,7 @@ def test_cmd_check_meta_only_still_processed(tmp_path):
     assert meta["imp_k_samples"] == [0.5]
 
 
-# -- Case 4: cmd_graduate mixed list -- 7 sibling of the check() skip -
+# -- Case 4: cmd_graduate mixed list --  sibling of the check() skip -
 def test_cmd_graduate_mixed_list_no_keyerror(tmp_path):
     """cmd_graduate iterated active_monitors doing monitor["meta_change_id"];
     an evolution monitor (no meta_change_id) KeyError'd the WHOLE endpoint,

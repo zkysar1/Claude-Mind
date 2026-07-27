@@ -88,7 +88,10 @@ def _scan(completed_id):
         for asp in read_jsonl(path):
             asp_id = asp.get("id", "")
             for goal in asp.get("goals", []):
-                bb = goal.get("blocked_by", [])
+                # `or []` not `.get(..., [])` — the default only fires when the
+                # KEY IS ABSENT, but a goal may carry `blocked_by: null`
+                # explicitly, which returned None and crashed the `in` test.
+                bb = goal.get("blocked_by") or []
                 if isinstance(bb, str):
                     bb = [bb]
                 if completed_id in bb:
@@ -177,8 +180,38 @@ def main(argv=None):
         ok, err = _update(source, gid, "blocked_by",
                           json.dumps(new_bb), args.dry_run)
         if ok:
-            unblocked.append({"goal_id": gid, "source": source,
-                              "asp_id": asp_id})
+            entry = {"goal_id": gid, "source": source, "asp_id": asp_id}
+            # Step 1b (RC1): clearing the LAST blocked_by must also return the
+            # goal to `pending`. Before this, we dropped the dependency but left
+            # status="blocked" forever — the goal was free but invisible to the
+            # selector, and nothing anywhere else performs this transition. The
+            # leak is silent and CUMULATIVE: every future unblock stranded its
+            # own dependents, so the backlog only ever grew.
+            #
+            # Three conditions, all required — each one is a goal that must NOT
+            # be flipped:
+            #   1. not new_bb        — still blocked by OTHER predecessors.
+            #   2. status=="blocked" — never touch completed/skipped/in-progress
+            #                          /expired; only `blocked` is ours to undo.
+            #   3. no blocker_ref    — a structured blocker is a SEPARATE
+            #                          suppression axis owned by CREATE_BLOCKER
+            #                          and its re-probe sweep. blocked_by going
+            #                          empty says nothing about whether THAT
+            #                          blocker cleared, so leave it alone.
+            # `defer_reason` is deliberately NOT a condition: defer and status
+            # are orthogonal axes (a pending+deferred goal is normal and stays
+            # suppressed by the defer), and gating on it would re-strand exactly
+            # the goals that carry both.
+            if (not new_bb
+                    and goal.get("status") == "blocked"
+                    and not goal.get("blocker_ref")):
+                ok2, err2 = _update(source, gid, "status", "pending",
+                                    args.dry_run)
+                entry["status_restored"] = bool(ok2)
+                if not ok2:
+                    skipped.append({"goal_id": gid, "source": source,
+                                    "step": "status_restore", "reason": err2})
+            unblocked.append(entry)
         else:
             skipped.append({"goal_id": gid, "source": source,
                             "step": "blocked_by", "reason": err})

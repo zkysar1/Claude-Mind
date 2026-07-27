@@ -86,6 +86,42 @@ def test_full_verb_set_leading_post_colon():
         assert is_modify_intent(f"Apply: {verb} the target module") is True, verb
 
 
+# ─── : evidence-based verb expansion (2026-07-22) ──────────────
+# Each title below is a real (or ledger-shaped) target_state SOLO-block
+# override that HARD-blocked pre-expansion because its modify verb was absent
+# from MODIFY_INTENT_VERBS. Each cites existing symbols as the modification
+# SUBJECT (present pre- AND post-edit), not a NEW deliverable — so DEMOTE, not
+# block. See the frozenset comment for the ledger evidence (386/565 uncovered).
+
+def test_g248118_added_verbs_classify_modify():
+    """The 14  additions all classify as modify-intent."""
+    for verb in ("edit", "tighten", "refine", "modify", "update", "replace",
+                 "normalize", "move", "bump", "restore", "flip", "instrument",
+                 "backfill", "hydrate"):
+        assert is_modify_intent(f"Apply: {verb} the existing loader") is True, verb
+
+
+def test_g248118_repro_move_sentinel():
+    """Verbatim ledger FP (bravo, 2026-07-21) — cited existing sentinel
+    identifiers as context; the 'move' verb was uncovered pre-fix."""
+    assert is_modify_intent(
+        "Apply: move pending_phase_6_spark sentinel to do_state_update") is True
+
+
+def test_g248118_repro_update_regexes():
+    """Ledger FP (zeta, 2026-07-22) — 'update' the existing convention-doc
+    ID regexes; cited identifiers present pre- and post-change."""
+    assert is_modify_intent(
+        "Idea: update rb/guard convention-doc ID regexes to 4-digit") is True
+
+
+def test_g248118_add_stays_excluded_post_expansion():
+    """Design-constraint guard: the 31-FP 'add' create-with-context class is
+    NOT folded into modify-intent by the expansion. Create verbs keep
+    hard-blocking (identifier presence IS duplication evidence for them)."""
+    assert is_modify_intent("Apply: add scaffolded-exploration to the matrix") is False
+
+
 def test_leading_verb_with_trailing_comma():
     """Punctuation on the leading verb is stripped before matching."""
     assert is_modify_intent("Apply: fix, then re-run the suite") is True

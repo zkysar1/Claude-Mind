@@ -247,7 +247,7 @@ def test_update_formation_quality_failed(pipeline_daemon):
     assert "validation_failed" in body
 
 
-# NOTE (5 / rb-2239): update() now probes the ARCHIVE when the id is
+# NOTE ( / rb-2239): update() now probes the ARCHIVE when the id is
 # absent from live, so multi-field-corrupt archived records have an atomic
 # whole-record repair path. The former `test_update_does_not_search_archive`
 # (404 on archive-only ids) asserted the retired live-only contract and was

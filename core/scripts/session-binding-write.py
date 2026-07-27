@@ -147,7 +147,7 @@ def write_binding(sid: str, agent: str, mode: str,
             except OSError:
                 # Non-fatal: the binding is the authoritative record now.
                 pass
-        # 4: also retire any OTHER agent's binding.yaml for this SID.
+        # : also retire any OTHER agent's binding.yaml for this SID.
         # A re-bound SID (`/start A` -> `/stop A` -> `/start B`) leaves the prior
         # agent's binding.yaml behind, which can shadow the live one in
         # resolve_binding's iterdir-order scan. /start passes --retire-legacy at

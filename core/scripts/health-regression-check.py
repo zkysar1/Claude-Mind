@@ -238,11 +238,19 @@ def _calibration_status(health_dir, cal_cfg, now_ts):
     - progress is (days, records) when freshly scanned, else None (marker
       short-circuit — exact counts no longer needed past the gate).
     """
+    # Read half is shared with health-revert.py via hl.calibration_state so the
+    # two entry points cannot disagree on `calibrated` (). The marker
+    # WRITE below stays here: this half owns the fires-exactly-once edge.
     marker = Path(health_dir) / ".calibrated"
-    if marker.exists():
-        return True, None, False
-    days, records = hl.full_calibration_progress(health_dir)
-    calibrated = days >= cal_cfg["min_days"] and records >= cal_cfg["min_records"]
+    calibrated, progress = hl.calibration_state(
+        health_dir, cal_cfg["min_days"], cal_cfg["min_records"])
+    if progress is None:          # marker short-circuit
+        # Return the helper's verdict, not a literal True. They are the same
+        # value today (progress is None only on the marker path, which returns
+        # True), but hardcoding it buries that coupling — a future change to the
+        # short-circuit's verdict would silently keep returning True here.
+        return calibrated, None, False
+    days, records = progress
     if not calibrated:
         return False, (days, records), False
     # First crossing — persist the marker so the edge fires once.
@@ -304,6 +312,26 @@ def run(*, config_dir, meta_dir, agent_dir, repo_root, now_ts, force=False,
     # Interval gating (idempotent within a window). force=True bypasses.
     if not force and isinstance(cur_iter, int):
         last = _read_interval_marker(health_dir)
+        # `iteration` is a per-session counter that RESTARTS low each session,
+        # while this marker persists on disk across sessions — so a marker
+        # written late in one session sits ABOVE the counter for all of the
+        # next. `cur_iter - last` then goes negative, a negative is always
+        # < interval, and the detector returns not-elapsed on EVERY call until
+        # the counter climbs back past the stale value. The old guard
+        # (`last >= 0`) defended a MISSING marker but not an UNREACHABLE one.
+        # Measured 2026-07-26: 4 of 5 agents stranded (foxtrot -381, alpha
+        # -344, bravo -300, zeta -299); zeta's detector had been dark since
+        # 2026-07-21 and the verdict string ("interval not elapsed (-299/10)")
+        # is indistinguishable from healthy waiting at a glance. Treat
+        # marker > cur_iter as a counter reset: re-arm and fire now. The write
+        # below re-anchors the marker to the live counter, so this self-heals
+        # once per reset instead of latching forever (; same shape as
+        # rb-5117 — a stale persisted number trusted without a sanity check
+        # against the value it is compared to, failing in the silent direction).
+        if last > cur_iter:
+            _eprint(f"interval marker {last} exceeds current iteration "
+                    f"{cur_iter} — counter reset detected, re-arming")
+            last = -1
         if last >= 0 and (cur_iter - last) < det["interval"]:
             return _verdict(False, f"interval not elapsed ({cur_iter - last}/{det['interval']})",
                             mode=mode, **cal_ctx)

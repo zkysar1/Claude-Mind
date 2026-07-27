@@ -1,4 +1,4 @@
-"""Tests for eval_signal_scorer.py (7, earn-the-keep Phase 1 / G3).
+"""Tests for eval_signal_scorer.py (, earn-the-keep Phase 1 / G3).
 
 Hermetic: imports the pure module directly (no bound agent, no daemon, no
 world/meta). conftest.py inserts core/scripts on sys.path. A small SYNTHETIC

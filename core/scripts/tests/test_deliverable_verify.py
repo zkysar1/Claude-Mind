@@ -1,4 +1,4 @@
-# Tests for deliverable-verify.py (6).
+# Tests for deliverable-verify.py ().
 #
 # The helper is pure + fail-open; every case here is hermetic (tmp files only,
 # no world/agent state, no S3-backed store). It verifies a recurring goal's

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin the 5 l1-skew-check recalibration.
+"""Pin the  l1-skew-check recalibration.
 
 The pre-2455 flag was max/min ratio >= threshold — unsatisfiable on a tree
 with a tiny-but-healthy L1 (measured 53.6x with the best available taxonomy

@@ -73,7 +73,7 @@ if [ ! -f "$WORLD/.initialized" ] && [ "${STORAGE_BACKEND:-local}" = "own-cloud"
     fi
 fi
 
-# --- Idempotent gate (+ 4 additive seed-backfill) ---
+# --- Idempotent gate (+  additive seed-backfill) ---
 # A world initialized BEFORE a seed line was added to this script never
 # received it — the early-exit closed the gate forever (seed-drift class,
 # guard-146 incident). Instead of exiting, an already-initialized world runs
@@ -102,7 +102,7 @@ extract_initial_state() {
     echo "  Seeded $(basename "$target_file") from $(basename "$config_file")"
 }
 
-# --- Helper: should <target> be seeded? (4 additive backfill) ---
+# --- Helper: should <target> be seeded? ( additive backfill) ---
 # TRUE only when the target is genuinely missing. Backfill runs are additive-
 # only: an existing local file is NEVER touched. Under own-cloud in backfill
 # mode, local absence is not authoritative (read-through cache, guard-980
@@ -291,7 +291,7 @@ if seed_needed "$WORLD/aspirations.jsonl"; then
         echo "  Created empty world aspirations.jsonl"
     fi
 fi
-# 4: touch targets route through seed_needed too — under own-cloud
+# : touch targets route through seed_needed too — under own-cloud
 # BACKFILL a bare touch on a cache-absent-but-store-present file creates a
 # 0-byte local with no manifest baseline, which the real-time single-file
 # push path (sync_file, multi_machine=False) or a single-machine sweep would
@@ -328,7 +328,7 @@ if seed_needed "$WORLD/pattern-signatures.jsonl"; then
 fi
 
 # --- 4. Create collective JSONL stores ---
-# 4: seed_needed-guarded (see the aspirations-archive comment above).
+# : seed_needed-guarded (see the aspirations-archive comment above).
 if seed_needed "$WORLD/pipeline.jsonl"; then
     touch "$WORLD/pipeline.jsonl"
 fi
@@ -392,7 +392,7 @@ fi
 echo "  Created knowledge support files"
 
 # --- 7. Program placeholder (populated by /start) ---
-# 4: guarded — an evolved store-present program.md must never be
+# : guarded — an evolved store-present program.md must never be
 # shadowed by a 0-byte placeholder under BACKFILL.
 if seed_needed "$WORLD/program.md"; then
     touch "$WORLD/program.md"
@@ -554,7 +554,7 @@ bash "$CORE_ROOT/scripts/team-state-init.sh"
 echo "  Initialized team-state.yaml"
 
 # --- 10. Changelog ---
-# 4: guarded for consistency (changelog.jsonl is sweep-excluded /
+# : guarded for consistency (changelog.jsonl is sweep-excluded /
 # machine-local, so the own-cloud clobber lane does not apply — the guard
 # still skips the gratuitous mtime bump on existing files).
 if seed_needed "$WORLD/changelog.jsonl"; then

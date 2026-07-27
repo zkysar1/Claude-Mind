@@ -1,4 +1,4 @@
-"""test_prose_verification_drift_daemon_parity.py — regression for 4.
+"""test_prose_verification_drift_daemon_parity.py — regression for .
 
 The prose-verification-drift gate (a goal whose description carries the
 "Verification outcomes:" / "Verification checks:" prose headers but has an

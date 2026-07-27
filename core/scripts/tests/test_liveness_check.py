@@ -1,4 +1,4 @@
-"""Unit tests for core/scripts/liveness_check.decide_liveness (9).
+"""Unit tests for core/scripts/liveness_check.decide_liveness ().
 
 Exercises the PURE decision function only — no backend / fresh-signal-fetch IO —
 so the tests run under the daemon-safe hermetic suite with no credentials.

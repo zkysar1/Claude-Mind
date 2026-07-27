@@ -233,7 +233,7 @@ def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
             prev = g["rec"]
             merged = record_merge_fn(prev, rec)
             # Displacement tombstone is STICKY through the field-merge
-            # (7, mirrors _merge_goal): the per-store merge fn's LWW
+            # (, mirrors _merge_goal): the per-store merge fn's LWW
             # base may be the stale pre-displacement copy lacking the field.
             # Union symmetrically (both-set -> lexicographic min) and
             # re-canonicalize key order when the field had to be re-added —
@@ -251,7 +251,7 @@ def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
 
     # 2. Each logical record's preferred id = the SMALLEST numeric id it was seen
     #    under (a re-id'd record settles back to its lowest id; deterministic) —
-    #    UNLESS the record carries a displacement tombstone (7, mirrors
+    #    UNLESS the record carries a displacement tombstone (, mirrors
     #    _merge_goals): then its LATEST settled displacement slot is preferred,
     #    so a stale replica replaying the pre-collision copy cannot drag it back
     #    into the contested bucket and re-displace it to a pair-dependent id.
@@ -292,7 +292,7 @@ def _merge_id_keyed_jsonl(local: bytes, remote: bytes, *, id_prefix: str,
         while next_free in taken:
             next_free += 1
         rec = dict(rec)
-        # Displacement tombstone (7, mirrors _merge_goals): record the
+        # Displacement tombstone (, mirrors _merge_goals): record the
         # contested id this record LOST, once (first home wins on chained
         # displacement), and emit sorted-key at the moment the record gains the
         # key — so a later re-merge against a stale tombstone-less copy
@@ -418,7 +418,7 @@ def merge_guardrails(local: bytes, remote: bytes) -> bytes:
         record_merge_fn=_merge_guard_record, id_format=lambda n: f"guard-{n:03d}")
 
 
-# --- pattern-signatures.jsonl : union by id (id-keyed shape, 3) -----
+# --- pattern-signatures.jsonl : union by id (id-keyed shape, ) -----
 def _sig_identity(rec: dict):
     """Stable cross-machine identity of a pattern-signature record:
     (created, name). ``created`` is DATE-only (coarser than rb's
@@ -644,9 +644,9 @@ def merge_team_state(local: bytes, remote: bytes) -> bytes:
         key_fields=("id", "goal_id"))
     out["recent_completions"] = _merge_recent_completions(
         a.get("recent_completions") or [], b.get("recent_completions") or [])
-    # Singleton-doc key order side-independent on divergence (0: the
+    # Singleton-doc key order side-independent on divergence (: the
     # exact-equal-canon tiebreak returns the FIRST arg, so identical content in
-    # different serialization order ping-pongs; same helper as 1).
+    # different serialization order ping-pongs; same helper as ).
     return _dump_yaml(_commutative_key_order(a, b, out))
 
 
@@ -679,13 +679,13 @@ def merge_team_state_shard(local: bytes, remote: bytes) -> bytes:
         # content-larger blob so the result stays deterministic + commutative.
         return local if _canon(a) >= _canon(b) else remote
     win, _ = _order_by_ts(a, b, "last_active")
-    # Key order side-independent on divergence (0; see merge_team_state).
+    # Key order side-independent on divergence (; see merge_team_state).
     return _dump_yaml(_commutative_key_order(a, b, dict(win)))
 
 
 # --- aspirations.jsonl : union aspirations by id, union goals by id ----------
 # The hot ~8MB multipart goal queue written by ALL agents every iteration. With
-# NO registered handler it froze on the both-diverged 412 — the 1 route
+# NO registered handler it froze on the both-diverged 412 — the  route
 # (_put's 412 handler -> _merge_reconcile_put) fires ONLY for a registered store,
 # so aspirations.jsonl fell through to the doomed RMW retry -> fleet-wide
 # write-freeze / silent revert (confirmed 2026-07-03: complete-by returns 200 but
@@ -766,7 +766,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
         out["created_at"] = ca
     elif cb is not None:
         out["created_at"] = cb
-    # Displacement tombstone is STICKY (7): the LWW base may be the
+    # Displacement tombstone is STICKY (): the LWW base may be the
     # stale pre-displacement copy (which lacks the field) — a tombstone present
     # on either side survives the field-merge, or _merge_goals' anchor cannot
     # recognize the settled displacement on re-merge. Both-set-and-different
@@ -792,7 +792,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
             out["status"] = sa if _canon(sa) >= _canon(sb) else sb
         # else: both terminal-equal OR both non-terminal -> base LWW status stands
     # Claim pair: first-claim-wins for LIVE claims by DIFFERENT agents
-    # (8 / rb-3043 second-claimer steal). Symmetric in (a, b):
+    # ( / rb-3043 second-claimer steal). Symmetric in (a, b):
     # comparisons are on field VALUES, never argument order.
     ca_by, cb_by = a.get("claimed_by"), b.get("claimed_by")
     if ca_by and cb_by and ca_by != cb_by:
@@ -817,7 +817,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
         # last_modified strictly postdates the claim's claimed_at, which marks a
         # genuine RELEASE followed by a later edit (or other supersession).
         # Otherwise the null side is a stale PRE-claim snapshot and dropping the
-        # claim is the 7 double-claim hazard (two agents both believe
+        # claim is the  double-claim hazard (two agents both believe
         # they own the goal).
         #
         # Why claimed_at, not the claim side's last_modified: neither claim() nor
@@ -970,12 +970,12 @@ def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> lis
             # seq. If that foreign-seq id rides into the min-seq bucket, the keeper
             # carries an id belonging to a DIFFERENT bucket and collides with THAT
             # bucket's keeper -- two distinct goals sharing one id in a single pass
-            # (7 fresh-eyes finding). Anchor a multi-seq group to its home id
+            # ( fresh-eyes finding). Anchor a multi-seq group to its home id
             # so every keeper's id matches its bucket. Single-seq groups are left
             # verbatim -- no churn of legacy non-canonical g-N-N ids.
             if len(seqs) >= 2 and isinstance(rec, dict):
                 rec = dict(rec)
-                # Anchor choice (7 associativity hardening): when the
+                # Anchor choice ( associativity hardening): when the
                 # group carries a displacement tombstone whose home seq is one
                 # of the seen ids, the OTHER (higher) id is this goal's SETTLED
                 # displacement slot — anchor there so a stale replica replaying
@@ -985,7 +985,7 @@ def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> lis
                 # collision path). Without a tombstone the higher id is drift
                 # of unknown provenance (e.g. a peer's LWW edit) — anchor home
                 # (min) exactly as before, so a same-goal id drift can never
-                # steal a DISTINCT goal's settled slot (7 fixture).
+                # steal a DISTINCT goal's settled slot ( fixture).
                 # Pure function of merged group content -> commutative
                 # (guard-907).
                 home = _seq(rec.get("displaced_from")) if isinstance(
@@ -1025,7 +1025,7 @@ def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> lis
         displaced.extend(recs[1:])
     taken = {s for s in (_seq(k.get("id")) for k in keepers) if s is not None}
     # Evicted seqs are allocated-forever: a displaced goal re-id'd onto one
-    # would be tombstone-dropped by the NEXT merge (0).
+    # would be tombstone-dropped by the NEXT merge ().
     taken |= {s for s in (_seq(i) for i in evicted_ids) if s is not None}
     displaced.sort(key=lambda r: (str(r.get("created_at") or ""), _canon(r)))
     next_free = (max(taken) + 1) if taken else 1
@@ -1033,7 +1033,7 @@ def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> lis
         while next_free in taken:
             next_free += 1
         rec = dict(rec)
-        # Displacement tombstone (7): record the contested id this goal
+        # Displacement tombstone (): record the contested id this goal
         # LOST, once (first home wins — never overwritten on chained
         # displacement). Step 2's anchor reads it to recognize a prior
         # displacement on re-merge, so a stale replica replaying the
@@ -1063,7 +1063,7 @@ def _merge_goals(goals_a, goals_b, asp_num: str, evicted_ids=frozenset()) -> lis
 
 
 def _merge_archived_census(a_census, b_census):
-    """Merge two ``archived_census`` dicts with per-field semantics (0 —
+    """Merge two ``archived_census`` dicts with per-field semantics ( —
     the fix for the g-115-2401 census phantom producer, guard-1153: counters in
     record-merge handlers need EXPLICIT merge semantics, never the opaque-LWW
     default; the old LWW-by-``last_selected`` ride-along reverted census repairs
@@ -1160,7 +1160,7 @@ def _merge_aspiration_record(a: dict, b: dict) -> dict:
     # Garbage-tolerant: a one-sided census passes through with its shape only
     # normalized when well-formed, so a hand-corrupted evicted_ids (non-dict,
     # or non-list bucket) must degrade to "no tombstones", never crash the
-    # store merge (fresh-eyes-code 0 finding).
+    # store merge (fresh-eyes-code  finding).
     _ids = (census or {}).get("evicted_ids")
     evicted = frozenset(
         str(gid)
@@ -1169,7 +1169,7 @@ def _merge_aspiration_record(a: dict, b: dict) -> dict:
         for gid in vals)
     # Goals unioned with concurrent-allocation collision tolerance: two DISTINCT
     # goals that raced to the same g-{asp}-{seq} id are BOTH kept (loser re-id'd),
-    # not field-interleaved into one franken-record (7). asp_num scopes
+    # not field-interleaved into one franken-record (). asp_num scopes
     # the re-id sequence to this aspiration.
     asp_num = str(out.get("id", "")).replace("asp-", "")
     out["goals"] = _merge_goals(a.get("goals") or [], b.get("goals") or [],
@@ -1203,7 +1203,7 @@ def merge_aspirations(local: bytes, remote: bytes) -> bytes:
 
 
 # --- pipeline.jsonl / pipeline-archive.jsonl : union by content-derived id ---
-# (7 / rb-2849 — BRD P0, the cc-04 fleet wedge.) Hypothesis records
+# ( / rb-2849 — BRD P0, the cc-04 fleet wedge.) Hypothesis records
 # are EDITED IN PLACE (stage moves via pipeline-move, outcome/reflected/
 # surprise set by review-hypotheses), so the append-only LINE-UNION would
 # resurrect superseded versions as duplicate ids; the correct reconcile is
@@ -1509,7 +1509,7 @@ def _log_ts(rec) -> str:
 
 
 def _parse_jsonl_lossy(data: bytes) -> Tuple[List[dict], List[str]]:
-    """Torn-line-tolerant parse for APPEND-ONLY logs ONLY (5).
+    """Torn-line-tolerant parse for APPEND-ONLY logs ONLY ().
 
     A torn half-line (a truncated append — the write was interrupted mid-line)
     is unrecoverable half-data for an append-only log: the complete record
@@ -1543,7 +1543,7 @@ def _parse_jsonl_lossy(data: bytes) -> Tuple[List[dict], List[str]]:
 
 
 def _warn_torn_lines(torn: List[str], side: str) -> None:
-    """Loud, bounded stderr surface for dropped torn lines (5).
+    """Loud, bounded stderr surface for dropped torn lines ().
 
     The full torn content (capped) is echoed so the daemon log / sweep output
     preserves the forensic bytes even after the merged write-back replaces the
@@ -1679,7 +1679,7 @@ def merge_module_health(local: bytes, remote: bytes) -> bytes:
         # idempotent; derived success_rate recomputed) so the merged doc is
         # canonical-form regardless of which path a module took — otherwise
         # merge(m, m) rewrites bytes once more when a formerly-one-sided
-        # module meets the both-sided normalizer (0 idempotency).
+        # module meets the both-sided normalizer ( idempotency).
         if ra is None:
             merged[mid] = _merge_module(rb, rb) if isinstance(rb, dict) else rb
         elif rb is None:
@@ -1692,13 +1692,13 @@ def merge_module_health(local: bytes, remote: bytes) -> bytes:
     # deterministically (today 'modules' is the only top-level key).
     out = dict(a) if _canon(a) >= _canon(b) else dict(b)
     out["modules"] = merged
-    # Key order side-independent on divergence (0; see merge_team_state).
+    # Key order side-independent on divergence (; see merge_team_state).
     return _dump_yaml_default(_commutative_key_order(a, b, out))
 
 
 # --- forged-skills.yaml : keyed dict union (skills registry) ----------------
-# 5 — CURE for the stale-base full-file clobber lane (8
-# check-production-health row + 9 probe-governed-store /
+#  — CURE for the stale-base full-file clobber lane (
+# check-production-health row +  probe-governed-store /
 # reconcile-fleet-fork rows, 07-12/07-13 window). The registry basename had NO
 # handler, so concurrent writers fell into the diverged/LWW lanes and a
 # stale-base writer deleted peer rows.
@@ -1757,7 +1757,7 @@ def merge_forged_skills(local: bytes, remote: bytes) -> bytes:
     return _dump_yaml_default(_commutative_key_order(a, b, out))
 
 
-# --- skill-relations.yaml : list-union relation graph (6) ----------
+# --- skill-relations.yaml : list-union relation graph () ----------
 # The sibling shared registry to forged-skills.yaml — same clobber lane
 # (no handler -> diverged/LWW -> stale-base full-file write deletes peer
 # entries). Writer inventory (rb-245, verified 2026-07-17): cmd_add appends
@@ -1919,13 +1919,13 @@ def merge_aspirations_meta(local: bytes, remote: bytes) -> bytes:
             else:
                 merged_g[k] = va2 if _canon(va2) >= _canon(vb2) else vb2
         out["readiness_gates"] = merged_g
-    # Key order side-independent on divergence (0; see merge_team_state).
+    # Key order side-independent on divergence (; see merge_team_state).
     out = _commutative_key_order(a, b, out)
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
 
 def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
-    """Field-level reconcile of two pipeline-meta.json documents (7 —
+    """Field-level reconcile of two pipeline-meta.json documents ( —
     frozen in the same cc-04 flow: every pipeline add/move/update recomputes
     and rewrites this file, so an unmergeable meta would re-freeze the flow the
     pipeline.jsonl handler just unfroze). Everything except
@@ -1957,7 +1957,7 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
                 merged_m[k] = va
             elif (isinstance(va, (int, float)) and not isinstance(va, bool)
                     and isinstance(vb, (int, float)) and not isinstance(vb, bool)):
-                # 3 (guard-1153 sweep): confirmed_all_time /
+                #  (guard-1153 sweep): confirmed_all_time /
                 # corrected_all_time are grow-only counters — numeric MAX.
                 # The previous _canon content-compare ordered lexicographically
                 # ("10" < "9"), so a counter could go BACKWARD on a same-key
@@ -1981,7 +1981,7 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
                 and (conf + corr) > 0 and "accuracy_all_time" in merged_m):
             merged_m["accuracy_all_time"] = round(conf / (conf + corr), 3)
         out["micro_hypothesis_stats"] = merged_m
-    # Key order side-independent on divergence (0; see merge_team_state).
+    # Key order side-independent on divergence (; see merge_team_state).
     out = _commutative_key_order(a, b, out)
     return (json.dumps(out, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
 
@@ -2026,10 +2026,10 @@ def merge_pipeline_meta(local: bytes, remote: bytes) -> bytes:
 _TREE_MAX_FIELDS = ("retrieval_count", "times_helpful", "times_noise",
                     "times_inferred_helpful", "sample_size")
 # Monotonic timestamps -> strictly-newer ISO wins. progression_updated_at
-# (5) is the dedicated PROGRESSION-field calibration stamp: writers of
+# () is the dedicated PROGRESSION-field calibration stamp: writers of
 # confidence/capability_level/domain_confidence bump it on edit, and the
 # PROGRESSION merge keys on it (see _merge_tree_node) instead of last_updated,
-# which 3 deliberately leaves un-bumped on a field poke. It merges NEWER
+# which  deliberately leaves un-bumped on a field poke. It merges NEWER
 # so the winning side's stamp is preserved.
 _TREE_NEWER_FIELDS = ("last_retrieved", "last_updated", "last_relevant_at",
                       "progression_updated_at")
@@ -2141,12 +2141,12 @@ def _merge_tree_node(a: dict, b: dict) -> dict:
             out[f] = b[f]
     # PROGRESSION merges key on the DEDICATED progression_updated_at stamp
     # (bumped by writers on any confidence/capability_level/domain_confidence
-    # edit), falling back to last_updated for un-migrated nodes. 3
+    # edit), falling back to last_updated for un-migrated nodes. 
     # deliberately does NOT bump last_updated on a field poke (it tracks .md
     # article freshness, SSOT ), so keying PROGRESSION on last_updated
     # made every confidence merge see equal stamps and hit the never-regress
     # tiebreak, silently reverting data-derived DOWNGRADES to the stale-higher
-    # value (4; rb-3823, guard-1170). The fallback keeps behavior
+    # value (; rb-3823, guard-1170). The fallback keeps behavior
     # byte-identical for nodes not yet re-written with the stamp (backfill-safe).
     # Commutative: pa/pb are each side's own value passed in (a, b) order and
     # _merge_field_progression is symmetric under (va, pa)<->(vb, pb) swap.
@@ -2576,7 +2576,7 @@ def merge_outcome_metrics(local: bytes, remote: bytes) -> bytes:
 
 
 # --- evolution event streams : revision_id-keyed, status-monotonic ----------
-# (1, from the 2026-07-18 12-file both-diverged repair 8.)
+# (, from the 2026-07-18 12-file both-diverged repair .)
 # The four evolution streams ({self,skill,rule,script}-evolution.jsonl) were
 # proposed as plain line-union, but the rb-245 writer read DISPROVED
 # append-only: evolution-record.py APPENDS stubs (status=awaiting_completion),
@@ -2603,7 +2603,7 @@ def _merge_evolution_record(a: dict, b: dict) -> dict:
     w, _l = _order_by_ts(a, b, "ts")
     # Canon tie = identical parsed content, but key ORDER may have diverged —
     # _order_by_ts then returns its first arg, which is side-dependent. Emit
-    # sorted-key order on divergence (1 pattern) so bytes stay
+    # sorted-key order on divergence ( pattern) so bytes stay
     # side-independent (guard-907).
     if _canon(a) == _canon(b):
         return _commutative_key_order(a, b, w)
@@ -2629,7 +2629,7 @@ def merge_evolution_stream(local: bytes, remote: bytes) -> bytes:
 
 
 # --- infra-health.yaml : per-component newest-activity-wins ------------------
-# (1.) Writer: infra-health.py via locked_modify_yaml — per-component
+# (.) Writer: infra-health.py via locked_modify_yaml — per-component
 # in-place mutation of {last_success, last_failure, consecutive_failures,
 # streak_started_at, ...}. A component's fields are internally consistent
 # (streak math), so the reconcile unit is the WHOLE component record, won by
@@ -2667,7 +2667,7 @@ def merge_infra_health(local: bytes, remote: bytes) -> bytes:
             comps[name] = xa if _canon(xa) > _canon(xb) else xb
         elif isinstance(xa, dict) and isinstance(xb, dict):
             # Canon tie: identical content, possibly diverged key order —
-            # side-independent order via 1 pattern (guard-907).
+            # side-independent order via  pattern (guard-907).
             comps[name] = _commutative_key_order(xa, xb, xa)
         else:
             comps[name] = xa
@@ -2686,7 +2686,7 @@ def merge_infra_health(local: bytes, remote: bytes) -> bytes:
 
 
 # --- goal-selection-strategy.yaml : version-winner + applications_log union --
-# (1.) Versioned meta-strategy: writers are whole-file/field RMW
+# (.) Versioned meta-strategy: writers are whole-file/field RMW
 # (meta-yaml.py set, meta-init.py seed, goal-selector.py applications_log
 # append via locked_modify_yaml). Reconcile: the side with the HIGHER version
 # wins the strategy body (tie -> newer last_updated -> canon); the
@@ -2721,7 +2721,7 @@ def merge_goal_selection_strategy(local: bytes, remote: bytes) -> bytes:
         # Canon tie: identical content, possibly diverged key order — a bare
         # "pick a" is side-dependent and breaks byte-commutativity
         # (guard-907; caught by test_serialization_order_commutative).
-        # Sorted-key order on divergence per the 1 pattern.
+        # Sorted-key order on divergence per the  pattern.
         w = _commutative_key_order(a, b, a)
     out = dict(w)
     la = a.get("applications_log") if isinstance(a.get("applications_log"), list) else []
@@ -2739,7 +2739,7 @@ def merge_goal_selection_strategy(local: bytes, remote: bytes) -> bytes:
 
 
 # --- hypothesis-category-bindings.json : key-union on a derived map ----------
-# (1.) Writer: tree-accuracy-sync.py — full-file rewrite of a FLAT
+# (.) Writer: tree-accuracy-sync.py — full-file rewrite of a FLAT
 # {category: node-key} string map DERIVED from tree state (rebuildable; the
 # next sync run recomputes authoritative values). Keys union; a same-key value
 # conflict has no per-key timestamp to arbitrate, so the canonical-larger
@@ -2771,7 +2771,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # id-keyed field-merge (records edited in place -> merge same-id copies)
     "reasoning-bank.jsonl": merge_reasoning_bank,
     "guardrails.jsonl": merge_guardrails,
-    # pattern signatures (3): in-place-mutating writers (record-outcome
+    # pattern signatures (): in-place-mutating writers (record-outcome
     # counter bumps, set-status retire) -> id-keyed field-merge, NOT line-union
     # (which would resurrect retired signatures). Mixed-format on-disk ids
     # (sig-001 legacy pad / sig-8+ unpadded) are preserved via the observed-form
@@ -2782,7 +2782,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # aspiration/goal-id union (records edited in place)
     "aspirations.jsonl": merge_aspirations,
     # hypothesis pipeline: union by content-derived id + stage-monotonic
-    # field-merge (records edited in place; 7 / rb-2849 — the cc-04
+    # field-merge (records edited in place;  / rb-2849 — the cc-04
     # NON-multipart no_clobber freeze, sibling of bdab36ab's multipart fix).
     # pipeline-archive.jsonl shares the record shape AND the flow (resolve
     # moves live->archive), so it takes the same handler.
@@ -2792,18 +2792,18 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # (complete/complete_intent/retire APPEND whole-aspiration records;
     # archive_sweep REWRITES normalizing via _normalize_terminal_goals_in) —
     # same handler. Writer inventory read per rb-245 (). Ported from
-    # cc-02 9 registry expansion at the 2 unwedge merge.
+    # cc-02  registry expansion at the  unwedge merge.
     "aspirations-archive.jsonl": merge_aspirations,
     # outcome metrics: whole-file derived snapshot -> LWW by updated_at
-    # (6; box-relative counter wart tracked in 8).
+    # (; box-relative counter wart tracked in ).
     "outcome-metrics.yaml": merge_outcome_metrics,
-    # forged-skills registry (5): keyed dict union under skills: —
+    # forged-skills registry (): keyed dict union under skills: —
     # append-mostly rows (retirement = status field, never deletion), so a
     # row on either side survives; same-name divergence -> whole-record
-    # newer-forged_date/richer/_canon winner. CURE for the 8 +
-    # 9 stale-base row-clobber incidents.
+    # newer-forged_date/richer/_canon winner. CURE for the  +
+    #  stale-base row-clobber incidents.
     "forged-skills.yaml": merge_forged_skills,
-    # skill-relations graph (6): sibling registry to forged-skills —
+    # skill-relations graph (): sibling registry to forged-skills —
     # forged_relations list unioned by (source,target,type), co_invocation_log
     # entry-unioned then re-capped at the writers' own cap (cmd_co_invoke's
     # tail-cap is a legitimate delete path a naive union would resurrect).
@@ -2816,7 +2816,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # board read-cursors: append-only per-agent read receipts.
     "coordination-reads.jsonl": merge_append_only_jsonl,
     "decisions-reads.jsonl": merge_append_only_jsonl,
-    # store-hygiene archive sinks (7): jsonl_hygiene compact/rotate
+    # store-hygiene archive sinks (): jsonl_hygiene compact/rotate
     # APPENDS moved retired/superseded records archive-FIRST via
     # locked_modify_jsonl and NOTHING deletes from an archive (bounded-by-
     # design, the hygiene glob explicitly never matches *-archive*). Two boxes
@@ -2829,7 +2829,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "guardrails-archive.jsonl": merge_append_only_jsonl,
     "reasoning-bank-archive.jsonl": merge_append_only_jsonl,
     "pattern-signatures-archive.jsonl": merge_append_only_jsonl,
-    # Triaged NOT-registered (7 audit, dispositions on record):
+    # Triaged NOT-registered ( audit, dispositions on record):
     #   world/journal.jsonl — 12-byte "placeholder" seed artifact, zero
     #     writers found (agents journal into agents/<name>/journal.jsonl);
     #     freeze is a no-op on a file nothing writes.
@@ -2842,7 +2842,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #     until a second writer or observed divergence justifies it.
     "findings-reads.jsonl": merge_append_only_jsonl,
     "general-reads.jsonl": merge_append_only_jsonl,
-    # 5th board read-cursor (1 — froze at streak 5 in the 2026-07-18
+    # 5th board read-cursor ( — froze at streak 5 in the 2026-07-18
     # both-diverged backlog): same board.py mark-read locked_append_jsonl
     # writer as the four registered above.
     "reasoning-reads.jsonl": merge_append_only_jsonl,
@@ -2862,11 +2862,11 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "general.jsonl": merge_append_only_jsonl,
     "findings.jsonl": merge_append_only_jsonl,
     "decisions.jsonl": merge_append_only_jsonl,
-    # non-default board channels (6): same board_write.py append path +
+    # non-default board channels (): same board_write.py append path +
     # same append-only contract as the canonical 4, but absent from
     # DEFAULT_CHANNELS so they were left unregistered and wedged on both-diverged.
     # The merge_append_only_jsonl docstring already claims to cover "the board
-    # channels" -- this closes the gap. CORRECTION (0): an earlier
+    # channels" -- this closes the gap. CORRECTION (): an earlier
     # revision of this comment claimed these non-default channels have "NO
     # archive/prune writer" and are "strictly safer" than the canonical 4 --
     # that was FALSE. store-hygiene.yaml rotates the GLOB `world/board/*.jsonl`
@@ -2890,12 +2890,12 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "parent-supersession-sweep-metrics.jsonl": merge_append_only_jsonl,
     "unblock-parent-status-sweep-metrics.jsonl": merge_append_only_jsonl,
     "routing-audit-target-status-sweep-metrics.jsonl": merge_append_only_jsonl,
-    # Phase 4 bulk-override audit ledger (6): multi-agent append-only
+    # Phase 4 bulk-override audit ledger (): multi-agent append-only
     # via _override_helpers.locked_append_jsonl (no rewrite writer). A shared
     # world store where concurrent overrides from two boxes can both-diverge and
     # wedge without a handler; strictly append-only (immutable audit records).
     "override-bypass-ledger.jsonl": merge_append_only_jsonl,
-    # 9 (6 remainder): the lower-churn shared append-only
+    #  ( remainder): the lower-churn shared append-only
     # stores that could still wedge on both-diverged. EACH verified strictly
     # append-only by reading its writer (rb-245 / rb-3153): merge_append_only_jsonl
     # is a commutative LINE-UNION, so a both-diverged merge RESURRECTS any
@@ -2922,8 +2922,8 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "retrieval-trace.jsonl": merge_append_only_jsonl,
     "loop-death-detections.jsonl": merge_append_only_jsonl,
     "description-length-telemetry.jsonl": merge_append_only_jsonl,
-    # changelog.jsonl + its rotation target changelog-archive.jsonl (3,
-    # ports cc-02 7b6801e1; SUPERSEDES the 6 "pruned -> exclude" call).
+    # changelog.jsonl + its rotation target changelog-archive.jsonl (,
+    # ports cc-02 7b6801e1; SUPERSEDES the  "pruned -> exclude" call).
     # changelog.jsonl IS rotated by store-hygiene.yaml, but the rotation MOVES
     # lines into changelog-archive.jsonl -- it is NOT a rewrite/rebuild that drops
     # records -- so the pair carries the SAME bounded rotate+line-union tradeoff
@@ -2940,7 +2940,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # the pair wants a paired-archive-aware handler instead of the plain line-union.
     "changelog.jsonl": merge_append_only_jsonl,
     "changelog-archive.jsonl": merge_append_only_jsonl,
-    # 1 (2026-07-18 12-file both-diverged repair, 8 cure):
+    #  (2026-07-18 12-file both-diverged repair,  cure):
     # evolution event streams — NOT line-union (rb-245 read disproved
     # append-only: evolution-complete/stub-expiry REWRITE stub records in
     # place); revision_id-keyed status-monotonic merge instead. Dispatch by
@@ -2955,11 +2955,11 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # stub-expiry rewrite), so it takes the same handler rather than staying
     # the lone freeze-prone sibling.
     "program-evolution.jsonl": merge_evolution_stream,
-    # meta/l1-pick-log.jsonl (1): NOW writer-verified append-only —
+    # meta/l1-pick-log.jsonl (): NOW writer-verified append-only —
     # _l1_pick.py open('a') + l1-domain-rename.py (self-documented "append");
     # leaves the DEFERRED list below.
     "l1-pick-log.jsonl": merge_append_only_jsonl,
-    # meta/meta-log.jsonl (1): NOW writer-verified append-only —
+    # meta/meta-log.jsonl (): NOW writer-verified append-only —
     # meta-yaml.py append_log() opens 'a' (the open('r') the old DEFERRED note
     # flagged is only mc-NNN ID ALLOCATION, not a rewrite; daemon twin
     # meta_yaml.py mirrors it). Accepted tradeoff: concurrent cross-box
@@ -2967,12 +2967,12 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # bounded duplicate-ID tolerance (next_meta_change_id takes max, so
     # allocation self-heals), same class as the archive-sink duplicates above.
     "meta-log.jsonl": merge_append_only_jsonl,
-    # world/auto-fix-evidence-sweep-metrics.jsonl (1): writer RETIRED
+    # world/auto-fix-evidence-sweep-metrics.jsonl (): writer RETIRED
     # (zero code references fleet-wide; last record 2026-06-23) — immutable
     # historical run_summary log, so line-union reconciles the residual
     # divergence and nothing can violate append-only going forward.
     "auto-fix-evidence-sweep-metrics.jsonl": merge_append_only_jsonl,
-    # 1 structured trio (per-file decisions on record in each handler):
+    #  structured trio (per-file decisions on record in each handler):
     "infra-health.yaml": merge_infra_health,
     "goal-selection-strategy.yaml": merge_goal_selection_strategy,
     "hypothesis-category-bindings.json": merge_hypothesis_category_bindings,
@@ -2988,12 +2988,12 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # = safe-freeze, the conservative default; needs per-writer read before adding):
     #   scoring-criterion-audit.jsonl, and the
     #   file-contention/gate-d/history-save/history-shadow/write-queue-telemetry
-    #   family (variable-path writers not resolved in the 9 pass).
+    #   family (variable-path writers not resolved in the  pass).
     #   (pattern-signatures.jsonl left this list 2026-07-16 — registered above
-    #   with merge_pattern_signatures, 3. meta-log.jsonl +
+    #   with merge_pattern_signatures, . meta-log.jsonl +
     #   l1-pick-log.jsonl left it 2026-07-18 — writer-verified and registered
-    #   above, 1.)
-    #   world/conventions/deploy-secrets.md (1 disposition) ->
+    #   above, .)
+    #   world/conventions/deploy-secrets.md ( disposition) ->
     #   hand-edited markdown with NO code writer; prose has no commutative
     #   merge unit, so it stays safe-freeze + hand-union on conflict (the
     #   2026-07-18 repair pushed LOCAL, which carried the  correction).
@@ -3003,7 +3003,7 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "aspirations-meta.json": merge_aspirations_meta,
     # pipeline meta: derived counters (LWW, self-correcting via recompute) +
     # micro_hypothesis_stats per-key union — rewritten by every pipeline
-    # mutation, so it must reconcile for the 7 flow to stay unfrozen.
+    # mutation, so it must reconcile for the  flow to stay unfrozen.
     "pipeline-meta.json": merge_pipeline_meta,
     # _tree.yaml: the 4th, highest-blast-radius freeze shape (~1140-node tree with
     # structural children/parent fields + a chronological growth log + CRLF). Node

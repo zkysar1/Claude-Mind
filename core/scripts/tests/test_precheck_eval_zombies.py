@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_precheck_eval_zombies.py — precheck-eval.py cmd_zombies contract (4).
+"""test_precheck_eval_zombies.py — precheck-eval.py cmd_zombies contract ().
 
 Pins the two-kind zombie predicate:
 

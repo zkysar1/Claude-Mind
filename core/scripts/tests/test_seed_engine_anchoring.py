@@ -261,22 +261,44 @@ def test_orphan_removal_preserves_registered_dest_forged_skill(tmp_path):
     assert ".claude/skills/sam-gov-search/SKILL.md" not in result["removed"]
 
 
-def test_orphan_removal_removes_unregistered_skill_when_registry_present(tmp_path):
-    """When a registry IS present, a skill dir absent from BOTH the source
-    include set AND the registry is a true orphan and is removed."""
+def test_orphan_removal_preserves_unregistered_skill_with_skillmd(tmp_path):
+    """Root cause A (/): a skill dir carrying a SKILL.md is a
+    REAL skill and is PRESERVED even when absent from BOTH the source include set
+    AND the dest registry — because forged-skill REGISTRATION is external/gitignored
+    and does NOT travel with a git promotion, so a legitimately-promoted skill
+    arrives unregistered (the notify-user deletion, twice). Protection is
+    SKILL.md-presence-based, not registry-membership-based (guard-1271). A skill
+    dir WITHOUT a SKILL.md, and a genuine non-skill orphan, are still removed —
+    so the protection is scoped to real skills, not a blanket `.claude/skills/` keep.
+
+    (Supersedes the retired test_orphan_removal_removes_unregistered_skill_when_
+    registry_present, which asserted the pre-fix behavior that DELETED such a skill.)"""
     src = tmp_path / "src"
     dest = tmp_path / "dest"
     manifest = _src_with_base_skill(src)
 
     _w(dest / ".claude" / "skills" / "start" / "SKILL.md", "old base")
+    # unregistered but REAL (has SKILL.md) — the promoted-but-unregistered shape
     _w(dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md", "not registered")
+    # skill DIR without a SKILL.md — not a real skill, still a true orphan
+    _w(dest / ".claude" / "skills" / "empty-shell" / "notes.txt", "no SKILL.md here")
+    # genuine non-skill orphan
+    _w(dest / ".claude" / "orphan-note.md", "removed upstream")
     _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="sam-gov-search"))
 
     result = _engine.do_remove_orphans(dest, manifest, src)
 
+    # base skill in include set: kept
     assert (dest / ".claude" / "skills" / "start" / "SKILL.md").exists()
-    assert not (dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md").exists()
-    assert ".claude/skills/ghost-skill/SKILL.md" in result["removed"]
+    # unregistered-but-real skill: NOW PRESERVED (root cause A fix)
+    assert (dest / ".claude" / "skills" / "ghost-skill" / "SKILL.md").exists()
+    assert ".claude/skills/ghost-skill/SKILL.md" not in result["removed"]
+    # no-SKILL.md skill dir: still an orphan, removed
+    assert not (dest / ".claude" / "skills" / "empty-shell" / "notes.txt").exists()
+    assert ".claude/skills/empty-shell/notes.txt" in result["removed"]
+    # non-skill orphan: removed
+    assert not (dest / ".claude" / "orphan-note.md").exists()
+    assert ".claude/orphan-note.md" in result["removed"]
 
 
 def test_orphan_removal_fail_safe_preserves_all_skills_when_no_registry(tmp_path):
@@ -394,6 +416,32 @@ def test_clean_cruft_preserves_forged_skill_dir_with_living_prod(tmp_path):
     assert (dest / ".claude" / "skills" / "notify-user" / "SKILL.md").exists()
     assert ".claude/skills/notify-user/" in result["skipped_preserved"]
     # Genuine cruft removed
+    assert not (dest / ".active-agent-abc123").exists()
+    assert ".active-agent-abc123" in result["removed"]
+
+
+def test_clean_cruft_preserves_unregistered_skill_with_skillmd_living_prod(tmp_path):
+    """Root cause A (): a skill dir with a SKILL.md matched by a cruft
+    pattern is preserved under --living-prod even when the dest registry does NOT
+    list it (registration is external/gitignored, so a git-promoted skill arrives
+    unregistered). SKILL.md-presence protection, not registry membership
+    (guard-1271) — the cruft-lane twin of the orphan-lane fix. A genuine cruft
+    file is still removed."""
+    dest = tmp_path / "dest"
+    _w(dest / ".claude" / "skills" / "notify-user" / "SKILL.md", "domain transport")
+    # registry lists a DIFFERENT skill — notify-user is unregistered at dest
+    _w(dest / "world" / "forged-skills.yaml", _REGISTRY.format(name="something-else"))
+    _w(dest / ".active-agent-abc123", "stale binding")
+
+    manifest = _cruft_manifest([
+        ".claude/skills/notify-user/",   # unregistered real skill — preserved via SKILL.md
+        ".active-agent-*",               # genuine cruft — removed
+    ])
+
+    result = _engine.do_clean_cruft(dest, manifest, preserve_deployment_local=True)
+
+    assert (dest / ".claude" / "skills" / "notify-user" / "SKILL.md").exists()
+    assert ".claude/skills/notify-user/" in result["skipped_preserved"]
     assert not (dest / ".active-agent-abc123").exists()
     assert ".active-agent-abc123" in result["removed"]
 

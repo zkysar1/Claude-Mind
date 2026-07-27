@@ -198,7 +198,7 @@ def test_empty_moves_is_noop(tmp_path, monkeypatch):
 
 
 def test_apply_chain_moves_no_corruption(tmp_path, monkeypatch):
-    """Finding 1 regression (5): two moves forming a CHAIN — move A's
+    """Finding 1 regression (): two moves forming a CHAIN — move A's
     NEW path equals move B's OLD path — must not corrupt. A body citing BOTH old
     paths must map each to ITS OWN target, never double-rewrite through the chain.
     The retired per-ref sequential str.replace produced `gamma` for BOTH refs:

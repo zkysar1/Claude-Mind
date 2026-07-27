@@ -153,7 +153,7 @@ then
     exit 1
 fi
 
-# ─────────────────── deliverable-file verification (6) ───────────────────
+# ─────────────────── deliverable-file verification () ───────────────────
 # rb-428 class: a recurring skill's deliverable-writing step (e.g. /agent-completion-
 # report writing agents/<agent>/COMPLETION-REPORT.md in its Phase 4) is LLM-gated and
 # can drift — a close advances lastAchievedAt WITHOUT the named deliverable being
@@ -163,7 +163,7 @@ fi
 # + its CURRENT lastAchievedAt (verify has NOT yet bumped it — this block runs before
 # the phases below) and checks mtime > lastAchievedAt. Goals WITHOUT the field verdict
 # "skip" → they close exactly as before. FAIL-OPEN + FLAG-ONLY: never blocks a close (a
-# false-stale mtime — e.g. an own-cloud stale pull, 9 — must not gate real
+# false-stale mtime — e.g. an own-cloud stale pull,  — must not gate real
 # work). {agent} in the path expands to $MIND_AGENT (a shared recurring goal produces
 # a per-agent deliverable — rb-1556). A hard-refuse mode would hook in here.
 DELIV_VERDICT="$(python3 "$SCRIPT_DIR/deliverable-verify.py" \
@@ -190,7 +190,7 @@ esac
 #   - signals.consecutive_blocked_sleeps (reset on deep)
 #   - goals_completed_this_session, productive_goals_this_session
 #
-# As of 1, bash ALSO owns evolutions / last_evolution_at /
+# As of , bash ALSO owns evolutions / last_evolution_at /
 # alignment_check_at / aspirations_touched (loop-state-bump-counters.py:
 # --goal-id increments alignment+touched every close, --reset-alignment at
 # aspirations-select, --evolution-fired at aspirations-evolve). The only fields
@@ -672,7 +672,7 @@ if original_outcome == "routine" and outcome == "deep":
         )
         sys.exit(0)
 
-    # 9: substantive-artifact probe (second-layer suppression).
+    # : substantive-artifact probe (second-layer suppression).
     # When the empty-WM check () did not fire (some buffer was
     # non-empty from earlier work this session), the canary still fires
     # unnecessarily if the just-closed iteration produced no new artifact.
@@ -779,7 +779,7 @@ if original_outcome == "routine" and outcome == "deep":
                         except Exception:
                             continue
             # 4. Pipeline state change (cheap proxy: pipeline.jsonl OR pipeline-meta.json mtime).
-            #    rb-1203 / 5: pipeline-add.sh writes pipeline.jsonl directly without
+            #    rb-1203 / : pipeline-add.sh writes pipeline.jsonl directly without
             #    touching pipeline-meta.json mtime (only pipeline-recompute-meta.sh refreshes
             #    meta), so checking meta alone missed in-window hypothesis filings and the
             #    canary suppressed genuinely-productive forced-flips. Probe pipeline.jsonl first.
@@ -837,7 +837,7 @@ if exp_path.exists():
                 e = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            # Match canonical goal_id OR legacy source_goal (1): 90 of
+            # Match canonical goal_id OR legacy source_goal (): 90 of
             # 476 store entries carry only source_goal (writer templates drifted
             # by analogy with the rb/guardrail stores where source_goal IS
             # canonical). Without the fallback the canary false-fires
@@ -912,7 +912,7 @@ fi
 # Without an outcome-aware imperative here, deep-outcome recurring closures
 # silently bypass Phase 6 — the same docs-vs-impl drift class universal RB
 # "Docs-vs-impl drift in framework shortcut wrappers" was filed against.
-# Sentinel-WM-slot transport for Phase 6 spark imperative (4).
+# Sentinel-WM-slot transport for Phase 6 spark imperative ().
 # When recurring-close.sh's wall-clock exceeds the Bash 2-minute timeout the
 # call backgrounds, the harness fires the stop hook before bg completes, and
 # the LLM re-enters /aspirations loop never seeing the stdout imperative
@@ -932,7 +932,7 @@ EXPIRES_AT="$(py -3 -c "from datetime import datetime, timedelta; print((datetim
 # (spark-fire-dedup.py check --sentinel-set-at): a spark recorded at/after this
 # set_at fired in response to THIS close (skip the re-fire); one from a prior
 # close fired before it (fire). Additive field — older consumers ignore it; the
-# new consumer prefers it over the time-window heuristic (4 / rb-1674).
+# new consumer prefers it over the time-window heuristic ( / rb-1674).
 SET_AT="$(py -3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
 if [[ -n "$EXPIRES_AT" ]]; then
     SENTINEL_PAYLOAD="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$EXPIRES_AT" SETAT="$SET_AT" py -3 -c "
@@ -979,7 +979,7 @@ else
 fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 
-# Imperative-fired tracer (6): independent observability lane confirming
+# Imperative-fired tracer (): independent observability lane confirming
 # the ITERATION COMPLETE imperative above reached this code path (outcome-aware).
 # Mirror of the iteration-close.sh tracer; carries goal_id + outcome for the
 # recurring path. Append-only, fail-open (|| true) — runs BEFORE `exit $MAX_RC`

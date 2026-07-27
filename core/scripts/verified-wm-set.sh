@@ -18,7 +18,7 @@
 #     consistent structured output on every exit path).
 #
 # Usage:  echo '<json-value>' | verified-wm-set.sh <slot-name>
-# Origin: 6 (board insight-trigger msg-20260613-122037-alpha-2004).
+# Origin:  (board insight-trigger msg-20260613-122037-alpha-2004).
 #         Single-writer of any given cadence slot stays with its owning skill
 #         (guard-155); this wrapper only hardens the WRITE MECHANISM.
 

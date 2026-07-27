@@ -200,7 +200,7 @@ def main() -> int:
             return 1
 
         # utility_ratio reflects the bump: (0 + 0.5*1) / 5 = 0.1. Tree nodes
-        # deliberately KEEP the max(rc, 1) denominator (9 changed
+        # deliberately KEEP the max(rc, 1) denominator ( changed
         # only rb/guardrails — tree th<=rc precondition holds).
         expected_ur = round((0 + 0.5 * 1) / 5, 4)
         if alpha_ur != expected_ur:

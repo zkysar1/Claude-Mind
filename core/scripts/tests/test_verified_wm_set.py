@@ -1,4 +1,4 @@
-"""test_verified_wm_set.py — 6 regression test.
+"""test_verified_wm_set.py —  regression test.
 
 verified-wm-set.sh hardens the WM-write mechanism for cadence stamps: it
 writes a value, reads it back, asserts JSON-canonical equality, and retries
@@ -23,12 +23,15 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from _bash_helpers import BASH  # noqa: E402
 CORE_SCRIPTS = SCRIPT_DIR.parent
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 VERIFIED_WM_SET = CORE_SCRIPTS / "verified-wm-set.sh"
@@ -42,7 +45,18 @@ VERIFY_LEARNING_SKILL = (
 
 
 def _bash() -> str:
-    return shutil.which("bash") or "bash"
+    # Route through the shared helper, NOT shutil.which ().
+    # `shutil.which` searches PATH only; CreateProcess searches System32
+    # FIRST, then PATH. Measured on this box: Git-bin sits at PATH index 2
+    # while System32 sits at index 12 — so which() returns Git bash and
+    # CreateProcess returns C:\Windows\System32\bash.exe, the WSL launcher.
+    # The two resolvers DISAGREE, and that disagreement is the bug: when
+    # WSL is broken (Wsl/0x80080005) the launcher blocks forever on a dead
+    # LxssManager, spawning 0-CPU processes that hang the suite until
+    # pytest's faulthandler bound aborts the whole run. This file is
+    # main()-style, so the conftest normalization never runs for it — the
+    # helper is the only protection here.
+    return BASH
 
 
 class TestVerifiedWmSetBehavior(unittest.TestCase):

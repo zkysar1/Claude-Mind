@@ -1,4 +1,4 @@
-"""test_post_state_update_gate_committed_files_only.py — regression test for 8.
+"""test_post_state_update_gate_committed_files_only.py — regression test for .
 
 Exercises the COMMIT_SHA-scoped detection branch added to
 core/scripts/post-state-update-gate.sh (Option B from the g-115-1154
@@ -159,7 +159,7 @@ def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None,
 
 @pytest.fixture(autouse=True)
 def _preserve_zeta_wm():
-    """Save, NEUTRALIZE, then restore zeta's fresh_eyes_last_fire (3).
+    """Save, NEUTRALIZE, then restore zeta's fresh_eyes_last_fire ().
 
     Root cause of the historical flake (g-115-1178): the gate's cooldown reads
     agents/zeta/session/working-memory.yaml via the daemon-routed wm-read. That
@@ -279,7 +279,7 @@ def test_invalid_commit_sha_falls_back_to_working_tree():
 
 
 def _setup_repo_multicommit(tmp: Path) -> tuple[Path, str]:
-    """Two goal commits stamped '(9)': a mid-Phase-4 CODE commit (3
+    """Two goal commits stamped '()': a mid-Phase-4 CODE commit (3
     core files, one new .py) followed by a close-time DOCS-ONLY commit. Returns
     (repo, close_sha) — the docs commit is what iteration-close passes as
     COMMIT_SHA (the g-115-2026 leak shape)."""
@@ -313,7 +313,7 @@ def _setup_repo_multicommit(tmp: Path) -> tuple[Path, str]:
 
 
 def test_goal_id_unions_midgoal_commits():
-    """0: GOAL_ID unions every '(goal-id)'-stamped commit into the
+    """: GOAL_ID unions every '(goal-id)'-stamped commit into the
     committed scope, so a mid-Phase-4 code commit is detected even when the
     close-time COMMIT_SHA carries only docs."""
     PROJECT_TMP.mkdir(exist_ok=True)

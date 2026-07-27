@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Handoff-Aging Escalation — bash-enforce precheck Phase 0.5b.2b (4).
+"""Handoff-Aging Escalation — bash-enforce precheck Phase 0.5b.2b ().
 
 Scan the world + agent goal queues for cross-agent handoff goals
 (`handoff_to` set, routed to an agent OTHER than self) that have aged past

@@ -24,7 +24,7 @@
 #                                  the agent is on-lane) vs. indicate drift. Default 0.0 =
 #                                  no direction info (legacy raw-count behavior). Down-weights
 #                                  evo_count so act_later fires on net-DIVERGENT signal, not
-#                                  gross volume (0).
+#                                  gross volume ().
 #   self_last_updated_days       — int — days since target md was last touched
 #   partner_alignment_score      — 0..1 — only for fresh-eyes-program; cross-agent alignment
 #   explicit_user_directive      — bool — true if user has asked about purpose/portfolio
@@ -146,7 +146,7 @@ actionable = num("signal_actionable_score")
 drift = num("portfolio_drift_score")
 health = num("completion_health")
 evo_count = int(num("self_evolution_signals_count"))
-# 0: confirming-vs-drift direction discriminator. A high count of
+# : confirming-vs-drift direction discriminator. A high count of
 # CONFIRMING self-evolution signals (team consensus the agent is on-lane) is
 # alignment evidence, NOT drift pressure — weighting evo_count by raw volume
 # misreads consensus as a reason to evolve Self (fresh-eyes 2026-06-28: evo=5

@@ -1,4 +1,4 @@
-"""4: the negative-diff self-heal must exist in EVERY goal-count cadence gate.
+""": the negative-diff self-heal must exist in EVERY goal-count cadence gate.
 
 THE BUG THIS PINS
 -----------------

@@ -1,4 +1,4 @@
-"""test_goal_selector_world_source_derivation.py -- 5 regression.
+"""test_goal_selector_world_source_derivation.py --  regression.
 
 Pins the source-derivation contract that the g-115-980 incident
 (2026-05-21T12:58:05) questioned: does goal-selector.py compute `source`

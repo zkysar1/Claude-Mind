@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / precheck critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
-# Cadence gate for /aspirations-evolve — the evolution-cadence precheck safety-net (0).
+# Cadence gate for /aspirations-evolve — the evolution-cadence precheck safety-net ().
 #
 # Exit 0 → evolution should fire this iteration (last_evolution_at_time is unset
 #          OR older than maintenance_cadence.evolution.hours_cadence, AND the
@@ -14,7 +14,7 @@
 #            core/config/evolution-triggers.yaml -> global.max_evolutions_per_session
 # State in:  <agent>/session/working-memory.yaml -> last_evolution_at_time + loop_state.evolutions
 #
-# WHY (0): the Phase 8.8 evolution cadence tick is bypassed by
+# WHY (): the Phase 8.8 evolution cadence tick is bypassed by
 # recurring-close.sh on recurring-heavy sessions, starving evolution (~99h vs
 # the 12h cadence, observed 2026-07-15). This is the precheck-side net — it fires
 # regardless of close path, mirroring the fresh-eyes / felt-sense /

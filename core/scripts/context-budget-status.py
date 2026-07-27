@@ -39,7 +39,7 @@ from pathlib import Path
 # session dies without closing stdin (Windows doesn't propagate EOF to
 # orphaned children). daemon=True so normal exit isn't blocked on the timer.
 # Armed HERE (before the _stdio/_paths imports + reconfigure_stdio below) so
-# the guard covers the ENTIRE module-import window: 8 found a 57h
+# the guard covers the ENTIRE module-import window:  found a 57h
 # orphan (pid-19476) that hung before the timer armed when this block sat
 # AFTER reconfigure_stdio().
 _timer = threading.Timer(10, lambda: os._exit(0))
@@ -81,7 +81,7 @@ def _resolve_budget_path_from_session(session_id):
     # Without this, status-line subprocesses (which don't inherit MIND_AGENT)
     # cannot resolve the agent → context-budget.json is never written →
     # zone-aware batching in goal-selector silently degrades.
-    # 9: use agents_root() instead of hardcoded "agents" literal so
+    # : use agents_root() instead of hardcoded "agents" literal so
     # Phase 2.6+ AGENTS_PARENT_DIR relocations don't silently regress this
     # status-line resolver (pre-Phase-2.5.D shape would re-emerge otherwise).
     agents_parent = agents_root()

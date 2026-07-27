@@ -44,7 +44,7 @@ if [ -z "$REC_ID" ] || [ -z "$STAGE" ]; then
 fi
 
 # Read stdin (optional merge data) BEFORE invoking the daemon.
-# Guarded (1, guard-664 bash twin): non-tty stdin does NOT guarantee
+# Guarded (, guard-664 bash twin): non-tty stdin does NOT guarantee
 # EOF — a backgrounded Bash task inherits an open, never-closing stdin, and a
 # bare `cat` wedges the wrapper forever (4 zombie process trees found
 # 2026-07-16; killed with exit 144, their stage moves never landed). Probe the

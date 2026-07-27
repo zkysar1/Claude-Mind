@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pre-apply-consult DRIFT gate — decision helper (1).
+"""Pre-apply-consult DRIFT gate — decision helper ().
 
 Second, complementary layer to the per-goal advisory `pre-apply-consult-gate.py`
 (g-115-826). That advisory fires at Phase 4 ONLY on cross-agent framework

@@ -88,6 +88,10 @@ def test_temp_pressure_drain_needed_at_threshold(tmp_path, monkeypatch):
     assert g is not None and g["priority"] == "HIGH"
     assert g["participants"] == ["agent"]          # capability-routing: agent, not user
     assert "drain" in g["title"].lower() and "temp" in g["title"].lower()
+    # : routes to the temp OWNER (AGENT_DIR.name, monkeypatched to tmp_path),
+    # NOT the content classifier — without this, capability_route's "knowledge tree"
+    # Tier-3 heuristic misroutes the drain to bravo and it no-ops on the wrong store.
+    assert g["intended_agent"] == tmp_path.name
 
 
 def test_temp_pressure_drained_subdir_excluded(tmp_path, monkeypatch):
@@ -110,7 +114,7 @@ def test_temp_pressure_dedup_existing_drain_goal(tmp_path, monkeypatch):
 
 
 def test_temp_pressure_other_agent_drain_goal_not_deduped(tmp_path, monkeypatch):
-    # 7: the undrained-doc COUNT is scoped to AGENT_DIR/temp (the bound
+    # : the undrained-doc COUNT is scoped to AGENT_DIR/temp (the bound
     # agent's store), so the existing-drain-goal DEDUP must ALSO be agent-scoped.
     # World-queue drain goals appear in every agent's compact — a drain goal filed
     # by ANOTHER agent must NOT suppress this agent's suggestion, else while any ONE
@@ -131,7 +135,7 @@ def test_temp_pressure_own_agent_drain_goal_deduped(tmp_path, monkeypatch):
     # Companion to the cross-agent test: this agent's OWN open drain goal
     # (filed_by_agent == the bound agent, i.e. AGENT_DIR.name == tmp_path.name)
     # still dedups -> temp_drain_pending, no duplicate goal filed. Proves the
-    # 7 scoping did not break same-agent dedup.
+    #  scoping did not break same-agent dedup.
     goals = [{"id": "g-001-77", "status": "pending",
               "title": "Maintain: drain accumulated temp/ working docs",
               "filed_by_agent": tmp_path.name}]
@@ -143,7 +147,7 @@ def test_temp_pressure_own_agent_drain_goal_deduped(tmp_path, monkeypatch):
 
 
 def test_temp_pressure_investigate_goal_not_treated_as_drain_goal(tmp_path, monkeypatch):
-    # 0 regression: an ANALYSIS goal (Investigate:) whose title happens to
+    #  regression: an ANALYSIS goal (Investigate:) whose title happens to
     # contain "drain"+"temp" must NOT satisfy the action-goal dedup — else it falsely
     # counts as the open drain goal and permanently suppresses the real "Maintain:
     # drain..." goal from ever filing (temp/ grows unbounded). At the drain threshold
@@ -161,7 +165,7 @@ def test_temp_pressure_investigate_goal_not_treated_as_drain_goal(tmp_path, monk
 
 def test_temp_pressure_idea_goal_not_treated_as_drain_goal(tmp_path, monkeypatch):
     # Companion to the Investigate case: an Idea: goal about the temp drain is also
-    # analysis, not an action goal, and must not trip the dedup (0).
+    # analysis, not an action goal, and must not trip the dedup ().
     goals = [{"id": "g-115-9001", "status": "pending",
               "title": "Idea: pressure-boost the temp drain goal's selector score"}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
@@ -170,7 +174,7 @@ def test_temp_pressure_idea_goal_not_treated_as_drain_goal(tmp_path, monkeypatch
 
 
 def test_temp_pressure_real_drain_goal_found_despite_analysis_goal(tmp_path, monkeypatch):
-    # No over-correction (0): when BOTH an analysis goal AND a real Maintain
+    # No over-correction (): when BOTH an analysis goal AND a real Maintain
     # drain goal are open, the dedup must SKIP the analysis goal and still find the
     # real action goal — so an existing drain goal is correctly deduped even when an
     # Investigate goal precedes it in iteration order.
@@ -184,6 +188,40 @@ def test_temp_pressure_real_drain_goal_found_despite_analysis_goal(tmp_path, mon
     assert r["flags"] == ["temp_drain_pending"]
     assert r["existing_drain_goal"] == "g-001-99"
     assert r["suggested_goal"] is None
+
+
+def test_temp_pressure_maintain_about_drain_not_treated_as_drain_goal(tmp_path, monkeypatch):
+    # : the  skip covered Investigate:/Idea: analysis goals, but a
+    # "Maintain:" goal merely ABOUT the temp drain (e.g. a verify-learning check on the
+    # drain FILING) starts with "Maintain:" — NOT investigate:/idea: — yet is NOT the
+    # real drain ACTION goal. The old keyword denylist ('"drain" in t and "temp" in t')
+    # falsely matched it (surfaced when 's ORIGINAL title tripped it): at the
+    # drain threshold it would count as the open drain goal and permanently suppress the
+    # real "Maintain: drain N accumulated temp/ working docs" goal (the same unbounded-
+    # growth failure as ). The positive drain-action signature excludes it BY
+    # CONSTRUCTION (it does not start with "Maintain: drain " + the template infix).
+    goals = [{"id": "g-115-2980", "status": "pending",
+              "title": "Maintain: add verify-learning check that precheck "
+                       "temp-drain filing carries intended_agent"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["count"] == 25
+    assert r["flags"] == ["temp_drain_needed"]           # NOT temp_drain_pending
+    assert r["existing_drain_goal"] is None               # Maintain-ABOUT-drain is not the action
+    assert r["suggested_goal"] is not None
+
+
+def test_temp_pressure_purge_only_drain_goal_deduped(tmp_path, monkeypatch):
+    # : the template also fires for a purge-only close (count==0, ephemera>0)
+    # and still emits a "Maintain: drain 0 accumulated temp/ working docs ... + purge N
+    # ..." title. The positive signature MUST match that variant too, so a pending
+    # purge-only drain goal correctly dedups. Guards the signature against being
+    # over-narrowed to only the count>0 form.
+    goals = [{"id": "g-001-66", "status": "pending",
+              "title": "Maintain: drain 0 accumulated temp/ working docs to the "
+                       "knowledge tree + purge 12 stale ephemera file(s)"}]
+    r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
+    assert r["flags"] == ["temp_drain_pending"]
+    assert r["existing_drain_goal"] == "g-001-66"
 
 
 def test_temp_pressure_warn_range_ignores_existing_drain_goal(tmp_path, monkeypatch):
@@ -217,7 +255,7 @@ def test_temp_pressure_missing_config_raises(tmp_path, monkeypatch):
         pe.cmd_temp_pressure(_Args(), {}, _compact())
 
 
-# ── Pure-ephemera (.log/.txt) counting (7) ───────────────────────
+# ── Pure-ephemera (.log/.txt) counting () ───────────────────────
 # Pre-fix, .log/.txt files were invisible to BOTH the drain glob and this
 # metric, so ephemera-only accumulation emitted NO flag and grew unbounded.
 # The metric now counts ephemera separately and folds it into the combined
@@ -235,7 +273,7 @@ def test_temp_pressure_ephemera_counted_separately(tmp_path, monkeypatch):
 
 def test_temp_pressure_ephemera_only_triggers_warn(tmp_path, monkeypatch):
     # 0 docs + 12 ephemera -> pressure_count=12 >= warn(10) -> temp_pressure_warn.
-    # This is the exact 7 bug: pre-fix, 12 invisible ephemera emitted
+    # This is the exact  bug: pre-fix, 12 invisible ephemera emitted
     # NO flag; now they are seen.
     r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=12)
     assert r["count"] == 0 and r["ephemera_count"] == 12
@@ -286,11 +324,11 @@ def test_temp_pressure_ephemera_dedup_existing_goal(tmp_path, monkeypatch):
     assert r["suggested_goal"] is None
 
 
-# ── One-shot scratch-script ephemera (.py/.sh/.err) counting (7) ──
+# ── One-shot scratch-script ephemera (.py/.sh/.err) counting () ──
 # Pre-fix, one-shot scratch scripts (build-*.py, orphan-*.py, restart-poller.sh,
 # gs.err) in temp/ root were invisible to BOTH the drain glob and this metric,
 # so scratch-only accumulation emitted NO flag and grew unbounded — the exact
-# 7 gap for a different file class. EPHEMERA_SUFFIXES now includes
+#  gap for a different file class. EPHEMERA_SUFFIXES now includes
 # .py/.sh/.err so they count as ephemera alongside .log/.txt.
 
 def test_temp_pressure_scratch_scripts_counted_as_ephemera(tmp_path, monkeypatch):

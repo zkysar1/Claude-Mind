@@ -1,4 +1,4 @@
-"""test_post_state_update_gate_mode_only.py — regression test for 2.
+"""test_post_state_update_gate_mode_only.py — regression test for .
 
 Exercises the mode-only exclusion added to core/scripts/post-state-update-gate.sh.
 A file whose ONLY change is a mode bit (exec-bit normalization, symlink/type

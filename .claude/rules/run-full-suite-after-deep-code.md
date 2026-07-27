@@ -52,12 +52,24 @@ Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
    the own-cloud S3-key-collision hazard below — this prefix is MANDATORY, not
    optional, whenever the box runs `STORAGE_BACKEND=own-cloud`):
    `STORAGE_BACKEND=local python -m pytest core/scripts/tests -q -m "not daemon_integration"`.
-   The `daemon_integration` marker (registered in `pytest.ini`) tags the only
-   tests that spawn REAL subprocess daemons and/or count system-wide
+   The `daemon_integration` marker (registered in `pytest.ini`) tags the tests
+   that spawn REAL subprocess daemons **deliberately** and/or count system-wide
    `mind_api.src` processes — currently just `test_daemon_orphan_prevention.py`.
-   Excluding them, the rest of the suite is hermetic (the in-process
-   `_daemon_fixture.py` / `running_daemon` fixtures bind a thread-local daemon
-   in a tmp project root) and is safe to run with a live daemon present —
+   **The marker does NOT bound the set of tests that CAN spawn one.** Any test
+   invoking a daemon-backed wrapper reaches `rt_ensure_running` → rc=3 →
+   `rt_spawn`, or `mind-api-start.sh` directly; with `RUNTIME_DIR` unset either
+   path claims the SHARED `mind_api/state/daemon.port` and force-kills the live
+   daemon. Observed 2026-07-26: an unmarked, ostensibly-hermetic test
+   (`test_post_state_update_metric_gate_category.py`) recycled the live daemon
+   out from under the running fleet — its tmp `local-paths.conf` did not isolate
+   it, because `.mind-data/` outranks the conf in the resolution chain. Both
+   chokepoints now REFUSE the spawn when `PYTEST_CURRENT_TEST` is set and
+   `RUNTIME_DIR` is not (g-115-3329), so a test needing its own daemon MUST set
+   `RUNTIME_DIR` — the failure is loud instead of a silent fleet-wide repoint.
+   Excluding the marked tests, the rest of the suite is hermetic in its
+   filesystem resolution (the in-process `_daemon_fixture.py` / `running_daemon`
+   fixtures bind a thread-local daemon in a tmp project root and set `RT_DIR`
+   for their subprocesses) and is safe to run with a live daemon present —
    **but ONLY with `STORAGE_BACKEND=local` prepended (as shown above).** On an
    own-cloud box (`STORAGE_BACKEND=own-cloud`, this repo's default when a live
    daemon serves agents) the "hermetic" claim is FALSE: tests that seed a
@@ -104,6 +116,48 @@ This is a scoped exception, not a repeal — the full unrestricted suite still
 runs whenever no live daemon is present. Enforced by `guard-672`.
 
 ### Progress-visible invocation (g-115-1496, 2026-06-17)
+
+> **RE-BASELINED 2026-07-26 (g-115-3085 Layer 2 landed, alpha). The 2026-06-17
+> AND 2026-07-25 figures are both HISTORICAL — do not compare against either.**
+>
+> | | 2026-06-17 | 2026-07-25 | **2026-07-26** |
+> |---|---|---|---|
+> | tests run | 2,234 | 5,226 | **5,969** |
+> | passed | 2,231 | 5,199 | **5,937** |
+> | failed | 2 | 20 | **32** |
+> | errors | 0 | 2 | **0** |
+> | run completes? | yes | **no** — needed `--ignore`, a chunk died at 51% | **yes, all 6 chunks 100%** |
+>
+> **The environmental-timeout class is GONE, and the previous entry's guidance is
+> now REVERSED.** The 2026-07-25 baseline told you to treat failures in 9 named
+> files as "a machine signal, NOT a code regression." That was true then and is
+> FALSE now. Root cause was found and fixed: a bare `"bash"` argv[0] resolves via
+> `CreateProcess`, which searches System32 **before** PATH, reaching the WSL
+> launcher and blocking forever on a wedged `LxssManager`. Swept out of 12
+> production sites plus the test side. Measured on this run: **0 occurrences of
+> `TimeoutExpired` or `assert 124 == 0`** anywhere — the exact signature that
+> accounted for all 20 prior failures. `test_monitor_tick`, `test_init_backfill`
+> and `test_history_vacuum_archive` are now fully **GREEN**.
+>
+> **So: do NOT excuse a failure in those files as environmental any more.** The 6
+> still failing (`test_pending_deploys_gate`, `test_pre_apply_consult_gate_scope`,
+> `test_pending_deploys_stop_hook`, `test_iteration_push`,
+> `test_infra_streak_dedup_sh`, `test_git_merge_ayoai_ledger`) carry no timeout
+> signature and are GENUINE — triage them, don't dismiss them.
+>
+> **Why failures rose 20 → 32 while the box got healthier**: +743 tests that had
+> never executed now run. Judge by FAILING FILE SET, never the count. The newly
+> visible failures are pre-existing, not regressions — the provision-from-vault
+> family (`test_provision_from_vault_agent_scope`, `..._default_out`,
+> `test_provision_github_from_vault`), plus `test_owncloud_pull_fleet`,
+> `test_retrieve_as_of_endpoint_e2e`, `test_retrieve_daemon_readonly_false`.
+> Triage tracked in g-115-3180.
+>
+> **`--ignore=...test_provision_github_from_vault.py` is NO LONGER REQUIRED.**
+> That file now runs to completion. Use `bash core/scripts/run-full-suite.sh`,
+> which pins `STORAGE_BACKEND=local`, excludes `daemon_integration`, chunks into
+> fresh processes, and returns **exit 2 = INVALID/contended** so a resource-starved
+> run can never be mistaken for a pass or a regression.
 
 The daemon-safe full suite takes ~32min (measured: 1916s; 2231 passed / 2 failed
 / 1 skipped over 2234 selected). The runtime concentrates in a handful of
@@ -161,6 +215,45 @@ The hang itself is now bounded by `faulthandler_timeout = 600` +
 test exceeding 600s (10min — well past the 139.61s slowest legit test) dumps
 all-thread tracebacks and aborts the process, so a true hang fails loud with a
 stack pointing at the stall instead of buffering forever.
+
+### Live-Fleet Exception — chunk the run, or the result is garbage (g-115-3085, 2026-07-25)
+
+Sibling to the Live-Daemon Exception above, and independent of it. Running the
+~5,200-test suite in ONE process while the live fleet is running on the same
+Windows box exhausts Windows process/desktop-heap resources partway through.
+Spawns then fail with **rc=3221225794 (`0xC0000142` STATUS_DLL_INIT_FAILED)** —
+even `git init` fails — and the run reports hundreds of bogus failures.
+
+Measured: one contended run reported **564 failed / 4,672 passed**. The same
+tree, re-measured properly, was clean. `test_release.py` alone accounted for 37
+of those failures and passes **88/88 when run by itself**.
+
+**Never conclude a regression from a large failure count without running these
+two discriminators first** — the failures look completely real up close:
+
+1. **Bucket failures by position in the run.** Progressive exhaustion shows
+   ZERO failures early and 20%+ late. Measured distribution of the 564: 0
+   failures across the first 1,368 tests, then 19–27% in the final decile. A
+   genuine regression fails from the START (changed scripts are used
+   throughout), so an all-late profile is near-conclusive evidence of
+   exhaustion, not code.
+2. **Re-run the worst-hit file alone.** Green solo ⇒ the failures were
+   environmental.
+
+**Remedy — run the suite as ~4 sequential chunks in FRESH processes**, which
+resets accumulated handles per chunk (a single process cannot recover them):
+
+```bash
+ls core/scripts/tests/test_*.py | sort > /tmp/all-tests.txt
+split -n l/4 -d /tmp/all-tests.txt /tmp/chunk-
+for c in 00 01 02 03; do
+  STORAGE_BACKEND=local python -m pytest $(cat /tmp/chunk-$c | tr '\n' ' ') \
+    -q -m "not daemon_integration" > /tmp/chunk-$c.log 2>&1
+  tail -1 /tmp/chunk-$c.log
+done
+```
+
+Or wait for a quiet window with the fleet stopped. Enforced by `guard-1448`.
 
 ## Required Full-Suite Commands (per code area)
 

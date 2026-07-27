@@ -1,4 +1,4 @@
-"""Tests for tombstone-in-live archival (6).
+"""Tests for tombstone-in-live archival ().
 
 Root cause being guarded: the own-cloud merge handler
 (coordination_merge.merge_pipeline) is a per-file union-by-id — a cross-file
@@ -38,10 +38,10 @@ import coordination_merge  # noqa: E402
 import pipeline as cli_pipeline  # noqa: E402
 from mind_api.src.world import pipeline_write  # noqa: E402
 
-# Fleet adoption landed (6, 2026-07-16): tombstone-in-live archival
+# Fleet adoption landed (, 2026-07-16): tombstone-in-live archival
 # now lives in pipeline_write.move / archive_sweep (+ compute_meta dedup on
 # both CLI and daemon) — these are hard regression tests. (History: the fix
-# was first cc-02-local, 6, superseded at the 2 unwedge
+# was first cc-02-local, , superseded at the  unwedge
 # merge; this file carried the spec as strict=False xfail pins until the
 # fleet fix shipped.)
 
@@ -217,7 +217,7 @@ def test_archive_sweep_no_dup_append_for_resurrected_resolved(tmp_path):
 
 
 def test_archive_sweep_skips_invalid_record_not_fatal(tmp_path):
-    # 7: one corrupt record must NOT wedge the whole batch. A valid
+    # : one corrupt record must NOT wedge the whole batch. A valid
     # aged record archives; an invalid aged record (confidence out of the
     # 0-1 range) is skipped-and-reported, stays in live un-flipped (visible),
     # and the sweep still returns 200 instead of 400-aborting everything.
@@ -246,7 +246,7 @@ def test_archive_sweep_skips_invalid_record_not_fatal(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# effective resolution date (3)
+# effective resolution date ()
 # ---------------------------------------------------------------------------
 # Pre-fix, archive_sweep aged resolved records on outcome_date ONLY via a bare
 # date.fromisoformat: 33/73 live resolved records were sweep-invisible (31 had

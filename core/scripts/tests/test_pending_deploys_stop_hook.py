@@ -1,4 +1,4 @@
-"""test_pending_deploys_stop_hook.py — 8-c (pending-deploys hard gate, SG-c STOP+HARDEN).
+"""test_pending_deploys_stop_hook.py — -c (pending-deploys hard gate, SG-c STOP+HARDEN).
 
 Covers the two SG-c guarantees:
 
@@ -146,7 +146,7 @@ def test_roll_handoff_preserves_unparseable_handoff():
 
 
 def test_roll_handoff_routes_through_locked_writer():
-    """Regression guard (9, fresh-eyes SG-c Finding 2): the handoff
+    """Regression guard (, fresh-eyes SG-c Finding 2): the handoff
     write in cmd_roll_handoff MUST go through the canonical locked_write_yaml
     (history snapshot + changelog + atomic rename + surrogate validation), NOT a
     raw Path.write_text that bypasses all of them. The write is a subprocess-only

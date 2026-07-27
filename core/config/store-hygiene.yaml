@@ -126,7 +126,7 @@ stores:
   # self-deadlock: locked_modify_jsonl holds base_dir/changelog.lock across its RMW
   # then calls append_changelog(path) post-write, which re-acquired the SAME
   # non-reentrant lock when path==changelog.jsonl (10s acquire_lock timeout, cap
-  # never persisted). FIXED in 1 via an early-return in append_changelog
+  # never persisted). FIXED in  via an early-return in append_changelog
   # (core/scripts/_fileops.py) that skips logging a changelog edit into the
   # changelog itself -- single-source fix for all 7 lock-holding call sites + this
   # rotate path. Cap/rotate on a changelog store no longer deadlocks (live-verified
@@ -142,7 +142,7 @@ stores:
   # Meta-write audit trail; read-never -> cap.
   # refresh_would_clobber guard (, owncloud_sync._EXCLUDE_NAMES) protects
   # both files from backend clobber during _snapshot. Enabled 2026-06-29 after
-  # confirming 4 +  both complete and guard in codebase.
+  # confirming  +  both complete and guard in codebase.
   - path: meta/changelog.jsonl
     enabled: true
     mode: cap
@@ -230,7 +230,7 @@ stores:
   # skill-evolution.jsonl ends -evolution.jsonl not -log.jsonl; board basenames
   # (coordination/general/findings/decisions/...) none end -log.jsonl. So the
   # jsonl_hygiene _snapshot UNCONDITIONAL refresh pulls correct S3 (no 
-  # clobber) -- G11 is INDEPENDENT of the in-flight 4 _snapshot fix
+  # clobber) -- G11 is INDEPENDENT of the in-flight  _snapshot fix
   # (contrast G7 changelog/G6 world-changelog which ARE machine-local -> blocked).
   # Bounds verified vs real content (2026-06-26): journal max 222 lines/agent
   # (<< 5000 no-op), evolution-log 2068 (<< 10000 no-op), skill-evolution 2174

@@ -193,7 +193,7 @@ def test_forced_flip_encoding_queue_nonempty_runs_canary(sandbox, agent_dir):
     second gate.
     """
     _write_wm(agent_dir, encoding_queue=[{"kind": "tree"}], sensory_buffer=[])
-    # Seed a recent tree .md so the 9 substantive-artifact probe
+    # Seed a recent tree .md so the  substantive-artifact probe
     # returns substantive=True and falls through to the canary's sentinel write.
     world_dir = sandbox / "world-test"
     tree_dir = world_dir / "knowledge" / "tree"
@@ -217,7 +217,7 @@ def test_forced_flip_sensory_buffer_nonempty_runs_canary(sandbox, agent_dir):
     artifact probe runs — the seeded tree-md provides substantive=True.
     """
     _write_wm(agent_dir, encoding_queue=[], sensory_buffer=[{"event": "x"}])
-    # Seed a recent tree .md so the 9 substantive-artifact probe
+    # Seed a recent tree .md so the  substantive-artifact probe
     # returns substantive=True and falls through to the canary's sentinel write.
     world_dir = sandbox / "world-test"
     tree_dir = world_dir / "knowledge" / "tree"

@@ -18,8 +18,8 @@ loop_state.productive_goals.
 
 Invocation:
   loop-state-bump-counters.py --outcome <routine|deep> [--goal-id <id>] [--recurring <true|false>]
-  loop-state-bump-counters.py --reset-alignment    # zero alignment_check_at (1)
-  loop-state-bump-counters.py --evolution-fired     # bump evolutions + stamp last_evolution_at (1)
+  loop-state-bump-counters.py --reset-alignment    # zero alignment_check_at ()
+  loop-state-bump-counters.py --evolution-fired     # bump evolutions + stamp last_evolution_at ()
 
 g-115-1785 extension: on the --outcome path WITH --recurring false, this is ALSO
 the single writer for the NON-RECURRING signal-mutation streak fields
@@ -137,7 +137,7 @@ def _to_int(v, default=0):
     return default
 
 
-# 5: non-recurring Block C ceiling read. Mirrors
+# : non-recurring Block C ceiling read. Mirrors
 # recurring-loop-state-mutate.py::_read_global_ceiling but FAIL-SAFE, not
 # fail-loud. recurring-loop-state-mutate.py RAISES on config-read failure
 # because recurring-close.sh's `|| echo "$ORIGINAL_OUTCOME"` catches the
@@ -161,7 +161,7 @@ def _read_global_ceiling(default=5):
         return default
 
 
-# 1: aspiration_id derivation for the orphaned `touched` accumulator.
+# : aspiration_id derivation for the orphaned `touched` accumulator.
 import re as _re
 
 
@@ -175,16 +175,16 @@ def _aspiration_id_from_goal(goal_id):
     return f"asp-{m.group(1)}" if m else None
 
 
-# 5: bounded read retry for the self-heal verify (see _verify_counted).
+# : bounded read retry for the self-heal verify (see _verify_counted).
 # A torn read here correlates with the same OneDrive+daemon write contention that
 # causes the original bump no-op, so a single bare read must not fail-open before
-# retrying — that defeats the 0 self-heal exactly when it is needed.
+# retrying — that defeats the  self-heal exactly when it is needed.
 _VERIFY_READ_RETRIES = 4
 _VERIFY_READ_BACKOFF_S = 0.05
 
 
 def _verify_counted(wm_path, goal_id):
-    """Return the exit code for --verify-counted (0 + 5 retry).
+    """Return the exit code for --verify-counted ( +  retry).
 
     The bump path below always exits 0 (fail-open at every layer), so a caller
     CANNOT use rc to detect a silent no-op (lock-acquire failure / WM-write
@@ -202,10 +202,10 @@ def _verify_counted(wm_path, goal_id):
           a bump that should have written it. The bump silently no-op'd; the
           caller records it durably and re-fires once.
     """
-    # 5: a torn read here hits the SAME OneDrive+daemon write contention
+    # : a torn read here hits the SAME OneDrive+daemon write contention
     # that causes the original bump no-op (correlated failures), so a single bare
     # read failing-open to 0 ("indeterminate -> no re-fire") defeats the self-heal
-    # exactly when it is most needed (6 permanently lost: backgrounded
+    # exactly when it is most needed ( permanently lost: backgrounded
     # close -> bump no-op -> verify torn-read -> 0 -> re-fire skipped, no ledger).
     # Mirror the write path's loop_state_cas_retry robustness with a bounded read
     # retry; only a genuinely-unreadable state after all retries falls through to
@@ -233,7 +233,7 @@ def _verify_counted(wm_path, goal_id):
     return 0 if goal_id in counted else 1
 
 
-# 1: single-field accumulator ops for the LLM-context events that the
+# : single-field accumulator ops for the LLM-context events that the
 # per-close bump cannot derive — the Self-Alignment cadence firing (reset) and
 # an evolution completing (increment). Both are bash writes invoked by the LLM
 # at the event, preserving the g-283 single-writer invariant (the LLM provides
@@ -309,7 +309,7 @@ def main():
             "double-bump if this goal_id is already in loop_state.counted_goals_this_session."
         ),
     )
-    # 5: non-recurring signal-mutation ownership. When "false", ALSO
+    # : non-recurring signal-mutation ownership. When "false", ALSO
     # apply the Block A/B (streak counters) + Block C ceiling-reset + Block D
     # (_this_session counters) mutation, atomically inside the SAME CAS RMW +
     # idempotency gate as the goals_completed bump. "true"/omitted → SKIP the
@@ -332,7 +332,7 @@ def main():
             "path owns streaks via recurring-loop-state-mutate.py). g-115-1785."
         ),
     )
-    # 0: read-only verification mode for iteration-close.sh self-heal.
+    # : read-only verification mode for iteration-close.sh self-heal.
     # Exit 1 == GOAL_ID confidently absent from counted_goals_this_session (the
     # bump silently no-op'd -> caller re-fires); exit 0 == counted or
     # indeterminate. Mutually exclusive with the --outcome bump path.
@@ -346,7 +346,7 @@ def main():
             "indeterminate. Does not take the lock or mutate WM."
         ),
     )
-    # 1: LLM-context accumulator events (separate from the --outcome bump).
+    # : LLM-context accumulator events (separate from the --outcome bump).
     parser.add_argument(
         "--reset-alignment",
         action="store_true",
@@ -373,12 +373,12 @@ def main():
     from wm import wm_path as _resolve_wm_path  # Phase 1A per-Body WM routing ()
     wm_path = _resolve_wm_path()
 
-    # 0: read-only verify path runs BEFORE the existence guard below —
+    # : read-only verify path runs BEFORE the existence guard below —
     # a missing WM file read-throws to the conservative exit 0 (indeterminate).
     if args.verify_counted is not None:
         sys.exit(_verify_counted(wm_path, args.verify_counted))
 
-    # 1: single-field accumulator ops (mutually exclusive with the bump).
+    # : single-field accumulator ops (mutually exclusive with the bump).
     if args.reset_alignment:
         sys.exit(_run_field_op(wm_path, "reset-alignment"))
     if args.evolution_fired:
@@ -390,7 +390,7 @@ def main():
             "--evolution-fired is given"
         )
 
-    # 5: hoist the Block C ceiling read OUT of the CAS loop below
+    # : hoist the Block C ceiling read OUT of the CAS loop below
     # (config is invariant across the retry, per recurring-loop-state-mutate.py's
     # same hoist). Only the non-recurring streak path needs it.
     global_ceiling = _read_global_ceiling() if args.recurring == "false" else None
@@ -409,8 +409,8 @@ def main():
         sys.exit(0)
 
     try:
-        # 4: the read-modify-write runs inside loop_state_cas_retry,
-        # which guards the stale-lock-steal race (9 mechanism B) via
+        # : the read-modify-write runs inside loop_state_cas_retry,
+        # which guards the stale-lock-steal race ( mechanism B) via
         # optimistic concurrency on slot_meta.loop_state.update_count. The
         # closures preserve this writer's exact self-init / idempotency /
         # byte-compat-write behaviour; the helper only adds the token re-read.
@@ -490,7 +490,7 @@ def main():
             loop_state["goals_completed"] = goals_completed
             loop_state["productive_goals"] = productive_goals
 
-            # 1: write the LLM-owned accumulators that  orphaned
+            # : write the LLM-owned accumulators that  orphaned
             # (no bash writer post mirror-retirement, so they froze at defaults
             # for ALL agents on the non-recurring path). These ride the SAME
             # idempotency gate as goals_completed (once per goal_id/session),
@@ -520,7 +520,7 @@ def main():
             alignment = _to_int(loop_state.get("alignment_check_at", 0))
             loop_state["alignment_check_at"] = alignment + 1
 
-            # 5: NON-RECURRING signal-mutation (Block A/B/C/D streaks).
+            # : NON-RECURRING signal-mutation (Block A/B/C/D streaks).
             # Gated to --recurring false: recurring goals get this from
             # recurring-loop-state-mutate.py (recurring-close.sh, BEFORE the
             # iteration-close phases), so applying it here for a recurring goal
@@ -610,7 +610,7 @@ def main():
 
             # : advance slot_meta.loop_state.updated_at + increment
             # update_count so wm-prune's stale-detection sees this write.
-            # update_count is ALSO the 4 CAS token the helper compares.
+            # update_count is ALSO the  CAS token the helper compares.
             _update_modified(wm, "loop_state")
             summary["goals_completed"] = goals_completed
             summary["productive_goals"] = productive_goals

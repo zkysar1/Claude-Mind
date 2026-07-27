@@ -238,7 +238,7 @@ fi
 # existed BEFORE this agent took ownership of its goal, therefore it is not
 # part of this commit's intent. Tolerate 5s of clock skew.
 #
-# INERT-BY-DESIGN IN THE NORMAL CLOSE PATH (5 / , verified
+# INERT-BY-DESIGN IN THE NORMAL CLOSE PATH ( / , verified
 # 2026-06-10). committer_claimed_at_epoch resolves to 0 — so the pre-claim
 # filter below (guarded by `committer_claimed_at_epoch -gt 0`) is SKIPPED —
 # during EVERY normal deep-outcome close, not merely fresh-install/test repos.
@@ -246,7 +246,7 @@ fi
 # BEFORE do_state_update invokes this script, so the live in_flight.claimed_at
 # read below returns null at commit time. self_claimed_at=0 is the RULE, not
 # the exception. This is the SAME root cause pinned for the sibling Python
-# filter _cross_agent_attribution_filter.py by 2, whose regression
+# filter _cross_agent_attribution_filter.py by , whose regression
 # test (test_attribution_filter_no_self_inflight.py) records the team decision:
 # do NOT add a "Source 4" claim-time anchor (e.g. snapshotting claimed_at into
 # iteration-checkpoint.json and reading THAT) — the standing bias is "never
@@ -367,7 +367,7 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
 import json, os, sys, time
 # Normalize recorded paths to PROJECT_ROOT-relative POSIX form so legacy
 # absolute uncommitted-edits.jsonl entries (C:/...) match the relative
-# git-status candidates checked below (0). SINGLE SOURCE OF TRUTH
+# git-status candidates checked below (). SINGLE SOURCE OF TRUTH
 # (rb-1405): import the SAME normalizer AND age-cutoff helpers the Python
 # attribution filter uses so the two uncommitted-edits.jsonl consumers cannot
 # drift on path format OR staleness policy ().
@@ -444,10 +444,10 @@ import json, os, sys
 # WITHOUT this, an absolute own-log entry silently misses the relative
 # candidate, the  first-person-authorship exemption never fires, and
 # the concurrent-partner filter drops the committer's OWN file (over-exclusion;
-# guard-608 / commit 7f1df61d). SINGLE SOURCE OF TRUTH (rb-1405, 0):
+# guard-608 / commit 7f1df61d). SINGLE SOURCE OF TRUTH (rb-1405, ):
 # this is the SAME _normalize_rel_path the partner-log snapshot above ()
 # imports, so the two uncommitted-edits.jsonl consumers cannot drift on path
-# format. Fix: 3 (the partner-log consumer got this fix at 0;
+# format. Fix:  (the partner-log consumer got this fix at ;
 # the own-log consumer added at  never did — asymmetry closed here).
 #
 # Deliberate asymmetry vs the partner block: the own-log applies normalization
@@ -570,14 +570,14 @@ declare -a content_skipped_files=()
 # index entries until they fully reconcile).
 declare -a staged_files=()
 declare -a rm_only_files=()
-declare -a staged_del_files=()  # 0: already-staged deletions (porcelain "D ") — routed OUT of the git-add pathspec batch (an already-staged-deleted path matches nothing in worktree or index, so it aborts the whole `git add -A -- ...` with rc=128 and drops the entire commit)
+declare -a staged_del_files=()  # : already-staged deletions (porcelain "D ") — routed OUT of the git-add pathspec batch (an already-staged-deleted path matches nothing in worktree or index, so it aborts the whole `git add -A -- ...` with rc=128 and drops the entire commit)
 declare -a skipped_files=()
 declare -a cross_agent_files=()
 declare -a cross_agent_uncommitted=()  #  + 38fb983: untracked OR modified files predating claimed_at
 declare -a cross_agent_concurrent_partner=()  # : files edited DURING a partner's active in_flight (post-committer-claim)
 declare -a cross_agent_partner_uncommitted_log=()  # : files recorded in OTHER agent's uncommitted-edits.jsonl (between-claim gap)
 declare -a committer_authored_exempt=()  # : files retained despite partner in_flight because committer's OWN uncommitted-edits.jsonl proves first-person authorship
-declare -a committer_authored_log_exempt=()  # 0: files retained despite a partner ALSO recording them in uncommitted-edits.jsonl, because the committer's OWN log proves first-person authorship (the own-log check the  partner-log filter previously lacked — asymmetry with the  concurrent-partner filter)
+declare -a committer_authored_log_exempt=()  # : files retained despite a partner ALSO recording them in uncommitted-edits.jsonl, because the committer's OWN log proves first-person authorship (the own-log check the  partner-log filter previously lacked — asymmetry with the  concurrent-partner filter)
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -692,7 +692,7 @@ while IFS= read -r line; do
     fi
   fi
 
-  # Already-staged-deletion check (0): porcelain "D " (index column D,
+  # Already-staged-deletion check (): porcelain "D " (index column D,
   # clean worktree) means the path is gone from BOTH the worktree AND the index.
   # Including it in the batched `git add -A -- "${staged_files[@]}"` pathspec at
   # the stage step makes git abort the ENTIRE batch with "pathspec did not match
@@ -895,7 +895,7 @@ PYEOF
   fi
   if [[ -n "$pl_match_owner" ]]; then
     if [[ -n "${committer_authored_paths["$path"]:-}" ]]; then
-      # 0: the committer's OWN uncommitted-edits.jsonl ALSO recorded
+      # : the committer's OWN uncommitted-edits.jsonl ALSO recorded
       # this path — first-person authorship proof overrides the partner-log
       # signal, mirroring the  own-log check in the concurrent-partner
       # filter above (line ~818). The  partner-log filter was built
@@ -905,7 +905,7 @@ PYEOF
       # was silently DROPPED from the committer's own commit. That drop is a WARN
       # not an ERROR, so a deletion-free goal could report exit-0 success while
       # leaving its own deep-close edits uncommitted (observed ,
-      # 9). Retain it; genuine partner edits absent from the committer's
+      # ). Retain it; genuine partner edits absent from the committer's
       # own log still drop via the else branch.
       committer_authored_log_exempt+=("$path|$pl_match_owner")
     else
@@ -1002,7 +1002,7 @@ if [[ ${#cross_agent_partner_uncommitted_log[@]} -gt 0 ]]; then
   echo "[$SCRIPT_NAME] HINT: pass --include-untracked to override the filter (rare; only when committer legitimately authored these files during the partner's between-claim window)" >&2
 fi
 
-# --- Stash-overlap filter (4) ---------------------------------------
+# --- Stash-overlap filter () ---------------------------------------
 # Defends against the rb-1127 / 3c4a61c4 stash-clobber incident: when agent A
 # stashes work (or an external `git stash push` runs) and a partner's
 # iteration-commit later sweeps up the recovered files, the partner's signature
@@ -1046,7 +1046,7 @@ if [[ ${#stash_filtered_files[@]} -gt 0 ]]; then
   fi
 fi
 
-# --- Over-inclusion audit (6) ---------------------------------------
+# --- Over-inclusion audit () ---------------------------------------
 # Detection-only complement to the attribution filters above. Those filters are
 # a DENYLIST: a neutral-path file is staged unless a partner signal fires
 # (namespace / mtime-vs-claim / partner in_flight / partner-log / stash). An
@@ -1061,7 +1061,7 @@ fi
 # swept under the committing goal_id (the  deep auto-override path).
 # A flagged file is EITHER a recording gap (own edit missing from the own-log)
 # OR a mis-attributed partner orphan — both actionable. The deny-vs-allow-list
-# contract question is the design decision tracked by 2 / 6.
+# contract question is the design decision tracked by  / .
 if [[ "$OUTCOME" == "deep" && ${#staged_files[@]} -gt 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -gt 0 ]]; then
   declare -a unattributed_neutral=()
   for sf in "${staged_files[@]}"; do
@@ -1108,7 +1108,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-# --- Stale git-lock auto-recovery (3, guard-883) --------------------
+# --- Stale git-lock auto-recovery (, guard-883) --------------------
 # A git process that crashes mid add/commit on the shared 6-agent tree leaves
 # .git/index.lock (+ a sibling .git/<op>-<PID>.lock), which blocks EVERY agent's
 # next commit until cleared. Incident 2026-06-27: PID 51452 crashed mid git-add,
@@ -1162,7 +1162,7 @@ clear_stale_git_lock_if_dead() {
 # --- Stage + commit ----------------------------------------------------------
 if [[ ${#staged_files[@]} -gt 0 ]]; then
   add_output=$(git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1) || {
-    # Stale-lock auto-recovery (3): if the add failed on an index.lock
+    # Stale-lock auto-recovery (): if the add failed on an index.lock
     # collision and the lock is verifiably stale, clear it and retry ONCE.
     if printf '%s' "$add_output" | grep -qi -e "index.lock" -e "Another git process" \
        && clear_stale_git_lock_if_dead; then
@@ -1189,7 +1189,7 @@ if [[ ${#rm_only_files[@]} -gt 0 ]]; then
 fi
 
 if [[ ${#staged_del_files[@]} -gt 0 ]]; then
-  # 0: already-staged deletions ("D "). The deletion is ALREADY in the
+  # : already-staged deletions ("D "). The deletion is ALREADY in the
   # shared index, so this git rm --cached --ignore-unmatch is a defensive rc=0
   # no-op (the path is already absent from the index) — its real purpose was to
   # keep these paths OUT of the `git add -A` pathspec above (done at routing
@@ -1212,19 +1212,19 @@ fi
 # above () now closes the cross-agent authorship-bleed race; this retry
 # handles transient infrastructure faults orthogonal to coordination semantics.
 #
-# PATHSPEC-SCOPED COMMIT (8, guard-741, rb-1907): commit ONLY the
+# PATHSPEC-SCOPED COMMIT (, guard-741, rb-1907): commit ONLY the
 # attribution-filtered staged_files[] (which includes rm_only_files appended
 # above), NOT the whole index. The cross-agent filters above gate what THIS
 # script `git add`s, but a bare `git commit` commits the ENTIRE index -- so a
 # concurrent partner's PRE-STAGED WIP (staged outside this script, e.g. by a
 # partner mid-commit or a non-iteration-commit `git add`) was swept into this
-# agent's commit regardless of the filters (observed: 6, 7;
+# agent's commit regardless of the filters (observed: , ;
 # alpha's deliverable swept into zeta's commit despite the partner-log filter
 # correctly excluding it from staged_files[]). The `-- "${staged_files[@]}"`
 # pathspec restricts the commit to exactly the intended paths (verified: git
 # commit --only correctly commits adds+modifies+deletions and LEAVES foreign
 # pre-staged entries staged+uncommitted for the partner's own commit). This is
-# COMPLEMENTARY to the 6 detection audit, which covers the orthogonal
+# COMPLEMENTARY to the  detection audit, which covers the orthogonal
 # orphan-IN-staged_files case (indistinguishable from own work, so detect-only).
 # staged_files[] is guaranteed non-empty here (both-empty cases exit 0 at the
 # filter-skip guards ~L882/L992 before reaching this commit).
@@ -1243,7 +1243,7 @@ while [[ $commit_attempt -lt $MAX_RETRIES ]]; do
     break
   }
   if [[ $commit_attempt -lt $MAX_RETRIES ]]; then
-    # Stale-lock auto-recovery (3): an index.lock-collision failure may
+    # Stale-lock auto-recovery (): an index.lock-collision failure may
     # be a crashed holder's stale lock -- clear it (only if verifiably dead) so
     # the next retry can proceed. Never clears a live lock (guard-883).
     if printf '%s' "$commit_last_output" | grep -qi -e "index.lock" -e "Another git process"; then
@@ -1279,9 +1279,9 @@ if [[ -n "${MIND_AGENT:-}" && ${#staged_files[@]} -gt 0 ]]; then
     committed_set=$(printf '%s\n' "${staged_files[@]}")
     OWN_LOG="$own_log" COMMITTED="$committed_set" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
 import json, os, tempfile, sys
-# 3: normalize the own-log `file` to PROJECT_ROOT-relative POSIX before
+# : normalize the own-log `file` to PROJECT_ROOT-relative POSIX before
 # the committed-set membership test — the SAME _normalize_rel_path the two
-# construction consumers use (0 partner snapshot, 3 own-log
+# construction consumers use ( partner snapshot,  own-log
 # snapshot), so this THIRD uncommitted-edits.jsonl consumer cannot drift on
 # path format (rb-1405 SSOT). WITHOUT this, a legacy-absolute or backslash-form
 # own-log entry never string-equals the relative committed path, so it is NEVER

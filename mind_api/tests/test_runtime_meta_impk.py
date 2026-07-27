@@ -142,7 +142,7 @@ def test_snapshot_then_compute(running_daemon):
 
 
 def test_compute_missing_metric_defaults_ok(running_daemon):
-    """1: `metric` is OPTIONAL — it defaults to the single
+    """: `metric` is OPTIONAL — it defaults to the single
     learning_value series, so a MISSING metric is NOT a 400. The evolve
     Step 0.7 caller relies on this (aspirations-evolve/SKILL.md invokes
     `meta-impk.sh compute --window 10` with no --metric). A missing metric

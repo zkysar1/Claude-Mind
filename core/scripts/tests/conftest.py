@@ -77,7 +77,7 @@ _set_default_agent()
 # rather than via this env selector, so the pin does not reduce its coverage.
 os.environ["STORAGE_BACKEND"] = "local"
 
-# 5: dormant-pin the own-cloud tempdir tripwire OFF for the whole pytest
+# : dormant-pin the own-cloud tempdir tripwire OFF for the whole pytest
 # session. Under pytest ALL backends are hermetic -- get_backend() returns
 # LocalBackend (STORAGE_BACKEND=local above), and the only tests reaching
 # OwnCloudBackend._put construct it directly against a moto-mocked S3 (no real
@@ -89,6 +89,30 @@ os.environ["STORAGE_BACKEND"] = "local"
 # production S3 key (rb-2983/guard-955). The presence of this env var IS the
 # "am I inside a hermetic pytest session?" signal the tripwire keys off.
 os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = "1"
+
+# Hermetic embedding index (). Sibling of the STORAGE_BACKEND pin
+# above and for the same reason: a test can redirect the STORE to a tmp path,
+# but retrieve.py's `_embedding_blend` calls `cosine_scores(query)` with no
+# index_dir, so the widen pass scored tmp-seeded records against the REAL
+# per-box index and pulled in any production ID above embedding_min_cosine
+# (0.35). Point the default at a nonexistent dir: index_available() is False,
+# cosine_scores returns {}, and the blend no-ops — exactly the flag-off path.
+#
+# This was latent for 17 days and invisible: the index named a model that
+# could not load, so cosine_scores already returned {} for the WRONG reason.
+# Repairing the index on 2026-07-27 immediately surfaced it as
+# test_load_guardrails_filters_by_category getting {guard-001, guard-002}
+# where it seeded and asserted only guard-002 — the real guard-001 scored
+# 0.588 against "framework-architecture". A hermeticity hole masked by a
+# broken dependency is the same shape as the gh-fixture breach ().
+#
+# Tests that genuinely exercise the index pass index_dir= explicitly
+# (test_embedding_retrieval.py) or monkeypatch cosine_scores
+# (test_embedding_blend.py, test_embedding_tree_channel.py), so none of them
+# lose coverage. Verified: no test relies on the real index.
+os.environ["MIND_EMBEDDING_INDEX_DIR"] = str(
+    Path(__file__).resolve().parent / "_no_such_embedding_index"
+)
 
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE
@@ -147,7 +171,7 @@ def _restore_env_per_test():
         os.environ.pop("STORAGE_BACKEND", None)
     else:
         os.environ["STORAGE_BACKEND"] = _BOOTSTRAP_MIND_BACKEND
-    # 5: keep the own-cloud tempdir-tripwire dormant-pin stable across
+    # : keep the own-cloud tempdir-tripwire dormant-pin stable across
     # tests that mutate it (the tripwire's own regression test toggles it).
     if _BOOTSTRAP_ALLOW_TMP_PUT is _UNSET:
         os.environ.pop("MIND_ALLOW_TMP_OWNCLOUD_PUT", None)
@@ -180,3 +204,130 @@ def _redirect_sweep_stats_sink(tmp_path_factory):
         yield
     finally:
         mod._SWEEP_STATS_LOG = orig
+
+
+# ── Default subprocess timeout — suite-abort defense () ────────────
+# Measured 2026-07-25 on DESKTOP-O91DLK2: spawning bash from Windows Python
+# intermittently HANGS AT BASH STARTUP (proven: `bash -x` emits zero trace, so
+# the hang precedes the first command). Hung bashes sit at 0 CPU, never exit,
+# and accumulate — the more that pile up, the more new spawns hang. The parent
+# then blocks forever in communicate(), and pytest's faulthandler bound
+# (faulthandler_timeout=600 + exit_on_timeout, pytest.ini) ABORTS THE WHOLE RUN.
+# One unlucky spawn therefore destroys a ~90-minute suite and, with it, anyone's
+# ability to satisfy .claude/rules/run-full-suite-after-deep-code.md on this box.
+#
+# 149 of 333 subprocess.run call sites across 149 test files passed no timeout.
+# Patching the shared surface ONCE here beats editing 149 sites AND covers every
+# test written later — the same reasoning as the STORAGE_BACKEND pin and the
+# sweep-stats redirect above.
+#
+# This does NOT fix the environment (that is  Layer 2, root unknown —
+# candidates: MSYS2 fork-emulation contention, AV scanning, handle pressure).
+# It converts an unbounded hang into ONE attributable test failure, so the run
+# completes and names its victim instead of dying anonymously at 70%.
+#
+# Default 300s: comfortably above the slowest legitimate test on record (139.6s,
+# per run-full-suite-after-deep-code.md) and comfortably BELOW the 600s
+# faulthandler abort — the ordering that matters, so our timeout always fires
+# first. Explicit caller timeouts are never overridden.
+_SUBPROC_TIMEOUT_ENV = "MIND_TEST_SUBPROCESS_TIMEOUT"
+
+
+def _default_subprocess_timeout():
+    """Seconds to inject, or None to disable the guard entirely (set env to 0)."""
+    raw = os.environ.get(_SUBPROC_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return 300.0
+    try:
+        val = float(raw)
+    except ValueError:
+        return 300.0
+    return val if val > 0 else None
+
+
+def _normalize_bash(args):
+    """Rewrite a bare `bash` argv[0] to the resolved Git-Bash path ().
+
+    ROOT CAUSE (measured 2026-07-25): subprocess.run(["bash", ...]) goes through
+    CreateProcess with lpApplicationName=NULL, and Windows searches **System32
+    BEFORE PATH**. On this box C:/Windows/System32/bash.exe exists — it is the
+    WSL launcher — and WSL is broken here (Wsl/0x80080005), so the launcher
+    blocks forever on the dead LxssManager service. The process never reaches
+    bash: `bash -x` emits zero trace, msys-2.0.dll never loads, and its threads
+    sit in EventPairLow (LPC) waits at 0 CPU, accumulating until the 600s
+    faulthandler bound aborts the whole suite.
+
+    Note shutil.which("bash") does NOT reveal this: which() searches PATH only,
+    so it reports Git's bash while CreateProcess picks System32's. Proven by
+    controlled comparison — bare "bash" HUNG while the identical binary named
+    explicitly succeeded in 0.14s, twice.
+
+    _bash_helpers.BASH already resolves this correctly (g-115-725, 2026-05-16)
+    and 38 test files use it — but several do not, and each is a latent
+    suite-abort. Normalizing here fixes every current AND future caller instead
+    of asking each one to remember, matching this file's existing philosophy.
+    Non-win32 platforms and non-bare argv[0] values are passed through untouched.
+    """
+    if sys.platform != "win32" or not args:
+        return args
+    seq = args[0] if isinstance(args[0], (list, tuple)) else args
+    if not isinstance(seq, (list, tuple)) or not seq:
+        return args
+    if str(seq[0]).lower() not in ("bash", "bash.exe"):
+        return args
+    try:
+        from _bash_helpers import BASH
+    except Exception:
+        return args
+    if not BASH or str(BASH).lower() in ("bash", "bash.exe"):
+        return args
+    new = [BASH, *list(seq)[1:]]
+    return (new, *args[1:]) if isinstance(args[0], (list, tuple)) else (new,)
+
+
+def _inject_timeout(kwargs, default):
+    """Return kwargs with `timeout` filled in when the caller left it unbounded.
+
+    Injects when `timeout` is ABSENT or explicitly None — both mean "unbounded"
+    today, and no test deliberately wants an unbounded hang. An explicit numeric
+    timeout is never overridden: the guard fills a gap, it does not impose
+    policy on a caller who already chose. Pure and side-effect-free so the
+    decision can be tested without spawning anything.
+    """
+    if kwargs.get("timeout") is None:
+        kwargs["timeout"] = default
+    return kwargs
+
+
+@pytest.fixture(autouse=True)
+def _default_subprocess_timeout_guard():
+    """Inject a default timeout into subprocess.run/call when none was given.
+
+    Injects only when `timeout` is ABSENT or explicitly None — both mean
+    "unbounded" today, and no test deliberately wants an unbounded hang. A test
+    that passes a real timeout keeps it untouched.
+
+    subprocess.Popen is deliberately NOT wrapped: its timeout lives on
+    .wait()/.communicate(), not the constructor, so a correct wrapper would have
+    to proxy the object. Only 7 Popen sites exist (4 without a timeout) versus
+    333 run sites, so the cost/benefit does not justify the added surface — the
+    remaining Popen exposure is documented in g-115-3085 rather than hidden.
+    """
+    import subprocess as _sp
+    default = _default_subprocess_timeout()
+    if default is None:
+        yield
+        return
+    _orig_run, _orig_call = _sp.run, _sp.call
+
+    def _run(*args, **kwargs):
+        return _orig_run(*_normalize_bash(args), **_inject_timeout(kwargs, default))
+
+    def _call(*args, **kwargs):
+        return _orig_call(*_normalize_bash(args), **_inject_timeout(kwargs, default))
+
+    _sp.run, _sp.call = _run, _call
+    try:
+        yield
+    finally:
+        _sp.run, _sp.call = _orig_run, _orig_call

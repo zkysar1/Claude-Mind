@@ -133,7 +133,7 @@ def _normalize_record(rec: Dict[str, Any]) -> Dict[str, Any]:
             # name is still at its None default and the old carries a real value.
             # DEFAULT_FIELDS pre-seeds surprise=None on every record, so without
             # this copy a {surprise_level: N} update always lost its value to the
-            # both-exist branch — surprise stayed None (7). Mirrors
+            # both-exist branch — surprise stayed None (). Mirrors
             # pipeline.py normalize_record (parity invariant, this module docstring).
             if rec[new_name] is None and rec[old_name] is not None:
                 rec[new_name] = rec[old_name]
@@ -284,7 +284,7 @@ def _validate_formation_quality(rec: Dict[str, Any]) -> None:
 
 # Recognized evidence-pointer shapes in free-text resolution fields.
 _EVIDENCE_PATTERNS = (
-    re.compile(r"\bg-\d{3}-\d{2,4}\b"),                          # goal-id
+    re.compile(r"\bg-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2})\b"),  # goal-id (incl xw, )
     re.compile(r"\b(?:rb|guard|sig|sa|bel)-\d+\b"),             # rb/guardrail/sig/...
     re.compile(r"\bexp-[a-z0-9][\w-]+", re.I),                  # experience-ref
     re.compile(r"\bmsg-\d{8}-"),                                # board message id
@@ -500,7 +500,7 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                     return Response.error(400, "resolution_evidence_required",
                                           str(e))
                 # Stamp the resolution clock at the single move-INTO-resolved
-                # chokepoint (3): archive_sweep ages resolved records
+                # chokepoint (): archive_sweep ages resolved records
                 # on outcome_date, but nothing on this path set it — 31 live
                 # records resolved date-less and never archived. Mirrors the
                 # archived_date stamp below; an explicit caller value wins.
@@ -508,7 +508,7 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                     rec["outcome_date"] = date.today().isoformat()
 
             if target_stage == "archived":
-                # Tombstone-in-live archival (6): keep the record in
+                # Tombstone-in-live archival (): keep the record in
                 # live as a stage=archived tombstone — the own-cloud merge
                 # (coordination_merge.merge_pipeline) is a per-file union-by-id
                 # that cannot express a cross-file removal, so popping here let
@@ -654,7 +654,7 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
     agent = _agent_name(ctx)
 
     # Probe live + archive outside the lock to pick the target file
-    # (5: mirror update_field's archive-probe below so a
+    # (: mirror update_field's archive-probe below so a
     # multi-field-corrupt ARCHIVED record can be repaired via this atomic
     # whole-record path; before this, update() was live-only and 404'd on
     # archived ids, leaving such records unrepairable by any tool — rb-2239).
@@ -764,9 +764,17 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
-            # Auto-set reflected_date when reflected becomes true.
-            if field == "reflected" and value is True and not rec.get("reflected_date"):
-                rec["reflected_date"] = date.today().isoformat()
+            # Auto-set provenance when reflected becomes true: WHEN
+            # (reflected_date) + WHO (reflected_by = the agent whose reflection
+            # set the flag), so the monotonic reflected=true is AUDITABLE, not
+            # opaque ( — reflection_ref provenance for the reflect log).
+            # Both write-once (guarded on absence): a later re-affirm of an
+            # already-reflected record never overwrites the original provenance.
+            if field == "reflected" and value is True:
+                if not rec.get("reflected_date"):
+                    rec["reflected_date"] = date.today().isoformat()
+                if agent and not rec.get("reflected_by"):
+                    rec["reflected_by"] = agent
 
             items[idx] = rec
             written_rec.update(rec)
@@ -805,7 +813,7 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
 # Duplicated from pipeline.py — same Decision #3 rationale.
 ARCHIVE_AGE_DAYS = 3
 
-# Tombstone-in-live archival (6): a record moved to archived STAYS in
+# Tombstone-in-live archival (): a record moved to archived STAYS in
 # pipeline.jsonl as a stage=archived tombstone for this many days before
 # archive_sweep physically prunes it. The grace window lets the stage flip
 # converge fleet-wide through the own-cloud union merge (which cannot express
@@ -844,7 +852,7 @@ def _empty_meta() -> Dict[str, Any]:
 def _compute_meta(live_items: List[Dict], archive_items: List[Dict]) -> Dict:
     """Recompute meta from all records. Mirrors pipeline.py compute_meta."""
     meta = _empty_meta()
-    # Dedup by id across live+archive (6; mirrors pipeline.py
+    # Dedup by id across live+archive (; mirrors pipeline.py
     # compute_meta): a tombstoned id is present in BOTH files by design —
     # count each hypothesis once (archive copy wins) so accuracy denominators
     # never double-count.
@@ -1069,7 +1077,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     archived_count = 0
     pruned_count = 0
     # Per-record validation failures are collected here rather than aborting
-    # the whole batch (7): one corrupt record must not wedge all
+    # the whole batch (): one corrupt record must not wedge all
     # archival. Invalid records stay in live (un-flipped, visible) and are
     # reported as skipped_invalid in the response.
     skipped_invalid: List[Dict[str, Any]] = []
@@ -1084,7 +1092,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
 
             for rec in items:
                 if rec.get("stage") == "archived":
-                    # Live tombstone maintenance (6): stamp a missing
+                    # Live tombstone maintenance (): stamp a missing
                     # prune clock, prune aged tombstones (the archive copy
                     # already holds the record), keep young ones so the stage
                     # flip has time to converge fleet-wide via the union merge.
@@ -1106,7 +1114,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     remaining.append(rec)
                     continue
                 if rec.get("stage") == "resolved":
-                    # Effective resolution clock (3): 33/73 live
+                    # Effective resolution clock (): 33/73 live
                     # resolved records were sweep-invisible — 31 carried only
                     # resolution_date_actual/reflected_date (no writer stamped
                     # outcome_date on the move-to-resolved path), 2 carried
@@ -1124,7 +1132,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                                 # Validate a candidate copy BEFORE mutating the
                                 # live record so a single invalid record is
                                 # skipped-and-reported, not fatal to the batch
-                                # (7).
+                                # ().
                                 candidate = dict(rec)
                                 candidate["stage"] = "archived"
                                 candidate["archived_date"] = today.isoformat()
@@ -1160,7 +1168,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     # discovered records validate cleanly.
                     # Validate a candidate copy BEFORE mutating the live record
                     # so a single invalid record is skipped-and-reported, not
-                    # fatal to the batch (7).
+                    # fatal to the batch ().
                     candidate = dict(rec)
                     candidate["outcome"] = "EXPIRED"
                     candidate["outcome_date"] = today.isoformat()

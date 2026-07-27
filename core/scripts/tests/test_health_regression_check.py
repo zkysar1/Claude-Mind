@@ -9,6 +9,7 @@ in the build, not here (it needs _paths + git). Safe with a live daemon present.
 from __future__ import annotations
 
 import importlib.util
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -316,6 +317,128 @@ class TestRunEndToEnd(unittest.TestCase):
         v = self._run()
         self.assertTrue(v["calibrated"])                    # 30 days despite 240 records
         self.assertTrue(v["calibration_just_completed"])
+
+
+class TestIntervalMarkerReset(TestRunEndToEnd):
+    """ signal 3: `iteration` is a per-session counter that restarts
+    low each session, but `.last-check` persists across sessions. A marker
+    written late in one session sits ABOVE the next session's counter, the
+    difference goes negative, and `negative < interval` returned not-elapsed on
+    EVERY call — the detector latched dark. Measured 2026-07-26: 4 of 5 live
+    agents stranded (foxtrot -381, alpha -344, bravo -300, zeta -299)."""
+
+    def _healthy_records(self, iteration):
+        return [{"warmup": False, "ts": "2026-06-03T12:00:00", "iteration": iteration,
+                 "composite": 0.95, "composite_trend": 0.01, "baseline": 0.71,
+                 "below_baseline": False, "signals": {"deep_ratio": 0.9}}]
+
+    def test_marker_above_current_iteration_rearms(self):
+        self._config("detect-and-report")
+        self._ledger(self._healthy_records(26))
+        (self.health_dir / ".last-check").write_text("325", encoding="utf-8")
+        v = self._run(force=False)
+        # Must NOT be the stranded verdict. Before the fix this returned
+        # "interval not elapsed (-299/10)" forever.
+        self.assertNotIn("interval not elapsed", v["reason"])
+        # And the marker must be re-anchored to the live counter, so the very
+        # next call gates normally instead of re-arming every time.
+        self.assertEqual((self.health_dir / ".last-check").read_text().strip(), "26")
+
+    def test_normal_interval_gating_still_blocks(self):
+        # The re-arm must not swallow legitimate interval gating: a marker
+        # BELOW the counter but within the interval still returns not-elapsed.
+        self._config("detect-and-report")
+        self._ledger(self._healthy_records(26))
+        (self.health_dir / ".last-check").write_text("20", encoding="utf-8")
+        v = self._run(force=False)
+        self.assertIn("interval not elapsed (6/10)", v["reason"])
+        # Marker untouched while gated.
+        self.assertEqual((self.health_dir / ".last-check").read_text().strip(), "20")
+
+    def test_elapsed_interval_fires_and_advances_marker(self):
+        self._config("detect-and-report")
+        self._ledger(self._healthy_records(40))
+        (self.health_dir / ".last-check").write_text("20", encoding="utf-8")
+        v = self._run(force=False)
+        self.assertNotIn("interval not elapsed", v["reason"])
+        self.assertEqual((self.health_dir / ".last-check").read_text().strip(), "40")
+
+    def test_equal_marker_is_not_treated_as_reset(self):
+        # Boundary: marker == cur_iter is a normal same-iteration re-check
+        # (delta 0 < interval), NOT a counter reset.
+        self._config("detect-and-report")
+        self._ledger(self._healthy_records(26))
+        (self.health_dir / ".last-check").write_text("26", encoding="utf-8")
+        v = self._run(force=False)
+        self.assertIn("interval not elapsed (0/10)", v["reason"])
+
+
+class TestCalibrationAgreesAcrossEntryPoints(unittest.TestCase):
+    """ signals 1-2, and the test whose ABSENCE let the halves drift.
+
+    `calibrated` has two consumers — the detection sweep here and
+    health-revert.py's `route_candidate` master safety gate — and they
+    disagreed in production: detection True, revert False, on the same agent
+    dir. An agent-dir fixture must yield ONE answer from both."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.health_dir = self.tmp / "health"
+        self.health_dir.mkdir(parents=True)
+        # Productive agent: 43 calendar days, 30 records/day. The newest 200
+        # records span ~7 days — the shape that made the windowed form fail.
+        import json as _j
+        for i in range(43):
+            day = f"2026-05-{i + 1:02d}" if i < 31 else f"2026-06-{i - 30:02d}"
+            (self.health_dir / f"{day}.jsonl").write_text(
+                "".join(_j.dumps({"warmup": False, "ts": f"{day}T{h:02d}:00:00",
+                                  "iteration": i * 30 + h, "composite": 0.95,
+                                  "composite_trend": 0.01, "baseline": 0.71,
+                                  "below_baseline": False}) + "\n"
+                        for h in range(30)), encoding="utf-8")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _revert_mod(self):
+        spec = importlib.util.spec_from_file_location(
+            "health_revert_agree", CORE_SCRIPTS / "health-revert.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_both_halves_report_the_same_calibrated(self):
+        hl = _MOD.hl   # the very module object the detection half uses
+        cal_cfg = {"min_days": 30, "min_records": 50}
+        detection_calibrated, _, _ = _MOD._calibration_status(
+            self.health_dir, cal_cfg, 1_000_000_000)
+        # The revert half's own config defaults, read from its loader rather
+        # than hardcoded here — if those defaults ever diverge from detection's
+        # this test must fail, not silently compare a stale copy.
+        revert_cfg = self._revert_mod()._load_revert_cfg(self.tmp / "no-config")
+        revert_calibrated, _ = hl.calibration_state(
+            self.health_dir,
+            revert_cfg["calibration"]["min_days"],
+            revert_cfg["calibration"]["min_records"])
+        self.assertTrue(detection_calibrated)
+        self.assertEqual(detection_calibrated, revert_calibrated,
+                         "detection and revert disagree on `calibrated` for the "
+                         "same agent dir — the g-115-3125 drift has returned")
+
+    def test_revert_does_not_gate_on_the_bounded_window(self):
+        """Source invariant. The behavioral test above passes as long as both
+        halves happen to agree TODAY; this one pins the mechanism, because the
+        defect was reintroducible by one plausible-looking edit. If
+        health-revert.py's calibration legitimately moves, update this test to
+        follow it — do not delete it."""
+        src = (CORE_SCRIPTS / "health-revert.py").read_text(encoding="utf-8")
+        self.assertIn("hl.calibration_state(", src,
+                      "health-revert.py must derive `calibrated` from the shared helper")
+        self.assertIsNone(
+            re.search(r"calibrated\s*=\s*\(?\s*cal_days", src),
+            "health-revert.py is again computing `calibrated` from a bounded "
+            "recent_records window — spec health-ledger.md §10 forbids it")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,24 @@ REPO_ROOT="$PROJECT_ROOT"                        # legacy alias
 # On any platform: falls back to 'python' if it's Python 3.8+.
 # Creates a cached shim script in .python-shim/ (gitignored). Delete to re-detect.
 _PY_SHIM_DIR="$SCRIPT_DIR/.python-shim"
-if [ -x "$_PY_SHIM_DIR/python3" ]; then
+# TEST SEAM (). MIND_SKIP_PY_SHIM=1 suppresses the PATH prepend below.
+# Unset in production, so the default path is unchanged for every real caller.
+#
+# Why it is needed: this block prepends .python-shim to the FRONT of PATH, so a
+# test that stubs `python3` by prepending its own dir can NEVER win — the stub is
+# shadowed the moment the script under test sources _paths.sh. Measured
+# 2026-07-26: with a test shim first in PATH, `command -v python3` after sourcing
+# still resolved to core/scripts/.python-shim/python3. That silently defeated
+# test-infra-streak-dedup.sh CASE 8, whose shim exists to simulate a CRASHED
+# monitor — the real monitor ran instead, reported "no alerts", and the case
+# failed as "expected exit 1, got rc=0". Windows-only: on Linux python3 is native,
+# no shim is created, and the test's stub wins normally.
+#
+# Only ever set this in a test that provides its own python3 on PATH. Setting it
+# without one leaves `python3` unresolvable on Windows.
+if [ "${MIND_SKIP_PY_SHIM:-}" = "1" ]; then
+    :   # test-controlled: leave PATH alone so a test-provided python3 stub wins
+elif [ -x "$_PY_SHIM_DIR/python3" ]; then
     export PATH="$_PY_SHIM_DIR:$PATH"
     # Backfill: older shim dirs only had python3 — also expose `python` for
     # LLM-issued bare `python` pipes (Windows Store stub eats the system one).
@@ -145,7 +162,7 @@ agent_state_dir() {
 # next filesystem operation rather than silently writing into PROJECT_ROOT.
 # MIND_AGENT_DIR (test-only override; UNSET in production) points agent-dir
 # resolution at a caller-supplied dir instead of live PROJECT_ROOT/agents/<name>.
-# Mirrors _paths.py L279-289. Closes the asymmetry (3) where _paths.py
+# Mirrors _paths.py L279-289. Closes the asymmetry () where _paths.py
 # honored the override but _paths.sh did not — which FORCED framework tests that
 # invoke a bash script to create a real agents/<name> dir under live PROJECT_ROOT
 # (the running fleet then ADOPTS it mid-test via agents_root().glob(*/local-paths.conf)
@@ -165,7 +182,7 @@ else
     # config) must NOT win just by sorting first. Mirrors the _paths.py
     # _read_local_paths fix (2026-06-14: empty agents/delta/local-paths.conf
     # sorted before omni's and resolved WORLD_DIR empty).
-    # The warning makes the silent wrong-agent read visible (6 root
+    # The warning makes the silent wrong-agent read visible ( root
     # cause B). The two PreToolUse hooks that source this file
     # (bash-agent-inject.sh, path-resolution-hook.sh) use `2>/dev/null`, which
     # suppresses stderr emitted during sourcing — so the warning fires only for
@@ -178,7 +195,7 @@ else
     # pure noise -- suppress it there. Multi-agent deployments keep the warning:
     # it is the signal that catches a genuine wrong-agent read ( / routed
     # from a downstream single-agent deployment, ; preserves the
-    # 6 multi-agent hook-miss diagnostic).
+    #  multi-agent hook-miss diagnostic).
     _CONF_COUNT=0
     for _CC in "$(agents_root)"/*/local-paths.conf; do
         [ -f "$_CC" ] && _CONF_COUNT=$((_CONF_COUNT + 1))
@@ -247,7 +264,7 @@ WORLD_DIR="${MIND_WORLD:-${_MD_WORLD:-${WORLD_PATH:-}}}"
 
 unset _MD_DIR _MD_WORLD _MD_META
 if [ -n "$_AGENT_DIR_OVERRIDE" ]; then
-    AGENT_DIR="$_AGENT_DIR_OVERRIDE"   # test override (3); UNSET in prod
+    AGENT_DIR="$_AGENT_DIR_OVERRIDE"   # test override (); UNSET in prod
 elif [ -n "$AGENT_NAME" ]; then
     AGENT_DIR="$(agent_dir "$AGENT_NAME")"
 else

@@ -21,7 +21,7 @@
 #                                with run-record JSON on stdin)
 #
 # --encoding-source / --encoding-reason are FORWARDED as encoding_source /
-# encoding_reason in the POST body (3): the daemon now appends the
+# encoding_reason in the POST body (): the daemon now appends the
 # S9 L1-pick-log telemetry itself (tree_write.py → _l1_pick.py SSOT) for
 # add-child / batch / reparent. Fail-open on the daemon side — a telemetry
 # error never blocks the tree write. They were no-ops 2026-05-28→2026-07-12
@@ -148,7 +148,7 @@ import json, os, sys
 op = os.environ["TU_OP"]
 a = sys.argv[1:]
 body = {"op": op}
-# S9 telemetry passthrough (3): the daemon reads these top-level for
+# S9 telemetry passthrough (): the daemon reads these top-level for
 # add-child/batch/reparent; harmless-ignored elsewhere. Only set when given.
 for flag, key in (("TU_ENC_SOURCE", "encoding_source"),
                   ("TU_ENC_REASON", "encoding_reason")):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_aspiration_trajectory_exempt.py - regression test (7).
+"""test_aspiration_trajectory_exempt.py - regression test ().
 
 Pins the record-level plateau exemption: an aspiration carrying
 `plateau_exempt: true` must have BOTH plateau_detected and diminishing_returns

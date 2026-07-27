@@ -1,4 +1,4 @@
-"""7 / rb-1150: insight-trigger-gate apply-time re-probe regression.
+""" / rb-1150: insight-trigger-gate apply-time re-probe regression.
 
 Mirrors the contract pinned by test_insight_trigger_sweep_reprobe.py
 (g-115-1076) onto the sibling event-driven gate path. Three cases match

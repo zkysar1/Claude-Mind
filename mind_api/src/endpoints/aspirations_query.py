@@ -83,7 +83,7 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
     raw_title = q.get("title_contains")
     raw_full = q.get("full")
     # full=true|1|yes → return raw goal records + {asp_id, source} metadata instead
-    # of the 5-field projection. Goal-by-id full-record read in one call (4).
+    # of the 5-field projection. Goal-by-id full-record read in one call ().
     full_mode = raw_full is not None and str(raw_full).strip().lower() in ("true", "1", "yes")
 
     # --goal-field is a 2-tuple at the CLI; rebuild from paired query params.
@@ -129,7 +129,7 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
             for goal in asp.get("goals", []):
                 if _goal_matches(goal, status_filter, field_filter, raw_title):
                     if full_mode:
-                        # Full-record read (4): raw goal dict + {asp_id,
+                        # Full-record read (): raw goal dict + {asp_id,
                         # source} metadata. Returns the canonical record
                         # (description, verification, priority, intended_agent) so a
                         # goal-by-id lookup needs one call, not an aspiration-scoped

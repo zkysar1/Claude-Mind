@@ -249,7 +249,7 @@ def _run_verify(tmpdir: Path, goal_id: str):
 
 
 def test_verify_counted_present_exit0() -> bool:
-    """0: GOAL_ID present in counted set → exit 0 (bump landed)."""
+    """: GOAL_ID present in counted set → exit 0 (bump landed)."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
     try:
         _seed_wm(
@@ -267,7 +267,7 @@ def test_verify_counted_present_exit0() -> bool:
 
 
 def test_verify_counted_absent_exit1() -> bool:
-    """0: loop_state present, GOAL_ID absent → exit 1 (no-op detected)."""
+    """: loop_state present, GOAL_ID absent → exit 1 (no-op detected)."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
     try:
         _seed_wm(
@@ -285,7 +285,7 @@ def test_verify_counted_absent_exit1() -> bool:
 
 
 def test_verify_counted_no_counted_list_exit1() -> bool:
-    """0: loop_state present but counted list missing → exit 1 (absent).
+    """: loop_state present but counted list missing → exit 1 (absent).
 
     This is the first-goal-of-session shape: a bump that should have created
     counted_goals_this_session=[goal] silently no-op'd, so the key never appears.
@@ -308,7 +308,7 @@ def test_verify_counted_no_counted_list_exit1() -> bool:
 
 
 def test_verify_counted_missing_wm_exit0() -> bool:
-    """0: WM file absent → exit 0 (indeterminate; conservative no re-fire)."""
+    """: WM file absent → exit 0 (indeterminate; conservative no re-fire)."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-verify-"))
     try:
         # Deliberately do NOT seed a WM — the file does not exist.
@@ -326,7 +326,7 @@ def test_verify_counted_missing_wm_exit0() -> bool:
 
 
 def test_refire_recovers_simulated_noop() -> bool:
-    """0: simulate a silent first-call no-op (counters frozen, goal
+    """: simulate a silent first-call no-op (counters frozen, goal
     absent from the counted set), then prove the iteration-close.sh self-heal
     sequence verify→re-fire→verify recovers the undercount."""
     tmpdir = Path(tempfile.mkdtemp(prefix="loop-state-bump-refire-"))

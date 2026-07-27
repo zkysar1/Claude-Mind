@@ -1,4 +1,4 @@
-"""Acceptance tests for core/scripts/provision-github-from-vault.sh (3).
+"""Acceptance tests for core/scripts/provision-github-from-vault.sh ().
 
 Hermetic — no SSH, no network. Two documented test seams stub the two external
 dependencies:
@@ -69,8 +69,14 @@ def test_keypair_generated_mode_600(tmp_path):
     priv = ssh_dir / "alpha_deploy"
     pub = ssh_dir / "alpha_deploy.pub"
     assert priv.exists() and pub.exists()
-    mode = stat.S_IMODE(priv.stat().st_mode)
-    assert mode == 0o600, f"private key mode {oct(mode)} != 0600"
+    # Enforced on POSIX, where the fleet runs and where the private-key mode is a
+    # real security property. NOT assertable on Windows: NTFS has no POSIX mode
+    # bits, so os.stat synthesizes st_mode and reports 0o666 for any writable file
+    # whatever chmod did. On win32 this can never pass and can never catch a
+    # regression — it measures the platform, not the script ().
+    if os.name != "nt":
+        mode = stat.S_IMODE(priv.stat().st_mode)
+        assert mode == 0o600, f"private key mode {oct(mode)} != 0600"
 
 
 def test_registration_idempotent_second_run_skips(tmp_path):
@@ -104,7 +110,9 @@ def test_ssh_config_updated_exactly_once(tmp_path):
     body1 = cfg.read_text(encoding="utf-8")
     assert body1.count("Host github.com") == 1
     assert f"IdentityFile {ssh_dir}/alpha_deploy" in body1
-    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+    # POSIX-only: see the note on the private-key mode check above ().
+    if os.name != "nt":
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
 
     # Re-run: ssh-config must NOT gain a second block.
     proc2, _ = _run(tmp_path, vault_body=vault, mock_state=mock)

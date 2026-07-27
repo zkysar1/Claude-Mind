@@ -82,9 +82,20 @@ def _resolve_path(ctx, rel_path: str) -> Path:
     return target
 
 
-def _read_yaml(path: Path) -> Dict[str, Any]:
+def _read_yaml(path: Path, force_fresh: bool = False) -> Dict[str, Any]:
+    """force_fresh=True force-pulls the latest remote object AND records its
+    ETag as the If-Match fence token, so a locked_rmw retry re-reads the peer's
+    landed write and re-fences each attempt. Without it a stale local mirror
+    fences every PUT against an etag the remote no longer has, and the 412
+    repeats forever against a remote that never changes — the per-object
+    stale-IfMatch DEADLOCK (rb-2639), not transient contention. Mirrors
+    meta_impk._read_yaml. Default False keeps read-only callers on the
+    cache-TTL ensure_local (no extra S3 GET per read)."""
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
@@ -110,16 +121,24 @@ def _atomic_write_yaml(path: Path, data: Any) -> None:
     _atomic_write_with_fallback(path, _write, fallback_counter_key="daemon_meta_yaml_write")
 
 
-def _persist(ctx, path: Path, data: Any) -> None:
+def _persist_unlocked(ctx, path: Path, data: Any) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (it takes a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread."""
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
+    _validate_no_surrogates(data, path)
+    history.snapshot(path, base_dir, agent)
+    _atomic_write_yaml(path, data)
+    changelog.append(base_dir, agent, path, "edit")
+
+
+def _persist(ctx, path: Path, data: Any) -> None:
     assert_not_cruft(path.parent, "mkdir (meta_yaml)")
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_locks.locked(path):
-        _validate_no_surrogates(data, path)
-        history.snapshot(path, base_dir, agent)
-        _atomic_write_yaml(path, data)
-        changelog.append(base_dir, agent, path, "edit")
+        _persist_unlocked(ctx, path, data)
 
 
 def _now() -> str:
@@ -402,19 +421,34 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         path = _resolve_path(ctx, file_rel)
-        data = _read_yaml(path)
         value = _coerce_set_value(body["value"], string_flag)
         value = _validate_weight_bounds(file_rel, dotpath, value, _load_bounds(ctx))
-        parent, key = _navigate(data, dotpath)
-        try:
-            old_value = parent[key]
-        except (KeyError, IndexError, TypeError):
-            old_value = None
-        if isinstance(parent, list) and isinstance(key, int) and key == len(parent):
-            parent.append(value)
-        else:
-            parent[key] = value
-        _persist(ctx, path, data)
+        assert_not_cruft(path.parent, "mkdir (meta_yaml)")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read-modify-write INSIDE one locked_rmw cycle. Previously the read sat
+        # OUTSIDE the lock and the write used a bare `locked()` with no retry:
+        # on own-cloud that fenced every PUT against a possibly-stale mirror etag
+        # and had no way to recover, so a peer's write from another box wedged
+        # this object permanently (5/5 failures on a demonstrably static remote,
+        #  skill-gaps.yaml). force_fresh re-fences per attempt (rb-2639)
+        # and locked_rmw retries, converting a permanent wedge into a self-heal.
+        # It also closes the unlocked-RMW lost-update window (guard-480).
+        def _cycle():
+            data = _read_yaml(path, force_fresh=True)
+            parent, key = _navigate(data, dotpath)
+            try:
+                prev = parent[key]
+            except (KeyError, IndexError, TypeError):
+                prev = None
+            if isinstance(parent, list) and isinstance(key, int) and key == len(parent):
+                parent.append(value)
+            else:
+                parent[key] = value
+            _persist_unlocked(ctx, path, data)
+            return prev
+
+        old_value = file_locks.locked_rmw(path, _cycle)
     except _MetaYamlError as e:
         return Response.error(e.status, e.code, e.detail)
 
@@ -456,18 +490,27 @@ def append_item(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         path = _resolve_path(ctx, file_rel)
-        data = _read_yaml(path)
-        parent, key = _navigate(data, dotpath)
-        arr = parent.get(key) if isinstance(parent, dict) else parent[key]
-        if arr is None:
-            parent[key] = []
-            arr = parent[key]
-        if not isinstance(arr, list):
-            return Response.error(400, "not_a_list",
-                                  "Field '{}' is {}, not a list".format(
-                                      dotpath, type(arr).__name__))
-        arr.append(item)
-        _persist(ctx, path, data)
+        assert_not_cruft(path.parent, "mkdir (meta_yaml)")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Same locked_rmw + force_fresh cycle as set_field above — an append is
+        # the RMW shape most exposed to the stale-fence wedge, since every agent
+        # appends to the same shared meta lists (skill-gaps encounter_log).
+        def _cycle():
+            data = _read_yaml(path, force_fresh=True)
+            parent, key = _navigate(data, dotpath)
+            arr = parent.get(key) if isinstance(parent, dict) else parent[key]
+            if arr is None:
+                parent[key] = []
+                arr = parent[key]
+            if not isinstance(arr, list):
+                raise _MetaYamlError(400, "not_a_list",
+                                     "Field '{}' is {}, not a list".format(
+                                         dotpath, type(arr).__name__))
+            arr.append(item)
+            _persist_unlocked(ctx, path, data)
+
+        file_locks.locked_rmw(path, _cycle)
     except _MetaYamlError as e:
         return Response.error(e.status, e.code, e.detail)
     return Response.text(

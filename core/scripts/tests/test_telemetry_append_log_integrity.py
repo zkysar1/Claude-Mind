@@ -1,4 +1,4 @@
-"""7: gate-firings telemetry integrity — the two write-path loss lanes.
+""": gate-firings telemetry integrity — the two write-path loss lanes.
 
 Part 1 (storage_backend._bootstrap_env_defaults): a BARE subprocess reaching
 get_backend() without the box's sourced env must self-resolve config from
@@ -51,6 +51,17 @@ def _rec(ts: str, gate: str, extra=None) -> dict:
 def _dump(records) -> bytes:
     return b"".join(
         (json.dumps(r, ensure_ascii=True) + "\n").encode() for r in records)
+
+
+@pytest.fixture(autouse=True)
+def _redirect_merge_events_log(tmp_path, monkeypatch):
+    """: the FakeMergeBackend success tests reach _try_merge_put,
+    which now appends a durable merge-event line via _persist_merge_event.
+    Redirect that write into tmp so no test touches the real
+    mind_api/state/owncloud-merge-events.jsonl."""
+    monkeypatch.setattr(
+        _mod, "_merge_events_path",
+        lambda: tmp_path / "owncloud-merge-events.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +270,10 @@ def test_push_lane_unregistered_store_keeps_mirror_put(tmp_path):
 
 
 def test_push_lane_torn_local_self_heals(tmp_path, monkeypatch, capsys):
-    # 5: the cc-04 franken-local shape END-TO-END — the local copy
+    # : the cc-04 franken-local shape END-TO-END — the local copy
     # carries a TORN half-line tail (truncated append). Pre-fix the handler
     # raised inside merge_put -> _try_merge_put counted an error and skipped ->
-    # the wedge persisted until a manual pre-filter (the 7 heal).
+    # the wedge persisted until a manual pre-filter (the  heal).
     # Now: pre-merge snapshot fires, the union proceeds, the torn line is
     # dropped LOUDLY, and every parseable record from both sides survives.
     be, full, local = _incident_files(tmp_path)

@@ -76,6 +76,40 @@ Keys fall into two classes:
 - **Non-secret config** — deployment wiring that is not sensitive (backend
   selection, environment id, resource names, region, machine id, remote paths).
   These are copied through, not prefix-stripped.
+- **Secret, agent-scoped** — a credential that must DIFFER per agent. The
+  env-prefix namespaces by ENVIRONMENT, and the environment id is
+  per-DEPLOYMENT, not per-agent, so every agent on a deployment resolves the
+  same prefix and therefore the same entries. That is correct for a shared
+  daemon credential and wrong for a per-agent one, where two agents must not
+  receive the same value. Such a key carries a trailing agent scope:
+  `<ENV>_<CONTAINER_KEY>__<AGENT>` (agent uppercased), resolving to
+  `<CONTAINER_KEY>` on that agent's box only.
+
+### Agent-scope resolution rules
+
+1. A scoped entry for the bound agent **overrides** its generic sibling.
+2. A scoped entry for **any other** agent is never written to this box. This is
+   the security-critical rule: one shared vault must not place agent A's
+   credential on agent B's box.
+3. An unscoped entry is generic and applies to every agent — unchanged
+   behavior, so a vault with no scoped entries maps exactly as it did before.
+   The extension is backward-compatible by construction.
+4. With no agent bound (`MIND_AGENT` unset), **no** scoped entry resolves and
+   every one is skipped. Fail-safe: never guess whose credential this is.
+5. `__` is RESERVED as the scope separator, so a container env name must not
+   contain it. No key in the current surface does.
+
+Resolution is two-pass, so precedence between a scoped entry and its generic
+sibling never depends on line order in the vault — that ordering is not part of
+the contract and must not decide which credential a box receives. The guarantee
+is scoped-vs-generic only: two entries at the SAME scope (a base name duplicated
+within the vault) are both emitted, so the last one wins on load and the
+duplicate is counted twice in the verify summary. Treat a duplicated base name
+as an operator error the provisioner does not currently detect.
+The verify block tags each resolved key `(agent-scoped: <AGENT>)`,
+which stays inside the values-blind contract (invariant 5) because it is a
+key-name-level fact, and lets an operator confirm scoping fired rather than
+silently falling back to generic.
 
 Because this capability is **formalized, not ported verbatim**, the provisioner
 DEFINES this contract — a downstream operator aligns the vault to the contract

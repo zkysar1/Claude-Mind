@@ -1,4 +1,4 @@
-"""Tests for precheck-sentinel-battery.py + _sentinel_registry.py (3).
+"""Tests for precheck-sentinel-battery.py + _sentinel_registry.py ().
 
 Pins:
   1. Battery lists a set sentinel and omits null/absent ones.

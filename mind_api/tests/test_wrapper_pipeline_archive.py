@@ -95,7 +95,7 @@ def test_wrapper_archive_sweep(archive_daemon):
     # stdout should be the archived count (matches legacy CLI shape)
     assert result.stdout.strip() == "1"
 
-    # Verify file state — 6: the swept record stays in live as a
+    # Verify file state — : the swept record stays in live as a
     # stage=archived tombstone (pruned only after PRUNE_GRACE_DAYS).
     live_items = _read_jsonl(live)
     archive_items = _read_jsonl(archive)

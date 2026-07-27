@@ -113,7 +113,7 @@ def apply_fix(refs):
             for r in group:
                 r["error"] = "read failed: {}".format(e)
             continue
-        # Single-pass replacement (5 Finding 1): build ONE regex
+        # Single-pass replacement ( Finding 1): build ONE regex
         # alternation of every old_tick and re.sub against the ORIGINAL body, so
         # each occurrence resolves EXACTLY once. The prior per-ref sequential
         # str.replace corrupted CHAINED moves — e.g. A->B and B->C in one batch:
@@ -150,7 +150,7 @@ def apply_fix(refs):
                 r["error"] = "write failed: {}".format(e)
             continue
         # Body IS on disk now — record success BEFORE the best-effort changelog
-        # append (5 Finding 2). The prior code put fixed.extend AFTER
+        # append ( Finding 2). The prior code put fixed.extend AFTER
         # append_changelog inside the SAME try, so a changelog-only failure (body
         # already written) wrongly marked the refs "write failed" and dropped them
         # from the fixed count. The changelog is audit-only; its failure is non-fatal.

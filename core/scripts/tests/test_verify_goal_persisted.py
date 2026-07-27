@@ -1,4 +1,4 @@
-"""Unit tests for aspirations_write._verify_goal_persisted (8).
+"""Unit tests for aspirations_write._verify_goal_persisted ().
 
 The daemon add_goal path on own-cloud can return a success-shaped 200 while
 NOTHING persisted to the authoritative store (the silent no-conflict write-loss
@@ -177,7 +177,7 @@ def test_empty_goals_list_returns_false(monkeypatch):
     assert aw._verify_goal_persisted(LIVE_PATH, ASP_ID, GOAL_ID) is False
 
 
-# ═══ 6: _verify_claim_persisted (claim-path extension) ═════════════
+# ═══ : _verify_claim_persisted (claim-path extension) ═════════════
 # The add_goal guard checks goal EXISTENCE; a lost CLAIM leaves the goal
 # present with claimed_by unset/stale (two cc-05 specimens 2026-07-16: claim
 # returned success JSON with claimed_by set, raw read-back showed
@@ -240,7 +240,7 @@ def test_claim_verifier_s3_raises_fails_open_true(monkeypatch):
                                       CLAIM_AGENT) is True
 
 
-# ═══ 6: claim() endpoint refuses the false 200 on resolve-away ═════
+# ═══ : claim() endpoint refuses the false 200 on resolve-away ═════
 # Direct-call endpoint tests: real claim() write path against a tmp world,
 # with get_backend monkeypatched to a fake own-cloud whose raw content IS the
 # authoritative store state after the (simulated) resolve-away.
@@ -318,10 +318,10 @@ def test_claim_endpoint_local_backend_unaffected(tmp_path, monkeypatch):
     assert json.loads(resp.body)["ok"] is True
 
 
-# ═══ 9: _verify_transition_persisted (critical goal transitions) ═══
+# ═══ : _verify_transition_persisted (critical goal transitions) ═══
 # A swallowed transition PUT (release / defer / complete) leaves the goal
 # PRESENT in the authoritative store with the OLD field values — the
-# 1 specimen (release+defer verified against the local mirror at
+#  specimen (release+defer verified against the local mirror at
 # 11:53, silently never persisted, time-traveled back at the 18:21 restart
 # re-sync). The transition verifier compares each just-written critical
 # field's final in-memory value against the raw-S3 copy. Same conservative
@@ -338,7 +338,7 @@ def test_transition_verifier_fields_match_true(monkeypatch):
 
 
 def test_transition_verifier_stale_value_false(monkeypatch):
-    """THE 1 shape: store still carries the PRE-transition state."""
+    """THE  shape: store still carries the PRE-transition state."""
     raw = _jsonl({"id": ASP_ID, "goals": [
         {"id": GOAL_ID, "status": "in-progress", "claimed_by": "echo"}]})
     _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
@@ -379,7 +379,7 @@ def test_transition_verifier_s3_raises_fails_open_true(monkeypatch):
         LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"}) is True
 
 
-# ═══ 9: endpoint guards refuse the false 200 on swallowed PUT ═══
+# ═══ : endpoint guards refuse the false 200 on swallowed PUT ═══
 
 
 def _fake_ctx_claimed(tmp_path, goal_id: str, agent: str, *, goal_extra=None,
@@ -411,7 +411,7 @@ def _fake_ctx_claimed(tmp_path, goal_id: str, agent: str, *, goal_extra=None,
 
 def test_release_endpoint_refuses_on_swallowed_release(tmp_path, monkeypatch,
                                                        capsys):
-    """1 specimen: release write succeeds locally but the raw store
+    """ specimen: release write succeeds locally but the raw store
     still shows the claim → 500 release_not_persisted, never a false 200."""
     gid = "g-115-7801"
     ctx = _fake_ctx_claimed(tmp_path, gid, CLAIM_AGENT,
@@ -519,7 +519,7 @@ def test_update_goal_noncritical_field_skips_verifier(tmp_path, monkeypatch):
 
 def test_update_goal_refuses_on_swallowed_terminal_status(tmp_path, monkeypatch,
                                                           capsys):
-    """Swallowed TERMINAL status PUT (2): the terminal branch extends
+    """Swallowed TERMINAL status PUT (): the terminal branch extends
     the expectation with claimed_by=None (step 9 popped the claim in-lock), so
     a store still showing the pre-transition state — in-progress AND the live
     claim — must fail the verify → 500, never a false 200. Pins the branch a

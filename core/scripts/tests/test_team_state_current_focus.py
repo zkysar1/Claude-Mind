@@ -1,4 +1,4 @@
-"""test_team_state_current_focus.py — regression for 5.
+"""test_team_state_current_focus.py — regression for .
 
 cmd_in_flight (CLI) and the daemon in_flight() endpoint now stamp
 agent_status.<agent>.current_focus (+ current_focus_updated_at) at claim time

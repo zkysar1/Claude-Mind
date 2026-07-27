@@ -12,10 +12,29 @@ config:
 gap_types:
   utility:
     description: "Well-defined procedures (API calls, data formatting, retrieval workflows)"
-    forge_gate: CALIBRATE  # 0.30+ confidence required
+    forge_gate: CALIBRATE  # tree.yaml competence_mapping: 0.50
   analytical:
     description: "Skills requiring domain understanding (pattern recognition, evaluation)"
-    forge_gate: EXPLOIT    # 0.60+ confidence required (default)
+    forge_gate: EXPLOIT    # tree.yaml competence_mapping: 0.75
+
+  # DEFAULT when a gap carries no `type`: utility (, 2026-07-25).
+  # Was `analytical`. Measured at decision time: 22 of 24 gaps were typeless, and
+  # classifying all 22 against the two descriptions above gave 20 utility / 2
+  # analytical — the old default was inverted against ~91% of the population it
+  # governed. It survived unnoticed because it errs STRICT (EXPLOIT 0.75 > CALIBRATE
+  # 0.50) and 63% of tree nodes (790/1246) already sit at EXPLOIT, so it usually
+  # passed anyway; it only bites a utility gap in a CALIBRATE category (the
+  # 0.50-0.75 band). Consumer of this default: .claude/skills/forge-skill/SKILL.md.
+  #
+  # The confidence numbers above are GLOSSES on core/config/tree.yaml
+  # competence_mapping, not free-standing values (guard-1195). They previously read
+  # 0.30 / 0.60 — matching NEITHER tree.yaml (0.25/0.50/0.75) NOR
+  # developmental-stage.yaml (0.15/0.45/0.70/0.90), and erring LOW in both cases so
+  # an agent trusting them would forge BELOW the real bar. Corrected here 2026-07-25;
+  # the sibling gloss in forge-skill/SKILL.md was corrected by zeta the same day.
+  # Two mappings exist because the gate reads the category NODE's stored
+  # capability_level (tree.yaml) and falls back to the agent's developmental stage
+  # (developmental-stage.yaml) only when no node confidence is available.
 
 experience_mining:
   min_cluster_size: 3           # Min similar executions to register a gap

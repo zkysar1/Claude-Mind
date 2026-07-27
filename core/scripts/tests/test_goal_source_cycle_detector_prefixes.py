@@ -1,4 +1,4 @@
-"""test_goal_source_cycle_detector_prefixes.py — regression for 0.
+"""test_goal_source_cycle_detector_prefixes.py — regression for .
 
 Pins the four automated detection-driven origin_signal prefixes
 (alert-email:, routing-mismatch:, routing-either-resolve:, insight_trigger:)

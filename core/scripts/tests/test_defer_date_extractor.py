@@ -91,7 +91,7 @@ def test_earliest_future_wins():
     assert r["deferred_until"] == "2026-06-15T00:00:00"
 
 
-# ---- Lane 1b: due-date disambiguation (3) ------------------------
+# ---- Lane 1b: due-date disambiguation () ------------------------
 # A "by <date> deadline" is a DUE date (work happens BEFORE it), NOT a
 # start-after date. It must NOT become deferred_until — that would freeze the
 # goal until its own deadline. Near-miss:  ARC final-submission.

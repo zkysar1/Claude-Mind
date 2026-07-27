@@ -21,7 +21,7 @@ reconfigure_stdio()
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT, CONFIG_DIR
 from _gate_log import log as _gate_log
 from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
-from _goal_census import all_evicted_ids as _all_evicted_ids  # 0 mint-site tombstone awareness
+from _goal_census import all_evicted_ids as _all_evicted_ids  #  mint-site tombstone awareness
 
 # Default paths point to world/ (collective task queue).
 # Overridden to agent/ at runtime when --source agent is passed.
@@ -168,7 +168,7 @@ from gates.defer_classifier import STRUCTURED_DEFER_PREFIXES  # noqa: E402,F401
 # an import — the refusal branch crashed with NameError instead of printing
 # the educational message + filing the atomic Unblock (refuse-without-queue,
 # surfaced by test_defer_to_unblock_integration.py cases 1/5/7; found during
-# 6). gates.blocker_ref is the single source of truth, same import
+# ). gates.blocker_ref is the single source of truth, same import
 # create-blocker.py uses.
 from gates.blocker_ref import BLOCKER_REF_TYPES  # noqa: E402
 
@@ -209,7 +209,7 @@ def _emit_description_length_warning(goal, source):
 
 VALID_SCOPES = {"sprint", "project", "initiative"}
 ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (companion to GOAL_ID_RE xw branch below)
-GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit:  hit  (2026-05-19); g-xw-<ts>-NN cross-world ids (1 made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit:  hit  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Single source of truth for the `add` (aspiration) and `add-goal` schemas —
@@ -395,6 +395,19 @@ def validate_verification(verification, goal_id):
     preconditions = verification.get("preconditions")
     if preconditions is not None and not isinstance(preconditions, list):
         raise ValueError(f"Goal {goal_id}: verification.preconditions must be a list")
+    # FIX 2 ( / rb-4371): a structured goal_completed_after precondition
+    # MISSING after_ref silently perma-blocks the goal — predicate.py returns False
+    # forever, goal-selector classifies precondition_unmet and EXCLUDES the goal
+    # from selection while status stays `pending` (invisible except via
+    # `goal-selector blocked`). Refuse it at filing time — fail LOUD, not silent.
+    for pc in (preconditions or []):
+        if isinstance(pc, dict) and pc.get("type") == "goal_completed_after":
+            if not pc.get("goal_id") or not pc.get("after_ref"):
+                raise ValueError(
+                    f"Goal {goal_id}: a goal_completed_after precondition requires "
+                    f"both 'goal_id' and 'after_ref' (got {pc!r}). A missing after_ref "
+                    f"silently perma-blocks the goal (rb-4371)."
+                )
 
 def validate_goal(goal):
     """Validate a goal dict within an aspiration.
@@ -544,7 +557,7 @@ def validate_goal(goal):
     _check_prose_verification_drift(goal)
 
 # Prose-verification-drift markers + check live in the shared
-# gates.prose_verification module (4) so the CLI validate_goal path
+# gates.prose_verification module () so the CLI validate_goal path
 # and the daemon aspirations_write.py paths run IDENTICAL logic (guard-547
 # anti-drift — duplication is exactly the CLI/daemon split that produced the
 # original FN gap). Re-exported here for any caller that imported the constant
@@ -657,7 +670,7 @@ def check_no_duplicate_id(items, asp_id):
 
 # The compact goal projection lives in the daemon:
 # mind_api/src/endpoints/aspirations.py `_COMPACT_GOAL_KEEP` (SSOT). The CLI
-# `COMPACT_GOAL_KEEP` copy that lived here was retired in 9 — it had
+# `COMPACT_GOAL_KEEP` copy that lived here was retired in  — it had
 # zero consumers since the daemon-only cutover removed the CLI read path
 # (`--active-compact` routes to the daemon via aspirations-read.sh).
 
@@ -690,6 +703,58 @@ def _validate_blocker_ref(raw):
     """Thin wrapper — delegates to gates.blocker_ref.validate."""
     from gates.blocker_ref import validate
     return validate(raw)
+
+def _credential_enum_guard(goal_id, raw_ref, context_text, args):
+    """Door-B credential-enumeration gate, CLI lane ().
+
+    Refuses (sys.exit(1)) when a credentials-required blocker_ref carries no
+    proof that the grant is genuinely unavailable. Returns None to allow.
+
+    `raw_ref` MUST be the un-normalized --blocker-ref argument: validate()
+    rebuilds a 5-key envelope and drops credential_source_enumeration, so
+    checking its output would refuse every credentials-required blocker.
+
+    Same predicate as blocker-create-gate check #5 — see gates/credential_enum.py
+    for why the two doors share one implementation. NOTE this is the CLI/import
+    lane; `aspirations-update-goal.sh` is daemon-only, so the enforcing copy for
+    live traffic is aspirations_write.py::_credential_enum_guard. Both call the
+    same predicate; this one exists so the lanes cannot diverge.
+    """
+    from gates.credential_enum import check, refusal_message
+    result = check(raw_ref)
+    if result.get("passed"):
+        return None
+
+    override = getattr(args, "override_blocker_gate", None)
+    if override:
+        from gates.blocker_ref import log_unstructured_override
+        if WORLD_DIR is None:
+            # Mirror _log_unstructured_defer_override's surface: an override
+            # granted WITHOUT an audit record must say so. Silence here would
+            # make an unaudited bypass indistinguishable from a logged one.
+            print("[credential-enum-gate] WARN: override granted but not logged "
+                  "(no MIND_AGENT binding -> cannot resolve WORLD_PATH).",
+                  file=sys.stderr)
+        else:
+            log_unstructured_override(
+                WORLD_DIR,
+                goal_id=goal_id,
+                defer_reason_text=context_text,
+                justification=override,
+                agent_name=os.environ.get("MIND_AGENT", "") or "unknown",
+                source="aspirations.py:cmd_update_goal:credential-enumeration-override",
+                which_checks_bypassed=["credential_enumeration"],
+            )
+        print(f"[credential-enum-gate] --override-blocker-gate on {goal_id}: "
+              f"{override}", file=sys.stderr)
+        return None
+
+    print(refusal_message(
+        goal_id, result.get("reason", ""),
+        flag_hint='pass --override-blocker-gate "<justification>" (audited)',
+    ), file=sys.stderr)
+    sys.exit(1)
+
 
 def _log_unstructured_defer_override(goal_id, defer_reason_text, justification):
     """Thin wrapper — delegates to gates.blocker_ref.log_unstructured_override.
@@ -942,6 +1007,19 @@ def _run_completion_artifact_gate(goal_id: str, goal_title: str,
 
 _UNBLOCK_ACTIVE_STATUSES = ("pending", "in-progress")
 
+# Circuit breaker (). _find_existing_unblock_for dedups only ACTIVE
+# Unblocks — a RESOLVED one never suppresses a re-file (guard-487-aligned: a
+# genuine recurrence must re-route). Under a STANDING outage that produces one
+# Unblock per defer attempt, each resolving before the next fires. After N such
+# same-parent Unblocks have RESOLVED while the parent is STILL being
+# defer-attempted, the block is standing (not recurring): escalate the PARENT to
+# a tracked blocker (blocker_ref + structured "Circuit breaker:" defer) so the
+# churn stops at the root. FAIL-OPEN / non-suppressing: the Nth+1 Unblock is
+# STILL filed — this only ADDS tracking, never removes routing. Mirrors the
+# consecutive_goal_failures circuit breaker (aspirations loop Phase 5.5).
+_UNBLOCK_RESOLVED_STATUSES = ("completed", "skipped")
+_UNBLOCK_CIRCUIT_BREAKER_THRESHOLD = 3
+
 def _find_existing_unblock_for(items: list, original_goal_id: str,
                                verb: str | None = None,
                                also_scan_agent: bool = True) -> dict | None:
@@ -1027,6 +1105,120 @@ def _find_existing_unblock_for(items: list, original_goal_id: str,
                 pass
 
     return None
+
+def _count_resolved_unblocks_for(items: list, original_goal_id: str,
+                                 also_scan_agent: bool = True) -> int:
+    """Count RESOLVED (completed/skipped) Unblock goals for original_goal_id.
+
+    Companion to _find_existing_unblock_for (which finds ACTIVE Unblocks for
+    dedup). This counts the RESOLVED ones — the churn signal the g-115-2772
+    circuit breaker reads: N resolved same-parent Unblocks means the
+    defer->Unblock loop has already cycled N times on a STANDING block.
+
+    Matches ONLY strategy (a) — origin_signal == 'unblock:{id}' — the exact
+    framework marker every defer-gate-filed Unblock carries. The title /
+    description strategies of _find_existing_unblock_for are DELIBERATELY
+    excluded: a false-positive count would ESCALATE spuriously, and
+    origin_signal is unambiguous for the gate-filed Unblocks this breaker
+    targets.
+
+    Fail-open: an unreadable agent queue is skipped (as-if-empty), same
+    contract as _find_existing_unblock_for. A count of 0 on any read error
+    means NO escalation (the Unblock still files normally) — the fail-OPEN
+    direction for an ESCALATION gate: never a false suppression (guard-487 is
+    about suppression gates; this one only adds tracking, so its safe-default
+    is "do not escalate").
+    """
+    expected_origin = f"unblock:{original_goal_id}"
+
+    def _count(asp_iter) -> int:
+        n = 0
+        for asp in asp_iter:
+            for g in asp.get("goals", []):
+                if (g.get("origin_signal") == expected_origin
+                        and g.get("status") in _UNBLOCK_RESOLVED_STATUSES):
+                    n += 1
+        return n
+
+    total = _count(items)
+
+    if also_scan_agent and AGENT_DIR is not None:
+        agent_live = AGENT_DIR / "aspirations.jsonl"
+        if agent_live.exists():
+            try:
+                total += _count(read_jsonl(agent_live))
+            except Exception:
+                # Fail-open: unreadable agent queue -> skip (no false escalation).
+                pass
+
+    return total
+
+def _escalate_standing_blocker(items: list, original_goal_id: str,
+                               resolved_count: int) -> str | None:
+    """Promote a churning parent goal to a tracked standing blocker ().
+
+    Called by _file_unblock_under_existing_lock when
+    _count_resolved_unblocks_for >= _UNBLOCK_CIRCUIT_BREAKER_THRESHOLD. Sets a
+    structured blocker_ref + a 'Circuit breaker:' structured defer_reason on the
+    PARENT goal so it stops being defer-attempted (the churn root) and becomes a
+    properly-tracked blocked goal (quiescence-legitimate). Mirrors the
+    consecutive_goal_failures circuit breaker (aspirations loop Phase 5.5); the
+    'Circuit breaker:' prefix is a STRUCTURED_DEFER_PREFIX so the escalated defer
+    bypasses the capability gate and is not swept by defer-recheck.
+
+    FAIL-OPEN / non-suppressing (guard-487): the CALLER still files the Unblock
+    after this returns — this ONLY adds tracking to the parent, never removes
+    routing.
+
+    Idempotent: if the parent already carries a blocker_ref, do nothing (the
+    standing block is already tracked) — returns None so the caller does not
+    double-log.
+
+    Returns the blocker_ref.external_id on a fresh escalation, else None
+    (parent not found, already tracked, or validator rejected).
+    """
+    # Locate the parent in the world items (cmd_update_goal found it there; the
+    # narrative defer that triggered this path is on it, never yet written).
+    parent = None
+    for asp in items:
+        for g in asp.get("goals", []):
+            if g.get("id") == original_goal_id:
+                parent = g
+                break
+        if parent is not None:
+            break
+    if parent is None:
+        return None  # fail-open: nothing to escalate
+
+    if parent.get("blocker_ref"):
+        return None  # idempotent: standing block already tracked
+
+    from gates.blocker_ref import validate as _validate_blocker_ref
+    external_id = f"standing-unblock-churn:{original_goal_id}"
+    ok, ref = _validate_blocker_ref({
+        "type": "infrastructure",
+        "external_id": external_id,
+    })
+    if not ok:
+        # Validator rejected — fail-open: skip escalation, let the Unblock file.
+        print(f"[unblock-circuit-breaker] blocker_ref build failed for "
+              f"{original_goal_id}: {ref}", file=sys.stderr)
+        return None
+
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    parent["blocker_ref"] = ref
+    parent["defer_reason"] = (
+        f"Circuit breaker: standing blocker after {resolved_count} resolved "
+        f"same-parent Unblocks — escalated to tracked blocker "
+        f"({external_id}); churn root-fix g-115-2772"
+    )
+    parent["defer_reason_set_at"] = now_iso
+    print(f"[unblock-circuit-breaker] ESCALATED {original_goal_id} to standing "
+          f"blocker after {resolved_count} resolved Unblocks "
+          f"(>= {_UNBLOCK_CIRCUIT_BREAKER_THRESHOLD}); set blocker_ref + "
+          f"structured defer. Unblock STILL filed (fail-open, guard-487).",
+          file=sys.stderr)
+    return external_id
 
 def _find_asp_in_items(items: list, asp_id: str) -> tuple[int, dict] | None:
     """Locate an aspiration by id within the in-memory items list.
@@ -1149,6 +1341,15 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
                       f"{existing_asp} ({existing_src} queue, "
                       f"strategy={match_strategy}) — idempotent skip")
 
+    # Circuit breaker (): no ACTIVE Unblock exists but we are about to
+    # file a FRESH one — the defer->Unblock loop is cycling. If >= N same-parent
+    # Unblocks have already RESOLVED, the block is STANDING (not recurring):
+    # escalate the parent to a tracked blocker so the churn stops at the root.
+    # FAIL-OPEN — we STILL file the Unblock below (never suppress; guard-487).
+    resolved_unblocks = _count_resolved_unblocks_for(items, original_goal_id)
+    if resolved_unblocks >= _UNBLOCK_CIRCUIT_BREAKER_THRESHOLD:
+        _escalate_standing_blocker(items, original_goal_id, resolved_unblocks)
+
     unblock_title = gate_result.get("unblock_title") or f"Unblock: capability-routed for {original_goal_id}"
     unblock_description = gate_result.get("unblock_description") or (
         "Defer-gate refused defer_reason — capability-routing matched an "
@@ -1157,7 +1358,7 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
 
     asp_num = target_asp_id.replace("asp-", "")
     max_seq = 0
-    # Evicted ids count toward max+1 (0): re-minting an evicted seq
+    # Evicted ids count toward max+1 (): re-minting an evicted seq
     # would collide with the merge-layer resurrection tombstone, which drops
     # any goal carrying an evicted id.
     live_ids = [g.get("id", "") for g in target_asp.get("goals", [])]
@@ -1263,7 +1464,7 @@ def cmd_update_goal(args):
         if field == "participants":
             _warn_missing_user_leg_scope(goal_id, value, goal.get("user_leg_scope"))
 
-        # Cross-lane TAKEOVER guard (4) — MIRROR of the daemon guard
+        # Cross-lane TAKEOVER guard () — MIRROR of the daemon guard
         # in mind_api/src/endpoints/aspirations_write.py update_goal() (the
         # `=== PR 7i in-lock status guards ===` block). guard-742: this logic
         # lives on BOTH sides. The daemon is the LIVE path for
@@ -1451,6 +1652,12 @@ def cmd_update_goal(args):
         # aspirations-precheck/SKILL.md Phase 0.5b.4 — the two sites must stay in sync.
         if _is_narrative_defer(field, value):
             override = getattr(args, "force_defer", None)
+            # : --override-agent-match is capability-gate's CREATE_BLOCKER
+            # bypass, NOT the defer-path one. A user reaching for it here (wrong
+            # context, from CREATE_BLOCKER muscle memory) must NOT get the bypass —
+            # --force-defer stays the single canonical defer flag. We capture it only
+            # to surface an actionable redirect in the BLOCKED message below.
+            wrong_defer_flag = getattr(args, "override_agent_match", None)
             gate_result = _run_capability_gate_for_defer(str(value), goal_id)
             if gate_result.get("would_block") and not override:
                 matches = gate_result.get("matches") or []
@@ -1515,6 +1722,17 @@ def cmd_update_goal(args):
                     except Exception as exc:
                         add_goal_status = f"add-goal write failed: {exc}"
 
+                # : if the user reached for --override-agent-match (the
+                # CREATE_BLOCKER-context bypass) on this defer, redirect them to the
+                # correct defer-path flag instead of leaving them staring at option 3.
+                wrong_flag_redirect = ""
+                if wrong_defer_flag:
+                    wrong_flag_redirect = (
+                        f"\nNOTE: you passed --override-agent-match — that flag is the "
+                        f"CREATE_BLOCKER-context bypass and does NOT apply to defers. "
+                        f"The defer-path bypass is --force-defer (option 3 above); "
+                        f"re-run with --force-defer \"<justification>\".\n"
+                    )
                 print(
                     f"BLOCKED: defer_reason on {goal_id} names an agent-provisionable "
                     f"capability ({matched_skill!r}, keyword {matched_kw!r}). Deferring "
@@ -1523,6 +1741,7 @@ def cmd_update_goal(args):
                     f"  1. Actually invoke the capability (probe-before-defer.md rule 1), or\n"
                     f"  2. Rewrite the defer_reason to name the genuine external signal, or\n"
                     f"  3. Pass --force-defer \"<justification>\" if this is a real false positive.\n"
+                    f"{wrong_flag_redirect}"
                     f"\n"
                     f"Defer-gate Unblock-routing: {add_goal_status}",
                     file=sys.stderr,
@@ -1569,6 +1788,9 @@ def cmd_update_goal(args):
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                # Door B credential-enumeration check () — RAW arg,
+                # not `parsed` (validate() drops the enumeration field).
+                _credential_enum_guard(goal_id, ref_raw, value, args)
                 blocker_ref_normalized = parsed
             elif force_unstructured:
                 _log_unstructured_defer_override(goal_id, value, force_unstructured)
@@ -1629,6 +1851,8 @@ def cmd_update_goal(args):
                         file=sys.stderr,
                     )
                     sys.exit(1)
+                # Door B credential-enumeration check () — RAW arg.
+                _credential_enum_guard(goal_id, ref_raw, "status=blocked", args)
                 blocker_ref_for_blocked_status = parsed
             elif not (has_existing_blocker_ref or has_blocked_by):
                 print(
@@ -1674,13 +1898,13 @@ def cmd_update_goal(args):
         # in-progress writes. Moving this read below `goal[field] = value` would
         # break the guard and inflate selection_count on every resume/retry.
         old_status = goal.get("status")
-        # 9: capture pre-update interval_hours BEFORE the write so the
+        # : capture pre-update interval_hours BEFORE the write so the
         # anchor-persist cascade below records the ORIGINAL cadence, not the
         # incoming (possibly already-extended) value.
         _prev_interval_hours = goal.get("interval_hours")
         goal[field] = value
 
-        # 9 (unbounded interval-ratchet fix): persist the cap anchor here,
+        #  (unbounded interval-ratchet fix): persist the cap anchor here,
         # at the single write site EVERY interval_hours path funnels through. The
         # per-goal path (cargo-cult-detector.update_interval_hours) writes the anchor
         # itself, but the BATCH-CALIBRATE and MANUAL apply paths reach interval_hours
@@ -1701,7 +1925,7 @@ def cmd_update_goal(args):
 
         # Stamp last_modified on every successful field write. A general
         # last-touched timestamp (originally -a for the stale-read gate,
-        # retired 7). Single timestamp per cmd_update_goal call
+        # retired ). Single timestamp per cmd_update_goal call
         # — auto-managed cascades below (defer_reason_set_at, blocked_since, blocker_ref,
         # deferred_until) are side-effects of THIS write and share its modification moment.
         # Local system time, no microseconds, matching blocked_since/defer_reason_set_at
@@ -1736,12 +1960,12 @@ def cmd_update_goal(args):
         ):
             goal["completed_at"] = datetime.now().isoformat(timespec="seconds")
 
-        # 2: stamp completed_by on the completion transition — the
+        # : stamp completed_by on the completion transition — the
         # completion chokepoint every non-recurring status->completed flows
         # through (recurring is blocked above). Pre-fix only ~11% (174/1609) of
         # completed world goals carried completed_by (the rest closed via this
         # path, which never stamped it), so agent-attribution audits and the
-        # cross_queue graduation count (0) undercounted real output.
+        # cross_queue graduation count () undercounted real output.
         # Scoped to value=="completed" (attribution = who completed it); agent
         # from MIND_AGENT. Idempotent: only when unset, preserving explicit
         # /aspirations-complete-by attribution and external backfill.
@@ -2101,7 +2325,21 @@ def main():
                            "names an agent-provisionable capability. Required to "
                            "bypass the defer-time capability gate. Echoed to stderr "
                            "for auditability. See .claude/rules/probe-before-defer.md.")
-    # --cross-lane is the takeover-time analogue of --force-defer (4).
+    # --override-agent-match is capability-gate.py's CREATE_BLOCKER-context bypass
+    # (participants:[user] routing), NOT the defer-path bypass — the defer analogue
+    # is --force-defer above (deliberate one-flag-per-context design; the two are
+    # documented as analogues in each other's help). It is accepted HERE only so a
+    # user reaching for it on a defer (from CREATE_BLOCKER muscle memory) gets a
+    # clear redirect to --force-defer in the BLOCKED message instead of a cryptic
+    # argparse "unrecognized arguments" error (). It does NOT honor the
+    # bypass — --force-defer stays the single canonical defer flag.
+    p_ug.add_argument("--override-agent-match", dest="override_agent_match",
+                      default=None,
+                      help="Wrong-context flag on the defer path: this is the "
+                           "CREATE_BLOCKER bypass. Recognized here only to redirect "
+                           "you to --force-defer (the defer-path bypass). Does NOT "
+                           "apply a defer override. See g-115-2814.")
+    # --cross-lane is the takeover-time analogue of --force-defer ().
     # Required to bypass the cross-lane TAKEOVER guard when the write is
     # status->in-progress or claimed_by on a goal whose intended_agent names a
     # DIFFERENT agent. Logged to world/override-bypass-ledger.jsonl via
@@ -2170,6 +2408,17 @@ def main():
                            "world/blocker-gate-overrides.jsonl. Use only when the "
                            "external signal genuinely cannot be referenced by ID. "
                            "Overrides disqualify the goal from quiescence eligibility.")
+    # --override-blocker-gate bypasses the credential-enumeration check on a
+    # credentials-required blocker_ref (). Same flag name and same
+    # ledger as blocker-create-gate.py's override — one vocabulary, both doors.
+    p_ug.add_argument("--override-blocker-gate",
+                      dest="override_blocker_gate", default=None,
+                      help="Justification for writing a credentials-required "
+                           "blocker_ref that fails the credential-enumeration "
+                           "check. Appends to world/blocker-gate-overrides.jsonl. "
+                           "Use only for a genuine false positive — the check "
+                           "exists because g-335-210 sat 90h on an unproven "
+                           "human-credential assertion.")
 
     # recompute-all-progress
     p_recompute = subparsers.add_parser("recompute-all-progress", help="Recompute progress for all aspirations in a JSONL file")

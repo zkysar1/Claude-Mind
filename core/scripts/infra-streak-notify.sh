@@ -48,12 +48,12 @@
 # so each NEW claimant re-emailed the same episode within the re_escalation
 # window. In --notify mode a coordination-board breadcrumb (tags:
 # infra-streak-sent,<episode-key>,<agent>) is the fleet-shared cooldown —
-# mirrors inbox-alert-age-check (3). Design decision (a) via the
+# mirrors inbox-alert-age-check (). Design decision (a) via the
 # sanctioned shared store: the board is daemon-routed (locked, own-cloud-synced);
 # a raw world-file append would bypass both. Option (b) — pinning --notify to a
 # designated agent — rejected: it couples alert delivery to one agent's claim
 # cadence. The breadcrumb posts at payload-emit time regardless of email
-# outcome (prevents retry storms; same posture as 3). Fail-open: a
+# outcome (prevents retry storms; same posture as ). Fail-open: a
 # board read error yields an empty fleet view (local-only dedup, at most one
 # extra email per claimant); a post error is stderr-only.
 #
@@ -105,7 +105,7 @@ if [ -n "$ALERT_FILE_OVERRIDE" ]; then
     # parsed since  but never consumed; this wires it.
     CURRENT_ALERTS=$(cat "$ALERT_FILE_OVERRIDE")
 else
-    # 4: disk-free floor check rides THIS recurring cadence ().
+    # : disk-free floor check rides THIS recurring cadence ().
     # The probe (world/scripts/probe-disk-free.sh) is auto-discovered by
     # infra-health.py, but nothing else checks it periodically — without a
     # cadence-driven check the floor breach is never RECORDED, so streak-alert
@@ -158,7 +158,7 @@ except Exception:
     print('[]')
 ")
 
-# 9: environment-reachability skip-list. A limited environment (a
+# : environment-reachability skip-list. A limited environment (a
 # headless box, sandbox, or CI runner) structurally cannot reach some infra
 # components -- their streaks are environment-reachability gates, not outages
 # (rb-2908). Drop those components BEFORE counting/dedup/notify so the wrapper

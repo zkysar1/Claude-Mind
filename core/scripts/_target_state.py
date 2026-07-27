@@ -203,7 +203,7 @@ def is_read_intent(title, _caller="unknown"):
 # THE REMOVAL TARGET. Presence means the work is NOT done; absence would mean
 # it is. Without this carve-out every retirement goal trips hit_ratio=1.0 and
 # needs a manual --override-duplication (3 FP overrides in session 104 alone:
-# , 7, 8 — the canonical shape is 7
+# , ,  — the canonical shape is 
 # "Apply: retire stale-read-gate", where the full removal scope list IS the
 # identifier set).
 #
@@ -301,12 +301,12 @@ def is_removal_intent(title, _caller="unknown"):
     return False
 
 
-# MODIFY-intent goal title detector (5, sibling of REMOVAL_INTENT_VERBS).
+# MODIFY-intent goal title detector (, sibling of REMOVAL_INTENT_VERBS).
 #
 # Modify goals (fix / extend / wire / harden / consolidate / refactor / ...)
 # NAME the existing symbols they change — those identifiers are the modification
 # SUBJECT, present in the target file BEFORE the work (that IS what is being
-# changed), not a completion signal. echo's 6 quantification: 71%
+# changed), not a completion signal. echo's  quantification: 71%
 # (37/52) of target_state SOLO-block overrides since 2026-07-04 were
 # subject-not-deliverable FPs on modify-verb goals (citation-shape 16,
 # modification-surface 11, test-absence 6, union-masks-miss 4).
@@ -328,6 +328,37 @@ def is_removal_intent(title, _caller="unknown"):
 MODIFY_INTENT_VERBS = frozenset({
     "fix", "extend", "wire", "harden", "consolidate", "serialize", "repair",
     "persist", "tune", "migrate", "refactor", "integrate", "rewire",
+    #  (2026-07-22, zeta): evidence-based expansion. The original 13
+    # verbs demoted only 99 of 565 target_state SOLO-block overrides in the
+    # ledger; 386 stayed UNCOVERED and kept HARD-blocking. Classifying every
+    # target_state override by action verb isolated a modify-not-create tail
+    # absent from the set — each NAMES an existing symbol it changes (present
+    # pre- AND post-edit, the SAME ambiguity the original 13 handle), so DEMOTE
+    # (not skip) is the correct treatment. Added = the goal's own cited examples
+    # (edit / tighten / refine / modify) + the ledger verbs carrying >=2 override
+    # FPs (update / replace / normalize / move / bump / restore / flip /
+    # instrument / backfill / hydrate). CREATE verbs (add / create / implement /
+    # introduce / build) stay DELIBERATELY EXCLUDED — for those, identifier
+    # presence IS duplication evidence and must still hard-block (see the
+    # create-exclusion negatives in test_target_state_modify_intent.py). The
+    # remaining uncovered classes are DISTINCT problems handled separately, NOT
+    # folded here: "add" (31 FPs, create-with-cited-context), noun-led titles
+    # (action verb is not the first post-colon word), and run-intent (13 FPs,
+    # execute-an-existing-script).
+    "edit", "tighten", "refine", "modify",
+    "update", "replace", "normalize", "move", "bump", "restore",
+    "flip", "instrument", "backfill", "hydrate",
+    #  (2026-07-23, zeta): prose-led residual catalog additions. Both
+    # NAME an existing subject they change (present pre- AND post-edit — the
+    # modify DEMOTE ambiguity), isolated from the target_state SOLO residual:
+    #   'switch' — "Switch utilization-gate.sh to call ..." (change a call target)
+    #   'document' — "Document mode-name divergence between session.py ... and
+    #     skill-structure-gate.py" (the named code symbols are the SUBJECT,
+    #     present before the doc is written). Routed to MODIFY (DEMOTE), NOT the
+    #     goal's suggested READ: is_read_intent SKIPS (full exempt), which would
+    #     wrongly bypass target_state for a "Document <doc-that-exists>" dup;
+    #     DEMOTE keeps the match visible while dropping only the hard --override.
+    "switch", "document",
 })
 
 
@@ -361,7 +392,7 @@ def is_modify_intent(title, _caller="unknown"):
         candidates = ([(_normalize_title_word(words[0]), "no-colon-first-word")]
                       if words else [])
     for w, position in candidates:
-        if w in MODIFY_INTENT_VERBS:
+        if _matches_intent_verb(w, MODIFY_INTENT_VERBS):
             # "pass" = modify-intent detected → caller DEMOTES the dup block to advisory.
             _gate_log("modify-intent-verbs", "pass",
                       caller=_caller,
@@ -374,6 +405,324 @@ def is_modify_intent(title, _caller="unknown"):
               caller=_caller,
               trigger_matched=None,
               payload=title[:200])
+    return False
+
+
+# BUILD- / TEST-AUTHORING-intent goal title detector (, DEMOTE sibling
+# of MODIFY_INTENT_VERBS).
+#
+# A goal to BUILD a NEW artifact (gate / check / module / script / detector ...)
+# or to ADD an integration test names the EXISTING file it will touch — and that
+# file's symbols are the integration SURFACE, present in the target file BEFORE
+# the work, not the deliverable. Presence proves neither duplication NOR
+# completion (the NEW artifact / test is absent; the named existing symbols are
+# just what it integrates with or exercises), the SAME ambiguity is_modify_intent
+# handles — so the caller DEMOTES the target_state block to a visible advisory
+# rather than skipping. Two 2026-07 filings hard-blocked (400) on this exact FP
+# and only cleared after re-wording:  ("Idea: goal-creation gate
+# refusing ...") and  ("Idea: integration test proving ...").
+#
+# CRITICAL DIFFERENCE from read/removal/modify — those are VERB-led (the primary
+# ACTION verb names the intent). Build/test titles are frequently NOUN-led: the
+# deliverable NOUN names the intent with no explicit build verb ("goal-creation
+# gate refusing X", "integration test proving Y"). So this detector matches a
+# build VERB *or* a deliverable NOUN (or the noun "test") in the LEADING segment.
+# The post-colon window is WIDER than the verb detectors' word-1 window — the
+# first THREE post-colon words — because a deliverable noun is commonly preceded
+# by a compound adjectival modifier ("goal-creation gate", "integration test",
+# "the admission gate"). Colon-less titles match the leading word only (same
+# subordinate-clause conservatism as is_read/removal/modify_intent). The wider
+# window's FP risk is bounded by DEMOTE (not skip): a misread stays a visible
+# advisory and the other 4 dup checks still apply.
+
+BUILD_INTENT_VERBS = frozenset({
+    "build", "create", "implement", "scaffold", "introduce", "author",
+})
+# Deliverable nouns naming a NEW framework artifact (the goal's own examples:
+# gate / check / module). Matched only in the leading segment so a noun deep in
+# a prose clause does not over-exempt.
+BUILD_INTENT_NOUNS = frozenset({
+    "gate", "check", "module", "script", "helper", "detector", "validator",
+    "wrapper", "scanner", "linter", "endpoint", "handler",
+})
+TEST_AUTHORING_NOUNS = frozenset({"test", "tests"})
+
+
+def is_build_or_test_authoring_intent(title, _caller="unknown"):
+    """Return "build-intent" | "test-authoring" if the goal's deliverable is a
+    NEW artifact (build noun/verb) or a test (test noun) that TOUCHES an existing
+    file, else None. Caller DEMOTES the target_state block to a visible advisory
+    (same ambiguity contract as is_modify_intent — the named existing symbols are
+    the integration surface, present before the work; g-115-2869).
+
+    Candidate positions: every pre-colon word + the first THREE post-colon words
+    (wider than the verb detectors because a deliverable noun carries a compound
+    modifier), or — for a colon-less title — the leading word only. `_caller` is
+    a telemetry callsite label, same contract as the sibling intent detectors.
+    """
+    if not title:
+        return None
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        cand = [_normalize_title_word(w) for w in prefix.split()]
+        cand += [_normalize_title_word(w) for w in rest.split()[:3]]
+    else:
+        words = title.split()
+        cand = [_normalize_title_word(words[0])] if words else []
+    # Test-authoring is the more specific class — check it first so a title that
+    # names both a test and a generic build noun classifies as test-authoring.
+    for w in cand:
+        if w in TEST_AUTHORING_NOUNS:
+            _gate_log("build-test-authoring-intent", "pass",
+                      caller=_caller,
+                      trigger_matched=w,
+                      payload=title[:200],
+                      extra={"intent_class": "test-authoring"})
+            return "test-authoring"
+    for w in cand:
+        if w in BUILD_INTENT_VERBS or w in BUILD_INTENT_NOUNS:
+            _gate_log("build-test-authoring-intent", "pass",
+                      caller=_caller,
+                      trigger_matched=w,
+                      payload=title[:200],
+                      extra={"intent_class": "build-intent"})
+            return "build-intent"
+    _gate_log("build-test-authoring-intent", "noop",
+              caller=_caller,
+              trigger_matched=None,
+              payload=title[:200])
+    return None
+
+
+# ─── : target_state FP classes 2-3 (DEMOTE carve-outs) ─────────────
+# Ledger analysis of world/goal-duplication-overrides.jsonl (142 SOLO / 565 ANY
+# target_state overrides) after  fixed the modify-verb tail isolated
+# THREE more distinct FP classes a verb-list extension cannot reach. Each is an
+# ORTHOGONAL detector wired as its own DEMOTE branch in
+# gates/goal_duplication.py::_check_target_state — none reverses an existing
+# carve-out (is_build_or_test_authoring's "add X to Y -> None" boundary tests
+# stay valid; the add-to-surface detector is separate). All DEMOTE (keep the
+# match visible, drop the hard --override requirement) rather than SKIP, because
+# the cited identifier's presence is AMBIGUOUS (surface/precondition vs
+# deliverable), the same posture as is_modify_intent / is_build_or_test_authoring.
+
+
+# RUN-intent (class 3a; 4 SOLO / 16 ANY). "Execute provision_aws.py ...",
+# "Apply: run -style forced-action verification ..." — the named script's
+# presence is a PRECONDITION (you cannot run a script that does not exist), not
+# run-completion. Unlike read/removal (which SKIP because presence INVERTS
+# completion), a run does not change the script's presence, so presence is simply
+# IRRELEVANT to run-completion -> DEMOTE. Match positions mirror is_modify_intent.
+RUN_INTENT_VERBS = frozenset({
+    "run", "execute", "rerun", "re-run", "invoke", "trigger", "launch",
+    "dispatch", "exec", "fire",
+})
+
+
+def is_run_intent(title, _caller="unknown"):
+    """Return True if the title's primary action is a RUN/EXECUTE verb (the named
+    script's presence is a precondition, not run-completion; caller DEMOTES —
+    g-248-119). Positions mirror is_modify_intent."""
+    if not title:
+        return False
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        candidates = [(_normalize_title_word(w), "pre-colon") for w in prefix.split()]
+        rest_words = rest.split()
+        if rest_words:
+            candidates.append((_normalize_title_word(rest_words[0]), "leading-post-colon"))
+            if len(rest_words) >= 2 and _normalize_title_word(rest_words[0]).endswith("ly"):
+                candidates.append((_normalize_title_word(rest_words[1]), "adverb-delayed-post-colon"))
+    else:
+        words = title.split()
+        candidates = ([(_normalize_title_word(words[0]), "no-colon-first-word")] if words else [])
+    for w, position in candidates:
+        if _matches_intent_verb(w, RUN_INTENT_VERBS):
+            _gate_log("run-intent-verbs", "pass", caller=_caller, trigger_matched=w,
+                      payload=title[:200], extra={"position": position})
+            return True
+    _gate_log("run-intent-verbs", "noop", caller=_caller, trigger_matched=None,
+              payload=title[:200])
+    return False
+
+
+# ADD-TO-SURFACE (class 2; 14 SOLO / 48 ANY). "Idea: add active-movement composite
+# to MovementAnalyzer", "Apply: add --outcome to recurring-close.sh verify call" —
+# ADDS a NEW deliverable but names an EXISTING integration surface (the cited
+# target, present before the work). 'add' is DELIBERATELY excluded from BOTH
+# MODIFY_INTENT_VERBS and BUILD_INTENT_VERBS (for a create verb, identifier
+# presence CAN be duplication evidence — "Add: new feature flag" where the flag
+# exists IS a dup). The discriminator between create-with-cited-CONTEXT and
+# create-that-IS-a-dup is the INTEGRATION PREPOSITION: it marks the cited target
+# as the surface X integrates INTO. A bare "Add: new feature flag" (no
+# preposition) has no cited surface, so it stays blockable. ORTHOGONAL to
+# is_build_or_test_authoring_intent (whose "add X to Y -> None" contract is
+# UNCHANGED — the two test_add_*_not_build boundary tests stay valid), so no
+# existing carve-out is reversed.
+ADD_TO_SURFACE_VERBS = frozenset({"add", "append", "register"})
+_INTEGRATION_PREPOSITIONS = frozenset({"to", "into", "onto", "for", "in", "within", "under"})
+
+
+# ── Past-tense completed-work verb stemming () ─────────────────────
+# The target_state prose-led residual includes completed-work records that lead
+# with a PAST-TENSE verb the present-tense verb sets miss — canonically
+# "Maintain: Replaced productivity-stop-gate encoding_ratio ..." ('replace' is
+# catalogued in MODIFY_INTENT_VERBS, 'replaced' is not), so the goal STILL
+# hard-blocks as a false positive. A verb-aware stemmer maps a past-tense form
+# to its base ONLY WHEN that base is a known intent verb — so it can NEVER
+# fabricate a verb from a non-verb (the adversarial-negative constraint from the
+# goal: "Add: embed-ded config" -> 'embedded'->'embed' ∉ any set stays put;
+# 'need'/'speed'/'proceed'/'field' likewise never become verbs). Consumed by
+# is_modify_intent + is_run_intent (both DEMOTE — low-harm advisory) via
+# _matches_intent_verb; deliberately NOT wired into is_read/is_removal (which
+# SKIP = full exempt, higher stakes, and carry zero past-tense residual in the
+# ledger). _ALL_INTENT_VERBS is the base-membership oracle: a candidate base
+# absent from it leaves the word unchanged.
+_ALL_INTENT_VERBS = (
+    REMOVAL_INTENT_VERBS | MODIFY_INTENT_VERBS | RUN_INTENT_VERBS
+    | READ_INTENT_VERBS | ADD_TO_SURFACE_VERBS | BUILD_INTENT_VERBS
+)
+
+
+def _past_tense_base(word):
+    """Return the base form of a regular past-tense verb IFF that base is a
+    known intent verb, else return `word` unchanged.
+
+    Handles three regular-inflection shapes, checked against _ALL_INTENT_VERBS:
+      - strip 'd'  (base ends in 'e'):  replaced->replace, moved->move, tuned->tune
+      - strip 'ed' (base ends in cons): fixed->fix, hardened->harden, bumped->bump
+      - doubled final consonant:        flipped->flip, dropped->drop, stripped->strip
+    Never fabricates a verb: if no candidate base is in _ALL_INTENT_VERBS the
+    original `word` is returned, so a non-verb ('embedded', 'need', 'speed')
+    can never be turned into a verb. Assumes `word` is already lowercased +
+    stripped by _normalize_title_word / the caller's inline normalization.
+    """
+    if not word or word in _ALL_INTENT_VERBS or not word.endswith("d"):
+        return word
+    cands = [word[:-1]]                       # strip 'd' (base ends in 'e')
+    if word.endswith("ed"):
+        stem = word[:-2]                      # strip 'ed'
+        cands.append(stem)
+        if len(stem) >= 2 and stem[-1] == stem[-2] and stem[-1].isalpha():
+            cands.append(stem[:-1])           # collapse doubled final consonant
+    for c in cands:
+        if c in _ALL_INTENT_VERBS:
+            return c
+    return word
+
+
+def _matches_intent_verb(word, verb_set):
+    """True if `word` — or its verb-aware past-tense base — is in `verb_set`.
+
+    The single membership primitive for the DEMOTE verb detectors so present-
+    and past-tense forms match identically (g-248-120). Falls back to plain
+    membership for non-past-tense words (the stemmer returns them unchanged).
+    """
+    return word in verb_set or _past_tense_base(word) in verb_set
+
+
+def is_add_to_surface_intent(title, _caller="unknown"):
+    """Return True for "add/append/register X <prep> <cited surface>" — a NEW
+    deliverable integrated into an EXISTING cited surface, so the surface
+    identifiers are context (present pre-work), not duplication. Caller DEMOTES
+    (g-248-119). Leading verb mirrors is_modify_intent; the integration
+    preposition may appear anywhere after the verb. A bare add with no
+    integration preposition returns False (stays blockable)."""
+    if not title:
+        return False
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        lead_candidates = [_normalize_title_word(w) for w in prefix.split()]
+        rest_words = rest.split()
+        if rest_words:
+            lead_candidates.append(_normalize_title_word(rest_words[0]))
+        body_words = [_normalize_title_word(w) for w in rest_words]
+    else:
+        words = title.split()
+        lead_candidates = [_normalize_title_word(words[0])] if words else []
+        body_words = [_normalize_title_word(w) for w in words]
+    has_add = any(w in ADD_TO_SURFACE_VERBS for w in lead_candidates)
+    has_prep = any(w in _INTEGRATION_PREPOSITIONS for w in body_words)
+    if has_add and has_prep:
+        _gate_log("add-to-surface-intent", "pass", caller=_caller,
+                  trigger_matched="add+prep", payload=title[:200])
+        return True
+    _gate_log("add-to-surface-intent", "noop", caller=_caller,
+              trigger_matched=None, payload=title[:200])
+    return False
+
+
+# CODE-TARGET-LEAD (class 3b; the LARGEST uncovered class — 48 of 93 noun-led
+# SOLO / correspondingly the biggest ANY slice). When a title LEADS (first
+# post-colon token, or first word if colon-less) with a CODE IDENTIFIER — a
+# filename (foo.py / bar.sh), a dotted symbol path
+# (self_drift_gate.target_aspiration_id), a hyphenated script/compound
+# (blocker-recheck.py, tree-fm-backfill), snake_case, or CamelCase — the goal is
+# NAMING THE FILE/SYMBOL IT OPERATES ON. That target is present BEFORE and AFTER
+# the change (it IS what is edited), so a solo target_state block is a
+# subject-not-deliverable FP, the same ambiguity is_modify_intent handles ->
+# DEMOTE. This corrects rb-4732's estimate that class 3 was the SMALLEST tail (13
+# FPs): the ledger shows it is the LARGEST (93 SOLO / 355 ANY). Create-guard: a
+# CREATE verb in the pre-colon segment ("Build: new_module.py") means the file is
+# the deliverable, not an edit target — return False (genuine creation stays
+# blockable; build-intent already demotes true build titles upstream).
+_CODE_ID_CREATE_GUARD = frozenset({
+    "add", "create", "implement", "introduce", "build", "scaffold",
+    "generate", "author", "design", "forge", "new",
+})
+
+
+def _looks_like_code_identifier(tok):
+    """True if a leading token has a code-identifier SHAPE: file extension,
+    dotted symbol path, hyphenated compound (>=2 parts), snake_case, or
+    CamelCase. A bare single lowercase English word returns False. NOT
+    lowercased by the caller (CamelCase detection needs original case)."""
+    if not tok:
+        return False
+    if re.search(r"\.(py|sh|lua|json|ya?ml|md|js|ts|txt|cfg|ini|toml)$", tok):
+        return True
+    if "." in tok and re.match(r"^[A-Za-z_][\w.]*\w$", tok):
+        return True   # dotted symbol path (a.b.c)
+    if "-" in tok and len([p for p in tok.split("-") if p]) >= 2:
+        return True   # hyphenated compound (blocker-recheck, tree-fm-backfill)
+    if "_" in tok:
+        return True   # snake_case
+    if re.match(r"^[A-Z][a-z]+[A-Z]", tok):
+        return True   # CamelCase (MovementAnalyzer)
+    return False
+
+
+def is_code_target_lead_intent(title, _caller="unknown"):
+    """Return True if the title LEADS with a code-identifier token (the file/
+    symbol it operates on) and NO create verb precedes the colon. Caller DEMOTES
+    the target_state block to a visible advisory (g-248-119)."""
+    if not title:
+        return False
+    if ":" in title:
+        prefix, _, rest = title.partition(":")
+        pre_words = [_normalize_title_word(w) for w in prefix.split()]
+        rest_words = rest.split()
+        lead = rest_words[0] if rest_words else ""
+    else:
+        pre_words = []
+        words = title.split()
+        lead = words[0] if words else ""
+    # Create-guard: a create verb before the colon means the leading code-id is
+    # the NEW deliverable, not an edit target — keep it blockable.
+    if any(w in _CODE_ID_CREATE_GUARD for w in pre_words):
+        _gate_log("code-target-lead-intent", "noop", caller=_caller,
+                  trigger_matched=None, payload=title[:200],
+                  extra={"reason": "create-verb-pre-colon"})
+        return False
+    # Strip only surrounding quotes/backticks + trailing sentence punctuation —
+    # NOT _normalize_title_word (it lowercases, breaking CamelCase detection).
+    lead_clean = lead.strip("`'\"").rstrip(",;")
+    if _looks_like_code_identifier(lead_clean):
+        _gate_log("code-target-lead-intent", "pass", caller=_caller,
+                  trigger_matched=lead_clean[:60], payload=title[:200])
+        return True
+    _gate_log("code-target-lead-intent", "noop", caller=_caller,
+              trigger_matched=None, payload=title[:200])
     return False
 
 

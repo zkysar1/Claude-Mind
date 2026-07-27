@@ -1,4 +1,4 @@
-"""6 / rb-1150: insight-trigger-sweep apply-time re-probe regression.
+""" / rb-1150: insight-trigger-sweep apply-time re-probe regression.
 
 Verifies the sweeper's audit-time -> apply-time staleness gap closure:
 when an insight_trigger carries `affects:<goal-id>` and the target goal's

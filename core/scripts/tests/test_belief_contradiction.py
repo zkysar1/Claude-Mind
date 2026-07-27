@@ -64,8 +64,8 @@ def test_classify_tolerates_malformed_beliefs(junk):
     assert BC.classify(junk, "partner-a", "x") == "skip"
 
 
-# --- 6: lane-granular comparison for verbose current_focus -----------
-# Since 5 current_focus is the verbose 'asp-NNN: title' string and
+# --- : lane-granular comparison for verbose current_focus -----------
+# Since  current_focus is the verbose 'asp-NNN: title' string and
 # fresh-eyes-review 2.6c stamps belief.domain from it VERBATIM. Comparison must
 # be at LANE ('asp-NNN') granularity: a goal-title change WITHIN a lane is NOT a
 # contradiction, while a genuine cross-lane move still is. Colon-free short
@@ -88,7 +88,7 @@ def test_focus_lane_empty_on_none_or_blank():
 
 
 def test_classify_match_same_lane_different_goal_title():
-    # THE 6 fix: belief snapshot 'asp-115: <title-A>', now observed on
+    # THE  fix: belief snapshot 'asp-115: <title-A>', now observed on
     # 'asp-115: <title-B>' (partner advanced to the next goal IN THE SAME lane).
     # Pre-fix this returned "contradiction" (verbose strings differ); must be "match".
     beliefs = [_belief("partner-a", "asp-115: Idea: reconcile current_focus")]

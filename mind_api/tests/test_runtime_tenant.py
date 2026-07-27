@@ -98,7 +98,7 @@ def test_tenant_defaults_to_default(project_root):
         lifecycle.clear_runtime_files(project_root)
 
 
-# --- T-c: multi-tenant app-authz gate (1) --------------------------
+# --- T-c: multi-tenant app-authz gate () --------------------------
 # The authz/activation is GATED behind MIND_MULTI_TENANT (default OFF). The OFF
 # path (acme-corp accepted + propagated) is covered by test_tenant_from_header
 # above; these cover the ON path + an explicit OFF-inert regression.

@@ -26,7 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 # resolve_binding_with_diagnostics returns (binding, failure_reason) so the
 # miss log can name the SPECIFIC failure mode instead of a single opaque
-# "no_active_agent_binding" (7). The legacy resolve() wrapper is no
+# "no_active_agent_binding" (). The legacy resolve() wrapper is no
 # longer imported here — the diagnostics variant supersedes it for the hook.
 from _session_binding import (
     resolve_binding_with_diagnostics,
@@ -74,7 +74,7 @@ def _mark_binding_resolved(sid: str, project_root: Path, agent: str = "") -> Non
         d.mkdir(parents=True, exist_ok=True)
         # Store the resolved agent NAME (was a zero-byte touch) so a later
         # transient resolve failure can fail SAFE -- reuse this SID's bound agent
-        # instead of fail-open to the first agent (6 cross-agent hazard).
+        # instead of fail-open to the first agent ( cross-agent hazard).
         (d / sid).write_text(agent or "", encoding="utf-8")
     except Exception:
         pass
@@ -367,7 +367,7 @@ def main():
     #   MIND_AGENT    → injected whenever the SID binding resolves; absent only
     #                    when no binding exists yet (first Bash call of /start
     #                    Step 0). Caller overrides compose through SHELL SCOPING,
-    #                    not through an injection skip (8): a head
+    #                    not through an injection skip (): a head
     #                    `export MIND_AGENT=other; ...` re-exports AFTER the
     #                    hook's clause and wins for the whole compound; a
     #                    per-statement `MIND_AGENT=other cmd` shadows the export
@@ -386,7 +386,7 @@ def main():
     # Transient I/O (OneDrive latency / AV scan / handle contention) can make
     # resolve spuriously return None for a SID whose binding is fine. Retry --
     # re-reading the actual binding yields the CORRECT current agent (no
-    # staleness), unlike the memo fallback below. 6 hazard.
+    # staleness), unlike the memo fallback below.  hazard.
     if binding is None or not getattr(binding, "agent", ""):
         for _retry in range(2):
             binding, fail_reason = resolve_binding_with_diagnostics(sid, project_root)
@@ -396,7 +396,7 @@ def main():
         agent_clause = f"export MIND_AGENT={binding.agent}; "
         # Record that this SID resolved at least once. A later miss can then
         # be classified as mid-session-disappeared rather than expected
-        # first-call-before-/start. See _mark_binding_resolved (7).
+        # first-call-before-/start. See _mark_binding_resolved ().
         _mark_binding_resolved(sid, project_root, binding.agent)
     elif not re.search(r"(^|[\s;&|(])MIND_AGENT=", command):
         # Defense-in-depth: surface SIDs that ran without a binding so the
@@ -408,15 +408,15 @@ def main():
         # whose caller supplied an explicit MIND_AGENT= is handled, not a
         # miss worth logging. It no longer gates injection itself.
         #
-        # Mid-session-disappeared upgrade (7): a "binding-yaml-missing"
+        # Mid-session-disappeared upgrade (): a "binding-yaml-missing"
         # miss AFTER a prior successful resolve for this SID is the canonical
-        # 6 bug (injection worked, then stopped) — promote the reason
+        #  bug (injection worked, then stopped) — promote the reason
         # so it greps distinctly from the expected first-Bash-before-/start miss.
         last = _last_resolved_agent(sid, project_root)
         if last:
             # Fail SAFE: transient resolve failure for a SID that resolved
             # earlier this session -- reuse its (immutable) bound agent rather
-            # than fall through to the first agent. 6 hazard.
+            # than fall through to the first agent.  hazard.
             agent_clause = f"export MIND_AGENT={last}; "
             _log_binding_miss_once(sid, project_root, "binding-resolve-transient-failsafe")
         else:
@@ -483,7 +483,7 @@ def main():
 
 
 # Guard module-level execution so the helpers above are importable for tests
-# (7). The hook is invoked as `python3 bash-agent-inject.py` by
+# (). The hook is invoked as `python3 bash-agent-inject.py` by
 # bash-agent-inject.sh, so __name__ == "__main__" and behavior is unchanged;
 # importing the module (test harness) no longer runs main() + sys.exit(0).
 if __name__ == "__main__":

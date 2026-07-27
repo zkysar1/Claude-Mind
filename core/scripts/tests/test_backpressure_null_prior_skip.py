@@ -1,4 +1,4 @@
-"""Regression pins for the rb-4024 null-prior rollback class (0).
+"""Regression pins for the rb-4024 null-prior rollback class ().
 
 Defect chain (2026-07-18): meta-backpressure emitted a rollback_action whose
 rollback_to was None (the tracked change mc-078 had old_value null — the field
@@ -92,7 +92,7 @@ def test_null_prior_rolls_back_to_numeric_floor(monkeypatch):
     assert result["rollbacks_applied"] == ["weights.opportunity_boost"]
     meta_sets = _meta_sets(calls)
     assert len(meta_sets) == 1
-    # add-key rollback -> NUMERIC floor 0.0 (7): type-safe, opts out
+    # add-key rollback -> NUMERIC floor 0.0 (): type-safe, opts out
     # identically to an absent key, breaks the re-null thrash. Neither the
     # literal string "None" nor a YAML null may be the value argument.
     assert meta_sets[0][3] == "0.0"

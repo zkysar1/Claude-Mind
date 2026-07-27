@@ -1,4 +1,4 @@
-"""test_tree_validate_tombstone_exclusion.py — 8 regression test.
+"""test_tree_validate_tombstone_exclusion.py —  regression test.
 
 validate_tree's orphan-file walk counts every on-disk .md with no _tree.yaml
 entry. Retired-tombstone files (moved-node stale twins tombstone-overwritten

@@ -1,4 +1,4 @@
-"""Tests for _runner_capabilities (0 per-runner capability filter).
+"""Tests for _runner_capabilities ( per-runner capability filter).
 
 Covers the three pure functions + the config-override precedence that make the
 goal-selector capability gate safe: derive_runner_capabilities (probe + provides
@@ -197,3 +197,90 @@ def test_filter_malformed_candidate_treated_as_untagged():
     out, dropped = rc.apply_capability_filter(cands, set())
     assert dropped == 0
     assert len(out) == 2
+
+
+# ── per-box declaration surface: local-paths.conf () ───────────────
+# `core/config/aspirations.yaml` is git-shared and `meta/config-overrides.yaml`
+# is S3-shared, so neither can say "THIS box has a live Studio session".
+# `local-paths.conf` is machine-local (gitignored + owncloud_sync._EXCLUDE_NAMES);
+# these cover its translation into a config block and the two-layer merge.
+
+def test_box_config_absent_keys_is_empty():
+    # A conf with only path keys declares nothing -> {} so the fleet default and
+    # probe behaviour are byte-identical on every box that never opts in.
+    assert rc.box_config_from_conf({"WORLD_PATH": "/w", "META_PATH": "/m"}) == {}
+
+
+def test_box_config_parses_comma_separated_tokens():
+    cfg = rc.box_config_from_conf({
+        rc.BOX_CONF_PROVIDES: "studio-session, product-runtime",
+        rc.BOX_CONF_LACKS: "gpu",
+    })
+    assert cfg["provides"] == ["studio-session", "product-runtime"]
+    assert cfg["lacks"] == ["gpu"]
+    assert "probe" not in cfg
+
+
+def test_box_config_probe_falsey_strings():
+    for raw in ("false", "False", "0", "no", "OFF"):
+        assert rc.box_config_from_conf({rc.BOX_CONF_PROBE: raw})["probe"] is False
+    for raw in ("true", "1", "yes"):
+        assert rc.box_config_from_conf({rc.BOX_CONF_PROBE: raw})["probe"] is True
+
+
+def test_box_config_blank_and_malformed_are_safe():
+    assert rc.box_config_from_conf({rc.BOX_CONF_PROVIDES: "  ,, "}) == {}
+    assert rc.box_config_from_conf(None) == {}
+    assert rc.box_config_from_conf("not-a-dict") == {}
+
+
+def test_merge_unions_provides():
+    merged = rc.merge_capability_config(
+        {"provides": ["aws"]}, {"provides": ["studio-session"]})
+    assert merged["provides"] == ["aws", "studio-session"]
+
+
+def test_merge_dedups_across_layers():
+    merged = rc.merge_capability_config(
+        {"provides": ["aws"]}, {"provides": ["aws", "gpu"]})
+    assert merged["provides"] == ["aws", "gpu"]
+
+
+def test_merge_lacks_from_either_layer_wins_over_provides():
+    # THE load-bearing case: a box must never be forced to claim a capability it
+    # says it does not have. lacks unions, and derive applies it after provides.
+    merged = rc.merge_capability_config(
+        {"provides": ["gpu"]}, {"lacks": ["gpu"]})
+    caps = rc.derive_runner_capabilities(merged, probe_fn=lambda: set())
+    assert "gpu" not in caps
+    # ...and symmetrically when the FLEET declares the lack.
+    merged = rc.merge_capability_config(
+        {"lacks": ["gpu"]}, {"provides": ["gpu"]})
+    caps = rc.derive_runner_capabilities(merged, probe_fn=lambda: set())
+    assert "gpu" not in caps
+
+
+def test_merge_box_wins_on_probe():
+    assert rc.merge_capability_config({"probe": True}, {"probe": False})["probe"] is False
+    # fleet value survives when the box declares none
+    assert rc.merge_capability_config({"probe": False}, {})["probe"] is False
+    assert "probe" not in rc.merge_capability_config({}, {})
+
+
+def test_merge_empty_layers_is_noop():
+    assert rc.merge_capability_config({}, {}) == {}
+    assert rc.merge_capability_config(None, None) == {}
+
+
+def test_studio_session_only_reachable_via_box_declaration():
+    # End-to-end shape of the real cc-05 case: studio-session is never probed,
+    # so ONLY a per-box conf declaration can make a runner provide it.
+    assert "studio-session" not in rc._probe_default_capabilities()
+    conf = {"WORLD_PATH": "/w", rc.BOX_CONF_PROVIDES: "studio-session"}
+    merged = rc.merge_capability_config({}, rc.box_config_from_conf(conf))
+    caps = rc.derive_runner_capabilities(merged, probe_fn=lambda: {"git-push"})
+    assert "studio-session" in caps
+    # A box that does NOT declare it still never provides it.
+    plain = rc.merge_capability_config({}, rc.box_config_from_conf({"WORLD_PATH": "/w"}))
+    assert "studio-session" not in rc.derive_runner_capabilities(
+        plain, probe_fn=lambda: {"git-push"})

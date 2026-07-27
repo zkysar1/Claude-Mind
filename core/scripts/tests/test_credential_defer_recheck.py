@@ -1,4 +1,4 @@
-"""test_credential_defer_recheck.py — unit tests for 9.
+"""test_credential_defer_recheck.py — unit tests for .
 
 Tests the _extract_env_key function from credential-defer-recheck.py in isolation
 (no system calls, no daemon dependency). Covers:

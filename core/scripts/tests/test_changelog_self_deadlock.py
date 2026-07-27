@@ -1,4 +1,4 @@
-"""1 regression: store-hygiene cap on a changelog.jsonl store must NOT
+""" regression: store-hygiene cap on a changelog.jsonl store must NOT
 self-deadlock.
 
 Root cause (confirmed rb-2736, verified 4/4 during g-115-1651): every

@@ -1,4 +1,4 @@
-"""test_cross_agent_write.py — regression for 7 (option A per bravo
+"""test_cross_agent_write.py — regression for  (option A per bravo
 decision msg-20260709-021804-bravo-118).
 
 Pins the cross-agent write-back MECHANISM + the option-A enforcement HELPER:

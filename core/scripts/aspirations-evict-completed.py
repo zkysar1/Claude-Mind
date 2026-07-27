@@ -126,7 +126,7 @@ _GOAL_SEQ_RE = re.compile(r"^g-(\d{3})-(\d{2,4})(-[a-z])?$")
 
 
 def _legacy_census_loose(asp: dict, in_list: int, capacity: int) -> bool:
-    """3: is the pigeonhole capacity a KNOWN-loose lower bound here?
+    """: is the pigeonhole capacity a KNOWN-loose lower bound here?
 
     True iff the census is 100% LEGACY count-only (no recorded evicted_ids,
     pre-g-115-2430) AND the aspiration is not-all-live (in_list < capacity). In
@@ -153,7 +153,7 @@ def _legacy_census_loose(asp: dict, in_list: int, capacity: int) -> bool:
 
 
 def _conservation_violation(asp: dict):
-    """Cross-run conservation canary (8; Mechanism D resurrection).
+    """Cross-run conservation canary (; Mechanism D resurrection).
 
     The in-run _metric_fingerprint assert proves ONE eviction is metric-neutral
     but is blind to cross-run resurrection: a stale write restoring goals[]
@@ -172,7 +172,7 @@ def _conservation_violation(asp: dict):
     lower bound there, and a false refusal would freeze legitimate eviction).
     """
     goals = asp.get("goals") or []
-    # Effective census (legacy counts + evicted-id set, 0).
+    # Effective census (legacy counts + evicted-id set, ).
     census_sum = sum(census_by_status(asp).values())
     asp_id = str(asp.get("id", ""))
     asp_num = asp_id[len("asp-"):] if asp_id.startswith("asp-") else None
@@ -191,7 +191,7 @@ def _conservation_violation(asp: dict):
     # capacity (NOT toward counted: they are census-side, not in-list). Without
     # this, evicting the max-seq goal shrinks the ceiling while the census grows
     # — a built-in false violation. Ids that are ALSO live (resurrected state)
-    # are skipped: one allocation, one capacity unit. (0)
+    # are skipped: one allocation, one capacity unit. ()
     live_id_set = {str((g or {}).get("id") or "") for g in goals}
     for gid in all_evicted_ids(asp):
         if gid in live_id_set:
@@ -207,7 +207,7 @@ def _conservation_violation(asp: dict):
     capacity = max_seq + suffixed
     if counted + census_sum <= capacity:
         return None
-    # 3: suppress the KNOWN-loose legacy-census false positive (capacity
+    # : suppress the KNOWN-loose legacy-census false positive (capacity
     # undercounts invisible pre-id-tracking evictions), preserving the all-live
     # resurrection signature. See _legacy_census_loose.
     if _legacy_census_loose(asp, counted, capacity):
@@ -302,7 +302,7 @@ def _capacity(asp) -> int:
 
 
 def _audit_violations(items):
-    """Read-only pigeonhole conservation audit (1 / 8).
+    """Read-only pigeonhole conservation audit ( / ).
     Returns a per-aspiration report where in_list_sequence_goals + census_sum
     exceeds id capacity — archived_census claiming more evicted goals than the
     id-space could ever have held. Sorted by excess desc."""
@@ -314,7 +314,7 @@ def _audit_violations(items):
         cap = _capacity(asp)
         census_sum = sum(census_by_status(asp).values())
         claimed = in_list + census_sum
-        # 3: skip the KNOWN-loose legacy-census false positive (see
+        # : skip the KNOWN-loose legacy-census false positive (see
         # _legacy_census_loose) — the all-live resurrection signature is retained.
         if cap > 0 and claimed > cap and not _legacy_census_loose(asp, in_list, cap):
             out.append({
@@ -509,7 +509,7 @@ def main():
     items = [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines()
              if ln.strip()]
 
-    # Read-only conservation audit (1 / 8). Reports and exits
+    # Read-only conservation audit ( / ). Reports and exits
     # BEFORE any eviction plan/write — --audit never mutates.
     if args.audit:
         violations = _audit_violations(items)
@@ -530,7 +530,7 @@ def main():
         print(f"[audit] total phantom excess: {total_excess}")
         return 1
 
-    # Census repair (1): shrink violating archived_census to
+    # Census repair (): shrink violating archived_census to
     # conservation-valid counts. DRY-RUN unless --apply.
     if args.repair_census:
         violations = _audit_violations(items)

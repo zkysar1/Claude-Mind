@@ -1,4 +1,4 @@
-"""Tests for orchestrator-entry-battery.py (0).
+"""Tests for orchestrator-entry-battery.py ().
 
 Covers: clean run (nothing actionable), WM-slot detection, file-presence
 detection (compact-checkpoint / pending-agents), fail-open on missing agent
@@ -100,7 +100,7 @@ def test_human_output_footer(fake_state_dir, tmp_path, capsys):
 
 
 def test_payload_truncation_preserves_short_machine_keys(fake_state_dir, tmp_path, capsys):
-    """3: a long `summary` written BEFORE set_at/expires_at must not
+    """: a long `summary` written BEFORE set_at/expires_at must not
     push them past the 400-char human-mode cap — Phase -0.5a0's contract is
     that the payload on the line IS the read (no wm re-read)."""
     wm = tmp_path / "wm.yaml"

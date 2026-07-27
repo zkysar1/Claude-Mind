@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill null goal_id on experience records from the id (7).
+"""Backfill null goal_id on experience records from the id ().
 
 Many experience records carry an id that embeds the owning goal-id
 (exp-g-NNN-NN-{slug}, as built by experience.py cmd_archive_goal) while the
@@ -37,7 +37,7 @@ import sys
 # invocation under the cc-04 default STORAGE_BACKEND=own-cloud aborts in
 # _fileops.locked_modify_jsonl → get_backend() (OwnCloudBackend.from_env needs
 # MIND_WORLD/MIND_META, which a non-sourced subprocess lacks). Set BEFORE the
-# _fileops import so the backend never resolves to own-cloud. (7 / )
+# _fileops import so the backend never resolves to own-cloud. ( / )
 os.environ["STORAGE_BACKEND"] = "local"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

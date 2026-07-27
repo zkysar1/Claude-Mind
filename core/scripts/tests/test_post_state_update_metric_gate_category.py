@@ -63,7 +63,7 @@ PRODUCTION_SHAPE_NOTE = (
 )
 
 
-# ---- Hermetic isolation of the gate's ambient-state reads (1) ----
+# ---- Hermetic isolation of the gate's ambient-state reads () ----
 # The gate reads TWO pieces of LIVE agent state that make its fired/not-fired
 # decision non-deterministic between a full-suite run and an alone run:
 #   - Test-case-5 (gate:192): $AGENT_DIR/session/iteration-checkpoint.json +
@@ -74,7 +74,7 @@ PRODUCTION_SHAPE_NOTE = (
 #   - Test-case-6 (gate:207): WM force_metric_encoding_pending. If a prior
 #     signal's candidate fingerprint matches PRODUCTION_SHAPE_NOTE's
 #     {2x, 250 vs 44, 0 -> 69}, the dedup suppresses -> fired=false.
-# The bug 1 diagnosed ("passes alone, fails in full suite") is this
+# The bug  diagnosed ("passes alone, fails in full suite") is this
 # non-hermeticity: _run_gate inherited the live bootstrap agent's session state
 # via the default subprocess env. The conftest _restore_env_per_test fixture
 # restores MIND_AGENT/MIND_WORLD but NOT the filesystem state (checkpoint, WM)
@@ -118,8 +118,16 @@ def _isolated_gate_agent(tmp_path_factory):
     )
     env = dict(os.environ)
     env["MIND_AGENT"] = _ISO_AGENT_NAME
-    env["MIND_AGENT_DIR"] = str(iso_agent_dir)  # route resolution at the tmp dir (3)
+    env["MIND_AGENT_DIR"] = str(iso_agent_dir)  # route resolution at the tmp dir ()
     env.pop("MIND_WORLD", None)      # force conf-based world resolution
+    # : deliberately does NOT set RT_DIR/RUNTIME_DIR. This test
+    # reached rt_spawn and recycled the LIVE daemon on 2026-07-26; the fix is
+    # the shared-runtime claim gate in _runtime.sh + mind-api-start.sh, which
+    # refuses that spawn for ANY pytest process. Isolating here instead would
+    # be the per-test convention the gate exists to not depend on — and would
+    # be worse: RT_DIR=<tmp> makes every wrapper call miss the live daemon and
+    # spawn its own (0.6s -> 10s+), while RUNTIME_DIR alone is inert on this
+    # path because _runtime.sh resolves its runtime dir from RT_DIR.
     _GATE_ENV = env
     try:
         yield

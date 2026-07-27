@@ -455,7 +455,7 @@ def load_tree_nodes(categories, depth, read_only=False):
                     all_channels[key] = cat_channels[key]
 
     # g-306-83: flag-gated tree embedding channel — semantic eligibility.
-    # Nodes whose query-cosine clears embedding_min_cosine join the matched
+    # Nodes whose query-cosine clears the tree-lane floor join the matched
     # set on the 'embedding' channel even when all four token strategies
     # missed them. Runs BEFORE sibling/parent inclusion so semantic matches
     # are first-class (they expand at deep like any other match). The same
@@ -463,9 +463,17 @@ def load_tree_nodes(categories, depth, read_only=False):
     # cosine bonus with true embedding cosine for this request.
     tree_emb = _tree_embedding_scores(categories, nodes)
     if tree_emb:
+        # g-306-92: tree-lane-specific floor. embedding_min_cosine is SHARED
+        # with the supplementary rb/guardrail lane and was tuned on that lane's
+        # evidence, never on tree-lane data; lowering it would silently change
+        # reasoning-bank behaviour. embedding_tree_min_cosine overrides it for
+        # THIS lane only and falls back to the shared value when unset, so
+        # deleting the config key restores the prior behaviour exactly.
+        _cfg = _load_retrieval_config()
         try:
-            _min_cos = float(_load_retrieval_config().get(
-                "embedding_min_cosine", 0.35))
+            _min_cos = float(_cfg.get(
+                "embedding_tree_min_cosine",
+                _cfg.get("embedding_min_cosine", 0.35)))
         except (TypeError, ValueError):
             _min_cos = 0.35
         for _k, _score in tree_emb.items():
@@ -1425,6 +1433,20 @@ _DEFAULT_RETRIEVAL_CFG = {
     "utility_weight_min": 0.5,
     "utility_weight_max": 1.5,
     "utility_weight_neutral_below_retrievals": 5,
+    # Cosine slot reservation (g-306-93). The semantic cosine bonus is ADDITIVE
+    # (at most COSINE_BONUS_WEIGHT=2.0 of a ~4.5-5.4 base, ~25%) while
+    # utility_weight and the MMR path-similarity penalty act on the WHOLE base,
+    # so a node can hold the highest cosine of any node for a query and still
+    # never be returned. Measured 2026-07-26 on the 12-query tree-embed harness:
+    # `server-lifecycle` scored cosine 0.5653 — the top cosine for its query —
+    # and was dropped, while 27 SUB-FLOOR nodes were returned (base 4.481 ->
+    # utility_weight 0.705 -> pre-MMR rank 21 of 61 -> MMR dropped it as
+    # path-redundant with higher-ranked sibling server/session nodes).
+    # Reserving the top-N floor-clearing nodes by cosine guarantees the
+    # strongest semantic matches survive, without touching how the other
+    # (limit - N) slots are ranked. 0 disables (byte-identical to pre-g-306-93).
+    # Only active on the real-embedding path; the TF-IDF fallback is untouched.
+    "cosine_reserved_slots": 3,
     # Poignancy blend (g-306-08, BRD Gap 1a). DEFAULT OFF — mirrors
     # core/config/tree.yaml retrieval:. When false, _poignancy_weight() returns
     # 1.0 for every record and ranking is identical to pre-g-306-08.
@@ -1481,7 +1503,28 @@ def _load_retrieval_config():
     return merged
 
 def _utility_weight(node, cfg=None):
-    """Clamp(`0.5 + utility_ratio`, min, max); neutral 1.0 for underretrieved nodes."""
+    """Clamp(`1.0 + (utility_ratio - center)`, min, max); neutral 1.0 for underretrieved nodes.
+
+    CENTERED on the corpus mean utility_ratio (g-306-95), not on a bare 0.5. The
+    old `0.5 + utility_ratio` inverted this function's own stated intent: measured
+    over 1254 live nodes, utility_ratio averages ~0.206 among the 1180 nodes that
+    reach this path, so the average PROVEN node scored 0.706 while every unmeasured
+    node returned the neutral 1.0 — a ~41% ranking edge for having no track record,
+    stepped off a cliff at retrieval_count 5 rather than ramped.
+
+    Centering fixes the semantics rather than the symptom: an average node now lands
+    ON the neutral 1.0, so the two early-return 1.0s below stop meaning "best
+    possible" and start meaning "unmeasured, assume average" — which is what they
+    were always intended to mean. The slope is unchanged (1:1 in utility_ratio);
+    this is purely a shift of the neutral point, so relative ordering among measured
+    nodes is identical and only measured-vs-unmeasured ordering changes.
+
+    `utility_weight_center` is a measured constant, not a tuning knob — see
+    core/config/tree.yaml for the derivation and when to re-derive it. It defaults
+    to 0.0 here, which reproduces a 1.0-centered (uncentered) weight rather than
+    silently restoring the old inverted 0.5 base, so a missing key degrades to
+    "no centering" instead of to the bug.
+    """
     cfg = cfg or _load_retrieval_config()
     rc = node.get("retrieval_count", 0) or 0
     if rc < cfg["utility_weight_neutral_below_retrievals"]:
@@ -1500,7 +1543,8 @@ def _utility_weight(node, cfg=None):
        and (node.get("times_noise", 0) or 0) == 0:
         return 1.0
     ur = node.get("utility_ratio", 0) or 0
-    w = 0.5 + float(ur)
+    center = float(cfg.get("utility_weight_center", 0.0) or 0.0)
+    w = 1.0 + (float(ur) - center)
     lo = float(cfg["utility_weight_min"])
     hi = float(cfg["utility_weight_max"])
     if w < lo:
@@ -1742,6 +1786,29 @@ def _score_weight_limit(matched, channels, limit,
             scored = rescored
 
     if all_nodes and len(scored) > limit:
+        # Cosine slot reservation (g-306-93). Pull the top-N floor-clearing
+        # nodes by SEMANTIC cosine out of the pool, fill the remaining slots
+        # with the unchanged MMR pass, then re-sort the union by effective
+        # score. Reserved nodes are GUARANTEED a slot but are NOT promoted —
+        # they land in their natural effective-score position, so this fixes
+        # exclusion without distorting the returned ORDER.
+        reserved = []
+        n_reserve = int(cfg.get("cosine_reserved_slots", 0) or 0)
+        if use_emb and n_reserve > 0 and limit > 1:
+            floor = float(cfg.get("embedding_tree_min_cosine",
+                                  cfg.get("embedding_min_cosine", 0.35)))
+            eligible = [e for e in scored
+                        if float(emb_scores.get(e[0], 0.0)) >= floor]
+            eligible.sort(key=lambda e: -float(emb_scores.get(e[0], 0.0)))
+            # Never reserve every slot — MMR must keep meaningful authority.
+            reserved = eligible[:min(n_reserve, limit - 1)]
+        if reserved:
+            reserved_keys = {e[0] for e in reserved}
+            rest = [e for e in scored if e[0] not in reserved_keys]
+            filled = _mmr_rerank(rest, all_nodes, limit - len(reserved))
+            merged = reserved + list(filled)
+            merged.sort(key=lambda x: -x[2])
+            return merged
         return _mmr_rerank(scored, all_nodes, limit)
     return scored[:limit]
 
@@ -1761,21 +1828,60 @@ _UTIL_STOPWORDS = frozenset([
 
 _MAX_DISTINCTIVE_TOKENS = 40  # cap per item to keep session file small
 
+# Identifier-preserving tokenizer (g-115-3144). The previous `[a-z0-9]+` SPLIT
+# on `-` and `_`, so `movement-navigation` became {movement, navigation} and no
+# token could ever carry structural shape — which made rb-1729's "token SHAPE
+# ([-_0-9]-bearing identifier) is the discriminator, not generic prose vocab"
+# rule structurally INAPPLICABLE downstream. Keeping identifiers whole is the
+# precondition for that rule to mean anything.
+_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
+_STRUCTURAL_RE = re.compile(r"[-_0-9]")
+
+
+def _is_structural_token(t):
+    """rb-1729 discriminator: a [-_0-9]-bearing identifier, not prose vocab.
+
+    `rb-1729`, `movement-navigation`, `loop_state`, `g-115-3144` qualify;
+    `architecture`, `framework`, `never`, `first` do not.
+    """
+    return len(t) > 3 and bool(_STRUCTURAL_RE.search(t))
+
+
 def _distinctive_tokens(text):
-    """Extract lowercase word-chars, filter stopwords and <3 chars, dedupe, cap."""
+    """Extract distinctive tokens: identifiers kept whole, structural ones first.
+
+    Two properties matter to the consumer (utilization-feedback.infer_feedback):
+
+    1. Identifier shape survives (see `_TOKEN_RE` above).
+    2. Structural tokens are ranked AHEAD of prose BEFORE the cap. The old
+       version took the first 40 survivors in DOCUMENT ORDER, so the cap kept
+       whatever happened to appear early — usually prose. Ranking first means
+       the cap keeps the informative tokens.
+
+    WHY (g-115-3134, measured): the old output was not distinctive at all. With
+    a 31-word stopword list and no rarity test it emitted `all, must, never,
+    two, first, when, they, only, same, where, even, full, like, across`, and
+    the consumer needed only ONE of those to appear anywhere in a multi-KB goal
+    description. Measured over 6 real manifests (485 items): mean
+    helpful/population 0.922. An unrelated CAKE RECIPE scored 0.627 against the
+    same manifests — 68% of every "helpful" verdict was reproducible by
+    topically-unrelated text. The name `_distinctive_tokens` described an
+    intent the implementation never had.
+    """
     if not text:
         return []
-    tokens = re.findall(r"[a-z0-9]+", str(text).lower())
     seen = []
     seen_set = set()
-    for t in tokens:
+    for raw in _TOKEN_RE.findall(str(text).lower()):
+        t = raw.strip("-_")
         if len(t) < 3 or t in _UTIL_STOPWORDS or t in seen_set:
             continue
         seen.append(t)
         seen_set.add(t)
-        if len(seen) >= _MAX_DISTINCTIVE_TOKENS:
-            break
-    return seen
+    # Structural first, then prose, THEN cap — order matters (property 2).
+    ordered = [t for t in seen if _is_structural_token(t)]
+    ordered += [t for t in seen if not _is_structural_token(t)]
+    return ordered[:_MAX_DISTINCTIVE_TOKENS]
 
 def _strip_long_form(result):
     """Strip long-form body fields from supplementary stores for metadata-only mode.

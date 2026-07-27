@@ -76,7 +76,7 @@ SENTINELS: list[dict] = [
         "dispatch_slot": None,
         "canary_tracked": False,
     },
-    # Legacy tripwire — writer RETIRED (1); no precheck consumer.
+    # Legacy tripwire — writer RETIRED (); no precheck consumer.
     # Kept canary-tracked so any future re-introduced set without a hot-path
     # consumer is still caught (see stale-sentinel-canary.py docstring).
     {
