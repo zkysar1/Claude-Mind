@@ -880,16 +880,32 @@ def test_corroborate_downgrades_claim_when_partner_is_demonstrably_elsewhere():
     assert "g-115-3342" in stale[0]["stale_reason"]
 
 
-def test_corroborate_uses_current_focus_when_in_flight_is_null():
-    # The exact  shape: in_flight null, current_focus names ANOTHER
-    # goal, agent demonstrably alive.
+def test_corroborate_never_downgrades_on_current_focus_alone():
+    """A live claim must SURVIVE when in_flight is null, using the LITERAL
+    production current_focus shape.
+
+    Regression for the fresh-eyes finding on 2026-07-27. current_focus is
+    "asp-NNN: <goal title>" in production — measured across all 5 live agents —
+    so it can never contain a goal-id. The original implementation tested
+    `gid not in focus` and therefore downgraded EVERY claim by every live agent
+    (5/5 measured), clearing live claims and re-opening the double-pickup race.
+    in_flight is null for most of a goal's life (cleared at Phase 5 verify), so
+    that branch was the common path, not an edge case.
+
+    The bug survived 15 new unit tests because the original version of THIS test
+    fed a synthetic focus that DID contain a goal-id. That is guard-920 /
+    rb-5346: replicate the literal production shape, not the contract-ideal one.
+    """
     hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
              "kind": "claim", "text": "x"}]
     live, stale = M.corroborate_claims("g-335-292", hits, {
         "zeta": {"in_flight_goal_id": None,
-                 "current_focus": "asp-115: Investigate g-115-3342 triage",
+                 # verbatim production shape — title, never an id
+                 "current_focus": ("asp-115: Investigate: failed Operator "
+                                   "deploy leaves operator.ayoai unreachable"),
                  "last_active_minutes": 13.0}})
-    assert live == [] and len(stale) == 1
+    assert stale == [], "live claim wrongly downgraded on current_focus alone"
+    assert len(live) == 1
 
 
 def test_corroborate_absence_is_never_clearance():

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -544,3 +545,443 @@ def test_sha_superseded_root_or_merge_parent_error_false():
         assert mod.sha_superseded("r00tc0m", ["/repo"]) is False
     finally:
         mod._git = orig
+
+
+# ── : TIER 2 — stranded on an unmerged branch ────────────────────
+# Tier 1 decides "landed" with `git branch -r --contains`, which ANY remote
+# branch satisfies. So work pushed to a feature branch whose pull request was
+# never merged scored LANDED and CLEAN. That is not a theoretical hole: on
+# 2026-07-23 a fleet-wide run reported "0 flagged — every completed goal's work
+# landed in git/origin" while the oldest of eleven open Lodestar pull requests
+# had been unmerged for eight days. A gate that is merely absent emits no
+# signal; this one emitted a positive all-clear for invisible work.
+#
+# Fixture shapes are taken from the LIVE records the fix was measured against,
+# not from an abstraction of them (sig-38: author detector predicates FROM the
+# motivating incidents; guard-920: replicate the production shape, not the
+# contract-ideal one). Both were verified against the real forge on 2026-07-27:
+# PR #53 head bravo/-watch-csp-stale-cap carries exactly 3b0b14ee...,
+# PR #54 head feat/-knowledge-node-body carries exactly 495fa814....
+
+def _pr(state="OPEN", number=53, hours_old=143.9, **kw):
+    """A pull-request record in the shape probe_sha_pull_request really emits.
+    created_at carries the trailing Z the GitHub API actually returns (guard-920:
+    replicate the production shape, not the contract-ideal one) — a naive-ISO
+    fixture would exercise a parse path the sweep never takes and would hide a
+    tz-handling regression in the PR-age gate."""
+    rec = {
+        "state": state,
+        "number": number,
+        "url": f"https://github.com/zkysar1/Vinheim-Web-App/pull/{number}",
+        "title": "fix(watch): CSP allow :443 ALB watchUrl (g-335-190)",
+        "created_at": (NOW - dt.timedelta(hours=hours_old)).isoformat(
+            timespec="seconds") + "Z",
+    }
+    rec.update(kw)
+    return rec
+
+
+# The  shape: a MULTI-REPO goal whose record names one commit that
+# reached main in an unprotected repo, while its other half sits on the branch
+# of an open PR and is discoverable ONLY by goal-id commit-scope match.
+_ON_DEFAULT = "326bf09"
+_OFF_DEFAULT = "3b0b14ee08c4d2e734790f924a13a93e5fe1a50a"
+
+
+def _multi_repo_goal(**kw):
+    g = _goal(id="g-335-190",
+              work_class="product",
+              title="Live watch validation for PEARL - make 'watch it think' work",
+              outcome_note=f"Committed {_ON_DEFAULT} and pushed.",
+              verification={"summary": "watch page verified live"})
+    g.update(kw)
+    return g
+
+
+def test_landed_shas_unions_record_and_goalid_paths():
+    """REGRESSION GUARD for the false clean this lane shipped with. landed_shas
+    must UNION both attribution paths, not pick one. classify_goal's either/or
+    is right for tier 1 (one landing proves shipment) and WRONG here: with
+    either/or, g-335-190's record-named on-default SHA wins, the goal-id-resolved
+    off-default half is never looked at, and a goal with a 6-day-old open PR
+    scores clean. Caught only by running the fixed sweep against the live
+    estate — the unit tests and the tier-1 suite were both green."""
+    mod = _import()
+    g = _multi_repo_goal()
+    landed = mod.landed_shas(
+        g, NOW, {_ON_DEFAULT: True},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert set(landed) == {_ON_DEFAULT, _OFF_DEFAULT}
+
+
+def test_landed_shas_dedups_sha_reachable_both_ways():
+    """A SHA named in the record AND resolved by goal-id appears once."""
+    mod = _import()
+    g = _multi_repo_goal()
+    landed = mod.landed_shas(
+        g, NOW, {_ON_DEFAULT: True},
+        goalid_status={"g-335-190": {_ON_DEFAULT: True}})
+    assert landed == [_ON_DEFAULT]
+
+
+def test_landed_shas_excludes_non_landed_and_ineligible():
+    """Only remote-landed SHAs count, and an ineligible goal yields nothing."""
+    mod = _import()
+    g = _multi_repo_goal()
+    assert mod.landed_shas(g, NOW, {_ON_DEFAULT: False}) == []
+    assert mod.landed_shas(_multi_repo_goal(status="in-progress"), NOW,
+                           {_ON_DEFAULT: True}) == []
+
+
+def test_stranded_open_pr_flags_multi_repo_partial_landing():
+    """POSITIVE CONTROL, live shape: half the deliverable on the default branch,
+    half on the branch of an open 6-day-old PR -> stranded_open_pr."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW,
+        {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr()},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert entry is not None
+    assert entry["reason"] == "stranded_open_pr"
+    assert entry["shas_off_default"] == [_OFF_DEFAULT]
+    assert entry["pull_request"]["number"] == 53
+    assert entry["resolved_via"] == "goal-id"
+
+
+def test_stranded_clean_when_everything_reached_default():
+    """NEGATIVE CONTROL: the ordinary shipped goal. Every landed SHA is on the
+    default branch -> silent. 3,630 of 3,632 live goals took this path."""
+    mod = _import()
+    assert mod.classify_stranded(
+        _multi_repo_goal(), NOW,
+        {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True},
+        {}) is None
+
+
+def test_stranded_fresh_pr_is_in_flight_not_stranded():
+    """A PR younger than min_pr_age_hours suppresses the entry ENTIRELY rather
+    than demoting it to stranded_no_pr — freshly-opened work is in flight. Two
+    live goals (g-335-268, g-335-45) sat in exactly this state and correctly
+    produced no flag."""
+    mod = _import()
+    assert mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr(hours_old=3.0)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}},
+        min_pr_age_hours=24.0) is None
+
+
+def test_stranded_unavailable_forge_never_flags():
+    """The goal's explicit scope note: an unreachable forge must not turn a
+    clean sweep into a flagged one. UNAVAILABLE degrades to silence."""
+    mod = _import()
+    assert mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: dict(mod._PR_UNAVAILABLE)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}}) is None
+
+
+def test_stranded_undeterminable_default_branch_never_flags():
+    """Conservative in the NO-FLAG direction: if the default branch could not be
+    resolved (None), we cannot claim the commit missed it."""
+    mod = _import()
+    assert mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: None, _OFF_DEFAULT: None},
+        {}) is None
+
+
+def test_stranded_no_pr_is_the_weaker_class():
+    """Off-default with no pull request at all — could be a live working branch,
+    so it gets its own report-only class rather than a flag."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: {"state": "NONE", "number": None, "url": None,
+                        "title": None, "created_at": None}},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert entry["reason"] == "stranded_no_pr"
+    assert entry["pull_request"] is None
+
+
+def test_stranded_merged_into_non_default_base_is_weaker_class():
+    """A MERGED PR whose commit still is not on the default branch merged into
+    some other base. Rare and ambiguous -> report-only, PR record retained."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr(state="MERGED", number=99)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert entry["reason"] == "stranded_no_pr"
+    assert entry["pull_request"]["number"] == 99
+
+
+def test_tiers_are_mutually_exclusive():
+    """classify_goal flags when NOTHING landed; classify_stranded looks only
+    where something DID. No goal can be in both lanes, so main() needs no
+    cross-dedup — this test is what makes that claim checkable."""
+    mod = _import()
+    g = _goal()  # names one SHA, local-only -> tier 1's lane
+    assert mod.classify_goal(g, NOW, {"f885a690": False}) is not None
+    assert mod.classify_stranded(
+        g, NOW, {"f885a690": False}, {"f885a690": False}, {}) is None
+
+
+def test_stranded_respects_goal_age_gates():
+    """The existing completion-age discipline still bounds tier 2."""
+    mod = _import()
+    fresh = _multi_repo_goal(
+        completed_at=(NOW - dt.timedelta(minutes=5)).isoformat(
+            timespec="seconds"))
+    assert mod.classify_stranded(
+        fresh, NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr()},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}}) is None
+    old = _multi_repo_goal(
+        completed_at=(NOW - dt.timedelta(days=30)).isoformat(
+            timespec="seconds"))
+    assert mod.classify_stranded(
+        old, NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr()},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}}) is None
+
+
+def test_stranded_dedup_key_is_independent_of_tier_one():
+    """The two lanes prescribe DIFFERENT remedies — push the commit vs merge the
+    pull request — so a tier-1 Investigate must not suppress a tier-2 one."""
+    mod = _import()
+    tier1 = [{"origin_signal": "investigate:completed-not-committed-g-335-190",
+              "status": "pending"}]
+    assert mod._existing_investigate("g-335-190", tier1) is True
+    assert mod._existing_investigate(
+        "g-335-190", tier1, mod.STRANDED_SIGNAL_PREFIX) is False
+    tier2 = [{"origin_signal": f"{mod.STRANDED_SIGNAL_PREFIX}g-335-190",
+              "status": "pending"}]
+    assert mod._existing_investigate(
+        "g-335-190", tier2, mod.STRANDED_SIGNAL_PREFIX) is True
+    assert mod._existing_investigate("g-335-190", tier2) is False
+
+
+def test_file_investigate_body_names_the_pull_request():
+    """The remedy is only actionable if the Investigate names the PR to merge."""
+    mod = _import()
+    captured = {}
+
+    def fake_add(asp_id, body, source=None):
+        captured["asp_id"] = asp_id
+        captured["body"] = body
+        return {"id": "g-115-9001"}
+
+    orig = mod._rt.aspirations_add_goal
+    mod._rt.aspirations_add_goal = fake_add
+    try:
+        entry = mod.classify_stranded(
+            _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+            {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+            {_OFF_DEFAULT: _pr()},
+            goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+        assert mod._file_investigate(entry) == "g-115-9001"
+    finally:
+        mod._rt.aspirations_add_goal = orig
+    assert captured["asp_id"] == "asp-115"
+    body = captured["body"]
+    assert "#53" in body["title"]
+    assert body["origin_signal"] == f"{mod.STRANDED_SIGNAL_PREFIX}g-335-190"
+    assert "pull/53" in body["description"]
+    assert "default branch" in body["description"]
+
+
+def test_probe_sha_on_default_error_is_undeterminable_not_a_flag():
+    """`branch -r --contains` is used instead of `merge-base --is-ancestor`
+    precisely so a probe ERROR (rc!=0) stays distinguishable from a genuine
+    negative (rc==0, empty stdout). Errors must not become flags."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        if args[:2] == ("cat-file", "-e"):
+            return (0, "")
+        return (129, "")  # probe error
+
+    mod._git = fake_git
+    try:
+        assert mod.probe_sha_on_default(
+            "deadbee", ["/repo"], {"/repo": "origin/main"}) is None
+    finally:
+        mod._git = orig
+
+
+def test_probe_sha_on_default_unknown_default_ref_is_undeterminable():
+    """resolve_default_ref returning None must not be guessed around."""
+    mod = _import()
+    orig = mod._git
+
+    def fake_git(repo, *args, timeout=15):
+        return (0, "") if args[:2] == ("cat-file", "-e") else (1, "")
+
+    mod._git = fake_git
+    try:
+        assert mod.probe_sha_on_default(
+            "deadbee", ["/repo"], {"/repo": None}) is None
+    finally:
+        mod._git = orig
+
+
+def test_probe_sha_pull_request_gh_failure_is_unavailable():
+    """gh absent / unauthenticated / non-forge remote -> UNAVAILABLE, which
+    classify_stranded maps to silence. Never an exception, never a flag."""
+    mod = _import()
+    orig_git, orig_gh = mod._git, mod._gh
+
+    def fake_git(repo, *args, timeout=15):
+        return (0, "") if args[:2] == ("cat-file", "-e") else (1, "")
+
+    mod._git = fake_git
+    mod._gh = lambda repo, *a, **k: (1, "")
+    try:
+        assert mod.probe_sha_pull_request("deadbee", ["/repo"])["state"] == \
+            "UNAVAILABLE"
+    finally:
+        mod._git, mod._gh = orig_git, orig_gh
+
+
+def test_probe_sha_pull_request_prefers_the_open_one():
+    """When several PRs carry the commit, the OPEN one is the stranding."""
+    mod = _import()
+    orig_git, orig_gh = mod._git, mod._gh
+
+    def fake_git(repo, *args, timeout=15):
+        return (0, "") if args[:2] == ("cat-file", "-e") else (1, "")
+
+    payload = json.dumps([
+        {"number": 40, "state": "closed", "merged_at": "2026-07-01T00:00:00Z",
+         "html_url": "u40", "title": "t40", "created_at": "2026-06-30T00:00:00Z"},
+        {"number": 53, "state": "open", "merged_at": None,
+         "html_url": "u53", "title": "t53", "created_at": "2026-07-21T09:15:50Z"},
+    ])
+    mod._git = fake_git
+    mod._gh = lambda repo, *a, **k: (0, payload)
+    try:
+        rec = mod.probe_sha_pull_request("deadbee", ["/repo"])
+    finally:
+        mod._git, mod._gh = orig_git, orig_gh
+    assert rec["state"] == "OPEN" and rec["number"] == 53
+
+
+def test_probe_sha_pull_request_empty_list_is_none_not_unavailable():
+    """A successful query returning no PRs is genuine absence (NONE), which is a
+    weaker signal — distinct from an UNAVAILABLE forge, which is no signal."""
+    mod = _import()
+    orig_git, orig_gh = mod._git, mod._gh
+
+    def fake_git(repo, *args, timeout=15):
+        return (0, "") if args[:2] == ("cat-file", "-e") else (1, "")
+
+    mod._git = fake_git
+    mod._gh = lambda repo, *a, **k: (0, "[]")
+    try:
+        assert mod.probe_sha_pull_request("deadbee", ["/repo"])["state"] == "NONE"
+    finally:
+        mod._git, mod._gh = orig_git, orig_gh
+
+
+# ──  fresh-eyes pass: three defects the author-pass missed ────────
+# Found by /fresh-eyes-code on the same code 40 minutes after writing it, each
+# confirmed by probe rather than by reading. All three point the same way — the
+# lane documents itself as conservative in the NO-FLAG direction and each defect
+# leaned the other way.
+
+def test_missing_pr_status_key_is_unavailable_not_absent_pr():
+    """DEFECT 1. An off-default SHA with NO pr_status entry must be treated as
+    UNAVAILABLE (silence), never as {} — which reads as "no PR exists" and lands
+    the goal in stranded_no_pr. "Not probed" and "probe failed" are the same
+    epistemic state; only one of them was being honoured. Latent while main()
+    probes every off-default SHA, but the obvious optimization (narrow the gh
+    probe set to bound network calls) would silently turn unprobed SHAs into
+    report lines asserting a negative nobody measured."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {},  # probe set never covered _OFF_DEFAULT
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert entry is None
+
+
+def test_all_stranding_prs_are_reported_not_just_the_first():
+    """DEFECT 2. A multi-repo goal can be stranded on SEVERAL open PRs at once.
+    Naming one sends the reader to half the remedy. Live case: g-335-191 is
+    stranded on BOTH Vinheim #54 and Zak-Code #129, and the first live report
+    named only #54."""
+    mod = _import()
+    second = "cdc1c2a149855ba500a013df3c6eb24f9447b748"
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False, second: False},
+        {_OFF_DEFAULT: _pr(number=54), second: _pr(number=129)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True, second: True}})
+    assert entry["reason"] == "stranded_open_pr"
+    reported = {entry["pull_request"]["number"]} | {
+        o["number"] for o in entry["other_pull_requests"]}
+    assert reported == {54, 129}
+
+
+def test_other_pull_requests_is_disjoint_from_the_primary():
+    """other_pull_requests carries the REMAINDER, not a copy — one PR must not
+    appear twice across the two fields (single source of truth)."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr(number=54)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}})
+    assert entry["pull_request"]["number"] == 54
+    assert entry["other_pull_requests"] == []
+
+
+def test_open_pr_with_unparseable_created_at_does_not_bypass_the_age_gate():
+    """DEFECT 3, the worst of the three — the only one that produced a WRITE.
+    `pr_age_hours is not None and pr_age_hours < min_pr_age_hours` let a PR whose
+    created_at would not parse walk straight past the age gate into
+    stranded_open_pr, which --apply files as an Investigate. "Cannot confirm the
+    PR is old enough" is not "the PR is old enough"."""
+    mod = _import()
+    entry = mod.classify_stranded(
+        _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+        {_ON_DEFAULT: True, _OFF_DEFAULT: False},
+        {_OFF_DEFAULT: _pr(number=99, created_at=None)},
+        goalid_status={"g-335-190": {_OFF_DEFAULT: True}},
+        min_pr_age_hours=24.0)
+    assert entry is None
+
+
+def test_file_investigate_names_every_stranding_pr():
+    """The Investigate body must name the extras too — merging only the PR in the
+    title leaves the rest of the goal invisible, which is the exact failure this
+    whole lane exists to surface."""
+    mod = _import()
+    captured = {}
+    orig = mod._rt.aspirations_add_goal
+    mod._rt.aspirations_add_goal = lambda a, b, source=None: (
+        captured.update({"body": b}) or {"id": "g-115-9002"})
+    try:
+        second = "cdc1c2a149855ba500a013df3c6eb24f9447b748"
+        entry = mod.classify_stranded(
+            _multi_repo_goal(), NOW, {_ON_DEFAULT: True},
+            {_ON_DEFAULT: True, _OFF_DEFAULT: False, second: False},
+            {_OFF_DEFAULT: _pr(number=54), second: _pr(number=129)},
+            goalid_status={"g-335-190": {_OFF_DEFAULT: True, second: True}})
+        mod._file_investigate(entry)
+    finally:
+        mod._rt.aspirations_add_goal = orig
+    desc = captured["body"]["description"]
+    assert "#54" in desc and "#129" in desc

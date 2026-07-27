@@ -597,13 +597,25 @@ def corroborate_claims(goal_id, hits, live_state, freshness_minutes=60):
     never mere absence. This is the asymmetry that
     .claude/rules/check-team-state-before-silent.md rule 5 mandates and that
     guard-1560 protects: artifact-absence is NOT clearance, so a null in_flight
-    or an empty current_focus leaves the claim standing. A claimant must ALSO be
-    demonstrably alive within freshness_minutes — a stale row means the heartbeat
-    may simply be broken (the 2026-07-14 incident where two live agents read 59h
-    and 66h stale), and stale state must never be read as "not working on it".
+    leaves the claim standing. A claimant must ALSO be demonstrably alive within
+    freshness_minutes — a stale row means the heartbeat may simply be broken (the
+    2026-07-14 incident where two live agents read 59h and 66h stale), and stale
+    state must never be read as "not working on it".
+
+    in_flight is the ONLY positive signal consulted. current_focus is
+    deliberately NOT used: its production format is "asp-NNN: <goal title>"
+    (measured across all 5 live agents, 2026-07-27) and so it is STRUCTURALLY
+    incapable of containing a goal-id. Testing `gid not in focus` therefore
+    returned True unconditionally, and because in_flight is null for most of a
+    goal's life (it is cleared at Phase 5 verify), that branch downgraded EVERY
+    claim by every live agent — 5/5 in the measurement — clearing live claims and
+    re-opening the double-pickup race this probe exists to prevent. It was caught
+    by fresh-eyes minutes after landing because the unit tests fed a synthetic
+    focus that DID contain a goal-id: guard-920 / rb-5346 (replicate the literal
+    production shape, not the contract-ideal one). Re-adding a focus leg requires
+    matching on the goal TITLE, not the id.
 
     live_state: {agent: {"in_flight_goal_id": str|None,
-                         "current_focus": str|None,
                          "last_active_minutes": float|None}}
 
     Returns (live_hits, stale_hits). Non-claim kinds always pass through.
@@ -623,15 +635,11 @@ def corroborate_claims(goal_id, hits, live_state, freshness_minutes=60):
             continue
         gid = str(goal_id or "").lower()
         inflight = st.get("in_flight_goal_id")
-        focus = st.get("current_focus")
         elsewhere = False
         why = ""
         if inflight and str(inflight).lower() != gid:
             elsewhere = True
             why = f"in_flight on {inflight}"
-        elif focus and gid and gid not in str(focus).lower():
-            elsewhere = True
-            why = f"current_focus '{str(focus)[:60]}'"
         if elsewhere:
             stale.append({**h, "stale_reason":
                           f"{h.get('author')} alive {mins:.0f}m ago but {why}"})
