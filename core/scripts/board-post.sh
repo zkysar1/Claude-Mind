@@ -23,7 +23,18 @@ while [[ $# -gt 0 ]]; do
         --type)     MSG_TYPE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --reply-to) REPLY_TO="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --tags)     TAGS="${2-}";     shift $(( $# >= 2 ? 2 : 1 ));;
-        *) shift;;
+        # Unknown args are REFUSED, not swallowed. A bare `*) shift;;` silently
+        # discarded both the flag and its value, so `--message "<text>"` produced
+        # an EMPTY stdin body and the daemon answered the confusing `empty_text`
+        # instead of naming the real mistake. guard-1036 / guard-1394 / guard-1531
+        # all already forbade that call shape and it still recurred 4x, because a
+        # guardrail cannot fire at the moment a flag is typed -- the parser can.
+        *)
+            echo "Error: unknown argument '$1'" >&2
+            echo "  The MESSAGE TEXT is read from STDIN. There is no --message/--body/--text flag." >&2
+            echo "  Correct: echo \"msg\" | bash core/scripts/board-post.sh --channel <ch> [--type <t>] [--tags <a,b>] [--author <a>] [--reply-to <id>]" >&2
+            exit 1
+            ;;
     esac
 done
 

@@ -33,6 +33,17 @@ Scripts: `aspirations-claim.sh`, `aspirations-release.sh`, `aspirations-complete
 - On infrastructure failure: release claim so other agent can attempt
 - Recurring goals: `complete-by` auto-clears claim for next cycle
 - Session end: release all held claims in handoff
+- **ANNOUNCE a release on the board, as `--type release`** — a claim you
+  announced but abandon silently becomes a permanent lien on the goal. If you
+  posted a `--type claim`, post the matching release: `board-post.sh --channel
+  coordination --type release --tags "<goal-id>,<agent>"`, or open the text with
+  `RELEASING <goal-id>`. `goal-pickup-coordination-check.py` pairs claim→release
+  per author and lets the LATEST event win, so an announced release CLEARS
+  `race_risk` for every other agent; an unannounced one cannot. Measured cost of
+  getting this wrong (g-115-3459, 2026-07-27): one abandoned claim stalled
+  g-335-292 ~3h across two agents, and took two hand-written board posts to
+  break. `aspirations-release.sh` updates the QUEUE; it does not post to the
+  board — these are two separate obligations.
 
 ## Board Communication
 

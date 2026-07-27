@@ -63,4 +63,25 @@ if [ "$_CUR_LEDGER_DRIVER" != "$_LEDGER_DRIVER" ]; then
     fi
 fi
 
+# Section-level merge driver for the NARRATIVE daily journal
+# (merge=ayoai-journal-md in .gitattributes). Same registration mechanism and
+# rationale as the ledger driver above. The narrative daily .md had NO merge
+# routing at all, so two boxes running one agent identity both created the same
+# agents/<agent>/journal/<yyyy>/<mm>/<yyyy-mm-dd>.md with no common ancestor —
+# a guaranteed add/add that wedged iteration-push EVERY calendar day and
+# stranded unrelated ledger work with it (, from ). NOT
+# merge=union: that path family has 1980 historical deleted content lines, so it
+# fails .gitattributes' zero-deleted-lines evidence gate. Idempotent + fail-open.
+_JOURNAL_MD_DRIVER='bash core/scripts/git-merge-journal-md.sh %O %A %B %P'
+_CUR_JOURNAL_MD_DRIVER="$(git config --local --get merge.ayoai-journal-md.driver 2>/dev/null || echo "")"
+if [ "$_CUR_JOURNAL_MD_DRIVER" != "$_JOURNAL_MD_DRIVER" ]; then
+    git config --local merge.ayoai-journal-md.name \
+        "the framework section-level narrative-journal merge (unions by ## heading; same-heading divergence still conflicts)" 2>/dev/null || true
+    if git config --local merge.ayoai-journal-md.driver "$_JOURNAL_MD_DRIVER" 2>/dev/null; then
+        echo "[install-git-hooks] merge.ayoai-journal-md driver registered (cross-box daily-journal add/add now self-heals)" >&2
+    else
+        echo "[install-git-hooks] WARN: could not register merge.ayoai-journal-md driver (non-fatal; journal conflicts fall back to manual union)" >&2
+    fi
+fi
+
 exit 0

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.7.0",
+    "previous_version": "2.6.0",
+    "date": "2026-07-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Seed-transform code-span fix (word_list_strip no longer corrupts code on trailing-comment lines); back-ported env-key case-insensitivity standing check; fleet deltas incl. skill-discovery re-flag + aws-capability-probe forge",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.6.0",
     "previous_version": "2.5.0",
     "date": "2026-07-27",

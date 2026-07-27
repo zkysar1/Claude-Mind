@@ -406,8 +406,83 @@ def collect_companion_script_dates(skill_names, forged_skills):
     return out
 
 
+def collect_triage_verdicts(skill_names):
+    """Map skill -> most recent SETTLED triage verdict from completed goals.
+
+    A skill that was already triaged to KEEP does not need re-flagging on the
+    same unchanged metric — that is measurement noise, not signal (g-115-3084).
+    The verdict lives in the completed goal's `outcome_note` (that is where
+    g-115-2389 recorded "Triage: KEEP + repair", NOT in the description), so
+    outcome_note is read first and description only as a fallback.
+
+    Keying is by SKILL NAME appearing in the goal's title or origin_signal.
+    There is deliberately NO structured `skill-discovery-audit:<skill>:*`
+    origin_signal to key on — that format was proposed but never existed in the
+    data (real signals are free-form, e.g.
+    "idea:review-forged-skill-add-npc-task-last-invoked-89d-ago-2-tota").
+    Matching title+origin_signal only (not description) keeps this precise: a
+    goal whose body happens to mention several skills must not mark them all
+    settled.
+
+    Only `completed` goals count — an in-flight triage has not settled anything.
+    Including completed (not just open) goals is required by guard-895.
+
+    STALENESS IS FAIL-SAFE HERE (guard-980/1139): aspirations.jsonl is a
+    backend-routed store and this is a raw local read, matching how this script
+    already reads forged-skills.yaml / skill-relations.yaml. If a verdict
+    recorded on another box has not synced locally, the verdict is simply not
+    found, suppression does not fire, and the behavior degrades to exactly
+    today's re-flagging. The failure direction is toward the status quo, never
+    toward wrongly silencing a live signal.
+    """
+    verdicts = {}
+    path = WORLD_DIR / "aspirations.jsonl"
+    if not path.exists():
+        return verdicts
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        print("[skill-discovery] WARN: could not read {} ({}) — verdict "
+              "suppression disabled this run".format(path, exc), file=sys.stderr)
+        return verdicts
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except ValueError:
+            continue
+        for goal in asp.get("goals", []) or []:
+            if goal.get("status") != "completed":
+                continue
+            note = goal.get("outcome_note") or goal.get("description") or ""
+            # Require an explicit settled KEEP. A RETIRE verdict must NOT
+            # suppress — it prescribes a different action that still needs doing.
+            if not re.search(r"\bKEEP\b", note):
+                continue
+            key_text = "{} {}".format(goal.get("title") or "",
+                                      goal.get("origin_signal") or "")
+            when = (parse_iso(goal.get("completed_at"))
+                    or parse_iso(goal.get("last_modified"))
+                    or parse_iso(goal.get("created_at")))
+            if when is None:
+                continue
+            for skill_name in skill_names:
+                if skill_name and skill_name in key_text:
+                    prev = verdicts.get(skill_name)
+                    if prev is None or when > prev["verdict_date"]:
+                        verdicts[skill_name] = {
+                            "goal_id": goal.get("id"),
+                            "verdict": "KEEP",
+                            "verdict_date": when,
+                        }
+    return verdicts
+
+
 def classify(skill_name, forged_info, quality_data, relations_data,
-             journal_dates, companion_dates, ledger_dates, strategy, now):
+             journal_dates, companion_dates, ledger_dates, strategy, now,
+             verdicts=None):
     """Compute discovery metrics + classification for one forged skill."""
     forged_date = parse_iso(forged_info.get("forged_date"))
     days_since_forge = days_between(forged_date, now)
@@ -490,6 +565,51 @@ def classify(skill_name, forged_info, quality_data, relations_data,
     elif status == "declining":
         action_required = True
 
+    # Verdict-aware suppression (). Re-flagging a skill on the SAME
+    # unchanged metric after it was already triaged to KEEP is measurement
+    # noise: it asks the agent to re-investigate settled work. add-npc-task was
+    # flagged four times; the third filing () closed itself verbatim
+    # as a duplicate, and the fourth () is sitting in the queue right
+    # now — the LLM-side suppression the sibling fix  relies on did
+    # not fire. This gate is script-side for exactly that reason.
+    #
+    # rb-3132 IS THE LOAD-BEARING CONSTRAINT: a same-class recurrence AFTER a
+    # remediated verdict FALSIFIES that verdict. So suppression is not a blanket
+    # mute — any invocation dated after the verdict means the skill was used and
+    # went cold AGAIN, which is new signal and must re-flag. Suppression applies
+    # only while the metric is genuinely unchanged since the verdict.
+    #
+    # Optional section, gated at the call site per load_strategy()'s contract —
+    # an older strategy file simply keeps today's behavior.
+    suppression = strategy.get("verdict_suppression") or {}
+    verdict_suppressed = None
+    if action_required and suppression.get("enabled") and verdicts:
+        v = verdicts.get(skill_name)
+        if v is not None:
+            verdict_age = days_between(v["verdict_date"], now)
+            new_signal_since_verdict = (
+                last_invocation is not None and last_invocation > v["verdict_date"]
+            )
+            if (
+                verdict_age is not None
+                and verdict_age <= suppression["window_days"]
+                and not new_signal_since_verdict
+            ):
+                action_required = False
+                verdict_suppressed = {
+                    "verdict": v["verdict"],
+                    "verdict_goal": v["goal_id"],
+                    "verdict_date": v["verdict_date"].isoformat(),
+                    "verdict_age_days": round(verdict_age, 2),
+                    "window_days": suppression["window_days"],
+                    "reason": (
+                        "already triaged to KEEP by {} {:.0f}d ago and no invocation "
+                        "since — same unchanged metric, no new signal (g-115-3084; "
+                        "rb-3132 recurrence check passed)".format(
+                            v["goal_id"], verdict_age)
+                    ),
+                }
+
     triage_hints = strategy["triage_hint_templates"].get(status, "")
 
     # Confidence: how many independent sources corroborate the invocation count.
@@ -522,6 +642,11 @@ def classify(skill_name, forged_info, quality_data, relations_data,
         "decline_signal": decline_signal,
         "status": status,
         "action_required": action_required,
+        # Non-null ONLY when a settled KEEP verdict suppressed a flag that
+        # would otherwise have filed a goal. Consumers should surface this
+        # rather than silently dropping the skill — a suppressed flag is a
+        # reportable decision, not an absence (no-silent-caps).
+        "verdict_suppressed": verdict_suppressed,
         "triage_hints": triage_hints,
     }
 
@@ -538,6 +663,11 @@ def build_report(now=None):
     journal_dates = collect_journal_skill_dates(skill_names)
     companion_dates = collect_companion_script_dates(skill_names, forged)
     ledger_dates = collect_ledger_skill_dates(skill_names)
+    # Only scan the goal store when suppression is actually enabled — an older
+    # strategy file without the section keeps today's behavior at zero cost.
+    verdicts = (collect_triage_verdicts(skill_names)
+                if (strategy.get("verdict_suppression") or {}).get("enabled")
+                else {})
 
     skills_out = []
     counts = {}
@@ -546,7 +676,8 @@ def build_report(now=None):
         if not isinstance(info, dict):
             continue
         record = classify(name, info, quality, relations, journal_dates,
-                          companion_dates, ledger_dates, strategy, now)
+                          companion_dates, ledger_dates, strategy, now,
+                          verdicts=verdicts)
         skills_out.append(record)
         counts[record["status"]] = counts.get(record["status"], 0) + 1
 
@@ -568,6 +699,14 @@ def build_report(now=None):
             "status_counts": counts,
             "total_invocations_logged": overall_invocations,
             "median_forge_to_first_latency_days": median_latency,
+            # Report suppressions explicitly. A suppressed flag is a decision
+            # the consumer should be able to see and audit, not a silent drop.
+            "verdict_suppressed_count": sum(
+                1 for s in skills_out if s.get("verdict_suppressed")),
+            "verdict_suppressed_skills": [
+                {"skill": s["skill"], **s["verdict_suppressed"]}
+                for s in skills_out if s.get("verdict_suppressed")
+            ],
         },
         "skills": skills_out,
     }

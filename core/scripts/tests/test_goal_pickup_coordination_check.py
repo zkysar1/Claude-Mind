@@ -758,3 +758,235 @@ def test_scan_skips_when_no_surface_named(tmp_path, monkeypatch):
         "g-115-2428", "Fix the learning-gate stub condition in the loop",
         set(), set(), 48.0, 2)
     assert result["surfaces"] == [] and result["repos_scanned"] == []
+
+
+# ── : claim/release pairing + live-state corroboration ─────────────
+#
+# The defect these pin: the probe had no notion of a release, so once ANY claim
+# post existed race_risk was true forever, for every agent, permanently. An
+# abandoned claim became a permanent lien on the goal. Measured on 
+# (2026-07-27): zeta claimed 03:59/04:00, released explicitly 06:18, and alpha +
+# bravo still yielded four times over ~3h because the probe could not see it.
+
+def _bmsg(mid, author, ts, mtype, text, tags=None):
+    return {"id": mid, "author": author, "timestamp": ts, "type": mtype,
+            "text": text, "tags": tags or []}
+
+
+def test_released_ids_text_prefix_forms():
+    # The real  shape is a type=status post whose text OPENS with
+    # "RELEASING <id>" — there is no type=release on the board.
+    assert M._released_ids(
+        "status", "RELEASING g-335-292 explicitly — @alpha, do not wait", []
+    ) == {"g-335-292"}
+    for verb in ("release:", "Released", "Unclaiming", "Abandoning"):
+        assert M._released_ids("status", f"{verb} g-115-99 because ...", []) \
+            == {"g-115-99"}, verb
+
+
+def test_released_ids_first_class_release_type():
+    # board.py VALID_MESSAGE_TYPES carries a real "release" type. A type=release
+    # post tagging this goal is unambiguous — no text prefix needed. Symmetric
+    # to how _claimed_ids reads type=claim + goal-id tags.
+    assert M._released_ids(
+        "release", "handing this back", ["g-115-99", "zeta"]) == {"g-115-99"}
+
+
+def test_released_ids_tag_leg():
+    assert M._released_ids(
+        "status", "no prefix here", ["release", "g-115-99"]) == {"g-115-99"}
+
+
+def test_released_ids_body_mention_is_not_a_release():
+    # Precision-first, mirroring _claimed_ids: the regex anchors at start of
+    # text, so a mid-body mention never counts.
+    assert M._released_ids(
+        "status", "I am not releasing g-115-99 yet, still working", []) == set()
+
+
+def test_released_ids_claim_typed_post_never_releases():
+    # An incoherent post that both claims and releases stays a CLAIM — the
+    # conservative direction (race_risk stays set).
+    assert M._released_ids(
+        "claim", "Releasing g-115-99", ["release", "g-115-99"]) == set()
+
+
+def test_classify_board_mentions_emits_release_kind():
+    hits = M.classify_board_mentions("g-115-99", "alpha", [
+        _bmsg("m1", "zeta", "2026-07-27T04:00:00", "status",
+             "RELEASING g-115-99 explicitly", []),
+    ])
+    assert [h["kind"] for h in hits] == ["release"]
+
+
+def test_release_supersedes_earlier_claim_by_same_author():
+    hits = M.classify_board_mentions("g-115-99", "alpha", [
+        _bmsg("m1", "zeta", "2026-07-27T03:59:00", "claim",
+             "Claiming g-115-99: doing the thing", ["g-115-99", "zeta"]),
+        _bmsg("m2", "zeta", "2026-07-27T06:18:00", "status",
+             "RELEASING g-115-99 explicitly — @alpha take it", []),
+    ])
+    live, superseded = M.supersede_released_claims(hits)
+    assert [h["id"] for h in superseded] == ["m1"]
+    assert not any(h["kind"] == "claim" for h in live)
+
+
+def test_release_does_not_clear_a_different_authors_claim():
+    # A release by zeta must never clear bravo's live claim.
+    hits = M.classify_board_mentions("g-115-99", "alpha", [
+        _bmsg("m1", "bravo", "2026-07-27T03:59:00", "claim",
+             "Claiming g-115-99", ["g-115-99", "bravo"]),
+        _bmsg("m2", "zeta", "2026-07-27T06:18:00", "status",
+             "RELEASING g-115-99", []),
+    ])
+    live, superseded = M.supersede_released_claims(hits)
+    assert superseded == []
+    assert any(h["kind"] == "claim" and h["author"] == "bravo" for h in live)
+
+
+def test_claim_after_release_is_not_superseded():
+    # Re-claim AFTER releasing: latest event wins, so the claim stands.
+    hits = M.classify_board_mentions("g-115-99", "alpha", [
+        _bmsg("m1", "zeta", "2026-07-27T03:00:00", "status",
+             "RELEASING g-115-99", []),
+        _bmsg("m2", "zeta", "2026-07-27T06:00:00", "claim",
+             "Claiming g-115-99 again", ["g-115-99", "zeta"]),
+    ])
+    live, superseded = M.supersede_released_claims(hits)
+    assert superseded == []
+    assert any(h["kind"] == "claim" for h in live)
+
+
+def test_unparseable_timestamp_keeps_the_claim():
+    # Fail-safe: a false yield is cheaper than a missed race.
+    hits = [
+        {"id": "m1", "author": "zeta", "timestamp": "not-a-date",
+         "kind": "claim", "text": "x"},
+        {"id": "m2", "author": "zeta", "timestamp": "2026-07-27T06:18:00",
+         "kind": "release", "text": "y"},
+    ]
+    live, superseded = M.supersede_released_claims(hits)
+    assert superseded == []
+    assert any(h["kind"] == "claim" for h in live)
+
+
+def test_corroborate_downgrades_claim_when_partner_is_demonstrably_elsewhere():
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "claim", "text": "x"}]
+    live, stale = M.corroborate_claims("g-115-99", hits, {
+        "zeta": {"in_flight_goal_id": "g-115-3342", "current_focus": None,
+                 "last_active_minutes": 2.0}})
+    assert live == [] and len(stale) == 1
+    assert "g-115-3342" in stale[0]["stale_reason"]
+
+
+def test_corroborate_uses_current_focus_when_in_flight_is_null():
+    # The exact  shape: in_flight null, current_focus names ANOTHER
+    # goal, agent demonstrably alive.
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "claim", "text": "x"}]
+    live, stale = M.corroborate_claims("g-335-292", hits, {
+        "zeta": {"in_flight_goal_id": None,
+                 "current_focus": "asp-115: Investigate g-115-3342 triage",
+                 "last_active_minutes": 13.0}})
+    assert live == [] and len(stale) == 1
+
+
+def test_corroborate_absence_is_never_clearance():
+    # guard-1560 / check-team-state-before-silent rule 5: a null in_flight AND
+    # empty focus is ABSENCE, not evidence. The claim must stand.
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "claim", "text": "x"}]
+    live, stale = M.corroborate_claims("g-115-99", hits, {
+        "zeta": {"in_flight_goal_id": None, "current_focus": None,
+                 "last_active_minutes": 2.0}})
+    assert stale == [] and len(live) == 1
+
+
+def test_corroborate_stale_row_never_downgrades():
+    # A partner whose heartbeat is stale may simply have a broken writer (the
+    # 2026-07-14 incident: two LIVE agents read 59h/66h stale). Not evidence.
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "claim", "text": "x"}]
+    live, stale = M.corroborate_claims("g-115-99", hits, {
+        "zeta": {"in_flight_goal_id": "g-115-3342", "current_focus": None,
+                 "last_active_minutes": 4000.0}})
+    assert stale == [] and len(live) == 1
+
+
+def test_corroborate_partner_in_flight_on_THIS_goal_stays_live():
+    # The  protection: a partner genuinely in_flight on this goal is
+    # a real race and must survive corroboration untouched.
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "claim", "text": "x"}]
+    live, stale = M.corroborate_claims("g-115-99", hits, {
+        "zeta": {"in_flight_goal_id": "g-115-99", "current_focus": "g-115-99",
+                 "last_active_minutes": 1.0}})
+    assert stale == [] and len(live) == 1
+
+
+def test_corroborate_passes_through_non_claim_kinds():
+    hits = [{"id": "m1", "author": "zeta", "timestamp": "2026-07-27T04:00:00",
+             "kind": "complete", "text": "x"}]
+    live, stale = M.corroborate_claims("g-115-99", hits, {
+        "zeta": {"in_flight_goal_id": "g-115-3342", "current_focus": None,
+                 "last_active_minutes": 1.0}})
+    assert stale == [] and len(live) == 1
+
+
+def test_g335292_replay_release_clears_race_risk():
+    """Goal check 1 — replay the real  board history.
+
+    zeta claimed twice at 03:59/04:00 and RELEASED explicitly at 06:18; bravo
+    posted a deadlock-break routing it to alpha at 06:16. Before the fix this
+    returned race_risk=true and cost ~3h across two agents.
+    """
+    msgs = [
+        _bmsg("msg-20260727-035951-zeta-5796", "zeta", "2026-07-27T03:59:51",
+             "claim", "Claiming g-335-292: MindWorlds PutItem probe",
+             ["g-335-292", "zeta"]),
+        _bmsg("msg-20260727-040009-zeta-5797", "zeta", "2026-07-27T04:00:09",
+             "claim", "Claiming g-335-292 (re-announce)",
+             ["g-335-292", "zeta"]),
+        _bmsg("msg-20260727-061831-zeta-5847", "zeta", "2026-07-27T06:18:31",
+             "status",
+             "RELEASING g-335-292 explicitly — @alpha, do not wait an "
+             "iteration. I CANNOT execute it from here.", []),
+    ]
+    hits = M.classify_board_mentions("g-335-292", "alpha", msgs)
+    live, superseded = M.supersede_released_claims(hits)
+    live, stale = M.corroborate_claims("g-335-292", live, {
+        "zeta": {"in_flight_goal_id": "g-115-3342", "current_focus": None,
+                 "last_active_minutes": 13.0}})
+    assert len(superseded) == 2, superseded
+    race_risk = any(h["kind"] in ("claim", "complete") for h in live)
+    assert race_risk is False
+
+
+def test_live_claim_still_yields_no_g115_1876_regression():
+    """Goal check 2 — the protection must NOT regress.
+
+    A partner in_flight on THIS goal with no release still sets race_risk.
+    """
+    msgs = [_bmsg("m1", "bravo", "2026-07-27T07:00:00", "claim",
+                 "Claiming g-115-99: live work", ["g-115-99", "bravo"])]
+    hits = M.classify_board_mentions("g-115-99", "alpha", msgs)
+    live, superseded = M.supersede_released_claims(hits)
+    live, stale = M.corroborate_claims("g-115-99", live, {
+        "bravo": {"in_flight_goal_id": "g-115-99",
+                  "current_focus": "g-115-99 live work",
+                  "last_active_minutes": 1.0}})
+    assert superseded == [] and stale == []
+    assert any(h["kind"] == "claim" for h in live)
+
+
+def test_release_alone_does_not_set_race_risk():
+    # A release is evidence the goal is FREE — counting it would invert the
+    # signal it was added to carry.
+    hits = M.classify_board_mentions("g-115-99", "alpha", [
+        _bmsg("m1", "zeta", "2026-07-27T06:18:00", "status",
+             "RELEASING g-115-99", [])])
+    live, _ = M.supersede_released_claims(hits)
+    live, _ = M.corroborate_claims("g-115-99", live, {})
+    assert live and not any(
+        h["kind"] in ("claim", "complete") for h in live)

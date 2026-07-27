@@ -71,7 +71,7 @@ def test_whitespace_strip():
 
 
 def test_dedup_collapses_case_variants():
-    """The original P3 #12 motivating case —  and iaus collapse."""
+    """The original P3 #12 motivating case — IAUS and iaus collapse."""
     rec = {"tags": ["iaus", "IAUS", "fallback", "ssot"]}
     _normalize_tags(rec)
     assert rec["tags"] == ["iaus", "fallback", "ssot"]

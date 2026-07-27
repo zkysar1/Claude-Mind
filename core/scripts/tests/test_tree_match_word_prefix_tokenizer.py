@@ -178,7 +178,7 @@ def test_empty_query_after_filter_returns_no_word_prefix_match():
 # ---------------------------------------------------------------------------
 
 def test_4char_acronym_works_via_word_prefix():
-    """'' (4 chars exactly) survives the filter and prefix-matches
+    """'IAUS' (4 chars exactly) survives the filter and prefix-matches
     keys containing 'iaus*'."""
     keys = ["iaus-personality-and-drift", "unrelated-thing"]
     matched, _ = _match("IAUS", keys)
