@@ -138,6 +138,31 @@ if [ -n "$DP" ] && [ -r "/proc/$DP/environ" ]; then
 else
   say daemon_environ_readable no
 fi
+# (c1) The daemon's OWN startup declaration (g-115-3410) — the AUTHORITY for which
+# backend is actually in force. /proc/<pid>/environ above shows only the EXEC-TIME
+# environment block; a daemon that derives its config IN-PROCESS at startup
+# (_load_env_local -> _apply_environment_registry, mind_api/src/__main__.py:526-536)
+# runs correctly while those keys stay ABSENT from /proc/environ for its entire life.
+# Reading environ alone therefore reports a CORRECTLY-configured node as DRIFT.
+# Observed on foxtrot 2026-07-25..27 (g-115-3157), 31h of false HIGH goals: environ
+# ABSENT, .env.local correct, daemon log "resolved STORAGE_BACKEND=own-cloud", and
+# its team-state shard reaching authoritative S3 through a daemon-ONLY writer
+# (team-state-update.sh has no CLI fallback) — which is possible only on own-cloud.
+# This does NOT blind the check to the real failure: a genuinely local-only daemon
+# logs "<unset->local>", normalised to "local" by the reader and flagged as drift.
+RL="$(grep -h 'resolved STORAGE_BACKEND=' "$R"/mind_api/state/*.log 2>/dev/null | tail -1)"
+if [ -n "$RL" ]; then
+  say daemon_logline_readable yes
+  # NOTE: this whole collector is a %%-format template (_COLLECTOR %% {...}), so a
+  # literal percent MUST be doubled — including inside COMMENTS like this one,
+  # which is how this very line first broke the template. A single percent
+  # raises "not enough arguments for format string" and kills collection for
+  # EVERY node, not just the one being edited.
+  say logline_STORAGE_BACKEND "$(printf '%%s\n' "$RL" | sed -n 's/.*resolved STORAGE_BACKEND=\([^ ]*\).*/\1/p')"
+  say logline_ENVIRONMENT_ID "$(printf '%%s\n' "$RL" | sed -n 's/.*ENVIRONMENT_ID=\([^ ]*\).*/\1/p')"
+else
+  say daemon_logline_readable no
+fi
 # file-side values for the same three, to expose file-vs-daemon disagreement
 if [ -r "$R/.env.local" ]; then
   for K in STORAGE_BACKEND ENVIRONMENT_ID MACHINE_ID; do
@@ -437,8 +462,28 @@ def _check_node(node, fields, manifest, deploy_keys):
             if got and got != want:
                 drift.append("file %s=%s expected %s" % (k, got, want))
     else:
+        # Daemon-lane value: prefer the daemon's OWN startup declaration
+        # (g-115-3410) over /proc/<pid>/environ. environ exposes only the
+        # EXEC-TIME block, so a daemon that derives its config in-process
+        # (mind_api/src/__main__.py:526-536) reports every derived key as
+        # "unset" there for its whole life, and a correctly-configured node
+        # reads as DRIFT — g-115-3157, where foxtrot emitted 31h of false HIGH
+        # goals while demonstrably writing to own-cloud. The logline states what
+        # is actually in force. A genuinely local-only daemon logs
+        # "<unset->local>", normalised to "local" here, so the failure this
+        # check exists for (2026-07-26: 28 of 49 starts local-only, ~8 encodings
+        # stranded) is still caught.
+        def _daemon_val(key):
+            if fields.get("daemon_logline_readable") == "yes":
+                lv = fields.get("logline_%s" % key)
+                if lv:
+                    if lv.startswith("<unset"):
+                        return "local" if key == "STORAGE_BACKEND" else "unset"
+                    return lv
+            return fields.get("resolved_%s" % key)
+
         for k, want in exp.items():
-            got = fields.get("resolved_%s" % k)
+            got = _daemon_val(k)
             if got in (None, "unset"):
                 drift.append("daemon has no %s (expected %s)" % (k, want))
             elif got != want:
@@ -447,7 +492,7 @@ def _check_node(node, fields, manifest, deploy_keys):
             if fileval and got and fileval != got:
                 drift.append("%s disagrees: daemon=%s file=%s (daemon wins; file is stale)"
                              % (k, got, fileval))
-        mid = fields.get("resolved_MACHINE_ID")
+        mid = _daemon_val("MACHINE_ID")
         if node.get("machine_id_check") != "skip":
             if mid in (None, "unset"):
                 drift.append("daemon has no MACHINE_ID")
@@ -578,8 +623,15 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
                 "node": fields.get("node_version"),
                 "claude": fields.get("claude_version"),
                 "kernel": fields.get("kernel"),
-                "storage_backend_resolved": fields.get("resolved_STORAGE_BACKEND"),
-                "environment_id_resolved": fields.get("resolved_ENVIRONMENT_ID"),
+                # Report the value the VERDICT used (startup logline preferred over
+                # exec-time environ, see _daemon_val). Displaying the raw environ
+                # here printed "PASS sb=unset" for any daemon that derives its
+                # config in-process — a contradiction on its face that invites a
+                # re-investigation of the very false positive this fix removed.
+                "storage_backend_resolved": (fields.get("logline_STORAGE_BACKEND")
+                                             or fields.get("resolved_STORAGE_BACKEND")),
+                "environment_id_resolved": (fields.get("logline_ENVIRONMENT_ID")
+                                            or fields.get("resolved_ENVIRONMENT_ID")),
                 "machine_id_resolved": fields.get("resolved_MACHINE_ID"),
                 "storage_backend_cli": fields.get("cli_STORAGE_BACKEND"),
                 "environment_id_cli": fields.get("cli_ENVIRONMENT_ID"),

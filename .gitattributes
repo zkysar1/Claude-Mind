@@ -52,3 +52,23 @@ agents/*/experience-meta.json merge=ayoai-ledger
 agents/*/changelog.jsonl merge=ayoai-ledger
 agents/*/journal.jsonl merge=ayoai-ledger
 agents/*/aspirations.jsonl merge=ayoai-ledger
+
+# Section-level cross-machine merge for the NARRATIVE daily journal. The rule
+# above covers journal.jsonl (the INDEX); nothing covered the daily .md the
+# index points AT, so it had no merge routing at all. journal-append.sh creates
+# it on the day's first write, so one agent identity running on two boxes has
+# BOTH boxes create the same path with no common ancestor — a textbook add/add
+# that recurs EVERY calendar day for EVERY multi-box agent and aborts the whole
+# merge, stranding unrelated ledger work with it (g-115-3425, root-caused in
+# g-115-3422: the authoritative conflict set from a real merge was exactly one
+# path, agents/bravo/journal/2026/07/2026-07-27.md).
+# NOT merge=union — this path family FAILS the zero-deleted-lines evidence gate
+# stated above: 6185 commits touched it and the probe counts 1980 deleted
+# content lines (a floor, since the regex excludes deleted markdown list items),
+# so these files are genuinely edited and union would resurrect that history.
+# The ayoai-journal-md driver (core/scripts/git-merge-journal-md.sh) instead
+# unions by '## heading' SECTION — the markdown analogue of how ayoai-ledger
+# unions by record — and still surfaces a REAL conflict when the same heading
+# diverges on both sides, so nothing is silently coalesced. Driver registered
+# per-clone by install-git-hooks.sh (git driver config is NOT version-controlled).
+agents/*/journal/**/*.md merge=ayoai-journal-md

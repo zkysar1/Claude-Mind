@@ -1,4 +1,4 @@
-"""AC6 (BRD -Backed Shared-State & Coordination API): the in-repo
+"""AC6 (BRD DynamoDB-Backed Shared-State & Coordination API): the in-repo
 idempotent AWS provisioner stands up the S3 bucket + DDB lock/sessions tables
 from an empty account, and its scoped IAM policy is env-id-scoped and grants the
 dynamodb:Scan that list_runner_claims / the FR-7 fleet-health endpoint need.
