@@ -99,7 +99,7 @@ JSON output:
     "since_hours": float,
     "affected_paths": [str, ...],      # extracted from goal prose
     "keywords": [str, ...],            # significant tokens from goal title
-    "race_risk": bool,                 # overlapping commit OR uncommitted OR board hit
+    "race_risk": bool,                 # overlapping commit OR uncommitted OR SURVIVING board claim/complete
     "overlapping_commits": [
       {"hash", "short", "subject", "committed_goal_id",
        "matched_paths": [...], "matched_keywords": [...]}
@@ -109,8 +109,14 @@ JSON output:
     "matched_uncommitted": [           # partner in-flight (uncommitted) overlaps ()
       {"file", "matched_paths": [...], "matched_stem": str}
     ],
-    "board_partner_activity": [        # partner claim/completion posts ()
-      {"id", "author", "timestamp", "kind": "claim"|"complete", "text"}
+    "board_partner_activity": [        # SURVIVING partner posts ()
+      {"id", "author", "timestamp", "kind": "claim"|"complete"|"release", "text"}
+    ],
+    "board_superseded_claims": [       # claims cleared by that author's later
+      {...}                            # explicit release ()
+    ],
+    "board_stale_claims": [            # claims live partner state contradicts;
+      {..., "stale_reason": str}       # carries WHY ()
     ],
     "product_surfaces": [str, ...],    # product surfaces the goal prose names ()
     "product_repos_scanned": [str, ...],
@@ -372,6 +378,52 @@ def _claimed_ids(mtype, text, tags):
     return ids
 
 
+# Release-announce forms (). board.py VALID_MESSAGE_TYPES DOES carry a
+# first-class "release" type ("Agent released a goal (failed/abandoned)"), so
+# type=="release" + goal-id tags is the strongest leg — exactly symmetric to how
+# _claimed_ids reads type=="claim". But agents do not reliably USE it: the
+# canonical  release was posted as type=="status" with the id only in
+# the prose. So the text-prefix and release-marker-tag legs must ALSO work on
+# non-release types. A bare body mention of "releasing" never counts (the regex
+# anchors at start-of-text), keeping the precision-first posture that stops
+# _claimed_ids flipping race_risk on citations ().
+_RELEASE_TEXT_PREFIX_RE = re.compile(
+    r"^\s*(?:releas(?:e|ing|ed)|unclaim(?:ing|ed)?|abandon(?:ing|ed)?)"
+    r"[:\s]+(?:goal\s+)?(g-\d+-\d+(?:-[a-z0-9]+)*)",
+    re.IGNORECASE)
+_RELEASE_TAG_MARKERS = frozenset({
+    "release", "released", "releasing", "unclaim", "unclaimed", "abandon",
+    "abandoned",
+})
+
+
+def _released_ids(mtype, text, tags):
+    """The goal-id(s) a post structurally RELEASES — the supersede half of the
+    claim/release pair that _claimed_ids opens (g-115-3459).
+
+    Three structural legs, strongest first: (1) type=="release" with the id in
+    goal-id-shaped TAGS — the first-class form, unambiguous, no prose needed;
+    (2) a release-announce TEXT PREFIX ("RELEASING <id>", "release: <id>",
+    "Unclaiming <id>", "Abandoning <id>") on ANY type, because agents commonly
+    post releases as type=="status"; (3) a release-marker TAG paired with
+    goal-id-shaped tags. A type=="claim" post can never be read as a release —
+    the caller checks the claim legs first, so an incoherent post that both
+    claims and releases the same id stays classified as a claim (the
+    conservative direction: race_risk stays).
+    """
+    if mtype == "claim":
+        return set()
+    ids = set()
+    if mtype == "release" or _RELEASE_TAG_MARKERS.intersection(
+            {str(t).strip().lower() for t in tags}):
+        ids |= {t.strip().lower() for t in tags
+                if _GOAL_ID_RE.fullmatch(t.strip())}
+    m = _RELEASE_TEXT_PREFIX_RE.match(text)
+    if m:
+        ids.add(m.group(1).lower())
+    return ids
+
+
 def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
                             goal_last_achieved=None):
     """Pure. Partner-authored board posts that STRUCTURALLY claim or complete
@@ -393,6 +445,11 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
                     wrongly yielded). Legacy tag-pair form (tags contain BOTH
                     "claim" and the goal_id) still accepted for non-claim-typed
                     posts.
+      - "release":  the post structurally RELEASES this goal_id (see
+                    _released_ids). Emitted as a hit rather than dropped so
+                    supersede_released_claims can pair it against that same
+                    author's earlier claim; a release alone never sets
+                    race_risk (g-115-3459).
       - "complete": type == "complete", OR text starts "Completed". (Completes
                     citing other goals' ids share the mention-FP mechanism but
                     are judgment-routed by the digest consumer, not hard-yield
@@ -443,6 +500,8 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
             # Not a race signal; dropping prevents the wrong digest yield
             # (, FP specimen msg-20260713-171224-alpha-5101).
             continue
+        elif goal_id in _released_ids(mtype, text, tags):
+            kind = "release"
         elif mtype == "complete" or text.lstrip().lower().startswith("completed"):
             kind = "complete"
         else:
@@ -474,6 +533,111 @@ def classify_board_mentions(goal_id, me, messages, goal_recurring=False,
             "text": text[:120],
         })
     return hits
+
+
+def supersede_released_claims(hits):
+    """Pure. Pair claim/release per AUTHOR and let the LATEST event win, so an
+    explicit release CLEARS that author's claim (g-115-3459).
+
+    Before this, the probe only ever ACCUMULATED yield signal: it had no notion
+    of a release, so once any claim post existed race_risk was true forever, for
+    every agent, permanently — an abandoned claim became a permanent lien on the
+    goal. Measured cost on g-335-292 (2026-07-27): zeta claimed at 03:59/04:00
+    and RELEASED explicitly at 06:18; alpha and bravo yielded four times across
+    ~3h, and the probe still returned race_risk=true after both the release AND
+    a deadlock-break post had landed.
+
+    Only that author's OWN claims are superseded — a release by zeta cannot
+    clear a live claim by bravo. Fail-safe in both directions: an unparseable
+    timestamp on either side KEEPS the claim (a false yield is cheaper than a
+    missed race, the same posture as the g-115-2978 stale-cycle drop), and a
+    release with no preceding claim is simply informational.
+
+    Returns (live_hits, superseded_hits). Order within live_hits is preserved.
+    """
+    latest_release = {}
+    for h in hits or []:
+        if h.get("kind") != "release":
+            continue
+        author = h.get("author") or ""
+        ts = h.get("timestamp") or ""
+        if not author or not ts:
+            continue
+        try:
+            when = parse_naive_iso(ts)
+        except Exception:
+            continue  # unparseable release cannot supersede anything
+        if author not in latest_release or when > latest_release[author]:
+            latest_release[author] = when
+
+    live, superseded = [], []
+    for h in hits or []:
+        rel = latest_release.get(h.get("author") or "")
+        if h.get("kind") == "claim" and rel is not None:
+            try:
+                if parse_naive_iso(h.get("timestamp")) < rel:
+                    superseded.append(h)
+                    continue
+            except Exception:
+                pass  # unparseable claim timestamp → keep (conservative)
+        live.append(h)
+    return live, superseded
+
+
+def corroborate_claims(goal_id, hits, live_state, freshness_minutes=60):
+    """Pure. Downgrade a claim that LIVE PARTNER STATE positively contradicts
+    (g-115-3459 outcome 2) — the second half of distinguishing a live claim from
+    a dead one.
+
+    On g-335-292 THREE independent signals said zeta's claim was dead and the
+    probe consulted none: zeta's in_flight was null, its current_focus named a
+    different goal, and it was demonstrably alive working elsewhere.
+
+    CRITICAL — only POSITIVE evidence of being elsewhere downgrades a claim,
+    never mere absence. This is the asymmetry that
+    .claude/rules/check-team-state-before-silent.md rule 5 mandates and that
+    guard-1560 protects: artifact-absence is NOT clearance, so a null in_flight
+    or an empty current_focus leaves the claim standing. A claimant must ALSO be
+    demonstrably alive within freshness_minutes — a stale row means the heartbeat
+    may simply be broken (the 2026-07-14 incident where two live agents read 59h
+    and 66h stale), and stale state must never be read as "not working on it".
+
+    live_state: {agent: {"in_flight_goal_id": str|None,
+                         "current_focus": str|None,
+                         "last_active_minutes": float|None}}
+
+    Returns (live_hits, stale_hits). Non-claim kinds always pass through.
+    """
+    live, stale = [], []
+    for h in hits or []:
+        if h.get("kind") != "claim":
+            live.append(h)
+            continue
+        st = (live_state or {}).get(h.get("author") or "")
+        if not isinstance(st, dict):
+            live.append(h)
+            continue
+        mins = st.get("last_active_minutes")
+        if mins is None or mins > freshness_minutes:
+            live.append(h)   # not demonstrably alive → absence, not evidence
+            continue
+        gid = str(goal_id or "").lower()
+        inflight = st.get("in_flight_goal_id")
+        focus = st.get("current_focus")
+        elsewhere = False
+        why = ""
+        if inflight and str(inflight).lower() != gid:
+            elsewhere = True
+            why = f"in_flight on {inflight}"
+        elif focus and gid and gid not in str(focus).lower():
+            elsewhere = True
+            why = f"current_focus '{str(focus)[:60]}'"
+        if elsewhere:
+            stale.append({**h, "stale_reason":
+                          f"{h.get('author')} alive {mins:.0f}m ago but {why}"})
+        else:
+            live.append(h)
+    return live, stale
 
 
 # ── Product-repo surface probe: pure classifiers () ────────────────
@@ -1089,6 +1253,69 @@ def _read_partners(since_minutes=360):
     return out
 
 
+def _agent_live_state():
+    """Best-effort per-agent live state for corroborate_claims ():
+    {agent: {in_flight_goal_id, current_focus, last_active_minutes}}.
+
+    Unlike _partner_in_flight (which returns only the single most-recently-
+    claimed partner) this is keyed BY AGENT, because a claim must be corroborated
+    against ITS OWN author's row. Fail-open: any error returns {} , which makes
+    corroborate_claims a no-op and leaves every claim standing — the safe
+    direction (guard-1560: absence is never clearance).
+
+    NOTE: this is the third team-state loader in this module (alongside
+    _partner_in_flight and _read_partners), all three duplicating the
+    load+compose_state shape. Consolidating them is out of scope for this fix
+    and is filed separately rather than inlined here.
+    """
+    try:
+        from _paths import WORLD_DIR
+        import yaml
+    except Exception:
+        return {}
+    if WORLD_DIR is None:
+        return {}
+    ts_path = Path(WORLD_DIR) / "team-state.yaml"
+    data = {}
+    try:
+        if ts_path.exists():
+            data = yaml.safe_load(ts_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        data = {}
+    try:
+        from _team_state import compose_state
+        data = compose_state(data, Path(WORLD_DIR))
+    except Exception:
+        pass
+    if not data.get("agent_status"):
+        return {}
+    import os
+    me = os.environ.get("MIND_AGENT", "")
+    now = dt.datetime.now()
+    out = {}
+    for name, info in (data.get("agent_status") or {}).items():
+        if name == me:
+            continue
+        info = info or {}
+        inf = info.get("in_flight")
+        mins = None
+        la = info.get("last_active")
+        if la:
+            try:
+                # Same clock-skew clamp as _read_partners ().
+                mins = max(0.0, round(
+                    (now - parse_naive_iso(la)).total_seconds() / 60, 0))
+            except Exception:
+                mins = None
+        out[name] = {
+            "in_flight_goal_id": (inf.get("goal_id")
+                                  if isinstance(inf, dict) else None),
+            "current_focus": info.get("current_focus"),
+            "last_active_minutes": mins,
+        }
+    return out
+
+
 def _build_advisory(goal_id, race_risk, overlapping, partners,
                     matched_uncommitted=None, partner_in_flight=None,
                     board_hits=None, product=None):
@@ -1239,7 +1466,16 @@ def main():
         args.goal_id, me, _board_recent_mentions(args.board_since_hours),
         goal_recurring=bool((goal or {}).get("recurring")),
         goal_last_achieved=(goal or {}).get("lastAchievedAt"))
-    if board_hits:
+    # Claim/release pairing + live-state corroboration (). Without
+    # these, the probe only ACCUMULATED yield signal and never cleared it, so a
+    # single abandoned claim became a permanent lien on the goal for every agent.
+    board_hits, superseded_claims = supersede_released_claims(board_hits)
+    board_hits, stale_claims = corroborate_claims(
+        args.goal_id, board_hits, _agent_live_state())
+    # race_risk keys on SURVIVING claim/complete hits only. A release-kind hit is
+    # informational — on its own it is evidence the goal is FREE, so counting it
+    # would invert the signal it was added to carry.
+    if any(h.get("kind") in ("claim", "complete") for h in board_hits):
         race_risk = True
 
     # Product-repo probe — . The mind-repo probes above are blind
@@ -1269,6 +1505,8 @@ def main():
         "overlapping_commits": overlapping,
         "matched_uncommitted": matched_uncommitted,
         "board_partner_activity": board_hits,
+        "board_superseded_claims": superseded_claims,
+        "board_stale_claims": stale_claims,
         "product_surfaces": product["surfaces"],
         "product_repos_scanned": product["repos_scanned"],
         "product_branch_hits": product["branch_hits"],
@@ -1285,6 +1523,8 @@ def main():
               f"overlapping={len(overlapping)} "
               f"uncommitted={len(matched_uncommitted)} "
               f"board={len(board_hits)} "
+              f"superseded={len(superseded_claims)} "
+              f"stale_claims={len(stale_claims)} "
               f"product={len(product['commits'])}c/"
               f"{len(product['branch_hits'])}b/{len(product['pr_hits'])}pr")
         if advisory:

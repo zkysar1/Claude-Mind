@@ -138,6 +138,43 @@ _COMMENT_PATTERNS = {
 }
 
 
+# Suffixes whose comment marker is a bare `#` running to end-of-line.
+_HASH_COMMENT_SUFFIXES = (".py", ".sh", ".yaml", ".yml")
+
+
+def _split_comment_span(line: str, suffix: str):
+    """Split `line` into (code, marker, comment) at the first REAL `#`.
+
+    Returns ``("", "", line)`` when the language has no `#`-to-EOL comment or
+    no comment marker is present — callers treat an empty marker as "no code
+    span to protect" and fall back to whole-line behavior.
+
+    A `#` inside a string literal is NOT a comment marker, so quote state is
+    tracked (single/double, with backslash escapes honored). This is the
+    guard that keeps `word_list_strip` off executable code: see the CODE-SPAN
+    GUARD note in ``apply_word_list_strip`` for the incident.
+    """
+    if suffix not in _HASH_COMMENT_SUFFIXES or "#" not in line:
+        return "", "", line
+
+    in_single = in_double = False
+    escaped = False
+    for idx, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            return line[:idx], "#", line[idx + 1:]
+    return "", "", line
+
+
 def _is_comment_line(line: str, suffix: str) -> bool:
     """Heuristic: does this line look like a comment in the file's language?
 
@@ -289,7 +326,22 @@ def apply_word_list_strip(content: str, rule: dict, rel_path: str) -> str:
     for i, line in enumerate(lines):
         prev = lines[i - 1] if i > 0 else ""
         if _check_context(line, context, suffix, prev):
-            line = word_re.sub(replacement, line)
+            # CODE-SPAN GUARD (g-115-3445). `_is_comment_line` returns True for a
+            # CODE line that merely carries a TRAILING comment — its docstring
+            # excuses this as safe "if the transformation is conservative", but
+            # word_list_strip DELETES tokens, so it is not. Substituting across
+            # the whole line rewrote `import boto3  # noqa: E402` to
+            # `import   # noqa: E402` in the planted seed — a SyntaxError shipped
+            # to the public repo, and one that recurred on every promotion
+            # because restoring the file could not outlive the next plant.
+            # `# noqa` lives on import lines by construction, so the stripped
+            # words and this idiom collide by design, not by accident.
+            # Confine the substitution to the comment span; leave code untouched.
+            if context == "comment":
+                head, sep, tail = _split_comment_span(line, suffix)
+                line = head + sep + word_re.sub(replacement, tail) if sep else line
+            else:
+                line = word_re.sub(replacement, line)
         out_lines.append(line)
     return "".join(out_lines)
 
